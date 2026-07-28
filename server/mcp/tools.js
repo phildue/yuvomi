@@ -600,7 +600,67 @@ const OPENAPI_TOOLS = [
   },
 ];
 
-const ALL_TOOLS = [...CORE_TOOLS, ...OPENAPI_TOOLS];
+
+// --------------------------------------------------------
+// Kuratierte Budget-/Meals-Tools: dünne Loopback-Wrapper.
+// Budget und Meals haben server-seitige Logik (familienspezifische Kategorien,
+// Wiederholungs-/Darlehens-Verrechnung bzw. Rezeptvorlagen), die nur in den
+// REST-Routen existiert. Statt sie hier zu duplizieren (Divergenzrisiko),
+// rufen diese Tools per authentifiziertem Loopback dieselben REST-Routen auf
+// wie call_api_operation — kuratierte Namen/Schemas, ohne die Fachlogik zu
+// verdoppeln.
+// --------------------------------------------------------
+
+const BUDGET_MEALS_TOOLS = [
+  {
+    name: 'list_expenses',
+    description: 'List budget entries (income and expenses) for a month, optionally filtered by category or account.',
+    scope: { module: 'budget', access: 'read' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        month:      { type: 'string', description: 'Month to list, format YYYY-MM. Defaults to the current month.' },
+        category:   { type: 'string', description: 'Optional category key to filter by.' },
+        account_id: { type: 'integer', description: 'Optional account id to filter by.' },
+      },
+    },
+    handler: (ctx, args) => internalApiRequest(ctx, 'GET', '/api/v1/budget', {
+      query: { month: args.month, category: args.category, account_id: args.account_id },
+    }),
+  },
+  {
+    name: 'create_expense',
+    description: 'Add an expense entry. Amount is the positive amount spent; it is recorded as money out.',
+    scope: { module: 'budget', access: 'write' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title:       { type: 'string', description: 'Short title (required).' },
+        amount:      { type: 'number', description: 'Positive amount spent (required).' },
+        category:    { type: 'string', description: 'Optional expense category key (see list_budget_categories).' },
+        subcategory: { type: 'string', description: 'Optional subcategory key.' },
+        date:        { type: 'string', description: 'Date, format YYYY-MM-DD (required).' },
+        account_id:  { type: 'integer', description: 'Optional account id.' },
+      },
+      required: ['title', 'amount', 'date'],
+    },
+    handler: (ctx, args) => {
+      const amount = Number(args.amount);
+      if (!Number.isFinite(amount)) throw new ToolError('amount must be a valid number.');
+      return internalApiRequest(ctx, 'POST', '/api/v1/budget', {
+        payload: {
+          title: args.title,
+          amount: -Math.abs(amount),
+          category: args.category,
+          subcategory: args.subcategory,
+          date: args.date,
+          account_id: args.account_id,
+        },
+      });
+    },
+  },
+];
+const ALL_TOOLS = [...CORE_TOOLS, ...BUDGET_MEALS_TOOLS, ...OPENAPI_TOOLS];
 
 // Abgeleitet aus der Registry — keine getrennt zu pflegende Struktur.
 const TOOL_DEFINITIONS = ALL_TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));

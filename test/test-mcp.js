@@ -212,6 +212,77 @@ test('tools/call list_upcoming_events: enthält das neue Event', async () => {
   assert.ok(events.some((e) => e.title === 'Zahnarzt'));
 });
 
+// ── Budget: list/create ──────────────────────────────────────────────────────
+
+test('tools/call list_expenses: baut Query aus month/category/account_id', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: [{ id: 1, title: 'Miete', amount: -800 }] }));
+  try {
+    const res = await toolCallWithHeaders(
+      'list_expenses',
+      { month: '2026-07', category: 'housing', account_id: 3 },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.deepEqual(parseContent(res), { data: [{ id: 1, title: 'Miete', amount: -800 }] });
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget?month=2026-07&category=housing&account_id=3');
+    assert.equal(calls[0].options.method, 'GET');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call create_expense: sendet Betrag als negativ (money out)', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: { id: 5, title: 'Miete', amount: -800 } }, { status: 201 }));
+  try {
+    const res = await toolCallWithHeaders(
+      'create_expense',
+      { title: 'Miete', amount: 800, date: '2026-07-01', category: 'housing' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].options.method, 'POST');
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget');
+    const body = JSON.parse(calls[0].options.body);
+    assert.equal(body.amount, -800, 'amount must be stored negative (money out)');
+    assert.equal(body.title, 'Miete');
+    assert.equal(body.date, '2026-07-01');
+    assert.equal(body.category, 'housing');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call create_expense: nicht-numerischer Betrag → isError (kein fetch)', async () => {
+  const calls = installFetchMock(() => jsonResponse({}));
+  try {
+    const res = await toolCallWithHeaders(
+      'create_expense',
+      { title: 'Miete', amount: 'viel', date: '2026-07-01' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /amount must be a valid number/i);
+    assert.equal(calls.length, 0, 'bei Validierungsfehler darf kein Request abgehen');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call create_expense: Upstream-Fehler wird als isError durchgereicht', async () => {
+  installFetchMock(() => jsonResponse({ error: 'Kategorie must be one of: housing, food.' }, { ok: false, status: 400 }));
+  try {
+    const res = await toolCallWithHeaders(
+      'create_expense',
+      { title: 'X', amount: 10, date: '2026-07-01', category: 'not_a_category' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /Kategorie must be one of/);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
 // ── OpenAPI-Brücke: Metadaten (list/get) ─────────────────────────────────────
 
 test('list_api_operations / get_api_operation: spiegeln die Live-OpenAPI-Spec', async () => {
