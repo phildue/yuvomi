@@ -600,7 +600,6 @@ const OPENAPI_TOOLS = [
   },
 ];
 
-
 // --------------------------------------------------------
 // Kuratierte Budget-/Meals-Tools: dünne Loopback-Wrapper.
 // Budget und Meals haben server-seitige Logik (familienspezifische Kategorien,
@@ -661,7 +660,7 @@ const BUDGET_MEALS_TOOLS = [
   },
   {
     name: 'update_expense',
-    description: 'Update an existing budget entry (expense or income) by id.',
+    description: 'Update an existing expense entry by id. amount is the positive amount spent and is always stored as money out — do not use this on income entries. For recurring entries, amount is the full period amount (not the smoothed monthly amount shown by list_expenses).',
     scope: { module: 'budget', access: 'write' },
     inputSchema: {
       type: 'object',
@@ -821,6 +820,7 @@ const BUDGET_MEALS_TOOLS = [
     handler: (ctx, args) => internalApiRequest(ctx, 'DELETE', `/api/v1/meals/${encodeURIComponent(args.id)}`),
   },
 ];
+
 const ALL_TOOLS = [...CORE_TOOLS, ...BUDGET_MEALS_TOOLS, ...OPENAPI_TOOLS];
 
 // Abgeleitet aus der Registry — keine getrennt zu pflegende Struktur.

@@ -356,7 +356,6 @@ test('tools/call create_expense: Upstream-Fehler wird als isError durchgereicht'
   }
 });
 
-
 test('tools/call update_expense: sendet nur gesetzte Felder, Betrag negativ', async () => {
   const calls = installFetchMock(() => jsonResponse({ data: { id: 5, title: 'Miete neu', amount: -850 } }));
   try {
@@ -505,7 +504,7 @@ test('tools/call create_meal: fehlender meal_type → isError (kein fetch)', asy
       { authorization: 'Bearer test-token' },
     );
     assert.equal(res.result.isError, true);
-    assert.equal(calls.length, 0, 'MCP-Schema-Validierung lässt fehlendes required-Feld gar nicht erst durch');
+    assert.equal(calls.length, 0, 'guard in the handler blocks the call before fetch (schema required is not runtime-enforced)');
   } finally {
     global.fetch = realFetch;
   }
