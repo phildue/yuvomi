@@ -123,18 +123,81 @@ test('initialize: unbekannte Protokollversion fällt auf die neueste zurück', a
 
 // ── tools/list ───────────────────────────────────────────────────────────────
 
-test('tools/list: listet die sechs Kern-Tools plus die drei OpenAPI-Brücken-Tools', async () => {
+test('tools/list: listet Kern-Tools, Budget/Meals-Tools und OpenAPI-Brücken-Tools', async () => {
   const res = await rpc('tools/list');
   const names = res.result.tools.map((t) => t.name).sort();
   assert.deepEqual(names, [
-    'add_shopping_item', 'call_api_operation', 'create_event', 'create_task',
-    'get_api_operation', 'list_api_operations', 'list_shopping_items',
-    'list_tasks', 'list_upcoming_events',
+    'add_shopping_item', 'call_api_operation', 'create_event', 'create_expense',
+    'create_meal', 'create_task', 'delete_expense', 'delete_meal',
+    'get_api_operation', 'get_budget_summary', 'list_api_operations',
+    'list_budget_categories', 'list_expenses', 'list_meals',
+    'list_shopping_items', 'list_tasks', 'list_upcoming_events',
+    'update_expense', 'update_meal',
   ]);
   assert.equal(res.result.tools.length, TOOL_DEFINITIONS.length);
   for (const t of res.result.tools) {
     assert.equal(t.inputSchema.type, 'object', `${t.name} braucht ein object-Schema`);
   }
+});
+
+test('Scope-Durchsetzung: budget:read darf list_expenses, aber nicht create_expense', async () => {
+  installFetchMock(() => jsonResponse({ data: [] }));
+  try {
+    const scopedActor = { id: uid, role: 'admin', scopes: ['budget:read'] };
+    const listRes = await handleMcpRequest(
+      db, scopedActor,
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_expenses', arguments: {} } },
+      (err) => internalErrors.push(err),
+      { requestHeaders: { authorization: 'Bearer test-token' } },
+    );
+    assert.equal(listRes.result.isError, false, listRes.result.content?.[0]?.text);
+
+    const createRes = await handleMcpRequest(
+      db, scopedActor,
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'create_expense', arguments: { title: 'X', amount: 10, date: '2026-07-01' } } },
+      (err) => internalErrors.push(err),
+      { requestHeaders: { authorization: 'Bearer test-token' } },
+    );
+    assert.equal(createRes.result.isError, true);
+    assert.match(createRes.result.content[0].text, /not permitted by this token's scopes/i);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('Scope-Durchsetzung: meals:write darf list_meals und create_meal', async () => {
+  installFetchMock(() => jsonResponse({ data: { id: 1 } }, { status: 201 }));
+  try {
+    const scopedActor = { id: uid, role: 'admin', scopes: ['meals:write'] };
+    const listRes = await handleMcpRequest(
+      db, scopedActor,
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_meals', arguments: {} } },
+      (err) => internalErrors.push(err),
+      { requestHeaders: { authorization: 'Bearer test-token' } },
+    );
+    assert.equal(listRes.result.isError, false, listRes.result.content?.[0]?.text);
+
+    const createRes = await handleMcpRequest(
+      db, scopedActor,
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'create_meal', arguments: { date: '2026-07-28', meal_type: 'dinner', title: 'Pasta' } } },
+      (err) => internalErrors.push(err),
+      { requestHeaders: { authorization: 'Bearer test-token' } },
+    );
+    assert.equal(createRes.result.isError, false, createRes.result.content?.[0]?.text);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('Scope-Durchsetzung: budget:read darf keine Meals-Tools nutzen', async () => {
+  const scopedActor = { id: uid, role: 'admin', scopes: ['budget:read'] };
+  const res = await handleMcpRequest(
+    db, scopedActor,
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_meals', arguments: {} } },
+    (err) => internalErrors.push(err),
+  );
+  assert.equal(res.result.isError, true);
+  assert.match(res.result.content[0].text, /not permitted by this token's scopes/i);
 });
 
 // ── create_task ──────────────────────────────────────────────────────────────
