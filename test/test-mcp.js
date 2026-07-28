@@ -96,6 +96,16 @@ function binaryResponse(bytes, { contentLength, contentType = 'application/octet
   };
 }
 
+function emptyResponse({ ok = true, status = 204 } = {}) {
+  return {
+    ok, status,
+    headers: { get: () => null },
+    json: async () => null,
+    text: async () => '',
+    arrayBuffer: async () => Buffer.alloc(0),
+  };
+}
+
 // ── initialize ───────────────────────────────────────────────────────────────
 
 test('initialize: liefert serverInfo, Capabilities und Protokollversion', async () => {
@@ -278,6 +288,109 @@ test('tools/call create_expense: Upstream-Fehler wird als isError durchgereicht'
     );
     assert.equal(res.result.isError, true);
     assert.match(res.result.content[0].text, /Kategorie must be one of/);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+
+test('tools/call update_expense: sendet nur gesetzte Felder, Betrag negativ', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: { id: 5, title: 'Miete neu', amount: -850 } }));
+  try {
+    const res = await toolCallWithHeaders(
+      'update_expense',
+      { id: 5, amount: 850 },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].options.method, 'PUT');
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget/5');
+    assert.deepEqual(JSON.parse(calls[0].options.body), { amount: -850 });
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call update_expense: nicht-numerischer Betrag → isError (kein fetch)', async () => {
+  const calls = installFetchMock(() => jsonResponse({}));
+  try {
+    const res = await toolCallWithHeaders(
+      'update_expense',
+      { id: 5, amount: 'viel' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /amount must be a valid number/i);
+    assert.equal(calls.length, 0);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call delete_expense: DELETE auf /budget/:id, leere Antwort ist kein Fehler', async () => {
+  const calls = installFetchMock(() => emptyResponse());
+  try {
+    const res = await toolCallWithHeaders('delete_expense', { id: 5 }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget/5');
+    assert.equal(calls[0].options.method, 'DELETE');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call delete_expense: Upstream-Fehler wird durchgereicht', async () => {
+  installFetchMock(() => jsonResponse({ error: 'Entry not found', code: 404 }, { ok: false, status: 404 }));
+  try {
+    const res = await toolCallWithHeaders('delete_expense', { id: 999 }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /Entry not found/);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call list_budget_categories: ohne type liefert alle Kategorien', async () => {
+  const calls = installFetchMock(() => jsonResponse({
+    data: [
+      { key: 'housing', type: 'expense', subcategories: [] },
+      { key: 'Erwerbseinkommen', type: 'income', subcategories: [] },
+    ],
+    lang: 'en',
+  }));
+  try {
+    const res = await toolCallWithHeaders('list_budget_categories', {}, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget/categories');
+    assert.equal(parseContent(res).data.length, 2);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call list_budget_categories: type=expense filtert client-seitig', async () => {
+  installFetchMock(() => jsonResponse({
+    data: [
+      { key: 'housing', type: 'expense', subcategories: [] },
+      { key: 'Erwerbseinkommen', type: 'income', subcategories: [] },
+    ],
+    lang: 'en',
+  }));
+  try {
+    const res = await toolCallWithHeaders('list_budget_categories', { type: 'expense' }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.deepEqual(parseContent(res).data.map((c) => c.key), ['housing']);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call get_budget_summary: leitet month als Query weiter', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: { month: '2026-07', income: 2000, expenses: -800, balance: 1200, byCategory: [] } }));
+  try {
+    const res = await toolCallWithHeaders('get_budget_summary', { month: '2026-07' }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget/summary?month=2026-07');
   } finally {
     global.fetch = realFetch;
   }
