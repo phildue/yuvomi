@@ -96,6 +96,16 @@ function binaryResponse(bytes, { contentLength, contentType = 'application/octet
   };
 }
 
+function emptyResponse({ ok = true, status = 204 } = {}) {
+  return {
+    ok, status,
+    headers: { get: () => null },
+    json: async () => null,
+    text: async () => '',
+    arrayBuffer: async () => Buffer.alloc(0),
+  };
+}
+
 // ── initialize ───────────────────────────────────────────────────────────────
 
 test('initialize: liefert serverInfo, Capabilities und Protokollversion', async () => {
@@ -113,18 +123,81 @@ test('initialize: unbekannte Protokollversion fällt auf die neueste zurück', a
 
 // ── tools/list ───────────────────────────────────────────────────────────────
 
-test('tools/list: listet die sechs Kern-Tools plus die drei OpenAPI-Brücken-Tools', async () => {
+test('tools/list: listet Kern-Tools, Budget/Meals-Tools und OpenAPI-Brücken-Tools', async () => {
   const res = await rpc('tools/list');
   const names = res.result.tools.map((t) => t.name).sort();
   assert.deepEqual(names, [
-    'add_shopping_item', 'call_api_operation', 'create_event', 'create_task',
-    'get_api_operation', 'list_api_operations', 'list_shopping_items',
-    'list_tasks', 'list_upcoming_events',
+    'add_shopping_item', 'call_api_operation', 'create_event', 'create_expense',
+    'create_meal', 'create_task', 'delete_expense', 'delete_meal',
+    'get_api_operation', 'get_budget_summary', 'list_api_operations',
+    'list_budget_categories', 'list_expenses', 'list_meals',
+    'list_shopping_items', 'list_tasks', 'list_upcoming_events',
+    'update_expense', 'update_meal',
   ]);
   assert.equal(res.result.tools.length, TOOL_DEFINITIONS.length);
   for (const t of res.result.tools) {
     assert.equal(t.inputSchema.type, 'object', `${t.name} braucht ein object-Schema`);
   }
+});
+
+test('Scope-Durchsetzung: budget:read darf list_expenses, aber nicht create_expense', async () => {
+  installFetchMock(() => jsonResponse({ data: [] }));
+  try {
+    const scopedActor = { id: uid, role: 'admin', scopes: ['budget:read'] };
+    const listRes = await handleMcpRequest(
+      db, scopedActor,
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_expenses', arguments: {} } },
+      (err) => internalErrors.push(err),
+      { requestHeaders: { authorization: 'Bearer test-token' } },
+    );
+    assert.equal(listRes.result.isError, false, listRes.result.content?.[0]?.text);
+
+    const createRes = await handleMcpRequest(
+      db, scopedActor,
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'create_expense', arguments: { title: 'X', amount: 10, date: '2026-07-01' } } },
+      (err) => internalErrors.push(err),
+      { requestHeaders: { authorization: 'Bearer test-token' } },
+    );
+    assert.equal(createRes.result.isError, true);
+    assert.match(createRes.result.content[0].text, /not permitted by this token's scopes/i);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('Scope-Durchsetzung: meals:write darf list_meals und create_meal', async () => {
+  installFetchMock(() => jsonResponse({ data: { id: 1 } }, { status: 201 }));
+  try {
+    const scopedActor = { id: uid, role: 'admin', scopes: ['meals:write'] };
+    const listRes = await handleMcpRequest(
+      db, scopedActor,
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_meals', arguments: {} } },
+      (err) => internalErrors.push(err),
+      { requestHeaders: { authorization: 'Bearer test-token' } },
+    );
+    assert.equal(listRes.result.isError, false, listRes.result.content?.[0]?.text);
+
+    const createRes = await handleMcpRequest(
+      db, scopedActor,
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'create_meal', arguments: { date: '2026-07-28', meal_type: 'dinner', title: 'Pasta' } } },
+      (err) => internalErrors.push(err),
+      { requestHeaders: { authorization: 'Bearer test-token' } },
+    );
+    assert.equal(createRes.result.isError, false, createRes.result.content?.[0]?.text);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('Scope-Durchsetzung: budget:read darf keine Meals-Tools nutzen', async () => {
+  const scopedActor = { id: uid, role: 'admin', scopes: ['budget:read'] };
+  const res = await handleMcpRequest(
+    db, scopedActor,
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_meals', arguments: {} } },
+    (err) => internalErrors.push(err),
+  );
+  assert.equal(res.result.isError, true);
+  assert.match(res.result.content[0].text, /not permitted by this token's scopes/i);
 });
 
 // ── create_task ──────────────────────────────────────────────────────────────
@@ -210,6 +283,267 @@ test('tools/call create_event: fehlender Start → isError', async () => {
 test('tools/call list_upcoming_events: enthält das neue Event', async () => {
   const events = parseContent(await toolCall('list_upcoming_events', { limit: 10 }));
   assert.ok(events.some((e) => e.title === 'Zahnarzt'));
+});
+
+// ── Budget: list/create ──────────────────────────────────────────────────────
+
+test('tools/call list_expenses: baut Query aus month/category/account_id', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: [{ id: 1, title: 'Miete', amount: -800 }] }));
+  try {
+    const res = await toolCallWithHeaders(
+      'list_expenses',
+      { month: '2026-07', category: 'housing', account_id: 3 },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.deepEqual(parseContent(res), { data: [{ id: 1, title: 'Miete', amount: -800 }] });
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget?month=2026-07&category=housing&account_id=3');
+    assert.equal(calls[0].options.method, 'GET');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call create_expense: sendet Betrag als negativ (money out)', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: { id: 5, title: 'Miete', amount: -800 } }, { status: 201 }));
+  try {
+    const res = await toolCallWithHeaders(
+      'create_expense',
+      { title: 'Miete', amount: 800, date: '2026-07-01', category: 'housing' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].options.method, 'POST');
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget');
+    const body = JSON.parse(calls[0].options.body);
+    assert.equal(body.amount, -800, 'amount must be stored negative (money out)');
+    assert.equal(body.title, 'Miete');
+    assert.equal(body.date, '2026-07-01');
+    assert.equal(body.category, 'housing');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call create_expense: nicht-numerischer Betrag → isError (kein fetch)', async () => {
+  const calls = installFetchMock(() => jsonResponse({}));
+  try {
+    const res = await toolCallWithHeaders(
+      'create_expense',
+      { title: 'Miete', amount: 'viel', date: '2026-07-01' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /amount must be a valid number/i);
+    assert.equal(calls.length, 0, 'bei Validierungsfehler darf kein Request abgehen');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call create_expense: Upstream-Fehler wird als isError durchgereicht', async () => {
+  installFetchMock(() => jsonResponse({ error: 'Kategorie must be one of: housing, food.' }, { ok: false, status: 400 }));
+  try {
+    const res = await toolCallWithHeaders(
+      'create_expense',
+      { title: 'X', amount: 10, date: '2026-07-01', category: 'not_a_category' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /Kategorie must be one of/);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call update_expense: sendet nur gesetzte Felder, Betrag negativ', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: { id: 5, title: 'Miete neu', amount: -850 } }));
+  try {
+    const res = await toolCallWithHeaders(
+      'update_expense',
+      { id: 5, amount: 850 },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].options.method, 'PUT');
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget/5');
+    assert.deepEqual(JSON.parse(calls[0].options.body), { amount: -850 });
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call update_expense: nicht-numerischer Betrag → isError (kein fetch)', async () => {
+  const calls = installFetchMock(() => jsonResponse({}));
+  try {
+    const res = await toolCallWithHeaders(
+      'update_expense',
+      { id: 5, amount: 'viel' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /amount must be a valid number/i);
+    assert.equal(calls.length, 0);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call delete_expense: DELETE auf /budget/:id, leere Antwort ist kein Fehler', async () => {
+  const calls = installFetchMock(() => emptyResponse());
+  try {
+    const res = await toolCallWithHeaders('delete_expense', { id: 5 }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget/5');
+    assert.equal(calls[0].options.method, 'DELETE');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call delete_expense: Upstream-Fehler wird durchgereicht', async () => {
+  installFetchMock(() => jsonResponse({ error: 'Entry not found', code: 404 }, { ok: false, status: 404 }));
+  try {
+    const res = await toolCallWithHeaders('delete_expense', { id: 999 }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /Entry not found/);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call list_budget_categories: ohne type liefert alle Kategorien', async () => {
+  const calls = installFetchMock(() => jsonResponse({
+    data: [
+      { key: 'housing', type: 'expense', subcategories: [] },
+      { key: 'Erwerbseinkommen', type: 'income', subcategories: [] },
+    ],
+    lang: 'en',
+  }));
+  try {
+    const res = await toolCallWithHeaders('list_budget_categories', {}, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget/categories');
+    assert.equal(parseContent(res).data.length, 2);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call list_budget_categories: type=expense filtert client-seitig', async () => {
+  installFetchMock(() => jsonResponse({
+    data: [
+      { key: 'housing', type: 'expense', subcategories: [] },
+      { key: 'Erwerbseinkommen', type: 'income', subcategories: [] },
+    ],
+    lang: 'en',
+  }));
+  try {
+    const res = await toolCallWithHeaders('list_budget_categories', { type: 'expense' }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.deepEqual(parseContent(res).data.map((c) => c.key), ['housing']);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call get_budget_summary: leitet month als Query weiter', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: { month: '2026-07', income: 2000, expenses: -800, balance: 1200, byCategory: [] } }));
+  try {
+    const res = await toolCallWithHeaders('get_budget_summary', { month: '2026-07' }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget/summary?month=2026-07');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+// ── Meals ────────────────────────────────────────────────────────────────────
+
+test('tools/call list_meals: leitet week als Query weiter', async () => {
+  const calls = installFetchMock(() => jsonResponse({
+    data: [{ id: 1, title: 'Pasta', meal_type: 'dinner' }],
+    weekStart: '2026-07-27', weekEnd: '2026-08-02',
+  }));
+  try {
+    const res = await toolCallWithHeaders('list_meals', { week: '2026-07-28' }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/meals?week=2026-07-28');
+    assert.equal(calls[0].options.method, 'GET');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call create_meal: sendet Pflichtfelder und optionale Zutaten', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: { id: 9, title: 'Pasta', meal_type: 'dinner' } }, { status: 201 }));
+  try {
+    const res = await toolCallWithHeaders(
+      'create_meal',
+      { date: '2026-07-28', meal_type: 'dinner', title: 'Pasta', ingredients: [{ name: 'Nudeln', quantity: '500g' }] },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].options.method, 'POST');
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/meals');
+    const body = JSON.parse(calls[0].options.body);
+    assert.equal(body.title, 'Pasta');
+    assert.equal(body.meal_type, 'dinner');
+    assert.deepEqual(body.ingredients, [{ name: 'Nudeln', quantity: '500g' }]);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call create_meal: fehlender meal_type → isError (kein fetch)', async () => {
+  const calls = installFetchMock(() => jsonResponse({}));
+  try {
+    const res = await toolCallWithHeaders(
+      'create_meal',
+      { date: '2026-07-28', title: 'Pasta' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, true);
+    assert.equal(calls.length, 0, 'guard in the handler blocks the call before fetch (schema required is not runtime-enforced)');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call update_meal: sendet nur gesetzte Felder', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: { id: 9, title: 'Pasta Bolognese' } }));
+  try {
+    const res = await toolCallWithHeaders('update_meal', { id: 9, title: 'Pasta Bolognese' }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].options.method, 'PUT');
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/meals/9');
+    assert.deepEqual(JSON.parse(calls[0].options.body), { title: 'Pasta Bolognese' });
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call delete_meal: DELETE auf /meals/:id', async () => {
+  const calls = installFetchMock(() => emptyResponse());
+  try {
+    const res = await toolCallWithHeaders('delete_meal', { id: 9 }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/meals/9');
+    assert.equal(calls[0].options.method, 'DELETE');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call delete_meal: Upstream-Fehler wird durchgereicht', async () => {
+  installFetchMock(() => jsonResponse({ error: 'Mahlzeit nicht gefunden', code: 404 }, { ok: false, status: 404 }));
+  try {
+    const res = await toolCallWithHeaders('delete_meal', { id: 999 }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /nicht gefunden/);
+  } finally {
+    global.fetch = realFetch;
+  }
 });
 
 // ── OpenAPI-Brücke: Metadaten (list/get) ─────────────────────────────────────

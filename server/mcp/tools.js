@@ -600,7 +600,228 @@ const OPENAPI_TOOLS = [
   },
 ];
 
-const ALL_TOOLS = [...CORE_TOOLS, ...OPENAPI_TOOLS];
+// --------------------------------------------------------
+// Kuratierte Budget-/Meals-Tools: dünne Loopback-Wrapper.
+// Budget und Meals haben server-seitige Logik (familienspezifische Kategorien,
+// Wiederholungs-/Darlehens-Verrechnung bzw. Rezeptvorlagen), die nur in den
+// REST-Routen existiert. Statt sie hier zu duplizieren (Divergenzrisiko),
+// rufen diese Tools per authentifiziertem Loopback dieselben REST-Routen auf
+// wie call_api_operation — kuratierte Namen/Schemas, ohne die Fachlogik zu
+// verdoppeln.
+// --------------------------------------------------------
+
+const BUDGET_MEALS_TOOLS = [
+  {
+    name: 'list_expenses',
+    description: 'List budget entries (income and expenses) for a month, optionally filtered by category or account.',
+    scope: { module: 'budget', access: 'read' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        month:      { type: 'string', description: 'Month to list, format YYYY-MM. Defaults to the current month.' },
+        category:   { type: 'string', description: 'Optional category key to filter by.' },
+        account_id: { type: 'integer', description: 'Optional account id to filter by.' },
+      },
+    },
+    handler: (ctx, args) => internalApiRequest(ctx, 'GET', '/api/v1/budget', {
+      query: { month: args.month, category: args.category, account_id: args.account_id },
+    }),
+  },
+  {
+    name: 'create_expense',
+    description: 'Add an expense entry. Amount is the positive amount spent; it is recorded as money out.',
+    scope: { module: 'budget', access: 'write' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title:       { type: 'string', description: 'Short title (required).' },
+        amount:      { type: 'number', description: 'Positive amount spent (required).' },
+        category:    { type: 'string', description: 'Optional expense category key (see list_budget_categories).' },
+        subcategory: { type: 'string', description: 'Optional subcategory key.' },
+        date:        { type: 'string', description: 'Date, format YYYY-MM-DD (required).' },
+        account_id:  { type: 'integer', description: 'Optional account id.' },
+      },
+      required: ['title', 'amount', 'date'],
+    },
+    handler: (ctx, args) => {
+      const amount = Number(args.amount);
+      if (!Number.isFinite(amount)) throw new ToolError('amount must be a valid number.');
+      return internalApiRequest(ctx, 'POST', '/api/v1/budget', {
+        payload: {
+          title: args.title,
+          amount: -Math.abs(amount),
+          category: args.category,
+          subcategory: args.subcategory,
+          date: args.date,
+          account_id: args.account_id,
+        },
+      });
+    },
+  },
+  {
+    name: 'update_expense',
+    description: 'Update an existing expense entry by id. amount is the positive amount spent and is always stored as money out — do not use this on income entries. For recurring entries, amount is the full period amount (not the smoothed monthly amount shown by list_expenses).',
+    scope: { module: 'budget', access: 'write' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id:          { type: 'integer', description: 'Entry id (required).' },
+        title:       { type: 'string', description: 'New title.' },
+        amount:      { type: 'number', description: 'New positive amount spent (stored as money out).' },
+        category:    { type: 'string', description: 'New category key.' },
+        subcategory: { type: 'string', description: 'New subcategory key.' },
+        date:        { type: 'string', description: 'New date, format YYYY-MM-DD.' },
+        account_id:  { type: 'integer', description: 'New account id.' },
+      },
+      required: ['id'],
+    },
+    handler: (ctx, args) => {
+      const payload = {};
+      if (args.title !== undefined) payload.title = args.title;
+      if (args.amount !== undefined) {
+        const amount = Number(args.amount);
+        if (!Number.isFinite(amount)) throw new ToolError('amount must be a valid number.');
+        payload.amount = -Math.abs(amount);
+      }
+      if (args.category !== undefined) payload.category = args.category;
+      if (args.subcategory !== undefined) payload.subcategory = args.subcategory;
+      if (args.date !== undefined) payload.date = args.date;
+      if (args.account_id !== undefined) payload.account_id = args.account_id;
+      return internalApiRequest(ctx, 'PUT', `/api/v1/budget/${encodeURIComponent(args.id)}`, { payload });
+    },
+  },
+  {
+    name: 'delete_expense',
+    description: 'Delete a budget entry by id.',
+    scope: { module: 'budget', access: 'write' },
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'integer', description: 'Entry id (required).' } },
+      required: ['id'],
+    },
+    handler: (ctx, args) => internalApiRequest(ctx, 'DELETE', `/api/v1/budget/${encodeURIComponent(args.id)}`),
+  },
+  {
+    name: 'list_budget_categories',
+    description: 'List budget categories (with subcategories), optionally filtered by type.',
+    scope: { module: 'budget', access: 'read' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        type: { type: 'string', enum: ['expense', 'income'], description: 'Optional category type filter.' },
+      },
+    },
+    handler: async (ctx, args) => {
+      const result = await internalApiRequest(ctx, 'GET', '/api/v1/budget/categories');
+      if (!args.type || !result || !Array.isArray(result.data)) return result;
+      return { ...result, data: result.data.filter((c) => c.type === args.type) };
+    },
+  },
+  {
+    name: 'get_budget_summary',
+    description: 'Get the income/expense summary for a month.',
+    scope: { module: 'budget', access: 'read' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        month: { type: 'string', description: 'Month, format YYYY-MM. Defaults to the current month.' },
+      },
+    },
+    handler: (ctx, args) => internalApiRequest(ctx, 'GET', '/api/v1/budget/summary', {
+      query: { month: args.month },
+    }),
+  },
+  {
+    name: 'list_meals',
+    description: 'List planned meals for a week, including ingredients.',
+    scope: { module: 'meals', access: 'read' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        week: { type: 'string', description: 'Any date within the target week, format YYYY-MM-DD. Defaults to the current week.' },
+      },
+    },
+    handler: (ctx, args) => internalApiRequest(ctx, 'GET', '/api/v1/meals', {
+      query: { week: args.week },
+    }),
+  },
+  {
+    name: 'create_meal',
+    description: 'Add a planned meal.',
+    scope: { module: 'meals', access: 'write' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        date:        { type: 'string', description: 'Date, format YYYY-MM-DD (required).' },
+        meal_type:   { type: 'string', enum: ['breakfast', 'lunch', 'dinner', 'snack'], description: 'Meal slot (required).' },
+        title:       { type: 'string', description: 'Meal title (required).' },
+        notes:       { type: 'string', description: 'Optional notes.' },
+        ingredients: {
+          type: 'array',
+          description: 'Optional ingredient list.',
+          items: {
+            type: 'object',
+            properties: {
+              name:     { type: 'string' },
+              quantity: { type: 'string' },
+            },
+            required: ['name'],
+          },
+        },
+      },
+      required: ['date', 'meal_type', 'title'],
+    },
+    handler: (ctx, args) => {
+      if (!args.meal_type) throw new ToolError('meal_type is required.');
+      return internalApiRequest(ctx, 'POST', '/api/v1/meals', {
+        payload: {
+          date: args.date,
+          meal_type: args.meal_type,
+          title: args.title,
+          notes: args.notes,
+          ingredients: args.ingredients,
+        },
+      });
+    },
+  },
+  {
+    name: 'update_meal',
+    description: 'Update a planned meal by id (basic fields only, applies to this occurrence).',
+    scope: { module: 'meals', access: 'write' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id:        { type: 'integer', description: 'Meal id (required).' },
+        date:      { type: 'string', description: 'New date, format YYYY-MM-DD.' },
+        meal_type: { type: 'string', enum: ['breakfast', 'lunch', 'dinner', 'snack'], description: 'New meal slot.' },
+        title:     { type: 'string', description: 'New title.' },
+        notes:     { type: 'string', description: 'New notes.' },
+      },
+      required: ['id'],
+    },
+    handler: (ctx, args) => {
+      const payload = {};
+      if (args.date !== undefined) payload.date = args.date;
+      if (args.meal_type !== undefined) payload.meal_type = args.meal_type;
+      if (args.title !== undefined) payload.title = args.title;
+      if (args.notes !== undefined) payload.notes = args.notes;
+      return internalApiRequest(ctx, 'PUT', `/api/v1/meals/${encodeURIComponent(args.id)}`, { payload });
+    },
+  },
+  {
+    name: 'delete_meal',
+    description: 'Delete a planned meal by id.',
+    scope: { module: 'meals', access: 'write' },
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'integer', description: 'Meal id (required).' } },
+      required: ['id'],
+    },
+    handler: (ctx, args) => internalApiRequest(ctx, 'DELETE', `/api/v1/meals/${encodeURIComponent(args.id)}`),
+  },
+];
+
+const ALL_TOOLS = [...CORE_TOOLS, ...BUDGET_MEALS_TOOLS, ...OPENAPI_TOOLS];
 
 // Abgeleitet aus der Registry — keine getrennt zu pflegende Struktur.
 const TOOL_DEFINITIONS = ALL_TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
