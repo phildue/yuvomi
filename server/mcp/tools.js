@@ -732,6 +732,94 @@ const BUDGET_MEALS_TOOLS = [
       query: { month: args.month },
     }),
   },
+  {
+    name: 'list_meals',
+    description: 'List planned meals for a week, including ingredients.',
+    scope: { module: 'meals', access: 'read' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        week: { type: 'string', description: 'Any date within the target week, format YYYY-MM-DD. Defaults to the current week.' },
+      },
+    },
+    handler: (ctx, args) => internalApiRequest(ctx, 'GET', '/api/v1/meals', {
+      query: { week: args.week },
+    }),
+  },
+  {
+    name: 'create_meal',
+    description: 'Add a planned meal.',
+    scope: { module: 'meals', access: 'write' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        date:        { type: 'string', description: 'Date, format YYYY-MM-DD (required).' },
+        meal_type:   { type: 'string', enum: ['breakfast', 'lunch', 'dinner', 'snack'], description: 'Meal slot (required).' },
+        title:       { type: 'string', description: 'Meal title (required).' },
+        notes:       { type: 'string', description: 'Optional notes.' },
+        ingredients: {
+          type: 'array',
+          description: 'Optional ingredient list.',
+          items: {
+            type: 'object',
+            properties: {
+              name:     { type: 'string' },
+              quantity: { type: 'string' },
+            },
+            required: ['name'],
+          },
+        },
+      },
+      required: ['date', 'meal_type', 'title'],
+    },
+    handler: (ctx, args) => {
+      if (!args.meal_type) throw new ToolError('meal_type is required.');
+      return internalApiRequest(ctx, 'POST', '/api/v1/meals', {
+        payload: {
+          date: args.date,
+          meal_type: args.meal_type,
+          title: args.title,
+          notes: args.notes,
+          ingredients: args.ingredients,
+        },
+      });
+    },
+  },
+  {
+    name: 'update_meal',
+    description: 'Update a planned meal by id (basic fields only, applies to this occurrence).',
+    scope: { module: 'meals', access: 'write' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id:        { type: 'integer', description: 'Meal id (required).' },
+        date:      { type: 'string', description: 'New date, format YYYY-MM-DD.' },
+        meal_type: { type: 'string', enum: ['breakfast', 'lunch', 'dinner', 'snack'], description: 'New meal slot.' },
+        title:     { type: 'string', description: 'New title.' },
+        notes:     { type: 'string', description: 'New notes.' },
+      },
+      required: ['id'],
+    },
+    handler: (ctx, args) => {
+      const payload = {};
+      if (args.date !== undefined) payload.date = args.date;
+      if (args.meal_type !== undefined) payload.meal_type = args.meal_type;
+      if (args.title !== undefined) payload.title = args.title;
+      if (args.notes !== undefined) payload.notes = args.notes;
+      return internalApiRequest(ctx, 'PUT', `/api/v1/meals/${encodeURIComponent(args.id)}`, { payload });
+    },
+  },
+  {
+    name: 'delete_meal',
+    description: 'Delete a planned meal by id.',
+    scope: { module: 'meals', access: 'write' },
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'integer', description: 'Meal id (required).' } },
+      required: ['id'],
+    },
+    handler: (ctx, args) => internalApiRequest(ctx, 'DELETE', `/api/v1/meals/${encodeURIComponent(args.id)}`),
+  },
 ];
 const ALL_TOOLS = [...CORE_TOOLS, ...BUDGET_MEALS_TOOLS, ...OPENAPI_TOOLS];
 

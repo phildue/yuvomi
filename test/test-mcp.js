@@ -396,6 +396,94 @@ test('tools/call get_budget_summary: leitet month als Query weiter', async () =>
   }
 });
 
+// ── Meals ────────────────────────────────────────────────────────────────────
+
+test('tools/call list_meals: leitet week als Query weiter', async () => {
+  const calls = installFetchMock(() => jsonResponse({
+    data: [{ id: 1, title: 'Pasta', meal_type: 'dinner' }],
+    weekStart: '2026-07-27', weekEnd: '2026-08-02',
+  }));
+  try {
+    const res = await toolCallWithHeaders('list_meals', { week: '2026-07-28' }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/meals?week=2026-07-28');
+    assert.equal(calls[0].options.method, 'GET');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call create_meal: sendet Pflichtfelder und optionale Zutaten', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: { id: 9, title: 'Pasta', meal_type: 'dinner' } }, { status: 201 }));
+  try {
+    const res = await toolCallWithHeaders(
+      'create_meal',
+      { date: '2026-07-28', meal_type: 'dinner', title: 'Pasta', ingredients: [{ name: 'Nudeln', quantity: '500g' }] },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].options.method, 'POST');
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/meals');
+    const body = JSON.parse(calls[0].options.body);
+    assert.equal(body.title, 'Pasta');
+    assert.equal(body.meal_type, 'dinner');
+    assert.deepEqual(body.ingredients, [{ name: 'Nudeln', quantity: '500g' }]);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call create_meal: fehlender meal_type → isError (kein fetch)', async () => {
+  const calls = installFetchMock(() => jsonResponse({}));
+  try {
+    const res = await toolCallWithHeaders(
+      'create_meal',
+      { date: '2026-07-28', title: 'Pasta' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, true);
+    assert.equal(calls.length, 0, 'MCP-Schema-Validierung lässt fehlendes required-Feld gar nicht erst durch');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call update_meal: sendet nur gesetzte Felder', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: { id: 9, title: 'Pasta Bolognese' } }));
+  try {
+    const res = await toolCallWithHeaders('update_meal', { id: 9, title: 'Pasta Bolognese' }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].options.method, 'PUT');
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/meals/9');
+    assert.deepEqual(JSON.parse(calls[0].options.body), { title: 'Pasta Bolognese' });
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call delete_meal: DELETE auf /meals/:id', async () => {
+  const calls = installFetchMock(() => emptyResponse());
+  try {
+    const res = await toolCallWithHeaders('delete_meal', { id: 9 }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].url, 'http://mcp.test/api/v1/meals/9');
+    assert.equal(calls[0].options.method, 'DELETE');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('tools/call delete_meal: Upstream-Fehler wird durchgereicht', async () => {
+  installFetchMock(() => jsonResponse({ error: 'Mahlzeit nicht gefunden', code: 404 }, { ok: false, status: 404 }));
+  try {
+    const res = await toolCallWithHeaders('delete_meal', { id: 999 }, { authorization: 'Bearer test-token' });
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /nicht gefunden/);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
 // ── OpenAPI-Brücke: Metadaten (list/get) ─────────────────────────────────────
 
 test('list_api_operations / get_api_operation: spiegeln die Live-OpenAPI-Spec', async () => {
