@@ -175,6 +175,47 @@ test('account_id-Filter in GET /budget', async () => {
   } finally { await h.close(); }
 });
 
+test('category-Filter in GET /budget (Drilldown aus dem Kategorien-Diagramm)', async () => {
+  cleanup();
+  const h = createHarness();
+  try {
+    const otherCat = suiteDatabase.prepare(
+      "SELECT key FROM budget_categories WHERE type = 'expense' AND key != ? ORDER BY sort_order ASC LIMIT 1"
+    ).get(EXPENSE_CAT)?.key;
+    assert.ok(otherCat, 'zweite Ausgabenkategorie muss für den Test existieren');
+    const month = PAST.slice(0, 7);
+    await h.call('POST', '', { title: 'Kategorie A', amount: -10, category: EXPENSE_CAT, date: PAST });
+    await h.call('POST', '', { title: 'Kategorie B', amount: -20, category: otherCat, date: PAST });
+
+    const filtered = (await h.call('GET', `/?month=${month}&category=${EXPENSE_CAT}`)).body.data;
+    assert.equal(filtered.length, 1);
+    assert.equal(filtered[0].title, 'Kategorie A');
+    assert.equal(filtered[0].category, EXPENSE_CAT);
+
+    const all = (await h.call('GET', `/?month=${month}`)).body.data;
+    assert.equal(all.length, 2);
+
+    const invalid = (await h.call('GET', `/?month=${month}&category=does-not-exist`)).body.data;
+    assert.equal(invalid.length, 2, 'unbekannte Kategorie wird ignoriert statt die Liste leer zu filtern');
+  } finally { await h.close(); }
+});
+
+test('category- und account_id-Filter in GET /budget kombinieren sich (UND-Verknüpfung)', async () => {
+  cleanup();
+  const h = createHarness();
+  try {
+    const acc = (await h.call('POST', '/accounts', { name: 'Konto', starting_balance: 0 })).body.data;
+    const month = PAST.slice(0, 7);
+    await h.call('POST', '', { title: 'Treffer', amount: -10, category: EXPENSE_CAT, date: PAST, account_id: acc.id });
+    await h.call('POST', '', { title: 'Falsches Konto', amount: -10, category: EXPENSE_CAT, date: PAST });
+    await h.call('POST', '', { title: 'Falsche Kategorie', amount: 50, category: INCOME_CAT, date: PAST, account_id: acc.id });
+
+    const filtered = (await h.call('GET', `/?month=${month}&category=${EXPENSE_CAT}&account_id=${acc.id}`)).body.data;
+    assert.equal(filtered.length, 1);
+    assert.equal(filtered[0].title, 'Treffer');
+  } finally { await h.close(); }
+});
+
 test('POST /budget: ungültige account_id → 400', async () => {
   cleanup();
   const h = createHarness();
