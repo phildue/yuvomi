@@ -492,6 +492,23 @@
 .budget-summary-card__trend--negative { color: var(--color-danger);  }
 .budget-summary-card__trend--neutral  { color: var(--color-text-secondary); }
 
+/* Einnahmen/Ausgaben-Kacheln als Drilldown-Trigger (Klick filtert die
+ * Transaktionsliste auf diesen Typ) — Button-Reset, Karte bleibt optisch gleich. */
+button.budget-summary-card--clickable {
+  width: 100%;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: box-shadow var(--transition-fast);
+}
+
+button.budget-summary-card--clickable:hover { box-shadow: var(--shadow-md); }
+button.budget-summary-card--clickable:focus-visible { outline: 2px solid var(--module-accent); outline-offset: 2px; }
+button.budget-summary-card--clickable.is-active {
+  border-color: var(--module-accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--module-accent) 30%, transparent);
+}
+
 /* --------------------------------------------------------
  * Kategorien-Diagramm (Canvas)
  * -------------------------------------------------------- */
@@ -516,6 +533,32 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
+}
+
+/* Kategorie-Balken als Drilldown-Trigger (Klick filtert die Transaktionsliste
+ * auf diese Kategorie) — Button-Reset, damit er wie die reine Anzeige wirkt. */
+button.budget-bar-row--clickable {
+  width: 100%;
+  background: none;
+  border: none;
+  margin: 0;
+  padding: var(--space-1) var(--space-1h, 6px);
+  border-radius: var(--radius-md);
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+button.budget-bar-row--clickable:hover { background-color: var(--color-surface-2); }
+button.budget-bar-row--clickable:focus-visible { outline: 2px solid var(--module-accent); outline-offset: 2px; }
+button.budget-bar-row--clickable.is-active {
+  background-color: color-mix(in srgb, var(--module-accent) 14%, transparent);
+}
+button.budget-bar-row--clickable.is-active .budget-bar-row__label {
+  color: var(--module-accent);
+  font-weight: var(--font-weight-semibold);
 }
 
 .budget-bar-row__label {

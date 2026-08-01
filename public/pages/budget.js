@@ -157,6 +157,8 @@ let state = {
   accounts:    [],
   netWorth:    0,
   accountFilterId: null,      // aktiver Konto-Filter für die Transaktionsliste (Drilldown)
+  categoryFilterKey: null,    // aktiver Kategorie-Filter für die Transaktionsliste (Drilldown aus dem Balkendiagramm)
+  typeFilter: null,           // 'income' | 'expenses' | null — Drilldown aus den Einnahmen/Ausgaben-Kacheln (rein clientseitig, kein Server-Roundtrip nötig)
   accountsShowArchived: false,
   activeTab:   'budget',
   loanFilterId: null,
@@ -200,9 +202,12 @@ async function loadMonth(month) {
   const prevMonth = addMonths(month, -1);
   // Konto-Drilldown: Transaktionsliste optional auf ein Konto filtern.
   const accountQuery = state.accountFilterId ? `&account_id=${state.accountFilterId}` : '';
+  // Kategorie-Drilldown: Transaktionsliste optional auf eine Kategorie filtern
+  // (Klick auf einen Balken im Kategorien-Diagramm). Beide Filter sind kombinierbar.
+  const categoryQuery = state.categoryFilterKey ? `&category=${encodeURIComponent(state.categoryFilterKey)}` : '';
   try {
     const [entriesRes, summaryRes, prevSummaryRes, loansRes] = await Promise.all([
-      api.get(`/budget?month=${month}${accountQuery}`),
+      api.get(`/budget?month=${month}${accountQuery}${categoryQuery}`),
       api.get(`/budget/summary?month=${month}`),
       api.get(`/budget/summary?month=${prevMonth}`),
       api.get('/budget/loans'),
@@ -485,16 +490,18 @@ function renderBody() {
     <div class="budget-tab-panel budget-tab-panel--budget">
     <!-- Zusammenfassung -->
     <div class="budget-summary">
-      <div class="budget-summary-card budget-summary-card--income">
+      <button type="button" class="budget-summary-card budget-summary-card--income budget-summary-card--clickable${state.typeFilter === 'income' ? ' is-active' : ''}"
+              data-type-filter="income" aria-pressed="${state.typeFilter === 'income'}" aria-label="${esc(t('budget.filterIncomeLabel'))}">
         <div class="budget-summary-card__label">${t('budget.income')}</div>
         <div class="budget-summary-card__amount">${formatAmount(s.income)}</div>
         ${p ? renderTrend(s.income, p.income, prevLabel) : ''}
-      </div>
-      <div class="budget-summary-card budget-summary-card--expenses">
+      </button>
+      <button type="button" class="budget-summary-card budget-summary-card--expenses budget-summary-card--clickable${state.typeFilter === 'expenses' ? ' is-active' : ''}"
+              data-type-filter="expenses" aria-pressed="${state.typeFilter === 'expenses'}" aria-label="${esc(t('budget.filterExpensesLabel'))}">
         <div class="budget-summary-card__label">${t('budget.expenses')}</div>
         <div class="budget-summary-card__amount">${formatAmount(Math.abs(s.expenses))}</div>
         ${p ? renderTrend(s.expenses, p.expenses, prevLabel) : ''}
-      </div>
+      </button>
       <div class="budget-summary-card ${balanceClass}">
         <div class="budget-summary-card__label">${t('budget.balance')}</div>
         <div class="budget-summary-card__amount">${formatAmount(s.balance)}</div>
@@ -522,6 +529,20 @@ function renderBody() {
                   aria-label="${t('budget.clearAccountFilter')}">
             <i data-lucide="wallet" class="icon-xs" aria-hidden="true"></i>
             <span>${esc(accountName(state.accountFilterId))}</span>
+            <i data-lucide="x" class="icon-xs" aria-hidden="true"></i>
+          </button>` : ''}
+          ${state.categoryFilterKey ? `
+          <button class="budget-account-chip" id="budget-clear-category-filter" type="button"
+                  aria-label="${t('budget.clearCategoryFilter')}">
+            <i data-lucide="tag" class="icon-xs" aria-hidden="true"></i>
+            <span>${esc(categoryLabel(state.categoryFilterKey))}</span>
+            <i data-lucide="x" class="icon-xs" aria-hidden="true"></i>
+          </button>` : ''}
+          ${state.typeFilter ? `
+          <button class="budget-account-chip" id="budget-clear-type-filter" type="button"
+                  aria-label="${t('budget.clearTypeFilter')}">
+            <i data-lucide="filter" class="icon-xs" aria-hidden="true"></i>
+            <span>${esc(t(state.typeFilter === 'income' ? 'budget.income' : 'budget.expenses'))}</span>
             <i data-lucide="x" class="icon-xs" aria-hidden="true"></i>
           </button>` : ''}
         </div>
@@ -552,6 +573,30 @@ function renderBody() {
     state.accountFilterId = null;
     await loadMonth(state.month);
     renderBody();
+  });
+  _container.querySelector('#budget-clear-category-filter')?.addEventListener('click', async () => {
+    state.categoryFilterKey = null;
+    await loadMonth(state.month);
+    renderBody();
+  });
+  _container.querySelector('#budget-clear-type-filter')?.addEventListener('click', () => {
+    state.typeFilter = null;
+    renderBody();
+  });
+  _container.querySelectorAll('.budget-summary-card[data-type-filter]').forEach((card) => {
+    card.addEventListener('click', () => {
+      const type = card.dataset.typeFilter;
+      state.typeFilter = state.typeFilter === type ? null : type;
+      renderBody();
+    });
+  });
+  _container.querySelectorAll('.budget-bar-row[data-category]').forEach((row) => {
+    row.addEventListener('click', async () => {
+      const key = row.dataset.category;
+      state.categoryFilterKey = state.categoryFilterKey === key ? null : key;
+      await loadMonth(state.month);
+      renderBody();
+    });
   });
   stagger(_container.querySelector('#budget-list')?.querySelectorAll('.budget-entry') ?? []);
 
@@ -620,23 +665,34 @@ function renderCategoryBars(byCategory) {
     const isExpense = c.total < 0;
     const pct       = Math.round((Math.abs(c.total) / maxAbs) * 100);
     const cls       = isExpense ? 'budget-bar-row__fill--expenses' : 'budget-bar-row__fill--income';
+    const label     = categoryLabel(c.category);
+    const isActive  = state.categoryFilterKey === c.category;
 
     return `
-      <div class="budget-bar-row">
-        <div class="budget-bar-row__label" title="${esc(categoryLabel(c.category))}">${esc(categoryLabel(c.category))}</div>
+      <button type="button" class="budget-bar-row budget-bar-row--clickable${isActive ? ' is-active' : ''}"
+              data-category="${esc(c.category)}" aria-pressed="${isActive}"
+              aria-label="${esc(t('budget.viewCategoryTransactions', { name: label }))}">
+        <div class="budget-bar-row__label" title="${esc(label)}">${esc(label)}</div>
         <div class="budget-bar-row__track">
           <div class="budget-bar-row__fill ${cls}" style="--bar-scale:${pct / 100}"></div>
         </div>
         <div class="budget-bar-row__amount" style="color:${isExpense ? 'var(--color-danger)' : 'var(--color-success)'};">
           ${isExpense ? '' : '+'}${formatAmount(c.total)}
         </div>
-      </div>
+      </button>
     `;
   }).join('');
 }
 
 function renderEntries() {
-  if (!state.entries.length) {
+  // Einnahmen/Ausgaben-Filter läuft rein clientseitig auf den bereits geladenen
+  // Einträgen (Vorzeichen steht schon fest) — kein zusätzlicher Server-Roundtrip
+  // wie beim Konto-/Kategorie-Drilldown nötig.
+  const entries = state.typeFilter
+    ? state.entries.filter((e) => (e.amount > 0) === (state.typeFilter === 'income'))
+    : state.entries;
+
+  if (!entries.length) {
     return `<div class="empty-state">
       <svg class="empty-state__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
         <line x1="12" y1="1" x2="12" y2="23"/>
@@ -652,7 +708,7 @@ function renderEntries() {
     </div>`;
   }
 
-  return state.entries.map((e) => {
+  return entries.map((e) => {
     const isIncome  = e.amount > 0;
     const amtClass  = isIncome ? 'budget-entry__amount--income' : 'budget-entry__amount--expenses';
     const indClass  = isIncome ? 'budget-entry__indicator--income' : 'budget-entry__indicator--expenses';
