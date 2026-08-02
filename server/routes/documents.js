@@ -8,7 +8,9 @@ import express from 'express';
 import * as db from '../db.js';
 import { createLogger } from '../logger.js';
 import { str, collectErrors, id as validateId, MAX_TEXT, MAX_TITLE } from '../middleware/validate.js';
+import { documentVisibleSql } from '../services/document-access.js';
 import { getAdapter as defaultGetDmsAdapter } from '../services/dms/index.js';
+import { getStatus as getGoogleDriveStatus } from '../services/google-drive-storage.js';
 import {
   StorageError,
   assertWebdavTargetAllowed,
@@ -18,10 +20,13 @@ import {
   getConfig as getStorageConfig,
   getEffectiveTarget,
   getLocalStorageConfig,
+  getSelectedUploadBackend,
   getStatus as getStorageStatus,
+  isUploadBackendSelectionExplicit,
   readDocumentContent,
   resolveConfig,
   saveConfig as saveStorageConfig,
+  setSelectedUploadBackend,
   stageDocumentUpload,
   testConnection as testStorageConnection,
   verifyExistingWebdavDocument,
@@ -59,8 +64,10 @@ const ALLOWED_MIME = new Set([
 // Nur diese Typen werden mit `Content-Disposition: inline` ausgeliefert. Bewusst
 // eine zweite, engere Allowlist (zusätzlich zur Upload-Prüfung): Sie schützt den
 // Preview-Endpunkt davor, jemals skriptfähige Inhalte (HTML, SVG) inline zu
-// rendern — selbst falls ALLOWED_MIME künftig erweitert wird. Spiegelt das
-// Client-seitige VIEWABLE_MIME in public/pages/documents.js.
+// rendern — selbst falls ALLOWED_MIME künftig erweitert wird. Das Client-Pendant
+// steht in public/utils/document-preview.js; die beiden Listen bleiben bewusst
+// unabhängig voneinander gepflegt, damit keine Frontend-Änderung mitentscheidet,
+// was inline ausgeliefert wird.
 const PREVIEWABLE_MIME = new Set([
   'application/pdf',
   'image/png',
@@ -68,6 +75,18 @@ const PREVIEWABLE_MIME = new Set([
   'image/webp',
   'text/plain',
   'text/csv',
+]);
+
+// Bild-Typen, die als kompaktes DMS-Thumbnail (Issue #533) inline ausgeliefert
+// werden dürfen. Bewusst nur nicht-skriptfähige Rasterformate — SVG ist NICHT
+// enthalten, da es Skripte ausführen könnte. Liefert das DMS etwas anderes
+// (z. B. octet-stream), wird die Vorschau verworfen und der Client fällt auf das
+// Kategorie-Icon zurück.
+const THUMBNAIL_MIME = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
 ]);
 
 function normalizeMime(value) {
@@ -94,14 +113,7 @@ function isAdmin(req) {
 }
 
 function canSeeSql(alias = 'd') {
-  return `(
-    ${alias}.created_by = @userId
-    OR ${alias}.visibility = 'family'
-    OR EXISTS (
-      SELECT 1 FROM family_document_access a
-      WHERE a.document_id = ${alias}.id AND a.user_id = @userId
-    )
-  )`;
+  return documentVisibleSql(alias);
 }
 
 function parseMemberIds(value) {
@@ -130,10 +142,12 @@ function documentSelect() {
            d.external_meta, d.folder_id, d.created_by, d.created_at, d.updated_at,
            f.name AS folder_name,
            u.display_name AS creator_name, u.avatar_color AS creator_color,
+           da.provider AS dms_provider,
            GROUP_CONCAT(a.user_id) AS allowed_member_ids
     FROM family_documents d
     LEFT JOIN family_document_folders f ON f.id = d.folder_id
     LEFT JOIN users u ON u.id = d.created_by
+    LEFT JOIN dms_accounts da ON da.id = d.dms_account_id
     LEFT JOIN family_document_access a ON a.document_id = d.id
   `;
 }
@@ -183,6 +197,29 @@ async function resolveDocumentContent(document) {
   return readDocumentContent(document, { dmsResolver });
 }
 
+// Kompaktes Vorschaubild (Issue #533). Nur für DMS-verknüpfte Dokumente, deren
+// Adapter Thumbnails liefert (Paperless). Wirft ThumbnailUnavailableError, wenn
+// kein Bild erzeugt werden kann — der Client fällt dann auf das Icon zurück.
+class ThumbnailUnavailableError extends Error {}
+
+async function resolveDmsThumbnail(account, storageKey) {
+  const adapter = dmsAdapterFactory(account);
+  if (typeof adapter.fetchThumbnail !== 'function') throw new ThumbnailUnavailableError();
+  const thumb = await adapter.fetchThumbnail(storageKey);
+  const mime = normalizeMime(thumb?.mime);
+  if (!thumb?.buffer?.length || !THUMBNAIL_MIME.has(mime)) throw new ThumbnailUnavailableError();
+  return { buffer: thumb.buffer, mime };
+}
+
+function sendThumbnail(res, thumb, cacheSeconds) {
+  res.setHeader('Content-Type', thumb.mime);
+  res.setHeader('Content-Length', String(thumb.buffer.length));
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', `private, max-age=${cacheSeconds}`);
+  res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'");
+  res.end(thumb.buffer);
+}
+
 function sendStorageError(res, error, fallbackMessage) {
   if (!(error instanceof StorageError)) return false;
   const status = error.storageCode === 'DOCUMENT_STORAGE_CONFIG_PROTECTED'
@@ -205,23 +242,32 @@ function storageConfigStatus() {
   const config = getStorageConfig();
   const status = getStorageStatus();
   const local = getLocalStorageConfig();
+  const selectedBackend = getSelectedUploadBackend();
   const activeBackend = getActiveUploadBackend();
-  const count = db.get().prepare(`
+  const webdavCount = db.get().prepare(`
     SELECT COUNT(*) AS count
     FROM family_documents
     WHERE storage_backend = 'webdav'
   `).get().count;
+  const googleDrive = getGoogleDriveStatus();
   const effectiveTarget = activeBackend === 'local_folder'
     ? local.basePath
-    : (activeBackend === 'webdav' ? getEffectiveTarget(config) : null);
+    : activeBackend === 'webdav'
+      ? getEffectiveTarget(config)
+      : activeBackend === 'google_drive'
+        ? googleDrive.folder_name
+        : null;
   return {
     enabled: status.enabled,
     configured: status.configured,
+    selected_upload_backend: selectedBackend,
     active_upload_backend: activeBackend,
     effective_target: effectiveTarget,
     local_enabled: local.enabled,
     local_path: local.basePath,
-    webdav_document_count: count,
+    webdav_document_count: webdavCount,
+    google_drive_document_count: googleDrive.document_count,
+    google_drive: googleDrive,
     last_test: status.lastTest,
     last_error: status.lastError,
     url: status.url,
@@ -257,6 +303,15 @@ router.put('/storage/config', async (req, res) => {
   try {
     if (!isAdmin(req)) {
       return res.status(403).json({ error: 'Not authorized.', code: 403 });
+    }
+    if (
+      req.body.selected_upload_backend !== undefined
+      && !['local', 'webdav', 'google_drive'].includes(req.body.selected_upload_backend)
+    ) {
+      return res.status(400).json({
+        error: 'selected_upload_backend must be local, webdav, or google_drive.',
+        code: 400,
+      });
     }
     if (
       req.body.confirm_existing_access !== undefined
@@ -346,7 +401,34 @@ router.put('/storage/config', async (req, res) => {
       }
     }
 
+    const selectorProvided = Object.hasOwn(req.body, 'selected_upload_backend');
+    const selectedBackend = selectorProvided
+      ? req.body.selected_upload_backend
+      : (isUploadBackendSelectionExplicit() ? getSelectedUploadBackend() : null);
+    if (selectedBackend === 'webdav' && (
+      !proposed.enabled
+      || !proposed.url
+      || !proposed.username
+      || !proposed.password
+      || !proposed.basePath
+    )) {
+      throw new StorageError(
+        'DOCUMENT_STORAGE_NOT_CONFIGURED',
+        'WebDAV must be enabled and fully configured while it is selected.'
+      );
+    }
+    if (selectedBackend === 'google_drive') {
+      const driveStatus = getGoogleDriveStatus();
+      if (!driveStatus.configured || !driveStatus.connected) {
+        throw new StorageError(
+          'DOCUMENT_STORAGE_NOT_CONFIGURED',
+          'Google Drive must be connected before it can be selected.'
+        );
+      }
+    }
+
     saveStorageConfig(req.body);
+    if (selectorProvided) setSelectedUploadBackend(req.body.selected_upload_backend);
     res.json({ data: storageConfigStatus() });
   } catch (err) {
     log.error('PUT /storage/config error:', err);
@@ -382,6 +464,9 @@ router.get('/meta/options', (req, res) => {
         allowed_mime_types: Array.from(ALLOWED_MIME),
         storage_providers: ['local', 'external'],
         active_upload_backend: getActiveUploadBackend(),
+        // Der Client blendet Deep-Links in die (admin-only) Dokument-Einstellungen
+        // nur ein, wenn sie auch erreichbar sind — kein toter Link für Mitglieder.
+        is_admin: isAdmin(req),
         dms_accounts: isAdmin(req) ? dmsAccounts : [],
       },
     });
@@ -550,7 +635,7 @@ router.post('/', async (req, res) => {
       return sendStorageError(res, err, 'Document storage upload failed.');
     }
     log.error('POST / error:', err);
-    if (stagedUpload?.storage_backend === 'webdav') {
+    if (stagedUpload) {
       try {
         await cleanupStagedUpload(stagedUpload);
       } catch (cleanupError) {
@@ -626,6 +711,27 @@ router.patch('/:id/archive', (req, res) => {
   } catch (err) {
     log.error('PATCH /:id/archive error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+router.get('/:id/thumbnail', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const doc = getVisibleDocument(id, req, true);
+    if (!doc) return res.status(404).json({ error: 'Document not found.', code: 404 });
+    if (doc.storage_backend !== 'dms') {
+      return res.status(415).json({ error: 'Thumbnail not available for this document.', code: 415 });
+    }
+    const account = loadDmsAccount(doc.dms_account_id);
+    if (!account) return res.status(404).json({ error: 'Linked DMS account is gone.', code: 404 });
+    const thumb = await resolveDmsThumbnail(account, doc.storage_key);
+    sendThumbnail(res, thumb, 300);
+  } catch (err) {
+    if (err instanceof ThumbnailUnavailableError) {
+      return res.status(415).json({ error: 'Thumbnail not available for this document.', code: 415 });
+    }
+    log.error('GET /:id/thumbnail error:', err);
+    res.status(502).json({ error: 'Failed to load thumbnail.', code: 502 });
   }
 });
 

@@ -32,7 +32,9 @@
     "dbLabel": "Adatbázis titkosító kulcs",
     "dbHint": "Titkosítja az SQLite adatbázist nyugalmi állapotban.",
     "errBoth": "Mindkét kulcs megadása kötelező.",
-    "dangerWarn": "Mentsd el most ezeket a kulcsokat. Ha elveszíted őket, a titkosított adataid helyreállíthatatlanok — nincs visszaállítás."
+    "dangerWarn": "Mentsd el most ezeket a kulcsokat. Ha elveszíted őket, a titkosított adataid helyreállíthatatlanok — nincs visszaállítás.",
+    "preserved": "A meglévő kulcsaid megmaradnak, így ez a beállítás nem zár ki a jelenlegi adatbázisból. Hagyj egy mezőt üresen a kulcs megtartásához; új érték megadása lecseréli.",
+    "keepPlaceholder": "Meglévő kulcs megtartva"
   },
   "weather": {
     "title": "Időjárás widget",
@@ -93,7 +95,8 @@
     "backups": "Biztonsági mentések",
     "webdavBackup": "Külső mentések",
     "on": "bekapcsolva",
-    "off": "kikapcsolva"
+    "off": "kikapcsolva",
+    "documentGoogleDrive": "Google Drive-dokumentumok"
   },
   "docker": {
     "title": "Yuvomi indítása",
@@ -178,7 +181,16 @@
     "fixerLabel": "Fixer API-kulcs (élő árfolyamok)",
     "fixerHint": "Nem kötelező. Élő árfolyamon váltja át az előfizetések pénznemeit. Az előfizetések enélkül is működnek.",
     "pushSubjectLabel": "Push kapcsolattartási cím",
-    "pushSubjectHint": "A push-szolgáltatásoknak küldjük a kiszolgálód elérhetőségeként. Hagyd üresen az alapértelmezetthez."
+    "pushSubjectHint": "A push-szolgáltatásoknak küldjük a kiszolgálód elérhetőségeként. Hagyd üresen az alapértelmezetthez.",
+    "documentGoogleDrive": "Dokumentumtárolás a Google Drive-ban",
+    "documentGoogleDriveHint": "Itt állíthatod be az OAuth-hitelesítő adatokat, majd a telepítés után a Dokumentumok beállításaiban csatlakoztasd, és válaszd ki külön a Google Drive-ot.",
+    "documentGoogleDriveEnable": "A Google Drive beállítása dokumentumokhoz",
+    "documentGoogleDriveClientIdLabel": "Saját kliensazonosító (opcionális)",
+    "documentGoogleDriveClientSecretLabel": "Saját kliens titkos kulcs (opcionális)",
+    "documentGoogleDriveReuseHint": "Hagyd mindkét mezőt üresen a Google Naptár OAuth-hitelesítő adatainak újrafelhasználásához. Saját adatokhoz hozd létre őket a Google Cloud Console-ban (mint a Naptár lépésben).",
+    "documentGoogleDriveRedirectLabel": "Átirányítási URI",
+    "errDocumentGoogleDrivePair": "A Google Drive kliensazonosítóját és titkos kulcsát vagy együtt kell megadni, vagy mindkettőt üresen kell hagyni.",
+    "errDocumentGoogleDriveCredentials": "A Google Drive használatához saját kliensazonosító és titkos kulcs, vagy beállított Google Naptár-hitelesítő adatok szükségesek."
   },
   "welcome": {
     "title": "Üdvözöl a Yuvomi",

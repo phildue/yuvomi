@@ -4,7 +4,7 @@
  */
 
 import { api } from '/api.js';
-import { closeModal, confirmModal, openModal, advancedSection } from '/components/modal.js';
+import { closeModal, confirmModal, confirmOverModal, openModal, advancedSection, reportFieldError } from '/components/modal.js';
 import {
   formatDate,
   getLocale,
@@ -15,6 +15,7 @@ import {
 import { esc } from '/utils/html.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
 import { toLocalDateKey } from '/utils/date.js';
+import { formatMoney } from '/utils/money.js';
 
 let state = {
   subscriptions: [],
@@ -30,9 +31,12 @@ let state = {
   user: null,
 };
 let container = null;
+// Muss mit VALID_CURRENCIES in server/routes/preferences.js übereinstimmen,
+// sonst ist die Haushaltswährung hier nicht wählbar (per Test abgesichert).
 const CURRENCIES = [
-  'AED', 'AUD', 'BRL', 'CAD', 'CHF', 'CNY', 'CZK', 'DKK', 'EUR', 'GBP', 'HUF', 'INR',
-  'JPY', 'KZT', 'NOK', 'PLN', 'RUB', 'SAR', 'SEK', 'TRY', 'UAH', 'USD', 'ZAR',
+  'AED', 'AUD', 'BRL', 'CAD', 'CHF', 'CLP', 'CNY', 'CZK', 'DKK', 'EUR', 'GBP',
+  'HUF', 'IDR', 'INR', 'IRR', 'JPY', 'KRW', 'KZT', 'MYR', 'NOK', 'PLN', 'RUB',
+  'SAR', 'SEK', 'TRY', 'UAH', 'USD', 'ZAR',
 ];
 const DEFAULT_CATEGORY_LABELS = {
   Entertainment: 'budget.subcatSubscriptionEntertainment',
@@ -48,9 +52,13 @@ function setHtml(element, html) {
   element.insertAdjacentHTML('afterbegin', html);
 }
 
+// Format aus utils/money.js - EINE Quelle für das ganze Budget-Modul. Vorher
+// hatte jede der drei Page-Dateien einen eigenen Formatierer, sodass dieselbe
+// Zahl in zwei Untertabs verschieden geschrieben sein konnte (Critique P0).
+// Abo-Beträge tragen die Rolle `plain`: Rechnungsbeträge ohne Kontorichtung,
+// also kein Vorzeichen und keine Ampelfarbe.
 function money(amount, currency = state.summary?.base_currency || state.settings.base_currency) {
-  const value = Number(amount || 0);
-  return new Intl.NumberFormat(getLocale(), { style: 'currency', currency }).format(value);
+  return formatMoney(amount, currency);
 }
 
 function categoryLabel(category) {
@@ -74,6 +82,24 @@ function addCycleDate(date, cycle, interval) {
   else if (cycle === 'yearly') next.setFullYear(next.getFullYear() + interval);
   else return addMonths(next, interval);
   return next;
+}
+
+// Letztes einzuplanendes Fälligkeitsdatum bei begrenztem Abo (#594), sonst null.
+// Für 'after_count' wird das Startdatum um die verbleibenden Zyklen fortgeschrieben.
+function subscriptionEndBoundary(subscription) {
+  if (subscription.end_type === 'on_date' && subscription.end_date) {
+    return new Date(`${subscription.end_date}T00:00:00`);
+  }
+  if (subscription.end_type === 'after_count') {
+    const remaining = Number(subscription.occurrence_count) - Number(subscription.occurrences_done || 0);
+    if (remaining <= 0) return new Date(0);
+    let last = new Date(`${subscription.next_payment_date}T00:00:00`);
+    for (let index = 1; index < remaining; index += 1) {
+      last = addCycleDate(last, subscription.billing_cycle, subscription.cycle_interval || 1);
+    }
+    return last;
+  }
+  return null;
 }
 
 function monthKey(date) {
@@ -114,7 +140,7 @@ async function load({ refreshRates = false } = {}) {
   if (state.query) params.set('q', state.query);
   if (state.categoryId) params.set('category_id', state.categoryId);
   if (state.paymentMethodId) params.set('payment_method_id', state.paymentMethodId);
-  if (state.status !== 'all') params.set('enabled', state.status === 'active' ? 'true' : 'false');
+  if (state.status !== 'all') params.set('status', state.status);
   if (refreshRates) params.set('refresh_rates', 'true');
 
   const [list, meta, settings] = await Promise.all([
@@ -140,25 +166,43 @@ export async function render(target, { user } = {}) {
           <span class="sr-only">${t('subscriptions.searchLabel')}</span>
           <input id="subscriptions-search" type="search" placeholder="${t('subscriptions.searchPlaceholder')}" autocomplete="off">
         </label>
-        <select class="form-input subscriptions-filter" id="subscriptions-category-filter" aria-label="${t('subscriptions.categoryFilter')}"></select>
-        <select class="form-input subscriptions-filter" id="subscriptions-method-filter" aria-label="${t('subscriptions.paymentMethodFilter')}"></select>
-        <select class="form-input subscriptions-filter" id="subscriptions-status-filter" aria-label="${t('subscriptions.statusFilter')}">
-          <option value="all">${t('subscriptions.statusAll')}</option>
-          <option value="active">${t('subscriptions.statusActive')}</option>
-          <option value="disabled">${t('subscriptions.statusDisabled')}</option>
-        </select>
-        <select class="form-input subscriptions-filter" id="subscriptions-sort" aria-label="${t('subscriptions.sortLabel')}">
-          <option value="due">${t('subscriptions.sortDue')}</option>
-          <option value="cost-desc">${t('subscriptions.sortCostDesc')}</option>
-          <option value="cost-asc">${t('subscriptions.sortCostAsc')}</option>
-          <option value="name">${t('subscriptions.sortName')}</option>
-        </select>
-        <button class="btn btn--secondary btn--icon" id="subscriptions-manage" aria-label="${t('subscriptions.manageMetadata')}">
-          <i data-lucide="tags" aria-hidden="true"></i>
+        <label class="subscriptions-filter-field">
+          <span class="subscriptions-filter-field__label">${t('subscriptions.filterLabelCategory')}</span>
+          <select class="form-input subscriptions-filter" id="subscriptions-category-filter"></select>
+        </label>
+        <label class="subscriptions-filter-field">
+          <span class="subscriptions-filter-field__label">${t('subscriptions.filterLabelMethod')}</span>
+          <select class="form-input subscriptions-filter" id="subscriptions-method-filter"></select>
+        </label>
+        <label class="subscriptions-filter-field">
+          <span class="subscriptions-filter-field__label">${t('subscriptions.filterLabelStatus')}</span>
+          <select class="form-input subscriptions-filter" id="subscriptions-status-filter">
+            <option value="all">${t('subscriptions.statusAll')}</option>
+            <option value="active">${t('subscriptions.statusActive')}</option>
+            <option value="paused">${t('subscriptions.statusDisabled')}</option>
+            <option value="completed">${t('subscriptions.completed')}</option>
+          </select>
+        </label>
+        <label class="subscriptions-filter-field">
+          <span class="subscriptions-filter-field__label">${t('subscriptions.filterLabelSort')}</span>
+          <select class="form-input subscriptions-filter" id="subscriptions-sort">
+            <option value="due">${t('subscriptions.sortDue')}</option>
+            <option value="cost-desc">${t('subscriptions.sortCostDesc')}</option>
+            <option value="cost-asc">${t('subscriptions.sortCostAsc')}</option>
+            <option value="name">${t('subscriptions.sortName')}</option>
+          </select>
+        </label>
+        <button class="btn btn--ghost subscriptions-filter-reset" id="subscriptions-reset-filters" type="button" hidden>
+          <i data-lucide="filter-x" class="icon-sm" aria-hidden="true"></i>${t('subscriptions.resetFilters')}
         </button>
-        <button class="btn btn--secondary btn--icon" id="subscriptions-settings" aria-label="${t('subscriptions.settingsTitle')}">
-          <i data-lucide="settings-2" aria-hidden="true"></i>
-        </button>
+        <div class="subscriptions-toolbar__actions">
+          <button class="btn btn--secondary btn--icon" id="subscriptions-manage" aria-label="${t('subscriptions.manageMetadata')}" title="${t('subscriptions.manageMetadata')}">
+            <i data-lucide="tags" aria-hidden="true"></i>
+          </button>
+          <button class="btn btn--secondary btn--icon" id="subscriptions-settings" aria-label="${t('subscriptions.settingsTitle')}" title="${t('subscriptions.settingsTitle')}">
+            <i data-lucide="settings-2" aria-hidden="true"></i>
+          </button>
+        </div>
       </div>
       <div id="subscriptions-content">${renderSkeletonList({ rows: 5, lines: 2 })}</div>
     </div>
@@ -198,6 +242,31 @@ function renderFilters() {
   method.value = state.paymentMethodId;
   container.querySelector('#subscriptions-status-filter').value = state.status;
   container.querySelector('#subscriptions-sort').value = state.sort;
+  updateResetButton();
+}
+
+// Vier Filter plus Suche können gleichzeitig greifen — ohne Ausweg wirkt eine
+// leere Liste wie „keine Abos" statt „nichts passt zum Filter". Der Knopf
+// erscheint nur, wenn tatsächlich etwas eingeschränkt ist.
+function hasActiveFilters() {
+  return Boolean(state.query) || Boolean(state.categoryId) || Boolean(state.paymentMethodId)
+    || state.status !== 'all' || state.sort !== 'due';
+}
+
+function updateResetButton() {
+  const btn = container.querySelector('#subscriptions-reset-filters');
+  if (btn) btn.hidden = !hasActiveFilters();
+}
+
+async function resetFilters() {
+  state.query = '';
+  state.categoryId = '';
+  state.paymentMethodId = '';
+  state.status = 'all';
+  state.sort = 'due';
+  const search = container.querySelector('#subscriptions-search');
+  if (search) search.value = '';
+  await reload();
 }
 
 function bindToolbar() {
@@ -223,8 +292,10 @@ function bindToolbar() {
   });
   container.querySelector('#subscriptions-sort').addEventListener('change', (event) => {
     state.sort = event.target.value;
+    updateResetButton();
     renderContent();
   });
+  container.querySelector('#subscriptions-reset-filters').addEventListener('click', resetFilters);
   container.querySelector('#subscriptions-manage').addEventListener('click', openMetadataModal);
   container.querySelector('#subscriptions-settings').addEventListener('click', openSettingsModal);
 }
@@ -251,6 +322,10 @@ function sortedSubscriptions() {
 function renderContent() {
   const content = container.querySelector('#subscriptions-content');
   const rows = sortedSubscriptions();
+  // Kurs-Status/-Aktion nur, wenn überhaupt ein Abo in Fremdwährung läuft -
+  // sonst ist „Wechselkurse nicht verfügbar" eine Dauerwarnung ohne Anlass.
+  const baseCurrency = state.summary?.base_currency || state.settings.base_currency;
+  const hasForeignCurrency = rows.some((s) => s.currency && s.currency !== baseCurrency);
   setHtml(content, `
     ${renderSummary()}
     ${renderAnalytics()}
@@ -260,9 +335,10 @@ function renderContent() {
           <h2>${t('subscriptions.listTitle')}</h2>
           <span>${t('subscriptions.listCount', { count: rows.length })}</span>
         </div>
-        ${state.rates?.source === 'unavailable'
-          ? `<span class="subscriptions-rate-status subscriptions-rate-status--warning">${t('subscriptions.ratesUnavailable')}</span>`
-          : `<button class="btn btn--secondary" id="subscriptions-refresh-rates">
+        ${!hasForeignCurrency ? ''
+          : state.rates?.source === 'unavailable'
+            ? `<span class="subscriptions-rate-status subscriptions-rate-status--warning">${t('subscriptions.ratesUnavailable')}</span>`
+            : `<button class="btn btn--secondary" id="subscriptions-refresh-rates">
               <i data-lucide="refresh-cw" aria-hidden="true"></i>${t('subscriptions.refreshRates')}
             </button>`}
       </div>
@@ -286,31 +362,38 @@ function renderSummary() {
   const budget = Number(summary.monthly_budget || 0);
   const used = Number(summary.monthly_total || 0);
   const hasBudget = budget > 0;
-  const percentage = hasBudget ? Math.min(100, Math.round((used / budget) * 100)) : 0;
+  // Balkenbreite ist bei 100% gecappt, das Label nennt die echte Auslastung (121% statt „100%").
+  const realPercentage = hasBudget ? Math.round((used / budget) * 100) : 0;
+  const percentage = Math.min(100, realPercentage);
   const isOverBudget = hasBudget && summary.remaining_budget < 0;
+  // Geteilte Kennzahl-Zeile und -Karte des Budget-Moduls (budget.css). Die
+  // frühere eigene .subscriptions-summary-card war die zweite von fünf
+  // Bauarten im selben Modul (Critique 2026-07-30, P0).
+  // Rolle `plain`: Abo-Kosten sind Rechnungsbeträge ohne Kontorichtung.
   return `
-    <section class="subscriptions-summary">
-      <article class="subscriptions-summary-card">
-        <span>${t('subscriptions.monthlyCost')}</span>
-        <strong>${money(used)}</strong>
-        <small>${t('subscriptions.activeCount', { count: summary.active_count })}</small>
+    <section class="budget-summary budget-summary--quad">
+      <article class="budget-summary-card">
+        <div class="budget-summary-card__label">${t('subscriptions.monthlyCost')}</div>
+        <div class="budget-summary-card__amount">${money(used)}</div>
+        <div class="budget-summary-card__note">${t('subscriptions.activeCount', { count: summary.active_count })}</div>
       </article>
-      <article class="subscriptions-summary-card">
-        <span>${t('subscriptions.monthlyBudget')}</span>
-        <strong>${money(budget)}</strong>
-        <div class="subscriptions-budget-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percentage}">
-          <span style="width:${percentage}%"></span>
+      <article class="budget-summary-card">
+        <div class="budget-summary-card__label">${t('subscriptions.monthlyBudget')}</div>
+        <div class="budget-summary-card__amount">${money(budget)}</div>
+        <div class="budget-summary-card__progress${isOverBudget ? ' budget-summary-card__progress--over' : ''}"
+             role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percentage}" aria-valuetext="${realPercentage}%">
+          <span style="--fill:${percentage / 100}"></span>
         </div>
       </article>
-      <article class="subscriptions-summary-card ${isOverBudget ? 'subscriptions-summary-card--danger' : ''}">
-        <span>${hasBudget ? (isOverBudget ? t('subscriptions.overBudget') : t('subscriptions.remainingBudget')) : t('subscriptions.noBudgetLimit')}</span>
-        <strong>${hasBudget ? money(Math.abs(summary.remaining_budget)) : t('subscriptions.unlimited')}</strong>
-        <small>${hasBudget ? `${percentage}% ${t('subscriptions.budgetUsed')}` : t('subscriptions.setBudgetHint')}</small>
+      <article class="budget-summary-card${isOverBudget ? ' budget-summary-card--negative' : ''}">
+        <div class="budget-summary-card__label">${hasBudget ? (isOverBudget ? t('subscriptions.overBudget') : t('subscriptions.remainingBudget')) : t('subscriptions.noBudgetLimit')}</div>
+        <div class="budget-summary-card__amount">${hasBudget ? money(Math.abs(summary.remaining_budget)) : t('subscriptions.unlimited')}</div>
+        <div class="budget-summary-card__note${isOverBudget ? ' budget-summary-card__note--danger' : ''}">${hasBudget ? `${realPercentage}% ${t('subscriptions.budgetUsed')}` : t('subscriptions.setBudgetHint')}</div>
       </article>
-      <article class="subscriptions-summary-card">
-        <span>${t('subscriptions.yearlyProjection')}</span>
-        <strong>${money(used * 12)}</strong>
-        <small>${summary.base_currency}</small>
+      <article class="budget-summary-card">
+        <div class="budget-summary-card__label">${t('subscriptions.yearlyProjection')}</div>
+        <div class="budget-summary-card__amount">${money(used * 12)}</div>
+        <div class="budget-summary-card__note">${esc(summary.base_currency)}</div>
       </article>
     </section>
   `;
@@ -354,9 +437,10 @@ function renewalForecast() {
   const monthMap = new Map(months.map((row) => [row.key, row]));
   const end = addMonths(start, months.length);
   for (const subscription of state.subscriptions.filter((row) => row.enabled)) {
+    const boundary = subscriptionEndBoundary(subscription);
     let due = new Date(`${subscription.next_payment_date}T00:00:00`);
     while (due < start) due = addCycleDate(due, subscription.billing_cycle, subscription.cycle_interval || 1);
-    while (due < end) {
+    while (due < end && (!boundary || due <= boundary)) {
       const row = monthMap.get(monthKey(due));
       if (row) row.amount += dueAmount(subscription);
       due = addCycleDate(due, subscription.billing_cycle, subscription.cycle_interval || 1);
@@ -391,7 +475,12 @@ function renderAreaChart(title, rows) {
 }
 
 function renderPieChart(title, rows) {
-  const colors = ['#6c3aed', '#0f766e', '#0969da', '#d97706', '#b91c1c', '#64748b'];
+  // Datenreihen-Tokens statt Hex-Literalen: tokens.css definiert die Serie im
+  // Dark Mode auf hellere Werte um, Literale machten das nicht mit - der Donut
+  // behielt dort seine Light-Mode-Sättigung, während der Statistik-Donut nebenan
+  // korrekt aufhellte (Critique 2026-07-30). conic-gradient und der Legenden-
+  // Hintergrund verarbeiten var() unverändert.
+  const colors = Array.from({ length: 6 }, (_, i) => `var(--chart-series-${i + 1})`);
   const total = rows.reduce((sum, row) => sum + row.amount, 0);
   let offset = 0;
   const gradient = total > 0
@@ -439,13 +528,37 @@ function renderBreakdown(title, rows) {
   `;
 }
 
+function statusMeta(subscription) {
+  const status = subscription.status || (subscription.enabled ? 'active' : 'paused');
+  if (status === 'completed') return { cardClass: 'subscription-card--completed', badgeClass: 'subscription-status--completed', label: t('subscriptions.completed') };
+  if (status === 'active') return { cardClass: '', badgeClass: 'subscription-status--active', label: t('subscriptions.active') };
+  return { cardClass: 'subscription-card--disabled', badgeClass: '', label: t('subscriptions.disabled') };
+}
+
+// Ende-Zeile in der Card (#594): abgeschlossen, Enddatum oder Restzahlungen.
+function endInfoLabel(subscription) {
+  if (subscription.status === 'completed') {
+    const day = subscription.completed_at ? String(subscription.completed_at).slice(0, 10) : null;
+    return { icon: 'circle-check', text: day ? t('subscriptions.completedOn', { date: formatDate(day) }) : t('subscriptions.completed') };
+  }
+  if (subscription.end_type === 'on_date' && subscription.end_date) {
+    return { icon: 'calendar-x', text: t('subscriptions.endsOn', { date: formatDate(subscription.end_date) }) };
+  }
+  if (subscription.end_type === 'after_count') {
+    return { icon: 'list-ordered', text: t('subscriptions.endsAfter', { count: Number(subscription.occurrences_remaining ?? 0) }) };
+  }
+  return null;
+}
+
 function renderCard(subscription) {
   const brandColor = subscription.brand_color || subscription.category_color || '#0F766E';
   const converted = subscription.monthly_base === null
     ? t('subscriptions.conversionUnavailable')
     : t('subscriptions.monthlyEquivalent', { amount: money(subscription.monthly_base) });
+  const status = statusMeta(subscription);
+  const endInfo = endInfoLabel(subscription);
   return `
-    <article class="subscription-card ${subscription.enabled ? '' : 'subscription-card--disabled'}"
+    <article class="subscription-card ${status.cardClass}"
              data-id="${subscription.id}" style="--subscription-color:${esc(brandColor)}">
       <div class="subscription-card__brand">
         ${subscription.logo_data
@@ -458,8 +571,8 @@ function renderCard(subscription) {
             <h3>${esc(subscription.name)}</h3>
             <p>${esc(subscription.description || categoryLabel(subscription.category_name))}</p>
           </div>
-          <span class="subscription-status ${subscription.enabled ? 'subscription-status--active' : ''}">
-            ${subscription.enabled ? t('subscriptions.active') : t('subscriptions.disabled')}
+          <span class="subscription-status ${status.badgeClass}">
+            ${status.label}
           </span>
         </div>
         <div class="subscription-card__meta">
@@ -467,6 +580,7 @@ function renderCard(subscription) {
           <span><i data-lucide="repeat-2" aria-hidden="true"></i>${cycleLabel(subscription)}</span>
           <span><i data-lucide="wallet-cards" aria-hidden="true"></i>${esc(subscription.payment_method_name || t('subscriptions.unspecified'))}</span>
           <span><i data-lucide="bell" aria-hidden="true"></i>${t('subscriptions.reminderMeta', { count: subscription.reminder_days })}</span>
+          ${endInfo ? `<span><i data-lucide="${endInfo.icon}" aria-hidden="true"></i>${esc(endInfo.text)}</span>` : ''}
         </div>
       </div>
       <div class="subscription-card__cost">
@@ -492,6 +606,19 @@ function renderCard(subscription) {
 }
 
 function renderEmpty() {
+  // „Keine Abos" und „nichts passt zum Filter" sind verschiedene Zustände: der
+  // erste braucht eine Anlegen-Aktion, der zweite einen Weg zurück.
+  if (hasActiveFilters()) {
+    return `
+      <div class="empty-state">
+        <i data-lucide="filter-x" class="empty-state__icon" aria-hidden="true"></i>
+        <div class="empty-state__title">${t('subscriptions.noMatchesTitle')}</div>
+        <div class="empty-state__description">${t('subscriptions.noMatchesDescription')}</div>
+        <button class="btn btn--primary empty-state__cta" id="subscriptions-empty-reset" type="button">
+          ${t('subscriptions.resetFilters')}
+        </button>
+      </div>`;
+  }
   return `
     <div class="empty-state">
       <i data-lucide="repeat-2" class="empty-state__icon" aria-hidden="true"></i>
@@ -505,6 +632,7 @@ function renderEmpty() {
 function bindContent() {
   container.querySelector('#subscriptions-refresh-rates')?.addEventListener('click', () => reload({ refreshRates: true }));
   container.querySelector('#subscriptions-empty-add')?.addEventListener('click', () => openSubscriptionModal());
+  container.querySelector('#subscriptions-empty-reset')?.addEventListener('click', resetFilters);
   container.querySelector('#subscriptions-list')?.addEventListener('click', async (event) => {
     const action = event.target.closest('[data-action]');
     if (!action) return;
@@ -776,6 +904,25 @@ export function openSubscriptionModal(subscription = null) {
             <input class="form-input" id="subscription-reminder" type="number" min="0" max="365" step="1" value="${subscription?.reminder_days ?? 3}">
           </div>
         </div>
+        <div class="form-group">
+          <label class="form-label" for="subscription-end-type">${t('subscriptions.endLabel')}</label>
+          <select class="form-input" id="subscription-end-type">
+            <option value="never">${t('subscriptions.endNever')}</option>
+            <option value="on_date">${t('subscriptions.endOnDate')}</option>
+            <option value="after_count">${t('subscriptions.endAfterCount')}</option>
+          </select>
+        </div>
+        <div class="form-grid-2">
+          <div class="form-group" id="subscription-end-date-field" ${(subscription?.end_type === 'on_date') ? '' : 'hidden'}>
+            <label class="form-label" for="subscription-end-date">${t('subscriptions.endDateLabel')}</label>
+            <yuvomi-datepicker id="subscription-end-date" type="date"
+                   value="${esc(subscription?.end_date || '')}"></yuvomi-datepicker>
+          </div>
+          <div class="form-group" id="subscription-end-count-field" ${(subscription?.end_type === 'after_count') ? '' : 'hidden'}>
+            <label class="form-label" for="subscription-end-count">${t('subscriptions.endCountLabel')}</label>
+            <input class="form-input" id="subscription-end-count" type="number" min="1" max="1200" step="1" value="${subscription?.occurrence_count ?? ''}">
+          </div>
+        </div>
       </section>
 
       ${advancedSection(advancedFieldsHtml, { open: advancedOpen })}
@@ -804,6 +951,15 @@ export function openSubscriptionModal(subscription = null) {
       wireCombobox(panel, 'subscription-cycle');
       wireCombobox(panel, 'subscription-category');
       wireCombobox(panel, 'subscription-method');
+      // Ende-Bedingung (#594): das passende Zusatzfeld ein-/ausblenden.
+      const endTypeSelect = panel.querySelector('#subscription-end-type');
+      endTypeSelect.value = subscription?.end_type || 'never';
+      const syncEndFields = () => {
+        panel.querySelector('#subscription-end-date-field').hidden = endTypeSelect.value !== 'on_date';
+        panel.querySelector('#subscription-end-count-field').hidden = endTypeSelect.value !== 'after_count';
+      };
+      endTypeSelect.addEventListener('change', syncEndFields);
+      syncEndFields();
       panel.querySelector('#subscription-cancel').addEventListener('click', closeModal);
       panel.querySelector('#subscription-logo').addEventListener('change', async (event) => {
         const file = event.target.files[0];
@@ -849,14 +1005,35 @@ async function saveSubscription(panel, existing, searchedLogoData = null) {
   const dateInput = panel.querySelector('#subscription-next-date');
   const currencyInput = panel.querySelector('#subscription-currency');
   if (!isDateInputValid(dateInput.value)) {
-    window.yuvomi?.showToast(t('subscriptions.invalidDate'), 'danger');
-    dateInput.focus();
+    // Fehler am Feld statt als ortloser Toast (geteiltes Muster, Critique P1).
+    reportFieldError(dateInput, t('subscriptions.invalidDate'));
     return;
   }
   if (!currencyInput.value) {
-    window.yuvomi?.showToast(t('subscriptions.currencyRequired'), 'danger');
-    panel.querySelector('#subscription-currency-search').focus();
+    // Die Meldung klebt am sichtbaren Suchfeld der Combobox, nicht am
+    // versteckten Wert-Input.
+    reportFieldError(panel.querySelector('#subscription-currency-search'), t('subscriptions.currencyRequired'));
     return;
+  }
+  // Ende-Bedingung (#594): nur das aktive Zusatzfeld liefert einen Wert.
+  const endType = panel.querySelector('#subscription-end-type').value;
+  let endDate = null;
+  let occurrenceCount = null;
+  if (endType === 'on_date') {
+    const endDateInput = panel.querySelector('#subscription-end-date');
+    if (!isDateInputValid(endDateInput.value)) {
+      reportFieldError(endDateInput, t('subscriptions.invalidDate'));
+      return;
+    }
+    endDate = parseDateInput(endDateInput.value);
+  } else if (endType === 'after_count') {
+    const countInput = panel.querySelector('#subscription-end-count');
+    const count = Number(countInput.value);
+    if (!Number.isInteger(count) || count < 1) {
+      reportFieldError(countInput, t('subscriptions.endCountInvalid'));
+      return;
+    }
+    occurrenceCount = count;
   }
   const submit = panel.querySelector('[type="submit"]');
   submit.disabled = true;
@@ -879,6 +1056,9 @@ async function saveSubscription(panel, existing, searchedLogoData = null) {
       logo_data: logoData,
       notes: panel.querySelector('#subscription-notes').value.trim() || null,
       enabled: panel.querySelector('#subscription-enabled').checked,
+      end_type: endType,
+      end_date: endDate,
+      occurrence_count: occurrenceCount,
     };
     if (existing) await api.put(`/budget/subscriptions/${existing.id}`, payload);
     else await api.post('/budget/subscriptions', payload);
@@ -986,9 +1166,10 @@ async function toggleSubscription(subscription) {
 
 async function renewSubscription(subscription) {
   try {
-    await api.post(`/budget/subscriptions/${subscription.id}/renew`, {});
+    const response = await api.post(`/budget/subscriptions/${subscription.id}/renew`, {});
     await reload();
-    window.yuvomi?.showToast(t('subscriptions.renewedToast'), 'success');
+    const completed = response.data?.status === 'completed';
+    window.yuvomi?.showToast(t(completed ? 'subscriptions.completedToast' : 'subscriptions.renewedToast'), 'success');
   } catch (err) {
     window.yuvomi?.showToast(err.data?.error || t('common.unknownError'), 'danger');
   }
@@ -1040,8 +1221,7 @@ async function openSettingsModal() {
         event.preventDefault();
         const baseCurrency = panel.querySelector('#subscriptions-base-currency').value;
         if (!baseCurrency) {
-          window.yuvomi?.showToast(t('subscriptions.currencyRequired'), 'danger');
-          panel.querySelector('#subscriptions-base-currency-search').focus();
+          reportFieldError(panel.querySelector('#subscriptions-base-currency-search'), t('subscriptions.currencyRequired'));
           return;
         }
         try {
@@ -1061,16 +1241,41 @@ async function openSettingsModal() {
 }
 
 function metadataRows(items, kind) {
+  const isCat = kind === 'categories';
+  const editLabel = isCat ? t('subscriptions.editCategory') : t('subscriptions.editPaymentMethod');
+  const deleteLabel = isCat ? t('subscriptions.deleteCategory') : t('subscriptions.deletePaymentMethod');
   return items.map((item, index) => `
-    <li data-id="${item.id}">
-      ${kind === 'categories' ? `<i style="background:${esc(item.color)}"></i>` : '<i data-lucide="credit-card" aria-hidden="true"></i>'}
-      <span>${esc(kind === 'categories' ? categoryLabel(item) : item.name)}</span>
-      <button class="btn btn--icon" data-move="-1" ${index === 0 ? 'disabled' : ''} aria-label="${t('subscriptions.moveUp')}">
-        <i data-lucide="chevron-up" aria-hidden="true"></i>
-      </button>
-      <button class="btn btn--icon" data-move="1" ${index === items.length - 1 ? 'disabled' : ''} aria-label="${t('subscriptions.moveDown')}">
-        <i data-lucide="chevron-down" aria-hidden="true"></i>
-      </button>
+    <li data-id="${item.id}" data-kind="${kind}">
+      <div class="subscriptions-metadata-row__view">
+        ${isCat ? `<i style="background:${esc(item.color)}"></i>` : '<i data-lucide="credit-card" aria-hidden="true"></i>'}
+        <span>${esc(isCat ? categoryLabel(item) : item.name)}</span>
+        <div class="subscriptions-metadata-row__actions">
+          <button class="btn btn--icon" data-move="-1" ${index === 0 ? 'aria-disabled="true"' : ''} aria-label="${t('subscriptions.moveUp')}">
+            <i data-lucide="chevron-up" aria-hidden="true"></i>
+          </button>
+          <button class="btn btn--icon" data-move="1" ${index === items.length - 1 ? 'aria-disabled="true"' : ''} aria-label="${t('subscriptions.moveDown')}">
+            <i data-lucide="chevron-down" aria-hidden="true"></i>
+          </button>
+          <button class="btn btn--icon" data-act="edit" aria-label="${editLabel}">
+            <i data-lucide="pencil" aria-hidden="true"></i>
+          </button>
+          <button class="btn btn--icon" data-act="delete" aria-label="${deleteLabel}">
+            <i data-lucide="trash-2" aria-hidden="true"></i>
+          </button>
+        </div>
+      </div>
+      <div class="subscriptions-metadata-row__edit" hidden>
+        <input class="form-input subscriptions-metadata-edit-name" value="${esc(isCat ? categoryLabel(item) : item.name)}" data-original-name="${esc(item.name)}" maxlength="100" aria-label="${editLabel}">
+        ${isCat ? `<input class="form-input form-input--color subscriptions-metadata-edit-color" type="color" value="${esc(item.color)}" aria-label="${t('subscriptions.brandColorLabel')}">` : ''}
+        <div class="subscriptions-metadata-row__actions">
+          <button class="btn btn--icon" data-act="save" aria-label="${t('common.save')}">
+            <i data-lucide="check" aria-hidden="true"></i>
+          </button>
+          <button class="btn btn--icon" data-act="cancel" aria-label="${t('common.cancel')}">
+            <i data-lucide="x" aria-hidden="true"></i>
+          </button>
+        </div>
+      </div>
     </li>
   `).join('');
 }
@@ -1103,7 +1308,7 @@ function openMetadataModal() {
   openModal({
     title: t('subscriptions.manageMetadata'),
     content,
-    size: 'lg',
+    size: 'xl',
     onSave(panel) {
       panel.querySelector('#subscriptions-metadata-close').addEventListener('click', closeModal);
       panel.querySelector('#subscription-add-category').addEventListener('click', async () => {
@@ -1127,6 +1332,9 @@ function openMetadataModal() {
       });
       panel.querySelectorAll('[data-move]').forEach((button) => {
         button.addEventListener('click', async () => {
+          // aria-disabled statt disabled: der Button bleibt fokussierbar, der
+          // No-op-Klick am Listenrand wird hier verworfen (siehe layout.css).
+          if (button.getAttribute('aria-disabled') === 'true') return;
           const list = button.closest('ul');
           const rows = [...list.querySelectorAll('li')];
           const index = rows.indexOf(button.closest('li'));
@@ -1136,6 +1344,101 @@ function openMetadataModal() {
           await api.put('/budget/subscriptions/meta/order', { [key]: rows.map((row) => Number(row.dataset.id)) });
           await closeModal({ force: true });
           await reload();
+          openMetadataModal();
+        });
+      });
+
+      // Inline-Bearbeitung: die vorgerenderte Edit-Zeile ein-/ausblenden.
+      panel.querySelectorAll('[data-act="edit"]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const li = button.closest('li');
+          li.querySelector('.subscriptions-metadata-row__view').hidden = true;
+          const editRow = li.querySelector('.subscriptions-metadata-row__edit');
+          editRow.hidden = false;
+          editRow.querySelector('.subscriptions-metadata-edit-name').focus();
+        });
+      });
+      panel.querySelectorAll('[data-act="cancel"]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const li = button.closest('li');
+          const editRow = li.querySelector('.subscriptions-metadata-row__edit');
+          const nameInput = editRow.querySelector('.subscriptions-metadata-edit-name');
+          nameInput.value = nameInput.defaultValue;
+          const colorInput = editRow.querySelector('.subscriptions-metadata-edit-color');
+          if (colorInput) colorInput.value = colorInput.defaultValue;
+          editRow.hidden = true;
+          li.querySelector('.subscriptions-metadata-row__view').hidden = false;
+          // Fokus zurück auf den Auslöser, statt ins Leere (der Cancel-Button
+          // wird gerade versteckt) - sonst verliert die Tastatur die Position.
+          li.querySelector('[data-act="edit"]').focus();
+        });
+      });
+      // Tastatur im Inline-Edit: Enter speichert, Escape bricht ab. stopPropagation
+      // hält den globalen Modal-Handler (modal.js) davon ab, den ersten .btn--primary
+      // im Panel zu klicken bzw. das ganze Modal via Escape zu schließen.
+      panel.querySelectorAll('.subscriptions-metadata-row__edit input').forEach((input) => {
+        input.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter' && event.key !== 'Escape') return;
+          event.preventDefault();
+          event.stopPropagation();
+          const act = event.key === 'Enter' ? 'save' : 'cancel';
+          input.closest('li').querySelector(`[data-act="${act}"]`).click();
+        });
+      });
+      panel.querySelectorAll('[data-act="save"]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const li = button.closest('li');
+          const id = Number(li.dataset.id);
+          const editRow = li.querySelector('.subscriptions-metadata-row__edit');
+          const nameInput = editRow.querySelector('.subscriptions-metadata-edit-name');
+          const typed = nameInput.value.trim();
+          if (!typed) { nameInput.focus(); return; }
+          // Das Feld zeigt bei Default-Kategorien den lokalisierten Namen ("Bildung").
+          // Bleibt er unverändert (z. B. nur Farbe geändert), den gespeicherten Kanon-
+          // Namen ("Education") behalten, damit die Lokalisierung nicht verloren geht.
+          const name = nameInput.value === nameInput.defaultValue
+            ? (nameInput.dataset.originalName ?? typed)
+            : typed;
+          const colorInput = editRow.querySelector('.subscriptions-metadata-edit-color');
+          try {
+            if (li.dataset.kind === 'categories') {
+              await api.put(`/budget/subscriptions/categories/${id}`, { name, color: colorInput.value });
+            } else {
+              await api.put(`/budget/subscriptions/payment-methods/${id}`, { name });
+            }
+            await closeModal({ force: true });
+            await reload();
+            openMetadataModal();
+            window.yuvomi?.showToast(t('subscriptions.metaSavedToast'), 'success');
+          } catch (err) {
+            window.yuvomi?.showToast(err.data?.error || err.message || t('common.unknownError'), 'danger');
+          }
+        });
+      });
+      panel.querySelectorAll('[data-act="delete"]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const li = button.closest('li');
+          const id = Number(li.dataset.id);
+          const isCat = li.dataset.kind === 'categories';
+          const item = state.meta[isCat ? 'categories' : 'payment_methods'].find((row) => row.id === id);
+          const inUse = item?.usage_count || 0;
+          const name = item ? (isCat ? categoryLabel(item) : item.name) : '';
+          // confirmOverModal parkt das Verwalten-Modal, statt es zu ersetzen:
+          // „Abbrechen" gibt es mitsamt Scrollposition und Fokus zurück. Nur
+          // nach echtem Löschen wird es neu aufgebaut - die Liste hat sich
+          // geändert.
+          const confirmed = await confirmOverModal(
+            t(isCat ? 'subscriptions.deleteCategoryConfirm' : 'subscriptions.deletePaymentMethodConfirm', { name }),
+            { danger: true, detail: inUse ? t('subscriptions.metaInUseWarning', { count: inUse }) : null },
+          );
+          if (!confirmed) return;
+          try {
+            await api.delete(`/budget/subscriptions/${isCat ? 'categories' : 'payment-methods'}/${id}`);
+            await reload();
+            window.yuvomi?.showToast(t('subscriptions.metaDeletedToast'), 'success');
+          } catch (err) {
+            window.yuvomi?.showToast(err.data?.error || err.message || t('common.unknownError'), 'danger');
+          }
           openMetadataModal();
         });
       });

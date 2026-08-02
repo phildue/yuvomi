@@ -5,8 +5,14 @@
  */
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import test from 'node:test';
+
+import {
+  rememberScrollPosition,
+  scrollPositionFor,
+  forgetScrollPositions,
+} from '../public/utils/scroll-restore.js';
 
 const routerJs = readFileSync(new URL('../public/router.js', import.meta.url), 'utf8');
 const layoutCss = readFileSync(new URL('../public/styles/layout.css', import.meta.url), 'utf8');
@@ -72,9 +78,28 @@ test('mobile bottom navigation keeps five equal slots with inset indicator geome
   assert.match(baseItemRule, /flex:\s*1/);
   assert.match(itemRule, /min-width:\s*0/);
   assert.match(indicatorSurfaceRule, /inset-inline:\s*var\(--space-1\)/);
-  assert.match(indicatorRule, /top:\s*var\(--space-1\)/);
-  assert.match(indicatorRule, /bottom:\s*var\(--space-1\)/);
+  // Kapsel hinter dem Icon statt über die ganze Bar-Höhe: bar-hoch schnitt sie
+  // die Label-Grundlinie an und lief in die Safe-Area (#569-Nachtrag).
+  assert.match(indicatorRule, /top:\s*0/);
+  assert.match(indicatorRule, /bottom:\s*auto/);
+  assert.match(indicatorRule, /height:\s*var\(--target-md\)/);
   assert.doesNotMatch(indicatorRule, /transition:[^;]*\bwidth\b/);
+});
+
+test('mobile tab indicator stays a capsule behind the icon, clear of the bar edges', () => {
+  // Slot-breite Pille lief im ersten/letzten Tab bis an die Bar-Kante, wo die
+  // Rundung gekappt wurde (#569-Nachtrag). Die Geometrie kommt aus dem
+  // Icon-Well-Rect plus seitlichem Inset, nicht aus der reinen Slot-Breite.
+  const fn = routerJs.slice(routerJs.indexOf('function positionTabIndicator'));
+  const body = fn.slice(0, fn.indexOf('\n}\n') + 2);
+
+  assert.match(body, /querySelector\('\.nav-item__icon-well'\)/);
+  assert.match(body, /Math\.min\(ar\.width - TAB_INDICATOR_INSET \* 2, TAB_INDICATOR_MAX_WIDTH\)/);
+  assert.match(body, /indicator\.style\.height = `\$\{wr\.height\}px`/);
+  assert.match(body, /translate\(\$\{left\}px, \$\{top\}px\)/);
+  assert.doesNotMatch(body, /indicator\.style\.width = `\$\{ar\.width\}px`/);
+  assert.match(routerJs, /const TAB_INDICATOR_INSET = 4;/);
+  assert.match(routerJs, /const TAB_INDICATOR_MAX_WIDTH = 64;/);
 });
 
 test('cold dashboard load does not transform the scroll surface', () => {
@@ -87,6 +112,120 @@ test('cold dashboard load does not transform the scroll surface', () => {
     routerJs,
     /if \(shouldAnimate\) \{\s*pageWrapper\.classList\.add\(inClass\);/,
     'the slide class must only be applied after an existing route',
+  );
+});
+
+test('a forward navigation opens the target page at the top, a back navigation where it was', () => {
+  forgetScrollPositions();
+
+  // Übersicht weit unten verlassen (gemessener Fall: scrollTop 1267 → /tasks).
+  rememberScrollPosition('/', 1267);
+
+  assert.equal(
+    scrollPositionFor('/tasks', { restore: false }),
+    0,
+    'ein eigener Aufruf (pushState) muss oben beginnen',
+  );
+  assert.equal(
+    scrollPositionFor('/', { restore: true }),
+    1267,
+    'Browser-Zurück muss den gemerkten Stand der ZIELseite liefern',
+  );
+  assert.equal(
+    scrollPositionFor('/tasks', { restore: true }),
+    0,
+    'ohne gemerkten Stand bleibt auch popstate bei 0',
+  );
+
+  // Oben stehende Seiten werden nicht eingetragen - der Default liefert dieselbe 0.
+  rememberScrollPosition('/', 0);
+  assert.equal(scrollPositionFor('/', { restore: true }), 0);
+
+  forgetScrollPositions();
+  rememberScrollPosition('/', 1267);
+  forgetScrollPositions();
+  assert.equal(
+    scrollPositionFor('/', { restore: true }),
+    0,
+    'nach Sitzungsende darf kein Stand überleben',
+  );
+});
+
+test('the router resets the surviving scrollport on every navigation', () => {
+  // #main-content IST .app-content (renderAppShell) und überlebt jede Navigation:
+  // renderPage() tauscht per replaceChildren nur seinen Inhalt. Ohne expliziten
+  // Reset öffnet die Zielseite auf dem Scrollstand der Vorseite.
+  const mainRule = cssRuleBody(layoutCss, '.app-content');
+  assert.match(mainRule, /overflow-y:\s*auto/, '.app-content ist der Scrollport');
+  assert.match(
+    routerJs,
+    /main\.className = 'app-content';\s*main\.id = 'main-content';/,
+    'Scrollport und getauschter Container müssen dasselbe Element bleiben',
+  );
+
+  // Kommentare vorab entfernen, statt sie im Muster mitzudenken. Hier stand eine
+  // Alternation aus Zeilen- und Blockkommentar unter einem `*` - die backtrackt
+  // exponentiell, sobald ein `/*` ohne Abschluss folgt (CodeQL js/redos). Beide
+  // Ersetzungen sind ungierig und ohne äußere Wiederholung, also linear.
+  const routerCode = routerJs
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/[^\n]*$/gm, '');
+
+  assert.match(
+    routerCode,
+    /content\.replaceChildren\(pageWrapper\);\s*content\.scrollTop = 0;/,
+    'der Reset muss direkt am Inhaltstausch hängen - VOR dem Render, sonst kassiert '
+    + 'er die modul-eigenen Scrolls (Kalender-Tagesansicht, Essensplan) wieder ein',
+  );
+  assert.match(
+    routerJs,
+    /if \(scrollTarget > 0\) content\.scrollTop = scrollTarget;/,
+    'die Wiederherstellung bei popstate gehört hinter das await auf den Render',
+  );
+  assert.match(
+    routerJs,
+    /scrollPositionFor\(basePath, \{ restore: !pushState \}\)/,
+    'die Richtung kommt aus pushState, nicht aus getDirection() - das ist die '
+    + 'Slide-Richtung nach ROUTE_ORDER und auch bei Vorwärts-Taps oft "left"',
+  );
+});
+
+/**
+ * Die Wiederherstellung bei Browser-Zurück hängt am Scrollstand von
+ * `#main-content`. Module, deren Root `overflow: hidden` auf voller Höhe ist und
+ * die einen INNEREN Container scrollen, halten `#main-content` dauerhaft auf 0 -
+ * dort gibt es nichts zu merken, und Zurück landet oben. Das ist eine bewusste
+ * Grenze (siehe utils/scroll-restore.js und SPEC, Responsive Composition), keine
+ * versehentliche.
+ *
+ * Dieser Guard hält die Liste ehrlich: kommt ein neuntes Modul dazu oder
+ * verliert eines seinen inneren Scroller, verschiebt sich die Reichweite der
+ * Zusage - und Kommentar wie Spezifikation müssen mitziehen, statt still falsch
+ * zu werden. Geprüft wird die REGEL über alle Modul-Stylesheets, nicht eine
+ * Handvoll bekannter Dateien.
+ */
+test('the modules with an inner scroll container are the documented eight', () => {
+  const styleDir = new URL('../public/styles/', import.meta.url);
+  const found = [];
+
+  for (const file of readdirSync(styleDir).filter((f) => f.endsWith('.css'))) {
+    const css = readFileSync(new URL(file, styleDir), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+    for (const [, selector, body] of css.matchAll(/([^{}]+)\{([^}]*)\}/g)) {
+      const sel = selector.split('\n').pop().trim();
+      if (!/^\.[a-z-]+-page$/.test(sel)) continue;
+      if (/height:\s*100%/.test(body) && /overflow:\s*hidden/.test(body)) found.push(sel);
+    }
+  }
+
+  assert.deepEqual(
+    [...new Set(found)].sort(),
+    [
+      '.budget-page', '.calendar-page', '.contacts-page', '.meals-page',
+      '.notes-page', '.pantry-page', '.recipes-page', '.shopping-page',
+    ],
+    'Die Module mit innerem Scroller haben sich geändert. Sie sind genau die, in '
+    + 'denen Browser-Zurück NICHT an die alte Position zurückkehrt - die Liste in '
+    + 'utils/scroll-restore.js und in docs/SPEC.md (Responsive Composition) muss mit.',
   );
 });
 

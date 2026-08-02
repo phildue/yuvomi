@@ -22,6 +22,7 @@ db.exec(`
   CREATE TABLE contacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
+    first_name TEXT, last_name TEXT, middle_name TEXT, name_prefix TEXT, name_suffix TEXT,
     family_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE
   );
 `);

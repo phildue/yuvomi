@@ -7,13 +7,13 @@
        Note: X-Frame-Options / CSP frame-ancestors only take effect as HTTP headers, not via meta. -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
   <meta name="referrer" content="strict-origin-when-cross-origin">
-  <title>Yuvomi — The Self-Hosted Family Planner</title>
-  <meta name="description" content="A privacy-first, self-hosted family planner. Tasks, shopping, meals, calendar sync, budget — one private home for everything your household runs on. No cloud, no subscriptions.">
+  <title>Yuvomi - The Self-Hosted Family Planner</title>
+  <meta name="description" content="A privacy-first, self-hosted family planner. Tasks, shopping, meals, calendar sync, budget - one private home for everything your household runs on. No cloud, no subscriptions.">
   <meta name="theme-color" content="#fafaf8" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#1a1a18" media="(prefers-color-scheme: dark)">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Yuvomi — The Self-Hosted Family Planner">
-  <meta property="og:description" content="Tasks, shopping, meals, calendar, budget — all self-hosted, no cloud dependency.">
+  <meta property="og:title" content="Yuvomi - The Self-Hosted Family Planner">
+  <meta property="og:description" content="Tasks, shopping, meals, calendar, budget - all self-hosted, no cloud dependency.">
   <meta property="og:image" content="https://yuvomi.cloud/og-image.png">
   <meta property="og:url" content="https://yuvomi.cloud/">
   <meta name="twitter:card" content="summary_large_image">
@@ -23,7 +23,7 @@
 
   <style>
     /* ============================================================
-       Plus Jakarta Sans — self-hosted variable font (no CDN).
+       Plus Jakarta Sans - self-hosted variable font (no CDN).
        Matches the Yuvomi app exactly. Roman + italic for editorial accents.
        ============================================================ */
     @font-face {
@@ -43,7 +43,7 @@
       --ff: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       --ff-mono: 'SF Mono', 'Fira Code', 'JetBrains Mono', ui-monospace, monospace;
 
-      /* Warm neutral surfaces — mirrors the app's tokens.css */
+      /* Warm neutral surfaces - mirrors the app's tokens.css */
       --bg: #FAFAF8;
       --bg-alt: #F2F1ED;
       --surface: #FFFFFF;
@@ -52,7 +52,7 @@
       --border-strong: #D8D7D1;
       --text-1: #1C1C1A;
       --text-2: #56554F;
-      --text-3: #8B8A85;
+      --text-3: #6E6D67;
 
       --accent: #6c3aed;
       --accent-hover: #5b2fd4;
@@ -62,21 +62,28 @@
       --accent-glow: rgba(108, 58, 237, 0.16);
       --accent-ink: #FFFFFF;
 
+      /* CTA drench: deliberately theme-independent deep violets so white text stays
+         >=4.5:1 in BOTH themes. NOT redefined in the dark block - the dark accents
+         (#a78bfa) are too light and dropped white text to 2.7:1. */
+      --cta-grad-1: #3d1f9e;
+      --cta-grad-2: #5b2fd4;
+      --cta-grad-3: #7c4de0;
+
       /* Module accent signature (from the app) */
       --m-tasks: #15803D;
-      --m-calendar: #8250DF;
+      --m-calendar: #4F46E5;
       --m-meals: #C2410C;
-      --m-recipes: #0D9488;
+      --m-recipes: #0C7C5B;
       --m-shopping: #DB2777;
       --m-notes: #A16207;
       --m-contacts: #0969DA;
-      --m-birthdays: #E11D48;
+      --m-birthdays: #D6336C;
       --m-budget: #0F766E;
-      --m-documents: #1D4ED8;
+      --m-documents: #42587E;
       --m-housekeeping: #7C3AED;
       --m-health: #9E1E88;
       --m-rewards: #BE4B6E;
-      --m-split: #2563EB;
+      --m-split: #1A7BAE;
 
       --code-bg: #1B1A22;
       --code-text: #E6E4F0;
@@ -121,15 +128,15 @@
       --accent-ink: #1A1A18;
 
       --m-tasks: #4ADE80;
-      --m-calendar: #A78BFA;
+      --m-calendar: #818CF8;
       --m-meals: #FB923C;
-      --m-recipes: #2DD4BF;
+      --m-recipes: #2ECC99;
       --m-shopping: #F472B6;
       --m-notes: #FCD34D;
       --m-contacts: #60A5FA;
       --m-birthdays: #FB7185;
       --m-budget: #2DD4BF;
-      --m-documents: #60A5FA;
+      --m-documents: #7E9BCC;
       --m-housekeeping: #C4B5FD;
       --m-health: #DB60CB;
       --m-rewards: #E68CA6;
@@ -156,9 +163,9 @@
         --text-1: #F5F4F1; --text-2: #B4B3B0; --text-3: #8E8D89;
         --accent: #a78bfa; --accent-hover: #9066f5; --accent-deep: #c4b5fd;
         --accent-soft: #1E1040; --accent-light: #160B30; --accent-glow: rgba(167,139,250,0.22); --accent-ink: #1A1A18;
-        --m-tasks: #4ADE80; --m-calendar: #A78BFA; --m-meals: #FB923C; --m-recipes: #2DD4BF;
+        --m-tasks: #4ADE80; --m-calendar: #818CF8; --m-meals: #FB923C; --m-recipes: #2ECC99;
         --m-shopping: #F472B6; --m-notes: #FCD34D; --m-contacts: #60A5FA; --m-birthdays: #FB7185;
-        --m-budget: #2DD4BF; --m-documents: #60A5FA; --m-housekeeping: #C4B5FD; --m-health: #DB60CB; --m-rewards: #E68CA6; --m-split: #7DA3FF;
+        --m-budget: #2DD4BF; --m-documents: #7E9BCC; --m-housekeeping: #C4B5FD; --m-health: #DB60CB; --m-rewards: #E68CA6; --m-split: #2FB6E8;
         --code-bg: #141413; --code-text: #E2E1DC; --code-comment: #7A786F;
         --shadow-sm: 0 1px 3px rgba(0,0,0,0.30); --shadow-md: 0 4px 12px rgba(0,0,0,0.38);
         --shadow-lg: 0 12px 30px rgba(0,0,0,0.48); --shadow-xl: 0 22px 60px rgba(0,0,0,0.60);
@@ -304,7 +311,7 @@
       border-radius: 26px; border: 4px solid var(--surface); box-shadow: var(--shadow-xl);
       z-index: 2; overflow: hidden; background: var(--surface);
     }
-    .hero-float img { width: 100%; display: block; }
+    .hero-float img { width: 100%; display: block; aspect-ratio: 1320 / 2867; }
     .hero-chip {
       position: absolute; display: inline-flex; align-items: center; gap: 8px; z-index: 3;
       padding: 9px 14px; border-radius: var(--r-full); font-size: 0.82rem; font-weight: 600; color: var(--text-1);
@@ -326,7 +333,7 @@
     @media (max-width: 560px) { .proof .dt { display: none; } }
 
     /* ===== Problem ===== */
-    /* Problem section is deliberately NOT cards — flat columns under hairline rules,
+    /* Problem section is deliberately NOT cards - flat columns under hairline rules,
        so it reads differently from the surface-card grids elsewhere. */
     .problem { padding: 96px 0; }
     .problem-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 36px 48px; margin-top: 48px; }
@@ -367,13 +374,13 @@
     .feat-list li { display: flex; align-items: flex-start; gap: 10px; font-size: 0.94rem; color: var(--text-2); }
     .feat-list svg { width: 18px; height: 18px; color: var(--m); flex-shrink: 0; margin-top: 2px; }
     .feat-visual { position: relative; }
-    .feat-visual .shot { border-radius: var(--r-lg); box-shadow: var(--shadow-lg); border: 1px solid var(--border); width: 100%; }
+    .feat-visual .shot { border-radius: var(--r-lg); box-shadow: var(--shadow-lg); border: 1px solid var(--border); width: 100%; aspect-ratio: 4 / 3; }
     .feat-visual::before {
       content: ''; position: absolute; inset: -8% -6% -12% -6%; z-index: -1; border-radius: var(--r-2xl);
       background: radial-gradient(60% 60% at 50% 40%, color-mix(in srgb, var(--m) 16%, transparent), transparent 75%);
       filter: blur(8px);
     }
-    .feat-mobile { width: 132px !important; border-radius: 20px !important; border: 4px solid var(--surface);
+    .feat-mobile { width: 132px !important; aspect-ratio: 1320 / 2867; border-radius: 20px !important; border: 4px solid var(--surface);
       box-shadow: var(--shadow-xl); position: absolute; bottom: -26px; right: -20px; z-index: 2; }
 
     /* ===== Feature grid ===== */
@@ -396,7 +403,7 @@
       -webkit-overflow-scrolling: touch; scrollbar-width: none; }
     .carousel-track::-webkit-scrollbar { display: none; }
     .carousel-item { flex: 0 0 auto; scroll-snap-align: center; text-align: center; }
-    .carousel-item img { height: 460px; width: auto; border-radius: 26px; box-shadow: var(--shadow-xl); border: 4px solid var(--surface); }
+    .carousel-item img { height: 460px; width: auto; aspect-ratio: 1320 / 2867; border-radius: 26px; box-shadow: var(--shadow-xl); border: 4px solid var(--surface); }
     .carousel-item span { display: block; margin-top: 14px; font-size: 0.82rem; font-weight: 600; color: var(--text-3); }
     .carousel-hint { text-align: center; font-size: 0.8rem; color: var(--text-3); margin-top: 4px; }
 
@@ -417,7 +424,9 @@
     .plat-badge { position: absolute; top: 16px; right: 16px; font-size: 0.66rem; font-weight: 700; letter-spacing: 0.04em;
       text-transform: uppercase; color: var(--m-tasks); background: color-mix(in srgb, var(--m-tasks) 13%, transparent);
       padding: 4px 9px; border-radius: var(--r-full); }
-    .plat-go { margin-top: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 0.84rem; font-weight: 700; color: var(--pc, var(--accent)); }
+    /* Label uses the theme accent (AA-contrast on --surface in both themes); the
+       platform brand colour (--pc) stays on the logo tint only. */
+    .plat-go { margin-top: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 0.84rem; font-weight: 700; color: var(--accent); }
     .plat-go svg { width: 15px; height: 15px; transition: transform .2s var(--ease-spring); }
     .plat-card:hover .plat-go svg { transform: translateX(4px); }
 
@@ -444,7 +453,7 @@
     /* ===== CTA ===== */
     .cta { padding: 110px 0; }
     .cta-box { position: relative; overflow: hidden; text-align: center; border-radius: var(--r-2xl); padding: 72px 40px;
-      background: linear-gradient(150deg, color-mix(in srgb, var(--accent) 92%, #000) 0%, var(--accent) 45%, var(--m-calendar) 110%);
+      background: linear-gradient(150deg, var(--cta-grad-1) 0%, var(--cta-grad-2) 46%, var(--cta-grad-3) 112%);
       box-shadow: var(--shadow-hero); }
     .cta-box::before { content: ''; position: absolute; inset: 0; opacity: 0.5;
       background: radial-gradient(60% 80% at 80% -10%, rgba(255,255,255,0.28), transparent 60%); }
@@ -453,12 +462,14 @@
     .cta-box > * { position: relative; z-index: 1; }
     .cta-box h2 { font-size: clamp(1.8rem, 4vw, 2.7rem); font-weight: 700; letter-spacing: -0.035em; color: #fff; margin-bottom: 14px; text-wrap: balance; }
     .cta-box h2 em { font-style: italic; font-weight: 600; }
-    .cta-box p { color: rgba(255,255,255,0.88); font-size: 1.08rem; max-width: 44ch; margin: 0 auto 32px; }
+    .cta-box p { color: rgba(255,255,255,0.95); font-size: 1.08rem; max-width: 44ch; margin: 0 auto 32px; }
     .cta-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
     .cta-actions .btn-primary { background: #fff; color: var(--accent-deep); box-shadow: 0 10px 30px rgba(0,0,0,0.22); }
     .cta-actions .btn-primary:hover { background: #fff; color: var(--accent-deep); opacity: 0.94; }
     .cta-actions .btn-secondary { background: rgba(255,255,255,0.12); color: #fff; border-color: rgba(255,255,255,0.30); box-shadow: none; }
     .cta-actions .btn-secondary:hover { background: rgba(255,255,255,0.2); border-color: rgba(255,255,255,0.5); }
+    /* Honest longevity line: MIT + self-host permanence, not a fabricated metric. */
+    .cta-note { color: rgba(255,255,255,0.92); font-size: 0.92rem; line-height: 1.55; max-width: 52ch; margin: 26px auto 0; }
 
     /* ===== Footer ===== */
     footer { border-top: 1px solid var(--border); padding: 56px 0 48px; }
@@ -467,7 +478,7 @@
     .foot-brand .nav-logo { margin-bottom: 14px; }
     .foot-brand p { font-size: 0.88rem; color: var(--text-2); line-height: 1.6; }
     .foot-cols { display: flex; gap: 56px; flex-wrap: wrap; }
-    .foot-col h4 { font-size: 0.74rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); margin-bottom: 14px; }
+    .foot-col h3 { font-size: 0.74rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); margin-bottom: 14px; }
     .foot-col a { display: block; font-size: 0.9rem; color: var(--text-2); padding: 6px 0; margin-bottom: 2px; transition: color .15s; }
     .foot-col a:hover { color: var(--accent); }
     .foot-bottom { margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
@@ -510,7 +521,7 @@
       .cta-box { padding: 52px 24px; }
       .nav-gh span:not(#gh-stars-nav) { display: none; }
     }
-    /* Sticky Install button in the thumb zone on phones — always reachable past the hero. */
+    /* Sticky Install button in the thumb zone on phones - always reachable past the hero. */
     @media (max-width: 700px) {
       .mobile-cta {
         display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; width: max-content;
@@ -545,7 +556,7 @@
       <button class="nav-btn" id="langBtn" type="button" aria-label="Switch language"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10A15.3 15.3 0 0 1 12 2z"/></svg><span id="langLbl">DE</span></button>
       <button class="nav-btn" id="themeBtn" type="button" aria-label="Toggle theme"><svg id="sunIco" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg><svg id="moonIco" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
       <a href="install.html" class="nav-btn nav-install"><span data-t="nav_install">Install</span></a>
-      <a href="https://github.com/ulsklyc/yuvomi" class="nav-btn nav-gh" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg><span data-t="nav_gh">GitHub</span><span id="gh-stars-nav" data-gh-stars>&nbsp;★ 931</span></a>
+      <a href="https://github.com/ulsklyc/yuvomi" class="nav-btn nav-gh" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg><span data-t="nav_gh">GitHub</span><span id="gh-stars-nav" data-gh-stars>&nbsp;★ 1.1k</span></a>
     </div>
   </div>
 </nav>
@@ -592,8 +603,8 @@
 <!-- PROOF -->
 <div class="proof">
   <div class="wrap">
-    <span id="gh-stars-proof" data-gh-stars>★ 931 ·</span>
-    <span class="dt"><b>16</b> <span data-t="proof_modules">modules</span></span>
+    <span id="gh-stars-proof" data-gh-stars>★ 1.1k ·</span>
+    <span class="dt"><b>17</b> <span data-t="proof_modules">modules</span></span>
     <span class="sep dt">·</span>
     <span><b>23</b> <span data-t="proof_langs">languages</span></span>
     <span class="sep">·</span>
@@ -601,7 +612,7 @@
     <span class="sep dt">·</span>
     <span data-t="proof_mit">MIT licensed</span>
     <span class="sep">·</span>
-    <span><b>v1.16.0</b></span>
+    <span><b>v1.73.0</b></span>
   </div>
 </div>
 
@@ -673,11 +684,11 @@
       <div class="feat-info">
         <span class="feat-kicker"><span class="k-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></span><span data-t="f_tasks_k">Tasks</span></span>
         <h3 data-t="f_tasks_t">Everyone knows what needs doing.</h3>
-        <p data-t="f_tasks_d">Shared tasks with deadlines, priorities, subtasks and recurring schedules, assignable to several family members at once.</p>
+        <p data-t="f_tasks_d">Shared tasks with deadlines, priorities, subtasks, tags and recurring schedules, assignable to several family members at once.</p>
         <ul class="feat-list">
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span data-t="f_tasks_l1">Kanban board with one-tap status changes</span></li>
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span data-t="f_tasks_l2">Multi-member assignment with stacked avatars</span></li>
-          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span data-t="f_tasks_l3">Optional read-only Apple Reminders import</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span data-t="f_tasks_l3">Optional two-way sync with CalDAV reminder lists</span></li>
         </ul>
       </div>
       <div class="feat-visual">
@@ -690,7 +701,7 @@
       <div class="feat-info">
         <span class="feat-kicker"><span class="k-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg></span><span data-t="f_cal_k">Calendar</span></span>
         <h3 data-t="f_cal_t">One calendar for the whole family.</h3>
-        <p data-t="f_cal_d">Google Calendar, iCloud, Nextcloud, all in one place. Two-way CalDAV sync, public ICS subscriptions and one-time import, plus built-in public & school holidays.</p>
+        <p data-t="f_cal_d">Google Calendar, iCloud, Nextcloud, all in one place. Two-way Google and CalDAV sync, public ICS subscriptions and one-time import, plus built-in public & school holidays.</p>
         <ul class="feat-list">
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span data-t="f_cal_l1">Two-way Google &amp; CalDAV sync</span></li>
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span data-t="f_cal_l2">Recurring events with file attachments</span></li>
@@ -727,8 +738,8 @@
         <p data-t="f_budget_d">Track who spent what, split shared costs automatically, and see exactly where the money goes.</p>
         <ul class="feat-list">
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span data-t="f_budget_l1">23 currencies, recurring entries, weekly/monthly/yearly statistics, monthly budgets &amp; savings goals</span></li>
-          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span data-t="f_budget_l2">Split expenses with automatic debt simplification</span></li>
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span data-t="f_budget_l3">Subscription tracker with renewals, budgets &amp; alerts</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span data-t="f_budget_l4">Receipts on any transaction - upload one or link a document you already filed</span></li>
         </ul>
       </div>
       <div class="feat-visual">
@@ -766,7 +777,7 @@
         </ul>
       </div>
       <div class="feat-visual">
-        <img class="sc shot" data-light="screenshots/health-cycle-light-web.png" data-dark="screenshots/health-cycle-dark-web.png" src="screenshots/health-cycle-light-web.png" alt="Health — menstrual cycle ring with period and fertile-window predictions" loading="lazy">
+        <img class="sc shot" data-light="screenshots/health-cycle-light-web.png" data-dark="screenshots/health-cycle-dark-web.png" src="screenshots/health-cycle-light-web.png" alt="Health - menstrual cycle ring with period and fertile-window predictions" loading="lazy">
         <img class="sc feat-mobile" data-light="screenshots/health-vitals-light-mobile.png" data-dark="screenshots/health-vitals-dark-mobile.png" src="screenshots/health-vitals-light-mobile.png" alt="Health vitals on mobile" loading="lazy" style="left:-20px;right:auto">
       </div>
     </div>
@@ -783,7 +794,7 @@
         </ul>
       </div>
       <div class="feat-visual">
-        <img class="sc shot" data-light="screenshots/rewards-light-web.png" data-dark="screenshots/rewards-dark-web.png" src="screenshots/rewards-light-web.png" alt="Rewards — point standings and a catalog of parent-approved rewards" loading="lazy">
+        <img class="sc shot" data-light="screenshots/rewards-light-web.png" data-dark="screenshots/rewards-dark-web.png" src="screenshots/rewards-light-web.png" alt="Rewards - point standings and a catalog of parent-approved rewards" loading="lazy">
         <img class="sc feat-mobile" data-light="screenshots/rewards-light-mobile.png" data-dark="screenshots/rewards-dark-mobile.png" src="screenshots/rewards-light-mobile.png" alt="Rewards on mobile" loading="lazy">
       </div>
     </div>
@@ -800,7 +811,7 @@
         </ul>
       </div>
       <div class="feat-visual">
-        <img class="sc shot" data-light="screenshots/split-expenses-light-web.png" data-dark="screenshots/split-expenses-dark-web.png" src="screenshots/split-expenses-light-web.png" alt="Split expenses — shared cost groups with balances and settle-up" loading="lazy">
+        <img class="sc shot" data-light="screenshots/split-expenses-light-web.png" data-dark="screenshots/split-expenses-dark-web.png" src="screenshots/split-expenses-light-web.png" alt="Split expenses - shared cost groups with balances and settle-up" loading="lazy">
         <img class="sc feat-mobile" data-light="screenshots/split-expenses-light-mobile.png" data-dark="screenshots/split-expenses-dark-mobile.png" src="screenshots/split-expenses-light-mobile.png" alt="Split expenses on mobile" loading="lazy" style="left:-20px;right:auto">
       </div>
     </div>
@@ -811,13 +822,13 @@
 <section class="modules">
   <div class="wrap">
     <div class="sec-head center reveal">
-      <h2 class="sec-title" data-t="more_title">One app, sixteen modules</h2>
+      <h2 class="sec-title" data-t="more_title">Eight more modules</h2>
       <p class="sec-desc" data-t="more_desc">Each module is independent. Use what fits your family, skip what doesn't.</p>
     </div>
     <div class="mod-grid">
       <div class="mod-card reveal" style="--m: var(--m-documents)">
         <div class="mod-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></div>
-        <h3 data-t="m_docs_t">Documents</h3><p data-t="m_docs_d">Family files with previews, visibility controls and storage badges. New uploads and calendar attachments can use a local folder or WebDAV; Paperless-ngx and Papra DMS integration is optional.</p>
+        <h3 data-t="m_docs_t">Documents</h3><p data-t="m_docs_d">Family files with previews, visibility controls and storage badges. Multi-file upload, folders, sorting and bulk actions. New uploads and calendar attachments can use a local folder, WebDAV, or Google Drive; Paperless-ngx and Papra DMS integration is optional.</p>
       </div>
       <div class="mod-card reveal d1" style="--m: var(--m-notes)">
         <div class="mod-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></svg></div>
@@ -837,7 +848,7 @@
       </div>
       <div class="mod-card reveal d2" style="--m: var(--m-recipes)">
         <div class="mod-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a7 7 0 0 0-7 7c0 2.4 1.2 4.5 3 5.7V17a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2.3c1.8-1.2 3-3.3 3-5.7a7 7 0 0 0-7-7z"/><line x1="9" y1="22" x2="15" y2="22"/></svg></div>
-        <h3 data-t="m_recipes_t">Recipes</h3><p data-t="m_recipes_d">Create, duplicate and scale reusable recipes. Pre-fill meal slots or save any meal as a recipe.</p>
+        <h3 data-t="m_recipes_t">Recipes</h3><p data-t="m_recipes_d">Create, duplicate and scale reusable recipes. Pre-fill meal slots, send the ingredients to a shopping list, or save any meal as a recipe. A self-hosted Mealie instance can be mirrored in read-only alongside your own.</p>
       </div>
       <div class="mod-card reveal" style="--m: var(--m-calendar)">
         <div class="mod-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></div>
@@ -924,7 +935,7 @@
     </div>
 
     <div class="quick-docker reveal">
-      <div class="code-block"><span class="c"># Pre-built image — Docker</span>
+      <div class="code-block"><span class="c"># Pre-built image - Docker</span>
 curl -O https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docker-compose.yml
 curl -O https://raw.githubusercontent.com/ulsklyc/yuvomi/main/.env.example
 cp .env.example .env  <span class="c"># set SESSION_SECRET and DB_ENCRYPTION_KEY</span>
@@ -961,6 +972,7 @@ cp .env.example .env  <span class="c"># set SESSION_SECRET and DB_ENCRYPTION_KEY
         <a href="install.html" class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span data-t="cta_install">Get started</span></a>
         <a href="https://github.com/ulsklyc/yuvomi" class="btn btn-secondary" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg><span data-t="cta_gh">View on GitHub</span></a>
       </div>
+      <p class="cta-note" data-t="cta_longevity">MIT-licensed and self-hosted: even if the project stops, nothing phones home and your instance keeps running. The data lives on your server - yours to keep, back up, and move.</p>
     </div>
   </div>
 </section>
@@ -975,27 +987,27 @@ cp .env.example .env  <span class="c"># set SESSION_SECRET and DB_ENCRYPTION_KEY
       </div>
       <div class="foot-cols">
         <div class="foot-col">
-          <h4 data-t="foot_product">Product</h4>
+          <h3 data-t="foot_product">Product</h3>
           <a href="#carousel" data-t="foot_screens">Screenshots</a>
           <a href="install.html" data-t="foot_install">Install</a>
           <a href="https://github.com/ulsklyc/yuvomi/blob/main/docs/SPEC.md" target="_blank" rel="noopener" data-t="foot_docs">Docs &amp; spec</a>
         </div>
         <div class="foot-col">
-          <h4 data-t="foot_project">Project</h4>
+          <h3 data-t="foot_project">Project</h3>
           <a href="https://github.com/ulsklyc/yuvomi" target="_blank" rel="noopener">GitHub</a>
           <a href="https://github.com/ulsklyc/yuvomi/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener" data-t="foot_contrib">Contributing</a>
           <a href="https://github.com/ulsklyc/yuvomi/blob/main/CHANGELOG.md" target="_blank" rel="noopener" data-t="foot_changelog">Changelog</a>
           <a href="https://github.com/ulsklyc/yuvomi/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
         </div>
         <div class="foot-col">
-          <h4 data-t="foot_legal">Legal</h4>
+          <h3 data-t="foot_legal">Legal</h3>
           <a href="impressum.html" data-t="foot_impressum">Impressum</a>
           <a href="datenschutz.html" data-t="foot_privacy">Datenschutz</a>
         </div>
       </div>
     </div>
     <div class="foot-bottom">
-      <span><span id="gh-stars-footer" data-gh-stars>★ 931 · </span><b>v1.16.0</b> · July 2026</span>
+      <span><span id="gh-stars-footer" data-gh-stars>★ 1.1k · </span><b>v1.73.0</b> · <span id="foot-released" data-released="2026-08-02">August 2026</span></span>
       <span data-t="foot_madewith">Self-hosted · Privacy-first · Open source</span>
     </div>
   </div>
@@ -1018,8 +1030,8 @@ cp .env.example .env  <span class="c"># set SESSION_SECRET and DB_ENCRYPTION_KEY
       prob_1_t:'Ten different apps', prob_1_d:'Tasks here, shopping there, calendar somewhere else. Nothing talks to anything.',
       prob_2_t:'Subscriptions, forever', prob_2_d:'Notion, Google One, iCloud. Another invoice every year, no way out.',
       prob_3_t:'Your data, everywhere', prob_3_d:"Your calendar on Google's servers, your notes on Dropbox. Who actually owns your family's data?",
-      prob_cta:"There's a calmer way.",
-      why_label:'Why Yuvomi', why_title:'Built for families, not for profit.',
+      prob_cta:"There's a calmer way. <span>Self-hosted, and yours.</span>",
+      why_label:'Why Yuvomi', why_title:'Built for families, <em>not for profit.</em>',
       why_desc:'It all runs on hardware you own, keeps working without any subscription, and never sends your data off your home network.',
       p_priv_t:'Privacy first', p_priv_d:'Optional AES-256 database encryption via SQLCipher (enabled in the recommended Docker setup). Zero telemetry. Your data never leaves your server.',
       p_self_t:'Fully self-hosted', p_self_d:'Runs on a Raspberry Pi, a NAS, or any server. Docker or Podman makes setup a one-liner.',
@@ -1027,14 +1039,15 @@ cp .env.example .env  <span class="c"># set SESSION_SECRET and DB_ENCRYPTION_KEY
       p_build_t:'Zero build step', p_build_d:'Pure ES modules, vanilla JS and plain CSS. What we write is exactly what ships, with nothing to bundle or transpile.',
       feat_label:'Features', feat_title:'Everything your household needs',
       feat_desc:'A complete set of tools for families, designed to work together, not scattered across sixteen separate tabs.',
-      f_tasks_k:'Tasks', f_tasks_t:'Everyone knows what needs doing.', f_tasks_d:'Shared tasks with deadlines, priorities, subtasks and recurring schedules, assignable to several family members at once.',
-      f_tasks_l1:'Kanban board with one-tap status changes', f_tasks_l2:'Multi-member assignment with stacked avatars', f_tasks_l3:'Optional read-only Apple Reminders import',
-      f_cal_k:'Calendar', f_cal_t:'One calendar for the whole family.', f_cal_d:'Google Calendar, iCloud, Nextcloud, all in one place. Two-way CalDAV sync, public ICS subscriptions and one-time import, plus built-in public & school holidays.',
+      f_tasks_k:'Tasks', f_tasks_t:'Everyone knows what needs doing.', f_tasks_d:'Shared tasks with deadlines, priorities, subtasks, tags and recurring schedules, assignable to several family members at once.',
+      f_tasks_l1:'Kanban board with one-tap status changes', f_tasks_l2:'Multi-member assignment with stacked avatars', f_tasks_l3:'Optional two-way sync with CalDAV reminder lists',
+      f_cal_k:'Calendar', f_cal_t:'One calendar for the whole family.', f_cal_d:'Google Calendar, iCloud, Nextcloud, all in one place. Two-way Google and CalDAV sync, public ICS subscriptions and one-time import, plus built-in public & school holidays.',
       f_cal_l1:'Two-way Google & CalDAV sync', f_cal_l2:'Recurring events with file attachments', f_cal_l3:'Readable month & agenda views',
       f_meals_k:'Meals & recipes', f_meals_t:'Dinner sorted before anyone asks.', f_meals_d:'A weekly drag-and-drop planner with repeating meals and ingredient lists that export straight to the shopping list in one click.',
       f_meals_l1:'Drag-and-drop weekly planner with repeats', f_meals_l2:'Reusable recipes you can scale & duplicate', f_meals_l3:'One-tap export to your shopping list',
       f_budget_k:'Budget', f_budget_t:'No surprise at the end of the month.', f_budget_d:'Track who spent what, split shared costs automatically, and see exactly where the money goes.',
-      f_budget_l1:'23 currencies, recurring entries, weekly/monthly/yearly statistics, monthly budgets & savings goals', f_budget_l2:'Split expenses with automatic debt simplification', f_budget_l3:'Subscription tracker with renewals, budgets & alerts',
+      f_budget_l1:'23 currencies, recurring entries, weekly/monthly/yearly statistics, monthly budgets & savings goals', f_budget_l3:'Subscription tracker with renewals, budgets & alerts',
+      f_budget_l4:'Receipts on any transaction - upload one or link a document you already filed',
       f_shop_k:'Shopping', f_shop_t:'The list everyone actually checks.', f_shop_d:'One shared shopping list for the whole family, organized by aisle and updating in real time.',
       f_shop_l1:'Aisle categories & swipe gestures', f_shop_l2:'Add a whole meal plan in one tap', f_shop_l3:'Touch-safe quick add on mobile',
       f_health_k:'Health', f_health_t:'Health that stays in the family.', f_health_d:'Vitals, medications, lab results, activity and cycles, tracked per member, private by default, and never leaving your server.',
@@ -1043,38 +1056,38 @@ cp .env.example .env  <span class="c"># set SESSION_SECRET and DB_ENCRYPTION_KEY
       f_rewards_l1:'Point values on any task, credited automatically', f_rewards_l2:'Reward catalog with parent-approved redemptions', f_rewards_l3:'Per-member opt-in and a full point ledger',
       f_split_k:'Split expenses', f_split_t:'Who owes whom, settled automatically.', f_split_d:'Track shared costs across the household, trips and events. Yuvomi simplifies the debts so everyone settles up with the fewest payments.',
       f_split_l1:'Groups for household, trips and events', f_split_l2:'Automatic debt simplification', f_split_l3:'Multiple currencies with live conversion',
-      more_label:"And there's more", more_title:'One app, sixteen modules', more_desc:"Each module is independent. Use what fits your family, skip what doesn't.",
-      m_docs_t:'Documents', m_docs_d:'Family files with previews, visibility controls and storage badges. New uploads and calendar attachments can use a local folder or WebDAV; Paperless-ngx and Papra DMS integration is optional.',
+      more_label:"And there's more", more_title:'Eight more modules', more_desc:"Each module is independent. Use what fits your family, skip what doesn't.",
+      m_docs_t:'Documents', m_docs_d:'Family files with previews, visibility controls and storage badges. Multi-file upload, folders, sorting and bulk actions. New uploads and calendar attachments can use a local folder, WebDAV, or Google Drive; Paperless-ngx and Papra DMS integration is optional.',
       m_notes_t:'Notes', m_notes_d:'Colored sticky notes with Markdown. Perfect for recipes, family memos and quick reminders.',
       m_contacts_t:'Contacts', m_contacts_d:'Shared family directory with CardDAV sync, vCard import/export and multi-account support.',
       m_bday_t:'Birthdays', m_bday_d:'Birthday tracker with automatic annual calendar events, age display and custom reminders.',
       m_house_t:'Housekeeping', m_house_d:'Manage household staff: schedules, check-in/out, daily or hourly billing, chores and supplies.',
       m_health_t:'Health', m_health_d:'Track vitals, medications with reminders, lab results, activity and menstrual cycles per family member, private or shared. Not a medical device.',
-      m_rewards_t:'Rewards', m_rewards_d:'Give tasks point values; finishing them credits the assigned members. A reward catalog with parent-approved redemptions, opt-in per member, bonus points and a full point ledger.',
-      m_recipes_t:'Recipes', m_recipes_d:'Create, duplicate and scale reusable recipes. Pre-fill meal slots or save any meal as a recipe.',
+      m_rewards_t:'Rewards', m_rewards_d:'Give tasks point values; finishing them credits the assigned members. Set a household default that prefills new tasks and can be rolled out to existing ones. A reward catalog with parent-approved redemptions, opt-in per member, bonus points and a full point ledger.',
+      m_recipes_t:'Recipes', m_recipes_d:'Create, duplicate and scale reusable recipes. Pre-fill meal slots, send the ingredients to a shopping list, or save any meal as a recipe. A self-hosted Mealie instance can be mirrored in read-only alongside your own.',
       m_rem_t:'Reminders', m_rem_d:'Time-based notifications on tasks and calendar events, with an in-app badge so nothing slips, plus opt-in push notifications that reach you even when the app is closed.',
       m_backup_t:'Backup & SSO', m_backup_d:'Scheduled backups with pre-restore rollback, optional WebDAV cloud upload (Nextcloud, ownCloud, Hetzner, etc.), plus single sign-on via any OIDC provider.',
-      screens_label:'Preview', screens_title:'Every screen, carefully crafted',
+      screens_label:'Preview', screens_title:'Every screen, <em>carefully crafted</em>',
       screens_desc:'A clean, intuitive interface with tuned touch targets and layouts that adapt to your device and theme.',
       screens_hint:'Drag, swipe or scroll to explore →',
       cap_tasks:'Tasks', cap_cal:'Calendar', cap_shop:'Shopping', cap_meals:'Meals', cap_recipes:'Recipes',
       cap_budget:'Budget', cap_notes:'Notes', cap_contacts:'Contacts', cap_bday:'Birthdays', cap_house:'Housekeeping', cap_documents:'Documents',
       cap_health:'Health', cap_rewards:'Rewards', cap_split:'Split expenses', cap_subs:'Subscriptions',
-      plat_label:'Install anywhere', plat_title:'Runs on your hardware',
+      plat_label:'Install anywhere', plat_title:'Runs on <em>your</em> hardware',
       plat_desc:"A Docker or Podman container that drops onto any home server or NAS. Or install it in a couple of clicks from your platform's app store.",
-      plat_docker:'Pre-built image, up and running with a single compose command.',
+      plat_docker:'Pre-built image, up and running with a single <code>compose</code> command.',
       plat_podman:'Rootless and SELinux-ready for RHEL, Fedora and CentOS Stream.',
       plat_truenas:'In the SCALE Community Apps catalog: install from the web UI, no terminal.',
       plat_umbrel:'Available in the Umbrel App Store; everything stays on your Umbrel.',
       plat_unraid:'A Community Apps template: add it straight from the Unraid Apps tab.',
       plat_oneclick:'1-click', plat_guide:'Guide',
-      quick_note:'Then open http://localhost:3000. The first visit walks you through creating your admin account. Prefer a guided setup? The step-by-step installer handles HTTPS, SSO and backups for you.',
+      quick_note:'Then open <code>http://localhost:3000</code>. The first visit walks you through creating your admin account. Prefer a guided setup? The <a href="install.html">step-by-step installer</a> handles HTTPS, SSO and backups for you.',
       setup_label:'Setup', setup_title:'Up and running in minutes',
       setup_1_t:'Start the installer', setup_1_d:'One command launches a setup wizard in your browser. No editing config files by hand.',
       setup_2_t:'Set up your account', setup_2_d:'Create an admin account and choose your preferences. Takes about two minutes.',
       setup_3_t:'Invite your family', setup_3_d:'Add family members, set roles, and start using Yuvomi together.',
       setup_link:'Step-by-step installation guide',
-      cta_title:"Take back control of your family's data.", cta_desc:'Free. Open source. Runs on your server. No subscriptions, ever.',
+      cta_title:"Take back control of your <em>family's data.</em>", cta_desc:'Free. Open source. Runs on your server. No subscriptions, ever.', cta_longevity:'MIT-licensed and self-hosted: even if the project stops, nothing phones home and your instance keeps running. The data lives on your server - yours to keep, back up, and move.',
       cta_install:'Get started', cta_gh:'View on GitHub',
       footer_heart:'Built with care for families who value privacy and simplicity.',
       foot_product:'Product', foot_screens:'Screenshots', foot_install:'Install', foot_docs:'Docs & spec',
@@ -1103,31 +1116,32 @@ cp .env.example .env  <span class="c"># set SESSION_SECRET and DB_ENCRYPTION_KEY
       p_build_t:'Kein Build-Schritt', p_build_d:'Pure ES-Module, Vanilla JS und reines CSS. Was wir schreiben, läuft genau so, ganz ohne Bundler oder Transpiler.',
       feat_label:'Funktionen', feat_title:'Alles, was euer Haushalt braucht',
       feat_desc:'Ein vollständiges Werkzeugset für Familien, aufeinander abgestimmt statt verstreut auf sechzehn getrennte Tabs.',
-      f_tasks_k:'Aufgaben', f_tasks_t:'Alle wissen, was zu tun ist.', f_tasks_d:'Gemeinsame Aufgaben mit Fristen, Prioritäten, Unteraufgaben und Wiederholungen, mehreren Mitgliedern gleichzeitig zuweisbar.',
-      f_tasks_l1:'Kanban-Board mit Ein-Tipp-Status', f_tasks_l2:'Mehrfachzuweisung mit gestapelten Avataren', f_tasks_l3:'Optionaler schreibgeschützter Apple-Erinnerungen-Import',
-      f_cal_k:'Kalender', f_cal_t:'Ein Kalender für die ganze Familie.', f_cal_d:'Google Calendar, iCloud, Nextcloud, alles an einem Ort. Zwei-Wege-CalDAV-Sync, öffentliche ICS-Abos und einmaliger Import sowie integrierte Feiertage & Schulferien.',
+      f_tasks_k:'Aufgaben', f_tasks_t:'Alle wissen, was zu tun ist.', f_tasks_d:'Gemeinsame Aufgaben mit Fristen, Prioritäten, Unteraufgaben, Tags und Wiederholungen, mehreren Mitgliedern gleichzeitig zuweisbar.',
+      f_tasks_l1:'Kanban-Board mit Ein-Tipp-Status', f_tasks_l2:'Mehrfachzuweisung mit gestapelten Avataren', f_tasks_l3:'Optionaler Zwei-Wege-Sync mit CalDAV-Erinnerungslisten',
+      f_cal_k:'Kalender', f_cal_t:'Ein Kalender für die ganze Familie.', f_cal_d:'Google Calendar, iCloud, Nextcloud, alles an einem Ort. Zwei-Wege-Sync mit Google und CalDAV, öffentliche ICS-Abos und einmaliger Import sowie integrierte Feiertage & Schulferien.',
       f_cal_l1:'Zwei-Wege-Sync mit Google & CalDAV', f_cal_l2:'Wiederkehrende Termine mit Dateianhängen', f_cal_l3:'Lesbare Monats- & Agenda-Ansichten',
       f_meals_k:'Mahlzeiten & Rezepte', f_meals_t:'Das Abendessen steht, bevor jemand fragt.', f_meals_d:'Ein wöchentlicher Drag-and-Drop-Planer mit wiederkehrenden Mahlzeiten und Zutatenlisten, die per Klick direkt auf die Einkaufsliste wandern.',
       f_meals_l1:'Drag-and-Drop-Wochenplaner mit Wiederholungen', f_meals_l2:'Wiederverwendbare Rezepte zum Skalieren & Duplizieren', f_meals_l3:'Ein-Tipp-Export auf die Einkaufsliste',
       f_budget_k:'Budget', f_budget_t:'Keine böse Überraschung am Monatsende.', f_budget_d:'Verfolgt, wer was ausgegeben hat, teilt gemeinsame Kosten automatisch und seht genau, wohin das Geld fließt.',
-      f_budget_l1:'23 Währungen, wiederkehrende Einträge, Wochen-/Monats-/Jahresstatistik, Monatsbudgets & Sparziele', f_budget_l2:'Geteilte Ausgaben mit automatischer Schulden-Vereinfachung', f_budget_l3:'Abo-Tracker mit Verlängerungen, Budgets & Erinnerungen',
+      f_budget_l1:'23 Währungen, wiederkehrende Einträge, Wochen-/Monats-/Jahresstatistik, Monatsbudgets & Sparziele', f_budget_l3:'Abo-Tracker mit Verlängerungen, Budgets & Erinnerungen',
+      f_budget_l4:'Belege an jeder Buchung - hochladen oder ein bereits abgelegtes Dokument verknüpfen',
       f_shop_k:'Einkauf', f_shop_t:'Die Liste, die alle wirklich nutzen.', f_shop_d:'Eine gemeinsame Einkaufsliste für die ganze Familie, nach Gang sortiert und in Echtzeit aktualisiert.',
       f_shop_l1:'Gang-Kategorien & Wisch-Gesten', f_shop_l2:'Ganzen Mahlzeitenplan per Tipp hinzufügen', f_shop_l3:'Touch-sicheres Schnell-Hinzufügen mobil',
       f_health_k:'Gesundheit', f_health_t:'Gesundheit, die in der Familie bleibt.', f_health_d:'Vitalwerte, Medikamente, Laborwerte, Aktivität und Zyklen, pro Mitglied erfasst, standardmäßig privat und ohne euren Server zu verlassen.',
       f_health_l1:'Zyklus-Ring mit Perioden- & fruchtbare-Tage-Prognose', f_health_l2:'Medikamenten-Erinnerungen mit Nachfüll-Warnung', f_health_l3:'Sichtbarkeit pro Eintrag: privat oder geteilt',
       f_rewards_k:'Belohnungen', f_rewards_t:'Aufgaben, die sich endlich lohnen.', f_rewards_d:'Gib jeder Aufgabe einen Punktwert; wer sie erledigt, bekommt ihn gutgeschrieben. Punkte gegen echte Belohnungen aus einem selbst gepflegten Katalog einlösen, mit Freigabe der Eltern.',
       f_rewards_l1:'Punktwerte auf jeder Aufgabe, automatisch gutgeschrieben', f_rewards_l2:'Prämienkatalog mit Eltern-Freigabe beim Einlösen', f_rewards_l3:'Opt-in je Mitglied und vollständiges Punktekonto',
-      f_split_k:'Geteilte Kosten', f_split_t:'Wer wem was schuldet — automatisch ausgeglichen.', f_split_d:'Erfasst gemeinsame Kosten für Haushalt, Reisen und Events. Yuvomi vereinfacht die Schulden, sodass alle mit möglichst wenigen Zahlungen quitt sind.',
+      f_split_k:'Geteilte Kosten', f_split_t:'Wer wem was schuldet - automatisch ausgeglichen.', f_split_d:'Erfasst gemeinsame Kosten für Haushalt, Reisen und Events. Yuvomi vereinfacht die Schulden, sodass alle mit möglichst wenigen Zahlungen quitt sind.',
       f_split_l1:'Gruppen für Haushalt, Reisen und Events', f_split_l2:'Automatische Schuldenvereinfachung', f_split_l3:'Mehrere Währungen mit Live-Umrechnung',
-      more_label:'Und da ist noch mehr', more_title:'Eine App, sechzehn Module', more_desc:'Jedes Modul ist eigenständig. Nutzt, was zu eurer Familie passt, lasst den Rest weg.',
-      m_docs_t:'Dokumente', m_docs_d:'Familiendateien mit Vorschau, Sichtbarkeitsregeln und Speicher-Badges. Neue Uploads und Kalenderanh\u00e4nge k\u00f6nnen einen lokalen Ordner oder WebDAV nutzen; Paperless-ngx und Papra als DMS sind optional.',
+      more_label:'Und da ist noch mehr', more_title:'Acht weitere Module', more_desc:'Jedes Modul ist eigenständig. Nutzt, was zu eurer Familie passt, lasst den Rest weg.',
+      m_docs_t:'Dokumente', m_docs_d:'Familiendateien mit Vorschau, Sichtbarkeitsregeln und Speicher-Badges. Mehrfach-Upload, Ordner, Sortierung und Stapelaktionen. Neue Uploads und Kalenderanh\u00e4nge k\u00f6nnen einen lokalen Ordner, WebDAV oder Google Drive nutzen; Paperless-ngx und Papra als DMS sind optional.',
       m_notes_t:'Notizen', m_notes_d:'Farbige Haftnotizen mit Markdown. Perfekt für Rezepte, Familien-Memos und schnelle Erinnerungen.',
       m_contacts_t:'Kontakte', m_contacts_d:'Gemeinsames Familienverzeichnis mit CardDAV-Sync, vCard-Import/-Export und Multi-Account-Support.',
       m_bday_t:'Geburtstage', m_bday_d:'Geburtstags-Tracker mit automatischen jährlichen Kalendereinträgen, Altersanzeige und Erinnerungen.',
       m_house_t:'Haushaltshilfe', m_house_d:'Haushaltspersonal verwalten: Pläne, Ein-/Ausstempeln, Tages- oder Stundenabrechnung, Chores und Bedarf.',
       m_health_t:'Gesundheit', m_health_d:'Vitalwerte, Medikamente mit Erinnerungen, Laborwerte, Aktivität und Menstruationszyklus je Familienmitglied, privat oder geteilt. Kein Medizinprodukt.',
-      m_rewards_t:'Belohnungen', m_rewards_d:'Aufgaben können Punkte tragen; beim Erledigen werden sie den zuständigen Mitgliedern gutgeschrieben. Prämien-Katalog mit Eltern-Freigabe, opt-in je Mitglied, Bonuspunkte und ein vollständiges Punkte-Ledger.',
-      m_recipes_t:'Rezepte', m_recipes_d:'Wiederverwendbare Rezepte erstellen, duplizieren und skalieren. Mahlzeiten vorausfüllen oder als Rezept speichern.',
+      m_rewards_t:'Belohnungen', m_rewards_d:'Aufgaben können Punkte tragen; beim Erledigen werden sie den zuständigen Mitgliedern gutgeschrieben. Ein Haushalts-Standard belegt neue Aufgaben vor und lässt sich auf bestehende übertragen. Prämien-Katalog mit Eltern-Freigabe, opt-in je Mitglied, Bonuspunkte und ein vollständiges Punkte-Ledger.',
+      m_recipes_t:'Rezepte', m_recipes_d:'Wiederverwendbare Rezepte erstellen, duplizieren und skalieren. Mahlzeiten vorausfüllen, die Zutaten auf eine Einkaufsliste schicken oder als Rezept speichern. Eine selbst gehostete Mealie-Instanz lässt sich nur lesend daneben spiegeln.',
       m_rem_t:'Erinnerungen', m_rem_d:'Zeitbasierte Benachrichtigungen für Aufgaben und Termine, mit In-App-Badge, damit nichts durchrutscht, plus optionale Push-Benachrichtigungen, die dich auch bei geschlossener App erreichen.',
       m_backup_t:'Backup & SSO', m_backup_d:'Geplante Backups mit Vor-Wiederherstellungs-Rollback, optionalem WebDAV-Cloud-Upload (Nextcloud, ownCloud, Hetzner\xa0usw.) und Single Sign-On \xfcber jeden OIDC-Provider.',
       screens_label:'Vorschau', screens_title:'Jeder Screen, sorgfältig gestaltet',
@@ -1150,7 +1164,7 @@ cp .env.example .env  <span class="c"># set SESSION_SECRET and DB_ENCRYPTION_KEY
       setup_2_t:'Konto einrichten', setup_2_d:'Admin-Konto erstellen und Einstellungen wählen. Dauert etwa zwei Minuten.',
       setup_3_t:'Familie einladen', setup_3_d:'Familienmitglieder hinzufügen, Rollen vergeben und gemeinsam loslegen.',
       setup_link:'Schritt-für-Schritt-Installationsanleitung',
-      cta_title:'Holt euch die Kontrolle über eure Familiendaten zurück.', cta_desc:'Kostenlos. Open Source. Läuft auf eurem Server. Keine Abos, nie.',
+      cta_title:'Holt euch die Kontrolle über eure Familiendaten zurück.', cta_desc:'Kostenlos. Open Source. Läuft auf eurem Server. Keine Abos, nie.', cta_longevity:'MIT-lizenziert und selbstgehostet: Selbst wenn das Projekt endet, funkt nichts nach Hause und eure Instanz läuft weiter. Die Daten liegen auf eurem Server - eure, zum Behalten, Sichern und Umziehen.',
       cta_install:'Jetzt starten', cta_gh:'Auf GitHub ansehen',
       footer_heart:'Mit Sorgfalt gebaut für Familien, die Privatsphäre und Einfachheit schätzen.',
       foot_product:'Produkt', foot_screens:'Screenshots', foot_install:'Installieren', foot_docs:'Doku & Spec',
@@ -1168,22 +1182,79 @@ cp .env.example .env  <span class="c"># set SESSION_SECRET and DB_ENCRYPTION_KEY
   var theme = lsGet('theme');
 
   function isDark(){ if (theme==='dark') return true; if (theme==='light') return false; return matchMedia('(prefers-color-scheme:dark)').matches; }
+  /* Screenshots vary on two axes: theme (data-light/data-dark hold the English
+     base paths) and locale (localized sets live under screenshots/<lang>/ with
+     identical basenames). A non-English shot falls back to the English one if it
+     is missing, so a partial localized set never leaves a broken image. */
+  function applyShots(){
+    var d = isDark();
+    document.querySelectorAll('.sc').forEach(function(img){
+      var base = img.dataset[d ? 'dark' : 'light'];
+      if (!base) return;
+      if (lang !== 'en') {
+        img.onerror = function(){ img.onerror = null; if (img.getAttribute('src') !== base) img.src = base; };
+        img.src = base.replace('screenshots/', 'screenshots/' + lang + '/');
+      } else {
+        img.onerror = null;
+        img.src = base;
+      }
+    });
+  }
   function applyTheme(){
     var d = isDark();
     if (theme) document.documentElement.setAttribute('data-theme', theme); else document.documentElement.removeAttribute('data-theme');
     document.getElementById('sunIco').style.display = d ? 'none' : 'block';
     document.getElementById('moonIco').style.display = d ? 'block' : 'none';
-    document.querySelectorAll('.sc').forEach(function(img){ var v = d ? 'dark' : 'light'; if (img.dataset[v]) img.src = img.dataset[v]; });
+    applyShots();
+  }
+  /* Some translated strings carry inline markup: the <em> accent that gives each
+     section headline its voice, <code> around commands, and the inline link to
+     the guided installer. Assigning textContent would strip all of it, so those
+     strings are built as real nodes through a strict tag/attribute whitelist.
+     No innerHTML, and the input is always a static literal from the table
+     above - never user data. Markup position differs per language, which is why
+     it lives in the strings rather than being split across sibling elements. */
+  var RICH_TAGS = ['em', 'code', 'strong', 'b', 'span', 'a'];
+  var RICH_ATTRS = ['href', 'target', 'rel', 'class'];
+  function setRich(el, str){
+    if (str.indexOf('<') === -1) { el.textContent = str; return; }
+    var frag = document.createDocumentFragment();
+    var stack = [frag];
+    var re = /<(\/?)([a-zA-Z]+)((?:\s+[a-zA-Z-]+="[^"]*")*)\s*>/g;
+    var last = 0, m;
+    function text(chunk){ if (chunk) stack[stack.length - 1].appendChild(document.createTextNode(chunk)); }
+    while ((m = re.exec(str)) !== null) {
+      var name = m[2].toLowerCase();
+      if (RICH_TAGS.indexOf(name) === -1) continue; // unknown tag stays literal text
+      text(str.slice(last, m.index));
+      last = re.lastIndex;
+      if (m[1]) { if (stack.length > 1) stack.pop(); continue; }
+      var node = document.createElement(name);
+      (m[3] || '').replace(/([a-zA-Z-]+)="([^"]*)"/g, function(_, attr, val){
+        attr = attr.toLowerCase();
+        if (RICH_ATTRS.indexOf(attr) === -1) return '';
+        if (attr === 'href' && /^\s*javascript:/i.test(val)) return '';
+        node.setAttribute(attr, val);
+        return '';
+      });
+      stack[stack.length - 1].appendChild(node);
+      stack.push(node);
+    }
+    text(str.slice(last));
+    el.replaceChildren(frag);
   }
   function applyLang(){
     document.documentElement.lang = lang;
     var s = T[lang];
-    document.querySelectorAll('[data-t]').forEach(function(el){ var k = el.getAttribute('data-t'); if (s[k] !== undefined) el.textContent = s[k]; });
+    document.querySelectorAll('[data-t]').forEach(function(el){ var k = el.getAttribute('data-t'); if (s[k] !== undefined) setRich(el, s[k]); });
     document.getElementById('langLbl').textContent = lang === 'en' ? 'DE' : 'EN';
     var lb = document.getElementById('langBtn');
     lb.setAttribute('aria-label', lang === 'en' ? 'Auf Deutsch umschalten' : 'Switch to English');
     lb.setAttribute('title', lang === 'en' ? 'Auf Deutsch umschalten' : 'Switch to English');
-    document.title = lang === 'en' ? 'Yuvomi — The Self-Hosted Family Planner' : 'Yuvomi — Der selbstgehostete Familienplaner';
+    document.title = lang === 'en' ? 'Yuvomi - The Self-Hosted Family Planner' : 'Yuvomi - Der selbstgehostete Familienplaner';
+    var rel = document.getElementById('foot-released');
+    if (rel) { var rp = (rel.getAttribute('data-released') || '').split('-'); if (rp[0]) { rel.textContent = new Date(+rp[0], (+rp[1] || 1) - 1, 1).toLocaleDateString(lang === 'de' ? 'de-DE' : 'en-US', { year: 'numeric', month: 'long' }); } }
+    applyShots();
   }
 
   document.getElementById('themeBtn').onclick = function(){ theme = isDark() ? 'light' : 'dark'; lsSet('theme', theme); applyTheme(); };
@@ -1221,7 +1292,7 @@ cp .env.example .env  <span class="c"># set SESSION_SECRET and DB_ENCRYPTION_KEY
 
   // GitHub star count is injected at build time into [data-gh-stars] elements
   // (see scripts/update-gh-stars.mjs). No request to api.github.com is made in
-  // the visitor's browser — no visitor data is transmitted to any third party.
+  // the visitor's browser - no visitor data is transmitted to any third party.
 
   applyTheme(); applyLang();
 })();

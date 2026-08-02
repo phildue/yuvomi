@@ -11,6 +11,7 @@ const DEFAULT_LOCALE = 'de';
 const STORAGE_KEY = 'yuvomi-locale';
 const DATE_FORMAT_KEY = 'yuvomi-date-format';
 const TIME_FORMAT_KEY = 'yuvomi-time-format';
+const NUMBER_LOCALE_KEY = 'yuvomi-number-locale';
 const DEFAULT_DATE_FORMAT = 'dmy';
 const DEFAULT_TIME_FORMAT = '24h';
 const VALID_TIME_FORMATS = ['24h', '12h'];
@@ -79,6 +80,7 @@ export async function setLocale(locale) {
   if (!SUPPORTED_LOCALES.includes(locale)) return;
   localStorage.setItem(STORAGE_KEY, locale);
   currentLocale = locale;
+  _numberFormatCache.clear();
   const loaded = locale === DEFAULT_LOCALE
     ? fallbackTranslations
     : await loadLocale(locale);
@@ -93,13 +95,64 @@ function resolve(obj, key) {
   return key.split('.').reduce((o, k) => (o != null ? o[k] : undefined), obj);
 }
 
-/** Übersetzungsfunktion mit Platzhalter-Unterstützung {{variable}} */
-export function t(key, params = {}) {
-  let str = resolve(translations, key) ?? resolve(fallbackTranslations, key) ?? key;
-  for (const [k, v] of Object.entries(params)) {
-    str = str.replaceAll(`{{${k}}}`, String(v));
+const pluralRulesCache = new Map();
+
+function pluralCategory(locale, count) {
+  let rules = pluralRulesCache.get(locale);
+  if (!rules) {
+    try {
+      rules = new Intl.PluralRules(locale);
+    } catch {
+      rules = new Intl.PluralRules('en');
+    }
+    pluralRulesCache.set(locale, rules);
   }
-  return str;
+  return rules.select(count);
+}
+
+/**
+ * Liefert den Schlüssel, der für diese Anzahl gilt. Sprachen unterscheiden sich
+ * in der Zahl der Formen (Deutsch 2, Polnisch 4, Japanisch 1), deshalb kommen
+ * die Kategorien aus Intl.PluralRules und nicht aus einer `count === 1`-Abfrage.
+ * Fehlt die Variante, greift `_other` und danach der nackte Schlüssel - so
+ * bleiben Locales ohne Pluralvarianten unverändert nutzbar.
+ */
+function resolvePluralKey(key, count) {
+  const category = pluralCategory(currentLocale, count);
+  for (const candidate of [`${key}_${category}`, `${key}_other`, key]) {
+    const hit = resolve(translations, candidate) ?? resolve(fallbackTranslations, candidate);
+    if (hit != null) return hit;
+  }
+  return key;
+}
+
+/**
+ * Übersetzungsfunktion mit Platzhalter-Unterstützung {{variable}}.
+ * Ein numerischer `count`-Parameter wählt zusätzlich die passende Pluralform
+ * (`key_one`, `key_few`, … ), sofern die Locale sie definiert.
+ *
+ * Die Ersetzung läuft in einem Durchgang über ein Regex mit Callback, nicht in
+ * einer Schleife aus replaceAll(string, string). Zwei Gründe, beide an echten
+ * Nutzereingaben nachvollziehbar:
+ *
+ *   - Ein String als Ersatz interpretiert `$&`, `` $` ``, `$'` und `$$` als
+ *     Rückverweise. Ein Kontakt namens "A $& B" wurde als "A {{name}} B"
+ *     angezeigt, und `` $` `` zog den Text vor dem Treffer in den Namen hinein
+ *     ("X $` Y" → "X Geburtstag:  Y").
+ *   - Nacheinander ersetzt, durchsucht jeder weitere Platzhalter den bereits
+ *     eingesetzten Wert erneut: ein Name "{{date}}" verwandelte sich beim
+ *     date-Durchgang in das Datum.
+ *
+ * Unbekannte Platzhalter bleiben stehen, statt zu verschwinden - ein fehlender
+ * Parameter soll im Ergebnis sichtbar sein und nicht still weggekürzt werden.
+ */
+export function t(key, params = {}) {
+  const str = typeof params.count === 'number'
+    ? resolvePluralKey(key, params.count)
+    : resolve(translations, key) ?? resolve(fallbackTranslations, key) ?? key;
+  return str.replace(/\{\{(\w+)\}\}/g, (placeholder, name) => (
+    Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : placeholder
+  ));
 }
 
 function isDateOnlyString(value) {
@@ -126,6 +179,16 @@ export function getTimeFormat() {
   return getTimeFormatPreference();
 }
 
+/**
+ * Nachgestelltes Zeitwort der Locale („Uhr", „ч."). Gilt nur für die
+ * 24-Stunden-Schreibweise - „3:00 PM Uhr" mischt zwei Systeme und liest sich
+ * falsch, deshalb liefert der Helfer im 12-Stunden-Format einen leeren String.
+ * Aufrufer hängen ihn mit `${time} ${timeSuffix()}`.trimEnd() an.
+ */
+export function timeSuffix() {
+  return getTimeFormatPreference() === '12h' ? '' : t('calendar.timeSuffix');
+}
+
 function formatDateParts(date, useUtc = false) {
   const d = date instanceof Date ? date : new Date(date);
   if (isNaN(d.getTime())) return '';
@@ -149,6 +212,47 @@ export function getLocale() {
   return currentLocale;
 }
 
+/**
+ * Locale für Zahlen-/Währungsformatierung (Intl.NumberFormat).
+ * Nutzt die gespeicherte Region (voller BCP-47-Tag, z. B. "de-CH" für Schweizer
+ * Gruppierung 123'456.78), damit Zahlenformate unabhängig von der UI-Sprache
+ * der Region folgen. Fällt auf die UI-Sprache zurück, wenn keine Region gesetzt
+ * ist. Siehe numberLocaleFor() in settings/region-presets.js für die Ableitung.
+ */
+export function getFormatLocale() {
+  let stored = null;
+  try {
+    stored = localStorage.getItem(NUMBER_LOCALE_KEY);
+  } catch {
+    stored = null;
+  }
+  return stored && /^[a-z]{2}-[A-Z]{2}$/.test(stored) ? stored : currentLocale;
+}
+
+// Gecachte Intl.NumberFormat-Instanzen je (Format-Locale × Options). Die
+// Konstruktion eines NumberFormat ist teuer; ohne Cache baut jede formatierte
+// Zahl auf einer Budget-/Dashboard-Seite einen neuen Formatter. Der Schlüssel
+// enthält getFormatLocale(), sodass ein Sprach-/Regionswechsel automatisch einen
+// neuen Formatter erzeugt; zusätzlich leert 'locale-changed' den Cache.
+const _numberFormatCache = new Map();
+
+/**
+ * Liefert einen gecachten Intl.NumberFormat für die aktuelle Format-Locale
+ * (region-abhängig via getFormatLocale). Ersetzt `new Intl.NumberFormat(
+ * getFormatLocale(), options)` an den Aufrufstellen, damit Formatter nicht pro
+ * Wert neu gebaut werden.
+ */
+export function getNumberFormat(options = {}) {
+  const locale = getFormatLocale();
+  const key = `${locale}\u0000${JSON.stringify(options)}`;
+  let fmt = _numberFormatCache.get(key);
+  if (!fmt) {
+    fmt = new Intl.NumberFormat(locale, options);
+    _numberFormatCache.set(key, fmt);
+  }
+  return fmt;
+}
+
 /** Liste der unterstützten Locales */
 export function getSupportedLocales() {
   return [...SUPPORTED_LOCALES];
@@ -161,6 +265,30 @@ export function formatDate(date) {
     return formatDateParts(new Date(`${date}T00:00:00Z`), true);
   }
   return formatDateParts(date);
+}
+
+/**
+ * Kompaktes Datum ohne Jahr (z. B. Spaltenköpfe im Wochenboard, Audit F-04):
+ * folgt der Datumsformat-Präferenz in Reihenfolge und Trennzeichen, lässt nur
+ * das Jahr weg — der umgebende Kontext (Wochen-Label) trägt es bereits.
+ */
+export function formatDayMonth(date) {
+  if (date == null) return '';
+  const useUtc = isDateOnlyString(date);
+  const d = useUtc ? new Date(`${date}T00:00:00Z`) : (date instanceof Date ? date : new Date(date));
+  if (isNaN(d.getTime())) return '';
+  const month = String((useUtc ? d.getUTCMonth() : d.getMonth()) + 1).padStart(2, '0');
+  const day = String(useUtc ? d.getUTCDate() : d.getDate()).padStart(2, '0');
+  switch (getDateFormatPreference()) {
+    case 'dmy': return `${day}.${month}.`;
+    case 'mdy_dot': return `${month}.${day}.`;
+    case 'dmy_dot': return `${day}.${month}.`;
+    case 'dmy_slash': return `${day}/${month}`;
+    case 'ymd': return `${month}-${day}`;
+    case 'ymd_dot': return `${month}.${day}.`;
+    case 'ymd_slash': return `${month}/${day}`;
+    default: return `${month}/${day}`;
+  }
 }
 
 export function dateInputPlaceholder() {

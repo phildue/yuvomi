@@ -6,11 +6,12 @@
 
 import { api } from '/api.js';
 import { canSeeWidget } from '/permissions.js';
-import { t, formatDate, formatTime, getLocale } from '/i18n.js';
+import { t, formatDate, formatTime, timeSuffix, getLocale, getNumberFormat } from '/i18n.js';
 import { getReadableTextColor, AVATAR_FALLBACK_COLOR } from '/utils/color.js';
 import { esc, fmtLocation, renderMarkdownLight } from '/utils/html.js';
 import { toLocalDateKey, parseLocalDateKey } from '/utils/date.js';
 import { predictCycle, PHASE } from '/utils/health-cycle.js';
+import { localizeBirthdayEvent } from '/utils/birthday-event.js';
 import { openModal, closeModal, confirmModal } from '/components/modal.js';
 import { renderAvatarStack } from '/components/user-multi-select.js';
 
@@ -319,9 +320,18 @@ function normalizeDashboardConfig(input) {
 // „Nutzerabsicht", sondern nur, weil der Default-Satz nicht sauber tesselliert (Critique P2).
 function isUserOrderedConfig(cfg) {
   if (!Array.isArray(cfg)) return false;
-  const defaultOrder = DEFAULT_WIDGET_CONFIG.map((w) => w.id).join(',');
-  const currentOrder = [...cfg].sort((a, b) => a.order - b.order).map((w) => w.id).join(',');
-  return currentOrder !== defaultOrder;
+  // Nur sichtbare, beidseitig bekannte Widgets vergleichen: nachträglich
+  // angehängte neue Widget-IDs (Config-Merge älterer Stände) oder reine
+  // Sichtbarkeits-Toggles sind KEINE Nutzer-Umsortierung. Der strikte
+  // Voll-Vergleich schaltete sonst dauerhaft auf preserve-order und der
+  // dense-Bento füllte nie wieder Lücken (Audit A1-03).
+  const defaultIds = DEFAULT_WIDGET_CONFIG.map((w) => w.id);
+  const currentOrder = [...cfg]
+    .filter((w) => w.visible !== false && defaultIds.includes(w.id))
+    .sort((a, b) => a.order - b.order)
+    .map((w) => w.id);
+  const defaultOrder = defaultIds.filter((id) => currentOrder.includes(id));
+  return currentOrder.join(',') !== defaultOrder.join(',');
 }
 
 function sameWidgetConfig(a, b) {
@@ -414,7 +424,7 @@ function formatDateTime(isoString) {
   const d = new Date(isoString);
   const dateStr = relativeDateLabel(d);
   const timeStr = formatTime(d);
-  const suffix = t('calendar.timeSuffix');
+  const suffix = timeSuffix();
   return `${dateStr}, ${timeStr}${suffix ? ' ' + suffix : ''}`.trim();
 }
 
@@ -497,7 +507,7 @@ function budgetCategoryLabel(category) {
 }
 
 function formatCurrency(amount, currency = 'EUR') {
-  return new Intl.NumberFormat(getLocale(), {
+  return getNumberFormat({
     style: 'currency',
     currency,
     maximumFractionDigits: Math.abs(amount) >= 1000 ? 0 : 2,
@@ -505,7 +515,7 @@ function formatCurrency(amount, currency = 'EUR') {
 }
 
 function formatPoints(value) {
-  return new Intl.NumberFormat(getLocale()).format(Number(value) || 0);
+  return getNumberFormat().format(Number(value) || 0);
 }
 
 function widgetHeader(icon, title, count, linkHref, linkLabel) {
@@ -639,7 +649,7 @@ function renderUrgentTasks(tasks) {
     const due = formatDueDate(t.due_date, t.due_time);
     return `
       <div class="task-item" data-task-id="${t.id}" data-task-title="${esc(t.title)}" role="button" tabindex="0">
-        ${t.priority !== 'none' ? `<div class="task-item__priority task-item__priority--${t.priority}" aria-hidden="true"></div>` : ''}
+        ${t.priority !== 'none' ? `<div class="task-item__priority task-item__priority--${t.priority}" title="${esc(PRIORITY_LABELS()[t.priority] ?? t.priority)}" aria-hidden="true"></div>` : ''}
         <span class="sr-only">${PRIORITY_LABELS()[t.priority] ?? t.priority}</span>
         <div class="task-item__content">
           <div class="task-item__title">${esc(t.title)}</div>
@@ -671,7 +681,7 @@ function renderUpcomingEvents(events) {
   const items = events.map((e) => {
     const d = eventStartDate(e) ?? new Date(e.start_datetime);
     const isToday = d.toDateString() === today;
-    const _suffix = t('calendar.timeSuffix');
+    const _suffix = timeSuffix();
     const timeStr = e.all_day ? t('dashboard.allDay') : `${formatTime(d)}${_suffix ? ' ' + _suffix : ''}`.trim();
     return `
       <div class="event-item" data-route="${esc(calendarEventRoute(e))}" role="button" tabindex="0">
@@ -722,7 +732,7 @@ function renderUpcomingBirthdays(birthdays) {
           <div class="birthday-widget-item__name">${esc(b.name)}</div>
           <div class="birthday-widget-item__meta">${formatDate(b.next_birthday)} · ${daysLabel}</div>
         </div>
-        <div class="birthday-widget-item__age">${esc(String(b.next_age ?? ''))}</div>
+        ${b.next_age != null ? `<div class="birthday-widget-item__age" title="${esc(t('birthdays.turnsAge', { age: b.next_age }))}" aria-label="${esc(t('birthdays.turnsAge', { age: b.next_age }))}">${esc(String(b.next_age))}</div>` : ''}
       </div>
     `;
   }).join('');
@@ -1193,7 +1203,10 @@ function renderDashboardOverview(user, editing = false) {
         <div class="dashboard-overview__tools">
           ${editing ? `
           <div class="dashboard-customize-toolbar" role="toolbar" aria-label="${t('dashboard.customizeTitle')}">
-            <button class="btn btn--ghost" id="dashboard-customize-reset">${t('dashboard.customizeReset')}</button>
+            <button class="btn btn--ghost" id="dashboard-customize-reset">
+              <i data-lucide="rotate-ccw" class="icon-sm" aria-hidden="true"></i>
+              ${t('dashboard.customizeReset')}
+            </button>
             <button class="btn btn--secondary" id="dashboard-customize-cancel">${t('common.cancel')}</button>
             <button class="btn btn--primary" id="dashboard-customize-save">${t('common.save')}</button>
           </div>` : ''}
@@ -1218,11 +1231,14 @@ function renderSizeMiniGrid(size) {
 }
 
 function renderSizeMiniGridCells(size) {
+  // 2x2-Basisraster statt 4x4: die vier Presets unterscheiden sich nur in
+  // Breite/Höhe 1 vs. 2 - auf 16 winzigen Zellen war das kaum ablesbar und
+  // die Buttons wirkten identisch (Audit A1-17).
   const [cols, rows] = size.split('x').map(Number);
-  return Array.from({ length: 16 }, (_, i) => {
-    const col = (i % 4) + 1;
-    const row = Math.floor(i / 4) + 1;
-    return `<span class="${col <= cols && row <= rows ? 'is-active' : ''}"></span>`;
+  return Array.from({ length: 4 }, (_, i) => {
+    const col = (i % 2) + 1;
+    const row = Math.floor(i / 2) + 1;
+    return `<span class="${col <= Math.min(cols, 2) && row <= Math.min(rows, 2) ? 'is-active' : ''}"></span>`;
   }).join('');
 }
 
@@ -1556,7 +1572,7 @@ function renderFab() {
   return `
     <div class="fab-backdrop" id="fab-backdrop"></div>
     <div class="fab-container" id="fab-container">
-      <button class="fab-main" id="fab-main" aria-label="${t('nav.quickActions')}" aria-expanded="false">
+      <button class="fab-main" id="fab-main" aria-label="${t('nav.quickActions')}" title="${t('nav.quickActions')} (n)" aria-keyshortcuts="n" aria-expanded="false">
         <i data-lucide="plus" aria-hidden="true"></i>
       </button>
       <div class="fab-actions" id="fab-actions" aria-hidden="true">
@@ -1624,11 +1640,11 @@ function openTaskQuickAction(taskId, taskTitle, rerender) {
     content: `
       <div class="modal-actions">
         <button type="button" class="btn btn--ghost" data-action="edit">
-          <i data-lucide="edit-2" style="width:16px;height:16px;" aria-hidden="true"></i>
+          <i data-lucide="edit-2" class="icon-md" aria-hidden="true"></i>
           ${t('common.edit')}
         </button>
         <button type="button" class="btn btn--primary" data-action="done">
-          <i data-lucide="check-circle" style="width:16px;height:16px;" aria-hidden="true"></i>
+          <i data-lucide="check-circle" class="icon-md" aria-hidden="true"></i>
           ${t('tasks.kanbanMoveToDone')}
         </button>
       </div>
@@ -1785,6 +1801,12 @@ export async function render(container, { user }) {
       api.get('/preferences').catch(() => ({ data: {} })),
     ]);
     data         = dashRes;
+    // Geburtstags-Termine tragen serverseitig einen sprachneutralen Titel
+    // („Birthday: <Name>"); anhand von birthday_name in die aktive Sprache
+    // übersetzen (Issue #524).
+    if (Array.isArray(data?.upcomingEvents)) {
+      data.upcomingEvents = data.upcomingEvents.map(localizeBirthdayEvent);
+    }
     weather      = weatherRes.data ?? null;
     weatherAutoLocate = Boolean(prefsRes.data?.weather_user?.auto_locate ?? prefsRes.data?.weather_auto_locate);
     widgetConfig = normalizeDashboardConfig(prefsRes.data?.dashboard_widgets ?? DEFAULT_WIDGET_CONFIG);
@@ -1846,7 +1868,7 @@ export async function render(container, { user }) {
             await api.put('/preferences', { dashboard_widgets: widgetConfig });
             savedWidgetConfig = widgetConfig.map((w) => ({ ...w }));
           } catch {
-            window.yuvomi?.showToast(t('common.errorGeneric'), 'error');
+            window.yuvomi?.showToast(t('common.errorGeneric'), 'danger');
           }
           isCustomizing = false;
           rebuildDashboard(widgetConfig);
@@ -1859,7 +1881,7 @@ export async function render(container, { user }) {
     try {
       await persistWidgetConfig(widgetConfig);
     } catch {
-      window.yuvomi?.showToast(t('common.errorGeneric'), 'error');
+      window.yuvomi?.showToast(t('common.errorGeneric'), 'danger');
     }
   }
 
@@ -2132,7 +2154,7 @@ function wireWeatherRefresh(container, onUpdated = null) {
       // Manuelle Aktion: ein Fehlschlag darf nicht still als Erfolg quittiert
       // werden (sonst wirkt der Button tot). Kein Datensatz → Fehler-Toast.
       if (!res.data) {
-        window.yuvomi?.showToast(t('common.errorGeneric'), 'error');
+        window.yuvomi?.showToast(t('common.errorGeneric'), 'danger');
         return;
       }
       const wWidget = container.querySelector('#weather-widget');
@@ -2148,7 +2170,7 @@ function wireWeatherRefresh(container, onUpdated = null) {
         window.yuvomi?.showToast(t('dashboard.weatherUpdated'), 'success', 1500);
       }
     } catch {
-      window.yuvomi?.showToast(t('common.errorGeneric'), 'error');
+      window.yuvomi?.showToast(t('common.errorGeneric'), 'danger');
     } finally {
       // Immer aufräumen, damit der Button nach jedem Ausgang wieder bedienbar
       // ist (bei Erfolg wird das Widget ohnehin frisch gerendert).

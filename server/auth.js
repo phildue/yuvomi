@@ -1,11 +1,10 @@
 /**
  * Modul: Authentifizierung (Auth)
  * Zweck: Login-Route, Session-Middleware, Auth-Guard für geschützte Routen
- * Abhängigkeiten: express, bcrypt, express-session, server/db.js
+ * Abhängigkeiten: express, express-session, server/db.js, server/utils/password.js
  */
 
 import express from 'express';
-import bcrypt from 'bcrypt';
 import session from 'express-session';
 import rateLimit from 'express-rate-limit';
 import crypto from 'node:crypto';
@@ -19,6 +18,7 @@ import { isOidcEnabled, getConfig as getOidcConfig } from './services/oidc.js';
 import { emailService as defaultEmailService } from './services/email.js';
 import { passwordResetService as defaultResetService } from './services/password-reset.js';
 import { parseScopes, serializeScopes, normalizeScopes } from './scopes.js';
+import { hashPassword, normalizePassword, verifyPassword } from './utils/password.js';
 import { resolvePermissions, buildSessionModuleAccess, clientPermissions } from './permissions.js';
 
 const log = createLogger('Auth');
@@ -27,6 +27,8 @@ const router = express.Router();
 // validiert wird über den Hash des gesamten Tokens, nicht über den Präfix.
 const API_TOKEN_PREFIX = 'yuvomi_';
 const FAMILY_ROLES = ['dad', 'mom', 'parent', 'child', 'grandparent', 'relative', 'other'];
+// Platzhalter-Hash für den Timing-Attack-Schutz beim Login unbekannter Benutzer.
+const DUMMY_PASSWORD_HASH = '$2b$12$invalidhashfortimingprotection000000000000000000000';
 const MAX_AVATAR_DATA_LENGTH = 768 * 1024;
 const USER_PUBLIC_COLUMNS = `
   id,
@@ -248,6 +250,9 @@ function publicUser(row) {
     email: row.email ?? null,
     birth_date: row.birth_date ?? null,
     created_at: row.created_at,
+    // Nur wenn die Query das Flag mitselektiert (GET /users); andere
+    // publicUser-Pfade behalten ihre bisherige Feldmenge.
+    ...(row.is_worker !== undefined && { is_worker: Boolean(row.is_worker) }),
   };
 }
 
@@ -299,6 +304,19 @@ function syncFamilyMemberArtifacts(database, userId, {
       email !== undefined ? email : contact.email,
       contact.id,
     );
+
+    // Der gespiegelte Anzeigename hat keine strukturierte Quelle (#535). Ändert
+    // er sich, sind zuvor im Kontakt gepflegte Namensteile veraltet - sonst
+    // sortierte die Liste weiter nach dem alten Nachnamen und der Dialog
+    // belegte damit vor. NULL heißt: Sortierung fällt auf `name` zurück.
+    if (contact.name !== name) {
+      database.prepare(`
+        UPDATE contacts
+        SET first_name = NULL, last_name = NULL, middle_name = NULL,
+            name_prefix = NULL, name_suffix = NULL
+        WHERE id = ?
+      `).run(contact.id);
+    }
   } else {
     database.prepare(`
       INSERT INTO contacts (name, category, phone, email, family_user_id)
@@ -514,7 +532,7 @@ function setupAuthSession(req, res, user) {
  * Authentik-Deployments). Nur setzen, wenn der IdP vollständig unter eigener
  * Kontrolle steht und keine unverifizierten E-Mails zulässt.
  *
- * @param {import('better-sqlite3').Database} database
+ * @param {import('better-sqlite3-multiple-ciphers').Database} database
  * @param {{ sub: string, email?: string, email_verified?: boolean, name?: string, preferred_username?: string }} claims
  * @returns {{ id: number, role: string, [key: string]: any }}
  */
@@ -596,16 +614,30 @@ router.post('/login', loginLimiter, async (req, res) => {
     const user = db.get().prepare('SELECT * FROM users WHERE username = ?').get(username);
 
     if (!user) {
-      // Timing-Attack-Schutz: trotzdem bcrypt ausführen
-      await bcrypt.compare(password, '$2b$12$invalidhashfortimingprotection000000000000000000000');
+      // Timing-Attack-Schutz: trotzdem bcrypt ausführen. Bewusst über
+      // verifyPassword, damit ein Fehlversuch dieselbe Anzahl bcrypt-Läufe
+      // kostet wie bei einem existierenden Konto.
+      await verifyPassword(password, DUMMY_PASSWORD_HASH);
       log.warn('Login failed', { ip: req.ip, username, reason: 'user_not_found' });
       return res.status(401).json({ error: 'Invalid credentials.', code: 401 });
     }
 
-    const valid = await bcrypt.compare(password, user.password_hash);
+    const { valid, needsRehash } = await verifyPassword(password, user.password_hash);
     if (!valid) {
       log.warn('Login failed', { ip: req.ip, username, reason: 'invalid_password' });
       return res.status(401).json({ error: 'Invalid credentials.', code: 401 });
+    }
+
+    // Der Hash stammt aus einer nicht-normalisierten Eingabe (Issue #608):
+    // still auf NFC migrieren, damit künftig jeder Browser passt.
+    if (needsRehash) {
+      try {
+        const migrated = await hashPassword(password);
+        db.get().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(migrated, user.id);
+        log.info('Password hash migrated to NFC', { userId: user.id });
+      } catch (rehashErr) {
+        log.error('Password hash migration failed:', rehashErr.message);
+      }
     }
 
     const isStaff = db.get().prepare('SELECT 1 FROM housekeeping_workers WHERE user_id = ?').get(user.id);
@@ -711,14 +743,14 @@ export function buildResetRoutes(targetRouter, {
       if (!token || !password) {
         return res.status(400).json({ error: 'Token and password are required.', code: 400 });
       }
-      if (String(password).length < 8) {
+      if (normalizePassword(password).length < 8) {
         return res.status(400).json({ error: 'Password must be at least 8 characters long.', code: 400 });
       }
       const userId = resetService.verifyToken(token);
       if (!userId) {
         return res.status(400).json({ error: 'Invalid or expired token.', code: 400 });
       }
-      const hash = await bcrypt.hash(password, 12);
+      const hash = await hashPassword(password);
       getDb().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, userId);
       resetService.consumeToken(token);
       // Best-effort: invalidate existing sessions for this user.
@@ -892,12 +924,12 @@ router.post('/setup', loginLimiter, async (req, res) => {
     if (display_name.length > 128) {
       return res.status(400).json({ error: 'Display name may be at most 128 characters long.', code: 400 });
     }
-    if (password.length < 8) {
+    if (normalizePassword(password).length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters long.', code: 400 });
     }
 
     const avatarColor = avatarColors[Math.floor(Math.random() * avatarColors.length)];
-    const hash = await bcrypt.hash(password, 12);
+    const hash = await hashPassword(password);
 
     const SETUP_DONE = Symbol('setup_done');
     let result;
@@ -982,9 +1014,13 @@ router.get('/me', requireAuth, (req, res) => {
  */
 router.get('/users', requireAuth, (req, res) => {
   try {
+    // is_worker markiert Konten der Haushaltshilfe (housekeeping_workers),
+    // damit die Familien-Verwaltung sie nicht als Familienmitglied labelt
+    // (Audit A2-25e). Muster wie der Worker-Ausschluss in routes/family.js.
     const users = db.get()
       .prepare(`
-        SELECT ${USER_PUBLIC_COLUMNS}
+        SELECT ${USER_PUBLIC_COLUMNS},
+               EXISTS(SELECT 1 FROM housekeeping_workers hw WHERE hw.user_id = users.id) AS is_worker
         FROM users
         ORDER BY display_name
       `)
@@ -1109,7 +1145,7 @@ router.post('/users', requireAuth, requireAdmin, csrfMiddleware, async (req, res
       return res.status(400).json({ error: 'Username, display name, and password are required.', code: 400 });
     }
 
-    if (password.length < 8) {
+    if (normalizePassword(password).length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters long.', code: 400 });
     }
 
@@ -1134,7 +1170,7 @@ router.post('/users', requireAuth, requireAdmin, csrfMiddleware, async (req, res
       return res.status(400).json({ error: memberFields.errors.join(' '), code: 400 });
     }
 
-    const hash = await bcrypt.hash(password, 12);
+    const hash = await hashPassword(password);
 
     const result = db.transaction(() => {
       const created = db.get()
@@ -1214,14 +1250,14 @@ router.patch('/users/:id', requireAuth, requireAdmin, csrfMiddleware, async (req
     }
 
     const newPassword = req.body.password !== undefined ? String(req.body.password) : '';
-    if (newPassword && newPassword.length < 8) {
+    if (newPassword && normalizePassword(newPassword).length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters long.', code: 400 });
     }
 
     const adminError = assertAdminWouldRemain(userId, nextRole);
     if (adminError) return res.status(400).json({ error: adminError, code: 400 });
 
-    const newPasswordHash = newPassword ? await bcrypt.hash(newPassword, 12) : null;
+    const newPasswordHash = newPassword ? await hashPassword(newPassword) : null;
 
     db.transaction(() => {
       db.get().prepare(`
@@ -1328,17 +1364,17 @@ router.patch('/me/password', requireAuth, csrfMiddleware, async (req, res) => {
     if (!current_password || !new_password) {
       return res.status(400).json({ error: 'Current and new password are required.', code: 400 });
     }
-    if (new_password.length < 8) {
+    if (normalizePassword(new_password).length < 8) {
       return res.status(400).json({ error: 'New password must be at least 8 characters long.', code: 400 });
     }
 
     const user = db.get().prepare('SELECT password_hash FROM users WHERE id = ?').get(req.authUserId);
     if (!user) return res.status(404).json({ error: 'User not found.', code: 404 });
 
-    const valid = await bcrypt.compare(current_password, user.password_hash);
+    const { valid } = await verifyPassword(current_password, user.password_hash);
     if (!valid) return res.status(401).json({ error: 'Current password is incorrect.', code: 401 });
 
-    const hash = await bcrypt.hash(new_password, 12);
+    const hash = await hashPassword(new_password);
     db.get().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, req.authUserId);
 
     invalidateUserSessions(req.authUserId, req.sessionID);

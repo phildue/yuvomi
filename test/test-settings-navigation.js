@@ -8,6 +8,8 @@ import {
   SETTINGS_LEAVES,
   SETTINGS_STORAGE_KEY,
   filterSettingsDomains,
+  currentSettingsPath,
+  RENAMED_SETTINGS_SOURCE_PATHS,
   findSettingsLeaf,
   migrateLegacySettingsTab,
   readStoredSettingsDestination,
@@ -39,8 +41,9 @@ import {
   SUPPORTED_CURRENCIES,
 } from '../public/settings/currency.js';
 import {
+  hasValidWeatherCoords,
   isConnectedWeatherControl,
-} from '../public/settings/pages/modules-dashboard.js';
+} from '../public/settings/weather-location.js';
 import {
   persistMealTypeSelection,
 } from '../public/settings/pages/modules-kitchen.js';
@@ -72,7 +75,7 @@ const sharedTranslationKeys = [
   'settings.appleLegacyHint',
   'settings.documentBackupWarning',
   'settings.kitchenActiveCount',
-  'settings.enabledCalendarCount',
+  'settings.enabledReminderListCount',
   'settings.lastSyncValue',
   'settings.neverSynced',
   'settings.mobileNavigationTitle',
@@ -96,9 +99,23 @@ function getTranslation(locale, key) {
 }
 
 test('settings leaves have unique IDs and paths', () => {
-  assert.equal(SETTINGS_LEAVES.length, 24);
   assert.equal(new Set(SETTINGS_LEAVES.map((leaf) => leaf.id)).size, SETTINGS_LEAVES.length);
   assert.equal(new Set(SETTINGS_LEAVES.map((leaf) => leaf.path)).size, SETTINGS_LEAVES.length);
+});
+
+test('die Blätter verteilen sich wie beschlossen auf die vier Domänen', () => {
+  // Statt einer nackten Gesamtzahl: die Verteilung ist die IA-Aussage. Der
+  // Critique 2026-07-27 fand sie unbalanciert (personal 5 / modules 8 / sync 3 /
+  // documents 2 / admin 6) - `documents` ist aufgelöst, `modules` von acht auf
+  // vier geschrumpft, und was per-user schreibt, liegt bei `personal`.
+  const perDomain = {};
+  for (const leaf of SETTINGS_LEAVES) perDomain[leaf.domainId] = (perDomain[leaf.domainId] ?? 0) + 1;
+  assert.deepEqual(perDomain, { personal: 7, modules: 4, sync: 5, admin: 7 });
+  // Jedes Blatt hängt an einer existierenden Domäne.
+  const domainIds = new Set(SETTINGS_DOMAINS.map((domain) => domain.id));
+  for (const leaf of SETTINGS_LEAVES) {
+    assert.ok(domainIds.has(leaf.domainId), `${leaf.id}: unbekannte Domäne "${leaf.domainId}"`);
+  }
 });
 
 test('settings registry is immutable', () => {
@@ -114,6 +131,7 @@ test('personal settings leaf modules import without browser globals', async () =
     import('/settings/pages/personal-appearance.js'),
     import('/settings/pages/personal-device.js'),
     import('/settings/pages/personal-weather.js'),
+    import('/settings/pages/personal-calendar.js'),
   ]);
 
   for (const module of modules) {
@@ -137,6 +155,58 @@ test('settings reuse the authenticated router user instead of blocking on auth.m
 test('navigation settings leaf imports without browser globals and exports render', async () => {
   const module = await import('/settings/pages/modules-navigation.js');
   assert.equal(typeof module.render, 'function');
+});
+
+test('Mitglieder können ihre eigene Navigation erreichen', () => {
+  // module_order und mobile_nav_order sind per-user (cfgUserSet, kein Admin-Check),
+  // das Blatt lag aber hinter adminOnly - 5 von 6 Mitgliedern kamen nie hin
+  // (Critique 2026-07-27).
+  assert.equal(findSettingsLeaf('/settings/personal/navigation', member)?.id, 'modules-navigation');
+  assert.equal(findSettingsLeaf('/settings/personal/navigation', admin)?.id, 'modules-navigation');
+  // Alter Pfad bleibt erreichbar und landet am neuen Ort.
+  assert.equal(findSettingsLeaf('/settings/modules/navigation', member)?.path, '/settings/personal/navigation');
+  // Und es liegt in der einzigen Domäne, die ein Mitglied sieht.
+  const leaf = SETTINGS_LEAVES.find((entry) => entry.id === 'modules-navigation');
+  assert.equal(leaf.domainId, 'personal');
+  assert.equal(leaf.adminOnly, false);
+});
+
+test('die Order eines Mitglieds reist ohne die haushaltweiten Schalter', async () => {
+  // `disabled_modules` ist serverseitig auf Admins beschränkt (403). Im
+  // gemeinsamen Payload wäre der GANZE Request eines Mitglieds gescheitert und
+  // seine Reihenfolge hätte nie gespeichert.
+  const { buildOrderPayload, buildNavigationPayload } = await import('/settings/pages/modules-navigation.js');
+
+  const memberPayload = buildOrderPayload(['calendar', 'tasks', 'kitchen']);
+  assert.deepEqual(Object.keys(memberPayload), ['module_order']);
+  assert.equal('disabled_modules' in memberPayload, false);
+
+  // Für Admins bleibt die gemeinsame Payload erhalten: Order und Aktivierung
+  // werden weiter zusammen geschrieben, also bleibt der Zustand konsistent.
+  const adminPayload = buildNavigationPayload(['notes'], new Set(['meals']), ['calendar', 'kitchen']);
+  assert.ok(Array.isArray(adminPayload.disabled_modules));
+  assert.ok(Array.isArray(adminPayload.module_order));
+
+  // Beide expandieren die Kitchen-Sammelzeile identisch zurück.
+  assert.deepEqual(
+    buildOrderPayload(['calendar', 'kitchen']).module_order,
+    adminPayload.module_order,
+  );
+});
+
+test('Aktivierungs-Schalter und Kitchen-Kinder sind für Mitglieder nicht gerendert', async () => {
+  const source = await readFile(
+    new URL('../public/settings/pages/modules-navigation.js', import.meta.url),
+    'utf8',
+  );
+  // Haushaltweite Schalter nur für Admins; Mitglieder bekommen stattdessen die
+  // Erklärung, wer darüber entscheidet.
+  assert.match(source, /\$\{isAdmin \? toggleRowHtml\(\{[\s\S]{0,300}data-built-in-module-toggle/);
+  assert.match(source, /data-kitchen-child-toggle[\s\S]{0,400}settings-module-kitchen__child--readonly/);
+  assert.match(source, /isAdmin \? '' : `<p class="form-hint">\$\{t\('settings\.modulesEnableAdminOnly'\)\}/);
+  // Der Save-Pfad muss die Rolle kennen, sonst sendet ein Mitglied disabled_modules.
+  assert.match(source, /async function saveNavigationState\(list, isAdmin\)/);
+  assert.match(source, /isAdmin\s*\?\s*buildNavigationPayload\(/);
 });
 
 test('navigation settings leaf reuses the canonical module-order helpers', async () => {
@@ -169,8 +239,58 @@ test('members only see the personal settings domain', () => {
 test('admins see all settings domains', () => {
   assert.deepEqual(
     filterSettingsDomains(admin).map((domain) => domain.id),
-    ['personal', 'modules', 'sync', 'documents', 'admin'],
+    ['personal', 'modules', 'sync', 'admin'],
   );
+});
+
+test('verschobene Blatt-Pfade landen am neuen Ort statt beim Fallback', () => {
+  // Die Domäne `documents` trug zwei Admin-Blätter, während `calendar` mit 729
+  // Zeilen Konfiguration keine eigene hatte (Critique 2026-07-27). Beide binden
+  // externe Dienste an und liegen jetzt unter `sync`. Alte Bookmarks und
+  // gespeicherte Ziele dürfen dabei nicht stumm auf `personal/account` fallen.
+  assert.equal(findSettingsLeaf('/settings/documents/storage', admin)?.path, '/settings/sync/storage');
+  assert.equal(findSettingsLeaf('/settings/documents/dms', admin)?.path, '/settings/sync/dms');
+  assert.equal(currentSettingsPath('/settings/documents/storage'), '/settings/sync/storage');
+  assert.equal(currentSettingsPath('/settings/sync/storage'), '/settings/sync/storage');
+  assert.equal(currentSettingsPath('/settings/unbekannt'), '/settings/unbekannt');
+  // Rollen-Gate greift auch über den alten Pfad.
+  assert.equal(findSettingsLeaf('/settings/documents/storage', member), null);
+});
+
+test('das aufgelöste Übersicht-Blatt landet beim Haushalts-Wetter', () => {
+  // "Übersicht" trug Haushalts-Wetter und App-Name, aber keinen einzigen
+  // Widget-Schalter (Critique 2026-07-27). Der App-Name sitzt jetzt bei den
+  // Systemangaben, das Wetter in einem eigenen Blatt; der Alt-Pfad zeigt dorthin.
+  assert.equal(currentSettingsPath('/settings/modules/dashboard'), '/settings/admin/weather');
+  assert.equal(findSettingsLeaf('/settings/modules/dashboard', admin)?.id, 'admin-weather');
+  assert.equal(findSettingsLeaf('/settings/modules/dashboard', member), null);
+  assert.equal(SETTINGS_LEAVES.some((leaf) => leaf.id === 'modules-dashboard'), false);
+});
+
+test('Mitglieder erreichen ihre eigenen Termin-Vorgaben', () => {
+  // calendar_default_reminders und calendar_default_assign_me schreiben per
+  // cfgUserSet pro Nutzer, lagen aber hinter dem adminOnly-Kalenderblatt
+  // (Critique 2026-07-27).
+  const leaf = SETTINGS_LEAVES.find((entry) => entry.id === 'personal-calendar');
+  assert.equal(leaf.domainId, 'personal');
+  assert.equal(leaf.adminOnly, false);
+  assert.equal(findSettingsLeaf('/settings/personal/calendar', member)?.id, 'personal-calendar');
+  // Das haushaltweite Kalenderblatt bleibt adminOnly.
+  assert.equal(findSettingsLeaf('/settings/modules/calendar', member), null);
+});
+
+test('drei Ein-Schalter-Blätter teilen sich jetzt eines', () => {
+  // Budget, Gesundheit und Haushaltshilfe trugen zusammen drei Checkboxen und
+  // kosteten drei Sidebar-Einträge und drei Requests (Critique 2026-07-27).
+  for (const legacyPath of [
+    '/settings/modules/budget',
+    '/settings/modules/health',
+    '/settings/modules/housekeeping',
+  ]) {
+    assert.equal(currentSettingsPath(legacyPath), '/settings/modules/options');
+    assert.equal(findSettingsLeaf(legacyPath, admin)?.id, 'modules-options');
+    assert.equal(findSettingsLeaf(legacyPath, member), null);
+  }
 });
 
 test('legacy settings tabs migrate to their new destinations', () => {
@@ -178,6 +298,9 @@ test('legacy settings tabs migrate to their new destinations', () => {
   assert.equal(migrateLegacySettingsTab('shopping'), '/shopping?manage=categories');
   assert.equal(migrateLegacySettingsTab('sync'), '/settings/sync/calendar');
   assert.equal(migrateLegacySettingsTab('backup'), '/settings/admin/backup');
+  // Ein Alt-Tab muss am heutigen Blatt ankommen, nicht am Zwischenstand von
+  // 2026-06: der Budget-Tab zeigte auf ein Blatt, das seither aufgegangen ist.
+  assert.equal(migrateLegacySettingsTab('budget'), '/settings/modules/options');
 });
 
 test('legacy settings migration covers every previous tab', () => {
@@ -189,7 +312,7 @@ test('legacy settings migration covers every previous tab', () => {
     {
       general: '/settings/personal/appearance',
       meals: '/settings/modules/kitchen',
-      budget: '/settings/modules/budget',
+      budget: '/settings/modules/options',
       shopping: '/shopping?manage=categories',
       calendar: '/settings/modules/calendar',
       sync: '/settings/sync/calendar',
@@ -219,8 +342,8 @@ test('settingsOverviewUrl builds an encoded domain overview URL', () => {
 
 test('resolveSettingsDestination restores an allowed stored leaf at the settings root', () => {
   assert.equal(
-    resolveSettingsDestination('/settings', admin, '/settings/documents/storage'),
-    '/settings/documents/storage',
+    resolveSettingsDestination('/settings', admin, '/settings/sync/storage'),
+    '/settings/sync/storage',
   );
 });
 
@@ -263,18 +386,28 @@ function createMemoryStorage(initial = {}) {
 }
 
 test('readStoredSettingsDestination restores a valid stored leaf', () => {
-  const storage = createMemoryStorage({ [SETTINGS_STORAGE_KEY]: '/settings/documents/storage' });
-  assert.equal(readStoredSettingsDestination(admin, storage), '/settings/documents/storage');
+  const storage = createMemoryStorage({ [SETTINGS_STORAGE_KEY]: '/settings/sync/storage' });
+  assert.equal(readStoredSettingsDestination(admin, storage), '/settings/sync/storage');
 });
 
-test('readStoredSettingsDestination falls back to account for an invalid stored leaf', () => {
+test('readStoredSettingsDestination hebt ein vor dem IA-Umbau gespeichertes Ziel an', () => {
+  const storage = createMemoryStorage({ [SETTINGS_STORAGE_KEY]: '/settings/documents/dms' });
+  assert.equal(readStoredSettingsDestination(admin, storage), '/settings/sync/dms');
+});
+
+// Ohne gueltiges gespeichertes Ziel gibt es kein "zuletzt besuchtes Blatt".
+// Frueher stand hier `/settings/personal/account`, und der erste Besuch der
+// Einstellungen landete wortlos in einem Formular; die Uebersicht war ueber die
+// App-Navigation gar nicht erreichbar (Critique 2026-07-27). `null` heisst
+// jetzt: der Aufrufer rendert die Uebersicht.
+test('readStoredSettingsDestination liefert null fuer ein ungueltiges gespeichertes Blatt', () => {
   const storage = createMemoryStorage({ [SETTINGS_STORAGE_KEY]: '/settings/not-a-page' });
-  assert.equal(readStoredSettingsDestination(admin, storage), '/settings/personal/account');
+  assert.equal(readStoredSettingsDestination(admin, storage), null);
 });
 
-test('readStoredSettingsDestination ignores a stored admin leaf for a member', () => {
+test('readStoredSettingsDestination ignoriert ein gespeichertes Admin-Blatt fuer ein Mitglied', () => {
   const storage = createMemoryStorage({ [SETTINGS_STORAGE_KEY]: '/settings/admin/system' });
-  assert.equal(readStoredSettingsDestination(member, storage), '/settings/personal/account');
+  assert.equal(readStoredSettingsDestination(member, storage), null);
 });
 
 test('readStoredSettingsDestination removes the legacy key only after a successful migration', () => {
@@ -286,7 +419,7 @@ test('readStoredSettingsDestination removes the legacy key only after a successf
 
 test('readStoredSettingsDestination keeps an unmigratable legacy key in place', () => {
   const storage = createMemoryStorage({ [LEGACY_SETTINGS_STORAGE_KEY]: 'totally-unknown' });
-  assert.equal(readStoredSettingsDestination(admin, storage), '/settings/personal/account');
+  assert.equal(readStoredSettingsDestination(admin, storage), null);
   assert.equal(storage.has(LEGACY_SETTINGS_STORAGE_KEY), true);
   assert.equal(storage.getItem(SETTINGS_STORAGE_KEY), null);
 });
@@ -298,9 +431,19 @@ test('readStoredSettingsDestination does not persist a migration that leaves Set
   assert.equal(storage.getItem(SETTINGS_STORAGE_KEY), null);
 });
 
-test('readStoredSettingsDestination defaults to account when storage is empty', () => {
+test('readStoredSettingsDestination liefert null bei leerem Speicher', () => {
   const storage = createMemoryStorage();
-  assert.equal(readStoredSettingsDestination(admin, storage), '/settings/personal/account');
+  assert.equal(readStoredSettingsDestination(admin, storage), null);
+});
+
+// Und der Controller muss daraus die Uebersicht machen, nicht einen Redirect:
+// nur ein vorhandenes Ziel loest eine Umleitung aus, alles andere faellt in den
+// Shell-Render mit 'domains'.
+test('der Settings-Controller rendert ohne gespeichertes Ziel die Uebersicht', async () => {
+  const source = await readFile(new URL('../public/pages/settings.js', import.meta.url), 'utf8');
+  assert.match(source, /if \(destination\) \{ await redirectTo\(destination\); return; \}/);
+  assert.match(source, /view: known \? 'domain' : 'domains'/);
+  assert.doesNotMatch(source, /await redirectTo\(readStoredSettingsDestination/);
 });
 
 test('every approved settings leaf is registered as an exact SPA route', async () => {
@@ -308,11 +451,21 @@ test('every approved settings leaf is registered as an exact SPA route', async (
     new URL('../public/router.js', import.meta.url),
     'utf8',
   );
-  assert.match(source, /import\s*\{\s*SETTINGS_LEAVES\s*\}\s*from\s*'\/settings\/registry\.js'/);
+  // Der Router muss seine Settings-Routen aus der Registry ableiten, nie aus
+  // einer Handliste - sonst driften Registry und Routentabelle auseinander.
+  assert.match(source, /import\s*\{[^}]*\bSETTINGS_LEAVES\b[^}]*\}\s*from\s*'\/settings\/registry\.js'/);
   assert.match(
     source,
     /SETTINGS_LEAVES\.map\(\(\{\s*path\s*\}\)\s*=>\s*\(\{\s*path,\s*page:\s*'\/pages\/settings\.js',\s*requiresAuth:\s*true,\s*module:\s*'settings'\s*\}\)\)/,
   );
+  // Und die vom IA-Umbau verschobenen Alt-Pfade ebenso: ohne eigene Route
+  // matcht ein alter Bookmark gar nichts und die Umleitung käme nie zum Zug.
+  assert.match(source, /import\s*\{[^}]*\bRENAMED_SETTINGS_SOURCE_PATHS\b[^}]*\}\s*from\s*'\/settings\/registry\.js'/);
+  assert.match(
+    source,
+    /RENAMED_SETTINGS_SOURCE_PATHS\.map\(\(path\)\s*=>\s*\(\{\s*path,\s*page:\s*'\/pages\/settings\.js',\s*requiresAuth:\s*true,\s*module:\s*'settings'\s*\}\)\)/,
+  );
+  assert.ok(RENAMED_SETTINGS_SOURCE_PATHS.length > 0);
 });
 
 test('the live Settings controller contains no page-specific endpoint strings', async () => {
@@ -340,6 +493,59 @@ test('the live Settings controller contains no page-specific endpoint strings', 
       `controller must not reference endpoint ${endpoint}`,
     );
   }
+});
+
+test('ungespeicherte Eingaben gehen beim Blattwechsel nicht still verloren', async () => {
+  const guard = await readFile(new URL('../public/settings/dirty-guard.js', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+
+  // Nur echte Nutzereingaben zaehlen: Daten aus der API und Re-Renders eines
+  // Blatts setzen Werte programmatisch und duerfen nicht als Arbeit gelten.
+  assert.match(guard, /event\.isTrusted/, 'programmatische Wertaenderungen duerfen nicht dirty machen');
+  // Die vielen Sofort-Speicherer der Einstellungen haben nie einen offenen
+  // Stand - eine Rueckfrage waere dort falsch.
+  assert.match(guard, /button\[type="submit"\]/, 'nur Formulare mit eigenem Absenden koennen offen sein');
+  assert.match(guard, /'submit'/, 'ein abgeschicktes Formular ist wieder sauber');
+  // Verlaesst der Nutzer die Einstellungen, faellt die Shell aus dem Dokument:
+  // ohne diese Pruefung blockierte beforeunload danach weiter.
+  assert.match(guard, /isConnected/);
+  assert.match(guard, /beforeunload/);
+  // Wiederverwendete Texte statt eigener Keys - der Modal-Dirty-Schutz sagt dasselbe.
+  assert.match(guard, /modal\.unsavedChanges/);
+
+  assert.match(shell, /import\s*\{[^}]*confirmLeafExit[^}]*\}\s*from\s*'\.\/dirty-guard\.js'/);
+  assert.match(shell, /await confirmLeafExit\(\)/, 'jede Navigation aus einem Blatt muss durch den Guard');
+  assert.match(shell, /watchLeafForms\(leafContainer\)/, 'das Tracking haengt am fertig gerenderten Blatt');
+});
+
+test('die Navigation laesst sich ueber alle Blaetter durchsuchen', async () => {
+  const source = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  // Bei 23 Blaettern in vier Domaenen war die Taxonomie der einzige Weg zu
+  // einer Einstellung, deren Domaene man nicht kennt (Critique 2026-07-27).
+  assert.match(source, /type\s*=\s*'search'/, 'die Suche braucht ein echtes Suchfeld');
+  assert.match(source, /descriptionKey/, 'gefiltert wird ueber Label UND Beschreibung');
+  assert.match(source, /searchNormalize/, 'die Suche muss Gross-/Kleinschreibung und Diakritika ignorieren');
+  assert.match(source, /normalize\('NFD'\)/);
+  assert.match(source, /setAttribute\('role',\s*'status'\)/, 'die Trefferzahl gehoert in eine Live-Region');
+  // Ohne Treffer greift der bestehende Leerzustand, statt stumm zu bleiben.
+  assert.match(source, /t\('search\.noResults'\)/);
+});
+
+test('der Blattwechsel zeigt einen Ladezustand statt eines leeren Kastens', async () => {
+  const source = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  // Zwischen `leafContainer.replaceChildren()` und dem fertigen Blatt lagen der
+  // dynamische Import und der erste Datenabruf (Critique 2026-07-27).
+  assert.match(source, /import\s*\{\s*renderSkeletonList\s*\}\s*from\s*'\/utils\/skeleton\.js'/);
+  assert.match(source, /setAttribute\('aria-busy',\s*'true'\)/, 'aria-busy muss den Ladezustand ansagen');
+  assert.match(source, /renderSkeletonList\(/, 'das Skelett muss aus dem geteilten Helfer kommen');
+  // Erfolg und Fehlschlag muessen aria-busy wieder abraeumen, sonst bleibt das
+  // Blatt fuer Screenreader dauerhaft "beschaeftigt".
+  assert.equal(
+    source.match(/removeAttribute\('aria-busy'\)/g)?.length,
+    2,
+    'aria-busy muss im Erfolgs- UND im Fehlerpfad entfernt werden',
+  );
+  assert.match(source, /clearTimeout\(skeletonTimer\)/, 'der verzoegerte Einsatz muss abbrechbar sein');
 });
 
 test('the former Shopping category tab and handlers are absent from Settings', async () => {
@@ -380,7 +586,8 @@ test('the Settings controller forces a full shell render when the locale changes
 });
 
 test('Kitchen child IDs use the canonical order', () => {
-  assert.deepEqual(KITCHEN_CHILD_IDS, ['meals', 'recipes', 'shopping']);
+  // Reihenfolge = Küchen-Kreislauf: planen → kochen → einkaufen → lagern (#596).
+  assert.deepEqual(KITCHEN_CHILD_IDS, ['meals', 'recipes', 'shopping', 'pantry']);
   assert.equal(Object.isFrozen(KITCHEN_CHILD_IDS), true);
 });
 
@@ -392,13 +599,14 @@ test('groupBuiltInModules enables Kitchen while any child is enabled', () => {
     { id: 'meals', enabled: true },
     { id: 'recipes', enabled: false },
     { id: 'shopping', enabled: true },
+    { id: 'pantry', enabled: true },
   ]);
-  assert.equal(kitchen.enabledChildren, 2);
+  assert.equal(kitchen.enabledChildren, 3);
   assert.equal(kitchen.enabled, true);
 });
 
 test('groupBuiltInModules disables Kitchen when every child is disabled', () => {
-  const [kitchen] = groupBuiltInModules(['meals', 'recipes', 'shopping']);
+  const [kitchen] = groupBuiltInModules(['meals', 'recipes', 'shopping', 'pantry']);
 
   assert.equal(kitchen.id, 'kitchen');
   assert.equal(kitchen.enabledChildren, 0);
@@ -442,7 +650,7 @@ test('normalizeModuleOrder replaces legacy Kitchen children with one Kitchen pos
 test('expandModuleOrder restores canonical Kitchen children', () => {
   assert.deepEqual(
     expandModuleOrder(['calendar', 'kitchen', 'tasks']),
-    ['calendar', 'meals', 'recipes', 'shopping', 'tasks'],
+    ['calendar', 'meals', 'recipes', 'shopping', 'pantry', 'tasks'],
   );
 });
 
@@ -455,7 +663,7 @@ test('module order helpers deduplicate repeated Kitchen children', () => {
   const order = ['meals', 'recipes', 'meals', 'shopping', 'recipes'];
 
   assert.deepEqual(normalizeModuleOrder(order), ['kitchen']);
-  assert.deepEqual(expandModuleOrder(order), ['meals', 'recipes', 'shopping']);
+  assert.deepEqual(expandModuleOrder(order), ['meals', 'recipes', 'shopping', 'pantry']);
 });
 
 test('explicit Kitchen and legacy children produce one Kitchen position', () => {
@@ -464,7 +672,7 @@ test('explicit Kitchen and legacy children produce one Kitchen position', () => 
   assert.deepEqual(normalizeModuleOrder(order), ['calendar', 'kitchen', 'tasks']);
   assert.deepEqual(
     expandModuleOrder(order),
-    ['calendar', 'meals', 'recipes', 'shopping', 'tasks'],
+    ['calendar', 'meals', 'recipes', 'shopping', 'pantry', 'tasks'],
   );
 });
 
@@ -474,7 +682,7 @@ test('module order helpers preserve stable unique non-Kitchen IDs', () => {
   assert.deepEqual(normalizeModuleOrder(order), ['tasks', 'calendar', 'kitchen', 'notes']);
   assert.deepEqual(
     expandModuleOrder(order),
-    ['tasks', 'calendar', 'meals', 'recipes', 'shopping', 'notes'],
+    ['tasks', 'calendar', 'meals', 'recipes', 'shopping', 'pantry', 'notes'],
   );
 });
 
@@ -724,6 +932,30 @@ test('Budget currency options match the existing preferences API contract', asyn
   assert.deepEqual(SUPPORTED_CURRENCIES, backendCurrencies);
 });
 
+// Die Haushaltswährung wird zentral in preferences.js validiert, aber Abos und
+// geteilte Ausgaben führen eigene Listen. Liefen sie auseinander, konnte man
+// eine Währung im Haushalt einstellen, die in diesen beiden Modulen nicht
+// wählbar war bzw. dort abgelehnt wurde (KRW, IDR und IRR waren so gestrandet).
+test('subscription and split-expense currency lists match the preferences contract', async () => {
+  const listFrom = async (path, name) => {
+    const source = await readFile(new URL(path, import.meta.url), 'utf8');
+    const declaration = source.match(new RegExp(`const ${name} = \\[([^\\]]+)\\]`));
+    assert.ok(declaration, `${path} must declare ${name}`);
+    return [...declaration[1].matchAll(/'([A-Z]{3})'/g)].map((match) => match[1]);
+  };
+
+  const backendCurrencies = await listFrom('../server/routes/preferences.js', 'VALID_CURRENCIES');
+
+  assert.deepEqual(
+    await listFrom('../public/pages/subscriptions.js', 'CURRENCIES'),
+    backendCurrencies,
+  );
+  assert.deepEqual(
+    await listFrom('../server/routes/split-expenses.js', 'CURRENCIES'),
+    backendCurrencies,
+  );
+});
+
 test('weather geolocation callbacks only update the active leaf', () => {
   assert.equal(
     isConnectedWeatherControl({ isConnected: true }, { isConnected: true }),
@@ -739,21 +971,35 @@ test('weather geolocation callbacks only update the active leaf', () => {
   );
 });
 
+// Die Koordinatenvalidierung lag doppelt in admin-weather und personal-weather
+// (Critique 2026-07-27) und liegt jetzt einmal in weather-location.js.
+test('hasValidWeatherCoords rejects empty, non-numeric and out-of-range input', () => {
+  assert.equal(hasValidWeatherCoords('52.52', '13.405'), true);
+  assert.equal(hasValidWeatherCoords('-90', '180'), true);
+  assert.equal(hasValidWeatherCoords('', '13.405'), false);
+  assert.equal(hasValidWeatherCoords('52.52', ''), false);
+  assert.equal(hasValidWeatherCoords('abc', '13.405'), false);
+  assert.equal(hasValidWeatherCoords('90.1', '13.405'), false);
+  assert.equal(hasValidWeatherCoords('52.52', '180.1'), false);
+});
+
 test('buildNavigationPayload expands the visible order back to canonical Kitchen children', () => {
+  // Das kanonische Kinder-Set, nicht eine Teilmenge: dieser Test prüft die
+  // Reihenfolgen-Expansion, nicht welche Kinder aktiviert sind.
   const payload = buildNavigationPayload(
     ['notes'],
-    new Set(['meals', 'recipes', 'shopping']),
+    new Set(KITCHEN_CHILD_IDS),
     ['calendar', 'tasks', 'kitchen', 'notes'],
   );
 
   assert.deepEqual(payload, {
     disabled_modules: ['notes'],
-    module_order: ['calendar', 'tasks', 'meals', 'recipes', 'shopping', 'notes'],
+    module_order: ['calendar', 'tasks', 'meals', 'recipes', 'shopping', 'pantry', 'notes'],
   });
 });
 
 test('buildNavigationPayload yields an empty module order for an empty visible order', () => {
-  const payload = buildNavigationPayload([], new Set(['meals', 'recipes', 'shopping']), []);
+  const payload = buildNavigationPayload([], new Set(KITCHEN_CHILD_IDS), []);
 
   assert.deepEqual(payload, { disabled_modules: [], module_order: [] });
 });
@@ -761,7 +1007,7 @@ test('buildNavigationPayload yields an empty module order for an empty visible o
 test('buildNavigationPayload keeps the single Kitchen position when expanding', () => {
   const payload = buildNavigationPayload([], new Set(KITCHEN_CHILD_IDS), ['kitchen']);
 
-  assert.deepEqual(payload.module_order, ['meals', 'recipes', 'shopping']);
+  assert.deepEqual(payload.module_order, ['meals', 'recipes', 'shopping', 'pantry']);
 });
 
 test('buildNavigationPayload disables Kitchen children that are not enabled', () => {
@@ -771,8 +1017,8 @@ test('buildNavigationPayload disables Kitchen children that are not enabled', ()
     ['kitchen', 'budget'],
   );
 
-  assert.deepEqual(payload.disabled_modules, ['budget', 'recipes', 'shopping']);
-  assert.deepEqual(payload.module_order, ['meals', 'recipes', 'shopping', 'budget']);
+  assert.deepEqual(payload.disabled_modules, ['budget', 'recipes', 'shopping', 'pantry']);
+  assert.deepEqual(payload.module_order, ['meals', 'recipes', 'shopping', 'pantry', 'budget']);
 });
 
 test('buildMobileNavigationPayload normalizes aliases, duplicates, and slot count', () => {

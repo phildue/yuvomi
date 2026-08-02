@@ -56,6 +56,33 @@ function nextRenewalOnOrAfter(startDate, cycle, interval, minimumDate) {
   return result;
 }
 
+const END_TYPES = ['never', 'on_date', 'after_count'];
+
+// Verbleibende Zahlungen bei 'after_count' (inkl. der aktuell anstehenden),
+// sonst null.
+function occurrencesRemaining(subscription) {
+  if (subscription.end_type !== 'after_count') return null;
+  return Math.max(0, Number(subscription.occurrence_count) - Number(subscription.occurrences_done || 0));
+}
+
+// Entscheidet beim Verlängern, ob das Abo endet oder auf den nächsten Zyklus
+// vorrückt. occurrencesDone verbucht die soeben fällige Zahlung.
+function resolveRenewal(subscription) {
+  const occurrencesDone = Number(subscription.occurrences_done || 0) + 1;
+  const nextDate = addBillingCycle(
+    subscription.next_payment_date,
+    subscription.billing_cycle,
+    subscription.cycle_interval,
+  );
+  let completed = false;
+  if (subscription.end_type === 'after_count') {
+    completed = occurrencesDone >= Number(subscription.occurrence_count);
+  } else if (subscription.end_type === 'on_date') {
+    completed = parseDateKey(nextDate).getTime() > parseDateKey(subscription.end_date).getTime();
+  }
+  return { completed, nextDate, occurrencesDone };
+}
+
 function monthlyEquivalent(amount, cycle, interval = 1) {
   const value = Number(amount);
   const count = Number(interval);
@@ -86,10 +113,13 @@ function reminderDate(nextPaymentDate, reminderDays) {
 export {
   BILLING_CYCLES,
   CURRENCY_RE,
+  END_TYPES,
   addBillingCycle,
   convertAmount,
   monthlyEquivalent,
   nextRenewalOnOrAfter,
+  occurrencesRemaining,
   parseDateKey,
   reminderDate,
+  resolveRenewal,
 };

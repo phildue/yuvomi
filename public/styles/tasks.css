@@ -16,13 +16,14 @@
 /* --------------------------------------------------------
  * Seiten-Layout
  * -------------------------------------------------------- */
-.tasks-page {
-  max-width: var(--content-max-width);
-  margin: 0 auto;
-}
+/* Full-bleed-Root (Issue #577): das frühere max-width/margin:auto lag um den
+ * Kopf herum, wodurch dessen Akzentstreifen in der Fläche endete. Die
+ * Content-Spalte entsteht jetzt über --page-inline-pad auf den direkten
+ * Kindern; das Chrome der Toolbar läuft bis zur Shell-Kante. */
 
 .tasks-body {
-  padding: var(--space-4);
+  padding-inline: var(--page-inline-pad);
+  padding-top: var(--space-4);
   /* Freiraum für den schwebenden FAB (52px + Abstand), damit die letzte
    * Karte nicht darunter verschwindet. */
   padding-bottom: calc(var(--space-16) + var(--space-8));
@@ -30,7 +31,7 @@
 
 @media (min-width: 1024px) {
   .tasks-body {
-    padding: var(--space-8);
+    padding-top: var(--space-8);
     padding-bottom: calc(var(--space-16) + var(--space-6));
   }
 }
@@ -39,96 +40,60 @@
  * Header + Toolbar
  * -------------------------------------------------------- */
 /* Gerüst (Shell, Titel, Actions) jetzt geteilt via .page-toolbar in layout.css.
- * Hier verbleiben nur die tasks-spezifischen Sekundär-Controls (Filter-Overflow). */
-.tasks-toolbar__secondary {
-  display: contents;
+ *
+ * Die Sekundär-Controls lagen bis v1.35 mobil hinter einem <details>-Overflow
+ * ("Filter-Slider"). Genau dieses Muster wurde in Dokumente (#506) verworfen:
+ * es versteckt die Ansichts- und Gruppierungswahl hinter einem Klick, ohne
+ * ihren Zustand zu zeigen. Aufgaben folgt jetzt derselben Grammatik wie
+ * Dokumente und Kontakte — umbrechender Kopf (.page-toolbar--wrap) plus eine
+ * eigene, immer sichtbare Filterzeile darunter. */
+.tasks-toolbar__search {
+  max-width: 320px;
 }
 
-.tasks-toolbar__secondary-trigger {
-  display: none;
-}
-
-.tasks-toolbar__secondary-panel {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-}
-
-.tasks-toolbar__secondary-panel .btn--icon {
+.tasks-toolbar .btn--icon {
   width: var(--target-base);
   height: var(--target-base);
   min-width: var(--target-base);
   min-height: var(--target-base);
 }
 
-@media (max-width: 1023px) {
-  /* Shell-Padding/Titel/Actions kommen aus .page-toolbar (layout.css).
-   * Das Overflow-Panel ankert an .tasks-toolbar__secondary, daher reicht hier
-   * dessen position:relative. */
-  .tasks-toolbar__secondary {
-    display: block;
-    position: relative;
+/* Sichtbarkeit wird per [hidden] geschaltet (Kanban blendet Gruppierung und
+ * Mehrfachauswahl aus). Ohne diese Regel gewinnt display:flex/inline-flex der
+ * Komponente gegen das Attribut. */
+.tasks-toolbar [hidden],
+.tasks-filters-row [hidden] {
+  display: none;
+}
+
+/* Filterzeile: Chips links, Gruppierungswahl rechts — dieselbe Aufteilung wie
+ * .documents-filters (Chips + .documents-filters__end). */
+.tasks-filters-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.tasks-filters-row .tasks-filters {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.tasks-filters__end {
+  flex-shrink: 0;
+  margin-inline-start: auto;
+}
+
+@media (max-width: 640px) {
+  .tasks-filters-row {
+    flex-wrap: wrap;
+    row-gap: var(--space-2);
   }
 
-  .tasks-toolbar__secondary-trigger {
-    display: inline-flex;
-  }
-
-  .tasks-toolbar__secondary-trigger::-webkit-details-marker,
-  .tasks-toolbar__secondary-trigger::marker {
-    display: none;
-    content: '';
-  }
-
-  .tasks-toolbar__secondary-panel {
-    position: absolute;
-    top: calc(100% + var(--space-2));
-    inset-inline-end: 0;
-    display: none;
-    flex-direction: column;
-    align-items: stretch;
-    gap: var(--space-2);
-    inline-size: max-content;
-    max-inline-size: calc(100vw - var(--space-8));
-    padding: var(--space-2);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-md);
-    background-color: var(--color-surface-raised);
-    box-shadow: var(--shadow-lg);
-    z-index: var(--z-dropdown);
-  }
-
-  [dir='rtl'] .tasks-toolbar__secondary-panel {
-    inset-inline-start: 0;
-    inset-inline-end: auto;
-  }
-
-  .tasks-toolbar__secondary[open] .tasks-toolbar__secondary-panel {
-    display: flex;
-  }
-
-  .tasks-toolbar__secondary-panel .group-toggle {
-    justify-content: stretch;
-  }
-
-  .tasks-toolbar__secondary-panel .group-toggle__btn {
-    flex: 1;
-  }
-
-  .toolbar-new-btn {
-    width: var(--target-base);
-    height: var(--target-base);
-    min-width: var(--target-base);
-    min-height: var(--target-base);
-    padding: 0;
-  }
-
-  .toolbar-new-btn:not(:focus-visible) {
-    color: transparent;
-  }
-
-  .toolbar-new-btn .icon-lg {
-    color: var(--color-text-on-accent);
+  .tasks-filters__end {
+    margin-inline-start: 0;
   }
 }
 
@@ -174,43 +139,9 @@
   padding-bottom: var(--space-1);
 }
 
-.filter-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  padding: var(--space-1) var(--space-3);
-  border-radius: var(--radius-full);
-  font-size: var(--text-sm);
-  font-weight: var(--font-weight-medium);
-  white-space: nowrap;
-  cursor: pointer;
-  border: 1.5px solid var(--color-border);
-  background-color: var(--color-surface);
-  color: var(--color-text-secondary);
-  transition: all var(--transition-fast);
-  min-height: var(--target-lg);
-}
-
-.filter-chip:hover:not(.filter-chip--active) {
-  border-color: var(--color-text-secondary);
-  color: var(--color-text-primary);
-}
-
-.filter-chip--active {
-  background-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) 14%, transparent);
-  border-color: var(--module-accent, var(--color-accent));
-  color: var(--module-accent, var(--color-accent));
-}
-
-@supports (backdrop-filter: blur(1px)) {
-  .filter-chip--active {
-    background: color-mix(in srgb, var(--module-accent, var(--color-accent)) 18%, transparent);
-    backdrop-filter: var(--blur-xs);
-    -webkit-backdrop-filter: var(--blur-xs);
-    border-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) 50%, transparent);
-    box-shadow: var(--glass-inset-base);
-  }
-}
+/* Basis, Aktiv-Zustand und Glass-Variante von .filter-chip leben in der geteilten
+ * styles/filter-chip.css (global eingebunden). Hier bleiben nur die
+ * Tasks-spezifischen Erweiterungen. */
 
 .filter-chip--recent {
   border-style: dashed;
@@ -478,8 +409,86 @@
   }
 }
 
+/* --------------------------------------------------------
+   Tags (#586)
+   Gespiegelte VTODO-CATEGORIES und lokal vergebene Etiketten. Bewusst leiser
+   als die Prioritäts-Badges: Tags ordnen, sie warnen nicht.
+   -------------------------------------------------------- */
+
+.task-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-0h) var(--space-2);
+  border: var(--space-px) solid var(--color-border-subtle);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-2);
+  color: var(--color-text-secondary);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+  /* Ein sehr langer Fremd-Tag darf die Zeile nicht sprengen. */
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Auf den Karten ist das Chip ein Button (Klick filtert). Die Button-Herkunft
+ * abräumen, damit es wie ein Etikett aussieht und nicht wie eine Schaltfläche -
+ * es ordnet, es ruft nicht zur Handlung auf. */
+.task-tag--filter {
+  cursor: pointer;
+  font-family: inherit;
+  transition: border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.task-tag--filter:hover {
+  border-color: var(--color-accent);
+  color: var(--color-text-primary);
+}
+
+/* Die Zusammenfassung ab dem vierten Tag ist kein Ziel: sie benennt keinen
+ * einzelnen Tag, auf den ein Klick filtern könnte. */
+.task-tag--more {
+  cursor: default;
+}
+
+/* Im Editor entfernt der Klick das Chip - dieselbe Aufräumarbeit, andere
+ * Bedeutung, daher die abweichende Hover-Farbe. */
+.task-tag--editable {
+  cursor: pointer;
+  font-family: inherit;
+  transition: border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.task-tag--editable:hover {
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+}
+
+.task-tags-editor__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+/* Nur wenn Chips da sind Abstand halten — sonst klafft über dem leeren Feld
+ * eine Lücke. */
+.task-tags-editor__chips:not(:empty) {
+  margin-bottom: var(--space-2);
+}
+
 .task-status-btn--done {
-  animation: check-pop 0.2s var(--ease-out);
+  animation: check-pop var(--duration-md) var(--ease-out);
+}
+
+/* Skalierungs-Pops unter reduzierter Bewegung abschalten (Audit F-07);
+ * der Farbwechsel trägt das Feedback allein. */
+@media (prefers-reduced-motion: reduce) {
+  .task-status-btn--done,
+  .subtask-item__checkbox--done {
+    animation: none;
+  }
 }
 
 .task-status-btn--done::after {
@@ -512,7 +521,14 @@
 }
 
 .task-card__title {
-  /* Typografie via .u-card-title */
+  /* Typografie via .u-card-title.
+   * Ist ein <button>: der Titel öffnet die Aufgabe und muss fokussierbar sein.
+   * Die Reset-Regeln (font/border/background) kommen aus reset.css, hier nur
+   * die Block-Geometrie, damit der Button wie der frühere Div fließt. */
+  display: block;
+  width: 100%;
+  padding: 0;
+  text-align: start;
   color: var(--color-text-primary);
   margin-bottom: var(--space-1);
   cursor: pointer;
@@ -615,11 +631,15 @@
 }
 
 /* Subtask-Fortschrittsbalken */
+/* <button>: klappt die Unteraufgaben auf. Als Div war die Liste (display:none)
+ * per Tastatur unerreichbar — es gab keinen anderen Öffner. */
 .subtask-progress {
   padding: 0 var(--space-3) var(--space-2);
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  width: 100%;
+  text-align: start;
   cursor: pointer;
 }
 
@@ -689,7 +709,7 @@
 .subtask-item__checkbox--done {
   background-color: var(--color-success);
   border-color: var(--color-success);
-  animation: check-pop 0.15s var(--ease-out);
+  animation: check-pop var(--duration-sm) var(--ease-out);
 }
 
 .subtask-item__checkbox-icon {
@@ -824,7 +844,13 @@
 }
 
 .kanban-card__title {
-  /* Typografie via .u-card-title.u-compact */
+  /* Typografie via .u-card-title.u-compact.
+   * <button>: einziger Tastaturzugang zu den Kartendetails — die Karte selbst
+   * ist ein Drag-Div und damit nicht fokussierbar. */
+  display: block;
+  width: 100%;
+  padding: 0;
+  text-align: start;
   color: var(--color-text-primary);
   margin-bottom: var(--space-2);
 }
@@ -883,6 +909,46 @@
   border-radius: var(--radius-sm);
   background-color: var(--color-accent-light);
   opacity: 0.5;
+}
+
+/* Leere Spalte: ruhiger Hinweis, dass hier (noch) nichts liegt - statt einer
+ * stummen Lücke (Audit P3). Beim Ziehen einer Karte wird die Spalte zur sichtbaren
+ * Ablagefläche ("Hierher ziehen"), damit auch leere Spalten als Ziel erkennbar
+ * sind - die icon-only-Statusbuttons bleiben die tastaturfreundliche Alternative. */
+.kanban-col__empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  min-height: 64px;
+  padding: var(--space-3);
+  border: var(--space-px) dashed var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
+  transition: border-color var(--transition-fast), color var(--transition-fast),
+              background-color var(--transition-fast);
+}
+
+.kanban-col__empty-drop {
+  display: none;
+}
+
+/* Während ein Karten-Drag läuft: leere Spalten laden aktiv zum Ablegen ein.
+ * Modul-Akzent (grün auf der Aufgaben-Seite), damit die Affordanz zur restlichen
+ * Modulfarbe passt statt zum globalen Akzent. */
+.kanban-board--dragging .kanban-col__empty {
+  border-color: var(--module-accent, var(--color-accent));
+  color: var(--module-accent, var(--color-accent));
+  background-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) 8%, transparent);
+}
+
+.kanban-board--dragging .kanban-col__empty-idle {
+  display: none;
+}
+
+.kanban-board--dragging .kanban-col__empty-drop {
+  display: inline;
 }
 
 /* --------------------------------------------------------
@@ -952,4 +1018,76 @@
   margin: var(--space-1) 0 0;
   font-size: var(--text-xs);
   color: var(--color-text-tertiary);
+}
+
+/* Verknüpfte Dokumente im Aufgaben-Modal (#503). */
+.task-documents__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 var(--space-3);
+}
+
+.task-documents__empty {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+}
+
+.task-doc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 100%;
+  padding: var(--space-1) var(--space-1) var(--space-1) var(--space-2);
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-full);
+  font-size: var(--text-xs);
+}
+
+.task-doc-chip__icon {
+  flex: 0 0 auto;
+  color: var(--color-text-tertiary);
+}
+
+.task-doc-chip__name {
+  overflow: hidden;
+  max-width: 16rem;
+  color: var(--color-text-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-decoration: none;
+}
+
+.task-doc-chip__name:hover {
+  color: var(--color-accent);
+  text-decoration: underline;
+}
+
+.task-doc-chip__remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 1.375rem;
+  height: 1.375rem;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-full);
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+}
+
+.task-doc-chip__remove:hover {
+  background: var(--color-surface-raised);
+  color: var(--color-danger);
+}
+
+/* Büroklammer-Badge auf der Aufgabenkarte (Anzahl verknüpfter Dokumente). */
+.task-card__docs {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-0h);
 }

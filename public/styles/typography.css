@@ -49,11 +49,16 @@
 .u-toolbar-title,
 .page-toolbar__title,
 .settings-leaf-header__title,
+/* Die Settings-Übersicht lief als .page__title auf 22px mobil / 28px Desktop,
+ * während jedes andere Modul seinen Seitentitel mit 20px rendert - zwei
+ * h1-Größen für denselben Seitentyp (Critique 2026-07-27). */
+.settings-shell-header__title,
 .split-title {
   font-size: var(--type-toolbar-title);
   font-weight: var(--font-weight-bold);
   line-height: var(--line-height-tight);
   letter-spacing: var(--tracking-tight);
+  text-wrap: balance;
 }
 
 /* --------------------------------------------------------------------------
@@ -63,13 +68,11 @@
 .birthdays-toolbar__title,
 .birthdays-section__header h2,
 .list-header__name,
-.shopping-cat-manager__title,
 .loan-report__title,
 .day-view__date-label,
 .today-cockpit__header h2,
 .settings-section__title,
 .settings-navigation-panel__title,
-.settings-navigation-group__title,
 .settings-mobile-overview__title,
 .split-group-header h2,
 .housekeeping-card h2,
@@ -96,9 +99,12 @@
 .budget-chart-section__title,
 .loan-report__section-title,
 .budget-list-header__title,
+.budget-panel-head__title,
+.budget-page .split-title,
 .contact-group__header,
 .day-header__name,
 .meal-slot__type-label,
+.week-gutter-label,
 .item-category__header,
 .documents-folder-browser__title {
   font-size: var(--text-xs);
@@ -136,7 +142,7 @@
  * ------------------------------------------------------------------------ */
 .u-card-title,
 .agenda-event__title,
-.event-popup__title,
+.detail-popover__title,
 .budget-loan-card__title,
 .budget-entry__title,
 .contact-item__name,
@@ -172,12 +178,16 @@
 .document-dropzone__title,
 .dms-result__title,
 .meal-card__title,
-.shopping-cat-row__name,
 .housekeeping-section-heading span,
 .subscription-card h3,
 .reminder-section__title,
 .cat-row__name,
-.cat-subrow__name {
+.cat-subrow__name,
+/* Gruppentitel über den Modul-Listen ("Übersicht", "Planen"). Sie standen in
+ * der Section-Rolle (18px) und wurden in settings.css auf 14px übersteuert -
+ * die Registrierung behauptete das eine, die Datei tat das andere, und im
+ * Ergebnis rendert dasselbe h3-Element zwei Größen (Critique 2026-07-27). */
+.settings-navigation-group__title {
   font-size: var(--type-secondary);
   font-weight: var(--font-weight-semibold);
   line-height: var(--line-height-snug);

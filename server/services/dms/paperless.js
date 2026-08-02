@@ -13,6 +13,19 @@ const REQUEST_TIMEOUT_MS = 8000;
 // ältere Instanzen ohne diese Version weiterhin funktionieren.
 const API_VERSION = 9;
 
+// Erkennt ASN-Suchen (Discussion #511): die Archiv-Seriennummer ist in Paperless
+// der eindeutige, oft aufs Papier gestempelte Ordnungsschlüssel. Ein expliziter
+// Präfix (`asn:123`, `asn 123`, `asn#123`) ODER eine reine Zahl wird als ASN
+// interpretiert und exakt gefiltert, statt per Volltext zu raten. Gibt die
+// numerische ASN zurück oder null, wenn es keine ASN-Suche ist.
+export function parseAsnQuery(query) {
+  const q = String(query || '').trim();
+  const prefixed = /^asn[:#\s]\s*(\d+)$/i.exec(q);
+  if (prefixed) return Number(prefixed[1]);
+  if (/^\d+$/.test(q)) return Number(q);
+  return null;
+}
+
 export class PaperlessAdapter {
   constructor(account) {
     this.provider = 'paperless';
@@ -63,7 +76,14 @@ export class PaperlessAdapter {
     // Leerer Query listet alle Dokumente (Paperless: /api/documents/ ohne query
     // liefert die volle Liste) — ermöglicht Durchblättern statt exaktes Raten.
     const params = new URLSearchParams({ page_size: String(limit) });
-    if (q) params.set('query', q);
+    const asn = parseAsnQuery(q);
+    if (asn !== null) {
+      // Exakter ASN-Filter statt Volltext: trifft genau das eine Dokument mit
+      // dieser Archiv-Seriennummer (Discussion #511).
+      params.set('archive_serial_number', String(asn));
+    } else if (q) {
+      params.set('query', q);
+    }
     const res = await this.#request(`/api/documents/?${params.toString()}`);
     const body = await res.json();
     return (body.results || []).map((r) => ({
@@ -98,6 +118,19 @@ export class PaperlessAdapter {
     };
   }
 
+  // Vorschaubild der ersten Seite (Issue #533). Paperless-ngx rendert für jedes
+  // Dokument ein Thumbnail (i. d. R. image/webp) unter /thumb/. Der Aufrufer prüft
+  // den zurückgegebenen MIME-Typ gegen eine Bild-Allowlist, bevor er es inline
+  // ausliefert; hier wird nur durchgereicht, was die Instanz sendet.
+  async fetchThumbnail(id) {
+    const res = await this.#request(`/api/documents/${encodeURIComponent(id)}/thumb/`);
+    const arrayBuf = await res.arrayBuffer();
+    return {
+      buffer: Buffer.from(arrayBuf),
+      mime: res.headers.get('content-type') || 'application/octet-stream',
+    };
+  }
+
   async upload({ buffer, filename, mime, title, tags = [] }) {
     if (!filename) throw new Error('DMS upload requires a filename');
     const form = new FormData();
@@ -111,7 +144,12 @@ export class PaperlessAdapter {
 
   async testConnection() {
     try {
-      const res = await this.#fetch('/api/');
+      // Einen echten JSON-Endpunkt testen statt `/api/` (Issue #527): der API-Root
+      // leitet auf manchen Instanzen/Reverse-Proxies (Traefik) auf die
+      // Swagger-HTML-View `/api/schema/view/` um, die einen JSON-`Accept`-Header
+      // mit 406 Not Acceptable ablehnt. `/api/documents/?page_size=1` vermeidet den
+      // Redirect und verifiziert zugleich Token und Dokumentzugriff.
+      const res = await this.#fetch('/api/documents/?page_size=1');
       return { ok: res.ok, status: res.status };
     } catch (err) {
       return { ok: false, status: 0, error: err.message };

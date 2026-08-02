@@ -1,11 +1,18 @@
 import { t } from '/i18n.js';
+import { renderSkeletonList } from '/utils/skeleton.js';
 import { createRetryState } from './components.js';
+import { clearLeafEdits, confirmLeafExit, watchLeafForms } from './dirty-guard.js';
+import { resetPreferencesCache } from './preferences-cache.js';
 import {
   SETTINGS_LEAVES,
   filterSettingsDomains,
   findSettingsLeaf,
   settingsOverviewUrl,
 } from './registry.js';
+
+// Unter dieser Schwelle ist ein Blatt gefuehlt sofort da; ein Skelett waere
+// dort nur ein Aufblitzen.
+const SKELETON_DELAY_MS = 120;
 
 function createIcon(name, className) {
   const icon = document.createElement('i');
@@ -20,7 +27,7 @@ function hydrateIcons(container) {
 }
 
 function bindSpaNavigation(link, href) {
-  link.addEventListener('click', (event) => {
+  link.addEventListener('click', async (event) => {
     if (
       event.defaultPrevented
       || event.button !== 0
@@ -33,6 +40,9 @@ function bindSpaNavigation(link, href) {
       return;
     }
     event.preventDefault();
+    // Alle Wege aus einem Blatt heraus laufen ueber diese Links: Seitenleiste,
+    // Suchtreffer, Breadcrumb und der Zurueck-Link.
+    if (!(await confirmLeafExit())) return;
     window.yuvomi.navigate(href);
   });
 }
@@ -90,6 +100,116 @@ function createDomainToggle(domain, panelId, expanded) {
   return toggle;
 }
 
+// Vergleichsform für die Blatt-Suche: Diakritika weg, damit "wetter" auch
+// "Wetter" findet und "prazdniny" auch "prázdniny".
+function searchNormalize(value) {
+  return String(value ?? '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '');
+}
+
+function createNavigationLink(entry, activeLeaf) {
+  const link = createLink(entry.path, 'settings-shell__navigation-link');
+  link.dataset.leafId = entry.id;
+  link.append(
+    createIcon(entry.icon, 'settings-shell__navigation-link-icon'),
+    document.createTextNode(t(entry.labelKey)),
+  );
+  if (entry.id === activeLeaf?.id) {
+    link.classList.add('settings-shell__navigation-link--active');
+    link.setAttribute('aria-current', 'page');
+  }
+  return link;
+}
+
+/**
+ * Suchfeld über alle sichtbaren Blätter. Bei 23 Blättern in vier Domänen ist
+ * die Taxonomie sonst der einzige Weg zu einer Einstellung, deren Domäne man
+ * nicht kennt (Critique 2026-07-27). Gefiltert wird über Label UND Beschreibung,
+ * damit "Zeitzone" auch ein Blatt findet, das anders heisst.
+ */
+function createNavigationSearch(navigation, domains, user, activeLeaf) {
+  const leaves = domains.flatMap((domain) => allowedLeavesForDomain(domain.id, user)
+    .map((entry) => ({
+      entry,
+      domainLabel: t(domain.labelKey),
+      haystack: searchNormalize(`${t(entry.labelKey)} ${t(entry.descriptionKey)} ${t(domain.labelKey)}`),
+    })));
+
+  const field = document.createElement('div');
+  field.className = 'settings-shell__navigation-search';
+  const input = document.createElement('input');
+  input.type = 'search';
+  input.className = 'form-input settings-shell__navigation-search-input';
+  input.placeholder = t('settings.searchLabel');
+  input.setAttribute('aria-label', t('settings.searchLabel'));
+  field.appendChild(input);
+
+  const results = document.createElement('ul');
+  results.className = 'settings-shell__navigation-list settings-shell__navigation-results';
+  results.hidden = true;
+
+  const status = document.createElement('p');
+  status.className = 'settings-shell__navigation-status';
+  status.setAttribute('role', 'status');
+  status.hidden = true;
+
+  const groups = () => navigation.querySelectorAll('.settings-shell__navigation-group');
+
+  const applyFilter = () => {
+    const query = searchNormalize(input.value.trim());
+    const searching = query.length > 0;
+
+    for (const group of groups()) group.hidden = searching;
+    results.hidden = !searching;
+    status.hidden = !searching;
+
+    if (!searching) {
+      results.replaceChildren();
+      status.textContent = '';
+      return;
+    }
+
+    const hits = leaves.filter((leaf) => leaf.haystack.includes(query));
+    results.replaceChildren(...hits.map(({ entry, domainLabel }) => {
+      const item = document.createElement('li');
+      const link = createLink(entry.path, 'settings-shell__navigation-link settings-shell__navigation-result');
+      link.dataset.leafId = entry.id;
+      if (entry.id === activeLeaf?.id) {
+        link.classList.add('settings-shell__navigation-link--active');
+        link.setAttribute('aria-current', 'page');
+      }
+
+      // Ohne die Gruppen fehlt der Ort: die Domäne wandert unter den Treffer.
+      // Label und Domäne stehen zusammen in einer Spalte neben dem Icon, damit
+      // ein langer Name nicht das Icon in eine eigene Zeile drängt.
+      const text = document.createElement('span');
+      text.className = 'settings-shell__navigation-result-text';
+      const label = document.createElement('span');
+      label.textContent = t(entry.labelKey);
+      const domainHint = document.createElement('span');
+      domainHint.className = 'settings-shell__navigation-result-domain';
+      domainHint.textContent = domainLabel;
+      text.append(label, domainHint);
+
+      link.append(createIcon(entry.icon, 'settings-shell__navigation-link-icon'), text);
+      item.appendChild(link);
+      return item;
+    }));
+    hydrateIcons(results);
+
+    status.textContent = hits.length
+      ? t('settings.searchResults', { count: hits.length })
+      : t('search.noResults');
+  };
+
+  input.addEventListener('input', applyFilter);
+  input.addEventListener('search', applyFilter);
+
+  navigation.prepend(field, status, results);
+}
+
 function createNavigation(domains, user, activeLeaf) {
   const navigation = document.createElement('nav');
   navigation.className = 'settings-shell__navigation';
@@ -116,17 +236,7 @@ function createNavigation(domains, user, activeLeaf) {
     list.className = 'settings-shell__navigation-list';
     for (const entry of allowedLeavesForDomain(domain.id, user)) {
       const item = document.createElement('li');
-      const link = createLink(entry.path, 'settings-shell__navigation-link');
-      link.dataset.leafId = entry.id;
-      link.append(
-        createIcon(entry.icon, 'settings-shell__navigation-link-icon'),
-        document.createTextNode(t(entry.labelKey)),
-      );
-      if (entry.id === activeLeaf?.id) {
-        link.classList.add('settings-shell__navigation-link--active');
-        link.setAttribute('aria-current', 'page');
-      }
-      item.appendChild(link);
+      item.appendChild(createNavigationLink(entry, activeLeaf));
       list.appendChild(item);
     }
 
@@ -166,6 +276,7 @@ function createNavigation(domains, user, activeLeaf) {
     navigation.appendChild(group);
   }
 
+  createNavigationSearch(navigation, domains, user, activeLeaf);
   return navigation;
 }
 
@@ -181,10 +292,13 @@ function updateNavigationActiveState(navigation, activeLeaf) {
   for (const group of navigation.querySelectorAll('.settings-shell__navigation-group')) {
     const isActiveDomain = group.dataset.domainId === activeDomainId;
     group.classList.toggle('settings-shell__navigation-group--active', isActiveDomain);
-    // Single-Open: die aktive Domäne wird aufgeklappt, alle anderen schließen mit.
-    // Ohne aktives Blatt (Übersicht) bleibt der manuelle Zustand unangetastet.
-    if (collapsible && activeDomainId) {
-      setGroupExpanded(group, isActiveDomain);
+    // Single-Open: die aktive Domäne wird aufgeklappt, alle anderen schließen
+    // mit. Ohne aktives Blatt schliessen alle - sonst stand links die Domäne
+    // des zuletzt besuchten Blatts offen, während rechts die Übersicht begann
+    // (Critique 2026-07-27). Ein Navigationszustand, der dem Inhalt
+    // widerspricht, kostet mehr Vertrauen als er Wege spart.
+    if (collapsible) {
+      setGroupExpanded(group, Boolean(activeDomainId) && isActiveDomain);
     }
   }
 
@@ -408,13 +522,17 @@ function createLeafHeader(leaf) {
 
 async function renderLeafContent(content, leaf, domain, user, query) {
   const breadcrumb = createBreadcrumb(domain, leaf);
+  // Nach dem Ziel benannt, nicht nach der Wurzel: der Link führt auf die
+  // Domänen-Übersicht, hiess aber "Zurück zu Einstellungen" - genau wie der
+  // Link eine Ebene höher, der woanders hinführt (Critique 2026-07-27).
+  // Mobil ist das die einzige Rückwärts-Affordance.
   const backLink = createLink(
     settingsOverviewUrl(domain.id),
     'settings-leaf-back-link',
   );
   backLink.append(
     createIcon('arrow-left', 'settings-leaf-back-link__icon'),
-    document.createTextNode(t('settings.backToSettings')),
+    document.createTextNode(t('settings.backToDomain', { domain: t(domain.labelKey) })),
   );
 
   // Der Leaf-Header wird zentral aus der Registry gerendert (Prio 5/B1): die
@@ -430,10 +548,25 @@ async function renderLeafContent(content, leaf, domain, user, query) {
 
   const loadAndRender = async ({ focusRetry = false } = {}) => {
     leafContainer.replaceChildren();
+    // Der Blattwechsel laedt ein Modul und danach dessen Daten. Bis dahin stand
+    // hier ein leerer Kasten (Critique 2026-07-27). aria-busy gilt sofort; das
+    // Skelett kommt erst nach einer kurzen Frist, damit ein Blatt aus dem
+    // Modul-Cache nicht kurz aufblitzt.
+    leafContainer.setAttribute('aria-busy', 'true');
+    const skeletonTimer = setTimeout(() => {
+      if (leafContainer.isConnected && !leafContainer.firstChild) {
+        leafContainer.insertAdjacentHTML('beforeend', renderSkeletonList({ rows: 3, lines: 3 }));
+      }
+    }, SKELETON_DELAY_MS);
+
     try {
       const module = await leaf.loader();
       if (typeof module.render !== 'function') throw new TypeError('Settings leaf must export render()');
+      clearTimeout(skeletonTimer);
+      leafContainer.replaceChildren();
       await module.render(leafContainer, { user, query });
+      leafContainer.removeAttribute('aria-busy');
+      watchLeafForms(leafContainer);
 
       heading.tabIndex = -1;
       requestAnimationFrame(() => {
@@ -442,6 +575,9 @@ async function renderLeafContent(content, leaf, domain, user, query) {
       hydrateIcons(content);
     } catch (error) {
       console.error(`[Settings] Failed to render ${leaf.id}:`, error);
+      clearTimeout(skeletonTimer);
+      leafContainer.removeAttribute('aria-busy');
+      clearLeafEdits();
       const retryState = createRetryState({
         message: t('settings.loadError'),
         onRetry: () => loadAndRender({ focusRetry: true }),
@@ -488,13 +624,21 @@ export async function renderSettingsShell(container, {
       activeLeaf,
     );
   } else {
+    // Frische Shell: der geteilte Preferences-Cache gilt genau für einen
+    // Settings-Besuch. Alles, was zwischenzeitlich ausserhalb geschrieben
+    // wurde (z. B. die Widget-Konfiguration im Dashboard), ist damit weg.
+    resetPreferencesCache();
+
     const page = document.createElement('div');
     page.className = 'page settings-page';
 
     const pageHeader = document.createElement('header');
     pageHeader.className = 'page__header settings-shell-header';
     const pageTitle = document.createElement('h1');
-    pageTitle.className = 'page__title';
+    // Nicht `page__title` (22/28px): jedes andere Modul rendert seinen
+    // Seitentitel mit 20px, und der Settings-Leaf-Titel tut es auch. Zwei
+    // h1-Größen für dieselbe Ebene (Critique 2026-07-27).
+    pageTitle.className = 'settings-shell-header__title';
     pageTitle.textContent = t('settings.title');
     pageHeader.appendChild(pageTitle);
 

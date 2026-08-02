@@ -1,4 +1,3 @@
-import { api } from '/api.js';
 import {
   getLocale,
   getSupportedLocales,
@@ -7,6 +6,7 @@ import {
 } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { appendCurrencyOptions, persistCurrencySelection } from '/settings/currency.js';
+import { getPreferences, savePreferences } from '/settings/preferences-cache.js';
 import {
   CUSTOM_REGION,
   REGION_CODES,
@@ -14,6 +14,7 @@ import {
   detectRegion,
   resolveRegion,
   regionLabel,
+  numberLocaleFor,
 } from '/settings/region-presets.js';
 
 const DATE_FORMATS = [
@@ -87,6 +88,23 @@ function localeOptions() {
   ].join('');
 }
 
+/**
+ * Optionen für die Datensprache des Haushalts (#631, #632). Der leere Wert steht
+ * für "automatisch"; sein Label nennt die Sprache, auf die die Automatik fiele -
+ * `language_auto`, nicht `language_effective`. Bei explizit gewählter Sprache
+ * sind die beiden verschieden, und `language_effective` würde dort genau die
+ * gewählte Sprache als Automatik-Ergebnis ausgeben.
+ */
+function dataLanguageOptions(selected, auto_) {
+  const auto = t('settings.dataLanguageAuto', { language: localeLabel(auto_) });
+  return [
+    `<option value=""${selected ? '' : ' selected'}>${esc(auto)}</option>`,
+    ...getSupportedLocales().map((locale) => (
+      `<option value="${esc(locale)}"${selected === locale ? ' selected' : ''}>${esc(localeLabel(locale))}</option>`
+    )),
+  ].join('');
+}
+
 function showError(element, message) {
   if (!element) return;
   element.textContent = message || t('common.errorGeneric');
@@ -111,6 +129,21 @@ function renderLoadError(container) {
   `);
 }
 
+/**
+ * Region, Währung, Datums- und Zeitformat bleiben eine Gruppe, obwohl sie sich
+ * in der Berechtigung teilen: Region und Währung schreiben nur Admins, die
+ * beiden Formate darf jedes Mitglied ändern (`server/routes/preferences.js:351`
+ * dokumentiert das ausdrücklich). Zwei Gründe gegen eine Trennung:
+ *
+ * 1. Der Region-Select setzt die anderen drei Werte mit (`syncRegionSelect` /
+ *    `detectRegion`) - auseinandergezogen reißt das #486 wieder auf.
+ * 2. Die ganze Gruppe nach `admin` zu schieben nähme Mitgliedern genau das
+ *    Formatändern, das die Route ihnen gewährt.
+ *
+ * Der Preis ist, dass ein "persönliches" Blatt vier haushaltweite Werte
+ * schreibt. Das trägt die Copy (`regionAdminOnly`, `formatsHouseholdHint`),
+ * nicht die Struktur (Critique 2026-07-27).
+ */
 function renderPage(container, preferences, isAdmin) {
   const theme = currentTheme();
   const activeRegion = resolveRegion(preferences);
@@ -120,7 +153,6 @@ function renderPage(container, preferences, isAdmin) {
     <section class="settings-section">
       <h2 class="settings-section__title">${t('settings.sectionDesign')}</h2>
       <div class="settings-card">
-        <h3 class="settings-card__title">${t('settings.cardAppearance')}</h3>
         <div class="theme-toggle" id="theme-toggle">
           <button class="theme-toggle__btn ${theme === 'system' ? 'theme-toggle__btn--active' : ''}" type="button" data-theme-value="system" aria-label="${t('settings.themeSysLabel')}" aria-pressed="${theme === 'system'}">
             <i data-lucide="monitor" class="icon-md" aria-hidden="true"></i>
@@ -149,21 +181,39 @@ function renderPage(container, preferences, isAdmin) {
         </div>
         <div id="locale-error" class="form-error" role="alert" hidden></div>
       </div>
+      <!-- Eigene Karte, nicht angehängt an die Sprachauswahl darüber: als
+           Nachbar im selben Block läse sich der Hinweis wie die Erklärung der
+           Anzeigesprache - und beide sagen etwas Gegensätzliches aus. -->
+      <div class="settings-card">
+        ${isAdmin ? `
+        <p class="form-hint" id="data-language-hint">${t('settings.dataLanguageHint')}</p>
+        <div class="form-group">
+          <label class="form-label" for="data-language-select">${t('settings.dataLanguageLabel')}</label>
+          <select class="form-input" id="data-language-select" aria-describedby="data-language-hint data-language-error">
+            ${dataLanguageOptions(preferences.language, preferences.language_auto)}
+          </select>
+        </div>
+        <div id="data-language-error" class="form-error" role="alert" hidden></div>` : `
+        <p class="form-hint">${t('settings.dataLanguageAdminOnly')}</p>`}
+      </div>
     </section>
 
     <section class="settings-section">
       <h2 class="settings-section__title">${t('settings.regionTitle')}</h2>
       ${isAdmin ? `
       <div class="settings-card">
-        <p class="form-hint">${t('settings.regionHint')}</p>
+        <p class="form-hint" id="region-hint">${t('settings.regionHint')}</p>
         <div class="form-group">
           <label class="form-label" for="region-select">${t('settings.regionLabel')}</label>
-          <select class="form-input" id="region-select" aria-describedby="region-error">
+          <select class="form-input" id="region-select" aria-describedby="region-hint region-error">
             ${regionOptions(activeRegion)}
           </select>
         </div>
         <div id="region-error" class="form-error" role="alert" hidden></div>
-      </div>` : ''}
+      </div>` : `
+      <div class="settings-card">
+        <p class="form-hint">${t('settings.regionAdminOnly')}</p>
+      </div>`}
       <div class="settings-card" id="custom-formats"${customHidden ? ' hidden' : ''}>
         ${isAdmin ? `
         <div class="form-group">
@@ -171,16 +221,17 @@ function renderPage(container, preferences, isAdmin) {
           <select class="form-input" id="currency-select" aria-describedby="currency-error"></select>
         </div>
         <div id="currency-error" class="form-error" role="alert" hidden></div>` : ''}
+        <p class="form-hint" id="formats-household-hint">${t('settings.formatsHouseholdHint')}</p>
         <div class="form-group">
           <label class="form-label" for="date-format-select">${t('settings.dateFormatLabel')}</label>
-          <select class="form-input" id="date-format-select" aria-describedby="date-format-error">
+          <select class="form-input" id="date-format-select" aria-describedby="formats-household-hint date-format-error">
             ${formatOptions(preferences.date_format)}
           </select>
         </div>
         <div id="date-format-error" class="form-error" role="alert" hidden></div>
         <div class="form-group">
           <label class="form-label" for="time-format-select">${t('settings.timeFormatLabel')}</label>
-          <select class="form-input" id="time-format-select" aria-describedby="time-format-error">
+          <select class="form-input" id="time-format-select" aria-describedby="formats-household-hint time-format-error">
             <option value="24h"${preferences.time_format === '24h' ? ' selected' : ''}>24 ${t('settings.timeFormatHours')}</option>
             <option value="12h"${preferences.time_format === '12h' ? ' selected' : ''}>AM/PM</option>
           </select>
@@ -209,6 +260,28 @@ function applyTheme(value) {
   }
 }
 
+// Spiegelt die aktive Region als Formatier-Locale für Zahlen/Währung in den
+// localStorage (getFormatLocale() in i18n.js liest ihn). Leert den Schlüssel bei
+// "Benutzerdefiniert", damit die Zahlenformatierung auf die UI-Sprache zurückfällt.
+function applyNumberLocale({ region, currency, date_format, time_format }) {
+  const numberLocale = numberLocaleFor({ region, currency, date_format, time_format });
+  if (numberLocale) {
+    safeStorageSet('yuvomi-number-locale', numberLocale);
+  } else {
+    safeStorageRemove('yuvomi-number-locale');
+  }
+}
+
+// Liest den aktuellen Format-Zustand aus den vier Selects der Seite.
+function readFormatState(container) {
+  return {
+    region: container.querySelector('#region-select')?.value,
+    currency: container.querySelector('#currency-select')?.value,
+    date_format: container.querySelector('#date-format-select')?.value,
+    time_format: container.querySelector('#time-format-select')?.value,
+  };
+}
+
 // Hält den Region-Dropdown mit den drei Einzel-Selects synchron (Preset oder
 // "Benutzerdefiniert"), nachdem ein Einzelwert manuell geändert wurde.
 function syncRegionSelect(container) {
@@ -219,6 +292,24 @@ function syncRegionSelect(container) {
     date_format: container.querySelector('#date-format-select')?.value,
     time_format: container.querySelector('#time-format-select')?.value,
   });
+}
+
+/**
+ * Baut die Optionen der Datensprache neu auf. Nötig nach einem Regionswechsel:
+ * steht die Datensprache auf "automatisch", leitet der Server sie aus der Region
+ * ab, und das Label nennt dann eine andere Sprache. Die Ableitung bleibt dabei
+ * beim Server - hier wird nur der frisch gelesene Wert angezeigt, statt die
+ * Regel im Client zu wiederholen.
+ */
+async function refreshDataLanguageOptions(container) {
+  const select = container.querySelector('#data-language-select');
+  if (!select) return;
+  const preferences = await getPreferences();
+  select.replaceChildren();
+  select.insertAdjacentHTML('beforeend', dataLanguageOptions(
+    preferences.language || null,
+    preferences.language_auto || 'en',
+  ));
 }
 
 function bindEvents(container, user) {
@@ -255,6 +346,34 @@ function bindEvents(container, user) {
     }
   });
 
+  // Datensprache: anders als der Locale-Picker darüber schreibt sie eine
+  // haushaltweite Preference und betitelt serverseitig die bereits gespeicherten
+  // Geburtstags-Termine um. Danach neu rendern, damit das Automatik-Label die
+  // eventuell veränderte Ableitung zeigt.
+  const dataLanguageSelect = container.querySelector('#data-language-select');
+  let persistedDataLanguage = dataLanguageSelect?.value ?? '';
+  dataLanguageSelect?.addEventListener('change', async () => {
+    const errorElement = container.querySelector('#data-language-error');
+    clearError(errorElement);
+    dataLanguageSelect.disabled = true;
+    try {
+      await savePreferences({ language: dataLanguageSelect.value || null });
+      persistedDataLanguage = dataLanguageSelect.value;
+      // Nur die Optionen neu aufbauen statt die Seite: ein voller Re-Render nähme
+      // dem gerade bedienten Select den Fokus und würde eine noch nicht
+      // gespeicherte "Benutzerdefiniert"-Wahl im Region-Block wieder zuklappen.
+      await refreshDataLanguageOptions(container);
+      window.yuvomi?.showToast(t('settings.dataLanguageSaved'), 'success');
+    } catch (error) {
+      // Zurück auf den gespeicherten Wert: sonst zeigt die Seite eine
+      // Datensprache an, die nie geschrieben wurde.
+      dataLanguageSelect.value = persistedDataLanguage;
+      showError(errorElement, error.message);
+    } finally {
+      if (dataLanguageSelect.isConnected) dataLanguageSelect.disabled = false;
+    }
+  });
+
   const regionSelect = container.querySelector('#region-select');
   regionSelect?.addEventListener('change', async () => {
     const customBlock = container.querySelector('#custom-formats');
@@ -268,7 +387,7 @@ function bindEvents(container, user) {
     clearError(errorElement);
     regionSelect.disabled = true;
     try {
-      await api.put('/preferences', {
+      await savePreferences({
         currency: preset.currency,
         date_format: preset.date_format,
         time_format: preset.time_format,
@@ -284,6 +403,12 @@ function bindEvents(container, user) {
       if (timeSelect) timeSelect.value = preset.time_format;
       safeStorageSet('yuvomi-date-format', preset.date_format);
       safeStorageSet('yuvomi-time-format', preset.time_format);
+      applyNumberLocale({
+        region: regionSelect.value,
+        currency: preset.currency,
+        date_format: preset.date_format,
+        time_format: preset.time_format,
+      });
       window.dispatchEvent(new CustomEvent('date-format-changed', {
         detail: { dateFormat: preset.date_format },
       }));
@@ -291,6 +416,9 @@ function bindEvents(container, user) {
         detail: { timeFormat: preset.time_format },
       }));
       if (customBlock) customBlock.hidden = true;
+      // Scheitert das Nachladen, bleibt nur das Automatik-Label stale - kein
+      // Grund, den erfolgreichen Regionswechsel als Fehler zu melden.
+      await refreshDataLanguageOptions(container).catch(() => {});
       window.yuvomi?.showToast(t('settings.regionSaved'), 'success');
     } catch (error) {
       showError(errorElement, error.message);
@@ -309,10 +437,11 @@ function bindEvents(container, user) {
       await persistCurrencySelection(
         currencySelect,
         persistedCurrency,
-        () => api.put('/preferences', { currency: currencySelect.value }),
+        () => savePreferences({ currency: currencySelect.value }),
       );
       persistedCurrency = currencySelect.value;
       syncRegionSelect(container);
+      applyNumberLocale(readFormatState(container));
       window.yuvomi?.showToast(t('settings.currencySaved'), 'success');
     } catch (error) {
       showError(errorElement, error.message);
@@ -325,12 +454,13 @@ function bindEvents(container, user) {
     clearError(errorElement);
     dateFormatSelect.disabled = true;
     try {
-      await api.put('/preferences', { date_format: dateFormatSelect.value });
+      await savePreferences({ date_format: dateFormatSelect.value });
       safeStorageSet('yuvomi-date-format', dateFormatSelect.value);
       window.dispatchEvent(new CustomEvent('date-format-changed', {
         detail: { dateFormat: dateFormatSelect.value },
       }));
       syncRegionSelect(container);
+      applyNumberLocale(readFormatState(container));
       window.yuvomi?.showToast(t('settings.dateFormatSavedToast'), 'success');
     } catch (error) {
       showError(errorElement, error.message);
@@ -345,12 +475,13 @@ function bindEvents(container, user) {
     clearError(errorElement);
     timeFormatSelect.disabled = true;
     try {
-      await api.put('/preferences', { time_format: timeFormatSelect.value });
+      await savePreferences({ time_format: timeFormatSelect.value });
       safeStorageSet('yuvomi-time-format', timeFormatSelect.value);
       window.dispatchEvent(new CustomEvent('time-format-changed', {
         detail: { timeFormat: timeFormatSelect.value },
       }));
       syncRegionSelect(container);
+      applyNumberLocale(readFormatState(container));
       window.yuvomi?.showToast(t('settings.timeFormatSavedToast'), 'success');
     } catch (error) {
       showError(errorElement, error.message);
@@ -362,16 +493,19 @@ function bindEvents(container, user) {
 
 export async function render(container, { user }) {
   try {
-    const response = await api.get('/preferences');
+    const loaded = await getPreferences();
     const preferences = {
-      currency: response?.data?.currency || 'EUR',
-      date_format: response?.data?.date_format || 'dmy',
-      time_format: response?.data?.time_format || '24h',
-      region: response?.data?.region || null,
+      currency: loaded.currency || 'EUR',
+      date_format: loaded.date_format || 'dmy',
+      time_format: loaded.time_format || '24h',
+      region: loaded.region || null,
+      language: loaded.language || null,
+      language_auto: loaded.language_auto || 'en',
     };
 
     safeStorageSet('yuvomi-date-format', preferences.date_format);
     safeStorageSet('yuvomi-time-format', preferences.time_format);
+    applyNumberLocale(preferences);
     const isAdmin = user?.role === 'admin';
     renderPage(container, preferences, isAdmin);
     if (isAdmin) {

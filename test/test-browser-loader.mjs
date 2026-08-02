@@ -24,6 +24,15 @@ const STUBS = {
       logout: async () => ({ ok: true }),
       updateProfile: async () => ({ user: null }),
     };
+    export const mealie = {
+      listAccounts: async () => ({ data: [] }),
+      createAccount: async () => ({ data: null }),
+      updateAccount: async () => ({ data: null }),
+      deleteAccount: async () => ({ data: null }),
+      testAccount: async () => ({ data: null }),
+      syncAccount: async () => ({ data: null }),
+      getStatus: async () => ({ data: [] }),
+    };
   `,
   '/i18n.js': `
     export const t = (key, values = {}) => {
@@ -33,9 +42,14 @@ const STUBS = {
     export const initI18n = async () => {};
     export const setLocale = async () => {};
     export const getLocale = () => 'de';
+    export const getFormatLocale = () => 'de';
+    export const getNumberFormat = (options = {}) => new Intl.NumberFormat('de', options);
     export const getSupportedLocales = () => ['de', 'en'];
     export const formatDate = (d) => String(d);
+    export const formatDayMonth = (d) => String(d);
     export const formatTime = (d) => String(d);
+    export const getTimeFormat = () => '24h';
+    export const timeSuffix = () => '';
     export const dateInputPlaceholder = () => 'YYYY-MM-DD';
     export const formatDateInput = (d) => String(d ?? '');
     export const parseDateInput = (d) => String(d ?? '');
@@ -48,6 +62,8 @@ const STUBS = {
     export const renderRRuleFields = () => '';
     export const bindRRuleEvents = () => {};
     export const getRRuleValues = () => ({});
+    export const describeRRule = () => '';
+    export const recurrenceRow = () => ({ icon: 'repeat', label: '', value: '' });
   `,
   '/components/modal.js': `
     export const openModal = () => {};
@@ -55,9 +71,25 @@ const STUBS = {
     export const confirmModal = async () => true;
     export const selectModal = async () => null;
     export const advancedSection = (inner = '') => String(inner);
+    export const wireBlurValidation = () => {};
+    export const reportFieldError = () => false;
+    export const mountFooter = () => null;
+    export const refreshDirtySnapshot = () => {};
+    export const focusFirstField = () => null;
+    export const updateHeaderAction = () => null;
+  `,
+  '/components/detail-view.js': `
+    export const openDetailView = () => ({ update: () => true, isOpen: () => true });
+    export const closeDetailView = () => {};
+    export const detailRowEl = () => null;
+    export const visibilityRow = () => ({ icon: 'users', label: '', value: '' });
+    export const assignedRow = () => ({ icon: 'user', label: '', value: '' });
   `,
   '/utils/ux.js': `
     export const stagger = () => {};
+    export const vibrate = () => {};
+    export const wireScrollFade = () => ({ update: () => {}, destroy: () => {} });
+    export const scheduleUndoableDelete = () => {};
   `,
   '/utils/html.js': `
     export const esc = (value) => String(value ?? '')
@@ -84,6 +116,7 @@ const STUBS = {
   `,
   '/utils/kitchen-tabs.js': `
     export const renderKitchenTabsBar = () => {};
+    export const refreshKitchenBadges = () => {};
   `,
   '/utils/pwa-install.js': `
     export const getPwaInstallState = () => ({

@@ -6,6 +6,7 @@
 import { email } from '/api.js';
 import { t } from '/i18n.js';
 import { esc } from '/utils/html.js';
+import { createInlineError } from '/settings/components.js';
 
 const DEFAULTS = {
   host: '', port: 587, secure: 'starttls', user: '',
@@ -24,8 +25,8 @@ export async function render(container, { user } = {}) {
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
     <section class="settings-section">
-      <h2 class="settings-section__title">${esc(t('settings.pageEmail'))}</h2>
       <div class="settings-card">
+        <p class="form-hint">${esc(t('email.purposeHint'))}</p>
         <form class="settings-form" id="email-form" novalidate>
           <div class="form-group">
             <label class="label" for="email-host">${esc(t('email.host'))}</label>
@@ -62,7 +63,7 @@ export async function render(container, { user } = {}) {
             <label class="label" for="email-fromname">${esc(t('email.fromName'))}</label>
             <input class="input" id="email-fromname" name="fromName" value="${esc(cfg.fromName)}" />
           </div>
-          <div class="settings-notice" id="email-notice" role="status" aria-live="polite" hidden></div>
+          <div id="email-notice"></div>
           <div class="settings-form-actions">
             <button type="submit" class="btn btn--primary" id="email-save">${esc(t('email.save'))}</button>
             <button type="button" class="btn btn--secondary" id="email-test">${esc(t('email.test'))}</button>
@@ -78,7 +79,16 @@ export async function render(container, { user } = {}) {
   const saveBtn = container.querySelector('#email-save');
   const testBtn = container.querySelector('#email-test');
 
-  const show = (msg) => { notice.textContent = msg; notice.hidden = false; };
+  // Vorher trug dieses Feld die Klasse `settings-notice`, die in
+  // `public/styles/` nie existiert hat: für Screenreader ein `role="status"`,
+  // für Sehende ein nackter Textknoten mitten im Formular (Critique
+  // 2026-07-27). Erfolg meldet jetzt der Toast wie in jedem anderen Blatt,
+  // Fehler bleiben als `createInlineError` am Formular stehen.
+  const showError = (msg) => notice.replaceChildren(createInlineError(msg));
+  const showSuccess = (msg) => {
+    notice.replaceChildren();
+    window.yuvomi?.showToast(msg, 'success');
+  };
 
   function collect() {
     const body = {
@@ -100,9 +110,10 @@ export async function render(container, { user } = {}) {
     try {
       await email.saveConfig(collect());
       form.pass.value = '';
-      show(t('email.saved'));
-    } catch (_) {
-      show(t('email.testFailed', { error: '' }));
+      showSuccess(t('email.saved'));
+    } catch (error) {
+      // Eigener Key: hier ist nichts getestet worden, nur gespeichert.
+      showError(t('email.saveFailed', { error: error?.message || t('common.errorGeneric') }));
     } finally {
       saveBtn.disabled = false;
     }
@@ -113,9 +124,10 @@ export async function render(container, { user } = {}) {
     try {
       await email.saveConfig(collect()); // persist before testing
       const res = (await email.test())?.data;
-      show(res?.ok ? t('email.testSuccess') : t('email.testFailed', { error: res?.error || '' }));
-    } catch (_) {
-      show(t('email.testFailed', { error: '' }));
+      if (res?.ok) showSuccess(t('email.testSuccess'));
+      else showError(t('email.testFailed', { error: res?.error || t('common.errorGeneric') }));
+    } catch (error) {
+      showError(t('email.testFailed', { error: error?.message || t('common.errorGeneric') }));
     } finally {
       testBtn.disabled = false;
     }

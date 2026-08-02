@@ -41,7 +41,9 @@ function freshDb() {
       recurrence_virtual     INTEGER NOT NULL DEFAULT 0,
       recurrence_full_amount REAL,
       created_by             INTEGER NOT NULL,
-      created_at             TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      created_at             TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      owner_id               INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      visibility             TEXT    NOT NULL DEFAULT 'shared' CHECK (visibility IN ('private', 'shared'))
     );
     CREATE TABLE budget_recurrence_skipped (
       parent_id INTEGER NOT NULL REFERENCES budget_entries(id) ON DELETE CASCADE,

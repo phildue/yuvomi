@@ -1,18 +1,65 @@
 .subscriptions-page {
-  --module-accent: var(--color-accent);
+  /* Sub-Domain erbt den Parent-Akzent (DESIGN.md §2): Abos leben unter Budget
+   * und tragen Teal - nicht das globale Violett (Akzentregel „Modul-Akzent führt"). */
+  --module-accent: var(--module-budget);
   min-height: 100%;
-  padding: var(--page-gutter);
+  /* Achsen getrennt: --page-gutter steigt ab 1024px auf --space-8 (Issue #577).
+   * Als Shorthand hätte das auch den vertikalen Rand mit verdoppelt, was mit der
+   * Kopf-Fluchtlinie nichts zu tun hat. */
+  padding-block: var(--space-4);
+  padding-inline: var(--page-gutter);
   background:
-    linear-gradient(180deg, color-mix(in srgb, var(--color-accent) 9%, transparent), transparent 280px),
+    linear-gradient(180deg, color-mix(in srgb, var(--module-accent) 9%, transparent), transparent 280px),
     var(--color-bg);
+}
+
+/* Eingebettet als Budget-Tab: Seitenfläche und Rand gehören dem Panel, nicht
+ * dem Sub-Page-Wrapper. Der eigene Gradient lief sonst als getönte Vollbreiten-
+ * Bahn innerhalb der Budget-Seite und brach an deren Container-Kante ab - beim
+ * Tabwechsel registrierte das Auge einen Ortswechsel, den die Navigation nicht
+ * angekündigt hatte (Critique 2026-07-30). Gleiches Muster in split-expenses.css. */
+.budget-page .subscriptions-page {
+  background: none;
+  padding-block: 0;
+  padding-inline: 0;
+  min-height: 0;
 }
 
 .subscriptions-toolbar {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) repeat(4, minmax(130px, auto)) auto auto;
+  /* Suche · 4 beschriftete Filter · Zurücksetzen · 2 Icon-Aktionen */
+  grid-template-columns: minmax(220px, 1fr) repeat(4, minmax(130px, auto)) auto auto auto;
   gap: var(--space-2);
-  align-items: center;
+  /* An der Unterkante ausrichten: die Filterfelder tragen jetzt eine Labelzeile
+   * über dem Select, die Suche nicht — sonst stünden die Eingaben versetzt. */
+  align-items: end;
   margin-bottom: var(--space-3);
+}
+
+/* Sichtbares Label statt reinem aria-label: vier gleich aussehende Selects sind
+ * ohne Beschriftung nicht auseinanderzuhalten, sobald ein Wert gewählt ist. */
+.subscriptions-filter-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.subscriptions-filter-field__label {
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.subscriptions-filter-reset {
+  min-height: var(--target-base);
+  white-space: nowrap;
+}
+
+/* Desktop: Wrapper ist transparent — die beiden Icon-Buttons bleiben direkte
+ * Grid-Items in den letzten zwei auto-Spalten. */
+.subscriptions-toolbar__actions {
+  display: contents;
 }
 
 .subscriptions-search {
@@ -34,7 +81,9 @@
   padding: 0 var(--space-3) 0 calc(var(--space-3) + 26px);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
-  background: var(--glass-bg-card);
+  /* Eingabefelder sind opak: Glass auf einem Feld, in das getippt wird, lässt
+   * den Text über den durchscheinenden Untergrund laufen (DESIGN.md §6). */
+  background: var(--color-surface);
   color: var(--color-text);
   /* Drop WebKit's native type=search magnifier; the explicit leading icon is
    * the only magnifier this field should show. */
@@ -60,56 +109,26 @@
   margin: 0;
 }
 
-.subscriptions-summary {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: var(--space-2);
-  margin-bottom: var(--space-3);
-}
+/* Die Kennzahl-Zeile ist .budget-summary (budget.css) mit --summary-cards: 4.
+ * Die frühere eigene .subscriptions-summary-card war die zweite von fünf
+ * Kartenbauarten im selben Modul (Critique 2026-07-30, P0) - sie ist ersatzlos
+ * entfallen, das Markup trägt jetzt .budget-summary-card. */
 
-.subscriptions-summary-card,
+/* Arbeitsflächen sind opak, auch hier: Glass bleibt Overlays und Modals
+ * vorbehalten (Begründung an .budget-summary-card in budget.css). Diese Datei
+ * setzte auf denselben Rollen --glass-bg-card und widersprach damit der Regel
+ * innerhalb des eigenen Moduls. */
 .subscriptions-chart,
 .subscriptions-list-section {
-  border: 1px solid var(--glass-border-subtle);
+  border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-glass-card);
-  background: var(--glass-bg-card);
-  box-shadow: var(--glass-shadow-sm);
+  background-color: var(--color-surface);
+  box-shadow: var(--shadow-sm);
 }
 
-.subscriptions-summary-card {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-3);
-}
-
-.subscriptions-summary-card > span,
-.subscriptions-summary-card small {
-  color: var(--color-text-secondary);
-}
-
-.subscriptions-summary-card strong {
-  font-size: var(--text-lg);
-}
-
-.subscriptions-summary-card--danger strong {
-  color: var(--color-danger);
-}
-
-.subscriptions-budget-progress {
-  height: 7px;
-  margin-top: var(--space-2);
-  overflow: hidden;
-  border-radius: 999px;
-  background: var(--color-surface-3);
-}
-
-.subscriptions-budget-progress span {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: var(--color-accent);
-}
+/* .subscriptions-budget-progress ist entfallen: der Balken in der Kennzahlkarte
+ * ist jetzt .budget-summary-card__progress (budget.css) und färbt sich bei
+ * Überschreitung um, statt stumm bei voller Breite stehen zu bleiben. */
 
 .subscriptions-analytics {
   display: grid;
@@ -148,12 +167,12 @@
 }
 
 .subscriptions-area-chart polygon {
-  fill: color-mix(in srgb, var(--color-accent) 18%, transparent);
+  fill: color-mix(in srgb, var(--module-accent) 18%, transparent);
 }
 
 .subscriptions-area-chart polyline {
   fill: none;
-  stroke: var(--color-accent);
+  stroke: var(--module-accent);
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 2.5;
@@ -225,7 +244,7 @@
 .subscriptions-chart-row > div {
   height: 8px;
   overflow: hidden;
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   background: var(--color-surface-3);
 }
 
@@ -233,7 +252,7 @@
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: var(--color-accent);
+  background: var(--module-accent);
 }
 
 .subscriptions-list-section {
@@ -283,15 +302,23 @@
   opacity: 0.62;
 }
 
+/* Monogramm: die Marke trägt Fläche und Rahmen, die Schrift kommt aus dem
+ * Text-Token. Vorher kamen Vorder- und Hintergrund aus DERSELBEN Markenfarbe
+ * (Vollton auf aufgehelltem Ton desselben Tons) — damit hing das Kontrast-
+ * verhältnis vollständig an der Datenlage: gemessen 10 AA-Verstöße über 7 Marken
+ * im Seed, bis hinunter auf 1.83:1 (Critique 2026-07-30, P1). Jede helle oder
+ * gesättigte Marke (Amazon-Orange, Spotify-Grün) fiel automatisch durch, und
+ * kein Nutzer konnte das umgehen, außer indem er die Markenfarbe änderte. */
 .subscription-card__brand {
   display: grid;
   width: 40px;
   height: 40px;
   place-items: center;
   overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--subscription-color) 45%, transparent);
   border-radius: var(--radius-md);
   background: color-mix(in srgb, var(--subscription-color) 16%, var(--color-surface));
-  color: var(--subscription-color);
+  color: var(--color-text-primary);
   font-weight: var(--font-weight-bold);
 }
 
@@ -322,7 +349,7 @@
 .subscription-status {
   align-self: flex-start;
   padding: 2px var(--space-2);
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   background: var(--color-surface-3);
   color: var(--color-text-secondary);
   font-size: var(--text-xs);
@@ -331,6 +358,16 @@
 .subscription-status--active {
   background: var(--color-success-light);
   color: var(--color-success);
+}
+
+/* Abgeschlossen (#594): abgesetzt vom Pausiert-Grau über den Modul-Akzent. */
+.subscription-card--completed {
+  opacity: 0.78;
+}
+
+.subscription-status--completed {
+  background: color-mix(in srgb, var(--module-accent) 16%, var(--color-surface));
+  color: color-mix(in srgb, var(--module-accent) 72%, var(--color-text-primary));
 }
 
 .subscription-card__meta {
@@ -574,8 +611,15 @@
 .subscriptions-combobox__options button:focus,
 .subscriptions-combobox__options button[aria-selected="true"] {
   outline: none;
-  background: var(--color-accent-light);
-  color: var(--color-accent);
+  background: color-mix(in srgb, var(--module-accent) 12%, transparent);
+  color: color-mix(in srgb, var(--module-accent, var(--color-accent)) 70%, var(--color-text-primary));
+}
+
+/* Tastatur-Fokus zusätzlich mit Inset-Ring markieren (Audit F-16): die reine
+ * Flächenfarbe unterscheidet Fokus nicht von Hover/aria-selected. */
+.subscriptions-combobox__options button:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset-inset);
 }
 
 .subscriptions-enabled-row > div {
@@ -674,8 +718,8 @@
 .subscriptions-logo-option:hover,
 .subscriptions-logo-option:focus-visible {
   outline: none;
-  border-color: var(--color-accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 18%, transparent);
+  border-color: var(--module-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--module-accent) 18%, transparent);
 }
 
 .subscriptions-logo-option img {
@@ -694,7 +738,10 @@
 
 .subscriptions-metadata {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* auto-fit: zwei Spalten nur, wenn jede breit genug für Name + vier Icon-Buttons
+   * ist (>= 24rem), sonst eine Spalte. Verhindert das Quetschen im schmalen Modal
+   * auf Tablet/Phone; min(100%, ...) schützt vor Overflow unter 24rem. */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 24rem), 1fr));
   gap: var(--space-4);
 }
 
@@ -707,17 +754,61 @@
 }
 
 .subscriptions-metadata li {
-  display: grid;
-  grid-template-columns: auto 1fr auto auto;
-  gap: var(--space-2);
-  align-items: center;
   min-height: 44px;
   padding: var(--space-1) var(--space-2);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
 }
 
-.subscriptions-metadata li > i {
+.subscriptions-metadata-row__view {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 36px;
+}
+
+/* Name behält Vorrang; die vier Icon-Buttons rutschen bei Enge (schmales
+ * Mobile) in die nächste Zeile, statt den Namen auf wenige Zeichen zu quetschen. */
+.subscriptions-metadata-row__view > span {
+  flex: 1 1 7rem;
+  min-width: 0;
+}
+
+.subscriptions-metadata-row__view .subscriptions-metadata-row__actions {
+  margin-left: auto;
+}
+
+.subscriptions-metadata-row__edit {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  min-height: 36px;
+}
+
+/* [hidden] hat gegenüber den display-Klassen zu geringe Spezifität - explizit übersteuern. */
+.subscriptions-metadata-row__view[hidden],
+.subscriptions-metadata-row__edit[hidden] {
+  display: none;
+}
+
+.subscriptions-metadata-edit-name {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.subscriptions-metadata-row__edit .form-input--color {
+  width: 44px;
+  flex: 0 0 44px;
+  padding: 2px;
+}
+
+.subscriptions-metadata-row__actions {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.subscriptions-metadata-row__view > i {
   width: 16px;
   height: 16px;
   border-radius: 50%;
@@ -773,9 +864,23 @@
     grid-column: 1 / -1;
   }
 
-  .subscriptions-summary {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* Dritte Zeile: Zurücksetzen links, die beiden Icon-Aktionen rechts in ihrer
+   * natürlichen Breite — als Grid-Items würden sie sich sonst über je eine
+   * volle Spalte spannen und als überbreite leere Pillen erscheinen. */
+  .subscriptions-filter-reset {
+    grid-column: 1 / 3;
+    justify-self: start;
   }
+
+  .subscriptions-toolbar__actions {
+    display: flex;
+    gap: var(--space-2);
+    grid-column: 3 / -1;
+    justify-content: flex-end;
+  }
+
+  /* Der Umbruch der Kennzahl-Zeile liegt jetzt an .budget-summary--quad
+     (budget.css) als Container-Query. */
 
   .subscriptions-analytics {
     grid-template-columns: 1fr;
@@ -797,10 +902,13 @@
   }
 
   .subscriptions-toolbar,
-  .subscriptions-summary,
   .subscriptions-metadata {
     grid-template-columns: 1fr;
   }
+
+  /* Kennzahlen bleiben zweispaltig (kompakte Bento-Dichte statt vier
+   * vollbreiter Einzelwert-Karten, Audit F5) - jetzt über
+   * .budget-summary--quad in budget.css. */
 
   .subscriptions-notifications li {
     grid-template-columns: auto minmax(0, 1fr) auto;
@@ -810,8 +918,15 @@
     grid-column: span 1;
   }
 
-  .subscriptions-toolbar .btn--icon {
-    width: 100%;
+  /* Mobile: die beiden Aktions-Icons teilen sich eine kompakte Zeile statt je
+   * eine vollbreite leere Pille zu bilden (Audit F8). */
+  .subscriptions-toolbar__actions {
+    display: flex;
+    gap: var(--space-2);
+  }
+
+  .subscriptions-toolbar__actions .btn--icon {
+    flex: 1;
   }
 
   .subscription-card {

@@ -3,9 +3,9 @@ import { getLocale } from '/i18n.js';
 // Haushaltweite Währungsauswahl. Muss exakt mit VALID_CURRENCIES in
 // server/routes/preferences.js übereinstimmen (per Test abgesichert).
 export const SUPPORTED_CURRENCIES = [
-  'AED', 'AUD', 'BRL', 'CAD', 'CHF', 'CNY', 'CZK', 'DKK', 'EUR', 'GBP', 'HUF',
-  'IDR', 'INR', 'IRR', 'JPY', 'KRW', 'KZT', 'NOK', 'PLN', 'RUB', 'SAR', 'SEK',
-  'TRY', 'UAH', 'USD', 'ZAR',
+  'AED', 'AUD', 'BRL', 'CAD', 'CHF', 'CLP', 'CNY', 'CZK', 'DKK', 'EUR', 'GBP',
+  'HUF', 'IDR', 'INR', 'IRR', 'JPY', 'KRW', 'KZT', 'MYR', 'NOK', 'PLN', 'RUB', 'SAR',
+  'SEK', 'TRY', 'UAH', 'USD', 'ZAR',
 ];
 
 export async function persistCurrencySelection(select, previousCurrency, save) {

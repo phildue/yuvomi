@@ -6,8 +6,9 @@
  */
 import { api } from '/api.js';
 import { t } from '/i18n.js';
-import { openModal, closeModal, confirmModal } from '/components/modal.js';
+import { openModal, closeModal, reportFieldError } from '/components/modal.js';
 import { vibrate } from '/utils/ux.js';
+import { renderSkeletonList } from '/utils/skeleton.js';
 
 const view = { month: '', data: null, error: false, ctx: null, root: null };
 
@@ -23,6 +24,11 @@ function fmt(v) { return view.ctx.formatAmount(v); }
 
 async function load() {
   const body = view.root.querySelector('#budget-plan-body');
+  // Gleiche Ladewahrnehmung wie im Budget-Tab statt leerer Fläche.
+  if (body) {
+    body.replaceChildren();
+    body.insertAdjacentHTML('beforeend', renderSkeletonList({ rows: 4, lines: 2 }));
+  }
   try {
     const res = await api.get(`/budget/plans?month=${view.month}`);
     view.data = res.data;
@@ -182,7 +188,9 @@ function openAddPlan() {
   const planned = new Set((view.data?.plans || []).map((p) => p.category));
   const options = (view.ctx.expenseCategories || []).filter((c) => !planned.has(c.key));
   if (!options.length) {
-    window.yuvomi?.showToast(t('budget.planAllCategoriesBudgeted'), 'info');
+    // 'info' ist kein gestylter Toast-Typ (es gibt nur success/danger/warning) —
+    // der Aufruf landete stumm im Default-Stil. Neutrale Meldung, also 'default'.
+    window.yuvomi?.showToast(t('budget.planAllCategoriesBudgeted'), 'default');
     return;
   }
   const optHtml = options.map((c) =>
@@ -195,7 +203,7 @@ function openAddPlan() {
         <select class="form-input" id="plan-category">${optHtml}</select>
       </div>
       ${amountFieldHtml('')}
-      <div class="modal-panel__footer" style="border:none;padding:0;margin-top:var(--space-4)">
+      <div class="modal-panel__footer modal-panel__footer--plain">
         <div></div>
         <div style="display:flex;gap:var(--space-3)">
           <button class="btn btn--secondary" data-action="close-modal">${t('common.cancel')}</button>
@@ -223,7 +231,7 @@ function openPlanEditor({ category, savings = false }) {
     content: `
       ${savings ? `<p class="form-hint" style="margin-bottom:var(--space-3)">${t('budget.planSavingsHint')}</p>` : ''}
       ${amountFieldHtml(hasCurrent ? current : '')}
-      <div class="modal-panel__footer" style="border:none;padding:0;margin-top:var(--space-4)">
+      <div class="modal-panel__footer modal-panel__footer--plain">
         ${hasCurrent ? `<button class="btn btn--danger btn--icon" id="plan-delete" aria-label="${t('common.delete')}">
           <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>
         </button>` : '<div></div>'}
@@ -241,7 +249,7 @@ function openPlanEditor({ category, savings = false }) {
         const btn = e.currentTarget;
         if (btn.disabled) return;        // Doppel-Klick-Schutz gegen doppeltes DELETE
         btn.disabled = true;
-        confirmDelete(category, savings, title).finally(() => { btn.disabled = false; });
+        deletePlan(category).finally(() => { btn.disabled = false; });
       });
       bindEnter(panel, () => savePlan(panel, category));
     },
@@ -267,7 +275,8 @@ async function savePlan(panel, category) {
   const raw = panel.querySelector('#plan-amount').value;
   const amount = parseFloat(raw);
   if (isNaN(amount) || amount <= 0) {
-    window.yuvomi?.showToast(t('budget.validAmountRequired'), 'error');
+    // Fehler am Feld statt als ortloser Toast (geteiltes Muster, Critique P1).
+    reportFieldError(panel.querySelector('#plan-amount'), t('budget.validAmountRequired'));
     return;
   }
   const btn = panel.querySelector('#plan-save');
@@ -281,28 +290,35 @@ async function savePlan(panel, category) {
   } catch (err) {
     console.error('[Budget] plan save error:', err);
     btn.disabled = false;
-    window.yuvomi?.showToast(t('budget.loadError'), 'error');
+    window.yuvomi?.showToast(t('budget.loadError'), 'danger');
   }
 }
 
-// Löschen erst nach Standard-Bestätigung (destruktiv, kein Undo).
-async function confirmDelete(category, savings, title) {
-  const message = savings
-    ? t('budget.planSavingsDeleteConfirm')
-    : t('budget.planDeleteConfirm', { category: title });
-  const ok = await confirmModal(message, { confirmLabel: t('common.delete'), danger: true });
-  if (ok) await deletePlan(category);
-}
-
+// Löschen mit Undo statt Bestätigungsdialog: ein Plan ist eine Zahl, kein Datum
+// mit Verlauf — er ist in zwei Klicks wieder gesetzt und reißt nichts mit sich.
+// Damit folgt der Plan-Tab demselben Modell wie Einträge, Darlehen und Raten;
+// eine Vorab-Bestätigung bleibt nur, wo Löschen kaskadiert (Konten).
 async function deletePlan(category) {
+  const previous = category === '__savings__'
+    ? view.data?.savings?.planned
+    : view.data?.plans?.find((p) => p.category === category)?.planned;
   try {
     await api.delete(`/budget/plans/${encodeURIComponent(category)}`);
     vibrate(10);
     closeModal({ force: true });
     await load();
-    window.yuvomi?.showToast(t('budget.planRemovedToast'), 'success');
+    window.yuvomi?.showToast(t('budget.planRemovedToast'), 'default', 5000, async () => {
+      if (previous == null) return;
+      try {
+        await api.put(`/budget/plans/${encodeURIComponent(category)}`, { amount: previous });
+        await load();
+      } catch (err) {
+        console.error('[Budget] plan restore error:', err);
+        window.yuvomi?.showToast(t('common.unknownError'), 'danger');
+      }
+    });
   } catch (err) {
     console.error('[Budget] plan delete error:', err);
-    window.yuvomi?.showToast(t('budget.loadError'), 'error');
+    window.yuvomi?.showToast(t('budget.loadError'), 'danger');
   }
 }

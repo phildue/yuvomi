@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 
 let scenarioCounter = 0;
 

@@ -7,7 +7,6 @@ export const SETTINGS_DOMAINS = freezeEntries([
   { id: 'personal', labelKey: 'settings.domainPersonal', icon: 'user', adminOnly: false },
   { id: 'modules', labelKey: 'settings.domainModules', icon: 'layout-grid', adminOnly: true },
   { id: 'sync', labelKey: 'settings.domainSync', icon: 'refresh-cw', adminOnly: true },
-  { id: 'documents', labelKey: 'settings.domainDocuments', icon: 'files', adminOnly: true },
   { id: 'admin', labelKey: 'settings.domainAdministration', icon: 'shield', adminOnly: true },
 ]);
 
@@ -53,6 +52,20 @@ export const SETTINGS_LEAVES = freezeEntries([
     loader: () => import('/settings/pages/notifications.js'),
   },
   {
+    // `calendar_default_reminders` und `calendar_default_assign_me` schreiben
+    // per `cfgUserSet` pro Nutzer, lagen aber im adminOnly-`modules-calendar`
+    // (Critique 2026-07-27). Wochenstart, Standarddauer und Feiertage bleiben
+    // dort: die gelten haushaltweit.
+    id: 'personal-calendar',
+    domainId: 'personal',
+    path: '/settings/personal/calendar',
+    labelKey: 'settings.pageCalendarDefaults',
+    descriptionKey: 'settings.pageCalendarDefaultsDescription',
+    icon: 'calendar-clock',
+    adminOnly: false,
+    loader: () => import('/settings/pages/personal-calendar.js'),
+  },
+  {
     id: 'personal-weather',
     domainId: 'personal',
     path: '/settings/personal/weather',
@@ -63,13 +76,17 @@ export const SETTINGS_LEAVES = freezeEntries([
     loader: () => import('/settings/pages/personal-weather.js'),
   },
   {
+    // Reihenfolge und Mobil-Slots sind per-user (cfgUserSet, kein Admin-Check in
+    // server/routes/preferences.js). Das Blatt lag trotzdem hinter adminOnly, also
+    // konnten 5 von 6 Familienmitgliedern ihre eigene Navigation nicht einstellen
+    // (Critique 2026-07-27). Die haushaltweiten Schalter sind im Blatt gegated.
     id: 'modules-navigation',
-    domainId: 'modules',
-    path: '/settings/modules/navigation',
+    domainId: 'personal',
+    path: '/settings/personal/navigation',
     labelKey: 'settings.pageNavigation',
     descriptionKey: 'settings.pageNavigationDescription',
     icon: 'panel-left',
-    adminOnly: true,
+    adminOnly: false,
     loader: () => import('/settings/pages/modules-navigation.js'),
   },
   {
@@ -93,24 +110,17 @@ export const SETTINGS_LEAVES = freezeEntries([
     loader: () => import('/settings/pages/modules-calendar.js'),
   },
   {
-    id: 'modules-budget',
+    // Budget, Gesundheit und Haushaltshilfe hatten je ein eigenes Blatt für je
+    // eine Checkbox - drei Sidebar-Einträge und drei Requests für drei Schalter
+    // (Critique 2026-07-27).
+    id: 'modules-options',
     domainId: 'modules',
-    path: '/settings/modules/budget',
-    labelKey: 'settings.pageBudgetModule',
-    descriptionKey: 'settings.pageBudgetModuleDescription',
-    icon: 'wallet',
+    path: '/settings/modules/options',
+    labelKey: 'settings.pageModuleOptions',
+    descriptionKey: 'settings.pageModuleOptionsDescription',
+    icon: 'sliders-horizontal',
     adminOnly: true,
-    loader: () => import('/settings/pages/modules-budget.js'),
-  },
-  {
-    id: 'modules-housekeeping',
-    domainId: 'modules',
-    path: '/settings/modules/housekeeping',
-    labelKey: 'settings.pageHousekeepingModule',
-    descriptionKey: 'settings.pageHousekeepingModuleDescription',
-    icon: 'sparkles',
-    adminOnly: true,
-    loader: () => import('/settings/pages/modules-housekeeping.js'),
+    loader: () => import('/settings/pages/modules-options.js'),
   },
   {
     id: 'modules-rewards',
@@ -121,26 +131,6 @@ export const SETTINGS_LEAVES = freezeEntries([
     icon: 'award',
     adminOnly: true,
     loader: () => import('/settings/pages/modules-rewards.js'),
-  },
-  {
-    id: 'modules-health',
-    domainId: 'modules',
-    path: '/settings/modules/health',
-    labelKey: 'settings.pageHealthModule',
-    descriptionKey: 'settings.pageHealthModuleDescription',
-    icon: 'heart-pulse',
-    adminOnly: true,
-    loader: () => import('/settings/pages/modules-health.js'),
-  },
-  {
-    id: 'modules-dashboard',
-    domainId: 'modules',
-    path: '/settings/modules/dashboard',
-    labelKey: 'settings.pageDashboardApp',
-    descriptionKey: 'settings.pageDashboardAppDescription',
-    icon: 'layout-dashboard',
-    adminOnly: true,
-    loader: () => import('/settings/pages/modules-dashboard.js'),
   },
   {
     id: 'sync-calendar',
@@ -173,9 +163,12 @@ export const SETTINGS_LEAVES = freezeEntries([
     loader: () => import('/settings/pages/sync-reminders.js'),
   },
   {
+    // Dateiname und ID bleiben `documents-*`: interne Bezeichner, die sonst den
+    // sw.js-Precache und zwei Test-Dateien mitziehen. Nutzersichtbar ist die
+    // Domäne, und externe Dienste anzubinden ist Synchronisation.
     id: 'documents-storage',
-    domainId: 'documents',
-    path: '/settings/documents/storage',
+    domainId: 'sync',
+    path: '/settings/sync/storage',
     labelKey: 'settings.pageDocumentStorage',
     descriptionKey: 'settings.pageDocumentStorageDescription',
     icon: 'hard-drive',
@@ -184,8 +177,8 @@ export const SETTINGS_LEAVES = freezeEntries([
   },
   {
     id: 'documents-dms',
-    domainId: 'documents',
-    path: '/settings/documents/dms',
+    domainId: 'sync',
+    path: '/settings/sync/dms',
     labelKey: 'settings.pageDocumentDms',
     descriptionKey: 'settings.pageDocumentDmsDescription',
     icon: 'archive',
@@ -211,6 +204,20 @@ export const SETTINGS_LEAVES = freezeEntries([
     icon: 'shield-check',
     adminOnly: true,
     loader: () => import('/settings/pages/admin-permissions.js'),
+  },
+  {
+    // Der Haushalts-Standardstandort lag als "Übersicht" in `modules` und trug
+    // dort keine einzige Widget-Einstellung (Critique 2026-07-27). Er ist eine
+    // haushaltweite Ressource, also Administration - das Gegenstück je Mitglied
+    // ist `personal-weather`.
+    id: 'admin-weather',
+    domainId: 'admin',
+    path: '/settings/admin/weather',
+    labelKey: 'settings.pageHouseholdWeather',
+    descriptionKey: 'settings.pageHouseholdWeatherDescription',
+    icon: 'cloud-sun',
+    adminOnly: true,
+    loader: () => import('/settings/pages/admin-weather.js'),
   },
   {
     id: 'admin-api',
@@ -258,6 +265,7 @@ const LEGACY_SETTINGS_PATHS = Object.freeze({
   general: '/settings/personal/appearance',
   meals: '/settings/modules/kitchen',
   budget: '/settings/modules/budget',
+  // Kategorienpflege lebt bewusst im Modul, neben ihren Daten.
   shopping: '/shopping?manage=categories',
   calendar: '/settings/modules/calendar',
   sync: '/settings/sync/calendar',
@@ -267,13 +275,47 @@ const LEGACY_SETTINGS_PATHS = Object.freeze({
   backup: '/settings/admin/backup',
 });
 
+/**
+ * Blatt-Pfade, die ein IA-Umbau verschoben hat. Ohne diese Tabelle landen alte
+ * Bookmarks und gespeicherte sessionStorage-Ziele stumm auf `personal/account`
+ * statt am umbenannten Blatt.
+ */
+const RENAMED_SETTINGS_PATHS = Object.freeze({
+  // Domäne `documents` aufgelöst: beide Blätter binden externe Dienste an und
+  // gehören damit zu Synchronisation (Critique 2026-07-27).
+  '/settings/documents/storage': '/settings/sync/storage',
+  '/settings/documents/dms': '/settings/sync/dms',
+  // Navigation ist überwiegend eine persönliche Einstellung, siehe Leaf-Kommentar.
+  '/settings/modules/navigation': '/settings/personal/navigation',
+  // `modules-dashboard` aufgelöst: der Anwendungsname sitzt jetzt bei den
+  // Systemangaben, der Haushalts-Standardstandort in einem eigenen Blatt.
+  '/settings/modules/dashboard': '/settings/admin/weather',
+  // Drei Blätter für drei Checkboxen zu einem zusammengelegt.
+  '/settings/modules/budget': '/settings/modules/options',
+  '/settings/modules/health': '/settings/modules/options',
+  '/settings/modules/housekeeping': '/settings/modules/options',
+});
+
 export function filterSettingsDomains(user) {
   const isAdmin = user?.role === 'admin';
   return SETTINGS_DOMAINS.filter((domain) => isAdmin || !domain.adminOnly);
 }
 
+/**
+ * Die verschobenen Alt-Pfade. Der Router muss sie als Routen kennen, sonst
+ * matcht ein direkter Aufruf (Bookmark, geteilter Link) überhaupt nichts und
+ * die Umleitung unten käme nie zum Zug.
+ */
+export const RENAMED_SETTINGS_SOURCE_PATHS = Object.freeze(Object.keys(RENAMED_SETTINGS_PATHS));
+
+/** Löst einen verschobenen Pfad auf seinen aktuellen auf; sonst unverändert. */
+export function currentSettingsPath(path) {
+  return RENAMED_SETTINGS_PATHS[path] ?? path;
+}
+
 export function findSettingsLeaf(path, user) {
-  const leaf = SETTINGS_LEAVES.find((entry) => entry.path === path);
+  const target = currentSettingsPath(path);
+  const leaf = SETTINGS_LEAVES.find((entry) => entry.path === target);
   if (!leaf || (leaf.adminOnly && user?.role !== 'admin')) return null;
   return leaf;
 }
@@ -290,12 +332,19 @@ export function resolveSettingsDestination(path, user, storedPath) {
 }
 
 export function migrateLegacySettingsTab(value) {
-  return LEGACY_SETTINGS_PATHS[value] ?? null;
+  const legacy = LEGACY_SETTINGS_PATHS[value];
+  // Die Tabelle bleibt historisch (Tab-Name -> Blatt von damals); dass ein Blatt
+  // seither weitergezogen ist, weiß nur `currentSettingsPath`. Ohne diesen
+  // Durchlauf käme ein Alt-Tab am Zwischenstand von 2026-06 an.
+  return legacy ? currentSettingsPath(legacy) : null;
 }
 
 export function readStoredSettingsDestination(user, storage = sessionStorage) {
   const current = storage.getItem(SETTINGS_STORAGE_KEY);
-  if (findSettingsLeaf(current, user)) return current;
+  // Den kanonischen Pfad zurückgeben, nicht den gespeicherten: ein vor dem
+  // IA-Umbau abgelegtes Ziel soll am neuen Ort landen, nicht auf der alten URL.
+  const leaf = findSettingsLeaf(current, user);
+  if (leaf) return leaf.path;
   const legacy = storage.getItem(LEGACY_SETTINGS_STORAGE_KEY);
   const migrated = migrateLegacySettingsTab(legacy);
   if (migrated) {
@@ -305,5 +354,9 @@ export function readStoredSettingsDestination(user, storage = sessionStorage) {
     }
     return migrated;
   }
-  return '/settings/personal/account';
+  // `null` statt eines erfundenen Ziels: wer noch nie in den Einstellungen war,
+  // hat kein "zuletzt besuchtes Blatt". Vorher landete der erste Besuch
+  // wortlos im Konto-Formular, und die Übersicht war über die App-Navigation
+  // gar nicht erreichbar (Critique 2026-07-27). Der Aufrufer entscheidet.
+  return null;
 }

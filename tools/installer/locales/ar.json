@@ -32,7 +32,9 @@
     "dbLabel": "مفتاح تشفير قاعدة البيانات",
     "dbHint": "يشفّر قاعدة بيانات SQLite في حالة السكون.",
     "errBoth": "كلا المفتاحين مطلوبان.",
-    "dangerWarn": "احفظ هذه المفاتيح الآن. إن فقدتها، فلن يمكن استرجاع بياناتك المشفّرة — لا توجد إعادة تعيين."
+    "dangerWarn": "احفظ هذه المفاتيح الآن. إن فقدتها، فلن يمكن استرجاع بياناتك المشفّرة — لا توجد إعادة تعيين.",
+    "preserved": "يتم الاحتفاظ بمفاتيحك الحالية، لذا لن يمنعك هذا الإعداد من الوصول إلى قاعدة البيانات الحالية. اترك الحقل فارغًا للاحتفاظ بمفتاحه؛ وإدخال قيمة جديدة يستبدله.",
+    "keepPlaceholder": "تم الاحتفاظ بالمفتاح الحالي"
   },
   "weather": {
     "title": "أداة الطقس",
@@ -93,7 +95,8 @@
     "backups": "النسخ الاحتياطية",
     "webdavBackup": "نسخ خارجية",
     "on": "مفعّل",
-    "off": "معطّل"
+    "off": "معطّل",
+    "documentGoogleDrive": "مستندات Google Drive"
   },
   "docker": {
     "title": "جارٍ بدء Yuvomi",
@@ -178,7 +181,16 @@
     "fixerLabel": "مفتاح Fixer API (أسعار عملات مباشرة)",
     "fixerHint": "اختياري. يحوّل عملات الاشتراكات بأسعار مباشرة. تعمل الاشتراكات من دونه.",
     "pushSubjectLabel": "عنوان اتصال الإشعارات",
-    "pushSubjectHint": "يُرسل إلى خدمات الإشعارات كجهة اتصال لخادمك. اتركه فارغًا للقيمة الافتراضية."
+    "pushSubjectHint": "يُرسل إلى خدمات الإشعارات كجهة اتصال لخادمك. اتركه فارغًا للقيمة الافتراضية.",
+    "documentGoogleDrive": "تخزين المستندات في Google Drive",
+    "documentGoogleDriveHint": "هيّئ بيانات اعتماد OAuth هنا، ثم اربط Google Drive وحدده صراحةً في إعدادات المستندات بعد التثبيت.",
+    "documentGoogleDriveEnable": "تهيئة Google Drive للمستندات",
+    "documentGoogleDriveClientIdLabel": "معرّف عميل خاص (اختياري)",
+    "documentGoogleDriveClientSecretLabel": "سر عميل خاص (اختياري)",
+    "documentGoogleDriveReuseHint": "اترك الحقلين فارغين لإعادة استخدام بيانات اعتماد OAuth الخاصة بتقويم Google. لاستخدام بيانات اعتماد مخصّصة، أنشئها في Google Cloud Console (كما في خطوة التقويم).",
+    "documentGoogleDriveRedirectLabel": "عنوان URI لإعادة التوجيه",
+    "errDocumentGoogleDrivePair": "يجب إدخال معرّف عميل Google Drive وسره معًا أو تركهما فارغين معًا.",
+    "errDocumentGoogleDriveCredentials": "يتطلب Google Drive إما معرّف عميل وسرًا خاصين به أو بيانات اعتماد Google Calendar المهيأة."
   },
   "welcome": {
     "title": "مرحبًا بك في Yuvomi",

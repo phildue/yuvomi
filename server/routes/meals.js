@@ -65,9 +65,11 @@ function sanitizedIngredients(ingredients) {
 
 function loadMealWithIngredients(id) {
   const meal = db.get().prepare(`
-    SELECT m.*, u.display_name AS creator_name, u.avatar_color AS creator_color
+    SELECT m.*, u.display_name AS creator_name, u.avatar_color AS creator_color,
+           mrt.end_date AS recurrence_end_date
     FROM meals m
     LEFT JOIN users u ON u.id = m.created_by
+    LEFT JOIN meal_recurrence_templates mrt ON mrt.id = m.recurrence_template_id
     WHERE m.id = ?
   `).get(id);
   if (!meal) return null;
@@ -101,8 +103,9 @@ function materializeRecurringMeals(from, to) {
     SELECT *
     FROM meal_recurrence_templates
     WHERE start_date <= ?
+      AND (end_date IS NULL OR end_date >= ?)
     ORDER BY id ASC
-  `).all(to);
+  `).all(to, from);
 
   if (!templates.length) return;
 
@@ -205,10 +208,15 @@ router.get('/', (req, res) => {
 
     materializeRecurringMeals(from, to);
 
+    // recurrence_end_date kommt aus der Vorlage mit: die Oberfläche zeigt im
+    // Bearbeiten-Dialog, bis wann die Serie läuft, und muss dafür nicht pro Karte
+    // nachfragen. NULL heißt unbegrenzt.
     const meals = db.get().prepare(`
-      SELECT m.*, u.display_name AS creator_name, u.avatar_color AS creator_color
+      SELECT m.*, u.display_name AS creator_name, u.avatar_color AS creator_color,
+             mrt.end_date AS recurrence_end_date
       FROM meals m
       LEFT JOIN users u ON u.id = m.created_by
+      LEFT JOIN meal_recurrence_templates mrt ON mrt.id = m.recurrence_template_id
       WHERE m.date BETWEEN ? AND ?
       ORDER BY m.date ASC,
         CASE m.meal_type
@@ -238,9 +246,29 @@ router.get('/', (req, res) => {
       }
     }
 
+    // Aus einem Rezept geplante Mahlzeiten tragen nur dessen recipe_id, keine
+    // eigenen meal_ingredients - die entstehen erst beim ersten Transfer
+    // (siehe POST /:id/to-shopping-list). Ohne diesen Zähler bliebe der
+    // Einkaufslisten-Button auf genau solchen Karten unsichtbar, obwohl die
+    // Zutaten bekannt sind. Bewusst nur die ZAHL, keine virtuellen Zutaten:
+    // Einträge ohne echte id würden das Zutaten-Formular brechen.
+    const recipeCountMap = {};
+    const fromRecipe = meals.filter((m) => m.recipe_id && !(ingredientMap[m.id]?.length));
+    if (fromRecipe.length > 0) {
+      const recipeIds = [...new Set(fromRecipe.map((m) => m.recipe_id))];
+      const counts = db.get().prepare(`
+        SELECT recipe_id, COUNT(*) AS c FROM recipe_ingredients
+        WHERE recipe_id IN (${recipeIds.map(() => '?').join(',')})
+        GROUP BY recipe_id
+      `).all(...recipeIds);
+      const byRecipe = Object.fromEntries(counts.map((r) => [r.recipe_id, r.c]));
+      for (const m of fromRecipe) recipeCountMap[m.id] = byRecipe[m.recipe_id] ?? 0;
+    }
+
     const result = meals.map((m) => ({
       ...m,
       ingredients: ingredientMap[m.id] || [],
+      recipe_ingredient_count: recipeCountMap[m.id] ?? 0,
     }));
 
     res.json({ data: result, weekStart: from, weekEnd: to });
@@ -270,8 +298,16 @@ router.post('/', (req, res) => {
     const vRecipeUrl  = str(req.body.recipe_url, 'Rezept-URL', { max: MAX_TEXT, required: false });
     const vRecipeId   = num(req.body.recipe_id, 'Rezept-ID', { required: false });
     const repeatWeekly = req.body.repeat_weekly === true;
-    const errors = collectErrors([vDate, vType, vTitle, vNotes, vRecipeUrl, vRecipeId]);
+    // Leeres/fehlendes repeat_until heißt „ohne Ende" - die Serie bleibt dann
+    // unbegrenzt, wie vor #619, aber jetzt als bewusste Wahl statt als einziger Zustand.
+    const vRepeatUntil = repeatWeekly
+      ? date(req.body.repeat_until, 'Wiederholungs-Ende')
+      : { value: null, error: null };
+    const errors = collectErrors([vDate, vType, vTitle, vNotes, vRecipeUrl, vRecipeId, vRepeatUntil]);
     if (!req.body.meal_type) errors.push('Mahlzeit-Typ ist erforderlich.');
+    if (vRepeatUntil.value && vDate.value && vRepeatUntil.value < vDate.value) {
+      errors.push('Wiederholungs-Ende darf nicht vor dem Datum liegen.');
+    }
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
 
     if (vRecipeId.value !== null) {
@@ -286,10 +322,11 @@ router.post('/', (req, res) => {
       if (repeatWeekly) {
         const template = db.get().prepare(`
           INSERT INTO meal_recurrence_templates
-            (start_date, weekday, meal_type, title, notes, recipe_url, recipe_id, created_by)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (start_date, end_date, weekday, meal_type, title, notes, recipe_url, recipe_id, created_by)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           vDate.value,
+          vRepeatUntil.value,
           mealWeekday(vDate.value),
           vType.value,
           vTitle.value,
@@ -427,12 +464,34 @@ router.put('/:id', (req, res) => {
       const nRecipeUrl = req.body.recipe_url !== undefined ? (req.body.recipe_url || null)       : tpl.recipe_url;
       const nRecipeId  = req.body.recipe_id  !== undefined ? (req.body.recipe_id  || null)       : tpl.recipe_id;
 
+      // repeat_until: leerer String heißt ausdrücklich „ohne Ende", ein fehlendes
+      // Feld lässt die bestehende Grenze stehen.
+      let nEndDate = tpl.end_date;
+      if (req.body.repeat_until !== undefined) {
+        const vRepeatUntil = date(req.body.repeat_until, 'Wiederholungs-Ende');
+        if (vRepeatUntil.error) return res.status(400).json({ error: vRepeatUntil.error, code: 400 });
+        if (vRepeatUntil.value && vRepeatUntil.value < tpl.start_date) {
+          return res.status(400).json({ error: 'Wiederholungs-Ende darf nicht vor dem Serienbeginn liegen.', code: 400 });
+        }
+        nEndDate = vRepeatUntil.value;
+      }
+
       db.transaction(() => {
         db.get().prepare(`
           UPDATE meal_recurrence_templates
-          SET meal_type = ?, title = ?, notes = ?, recipe_url = ?, recipe_id = ?
+          SET meal_type = ?, title = ?, notes = ?, recipe_url = ?, recipe_id = ?, end_date = ?
           WHERE id = ?
-        `).run(nMealType, nTitle, nNotes, nRecipeUrl, nRecipeId, templateId);
+        `).run(nMealType, nTitle, nNotes, nRecipeUrl, nRecipeId, nEndDate, templateId);
+
+        // Ein neu gesetztes (oder vorgezogenes) Ende muss die bereits
+        // materialisierten Instanzen dahinter mitnehmen - sonst bliebe die Serie
+        // sichtbar über ihr eigenes Ende hinaus bestehen.
+        if (nEndDate) {
+          db.get().prepare('DELETE FROM meals WHERE recurrence_template_id = ? AND date > ?')
+            .run(templateId, nEndDate);
+          db.get().prepare('DELETE FROM meal_recurrence_exceptions WHERE template_id = ? AND date > ?')
+            .run(templateId, nEndDate);
+        }
 
         db.get().prepare(`
           UPDATE meals
@@ -517,6 +576,35 @@ router.delete('/:id', (req, res) => {
       db.transaction(() => {
         db.get().prepare('DELETE FROM meals WHERE recurrence_template_id = ?').run(templateId);
         db.get().prepare('DELETE FROM meal_recurrence_templates WHERE id = ?').run(templateId);
+      });
+      return res.status(204).end();
+    }
+
+    // scope=future beendet die Serie an dieser Stelle: das Template bekommt ein
+    // Ende vor diesem Termin, alle Instanzen ab hier verschwinden. Das ist der
+    // Ausweg für eine Serie, deren erster Termin längst gelöscht wurde - ohne ihn
+    // blieb nur das Löschen jedes einzelnen Vorkommens, während die Woche danach
+    // schon wieder ein neues erzeugte (#619).
+    if (req.query.scope === 'future' && meal.recurrence_template_id) {
+      const templateId = meal.recurrence_template_id;
+      const tpl = db.get().prepare('SELECT start_date FROM meal_recurrence_templates WHERE id = ?').get(templateId);
+      const newEnd = addDays(meal.date, -1);
+
+      db.transaction(() => {
+        db.get().prepare('DELETE FROM meals WHERE recurrence_template_id = ? AND date >= ?')
+          .run(templateId, meal.date);
+
+        // Endet die Serie vor ihrem eigenen Beginn, bleibt kein Termin übrig -
+        // dann ist die Vorlage selbst überflüssig (CASCADE räumt Zutaten und
+        // Ausnahmen ab).
+        if (!tpl || newEnd < tpl.start_date) {
+          db.get().prepare('DELETE FROM meal_recurrence_templates WHERE id = ?').run(templateId);
+        } else {
+          db.get().prepare('UPDATE meal_recurrence_templates SET end_date = ? WHERE id = ?')
+            .run(newEnd, templateId);
+          db.get().prepare('DELETE FROM meal_recurrence_exceptions WHERE template_id = ? AND date >= ?')
+            .run(templateId, meal.date);
+        }
       });
       return res.status(204).end();
     }
@@ -633,12 +721,19 @@ router.delete('/ingredients/:ingId', (req, res) => {
  * POST /api/v1/meals/:id/to-shopping-list
  * Alle noch nicht übertragenen Zutaten einer Mahlzeit auf eine Einkaufsliste übernehmen.
  * Body: { listId: number, category?: string }
- * Response: { data: { transferred: number } }
+ * Response: { data: { transferred: number, added_ids: number[] } }
+ *
+ * `added_ids` trägt das Undo im Client (Audit 2026-07-30, P1-B). Zurückgenommen
+ * wird über `POST /shopping/items/undo-transfer` und nicht durch einfaches
+ * Löschen der Artikel: dieser Pfad setzt zusätzlich `on_shopping_list` auf den
+ * Zutaten. Wer nur die Einkaufsartikel entfernt, lässt die Mahlzeit für immer als
+ * „schon übertragen" zurück - die Zutaten wären dann weder auf der Liste noch
+ * erneut übertragbar.
  */
 router.post('/:id/to-shopping-list', (req, res) => {
   try {
     const mealId = parseInt(req.params.id, 10);
-    const meal   = db.get().prepare('SELECT id FROM meals WHERE id = ?').get(mealId);
+    const meal   = db.get().prepare('SELECT id, recipe_id FROM meals WHERE id = ?').get(mealId);
     if (!meal) return res.status(404).json({ error: 'Mahlzeit nicht gefunden', code: 404 });
 
     const { listId } = req.body;
@@ -648,15 +743,40 @@ router.post('/:id/to-shopping-list', (req, res) => {
     const list = db.get().prepare('SELECT id FROM shopping_lists WHERE id = ?').get(listId);
     if (!list) return res.status(404).json({ error: 'Einkaufsliste nicht gefunden', code: 404 });
 
+    // Eine aus einem Rezept geplante Mahlzeit hat keine eigenen Zutaten - sie
+    // kennt nur die recipe_id. Beim ersten Transfer werden die Rezeptzutaten
+    // hier zu echten meal_ingredients materialisiert. Erst danach greift das
+    // on_shopping_list-Flag, das die Mahlzeit (anders als das wiederverwendbare
+    // Rezept) vor doppeltem Übertragen schützt. Bedingung ist bewusst „gar
+    // keine Zutaten" und nicht „keine offenen": nach einem vollständigen
+    // Transfer darf nicht erneut materialisiert werden.
+    const existingCount = db.get()
+      .prepare('SELECT COUNT(*) AS c FROM meal_ingredients WHERE meal_id = ?').get(mealId).c;
+    if (existingCount === 0 && meal.recipe_id) {
+      const recipeIngredients = db.get().prepare(
+        'SELECT name, quantity, category FROM recipe_ingredients WHERE recipe_id = ? ORDER BY id ASC',
+      ).all(meal.recipe_id);
+      if (recipeIngredients.length > 0) {
+        const copyIng = db.get().prepare(
+          'INSERT INTO meal_ingredients (meal_id, name, quantity, category) VALUES (?, ?, ?, ?)',
+        );
+        db.transaction(() => {
+          for (const ing of recipeIngredients) {
+            copyIng.run(mealId, ing.name, ing.quantity, ing.category || 'Sonstiges');
+          }
+        });
+      }
+    }
+
     const ingredients = db.get().prepare(`
       SELECT * FROM meal_ingredients
       WHERE meal_id = ? AND on_shopping_list = 0
     `).all(mealId);
 
     if (ingredients.length === 0)
-      return res.json({ data: { transferred: 0 } });
+      return res.json({ data: { transferred: 0, added_ids: [] } });
 
-    const transferred = db.transaction(() => {
+    const addedIds = db.transaction(() => {
       const insertItem = db.get().prepare(`
         INSERT INTO shopping_items (list_id, name, quantity, category, added_from_meal)
         VALUES (?, ?, ?, ?, ?)
@@ -665,16 +785,16 @@ router.post('/:id/to-shopping-list', (req, res) => {
         UPDATE meal_ingredients SET on_shopping_list = 1 WHERE id = ?
       `);
 
-      let count = 0;
+      const ids = [];
       for (const ing of ingredients) {
-        insertItem.run(listId, ing.name, ing.quantity, ing.category || 'Sonstiges', mealId);
+        const info = insertItem.run(listId, ing.name, ing.quantity, ing.category || 'Sonstiges', mealId);
         markDone.run(ing.id);
-        count++;
+        ids.push(Number(info.lastInsertRowid));
       }
-      return count;
+      return ids;
     });
 
-    res.json({ data: { transferred } });
+    res.json({ data: { transferred: addedIds.length, added_ids: addedIds } });
   } catch (err) {
     log.error('POST /:id/to-shopping-list', err);
     res.status(500).json({ error: 'Interner Fehler', code: 500 });
@@ -685,7 +805,11 @@ router.post('/:id/to-shopping-list', (req, res) => {
  * POST /api/v1/meals/week-to-shopping-list
  * Alle noch nicht übertragenen Zutaten einer ganzen Woche auf eine Einkaufsliste übernehmen.
  * Body: { listId, week: YYYY-MM-DD, category? }
- * Response: { data: { transferred: number } }
+ * Response: { data: { transferred: number, added_ids: number[] } }
+ *
+ * `added_ids` wie beim Einzel-Transfer. Diese Route hat derzeit keinen Aufrufer in
+ * der Oberfläche; die IDs stehen trotzdem in der Antwort, damit ein künftiger
+ * Aufrufer nicht als einziger Erzeuger-Pfad ohne Rücknahme dasteht.
  */
 router.post('/week-to-shopping-list', (req, res) => {
   try {
@@ -710,9 +834,9 @@ router.post('/week-to-shopping-list', (req, res) => {
     `).all(from, to);
 
     if (ingredients.length === 0)
-      return res.json({ data: { transferred: 0 } });
+      return res.json({ data: { transferred: 0, added_ids: [] } });
 
-    const transferred = db.transaction(() => {
+    const addedIds = db.transaction(() => {
       const insertItem = db.get().prepare(`
         INSERT INTO shopping_items (list_id, name, quantity, category, added_from_meal)
         VALUES (?, ?, ?, ?, ?)
@@ -721,16 +845,16 @@ router.post('/week-to-shopping-list', (req, res) => {
         UPDATE meal_ingredients SET on_shopping_list = 1 WHERE id = ?
       `);
 
-      let count = 0;
+      const ids = [];
       for (const ing of ingredients) {
-        insertItem.run(listId, ing.name, ing.quantity, ing.category || 'Sonstiges', ing.meal_id);
+        const info = insertItem.run(listId, ing.name, ing.quantity, ing.category || 'Sonstiges', ing.meal_id);
         markDone.run(ing.id);
-        count++;
+        ids.push(Number(info.lastInsertRowid));
       }
-      return count;
+      return ids;
     });
 
-    res.json({ data: { transferred } });
+    res.json({ data: { transferred: addedIds.length, added_ids: addedIds } });
   } catch (err) {
     log.error('POST /week-to-shopping-list', err);
     res.status(500).json({ error: 'Interner Fehler', code: 500 });

@@ -7,9 +7,10 @@
  */
 
 import { api } from '/api.js';
-import { t, formatDate, getLocale } from '/i18n.js';
+import { t, formatDate, getLocale, getNumberFormat } from '/i18n.js';
 import { esc } from '/utils/html.js';
-import { openModal, closeModal, confirmModal } from '/components/modal.js';
+import { getReadableTextColor, AVATAR_FALLBACK_COLOR } from '/utils/color.js';
+import { openModal, closeModal, confirmModal, confirmOverModal } from '/components/modal.js';
 import { createPageFab, setPageFabAction } from '/utils/fab.js';
 import { wireTablist } from '/utils/tablist.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
@@ -71,7 +72,7 @@ function isAdmin() {
 }
 
 function fmtPoints(n) {
-  return new Intl.NumberFormat(getLocale()).format(Number(n || 0));
+  return getNumberFormat().format(Number(n || 0));
 }
 
 function pointsLabel(n) {
@@ -88,9 +89,13 @@ function avatar(member, size = 40) {
     const src = member.avatar_data || member.user_avatar;
     return `<span class="rw-avatar" style="${dim}"><img src="${esc(src)}" alt="" loading="lazy"></span>`;
   }
-  const color = member?.avatar_color || member?.user_color || 'var(--module-rewards)';
+  // Nutzerfarben kommen aus der DB und können beliebig hell sein: fest weißer
+  // Text erreichte auf hellen Tönen nur 2.8:1 (gemessen: Orange #F97316).
+  // getReadableTextColor wählt den kontraststärkeren Ton — dasselbe Muster wie
+  // in dashboard.js, calendar.js, notes.js und user-multi-select.js.
+  const color = member?.avatar_color || member?.user_color || AVATAR_FALLBACK_COLOR;
   const name = member?.display_name || member?.user_name || '';
-  return `<span class="rw-avatar rw-avatar--initials" style="${dim};--rw-avatar-bg:${esc(color)}">${esc(initials(name))}</span>`;
+  return `<span class="rw-avatar rw-avatar--initials" style="${dim};--rw-avatar-bg:${esc(color)};color:${getReadableTextColor(color)}">${esc(initials(name))}</span>`;
 }
 
 function emptyState(icon, title, body, action = '') {
@@ -561,7 +566,7 @@ async function openRedeemModal(memberId, presetItemId = null) {
           <input class="input" id="rw-redeem-note" maxlength="500" placeholder="${esc(t('rewards.notePlaceholder'))}">
         </div>
         <div id="rw-redeem-error" class="login-error" hidden></div>
-        <div class="modal-panel__footer" style="padding:0;border:none;margin-top:var(--space-6)">
+        <div class="modal-panel__footer modal-panel__footer--plain">
           <button type="submit" class="btn btn--primary" id="rw-redeem-submit">${esc(isAdmin() ? t('rewards.confirmRedeem') : t('rewards.requestAction'))}</button>
         </div>
       </form>`,
@@ -656,7 +661,7 @@ function openBonusModal() {
           <input class="input" id="rw-bonus-reason" maxlength="200" placeholder="${esc(t('rewards.reasonPlaceholder'))}">
         </div>
         <div id="rw-bonus-error" class="login-error" hidden></div>
-        <div class="modal-panel__footer" style="padding:0;border:none;margin-top:var(--space-6)">
+        <div class="modal-panel__footer modal-panel__footer--plain">
           <button type="submit" class="btn btn--primary" id="rw-bonus-submit">${esc(t('common.save'))}</button>
         </div>
       </form>`,
@@ -717,17 +722,18 @@ function openRewardModal(item) {
             <span>${esc(t('rewards.activeLabel'))}</span>
           </label>` : ''}
         <div id="rw-reward-error" class="login-error" hidden></div>
-        <div class="modal-panel__footer" style="padding:0;border:none;margin-top:var(--space-6)">
+        <div class="modal-panel__footer modal-panel__footer--plain">
           ${isEdit ? `<button type="button" class="btn btn--danger" id="rw-reward-delete">${esc(t('common.delete'))}</button>` : ''}
           <button type="submit" class="btn btn--primary" id="rw-reward-submit">${isEdit ? esc(t('common.save')) : esc(t('common.create'))}</button>
         </div>
       </form>`,
     onSave: (panel) => {
       panel.querySelector('#rw-reward-delete')?.addEventListener('click', async () => {
-        const ok = await confirmModal(t('rewards.confirmDeleteReward', { reward: item.name }), { confirmLabel: t('common.delete'), danger: true });
+        // confirmOverModal statt confirmModal: „Abbrechen" gibt das Belohnungs-
+        // Formular unverändert zurück; bestätigt schliesst es die Frage selbst.
+        const ok = await confirmOverModal(t('rewards.confirmDeleteReward', { reward: item.name }), { confirmLabel: t('common.delete'), danger: true });
         if (!ok) return;
         await api.delete(`/rewards/catalog/${item.id}`);
-        await closeModal({ force: true });
         toast(t('rewards.toastRewardDeleted'), 'default');
         await refreshActiveTab();
       });
@@ -786,7 +792,7 @@ async function openParticipantsModal() {
           </li>`).join('')}
       </ul>
       <div id="rw-participants-error" class="login-error" hidden></div>
-      <div class="modal-panel__footer" style="padding:0;border:none;margin-top:var(--space-6)">
+      <div class="modal-panel__footer modal-panel__footer--plain">
         <button type="button" class="btn btn--primary" id="rw-participants-done">${esc(t('rewards.done'))}</button>
       </div>`,
     onSave: (panel) => {
@@ -841,7 +847,7 @@ async function openMemberDetail(memberId) {
         </div>
       </div>
       <ul class="rw-ledger rw-ledger--compact">${rows}</ul>
-      ${canRedeem ? `<div class="modal-panel__footer" style="padding:0;border:none;margin-top:var(--space-6)">
+      ${canRedeem ? `<div class="modal-panel__footer modal-panel__footer--plain">
         <button type="button" class="btn btn--primary" id="rw-detail-redeem"><i data-lucide="gift" aria-hidden="true"></i>${esc(redeemVerb())}</button>
       </div>` : ''}`,
     onSave: (panel) => {

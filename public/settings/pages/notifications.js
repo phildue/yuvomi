@@ -2,10 +2,12 @@
  * Settings-Seite: Push-Benachrichtigungen (pro Gerät) und Admin-Notification-Channels.
  */
 import { t } from '/i18n.js';
-import { pushSupported, pushStatus, enablePush, disablePush } from '/push.js';
+import { pushSupported, pushStatus, enablePush, disablePush, repairPush } from '/push.js';
 import { api, notifications } from '/api.js';
 import { confirmModal } from '/components/modal.js';
 import { esc } from '/utils/html.js';
+import { getPwaInstallState } from '/utils/pwa-install.js';
+import { toggleRowHtml } from '/settings/components.js';
 
 const DEFAULT_PROVIDERS = [
   { id: 'gotify', name: 'Gotify' },
@@ -14,10 +16,6 @@ const DEFAULT_PROVIDERS = [
 
 function selected(value, expected) {
   return value === expected ? ' selected' : '';
-}
-
-function checked(value) {
-  return value ? ' checked' : '';
 }
 
 function channelDefaults(provider = 'gotify') {
@@ -42,17 +40,18 @@ function renderPage(container, user) {
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
     <section class="settings-section">
-      <h2 class="settings-section__title">${t('settings.notificationsTitle')}</h2>
+      <h2 class="settings-section__title">${t('settings.pushToggleTitle')}</h2>
       <div class="settings-card">
         <div class="settings-card__body">
-          <h3 class="settings-card__title">${t('settings.pushToggleTitle')}</h3>
           <p class="form-hint">${t('settings.pushDeviceDescription')}</p>
+          <p class="form-hint" id="push-ios-hint" hidden>${t('settings.pushIosHomescreenHint')}</p>
           <p class="form-hint" id="push-status" aria-live="polite">${t('settings.pushChecking')}</p>
           <div class="settings-form-actions">
-            <label class="toggle-row">
-              <input type="checkbox" id="push-toggle" disabled>
-              <span>${t('settings.pushToggleLabel')}</span>
-            </label>
+            ${toggleRowHtml({
+              label: t('settings.pushToggleLabel'),
+              disabled: true,
+              attrs: { id: 'push-toggle' },
+            })}
           </div>
           <div class="settings-form-actions">
             <button type="button" class="btn btn--secondary" id="push-test-btn" disabled>
@@ -125,10 +124,11 @@ function renderChannelList(container, channels, providers = DEFAULT_PROVIDERS) {
           <label class="form-label" for="notification-name-${suffix}">${t('settings.notificationChannelName')}</label>
           <input class="form-input" id="notification-name-${suffix}" name="name" value="${esc(channel.name)}" required>
         </div>
-        <label class="toggle-row">
-          <input type="checkbox" name="enabled"${checked(channel.enabled)}>
-          <span>${t('settings.notificationChannelEnabled')}</span>
-        </label>
+        ${toggleRowHtml({
+          label: t('settings.notificationChannelEnabled'),
+          checked: !!channel.enabled,
+          attrs: { name: 'enabled' },
+        })}
         <div class="form-field">
           <label class="form-label" for="notification-base-url-${suffix}">${t('settings.notificationChannelBaseUrl')}</label>
           <input class="form-input" id="notification-base-url-${suffix}" name="baseUrl" value="${esc(channel.config.baseUrl)}" required>
@@ -323,9 +323,17 @@ export async function render(container, { user } = {}) {
     const toggle  = container.querySelector('#push-toggle');
     const status  = container.querySelector('#push-status');
     const testBtn = container.querySelector('#push-test-btn');
+    const iosHint = container.querySelector('#push-ios-hint');
+
+    // getPwaInstallState().ios ist nur true, wenn iOS/iPadOS *und* nicht
+    // installiert. Genau dann liefert iOS keinen Web Push aus.
+    const iosNotInstalled = getPwaInstallState().ios;
+    if (iosNotInstalled) iosHint.hidden = false;
 
     if (!pushSupported()) {
-      status.textContent = t('settings.pushUnsupported');
+      status.textContent = iosNotInstalled
+        ? t('settings.pushIosNotInstalled')
+        : t('settings.pushUnsupported');
       return;
     }
 
@@ -353,11 +361,32 @@ export async function render(container, { user } = {}) {
     testBtn.addEventListener('click', async () => {
       testBtn.disabled = true;
       try {
-        await api.post('/push/test', {
+        const sendTest = () => api.post('/push/test', {
           title: t('settings.pushTestTitle'),
           body: t('settings.pushTestBody'),
         });
-        status.textContent = t('settings.pushTestSent');
+
+        // sent === 0 heisst: nichts zugestellt. Ohne diese Unterscheidung meldet
+        // der Button Erfolg, obwohl kein Geraet erreicht wurde.
+        let res = await sendTest();
+        let sent = Number(res?.data?.sent) || 0;
+        let devices = Number(res?.data?.devices) || 0;
+
+        if (sent === 0) {
+          // Selbstheilung: Der Browser haelt das Abo fuer aktiv, der Server kennt
+          // es nicht (mehr). Einmal neu registrieren und genau einmal erneut senden.
+          let repaired = false;
+          try { repaired = await repairPush(); } catch { repaired = false; }
+          if (repaired) {
+            res = await sendTest();
+            sent = Number(res?.data?.sent) || 0;
+            devices = Number(res?.data?.devices) || 0;
+          }
+        }
+
+        if (sent > 0) status.textContent = t('settings.pushTestSent');
+        else if (devices > 0) status.textContent = t('settings.pushTestFailed');
+        else status.textContent = t('settings.pushTestNoDevice');
       } catch {
         status.textContent = t('settings.pushError');
       } finally {

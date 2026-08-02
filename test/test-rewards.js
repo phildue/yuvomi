@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import test from 'node:test';
 import express from 'express';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { MIGRATIONS, _setTestDatabase } from '../server/db.js';
 import {
   awardForCompletion, reverseTaskEarnings, syncTaskRewards, getBalance, isEnrolled,

@@ -32,7 +32,9 @@
     "dbLabel": "Chiave di cifratura del database",
     "dbHint": "Cifra il database SQLite a riposo.",
     "errBoth": "Entrambe le chiavi sono obbligatorie.",
-    "dangerWarn": "Salva subito queste chiavi. Se le perdi, i tuoi dati cifrati saranno irrecuperabili: non esiste un reset."
+    "dangerWarn": "Salva subito queste chiavi. Se le perdi, i tuoi dati cifrati saranno irrecuperabili: non esiste un reset.",
+    "preserved": "Le tue chiavi esistenti vengono mantenute, quindi questa configurazione non ti bloccherà l'accesso al database attuale. Lascia vuoto un campo per mantenerne la chiave; inserire un nuovo valore la sostituisce.",
+    "keepPlaceholder": "Chiave esistente mantenuta"
   },
   "weather": {
     "title": "Widget Meteo",
@@ -93,7 +95,8 @@
     "backups": "Backup",
     "webdavBackup": "Backup esterni",
     "on": "attivo",
-    "off": "disattivato"
+    "off": "disattivato",
+    "documentGoogleDrive": "Documenti di Google Drive"
   },
   "docker": {
     "title": "Avvio di Yuvomi",
@@ -178,7 +181,16 @@
     "fixerLabel": "Chiave API Fixer (cambi valuta in tempo reale)",
     "fixerHint": "Facoltativa. Converte le valute degli abbonamenti con tassi in tempo reale. Gli abbonamenti funzionano anche senza.",
     "pushSubjectLabel": "Indirizzo di contatto push",
-    "pushSubjectHint": "Inviato ai servizi push come contatto del tuo server. Lascia vuoto per il valore predefinito."
+    "pushSubjectHint": "Inviato ai servizi push come contatto del tuo server. Lascia vuoto per il valore predefinito.",
+    "documentGoogleDrive": "Archiviazione dei documenti su Google Drive",
+    "documentGoogleDriveHint": "Configura qui le credenziali OAuth. Dopo l’installazione, collega Google Drive nelle impostazioni dei Documenti e selezionalo esplicitamente.",
+    "documentGoogleDriveEnable": "Configura Google Drive per i Documenti",
+    "documentGoogleDriveClientIdLabel": "ID client personale (facoltativo)",
+    "documentGoogleDriveClientSecretLabel": "Client secret personale (facoltativo)",
+    "documentGoogleDriveReuseHint": "Lascia entrambi i campi vuoti per riutilizzare le credenziali OAuth di Google Calendar. Per usarne di dedicate, creale nella console Google Cloud (come nel passaggio Calendar).",
+    "documentGoogleDriveRedirectLabel": "URI di reindirizzamento",
+    "errDocumentGoogleDrivePair": "L’ID client e il client secret di Google Drive devono essere entrambi impostati o entrambi vuoti.",
+    "errDocumentGoogleDriveCredentials": "Google Drive richiede un proprio ID client e client secret oppure credenziali di Google Calendar configurate."
   },
   "welcome": {
     "title": "Ti diamo il benvenuto in Yuvomi",

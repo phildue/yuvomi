@@ -12,9 +12,14 @@ import { register } from 'node:module';
 import * as nodeAssert from 'node:assert/strict';
 import express from 'express';
 import { MIGRATIONS_SQL } from '../server/db-schema-test.js';
-import { hydrateBirthday, syncBirthdayArtifacts } from '../server/services/birthdays.js';
-import { getUpcomingEvents } from '../server/services/calendar-events.js';
 import { addLocalDays, toLocalDateKey } from '../public/utils/date.js';
+
+// Dynamisch geladen, weil beide Module inzwischen server/db.js in ihren
+// Import-Graphen ziehen: statische Imports laufen vor der DB_PATH-Zuweisung
+// oben, sodass db.js eine echte yuvomi.db im Repo anlegen würde
+// (`test:db-isolation` wacht darüber).
+const { hydrateBirthday, syncBirthdayArtifacts } = await import('../server/services/birthdays.js');
+const { getUpcomingEvents } = await import('../server/services/calendar-events.js');
 
 register('./test-browser-loader.mjs', import.meta.url);
 
@@ -527,7 +532,7 @@ test('Dashboard-Endpoint: Belohnungen liefert Punktestand, Teilnehmerzahl und of
   }
 });
 
-test('Dashboard-Endpoint: Gesundheit zählt heute fällige familiensichtbare Dosen und Nachbestellungen', async () => {
+test('Dashboard-Endpoint: Gesundheit zählt heute fällige eigene Dosen und Nachbestellungen', async () => {
   const { get } = await import('../server/db.js');
   const { default: dashboardRouter } = await import('../server/routes/dashboard.js');
   const routeDb = get();
@@ -536,6 +541,10 @@ test('Dashboard-Endpoint: Gesundheit zählt heute fällige familiensichtbare Dos
   const owner = routeDb.prepare(`
     INSERT INTO users (username, display_name, password_hash, avatar_color, role)
     VALUES ('dashboard-health-owner', 'Health Owner', 'x', '#007AFF', 'admin')
+  `).run().lastInsertRowid;
+  const other = routeDb.prepare(`
+    INSERT INTO users (username, display_name, password_hash, avatar_color, role)
+    VALUES ('dashboard-health-other', 'Health Other', 'x', '#34C759', 'member')
   `).run().lastInsertRowid;
 
   // Familiensichtbares Medikament mit täglichem Plan (days_mask NULL) → heute fällig.
@@ -550,13 +559,69 @@ test('Dashboard-Endpoint: Gesundheit zählt heute fällige familiensichtbare Dos
     INSERT INTO medications (user_id, name, active, visibility, stock_qty, refill_threshold)
     VALUES (?, 'Ibuprofen', 1, 'family', 2, 5)
   `).run(owner);
-  // Privates Medikament mit Plan → darf NICHT auf dem geteilten Dashboard erscheinen.
+  // Eigenes privates Medikament mit Plan → zählt auf dem persönlichen Dashboard mit.
   const privMed = routeDb.prepare(`
     INSERT INTO medications (user_id, name, active, visibility) VALUES (?, 'Privat-Med', 1, 'private')
   `).run(owner).lastInsertRowid;
   routeDb.prepare(`
     INSERT INTO medication_schedules (medication_id, time_of_day, days_mask, active) VALUES (?, '09:00', NULL, 1)
   `).run(privMed);
+  // Fremdes Medikament, familiensichtbar, früheste Zeit + niedriger Bestand → darf weder
+  // als Dosis noch als nextDose noch als Nachbestellung erscheinen (Issue #592).
+  const foreignMed = routeDb.prepare(`
+    INSERT INTO medications (user_id, name, active, visibility, stock_qty, refill_threshold)
+    VALUES (?, 'Fremd-Med', 1, 'family', 0, 5)
+  `).run(other).lastInsertRowid;
+  routeDb.prepare(`
+    INSERT INTO medication_schedules (medication_id, time_of_day, days_mask, active) VALUES (?, '05:00', NULL, 1)
+  `).run(foreignMed);
+
+  // Lokaler Tagesschlüssel wie im Handler (lokales Kalenderdatum), damit die
+  // medication_logs-Zuordnung (substr(scheduled_at,1,10)) auch westlich von UTC greift.
+  const localKey = toLocalDateKey(new Date());
+
+  // Zusätzlicher familiensichtbarer Med mit gesetzter days_mask=127 (jeder Wochentag) →
+  // deckt den Nicht-NULL-Maskenzweig ab und ist mit 07:00 die früheste offene Dosis.
+  const dailyMed = routeDb.prepare(`
+    INSERT INTO medications (user_id, name, active, visibility) VALUES (?, 'Tagesmed', 1, 'family')
+  `).run(owner).lastInsertRowid;
+  routeDb.prepare(`
+    INSERT INTO medication_schedules (medication_id, time_of_day, days_mask, active) VALUES (?, '07:00', 127, 1)
+  `).run(dailyMed);
+  // Plan startet erst in ferner Zukunft → heute nicht fällig (start_date-Zweig).
+  const futureMed = routeDb.prepare(`
+    INSERT INTO medications (user_id, name, active, visibility) VALUES (?, 'Zukunftsmed', 1, 'family')
+  `).run(owner).lastInsertRowid;
+  routeDb.prepare(`
+    INSERT INTO medication_schedules (medication_id, time_of_day, days_mask, start_date, active) VALUES (?, '06:00', NULL, '2099-12-31', 1)
+  `).run(futureMed);
+  // Plan bereits abgelaufen → heute nicht fällig (end_date-Zweig).
+  const endedMed = routeDb.prepare(`
+    INSERT INTO medications (user_id, name, active, visibility) VALUES (?, 'Abgelaufenmed', 1, 'family')
+  `).run(owner).lastInsertRowid;
+  routeDb.prepare(`
+    INSERT INTO medication_schedules (medication_id, time_of_day, days_mask, end_date, active) VALUES (?, '06:30', NULL, '2000-01-01', 1)
+  `).run(endedMed);
+  // Fällig + heute bereits genommen → zählt als dosesTaken, nicht als nextDose.
+  const takenMed = routeDb.prepare(`
+    INSERT INTO medications (user_id, name, active, visibility) VALUES (?, 'Genommenmed', 1, 'family')
+  `).run(owner).lastInsertRowid;
+  routeDb.prepare(`
+    INSERT INTO medication_schedules (medication_id, time_of_day, days_mask, active) VALUES (?, '10:00', NULL, 1)
+  `).run(takenMed);
+  routeDb.prepare(`
+    INSERT INTO medication_logs (medication_id, scheduled_at, status) VALUES (?, ?, 'taken')
+  `).run(takenMed, `${localKey}T10:00:00`);
+  // Fällig + heute ausgelassen → zählt als dosesSkipped.
+  const skippedMed = routeDb.prepare(`
+    INSERT INTO medications (user_id, name, active, visibility) VALUES (?, 'Ausgelassenmed', 1, 'family')
+  `).run(owner).lastInsertRowid;
+  routeDb.prepare(`
+    INSERT INTO medication_schedules (medication_id, time_of_day, days_mask, active) VALUES (?, '11:00', NULL, 1)
+  `).run(skippedMed);
+  routeDb.prepare(`
+    INSERT INTO medication_logs (medication_id, scheduled_at, status) VALUES (?, ?, 'skipped')
+  `).run(skippedMed, `${localKey}T11:00:00`);
 
   const app = express();
   app.use((req, _res, next) => { req.authUserId = owner; req.session = { userId: owner }; next(); });
@@ -566,10 +631,14 @@ test('Dashboard-Endpoint: Gesundheit zählt heute fällige familiensichtbare Dos
   try {
     const body = await (await fetch(`http://127.0.0.1:${server.address().port}/`)).json();
     nodeAssert.equal(body.health.hasMeds, true);
-    nodeAssert.equal(body.health.dosesTotal, 1, 'nur die familiensichtbare Dosis zählt (privat ausgeschlossen)');
-    nodeAssert.equal(body.health.dosesTaken, 0);
-    nodeAssert.equal(body.health.nextDose.name, 'Vitamin D');
-    nodeAssert.equal(body.health.lowStockCount, 1, 'niedriger Bestand wird gezählt');
+    // Fällig heute: Tagesmed (07:00), Vitamin D (08:00), Privat-Med (09:00),
+    // Genommenmed (10:00), Ausgelassenmed (11:00). Zukunfts-/Abgelaufen-Plan zählen
+    // nicht; das fremde Med (05:00) ist trotz visibility='family' ausgeschlossen.
+    nodeAssert.equal(body.health.dosesTotal, 5, 'fünf eigene, heute fällige Dosen (zukunft/abgelaufen/fremd ausgeschlossen)');
+    nodeAssert.equal(body.health.dosesTaken, 1, 'die geloggte Einnahme zählt als genommen');
+    nodeAssert.equal(body.health.dosesSkipped, 1, 'die geloggte Auslassung zählt als ausgelassen');
+    nodeAssert.equal(body.health.nextDose.name, 'Tagesmed', 'früheste eigene offene Dosis (07:00) ist die nächste');
+    nodeAssert.equal(body.health.lowStockCount, 1, 'nur der eigene niedrige Bestand wird gezählt');
   } finally {
     await new Promise((resolve) => server.close(resolve));
     routeDb.prepare("DELETE FROM users WHERE username LIKE 'dashboard-health-%'").run();
@@ -620,6 +689,96 @@ test('Dashboard-Endpoint: Haushaltshilfe meldet Anwesenheit, Monatsbesuche und o
   } finally {
     await new Promise((resolve) => server.close(resolve));
     routeDb.prepare("DELETE FROM users WHERE username LIKE 'dashboard-hk-%'").run();
+  }
+});
+
+test('Dashboard-Endpoint: dringende Aufgaben, anstehende Termine, Einkaufslisten und Sparziel', async () => {
+  const { get } = await import('../server/db.js');
+  const { default: dashboardRouter } = await import('../server/routes/dashboard.js');
+  const routeDb = get();
+
+  routeDb.prepare("DELETE FROM budget_plans WHERE category = '__savings__'").run();
+  routeDb.prepare("DELETE FROM users WHERE username LIKE 'dashboard-widgets-%'").run();
+  const owner = routeDb.prepare(`
+    INSERT INTO users (username, display_name, password_hash, avatar_color, role)
+    VALUES ('dashboard-widgets-owner', 'Widget Owner', 'x', '#007AFF', 'admin')
+  `).run().lastInsertRowid;
+
+  // Offene, dringende Aufgabe mit Zuweisung → deckt die urgentTasks-Map + addAssignedUsers.
+  const taskId = routeDb.prepare(`
+    INSERT INTO tasks (title, priority, status, due_date, visibility, created_by, assigned_to)
+    VALUES ('Widget Urgent', 'urgent', 'open', ?, 'all', ?, ?)
+  `).run(today, owner, owner).lastInsertRowid;
+  routeDb.prepare('INSERT INTO task_assignments (task_id, user_id) VALUES (?, ?)').run(taskId, owner);
+
+  // Anstehender Termin mit Zuweisung → deckt die upcomingEvents-Map (assigned_users).
+  const eventId = routeDb.prepare(`
+    INSERT INTO calendar_events (title, start_datetime, visibility, created_by, assigned_to)
+    VALUES ('Widget Termin', ?, 'all', ?, ?)
+  `).run(`${in72h}T09:00:00`, owner, owner).lastInsertRowid;
+  routeDb.prepare('INSERT INTO event_assignments (event_id, user_id) VALUES (?, ?)').run(eventId, owner);
+
+  // Einkaufsliste mit offenen Artikeln → deckt die innere Items-Schleife.
+  const listId = routeDb.prepare(`
+    INSERT INTO shopping_lists (name, created_by) VALUES ('Widget Einkauf', ?)
+  `).run(owner).lastInsertRowid;
+  routeDb.prepare('INSERT INTO shopping_items (list_id, name, is_checked) VALUES (?, ?, 0)').run(listId, 'Milch');
+  routeDb.prepare('INSERT INTO shopping_items (list_id, name, is_checked) VALUES (?, ?, 0)').run(listId, 'Brot');
+  routeDb.prepare('INSERT INTO shopping_items (list_id, name, is_checked) VALUES (?, ?, 1)').run(listId, 'Butter (erledigt)');
+
+  // Monats-Sparziel (Budgetplan) → deckt den savingsGoal-Zweig.
+  routeDb.prepare("INSERT INTO budget_plans (category, amount) VALUES ('__savings__', 500)").run();
+
+  const app = express();
+  app.use((req, _res, next) => { req.authUserId = owner; req.session = { userId: owner }; next(); });
+  app.use('/', dashboardRouter);
+  const server = app.listen(0);
+  await new Promise((resolve) => server.once('listening', resolve));
+  try {
+    const body = await (await fetch(`http://127.0.0.1:${server.address().port}/`)).json();
+
+    const urgent = body.urgentTasks.find((t) => t.title === 'Widget Urgent');
+    nodeAssert.ok(urgent, 'dringende Aufgabe erscheint im Widget');
+    nodeAssert.ok(Array.isArray(urgent.assigned_users), 'assigned_users ist ein Array (addAssignedUsers lief)');
+    nodeAssert.equal(urgent.assigned_users.length, 1, 'die eine Zuweisung ist enthalten');
+    nodeAssert.equal(urgent.assigned_users_json, undefined, 'das rohe JSON-Feld wird entfernt');
+
+    const upcoming = body.upcomingEvents.find((e) => e.title === 'Widget Termin');
+    nodeAssert.ok(upcoming, 'anstehender Termin erscheint im Widget');
+    nodeAssert.ok(Array.isArray(upcoming.assigned_users), 'assigned_users am Termin ist ein Array');
+
+    const list = body.shoppingLists.find((l) => l.name === 'Widget Einkauf');
+    nodeAssert.ok(list, 'Einkaufsliste mit offenen Artikeln erscheint');
+    nodeAssert.equal(list.open_count, 2, 'nur die zwei offenen Artikel zählen');
+    nodeAssert.equal(list.items.length, 2, 'die innere Items-Liste enthält nur offene Artikel');
+    nodeAssert.ok(list.items.every((i) => i.is_checked === 0), 'kein erledigter Artikel in der Items-Liste');
+
+    nodeAssert.equal(body.budget.savingsGoal, 500, 'Sparziel wird aus dem Budgetplan gelesen');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    routeDb.prepare("DELETE FROM budget_plans WHERE category = '__savings__'").run();
+    routeDb.prepare("DELETE FROM users WHERE username LIKE 'dashboard-widgets-%'").run();
+  }
+});
+
+test('Dashboard-Endpoint: fehlender Auth-Kontext führt zu 500 (kritischer Fehlerpfad)', async () => {
+  const { default: dashboardRouter } = await import('../server/routes/dashboard.js');
+
+  const app = express();
+  // Middleware setzt weder authUserId noch session → der Handler wirft beim Lesen von
+  // req.session.userId und der äußere try/catch liefert die 500-Antwort.
+  app.use((req, _res, next) => { next(); });
+  app.use('/', dashboardRouter);
+  const server = app.listen(0);
+  await new Promise((resolve) => server.once('listening', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+    nodeAssert.equal(response.status, 500);
+    const body = await response.json();
+    nodeAssert.equal(body.code, 500);
+    nodeAssert.equal(body.error, 'Dashboard could not be loaded.');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
   }
 });
 
@@ -704,6 +863,13 @@ cdb.exec(`
     exception_date TEXT    NOT NULL,
     created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     PRIMARY KEY (event_id, exception_date)
+  );
+  -- Für den LEFT JOIN in getUpcomingEvents (Geburtstags-Lokalisierung, Issue #524).
+  CREATE TABLE birthdays (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL, birth_date TEXT NOT NULL,
+    calendar_event_id INTEGER REFERENCES calendar_events(id) ON DELETE SET NULL,
+    created_by INTEGER REFERENCES users(id) ON DELETE CASCADE
   );
 `);
 

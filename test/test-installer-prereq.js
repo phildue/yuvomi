@@ -112,12 +112,12 @@ test('composeCommand baut den richtigen Befehl je Engine', async () => {
 
 test('inspectCommand nutzt das passende Binary (podman auch bei podman-compose)', async () => {
   const pc = await detectEngine(checkFor(['podman --version', 'podman-compose --version']));
-  assert.deepEqual(inspectCommand(pc, ['inspect', 'oikos']),
-    { cmd: 'podman', args: ['inspect', 'oikos'] });
+  assert.deepEqual(inspectCommand(pc, ['inspect', 'yuvomi']),
+    { cmd: 'podman', args: ['inspect', 'yuvomi'] });
 
   const docker = await detectEngine(checkFor(['docker --version', 'docker compose version']));
-  assert.deepEqual(inspectCommand(docker, ['inspect', 'oikos']),
-    { cmd: 'docker', args: ['inspect', 'oikos'] });
+  assert.deepEqual(inspectCommand(docker, ['inspect', 'yuvomi']),
+    { cmd: 'docker', args: ['inspect', 'yuvomi'] });
 });
 
 // ── checkPrereqs liefert den Engine-Deskriptor mit ─────────────────────────────

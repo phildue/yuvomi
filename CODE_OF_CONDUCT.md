@@ -45,9 +45,8 @@ an individual is officially representing the community in public spaces.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported via [GitHub Private Vulnerability Reporting](https://github.com/ulsklyc/yuvomi/security/advisories/new)
-or by opening a private issue on GitHub. All complaints will be reviewed and
-investigated promptly and fairly.
+reported privately to the maintainer via [GitHub Private Vulnerability Reporting](https://github.com/ulsklyc/yuvomi/security/advisories/new).
+All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the
 reporter of any incident.

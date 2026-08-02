@@ -1,7 +1,29 @@
 import { api } from '/api.js';
 import { formatDate, formatTime, t } from '/i18n.js';
 import { confirmModal } from '/components/modal.js';
-import { createDisclosure, createInfoRow } from '/settings/components.js';
+import { formatCronSchedule } from '/settings/cron-label.js';
+import {
+  createDisclosure,
+  createInfoRow,
+  createRetryState,
+  toggleRowHtml,
+} from '/settings/components.js';
+
+// Zeitplan-Zelle: der Klartext trägt die Aussage, der Cron-Ausdruck bleibt als
+// Beleg daneben stehen. Ohne erkanntes Muster ist der Ausdruck die Aussage.
+function scheduleValue(schedule) {
+  const readable = formatCronSchedule(schedule);
+  if (!readable) return { value: schedule, code: true };
+
+  const wrapper = document.createElement('span');
+  wrapper.className = 'settings-info-value__stack';
+  const text = document.createElement('span');
+  text.textContent = readable;
+  const expression = document.createElement('code');
+  expression.textContent = schedule;
+  wrapper.append(text, expression);
+  return { value: wrapper, code: false };
+}
 
 function showError(element, message) {
   if (!element) return;
@@ -65,11 +87,10 @@ function renderPage(container) {
         <p class="form-hint">${t('settings.backupWebdavHint')}</p>
         <form class="settings-form settings-webdav-form" id="backup-webdav-form" novalidate>
           <div class="settings-webdav-toggle-row">
-            <span class="form-label">${t('settings.backupWebdavEnabled')}</span>
-            <label class="toggle">
-              <input type="checkbox" id="webdav-enabled" name="enabled" />
-              <span class="toggle__track" aria-hidden="true"></span>
-            </label>
+            ${toggleRowHtml({
+              label: t('settings.backupWebdavEnabled'),
+              attrs: { id: 'webdav-enabled', name: 'enabled' },
+            })}
           </div>
           <div class="form-group">
             <label class="form-label" for="webdav-url">${t('settings.backupWebdavUrl')}</label>
@@ -124,14 +145,14 @@ function buildCliContent() {
   wrap.className = 'settings-backup-cli';
   wrap.insertAdjacentHTML('beforeend', `
     <p class="form-hint">${t('settings.backupCliHint')}</p>
-    <pre class="settings-code-block"><code>SERVICE=oikos
+    <pre class="settings-code-block"><code>SERVICE=yuvomi
 BACKUP="$PWD/yuvomi-backup.db"
 docker compose stop "$SERVICE"
 docker compose run --rm -v "$BACKUP:/tmp/yuvomi-restore.db:ro" --entrypoint sh "$SERVICE" -c 'set -eu; target="\${DB_PATH:-/data/yuvomi.db}"; case "$target" in */oikos.db) target="\${target%/oikos.db}/yuvomi.db";; esac; stamp=$(date -u +%Y%m%dT%H%M%SZ); if [ -f "$target" ]; then cp "$target" "$target.pre-restore-$stamp"; fi; rm -f "$target-wal" "$target-shm"; cp /tmp/yuvomi-restore.db "$target"; chown node:node "$target" 2&gt;/dev/null || true'
 docker compose up -d "$SERVICE"</code></pre>
     <p class="form-hint">${t('settings.backupCliBackupHint')}</p>
-    <pre class="settings-code-block"><code>docker compose exec oikos node -e "import('./server/db.js').then(async db =&gt; { await db.backupToFile('/data/yuvomi-backup.db'); process.exit(0); })"
-docker cp oikos:/data/yuvomi-backup.db ./yuvomi-backup.db</code></pre>
+    <pre class="settings-code-block"><code>docker compose exec yuvomi node -e "import('./server/db.js').then(async db =&gt; { await db.backupToFile('/data/yuvomi-backup.db'); process.exit(0); })"
+docker cp yuvomi:/data/yuvomi-backup.db ./yuvomi-backup.db</code></pre>
   `);
   return wrap;
 }
@@ -150,14 +171,34 @@ function renderCliDisclosure(container) {
   host.replaceChildren(card);
 }
 
+/**
+ * "Automatische Backups" mit Titel, Hinweis und leerem Inhalt liest sich als
+ * "es gibt keine" - die gefaehrlichste moegliche Fehldeutung auf einer
+ * Backup-Seite. Beide Ladepfade schrieben den Fehler nur in die Konsole
+ * (Critique 2026-07-27); `createRetryState` sagt jetzt, dass der Stand
+ * unbekannt ist, und bietet den zweiten Versuch an.
+ */
 async function loadBackupSchedulerStatus(container) {
   const infoContainer = container.querySelector('#backup-scheduler-info');
   if (!infoContainer) return;
 
+  const failWithRetry = (error) => {
+    console.error('[Settings] Failed to load backup scheduler status:', error);
+    infoContainer.replaceChildren(createRetryState({
+      message: error?.message || t('settings.loadError'),
+      onRetry: () => loadBackupSchedulerStatus(container),
+    }));
+  };
+
   try {
     const res = await api.get('/backup/status');
     const scheduler = res.data?.scheduler;
-    if (!scheduler) return;
+    // Die Route liefert den Scheduler-Status immer mit; fehlt er, ist die
+    // Antwort kaputt und nicht etwa "kein Scheduler eingerichtet".
+    if (!scheduler) {
+      failWithRetry(new Error(t('settings.loadError')));
+      return;
+    }
 
     const { enabled, schedule, keepCount, lastBackup } = scheduler;
 
@@ -178,7 +219,7 @@ async function loadBackupSchedulerStatus(container) {
     ];
 
     if (enabled) {
-      rows.push(createInfoRow({ label: t('settings.backupSchedulerSchedule'), value: schedule, code: true }));
+      rows.push(createInfoRow({ label: t('settings.backupSchedulerSchedule'), ...scheduleValue(schedule) }));
       rows.push(createInfoRow({
         label: t('settings.backupSchedulerKeep'),
         value: t('settings.backupSchedulerKeepCount', { count: keepCount }),
@@ -215,7 +256,7 @@ async function loadBackupSchedulerStatus(container) {
       });
     }
   } catch (err) {
-    console.error('[Settings] Failed to load backup scheduler status:', err);
+    failWithRetry(err);
   }
 }
 
@@ -286,6 +327,23 @@ async function loadWebdavConfig(container) {
   const statusGrid = container.querySelector('#backup-webdav-status');
   if (!form) return;
 
+  // Ein leeres Formular nach einem Ladefehler ist schlimmer als gar keins: es
+  // sieht aus wie "nichts konfiguriert" und wuerde beim Speichern eine
+  // bestehende Verbindung ueberschreiben, deren Werte niemand gesehen hat.
+  const failWithRetry = (error) => {
+    console.error('[Settings] Failed to load WebDAV config:', error);
+    form.hidden = true;
+    const state = createRetryState({
+      message: error?.message || t('settings.loadError'),
+      onRetry: async () => {
+        state.remove();
+        form.hidden = false;
+        await loadWebdavConfig(container);
+      },
+    });
+    form.after(state);
+  };
+
   try {
     const res = await api.get('/backup/webdav/config');
     const d = res.data ?? {};
@@ -310,7 +368,6 @@ async function loadWebdavConfig(container) {
         if (el) {
           el.readOnly = true;
           el.disabled = true;
-          el.style.opacity = '0.6';
         }
       });
       const hint = form.querySelector('#webdav-test-result');
@@ -324,7 +381,7 @@ async function loadWebdavConfig(container) {
     renderWebdavStatus(statusGrid, container, d);
     window.lucide?.createIcons({ el: form });
   } catch (err) {
-    console.error('[Settings] Failed to load WebDAV config:', err);
+    failWithRetry(err);
   }
 }
 
@@ -369,14 +426,12 @@ function bindWebdavBackupEvents(container) {
       const res = await api.post('/backup/webdav/test', overrides);
       if (resultEl) {
         resultEl.textContent = t('settings.backupWebdavTestSuccess', { files: res.data?.files ?? 0 });
-        resultEl.className = 'form-hint';
-        resultEl.style.color = 'var(--color-success)';
+        resultEl.className = 'form-hint form-hint--success';
       }
     } catch (err) {
       if (resultEl) {
         resultEl.textContent = t('settings.backupWebdavTestFailed', { error: err.message });
-        resultEl.className = 'form-hint';
-        resultEl.style.color = 'var(--color-danger)';
+        resultEl.className = 'form-hint form-hint--danger';
       }
     } finally {
       testBtn.disabled = false;
@@ -462,9 +517,12 @@ function bindRestoreEvents(container) {
     event.preventDefault();
     const file = fileInput.files?.[0];
     if (!file) return;
+    // Die Warnung zu Dateien ausserhalb der DB stand bisher nur auf dem
+    // Dokumentenspeicher-Blatt - also nicht dort, wo sie gebraucht wird.
     if (!await confirmModal(t('settings.backupRestoreConfirm'), {
       danger: true,
       confirmLabel: t('settings.backupRestoreButton'),
+      detail: t('settings.backupRestoreDetail'),
     })) return;
 
     errorEl.hidden = true;

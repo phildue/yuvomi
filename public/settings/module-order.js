@@ -1,4 +1,4 @@
-export const KITCHEN_CHILD_IDS = Object.freeze(['meals', 'recipes', 'shopping']);
+export const KITCHEN_CHILD_IDS = Object.freeze(['meals', 'recipes', 'shopping', 'pantry']);
 export const DEFAULT_MOBILE_NAV_ORDER = Object.freeze(['calendar', 'tasks', 'kitchen']);
 export const NAV_SECTION = Object.freeze({
   overview: 0,

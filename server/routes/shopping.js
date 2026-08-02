@@ -12,6 +12,10 @@ import express from 'express';
 import * as db from '../db.js';
 import { str, oneOf, url, date, collectErrors, MAX_TITLE, MAX_SHORT, MAX_TEXT } from '../middleware/validate.js';
 import { aggregateMealIngredients } from '../services/shopping-import.js';
+import { loadItemTagsFor } from '../utils/task-tags.js';
+import {
+  flushOutbound, markTodoOutbound, queueTodoDeletions,
+} from '../services/caldav-todo-outbound.js';
 
 const log = createLogger('Shopping');
 
@@ -20,6 +24,26 @@ const router  = express.Router();
 // --------------------------------------------------------
 // Hilfsfunktionen
 // --------------------------------------------------------
+
+/**
+ * Aus einer CalDAV-Liste gespiegelte Artikel einer Auswahl - vor dem Löschen zu
+ * ermitteln, danach sind UID und Objekt-URL weg (#617).
+ */
+function mirroredItems(where, ...params) {
+  return db.get().prepare(
+    `SELECT * FROM shopping_items WHERE ${where} AND external_source = 'caldav'`
+  ).all(...params);
+}
+
+/**
+ * Ausgehende Arbeit an einem CalDAV-Spiegel anstoßen (#617). Bewusst nach der
+ * Antwort und ohne await: der Server-Aufruf darf die Antwort weder verzögern
+ * noch scheitern lassen. Schlägt er fehl, bleibt die Vormerkung liegen und der
+ * nächste Sync-Lauf holt sie nach.
+ */
+function pushToCalDAV(what) {
+  flushOutbound().catch((err) => log.warn(`${what} vorgemerkt, Sofortversuch fehlgeschlagen:`, err.message));
+}
 
 /** Alle Kategorien aus DB laden (nach sort_order sortiert). */
 function loadCategories() {
@@ -250,9 +274,76 @@ router.patch('/items/:itemId', (req, res) => {
     const updated = db.get()
       .prepare('SELECT * FROM shopping_items WHERE id = ?')
       .get(req.params.itemId);
+
+    // Abhaken oder Umbenennen eines gespiegelten Artikels zieht auf dem
+    // CalDAV-Server nach (#617).
+    const pending = markTodoOutbound('shopping', item, updated);
+
     res.json({ data: updated });
+
+    if (pending) pushToCalDAV('Änderung');
   } catch (err) {
     log.error('PATCH items/:id error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// --------------------------------------------------------
+// POST /api/v1/shopping/items/undo-transfer
+// Nimmt einen Übertrag aus einem Nachbar-Tab der Küche zurück.
+// Body: { ids: number[] } - die `added_ids` aus der Transfer-Antwort.
+// Response: { data: { removed: number } }
+//
+// Die drei erzeugenden Pfade der Küche (Vorrat, Rezept, Mahlzeit → Einkauf)
+// nehmen über DIESE Route zurück, nicht über N einzelne DELETEs. Zwei Gründe:
+//
+//   1. Ein Übertrag ist eine Handlung, also ist auch seine Rücknahme eine.
+//      Einzel-DELETEs können zur Hälfte scheitern und lassen dann einen Zustand
+//      zurück, den der Nutzer nie hergestellt hat. Hier ist es eine Transaktion.
+//   2. Der Mahlzeit-Pfad setzt beim Übertragen `meal_ingredients.on_shopping_list`.
+//      Wer nur die Einkaufsartikel löscht, lässt die Zutaten für immer als „schon
+//      übertragen" zurück - weder auf der Liste noch erneut übertragbar. Das Flag
+//      gehört zum Übertrag und muss mit ihm zurück (Audit 2026-07-30, P1-B).
+//
+// Zugeordnet wird über `added_from_meal` + Name: der Übertrag hat genau die
+// offenen Zutaten dieser Mahlzeit eingefügt, der Name ist innerhalb einer
+// Mahlzeit ihre Identität. Ein Doppelname wäre gemeinsam übertragen worden und
+// geht damit auch gemeinsam zurück.
+//
+// Fremde IDs werden still übergangen statt mit 404 quittiert: `removed` sagt,
+// was tatsächlich zurückging, und ein Undo, das mit einem Fehler endet, weil ein
+// Artikel inzwischen von Hand gelöscht wurde, wäre die schlechtere Antwort.
+// --------------------------------------------------------
+router.post('/items/undo-transfer', (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids)
+      ? req.body.ids.map(Number).filter(Number.isInteger)
+      : [];
+    if (!ids.length) return res.json({ data: { removed: 0 } });
+
+    const removed = db.get().transaction(() => {
+      const findItem = db.get()
+        .prepare('SELECT id, name, added_from_meal FROM shopping_items WHERE id = ?');
+      const deleteItem = db.get().prepare('DELETE FROM shopping_items WHERE id = ?');
+      const unmarkIngredient = db.get().prepare(`
+        UPDATE meal_ingredients SET on_shopping_list = 0
+        WHERE meal_id = ? AND name = ? AND on_shopping_list = 1
+      `);
+
+      let count = 0;
+      for (const id of ids) {
+        const item = findItem.get(id);
+        if (!item) continue;
+        deleteItem.run(id);
+        if (item.added_from_meal) unmarkIngredient.run(item.added_from_meal, item.name);
+        count += 1;
+      }
+      return count;
+    })();
+
+    res.json({ data: { removed } });
+  } catch (err) {
+    log.error('POST /items/undo-transfer error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
@@ -264,12 +355,16 @@ router.patch('/items/:itemId', (req, res) => {
 // --------------------------------------------------------
 router.delete('/items/:itemId', (req, res) => {
   try {
+    const queued = queueTodoDeletions('shopping', mirroredItems('id = ?', req.params.itemId));
+
     const result = db.get()
       .prepare('DELETE FROM shopping_items WHERE id = ?')
       .run(req.params.itemId);
     if (result.changes === 0)
       return res.status(404).json({ error: 'Item not found.', code: 404 });
     res.json({ ok: true });
+
+    if (queued) pushToCalDAV('Löschung');
   } catch (err) {
     log.error('DELETE items/:id error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -359,12 +454,18 @@ router.put('/:listId', (req, res) => {
 // --------------------------------------------------------
 router.delete('/:listId', (req, res) => {
   try {
+    // Die Artikel gehen per CASCADE mit, also müssen ihre Löschungen vorher
+    // vorgemerkt sein (#617).
+    const queued = queueTodoDeletions('shopping', mirroredItems('list_id = ?', req.params.listId));
+
     const result = db.get()
       .prepare('DELETE FROM shopping_lists WHERE id = ?')
       .run(req.params.listId);
     if (result.changes === 0)
       return res.status(404).json({ error: 'List not found.', code: 404 });
     res.json({ ok: true });
+
+    if (queued) pushToCalDAV('Löschung');
   } catch (err) {
     log.error('DELETE /:listId error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -395,6 +496,11 @@ router.get('/:listId/items', (req, res) => {
         is_checked ASC,
         created_at ASC
     `).all(req.params.listId);
+
+    // Gespiegelte CATEGORIES der Quellliste (#586). Eine Abfrage für die ganze
+    // Liste, nicht eine pro Zeile.
+    const tagMap = loadItemTagsFor(db.get(), items.map((i) => i.id));
+    for (const item of items) item.tags = tagMap.get(item.id) ?? [];
 
     res.json({ data: items, list, categories });
   } catch (err) {
@@ -446,8 +552,10 @@ router.post('/:listId/items', (req, res) => {
 // --------------------------------------------------------
 // POST /api/v1/shopping/:listId/import-meal-plan
 // Importiert Zutaten aus dem Essensplan eines Datumsbereichs in eine Liste.
-// Body: { from: YYYY-MM-DD, to: YYYY-MM-DD }
-// Response: { data: { transferred: number, added: number } }
+// Body: { from: YYYY-MM-DD, to: YYYY-MM-DD, preview?: boolean }
+// preview:true rechnet nur (keine Schreib-Transaktion) - für die Vorschau
+// "X Zutaten aus Y Mahlzeiten" im Import-Dialog (Audit A1-22).
+// Response: { data: { transferred: number, added: number, meals: number, preview?: true } }
 // --------------------------------------------------------
 router.post('/:listId/import-meal-plan', (req, res) => {
   try {
@@ -474,10 +582,19 @@ router.post('/:listId/import-meal-plan', (req, res) => {
     `).all(vFrom.value, vTo.value);
 
     if (!ingredients.length) {
-      return res.json({ data: { transferred: 0, added: 0 } });
+      return res.json({ data: { transferred: 0, added: 0, meals: 0 } });
     }
 
+    const mealCount = new Set(ingredients.map((i) => i.meal_id)).size;
     const aggregated = aggregateMealIngredients(ingredients);
+
+    // Vorschau (Audit A1-22): identische Auswahl und Aggregation, aber ohne
+    // Schreib-Transaktion. Der Client zeigt "X Zutaten aus Y Mahlzeiten",
+    // bevor der Nutzer den Import bestätigt.
+    if (req.body.preview === true) {
+      return res.json({ data: { transferred: ingredients.length, added: aggregated.length, meals: mealCount, preview: true } });
+    }
+
     const added = db.get().transaction(() => {
       const insertItem = db.get().prepare(`
         INSERT INTO shopping_items (list_id, name, quantity, category, added_from_meal)
@@ -494,9 +611,78 @@ router.post('/:listId/import-meal-plan', (req, res) => {
       return aggregated.length;
     })();
 
-    res.json({ data: { transferred: ingredients.length, added } });
+    res.json({ data: { transferred: ingredients.length, added, meals: mealCount } });
   } catch (err) {
     log.error('POST /:listId/import-meal-plan error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// --------------------------------------------------------
+// POST /api/v1/shopping/:listId/import-pantry
+// Setzt Vorratsartikel auf die Einkaufsliste (leer oder unter Mindestbestand).
+// Body: { items: [{ pantry_item_id, quantity? }] }
+//
+// Die Mengen-Angabe kommt als fertiger Anzeigetext vom Client: shopping_items.quantity
+// ist Freitext, und die Einheiten des Vorrats ('pcs', 'can', …) sind erst über t()
+// lesbar. Die Übersetzung bleibt damit im Frontend, wo sie hingehört.
+//
+// Liegt derselbe Name bereits unabgehakt auf der Liste, wird übersprungen statt
+// dupliziert - zweimal "Milch" hilft im Supermarkt niemandem.
+// Response: { data: { added: number, skipped: number, added_ids: number[] } }
+//
+// `added_ids` traegt das Undo im Client: der Warenkorb in einer Vorratszeile war
+// die einzige Aktion des Kuechenmoduls, die etwas erzeugt und dafuer kein
+// Zuruecknehmen anbot - und sie sitzt 4px neben "Menge erhoehen", das das
+// Gegenteil bedeutet (Critique 2026-07-30). Ein verzoegerter Commit waere die
+// Alternative gewesen; dann muesste der Toast eine Anzahl versprechen, die erst
+// der Server kennt (Duplikate werden hier uebersprungen). Deshalb echtes Undo:
+// sofort einfuegen, IDs zurueckgeben, auf Wunsch genau diese wieder loeschen.
+// --------------------------------------------------------
+router.post('/:listId/import-pantry', (req, res) => {
+  try {
+    const list = db.get()
+      .prepare('SELECT id FROM shopping_lists WHERE id = ?')
+      .get(req.params.listId);
+    if (!list) return res.status(404).json({ error: 'List not found.', code: 404 });
+
+    const entries = Array.isArray(req.body.items) ? req.body.items : [];
+    if (!entries.length) return res.json({ data: { added: 0, skipped: 0, added_ids: [] } });
+
+    const validNames = validCategoryNames();
+    const defaultCat = validNames[validNames.length - 1] ?? 'Sonstiges';
+
+    const result = db.get().transaction(() => {
+      const findPantryItem = db.get().prepare('SELECT name, category FROM pantry_items WHERE id = ?');
+      const findDuplicate = db.get().prepare(`
+        SELECT id FROM shopping_items
+        WHERE list_id = ? AND is_checked = 0 AND name = ? COLLATE NOCASE
+        LIMIT 1
+      `);
+      const insertItem = db.get().prepare(`
+        INSERT INTO shopping_items (list_id, name, quantity, category) VALUES (?, ?, ?, ?)
+      `);
+
+      let skipped = 0;
+      const addedIds = [];
+
+      for (const entry of entries) {
+        const pantryItem = findPantryItem.get(Number(entry?.pantry_item_id));
+        if (!pantryItem) { skipped += 1; continue; }
+        if (findDuplicate.get(req.params.listId, pantryItem.name)) { skipped += 1; continue; }
+
+        const vQty = str(entry.quantity, 'Menge', { max: MAX_SHORT, required: false });
+        const category = validNames.includes(pantryItem.category) ? pantryItem.category : defaultCat;
+        const info = insertItem.run(req.params.listId, pantryItem.name, vQty.value, category);
+        addedIds.push(Number(info.lastInsertRowid));
+      }
+
+      return { added: addedIds.length, skipped, added_ids: addedIds };
+    })();
+
+    res.json({ data: result });
+  } catch (err) {
+    log.error('POST /:listId/import-pantry error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
@@ -508,10 +694,16 @@ router.post('/:listId/import-meal-plan', (req, res) => {
 // --------------------------------------------------------
 router.delete('/:listId/items/checked', (req, res) => {
   try {
+    const queued = queueTodoDeletions(
+      'shopping', mirroredItems('list_id = ? AND is_checked = 1', req.params.listId)
+    );
+
     const result = db.get().prepare(`
       DELETE FROM shopping_items WHERE list_id = ? AND is_checked = 1
     `).run(req.params.listId);
     res.json({ deleted: result.changes });
+
+    if (queued) pushToCalDAV('Löschung');
   } catch (err) {
     log.error('DELETE /:listId/items/checked error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });

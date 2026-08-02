@@ -19,6 +19,7 @@ Independent modules — turn on what fits, ignore the rest:
 - Tasks — shared to-dos with priorities, due dates and assignees
 - Shopping — collaborative grocery lists, auto-sorted by category
 - Meals &amp; Recipes — weekly meal planner with a built-in recipe book
+- Pantry — what's actually in the house, with storage places and best-before alerts
 - Calendar — family calendar with recurring events and reminders
 - Budget — shared expenses, split costs and a spending overview
 - Housekeeping — chores, supplies and staff/session tracking
@@ -49,7 +50,7 @@ After the container starts, open the WebUI — the first visit guides you throug
 
   <Category>Productivity: HomeAutomation: Tools:</Category>
   <License>MIT</License>
-  <ExtraSearchTerms>family planner household organizer tasks groceries shopping meals recipes calendar budget chores notes contacts birthdays caldav carddav pwa selfhosted</ExtraSearchTerms>
+  <ExtraSearchTerms>family planner household organizer tasks groceries shopping meals recipes pantry inventory expiry calendar budget chores notes contacts birthdays caldav carddav pwa selfhosted</ExtraSearchTerms>
 
   <!-- Combined desktop + mobile dark-mode composites (see docs/screenshots/build-unraid-composites.mjs) -->
   <Screenshot>https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/screenshots/unraid/dashboard-combined-dark.png</Screenshot>
@@ -74,7 +75,7 @@ After the container starts, open the WebUI — the first visit guides you throug
   <Config Name="DB_ENCRYPTION_KEY" Target="DB_ENCRYPTION_KEY" Default="" Mode="" Description="RECOMMENDED. Strong key to encrypt the database at rest (SQLCipher). Leave empty for unencrypted SQLite. Cannot be changed later without re-encrypting. Generate with: openssl rand -base64 48" Type="Variable" Display="always" Required="false" Mask="true"/>
 
   <!-- Timezone -->
-  <Config Name="Timezone" Target="TZ" Default="Europe/Berlin" Mode="" Description="Container timezone, e.g. Europe/Berlin. Affects scheduled backups and reminders." Type="Variable" Display="always" Required="false" Mask="false">Europe/Berlin</Config>
+  <Config Name="Timezone" Target="TZ" Default="Europe/Berlin" Mode="" Description="Container timezone, e.g. Europe/Berlin. Affects scheduled backups, reminders, and is the fallback zone for events pushed to Google Calendar." Type="Variable" Display="always" Required="false" Mask="false">Europe/Berlin</Config>
 
   <!-- HTTPS / cookie security -->
   <Config Name="SESSION_SECURE" Target="SESSION_SECURE" Default="false" Mode="" Description="Set to true only when serving Yuvomi over HTTPS behind a reverse proxy. Keep false for direct HTTP access on the LAN." Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
@@ -82,6 +83,9 @@ After the container starts, open the WebUI — the first visit guides you throug
 
   <!-- Database path (advanced; matches the /data mount) -->
   <Config Name="DB_PATH" Target="DB_PATH" Default="/data/yuvomi.db" Mode="" Description="Path to the SQLite database inside the container. Keep default unless you know what you are doing. Legacy /data/oikos.db is auto-migrated on boot." Type="Variable" Display="advanced" Required="false" Mask="false">/data/yuvomi.db</Config>
+
+  <!-- Backup path (advanced; must match the /backups mount above) -->
+  <Config Name="BACKUP_DIR" Target="BACKUP_DIR" Default="/backups" Mode="" Description="Directory inside the container where backup files are written. Must match the Backups path mapping above, otherwise backups fail with a permission error." Type="Variable" Display="advanced" Required="false" Mask="false">/backups</Config>
 
   <!-- Weather (optional) — Open-Meteo (recommended, free, no API key) -->
   <Config Name="WEATHER_LAT" Target="WEATHER_LAT" Default="" Mode="" Description="Optional. Latitude for the Open-Meteo weather widget (no API key required). Find coordinates on openstreetmap.org or Google Maps, e.g. 52.52." Type="Variable" Display="advanced" Required="false" Mask="false"/>
@@ -98,6 +102,9 @@ After the container starts, open the WebUI — the first visit guides you throug
   <Config Name="GOOGLE_CLIENT_ID" Target="GOOGLE_CLIENT_ID" Default="" Mode="" Description="Optional. Google OAuth 2.0 client ID for Google Calendar sync." Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="GOOGLE_CLIENT_SECRET" Target="GOOGLE_CLIENT_SECRET" Default="" Mode="" Description="Optional. Google OAuth 2.0 client secret for Google Calendar sync." Type="Variable" Display="advanced" Required="false" Mask="true"/>
   <Config Name="GOOGLE_REDIRECT_URI" Target="GOOGLE_REDIRECT_URI" Default="" Mode="" Description="Optional. OAuth callback URL, e.g. https://your-domain.com/api/v1/calendar/google/callback" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="GOOGLE_DRIVE_CLIENT_ID" Target="GOOGLE_DRIVE_CLIENT_ID" Default="" Mode="" Description="Optional Google Drive OAuth client ID override. Leave both Drive overrides empty to reuse Google Calendar credentials." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="GOOGLE_DRIVE_CLIENT_SECRET" Target="GOOGLE_DRIVE_CLIENT_SECRET" Default="" Mode="" Description="Optional Google Drive OAuth client secret override." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="GOOGLE_DRIVE_REDIRECT_URI" Target="GOOGLE_DRIVE_REDIRECT_URI" Default="" Mode="" Description="Google Drive Documents callback URL, e.g. https://your-domain.com/api/v1/documents/storage/google-drive/callback" Type="Variable" Display="advanced" Required="false" Mask="false"/>
 
   <!-- OIDC / SSO (optional — all four values required to enable SSO) -->
   <Config Name="OIDC_ISSUER" Target="OIDC_ISSUER" Default="" Mode="" Description="Optional. OIDC issuer URL, e.g. https://authentik.example.com/application/o/yuvomi/" Type="Variable" Display="advanced" Required="false" Mask="false"/>
@@ -112,7 +119,7 @@ After the container starts, open the WebUI — the first visit guides you throug
   <Config Name="APPLE_APP_SPECIFIC_PASSWORD" Target="APPLE_APP_SPECIFIC_PASSWORD" Default="" Mode="" Description="Optional. Apple app-specific password for iCloud Calendar sync (generate at appleid.apple.com)." Type="Variable" Display="advanced" Required="false" Mask="true"/>
 
   <!-- Calendar sync interval -->
-  <Config Name="SYNC_INTERVAL_MINUTES" Target="SYNC_INTERVAL_MINUTES" Default="15" Mode="" Description="Interval in minutes for calendar sync (Google, Apple, CalDAV). Default: 15." Type="Variable" Display="advanced" Required="false" Mask="false">15</Config>
+  <Config Name="SYNC_INTERVAL_MINUTES" Target="SYNC_INTERVAL_MINUTES" Default="15" Mode="" Description="Interval in minutes for calendar and contact sync (Google, Apple, CalDAV, CardDAV). Default: 15." Type="Variable" Display="advanced" Required="false" Mask="false">15</Config>
 
   <!-- Backups (optional) -->
   <Config Name="BACKUP_ENABLED" Target="BACKUP_ENABLED" Default="true" Mode="" Description="Optional. Enable automated database backups (default: true)." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
@@ -149,6 +156,11 @@ After the container starts, open the WebUI — the first visit guides you throug
   <Config Name="EMAIL_FROM_ADDRESS" Target="EMAIL_FROM_ADDRESS" Default="" Mode="" Description="Optional. Sender email address for outgoing mail, e.g. yuvomi@example.com." Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="EMAIL_FROM_NAME" Target="EMAIL_FROM_NAME" Default="Yuvomi" Mode="" Description="Optional. Sender display name for outgoing mail (default: Yuvomi)." Type="Variable" Display="advanced" Required="false" Mask="false">Yuvomi</Config>
   <Config Name="BASE_URL" Target="BASE_URL" Default="" Mode="" Description="Optional but required for password-reset emails to be sent. Absolute origin used to build reset links, e.g. https://yuvomi.example.com. The request Host header is never trusted as a fallback, to prevent reset-link poisoning." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <!-- Web Push (optional) — browser/PWA notifications. Keys are generated on first use and stored in the database; set them only to pin a fixed pair across redeployments. Requires HTTPS. -->
+  <Config Name="VAPID_SUBJECT" Target="VAPID_SUBJECT" Default="" Mode="" Description="Optional. Contact URI sent to push services, either a mailto: address or an https: origin, e.g. mailto:admin@example.com. Must be reachable from the internet: Apple rejects a localhost or .local subject with 403 BadJwtToken, which disables push on iPhone/iPad while Android keeps working. Falls back to the SMTP sender address, then BASE_URL, then a placeholder." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="VAPID_PUBLIC_KEY" Target="VAPID_PUBLIC_KEY" Default="" Mode="" Description="Optional. VAPID public key. Auto-generated on first use and stored in the database when left empty. Set together with the private key to keep existing device subscriptions valid across a redeployment. Generate with: npx web-push generate-vapid-keys" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="VAPID_PRIVATE_KEY" Target="VAPID_PRIVATE_KEY" Default="" Mode="" Description="Optional. VAPID private key. Must be set together with the public key." Type="Variable" Display="advanced" Required="false" Mask="true"/>
 
   <!-- Budget → Subscriptions currency conversion (optional) -->
   <Config Name="FIXER_API_KEY" Target="FIXER_API_KEY" Default="" Mode="" Description="Optional. Fixer API key for live currency conversion in Budget → Subscriptions. Rates are cached for 12 hours; works without this key using the cached/manual rate." Type="Variable" Display="advanced" Required="false" Mask="true"/>

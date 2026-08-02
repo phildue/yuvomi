@@ -32,7 +32,9 @@
     "dbLabel": "数据库加密密钥",
     "dbHint": "在静态状态下加密 SQLite 数据库。",
     "errBoth": "两个密钥都为必填项。",
-    "dangerWarn": "现在就保存这些密钥。一旦丢失，你的加密数据将无法恢复——没有重置。"
+    "dangerWarn": "现在就保存这些密钥。一旦丢失，你的加密数据将无法恢复——没有重置。",
+    "preserved": "系统会保留你现有的密钥，因此本次安装不会让你无法访问当前数据库。留空即保留该密钥；填入新值则会替换它。",
+    "keepPlaceholder": "保留现有密钥"
   },
   "weather": {
     "title": "天气小组件",
@@ -93,7 +95,8 @@
     "backups": "备份",
     "webdavBackup": "异地备份",
     "on": "已启用",
-    "off": "已禁用"
+    "off": "已禁用",
+    "documentGoogleDrive": "Google Drive 文档"
   },
   "docker": {
     "title": "正在启动 Yuvomi",
@@ -178,7 +181,16 @@
     "fixerLabel": "Fixer API 密钥（实时汇率）",
     "fixerHint": "可选。用实时汇率换算订阅货币。没有它订阅也能正常使用。",
     "pushSubjectLabel": "推送联系地址",
-    "pushSubjectHint": "作为你服务器的联系方式发送给推送服务。留空则使用默认值。"
+    "pushSubjectHint": "作为你服务器的联系方式发送给推送服务。留空则使用默认值。",
+    "documentGoogleDrive": "Google Drive 文档存储",
+    "documentGoogleDriveHint": "在此配置 OAuth 凭据。安装完成后，请在“文档”设置中连接 Google Drive 并明确将其选为存储目标。",
+    "documentGoogleDriveEnable": "为文档配置 Google Drive",
+    "documentGoogleDriveClientIdLabel": "自有客户端 ID（可选）",
+    "documentGoogleDriveClientSecretLabel": "自有客户端密钥（可选）",
+    "documentGoogleDriveReuseHint": "两项均留空可复用 Google 日历 OAuth 凭据。若要使用专用凭据，请在 Google Cloud Console 中创建（与日历步骤相同）。",
+    "documentGoogleDriveRedirectLabel": "重定向 URI",
+    "errDocumentGoogleDrivePair": "Google Drive 客户端 ID 和密钥必须同时填写或同时留空。",
+    "errDocumentGoogleDriveCredentials": "Google Drive 需要单独的客户端 ID 和密钥，或已配置的 Google 日历凭据。"
   },
   "welcome": {
     "title": "欢迎使用 Yuvomi",

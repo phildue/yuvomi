@@ -12,10 +12,11 @@
  */
 
 import { api } from '/api.js';
-import { t, formatDate, formatTime, getLocale } from '/i18n.js';
+import { t, formatDate, formatTime, getLocale, getNumberFormat } from '/i18n.js';
 import { esc } from '/utils/html.js';
+import { wireScrollFade, scheduleUndoableDelete } from '/utils/ux.js';
 import { toLocalDateKey, parseLocalDateKey, addLocalDays } from '/utils/date.js';
-import { openModal, closeModal, confirmModal } from '/components/modal.js';
+import { openModal, closeModal, confirmOverModal, reportFieldError } from '/components/modal.js';
 import { createPageFab, setPageFabAction } from '/utils/fab.js';
 import { computeVitalSeries, VITAL_METRICS, vitalMetric } from '/utils/health-vitals.js';
 import {
@@ -92,11 +93,15 @@ function chartGridMarkup(min, max) {
   const { W, PAD_L, PAD_R } = CHART;
   const { top, bottom } = chartScales();
   const out = [];
+  // Bei Spannen ab 4 Einheiten sind Dezimal-Ticks Pseudo-Präzision
+  // ("125,9 mmHg", Audit A2-21) - dort runden die Labels auf Ganzzahlen.
+  // Kleine Labor-Spannen (z. B. 0,5-1,2) behalten ihre Nachkommastellen.
+  const wholeTicks = (max - min) >= 4;
   for (let k = 0; k <= 4; k++) {
     const gy = top + (k * (bottom - top)) / 4;
     const val = max - (k * (max - min)) / 4;
     out.push(`<line class="health-chart__grid" x1="${PAD_L}" y1="${gy.toFixed(1)}" x2="${W - PAD_R}" y2="${gy.toFixed(1)}" />`);
-    out.push(`<text x="${PAD_L - 6}" y="${(gy + 3.5).toFixed(1)}" class="health-chart__axis health-chart__axis--y" text-anchor="end">${esc(fmtNum(val))}</text>`);
+    out.push(`<text x="${PAD_L - 6}" y="${(gy + 3.5).toFixed(1)}" class="health-chart__axis health-chart__axis--y" text-anchor="end">${esc(fmtNum(wholeTicks ? Math.round(val) : val))}</text>`);
   }
   return out.join('');
 }
@@ -462,6 +467,16 @@ function chartTableMarkup(caption, headers, rows) {
 // so löst nicht jeder Tastendruck einen Personen-Reload aus. Der Haupt-Tab-Balken
 // (.health-tabs-bar) liegt außerhalb der Panels und bringt eigene Tastatur mit.
 function wireTablistKeys(root) {
+  // Personen-Chipzeile: Rand-Fade-Affordanz beim Überlaufen (geteilte
+  // has-fade-*-Konvention, Audit F-06). Hier zentral, weil alle sechs Tabs
+  // diesen Helfer nach jedem Panel-Render aufrufen.
+  const persons = root.querySelector('.health-persons');
+  wireScrollFade(persons);
+  // Aktive Person ins Sichtfeld holen: mobil kann der ausgewählte Chip außerhalb
+  // des Viewports liegen (Audit P2 "Sichtbarkeit vor Scroll-Position", Muster wie
+  // tablist.js/sub-tabs.js). role="tab"+aria-selected trägt den Gedrückt-Zustand.
+  persons?.querySelector('.health-person-chip.is-active')
+    ?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
   root.querySelectorAll('[role="tablist"]:not(.health-tabs-bar)').forEach((list) => {
     const tabs = () => [...list.querySelectorAll('[role="tab"]')];
     tabs().forEach((el) => { el.tabIndex = el.getAttribute('aria-selected') === 'true' ? 0 : -1; });
@@ -645,7 +660,8 @@ function renderDetail() {
         <div class="empty-state health-chart-empty">
           <div class="empty-state__title">${esc(t('health.vitals.noData'))}</div>
         </div>`}
-    </div>`);
+    </div>
+    ${recentMeasurementsMarkup(metric)}`);
   if (window.lucide) window.lucide.createIcons({ el: host });
 
   host.querySelectorAll('[data-step]').forEach((btn) =>
@@ -653,6 +669,52 @@ function renderDetail() {
       stepAnchor(Number(btn.dataset.step));
       renderVitalsShell();
     }));
+
+  // Korrekturpfad (Audit R2, A2-08): Einzelmessungen sind lösch-, damit
+  // korrigierbar (löschen + neu erfassen). Undo-Toast statt Confirm (Hausmuster).
+  host.querySelectorAll('[data-delete-vital]').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      const id = Number(btn.dataset.deleteVital);
+      const idx = vitals.rows.findIndex((r) => r.id === id);
+      if (idx === -1) return;
+      const [row] = vitals.rows.splice(idx, 1);
+      renderVitalsShell();
+      scheduleUndoableDelete({
+        commit: ({ keepalive } = {}) => api.delete(`/health/vitals/${id}`, { keepalive }),
+        restore: () => { vitals.rows.splice(idx, 0, row); renderVitalsShell(); },
+        message: t('health.vitals.measurementDeleted'),
+      });
+    }));
+}
+
+// Kompakte Historie der gewählten Metrik: jüngste Messungen mit Löschweg
+// (nur eigene Ansicht) - macht Tippfehler ohne Umweg korrigierbar.
+function recentMeasurementsMarkup(metric) {
+  const rows = vitals.rows
+    .filter((r) => r.type === metric.type)
+    .sort((a, b) => String(b.measured_at).localeCompare(String(a.measured_at)))
+    .slice(0, 8);
+  if (!rows.length) return '';
+  const own = isOwnView();
+  const valueText = (r) => metric.type === 'bp'
+    ? `${fmtNum(r.value_num)}/${fmtNum(r.value_num2)}`
+    : fmtNum(r.value_num);
+  return `
+    <div class="health-recent">
+      <div class="health-recent__title">${esc(t('health.vitals.recentMeasurements'))}</div>
+      <ul class="health-recent__list">
+        ${rows.map((r) => `
+          <li class="health-recent__row">
+            <span class="health-recent__date">${esc(formatDate(String(r.measured_at).slice(0, 10)))}</span>
+            <span class="health-recent__value">${esc(valueText(r))}${r.unit ? ` <small>${esc(r.unit)}</small>` : ''}</span>
+            ${own ? `
+            <button type="button" class="row-action row-action--danger" data-delete-vital="${r.id}"
+                    aria-label="${esc(t('health.vitals.deleteMeasurement'))}">
+              <i data-lucide="trash-2" aria-hidden="true"></i>
+            </button>` : ''}
+          </li>`).join('')}
+      </ul>
+    </div>`;
 }
 
 function stepAnchor(dir) {
@@ -872,7 +934,9 @@ function openVitalModal(opts = {}) {
         const body = collectVitalBody(panel, typeSelect.value);
         if (!body) {
           submitBtn.disabled = false;
-          window.yuvomi?.showToast(t('health.vitals.invalidValue'), 'danger');
+          // Fehler am Wertefeld statt als ortloser Toast (geteiltes Muster,
+          // Critique P1): erstes Eingabefeld der Metrik markieren.
+          reportFieldError(panel.querySelector('#vital-value-fields input'), t('health.vitals.invalidValue'));
           return;
         }
         submitBtn.disabled = true;
@@ -944,12 +1008,12 @@ async function reloadAfterSave(savedType) {
 
 function fmtNum(value, opts) {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return '–';
-  return new Intl.NumberFormat(getLocale(), { maximumFractionDigits: 1, ...opts }).format(Number(value));
+  return getNumberFormat({ maximumFractionDigits: 1, ...opts }).format(Number(value));
 }
 
 function fmtDelta(value) {
   if (value === null || value === undefined) return '';
-  return new Intl.NumberFormat(getLocale(), { maximumFractionDigits: 1, signDisplay: 'exceptZero' }).format(value);
+  return getNumberFormat({ maximumFractionDigits: 1, signDisplay: 'exceptZero' }).format(value);
 }
 
 // ========================================================
@@ -1081,7 +1145,7 @@ function renderMedsShell() {
       <h3 class="health-meds__section-title u-toolbar-title">${esc(t('health.meds.dueToday.title'))}</h3>
     </div>
     <div class="health-meds__due">${dueTodayMarkup()}</div>
-    <div class="health-meds__adherence-wrap">${adherenceMarkup()}</div>
+    <div class="health-meds__adherence-wrap">${adherenceMarkup()}${medLogHistoryMarkup()}</div>
     <h3 class="health-meds__section-title u-toolbar-title">${esc(t('health.meds.title'))}</h3>
     <div class="health-meds__list" id="health-meds-list">${medListMarkup()}</div>
   `);
@@ -1107,7 +1171,7 @@ function dueRowMarkup(dose, med, log) {
   const name = med ? med.name : '';
   const status = log?.status;
   const own = isOwnMedsView();
-  const doseText = dose.dose_qty != null ? ` · ${fmtNum(dose.dose_qty)}` : '';
+  const doseText = dose.dose_qty != null ? ` · ${t('health.meds.doseQty', { count: fmtNum(dose.dose_qty) })}` : '';
 
   let actions;
   if (status === 'taken') {
@@ -1163,6 +1227,38 @@ function adherenceMarkup() {
       <div class="health-adherence__bar"><span style="width:${pct}%"></span></div>
       <div class="health-adherence__summary">${esc(t('health.meds.adherence.summary', { taken: a.taken, planned: a.planned }))}</div>
     </div>`;
+}
+
+// Einnahmeprotokoll als aufklappbare Ansicht unter der Adhärenz (Audit R2,
+// A2-22): die aggregierte Zahl bekommt ihre nachlesbaren Belege - bisher gab
+// es das Protokoll nur als CSV-Export.
+function medLogHistoryMarkup() {
+  const entries = [];
+  for (const m of meds.list) {
+    for (const l of (meds.logsByMed[m.id] || [])) {
+      entries.push({ med: m.name, at: l.taken_at || l.scheduled_at || l.created_at || '', status: l.status });
+    }
+  }
+  if (!entries.length) return '';
+  entries.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+  const rows = entries.slice(0, 10).map((e) => {
+    const skipped = e.status === 'skipped';
+    const d = String(e.at);
+    const timeLabel = d.length >= 16
+      ? `${formatDate(d.slice(0, 10))} · ${formatTime(new Date(d))}`
+      : formatDate(d.slice(0, 10));
+    return `<li class="health-medlog__row${skipped ? ' is-skipped' : ''}">
+        <i data-lucide="${skipped ? 'circle-slash' : 'check'}" aria-hidden="true"></i>
+        <span class="health-medlog__med">${esc(e.med)}</span>
+        <span class="health-medlog__time">${esc(timeLabel)}</span>
+        <span class="health-medlog__status">${esc(skipped ? t('health.meds.status.skipped') : t('health.meds.status.taken'))}</span>
+      </li>`;
+  }).join('');
+  return `
+    <details class="health-medlog">
+      <summary>${esc(t('health.meds.logTitle'))}</summary>
+      <ul class="health-medlog__list">${rows}</ul>
+    </details>`;
 }
 
 function medListMarkup() {
@@ -1314,8 +1410,8 @@ function openMedModal(med) {
             <input class="input" id="med-dosage" type="text" maxlength="100" value="${esc(val(med?.dosage_text))}">
           </div>
           <div class="form-field">
-            <label class="label" for="med-form">${esc(t('health.meds.field.form'))}</label>
-            <input class="input" id="med-form" type="text" maxlength="30" value="${esc(val(med?.form))}">
+            <label class="label" for="med-form-field">${esc(t('health.meds.field.form'))}</label>
+            <input class="input" id="med-form-field" type="text" maxlength="30" value="${esc(val(med?.form))}">
           </div>
         </div>
         <div class="modal-grid modal-grid--3">
@@ -1377,7 +1473,7 @@ function openMedModal(med) {
         const submitBtn = panel.querySelector('[type="submit"]');
         const body = collectMedBody(panel);
         if (!body) {
-          window.yuvomi?.showToast(t('health.meds.nameRequired'), 'danger');
+          reportFieldError(panel.querySelector('#med-name'), t('health.meds.nameRequired'));
           return;
         }
         submitBtn.disabled = true;
@@ -1405,12 +1501,12 @@ function collectMedBody(panel) {
     const raw = panel.querySelector(sel)?.value;
     return raw !== '' && raw != null ? Number(raw) : null;
   };
-  const str = (sel) => panel.querySelector(sel)?.value.trim() || undefined;
+  const str = (sel) => panel.querySelector(sel)?.value?.trim() || undefined;
 
   return {
     name,
     dosage_text: str('#med-dosage'),
-    form: str('#med-form'),
+    form: str('#med-form-field'),
     stock_qty: num('#med-stock'),
     stock_unit: str('#med-stock-unit'),
     refill_threshold: num('#med-refill'),
@@ -1423,10 +1519,9 @@ function collectMedBody(panel) {
 
 async function deleteMed(med) {
   if (!med?.id) return;
-  if (!(await confirmModal(t('health.meds.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
+  if (!(await confirmOverModal(t('health.meds.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
   try {
     await api.delete(`/health/medications/${med.id}`);
-    closeModal({ force: true });
     window.yuvomi?.showToast(t('health.meds.deleted'), 'success');
     await reloadMeds();
   } catch (err) {
@@ -1486,7 +1581,7 @@ function schedRowMarkup(s) {
   const daysLabel = (s.days_mask == null || indices.length === WEEKDAY_COUNT)
     ? t('health.meds.schedule.daily')
     : indices.map((i) => t(WEEKDAY_LABEL_KEYS[i])).join(', ');
-  const doseText = s.dose_qty != null ? ` · ${fmtNum(s.dose_qty)}` : '';
+  const doseText = s.dose_qty != null ? ` · ${t('health.meds.doseQty', { count: fmtNum(s.dose_qty) })}` : '';
   return `
     <li class="health-sched-row" data-schedule-id="${esc(s.id)}">
       <span class="health-sched-row__time">${esc(s.time_of_day)}</span>
@@ -1508,7 +1603,10 @@ function wireSchedEditor(panel, med) {
   host.querySelector('[data-action="sched-add"]')?.addEventListener('click', async (e) => {
     const addBtn = e.currentTarget;
     const time = host.querySelector('#sched-time')?.value;
-    if (!time) { window.yuvomi?.showToast(t('health.meds.schedule.timeRequired'), 'danger'); return; }
+    if (!time) {
+      reportFieldError(host.querySelector('#sched-time'), t('health.meds.schedule.timeRequired'));
+      return;
+    }
     const doseRaw = host.querySelector('#sched-dose')?.value;
     const indices = [...host.querySelectorAll('.health-weekday.is-active')].map((b) => Number(b.dataset.day));
 
@@ -2027,7 +2125,7 @@ function openLabModal(report) {
         const submitBtn = panel.querySelector('[type="submit"]');
         const body = collectLabHead(panel);
         if (!body) {
-          window.yuvomi?.showToast(t('health.labs.dateRequired'), 'danger');
+          reportFieldError(panel.querySelector('#lab-date'), t('health.labs.dateRequired'));
           return;
         }
         submitBtn.disabled = true;
@@ -2067,10 +2165,9 @@ function collectLabHead(panel) {
 
 async function deleteLabReport(report) {
   if (!report?.id) return;
-  if (!(await confirmModal(t('health.labs.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
+  if (!(await confirmOverModal(t('health.labs.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
   try {
     await api.delete(`/health/labs/${report.id}`);
-    closeModal({ force: true });
     window.yuvomi?.showToast(t('health.labs.deleted'), 'success');
     if (labs.selectedReportId === report.id) labs.selectedReportId = null;
     await reloadLabs();
@@ -2171,9 +2268,13 @@ function wireResultEditor(panel, report) {
     const addBtn = e.currentTarget;
     const analyte = host.querySelector('#res-analyte')?.value.trim();
     const valueRaw = valueEl?.value;
-    if (!analyte) { window.yuvomi?.showToast(t('health.labs.results.analyteRequired'), 'danger'); return; }
+    if (!analyte) {
+      reportFieldError(host.querySelector('#res-analyte'), t('health.labs.results.analyteRequired'));
+      return;
+    }
     if (valueRaw === '' || valueRaw == null || !Number.isFinite(Number(valueRaw))) {
-      window.yuvomi?.showToast(t('health.labs.results.valueRequired'), 'danger'); return;
+      reportFieldError(valueEl, t('health.labs.results.valueRequired'));
+      return;
     }
 
     const body = { analyte, value_num: Number(valueRaw) };
@@ -2351,6 +2452,9 @@ function renderActivityShell() {
   const summary = weekSummary(activity.rows, { anchor: activity.anchor, weekStartsOn: 1 });
   const weekRows = activityWeekRows(summary);
   const totals = activityTotals(weekRows);
+  // Leere Woche: nur der Stepper (Wochen-Navigation) und EINE Leerzustand-
+  // Karte im Chart-Slot. Die "0 Einheiten"-Stat-Wand und die doppelte
+  // Leer-Meldung im Log entfallen (Audit A2-09/A2-21).
 
   activity.root.insertAdjacentHTML('beforeend', `
     <div class="health-persons" role="tablist" aria-label="${esc(t('health.activity.personsLabel'))}">
@@ -2364,9 +2468,9 @@ function renderActivityShell() {
         <button class="btn btn--icon" data-step="1" aria-label="${esc(t('health.activity.nextWeek'))}"><i data-lucide="chevron-right" aria-hidden="true"></i></button>
       </div>
     </div>
-    <div class="health-activity__summary">${activityStatsMarkup(totals)}</div>
+    ${totals.count === 0 ? '' : `<div class="health-activity__summary">${activityStatsMarkup(totals)}</div>`}
     <div class="health-activity__chart">${activityChartMarkup(summary)}</div>
-    <div class="health-activity__log">${activityLogMarkup(weekRows)}</div>
+    ${totals.count === 0 ? '' : `<div class="health-activity__log">${activityLogMarkup(weekRows)}</div>`}
   `);
   if (window.lucide) window.lucide.createIcons({ el: activity.root });
   wireActivity();
@@ -2677,10 +2781,9 @@ function collectActivityBody(panel) {
 
 async function deleteActivity(row) {
   if (!row?.id) return;
-  if (!(await confirmModal(t('health.activity.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
+  if (!(await confirmOverModal(t('health.activity.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
   try {
     await api.delete(`/health/activities/${row.id}`);
-    closeModal({ force: true });
     window.yuvomi?.showToast(t('health.activity.deleted'), 'success');
     await reloadActivity();
   } catch (err) {
@@ -2887,7 +2990,7 @@ function overviewDueMarkup() {
 function overviewDueRowMarkup(dose, med, log, own) {
   const name = med ? med.name : '';
   const status = log?.status;
-  const doseText = dose.dose_qty != null ? ` · ${fmtNum(dose.dose_qty)}` : '';
+  const doseText = dose.dose_qty != null ? ` · ${t('health.meds.doseQty', { count: fmtNum(dose.dose_qty) })}` : '';
 
   let actions;
   if (status === 'taken') {
@@ -3048,7 +3151,7 @@ function overviewUpcomingMarkup() {
   }
   const rows = up.map((dose) => {
     const med = overview.meds.find((m) => m.id === dose.medicationId);
-    const doseText = dose.dose_qty != null ? ` · ${fmtNum(dose.dose_qty)}` : '';
+    const doseText = dose.dose_qty != null ? ` · ${t('health.meds.doseQty', { count: fmtNum(dose.dose_qty) })}` : '';
     return `
       <li class="health-overview-reminder">
         <span class="health-dose__time">${esc(dose.time)}</span>
@@ -3392,7 +3495,7 @@ function cyclePregnancyMarkup(prediction, own) {
         <span class="cycle-preg__countdown">${esc(countdown)}</span>
       </div>
       <div class="cycle-preg__bar" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(t('health.cycle.pregnancy.progressLabel'))}">
-        <span class="cycle-preg__bar-fill" style="width:${pct}%"></span>
+        <span class="cycle-preg__bar-fill" style="--cycle-fill:${(pct / 100).toFixed(4)}"></span>
       </div>
       <div class="cycle-preg__due">${esc(t('health.cycle.pregnancy.dueDate', { date: formatDate(p.dueDate) }))}</div>`;
   } else {
@@ -3455,7 +3558,7 @@ function cycleRingMarkup(prediction) {
       <div class="cycle-ring__center">
         <span class="cycle-ring__phase">${esc(phaseLabel)}</span>
         <span class="cycle-ring__day">${esc(t('health.cycle.ring.cycleDay', { day: prediction.cycleDay }))}</span>
-        <span class="cycle-ring__status">${esc(cycleCountdownText(prediction))}</span>
+        <span class="cycle-ring__status">${esc(`${t('health.cycle.status.nextPeriod')}: ${cycleCountdownText(prediction)}`)}</span>
       </div>
     </div>`;
 }
@@ -3735,6 +3838,13 @@ function wireCycle() {
   cycle.root.querySelector('[data-action="cycle-settings"]')?.addEventListener('click', () => openCycleSettingsModal());
 }
 
+// Sichtbarkeit für ein Zyklus-Event vorauswählen: bestehender Wert gewinnt,
+// sonst greift die persönliche Default-Preference aus den Cycle-Settings,
+// sonst 'private'. Pro Event bleibt die Auswahl im Modal überschreibbar.
+function cycleVisibilityFor(row) {
+  return row?.visibility || cycle.settings?.default_visibility || 'private';
+}
+
 // --------------------------------------------------------
 // Perioden-Modal (Anlegen/Bearbeiten inkl. Löschen)
 // --------------------------------------------------------
@@ -3762,8 +3872,8 @@ function openPeriodModal(period) {
         <div class="form-field">
           <label class="label" for="cycle-visibility">${esc(t('health.cycle.field.visibility'))}</label>
           <select class="input" id="cycle-visibility">
-            <option value="private" ${period?.visibility === 'family' ? '' : 'selected'}>${esc(t('health.cycle.visibility.private'))}</option>
-            <option value="family" ${period?.visibility === 'family' ? 'selected' : ''}>${esc(t('health.cycle.visibility.family'))}</option>
+            <option value="private" ${cycleVisibilityFor(period) === 'family' ? '' : 'selected'}>${esc(t('health.cycle.visibility.private'))}</option>
+            <option value="family" ${cycleVisibilityFor(period) === 'family' ? 'selected' : ''}>${esc(t('health.cycle.visibility.family'))}</option>
           </select>
         </div>
         <div class="form-field">
@@ -3811,10 +3921,9 @@ function openPeriodModal(period) {
 
 async function deletePeriod(period) {
   if (!period?.id) return;
-  if (!(await confirmModal(t('health.cycle.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
+  if (!(await confirmOverModal(t('health.cycle.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
   try {
     await api.delete(`/health/cycle/periods/${period.id}`);
-    closeModal({ force: true });
     window.yuvomi?.showToast(t('health.cycle.deleted'), 'success');
     await reloadCycle();
   } catch (err) {
@@ -3865,8 +3974,8 @@ function openDayLogModal(dateKey) {
           <div class="form-field">
             <label class="label" for="cycle-log-visibility">${esc(t('health.cycle.field.visibility'))}</label>
             <select class="input" id="cycle-log-visibility">
-              <option value="private" ${existing?.visibility === 'family' ? '' : 'selected'}>${esc(t('health.cycle.visibility.private'))}</option>
-              <option value="family" ${existing?.visibility === 'family' ? 'selected' : ''}>${esc(t('health.cycle.visibility.family'))}</option>
+              <option value="private" ${cycleVisibilityFor(existing) === 'family' ? '' : 'selected'}>${esc(t('health.cycle.visibility.private'))}</option>
+              <option value="family" ${cycleVisibilityFor(existing) === 'family' ? 'selected' : ''}>${esc(t('health.cycle.visibility.family'))}</option>
             </select>
           </div>
         </div>
@@ -3925,10 +4034,9 @@ function openDayLogModal(dateKey) {
 
 async function deleteDayLog(log) {
   if (!log?.id) return;
-  if (!(await confirmModal(t('health.cycle.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
+  if (!(await confirmOverModal(t('health.cycle.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
   try {
     await api.delete(`/health/cycle/logs/${log.id}`);
-    closeModal({ force: true });
     window.yuvomi?.showToast(t('health.cycle.deleted'), 'success');
     await reloadCycle();
   } catch (err) {
@@ -3960,33 +4068,56 @@ function openCycleSettingsModal() {
         <div class="form-field">
           <label class="label" for="cs-cycle">${esc(t('health.cycle.settings.cycleLength'))}</label>
           <input class="input" id="cs-cycle" type="number" inputmode="numeric" min="15" max="60" step="1"
+            aria-describedby="cs-auto-hint"
             placeholder="${esc(fmtNum(stats.avgCycle))}" value="${esc(val(s.cycle_length_avg))}">
         </div>
         <div class="form-field">
           <label class="label" for="cs-period">${esc(t('health.cycle.settings.periodLength'))}</label>
           <input class="input" id="cs-period" type="number" inputmode="numeric" min="1" max="15" step="1"
+            aria-describedby="cs-auto-hint"
             placeholder="${esc(fmtNum(stats.avgPeriod))}" value="${esc(val(s.period_length_avg))}">
         </div>
         <div class="form-field">
           <label class="label" for="cs-luteal">${esc(t('health.cycle.settings.lutealLength'))}</label>
           <input class="input" id="cs-luteal" type="number" inputmode="numeric" min="8" max="18" step="1"
+            aria-describedby="cs-auto-hint"
             value="${esc(val(s.luteal_length ?? 14))}">
         </div>
         <label class="cycle-toggle">
           <input type="checkbox" id="cs-fertility" ${s.track_fertility === 0 ? '' : 'checked'}>
           <span>${esc(t('health.cycle.settings.trackFertility'))}</span>
         </label>
-        <p class="cycle-hint">${esc(t('health.cycle.settings.autoHint'))}</p>
+        <p class="cycle-hint" id="cs-auto-hint">${esc(t('health.cycle.settings.autoHint'))}</p>
+        <div class="form-field">
+          <label class="label" for="cs-default-visibility">${esc(t('health.cycle.settings.defaultVisibility'))}</label>
+          <select class="input" id="cs-default-visibility" aria-describedby="cs-default-visibility-hint">
+            <option value="private" ${s.default_visibility === 'family' ? '' : 'selected'}>${esc(t('health.cycle.visibility.private'))}</option>
+            <option value="family" ${s.default_visibility === 'family' ? 'selected' : ''}>${esc(t('health.cycle.visibility.family'))}</option>
+          </select>
+          <p class="cycle-hint" id="cs-default-visibility-hint">${esc(t('health.cycle.settings.defaultVisibilityHint'))}</p>
+        </div>
+        <div class="form-field cycle-bulk">
+          <button type="button" class="btn btn--secondary" data-action="cycle-apply-visibility"
+            aria-describedby="cs-bulk-hint">${esc(t('health.cycle.settings.applyToAll'))}</button>
+          <p class="cycle-hint" id="cs-bulk-hint">${esc(t('health.cycle.settings.applyToAllHint'))}</p>
+          <div class="cycle-bulk__confirm" data-role="bulk-confirm" role="group" aria-labelledby="cs-bulk-question" hidden>
+            <p class="cycle-hint cycle-bulk__question" id="cs-bulk-question" data-role="bulk-confirm-text"></p>
+            <div class="cycle-bulk__actions">
+              <button type="button" class="btn btn--ghost" data-action="cycle-apply-cancel">${esc(t('common.cancel'))}</button>
+              <button type="button" class="btn btn--primary" data-action="cycle-apply-run" aria-describedby="cs-bulk-question">${esc(t('common.confirm'))}</button>
+            </div>
+          </div>
+        </div>
         <hr class="cycle-settings__sep">
         <label class="cycle-toggle">
-          <input type="checkbox" id="cs-pregnancy" ${s.pregnancy_mode ? 'checked' : ''}>
+          <input type="checkbox" id="cs-pregnancy" aria-describedby="cs-pregnancy-hint" ${s.pregnancy_mode ? 'checked' : ''}>
           <span>${esc(t('health.cycle.settings.pregnancyMode'))}</span>
         </label>
         <div class="form-field" id="cs-due-field" ${s.pregnancy_mode ? '' : 'hidden'}>
           <label class="label" for="cs-due">${esc(t('health.cycle.settings.dueDate'))}</label>
           <yuvomi-datepicker id="cs-due" type="date" value="${esc(s.pregnancy_due_date || '')}" min="${esc(dueMin)}" max="${esc(dueMax)}"></yuvomi-datepicker>
         </div>
-        <p class="cycle-hint">${esc(t('health.cycle.settings.pregnancyHint'))}</p>
+        <p class="cycle-hint" id="cs-pregnancy-hint">${esc(t('health.cycle.settings.pregnancyHint'))}</p>
         <div class="modal-actions">
           <button type="button" class="btn btn--ghost" data-action="cancel">${esc(t('common.cancel'))}</button>
           <button type="submit" class="btn btn--primary">${esc(t('common.save'))}</button>
@@ -3998,6 +4129,46 @@ function openCycleSettingsModal() {
       const pregToggle = panel.querySelector('#cs-pregnancy');
       const dueField = panel.querySelector('#cs-due-field');
       pregToggle?.addEventListener('change', () => { dueField.hidden = !pregToggle.checked; });
+
+      // Bulk-Sichtbarkeit: setzt alle bestehenden Einträge auf den oben gewählten
+      // Wert. Inline-Bestätigung statt confirmModal - das Modal-System stapelt
+      // nicht, ein verschachteltes confirmModal würde die Settings mitsamt noch
+      // ungespeicherter Eingaben schließen. Betrifft nur die eigenen Daten.
+      const bulkBtn     = panel.querySelector('[data-action="cycle-apply-visibility"]');
+      const bulkConfirm = panel.querySelector('[data-role="bulk-confirm"]');
+      const bulkText    = panel.querySelector('[data-role="bulk-confirm-text"]');
+      const bulkRun     = panel.querySelector('[data-action="cycle-apply-run"]');
+      const visSelect   = panel.querySelector('#cs-default-visibility');
+      const selectedVisibility = () => visSelect.value || 'private';
+      const visLabel = () => t(`health.cycle.visibility.${selectedVisibility()}`);
+      const showBulk = (confirming) => { bulkConfirm.hidden = !confirming; bulkBtn.hidden = confirming; };
+      // Button-Label nennt den Zielwert und folgt dem Dropdown - so ist vor dem
+      // Klick klar, worauf „alle" gesetzt werden.
+      const syncBulkLabel = () => { bulkBtn.textContent = t('health.cycle.settings.applyToAllValue', { visibility: visLabel() }); };
+      syncBulkLabel();
+      visSelect.addEventListener('change', syncBulkLabel);
+      bulkBtn?.addEventListener('click', () => {
+        bulkText.textContent = t('health.cycle.settings.applyToAllConfirm', { visibility: visLabel() });
+        showBulk(true);
+        bulkRun.focus(); // Fokus auf die Bestätigung; SR liest die Frage via aria-describedby
+      });
+      panel.querySelector('[data-action="cycle-apply-cancel"]')?.addEventListener('click', () => { showBulk(false); bulkBtn.focus(); });
+      bulkRun?.addEventListener('click', async () => {
+        bulkRun.disabled = true;
+        try {
+          const { data } = await api.patch('/health/cycle/visibility', { visibility: selectedVisibility() });
+          const count = (data?.periods || 0) + (data?.logs || 0);
+          showBulk(false);
+          window.yuvomi?.showToast(t('health.cycle.settings.applyToAllDone', { count }), 'success');
+          await reloadCycle();
+        } catch (err) {
+          console.error('[Health] cycle bulk visibility error:', err);
+          window.yuvomi?.showToast(err?.data?.error || t('health.cycle.saveError'), 'danger');
+        } finally {
+          bulkRun.disabled = false;
+        }
+      });
+
       panel.querySelector('#cycle-settings-form').addEventListener('submit', async (e) => {
         e.preventDefault();
         const submitBtn = panel.querySelector('[type="submit"]');
@@ -4009,6 +4180,7 @@ function openCycleSettingsModal() {
           period_length_avg: numOr('#cs-period'),
           luteal_length: numOr('#cs-luteal') ?? 14,
           track_fertility: panel.querySelector('#cs-fertility').checked,
+          default_visibility: panel.querySelector('#cs-default-visibility').value || 'private',
           pregnancy_mode: pregnant,
           // Termin auch beim Ausschalten behalten (nur im aktiven Modus genutzt) —
           // versehentliches Umschalten löscht die Eingabe dann nicht.

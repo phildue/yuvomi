@@ -10,6 +10,12 @@ const ORIGINAL_KEYS = [
   'APPLE_USERNAME', 'APPLE_APP_SPECIFIC_PASSWORD', 'SYNC_INTERVAL_MINUTES',
 ];
 
+const GOOGLE_DRIVE_KEYS = [
+  'GOOGLE_DRIVE_CLIENT_ID',
+  'GOOGLE_DRIVE_CLIENT_SECRET',
+  'GOOGLE_DRIVE_REDIRECT_URI',
+];
+
 // Phase 5 ergänzt Reverse-Proxy-, OIDC- und Backup-Settings sowie APPLE_CALDAV_URL.
 const P5_KEYS = [
   'APPLE_CALDAV_URL', 'SESSION_SECURE', 'TRUST_PROXY',
@@ -46,7 +52,7 @@ const WEBDAV_BACKUP_KEYS = [
 
 const WIZARD_EXTRA_KEYS = ['BASE_URL', 'VAPID_SUBJECT'];
 
-const TOTAL_KEYS = ORIGINAL_KEYS.length + 2 + P5_KEYS.length
+const TOTAL_KEYS = ORIGINAL_KEYS.length + GOOGLE_DRIVE_KEYS.length + 2 + P5_KEYS.length
   + DOCUMENT_STORAGE_KEYS.length + DOCUMENT_STORAGE_LOCAL_KEYS.length
   + SUBSCRIPTION_KEYS.length + EMAIL_KEYS.length + WEBDAV_BACKUP_KEYS.length
   + WIZARD_EXTRA_KEYS.length; // + TZ + OIKOS_HTTP_PORT
@@ -56,6 +62,9 @@ test('ENV_SCHEMA enthält alle Original-Keys, TZ, OIKOS_HTTP_PORT, P5, Subscript
   const keys = ENV_SCHEMA.map(e => e.key);
   for (const k of ORIGINAL_KEYS) {
     assert.ok(keys.includes(k), `Key fehlt: ${k}`);
+  }
+  for (const k of GOOGLE_DRIVE_KEYS) {
+    assert.ok(keys.includes(k), `Google-Drive-Key fehlt: ${k}`);
   }
   assert.ok(keys.includes('TZ'), 'Key fehlt: TZ');
   assert.ok(keys.includes('OIKOS_HTTP_PORT'), 'Key fehlt: OIKOS_HTTP_PORT');
@@ -185,6 +194,45 @@ test('Lokale Dokumentspeicher-Werte erzeugen keine TrueNAS- oder Umbrel-Fragen',
   }
 });
 
+test('Jedes Container-Deployment schreibt Backups nach /backups (issue #579)', () => {
+  // Ohne BACKUP_DIR fällt die App auf ihren Bare-Metal-Default './backups' zurück,
+  // also /app/backups im Container - ausserhalb des gemounteten Volumes und für den
+  // node-User nicht anlegbar. Das Image setzt den Default deshalb selbst, und jeder
+  // Descriptor mit einem /backups-Mount muss die Variable passend belegen.
+  const dockerfile = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
+  assert.match(
+    dockerfile,
+    /^ENV BACKUP_DIR=\/backups$/m,
+    'Dockerfile muss BACKUP_DIR=/backups als Image-Default setzen'
+  );
+
+  for (const path of [
+    '../docker-compose.yml',
+    '../podman-compose.yml',
+    '../docs/docker-compose.portainer.yml',
+    '../deploy/umbrel/docker-compose.yml',
+  ]) {
+    const src = readFileSync(new URL(path, import.meta.url), 'utf8');
+    assert.match(src, /:\/backups(:Z)?$/m, `${path} mountet kein /backups`);
+    assert.match(src, /- BACKUP_DIR=\/backups$/m, `${path} setzt BACKUP_DIR nicht auf /backups`);
+  }
+
+  const truenas = readFileSync(
+    new URL('../deploy/truenas/templates/docker-compose.yaml', import.meta.url),
+    'utf8'
+  );
+  assert.match(truenas, /add_env\("BACKUP_DIR", "\/backups"\)/, 'TrueNAS setzt BACKUP_DIR nicht');
+
+  const quadlet = readFileSync(new URL('../tools/quadlet/oikos.container', import.meta.url), 'utf8');
+  assert.match(quadlet, /^Environment=BACKUP_DIR=\/backups$/m, 'Quadlet setzt BACKUP_DIR nicht');
+
+  const unraid = readFileSync(new URL('../templates/yuvomi.xml', import.meta.url), 'utf8');
+  const backupVar = unraid.match(/<Config[^>]+Target="BACKUP_DIR"[^>]*>[^<]*/);
+  assert.ok(backupVar, 'Unraid deklariert BACKUP_DIR nicht');
+  assert.match(backupVar[0], /Default="\/backups"/, 'Unraid BACKUP_DIR muss /backups defaulten');
+  assert.match(unraid, /Target="\/backups"[^>]+Type="Path"/, 'Unraid mountet kein /backups');
+});
+
 test('TZ und OIKOS_HTTP_PORT haben writeToEnv: true', () => {
   for (const key of ['TZ', 'OIKOS_HTTP_PORT']) {
     const entry = ENV_SCHEMA.find(e => e.key === key);
@@ -207,6 +255,90 @@ test('Dokument-WebDAV ist optional, standardmäßig deaktiviert und maskiert das
 
   const password = ENV_SCHEMA.find(e => e.key === 'DOCUMENT_STORAGE_WEBDAV_PASSWORD');
   assert.equal(password.secret, true, 'WebDAV-Passwort muss als Secret markiert sein');
+});
+
+test('Google Drive OAuth installer wiring is optional, masked, validated and deployed consistently', () => {
+  for (const key of GOOGLE_DRIVE_KEYS) {
+    const entry = ENV_SCHEMA.find((item) => item.key === key);
+    assert.ok(entry, `${key} missing from ENV_SCHEMA`);
+    assert.equal(entry.required, false);
+    assert.equal(entry.writeToEnv, true);
+    assert.equal(entry.group, 'googleDrive');
+  }
+  assert.equal(
+    ENV_SCHEMA.find((item) => item.key === 'GOOGLE_DRIVE_CLIENT_SECRET').secret,
+    true
+  );
+
+  const web = readFileSync(new URL('../tools/installer/install.html', import.meta.url), 'utf8');
+  for (const id of [
+    'adv-document-google-drive-enable',
+    'adv-document-google-drive-client-id',
+    'adv-document-google-drive-client-secret',
+    'document-google-drive-redirect-hint',
+    'rv-document-google-drive',
+  ]) assert.match(web, new RegExp(`id="${id}"`), `web installer missing ${id}`);
+  for (const key of GOOGLE_DRIVE_KEYS) {
+    assert.match(web, new RegExp(`${key}:\\s*S\\.${key}`));
+    assert.match(web, new RegExp(`${key}:\\s*''`));
+  }
+  assert.match(web, /errDocumentGoogleDrivePair/);
+  assert.match(web, /errDocumentGoogleDriveCredentials/);
+  assert.match(web, /\/api\/v1\/documents\/storage\/google-drive\/callback/);
+
+  const cli = readFileSync(new URL('../install.sh', import.meta.url), 'utf8');
+  for (const key of GOOGLE_DRIVE_KEYS) assert.match(cli, new RegExp(`^${key}=`, 'm'));
+  assert.match(cli, /read -rs GOOGLE_DRIVE_CLIENT_SECRET/);
+  assert.match(cli, /document_google_drive\.err_pair/);
+
+  const envExample = readFileSync(new URL('../.env.example', import.meta.url), 'utf8');
+  const portainer = readFileSync(new URL('../docs/docker-compose.portainer.yml', import.meta.url), 'utf8');
+  const unraid = readFileSync(new URL('../templates/yuvomi.xml', import.meta.url), 'utf8');
+  for (const key of GOOGLE_DRIVE_KEYS) {
+    assert.match(envExample, new RegExp(`^${key}=`, 'm'));
+    assert.match(portainer, new RegExp(`- ${key}=\\$\\{${key}:-`));
+    assert.match(unraid, new RegExp(`Target="${key}"`));
+  }
+  assert.match(
+    unraid.match(/<Config[^>]+Target="GOOGLE_DRIVE_CLIENT_SECRET"[^>]*>/)[0],
+    /Mask="true"/
+  );
+  for (const deployment of [
+    '../deploy/truenas/questions.yaml',
+    '../deploy/truenas/templates/docker-compose.yaml',
+    '../deploy/umbrel/docker-compose.yml',
+    '../deploy/umbrel/umbrel-app.yml',
+  ]) {
+    const source = readFileSync(new URL(deployment, import.meta.url), 'utf8');
+    for (const key of GOOGLE_DRIVE_KEYS) assert.doesNotMatch(source, new RegExp(key));
+  }
+});
+
+test('Unraid deklariert alle Web-Push-Variablen advanced und maskiert den privaten Schluessel', () => {
+  // Unraid zaehlt jede Variable von Hand auf und hat keinen Fallback: fehlt ein
+  // Eintrag, koennen Unraid-Nutzer die Variable ueberhaupt nicht setzen. Genau
+  // daran scheiterte Push auf iOS - das Subject war nirgends erreichbar (#580).
+  const unraid = readFileSync(new URL('../templates/yuvomi.xml', import.meta.url), 'utf8');
+  const envExample = readFileSync(new URL('../.env.example', import.meta.url), 'utf8');
+
+  for (const key of ['VAPID_SUBJECT', 'VAPID_PUBLIC_KEY', 'VAPID_PRIVATE_KEY']) {
+    const entry = unraid.match(new RegExp(`<Config[^>]+Target="${key}"[^>]*>`));
+    assert.ok(entry, `${key} fehlt in templates/yuvomi.xml`);
+    assert.match(entry[0], /Display="advanced"/, `${key} sollte advanced sein`);
+    assert.match(entry[0], /Required="false"/, `${key} ist optional`);
+    assert.match(envExample, new RegExp(`^# ?${key}=`, 'm'), `${key} fehlt in .env.example`);
+  }
+
+  assert.match(
+    unraid.match(/<Config[^>]+Target="VAPID_PRIVATE_KEY"[^>]*>/)[0],
+    /Mask="true"/,
+    'der private VAPID-Schluessel muss maskiert sein'
+  );
+  assert.match(
+    unraid.match(/<Config[^>]+Target="VAPID_SUBJECT"[^>]*>/)[0],
+    /BadJwtToken/,
+    'die Apple-Falle gehoert in die Beschreibung, sonst setzt sie niemand'
+  );
 });
 
 test('FIXER_API_KEY ist optional und als Secret markiert', () => {

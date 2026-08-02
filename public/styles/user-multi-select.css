@@ -31,8 +31,13 @@
   margin-left: 0;
 }
 
+/* Der Grund ist ein Textton und kippt daher mit dem Theme (Light #6C6B67,
+ * Dark #AEADB0). Das feste Weiß aus .avatar-stack__item erreichte im Dark nur
+ * 2.23:1; --color-surface schaltet als Gegenstück mit und bleibt in beiden
+ * Themes der invertierte Ton. */
 .avatar-stack__overflow {
   background-color: var(--color-text-secondary);
+  color: var(--color-surface);
 }
 
 /* ------------------------------------------------------------------ */
@@ -87,8 +92,8 @@
 }
 
 .user-ms__option:has(.user-ms__checkbox:focus-visible) {
-  outline: 2px solid var(--active-module-accent, var(--module-accent, var(--color-accent)));
-  outline-offset: 2px;
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
 }
 
 /* Checkbox visuell entfernen, aber fokussierbar/zugänglich lassen. */

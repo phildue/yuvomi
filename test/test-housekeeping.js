@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import test from 'node:test';
 import express from 'express';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { MIGRATIONS, _setTestDatabase, _resetTestDatabase } from '../server/db.js';
 import { roundMinutesTo15, computeHourlyAmount } from '../server/services/housekeeping-billing.js';
 

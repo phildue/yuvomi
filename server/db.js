@@ -1,20 +1,29 @@
 /**
  * Modul: Datenbank (Database)
  * Zweck: SQLite/SQLCipher Verbindung, Schema-Migration (versioniert) und Query-Helfer
- * Abhängigkeiten: better-sqlite3
+ * Abhängigkeiten: better-sqlite3-multiple-ciphers
  *
- * SQLCipher-Hinweis:
- *   Verschlüsselung funktioniert nur wenn better-sqlite3 gegen SQLCipher kompiliert wurde.
- *   Im Docker-Container (Dockerfile: libsqlcipher-dev + npm rebuild) ist das gewährleistet.
- *   Ohne DB_ENCRYPTION_KEY gesetzt läuft die App mit unverschlüsseltem SQLite (für Entwicklung).
+ * Verschlüsselung:
+ *   `better-sqlite3-multiple-ciphers` ist ein API-kompatibler Ersatz für
+ *   `better-sqlite3`, der die Cipher-Schicht bereits im vorkompilierten Binary
+ *   mitbringt. Es wird KEIN System-SQLCipher und kein Quell-Build benötigt -
+ *   das gilt für Docker und Bare-Metal gleichermaßen.
+ *
+ *   Ohne DB_ENCRYPTION_KEY läuft die App bewusst mit unverschlüsseltem SQLite
+ *   (Entwicklung). Ist der Key gesetzt, wird der Cipher auf `sqlcipher`
+ *   (AES-256) gestellt und beim Start hart verifiziert: fehlender
+ *   Cipher-Support oder eine trotz Key unverschlüsselte Datei sind ein
+ *   Startfehler, kein stilles Weiterlaufen. Eine bereits vorhandene
+ *   unverschlüsselte Datenbank wird dabei einmalig migriert.
  */
 
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import path from 'path';
 import fs from 'node:fs/promises';
-import { mkdirSync, existsSync, renameSync, rmSync } from 'node:fs';
+import { mkdirSync, existsSync, renameSync, rmSync, copyFileSync, openSync, readSync, closeSync } from 'node:fs';
 import { createLogger } from './logger.js';
 import { decodeHtmlEntities } from './utils/html-entities.js';
+import { toE164, defaultCountryFromConfig } from './utils/phone.js';
 
 const log = createLogger('DB');
 
@@ -78,9 +87,16 @@ function migrateLegacyDbFile() {
   //    WAL liegen; dann NICHT teil-migrieren.
   let checkpointed = false;
   try {
+    // Bestands-Installationen haben typischerweise einen gesetzten Key UND eine
+    // noch unverschlüsselte Datei (bis v1.52.x lief `PRAGMA key` ins Leere).
+    // Setzten wir ihr den Key auf, läse SQLite sie als verschlüsselt und schon
+    // der Checkpoint scheiterte mit „file is not a database" — über eine völlig
+    // intakte Datenbank. Verschlüsselt wird erst nach dem Rename, durch
+    // encryptPlaintextDatabase() auf dem dann gültigen DB_PATH.
+    const encrypted = !isPlaintextDatabase(LEGACY_DB_PATH);
     const legacy = new Database(LEGACY_DB_PATH);
     try {
-      applyEncryptionKey(legacy);
+      if (encrypted) applyEncryptionKey(legacy);
       // wal_checkpoint(TRUNCATE) WIRFT nicht, wenn eine andere Verbindung den
       // WAL-Lock hält — es liefert eine Zeile { busy, log, checkpointed }. Nur
       // busy === 0 bedeutet, dass der WAL vollständig gefaltet & getrunct wurde
@@ -138,9 +154,13 @@ let db;
 /**
  * Datenbankverbindung öffnen, SQLCipher-Key setzen, Migrations ausführen.
  * Einmalig beim Serverstart aufrufen.
- * @returns {import('better-sqlite3').Database}
+ * @param {{ plaintextBackup?: boolean }} [options] `plaintextBackup: false`
+ *   unterdrückt die Klartext-Sicherheitskopie der Verschlüsselungs-Migration.
+ *   Nur für Aufrufer, die die Quelldaten selbst schon gesichert halten — siehe
+ *   `restoreFromFile()`.
+ * @returns {import('better-sqlite3-multiple-ciphers').Database}
  */
-function init() {
+function init({ plaintextBackup = true } = {}) {
   if (db) return db;
   if (!path.isAbsolute(DB_PATH)) {
     log.warn(
@@ -151,6 +171,14 @@ function init() {
   }
   mkdirSync(path.dirname(DB_PATH), { recursive: true });
   migrateLegacyDbFile();
+
+  // Beide Prüfungen laufen VOR dem Öffnen: fehlt der Cipher-Support, darf gar
+  // nicht erst eine unverschlüsselte Datei entstehen.
+  if (DB_KEY) {
+    assertCipherSupport();
+    encryptPlaintextDatabase({ backup: plaintextBackup });
+  }
+
   db = new Database(DB_PATH);
 
   applyEncryptionKey(db);
@@ -160,7 +188,10 @@ function init() {
     try {
       assertReadable(db);
     } catch {
-      throw new Error('[DB] Wrong encryption key or SQLCipher support is unavailable.');
+      throw new Error(
+        `[DB] Wrong encryption key — ${DB_PATH} could not be decrypted. ` +
+        'Check DB_ENCRYPTION_KEY against the value used when the database was created.'
+      );
     }
   }
 
@@ -170,6 +201,11 @@ function init() {
   db.pragma('temp_store = MEMORY');
 
   migrate();
+  reconcileCriticalSchema();
+
+  // Erst hier steht garantiert eine beschriebene Datei auf der Platte. Der
+  // Header ist der einzige Beleg, der nicht auf einer API-Zusage beruht.
+  if (DB_KEY) assertStoredEncrypted();
 
   log.info(`Connected: ${DB_PATH} | Schema v${currentVersion()}`);
   return db;
@@ -177,12 +213,177 @@ function init() {
 
 function applyEncryptionKey(database) {
   if (!DB_KEY) return;
-  // Nur wirksam wenn Binary gegen SQLCipher kompiliert ist (Docker)
+  // `cipher` muss vor `key` gesetzt werden. `sqlcipher` = AES-256 im
+  // SQLCipher-Format (statt des Default-Ciphers ChaCha20).
+  database.pragma("cipher = 'sqlcipher'");
   database.pragma(`key="x'${Buffer.from(DB_KEY, 'utf8').toString('hex')}'"`);
 }
 
 function assertReadable(database) {
   database.prepare('SELECT count(*) FROM sqlite_master').get();
+}
+
+/**
+ * Belegt, dass das geladene Binary überhaupt verschlüsseln kann.
+ * `sqlite3mc_version()` existiert ausschließlich in
+ * better-sqlite3-multiple-ciphers. Ohne diese Prüfung schluckt reguläres
+ * SQLite das unbekannte `PRAGMA key` kommentarlos und die Daten lägen im
+ * Klartext, während die Konfiguration Verschlüsselung verspricht.
+ */
+function assertCipherSupport() {
+  const probe = new Database(':memory:');
+  try {
+    probe.prepare('SELECT sqlite3mc_version() AS version').get();
+  } catch {
+    throw new Error(
+      '[DB] DB_ENCRYPTION_KEY is set, but the installed SQLite binding has no ' +
+      'encryption support (expected better-sqlite3-multiple-ciphers). Refusing ' +
+      'to start rather than storing your data unencrypted.'
+    );
+  } finally {
+    probe.close();
+  }
+}
+
+/** Header jeder unverschlüsselten SQLite-Datei. Verschlüsselt ist er Zufallsrauschen. */
+const SQLITE_PLAINTEXT_HEADER = Buffer.from('SQLite format 3\0', 'binary');
+
+function isPlaintextDatabase(filePath) {
+  let fd;
+  try {
+    fd = openSync(filePath, 'r');
+    const head = Buffer.alloc(SQLITE_PLAINTEXT_HEADER.length);
+    const bytesRead = readSync(fd, head, 0, head.length, 0);
+    return bytesRead === head.length && head.equals(SQLITE_PLAINTEXT_HEADER);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* Datei ist ohnehin gleich zu */ }
+    }
+  }
+}
+
+/**
+ * Einmalige Migration einer unverschlüsselten Bestands-Datenbank.
+ *
+ * Bis einschließlich v1.52.x war `DB_ENCRYPTION_KEY` faktisch wirkungslos:
+ * das ausgelieferte Binary hatte keine Cipher-Schicht, `PRAGMA key` lief ins
+ * Leere. Bestands-Installationen haben deshalb einen gesetzten Key UND eine
+ * unverschlüsselte Datei. Ohne diese Migration würde die App nach dem Update
+ * nicht mehr starten.
+ *
+ * Der Ablauf lässt das Original bis zum abschließenden, atomaren rename
+ * unangetastet: bricht der Vorgang ab, ist die Datenbank unverändert.
+ *
+ * @param {{ backup?: boolean }} [options] `backup: false` überspringt die
+ *   Klartext-Sicherheitskopie. Gedacht für den Restore-Pfad: dort ist die
+ *   eingespielte Backup-Datei selbst die Sicherung, und `.pre-restore-*` deckt
+ *   den Rollback ab. Eine dritte, unverschlüsselte Vollkopie im Datenverzeichnis
+ *   wäre reine Duplikation — und würde sich bei jedem Restore erneut anhäufen.
+ */
+function encryptPlaintextDatabase({ backup = true } = {}) {
+  if (!existsSync(DB_PATH)) return;           // Neuinstallation
+  if (!isPlaintextDatabase(DB_PATH)) return;  // bereits verschlüsselt
+
+  // Ein bereits vorhandenes Backup darf nicht überschrieben werden: nach dem
+  // Einspielen eines alten Klartext-Backups liefe die Migration erneut und
+  // würde sonst die Sicherheitskopie des ersten Durchlaufs vernichten.
+  let backupPath = null;
+  if (backup) {
+    backupPath = `${DB_PATH}.plaintext-backup`;
+    if (existsSync(backupPath)) {
+      backupPath = `${DB_PATH}.plaintext-backup-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    }
+  }
+  const workingPath = `${DB_PATH}.encrypting`;
+
+  log.warn(`${DB_PATH} is unencrypted but DB_ENCRYPTION_KEY is set — encrypting now.`);
+
+  // Offenes WAL einchecken, damit die .db-Datei für sich vollständig ist.
+  // wal_checkpoint(TRUNCATE) WIRFT NICHT, wenn eine andere Verbindung den
+  // WAL-Lock hält — es liefert { busy, log, checkpointed }. Nur busy === 0
+  // heißt, dass alle committeten Frames in der .db stehen. Würden wir bei
+  // busy != 0 weitermachen, verschlüsselten wir eine unvollständige Kopie und
+  // löschten anschließend die Sidecars: committete Daten wären verloren.
+  // Deshalb hier abbrechen statt teil-migrieren — unverschlüsselt weiterlaufen
+  // ist wegen der Sicherheitszusage ebenfalls keine Option.
+  let checkpointed = false;
+  const source = new Database(DB_PATH);
+  try {
+    const [row] = source.pragma('wal_checkpoint(TRUNCATE)');
+    checkpointed = row != null && row.busy === 0;
+    if (!checkpointed) {
+      log.warn(`WAL checkpoint incomplete (busy=${row?.busy}) — not encrypting a partial copy.`);
+    }
+  } finally {
+    source.close();
+  }
+
+  if (!checkpointed) {
+    throw new Error(
+      `[DB] Cannot encrypt ${DB_PATH}: its write-ahead log could not be checkpointed, ` +
+      'which means another connection is still using the database. Encrypting now ' +
+      'would risk losing committed data. Make sure no second instance is running ' +
+      'against this volume and start again.'
+    );
+  }
+
+  if (backupPath) copyFileSync(DB_PATH, backupPath);
+  copyFileSync(DB_PATH, workingPath);
+
+  try {
+    const working = new Database(workingPath);
+    try {
+      // rekey ist im WAL-Modus nicht erlaubt.
+      working.pragma('journal_mode = DELETE');
+      working.pragma("cipher = 'sqlcipher'");
+      working.pragma(`rekey="x'${Buffer.from(DB_KEY, 'utf8').toString('hex')}'"`);
+      working.pragma('journal_mode = WAL');
+    } finally {
+      working.close();
+    }
+  } catch (err) {
+    for (const suffix of ['', '-wal', '-shm']) {
+      try { rmSync(`${workingPath}${suffix}`, { force: true }); } catch { /* Aufräumen ist best-effort */ }
+    }
+    throw new Error(
+      `[DB] Encrypting the existing database failed (${err?.message}). ` +
+      `The original database is untouched at ${DB_PATH}.`
+    );
+  }
+
+  renameSync(workingPath, DB_PATH);
+
+  // Sidecars der unverschlüsselten Datei sind nach dem Checkpoint leer und
+  // passen nicht mehr zur neuen Datei.
+  for (const suffix of ['-wal', '-shm']) {
+    try { rmSync(`${DB_PATH}${suffix}`, { force: true }); } catch { /* SQLite legt sie neu an */ }
+    try { rmSync(`${workingPath}${suffix}`, { force: true }); } catch { /* dito */ }
+  }
+
+  if (!backupPath) {
+    log.info('Database encrypted (AES-256).');
+    return;
+  }
+
+  log.info(`Database encrypted (AES-256). Plaintext backup: ${backupPath}`);
+  log.warn(
+    `${backupPath} still contains UNENCRYPTED data — delete it once you have ` +
+    'verified that the app starts and your data is complete.'
+  );
+}
+
+/**
+ * Letzte Instanz gegen den stillen Fehlschlag: liegt trotz gesetztem Key eine
+ * unverschlüsselte Datei auf der Platte, ist der Start ein Fehler.
+ */
+function assertStoredEncrypted() {
+  if (!isPlaintextDatabase(DB_PATH)) return;
+  throw new Error(
+    `[DB] DB_ENCRYPTION_KEY is set, but ${DB_PATH} is stored unencrypted. ` +
+    'Refusing to continue — your data would not be protected.'
+  );
 }
 
 // --------------------------------------------------------
@@ -3171,6 +3372,1203 @@ const MIGRATIONS = [
       );
     `,
   },
+  {
+    version: 86,
+    description: 'Link family documents to tasks (#503)',
+    up: `
+      -- Verknüpft Dokumente aus dem Dokumente-Modul mit Aufgaben (n:m, #503).
+      -- ON DELETE CASCADE auf beiden Seiten: löscht die Verknüpfung, wenn entweder
+      -- die Aufgabe oder das Dokument entfernt wird (das jeweils andere bleibt
+      -- bestehen). created_by hält fest, wer verknüpft hat.
+      CREATE TABLE IF NOT EXISTS task_documents (
+        task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        document_id INTEGER NOT NULL REFERENCES family_documents(id) ON DELETE CASCADE,
+        created_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        PRIMARY KEY (task_id, document_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_documents_document ON task_documents(document_id);
+    `,
+  },
+  {
+    version: 87,
+    description: 'School-holiday group code for multilingual cantons (#434)',
+    up: `
+      -- OpenHolidays modelliert innerhalb EINER Subdivision teils mehrere
+      -- Schulferien-Regime (z. B. Kanton Bern: deutschsprachige Region CH-BE-VS
+      -- vs. französischsprachiger Berner Jura CH-BE-EO), unterschieden nur über
+      -- das "groups"-Feld. group_code hält diesen Gruppen-Code je Cache-Zeile,
+      -- damit die konfigurierte Ferien-Gruppe lese-seitig gefiltert werden kann
+      -- (NULL = gilt für die gesamte Subdivision, z. B. Feiertage). (#434)
+      ALTER TABLE holiday_cache ADD COLUMN group_code TEXT;
+    `,
+  },
+  {
+    version: 88,
+    description: 'Budget personal/shared: owner_id + visibility on entries, loans, subscriptions (#476/#505)',
+    up: `
+      -- Persönliche vs. geteilte Budget-Objekte (Lean, #476/#505). Jedes Objekt
+      -- bekommt eine:n Eigentümer:in (owner_id, fix = Ersteller:in) und eine
+      -- Sichtbarkeit (private/shared). Bestand → shared = bisheriges Haushalts-
+      -- Verhalten, voll rückwärtskompatibel. owner_id ist ON DELETE SET NULL:
+      -- Löschen eines Mitglieds macht seine Objekte zu verwaisten (nur im
+      -- Shared-Modus sichtbaren) Haushalts-Objekten, statt sie mitzureißen.
+      ALTER TABLE budget_entries ADD COLUMN owner_id INTEGER
+        REFERENCES users(id) ON DELETE SET NULL;
+      ALTER TABLE budget_entries ADD COLUMN visibility TEXT NOT NULL DEFAULT 'shared'
+        CHECK (visibility IN ('private', 'shared'));
+      UPDATE budget_entries SET owner_id = created_by WHERE owner_id IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_budget_owner ON budget_entries(owner_id);
+
+      ALTER TABLE budget_loans ADD COLUMN owner_id INTEGER
+        REFERENCES users(id) ON DELETE SET NULL;
+      ALTER TABLE budget_loans ADD COLUMN visibility TEXT NOT NULL DEFAULT 'shared'
+        CHECK (visibility IN ('private', 'shared'));
+      UPDATE budget_loans SET owner_id = created_by WHERE owner_id IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_budget_loans_owner ON budget_loans(owner_id);
+
+      ALTER TABLE budget_subscriptions ADD COLUMN owner_id INTEGER
+        REFERENCES users(id) ON DELETE SET NULL;
+      ALTER TABLE budget_subscriptions ADD COLUMN visibility TEXT NOT NULL DEFAULT 'shared'
+        CHECK (visibility IN ('private', 'shared'));
+      UPDATE budget_subscriptions SET owner_id = created_by WHERE owner_id IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_budget_subs_owner ON budget_subscriptions(owner_id);
+    `,
+  },
+  {
+    version: 89,
+    description: 'CardDAV contact origin: distinguish remotely imported from locally adopted contacts',
+    up: `
+      -- Herkunft eines CardDAV-verknüpften Kontakts. Der Sync muss entscheiden
+      -- können, was passiert, wenn der Server einen Kontakt nicht mehr liefert:
+      --   'remote' = ausschließlich aus CardDAV importiert → darf gelöscht werden.
+      --   'merged' = ein bereits lokal vorhandener Kontakt, den die Smart-Merge-
+      --              Logik nur adoptiert hat (Treffer über E-Mail/Telefon). Er
+      --              trägt lokal gepflegte Daten, die remote nie existiert haben,
+      --              und wird deshalb nur entkoppelt statt gelöscht.
+      -- NULL = kein CardDAV-Bezug (rein lokaler Kontakt).
+      --
+      -- Bestand bekommt bewusst 'merged' und NICHT 'remote': für bereits
+      -- synchronisierte Kontakte ist die Herkunft nicht mehr rekonstruierbar. Die
+      -- konservative Annahme kostet höchstens einen Kontakt, der nach dem
+      -- Remote-Löschen als lokaler Kontakt zurückbleibt; die umgekehrte Annahme
+      -- würde beim ersten Sync Nutzerdaten vernichten. Ab dieser Migration frisch
+      -- importierte Kontakte tragen ihre echte Herkunft.
+      ALTER TABLE contacts ADD COLUMN carddav_origin TEXT
+        CHECK (carddav_origin IN ('remote', 'merged'));
+
+      UPDATE contacts SET carddav_origin = 'merged' WHERE carddav_uid IS NOT NULL;
+    `,
+  },
+  {
+    version: 90,
+    description: 'Link imported birthdays to their source contact',
+    up: `
+      -- Koppelt einen importierten Geburtstag an seinen Quell-Kontakt. Der
+      -- partielle Unique-Index erzwingt Idempotenz: ein Kontakt kann nur einmal
+      -- als Geburtstag im Haushalt landen (GET /birthdays ist haushaltsweit, nicht
+      -- pro Nutzer). ON DELETE SET NULL: wird der Kontakt gelöscht, bleibt der
+      -- Geburtstag als rein lokaler Eintrag bestehen.
+      ALTER TABLE birthdays ADD COLUMN contact_id INTEGER
+        REFERENCES contacts(id) ON DELETE SET NULL;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_birthdays_contact_id
+        ON birthdays(contact_id) WHERE contact_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 91,
+    description: 'Heal CardDAV contacts synced with escaped names, missing details, wrong category (#531)',
+    up: `
+      -- Bereits per CardDAV synchronisierte Kontakte (carddav_uid IS NOT NULL)
+      -- heilen, die vor dem #531-Fix falsch abgelegt wurden. Nur Sync-Kontakte,
+      -- damit manuell angelegte Kontakte unberührt bleiben.
+
+      -- 1) Nicht abgebildete Kategorie 'Sonstiges' auf den stabilen Key 'misc'.
+      UPDATE contacts SET category = 'misc'
+        WHERE carddav_uid IS NOT NULL AND category = 'Sonstiges';
+
+      -- 2) Literale vCard-Escapes im Namen auflösen. Backslash ist in SQLite-LIKE
+      -- kein Metazeichen, daher matcht '%\\,%' die Sequenz Backslash+Komma direkt.
+      UPDATE contacts
+        SET name = REPLACE(REPLACE(REPLACE(name, '\\,', ','), '\\;', ';'), '\\\\', '\\')
+        WHERE carddav_uid IS NOT NULL
+          AND (name LIKE '%\\,%' OR name LIKE '%\\;%' OR name LIKE '%\\\\%');
+
+      -- 3) Fehlende Legacy-Skalarfelder aus den Multi-Value-Tabellen nachfüllen,
+      -- damit Liste und Bearbeiten-Dialog Telefon/E-Mail sofort zeigen (die Adresse
+      -- wird beim nächsten Sync ergänzt). Nur NULL-Spalten, keine manuellen Werte.
+      UPDATE contacts SET phone = (
+          SELECT value FROM contact_phones
+          WHERE contact_id = contacts.id ORDER BY is_primary DESC, id ASC LIMIT 1
+        )
+        WHERE carddav_uid IS NOT NULL AND phone IS NULL
+          AND EXISTS (SELECT 1 FROM contact_phones WHERE contact_id = contacts.id);
+
+      UPDATE contacts SET email = (
+          SELECT value FROM contact_emails
+          WHERE contact_id = contacts.id ORDER BY is_primary DESC, id ASC LIMIT 1
+        )
+        WHERE carddav_uid IS NOT NULL AND email IS NULL
+          AND EXISTS (SELECT 1 FROM contact_emails WHERE contact_id = contacts.id);
+    `,
+  },
+  {
+    version: 92,
+    description: 'Surface CardDAV sync errors in the UI instead of only the server log (#534)',
+    up: `
+      -- Bisher landete ein fehlgeschlagener Adressbuch-Abruf ausschließlich im
+      -- Server-Log ("501 Not Implemented" in #534). Das UI meldete weiterhin
+      -- "zuletzt synchronisiert", während die Hälfte der Kontakte fehlte.
+      -- Beide Spalten sind nullable: NULL heißt "letzter Lauf war sauber".
+      ALTER TABLE carddav_accounts ADD COLUMN last_error TEXT;
+      ALTER TABLE carddav_accounts ADD COLUMN last_error_at TEXT;
+    `,
+  },
+  {
+    version: 93,
+    description: 'Attach CardDAV sync errors to the failing address book, not just the account (#534)',
+    up: `
+      -- Der Konto-Fehler nennt zwar das Adressbuch im Text, aber als Fließtext:
+      -- die Liste kann die betroffene Zeile damit nicht markieren, und der Name
+      -- im Fehler muss nicht mit dem Namen in der Liste übereinstimmen.
+      -- NULL heißt "dieses Adressbuch lief zuletzt sauber durch".
+      ALTER TABLE carddav_addressbook_selection ADD COLUMN last_error TEXT;
+    `,
+  },
+  {
+    version: 94,
+    description: 'Store structured vCard N name components for contacts (#535)',
+    up: `
+      -- Bisher trug ein Kontakt nur den kombinierten Anzeigenamen (aus FN).
+      -- Quellen formatieren FN unterschiedlich ("Given Family" vs. "Family, Given",
+      -- teils mit Titel oder Spitzname) - dadurch war weder Anzeige noch Sortierung
+      -- konsistent. Die vCard-Eigenschaft N trägt die Struktur; sie wird ab jetzt
+      -- gespeichert. name bleibt der Anzeigename und wird daraus abgeleitet.
+      -- Alle Spalten nullable: NULL heißt "keine Struktur bekannt" (Altbestand,
+      -- CardDAV-Kontakte füllen sie beim nächsten Sync nach).
+      ALTER TABLE contacts ADD COLUMN first_name TEXT;
+      ALTER TABLE contacts ADD COLUMN last_name TEXT;
+      ALTER TABLE contacts ADD COLUMN middle_name TEXT;
+      ALTER TABLE contacts ADD COLUMN name_prefix TEXT;
+      ALTER TABLE contacts ADD COLUMN name_suffix TEXT;
+    `,
+  },
+  {
+    version: 95,
+    description: 'Add additive value_e164 column to contact_phones for format-independent CardDAV matching (libphonenumber-js)',
+    up: `
+      -- STRIKT ADDITIV. value bleibt die Wahrheit (roher User-String) und wird nie
+      -- verändert. value_e164 ist eine reine Zusatzspalte fürs format-unabhängige
+      -- Kontakt-Matching beim CardDAV-Sync (verhindert Duplikate durch Format-
+      -- Varianz). Nullable: NULL heißt "nicht parsebar" → das Matching fällt auf den
+      -- exakten Rohwert-Vergleich zurück. Der Backfill läuft in afterUp() (JS/E.164).
+      ALTER TABLE contact_phones ADD COLUMN value_e164 TEXT;
+      CREATE INDEX idx_contact_phones_e164 ON contact_phones(value_e164);
+    `,
+    afterUp: (db) => {
+      // E.164 pro Zeile aus dem ROHWERT berechnen; value bleibt unangetastet.
+      // Default-Land aus der haushaltweiten Konfiguration; fehlt es, werden nur
+      // Nummern mit internationaler Vorwahl (+) normalisiert.
+      const defaultCountry = defaultCountryFromConfig(db);
+      const rows = db.prepare('SELECT id, value FROM contact_phones').all();
+      const upd = db.prepare('UPDATE contact_phones SET value_e164 = ? WHERE id = ?');
+      for (const row of rows) {
+        const e164 = toE164(row.value, defaultCountry);
+        if (e164) upd.run(e164, row.id); // nur wo parsebar; sonst bleibt NULL
+      }
+    },
+  },
+  {
+    version: 96,
+    description: 'Add default_visibility to cycle_settings so new cycle entries can default to family-visible',
+    up: `
+      -- Persönliche Voreinstellung für die Sichtbarkeit neu geloggter Zyklus-Daten
+      -- (Perioden + Tageslogs). Bestehende Zeilen bleiben unberührt; 'private' hält
+      -- das bisherige Verhalten als Default bei. Das UI wählt diesen Wert nur vor -
+      -- pro Event bleibt die Sichtbarkeit weiterhin einzeln überschreibbar.
+      ALTER TABLE cycle_settings ADD COLUMN default_visibility TEXT NOT NULL DEFAULT 'private'
+        CHECK(default_visibility IN ('private', 'family'));
+    `,
+  },
+  {
+    version: 97,
+    description: 'Add tzid to calendar_events for DST-correct recurrence expansion (#549)',
+    up: `
+      -- IANA-Zeitzone (z.B. Europe/Berlin) des Serien-Starts. Nur für zeitgebundene
+      -- CalDAV/Apple-Wiederholungen relevant, die am Anzeige-Zeitpunkt expandiert
+      -- werden: ohne die Zone behält jede Instanz den festen UTC-Zeit-Suffix des
+      -- Masters, sodass die lokale Uhrzeit über die Sommer-/Winterzeit-Grenze um
+      -- eine Stunde driftet (#549). NULL = wie bisher (floating/UTC, kein DST-Bezug).
+      ALTER TABLE calendar_events ADD COLUMN tzid TEXT;
+    `,
+  },
+  {
+    version: 98,
+    description: 'Add Google Drive as a document storage backend',
+    foreignKeysOff: true,
+    up: `
+      CREATE TABLE family_documents_new (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        name             TEXT    NOT NULL,
+        description      TEXT,
+        category         TEXT    NOT NULL DEFAULT 'other'
+                                  CHECK(category IN ('medical', 'school', 'identity', 'insurance', 'finance', 'home', 'vehicle', 'legal', 'travel', 'pets', 'warranty', 'taxes', 'work', 'other')),
+        status           TEXT    NOT NULL DEFAULT 'active'
+                                  CHECK(status IN ('active', 'archived')),
+        visibility       TEXT    NOT NULL DEFAULT 'family'
+                                  CHECK(visibility IN ('family', 'restricted', 'private')),
+        original_name    TEXT    NOT NULL,
+        mime_type        TEXT    NOT NULL,
+        file_size        INTEGER NOT NULL,
+        content_data     TEXT    NOT NULL,
+        storage_provider TEXT    NOT NULL DEFAULT 'local'
+                                  CHECK(storage_provider IN ('local', 'external')),
+        storage_key      TEXT,
+        created_by       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        folder_id        INTEGER REFERENCES family_document_folders(id) ON DELETE SET NULL,
+        dms_account_id   INTEGER REFERENCES dms_accounts(id) ON DELETE SET NULL,
+        external_url     TEXT,
+        external_meta    TEXT,
+        storage_backend  TEXT    NOT NULL DEFAULT 'local'
+                                  CHECK(storage_backend IN ('local', 'webdav', 'dms', 'google_drive'))
+      );
+
+      INSERT INTO family_documents_new (
+        id, name, description, category, status, visibility, original_name,
+        mime_type, file_size, content_data, storage_provider, storage_key,
+        created_by, created_at, updated_at, folder_id, dms_account_id,
+        external_url, external_meta, storage_backend
+      )
+      SELECT
+        id, name, description, category, status, visibility, original_name,
+        mime_type, file_size, content_data, storage_provider, storage_key,
+        created_by, created_at, updated_at, folder_id, dms_account_id,
+        external_url, external_meta, storage_backend
+      FROM family_documents;
+
+      DROP TABLE family_documents;
+      ALTER TABLE family_documents_new RENAME TO family_documents;
+
+      UPDATE family_documents
+      SET visibility = CASE
+        WHEN EXISTS (
+          SELECT 1 FROM calendar_events e
+          WHERE e.attachment_document_id = family_documents.id
+            AND e.visibility = 'all'
+        ) THEN 'family'
+        WHEN EXISTS (
+          SELECT 1 FROM calendar_events e
+          WHERE e.attachment_document_id = family_documents.id
+            AND e.visibility = 'assignees'
+        ) THEN 'restricted'
+        ELSE 'private'
+      END
+      WHERE EXISTS (
+        SELECT 1 FROM calendar_events e
+        WHERE e.attachment_document_id = family_documents.id
+      );
+
+      DELETE FROM family_document_access
+      WHERE document_id IN (
+        SELECT attachment_document_id
+        FROM calendar_events
+        WHERE attachment_document_id IS NOT NULL
+      );
+
+      INSERT OR IGNORE INTO family_document_access (document_id, user_id)
+      SELECT e.attachment_document_id, ea.user_id
+      FROM calendar_events e
+      JOIN event_assignments ea ON ea.event_id = e.id
+      WHERE e.attachment_document_id IS NOT NULL
+        AND e.visibility = 'assignees'
+        AND NOT EXISTS (
+          SELECT 1 FROM calendar_events family_event
+          WHERE family_event.attachment_document_id = e.attachment_document_id
+            AND family_event.visibility = 'all'
+        );
+
+      CREATE TRIGGER trg_family_documents_updated_at
+        AFTER UPDATE ON family_documents FOR EACH ROW
+        BEGIN UPDATE family_documents SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+
+      CREATE TRIGGER trg_family_documents_storage_insert
+        BEFORE INSERT ON family_documents
+        FOR EACH ROW
+        BEGIN
+          SELECT CASE
+            WHEN NOT (
+              (NEW.storage_provider = 'local' AND NEW.storage_backend = 'local')
+              OR (NEW.storage_provider = 'external' AND NEW.storage_backend = 'webdav')
+              OR (NEW.storage_provider = 'external' AND NEW.storage_backend = 'dms')
+              OR (NEW.storage_provider = 'external' AND NEW.storage_backend = 'google_drive')
+            )
+            THEN RAISE(ABORT, 'invalid document storage provider/backend combination')
+          END;
+          SELECT CASE
+            WHEN NEW.storage_backend != 'dms' AND NEW.dms_account_id IS NOT NULL
+            THEN RAISE(ABORT, 'dms_account_id requires dms storage backend')
+          END;
+        END;
+
+      CREATE TRIGGER trg_family_documents_storage_update
+        BEFORE UPDATE OF storage_provider, storage_backend, dms_account_id ON family_documents
+        FOR EACH ROW
+        BEGIN
+          SELECT CASE
+            WHEN NOT (
+              (NEW.storage_provider = 'local' AND NEW.storage_backend = 'local')
+              OR (NEW.storage_provider = 'external' AND NEW.storage_backend = 'webdav')
+              OR (NEW.storage_provider = 'external' AND NEW.storage_backend = 'dms')
+              OR (NEW.storage_provider = 'external' AND NEW.storage_backend = 'google_drive')
+            )
+            THEN RAISE(ABORT, 'invalid document storage provider/backend combination')
+          END;
+          SELECT CASE
+            WHEN NEW.storage_backend != 'dms' AND NEW.dms_account_id IS NOT NULL
+            THEN RAISE(ABORT, 'dms_account_id requires dms storage backend')
+          END;
+        END;
+
+      CREATE INDEX idx_family_documents_status     ON family_documents(status);
+      CREATE INDEX idx_family_documents_category   ON family_documents(category);
+      CREATE INDEX idx_family_documents_created_by ON family_documents(created_by);
+      CREATE INDEX idx_family_documents_folder     ON family_documents(folder_id);
+      CREATE INDEX idx_family_documents_dms        ON family_documents(dms_account_id);
+    `,
+  },
+  {
+    version: 99,
+    description: 'Add per-group default split method and config for shared expenses (#517)',
+    up: `
+      -- Persistente Standard-Aufteilung pro Ausgaben-Gruppe (#517): neue Ausgaben
+      -- übernehmen Methode und - bei percentage/shares - die pro-Mitglied-Werte,
+      -- statt jedes Mal auf 'equal' zu starten. default_split_config ist JSON
+      -- ([{ user_id, percentage }] bzw. [{ user_id, shares }]) oder NULL bei
+      -- equal/exact. Reine UI-Vorbelegung: die harte Split-Validierung bleibt pro
+      -- Ausgabe (buildSplits), daher hier bewusst keine Summen-/FK-Constraints.
+      ALTER TABLE expense_groups ADD COLUMN default_split_method TEXT NOT NULL DEFAULT 'equal'
+        CHECK(default_split_method IN ('equal', 'exact', 'percentage', 'shares'));
+      ALTER TABLE expense_groups ADD COLUMN default_split_config TEXT;
+    `,
+  },
+  {
+    version: 100,
+    description: 'Loans: optional interest phases (fixed rate + forecast follow-up rate, #569)',
+    up: `
+      -- Zins-Darlehen (#569): Bisher waren Darlehen zinsfrei (total_amount fest,
+      -- installment_count manuell). Optional wird jetzt ein Annuitätendarlehen
+      -- nach deutschem Muster abgebildet: Sollzins (fixed_rate) + Anfangstilgung
+      -- (initial_repayment_rate) auf die Kreditsumme (principal) ergeben die
+      -- konstante Monatsrate; die Laufzeit wird daraus berechnet. Nach der
+      -- Zinsbindung (fixed_period_months) rechnet der Prognose-Anschlusszins
+      -- (followup_rate) weiter. Der Server leitet daraus total_amount +
+      -- installment_count ab, sodass die bestehende Raten-/Status-Logik
+      -- unverändert weiterläuft. interest_mode='none' = bisheriges Verhalten.
+      -- Validierung bewusst in der Route (wie #517), daher hier nur der Enum-CHECK.
+      ALTER TABLE budget_loans ADD COLUMN interest_mode TEXT NOT NULL DEFAULT 'none'
+        CHECK(interest_mode IN ('none', 'fixed', 'fixed_then_variable'));
+      ALTER TABLE budget_loans ADD COLUMN principal REAL;
+      ALTER TABLE budget_loans ADD COLUMN fixed_rate REAL;
+      ALTER TABLE budget_loans ADD COLUMN initial_repayment_rate REAL;
+      ALTER TABLE budget_loans ADD COLUMN fixed_period_months INTEGER;
+      ALTER TABLE budget_loans ADD COLUMN followup_rate REAL;
+    `,
+  },
+  {
+    version: 101,
+    description: 'Loans: allow a purely variable interest rate (#569 follow-up)',
+    foreignKeysOff: true,
+    up: `
+      -- Rein variables Darlehen (#569-Nachtrag): interest_mode kannte bisher nur
+      -- 'fixed' (Sollzins über die ganze Laufzeit) und 'fixed_then_variable'
+      -- (Zinsbindung, danach Prognosezins). Ein Darlehen ohne jede Zinsbindung
+      -- ließ sich nur als "fester Zins" anlegen - die Anzeige behauptete dann
+      -- eine Bindung, die es nicht gibt. 'variable' rechnet identisch zu 'fixed'
+      -- (ein Zinssatz, keine Phasen), deklariert ihn aber als aktuellen
+      -- Prognosewert ohne Bindung.
+      --
+      -- SQLite kann einen Spalten-CHECK nicht per ALTER erweitern, daher Tabelle
+      -- neu erstellen (Muster wie v98). foreignKeysOff ist Pflicht: mit aktiver
+      -- FK-Durchsetzung würde DROP TABLE die gekoppelten Ratenzahlungen
+      -- (budget_loan_payments ... ON DELETE CASCADE) mitlöschen.
+      CREATE TABLE budget_loans_new (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        title             TEXT    NOT NULL,
+        borrower          TEXT    NOT NULL,
+        total_amount      REAL    NOT NULL CHECK(total_amount > 0),
+        installment_count INTEGER NOT NULL CHECK(installment_count > 0),
+        start_month       TEXT    NOT NULL,
+        notes             TEXT,
+        status            TEXT    NOT NULL DEFAULT 'active'
+                                  CHECK(status IN ('active', 'paid')),
+        created_by        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        owner_id          INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        visibility        TEXT    NOT NULL DEFAULT 'shared'
+                                  CHECK (visibility IN ('private', 'shared')),
+        interest_mode     TEXT    NOT NULL DEFAULT 'none'
+                                  CHECK(interest_mode IN ('none', 'fixed', 'variable', 'fixed_then_variable')),
+        principal              REAL,
+        fixed_rate             REAL,
+        initial_repayment_rate REAL,
+        fixed_period_months    INTEGER,
+        followup_rate          REAL
+      );
+
+      INSERT INTO budget_loans_new (
+        id, title, borrower, total_amount, installment_count, start_month, notes,
+        status, created_by, created_at, updated_at, owner_id, visibility,
+        interest_mode, principal, fixed_rate, initial_repayment_rate,
+        fixed_period_months, followup_rate
+      )
+      SELECT
+        id, title, borrower, total_amount, installment_count, start_month, notes,
+        status, created_by, created_at, updated_at, owner_id, visibility,
+        interest_mode, principal, fixed_rate, initial_repayment_rate,
+        fixed_period_months, followup_rate
+      FROM budget_loans;
+
+      DROP TABLE budget_loans;
+      ALTER TABLE budget_loans_new RENAME TO budget_loans;
+
+      CREATE TRIGGER IF NOT EXISTS trg_budget_loans_updated_at
+        AFTER UPDATE ON budget_loans FOR EACH ROW
+        BEGIN UPDATE budget_loans SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+
+      CREATE INDEX IF NOT EXISTS idx_budget_loans_status ON budget_loans(status);
+      CREATE INDEX IF NOT EXISTS idx_budget_loans_start_month ON budget_loans(start_month);
+      CREATE INDEX IF NOT EXISTS idx_budget_loans_owner ON budget_loans(owner_id);
+    `,
+  },
+  {
+    version: 102,
+    description: 'Loans: own currency per loan with a fixed conversion rate (#582)',
+    up: `
+      -- Eigene Währung je Darlehen (#582): Ein Auslandskredit läuft in einer
+      -- anderen Währung als das Budget. Alle Geldfelder des Darlehens
+      -- (total_amount, principal, budget_loan_payments.amount) bleiben in DIESER
+      -- Währung gespeichert - nur so bleiben Tilgungsplan und Restschuld exakt.
+      --
+      -- currency = NULL bedeutet "Budget-Währung" (Altbestand und der Normalfall);
+      -- die Route löst das gegen sync_config.currency auf, statt hier einen
+      -- Default einzubrennen, der bei einer Währungsumstellung falsch würde.
+      --
+      -- exchange_rate ist ein FESTER, manuell gepflegter Kurs statt eines
+      -- Tageskurses: ein Tilgungsplan über 30 Jahre darf seine Restschuld nicht
+      -- täglich ändern, und der Live-Kurs-Pfad des Abo-Moduls braucht einen
+      -- FIXER_API_KEY, den die meisten Installationen nicht setzen.
+      -- Semantik: 1 Einheit Darlehenswährung = exchange_rate Einheiten
+      -- Budget-Währung, also budget_amount = loan_amount * exchange_rate.
+      -- Nur die Budget-Buchung der Rate und die währungsübergreifende
+      -- Summenkarte rechnen damit um; das Darlehen selbst rechnet ungewandelt.
+      ALTER TABLE budget_loans ADD COLUMN currency TEXT;
+      ALTER TABLE budget_loans ADD COLUMN exchange_rate REAL NOT NULL DEFAULT 1;
+    `,
+  },
+  {
+    version: 103,
+    description: 'Calendar: tombstones for events deleted locally but still remote (#593)',
+    up: `
+      -- Lokales Löschen eines gespiegelten Termins muss auch beim Provider löschen
+      -- (#593). Die Route kann das nicht selbst tun: der Provider-Call ist async
+      -- und darf weder die 204-Antwort verzögern noch bei Netzfehlern den lokalen
+      -- Löschvorgang scheitern lassen. Deshalb ein Tombstone - die Zeile überlebt
+      -- das gelöschte Event und wird vom Sync abgearbeitet (at-least-once).
+      --
+      -- Bewusst NICHT als Trigger auf calendar_events: der Inbound-Sync löscht
+      -- lokale Zeilen ebenfalls (cancelled-Events, Kalender-Abwahl). Ein Trigger
+      -- würde daraus Löschbefehle an den Provider machen und fremde Termine
+      -- vernichten. Tombstones entstehen nur im expliziten User-Delete.
+      --
+      -- source ist von Anfang an vorhanden, damit CalDAV/Apple dieselbe Tabelle
+      -- nutzen können; aktuell schreibt nur 'google'.
+      CREATE TABLE IF NOT EXISTS calendar_pending_deletions (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        source               TEXT NOT NULL,
+        calendar_external_id TEXT NOT NULL,
+        event_external_id    TEXT NOT NULL,
+        attempts             INTEGER NOT NULL DEFAULT 0,
+        last_error           TEXT,
+        created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE(source, calendar_external_id, event_external_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_cal_pending_del_event
+        ON calendar_pending_deletions(source, event_external_id);
+    `,
+  },
+  {
+    version: 104,
+    description: 'Calendar: mark locally edited mirrored events for outbound push (#593)',
+    up: `
+      -- Gegenstück zu v103 für Änderungen: ein bereits nach Google gespiegelter
+      -- Termin wurde nach dem ersten Push nie wieder ausgehend angefasst, weil der
+      -- Outbound-Zweig nur external_source='local' selektiert. Titel-, Zeit- oder
+      -- Farbänderungen blieben damit in Yuvomi hängen.
+      --
+      -- outbound_dirty ist bewusst NICHT user_modified: das Flag bedeutet
+      -- dauerhaft "lokal angefasst, Farbe nicht überschreiben" und würde als
+      -- Push-Signal jeden Sync-Lauf ein Update an Google schicken. outbound_dirty
+      -- ist eine Warteschlange - gesetzt beim Bearbeiten, gelöscht nach dem Push.
+      --
+      -- outbound_attempts begrenzt Fehlversuche analog zu den Tombstones, damit
+      -- ein dauerhaft unschreibbares Event nicht jeden Lauf blockiert.
+      ALTER TABLE calendar_events ADD COLUMN outbound_dirty INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE calendar_events ADD COLUMN outbound_attempts INTEGER NOT NULL DEFAULT 0;
+
+      CREATE INDEX IF NOT EXISTS idx_calendar_outbound_dirty
+        ON calendar_events(outbound_dirty) WHERE outbound_dirty = 1;
+    `,
+  },
+  {
+    version: 105,
+    description: 'Calendar: queue a pending calendar move for mirrored Google events (#593)',
+    up: `
+      -- Wechselt der Zielkalender eines bereits gespiegelten Termins, muss er in
+      -- Google per events.move umziehen; ein Patch im alten Kalender würde ihn
+      -- dort belassen.
+      --
+      -- Der anstehende Umzug wird als eigener Wert vorgemerkt statt beim Sync aus
+      -- target_google_calendar_id != calendar_ref_id abgeleitet. Bestandsdaten
+      -- können diese Abweichung längst enthalten: target_google_calendar_id ließ
+      -- sich immer setzen, blieb für bereits gespiegelte Termine aber folgenlos.
+      -- Ein Zustandsvergleich würde daraus beim ersten Sync nach dem Update eine
+      -- stille Umzugswelle in fremden Google-Kalendern machen. So zieht nur um,
+      -- was ein Nutzer nach dem Update ausdrücklich umstellt.
+      ALTER TABLE calendar_events ADD COLUMN outbound_move_to TEXT;
+    `,
+  },
+  {
+    version: 106,
+    description: 'Calendar: remember the CalDAV object URL so edits and deletes can reach the server (#593)',
+    up: `
+      -- CalDAV/Apple kennen keinen Aufruf "ändere Event X in Kalender Y": ein
+      -- Kalenderobjekt wird über SEINE eigene URL per PUT/DELETE angefasst. Bisher
+      -- verwarf der Inbound diese URL (obj.url) und der Outbound-Push speicherte
+      -- sie nicht, weshalb dort ausgehend nur Anlegen möglich war.
+      --
+      -- Nullable und ohne Backfill: für Bestandstermine ist die URL schlicht noch
+      -- nicht bekannt. Der Sync füllt sie beim nächsten Inbound-Lauf nach, und bis
+      -- dahin löst die Löschung die URL über die UID des laufenden Fetches auf -
+      -- ein Backfill bräuchte ohnehin genau denselben Netzabruf.
+      ALTER TABLE calendar_events ADD COLUMN external_object_url TEXT;
+
+      -- Die Objekt-URL wandert in den Tombstone mit: nach dem lokalen Löschen ist
+      -- die Zeile weg, aus der sie sonst zu holen wäre.
+      ALTER TABLE calendar_pending_deletions ADD COLUMN object_url TEXT;
+    `,
+  },
+  {
+    version: 107,
+    description: 'Subscriptions: optional end condition (never / on date / after N payments) (#594)',
+    up: `
+      -- Abos sind oft befristet (Leasing, Ratenkauf, Miete bis zum Umzug). Ohne
+      -- Ende laufen sie in der Verlängerungsprognose unbegrenzt weiter, und man
+      -- muss selbst daran denken, sie zu deaktivieren.
+      --
+      -- end_type steuert die drei Modi; end_date bzw. occurrence_count tragen den
+      -- jeweiligen Grenzwert. Bestandsabos bekommen 'never' und verhalten sich
+      -- unverändert.
+      ALTER TABLE budget_subscriptions
+        ADD COLUMN end_type TEXT NOT NULL DEFAULT 'never'
+        CHECK(end_type IN ('never', 'on_date', 'after_count'));
+      ALTER TABLE budget_subscriptions ADD COLUMN end_date TEXT;
+      ALTER TABLE budget_subscriptions ADD COLUMN occurrence_count INTEGER;
+
+      -- Zählt die bereits verbuchten Zahlungen mit, damit 'after_count' beim
+      -- Verlängern gegen occurrence_count laufen kann. Die aktuell anstehende
+      -- Zahlung ist immer Nummer occurrences_done + 1.
+      ALTER TABLE budget_subscriptions
+        ADD COLUMN occurrences_done INTEGER NOT NULL DEFAULT 0;
+
+      -- Gesetzt, sobald die letzte Zahlung durch ist: das Abo gilt als
+      -- abgeschlossen (zusätzlich enabled = 0), unterscheidbar vom manuellen
+      -- Pausieren.
+      ALTER TABLE budget_subscriptions ADD COLUMN completed_at TEXT;
+    `,
+  },
+  {
+    version: 108,
+    description: 'Pantry: food inventory with quantity, storage location and expiry date (#596)',
+    up: `
+      -- Der Küchen-Kreislauf hatte bisher drei Seiten - planen (Mahlzeiten),
+      -- kochen (Rezepte), einkaufen (Einkauf) - und keine vierte: was tatsächlich
+      -- im Haus ist. Ohne Bestand beantwortet die App weder "wie viel Mehl noch?"
+      -- noch "was läuft bald ab?" (#596).
+
+      -- Lagerorte analog shopping_categories: eigene Tabelle, sortierbar,
+      -- umbenennbar. Deutsche Seed-Namen, die Anzeige übersetzt über
+      -- DEFAULT_LOCATION_I18N - umbenannte Orte behalten ihren Klartext.
+      CREATE TABLE IF NOT EXISTS pantry_locations (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        name       TEXT    NOT NULL UNIQUE,
+        icon       TEXT    NOT NULL DEFAULT 'package',
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      INSERT INTO pantry_locations (name, icon, sort_order) VALUES
+        ('Vorratsschrank', 'archive',      0),
+        ('Kühlschrank',    'refrigerator', 1),
+        ('Gefrierschrank', 'snowflake',    2),
+        ('Keller',         'warehouse',    3),
+        ('Sonstiges',      'package',      4);
+
+      CREATE TABLE IF NOT EXISTS pantry_items (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        name         TEXT    NOT NULL,
+        -- REAL statt des Freitexts von recipe_ingredients.quantity: nur eine Zahl
+        -- lässt sich per Stepper verringern, gegen min_quantity prüfen und beim
+        -- Einkaufs-Import zusammenzählen. Der Vorrat ist die einzige Küchen-
+        -- Tabelle, die rechnen muss.
+        quantity     REAL    NOT NULL DEFAULT 1,
+        -- Bewusst OHNE CHECK-Constraint: eine zusätzliche Einheit wäre in SQLite
+        -- sonst ein Tabellen-Rebuild. Gültigkeit erzwingt der Router gegen die
+        -- geteilte Liste in public/utils/pantry-units.js.
+        unit         TEXT    NOT NULL DEFAULT 'pcs',
+        -- ON DELETE SET NULL: einen Lagerort zu löschen darf nie Bestand
+        -- vernichten. Ortlose Zeilen sammelt die Seite unter "Ohne Lagerort".
+        location_id  INTEGER REFERENCES pantry_locations(id) ON DELETE SET NULL,
+        category     TEXT    NOT NULL DEFAULT 'Sonstiges',
+        -- YYYY-MM-DD; NULL = unbegrenzt haltbar (Salz, Reis, Konserven ohne MHD).
+        expires_on   TEXT,
+        -- NULL = kein Mindestbestand überwacht. Ist er gesetzt, meldet die Zeile
+        -- "fast leer", sobald quantity <= min_quantity.
+        min_quantity REAL,
+        notes        TEXT,
+        created_by   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      -- Eine Zeile = eine Charge. Zwei Packungen Milch mit verschiedenem MHD
+      -- sind zwei Zeilen; eine Chargen-Hierarchie unter dem Produkt kostet
+      -- Komplexität, die eine Familienküche nicht braucht.
+
+      CREATE INDEX IF NOT EXISTS idx_pantry_items_expires  ON pantry_items(expires_on);
+      CREATE INDEX IF NOT EXISTS idx_pantry_items_location ON pantry_items(location_id);
+      CREATE INDEX IF NOT EXISTS idx_pantry_items_name     ON pantry_items(name);
+
+      CREATE TRIGGER IF NOT EXISTS trg_pantry_items_updated_at
+        AFTER UPDATE ON pantry_items FOR EACH ROW
+        BEGIN UPDATE pantry_items SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+    `,
+  },
+  {
+    version: 109,
+    description: 'Pantry: keep household stock when the member who entered it is deleted (#596 follow-up)',
+    up: `
+      -- v108 gab pantry_items.created_by ein ON DELETE CASCADE - übernommen aus
+      -- den Modulen, in denen ein Eintrag WIRKLICH seinem Ersteller gehört
+      -- (Rezepte, Notizen). Der Vorrat ist aber ausdrücklich Haushaltsbesitz:
+      -- server/routes/pantry.js kennt bewusst kein Eigentümer-Gate, weil jeder
+      -- die Milch ausbuchen darf, egal wer sie eingetragen hat.
+      --
+      -- Mit CASCADE hätte das Löschen eines Mitglieds jeden von ihm erfassten
+      -- Artikel mitgerissen und damit den Bestand des ganzen Haushalts
+      -- vernichtet. created_by wird zum reinen Herkunftsnachweis: nullable und
+      -- ON DELETE SET NULL.
+      --
+      -- SQLite kann eine FK nicht ändern, deshalb der kanonische Zwölf-Schritte-
+      -- Rebuild (Tabelle neu, Daten kopieren, tauschen). Indizes und Trigger
+      -- hängen an der alten Tabelle und werden danach neu angelegt.
+      CREATE TABLE pantry_items_new (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        name         TEXT    NOT NULL,
+        quantity     REAL    NOT NULL DEFAULT 1,
+        unit         TEXT    NOT NULL DEFAULT 'pcs',
+        location_id  INTEGER REFERENCES pantry_locations(id) ON DELETE SET NULL,
+        category     TEXT    NOT NULL DEFAULT 'Sonstiges',
+        expires_on   TEXT,
+        min_quantity REAL,
+        notes        TEXT,
+        created_by   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      INSERT INTO pantry_items_new
+        (id, name, quantity, unit, location_id, category, expires_on, min_quantity, notes, created_by, created_at, updated_at)
+        SELECT id, name, quantity, unit, location_id, category, expires_on, min_quantity, notes, created_by, created_at, updated_at
+        FROM pantry_items;
+
+      DROP TABLE pantry_items;
+      ALTER TABLE pantry_items_new RENAME TO pantry_items;
+
+      CREATE INDEX IF NOT EXISTS idx_pantry_items_expires  ON pantry_items(expires_on);
+      CREATE INDEX IF NOT EXISTS idx_pantry_items_location ON pantry_items(location_id);
+      CREATE INDEX IF NOT EXISTS idx_pantry_items_name     ON pantry_items(name);
+
+      CREATE TRIGGER IF NOT EXISTS trg_pantry_items_updated_at
+        AFTER UPDATE ON pantry_items FOR EACH ROW
+        BEGIN UPDATE pantry_items SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+    `,
+  },
+  {
+    version: 110,
+    description: 'Google Calendar: force one full resync so series arrive as masters (#593)',
+    up: `
+      -- Der Google-Abruf stellt von singleEvents:true auf false um: eine Serie
+      -- kommt künftig als EIN Master mit ihrer Wiederholungsregel statt als
+      -- hunderte Einzelvorkommen, so wie CalDAV und ICS sie liefern und wie
+      -- Yuvomi Serien lokal führt.
+      --
+      -- Der gespeicherte syncToken gehört zu den alten Abrufparametern. Google
+      -- beantwortet ihn nach der Umstellung mit 410 GONE, was der Sync zwar
+      -- abfängt, aber erst nach einem vergeblichen Request. Ihn hier zu leeren
+      -- macht den ersten Lauf deterministisch - und dieser Full-Resync ist es,
+      -- der die alten Einzelvorkommen in ihre Serie zurückführt.
+      --
+      -- Nur der Token wird angefasst, keine Termine: das Zusammenführen passiert
+      -- im Sync gegen die echten Google-Daten, nicht per Rateschluss über
+      -- ID-Muster. Termine, die dabei lokale Anpassungen tragen, bleiben als
+      -- eigenständige Einträge erhalten.
+      UPDATE google_calendar_selection SET sync_token = NULL;
+    `,
+  },
+  {
+    version: 111,
+    description: 'meal recurrence: optional end date (#619)',
+    up: `
+      -- Eine wöchentliche Mahlzeit lief bisher ohne Horizont: jede aufgeschlagene
+      -- Woche materialisierte eine weitere Instanz, ohne dass die Serie je hätte
+      -- enden können (#619). end_date ist die Grenze; NULL bleibt bewusst
+      -- „unbegrenzt", damit bestehende Serien unverändert weiterlaufen.
+      ALTER TABLE meal_recurrence_templates ADD COLUMN end_date TEXT;
+    `,
+  },
+  {
+    version: 112,
+    description: 'budget entries: receipt/document attachments (#583)',
+    up: `
+      -- Belege an Buchungen (#583). Eigene Tabelle statt einer Spalte auf
+      -- budget_entries, weil ein Kauf mehr als einen Beleg tragen kann
+      -- (Kassenbon + Rechnung + Garantie). Spiegelt bewusst expense_attachments,
+      -- damit Split-Expenses und Budget dieselbe Form haben.
+      --
+      -- Kein kind-Feld: expense_attachments führt eines, das dort nie gesetzt
+      -- wird. Eine Spalte, die immer denselben Wert hätte, bleibt hier weg.
+      --
+      -- ON DELETE CASCADE auf beiden Seiten: verschwindet die Buchung, ist die
+      -- Verknüpfung sinnlos; verschwindet das Dokument, zeigt sie ins Leere. Das
+      -- Dokument selbst bleibt beim Löschen der Buchung erhalten - es lebt im
+      -- Dokumenten-Modul weiter und kann dort an anderer Stelle hängen.
+      CREATE TABLE IF NOT EXISTS budget_entry_attachments (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        entry_id    INTEGER NOT NULL REFERENCES budget_entries(id) ON DELETE CASCADE,
+        document_id INTEGER NOT NULL REFERENCES family_documents(id) ON DELETE CASCADE,
+        created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE(entry_id, document_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_budget_entry_attachments_entry
+        ON budget_entry_attachments(entry_id);
+      CREATE INDEX IF NOT EXISTS idx_budget_entry_attachments_document
+        ON budget_entry_attachments(document_id);
+    `,
+  },
+  {
+    version: 113,
+    description: 'CalDAV VTODO: push local changes and deletions back to the server (#617)',
+    up: `
+      -- Der VTODO-Spiegel war einseitig: eine hier abgehakte, umbenannte oder
+      -- gelöschte Aufgabe blieb auf dem CalDAV-Server unverändert stehen, und der
+      -- nächste Inbound-Lauf machte die lokale Änderung wieder rückgängig. Die
+      -- Rückrichtung braucht dieselben drei Dinge wie die Termine (#593):
+      --
+      --   Weg zum Objekt  → external_object_url
+      --   Absicht merken  → outbound_dirty
+      --   Aufgeben können → outbound_attempts
+      --
+      -- Nullable und ohne Backfill: für bereits gespiegelte Einträge ist die URL
+      -- noch nicht bekannt. Der nächste Inbound-Lauf trägt sie nach, und bis dahin
+      -- löst der Sync das Objekt über die UID des laufenden Abrufs auf.
+      ALTER TABLE tasks ADD COLUMN external_object_url TEXT;
+      ALTER TABLE tasks ADD COLUMN outbound_dirty      INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE tasks ADD COLUMN outbound_attempts   INTEGER NOT NULL DEFAULT 0;
+
+      ALTER TABLE shopping_items ADD COLUMN external_object_url TEXT;
+      ALTER TABLE shopping_items ADD COLUMN outbound_dirty      INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE shopping_items ADD COLUMN outbound_attempts   INTEGER NOT NULL DEFAULT 0;
+
+      -- Eigene Tombstone-Tabelle statt calendar_pending_deletions: dort ist der
+      -- Schlüssel (source, calendar_external_id, event_external_id) auf Kalender
+      -- und Termin zugeschnitten, während eine VTODO-Löschung ihr Konto und ihr
+      -- Modul kennen muss - tasks und shopping_items sind getrennte Ziele mit
+      -- eigenen UID-Räumen. Die Fehler- und Aufgeberegeln bleiben trotzdem
+      -- geteilt (calendar-outbound.js: outboundFailureAction).
+      --
+      -- Die Zeile überlebt bewusst den gelöschten Eintrag: danach ist die Zeile
+      -- weg, aus der UID und Objekt-URL sonst zu holen wären.
+      CREATE TABLE IF NOT EXISTS caldav_todo_pending_deletions (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER NOT NULL REFERENCES caldav_accounts(id) ON DELETE CASCADE,
+        module     TEXT    NOT NULL CHECK(module IN ('tasks', 'shopping')),
+        uid        TEXT    NOT NULL,
+        object_url TEXT,
+        attempts   INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE(account_id, module, uid)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_caldav_todo_deletions_account
+        ON caldav_todo_pending_deletions(account_id);
+    `,
+  },
+  {
+    version: 114,
+    description: 'Tasks: repair the category default left behind by v83 (#586)',
+    // Der Rebuild droppt `tasks` und nimmt dabei alle Indizes und die drei
+    // Suchindex-Trigger mit - beide werden unten vollständig neu angelegt. Ohne
+    // Fremdschlüssel-Pause würde das DROP die referenzierenden Zeilen
+    // (task_assignments, task_documents, reward_ledger, Unteraufgaben) per
+    // CASCADE mitreißen.
+    foreignKeysOff: true,
+    up: `
+      -- v83 hat die Kategorien in eine eigene Tabelle überführt und den Bestand
+      -- von 'Sonstiges' auf den Key 'misc' gezogen, den Spalten-Default der
+      -- Tabelle aber stehen lassen. Seitdem trägt jede Zeile, die ohne
+      -- ausdrückliche Kategorie entsteht, einen Key, den es in task_categories
+      -- nicht gibt. Über den CalDAV-Spiegel passiert genau das bei jeder
+      -- eingespielten Aufgabe (#586): sie landet in einer Kategorie, die in
+      -- keinem Dropdown und keinem Filter auftaucht, und springt beim ersten
+      -- Speichern im Modal still auf die erste echte Kategorie.
+      CREATE TABLE tasks_new (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        title               TEXT    NOT NULL,
+        description         TEXT,
+        category            TEXT    NOT NULL DEFAULT 'misc',
+        priority            TEXT    NOT NULL DEFAULT 'none'
+                                    CHECK(priority IN ('none', 'low', 'medium', 'high', 'urgent')),
+        status              TEXT    NOT NULL DEFAULT 'open'
+                                    CHECK(status IN ('open', 'in_progress', 'done', 'archived')),
+        due_date            TEXT,
+        due_time            TEXT,
+        assigned_to         INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_by          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        is_recurring        INTEGER NOT NULL DEFAULT 0,
+        recurrence_rule     TEXT,
+        parent_task_id      INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+        created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        start_date          TEXT,
+        external_uid        TEXT,
+        external_source     TEXT    NOT NULL DEFAULT 'local',
+        external_account_id INTEGER,
+        points              INTEGER NOT NULL DEFAULT 0,
+        visibility          TEXT    NOT NULL DEFAULT 'all',
+        external_object_url TEXT,
+        outbound_dirty      INTEGER NOT NULL DEFAULT 0,
+        outbound_attempts   INTEGER NOT NULL DEFAULT 0
+      );
+
+      INSERT INTO tasks_new (
+        id, title, description, category, priority, status, due_date, due_time,
+        assigned_to, created_by, is_recurring, recurrence_rule, parent_task_id,
+        created_at, updated_at, start_date, external_uid, external_source,
+        external_account_id, points, visibility, external_object_url,
+        outbound_dirty, outbound_attempts
+      )
+      SELECT
+        id, title, description, category, priority, status, due_date, due_time,
+        assigned_to, created_by, is_recurring, recurrence_rule, parent_task_id,
+        created_at, updated_at, start_date, external_uid, external_source,
+        external_account_id, points, visibility, external_object_url,
+        outbound_dirty, outbound_attempts
+      FROM tasks;
+
+      -- Den AUTOINCREMENT-Hochstand mitnehmen. Ein Rebuild kopiert nur die
+      -- überlebenden Zeilen, also fällt sqlite_sequence auf deren höchste ID
+      -- zurück. Wurde vor dem Upgrade die höchste Aufgabe gelöscht, vergäbe die
+      -- nächste Aufgabe eine schon einmal benutzte ID. Die Tabelle reminders zeigt
+      -- entity_type/entity_id auf Aufgaben, ohne Fremdschlüssel und ohne
+      -- Aufräumen beim Löschen - eine verwaiste Erinnerung fiele damit einer
+      -- fremden neuen Aufgabe zu.
+      CREATE TEMP TABLE _tasks_seq AS
+        SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'tasks'), 0) AS seq;
+
+      DROP TABLE tasks;
+      ALTER TABLE tasks_new RENAME TO tasks;
+
+      -- Auch wenn keine einzige Aufgabe überlebt, greift das: eine Kopie mit
+      -- null Zeilen legt für tasks_new trotzdem einen sqlite_sequence-Eintrag
+      -- an (seq = 0), den das RENAME mitnimmt. Das UPDATE hebt ihn dann an.
+      UPDATE sqlite_sequence
+         SET seq = (SELECT seq FROM _tasks_seq)
+       WHERE name = 'tasks' AND seq < (SELECT seq FROM _tasks_seq);
+
+      DROP TABLE _tasks_seq;
+
+      -- Bestand einsammeln: nicht nur 'Sonstiges', sondern jeden Key, für den es
+      -- keine Kategorie (mehr) gibt. Nach v83 konnten weitere entstehen.
+      UPDATE tasks SET category = 'misc'
+      WHERE category NOT IN (SELECT key FROM task_categories);
+
+      CREATE INDEX IF NOT EXISTS idx_tasks_status     ON tasks(status);
+      CREATE INDEX IF NOT EXISTS idx_tasks_assigned   ON tasks(assigned_to);
+      CREATE INDEX IF NOT EXISTS idx_tasks_parent     ON tasks(parent_task_id);
+      CREATE INDEX IF NOT EXISTS idx_tasks_start_date ON tasks(start_date);
+      CREATE INDEX IF NOT EXISTS idx_tasks_external
+        ON tasks(external_source, external_account_id, external_uid);
+
+      -- Die Suchindex-Trigger hingen an der gedroppten Tabelle. Fehlen sie, läuft
+      -- die Suche still auf einem einfrierenden Index weiter.
+      DROP TRIGGER IF EXISTS trg_search_tasks_ai;
+      DROP TRIGGER IF EXISTS trg_search_tasks_au;
+      DROP TRIGGER IF EXISTS trg_search_tasks_ad;
+
+      CREATE TRIGGER trg_search_tasks_ai AFTER INSERT ON tasks BEGIN
+        INSERT INTO search_index (entity, entity_id, title, body)
+        VALUES ('task', NEW.id, COALESCE(NEW.title, ''), COALESCE(NEW.description, ''));
+      END;
+
+      CREATE TRIGGER trg_search_tasks_au AFTER UPDATE ON tasks BEGIN
+        DELETE FROM search_index WHERE entity = 'task' AND entity_id = OLD.id;
+        INSERT INTO search_index (entity, entity_id, title, body)
+        VALUES ('task', NEW.id, COALESCE(NEW.title, ''), COALESCE(NEW.description, ''));
+      END;
+
+      CREATE TRIGGER trg_search_tasks_ad AFTER DELETE ON tasks BEGIN
+        DELETE FROM search_index WHERE entity = 'task' AND entity_id = OLD.id;
+      END;
+    `,
+  },
+  {
+    version: 115,
+    description: 'Tasks: free-form tags, mirrored from VTODO CATEGORIES (#586)',
+    up: `
+      -- Tags sind das Gegenstück zu VTODO CATEGORIES und bewusst NICHT die
+      -- Kategorie: eine Aufgabe liegt in genau einer Kategorie (einer Schublade),
+      -- trägt aber beliebig viele Tags (Etiketten). CATEGORIES auf category
+      -- abzubilden hieße, alle Werte ab dem zweiten zu verlieren und beim Push
+      -- die Tags zu löschen, die der Server kennt und Yuvomi nie gesehen hat.
+      --
+      -- Freitext statt verwalteter Liste: die Werte kommen von fremden Servern,
+      -- eine Registry würde sich bei jedem Sync mit Fremdwerten füllen und in
+      -- jedem Kategorie-Dropdown auftauchen.
+      -- Die Spalte tag ist die Schreibweise für die Anzeige, tag_key der
+      -- Vergleichsschlüssel (NFC + kleingeschrieben, gebildet in JS). Der
+      -- Schlüssel ist keine Bequemlichkeit: SQLites COLLATE NOCASE faltet nur
+      -- ASCII, "Äpfel" wäre über "äpfel" nicht auffindbar. Der Primärschlüssel
+      -- hängt am Schlüssel, damit dieselbe Aufgabe ein Etikett nicht in zwei
+      -- Schreibweisen tragen kann.
+      CREATE TABLE IF NOT EXISTS task_tags (
+        task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        tag     TEXT    NOT NULL,
+        tag_key TEXT    NOT NULL,
+        PRIMARY KEY (task_id, tag_key)
+      );
+
+      -- Für den ?tag=-Filter und die Vorschlagsliste.
+      CREATE INDEX IF NOT EXISTS idx_task_tags_key ON task_tags(tag_key);
+    `,
+  },
+  {
+    version: 116,
+    description: 'Shopping items: tags mirrored from VTODO CATEGORIES (#586)',
+    up: `
+      -- Einkaufsposten spiegeln dieselbe VTODO-Eigenschaft wie Aufgaben: eine
+      -- CalDAV-Erinnerungsliste kann auf beide Module zeigen (#617), und bis
+      -- hierher fielen die CATEGORIES eines Einkaufspostens stillschweigend weg.
+      --
+      -- Bewusst NICHT auf shopping_items.category abgebildet: die Kategorie ist
+      -- hier der Gang im Laden, eine verwaltete Liste mit Icon und Sortierung.
+      -- Fremdwerte hineinzuspülen hieße, diese Liste bei jedem Sync wachsen zu
+      -- lassen - derselbe Fehler, den v115 für Aufgaben vermeidet.
+      CREATE TABLE IF NOT EXISTS shopping_item_tags (
+        item_id INTEGER NOT NULL REFERENCES shopping_items(id) ON DELETE CASCADE,
+        tag     TEXT    NOT NULL,
+        tag_key TEXT    NOT NULL,
+        PRIMARY KEY (item_id, tag_key)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_shopping_item_tags_key ON shopping_item_tags(tag_key);
+    `,
+  },
+  {
+    version: 117,
+    description: 'Search index: tags belong to the searchable text (#586)',
+    up: `
+      -- Ein Tag ist Freitext und damit Inhalt. Die Aufgabenliste filtert danach,
+      -- die globale Suche fand ihn bisher nicht - dasselbe Wort führte je nach
+      -- Eingabefeld zu einem Treffer oder zu keinem.
+      --
+      -- Die Tags liegen in eigenen Tabellen, die bestehenden Trigger hängen aber
+      -- an tasks bzw. shopping_items und sehen nur die Zeile. Es braucht deshalb
+      -- beides: erweiterte Trigger auf der Hauptzeile UND eigene Trigger auf den
+      -- Tag-Tabellen, sonst bliebe eine reine Tag-Änderung unindiziert.
+      --
+      -- Alle Neuaufnahmen laufen als INSERT ... SELECT über die Haupttabelle.
+      -- Das ist kein Stil, sondern der Schutz gegen das Löschen: beim Entfernen
+      -- einer Aufgabe räumt CASCADE die Tag-Zeilen ab und feuert den
+      -- Tag-Trigger. Ein VALUES-INSERT legte dann eine Karteileiche für eine
+      -- Aufgabe an, die es nicht mehr gibt; das SELECT findet nichts und fügt
+      -- folgerichtig nichts ein.
+
+      DROP TRIGGER IF EXISTS trg_search_tasks_ai;
+      DROP TRIGGER IF EXISTS trg_search_tasks_au;
+      DROP TRIGGER IF EXISTS trg_search_tasks_ad;
+      DROP TRIGGER IF EXISTS trg_search_items_ai;
+      DROP TRIGGER IF EXISTS trg_search_items_au;
+      DROP TRIGGER IF EXISTS trg_search_items_ad;
+
+      CREATE TRIGGER trg_search_tasks_ai AFTER INSERT ON tasks BEGIN
+        INSERT INTO search_index (entity, entity_id, title, body)
+        SELECT 'task', t.id, COALESCE(t.title, ''),
+               TRIM(COALESCE(t.description, '') || ' ' ||
+                    COALESCE((SELECT group_concat(tag, ' ') FROM task_tags WHERE task_id = t.id), ''))
+        FROM tasks t WHERE t.id = NEW.id;
+      END;
+
+      CREATE TRIGGER trg_search_tasks_au AFTER UPDATE ON tasks BEGIN
+        DELETE FROM search_index WHERE entity = 'task' AND entity_id = OLD.id;
+        INSERT INTO search_index (entity, entity_id, title, body)
+        SELECT 'task', t.id, COALESCE(t.title, ''),
+               TRIM(COALESCE(t.description, '') || ' ' ||
+                    COALESCE((SELECT group_concat(tag, ' ') FROM task_tags WHERE task_id = t.id), ''))
+        FROM tasks t WHERE t.id = NEW.id;
+      END;
+
+      CREATE TRIGGER trg_search_tasks_ad AFTER DELETE ON tasks BEGIN
+        DELETE FROM search_index WHERE entity = 'task' AND entity_id = OLD.id;
+      END;
+
+      CREATE TRIGGER trg_search_task_tags_ai AFTER INSERT ON task_tags BEGIN
+        DELETE FROM search_index WHERE entity = 'task' AND entity_id = NEW.task_id;
+        INSERT INTO search_index (entity, entity_id, title, body)
+        SELECT 'task', t.id, COALESCE(t.title, ''),
+               TRIM(COALESCE(t.description, '') || ' ' ||
+                    COALESCE((SELECT group_concat(tag, ' ') FROM task_tags WHERE task_id = t.id), ''))
+        FROM tasks t WHERE t.id = NEW.task_id;
+      END;
+
+      CREATE TRIGGER trg_search_task_tags_ad AFTER DELETE ON task_tags BEGIN
+        DELETE FROM search_index WHERE entity = 'task' AND entity_id = OLD.task_id;
+        INSERT INTO search_index (entity, entity_id, title, body)
+        SELECT 'task', t.id, COALESCE(t.title, ''),
+               TRIM(COALESCE(t.description, '') || ' ' ||
+                    COALESCE((SELECT group_concat(tag, ' ') FROM task_tags WHERE task_id = t.id), ''))
+        FROM tasks t WHERE t.id = OLD.task_id;
+      END;
+
+      CREATE TRIGGER trg_search_items_ai AFTER INSERT ON shopping_items BEGIN
+        INSERT INTO search_index (entity, entity_id, title, body)
+        SELECT 'item', i.id, COALESCE(i.name, ''),
+               TRIM(COALESCE(i.notes, '') || ' ' ||
+                    COALESCE((SELECT group_concat(tag, ' ') FROM shopping_item_tags WHERE item_id = i.id), ''))
+        FROM shopping_items i WHERE i.id = NEW.id;
+      END;
+
+      CREATE TRIGGER trg_search_items_au AFTER UPDATE ON shopping_items BEGIN
+        DELETE FROM search_index WHERE entity = 'item' AND entity_id = OLD.id;
+        INSERT INTO search_index (entity, entity_id, title, body)
+        SELECT 'item', i.id, COALESCE(i.name, ''),
+               TRIM(COALESCE(i.notes, '') || ' ' ||
+                    COALESCE((SELECT group_concat(tag, ' ') FROM shopping_item_tags WHERE item_id = i.id), ''))
+        FROM shopping_items i WHERE i.id = NEW.id;
+      END;
+
+      CREATE TRIGGER trg_search_items_ad AFTER DELETE ON shopping_items BEGIN
+        DELETE FROM search_index WHERE entity = 'item' AND entity_id = OLD.id;
+      END;
+
+      CREATE TRIGGER trg_search_item_tags_ai AFTER INSERT ON shopping_item_tags BEGIN
+        DELETE FROM search_index WHERE entity = 'item' AND entity_id = NEW.item_id;
+        INSERT INTO search_index (entity, entity_id, title, body)
+        SELECT 'item', i.id, COALESCE(i.name, ''),
+               TRIM(COALESCE(i.notes, '') || ' ' ||
+                    COALESCE((SELECT group_concat(tag, ' ') FROM shopping_item_tags WHERE item_id = i.id), ''))
+        FROM shopping_items i WHERE i.id = NEW.item_id;
+      END;
+
+      CREATE TRIGGER trg_search_item_tags_ad AFTER DELETE ON shopping_item_tags BEGIN
+        DELETE FROM search_index WHERE entity = 'item' AND entity_id = OLD.item_id;
+        INSERT INTO search_index (entity, entity_id, title, body)
+        SELECT 'item', i.id, COALESCE(i.name, ''),
+               TRIM(COALESCE(i.notes, '') || ' ' ||
+                    COALESCE((SELECT group_concat(tag, ' ') FROM shopping_item_tags WHERE item_id = i.id), ''))
+        FROM shopping_items i WHERE i.id = OLD.item_id;
+      END;
+
+      -- Bestand neu einlesen: die Tags der bereits gespiegelten Zeilen stehen
+      -- sonst erst nach der nächsten Bearbeitung im Index.
+      DELETE FROM search_index WHERE entity IN ('task', 'item');
+      INSERT INTO search_index (entity, entity_id, title, body)
+        SELECT 'task', id, COALESCE(title, ''),
+               TRIM(COALESCE(description, '') || ' ' ||
+                    COALESCE((SELECT group_concat(tag, ' ') FROM task_tags WHERE task_id = tasks.id), ''))
+        FROM tasks;
+      INSERT INTO search_index (entity, entity_id, title, body)
+        SELECT 'item', id, COALESCE(name, ''),
+               TRIM(COALESCE(notes, '') || ' ' ||
+                    COALESCE((SELECT group_concat(tag, ' ') FROM shopping_item_tags WHERE item_id = shopping_items.id), ''))
+        FROM shopping_items;
+    `,
+  },
+  {
+    version: 118,
+    description: 'Mealie integration: mealie_accounts table + recipe mirror columns',
+    up: `
+      CREATE TABLE IF NOT EXISTS mealie_accounts (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT    NOT NULL,
+        base_url    TEXT    NOT NULL,
+        api_token   TEXT    NOT NULL,
+        enabled     INTEGER NOT NULL DEFAULT 1,
+        created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        last_sync   TEXT,
+        last_error  TEXT,
+        -- Eine Rezepttabelle je Mealie-Server: die UNIQUE-Bedingung verhindert,
+        -- dass derselbe Server zweimal angelegt wird und alle Rezepte doppelt
+        -- gespiegelt ankommen.
+        UNIQUE(base_url)
+      );
+
+      CREATE TRIGGER IF NOT EXISTS trg_mealie_accounts_updated_at
+        AFTER UPDATE ON mealie_accounts FOR EACH ROW
+        BEGIN UPDATE mealie_accounts SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+
+      -- mealie_account_id NULL = eigenes Rezept; gesetzt = Spiegel dieses Kontos.
+      ALTER TABLE recipes ADD COLUMN mealie_account_id INTEGER
+        REFERENCES mealie_accounts(id) ON DELETE CASCADE;
+      -- Mealies eigener Slug/Id, Schlüssel für den Upsert bei jedem Sync-Lauf.
+      ALTER TABLE recipes ADD COLUMN mealie_recipe_id TEXT;
+      -- Mealies updatedAt: unveränderte Rezepte überspringt der Sync damit.
+      ALTER TABLE recipes ADD COLUMN mealie_updated_at TEXT;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_mealie_unique
+        ON recipes(mealie_account_id, mealie_recipe_id) WHERE mealie_account_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 119,
+    description: 'Mealie integration: separate public link URL from the server-reachable sync URL',
+    up: `
+      -- base_url muss vom Server aus erreichbar sein (oft ein Docker-internes
+      -- Compose-Hostname) und ist damit für den Browser des Nutzers meist tot.
+      -- external_url trägt die von außen erreichbare Adresse für die Deep-Links.
+      ALTER TABLE mealie_accounts ADD COLUMN external_url TEXT;
+    `,
+  },
+  {
+    version: 120,
+    description: 'Mealie integration: store recipe slug and image flag for link rebuild and thumbnails',
+    up: `
+      -- Slug persistieren: recipe_url wird bei jedem Sync neu daraus gebaut, ohne
+      -- erneuten Abruf. Sonst erreichte eine geänderte external_url nur Rezepte,
+      -- die sich in Mealie selbst wieder ändern.
+      ALTER TABLE recipes ADD COLUMN mealie_slug TEXT;
+      ALTER TABLE recipes ADD COLUMN mealie_has_image INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
 ];
 
 /**
@@ -3204,13 +4602,86 @@ function migrate() {
     if (typeof migration.afterUp === 'function') {
       migration.afterUp(db);
     }
+    if (migration.foreignKeysOff) {
+      const violations = db.pragma('foreign_key_check');
+      if (violations.length > 0) {
+        throw new Error(
+          `Migration ${migration.version} left ${violations.length} foreign key violation(s).`
+        );
+      }
+    }
     db.prepare('INSERT INTO schema_migrations (version, description) VALUES (?, ?)')
       .run(migration.version, migration.description);
     log.info(`Migration ${migration.version} applied: ${migration.description}`);
   });
 
   for (const migration of pending) {
-    runMigration(migration);
+    if (!migration.foreignKeysOff) {
+      runMigration(migration);
+      continue;
+    }
+
+    db.pragma('foreign_keys = OFF');
+    if (db.pragma('foreign_keys', { simple: true }) !== 0) {
+      throw new Error(`Migration ${migration.version} could not disable foreign key enforcement.`);
+    }
+    try {
+      runMigration(migration);
+    } finally {
+      db.pragma('foreign_keys = ON');
+      if (db.pragma('foreign_keys', { simple: true }) !== 1) {
+        throw new Error(`Migration ${migration.version} could not restore foreign key enforcement.`);
+      }
+    }
+  }
+}
+
+/**
+ * Kritische additive Spalten, die real vorhanden sein MÜSSEN, sobald ihre
+ * Migration als angewendet gilt. Jede Spalte ist eine gefahrlos wiederholbare
+ * `ADD COLUMN` (NULL-Default) - die einzige idempotente Reparaturform.
+ */
+const CRITICAL_COLUMNS = [
+  // #538: v54 trägt reminders.pushed_at nach; ohne die Spalte scheitert der
+  // Notification-/Push-Scheduler bei jedem Lauf still auf `no such column`.
+  { table: 'reminders', column: 'pushed_at', type: 'TEXT' },
+  // #549: v97 trägt calendar_events.tzid nach; ohne die Spalte scheitert der
+  // Sync-Upsert (schreibt tzid) still und die Kalender-Expansion driftet über DST.
+  { table: 'calendar_events', column: 'tzid', type: 'TEXT' },
+];
+
+/**
+ * Selbstheilung gegen Migrations-Drift (#538).
+ *
+ * In seltenen Fällen ist eine Migration in `schema_migrations` als angewendet
+ * vermerkt, ihr additiver Effekt fehlt real aber - etwa nach Restore aus einem
+ * zu einem inkonsistenten Zeitpunkt gezogenen Backup oder einem abgebrochenen
+ * Migrationslauf. Eine so fehlende Spalte lässt einen ganzen Hintergrund-Loop
+ * still auf `no such column` scheitern (der Push-/Notification-Scheduler auf
+ * `reminders.pushed_at`), ohne dass es in der UI sichtbar wird.
+ *
+ * Diese Funktion stellt die bekannten kritischen Spalten idempotent sicher und
+ * protokolliert jede Nachbesserung sichtbar. Sie ersetzt Migrationen NICHT -
+ * die bleiben die einzige Quelle für Schemaänderungen; dies ist nur ein
+ * Sicherheitsnetz für additive Drift.
+ */
+function reconcileCriticalSchema(database = db) {
+  if (!database) return;
+  for (const { table, column, type } of CRITICAL_COLUMNS) {
+    let columns;
+    try {
+      columns = database.prepare(`PRAGMA table_info(${table})`).all();
+    } catch {
+      continue; // Tabelle nicht lesbar - keine additive Reparatur möglich.
+    }
+    if (!columns.length) continue;                          // Tabelle existiert nicht
+    if (columns.some((c) => c.name === column)) continue;   // Spalte bereits vorhanden
+    try {
+      database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      log.warn(`Schema-Drift behoben: ${table}.${column} fehlte trotz vermerkter Migration und wurde nachgetragen (#538).`);
+    } catch (err) {
+      log.error(`Schema-Reconciliation ${table}.${column} fehlgeschlagen:`, err?.message || err);
+    }
   }
 }
 
@@ -3236,7 +4707,16 @@ async function backupToFile(destinationPath) {
   const database = get();
   await fs.mkdir(path.dirname(destinationPath), { recursive: true });
 
-  if (typeof database.backup === 'function') {
+  if (DB_KEY) {
+    // Die SQLite-Backup-API kann nicht von einer verschlüsselten Quelle in ein
+    // frisch angelegtes Ziel schreiben ("backup is not supported with
+    // incompatible source and target databases") — ohne diesen Zweig wäre bei
+    // gesetztem Key JEDES Backup kaputt. VACUUM INTO übernimmt Cipher und Key
+    // der Quelle, das Backup ist also ebenfalls verschlüsselt. Es verlangt
+    // allerdings ein noch nicht existierendes Ziel.
+    await unlinkIfExists(destinationPath);
+    database.prepare('VACUUM INTO ?').run(destinationPath);
+  } else if (typeof database.backup === 'function') {
     await database.backup(destinationPath);
   } else {
     database.prepare('VACUUM INTO ?').run(destinationPath);
@@ -3246,9 +4726,14 @@ async function backupToFile(destinationPath) {
 }
 
 function validateBackupFile(sourcePath) {
+  // Backups, die vor der Verschlüsselungs-Umstellung entstanden sind, liegen im
+  // Klartext vor. Sie müssen einspielbar bleiben — würden wir ihnen den Key
+  // aufsetzen, läse SQLite sie als verschlüsselt und die Validierung schlüge
+  // fehl. Nach dem Restore verschlüsselt init() sie ohnehin.
+  const encrypted = !isPlaintextDatabase(sourcePath);
   const candidate = new Database(sourcePath, { readonly: true, fileMustExist: true });
   try {
-    applyEncryptionKey(candidate);
+    if (encrypted) applyEncryptionKey(candidate);
     assertReadable(candidate);
     const row = candidate.prepare(`
       SELECT name
@@ -3297,7 +4782,13 @@ async function restoreFromFile(sourcePath) {
     await unlinkIfExists(`${DB_PATH}-shm`);
     await fs.copyFile(sourcePath, DB_PATH);
 
-    init();
+    // Ohne Klartext-Sicherheitskopie: stammt das Backup aus der Zeit vor der
+    // Verschlüsselung, verschlüsselt init() es jetzt — die Sicherung dafür ist
+    // die Quelldatei selbst, plus `.pre-restore-*` für den Rollback. Eine
+    // zusätzliche unverschlüsselte Vollkopie im Datenverzeichnis würde sich bei
+    // jedem Restore erneut anhäufen und die Zusage „verschlüsselt at rest"
+    // unterlaufen, ohne dass die Backup-UI davon berichtet.
+    init({ plaintextBackup: false });
     log.info(`Database restored from backup. Schema v${backupVersion}${rollbackCreated ? ` | rollback: ${rollbackPath}` : ''}`);
 
     return {
@@ -3314,12 +4805,12 @@ async function restoreFromFile(sourcePath) {
         await unlinkIfExists(`${DB_PATH}-wal`);
         await unlinkIfExists(`${DB_PATH}-shm`);
         await fs.copyFile(rollbackPath, DB_PATH);
-        init();
+        init({ plaintextBackup: false });
       } catch (rollbackErr) {
         log.error('Rollback after failed restore also failed:', rollbackErr);
       }
     } else if (!db) {
-      try { init(); } catch { /* preserve original restore error */ }
+      try { init({ plaintextBackup: false }); } catch { /* preserve original restore error */ }
     }
     throw err;
   }
@@ -3331,7 +4822,7 @@ async function restoreFromFile(sourcePath) {
 
 /**
  * Datenbankinstanz zurückgeben.
- * @returns {import('better-sqlite3').Database}
+ * @returns {import('better-sqlite3-multiple-ciphers').Database}
  */
 function get() {
   if (!db) throw new Error('[DB] Not initialized - call init() first.');
@@ -3352,7 +4843,7 @@ let _originalDb = null;
 
 /**
  * ONLY FOR TESTING: Override the internal db instance
- * @param {import('better-sqlite3').Database} testDb
+ * @param {import('better-sqlite3-multiple-ciphers').Database} testDb
  */
 function _setTestDatabase(testDb) {
   if (!_originalDb) _originalDb = db;
@@ -3371,4 +4862,4 @@ function _resetTestDatabase() {
 
 init();   // auto-initialise when module is first imported
 
-export { init, get, transaction, currentVersion, getPath, backupToFile, restoreFromFile, MIGRATIONS, _setTestDatabase, _resetTestDatabase };
+export { init, get, transaction, currentVersion, getPath, backupToFile, restoreFromFile, MIGRATIONS, reconcileCriticalSchema, _setTestDatabase, _resetTestDatabase };

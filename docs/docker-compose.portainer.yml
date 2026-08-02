@@ -6,7 +6,7 @@
 #   1. Copy this file and the .env section below to your server
 #   2. Create a .env file next to this compose file (see below)
 #   3. docker compose -f docker-compose.portainer.yml up -d
-#   4. docker compose -f docker-compose.portainer.yml exec oikos node setup.js
+#   4. docker compose -f docker-compose.portainer.yml exec yuvomi node setup.js
 #   5. Open http://<your-host>:3000
 #
 # Required .env variables:
@@ -17,20 +17,26 @@
 #   openssl rand -base64 32
 
 services:
-  oikos:
+  yuvomi:
     image: ghcr.io/ulsklyc/yuvomi:latest
-    container_name: oikos
+    container_name: yuvomi
     restart: unless-stopped
     ports:
       - "3000:3000"
     volumes:
+      # Named volume keeps its legacy slug so existing Portainer stacks upgrade
+      # in place instead of orphaning their data on rename.
       - oikos_data:/data
+      # Scheduled and manual backups. Without this volume the files would only
+      # live inside the container layer and vanish on the next image update.
+      - oikos_backups:/backups
       # Optional: mount a host folder for storing uploaded documents locally
       # - ./documents:/documents
     environment:
       - NODE_ENV=production
       - PORT=3000
       - DB_PATH=/data/yuvomi.db
+      - BACKUP_DIR=/backups
       - SESSION_SECRET=${SESSION_SECRET:?Set SESSION_SECRET in .env}
       - DB_ENCRYPTION_KEY=${DB_ENCRYPTION_KEY:?Set DB_ENCRYPTION_KEY in .env}
       # Set to true when behind a reverse proxy with HTTPS (Caddy, nginx, Traefik)
@@ -52,6 +58,9 @@ services:
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
       - GOOGLE_REDIRECT_URI=${GOOGLE_REDIRECT_URI:-}
+      - GOOGLE_DRIVE_CLIENT_ID=${GOOGLE_DRIVE_CLIENT_ID:-}
+      - GOOGLE_DRIVE_CLIENT_SECRET=${GOOGLE_DRIVE_CLIENT_SECRET:-}
+      - GOOGLE_DRIVE_REDIRECT_URI=${GOOGLE_DRIVE_REDIRECT_URI:-}
       # Apple Calendar CalDAV (optional)
       - APPLE_CALDAV_URL=${APPLE_CALDAV_URL:-https://caldav.icloud.com}
       - APPLE_USERNAME=${APPLE_USERNAME:-}
@@ -80,4 +89,6 @@ services:
 
 volumes:
   oikos_data:
+    driver: local
+  oikos_backups:
     driver: local

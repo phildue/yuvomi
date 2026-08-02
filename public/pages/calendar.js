@@ -5,17 +5,20 @@
  */
 
 import { api } from '/api.js';
-import { renderRRuleFields, bindRRuleEvents, getRRuleValues } from '/rrule-ui.js';
-import { openModal as openSharedModal, closeModal, advancedSection } from '/components/modal.js';
-import { stagger } from '/utils/ux.js';
-import { t, formatDate as formatPreferredDate, formatTime, formatDateInput, parseDateInput, isDateInputValid, formatTimeInput, parseTimeInput } from '/i18n.js';
+import { renderRRuleFields, bindRRuleEvents, getRRuleValues, recurrenceRow } from '/rrule-ui.js';
+import { openModal as openSharedModal, closeModal, advancedSection, wireBlurValidation, reportFieldError } from '/components/modal.js';
+import { openDetailView, visibilityRow, assignedRow } from '/components/detail-view.js';
+import { stagger, wireScrollFade, scheduleUndoableDelete } from '/utils/ux.js';
+import { t, formatDate as formatPreferredDate, formatDayMonth, formatTime, timeSuffix, formatDateInput, parseDateInput, isDateInputValid, formatTimeInput, parseTimeInput } from '/i18n.js';
 import { esc, fmtLocation } from '/utils/html.js';
 import { shiftEndDateKey, isEndBeforeStart, weekStartIndex, weekdayOrder } from '/utils/date.js';
+import { truncateRuleBefore, shiftSeriesStart, shiftEndForStart } from '/utils/recurrence-scope.js';
 import { getReadableTextColor } from '/utils/color.js';
 import { refresh as refreshReminders } from '/reminders.js';
 import { parseRemindAtAsUtc } from '/utils/reminder-offset.js';
 import { renderUserMultiSelect, getSelectedUserIds, bindUserMultiSelect, renderAvatarStack } from '/components/user-multi-select.js';
 import { wireTablist } from '/utils/tablist.js';
+import { localizeBirthdayEvent } from '/utils/birthday-event.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
 
 // --------------------------------------------------------
@@ -529,7 +532,7 @@ function formatDateTime(datetimeStr) {
   const date    = localDate(datetimeStr);
   const hasTime = datetimeStr.length > 10;
   const time    = hasTime ? formatTime(datetimeStr) : '';
-  return time ? `${formatDate(date)} ${time} ${t('calendar.timeSuffix')}`.trimEnd() : formatDate(date);
+  return time ? `${formatDate(date)} ${time} ${timeSuffix()}`.trimEnd() : formatDate(date);
 }
 
 function eventIconName(icon) {
@@ -556,7 +559,7 @@ function calendarMetaIconHtml(icon) {
 }
 
 function calendarRepeatIconHtml() {
-  return '<i data-lucide="repeat" class="calendar-repeat-icon icon-xs" aria-hidden="true"></i>';
+  return '<i data-lucide="repeat" class="calendar-repeat-icon icon-sm" aria-hidden="true"></i>';
 }
 
 function eventIconElement(icon, className = 'event-icon') {
@@ -619,23 +622,6 @@ function attachmentUrls(event) {
     preview: event?.attachment_preview_url || legacyUrl,
     download: event?.attachment_download_url || legacyUrl,
   };
-}
-
-function attachmentHtml(event) {
-  if (!hasAttachment(event)) return '';
-  const name = esc(event.attachment_name || t('calendar.attachmentFallback'));
-  const urls = attachmentUrls(event);
-  if (isImageAttachment(event.attachment_mime)) {
-    return `
-      <div class="event-popup__attachment event-popup__attachment--image">
-        <img src="${esc(urls.preview)}" alt="${name}">
-      </div>`;
-  }
-  return `
-    <a class="event-popup__attachment event-popup__attachment--file" href="${esc(urls.download)}" download="${name}">
-      <i data-lucide="paperclip" aria-hidden="true"></i>
-      <span>${name}</span>
-    </a>`;
 }
 
 function truncateDescription(description, maxLength = 500) {
@@ -815,18 +801,21 @@ function holidaysOnDay(dateStr) {
   });
 }
 
-/** Rendert einen read-only Task-Chip für Kalenderansichten. */
-function renderTaskChip(task) {
+/** Rendert einen read-only Task-Chip für Kalenderansichten. In der Monatsansicht
+ *  (interactive:false) ist die Tageszelle selbst der Drill-in-Button; die Chips
+ *  sind dort nur visuelles Signal und dürfen kein eigenes role/tabindex tragen -
+ *  sonst entsteht ein fokussierbarer Button im Zellen-Button (Audit P1). */
+function renderTaskChip(task, { interactive = true } = {}) {
   const priority = task.priority || 'none';
   const label    = esc(task.title);
-  const ariaLbl  = t('calendar.taskChipAriaLabel', { title: task.title });
   const timeStr  = task.due_time ? ` · ${task.due_time.slice(0, 5)}` : '';
+  const button   = interactive
+    ? ` role="button" tabindex="0" aria-label="${esc(t('calendar.taskChipAriaLabel', { title: task.title }))}"`
+    : '';
   return `<div class="cal-task-chip cal-task-chip--${priority}"
-               data-task-id="${task.id}"
-               role="button" tabindex="0"
-               aria-label="${esc(ariaLbl)}"
+               data-task-id="${task.id}"${button}
                title="${label}${esc(timeStr)}">
-    <i data-lucide="check-square" class="icon-xs" aria-hidden="true"></i>
+    <i data-lucide="check-square" class="icon-sm" aria-hidden="true"></i>
     <span>${label}${esc(timeStr)}</span>
   </div>`;
 }
@@ -846,7 +835,7 @@ async function loadRange(from, to) {
       }),
       api.get(`/calendar/holidays?from=${from}&to=${to}`).catch(() => ({ data: [] })),
     ]);
-    state.events   = evRes.data;
+    state.events   = (evRes.data ?? []).map(localizeBirthdayEvent);
     state.tasks    = filterTasksForCalendar(taskRes.data ?? []);
     state.holidays = holRes.data ?? [];
     // Offline-Stand: wenn der Browser offline ist, kamen die Daten aus dem
@@ -862,6 +851,21 @@ async function loadRange(from, to) {
   }
   state.rangeFrom = from;
   state.rangeTo   = to;
+}
+
+/**
+ * Nur die Kalender-Events des aktuellen Bereichs neu laden (ohne Tasks/Feiertage).
+ * Für serienweite Bearbeitungen (#532), bei denen sich lediglich die Expansion
+ * ändert - vermeidet das Überholen unveränderter Tasks/Feiertage aus loadRange.
+ */
+async function reloadCalendarEventsOnly() {
+  if (!state.rangeFrom || !state.rangeTo) return;
+  try {
+    const res = await api.get(`/calendar?from=${state.rangeFrom}&to=${state.rangeTo}`);
+    state.events = (res.data ?? []).map(localizeBirthdayEvent);
+  } catch (err) {
+    console.error('[Calendar] reloadCalendarEventsOnly Fehler:', err);
+  }
 }
 
 /**
@@ -930,7 +934,7 @@ export async function render(container, { user }) {
     try {
       const eventRes = await api.get(`/calendar/${openId}`);
       if (eventRes?.data) {
-        initialEvent = eventRes.data;
+        initialEvent = localizeBirthdayEvent(eventRes.data);
         state.cursor = deepLinkTargetDate(initialEvent, dateParam);
       } else {
         console.warn('[Calendar] Deep-link event not found:', openId);
@@ -977,14 +981,11 @@ export async function render(container, { user }) {
 
     if (chip) {
       chip.scrollIntoView({ block: 'center', behavior: 'instant' });
-      showEventPopup(occurrence, chip);
+      openEventDetail(occurrence, chip);
     } else {
-      try {
-        const reminder = await loadReminderForEvent(openId);
-        openEventModal({ mode: 'edit', event: occurrence, reminder });
-      } catch {
-        openEventModal({ mode: 'edit', event: occurrence });
-      }
+      // Kein sichtbarer Chip (Termin außerhalb der aktuellen Ansicht): Der
+      // Deep-Link landet trotzdem in der Leseansicht, nur ohne Verankerung.
+      openEventDetail(occurrence);
     }
   }
 }
@@ -1100,6 +1101,9 @@ function renderToolbar() {
     });
   });
 
+  // Ansichts-Umschalter scrollt auf Mobile horizontal (Scrollbalken versteckt):
+  // Rand-Fade als Affordanz (geteilte has-fade-*-Konvention, Audit F-06).
+  wireScrollFade(bar.querySelector('.cal-toolbar__views'));
   viewTabs = wireTablist(bar.querySelector('.cal-toolbar__views'), {
     activeId: state.view,
     activeClass: 'cal-toolbar__view-btn--active',
@@ -1122,7 +1126,14 @@ function updateLabel() {
   const mon  = MONTH_NAMES()[d.getMonth()];
 
   if (state.view === 'month')  lbl.textContent = `${mon} ${year}`;
-  if (state.view === 'week')   lbl.textContent = t('calendar.weekNumberLabel', { week: getWeekNumber(state.cursor), month: mon, year });
+  if (state.view === 'week') {
+    // Mobil zeigt die "Woche" ein 3-Tage-Fenster um den Cursor (renderWeekView);
+    // ein "KW 30"-Label würde dann einen Bereich behaupten, der nicht zu sehen
+    // ist (Audit A1-19). Das Label nennt stattdessen den sichtbaren Bereich.
+    lbl.textContent = window.matchMedia('(max-width: 639px)').matches
+      ? t('calendar.dayRangeLabel', { from: formatDayMonth(addDays(state.cursor, -1)), to: formatPreferredDate(addDays(state.cursor, 1)) })
+      : t('calendar.weekNumberLabel', { week: getWeekNumber(state.cursor), month: mon, year });
+  }
   if (state.view === 'day')    lbl.textContent = formatDate(state.cursor, { weekday: true, long: true });
   if (state.view === 'agenda') lbl.textContent = t('calendar.agendaFrom', { date: formatDate(state.cursor) });
 }
@@ -1220,9 +1231,85 @@ function updateOfflineNotice() {
   if (window.lucide) lucide.createIcons({ el: page.querySelector('#cal-offline-notice') });
 }
 
+// --------------------------------------------------------
+// Monatszellen-Kapazität (Audit P2)
+// --------------------------------------------------------
+
+// Render-Puffer je Zelle; wie viele Chips sichtbar bleiben, entscheidet
+// fitMonthDayCells aus der realen Zellhöhe. Der Deckel begrenzt nur das DOM an
+// extrem vollen Tagen (>14 Items) - "+N" zählt via data-total trotzdem korrekt.
+const MONTH_DAY_MAX_CHIPS = 14;
+
+let _monthGridResizeObserver = null;
+let _monthFitRaf = 0;
+
+// Sichtbare Chip-Zahl je Monatszelle aus der REALEN Zellhöhe ableiten. Weil
+// grid-auto-rows:1fr die Zellhöhe inhaltsunabhängig macht (per Grid verteilt,
+// variiert mit dem Viewport), ist die Messung stabil: Chips zu verstecken ändert
+// die Zellhöhe nicht. Der letzte Platz bleibt immer für die "+N"-Zeile reserviert,
+// damit nie ein Chip mittig abschneidet (vorher: festes Budget=3 clippte still).
+function fitMonthDayCells(grid) {
+  if (!grid) return;
+  grid.querySelectorAll('.month-day').forEach((cell) => {
+    const chips   = [...cell.querySelectorAll('.month-day__holiday, .month-day__event, .cal-task-chip')];
+    const moreRow = cell.querySelector('.month-day__more');
+    if (!moreRow) return;
+    const total = Number(cell.dataset.total) || chips.length;
+
+    // Reset auf vollständig sichtbar für eine stabile Messung.
+    chips.forEach((c) => c.classList.remove('is-clipped'));
+    moreRow.hidden = true;
+    moreRow.textContent = '';
+    if (!chips.length) return;
+
+    const cs         = getComputedStyle(cell);
+    const cellBottom = cell.getBoundingClientRect().bottom - parseFloat(cs.paddingBottom);
+
+    // Passt alles rein (inkl. evtl. nicht gerenderter Überzähliger)? Dann fertig.
+    const fitsAll = total <= chips.length
+      && chips[chips.length - 1].getBoundingClientRect().bottom <= cellBottom;
+    if (fitsAll) return;
+
+    // Platz für die "+N"-Zeile freihalten (einzeilig, Höhe unabhängig von N).
+    moreRow.hidden = false;
+    moreRow.textContent = t('calendar.moreEvents', { count: total });
+    const reserved = cellBottom - moreRow.getBoundingClientRect().height;
+
+    let visible = 0;
+    for (const chip of chips) {
+      if (chip.getBoundingClientRect().bottom <= reserved) visible += 1;
+      else break;
+    }
+    visible = Math.max(1, visible); // nie ganz leer wirken lassen
+
+    chips.forEach((chip, i) => chip.classList.toggle('is-clipped', i >= visible));
+    const hiddenCount = total - visible;
+    if (hiddenCount > 0) {
+      moreRow.textContent = t('calendar.moreEvents', { count: hiddenCount });
+    } else {
+      moreRow.hidden = true;
+      moreRow.textContent = '';
+    }
+  });
+}
+
+// Neurechnung per rAF drosseln: der ResizeObserver kann beim Fensterziehen
+// mehrfach pro Frame feuern; ein fit pro Frame reicht.
+function scheduleMonthFit(grid) {
+  if (_monthFitRaf) return;
+  _monthFitRaf = requestAnimationFrame(() => {
+    _monthFitRaf = 0;
+    fitMonthDayCells(grid);
+  });
+}
+
 function renderView() {
   const body = _container.querySelector('#cal-body');
   if (!body) return;
+  // Monats-Resize-Observer lösen, bevor das alte #month-grid detached wird;
+  // nur die Monatsansicht setzt ihn danach wieder auf.
+  _monthGridResizeObserver?.disconnect();
+  _monthGridResizeObserver = null;
   body.replaceChildren();
 
   // Tages-Buckets einmal pro Render-Pass aufbauen; danach wieder deaktivieren,
@@ -1276,25 +1363,51 @@ function renderMonthView(container) {
     </div>
   `);
 
-  container.querySelector('#month-grid').addEventListener('click', (e) => {
-    const taskChip = e.target.closest('.cal-task-chip');
-    if (taskChip) {
-      e.stopPropagation();
-      window.yuvomi.navigate(`/tasks?open=${taskChip.dataset.taskId}`);
-      return;
-    }
-    const evEl = e.target.closest('.month-day__event');
-    if (evEl) {
-      e.stopPropagation();
-      const ev = state.events.find((ev) => ev.id === parseInt(evEl.dataset.id, 10));
-      if (ev) showEventPopup(ev, evEl);
-      return;
-    }
+  const grid = container.querySelector('#month-grid');
+  grid.addEventListener('click', (e) => {
     const dayEl = e.target.closest('.month-day');
-    if (dayEl) {
-      switchToDayView(dayEl.dataset.date);
+    if (!dayEl) return;
+
+    // Mobil ist die ganze Zelle EIN Drill-in-Ziel: die Chips sind dort zu
+    // Punkten reduziert (reines "etwas ist los"-Signal), ein Tap darf nie in
+    // einem Event-Popup enden statt in der handlungsfähigen Tagesansicht (P1).
+    // Desktop behält die feinere Interaktion: Chip -> Ziel, Zelle -> Tag.
+    const isMobile = window.matchMedia('(max-width: 639px)').matches;
+    if (!isMobile) {
+      const taskChip = e.target.closest('.cal-task-chip');
+      if (taskChip) {
+        e.stopPropagation();
+        window.yuvomi.navigate(`/tasks?open=${taskChip.dataset.taskId}`);
+        return;
+      }
+      const evEl = e.target.closest('.month-day__event');
+      if (evEl) {
+        e.stopPropagation();
+        const ev = state.events.find((ev) => ev.id === parseInt(evEl.dataset.id, 10));
+        if (ev) openEventDetail(ev, evEl);
+        return;
+      }
     }
+    switchToDayView(dayEl.dataset.date);
   });
+
+  // Tastatur-Aktivierung der Tageszelle (role="button"): Enter/Space -> Tag.
+  // Nur wenn der Fokus auf der Zelle selbst liegt; innere Chips tragen desktop
+  // ihre eigene Semantik und werden hier nicht abgefangen (Audit P1).
+  grid.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const dayEl = e.target.closest('.month-day');
+    if (!dayEl || e.target !== dayEl) return;
+    e.preventDefault();
+    switchToDayView(dayEl.dataset.date);
+  });
+
+  // Sichtbare Kapazität je Zelle aus der realen Höhe ableiten und bei Viewport-
+  // Änderungen (Fenster-Resize, Sidebar-Toggle) neu rechnen (Audit P2). Der
+  // ResizeObserver feuert nach observe() initial einmal -> erster fit nach Paint.
+  _monthGridResizeObserver?.disconnect();
+  _monthGridResizeObserver = new ResizeObserver(() => scheduleMonthFit(grid));
+  _monthGridResizeObserver.observe(grid);
 }
 
 function renderMonthDay(date, inMonth) {
@@ -1308,11 +1421,25 @@ function renderMonthDay(date, inMonth) {
     isToday  ? 'month-day--today' : '',
   ].filter(Boolean).join(' ');
 
-  const MAX_SHOW = 3;
-  const shown    = evs.slice(0, MAX_SHOW);
-  const extra    = evs.length - MAX_SHOW;
+  // Alle Chips (Feiertagsband, Termine, Aufgaben) bis zu einem großzügigen Puffer
+  // ins DOM rendern; welche sichtbar bleiben, entscheidet fitMonthDayCells aus der
+  // REALEN Zellhöhe (grid-auto-rows:1fr -> variiert mit dem Viewport). Zuvor kappte
+  // ein festes Budget=3 blind: bei niedriger Zellhöhe schnitt die Zelle den letzten
+  // Chip mittig ab, ohne "+N" (Audit A1-04 / P2). data-total trägt die Gesamtzahl,
+  // damit "+N" auch die nicht gerenderten Überzähligen mitzählt. Reihenfolge
+  // Feiertag -> Termin -> Aufgabe.
+  const total     = dayHols.length + evs.length + dayTasks.length;
+  const holShown  = dayHols.slice(0, MONTH_DAY_MAX_CHIPS);
+  const evShown   = evs.slice(0, Math.max(0, MONTH_DAY_MAX_CHIPS - holShown.length));
+  const taskShown = dayTasks.slice(0, Math.max(0, MONTH_DAY_MAX_CHIPS - holShown.length - evShown.length));
 
-  const evHtml = shown.map((ev) => `
+  const holHtml = holShown.map((h) => `
+    <div class="month-day__holiday" style="--holi-color:${esc(h.color)};--holi-ink:${esc(getReadableTextColor(h.color))}" title="${esc(h.name)}">
+      <span>${esc(h.name)}</span>
+    </div>
+  `).join('');
+
+  const evHtml = evShown.map((ev) => `
     <div class="month-day__event"
          data-id="${ev.id}"
          style="${eventSurfaceStyle(ev)}"
@@ -1320,24 +1447,27 @@ function renderMonthDay(date, inMonth) {
     >${eventIconHtml(ev.icon, 'event-icon event-icon--compact')}<span>${esc(ev.title)}</span>${chipAssigneeStack(ev, { size: 15, maxVisible: 2 })}</div>
   `).join('');
 
-  const MAX_TASK_SHOW = 2;
-  const taskHtml = dayTasks.slice(0, MAX_TASK_SHOW).map(renderTaskChip).join('');
-
-  const holHtml = dayHols.map((h) => `
-    <div class="month-day__holiday" style="--holi-color:${esc(h.color)};--holi-ink:${esc(getReadableTextColor(h.color))}" title="${esc(h.name)}">
-      <span>${esc(h.name)}</span>
-    </div>
-  `).join('');
+  const taskHtml = taskShown.map((tk) => renderTaskChip(tk, { interactive: false })).join('');
 
   return `
-    <div class="${classes}" data-date="${date}">
+    <div class="${classes}" data-date="${date}" data-total="${total}"
+         role="button" tabindex="0"
+         aria-label="${esc(monthDayAriaLabel(date, total))}"${isToday ? ' aria-current="date"' : ''}>
       <div class="month-day__number">${new Date(date + 'T00:00:00').getDate()}</div>
       ${holHtml}
       ${evHtml}
-      ${extra > 0 ? `<div class="month-day__more">${t('calendar.moreEvents', { count: extra })}</div>` : ''}
       ${taskHtml}
+      <div class="month-day__more" hidden></div>
     </div>
   `;
+}
+
+// aria-label der Tageszelle: lokalisiertes Datum + (falls vorhanden) Zahl der
+// Einträge, damit Tastatur/Screenreader den Tag vor dem Drill-in einordnen
+// können. Leere Tage tragen nur das Datum (die role sagt "Schaltfläche"). P1.
+function monthDayAriaLabel(date, total) {
+  const d = formatPreferredDate(date);
+  return total > 0 ? `${d}, ${t('calendar.monthDayEntries', { count: total })}` : d;
 }
 
 // --------------------------------------------------------
@@ -1432,7 +1562,7 @@ function renderWeekView(container) {
     const evEl = e.target.closest('.week-event');
     if (evEl) {
       const ev = state.events.find((ev) => ev.id === parseInt(evEl.dataset.id, 10));
-      if (ev) showEventPopup(ev, evEl);
+      if (ev) openEventDetail(ev, evEl);
       return;
     }
     const col = e.target.closest('[data-date]');
@@ -1451,7 +1581,7 @@ function renderWeekView(container) {
     const evEl = e.target.closest('.allday-event');
     if (evEl) {
       const ev = state.events.find((ev) => ev.id === parseInt(evEl.dataset.id, 10));
-      if (ev) showEventPopup(ev, evEl);
+      if (ev) openEventDetail(ev, evEl);
     }
   });
 
@@ -1591,11 +1721,10 @@ function renderDayView(container) {
   const layout = layoutOverlaps(timed);
 
   container.replaceChildren();
+  // Kein eigener Datums-Header mehr: die Toolbar zeigt exakt dasselbe Datum
+  // bereits als Ansichts-Label (Audit A1-18).
   container.insertAdjacentHTML('beforeend', `
     <div class="day-view">
-      <div class="day-view__header">
-        <div class="day-view__date-label">${formatDate(state.cursor, { weekday: true, long: true })}</div>
-      </div>
       ${(allday.length || tasksOnDay(state.cursor).length || holidaysOnDay(state.cursor).length) ? `
       <div class="allday-row" style="display:grid;grid-template-columns:var(--space-12) 1fr;">
         <div class="calendar-all-day-label">${t('calendar.allDayShort')}</div>
@@ -1626,6 +1755,7 @@ function renderDayView(container) {
               <div class="week-view__hour-line" style="top:${h * HOUR_HEIGHT}px;"></div>
             `).join('')}
             ${timed.map((ev) => renderWeekEvent(ev, layout.get(ev.id))).join('')}
+            ${dayEvs.length === 0 ? `<div class="day-view__empty-hint" style="top:${(state.cursor === state.today ? nowTop() : 9 * HOUR_HEIGHT) + 16}px">${t('calendar.dayEmptyHint')}</div>` : ''}
             ${state.cursor === state.today ? `<div class="week-view__now-line" style="top:${nowTop()}px;"></div>` : ''}
           </div>
         </div>
@@ -1642,7 +1772,7 @@ function renderDayView(container) {
     const evEl = e.target.closest('.allday-event');
     if (evEl) {
       const ev = state.events.find((ev) => ev.id === parseInt(evEl.dataset.id, 10));
-      if (ev) showEventPopup(ev, evEl);
+      if (ev) openEventDetail(ev, evEl);
     }
   });
 
@@ -1650,7 +1780,7 @@ function renderDayView(container) {
     const evEl = e.target.closest('.week-event');
     if (evEl) {
       const ev = state.events.find((ev) => ev.id === parseInt(evEl.dataset.id, 10));
-      if (ev) showEventPopup(ev, evEl);
+      if (ev) openEventDetail(ev, evEl);
       return;
     }
     const time = clickedTime(e, e.currentTarget);
@@ -1719,7 +1849,7 @@ function renderAgendaView(container) {
     const evEl = e.target.closest('.agenda-event');
     if (evEl) {
       const ev = state.events.find((ev) => ev.id === parseInt(evEl.dataset.id, 10));
-      if (ev) showEventPopup(ev, evEl);
+      if (ev) openEventDetail(ev, evEl);
     }
   });
 
@@ -1730,7 +1860,7 @@ function renderAgendaView(container) {
     if (!evEl) return;
     e.preventDefault();
     const ev = state.events.find((x) => x.id === parseInt(evEl.dataset.id, 10));
-    if (ev) showEventPopup(ev, evEl);
+    if (ev) openEventDetail(ev, evEl);
   });
 }
 
@@ -1823,7 +1953,7 @@ async function runCalendarSearch(raw) {
     const res = await api.get(`/calendar/search?q=${encodeURIComponent(q)}`);
     // Verworfen, wenn die Suche zwischenzeitlich geschlossen oder weitergetippt wurde.
     if (!searchActive || searchQuery !== q) return;
-    searchResults = res.data ?? [];
+    searchResults = (res.data ?? []).map(localizeBirthdayEvent);
     searchTotal = Number.isFinite(res.total) ? res.total : searchResults.length;
     renderCalendarSearchState(searchResults.length ? 'results' : 'empty');
   } catch (err) {
@@ -1957,9 +2087,9 @@ async function openFoundEvent(ev) {
   const chip = _container.querySelector(`[data-id="${CSS.escape(String(ev.id))}"]`);
   if (chip) {
     chip.scrollIntoView({ block: 'center', behavior: 'instant' });
-    showEventPopup(full, chip);
+    openEventDetail(full, chip);
   } else {
-    openEventModal({ mode: 'edit', event: full });
+    openEventDetail(full);
   }
 }
 
@@ -1996,7 +2126,7 @@ function renderAgendaEvent(ev, dayStr) {
       break;
     default: // single
       timeStr = formatTime(ev.start_datetime)
-        + (ev.end_datetime ? ` – ${formatTime(ev.end_datetime)} ${t('calendar.timeSuffix')}`.trimEnd() : ` ${t('calendar.timeSuffix')}`.trimEnd());
+        + (ev.end_datetime ? ` – ${formatTime(ev.end_datetime)} ${timeSuffix()}`.trimEnd() : ` ${timeSuffix()}`.trimEnd());
   }
 
   const displayBg     = resolveEventBackground(ev);
@@ -2033,127 +2163,192 @@ function eventVisibilityMeta(visibility) {
 }
 
 // --------------------------------------------------------
-// Event-Popup (Detail-Ansicht bei Klick auf Termin)
+// Termin-Detailansicht (beim Antippen eines Termins)
 // --------------------------------------------------------
 
-function showEventPopup(ev, anchor) {
-  document.querySelector('#event-popup')?.remove();
+/** Anhang als Bildvorschau oder Download-Link - beides als DOM, nie als Markup. */
+function attachmentNode(ev) {
+  if (!hasAttachment(ev)) return null;
+  const name = ev.attachment_name || t('calendar.attachmentFallback');
+  const urls = attachmentUrls(ev);
 
-  const popup = document.createElement('div');
-  popup.id        = 'event-popup';
-  popup.className = 'event-popup';
-  popup.setAttribute('role', 'dialog');
-  popup.setAttribute('aria-label', ev.title || t('calendar.title'));
-  popup.tabIndex  = -1;
+  if (isImageAttachment(ev.attachment_mime)) {
+    const wrap = document.createElement('div');
+    wrap.className = 'detail-attachment detail-attachment--image';
+    const img = document.createElement('img');
+    img.src = urls.preview;
+    img.alt = name;
+    wrap.appendChild(img);
+    return wrap;
+  }
 
+  const link = document.createElement('a');
+  link.className = 'detail-attachment detail-attachment--file';
+  link.href = urls.download;
+  link.download = name;
+  const icon = document.createElement('i');
+  icon.dataset.lucide = 'paperclip';
+  icon.className = 'icon-md';
+  icon.setAttribute('aria-hidden', 'true');
+  link.append(icon, document.createTextNode(name));
+  return link;
+}
+
+/** Kalendername als farbiger Chip, wie in der Agenda-Ansicht. */
+function calendarChipNode(ev) {
+  if (!ev.cal_name) return null;
+  const chip = document.createElement('span');
+  chip.className = 'event-cal-label';
+  chip.style.setProperty('--cal-color', ev.cal_color || ev.color || resolveEventColor(ev));
+  chip.textContent = ev.cal_name;
+  return chip;
+}
+
+/** Erinnerungen im Klartext („1 Tag vorher"), statt sie ganz zu verschweigen. */
+function reminderSummary(ev, reminders) {
+  const list = Array.isArray(reminders) ? reminders : [];
+  if (!list.length) return '';
+  const labels = REMINDER_OFFSETS();
+  return list
+    .map((r) => {
+      const value = reminderOffsetFromEvent(ev, r);
+      const match = labels.find((o) => o.value === value && o.value !== '');
+      // „Benutzerdefiniert…" ist als Auswahl-Label gedacht, nicht als Aussage -
+      // in der Leseansicht steht stattdessen der tatsächliche Zeitpunkt.
+      return value === 'custom' || !match
+        ? formatDateTime(parseRemindAtAsUtc(r.remind_at))
+        : match.label;
+    })
+    .filter(Boolean)
+    .join(', ');
+}
+
+/**
+ * Die Leseinformationen eines Termins.
+ *
+ * Wiederholung, Erinnerungen und Sichtbarkeit standen bisher nur im
+ * Bearbeitungsformular - wer wissen wollte, ob ein Termin wöchentlich
+ * wiederkehrt, musste ihn zum Bearbeiten öffnen.
+ */
+function renderEventDetail(ev, reminders = []) {
   const timeStr = ev.all_day
-    ? t('calendar.allDay')
+    ? `${formatPreferredDate(localDate(ev.start_datetime))} · ${t('calendar.allDay')}`
     : formatDateTime(ev.start_datetime)
-      + (ev.end_datetime ? ` – ${formatTime(ev.end_datetime)}${t('calendar.timeSuffix') ? ' ' + t('calendar.timeSuffix') : ''}`.trim() : '');
+      + (ev.end_datetime ? ` – ${formatTime(ev.end_datetime)} ${timeSuffix()}`.trimEnd() : '');
 
-  const displayBg     = resolveEventBackground(ev);
-  const displayColor  = resolveEventColor(ev);
-  const calLabelColor = ev.cal_color || ev.color || displayColor;
+  return [
+    { icon: 'calendar', label: t('calendar.detailCalendar'), node: calendarChipNode(ev) },
+    { icon: 'clock', label: t('calendar.detailWhen'), value: timeStr },
+    recurrenceRow(ev.recurrence_rule),
+    { icon: 'map-pin', label: t('calendar.locationLabel'), value: ev.location ? fmtLocation(ev.location) : '' },
+    assignedRow(ev.assigned_users, t('calendar.assignedLabel'), ev.assigned_name || ''),
+    {
+      icon: 'bell',
+      label: reminders.length > 1 ? t('reminders.sectionTitlePlural') : t('reminders.sectionTitle'),
+      value: reminderSummary(ev, reminders),
+    },
+    visibilityRow(ev.visibility),
+    {
+      icon: 'align-left',
+      label: t('calendar.descriptionLabel'),
+      value: ev.description ? truncateDescription(ev.description, 500) : '',
+      multiline: true,
+    },
+    { icon: 'paperclip', label: t('calendar.attachmentLabel'), node: attachmentNode(ev) },
+  ];
+}
 
-  // Alle zugewiesenen Mitglieder anzeigen, nicht nur das erste (#492).
-  const assignedNames = (ev.assigned_users ?? [])
-    .map((u) => u.display_name)
-    .filter(Boolean);
-  const assignedLabel = assignedNames.length
-    ? assignedNames.join(', ')
-    : (ev.assigned_name || '');
-  popup.insertAdjacentHTML('beforeend', `
-    <div class="event-popup__color-bar" style="background:${esc(displayBg)};"></div>
-    <div class="event-popup__title">${eventIconHtml(ev.icon)}<span>${esc(ev.title)}</span></div>
-    <div class="event-popup__meta">
-      ${ev.cal_name ? `<div><span class="event-cal-label" style="--cal-color:${esc(calLabelColor)}">${esc(ev.cal_name)}</span></div>` : ''}
-      <div class="calendar-meta-item">${calendarMetaIconHtml('clock')}<span>${esc(timeStr)}</span></div>
-      ${ev.location ? `<div class="calendar-meta-item">${calendarMetaIconHtml('map-pin')}<span>${esc(fmtLocation(ev.location))}</span></div>` : ''}
-      ${ev.description ? `<div>${esc(truncateDescription(ev.description, 500))}</div>` : ''}
-      ${hasAttachment(ev) ? attachmentHtml(ev) : ''}
-      ${assignedLabel ? `<div class="calendar-meta-item">${calendarMetaIconHtml(assignedNames.length > 1 ? 'users' : 'user')}<span>${esc(assignedLabel)}</span></div>` : ''}
-    </div>
-    <div class="event-popup__actions">
-      <button class="btn btn--secondary event-popup__edit" id="popup-edit">${t('calendar.popupEdit')}</button>
-      <button class="btn btn--danger"    id="popup-delete">
-        <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>
-      </button>
-    </div>
-  `);
+/**
+ * Der einzige Einstieg in einen bestehenden Termin. Ohne Anker (Deep-Link,
+ * Suchtreffer) wird daraus ein Sheet, mit Anker am Desktop ein Popover.
+ */
+async function openEventDetail(ev, anchor = null) {
+  // Haushaltshilfe-Besuche werden in ihrem eigenen Modul bearbeitet; der Umweg
+  // über eine Detailansicht führte sonst ins Leere.
+  if (ev?.housekeeping_visit_id) {
+    window.yuvomi.navigate(`/housekeeping?editVisit=${ev.housekeeping_visit_id}`);
+    return;
+  }
 
-  document.body.appendChild(popup);
-  if (window.lucide) lucide.createIcons({ el: popup });
+  // Die Erinnerungen kosten einen eigenen Serveraufruf; alles andere steckt
+  // schon im Termin. Früher wurde davor gewartet, und der Antipp-Moment - der
+  // einzige, dessen ganzer Zweck Leichtigkeit ist - blieb einen Roundtrip lang
+  // stumm. Jetzt läuft der Aufruf neben dem Öffnen her und die Zeile kommt
+  // nach. Die Sync-Ziele braucht nur das Formular, die lädt erst dessen mount().
+  let reminders = [];
+  const remindersReady = loadReminderForEvent(ev.id).then((r) => { reminders = r; });
 
+  const actions = [{
+    id: 'detail-delete',
+    label: t('common.delete'),
+    variant: 'danger-ghost',
+    icon: 'trash-2',
+    align: 'start',
+    // force + await: Löschen entscheidet über die Eingaben mit, eine
+    // Verwerfen-Frage davor wäre die zweite Rückfrage für dieselbe
+    // Entscheidung. Der await hält das Löschen zurück, bis der Overlay-Slot
+    // wirklich frei ist - requestDeleteEvent öffnet bei Serien selbst einen
+    // Dialog, und das Shared-Modal kennt kein Stacking.
+    onClick: async ({ close }) => { await close({ force: true }); await requestDeleteEvent(ev); },
+  }];
+
+  // ICS-Abos: Ein lokal geänderter Termin lässt sich auf das Original
+  // zurücksetzen. Die Aktion gehört zum Objekt, also in die Fußzeile.
   if (ev.external_source === 'ics' && ev.user_modified === 1) {
-    const resetLink = document.createElement('a');
-    resetLink.href = '#';
-    resetLink.className = 'event-popup__reset-link';
-    resetLink.textContent = t('calendar.ics.reset');
-    resetLink.style.cssText = 'display:block;text-align:center;font-size:var(--text-xs);color:var(--color-text-secondary);margin-top:var(--space-2);cursor:pointer;text-decoration:underline;';
-    resetLink.addEventListener('click', async (e) => {
-      e.preventDefault();
-      try {
-        await api.post(`/calendar/${ev.id}/reset`, {});
-        dismiss();
-        await reloadForView();
-        window.yuvomi?.showToast(t('calendar.ics.resetToast'), 'success');
-      } catch (err) {
-        // Server-Meldung bevorzugen (nutzerorientiert), sonst lokalisierter
-        // Fallback — nie den rohen JS-/Netzwerk-Fehlertext zeigen.
-        window.yuvomi?.showToast(err.data?.error ?? t('calendar.saveError'), 'danger');
-      }
+    actions.push({
+      id: 'detail-ics-reset',
+      label: t('calendar.ics.reset'),
+      variant: 'ghost',
+      icon: 'rotate-ccw',
+      onClick: async ({ close }) => {
+        try {
+          await api.post(`/calendar/${ev.id}/reset`, {});
+          // Der Schreibvorgang ist durch - ohne force fragte der Dirty-Guard
+          // nach dem Verwerfen von Änderungen, die der Reset ohnehin
+          // zurückgenommen hat (#625).
+          await close({ force: true });
+          await reloadForView();
+          window.yuvomi?.showToast(t('calendar.ics.resetToast'), 'success');
+        } catch (err) {
+          // Server-Meldung bevorzugen (nutzerorientiert), sonst lokalisierter
+          // Fallback — nie den rohen JS-/Netzwerk-Fehlertext zeigen.
+          window.yuvomi?.showToast(err.data?.error ?? t('calendar.saveError'), 'danger');
+        }
+      },
     });
-    popup.querySelector('.event-popup__actions').before(resetLink);
   }
 
-  // Positionierung: erst messen, dann im Viewport halten.
-  const rect = anchor.getBoundingClientRect();
-  const gap = 8;
-  const margin = 8;
-  const popupRect = popup.getBoundingClientRect();
-  const viewportWidth = document.documentElement.clientWidth;
-  const viewportHeight = document.documentElement.clientHeight;
-  const fitsBelow = rect.bottom + gap + popupRect.height <= viewportHeight - margin;
-  const top = fitsBelow
-    ? rect.bottom + gap
-    : Math.max(margin, rect.top - gap - popupRect.height);
-  const left = Math.min(
-    Math.max(margin, rect.left),
-    Math.max(margin, viewportWidth - popupRect.width - margin)
-  );
-  const maxTop = Math.max(margin, viewportHeight - popupRect.height - margin);
-  popup.style.top = `${Math.min(Math.max(margin, top), maxTop)}px`;
-  popup.style.left = `${left}px`;
-
-  // Gemeinsames Schließen: entfernt Popup und beide globalen Listener, damit
-  // kein keydown-/click-Handler verwaist zurückbleibt.
-  const onKeydown = (e) => {
-    if (e.key === 'Escape') { e.stopPropagation(); dismiss(); anchor?.focus?.(); }
-  };
-  function dismiss() {
-    popup.remove();
-    document.removeEventListener('keydown', onKeydown);
-    document.removeEventListener('click', onOutsideClick);
-  }
-  function onOutsideClick(e) {
-    if (!popup.isConnected || !popup.contains(e.target)) dismiss();
-  }
-
-  popup.querySelector('#popup-edit').addEventListener('click', async () => {
-    dismiss();
-    const reminder = await loadReminderForEvent(ev.id);
-    openEventModal({ mode: 'edit', event: ev, reminder });
+  const view = openDetailView({
+    title: ev.title,
+    accentColor: resolveEventBackground(ev),
+    anchor,
+    sections: renderEventDetail(ev, reminders),
+    actions,
+    edit: {
+      label: t('common.edit'),
+      title: t('calendar.editEvent'),
+      // Das Formular wartet auf die Erinnerungen, die Leseansicht nicht. Ohne
+      // diese Sperre baute ein sofortiger Klick auf „Bearbeiten" das Formular
+      // ohne Erinnerungszeilen auf - und saveEvent löscht die Erinnerungen des
+      // Termins, wenn es keine Zeile findet.
+      ready: remindersReady,
+      mount: (panel, pane) => {
+        pane.insertAdjacentHTML('beforeend', buildEventModalContent({ mode: 'edit', event: ev, reminder: reminders }));
+        wireEventForm(panel, { mode: 'edit', event: ev, reminder: reminders });
+      },
+      // Am Desktop bleibt der gewohnte Weg: Popover zu, Formular auf.
+      standalone: async () => {
+        await remindersReady;
+        openEventModal({ mode: 'edit', event: ev, reminder: reminders });
+      },
+    },
   });
 
-  popup.querySelector('#popup-delete').addEventListener('click', async () => {
-    dismiss();
-    await requestDeleteEvent(ev);
-  });
-
-  // Escape schließt und gibt den Fokus an den Auslöser zurück; Außenklick schließt.
-  document.addEventListener('keydown', onKeydown);
-  setTimeout(() => document.addEventListener('click', onOutsideClick), 0);
-  popup.focus();
+  // Die Erinnerungszeile nachtragen. Zeilen ohne Inhalt fallen ohnehin weg, ein
+  // Termin ohne Erinnerung bewegt sich also gar nicht. `update` verwirft sich
+  // selbst, wenn der Nutzer inzwischen etwas anderes geöffnet hat.
+  await remindersReady;
+  if (reminders.length) view.update(renderEventDetail(ev, reminders));
 }
 
 // --------------------------------------------------------
@@ -2356,49 +2551,46 @@ async function loadSyncTargets(selectElement, currentEvent = null) {
   localOption.textContent = t('calendar.syncTargetLocal');
   selectElement.appendChild(localOption);
 
-  // Google calendars (enabled only)
+  // Ziele über die gemeinsame Lese-Route holen (#618): die Verwaltungsrouten
+  // sind admin-only und lieferten Familienmitgliedern nur 403 - übrig blieb
+  // "Lokal speichern". /sync-targets liefert bereits gefiltert (aktiviert +
+  // beschreibbar) und ohne Zugangsdaten.
+  let targets = { google: [], caldav: [] };
   try {
-    const res = await api.get('/calendar/google/calendars');
-    const enabled = (res.data || []).filter((c) => c.enabled && c.writable);
-    if (enabled.length) {
-      const group = document.createElement('optgroup');
-      group.className = 'js-google-targets';
-      group.label = t('calendar.syncTargetGoogleGroup');
-      for (const cal of enabled) {
-        const option = document.createElement('option');
-        option.value = `google:${cal.id}`;
-        option.textContent = cal.summary || cal.id;
-        group.appendChild(option);
-      }
-      selectElement.appendChild(group);
-    }
+    const res = await api.get('/calendar/sync-targets');
+    targets = { google: res.data?.google || [], caldav: res.data?.caldav || [] };
   } catch (err) {
-    console.warn('Failed to load Google targets:', err);
+    console.warn('Failed to load sync targets:', err);
   }
 
-  // CalDAV calendars (enabled only), grouped per account
-  try {
-    const accountsRes = await api.get('/calendar/caldav/accounts');
-    for (const account of accountsRes.data || []) {
-      try {
-        const calRes = await api.get(`/calendar/caldav/accounts/${account.id}/calendars`);
-        const enabled = (calRes.data || []).filter((cal) => cal.enabled);
-        if (!enabled.length) continue;
-        const group = document.createElement('optgroup');
-        group.label = `${t('calendar.syncTargetCaldavGroup')} · ${account.name}`;
-        for (const cal of enabled) {
-          const option = document.createElement('option');
-          option.value = `caldav:${account.id}|${cal.calendarUrl}`;
-          option.textContent = cal.calendarName || cal.calendarUrl;
-          group.appendChild(option);
-        }
-        selectElement.appendChild(group);
-      } catch (err) {
-        console.warn(`Failed to load calendars for account ${account.id}:`, err);
-      }
+  if (targets.google.length) {
+    const group = document.createElement('optgroup');
+    group.className = 'js-google-targets';
+    group.label = t('calendar.syncTargetGoogleGroup');
+    for (const cal of targets.google) {
+      const option = document.createElement('option');
+      option.value = `google:${cal.id}`;
+      option.textContent = cal.summary || cal.id;
+      group.appendChild(option);
     }
-  } catch (err) {
-    console.warn('Failed to load CalDAV targets:', err);
+    selectElement.appendChild(group);
+  }
+
+  // CalDAV-Kalender nach Konto gruppieren - die Route liefert sie kontoweise
+  // sortiert, ein Wechsel der accountId beginnt die nächste optgroup.
+  let caldavGroup = null;
+  let caldavGroupAccountId = null;
+  for (const cal of targets.caldav) {
+    if (caldavGroupAccountId !== cal.accountId) {
+      caldavGroup = document.createElement('optgroup');
+      caldavGroup.label = `${t('calendar.syncTargetCaldavGroup')} · ${cal.accountName}`;
+      caldavGroupAccountId = cal.accountId;
+      selectElement.appendChild(caldavGroup);
+    }
+    const option = document.createElement('option');
+    option.value = `caldav:${cal.accountId}|${cal.calendarUrl}`;
+    option.textContent = cal.calendarName || cal.calendarUrl;
+    caldavGroup.appendChild(option);
   }
 
   // Pre-select the editing event's existing target
@@ -2458,232 +2650,246 @@ function openEventModal({ mode, event = null, date = null, reminder = null, time
     title: isEdit ? t('calendar.editEvent') : t('calendar.newEvent'),
     content,
     size: 'md',
-    onSave(panel) {
-      // RRULE-Events binden
-      bindRRuleEvents(panel, 'event');
-      bindUserMultiSelect(panel, 'cal_assigned');
-      wireVisibilityWarning(panel, '#modal-visibility', 'cal_assigned', '#modal-visibility-warning');
-
-      // Color-Picker ausgrauen wenn Assignees gesetzt sind (Avatar-Farbe hat Vorrang)
-      function syncColorPickerState() {
-        const hasAssignees = getSelectedUserIds(panel, 'cal_assigned').length > 0;
-        const group  = panel.querySelector('.js-color-picker-group');
-        const hint   = panel.querySelector('#color-picker-assignee-hint');
-        const picker = panel.querySelector('#event-color-picker');
-        if (group)  group.classList.toggle('color-picker--disabled', hasAssignees);
-        if (hint)   hint.hidden = !hasAssignees;
-        if (picker) {
-          picker.setAttribute('aria-disabled', hasAssignees ? 'true' : 'false');
-          picker.querySelectorAll('.color-swatch').forEach((s) => {
-            if (hasAssignees) {
-              s.setAttribute('tabindex', '-1');
-            } else {
-              s.setAttribute('tabindex', s.classList.contains('color-swatch--active') ? '0' : '-1');
-            }
-          });
-        }
-      }
-      const msWidget = panel.querySelector('.user-ms[data-ms-name="cal_assigned"]');
-      msWidget?.addEventListener('change', syncColorPickerState);
-      syncColorPickerState();
-
-      const selectedColor = isEdit ? (event?.color || EVENT_COLORS[0]) : EVENT_COLORS[0];
-
-      // Farb-Auswahl: Auswahl + ARIA + Keyboard (Roving Tabindex)
-      function selectSwatch(target) {
-        panel.querySelectorAll('.color-swatch').forEach((s) => {
-          s.classList.remove('color-swatch--active');
-          s.setAttribute('aria-checked', 'false');
-          s.setAttribute('tabindex', '-1');
-        });
-        target.classList.add('color-swatch--active');
-        target.setAttribute('aria-checked', 'true');
-        target.setAttribute('tabindex', '0');
-      }
-      panel.querySelectorAll('.color-swatch').forEach((sw) => {
-        if (sw.dataset.color === selectedColor) selectSwatch(sw);
-        sw.addEventListener('click', () => { selectSwatch(sw); sw.focus(); });
-        sw.addEventListener('keydown', (e) => {
-          const swatches = [...panel.querySelectorAll('.color-swatch')];
-          const idx = swatches.indexOf(sw);
-          if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
-            e.preventDefault();
-            const next = swatches[(idx + 1) % swatches.length];
-            selectSwatch(next); next.focus();
-          } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
-            e.preventDefault();
-            const prev = swatches[(idx - 1 + swatches.length) % swatches.length];
-            selectSwatch(prev); prev.focus();
-          } else if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            selectSwatch(sw);
-          }
-        });
-      });
-
-      // Ganztägig-Toggle
-      const alldayCheck = panel.querySelector('#modal-allday');
-      const timeFields  = panel.querySelector('#time-fields');
-      const alldayFields = panel.querySelector('#allday-fields');
-      alldayCheck.addEventListener('change', () => {
-        if (alldayCheck.checked) { timeFields.style.display = 'none'; alldayFields.style.display = ''; }
-        else                      { timeFields.style.display = '';     alldayFields.style.display = 'none'; }
-      });
-      if (isEdit && event?.all_day) { timeFields.style.display = 'none'; alldayFields.style.display = ''; }
-
-      const iconInput = panel.querySelector('#modal-icon');
-      const iconTrigger = panel.querySelector('#modal-icon-trigger');
-      const selectIcon = (icon) => {
-        const nextIcon = eventIconName(icon);
-        if (iconInput) iconInput.value = nextIcon;
-        if (iconTrigger) {
-          iconTrigger.dataset.icon = nextIcon;
-          iconTrigger.replaceChildren(eventIconElement(nextIcon, 'event-icon-picker__trigger-icon'));
-        }
-        if (window.lucide) lucide.createIcons({ el: iconTrigger });
-      };
-
-      iconTrigger?.addEventListener('click', () => {
-        iconTrigger.setAttribute('aria-expanded', 'true');
-        openIconPickerDialog(iconInput?.value || 'calendar', (icon) => {
-          selectIcon(icon);
-          iconTrigger?.setAttribute('aria-expanded', 'false');
-          iconTrigger?.focus();
-        }, () => {
-          iconTrigger?.setAttribute('aria-expanded', 'false');
-          iconTrigger?.focus();
-        });
-      });
-
-      const attachmentInput = panel.querySelector('#modal-attachment');
-      const selectedAttachment = panel.querySelector('#modal-selected-attachment');
-      const attachmentPreview = panel.querySelector('#modal-attachment-preview');
-      const removeAttachment = panel.querySelector('#modal-remove-attachment');
-      const attachmentState = {
-        name: event?.attachment_name || null,
-        mime: event?.attachment_mime || null,
-        size: event?.attachment_size || null,
-        changed: false,
-        removed: false,
-      };
-
-      const syncSelectedAttachment = () => {
-        if (!selectedAttachment) return;
-        selectedAttachment.hidden = !attachmentState.name;
-        selectedAttachment.textContent = attachmentState.name ? selectedAttachmentLabel(attachmentState.name) : '';
-        if (removeAttachment) removeAttachment.hidden = !attachmentState.name;
-      };
-
-      const syncAttachmentSelection = () => {
-        if (!selectedAttachment) return;
-        const file = attachmentInput.files?.[0];
-        if (file) {
-          attachmentState.name = file.name;
-          attachmentState.mime = file.type || 'application/octet-stream';
-          attachmentState.size = file.size;
-          attachmentState.changed = true;
-          attachmentState.removed = false;
-          selectedAttachment.hidden = false;
-          selectedAttachment.textContent = selectedAttachmentLabel(file.name);
-          if (removeAttachment) removeAttachment.hidden = false;
-          if (attachmentPreview) {
-            attachmentPreview.replaceChildren();
-            attachmentPreview.hidden = true;
-          }
-          return;
-        }
-        syncSelectedAttachment();
-      };
-
-      attachmentInput?.addEventListener('change', syncAttachmentSelection);
-      removeAttachment?.addEventListener('click', () => {
-        if (attachmentInput) attachmentInput.value = '';
-        attachmentState.name = null;
-        attachmentState.mime = null;
-        attachmentState.size = null;
-        attachmentState.changed = true;
-        attachmentState.removed = true;
-        if (attachmentPreview) {
-          attachmentPreview.replaceChildren();
-          attachmentPreview.hidden = true;
-        }
-        syncSelectedAttachment();
-      });
-
-      const attachmentDropzone = panel.querySelector('#modal-attachment-dropzone');
-      if (attachmentDropzone && attachmentInput) {
-        ['dragenter', 'dragover'].forEach((eventName) => {
-          attachmentDropzone.addEventListener(eventName, (dropEvent) => {
-            dropEvent.preventDefault();
-            attachmentDropzone.classList.add('document-dropzone--active');
-          });
-        });
-        ['dragleave', 'drop'].forEach((eventName) => {
-          attachmentDropzone.addEventListener(eventName, (dropEvent) => {
-            dropEvent.preventDefault();
-            attachmentDropzone.classList.remove('document-dropzone--active');
-          });
-        });
-        attachmentDropzone.addEventListener('drop', (dropEvent) => {
-          const file = dropEvent.dataTransfer?.files?.[0];
-          if (!file) return;
-          const transfer = new DataTransfer();
-          transfer.items.add(file);
-          attachmentInput.files = transfer.files;
-          syncAttachmentSelection();
-        });
-      }
-
-      syncSelectedAttachment();
-
-      // Erinnerungen: Toggle blendet die Zeilenliste ein/aus; „Hinzufügen" und
-      // „Entfernen" verwalten mehrere Erinnerungen je Termin (#436).
-      wireReminderRows(panel);
-
-      // Load unified sync targets (Google + CalDAV)
-      const syncTargetSelect = panel.querySelector('#event-sync-target');
-      if (syncTargetSelect) {
-        loadSyncTargets(syncTargetSelect, event);
-      }
-
-      // Enddatum dem Startdatum nachführen, damit das Verschieben des Starts
-      // das Ende nicht davor zurücklässt (Dauer bleibt erhalten).
-      const wireDateFollow = (startSel, endSel) => {
-        const startEl = panel.querySelector(startSel);
-        const endEl   = panel.querySelector(endSel);
-        if (!startEl || !endEl) return;
-        let prevStart = startEl.value;
-        startEl.addEventListener('change', () => {
-          if (isDateInputValid(startEl.value) && isDateInputValid(endEl.value)) {
-            const oldKey = parseDateInput(prevStart);
-            const newKey = parseDateInput(startEl.value);
-            const endKey = parseDateInput(endEl.value);
-            if (oldKey && newKey && endKey) {
-              endEl.value = formatDateInput(shiftEndDateKey(oldKey, newKey, endKey));
-            }
-          }
-          prevStart = startEl.value;
-        });
-      };
-      wireDateFollow('#modal-start-date', '#modal-end-date');
-      wireDateFollow('#modal-allday-start', '#modal-allday-end');
-
-      // Dynamische Termindauer (#441): das Ende folgt dem Start um die gemerkte
-      // Dauer. Ändert der Nutzer das Ende, wird die neue Dauer übernommen und bei
-      // der nächsten Start-Änderung angewendet. Nur für Zeit-Termine.
-      wireDurationMemory(panel);
-
-      panel.querySelector('#modal-cancel').addEventListener('click', closeModal);
-
-      panel.querySelector('#modal-delete')?.addEventListener('click', async () => {
-        closeModal({ force: true });
-        await requestDeleteEvent(event);
-      });
-
-      panel.querySelector('#modal-save').addEventListener('click', () => saveEvent(panel, mode, event?.id, reminder, attachmentState));
-      if (window.lucide) lucide.createIcons({ el: panel });
-    },
+    // Ein neuer Termin startet weiterhin mit dem Fokus im Titelfeld: Hier ist
+    // Tippen die Absicht, hier ist der Autofokus richtig.
+    onSave(panel) { wireEventForm(panel, { mode, event, reminder }); },
   });
+}
+
+/**
+ * Verdrahtet das Termin-Formular. Eigene Funktion, weil das Formular an zwei
+ * Orten entsteht: als eigenes Modal (neuer Termin, Desktop-Bearbeiten) und als
+ * zweites Pane der Detailansicht, das erst beim Wechsel gemountet wird.
+ */
+function wireEventForm(panel, { mode, event = null, reminder = null }) {
+  const isEdit = mode === 'edit';
+  // RRULE-Events binden
+  bindRRuleEvents(panel, 'event');
+  bindRecurringScopeChooser(panel, 'modal-edit');
+  bindUserMultiSelect(panel, 'cal_assigned');
+  wireVisibilityWarning(panel, '#modal-visibility', 'cal_assigned', '#modal-visibility-warning');
+
+  // Color-Picker ausgrauen wenn Assignees gesetzt sind (Avatar-Farbe hat Vorrang)
+  function syncColorPickerState() {
+    const hasAssignees = getSelectedUserIds(panel, 'cal_assigned').length > 0;
+    const group  = panel.querySelector('.js-color-picker-group');
+    const hint   = panel.querySelector('#color-picker-assignee-hint');
+    const picker = panel.querySelector('#event-color-picker');
+    if (group)  group.classList.toggle('color-picker--disabled', hasAssignees);
+    if (hint)   hint.hidden = !hasAssignees;
+    if (picker) {
+      picker.setAttribute('aria-disabled', hasAssignees ? 'true' : 'false');
+      picker.querySelectorAll('.color-swatch').forEach((s) => {
+        if (hasAssignees) {
+          s.setAttribute('tabindex', '-1');
+        } else {
+          s.setAttribute('tabindex', s.classList.contains('color-swatch--active') ? '0' : '-1');
+        }
+      });
+    }
+  }
+  const msWidget = panel.querySelector('.user-ms[data-ms-name="cal_assigned"]');
+  msWidget?.addEventListener('change', syncColorPickerState);
+  syncColorPickerState();
+
+  const selectedColor = isEdit ? (event?.color || EVENT_COLORS[0]) : EVENT_COLORS[0];
+
+  // Farb-Auswahl: Auswahl + ARIA + Keyboard (Roving Tabindex)
+  function selectSwatch(target) {
+    panel.querySelectorAll('.color-swatch').forEach((s) => {
+      s.classList.remove('color-swatch--active');
+      s.setAttribute('aria-checked', 'false');
+      s.setAttribute('tabindex', '-1');
+    });
+    target.classList.add('color-swatch--active');
+    target.setAttribute('aria-checked', 'true');
+    target.setAttribute('tabindex', '0');
+  }
+  panel.querySelectorAll('.color-swatch').forEach((sw) => {
+    if (sw.dataset.color === selectedColor) selectSwatch(sw);
+    sw.addEventListener('click', () => { selectSwatch(sw); sw.focus(); });
+    sw.addEventListener('keydown', (e) => {
+      const swatches = [...panel.querySelectorAll('.color-swatch')];
+      const idx = swatches.indexOf(sw);
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        const next = swatches[(idx + 1) % swatches.length];
+        selectSwatch(next); next.focus();
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const prev = swatches[(idx - 1 + swatches.length) % swatches.length];
+        selectSwatch(prev); prev.focus();
+      } else if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        selectSwatch(sw);
+      }
+    });
+  });
+
+  // Ganztägig-Toggle
+  const alldayCheck = panel.querySelector('#modal-allday');
+  const timeFields  = panel.querySelector('#time-fields');
+  const alldayFields = panel.querySelector('#allday-fields');
+  alldayCheck.addEventListener('change', () => {
+    if (alldayCheck.checked) { timeFields.style.display = 'none'; alldayFields.style.display = ''; }
+    else                      { timeFields.style.display = '';     alldayFields.style.display = 'none'; }
+  });
+  if (isEdit && event?.all_day) { timeFields.style.display = 'none'; alldayFields.style.display = ''; }
+
+  const iconInput = panel.querySelector('#modal-icon');
+  const iconTrigger = panel.querySelector('#modal-icon-trigger');
+  const selectIcon = (icon) => {
+    const nextIcon = eventIconName(icon);
+    if (iconInput) iconInput.value = nextIcon;
+    if (iconTrigger) {
+      iconTrigger.dataset.icon = nextIcon;
+      iconTrigger.replaceChildren(eventIconElement(nextIcon, 'event-icon-picker__trigger-icon'));
+    }
+    if (window.lucide) lucide.createIcons({ el: iconTrigger });
+  };
+
+  iconTrigger?.addEventListener('click', () => {
+    iconTrigger.setAttribute('aria-expanded', 'true');
+    openIconPickerDialog(iconInput?.value || 'calendar', (icon) => {
+      selectIcon(icon);
+      iconTrigger?.setAttribute('aria-expanded', 'false');
+      iconTrigger?.focus();
+    }, () => {
+      iconTrigger?.setAttribute('aria-expanded', 'false');
+      iconTrigger?.focus();
+    });
+  });
+
+  const attachmentInput = panel.querySelector('#modal-attachment');
+  const selectedAttachment = panel.querySelector('#modal-selected-attachment');
+  const attachmentPreview = panel.querySelector('#modal-attachment-preview');
+  const removeAttachment = panel.querySelector('#modal-remove-attachment');
+  const attachmentState = {
+    name: event?.attachment_name || null,
+    mime: event?.attachment_mime || null,
+    size: event?.attachment_size || null,
+    changed: false,
+    removed: false,
+  };
+
+  const syncSelectedAttachment = () => {
+    if (!selectedAttachment) return;
+    selectedAttachment.hidden = !attachmentState.name;
+    selectedAttachment.textContent = attachmentState.name ? selectedAttachmentLabel(attachmentState.name) : '';
+    if (removeAttachment) removeAttachment.hidden = !attachmentState.name;
+  };
+
+  const syncAttachmentSelection = () => {
+    if (!selectedAttachment) return;
+    const file = attachmentInput.files?.[0];
+    if (file) {
+      attachmentState.name = file.name;
+      attachmentState.mime = file.type || 'application/octet-stream';
+      attachmentState.size = file.size;
+      attachmentState.changed = true;
+      attachmentState.removed = false;
+      selectedAttachment.hidden = false;
+      selectedAttachment.textContent = selectedAttachmentLabel(file.name);
+      if (removeAttachment) removeAttachment.hidden = false;
+      if (attachmentPreview) {
+        attachmentPreview.replaceChildren();
+        attachmentPreview.hidden = true;
+      }
+      return;
+    }
+    syncSelectedAttachment();
+  };
+
+  attachmentInput?.addEventListener('change', syncAttachmentSelection);
+  removeAttachment?.addEventListener('click', () => {
+    if (attachmentInput) attachmentInput.value = '';
+    attachmentState.name = null;
+    attachmentState.mime = null;
+    attachmentState.size = null;
+    attachmentState.changed = true;
+    attachmentState.removed = true;
+    if (attachmentPreview) {
+      attachmentPreview.replaceChildren();
+      attachmentPreview.hidden = true;
+    }
+    syncSelectedAttachment();
+  });
+
+  const attachmentDropzone = panel.querySelector('#modal-attachment-dropzone');
+  if (attachmentDropzone && attachmentInput) {
+    ['dragenter', 'dragover'].forEach((eventName) => {
+      attachmentDropzone.addEventListener(eventName, (dropEvent) => {
+        dropEvent.preventDefault();
+        attachmentDropzone.classList.add('document-dropzone--active');
+      });
+    });
+    ['dragleave', 'drop'].forEach((eventName) => {
+      attachmentDropzone.addEventListener(eventName, (dropEvent) => {
+        dropEvent.preventDefault();
+        attachmentDropzone.classList.remove('document-dropzone--active');
+      });
+    });
+    attachmentDropzone.addEventListener('drop', (dropEvent) => {
+      const file = dropEvent.dataTransfer?.files?.[0];
+      if (!file) return;
+      const transfer = new DataTransfer();
+      transfer.items.add(file);
+      attachmentInput.files = transfer.files;
+      syncAttachmentSelection();
+    });
+  }
+
+  syncSelectedAttachment();
+
+  // Erinnerungen: Toggle blendet die Zeilenliste ein/aus; „Hinzufügen" und
+  // „Entfernen" verwalten mehrere Erinnerungen je Termin (#436).
+  wireReminderRows(panel);
+
+  // Load unified sync targets (Google + CalDAV)
+  const syncTargetSelect = panel.querySelector('#event-sync-target');
+  if (syncTargetSelect) {
+    loadSyncTargets(syncTargetSelect, event);
+  }
+
+  // Enddatum dem Startdatum nachführen, damit das Verschieben des Starts
+  // das Ende nicht davor zurücklässt (Dauer bleibt erhalten).
+  const wireDateFollow = (startSel, endSel) => {
+    const startEl = panel.querySelector(startSel);
+    const endEl   = panel.querySelector(endSel);
+    if (!startEl || !endEl) return;
+    let prevStart = startEl.value;
+    startEl.addEventListener('change', () => {
+      if (isDateInputValid(startEl.value) && isDateInputValid(endEl.value)) {
+        const oldKey = parseDateInput(prevStart);
+        const newKey = parseDateInput(startEl.value);
+        const endKey = parseDateInput(endEl.value);
+        if (oldKey && newKey && endKey) {
+          endEl.value = formatDateInput(shiftEndDateKey(oldKey, newKey, endKey));
+        }
+      }
+      prevStart = startEl.value;
+    });
+  };
+  wireDateFollow('#modal-start-date', '#modal-end-date');
+  wireDateFollow('#modal-allday-start', '#modal-allday-end');
+
+  // Dynamische Termindauer (#441): das Ende folgt dem Start um die gemerkte
+  // Dauer. Ändert der Nutzer das Ende, wird die neue Dauer übernommen und bei
+  // der nächsten Start-Änderung angewendet. Nur für Zeit-Termine.
+  wireDurationMemory(panel);
+
+  panel.querySelector('#modal-cancel').addEventListener('click', closeModal);
+
+  panel.querySelector('#modal-delete')?.addEventListener('click', async () => {
+    closeModal({ force: true });
+    await requestDeleteEvent(event);
+  });
+
+  panel.querySelector('#modal-save').addEventListener('click', () => saveEvent(panel, mode, event, reminder, attachmentState));
+  // Pflichtfelder melden sich beim Verlassen inline statt erst beim
+  // Speichern als ortloser Toast (Critique P1).
+  wireBlurValidation(panel);
+  if (window.lucide) lucide.createIcons({ el: panel });
 }
 
 /**
@@ -2730,13 +2936,26 @@ function wireDurationMemory(panel) {
   });
 }
 
+// Neue Termine ohne explizite Uhrzeit starten heute zur nächsten halben
+// Stunde: der starre 09:00-Default legte den Start nachmittags in die
+// Vergangenheit (Audit A1-18). Andere Tage behalten 09:00 als neutralen
+// Start; kippt die Rundung über Mitternacht, ebenfalls.
+function defaultNewEventTime(dateStr) {
+  if (dateStr !== state.today) return '09:00';
+  const now = new Date();
+  const dayBefore = now.getDate();
+  now.setMinutes(now.getMinutes() <= 30 ? 30 : 60, 0, 0);
+  if (now.getDate() !== dayBefore) return '09:00';
+  return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+}
+
 function buildEventModalContent({ mode, event, date, reminder = null, time = null }) {
   const isEdit = mode === 'edit';
   const today  = date || state.today;
 
   const startDate = isEdit ? localDate(event.start_datetime) : today;
   const startTime = isEdit && event.start_datetime.length > 10
-    ? localTime(event.start_datetime) : (time ?? '09:00');
+    ? localTime(event.start_datetime) : (time ?? defaultNewEventTime(today));
   // Standard-Termindauer aus den Präferenzen: neue Termine erhalten ein Ende,
   // das um die konfigurierte Dauer nach dem Start liegt (#441).
   const durationMin = state.defaultDuration || 60;
@@ -2754,17 +2973,12 @@ function buildEventModalContent({ mode, event, date, reminder = null, time = nul
   const visibility = (isEdit ? event.visibility : null) || 'all';
 
   // Sekundärfelder: wandern hinter „Weitere Einstellungen". Beim Bearbeiten
-  // automatisch geöffnet, falls bereits Werte gesetzt sind.
+  // automatisch geöffnet, falls bereits Werte gesetzt sind. Der Ort steht als
+  // Alltagsfeld im Hauptbereich (Audit A1-11), nicht mehr hier.
   const advancedFieldsOpen = isEdit
-    && (!!event.location || !!event.description || hasAttachment(event));
+    && (!!event.description || hasAttachment(event));
 
   const advancedFieldsHtml = `
-    <div class="form-group">
-      <label class="form-label" for="modal-location">${t('calendar.locationLabel')}</label>
-      <input type="text" class="form-input" id="modal-location"
-             placeholder="${t('calendar.locationPlaceholder')}" value="${esc(isEdit && event.location ? event.location : '')}">
-    </div>
-
     <div class="form-group js-color-picker-group">
       <label class="form-label" id="event-color-label">${t('calendar.colorLabel')}</label>
       <div class="color-picker" id="event-color-picker" role="radiogroup" aria-labelledby="event-color-label">
@@ -2841,7 +3055,7 @@ function buildEventModalContent({ mode, event, date, reminder = null, time = nul
       </div>
       <div class="form-group event-title-picker__title">
         <label class="form-label" for="modal-title">${t('calendar.titleLabel')}<span class="required-marker" aria-hidden="true"> *</span></label>
-        <input type="text" class="form-input" id="modal-title"
+        <input type="text" class="form-input" id="modal-title" required
                placeholder="${t('calendar.titlePlaceholder')}" value="${esc(isEdit ? event.title : '')}">
       </div>
     </div>
@@ -2890,6 +3104,12 @@ function buildEventModalContent({ mode, event, date, reminder = null, time = nul
     </div>
 
     <div class="form-group">
+      <label class="form-label" for="modal-location">${t('calendar.locationLabel')}</label>
+      <input type="text" class="form-input" id="modal-location"
+             placeholder="${t('calendar.locationPlaceholder')}" value="${esc(isEdit && event.location ? event.location : '')}">
+    </div>
+
+    <div class="form-group">
       ${renderUserMultiSelect(state.users, selectedUserIds, 'cal_assigned', 'calendar.assignedLabel')}
     </div>
 
@@ -2907,27 +3127,32 @@ function buildEventModalContent({ mode, event, date, reminder = null, time = nul
 
     ${advancedSection(advancedFieldsHtml, { open: advancedFieldsOpen })}
 
-    ${renderRRuleFields('event', isEdit ? event.recurrence_rule : null)}
+    ${renderRRuleFields('event', isEdit ? event.recurrence_rule : null, { allowCount: true })}
+
+    ${isEdit && isLocalRecurringSeries(event) ? renderRecurringScopeChooser('modal-edit', event.start_datetime.slice(0, 10)) : ''}
 
     ${renderCalendarReminderSection(reminder, event, isEdit ? [] : state.defaultReminders)}
 
-    <div class="modal-panel__footer" style="border:none;padding:0;margin-top:var(--space-4)">
-      ${isEdit ? `<button class="btn btn--danger btn--icon" id="modal-delete" aria-label="${t('calendar.deleteEvent')}">
-        <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>
+    <div class="modal-panel__footer modal-panel__footer--plain">
+      ${isEdit ? `<button class="btn btn--danger-outline" id="modal-delete">
+        <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${t('common.delete')}
       </button>` : '<div></div>'}
       <div style="display:flex;gap:var(--space-3)">
-        <button class="btn btn--secondary" id="modal-cancel">${t('common.cancel')}</button>
+        <button class="btn btn--ghost" id="modal-cancel">${t('common.cancel')}</button>
         <button class="btn btn--primary" id="modal-save">${isEdit ? t('common.save') : t('common.create')}</button>
       </div>
     </div>`;
 }
 
-async function saveEvent(overlay, mode, eventId, existingReminder = null, attachmentState = null) {
+async function saveEvent(overlay, mode, event, existingReminder = null, attachmentState = null) {
+  const eventId = event?.id;
   const saveBtn = overlay.querySelector('#modal-save');
   const title   = overlay.querySelector('#modal-title').value.trim();
 
   if (!title) {
-    window.yuvomi?.showToast(t('calendar.titleRequired'), 'error');
+    // Fehler am Ort des Geschehens statt als Toast unten links (Critique P1):
+    // Meldung unterm Feld, Fehler-Rahmen, Fokus + Scroll aufs Feld.
+    reportFieldError(overlay.querySelector('#modal-title'), t('calendar.titleRequired'));
     return;
   }
 
@@ -2954,7 +3179,10 @@ async function saveEvent(overlay, mode, eventId, existingReminder = null, attach
     const etRaw = overlay.querySelector('#modal-end-time').value;
     const et = parseTimeInput(etRaw);
     if ((stRaw && !st) || (etRaw && !et)) {
-      window.yuvomi?.showToast(t('calendar.invalidDate'), 'error');
+      reportFieldError(
+        overlay.querySelector(stRaw && !st ? '#modal-start-time' : '#modal-end-time'),
+        t('calendar.invalidDate')
+      );
       return;
     }
     start_datetime = st ? `${sd}T${st}` : sd;
@@ -2964,13 +3192,24 @@ async function saveEvent(overlay, mode, eventId, existingReminder = null, attach
   const visibleDateFields = allday
     ? ['#modal-allday-start', '#modal-allday-end']
     : ['#modal-start-date', '#modal-end-date'];
-  const hasInvalidDate = visibleDateFields.some((selector) => !isDateInputValid(overlay.querySelector(selector)?.value));
-  if (!start_datetime || hasInvalidDate) {
-    window.yuvomi?.showToast(t('calendar.invalidDate'), 'error');
+  const invalidDateField = visibleDateFields.find((selector) => !isDateInputValid(overlay.querySelector(selector)?.value));
+  if (!start_datetime || invalidDateField) {
+    reportFieldError(
+      overlay.querySelector(invalidDateField ?? visibleDateFields[0]),
+      t('calendar.invalidDate')
+    );
     return;
   }
   if (isEndBeforeStart(start_datetime, end_datetime)) {
-    window.yuvomi?.showToast(t('calendar.endBeforeStart'), 'error');
+    // Der Fehler klebt am Feld, das ihn verursacht: liegt schon das Enddatum
+    // vor dem Startdatum, am Datums-Feld; sonst (gleicher Tag, Zeit davor)
+    // an der Endzeit.
+    const endsOnEarlierDay = String(end_datetime).slice(0, 10) < String(start_datetime).slice(0, 10);
+    const endField = (allday ? overlay.querySelector('#modal-allday-end') : null)
+      ?? (endsOnEarlierDay ? overlay.querySelector('#modal-end-date') : null)
+      ?? (overlay.querySelector('#modal-end-time')?.value ? overlay.querySelector('#modal-end-time') : null)
+      ?? overlay.querySelector('#modal-end-date');
+    reportFieldError(endField, t('calendar.endBeforeStart'));
     return;
   }
 
@@ -2980,7 +3219,7 @@ async function saveEvent(overlay, mode, eventId, existingReminder = null, attach
   try {
     const rrule = getRRuleValues(overlay, 'event');
     if (!rrule.valid_until) {
-      window.yuvomi?.showToast(t('calendar.invalidDate'), 'error');
+      reportFieldError(overlay.querySelector('#event-rrule-until'), t('calendar.invalidDate'));
       saveBtn.disabled    = false;
       saveBtn.textContent = mode === 'edit' ? t('common.save') : t('common.create');
       return;
@@ -3038,21 +3277,66 @@ async function saveEvent(overlay, mode, eventId, existingReminder = null, attach
     }
 
     let savedEventId = eventId;
+    // Start, an dem die Erinnerungs-Offsets ausgerichtet werden. Für „ganze Serie"
+    // wird das auf den (evtl. verschobenen) Master-Start umgestellt (#532).
+    let reminderBaseStart = start_datetime;
+    // Serien-Scopes ändern die Expansion (Split/EXDATE): danach den sichtbaren
+    // Bereich neu laden, damit der Server korrekt expandiert (#532).
+    let reloadAfter = false;
+
     if (mode === 'create') {
       const res = await api.post('/calendar', body);
       state.events.push(res.data);
       savedEventId = res.data?.id;
     } else {
-      const res = await api.put(`/calendar/${eventId}`, body);
-      const idx = state.events.findIndex((e) => e.id === eventId);
-      if (idx !== -1) state.events[idx] = res.data;
+      // Scope-Auswahl greift nur für rein lokale Serien (#532); sonst normaler
+      // Master-Update wie bisher (Einzeltermine, externe Serien).
+      const scope = isLocalRecurringSeries(event)
+        ? getRecurringScope(overlay, 'modal-edit')
+        : 'series';
+      const occDate = event?.start_datetime?.slice(0, 10);
+      const truncated = scope === 'following' && event.is_recurring_instance
+        ? truncateRuleBefore(event.recurrence_rule, occDate)
+        : null;
+
+      if (scope === 'this') {
+        // Nur dieses Vorkommen: losgelösten Einzeltermin anlegen + Master-EXDATE.
+        const res = await api.post('/calendar', { ...body, recurrence_rule: null });
+        await api.post(`/calendar/${eventId}/exceptions`, { date: occDate });
+        savedEventId = res.data?.id;
+        reloadAfter = true;
+      } else if (truncated) {
+        // Dieser und folgende: Master per UNTIL kürzen, neue Serie ab hier anlegen.
+        // body trägt die (ggf. bearbeitete) recurrence_rule als Fortsetzungsregel.
+        await api.put(`/calendar/${eventId}`, { recurrence_rule: truncated });
+        const res = await api.post('/calendar', body);
+        savedEventId = res.data?.id;
+        reloadAfter = true;
+      } else {
+        // Ganze Serie (auch „folgende" beim ersten Vorkommen): Master aktualisieren.
+        // Bei lokalen Serien den DTSTART erhalten, indem die im Modal sichtbare
+        // Instanz-Verschiebung auf den Master-Start übertragen wird.
+        let seriesBody = body;
+        if (isLocalRecurringSeries(event)) {
+          const master  = (await api.get(`/calendar/${eventId}`)).data;
+          const allDay  = !!body.all_day;
+          const newStart = shiftSeriesStart(master.start_datetime, event.start_datetime, start_datetime, allDay);
+          const newEnd   = shiftEndForStart(newStart, start_datetime, end_datetime, allDay);
+          seriesBody = { ...body, start_datetime: newStart, end_datetime: newEnd };
+          reminderBaseStart = newStart;
+          reloadAfter = true;
+        }
+        const res = await api.put(`/calendar/${eventId}`, seriesBody);
+        const idx = state.events.findIndex((e) => e.id === eventId);
+        if (idx !== -1) state.events[idx] = res.data;
+      }
     }
 
     // Erinnerungen speichern oder löschen (mehrere je Termin möglich, #436).
     if (savedEventId) {
       const reminderOn = overlay.querySelector('#modal-reminder-toggle')?.checked;
       const rowsEl     = overlay.querySelector('#modal-reminder-rows');
-      const startMs    = new Date(reminderStartValue(start_datetime)).getTime();
+      const startMs    = new Date(reminderStartValue(reminderBaseStart)).getTime();
       let remindAts = [];
 
       if (reminderOn && rowsEl) {
@@ -3078,6 +3362,10 @@ async function saveEvent(overlay, mode, eventId, existingReminder = null, attach
       refreshReminders();
     }
 
+    if (reloadAfter) {
+      await reloadCalendarEventsOnly();
+    }
+
     closeModal({ force: true });
     renderView();
     window.yuvomi?.showToast(mode === 'create' ? t('calendar.createdToast') : t('calendar.savedToast'), 'success');
@@ -3085,7 +3373,7 @@ async function saveEvent(overlay, mode, eventId, existingReminder = null, attach
     // Server-Validierungsmeldung bevorzugen, sonst lokalisierter Fallback; der
     // rohe err.message-Text (Netzwerk/JS) wird nie gezeigt. Das Modal bleibt offen
     // und der Button reaktiviert — die Eingaben des Nutzers bleiben erhalten.
-    window.yuvomi?.showToast(err.data?.error ?? t('calendar.saveError'), 'error');
+    window.yuvomi?.showToast(err.data?.error ?? t('calendar.saveError'), 'danger');
     saveBtn.disabled    = false;
     saveBtn.textContent = mode === 'edit' ? t('common.save') : t('common.create');
   }
@@ -3096,56 +3384,102 @@ async function deleteEvent(id) {
   state.events = state.events.filter((e) => e.id !== id);
   renderView();
 
-  let undone = false;
-  window.yuvomi?.showToast(t('calendar.deletedToast'), 'default', 5000, () => {
-    undone = true;
-    if (event) {
-      state.events = [...state.events, event];
-      renderView();
-    }
-  });
-
-  setTimeout(async () => {
-    if (undone) return;
-    try {
-      await api.delete(`/calendar/${id}`);
-      api.delete(`/reminders?entity_type=event&entity_id=${id}`).catch(() => {});
+  scheduleUndoableDelete({
+    message: t('calendar.deletedToast'),
+    commit: async ({ keepalive }) => {
+      await api.delete(`/calendar/${id}`, { keepalive });
+      api.delete(`/reminders?entity_type=event&entity_id=${id}`, { keepalive }).catch(() => {});
+      if (keepalive) return; // Seite verschwindet — kein UI-Refresh mehr
       refreshReminders();
-    } catch (err) {
+    },
+    restore: (err) => {
       if (event) {
         state.events = [...state.events, event];
         renderView();
       }
-      window.yuvomi?.showToast(err.data?.error ?? t('calendar.deleteError'), 'danger');
-    }
-  }, 5000);
+      if (err) window.yuvomi?.showToast(err.data?.error ?? t('calendar.deleteError'), 'danger');
+    },
+  });
 }
 
 /**
- * Einstiegspunkt für das Löschen (#489). Lokale Serien fragen „nur dieser Termin"
- * vs. „ganze Serie"; alles andere (Einzeltermine, externe Serien) wird direkt gelöscht.
+ * True für rein lokale, nicht extern synchronisierte Serien. Nur diese erhalten die
+ * Scope-Auswahl (#489/#532); Google/Apple/CalDAV/ICS-Serien würden beim nächsten Sync
+ * wiederkehren und bleiben deshalb „ganze Serie".
  */
-async function requestDeleteEvent(event) {
-  // Nur rein lokale Serien bekommen die Einzeltermin-Option (#489); extern
-  // synchronisierte (Google/Apple/CalDAV/ICS) behalten „ganze Serie löschen".
-  const isLocalSeries = !!event?.recurrence_rule
+function isLocalRecurringSeries(event) {
+  return !!event?.recurrence_rule
     && (event.external_source ?? 'local') === 'local'
     && !event.calendar_ref_id && !event.subscription_id;
-  if (!isLocalSeries) {
+}
+
+/**
+ * Gemeinsame Scope-Auswahl für Serientermine (#532): identisches Control für
+ * „Bearbeiten" und „Löschen". Select (App-weites Formular-Vokabular) mit Default
+ * „Nur diesen Termin" (least-destructive) plus dynamischem Reichweiten-Hinweis,
+ * der das konkrete Vorkommensdatum nennt. `prefix` → Element-ID `${prefix}-scope`.
+ */
+function renderRecurringScopeChooser(prefix, occDateKey) {
+  return `
+    <div class="form-group">
+      <label class="form-label" for="${prefix}-scope">${t('calendar.recurringScopeLabel')}</label>
+      <select class="input" id="${prefix}-scope" name="${prefix}-scope" data-occ-date="${esc(occDateKey)}">
+        <option value="this" selected>${t('calendar.recurringScopeThis')}</option>
+        <option value="following">${t('calendar.recurringScopeFollowing')}</option>
+        <option value="series">${t('calendar.recurringScopeSeries')}</option>
+      </select>
+      <p class="form-hint" id="${prefix}-scope-hint" role="status"></p>
+    </div>`;
+}
+
+/** Reichweiten-Hinweistext für den gewählten Scope (mit formatiertem Datum). */
+function recurringScopeHint(value, occDateKey) {
+  if (value === 'series') return t('calendar.recurringScopeHintSeries');
+  const date = formatPreferredDate(occDateKey);
+  return value === 'following'
+    ? t('calendar.recurringScopeHintFollowing', { date })
+    : t('calendar.recurringScopeHintThis', { date });
+}
+
+/** Verdrahtet den dynamischen Hinweis der Scope-Auswahl. No-op ohne Chooser. */
+function bindRecurringScopeChooser(root, prefix) {
+  const sel  = root.querySelector(`#${prefix}-scope`);
+  const hint = root.querySelector(`#${prefix}-scope-hint`);
+  if (!sel || !hint) return;
+  const update = () => { hint.textContent = recurringScopeHint(sel.value, sel.dataset.occDate); };
+  sel.addEventListener('change', update);
+  update();
+}
+
+/** Liest den gewählten Scope; Default „this" (least-destructive). */
+function getRecurringScope(root, prefix) {
+  return root.querySelector(`#${prefix}-scope`)?.value || 'this';
+}
+
+/**
+ * Einstiegspunkt für das Löschen (#489/#532). Lokale Serien fragen „nur dieser
+ * Termin" / „dieser und folgende" / „ganze Serie"; alles andere (Einzeltermine,
+ * externe Serien) wird direkt gelöscht.
+ */
+async function requestDeleteEvent(event) {
+  if (!isLocalRecurringSeries(event)) {
     await deleteEvent(event.id);
     return;
   }
-  const choice = await recurringDeleteChoice();
+  const choice = await recurringDeleteChoice(event);
   if (choice === 'series') await deleteEvent(event.id);
+  else if (choice === 'following') await deleteThisAndFollowing(event);
   else if (choice === 'this') await deleteSingleOccurrence(event);
   // null → abgebrochen, nichts tun
 }
 
 /**
- * Auswahl-Dialog für das Löschen wiederkehrender Termine (Blaupause:
- * recurringChoiceModal in budget.js). Löst zu 'this' | 'series' | null auf.
+ * Auswahl-Dialog für das Löschen wiederkehrender Termine (#532). Nutzt dieselbe
+ * Scope-Komponente wie das Bearbeiten-Modal (Konsistenz) plus einen destruktiven
+ * „Löschen"-Bestätiger. Löst zu 'this' | 'following' | 'series' | null.
  */
-function recurringDeleteChoice() {
+function recurringDeleteChoice(event) {
+  const occDateKey = event.start_datetime.slice(0, 10);
   return new Promise((resolve) => {
     let resolved = false;
     const finish = (value) => {
@@ -3158,19 +3492,54 @@ function recurringDeleteChoice() {
       title: t('calendar.deleteRecurringTitle'),
       size: 'sm',
       content: `
-        <p class="form-hint modal-lead">${t('calendar.deleteRecurringHint')}</p>
+        ${renderRecurringScopeChooser('rds', occDateKey)}
         <div class="modal-actions modal-actions--stack">
-          <button type="button" class="btn btn--primary" id="rds-this">${t('calendar.deleteThisOccurrence')}</button>
-          <button type="button" class="btn btn--danger" id="rds-series">${t('calendar.deleteWholeSeries')}</button>
+          <button type="button" class="btn btn--danger" id="rds-confirm">${t('common.delete')}</button>
           <button type="button" class="btn btn--ghost" id="rds-cancel">${t('common.cancel')}</button>
         </div>`,
       onClose: () => finish(null),
       onSave(panel) {
-        panel.querySelector('#rds-this')?.addEventListener('click', () => finish('this'));
-        panel.querySelector('#rds-series')?.addEventListener('click', () => finish('series'));
+        bindRecurringScopeChooser(panel, 'rds');
+        panel.querySelector('#rds-confirm')?.addEventListener('click', () => finish(getRecurringScope(panel, 'rds')));
         panel.querySelector('#rds-cancel')?.addEventListener('click', () => finish(null));
       },
     });
+  });
+}
+
+/**
+ * Löscht dieses und alle folgenden Vorkommen einer lokalen Serie (#532), indem die
+ * RRULE per UNTIL auf den Vortag gekürzt wird. Ist das geöffnete Vorkommen bereits
+ * das erste (Master-DTSTART), verschwindet die gesamte Serie. Optimistisch + Undo.
+ */
+async function deleteThisAndFollowing(event) {
+  // Erstes Vorkommen: „dieser und folgende" == ganze Serie.
+  if (!event.is_recurring_instance) {
+    await deleteEvent(event.id);
+    return;
+  }
+  const fromKey = event.start_datetime.slice(0, 10);
+  const newRule = truncateRuleBefore(event.recurrence_rule, fromKey);
+  if (!newRule) { await deleteEvent(event.id); return; }
+
+  const affects = (e) => e.id === event.id && e.start_datetime.slice(0, 10) >= fromKey;
+  const removed = state.events.filter(affects);
+  state.events  = state.events.filter((e) => !affects(e));
+  renderView();
+
+  scheduleUndoableDelete({
+    message: t('calendar.deletedToast'),
+    commit: async ({ keepalive }) => {
+      await api.put(`/calendar/${event.id}`, { recurrence_rule: newRule }, { keepalive });
+      if (keepalive) return; // Seite verschwindet — kein UI-Refresh mehr
+      // Verbleibende Instanzen tragen künftig die gekürzte Regel.
+      for (const e of state.events) if (e.id === event.id) e.recurrence_rule = newRule;
+    },
+    restore: (err) => {
+      state.events = [...state.events, ...removed];
+      renderView();
+      if (err) window.yuvomi?.showToast(err.data?.error ?? t('calendar.deleteError'), 'danger');
+    },
   });
 }
 
@@ -3185,21 +3554,13 @@ async function deleteSingleOccurrence(event) {
   state.events     = state.events.filter((e) => !matches(e));
   renderView();
 
-  let undone = false;
-  window.yuvomi?.showToast(t('calendar.deletedToast'), 'default', 5000, () => {
-    undone = true;
-    state.events = [...state.events, ...removed];
-    renderView();
-  });
-
-  setTimeout(async () => {
-    if (undone) return;
-    try {
-      await api.post(`/calendar/${event.id}/exceptions`, { date });
-    } catch (err) {
+  scheduleUndoableDelete({
+    message: t('calendar.deletedToast'),
+    commit: ({ keepalive }) => api.post(`/calendar/${event.id}/exceptions`, { date }, { keepalive }),
+    restore: (err) => {
       state.events = [...state.events, ...removed];
       renderView();
-      window.yuvomi?.showToast(err.data?.error ?? t('calendar.deleteError'), 'danger');
-    }
-  }, 5000);
+      if (err) window.yuvomi?.showToast(err.data?.error ?? t('calendar.deleteError'), 'danger');
+    },
+  });
 }

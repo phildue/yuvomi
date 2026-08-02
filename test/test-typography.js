@@ -175,6 +175,34 @@ test('Settings zeigen auf Leaf-Seiten nur den Leaf-Titel als sichtbare Hauptübe
   );
 });
 
+test('Settings-Blätter wiederholen ihren eigenen Titel nicht als Unterüberschrift', async () => {
+  // Der Test darüber prüft nur, dass die Shell ihren globalen Titel versteckt.
+  // Er hat nie gesehen, dass ein Blatt seinen EIGENEN Titel direkt darunter als
+  // h2 wiederholt - fünf taten es, eines sogar mit demselben i18n-Key. Die Suite
+  // war grün und der Defekt drei Critique-Läufe lang vorhanden (2026-07-27).
+  const { SETTINGS_LEAVES } = await import('../public/settings/registry.js');
+  const de = JSON.parse(readFileSync(new URL('../public/locales/de.json', import.meta.url), 'utf8'));
+  const translate = (key) => key.split('.').reduce((value, segment) => value?.[segment], de);
+  const normalize = (value) => String(value ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+  const failures = [];
+  for (const leaf of SETTINGS_LEAVES) {
+    const file = String(leaf.loader).match(/\/settings\/(pages\/[\w-]+\.js)/)?.[1];
+    assert.ok(file, `${leaf.id}: Loader-Pfad nicht erkennbar`);
+    const source = readFileSync(new URL(`../public/settings/${file}`, import.meta.url), 'utf8');
+    const label = normalize(translate(leaf.labelKey));
+
+    // Statische Überschriften im Markup: <h2 …>${t('key')}</h2>, auch via esc().
+    for (const match of source.matchAll(/<h([23])\b[^>]*>\s*\$\{(?:esc\()?\s*t\(\s*['"]([\w.]+)['"]/g)) {
+      const [, level, key] = match;
+      if (normalize(translate(key)) === label) {
+        failures.push(`${leaf.id}: <h${level}> wiederholt den Blatt-Titel "${translate(key)}" (${key})`);
+      }
+    }
+  }
+  assert.deepEqual(failures, []);
+});
+
 test('lange Inhalts- und interaktive Texte verwenden mindestens die Sekundärrolle', () => {
   const dashboard = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
   const notes = readFileSync(new URL('../public/styles/notes.css', import.meta.url), 'utf8');
@@ -200,7 +228,9 @@ test('lange Inhalts- und interaktive Texte verwenden mindestens die Sekundärrol
     /\.note-card__content[\s\S]*?font-size:\s*var\(--type-body\)/,
     'Notiz-Fließtext muss die 16px-Bodyrolle verwenden',
   );
-  for (const selector of ['.recipe-card__notes', '.recipe-card__ingredient']) {
+  // Umbenannt mit dem Wechsel von der Rezeptkarte zur Rezeptzeile mit
+  // Aufklapp-Detail: die Fließtext-Rolle gilt jetzt für den Detail-Inhalt.
+  for (const selector of ['.recipe-detail__notes', '.recipe-detail__ingredient']) {
     assert.match(
       recipes,
       new RegExp(`${selector.replace('.', '\\.')}[\\s\\S]*?font-size:\\s*var\\(--type-body\\)`),

@@ -21,16 +21,16 @@
 .contacts-page {
   display: flex;
   flex-direction: column;
-  height: calc(100dvh - var(--safe-area-inset-top) - var(--nav-bottom-height) - var(--safe-area-inset-bottom));
-  max-width: var(--content-max-width);
-  margin: 0 auto;
+  height: 100%;
+  /* Full-bleed-Root (Issue #577): Content-Spalte über --page-inline-pad auf den
+   * direkten Kindern, damit das Chrome des Kopfes bis zur Shell-Kante läuft. */
   /* overflow:clip inside overflow:auto (.app-content) triggers iOS WebKit blank-screen on scroll.
    * overflow:hidden provides identical clipping without the compositor bug. */
   overflow: hidden;
 }
 
 @media (min-width: 1024px) {
-  .contacts-page { height: 100dvh; }
+  .contacts-page { height: 100%; }
 }
 
 /* --------------------------------------------------------
@@ -47,7 +47,8 @@
 .contacts-filters {
   display: flex;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-4);
+  padding-block: var(--space-2);
+  padding-inline: var(--page-inline-pad);
   border-bottom: 1px solid var(--color-border);
   overflow-x: auto;
   scrollbar-width: none;
@@ -60,7 +61,9 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  padding: var(--space-1) var(--space-3);
+  /* Mehr Seitenraum: der gefüllte Aktiv-Zustand (--c-accent) ließ kurze Labels
+     wie „Alle" bei space-3 fast kreisrund und randeng wirken (#569). */
+  padding: var(--space-1) var(--space-4);
   border-radius: var(--radius-full);
   font-size: var(--text-sm);
   font-weight: var(--font-weight-medium);
@@ -97,6 +100,7 @@
   flex: 1;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
+  padding-inline: var(--page-inline-pad);
 }
 
 .contact-group {
@@ -157,7 +161,8 @@
   align-items: center;
   gap: var(--space-2) var(--space-3);
   flex-wrap: wrap;
-  padding: var(--space-2) var(--space-4);
+  padding-block: var(--space-2);
+  padding-inline: var(--page-inline-pad);
   border-bottom: 1px solid var(--color-border);
   background-color: var(--color-surface-2);
   flex-shrink: 0;
@@ -224,8 +229,8 @@
 }
 
 .contact-item__open:focus-visible {
-  outline: 2px solid var(--active-module-accent, var(--color-accent));
-  outline-offset: -2px;
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset-inset);
   border-radius: var(--radius-md);
 }
 
@@ -303,11 +308,18 @@
 .contact-item__meta-phone {
   flex-shrink: 0;
   white-space: nowrap;
+  /* Stabile Ziffernbreite: mildert den Rohwert→formatiert-Reflow beim ersten
+     Paint (progressive enhancement), v. a. bei internationalen Nummern. */
+  font-variant-numeric: tabular-nums;
 }
 
+/* Strukturtrenner, kein deaktivierter Zustand: --color-text-disabled (#D1D0CB)
+ * lag bei 1.54:1 und ließ Telefon und E-Mail optisch ineinanderlaufen. Tertiary
+ * bleibt eine Stufe unter dem Meta-Text (secondary) und ist als schmales
+ * Glyph zurückhaltend genug. */
 .contact-item__meta-sep {
   flex-shrink: 0;
-  color: var(--color-text-disabled);
+  color: var(--color-text-tertiary);
 }
 
 .contact-item__meta-email {
@@ -324,36 +336,11 @@
   align-items: center;
 }
 
-.contact-action-btn {
-  width: var(--target-lg);
-  height: var(--target-lg);
-  border-radius: var(--radius-full);
-  border: none;
-  background: var(--color-surface-2);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--color-text-secondary);
-  transition: background-color var(--transition-fast), color var(--transition-fast);
-  min-height: var(--target-lg);
-  min-width: var(--target-lg);
+/* Zeilen-Aktionen (Anrufen/Mehr) nutzen die geteilte .row-action-Grammatik aus
+ * layout.css (Audit F1). Anrufen trägt row-action--success (grün, semantisch);
+ * der tel:-Link braucht nur noch text-decoration: none. */
+.contact-item__actions .row-action[href] {
   text-decoration: none;
-}
-
-.contact-action-btn:hover {
-  background-color: color-mix(in srgb, var(--c-accent) 14%, transparent);
-  color: var(--c-accent);
-}
-
-/* Anrufen ist die primäre, stets sichtbare Zeilenaktion (grün, semantisch). */
-.contact-action-btn--call {
-  color: var(--color-success);
-}
-
-.contact-action-btn--call:hover {
-  background-color: var(--color-success-light);
-  color: var(--color-success);
 }
 
 /* --------------------------------------------------------
@@ -404,10 +391,15 @@
   transition: background-color var(--transition-fast);
 }
 
-.contact-menu-item:hover,
+.contact-menu-item:hover {
+  background-color: var(--color-surface-2);
+}
+
+/* Tastatur-Fokus mit Inset-Ring statt nur Flächenfarbe (Audit F-16). */
 .contact-menu-item:focus-visible {
   background-color: var(--color-surface-2);
-  outline: none;
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset-inset);
 }
 
 .contact-menu-item__icon {
@@ -461,6 +453,42 @@
   min-width: 0;
 }
 
+/* Vor- und Nachname sind ein Feldpaar (#535): die Legende trägt die
+   Pflicht-Markierung für beide zusammen ("Name *"), die Einzel-Labels bleiben
+   unmarkiert - Pflicht ist die Gruppe, nicht jedes Feld. */
+.contact-modal__name-group {
+  border: none;
+  padding: 0;
+  margin: 0 0 var(--space-4);
+  min-width: 0;
+}
+
+/* Die Legende steht über zwei Feld-Labels und muss sich von ihnen abheben,
+   sonst liest man drei gleichrangige Beschriftungen statt einer Gruppe. */
+.contact-modal__name-group > legend {
+  padding: 0;
+  margin-bottom: var(--space-2);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.contact-modal__name-grid {
+  margin-bottom: 0;
+}
+
+/* Gestapelt (eine Spalte) stehen die beiden Felder dichter beieinander, und die
+   Gruppe rückt vom nächsten Feld ab - sonst liest sich das Paar loser als seine
+   Trennung zur Kategorie. */
+@container modal-body (max-width: 480px) {
+  .contact-modal__name-grid {
+    gap: var(--space-1);
+  }
+
+  .contact-modal__name-group {
+    margin-bottom: var(--space-6);
+  }
+}
+
 /* Modal-Footer (ersetzt Inline-Styles). */
 .contact-modal__footer {
   border: none;
@@ -491,4 +519,233 @@
     width: 36px;
     height: 36px;
   }
+}
+
+/* ================================================================
+ * vCard-Import: Auswahl-Vorstufe (Modal). Spiegelt die bd-import-
+ * Grammatik der Geburtstage, aber contacts-scoped (Page-CSS lädt
+ * pro Seite nur ein Stylesheet) und mit dem Kontakte-Modulakzent.
+ * ================================================================ */
+.vcard-import__intro {
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  margin-bottom: var(--space-3);
+}
+
+.vcard-import__bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-bottom: var(--space-1);
+}
+
+.vcard-import__toggle {
+  background: none;
+  border: none;
+  padding: var(--space-1) var(--space-2);
+  color: var(--module-accent);
+  font-size: var(--text-sm);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.vcard-import__toggle:hover {
+  background: var(--color-surface-hover);
+}
+
+.vcard-import__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-height: 48vh;
+  overflow-y: auto;
+  margin: 0 calc(-1 * var(--space-1));
+  padding: 0 var(--space-1);
+}
+
+.vcard-import-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: var(--target-base);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition: background-color var(--duration-sm) ease;
+}
+
+.vcard-import-row:hover,
+.vcard-import-row:focus-within {
+  background: var(--color-surface-hover);
+}
+
+.vcard-import-row input {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  accent-color: var(--module-accent);
+  cursor: pointer;
+}
+
+.vcard-import-row__name {
+  flex: 1 1 auto;
+  color: var(--color-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vcard-import-row__detail {
+  flex: none;
+  max-width: 40%;
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vcard-import-row__bday {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  color: var(--module-birthdays, var(--module-accent));
+}
+
+.vcard-import-row__bday i {
+  width: 16px;
+  height: 16px;
+}
+
+.vcard-import-row--exists {
+  opacity: 0.72;
+}
+
+.vcard-import-row__badge {
+  flex: none;
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+  background: var(--color-surface-2);
+  padding: var(--space-0h) var(--space-2);
+  border-radius: var(--radius-full);
+  white-space: nowrap;
+}
+
+.vcard-import__skipped {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border-subtle);
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
+}
+
+.vcard-import__footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+/* Mehrwert-Editor im Kontakt-Modal (Audit R2, A2-11): Wert + optionales Label
+ * je Zeile, Entfernen als row-action; das Label bleibt schmal. */
+.contact-mv-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.contact-mv-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr) auto;
+  gap: var(--space-2);
+  align-items: center;
+  /* Inline-Padding + negatives Margin: Platz für den Aktiv-Ton, ohne die
+     Spalten zu verschieben. */
+  padding-inline: var(--space-1);
+  margin-inline: calc(var(--space-1) * -1);
+  border-radius: var(--radius-sm);
+  transition: background-color 150ms ease;
+}
+
+/* Aktive Telefonzeile: dezenter Ton verankert den (geteilten) Hint an der Zeile,
+   auf die er sich bezieht. Kein Side-Stripe - flächiger Ton. */
+.contact-mv-row--active {
+  background: var(--color-surface-hover);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .contact-mv-row { transition: none; }
+}
+
+.contact-mv-add {
+  margin-top: var(--space-2);
+}
+
+/* Telefon-Tipphilfe (AsYouType-Vorschau / Plausibilitäts-Hinweis). Rein visuell,
+   nie blockierend; leer, solange kein Telefonfeld aktiv ist. Selbst-gestylt, da
+   .form-hint page-scoped in settings.css liegt und hier nicht geladen wird. */
+.contact-phone-hint {
+  margin-top: var(--space-2);
+  min-height: 1.25em; /* kein Sprung, wenn der Hinweis erscheint/verschwindet */
+  font-size: var(--text-sm);
+}
+
+/* Vorschau gedämpft (Hinweis-Charakter), Warnung im Warnton. */
+.contact-phone-hint__preview {
+  color: var(--color-text-secondary);
+}
+
+.contact-phone-hint__warn {
+  color: var(--color-warning);
+}
+
+/* --------------------------------------------------------
+   Detailansicht: antippbare Werte
+
+   Eine Zeile je Gruppe (Telefon, Mail, Adresse), darin je ein Wert pro Zeile.
+   Der Wert IST die Aktion - anrufen, mailen, Karte öffnen -, deshalb liegt die
+   Trefferfläche auf dem Link und nicht auf einem zusätzlichen Icon daneben.
+   -------------------------------------------------------- */
+.contact-detail__values {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.contact-detail__value {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* Volle Zeilenhöhe als Trefferfläche: Auf dem Smartphone steht hier die
+   häufigste Handlung der ganzen Seite, und Telefonnummern liegen dicht
+   untereinander. --target-base ist dasselbe Maß, das die Detailansicht für
+   Kopf- und Fußzeilen-Aktionen nutzt. */
+.contact-detail__link {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target-base);
+  color: var(--module-contacts, var(--color-accent));
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.contact-detail__link:hover,
+.contact-detail__link:focus-visible {
+  text-decoration: underline;
+}
+
+/* Das Label der Nummer ("mobil", "Arbeit") ordnet ein, ohne mit dem Wert zu
+   konkurrieren - es steht daneben, nicht darüber, weil die Zeile sonst bei drei
+   Nummern zu einem Block aus sechs Zeilen wird. */
+.contact-detail__sub {
+  font-size: var(--type-caption);
+  color: var(--color-text-tertiary);
 }

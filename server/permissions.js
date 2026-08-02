@@ -43,6 +43,7 @@ export const PERMISSION_MODULES = Object.freeze([
   { key: 'contacts',     labelKey: 'nav.contacts',     icon: 'book-user',     navIds: ['contacts'] },
   { key: 'meals',        labelKey: 'nav.kitchen',      icon: 'utensils',      navIds: ['meals', 'recipes'] },
   { key: 'shopping',     labelKey: 'nav.shopping',     icon: 'shopping-cart', navIds: ['shopping'] },
+  { key: 'pantry',       labelKey: 'nav.pantry',       icon: 'archive',       navIds: ['pantry'] },
   { key: 'budget',       labelKey: 'nav.budget',       icon: 'wallet',        navIds: ['budget'] },
   { key: 'documents',    labelKey: 'nav.documents',    icon: 'folder-lock',   navIds: ['documents'] },
   { key: 'housekeeping', labelKey: 'nav.housekeeping', icon: 'paintbrush',    navIds: ['housekeeping'] },
@@ -99,7 +100,7 @@ function loadSubjectRows(database, subjectType, subjectId) {
 
 /**
  * Löst die effektiven Rechte eines konkreten Nutzers auf.
- * @param {import('better-sqlite3').Database} database
+ * @param {import('better-sqlite3-multiple-ciphers').Database} database
  * @param {{ id: number, role: string, family_role?: string }} user
  * @returns {{ admin: boolean, modules: Record<string,'none'|'read'|'write'>, widgets: Record<string,'none'|'allow'> }}
  */
@@ -224,7 +225,7 @@ export function normalizePermissionInput({ modules = {}, widgets = {} } = {}) {
  * Ersetzt die komplette Rechte-Zeile eines Subjekts atomar (delete + insert der
  * abweichenden Einträge). Transaktion vom Aufrufer bereitgestellt oder hier
  * gekapselt.
- * @param {import('better-sqlite3').Database} database
+ * @param {import('better-sqlite3-multiple-ciphers').Database} database
  */
 export function replaceSubjectPermissions(database, subjectType, subjectId, input) {
   const rows = normalizePermissionInput(input);

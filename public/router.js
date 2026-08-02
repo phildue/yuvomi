@@ -7,18 +7,26 @@
 import { api, auth } from '/api.js';
 import { canAccessNavModule, navModuleAccess } from '/permissions.js';
 import { clearApiCache } from '/sw-register.js';
-import { initI18n, getLocale, t } from '/i18n.js';
+import { initI18n, getLocale, t, formatDate, formatTime } from '/i18n.js';
 import { esc } from '/utils/html.js';
+import { wireScrollFade } from '/utils/ux.js';
 import { init as initReminders, stop as stopReminders } from '/reminders.js';
 import { initPush, stopPush } from '/push.js';
-import { isKitchenRoute, getLastKitchenRoute } from '/utils/kitchen-tabs.js';
+import { numberLocaleFor } from '/settings/region-presets.js';
+import { isKitchenRoute, isKitchenModule, getLastKitchenRoute } from '/utils/kitchen-tabs.js';
 import { getLastHealthRoute, HEALTH_ROUTES } from '/utils/health-tabs.js';
 import { activityType } from '/utils/health-activity.js';
 import { buildHelpRows } from '/utils/help.js';
+import { renderSkeletonList } from '/utils/skeleton.js';
+import {
+  rememberScrollPosition,
+  scrollPositionFor,
+  forgetScrollPositions,
+} from '/utils/scroll-restore.js';
 import { openModal, confirmModal } from '/components/modal.js';
 import '/components/datepicker.js';
 import { NAV_ICONS } from '/nav-icons.js';
-import { SETTINGS_LEAVES } from '/settings/registry.js';
+import { RENAMED_SETTINGS_SOURCE_PATHS, SETTINGS_LEAVES } from '/settings/registry.js';
 import {
   NAV_SECTION,
   resolveMobileNavOrder,
@@ -42,6 +50,7 @@ const ROUTES = [
   { path: '/birthdays', page: '/pages/birthdays.js', requiresAuth: true, module: 'birthdays' },
   { path: '/notes',    page: '/pages/notes.js',     requiresAuth: true, module: 'notes'     },
   { path: '/recipes',  page: '/pages/recipes.js',   requiresAuth: true, module: 'recipes'   },
+  { path: '/pantry',   page: '/pages/pantry.js',    requiresAuth: true, module: 'pantry'    },
   { path: '/contacts', page: '/pages/contacts.js',  requiresAuth: true, module: 'contacts'  },
   { path: '/budget',   page: '/pages/budget.js',    requiresAuth: true, module: 'budget'    },
   { path: '/documents', page: '/pages/documents.js', requiresAuth: true, module: 'documents' },
@@ -55,6 +64,9 @@ const ROUTES = [
 const SETTINGS_ROUTES = [
   { path: '/settings', page: '/pages/settings.js', requiresAuth: true, module: 'settings' },
   ...SETTINGS_LEAVES.map(({ path }) => ({ path, page: '/pages/settings.js', requiresAuth: true, module: 'settings' })),
+  // Vom IA-Umbau verschobene Blätter: als Route registriert, damit ein alter
+  // Bookmark überhaupt matcht. settings.js leitet dann auf den neuen Pfad um.
+  ...RENAMED_SETTINGS_SOURCE_PATHS.map((path) => ({ path, page: '/pages/settings.js', requiresAuth: true, module: 'settings' })),
 ];
 
 ROUTES.push(...SETTINGS_ROUTES);
@@ -76,6 +88,14 @@ const isStandalone = window.matchMedia('(display-mode: standalone)').matches
   || navigator.standalone === true;
 
 /**
+ * System-Farbschema als langlebige MediaQueryList. Bewusst ein Modul-Binding
+ * und kein `window.matchMedia(...).addEventListener(...)` in einem Rutsch: ohne
+ * gehaltene Referenz darf die Engine die Liste einsammeln, und der Listener
+ * verstummt irgendwann still. Genutzt vom Auto-Modus-Nachzug des Modul-Akzents.
+ */
+const darkSchemeQuery = window.matchMedia?.('(prefers-color-scheme: dark)') ?? null;
+
+/**
  * Setzt die theme-color Meta-Tags (Light + Dark Variante).
  * @param {string} lightColor
  * @param {string} [darkColor] - Falls nicht angegeben, wird lightColor für beide gesetzt
@@ -94,6 +114,27 @@ function setThemeColor(lightColor, darkColor) {
 /** Liest eine CSS Custom Property vom :root */
 function getCSSToken(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+/**
+ * Setzt den Modul-Akzent der Route als Inline-Custom-Property auf <html>.
+ *
+ * Der Wert ist die AUFGELÖSTE Farbe, keine `var(--module-*)`-Kette: Dritt-
+ * anbieter-Module liefern einen literalen Hex-Wert, und ein nicht existierendes
+ * `--module-<name>` würde als var()-Kette „invalid at computed-value time"
+ * enden statt in den CSS-Fallback `var(--color-accent)` zu laufen.
+ *
+ * Preis dieser Auflösung: der Inline-Wert ist eine Momentaufnahme des aktuellen
+ * Themes. `--module-tasks` wechselt im Dark-Theme von #15803D auf #4ADE80 - die
+ * Momentaufnahme tut das nicht. Deshalb MUSS jeder Theme-Wechsel diese Funktion
+ * erneut aufrufen (applyTheme + der prefers-color-scheme-Listener für den
+ * Auto-Modus), sonst behält die ganze Shell den Akzent des alten Themes und
+ * Text darauf fiel im Dunkelmodus auf 2.71:1 statt 7.81:1 - unter WCAG AA.
+ */
+function applyModuleAccentForRoute(route) {
+  const accentToken = moduleAccentToken(route?.module);
+  const accent = route?.thirdPartyModule?.accent || (accentToken ? getCSSToken(accentToken) : '');
+  document.documentElement.style.setProperty('--active-module-accent', accent);
 }
 
 /** Setzt theme-color passend zum aktuellen Modul */
@@ -149,9 +190,72 @@ function loadPageStyle(moduleName, routeStyle = null) {
 // --------------------------------------------------------
 const moduleCache = new Map();
 
+// --------------------------------------------------------
+// Veraltete Shell nach SW-Update (#616)
+//
+// Der Browser führt pro Dokument genau eine Modul-Map. Ist ein geteiltes Modul
+// (z. B. /utils/empty-state.js) einmal geladen, wird jeder spätere Import
+// dagegen gebunden - auch der eines Seitenmoduls, das der neue Service Worker
+// frisch vom Netz geholt hat. Nach einem Update im laufenden Tab trifft dann
+// neues Seitenmodul auf alte Abhängigkeit, und ein in der neuen Version
+// hinzugekommener Export fliegt als SyntaxError auf. Die Modul-Map lässt sich
+// nicht leeren; nur ein Reload des Dokuments verwirft sie.
+//
+// Sobald ein Update angekündigt ist, wird deshalb kein Seitenmodul mehr
+// nachgeladen: importPage() löst die Navigation stattdessen in einen Reload
+// auf. Das Promise bleibt bewusst offen, damit renderPage() nicht mit einem
+// Fehlerbildschirm weiterläuft, den der Reload eine Sekunde später wegwirft.
+// --------------------------------------------------------
+let shellStale = false;
+
+// Reload-Schleifen-Bremse: ein durch einen Modulfehler ausgelöster Reload darf
+// sich nicht wiederholen, wenn der Fehler nach dem Reload fortbesteht (echter
+// Bug statt Versions-Mischzustand). Zeitbasiert statt einmalig, damit ein
+// späteres, echtes Update wieder reloaden darf.
+const RELOAD_GUARD_KEY = 'yuvomi-stale-shell-reload';
+const RELOAD_GUARD_MS  = 30000;
+
+function reloadOnce() {
+  try {
+    const last = parseInt(sessionStorage.getItem(RELOAD_GUARD_KEY) || '0', 10);
+    if (Date.now() - last < RELOAD_GUARD_MS) return false;
+    sessionStorage.setItem(RELOAD_GUARD_KEY, String(Date.now()));
+  } catch { /* sessionStorage gesperrt (Private Mode) → Reload trotzdem wagen */ }
+  location.reload();
+  return true;
+}
+
+/**
+ * Erkennt Fehler, die ein Reload heilt: ein gegen eine alte Abhängigkeit
+ * gebundenes Modul (SyntaxError) oder ein Modul, das gar nicht erst geladen
+ * werden konnte (TypeError). Offline ist Letzteres normal und kein Grund für
+ * einen Reload - dann greift die reguläre Fehlerbehandlung.
+ */
+function isStaleModuleError(err) {
+  if (err instanceof SyntaxError) return true;
+  return err instanceof TypeError && navigator.onLine;
+}
+
 async function importPage(pagePath) {
+  // Nur wenn der Reload wirklich angestoßen wurde, bleibt das Promise offen.
+  // Greift die Schleifen-Bremse, wird regulär importiert: ein hängendes
+  // Promise ohne folgenden Reload ließe die Seite dauerhaft im Skelett stehen.
+  if (shellStale && reloadOnce()) {
+    return new Promise(() => {});
+  }
   if (!moduleCache.has(pagePath)) {
-    moduleCache.set(pagePath, await import(pagePath));
+    try {
+      moduleCache.set(pagePath, await import(pagePath));
+    } catch (err) {
+      moduleCache.delete(pagePath);
+      // Zweiter Rettungsanker: das Update kam ohne Vorankündigung durch (der
+      // Service Worker kann den Tab zwischen zwei Fetches übernehmen). Reload
+      // statt Fehlerbildschirm - beim zweiten Mal fällt der Fehler durch.
+      if (isStaleModuleError(err) && reloadOnce()) {
+        return new Promise(() => {});
+      }
+      throw err;
+    }
   }
   return moduleCache.get(pagePath);
 }
@@ -170,6 +274,10 @@ const _prefetchedStyles = new Set();
 
 function prefetchRoute(path) {
   if (!path) return;
+  // Nach angekündigtem Update nichts mehr vorwärmen: ein modulepreload zieht den
+  // kompletten Modulgraph in die Modul-Map und würde neue Seitenmodule gegen die
+  // alten geteilten Module binden, bevor der Reload greift (#616).
+  if (shellStale) return;
   const route = allRoutes().find((r) => r.path === path);
   if (!route) return;
 
@@ -244,7 +352,7 @@ let _setupRequired = false;
 // Router
 // --------------------------------------------------------
 
-const ROUTE_ORDER = ['/', '/calendar', '/tasks', '/meals', '/recipes', '/shopping',
+const ROUTE_ORDER = ['/', '/calendar', '/tasks', '/meals', '/recipes', '/shopping', '/pantry',
                      '/birthdays', '/notes', '/contacts', '/budget', '/documents', '/housekeeping', '/health', '/settings'];
 
 const MOBILE_FAVORITE_COUNT = 3;
@@ -322,6 +430,7 @@ function routeTitle(path) {
     '/meals': t('nav.meals'),
     '/recipes': t('nav.recipes'),
     '/shopping': t('nav.shopping'),
+    '/pantry': t('nav.pantry'),
     '/notes': t('nav.notes'),
     '/contacts': t('nav.contacts'),
     '/budget': t('nav.budget'),
@@ -449,6 +558,17 @@ async function navigate(path, userOrPushState = true, pushState = true) {
     const previousPath = currentPath;
     const basePath = path.split('?')[0];
     currentPath = basePath;
+
+    // Scrollstand der Seite festhalten, die gerade verlassen wird - er ist die
+    // Antwort auf ein späteres Browser-Zurück. Bewusst vor den Guards: was hier
+    // sichtbar ist, gilt unabhängig davon, ob die Navigation gleich umgeleitet
+    // wird. Der Scrollport ist #main-content selbst (== .app-content).
+    if (previousPath) {
+      rememberScrollPosition(previousPath, document.getElementById('main-content')?.scrollTop ?? 0);
+    }
+    // Vorwärts heißt oben anfangen, Zurück/Vor heißt weitermachen. Details und
+    // die Begründung gegen getDirection() in utils/scroll-restore.js.
+    const scrollTarget = scrollPositionFor(basePath, { restore: !pushState });
 
     // First-Run-Weiche: Solange kein Account existiert und niemand eingeloggt ist,
     // alle Routen außer /setup auf /setup umleiten.
@@ -582,13 +702,22 @@ async function navigate(path, userOrPushState = true, pushState = true) {
         handled = false;
       }
       if (handled) {
+        // Auch die Soft-Navigation wechselt den Inhalt (Settings-Blatt, Health-Tab)
+        // und muss den Scrollport nachziehen - hier zwangsläufig NACH dem Render,
+        // weil kein Teardown existiert, an den man sich hängen könnte.
+        const main = document.getElementById('main-content');
+        if (main) main.scrollTop = scrollTarget;
         updateNav(topLevelSection(basePath));
         return;
       }
     }
 
-    const accent = route?.thirdPartyModule?.accent || (route?.module ? getCSSToken(`--module-${route.module}`) : '');
-    document.documentElement.style.setProperty('--active-module-accent', accent);
+    // Küchen-Routen lösen auf --module-kitchen auf, nicht auf ihr eigenes
+    // --module-*: die vier Tabs sind EIN Modul (kitchenGroup) und teilen einen
+    // Akzent. Sonst wechselte der 3px-Streifen der Tab-Leiste und der FAB beim
+    // Tabwechsel die Farbe - dieselbe Botschaft wie ein echter Modulwechsel
+    // (Critique 2026-07-29). Begründung am Token in tokens.css.
+    applyModuleAccentForRoute(route);
 
     // Optimistisches Chrome-Feedback: aktive Nav-Markierung + Indikator-Pille und
     // Statusbar-Farbe schon VOR dem Modul-Render setzen, sobald die Shell existiert.
@@ -601,7 +730,7 @@ async function navigate(path, userOrPushState = true, pushState = true) {
       updateThemeColorForRoute(route);
     }
 
-    await renderPage(route, previousPath);
+    await renderPage(route, previousPath, scrollTarget);
     // Autoritative Aktualisierung nach dem Render: deckt den Erstlade-Fall ab und
     // markiert ggf. seiten-interne [data-route]-Links (idempotent).
     // Settings-Blätter teilen sich den /settings Nav-Eintrag (aria-current).
@@ -633,6 +762,19 @@ async function syncPreferencesOnce() {
     const timeFormat = res?.data?.time_format;
     if (timeFormat) {
       localStorage.setItem('yuvomi-time-format', timeFormat);
+    }
+    // Region als Formatier-Locale für Zahlen/Währung spiegeln (z. B. de-CH →
+    // 123'456.78). getFormatLocale() in i18n.js liest diesen Wert.
+    const numberLocale = numberLocaleFor({
+      region: res?.data?.region,
+      currency: res?.data?.currency,
+      date_format: res?.data?.date_format,
+      time_format: res?.data?.time_format,
+    });
+    if (numberLocale) {
+      localStorage.setItem('yuvomi-number-locale', numberLocale);
+    } else {
+      localStorage.removeItem('yuvomi-number-locale');
     }
     if (res?.data?.app_name) {
       setAppName(res.data.app_name);
@@ -707,6 +849,38 @@ function allRoutes() {
       thirdPartyModule: module,
     }));
   return [...ROUTES, ...moduleRoutes];
+}
+
+/**
+ * Die Route der gerade dargestellten Seite. Nötig für alles, was Chrome-Farben
+ * ausserhalb einer Navigation nachzieht (Theme-Wechsel, Rückkehr aus einem
+ * Overlay) - dort gibt es kein `route`-Objekt aus navigate() mehr.
+ */
+function currentRoute() {
+  return allRoutes().find((r) => r.path === currentPath);
+}
+
+/**
+ * Zieht die Statusbar-Farbe auf das jetzt gültige Theme nach.
+ *
+ * Der Modul-Akzent ist nicht die einzige eingefrorene Momentaufnahme:
+ * `updateThemeColorForRoute` löst `--module-<name>` über denselben `getCSSToken`
+ * auf und schreibt das Ergebnis in beide `<meta name="theme-color">`. Ein
+ * Attribut nimmt an keiner Kaskade teil, also behielt die Statusbar nach
+ * hell↔dunkel die Modulfarbe des alten Themes, während die Shell darunter längst
+ * umgeschaltet hatte - dieselbe Regel wie bei applyModuleAccentForRoute, nur für
+ * die zweite Momentaufnahme.
+ *
+ * Sichtbar nur in der installierten PWA: `setThemeColor` steigt außerhalb des
+ * Standalone-Modus früh aus. Deshalb fiel es neben dem Akzent-Befund nicht auf.
+ */
+function refreshThemeColorForTheme() {
+  // Liegt ein Modal über der Seite, gehört die Statusbar ihm: modal.js dunkelt
+  // sie beim Öffnen ab und stellt sie über restoreThemeColor selbst wieder her.
+  // Ein Nachziehen der Routenfarbe höbe die Abdunklung mitten im offenen Modal
+  // auf - der Fall tritt im Auto-Modus ein, wenn das System selbst umschaltet.
+  if (document.getElementById('shared-modal-overlay')) return;
+  updateThemeColorForRoute(currentRoute());
 }
 
 // Bestätigter Logout, überall aus der Navigation erreichbar (Sidebar-Footer +
@@ -872,8 +1046,9 @@ function buildMoreSheetBody() {
  * Lädt und rendert eine Seite dynamisch.
  * @param {{ path: string, page: string }} route
  * @param {string|null} previousPath - Pfad vor der Navigation (für Richtungsberechnung)
+ * @param {number} scrollTarget - Scrollstand der Zielseite (0 vorwärts, gemerkt bei popstate)
  */
-async function renderPage(route, previousPath = null) {
+async function renderPage(route, previousPath = null, scrollTarget = 0) {
   const app = document.getElementById('app');
   const loading = document.getElementById('app-loading');
 
@@ -930,6 +1105,16 @@ async function renderPage(route, previousPath = null) {
     pageWrapper.className = 'page-transition';
     pageWrapper.style.opacity = '0';
     content.replaceChildren(pageWrapper);
+    // Scrollport auf Anfang, solange er leer ist. `content` IST der Scrollport
+    // (#main-content == .app-content) und überlebt die Navigation; ohne diese
+    // Zeile öffnet die Zielseite auf dem Scrollstand der Vorseite.
+    //
+    // HIER, NICHT NACH DEM RENDER: Module scrollen beim Aufbau selbst - die
+    // Tagesansicht des Kalenders zur aktuellen Stunde, der Essensplan zum
+    // heutigen Tag. Ein Reset danach würde genau das wieder einkassieren. Die
+    // Wiederherstellung bei popstate darf und soll das dagegen überschreiben,
+    // sie steht deshalb unten hinter dem await.
+    content.scrollTop = 0;
     style.cleanup();
 
     // Teardown abgeschlossen: ein evtl. gemerktes Soft-Update-Ziel ist jetzt
@@ -965,12 +1150,26 @@ async function renderPage(route, previousPath = null) {
 
     await renderPromise;
 
+    // Browser-Zurück/-Vor: gemerkten Stand wiederherstellen, jetzt wo der Inhalt
+    // seine volle Höhe hat. Best effort - ist die Seite kürzer als beim Verlassen
+    // (gefilterte Liste, gelöschter Eintrag), klemmt der Browser auf sein Maximum.
+    if (scrollTarget > 0) content.scrollTop = scrollTarget;
+
     // Ab hier kann das Modul Soft-Navigationen bedienen (sofern es update() bietet).
     _renderedModule = module;
     _renderedModuleName = route.module;
 
     // FAB Long Loop: Einstiegsanimation nach FAB_SEEN_MAX Views pro Modul deaktivieren
-    if (pageWrapper.querySelector('.page-fab')) {
+    const pageFab = pageWrapper.querySelector('.page-fab');
+    if (pageFab) {
+      // Shortcut-Discoverability (Audit P3): der 'n'-Chord öffnet den FAB — als
+      // Tooltip-Titel + aria-keyshortcuts sichtbar bzw. vorlesbar machen.
+      pageFab.setAttribute('aria-keyshortcuts', 'n');
+      const fabLabel = pageFab.getAttribute('aria-label');
+      if (fabLabel && !/\(n\)$/.test(pageFab.getAttribute('title') || '')) {
+        pageFab.setAttribute('title', `${fabLabel} (n)`);
+      }
+
       const fabKey = FAB_SEEN_KEY(route.module);
       let fabCount = parseInt(localStorage.getItem(fabKey) ?? '0', 10);
       if (fabCount < FAB_SEEN_MAX) {
@@ -1000,7 +1199,12 @@ async function renderPage(route, previousPath = null) {
     if (route.thirdPartyModule?.id) {
       await disableFailedThirdPartyModule(route.thirdPartyModule.id);
     }
-    renderError(app, err);
+    // Fehler NUR in den Inhaltsbereich rendern. #app enthält auch die App-Shell
+    // (Sidebar, Bottom-Nav, Suche); ein replaceChildren() darauf löscht die
+    // gesamte Navigation und die Fehlerkarte dehnt sich über die Nav-Spalte -
+    // die Seite ist dann nur noch per Reload verlassbar. Erst wenn noch keine
+    // Shell steht (Auth-Seiten, früher Fehler), ist #app der richtige Ort.
+    renderError(document.getElementById('main-content') ?? app, err);
   }
 }
 
@@ -1110,6 +1314,11 @@ function renderAppShell(container) {
   // Navigations-Semantik, die Gruppen die Sektions-Struktur.
   sidebarNavItems().forEach((item) => sidebarItems.appendChild(item));
 
+  // Scroll-Affordanz (Audit F-01): weiche Fade-Anrisse oben/unten, sobald die
+  // Liste überläuft — der Scrollbalken ist bewusst versteckt, ohne Anriss waren
+  // Einträge unterhalb der Falte (Budget/Gesundheit/Einstellungen) unsichtbar.
+  wireScrollFade(sidebarItems, { axis: 'y' });
+
   // Zarte Hover-Vorschau — bewegt das separate `__hover`-Element (NICHT die
   // Aktiv-Pille) für Maus (hover) UND Tastatur (focus). Auf dem aktiven Item
   // wird nichts gezeigt: die Aktiv-Pille steht dort bereits.
@@ -1159,6 +1368,20 @@ function renderAppShell(container) {
 
   sidebar.appendChild(sidebarLogo);
   sidebar.appendChild(sidebarToggle);
+
+  // Sichtbarer Desktop-Einstieg in die globale Suche (Audit R2, A1-01): vor den
+  // Modul-Items, bleibt im eingeklappten Modus als Lupe erreichbar. Kein
+  // data-route, damit Delegation/Indikator das Item ignorieren.
+  const sidebarSearch = sidebarActionEl({
+    labelKey: 'nav.search',
+    icon: 'search',
+    className: 'nav-item--search',
+    onClick: () => _openSearch?.(),
+  });
+  sidebarSearch.setAttribute('aria-keyshortcuts', '/');
+  sidebarSearch.setAttribute('title', `${t('nav.search')} (/)`);
+  sidebar.appendChild(sidebarSearch);
+
   sidebar.appendChild(sidebarItems);
 
   // Footer-Aktionen (keine Routen → kein data-route, damit Delegation/Indikator
@@ -1286,12 +1509,30 @@ function renderAppShell(container) {
   closeIcon.setAttribute('aria-hidden', 'true');
   searchClose.appendChild(closeIcon);
   searchHeader.appendChild(searchInput);
-  searchHeader.appendChild(searchClose);
   const searchResults = document.createElement('div');
   searchResults.className = 'search-overlay__results';
   searchResults.id = 'search-results';
-  searchOverlay.appendChild(searchHeader);
-  searchOverlay.appendChild(searchResults);
+  // Panel-Wrapper: auf Mobile transparent + bildschirmfüllend (Sheet bleibt
+  // unverändert), am Desktop die zentrierte Command-Palette (~640px, Glas-Karte
+  // über geblurtem Scrim). Das Overlay selbst ist nur noch die Scrim-Ebene.
+  const searchPanel = document.createElement('div');
+  searchPanel.className = 'search-overlay__panel';
+  searchPanel.appendChild(searchHeader);
+  searchPanel.appendChild(searchResults);
+  // Sr-only Live-Region: sagt „Suche läuft…" und die Trefferzahl an, damit der
+  // debounced Fetch für Screenreader nicht als Stille verpufft (Critique P1).
+  // Die sichtbaren Skeletons tragen aria-hidden; die Semantik lebt hier.
+  const searchStatus = document.createElement('p');
+  searchStatus.className = 'sr-only';
+  searchStatus.id = 'search-status';
+  searchStatus.setAttribute('role', 'status');
+  searchStatus.setAttribute('aria-live', 'polite');
+  searchPanel.appendChild(searchStatus);
+  // Schließen NACH den Treffern im DOM (visuell absolut oben rechts): Tab aus
+  // dem Suchfeld erreicht so direkt das erste Ergebnis statt erst den
+  // Schließen-Button (Audit A1-14); Esc bleibt der schnelle Ausstieg.
+  searchPanel.appendChild(searchClose);
+  searchOverlay.appendChild(searchPanel);
 
   const toastContainerPolite = document.createElement('div');
   toastContainerPolite.className = 'toast-container';
@@ -1349,6 +1590,7 @@ function renderAppShell(container) {
   container.addEventListener('pointerdown', prefetchFromEvent);
 
   const openSearch = initSearch(container);
+  _openSearch = openSearch;
   initMoreSheet(container, openSearch);
   initOfflineBanner();
   initKeyboardShortcuts();
@@ -1363,10 +1605,12 @@ const FAB_SEEN_MAX = 5;
 const SIDEBAR_COLLAPSED_KEY = 'yuvomi.sidebar.collapsed';
 
 const SHORTCUTS = [
-  { key: '/',   description: () => t('shortcuts.search'),  action: () => {
-    document.getElementById('more-sheet-search')?.click();
-  } },
-  { key: 'n',   description: () => t('shortcuts.new'),     action: () => document.querySelector('.page-fab')?.click() },
+  // Direkt auf die Overlay-Funktion — der alte Umweg über einen Klick auf die
+  // Suchleiste im (geschlossenen, inerten) Mehr-Sheet war eine fragile Kette.
+  { key: '/',   description: () => t('shortcuts.search'),  action: () => _openSearch?.() },
+  // Fallback auf den Schnellaktionen-FAB des Dashboards (#fab-main): dort gibt
+  // es keinen .page-fab und `n` war ein stilles No-op (Audit A1-12).
+  { key: 'n',   description: () => t('shortcuts.new'),     action: () => (document.querySelector('.page-fab') ?? document.querySelector('#fab-main'))?.click() },
   { key: 'f',   description: () => t('shortcuts.searchCalendar'), action: () => {
     if (location.pathname === '/calendar') document.querySelector('#cal-search')?.click();
   } },
@@ -1377,14 +1621,20 @@ const SHORTCUTS = [
   { key: 'g s', description: () => t('shortcuts.goShop'),  action: () => navigate('/shopping') },
   { key: 'g n', description: () => t('shortcuts.goNotes'),   action: () => navigate('/notes')              },
   { key: 'g h', description: () => t('shortcuts.goHealth'),  action: () => navigate(getLastHealthRoute())  },
+  // Die 3er-Chords nennen ihr konkretes Ziel (Essensplan/Rezepte/Einkauf):
+  // vier identische "Küche"-Zeilen im Hilfe-Modal waren nicht unterscheidbar
+  // (Audit A1-13).
   { key: 'g k',   description: () => t('shortcuts.goKitchen'), action: () => navigate(getLastKitchenRoute()) },
-  { key: 'g k m', description: () => t('shortcuts.goKitchen'), action: () => navigate('/meals')             },
-  { key: 'g k r', description: () => t('shortcuts.goKitchen'), action: () => navigate('/recipes')           },
-  { key: 'g k s', description: () => t('shortcuts.goKitchen'), action: () => navigate('/shopping')          },
+  { key: 'g k m', description: () => t('nav.meals'),           action: () => navigate('/meals')             },
+  { key: 'g k r', description: () => t('nav.recipes'),         action: () => navigate('/recipes')           },
+  { key: 'g k s', description: () => t('nav.shopping'),        action: () => navigate('/shopping')          },
+  { key: 'g k v', description: () => t('nav.pantry'),          action: () => navigate('/pantry')            },
 ];
 
 let _pendingKey = null;
 let _pendingTimer = null;
+// Von initSearch gesetzt: öffnet das globale Such-Overlay (Sidebar-Item + `/`).
+let _openSearch = null;
 
 function initKeyboardShortcuts() {
   document.addEventListener('keydown', (e) => {
@@ -1725,12 +1975,29 @@ function initMoreSheet(container, openSearch) {
 /**
  * Initialisiert die Suchfunktion (Overlay + API-Calls).
  */
+// Durchsuchbare Domänen des /search-Endpunkts, in Anzeige-Reihenfolge. Dienen
+// im Leerzustand als Direktsprung-Kacheln (labelKey/icon gespiegelt aus der
+// Haupt-Navigation, damit Suche und Nav dieselbe Sprache sprechen).
+const SEARCH_SCOPES = [
+  { labelKey: 'nav.tasks',    icon: 'check-square',  route: '/tasks'    },
+  { labelKey: 'nav.calendar', icon: 'calendar',      route: '/calendar' },
+  { labelKey: 'nav.notes',    icon: 'sticky-note',   route: '/notes'    },
+  { labelKey: 'nav.contacts', icon: 'book-user',     route: '/contacts' },
+  { labelKey: 'nav.shopping', icon: 'shopping-cart', route: '/shopping' },
+  { labelKey: 'nav.health',   icon: 'heart-pulse',   route: '/health'   },
+];
+
 function initSearch(container) {
   const searchClose = container.querySelector('#search-close');
   const overlay      = container.querySelector('#search-overlay');
   const input        = container.querySelector('#search-input');
   const results      = container.querySelector('#search-results');
+  const status       = container.querySelector('#search-status');
   if (!overlay || !input || !results) return null;
+
+  function setStatus(text) {
+    if (status) status.textContent = text || '';
+  }
 
   // Leichtgewichtiger Focus Trap für das Search Overlay.
   // Eigenständig (kein modal.js), da modul-globale Variablen in modal.js
@@ -1738,11 +2005,57 @@ function initSearch(container) {
   let _searchTrapHandler = null;
   let lastFocusedBeforeSearch = null;
 
+  // Leerzustand mit Erwartungshilfe + Direktsprung: statt einer leeren Fläche
+  // erklärt die Lead-Zeile, was ab 2 Zeichen durchsucht wird, und darunter
+  // führen Scope-Kacheln direkt ins jeweilige Modul (Critique P1: der leere
+  // Zustand war der wertvollste, aber ungenutzte Moment der Palette).
+  function renderSearchHint() {
+    results.replaceChildren();
+    results.removeAttribute('aria-busy');
+    setStatus('');
+    const hint = document.createElement('p');
+    hint.className = 'search-overlay__empty';
+    hint.textContent = t('search.emptyHint');
+    results.appendChild(hint);
+
+    const scopes = document.createElement('div');
+    scopes.className = 'search-scopes';
+    const scopesHeading = document.createElement('h3');
+    scopesHeading.className = 'search-section__heading';
+    scopesHeading.textContent = t('search.scopesLabel');
+    scopes.appendChild(scopesHeading);
+    const list = document.createElement('div');
+    list.className = 'search-scopes__list';
+    SEARCH_SCOPES.forEach((scope) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'search-scope';
+      const icon = document.createElement('i');
+      icon.dataset.lucide = scope.icon;
+      icon.className = 'search-scope__icon';
+      icon.setAttribute('aria-hidden', 'true');
+      const label = document.createElement('span');
+      label.textContent = t(scope.labelKey);
+      btn.append(icon, label);
+      btn.addEventListener('click', () => {
+        closeSearch();
+        navigate(scope.route);
+      });
+      list.appendChild(btn);
+    });
+    scopes.appendChild(list);
+    results.appendChild(scopes);
+    // Auch aus dem input-Handler (< 2 Zeichen) aufgerufen, wo openSearch die
+    // Icons nicht nachzieht — daher hier selbst rendern.
+    window.lucide?.createIcons({ el: results });
+  }
+
   function openSearch() {
     if (window._closeMoreSheet) window._closeMoreSheet({ restoreFocus: false });
     lastFocusedBeforeSearch = document.activeElement;
     setOverlayInteractive(overlay, true);
     overlay.classList.add('search-overlay--visible');
+    if (!input.value.trim()) renderSearchHint();
     setTimeout(() => input.focus(), 50);
     if (window.lucide) window.lucide.createIcons({ el: overlay });
 
@@ -1751,6 +2064,9 @@ function initSearch(container) {
   }
 
   function closeSearch({ restoreFocus = true } = {}) {
+    // Laufenden Debounce abbrechen: sonst feuert ein noch offener Timer nach dem
+    // Schließen ins versteckte Overlay und macht eine Phantom-Live-Ansage.
+    clearTimeout(searchTimer);
     setOverlayInteractive(overlay, false);
     overlay.classList.remove('search-overlay--visible');
     if (_searchTrapHandler) {
@@ -1759,6 +2075,8 @@ function initSearch(container) {
     }
     input.value = '';
     results.replaceChildren();
+    results.removeAttribute('aria-busy');
+    setStatus('');
     if (restoreFocus) returnFocus(lastFocusedBeforeSearch);
   }
 
@@ -1770,26 +2088,59 @@ function initSearch(container) {
     }
   });
 
+  // Pfeiltasten führen vom Suchfeld durch die Treffer (Audit A1-14): Enter
+  // aktiviert den fokussierten Treffer nativ (Buttons), Esc schließt.
+  overlay.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    const hits = [...results.querySelectorAll('.search-result')];
+    if (!hits.length) return;
+    e.preventDefault();
+    const idx = hits.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown') {
+      (idx < 0 ? hits[0] : hits[Math.min(idx + 1, hits.length - 1)]).focus();
+    } else if (idx > 0) {
+      hits[idx - 1].focus();
+    } else if (idx === 0) {
+      input.focus();
+    }
+  });
+
   let searchTimer = null;
   input.addEventListener('input', () => {
     clearTimeout(searchTimer);
     const q = input.value.trim();
     if (q.length < 2) {
-      results.replaceChildren();
+      renderSearchHint();
       return;
     }
     searchTimer = setTimeout(async () => {
+      // Ladezustand erst wenn der Fetch wirklich startet (nach dem Debounce):
+      // Skeletons + „Suche läuft…" statt einer eingefroren wirkenden Fläche auf
+      // langsamem Home-Server (Critique P1). Kein Flackern bei schnellem Tippen.
+      results.replaceChildren();
+      results.setAttribute('aria-busy', 'true');
+      results.insertAdjacentHTML('beforeend', renderSkeletonList({ rows: 4, lines: 2 }));
+      setStatus(t('search.loading'));
       try {
         const data = await api.get(`/search?q=${encodeURIComponent(q)}`);
-        renderSearchResults(results, data, closeSearch);
+        const count = renderSearchResults(results, data, closeSearch);
+        results.setAttribute('aria-busy', 'false');
+        setStatus(
+          count === 0 ? t('search.noResults')
+            : count === 1 ? t('search.resultCountOne', { count })
+            : t('search.resultCountMany', { count }),
+        );
       } catch {
         // Fehler nicht verschlucken: sichtbare Meldung statt „wirkt wie 0 Treffer".
+        // Die Ansage besitzt jetzt #search-status; der sichtbare Text bleibt rein
+        // visuell (kein role=status), sonst läse der Screenreader ihn doppelt.
         results.replaceChildren();
+        results.setAttribute('aria-busy', 'false');
         const err = document.createElement('p');
         err.className = 'search-overlay__empty';
-        err.setAttribute('role', 'status');
         err.textContent = t('search.error');
         results.appendChild(err);
+        setStatus(t('search.error'));
       }
     }, 300);
   });
@@ -1811,7 +2162,7 @@ function renderSearchResults(container, data, onClose) {
     empty.className = 'search-overlay__empty';
     empty.textContent = t('search.noResults');
     container.appendChild(empty);
-    return;
+    return 0;
   }
 
   // Aktivitätstyp lokalisieren (Preset via labelKey, Freitext unverändert).
@@ -1820,7 +2171,7 @@ function renderSearchResults(container, data, onClose) {
     return preset ? t(preset.labelKey) : item.title;
   };
 
-  function makeSection(labelKey, items, routeFn, labelFn) {
+  function makeSection(labelKey, items, routeFn, labelFn, metaFn) {
     if (!items.length) return;
     const section = document.createElement('div');
     section.className = 'search-section';
@@ -1835,6 +2186,15 @@ function renderSearchResults(container, data, onClose) {
       title.className = 'search-result__title';
       title.textContent = labelFn ? labelFn(item) : item.title;
       btn.appendChild(title);
+      // Zweitzeile mit Datum/Detail: Treffer ohne jeden Kontext waren nicht
+      // unterscheidbar (Audit A1-14).
+      const metaText = metaFn?.(item);
+      if (metaText) {
+        const meta = document.createElement('span');
+        meta.className = 'search-result__meta';
+        meta.textContent = metaText;
+        btn.appendChild(meta);
+      }
       btn.addEventListener('click', () => {
         onClose();
         navigate(routeFn(item));
@@ -1844,13 +2204,19 @@ function renderSearchResults(container, data, onClose) {
     container.appendChild(section);
   }
 
-  makeSection('nav.tasks',    tasks,    (i) => `/tasks?open=${i.id}`);
-  makeSection('nav.calendar', events,   (i) => `/calendar?open=${i.id}`);
+  makeSection('nav.tasks',    tasks,    (i) => `/tasks?open=${i.id}`, null,
+    (i) => (i.due_date ? formatDate(i.due_date) : ''));
+  makeSection('nav.calendar', events,   (i) => `/calendar?open=${i.id}`, null,
+    (i) => (i.start_datetime ? `${formatDate(i.start_datetime)}${i.all_day ? '' : ` · ${formatTime(i.start_datetime)}`}` : ''));
   makeSection('nav.notes',    notes,    (i) => `/notes?open=${i.id}`);
   makeSection('nav.contacts', contacts, (i) => `/contacts?open=${i.id}`);
   makeSection('nav.shopping', items,    (i) => `/shopping?list=${i.list_id}&highlight=${i.id}`);
-  makeSection('health.tabs.meds',     meds,       () => '/health/meds');
-  makeSection('health.tabs.activity', activities, () => '/health/activity', activityLabel);
+  makeSection('health.tabs.meds',     meds,       () => '/health/meds', null,
+    (i) => i.dosage_text || '');
+  makeSection('health.tabs.activity', activities, () => '/health/activity', activityLabel,
+    (i) => (i.performed_at ? formatDate(i.performed_at) : ''));
+
+  return total;
 }
 
 // Read-only-Modus für ein Modul anwenden (#467): FAB via <html data-module-readonly>
@@ -1889,6 +2255,7 @@ function navItems() {
     { path: '/meals',     label: t('nav.meals'),     icon: 'utensils',      module: 'meals',    section: NAV_SECTION.household, kitchenGroup: true },
     { path: '/recipes',   label: t('nav.recipes'),   icon: 'book-text',     module: 'recipes',  section: NAV_SECTION.household, kitchenGroup: true },
     { path: '/shopping',  label: t('nav.shopping'),  icon: 'shopping-cart', module: 'shopping', section: NAV_SECTION.household, kitchenGroup: true },
+    { path: '/pantry',    label: t('nav.pantry'),    icon: 'archive',       module: 'pantry',   section: NAV_SECTION.household, kitchenGroup: true },
     { path: '/housekeeping', label: t('nav.housekeeping'), icon: 'paintbrush', module: 'housekeeping', section: NAV_SECTION.household },
     { path: '/documents', label: t('nav.documents'), icon: 'folder-lock',      module: 'documents',   section: NAV_SECTION.household },
     { path: '/rewards',   label: t('nav.rewards'),   icon: 'award',            module: 'rewards',     section: NAV_SECTION.household },
@@ -2101,6 +2468,23 @@ async function disableFailedThirdPartyModule(moduleId) {
   }
 }
 
+/**
+ * Akzent-Token-Name eines Moduls. Die vier Küchen-Module lösen gemeinsam auf
+ * --module-kitchen auf: sie sind EIN Modul mit einem Nav-Eintrag, und ein
+ * Farbwechsel beim Tabwechsel sendet dieselbe Botschaft wie ein Modulwechsel
+ * (Critique 2026-07-29). Ein Auflöser für alle Nav-Pfade - Bottom-Nav, Sidebar,
+ * More-Sheet und Streifen -, damit die Regel nicht viermal einzeln steht.
+ */
+function moduleAccentToken(mod) {
+  if (!mod) return '';
+  return isKitchenModule(mod) ? '--module-kitchen' : `--module-${mod}`;
+}
+
+function moduleAccentVar(mod) {
+  const token = moduleAccentToken(mod);
+  return token ? `var(${token})` : '';
+}
+
 function navItemEl({ path, navHref, label, icon, module: mod, accent, navId }) {
   const a = document.createElement('a');
   a.href = navHref ?? path;
@@ -2111,7 +2495,7 @@ function navItemEl({ path, navHref, label, icon, module: mod, accent, navId }) {
   a.setAttribute('aria-label', label);
   a.setAttribute('title', label);
   if (accent) a.style.setProperty('--item-module-accent', accent);
-  else if (mod) a.style.setProperty('--item-module-accent', `var(--module-${mod})`);
+  else if (mod) a.style.setProperty('--item-module-accent', moduleAccentVar(mod));
   const iconWrap = document.createElement('div');
   iconWrap.className = 'nav-item__icon-wrap';
   const well = document.createElement('div');
@@ -2137,13 +2521,16 @@ function navItemEl({ path, navHref, label, icon, module: mod, accent, navId }) {
   return a;
 }
 
-function kitchenNavButtonEl(item) {
+function kitchenNavButtonEl() {
   const kitchenBtn = document.createElement('button');
   kitchenBtn.className = 'nav-item nav-item--kitchen';
   kitchenBtn.id = 'kitchen-btn';
   kitchenBtn.type = 'button';
   kitchenBtn.dataset.navId = 'kitchen';
-  kitchenBtn.style.setProperty('--item-module-accent', `var(--module-${item.module || 'meals'})`);
+  // Konstant: EIN Eintrag, EIN Akzent. Vorher folgte er dem aktiven Sub-Tab und
+  // wechselte orange → teal → pink → oliv, obwohl der Nutzer das Modul nicht
+  // verlassen hat (Critique 2026-07-29).
+  kitchenBtn.style.setProperty('--item-module-accent', 'var(--module-kitchen)');
   kitchenBtn.setAttribute('aria-label', t('nav.kitchen'));
   kitchenBtn.setAttribute('title', t('nav.kitchen'));
 
@@ -2184,6 +2571,9 @@ function moreNavButtonEl() {
   moreBtn.style.setProperty('--item-module-accent', 'var(--color-accent)');
   moreBtn.setAttribute('aria-label', t('nav.more'));
   moreBtn.setAttribute('title', t('nav.more'));
+  // Öffnet das „Mehr"-Sheet (role=dialog): aria-haspopup kündigt das Popup an,
+  // aria-expanded/-controls spiegeln den Offen-Zustand (Audit P3, Sam-Persona).
+  moreBtn.setAttribute('aria-haspopup', 'dialog');
   moreBtn.setAttribute('aria-expanded', 'false');
   moreBtn.setAttribute('aria-controls', 'more-sheet');
 
@@ -2213,7 +2603,7 @@ function moreNavButtonEl() {
 }
 
 function mobileDestinationEl(item) {
-  return item.navId === 'kitchen' ? kitchenNavButtonEl(item) : navItemEl(item);
+  return item.navId === 'kitchen' ? kitchenNavButtonEl() : navItemEl(item);
 }
 
 function buildBottomNavItems(moreBtn = moreNavButtonEl()) {
@@ -2271,16 +2661,40 @@ function positionSidebarIndicator() {
     indicator.style.opacity = '0';
     return;
   }
-  const cr = container.getBoundingClientRect();
-  const ar = active.getBoundingClientRect();
-  // Pille (44px) vertikal im Item (48px) zentrieren — aus realen Höhen, token-unabhängig
-  const centerOffset = (ar.height - indicator.getBoundingClientRect().height) / 2;
-  indicator.style.transform = `translateY(${ar.top - cr.top + container.scrollTop + centerOffset}px)`;
+  // Aktives Item in den Sichtbereich holen (Audit F-01): bei überlaufender
+  // Liste lagen Item UND Pille sonst unsichtbar unterhalb der Falte — die
+  // Navigation verlor ihren „Du bist hier"-Anker. Manuelles Scrollen statt
+  // scrollIntoView, damit garantiert nur dieser Container scrollt. Nur wenn das
+  // Item wirklich außerhalb liegt: rebuildNavigation() stellt die Scroll-Position
+  // vorher wieder her, ein sichtbares Item wird also nie mehr verschoben.
+  const margin = 8;
+  const top = active.offsetTop;
+  const bottom = top + active.offsetHeight;
+  if (top < container.scrollTop + margin) {
+    container.scrollTop = Math.max(0, top - margin);
+  } else if (bottom > container.scrollTop + container.clientHeight - margin) {
+    container.scrollTop = bottom - container.clientHeight + margin;
+  }
+  // Pille vertikal im Item zentrieren — aus realen Höhen, token-unabhängig.
+  // offsetTop ist scroll-unabhängig relativ zum (position:relative) Container.
+  const centerOffset = (active.offsetHeight - indicator.getBoundingClientRect().height) / 2;
+  indicator.style.transform = `translateY(${top + centerOffset}px)`;
   indicator.style.opacity = '';
 }
 
+// Seitliche Luft zur Slot-Kante und Maximalbreite der Aktiv-Kapsel. Eine
+// slot-breite Pille lief im ersten/letzten Tab bis an die Bar-Kante, wo ihre
+// Rundung gekappt wurde (#569-Nachtrag); begrenzt bleibt sie eine Kapsel hinter
+// dem Icon statt einer randlosen Kachel.
+const TAB_INDICATOR_INSET = 4;
+const TAB_INDICATOR_MAX_WIDTH = 64;
+
 /**
  * Positioniert den gleitenden Indikator in der mobilen Tab-Bar.
+ *
+ * Vertikal an der Icon-Well ausgerichtet (nicht über die ganze Bar-Höhe), damit
+ * die Label-Grundlinie frei bleibt und die Kapsel weder in die Safe-Area noch
+ * an die Bar-Kante läuft.
  */
 function positionTabIndicator() {
   const nav = document.querySelector('.nav-bottom');
@@ -2295,8 +2709,19 @@ function positionTabIndicator() {
   }
   const nr = nav.getBoundingClientRect();
   const ar = active.getBoundingClientRect();
-  indicator.style.width = `${ar.width}px`;
-  indicator.style.transform = `translateX(${ar.left - nr.left}px)`;
+  const well = active.querySelector('.nav-item__icon-well');
+  const wr = well ? well.getBoundingClientRect() : ar;
+  const width = Math.max(
+    wr.width,
+    Math.min(ar.width - TAB_INDICATOR_INSET * 2, TAB_INDICATOR_MAX_WIDTH),
+  );
+  // clientTop: der Indikator sitzt in der Padding-Box der Bar, das Rect an der
+  // Border-Kante - ohne den Abzug sitzt die Kapsel 1px zu tief.
+  const top = wr.top - nr.top - nav.clientTop;
+  const left = ar.left - nr.left + (ar.width - width) / 2;
+  indicator.style.width = `${width}px`;
+  indicator.style.height = `${wr.height}px`;
+  indicator.style.transform = `translate(${left}px, ${top}px)`;
   indicator.style.opacity = '';
 }
 
@@ -2323,7 +2748,7 @@ function moreItemEl({ path, navHref, label, icon, module: mod, accent, navId }) 
   if (navHref) a.dataset.navHref = navHref;
   a.className = 'more-item';
   if (accent) a.style.setProperty('--item-module-accent', accent);
-  else if (mod) a.style.setProperty('--item-module-accent', `var(--module-${mod})`);
+  else if (mod) a.style.setProperty('--item-module-accent', moduleAccentVar(mod));
   const well = document.createElement('div');
   well.className = 'more-item__icon-well';
   const iconFactory = NAV_ICONS[icon];
@@ -2378,7 +2803,7 @@ function setMoreButtonState(moreBtn, activeSecondary) {
     if (activeSecondary.accent) {
       moreBtn.style.setProperty('--item-module-accent', activeSecondary.accent);
     } else if (activeSecondary.module) {
-      moreBtn.style.setProperty('--item-module-accent', `var(--module-${activeSecondary.module})`);
+      moreBtn.style.setProperty('--item-module-accent', moduleAccentVar(activeSecondary.module));
     }
   } else {
     moreBtn.removeAttribute('aria-current');
@@ -2411,14 +2836,12 @@ function updateNav(path) {
   if (kitchenNavBtn) {
     const isKitchen = isKitchenRoute(path);
     kitchenNavBtn.classList.toggle('nav-item--active', isKitchen);
+    // Der Akzent ist konstant (--module-kitchen, in kitchenNavButtonEl gesetzt)
+    // und wird hier nicht mehr je aktivem Sub-Tab nachgezogen.
     if (isKitchen) {
       kitchenNavBtn.setAttribute('aria-current', 'page');
-      const kitchenMod = navItems().find((n) => n.path === getLastKitchenRoute())?.module;
-      if (kitchenMod) kitchenNavBtn.style.setProperty('--item-module-accent', `var(--module-${kitchenMod})`);
     } else {
       kitchenNavBtn.removeAttribute('aria-current');
-      const kitchenMod = navItems().find((n) => n.path === getLastKitchenRoute())?.module;
-      kitchenNavBtn.style.setProperty('--item-module-accent', `var(--module-${kitchenMod || 'meals'})`);
     }
 
     const kitchenBtnLabel = kitchenNavBtn.querySelector('.nav-item__label');
@@ -2432,8 +2855,6 @@ function updateNav(path) {
     const isKitchen = isKitchenRoute(path);
     if (isKitchen) {
       sidebarKitchenNav.setAttribute('aria-current', 'page');
-      const kitchenMod = navItems().find((n) => n.path === getLastKitchenRoute())?.module;
-      if (kitchenMod) sidebarKitchenNav.style.setProperty('--item-module-accent', `var(--module-${kitchenMod})`);
     } else {
       sidebarKitchenNav.removeAttribute('aria-current');
     }
@@ -2477,8 +2898,38 @@ function renderError(container, err) {
   btn.textContent = t('common.reload');
   btn.addEventListener('click', () => location.reload());
   state.append(title, desc, btn);
+
+  // „Ein unerwarteter Fehler ist aufgetreten" sagt niemandem, was kaputt ist -
+  // die einzige verwertbare Information (Name, Meldung, Stack) lag bisher nur in
+  // der Browserkonsole. Zugeklappt beigelegt stört sie das Layout nicht, ist
+  // aber ohne DevTools erreichbar und kopierbar.
+  const detailText = errorDetails(err);
+  if (detailText) {
+    const details = document.createElement('details');
+    details.className = 'empty-state__details';
+    const summary = document.createElement('summary');
+    summary.textContent = t('common.errorDetails');
+    const pre = document.createElement('pre');
+    pre.textContent = detailText;
+    details.append(summary, pre);
+    state.append(details);
+  }
+
   container.replaceChildren(state);
   state.focus({ preventScroll: true });
+}
+
+/**
+ * Technische Fehlerbeschreibung für die aufklappbaren Details. Bewusst roh
+ * (nicht übersetzt): der Text ist zum Weitergeben in einem Bugreport da.
+ */
+function errorDetails(err) {
+  if (!err) return '';
+  const head = [err.name, err.message].filter(Boolean).join(': ');
+  const stack = typeof err.stack === 'string' ? err.stack.trim() : '';
+  // Manche Engines wiederholen "Name: Message" als erste Stack-Zeile.
+  if (stack) return stack.startsWith(head) ? stack : `${head}\n${stack}`;
+  return head || String(err);
 }
 
 // --------------------------------------------------------
@@ -2532,8 +2983,14 @@ function showToast(message, type = 'default', duration = 3000, onUndo = null) {
   const container = document.getElementById(containerId);
   if (!container) return;
 
-  // Long Loop: Success-Toasts nach TOAST_SUCCESS_MAX Aufrufen unterdrücken
-  if (type === 'success' && typeof onUndo !== 'function') {
+  // Aktions-Button: Legacy-Undo (Funktion) oder benannte Aktion ({ label, onClick }).
+  const action = typeof onUndo === 'function'
+    ? { label: t('common.undo'), onClick: onUndo }
+    : (onUndo && typeof onUndo.onClick === 'function' ? onUndo : null);
+
+  // Long Loop: Success-Toasts nach TOAST_SUCCESS_MAX Aufrufen unterdrücken.
+  // Aktions-Toasts (Undo oder benannte Aktion) sind wichtig → nie unterdrücken.
+  if (type === 'success' && !action) {
     const successCount = parseInt(localStorage.getItem(TOAST_SUCCESS_KEY) ?? '0', 10) + 1;
     localStorage.setItem(TOAST_SUCCESS_KEY, String(successCount));
     if (successCount > TOAST_SUCCESS_MAX) return;
@@ -2553,16 +3010,16 @@ function showToast(message, type = 'default', duration = 3000, onUndo = null) {
   span.textContent = message;
   toast.appendChild(span);
 
-  if (typeof onUndo === 'function') {
-    const undoBtn = document.createElement('button');
-    undoBtn.className = 'toast__undo';
-    undoBtn.textContent = t('common.undo');
-    undoBtn.addEventListener('click', () => {
+  if (action) {
+    const actionBtn = document.createElement('button');
+    actionBtn.className = 'toast__undo';
+    actionBtn.textContent = action.label;
+    actionBtn.addEventListener('click', () => {
       clearTimeout(dismissTimer);
       toast.remove();
-      onUndo();
+      action.onClick();
     });
-    toast.appendChild(undoBtn);
+    toast.appendChild(actionBtn);
   }
 
   container.appendChild(toast);
@@ -2639,8 +3096,12 @@ window.addEventListener('unhandledrejection', (e) => {
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('message', (e) => {
     if (e.data?.type === 'SW_UPDATED') {
-      // Modul-Cache leeren damit nächste Navigation frische Module lädt
-      moduleCache.clear();
+      // Ab hier keine Seitenmodule mehr nachladen. Früher wurde an dieser Stelle
+      // der Modul-Cache dieses Routers geleert, damit die nächste Navigation
+      // frische Module lädt - wirkungslos: geleert wurde nur die eigene Map,
+      // während die Modul-Map des Dokuments die alten Abhängigkeiten weiter
+      // auflöst. Genau daraus entstand der Mischzustand aus #616.
+      shellStale = true;
       showToast(t('common.updateAvailable'), 'default', 8000);
       setTimeout(() => location.reload(), 8000);
     }
@@ -2658,6 +3119,9 @@ window.addEventListener('auth:expired', () => {
   // Offline-API-Cache leeren: Session-Ende → keine gecachten Daten zurücklassen,
   // die der nächste Nutzer am selben Gerät offline sehen könnte.
   clearApiCache();
+  // Gemerkte Scrollstände gehören zur Sitzung: der nächste Nutzer am selben
+  // Gerät soll nicht auf den Positionen des vorigen landen.
+  forgetScrollPositions();
   stopThirdPartyModulePolling();
   stopReminders();
   stopPush();
@@ -2689,10 +3153,23 @@ function rebuildNavigation({ updateLabels = true } = {}) {
   }
 
   if (navSidebarItems) {
+    // replaceChildren recria toda a árvore da navegação (por exemplo, após
+    // replaceChildren baut die Navigation komplett neu (Routenwechsel, Sprache,
+    // Modulliste) und der Browser setzt die Scroll-Position dabei auf 0 zurück.
+    // Ohne Sicherung sprang die Liste bei jedem Rebuild an den Anfang und das
+    // Auto-Scroll unten riss sie sofort wieder zum aktiven Item — sichtbar als
+    // Springen zwischen erstem und letztem Eintrag.
+    const previousScrollTop = navSidebarItems.scrollTop;
     const sidebarEls = sidebarNavItems();
     navSidebarItems.replaceChildren(...sidebarEls);
     if (window.lucide) window.lucide.createIcons({ el: navSidebarItems });
-    requestAnimationFrame(() => positionSidebarIndicator());
+    requestAnimationFrame(() => {
+      navSidebarItems.scrollTop = Math.min(
+        previousScrollTop,
+        Math.max(0, navSidebarItems.scrollHeight - navSidebarItems.clientHeight),
+      );
+      positionSidebarIndicator();
+    });
   }
   if (bottomItems) {
     const moreBtn = bottomItems.querySelector('#more-btn') ?? moreNavButtonEl();
@@ -2808,7 +3285,19 @@ if (/iPhone|iPad|iPod/.test(navigator.userAgent)) {
     } else {
       document.documentElement.removeAttribute('data-theme');
     }
-    
+
+    // Theme „Automatisch" (kein data-theme) folgt prefers-color-scheme rein per
+    // CSS - applyTheme() feuert dabei nie. Der Modul-Akzent im Inline-Style
+    // bliebe also beim Sonnenuntergang des Systems auf dem Hellmodus-Wert
+    // stehen: derselbe Kontrast-Bruch wie beim manuellen Umschalten, nur ohne
+    // Nutzeraktion. Der Listener zieht ihn nach; bei explizitem Theme ist der
+    // Aufruf idempotent (dieselbe Farbe wird erneut aufgelöst). Die Statusbar
+    // hängt an derselben Momentaufnahme, siehe refreshThemeColorForTheme.
+    darkSchemeQuery?.addEventListener?.('change', () => {
+      applyModuleAccentForRoute(currentRoute());
+      refreshThemeColorForTheme();
+    });
+
     await initI18n();
     try {
       const v = await api.get('/version');
@@ -2839,7 +3328,6 @@ window.yuvomi = {
   refreshThirdPartyModules,
   isModuleDisabled,
   applyTheme: (value) => {
-    localStorage.setItem('yuvomi-theme', value);
     if (value === 'dark') {
       document.documentElement.setAttribute('data-theme', 'dark');
     } else if (value === 'light') {
@@ -2847,10 +3335,28 @@ window.yuvomi = {
     } else {
       document.documentElement.removeAttribute('data-theme');
     }
+    // Der Modul-Akzent liegt als aufgelöste Farbe im Inline-Style von <html> und
+    // folgt der CSS-Kaskade daher NICHT. Ohne dieses Nachziehen behielte die
+    // ganze Shell (Buttons, Fokusringe, FAB, aktive Nav-Pille) den Akzent des
+    // vorherigen Themes. Begründung an applyModuleAccentForRoute.
+    applyModuleAccentForRoute(currentRoute());
+    // Die Statusbar im Standalone-Modus trägt dieselbe eingefrorene
+    // Momentaufnahme, siehe refreshThemeColorForTheme.
+    refreshThemeColorForTheme();
+    // Persistenz zuletzt und fehlertolerant: ein werfendes localStorage (Safari
+    // Privatmodus, Quota) darf das sichtbare Anwenden nicht abbrechen. Vorher
+    // stand diese Zeile zuerst - warf sie, fiel der Aufrufer in den
+    // Einstellungen auf ein direktes data-theme zurück und liess den Akzent
+    // stehen. Derselbe Schlüssel wird dort ohnehin über safeStorageSet
+    // geschrieben, hier geht also nichts verloren.
+    try {
+      localStorage.setItem('yuvomi-theme', value);
+    } catch {
+      // Theme gilt für diese Sitzung, überlebt den Reload aber nicht.
+    }
   },
   restoreThemeColor: () => {
-    const route = allRoutes().find((r) => r.path === currentPath);
-    updateThemeColorForRoute(route);
+    updateThemeColorForRoute(currentRoute());
   },
   // Client-seitigen Sitzungszustand nach einem bewussten Logout zurücksetzen,
   // damit die anschließende navigate('/login') nicht am currentUser-Guard
@@ -2859,6 +3365,7 @@ window.yuvomi = {
   clearSession: () => {
     currentUser = null;
     _navBuiltForUserId = null;
+    forgetScrollPositions();
     stopThirdPartyModulePolling();
     stopReminders();
     stopPush();

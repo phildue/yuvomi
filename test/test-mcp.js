@@ -137,6 +137,11 @@ test('tools/list: listet Kern-Tools, Budget/Meals-Tools und OpenAPI-Brücken-Too
   assert.equal(res.result.tools.length, TOOL_DEFINITIONS.length);
   for (const t of res.result.tools) {
     assert.equal(t.inputSchema.type, 'object', `${t.name} braucht ein object-Schema`);
+    // Issue #599: Properties ohne `type` werden von manchen Clients zu Strings
+    // koerziert — jede Property muss ihren Typ deklarieren.
+    for (const [prop, schema] of Object.entries(t.inputSchema.properties || {})) {
+      assert.ok(schema.type, `${t.name}.${prop} braucht ein deklariertes type`);
+    }
   }
 });
 
@@ -215,6 +220,22 @@ test('tools/call create_task: legt Task an und gibt sie zurück', async () => {
   assert.equal(row.created_by, uid, 'created_by muss der Actor sein');
 });
 
+test('tools/call create_task: ohne Kategorie fällt auf den Key misc, nicht auf Sonstiges', async () => {
+  // 'Sonstiges' war der Anzeigename der Auffangkategorie vor v83, nie ein Key in
+  // task_categories. Der alte Fallback ließ jede per MCP erzeugte Aufgabe aus
+  // Dropdown und Filter fallen und sie beim ersten Speichern im Modal still auf
+  // die erste echte Kategorie springen. Migration v114 hat den Bestand geputzt -
+  // ohne diesen Guard liefert die Tool-Schicht ihn weiter nach.
+  // priority explizit: die Test-DB hier steht auf dem v1-Schema, dessen
+  // CHECK-Constraint den späteren Wert 'none' noch nicht kennt. Das ist eine
+  // eigene Baustelle (server/db-schema-test.js endet bei v97) und soll diesen
+  // Guard nicht mit einem fremden Fehlschlag verdecken.
+  const res = await toolCall('create_task', { title: 'Ohne Kategorie', priority: 'low' });
+  assert.equal(res.result.isError, false);
+  const task = parseContent(res);
+  assert.equal(task.category, 'misc');
+});
+
 test('tools/call create_task: fehlender Titel → isError mit Meldung', async () => {
   const res = await toolCall('create_task', {});
   assert.equal(res.result.isError, true);
@@ -234,6 +255,60 @@ test('tools/call list_tasks: enthält den neu angelegten Task', async () => {
   assert.equal(res.result.isError, false);
   const tasks = parseContent(res);
   assert.ok(tasks.some((t) => t.title === 'Müll rausbringen'), 'neuer Task muss gelistet sein');
+});
+
+test('tools/call create_task + list_tasks: Tags reisen mit (#586)', async () => {
+  const created = await toolCall('create_task', {
+    title: 'Rasen mähen', priority: 'low', tags: ['Garten', 'Sommer'],
+  });
+  assert.equal(created.result.isError, false);
+  assert.deepEqual(parseContent(created).tags, ['Garten', 'Sommer']);
+
+  const listed = parseContent(await toolCall('list_tasks', {}));
+  const row = listed.find((t) => t.title === 'Rasen mähen');
+  // Als Liste, nicht als verbundene Zeichenkette: ein Tag darf selbst ein Komma
+  // enthalten ("Haus, Hof"), verbunden wäre er nicht mehr eindeutig trennbar.
+  assert.deepEqual(row.tags, ['Garten', 'Sommer']);
+});
+
+test('tools/call list_tasks: der tag-Filter engt UND-verknüpft ein', async () => {
+  await toolCall('create_task', { title: 'Nur Garten', priority: 'low', tags: ['Garten'] });
+
+  const beide = parseContent(await toolCall('list_tasks', { tag: ['Garten', 'Sommer'] }));
+  assert.deepEqual(beide.map((t) => t.title), ['Rasen mähen'],
+    'Eine Aufgabe muss alle genannten Tags tragen');
+
+  const einer = parseContent(await toolCall('list_tasks', { tag: ['garten'] }));
+  assert.equal(einer.length, 2, 'Die Schreibweise zählt beim Filtern nicht');
+});
+
+test('tools/call list_tasks: private Aufgaben anderer bleiben verborgen (#474)', async () => {
+  // Diese Prüfung fehlte, obwohl die Termin-Abfrage sie führt und docs/SPEC.md
+  // sie für MCP zusagt: ein Token sah jede private Aufgabe des Haushalts. Mit
+  // den Tags käme deren Freitext gleich mit.
+  const other = db.prepare(
+    `INSERT INTO users (username, display_name, password_hash, avatar_color, role)
+     VALUES ('bob', 'Bob', 'x', '#FF0000', 'member')`
+  ).run().lastInsertRowid;
+  db.prepare(
+    `INSERT INTO tasks (title, created_by, status, visibility) VALUES (?, ?, 'open', 'private')`
+  ).run('Geschenk für Anna', other);
+
+  const seenByAnna = await callTool({ db, actor }, 'list_tasks', {});
+  assert.equal(seenByAnna.some((t) => t.title === 'Geschenk für Anna'), false);
+  // Gegenprobe: die Ersteller:in sieht sie sehr wohl.
+  const seenByBob = await callTool({ db, actor: { id: other, role: 'member' } }, 'list_tasks', {});
+  assert.equal(seenByBob.some((t) => t.title === 'Geschenk für Anna'), true);
+});
+
+test('tools/call list_tasks: ein unsinniger tag-Filter wird abgewiesen', async () => {
+  // Die gefährliche Richtung: callTool erzwingt das JSON-Schema zur Laufzeit
+  // nicht, und normalizeTags macht aus einem Objekt stillschweigend eine leere
+  // Liste. Ein einschränkender Filter lieferte damit die VOLLE Liste statt
+  // eines Fehlers, und eine Automatisierung handelte an fremden Aufgaben.
+  const res = await toolCall('list_tasks', { tag: { nope: 1 } });
+  assert.equal(res.result.isError, true);
+  assert.match(res.result.content[0].text, /tag/i);
 });
 
 // ── Shopping ─────────────────────────────────────────────────────────────────
@@ -624,6 +699,41 @@ test('call_api_operation POST: sendet JSON-Payload mit Content-Type', async () =
     assert.equal(calls[0].options.method, 'POST');
     assert.equal(calls[0].options.headers['Content-Type'], 'application/json');
     assert.deepEqual(JSON.parse(calls[0].options.body), { title: 'Neu' });
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+// Issue #599: Clients, die Tool-Argumente typkoerzieren, schicken das Payload als
+// JSON-String. Ohne Durchreichen entstünde ein doppelt kodiertes String-Primitive,
+// das `express.json({ strict: true })` mit „Invalid JSON in request body" ablehnt.
+test('call_api_operation POST: string-serialisiertes Payload wird nicht doppelt kodiert', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: { id: 8, title: 'Neu' } }));
+  try {
+    const res = await toolCallWithHeaders(
+      'call_api_operation',
+      { operation_key: 'post_tasks', payload: '{"title":"Neu"}' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls[0].options.headers['Content-Type'], 'application/json');
+    assert.deepEqual(JSON.parse(calls[0].options.body), { title: 'Neu' });
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('call_api_operation POST: unparsbares String-Payload → isError (kein fetch)', async () => {
+  const calls = installFetchMock(() => jsonResponse({}));
+  try {
+    const res = await toolCallWithHeaders(
+      'call_api_operation',
+      { operation_key: 'post_tasks', payload: 'Neu' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /payload must be a JSON object/i);
+    assert.equal(calls.length, 0, 'ungültiges Payload darf keinen Request auslösen');
   } finally {
     global.fetch = realFetch;
   }

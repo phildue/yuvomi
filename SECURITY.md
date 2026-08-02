@@ -33,13 +33,16 @@ Vulnerabilities that require physical access to the host or root on the server a
   which would cause 401 errors on login. CSRF risk is mitigated by the
   Double Submit Cookie pattern listed below and the `Secure` flag.)
 - CSRF protection via Double Submit Cookie on all state-changing requests
-- Passwords hashed with bcrypt v6 (cost factor 12)
+- Passwords hashed with bcrypt v6 (cost factor 12). Passwords are Unicode-normalized to NFC before hashing and verification, so non-ASCII characters (umlauts, accents) authenticate identically regardless of how the browser normalizes the input. Hashes created before this normalization are still accepted and are silently re-hashed to NFC on the next successful login
 - Login rate limiting (5 attempts/min per IP)
 - API rate limiting (300 requests/min per IP)
 - Content Security Policy via Helmet (`self`-only)
-- Optional SQLCipher AES-256 database encryption (built into the official Docker image; enable by setting `DB_ENCRYPTION_KEY`. Bare-metal installs require a SQLCipher-enabled build of better-sqlite3.)
+- Optional SQLCipher AES-256 database encryption, enabled by setting `DB_ENCRYPTION_KEY`. The cipher ships inside the `better-sqlite3-multiple-ciphers` binding, so Docker and bare-metal installs are covered alike and no system SQLCipher is required. If the key is set but encryption is unavailable, or the file on disk is still plaintext, the app refuses to start instead of silently storing data unencrypted. An existing unencrypted database is migrated once on startup, leaving a `*.plaintext-backup` copy behind that you should delete after verifying the migration
 - Existing WebDAV documents protect their connection configuration: changing the URL, username, password, or base path requires explicit admin confirmation and a successful read test against an existing object; required connection data cannot be removed while WebDAV documents exist
 - UI-managed WebDAV document-storage URLs are protected against SSRF: private, loopback, link-local, internal-DNS, and DNS-rebinding targets are rejected before persistence and during socket lookup. Trusted private-network targets require the deployment-controlled `DOCUMENT_STORAGE_WEBDAV_URL` override
+- Google Drive document storage requests only `drive.file`, creates no public permissions, and uses a Drive-specific redirect URI, session OAuth state and `document_storage_google_drive_*` token namespace. Calendar token and state records are never reused or broadened
+- Drive OAuth tokens, codes, folder IDs and raw Google responses are never returned by the API or intentionally logged. Disconnect deletes local Drive state without calling Google's revocation endpoint, so shared Calendar credentials are not revoked
+- Reconnection validates the candidate account and access to an existing Drive-backed file before atomically replacing working tokens. Disconnect is blocked while Drive is selected or referenced by documents; connecting Drive never activates it for uploads
 - Subscription logo discovery is SSRF-protected: only public HTTPS targets are fetched, every redirect is re-validated, and remote image responses are size/type constrained
 - No API endpoint accessible without session auth (except login)
 - `SESSION_SECRET` is mandatory - server refuses to start if unset
