@@ -998,6 +998,7 @@
         "accountType_other": "其他",
         "viewAccountTransactions": "查看{{name}}的交易",
         "viewCategoryTransactions": "查看{{name}}分类的交易",
+        "viewSubcategoryTransactions": "查看{{name}}子分类的交易",
         "currentBalance": "当前余额",
         "clearAccountFilter": "清除账户筛选",
         "clearCategoryFilter": "清除分类筛选",

@@ -1005,6 +1005,7 @@
         "accountType_other": "Inne",
         "viewAccountTransactions": "Pokaż operacje konta {{name}}",
         "viewCategoryTransactions": "Pokaż operacje kategorii {{name}}",
+        "viewSubcategoryTransactions": "Pokaż operacje podkategorii {{name}}",
         "currentBalance": "Bieżące saldo",
         "clearAccountFilter": "Usuń filtr konta",
         "clearCategoryFilter": "Usuń filtr kategorii",

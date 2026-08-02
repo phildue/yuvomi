@@ -1005,6 +1005,7 @@
         "accountType_other": "기타",
         "viewAccountTransactions": "{{name}} 거래 내역 보기",
         "viewCategoryTransactions": "{{name}} 카테고리 거래 내역 보기",
+        "viewSubcategoryTransactions": "{{name}} 하위 카테고리 거래 내역 보기",
         "currentBalance": "현재 잔액",
         "clearAccountFilter": "계좌 필터 해제",
         "clearCategoryFilter": "카테고리 필터 해제",

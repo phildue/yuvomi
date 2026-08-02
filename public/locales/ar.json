@@ -998,6 +998,7 @@
         "accountType_other": "أخرى",
         "viewAccountTransactions": "عرض حركات {{name}}",
         "viewCategoryTransactions": "عرض حركات فئة {{name}}",
+        "viewSubcategoryTransactions": "عرض حركات الفئة الفرعية {{name}}",
         "currentBalance": "الرصيد الحالي",
         "clearAccountFilter": "إزالة تصفية الحساب",
         "clearCategoryFilter": "إزالة تصفية الفئة",

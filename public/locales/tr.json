@@ -998,6 +998,7 @@
         "accountType_other": "Diğer",
         "viewAccountTransactions": "{{name}} hareketlerini göster",
         "viewCategoryTransactions": "{{name}} kategorisi hareketlerini göster",
+        "viewSubcategoryTransactions": "{{name}} alt kategorisi hareketlerini göster",
         "currentBalance": "Güncel bakiye",
         "clearAccountFilter": "Hesap filtresini kaldır",
         "clearCategoryFilter": "Kategori filtresini kaldır",

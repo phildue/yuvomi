@@ -998,6 +998,7 @@
         "accountType_other": "Άλλο",
         "viewAccountTransactions": "Εμφάνιση κινήσεων του {{name}}",
         "viewCategoryTransactions": "Εμφάνιση κινήσεων της κατηγορίας {{name}}",
+        "viewSubcategoryTransactions": "Εμφάνιση κινήσεων της υποκατηγορίας {{name}}",
         "currentBalance": "Τρέχον υπόλοιπο",
         "clearAccountFilter": "Κατάργηση φίλτρου λογαριασμού",
         "clearCategoryFilter": "Κατάργηση φίλτρου κατηγορίας",

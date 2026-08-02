@@ -998,6 +998,7 @@
         "accountType_other": "Egyéb",
         "viewAccountTransactions": "{{name}} tételeinek megjelenítése",
         "viewCategoryTransactions": "{{name}} kategória tételeinek megjelenítése",
+        "viewSubcategoryTransactions": "{{name}} alkategória tételeinek megjelenítése",
         "currentBalance": "Aktuális egyenleg",
         "clearAccountFilter": "Számlaszűrő törlése",
         "clearCategoryFilter": "Kategóriaszűrő törlése",

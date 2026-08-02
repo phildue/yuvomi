@@ -158,6 +158,7 @@ let state = {
   netWorth:    0,
   accountFilterId: null,      // aktiver Konto-Filter für die Transaktionsliste (Drilldown)
   categoryFilterKey: null,    // aktiver Kategorie-Filter für die Transaktionsliste (Drilldown aus dem Balkendiagramm)
+  subcategoryFilterKey: null, // aktiver Subkategorie-Filter (nur gültig innerhalb der aktiven Kategorie; klappt deren Subkategorien-Balken auf)
   typeFilter: null,           // 'income' | 'expenses' | null — Drilldown aus den Einnahmen/Ausgaben-Kacheln (rein clientseitig, kein Server-Roundtrip nötig)
   accountsShowArchived: false,
   activeTab:   'budget',
@@ -205,9 +206,11 @@ async function loadMonth(month) {
   // Kategorie-Drilldown: Transaktionsliste optional auf eine Kategorie filtern
   // (Klick auf einen Balken im Kategorien-Diagramm). Beide Filter sind kombinierbar.
   const categoryQuery = state.categoryFilterKey ? `&category=${encodeURIComponent(state.categoryFilterKey)}` : '';
+  // Subkategorie-Drilldown: nur gültig innerhalb einer aktiven Kategorie (siehe Klick-Handler).
+  const subcategoryQuery = state.subcategoryFilterKey ? `&subcategory=${encodeURIComponent(state.subcategoryFilterKey)}` : '';
   try {
     const [entriesRes, summaryRes, prevSummaryRes, loansRes] = await Promise.all([
-      api.get(`/budget?month=${month}${accountQuery}${categoryQuery}`),
+      api.get(`/budget?month=${month}${accountQuery}${categoryQuery}${subcategoryQuery}`),
       api.get(`/budget/summary?month=${month}`),
       api.get(`/budget/summary?month=${prevMonth}`),
       api.get('/budget/loans'),
@@ -221,7 +224,7 @@ async function loadMonth(month) {
     console.error('[Budget] loadMonth Fehler:', err);
     state.month       = month;
     state.entries     = [];
-    state.summary     = { income: 0, expenses: 0, balance: 0, byCategory: [] };
+    state.summary     = { income: 0, expenses: 0, balance: 0, byCategory: [], bySubcategory: [] };
     state.prevSummary = null;
     state.loans       = { loans: [], summary: { active_count: 0, remaining_amount: 0, remaining_installments: 0 } };
     window.yuvomi?.showToast(t('budget.loadError'), 'danger');
@@ -330,7 +333,7 @@ export async function render(container, { user }) {
     // Nachladen pro Monatswechsel). Namensliste versorgt die Transaktions-Meta.
     await Promise.all([loadMonth(state.month), loadAccounts()]);
   } else {
-    state.summary = { income: 0, expenses: 0, balance: 0, byCategory: [] };
+    state.summary = { income: 0, expenses: 0, balance: 0, byCategory: [], bySubcategory: [] };
     state.prevSummary = null;
     state.entries = [];
   }
@@ -535,7 +538,7 @@ function renderBody() {
           <button class="budget-account-chip" id="budget-clear-category-filter" type="button"
                   aria-label="${t('budget.clearCategoryFilter')}">
             <i data-lucide="tag" class="icon-xs" aria-hidden="true"></i>
-            <span>${esc(categoryLabel(state.categoryFilterKey))}</span>
+            <span>${esc(categoryLabel(state.categoryFilterKey))}${state.subcategoryFilterKey ? ` · ${esc(subcategoryLabel(state.subcategoryFilterKey))}` : ''}</span>
             <i data-lucide="x" class="icon-xs" aria-hidden="true"></i>
           </button>` : ''}
           ${state.typeFilter ? `
@@ -576,6 +579,7 @@ function renderBody() {
   });
   _container.querySelector('#budget-clear-category-filter')?.addEventListener('click', async () => {
     state.categoryFilterKey = null;
+    state.subcategoryFilterKey = null;
     await loadMonth(state.month);
     renderBody();
   });
@@ -594,6 +598,17 @@ function renderBody() {
     row.addEventListener('click', async () => {
       const key = row.dataset.category;
       state.categoryFilterKey = state.categoryFilterKey === key ? null : key;
+      // Subkategorie gehört zur vorher aktiven Kategorie — beim Wechsel/Abwählen
+      // der Kategorie ist sie nicht mehr gültig.
+      state.subcategoryFilterKey = null;
+      await loadMonth(state.month);
+      renderBody();
+    });
+  });
+  _container.querySelectorAll('.budget-bar-row[data-subcategory]').forEach((row) => {
+    row.addEventListener('click', async () => {
+      const key = row.dataset.subcategory;
+      state.subcategoryFilterKey = state.subcategoryFilterKey === key ? null : key;
       await loadMonth(state.month);
       renderBody();
     });
@@ -667,6 +682,10 @@ function renderCategoryBars(byCategory) {
     const cls       = isExpense ? 'budget-bar-row__fill--expenses' : 'budget-bar-row__fill--income';
     const label     = categoryLabel(c.category);
     const isActive  = state.categoryFilterKey === c.category;
+    // Subkategorien-Balken klappen nur unter der gerade aktiven (angeklickten)
+    // Kategorie auf — Einnahmen haben keine Subkategorien, byCategory-Zeilen dafür
+    // liefern also nie Treffer in subcategoriesFor().
+    const subcats   = isActive ? subcategoriesFor(c.category) : [];
 
     return `
       <button type="button" class="budget-bar-row budget-bar-row--clickable${isActive ? ' is-active' : ''}"
@@ -680,8 +699,41 @@ function renderCategoryBars(byCategory) {
           ${isExpense ? '' : '+'}${formatAmount(c.total)}
         </div>
       </button>
+      ${subcats.length ? renderSubcategoryBars(subcats) : ''}
     `;
   }).join('');
+}
+
+function subcategoriesFor(categoryKey) {
+  return (state.summary.bySubcategory ?? []).filter((s) => s.category === categoryKey);
+}
+
+function renderSubcategoryBars(subcats) {
+  const maxAbs = Math.max(...subcats.map((s) => Math.abs(s.total)), 1);
+
+  const rows = subcats.map((s) => {
+    const isExpense = s.total < 0;
+    const pct       = Math.round((Math.abs(s.total) / maxAbs) * 100);
+    const cls       = isExpense ? 'budget-bar-row__fill--expenses' : 'budget-bar-row__fill--income';
+    const label     = subcategoryLabel(s.subcategory);
+    const isActive  = state.subcategoryFilterKey === s.subcategory;
+
+    return `
+      <button type="button" class="budget-bar-row budget-bar-row--sub budget-bar-row--clickable${isActive ? ' is-active' : ''}"
+              data-subcategory="${esc(s.subcategory)}" aria-pressed="${isActive}"
+              aria-label="${esc(t('budget.viewSubcategoryTransactions', { name: label }))}">
+        <div class="budget-bar-row__label" title="${esc(label)}">${esc(label)}</div>
+        <div class="budget-bar-row__track">
+          <div class="budget-bar-row__fill ${cls}" style="--bar-scale:${pct / 100}"></div>
+        </div>
+        <div class="budget-bar-row__amount" style="color:${isExpense ? 'var(--color-danger)' : 'var(--color-success)'};">
+          ${isExpense ? '' : '+'}${formatAmount(s.total)}
+        </div>
+      </button>
+    `;
+  }).join('');
+
+  return `<div class="budget-subchart">${rows}</div>`;
 }
 
 function renderEntries() {
