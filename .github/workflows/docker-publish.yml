@@ -9,6 +9,7 @@ on:
 permissions:
   contents: read
   packages: write
+  actions: read
 
 env:
   REGISTRY: ghcr.io
@@ -67,3 +68,40 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max,ignore-error=true
+
+  deploy:
+    name: Deploy to Production
+    needs: build-and-push
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: self-hosted
+
+    steps:
+      - name: Wait for CI to pass on this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          conclusion=$(curl -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${{ github.sha }}&per_page=1" \
+            | python3 -c "import json,sys; runs=json.load(sys.stdin)['workflow_runs']; print(runs[0]['conclusion'] if runs else 'missing')")
+          echo "CI conclusion for ${{ github.sha }}: $conclusion"
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::CI did not succeed for this commit (conclusion: $conclusion) — refusing to deploy."
+            exit 1
+          fi
+
+      - name: Deploy over SSH
+        run: |
+          set -euo pipefail
+          # github.ref_name for a tag push is the tag itself, e.g. "v1.20.2".
+          # Strip the leading "v" to match the image tag docker/metadata-action
+          # produced (its type=semver pattern does the same stripping).
+          IMAGE_TAG="${GITHUB_REF_NAME#v}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.YUVOMI_DEPLOY_SSH_KEY }}" > ~/.ssh/yuvomi_deploy_key
+          chmod 600 ~/.ssh/yuvomi_deploy_key
+          ssh -i ~/.ssh/yuvomi_deploy_key -o StrictHostKeyChecking=accept-new \
+            root@192.168.178.95 "$IMAGE_TAG"
+          rm -f ~/.ssh/yuvomi_deploy_key
