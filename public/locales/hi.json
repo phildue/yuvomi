@@ -998,6 +998,7 @@
         "accountType_other": "अन्य",
         "viewAccountTransactions": "{{name}} के लेन-देन दिखाएं",
         "viewCategoryTransactions": "{{name}} श्रेणी के लेन-देन दिखाएं",
+        "viewSubcategoryTransactions": "{{name}} उप-श्रेणी के लेन-देन दिखाएं",
         "currentBalance": "वर्तमान शेष",
         "clearAccountFilter": "खाता फ़िल्टर हटाएं",
         "clearCategoryFilter": "श्रेणी फ़िल्टर हटाएं",

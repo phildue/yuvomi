@@ -998,6 +998,7 @@
         "accountType_other": "Khác",
         "viewAccountTransactions": "Xem giao dịch của {{name}}",
         "viewCategoryTransactions": "Xem giao dịch của danh mục {{name}}",
+        "viewSubcategoryTransactions": "Xem giao dịch của danh mục phụ {{name}}",
         "currentBalance": "Số dư hiện tại",
         "clearAccountFilter": "Xóa bộ lọc tài khoản",
         "clearCategoryFilter": "Xóa bộ lọc danh mục",

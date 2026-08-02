@@ -998,6 +998,7 @@
         "accountType_other": "Other",
         "viewAccountTransactions": "Show transactions for {{name}}",
         "viewCategoryTransactions": "Show transactions for {{name}}",
+        "viewSubcategoryTransactions": "Show transactions for {{name}}",
         "currentBalance": "Current balance",
         "clearAccountFilter": "Clear account filter",
         "clearCategoryFilter": "Clear category filter",

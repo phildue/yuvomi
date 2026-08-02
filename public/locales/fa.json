@@ -1005,6 +1005,7 @@
         "accountType_other": "سایر",
         "viewAccountTransactions": "نمایش تراکنش‌های {{name}}",
         "viewCategoryTransactions": "نمایش تراکنش‌های دسته {{name}}",
+        "viewSubcategoryTransactions": "نمایش تراکنش‌های زیردسته {{name}}",
         "currentBalance": "موجودی فعلی",
         "clearAccountFilter": "حذف فیلتر حساب",
         "clearCategoryFilter": "حذف فیلتر دسته",

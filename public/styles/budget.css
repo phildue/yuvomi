@@ -561,6 +561,26 @@ button.budget-bar-row--clickable.is-active .budget-bar-row__label {
   font-weight: var(--font-weight-semibold);
 }
 
+/* Subkategorien-Balken: klappen unter der aktiven Kategorie auf (Drilldown
+ * eine Ebene tiefer) — eingerückt mit einer dünnen Führungslinie, damit die
+ * Zugehörigkeit zur Kategorie darüber erkennbar bleibt. */
+.budget-subchart {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-1) 0 var(--space-1) var(--space-4);
+  padding-left: var(--space-2);
+  border-left: 2px solid var(--color-border-subtle);
+}
+
+.budget-bar-row--sub .budget-bar-row__label { width: 88px; font-size: var(--text-xs); }
+.budget-bar-row--sub .budget-bar-row__track { height: 6px; }
+.budget-bar-row--sub .budget-bar-row__amount { font-size: var(--text-xs); }
+
+@container budget-page (min-width: 480px) {
+  .budget-bar-row--sub .budget-bar-row__label { width: 152px; }
+}
+
 .budget-bar-row__label {
   font-size: var(--text-xs);
   color: var(--color-text-secondary);

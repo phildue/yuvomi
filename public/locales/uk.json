@@ -998,6 +998,7 @@
         "accountType_other": "Інше",
         "viewAccountTransactions": "Показати операції рахунку {{name}}",
         "viewCategoryTransactions": "Показати операції категорії {{name}}",
+        "viewSubcategoryTransactions": "Показати операції підкатегорії {{name}}",
         "currentBalance": "Поточний баланс",
         "clearAccountFilter": "Прибрати фільтр рахунку",
         "clearCategoryFilter": "Прибрати фільтр категорії",

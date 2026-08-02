@@ -998,6 +998,7 @@
         "accountType_other": "Autre",
         "viewAccountTransactions": "Voir les écritures de {{name}}",
         "viewCategoryTransactions": "Voir les écritures de la catégorie {{name}}",
+        "viewSubcategoryTransactions": "Voir les écritures de la sous-catégorie {{name}}",
         "currentBalance": "Solde actuel",
         "clearAccountFilter": "Retirer le filtre de compte",
         "clearCategoryFilter": "Retirer le filtre de catégorie",

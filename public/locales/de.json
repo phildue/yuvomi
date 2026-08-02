@@ -1005,6 +1005,7 @@
         "accountType_other": "Sonstiges",
         "viewAccountTransactions": "Buchungen von {{name}} anzeigen",
         "viewCategoryTransactions": "Buchungen der Kategorie {{name}} anzeigen",
+        "viewSubcategoryTransactions": "Buchungen der Unterkategorie {{name}} anzeigen",
         "currentBalance": "Aktueller Saldo",
         "clearAccountFilter": "Konto-Filter entfernen",
         "clearCategoryFilter": "Kategorie-Filter entfernen",
