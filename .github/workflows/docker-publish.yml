@@ -81,16 +81,40 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          conclusion=$(curl -sS \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${{ github.sha }}&per_page=1" \
-            | python3 -c "import json,sys; runs=json.load(sys.stdin)['workflow_runs']; print(runs[0]['conclusion'] if runs else 'missing')")
-          echo "CI conclusion for ${{ github.sha }}: $conclusion"
-          if [ "$conclusion" != "success" ]; then
-            echo "::error::CI did not succeed for this commit (conclusion: $conclusion) — refusing to deploy."
-            exit 1
-          fi
+          # Polls rather than doing a single point-in-time read: on a tag push,
+          # this deploy job can start racing the ci.yml run for the same
+          # commit, so a one-shot check can observe "no run yet" or
+          # "in_progress" and fail a commit whose CI hasn't had a chance to
+          # finish. An empty workflow_runs array (run not registered yet) and
+          # a null/missing conclusion (run registered but not concluded) are
+          # both treated as "pending" and retried; only a definitive terminal
+          # conclusion other than success (failure, cancelled, timed_out,
+          # etc.) fails immediately.
+          DEADLINE=$((SECONDS + 300))
+          while true; do
+            conclusion=$(curl -sS \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${{ github.sha }}&per_page=1" \
+              | python3 -c "import json,sys; runs=json.load(sys.stdin).get('workflow_runs', []); print((runs[0].get('conclusion') or 'pending') if runs else 'pending')")
+            echo "CI conclusion for ${{ github.sha }}: $conclusion"
+
+            if [ "$conclusion" = "success" ]; then
+              break
+            fi
+
+            if [ "$conclusion" != "pending" ]; then
+              echo "::error::CI did not succeed for this commit (conclusion: $conclusion) — refusing to deploy."
+              exit 1
+            fi
+
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "::error::Timed out after 5m waiting for CI to conclude for this commit — refusing to deploy."
+              exit 1
+            fi
+
+            sleep 15
+          done
 
       - name: Deploy over SSH
         run: |
