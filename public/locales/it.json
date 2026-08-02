@@ -998,6 +998,7 @@
         "accountType_other": "Altro",
         "viewAccountTransactions": "Mostra i movimenti di {{name}}",
         "viewCategoryTransactions": "Mostra i movimenti della categoria {{name}}",
+        "viewSubcategoryTransactions": "Mostra i movimenti della sottocategoria {{name}}",
         "currentBalance": "Saldo attuale",
         "clearAccountFilter": "Rimuovi filtro conto",
         "clearCategoryFilter": "Rimuovi filtro categoria",

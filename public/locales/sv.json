@@ -998,6 +998,7 @@
         "accountType_other": "Övrigt",
         "viewAccountTransactions": "Visa transaktioner för {{name}}",
         "viewCategoryTransactions": "Visa transaktioner för kategorin {{name}}",
+        "viewSubcategoryTransactions": "Visa transaktioner för underkategorin {{name}}",
         "currentBalance": "Aktuellt saldo",
         "clearAccountFilter": "Rensa kontofilter",
         "clearCategoryFilter": "Rensa kategorifilter",

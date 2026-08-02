@@ -998,6 +998,7 @@
         "accountType_other": "Outra",
         "viewAccountTransactions": "Ver lançamentos de {{name}}",
         "viewCategoryTransactions": "Ver lançamentos da categoria {{name}}",
+        "viewSubcategoryTransactions": "Ver lançamentos da subcategoria {{name}}",
         "currentBalance": "Saldo atual",
         "clearAccountFilter": "Remover filtro de conta",
         "clearCategoryFilter": "Remover filtro de categoria",

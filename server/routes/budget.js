@@ -315,6 +315,12 @@ function validCategoryKeys() {
   return db.get().prepare('SELECT key FROM budget_categories').all().map((c) => c.key);
 }
 
+// subcategories.key ist global PRIMARY KEY (nicht nur je Kategorie eindeutig) —
+// ein einzelner Filterwert reicht daher zur eindeutigen Identifikation aus.
+function validSubcategoryKeys() {
+  return db.get().prepare('SELECT key FROM budget_subcategories').all().map((s) => s.key);
+}
+
 function validExpenseCategoryKeys() {
   return db.get().prepare("SELECT key FROM budget_categories WHERE type = 'expense'").all().map((c) => c.key);
 }
@@ -519,6 +525,20 @@ router.get('/summary', (req, res) => {
       ORDER BY ABS(SUM(amount)) DESC
     `).all(from, to);
 
+    // Nur Ausgabenkategorien haben Subkategorien (validateSubcategory erzwingt
+    // '' für Einnahmen) — der Filter auf subcategory != '' reicht daher aus,
+    // ohne zusätzlich nach Kategorie-Typ zu joinen.
+    const bySubcategory = db.get().prepare(`
+      SELECT category, subcategory,
+             SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) AS income,
+             SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END) AS expenses,
+             SUM(amount) AS total
+      FROM budget_entries
+      WHERE date BETWEEN ? AND ? AND subcategory != ''
+      GROUP BY category, subcategory
+      ORDER BY category, ABS(SUM(amount)) DESC
+    `).all(from, to);
+
     res.json({
       data: {
         month,
@@ -526,6 +546,7 @@ router.get('/summary', (req, res) => {
         expenses:   totals.expenses || 0,
         balance:    totals.balance  || 0,
         byCategory,
+        bySubcategory,
       },
     });
   } catch (err) {
@@ -1385,6 +1406,11 @@ router.get('/', (req, res) => {
     if (req.query.category && validCategoryKeys().includes(req.query.category)) {
       sql += ' AND b.category = ?';
       params.push(req.query.category);
+    }
+
+    if (req.query.subcategory && validSubcategoryKeys().includes(req.query.subcategory)) {
+      sql += ' AND b.subcategory = ?';
+      params.push(req.query.subcategory);
     }
 
     if (req.query.account_id) {

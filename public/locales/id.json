@@ -1005,6 +1005,7 @@
         "accountType_other": "Lainnya",
         "viewAccountTransactions": "Tampilkan transaksi {{name}}",
         "viewCategoryTransactions": "Tampilkan transaksi kategori {{name}}",
+        "viewSubcategoryTransactions": "Tampilkan transaksi subkategori {{name}}",
         "currentBalance": "Saldo saat ini",
         "clearAccountFilter": "Hapus filter akun",
         "clearCategoryFilter": "Hapus filter kategori",

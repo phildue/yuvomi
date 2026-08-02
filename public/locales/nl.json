@@ -998,6 +998,7 @@
         "accountType_other": "Overig",
         "viewAccountTransactions": "Boekingen van {{name}} tonen",
         "viewCategoryTransactions": "Boekingen van categorie {{name}} tonen",
+        "viewSubcategoryTransactions": "Boekingen van subcategorie {{name}} tonen",
         "currentBalance": "Huidig saldo",
         "clearAccountFilter": "Rekeningfilter wissen",
         "clearCategoryFilter": "Categoriefilter wissen",

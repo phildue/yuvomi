@@ -998,6 +998,7 @@
         "accountType_other": "その他",
         "viewAccountTransactions": "{{name}} の記録を表示",
         "viewCategoryTransactions": "{{name}} カテゴリーの記録を表示",
+        "viewSubcategoryTransactions": "{{name}} サブカテゴリーの記録を表示",
         "currentBalance": "現在の残高",
         "clearAccountFilter": "口座フィルターを解除",
         "clearCategoryFilter": "カテゴリーフィルターを解除",

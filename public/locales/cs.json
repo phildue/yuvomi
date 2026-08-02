@@ -998,6 +998,7 @@
         "accountType_other": "Jiné",
         "viewAccountTransactions": "Zobrazit pohyby účtu {{name}}",
         "viewCategoryTransactions": "Zobrazit pohyby kategorie {{name}}",
+        "viewSubcategoryTransactions": "Zobrazit pohyby podkategorie {{name}}",
         "currentBalance": "Aktuální zůstatek",
         "clearAccountFilter": "Zrušit filtr účtu",
         "clearCategoryFilter": "Zrušit filtr kategorie",
