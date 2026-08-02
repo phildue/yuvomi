@@ -95,6 +95,7 @@ jobs:
       - name: Deploy over SSH
         run: |
           set -euo pipefail
+          trap 'rm -f ~/.ssh/yuvomi_deploy_key' EXIT
           # github.ref_name for a tag push is the tag itself, e.g. "v1.20.2".
           # Strip the leading "v" to match the image tag docker/metadata-action
           # produced (its type=semver pattern does the same stripping).
@@ -104,4 +105,3 @@ jobs:
           chmod 600 ~/.ssh/yuvomi_deploy_key
           ssh -i ~/.ssh/yuvomi_deploy_key -o StrictHostKeyChecking=accept-new \
             root@192.168.178.95 "$IMAGE_TAG"
-          rm -f ~/.ssh/yuvomi_deploy_key
