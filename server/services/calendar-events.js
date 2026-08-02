@@ -5,8 +5,9 @@
  * Abhängigkeiten: server/services/recurrence.js
  */
 
-import { nextOccurrence } from './recurrence.js';
+import { nextOccurrence, parseRRule, matchesRRuleByday } from './recurrence.js';
 import { visibilityWhere } from './visibility.js';
+import { localToUTC, utcToWall } from '../utils/timezone.js';
 
 // Zugewiesene Personen eines Events als JSON-Array (Multi-Assignment).
 const ASSIGNED_USERS_SQL = `(
@@ -71,16 +72,32 @@ export function expandRecurringEvents(events, from, to, exceptionsByEvent = null
     // Original-Zeit-Teil erhalten (z.B. 'T14:30:00' oder '' bei All-Day)
     const timeSuffix = event.start_datetime.slice(10);
 
+    // DST-korrekte Expansion: bei bekannter TZID (CalDAV/Apple-Serie) pro Vorkommen
+    // die lokale Wanduhrzeit des Masters neu nach UTC rechnen, statt den festen
+    // UTC-Suffix zu wiederholen (sonst driftet die Uhrzeit über die Sommer-/
+    // Winterzeit-Grenze, #549). Nur für Tagtermine, deren lokales Datum == UTC-Datum
+    // ist (kein Mitternachts-Überlauf) - sonst alte Fixe-Suffix-Logik.
+    const wall = (event.tzid && !isAllDay) ? utcToWall(event.start_datetime, event.tzid) : null;
+    const tzAware = wall && wall.date === event.start_datetime.slice(0, 10);
+
     let currentDate = event.start_datetime.slice(0, 10); // YYYY-MM-DD
     let iterations  = 0;
     const MAX_ITER  = 1000; // Sicherheitsgrenze
     const exceptions = exceptionsByEvent?.get(event.id) ?? null; // ausgenommene Instanz-Daten (#489)
+    // COUNT=N begrenzt die Serie auf N Vorkommen ab DTSTART. Gezählt wird über
+    // die Instanzen der Serie (nicht das Anzeigefenster) und VOR EXDATE-Entfernung
+    // (RFC 5545): ausgenommene Vorkommen zählen mit, erzeugen aber keine Instanz (#513).
+    const maxCount   = parseRRule(event.recurrence_rule)?.count ?? null;
+    let   occurrence = 0;
 
     while (currentDate <= to && iterations < MAX_ITER) {
       iterations++;
+      if (maxCount !== null && occurrence >= maxCount) break;
+      occurrence++;
 
-      // Ausgenommenes Vorkommen (EXDATE, #489): überspringen, aber Serie weiterlaufen lassen.
-      if (exceptions?.has(currentDate)) {
+      // Ausgenommenes Vorkommen (EXDATE, #489) oder Tag außerhalb des BYDAY-Musters
+      // (#549: DTSTART am Wochenende bei BYDAY=MO..FR): überspringen, Serie weiterlaufen lassen.
+      if (exceptions?.has(currentDate) || !matchesRRuleByday(currentDate, event.recurrence_rule)) {
         const next = nextOccurrence(currentDate, event.recurrence_rule);
         if (!next || next <= currentDate) break;
         currentDate = next;
@@ -96,7 +113,7 @@ export function expandRecurringEvents(events, from, to, exceptionsByEvent = null
       }
 
       if (currentDate >= from || instanceEnd >= from) {
-        const newStart = currentDate + timeSuffix;
+        const newStart = tzAware ? localToUTC(`${currentDate}T${wall.time}`, event.tzid) : currentDate + timeSuffix;
         let newEnd = event.end_datetime;
         if (durationMs !== null) {
           if (isAllDay) {
@@ -162,10 +179,13 @@ export function getUpcomingEvents(d, { userId = null, limit = 5, windowDays = 90
            u_assigned.avatar_color AS assigned_color,
            ec.name  AS cal_name,
            ec.color AS cal_color,
+           bd.name       AS birthday_name,
+           bd.birth_date AS birthday_date,
            ${ASSIGNED_USERS_SQL}
     FROM calendar_events e
     LEFT JOIN users u_assigned ON u_assigned.id = e.assigned_to
     LEFT JOIN external_calendars ec ON ec.id = e.calendar_ref_id
+    LEFT JOIN birthdays bd ON bd.calendar_event_id = e.id
     WHERE (
       (e.recurrence_rule IS NULL AND DATE(e.start_datetime) BETWEEN ? AND ?)
       OR

@@ -1,11 +1,18 @@
-import { api } from '/api.js';
 import { t } from '/i18n.js';
-import { esc } from '/utils/html.js';
+import { getPreferences, savePreferences } from '/settings/preferences-cache.js';
+import {
+  PERSONAL_WEATHER_SCOPE as SCOPE,
+  bindWeatherLocationEvents,
+  hasValidWeatherCoords,
+  readWeatherLocation,
+  weatherLocationFieldsHtml,
+} from '/settings/weather-location.js';
 
-function isConnected(control, container) {
-  return Boolean(control?.isConnected && container?.isConnected);
-}
-
+/**
+ * Persönlicher Standort je Mitglied; überschreibt den Haushaltsstandort aus
+ * `admin-weather`. Beide Blätter teilen sich das Standortformular aus
+ * `/settings/weather-location.js`.
+ */
 function hasOwnLocation(wu) {
   return Boolean(wu && (wu.lat !== null || wu.lon !== null));
 }
@@ -28,43 +35,11 @@ function renderPage(container, prefs) {
         </div>
 
         <form class="settings-form settings-form--compact" id="pweather-form" novalidate autocomplete="off">
-          <div class="form-row">
-            <div class="form-group">
-              <label class="form-label" for="pweather-lat">${t('settings.weatherLatLabel')}</label>
-              <input class="form-input" type="number" id="pweather-lat" step="any" min="-90" max="90"
-                value="${esc(wu.lat ?? '')}" placeholder="${t('settings.weatherLatPlaceholder')}">
-            </div>
-            <div class="form-group">
-              <label class="form-label" for="pweather-lon">${t('settings.weatherLonLabel')}</label>
-              <input class="form-input" type="number" id="pweather-lon" step="any" min="-180" max="180"
-                value="${esc(wu.lon ?? '')}" placeholder="${t('settings.weatherLonPlaceholder')}">
-            </div>
-          </div>
-          <div class="settings-form-actions">
-            <button type="button" class="btn btn--secondary btn--sm" id="pweather-locate-btn">
-              <i data-lucide="map-pin" aria-hidden="true"></i>
-              ${t('settings.weatherLocateBtn')}
-            </button>
-          </div>
-          <div class="form-group">
-            <label class="toggle-row">
-              <input type="checkbox" id="pweather-auto-locate"${wu.auto_locate ? ' checked' : ''}${providerIsOpenMeteo ? '' : ' disabled'}>
-              <span>${t('settings.weatherAutoLocateLabel')}</span>
-            </label>
-            <p class="form-hint">${t('settings.weatherAutoLocateHint')}</p>
-          </div>
-          <div class="form-group">
-            <label class="form-label" for="pweather-city">${t('settings.weatherCityLabel')}</label>
-            <input class="form-input" type="text" id="pweather-city" maxlength="100"
-              value="${esc(wu.city ?? '')}" placeholder="${t('settings.weatherCityPlaceholder')}">
-          </div>
-          <div class="form-group">
-            <label class="form-label" for="pweather-units">${t('settings.weatherUnitsLabel')}</label>
-            <select class="form-input" id="pweather-units">
-              <option value="metric"${wu.units === 'imperial' ? '' : ' selected'}>${t('settings.weatherUnitsMetric')}</option>
-              <option value="imperial"${wu.units === 'imperial' ? ' selected' : ''}>${t('settings.weatherUnitsImperial')}</option>
-            </select>
-          </div>
+          ${weatherLocationFieldsHtml({
+            scope: SCOPE,
+            values: wu,
+            autoLocateDisabled: !providerIsOpenMeteo,
+          })}
           <div id="pweather-form-error" class="form-error" role="alert" hidden></div>
           <div class="settings-form-actions">
             <button type="submit" class="btn btn--primary">${t('settings.weatherSave')}</button>
@@ -76,74 +51,29 @@ function renderPage(container, prefs) {
   `);
 }
 
-function requestLocation(container, locateButton) {
-  if (!navigator.geolocation) {
-    window.yuvomi?.showToast(t('settings.weatherLocateUnsupported'), 'warning');
-    return;
-  }
-  locateButton.disabled = true;
-  navigator.geolocation.getCurrentPosition(
-    (position) => {
-      if (!isConnected(locateButton, container)) return;
-      container.querySelector('#pweather-lat').value = position.coords.latitude.toFixed(4);
-      container.querySelector('#pweather-lon').value = position.coords.longitude.toFixed(4);
-      locateButton.disabled = false;
-      window.yuvomi?.showToast(t('settings.weatherLocateSuccess'), 'success');
-    },
-    (error) => {
-      if (!isConnected(locateButton, container)) return;
-      locateButton.disabled = false;
-      window.yuvomi?.showToast(error.message || t('common.errorGeneric'), 'danger');
-    },
-    { enableHighAccuracy: true, timeout: 8000 },
-  );
-}
-
-function readForm(container) {
-  const lat = container.querySelector('#pweather-lat')?.value.trim() ?? '';
-  const lon = container.querySelector('#pweather-lon')?.value.trim() ?? '';
-  return {
-    lat, lon,
-    city: container.querySelector('#pweather-city')?.value.trim() ?? '',
-    units: container.querySelector('#pweather-units')?.value ?? 'metric',
-    auto_locate: container.querySelector('#pweather-auto-locate')?.checked ?? false,
-  };
-}
-
-function validCoords(lat, lon) {
-  const a = Number(lat), b = Number(lon);
-  return lat !== '' && lon !== '' && Number.isFinite(a) && Number.isFinite(b)
-    && a >= -90 && a <= 90 && b >= -180 && b <= 180;
-}
-
 function bindEvents(container, user) {
   const form = container.querySelector('#pweather-form');
   const errorElement = container.querySelector('#pweather-form-error');
-  const locateButton = container.querySelector('#pweather-locate-btn');
 
-  locateButton.addEventListener('click', () => requestLocation(container, locateButton));
-
-  const autoLocate = container.querySelector('#pweather-auto-locate');
-  autoLocate?.addEventListener('change', () => {
-    if (autoLocate.checked) requestLocation(container, locateButton);
-  });
+  bindWeatherLocationEvents(container, SCOPE);
 
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     errorElement.hidden = true;
-    const v = readForm(container);
-    if (!validCoords(v.lat, v.lon)) {
+    const location = readWeatherLocation(container, SCOPE);
+    if (!hasValidWeatherCoords(location.lat, location.lon)) {
       errorElement.textContent = `${t('settings.weatherLatLabel')} / ${t('settings.weatherLonLabel')}`;
       errorElement.hidden = false;
       return;
     }
     try {
-      await api.put('/preferences', {
+      await savePreferences({
         weather_user: {
-          lat: v.lat, lon: v.lon,
-          city: v.city || null,
-          units: v.units,
-          auto_locate: v.auto_locate,
+          lat: location.lat,
+          lon: location.lon,
+          city: location.city || null,
+          units: location.units,
+          auto_locate: location.auto_locate,
         },
       });
       window.yuvomi?.showToast(t('settings.personalWeatherSaved'), 'success');
@@ -156,7 +86,7 @@ function bindEvents(container, user) {
 
   container.querySelector('#pweather-reset-btn')?.addEventListener('click', async () => {
     try {
-      await api.put('/preferences', {
+      await savePreferences({
         weather_user: { lat: null, lon: null, city: null, units: null, auto_locate: null },
       });
       window.yuvomi?.showToast(t('settings.personalWeatherReset'), 'success');
@@ -168,8 +98,7 @@ function bindEvents(container, user) {
 }
 
 export async function render(container, { user }) {
-  const response = await api.get('/preferences');
-  const prefs = response?.data ?? {};
+  const prefs = await getPreferences();
   renderPage(container, prefs);
   bindEvents(container, user);
   window.lucide?.createIcons({ el: container });

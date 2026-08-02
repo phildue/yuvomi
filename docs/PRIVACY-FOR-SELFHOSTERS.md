@@ -1,8 +1,7 @@
 # Datenschutz-Hinweise für Selfhoster (Yuvomi)
 
-> **Stand: 09.06.2026** — Diese Hinweise sind eine technisch orientierte
-> Hilfestellung für Betreiber und ersetzen keine individuelle rechtliche
-> Beratung im Einzelfall. Prüfe die Aktualität von Angemessenheitsbeschlüssen
+> **Stand: 14.07.2026** - Diese Hinweise sind eine technisch orientierte
+> Hilfestellung für Betreiber. Prüfe die Aktualität von Angemessenheitsbeschlüssen
 > und DPF-Listungen selbst (siehe Abschnitt „Quellen").
 
 > Dieses Dokument richtet sich an **Betreiber, die Yuvomi in einer Umgebung
@@ -28,7 +27,9 @@
    - 2.4 [OIDC-Provider (Single Sign-On)](#24-oidc-provider-single-sign-on)
    - 2.5 [WebDAV-Backup](#25-webdav-backup)
    - 2.6 [WebDAV-Dokumentspeicher](#26-webdav-dokumentspeicher)
-   - 2.7 [Abonnement-Integrationen](#27-abonnement-integrationen)
+   - 2.7 [Google-Drive-Dokumentspeicher](#27-google-drive-dokumentspeicher)
+   - 2.8 [Abonnement-Integrationen](#28-abonnement-integrationen)
+   - 2.9 [MCP-Endpoint (KI-/Agent-Zugriff)](#29-mcp-endpoint-ki-agent-zugriff)
 3. [Logging und Speicherbegrenzung](#3-logging-und-speicherbegrenzung-art-5-abs-1-lit-e-dsgvo)
 4. [Haushaltsausnahme](#4-haushaltsausnahme-art-2-abs-2-lit-c-dsgvo)
 5. [Verarbeitungsverzeichnis-Vorlage (Art. 30 DSGVO)](#5-verarbeitungsverzeichnis-vorlage-art-30-dsgvo)
@@ -56,6 +57,13 @@ bedeutet u. a.:
   Voraussetzungen nach Art. 44 ff. DSGVO (Angemessenheitsbeschluss, SCCs +
   Transfer Impact Assessment).
 
+> **NIS2 (nur in bestimmten Sektoren):** Das NIS2UmsuCG ist seit 06.12.2025 in
+> Kraft (BSI-Registrierungsfrist lief am 06.03.2026 ab). Für den normalen
+> Familien-/Privatbetrieb ist es **nicht** einschlägig. Betreibst du die Instanz
+> dagegen in einer **Einrichtung eines besonders wichtigen oder wichtigen
+> Sektors** oberhalb der Größenschwellen, prüfe die NIS2-Registrierungs- und
+> Meldepflichten eigenständig.
+
 ---
 
 ## 2. Externe Dienste, die Yuvomi kontaktiert
@@ -72,7 +80,9 @@ Betreiber daraus resultieren.
 | OIDC-Provider | `server/auth.js`, `server/services/oidc.js` | nur wenn konfiguriert | abhängig vom Provider | meistens ja (siehe 2.4) |
 | WebDAV-Backup | `server/services/backup-webdav.js` | nur wenn konfiguriert | abhängig vom Provider | ja, bei kommerziellen Anbietern (siehe 2.5) |
 | WebDAV-Dokumentspeicher | `server/services/document-storage.js` | nur wenn konfiguriert | abhängig vom Provider | ja, bei kommerziellen Anbietern (siehe 2.6) |
-| Abonnement-Integrationen | `server/services/subscription-*` | nur wenn konfiguriert/ausgelöst | abhängig von Fixer, Benachrichtigungs- oder KI-Provider | abhängig vom Provider (siehe 2.7) |
+| Google-Drive-Dokumentspeicher | `server/services/google-drive-storage.js` | nur nach OAuth-Verbindung und expliziter Auswahl | USA/Google; DPF-Status prüfen | ja (siehe 2.7) |
+| Abonnement-Integrationen | `server/services/subscription-*` | nur wenn konfiguriert/ausgelöst | abhängig von Fixer, Benachrichtigungs- oder KI-Provider | abhängig vom Provider (siehe 2.8) |
+| MCP-Endpoint (KI-/Agent-Zugriff) | `server/index.js:338`, `server/mcp/*` | nur wenn Nutzer ein API-Token erstellt und einen MCP-Client anbindet | **lokaler Client: nein** · Cloud-Client: abhängig vom Anbieter | lokaler Client: nein · Cloud-Client: ggf. gegenüber dem Anbieter (siehe 2.9) |
 
 ### 2.1 Open-Meteo (Wetter-Standard)
 
@@ -211,7 +221,32 @@ Konfiguration so, dass du auf einen EU-Provider umstellen könntest.
   dieses Ziel separat. SQLite-Backups enthalten nur Metadaten und
   Speicher-Schlüssel, nicht die dort abgelegten Binärdateien.
 
-### 2.7 Abonnement-Integrationen
+### 2.7 Google-Drive-Dokumentspeicher
+
+- **Code-Stelle:** `server/services/google-drive-storage.js`, gesteuert über die
+  Dokumentenspeicher-Einstellungen. Aktiv erst nach OAuth-Verbindung **und**
+  ausdrücklicher Auswahl als Upload-Ziel.
+- **Was wird übertragen:** neue Dokumentdateien und Kalenderanhänge, generierte
+  Dateinamen, Server-IP sowie OAuth-Zugriffs-/Refresh-Token. Yuvomi liest zusätzlich
+  die Google-Kontoidentität (Permission-ID, E-Mail, Anzeigename) zur sicheren
+  Wiederverbindung. Es wird ausschließlich der Scope `drive.file` angefordert.
+- **Empfänger und Drittland:** Google LLC/Google Ireland; Verarbeitung kann in den
+  USA stattfinden. Prüfe aktuellen DPF-Status, schließe den Google-AVV/DPA ab und
+  dokumentiere bei Bedarf SCCs und TIA. Für besonders sensible Dokumente ist ein
+  EU-gehosteter WebDAV- oder lokaler Speicher die datensparsamere Alternative.
+- **Zugriffsgrenze:** Yuvomis Sichtbarkeitseinstellungen steuern nur den Zugriff
+  über Yuvomi. Alle Personen mit Zugriff auf den verbundenen Google-Drive-Ordner
+  `Yuvomi/Documents` können sämtliche dort gespeicherten Dateien sehen. Teile diesen Ordner nicht unnötig.
+- **Löschung und Aufbewahrung:** Das Löschen eines Drive-Dokuments in Yuvomi löscht
+  die zugehörige Drive-Datei; ein bereits fehlendes Objekt gilt als gelöscht.
+  Trennen entfernt nur lokale Token und widerruft keine gemeinsam genutzten
+  Google-Credentials. Google-Papierkorb-, Audit- und Backup-Fristen sind separat zu
+  prüfen.
+- **Backup:** SQLite-Backups enthalten Konto-/Datei-Referenzen, aber keine
+  Drive-Binärdateien. Exportiere oder sichere den Ordner separat und bewahre ihn
+  zusammen mit dem passenden Datenbankstand auf.
+
+### 2.8 Abonnement-Integrationen
 
 - **Standardverhalten:** Abonnementdaten, lokale Erinnerungen und Budgets
   bleiben vollständig in der selbst gehosteten Instanz. Externe Übertragungen
@@ -227,6 +262,41 @@ Konfiguration so, dass du auf einen EU-Provider umstellen könntest.
   Fälligkeitsdatum eines Abonnements an SMTP, Discord, Telegram, Pushover,
   Gotify, Serverchan, Ntfy oder einen Webhook übertragen. Für private/LAN-Ziele
   ist eine ausdrückliche Deployment-Freigabe erforderlich.
+
+### 2.9 MCP-Endpoint (KI-/Agent-Zugriff)
+
+- **Code-Stellen:** `server/index.js:338` (Mount `/mcp`, nur mit
+  Authentifizierung), `server/mcp/server.js`, `server/mcp/protocol.js`,
+  `server/mcp/tools.js`; Token-Verwaltung `server/scopes.js`.
+- **Was ist das?** Yuvomi stellt einen **MCP-Endpoint** bereit, über den ein
+  **von dir angebundener** KI-/Agent-Client (MCP-Client) per API-Token auf
+  Instanzdaten zugreifen und Tools ausführen kann. Der Endpoint ist
+  **provider-neutral** - er funktioniert mit einem **lokal gehosteten LLM**
+  (z. B. Ollama, LM Studio, llama.cpp) genauso wie mit einem Cloud-Client
+  (z. B. Claude Desktop). Yuvomi selbst ruft **keinen** KI-Anbieter auf; der
+  Client verbindet sich mit dem Endpoint und zieht die Daten.
+- **Aktiv nur, wenn:** du in den Einstellungen ein **API-Token** erstellst und in
+  einem MCP-Client hinterlegst. Ohne angebundenen Client verlässt kein Datum die
+  Instanz.
+- **Datenschutz — hängt an deiner Client-Wahl:**
+  | Client | Datenfluss | Pflichten |
+  |---|---|---|
+  | **Lokales LLM / EU-gehostet** | Daten bleiben in der Instanz bzw. im EWR | **kein Drittland, kein AVV.** Datensparsamste Option. |
+  | **Cloud-Client (z. B. US-Anbieter)** | Token-freigegebene Daten fließen an den Anbieter | Wie bei jedem Auftragsverarbeiter: **AVV (Art. 28)**, bei Drittland zusätzlich **Art. 44 ff.** (DPF/SCCs + TIA), Aufnahme in die **Datenschutzerklärung** (Art. 13). |
+- **Empfehlungen:**
+  1. **Least Privilege:** Erstelle das Token **nur mit den Modulen und Rechten**,
+     die der Client wirklich braucht (die Token-UI bietet Modul- und
+     Lese-/Schreib-Scoping). Schließe sensible Module wie `health` oder
+     `housekeeping` aus, wenn nicht zwingend nötig.
+  2. **Lokal/EU bevorzugen:** Ein lokal laufendes oder in der EU gehostetes Modell
+     vermeidet den externen Transfer vollständig - dann entfallen AVV- und
+     Drittland-Fragen für diesen Kanal.
+  3. **Nur bei Cloud-Client:** Empfänger, Zweck, Rechtsgrundlage (i. d. R.
+     Art. 6 Abs. 1 lit. a oder lit. f), Drittland-Hinweis und freigegebene
+     Datenkategorien in die Datenschutzerklärung aufnehmen; AVV/DPF-Status prüfen.
+  4. **Token widerrufbar halten:** Tokens einzeln widerrufbar; dokumentiere,
+     welcher Client welches Token nutzt.
+
 ---
 
 ## 3. Logging und Speicherbegrenzung (Art. 5 Abs. 1 lit. e DSGVO)
@@ -343,8 +413,9 @@ konkrete Konfiguration ein und ergänze um eigene Verarbeitungen.
 | 3 | Kontakte / CardDAV | Adressbuch | Art. 6 Abs. 1 lit. b/f | Nutzer, Kontakte | Name, Adresse, Telefon, E-Mail | CardDAV-Server (falls Sync) | <<je nach Anbieter>> | bis Löschung | TLS, AVV |
 | 4 | Wetter | Anzeige Vorhersage | Art. 6 Abs. 1 lit. b | Nutzer | Koordinaten/Ortsname | Open-Meteo (CH); ggf. OpenWeather (UK) | CH/UK Angemessenheit | sofort nach Anfrage | TLS |
 | 5 | Backups | Datensicherung | Art. 6 Abs. 1 lit. f | Nutzer und alle Datensubjekte der App | Vollbackup der DB | <<WebDAV-Provider>> | <<Aufbewahrungs-Konzept, z. B. 30 Tage rollierend>> | Verschlüsselung vor Upload, AVV |
-| 6 | Dokumentablage | Gemeinsame Ablage und Kalenderanhänge | Art. 6 Abs. 1 lit. b/f | Nutzer und in Dokumenten genannte Personen | Dokumentdateien, Anhänge, Metadaten | <<WebDAV-Provider, falls aktiv>> | <<je nach Anbieter>> | bis Löschung durch Nutzer | TLS, eigener Pfad, AVV, separates Backup |
+| 6 | Dokumentablage | Gemeinsame Ablage und Kalenderanhänge | Art. 6 Abs. 1 lit. b/f | Nutzer und in Dokumenten genannte Personen | Dokumentdateien, Anhänge, Metadaten | <<lokaler Hoster, WebDAV-Provider oder Google Drive, falls aktiv>> | <<je nach Anbieter; Google ggf. USA>> | bis Löschung durch Nutzer, Provider-Papierkorb prüfen | TLS, eigener Pfad, AVV, Drive-ACL-Grenze, separates Backup |
 | 7 | Sicherheits-/Betriebs-Logs | Missbrauchserkennung, Fehlersuche | Art. 6 Abs. 1 lit. f | Nutzer / Login-Versuchende | IP bei fehlgeschlagenen Logins, Fehler-Stacktraces | nur lokal | nein | **max. 30 Tage** | Rotation, Zugangsbeschränkung |
+| 8 | MCP-/KI-Anbindung (falls genutzt) | Zugriff eines angebundenen KI-/Agent-Clients auf Instanzdaten | Art. 6 Abs. 1 lit. a/f; bei Art.-9-Daten zusätzlich Art. 9 Abs. 2 lit. a | Nutzer und in den Daten genannte Personen | je nach Token-Scope: Aufgaben, Termine, Einkauf, ggf. health/housekeeping | lokaler Client: keiner · Cloud: <<Anbieter>> | lokaler Client: nein · Cloud: <<je nach Anbieter>> | bis Token-Widerruf | Token-Scoping (Least Privilege), TLS; bei Cloud: AVV, DPF/SCCs+TIA |
 
 ### 5.3 Auftragsverarbeiter (Art. 28)
 
@@ -354,6 +425,7 @@ konkrete Konfiguration ein und ergänze um eigene Verarbeitungen.
 | <<OpenWeather Ltd.>> | Wetter-API (falls aktiv) | <<Datum>> | UK | Angemessenheit; DPA |
 | <<OIDC-Provider>> | Authentifizierung | <<Datum>> | <<EU/USA>> | <<AVV; ggf. DPF + SCCs>> |
 | <<WebDAV-Provider>> | Backup- und/oder Dokument-Storage | <<Datum>> | <<je nach Anbieter>> | <<AVV; Verschlüsselung für Backups; Zugriffsbeschränkung>> |
+| <<Google Ireland/Google LLC>> | Google-Drive-Dokumentspeicher (falls aktiv) | <<Datum>> | EU/USA | <<Google-DPA; DPF-Status; ggf. SCCs/TIA; drive.file>> |
 
 ---
 

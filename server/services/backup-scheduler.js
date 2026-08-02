@@ -50,6 +50,21 @@ async function ensureBackupDir() {
   try {
     await fs.mkdir(BACKUP_DIR, { recursive: true });
   } catch (err) {
+    // Häufigster Praxisfall im Container: BACKUP_DIR zeigt auf einen Pfad ausserhalb
+    // des gemounteten Volumes (z. B. den relativen Default './backups' unter /app),
+    // den der unprivilegierte Prozess nicht anlegen darf. Der nackte EACCES-Text
+    // nennt nur den relativen Pfad und führt beim Debuggen in die Irre.
+    if (err.code === 'EACCES' || err.code === 'EPERM' || err.code === 'EROFS') {
+      const detailed = new Error(
+        `Backup directory "${path.resolve(BACKUP_DIR)}" is not writable (${err.code}). `
+        + 'Set BACKUP_DIR to a writable, mounted path (in Docker: /backups) '
+        + 'and verify the ownership of the mounted host folder.'
+      );
+      detailed.code = err.code;
+      detailed.cause = err;
+      log.error(detailed.message);
+      throw detailed;
+    }
     log.error('Failed to create backup directory:', err);
     throw err;
   }

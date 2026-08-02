@@ -2,19 +2,19 @@
  * Modul: ICS-Abonnements
  * Zweck: Fetch, Parsing, CRUD und periodischer Sync für ICS-URL-Kalenderabonnements.
  *        Enthält SSRF-Schutz, ETag-basiertes Conditional Fetching und RRULE-Expansion.
- * Abhängigkeiten: node-fetch, node:dns/promises, server/db.js, server/services/ics-parser.js
+ * Abhängigkeiten: node:dns/promises, server/db.js, server/services/ics-parser.js,
+ *                  server/utils/ssrf.js (zentraler SSRF-Schutz),
+ *                  server/utils/http.js (node-nativer Safe-HTTP-Client)
  */
 
 import dns from 'node:dns/promises';
-import { lookup as dnsLookup } from 'node:dns';
 import { isIP } from 'node:net';
-import http from 'node:http';
-import https from 'node:https';
-import fetch from 'node-fetch';
 import { createLogger } from '../logger.js';
 import * as db from '../db.js';
 import { assignDefaultToEvent } from './sync-assignment.js';
-import { parseICS, expandRRULE } from './ics-parser.js';
+import { parseICS, expandRRULE, normalizeRecurrenceOverrides } from './ics-parser.js';
+import { isBlockedAddress, readPrivateNetworkOptIn, createGuardedLookup } from '../utils/ssrf.js';
+import { safeRequest } from '../utils/http.js';
 
 const log = createLogger('ICS');
 
@@ -22,30 +22,6 @@ const SYNC_WINDOW_PAST_MONTHS   = 6;
 const SYNC_WINDOW_FUTURE_MONTHS = 12;
 const MAX_RESPONSE_BYTES        = 10 * 1024 * 1024;
 const FETCH_TIMEOUT_MS          = 15_000;
-
-const PRIVATE_RANGES = [
-  /^127\./, /^10\./, /^172\.(1[6-9]|2\d|3[01])\./, /^192\.168\./,
-  /^169\.254\./, /^0\./, /^::1$/, /^::$/, /^f[cd]/i, /^fe[89ab]/i,
-];
-
-/**
- * Prüft eine rohe IP-Adresse gegen die privaten/lokalen Bereiche. Berücksichtigt
- * IPv4-mapped-IPv6 (`::ffff:a.b.c.d`), damit ein Angreifer eine private IPv4 nicht
- * über die IPv6-Schreibweise am Filter vorbeischmuggeln kann.
- */
-function ipIsPrivate(addr) {
-  let a = addr;
-  // IPv4-mapped IPv6 in dezimaler Schreibweise: ::ffff:192.168.0.1
-  const dec = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(a);
-  if (dec) a = dec[1];
-  // ... und in Hex-Schreibweise (so normalisiert die URL/DNS sie): ::ffff:c0a8:1
-  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(a);
-  if (hex) {
-    const hi = parseInt(hex[1], 16), lo = parseInt(hex[2], 16);
-    a = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
-  }
-  return PRIVATE_RANGES.some((re) => re.test(a));
-}
 
 const ENV_ALLOW_PRIVATE_NETWORK = 'ICS_SUBSCRIPTION_ALLOW_PRIVATE_NETWORK';
 
@@ -58,8 +34,7 @@ const syncingNow = new Set();
  * Tests process.env vor dem Aufruf setzen können.
  */
 function isPrivateNetworkAllowed() {
-  const raw = process.env[ENV_ALLOW_PRIVATE_NETWORK];
-  return raw !== undefined && (raw.trim() === 'true' || raw.trim() === '1');
+  return readPrivateNetworkOptIn(ENV_ALLOW_PRIVATE_NETWORK);
 }
 
 function normalizeUrl(raw) {
@@ -82,49 +57,16 @@ async function checkSSRF(urlStr) {
   // Literale IPs werden von dns.resolve4/6 nicht aufgelöst (liefert []), müssen
   // also direkt geprüft werden – sonst schlüpft https://192.168.0.1/ durch.
   if (isIP(host)) {
-    if (ipIsPrivate(host)) throw new Error(`URL resolves to a private IP address: ${host}`);
+    if (isBlockedAddress(host)) throw new Error(`URL resolves to a private IP address: ${host}`);
     return;
   }
   const v4 = await dns.resolve4(hostname).catch(() => []);
   const v6 = await dns.resolve6(hostname).catch(() => []);
   for (const addr of [...v4, ...v6]) {
-    if (ipIsPrivate(addr)) {
+    if (isBlockedAddress(addr)) {
       throw new Error(`URL resolves to a private IP address: ${addr}`);
     }
   }
-}
-
-/**
- * DNS-Lookup-Wrapper für den fetch-Agent: validiert JEDE aufgelöste Adresse zum
- * Zeitpunkt des Verbindungsaufbaus. Damit ist DNS-Rebinding ausgeschlossen – ein
- * Angreifer-DNS kann `checkSSRF` nicht mehr mit einer öffentlichen IP täuschen und
- * beim eigentlichen fetch auf eine private IP (z. B. 169.254.169.254) umschwenken,
- * weil hier die Adresse geprüft wird, mit der die Socket-Verbindung wirklich aufgebaut wird.
- */
-function guardedLookup(hostname, options, callback) {
-  if (typeof options === 'function') { callback = options; options = {}; }
-  const opts = typeof options === 'number' ? { family: options } : (options || {});
-  dnsLookup(hostname, { ...opts, all: true }, (err, addresses) => {
-    if (err) return callback(err);
-    for (const entry of addresses) {
-      if (ipIsPrivate(entry.address)) {
-        return callback(new Error(`URL resolves to a private IP address: ${entry.address}`));
-      }
-    }
-    if (opts.all) return callback(null, addresses);
-    const [first] = addresses;
-    return callback(null, first.address, first.family);
-  });
-}
-
-/**
- * Agent-Fabrik für node-fetch: erzwingt die Rebinding-sichere IP-Validierung über
- * guardedLookup. Literale IPs umgehen den Socket-Lookup (Node verbindet direkt),
- * werden aber bereits von checkSSRF abgefangen.
- */
-function ssrfSafeAgent(parsedUrl) {
-  const Agent = parsedUrl.protocol === 'https:' ? https.Agent : http.Agent;
-  return new Agent({ lookup: guardedLookup });
 }
 
 async function fetchAndParse(urlRaw, etag, lastModified) {
@@ -137,13 +79,14 @@ async function fetchAndParse(urlRaw, etag, lastModified) {
 
   const controller = new AbortController();
   const timer      = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  // Der Agent validiert die Ziel-IP zum Verbindungszeitpunkt (Anti-Rebinding).
-  // Bei aktivem Opt-in für private Netze entfällt er bewusst (Default-Agent).
-  const fetchOpts = { headers, signal: controller.signal };
-  if (!isPrivateNetworkAllowed()) fetchOpts.agent = ssrfSafeAgent;
+  // createGuardedLookup validiert die Ziel-IP JEDER Verbindung — auch die von
+  // Redirect-Zielen — zum Verbindungszeitpunkt (Anti-Rebinding). Bei aktivem Opt-in
+  // für private Netze entfällt er bewusst (Default-DNS).
+  const reqOpts = { headers, signal: controller.signal };
+  if (!isPrivateNetworkAllowed()) reqOpts.lookup = createGuardedLookup();
   let res;
   try {
-    res = await fetch(url, fetchOpts);
+    res = await safeRequest(url, reqOpts);
   } finally { clearTimeout(timer); }
 
   if (res.status === 304) return { notModified: true };
@@ -200,8 +143,12 @@ async function syncOne(sub) {
     const createdBy = sub.created_by ?? owner?.id;
     if (!createdBy) { log.warn('No user found.'); return; }
 
+    // RECURRENCE-ID-Overrides zusammenführen: der Master behält die RRULE (sonst
+    // überschreibt ein geändertes Einzel-Vorkommen die Serie), verschobene
+    // Instanzen bleiben als eigenständige Termine erhalten (#549).
+    const normalized = normalizeRecurrenceOverrides(events);
     const flatEvents = [];
-    for (const ev of events) {
+    for (const ev of normalized) {
       if (ev.rrule) {
         flatEvents.push(...expandRRULE(ev, windowStart, windowEnd));
       } else if (ev.dtstart >= windowStart && ev.dtstart <= windowEnd) {
@@ -219,20 +166,42 @@ async function syncOne(sub) {
         .all(sub.id).map((r) => r.external_calendar_id)
     );
 
-    const upsert = db.get().prepare(`
+    // Bekannte UIDs werden nachgeschlagen statt blind eingefügt: ein INSERT mit
+    // ON CONFLICT reserviert bei AUTOINCREMENT auch dann eine neue Rowid und
+    // schreibt sqlite_sequence fort, wenn das DO UPDATE per WHERE unterdrückt
+    // wird. Ein unveränderter Lauf würde also weiterhin schreiben, nur für
+    // changes und total_changes() unsichtbar.
+    const findExisting = db.get().prepare(`
+      SELECT id FROM calendar_events
+      WHERE subscription_id = ? AND external_calendar_id = ?
+    `);
+
+    const insertEvent = db.get().prepare(`
       INSERT INTO calendar_events
         (title, description, start_datetime, end_datetime, all_day, location,
          color, external_calendar_id, external_source, subscription_id, recurrence_rule, user_modified, created_by)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ics', ?, ?, 0, ?)
-      ON CONFLICT(subscription_id, external_calendar_id) DO UPDATE SET
-        title          = excluded.title,
-        description    = excluded.description,
-        start_datetime = excluded.start_datetime,
-        end_datetime   = excluded.end_datetime,
-        all_day        = excluded.all_day,
-        location       = excluded.location,
-        color          = excluded.color
-      WHERE user_modified = 0
+    `);
+
+    // Der Wertvergleich hält Schreibvorgänge ab, die nichts ändern: liefert ein
+    // Server kein ETag, kommt bei jedem Lauf der komplette Kalender erneut an.
+    // IS NOT statt Ungleich wegen der NULL-Sicherheit. Verglichen wird genau
+    // über die Spalten, die auch gesetzt werden - recurrence_rule bleibt beim
+    // Update außen vor, wie zuvor beim ON CONFLICT, und darf deshalb auch den
+    // Vergleich nicht auslösen.
+    const updateEvent = db.get().prepare(`
+      UPDATE calendar_events
+      SET title = ?, description = ?, start_datetime = ?, end_datetime = ?,
+          all_day = ?, location = ?, color = ?
+      WHERE id = ? AND user_modified = 0
+        AND (   title          IS NOT ?
+             OR description    IS NOT ?
+             OR start_datetime IS NOT ?
+             OR end_datetime   IS NOT ?
+             OR all_day        IS NOT ?
+             OR location       IS NOT ?
+             OR color          IS NOT ?
+            )
     `);
 
     const deleteStale = db.get().prepare(`
@@ -242,15 +211,32 @@ async function syncOne(sub) {
         AND user_modified = 0
     `);
 
+    // Zählt, was den lokalen Stand wirklich verändert hat. Gesehen ist nicht
+    // geändert: ein Abo mit 200 Terminen liefert bei jedem Lauf 200 Events,
+    // im Regelfall aber keine einzige Änderung.
+    let changedEvents = 0;
+
     db.get().transaction(() => {
       for (const ev of flatEvents) {
         try {
           // Event-Eigenfarbe (RFC 7986) hat Vorrang, sonst die Abo-Farbe.
-          upsert.run(ev.summary, ev.description, ev.dtstart, ev.dtend,
-            ev.allDay ? 1 : 0, ev.location, ev.color || sub.color, ev.uid, sub.id, ev.rrule, createdBy);
+          const color    = ev.color || sub.color;
+          const existing = findExisting.get(sub.id, ev.uid);
+          if (existing) {
+            // Dieselben Werte binden die SET-Liste und den Vergleich.
+            const values = [
+              ev.summary, ev.description, ev.dtstart, ev.dtend,
+              ev.allDay ? 1 : 0, ev.location, color,
+            ];
+            changedEvents += updateEvent.run(...values, existing.id, ...values).changes;
+          } else {
+            insertEvent.run(ev.summary, ev.description, ev.dtstart, ev.dtend,
+              ev.allDay ? 1 : 0, ev.location, color, ev.uid, sub.id, ev.rrule, createdBy);
+            changedEvents++;
+          }
         } catch (err) { log.error(`Upsert UID ${ev.uid}: ${err.message}`); }
       }
-      deleteStale.run(sub.id, JSON.stringify([...seenUids]));
+      changedEvents += deleteStale.run(sub.id, JSON.stringify([...seenUids])).changes;
 
       // #459: neu importierte Termine der Standard-Person zuweisen.
       if (sub.default_assignee_user_id) {
@@ -267,7 +253,11 @@ async function syncOne(sub) {
         .run(new Date().toISOString(), newEtag, newLastModified, sub.id);
     })();
 
-    log.info(`Subscription ${sub.id} (${sub.name}): ${flatEvents.length} events synced.`);
+    // Ein Lauf, der nichts verändert hat, gehört nicht ins Standard-Log: er
+    // wiederholt sich bei jedem Scheduler-Tick.
+    const summary = `Subscription ${sub.id} (${sub.name}): ${flatEvents.length} events seen, ${changedEvents} changed.`;
+    if (changedEvents > 0) log.info(summary);
+    else log.debug(summary);
   } finally { syncingNow.delete(sub.id); }
 }
 
@@ -289,9 +279,12 @@ function getAll(userId) {
 
 /**
  * Reduziert eine ICS-RRULE auf das lokal unterstützte Subset
- * (FREQ / INTERVAL / BYDAY / UNTIL) und gibt sie ohne "RRULE:"-Präfix zurück –
- * passend zum rrule()-Validator und zur Recurrence-Engine. Nicht abbildbare
- * Regeln (reines COUNT, BYMONTHDAY, Ordinal-BYDAY …) ergeben null → Einzeltermin.
+ * (FREQ / INTERVAL / BYDAY / UNTIL / COUNT) und gibt sie ohne "RRULE:"-Präfix
+ * zurück – passend zum rrule()-Validator und zur Recurrence-Engine. Nicht
+ * abbildbare Regeln (BYMONTHDAY, Ordinal-BYDAY …) ergeben null → Einzeltermin.
+ * COUNT begrenzt endliche Serien; ohne Erhalt würde aus einer 10-fachen
+ * Wiederholung eine unendliche Serie (#513). COUNT und UNTIL schließen sich
+ * laut RFC 5545 aus – bei beidem gewinnt COUNT (die konkrete Anzahl).
  */
 function toLocalRRule(raw) {
   if (!raw) return null;
@@ -313,7 +306,10 @@ function toLocalRRule(raw) {
       .filter((d) => /^(MO|TU|WE|TH|FR|SA|SU)$/.test(d));
     if (days.length) rule += `;BYDAY=${days.join(',')}`;
   }
-  if (parts.UNTIL) {
+  const count = parts.COUNT ? parseInt(parts.COUNT, 10) : null;
+  if (Number.isInteger(count) && count > 0) {
+    rule += `;COUNT=${count}`;
+  } else if (parts.UNTIL) {
     const m = /^(\d{8})(T\d{6}Z)?/.exec(parts.UNTIL);
     if (m) rule += `;UNTIL=${m[1]}${m[2] || ''}`;
   }
@@ -341,6 +337,9 @@ async function importToLocal(userId, { ics, url, color } = {}) {
   } else {
     throw new Error('Either an ICS file or a URL is required.');
   }
+  // RECURRENCE-ID-Overrides zusammenführen: Master behält die Serie, geänderte
+  // Einzel-Vorkommen werden eigenständige Termine statt die Serie zu killen (#549).
+  rawEvents = normalizeRecurrenceOverrides(rawEvents);
 
   const fallbackColor = color || '#007AFF';
   const insert = db.get().prepare(`
@@ -355,6 +354,11 @@ async function importToLocal(userId, { ics, url, color } = {}) {
     WHERE created_by = ? AND subscription_id IS NULL AND external_calendar_id = ?
     LIMIT 1
   `);
+  // EXDATE-Ausnahmen der importierten Serie (#513): dieselbe Tabelle wie
+  // lokal ausgenommene Einzeltermine (#489), matcht per Instanz-Datum.
+  const insertException = db.get().prepare(
+    'INSERT OR IGNORE INTO calendar_event_exceptions (event_id, exception_date) VALUES (?, ?)'
+  );
 
   let imported = 0;
   let skipped  = 0;
@@ -365,11 +369,17 @@ async function importToLocal(userId, { ics, url, color } = {}) {
       if (!ev.dtstart) { skipped++; continue; }
       if (ev.uid && existsStmt.get(userId, ev.uid)) { skipped++; continue; }
       try {
-        insert.run(
+        const localRule = toLocalRRule(ev.rrule);
+        const info = insert.run(
           ev.summary, ev.description, ev.dtstart, ev.dtend,
           ev.allDay ? 1 : 0, ev.location, ev.color || fallbackColor,
-          ev.uid || null, toLocalRRule(ev.rrule), userId,
+          ev.uid || null, localRule, userId,
         );
+        // EXDATE nur übernehmen, wenn die Serie erhalten blieb (localRule != null).
+        if (localRule && Array.isArray(ev.exdates) && ev.exdates.length) {
+          const eventId = Number(info.lastInsertRowid);
+          for (const exDate of ev.exdates) insertException.run(eventId, exDate);
+        }
         imported++;
       } catch (err) {
         log.error(`Import UID ${ev.uid}: ${err.message}`);

@@ -4,12 +4,13 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, globSync, readFileSync } from 'node:fs';
 
 // Minimales Window/Navigator-Mock für Node
-const { stagger, vibrate, deleteWithUndo } = await (async () => {
+const { stagger, vibrate, withBusy, scheduleUndoableDelete } = await (async () => {
   global.window = {
     matchMedia: () => ({ matches: false }),
+    addEventListener: () => {},
     yuvomi: { showToast: () => {} },
   };
   global.t = (k) => k;
@@ -78,6 +79,91 @@ test('vibrate: tut nichts wenn API nicht vorhanden', () => {
   assert.doesNotThrow(() => vibrate(10));
 });
 
+// ---------------------------------------------------------------------------
+// withBusy - Fokus-Rückgabe nach einer asynchronen Aktion (#534-Audit).
+// `disabled` entzieht dem fokussierten Element den Fokus; ohne Rückgabe landet
+// die Tastatur nach jedem Toggle wieder am Seitenanfang.
+// ---------------------------------------------------------------------------
+
+/** Minimales Control-Mock, das die relevanten DOM-Effekte nachbildet. */
+function makeControl({ connected = true } = {}) {
+  const classes = new Set();
+  const attrs = new Map();
+  const control = {
+    isConnected: connected,
+    classList: {
+      add: (c) => classes.add(c),
+      remove: (c) => classes.delete(c),
+      has: (c) => classes.has(c),
+    },
+    setAttribute: (k, v) => attrs.set(k, v),
+    removeAttribute: (k) => attrs.delete(k),
+    getAttribute: (k) => attrs.get(k) ?? null,
+    focus: () => { global.document.activeElement = control; },
+  };
+  // Wie im Browser: disabled = true nimmt dem fokussierten Element den Fokus.
+  let disabled = false;
+  Object.defineProperty(control, 'disabled', {
+    get: () => disabled,
+    set: (value) => {
+      disabled = value;
+      if (value && global.document.activeElement === control) {
+        global.document.activeElement = { tag: 'body' };
+      }
+    },
+  });
+  return control;
+}
+
+test('withBusy: gibt den Fokus nach der Aktion an das Control zurück', async () => {
+  global.document = { activeElement: null };
+  const control = makeControl();
+  global.document.activeElement = control;
+
+  await withBusy(control, async () => {
+    assert.equal(control.disabled, true, 'während der Aktion gesperrt');
+    assert.equal(control.getAttribute('aria-busy'), 'true', 'aria-busy gesetzt');
+    assert.notEqual(global.document.activeElement, control, 'disabled entzieht den Fokus');
+  });
+
+  assert.equal(control.disabled, false, 'danach wieder bedienbar');
+  assert.equal(control.getAttribute('aria-busy'), null, 'aria-busy entfernt');
+  assert.equal(global.document.activeElement, control, 'Fokus zurück auf dem Control');
+});
+
+test('withBusy: stiehlt keinen Fokus, wenn das Control ihn vorher nicht hatte', async () => {
+  global.document = { activeElement: { tag: 'other' } };
+  const control = makeControl();
+  await withBusy(control, async () => {});
+  assert.notEqual(global.document.activeElement, control);
+});
+
+test('withBusy: kein focus() auf abgehängten Controls (Re-Render)', async () => {
+  global.document = { activeElement: null };
+  const control = makeControl({ connected: false });
+  global.document.activeElement = control;
+  await withBusy(control, async () => {});
+  assert.notEqual(global.document.activeElement, control, 'abgehängtes Control bekommt keinen Fokus');
+});
+
+test('withBusy: räumt Lade-Klasse und Sperre auch im Fehlerfall auf', async () => {
+  global.document = { activeElement: null };
+  const control = makeControl();
+  await assert.rejects(
+    () => withBusy(control, async () => { throw new Error('boom'); }, { loadingClass: 'btn--loading' }),
+    /boom/,
+  );
+  assert.equal(control.disabled, false);
+  assert.equal(control.classList.has('btn--loading'), false);
+  assert.equal(control.getAttribute('aria-busy'), null);
+});
+
+test('withBusy: reicht den Rückgabewert der Aktion durch', async () => {
+  global.document = { activeElement: null };
+  const control = makeControl();
+  assert.equal(await withBusy(control, async () => 42), 42);
+});
+
 test('vibrate: ruft navigator.vibrate auf wenn vorhanden', () => {
   let called = null;
   Object.defineProperty(global, 'navigator', { value: { vibrate: (p) => { called = p; } }, writable: true, configurable: true });
@@ -97,30 +183,67 @@ test('readable text color selects a WCAG-safe ink for arbitrary card colors', as
   assert.equal(getReadableTextColor('#FFFFFF'), 'var(--color-ink-on-bright)');
 });
 
-test('deleteWithUndo: ruft onDelete auf', async () => {
-  let deleteCalled = false;
-  global.window.yuvomi = { showToast: () => {} };
-  await deleteWithUndo({
-    onDelete: async () => { deleteCalled = true; },
-    toastMessage: 'Gelöscht',
+// Löschen mit Undo läuft ausschließlich über scheduleUndoableDelete: der
+// Server-Delete wird bis zum Ablauf des Undo-Fensters zurückgehalten und bei
+// pagehide per keepalive nachgereicht. Die frühere deleteWithUndo-API löschte
+// sofort und überließ das Zurückholen dem Aufrufer — in Birthdays stellte das
+// Undo nur den lokalen State wieder her, der Eintrag war serverseitig weg.
+// Die Invariante, an der der alte Birthdays-Pfad scheiterte: dort lief der
+// Server-Delete sofort und „Rückgängig" stellte nur den lokalen State her —
+// der Eintrag kam sichtbar zurück und war beim nächsten Reload trotzdem weg.
+test('scheduleUndoableDelete: Undo verhindert den Server-Delete', async () => {
+  let committed = false;
+  let restored = false;
+  let capturedUndo = null;
+  global.window.yuvomi = { showToast: (_msg, _type, _duration, undoFn) => { capturedUndo = undoFn; } };
+
+  scheduleUndoableDelete({
+    message: 'Gelöscht',
+    duration: 40,
+    commit: async () => { committed = true; },
+    restore: () => { restored = true; },
   });
-  assert.equal(deleteCalled, true);
+
+  assert.ok(capturedUndo, 'der Undo-Toast muss eine Rückgängig-Aktion tragen');
+  capturedUndo();
+  await new Promise((resolve) => setTimeout(resolve, 90));
+
+  assert.equal(committed, false, 'nach Undo darf kein DELETE an den Server gehen');
+  assert.equal(restored, true, 'die UI muss zurückgesetzt werden');
 });
 
-test('deleteWithUndo: übergibt onUndo an showToast', async () => {
-  let undoCalled = false;
-  let capturedUndo = null;
-  global.window.yuvomi = {
-    showToast: (_msg, _type, _duration, undoFn) => { capturedUndo = undoFn; },
-  };
-  await deleteWithUndo({
-    onDelete: async () => {},
-    onUndo: async () => { undoCalled = true; },
-    toastMessage: 'Gelöscht',
+test('scheduleUndoableDelete: ohne Undo läuft der Delete nach dem Fenster', async () => {
+  let committed = false;
+  let keepaliveFlag = null;
+  global.window.yuvomi = { showToast: () => {} };
+
+  scheduleUndoableDelete({
+    message: 'Gelöscht',
+    duration: 20,
+    commit: async ({ keepalive }) => { committed = true; keepaliveFlag = keepalive; },
   });
-  assert.ok(capturedUndo, 'showToast muss eine Undo-Funktion erhalten haben');
-  await capturedUndo();
-  assert.equal(undoCalled, true);
+
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  assert.equal(committed, true, 'ohne Undo muss der Delete nach Ablauf des Fensters laufen');
+  assert.equal(keepaliveFlag, false, 'der reguläre Commit läuft ohne keepalive');
+});
+
+test('scheduleUndoableDelete ist das einzige Undo-Löschmuster', () => {
+  const ux = readFileSync(new URL('../public/utils/ux.js', import.meta.url), 'utf8');
+  assert.ok(
+    ux.includes('export function scheduleUndoableDelete'),
+    'scheduleUndoableDelete muss die kanonische Undo-Lösch-API bleiben',
+  );
+  assert.ok(
+    !ux.includes('deleteWithUndo'),
+    'deleteWithUndo löscht sofort und ist ersatzlos entfernt — nicht wieder einführen',
+  );
+
+  // Aufruf oder Import — erklärende Kommentare dürfen den alten Namen nennen.
+  const usage = /deleteWithUndo\s*\(|import\s*\{[^}]*\bdeleteWithUndo\b/;
+  const pages = globSync('public/{pages,settings/pages,components,utils}/**/*.js');
+  const offenders = pages.filter((file) => usage.test(readFileSync(file, 'utf8')));
+  assert.deepEqual(offenders, [], 'deleteWithUndo darf nirgends mehr verwendet werden');
 });
 
 test('parseTimeInput: bare hour (24 h) expands to HH:00', () => {

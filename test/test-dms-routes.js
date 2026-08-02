@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import test from 'node:test';
 import express from 'express';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 
 process.env.DB_PATH = ':memory:';
 
@@ -481,6 +481,90 @@ test('DELETE account: verlinktes Dokument verliert dms_account_id (SET NULL) und
   // Preview kann den Inhalt nicht mehr proxen → 404 statt Crash
   const res = await fetch(`http://127.0.0.1:${server.address().port}/api/v1/documents/${linked.id}/preview`);
   assert.equal(res.status, 404);
+});
+
+// --- Thumbnail-Vorschau (Issue #533) ---
+
+const PNG = Buffer.from('89504e470d0a1a0a', 'hex'); // PNG-Signatur reicht für den Test
+
+test('GET /dms/thumbnail (Picker): Admin bekommt Bild mit nosniff + enger CSP', async () => {
+  session = { userId: adminId, role: 'admin' };
+  _setAdapterFactory(() => ({ async fetchThumbnail() { return { buffer: PNG, mime: 'image/png' }; } }));
+  const accId = (await call('GET', '/accounts')).body.data[0].id;
+  const res = await fetch(`${base}/thumbnail?account_id=${accId}&dms_document_id=5`);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('content-type'), 'image/png');
+  assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+  assert.match(res.headers.get('content-security-policy'), /default-src 'none'/);
+  assert.deepEqual(Buffer.from(await res.arrayBuffer()), PNG);
+});
+
+test('GET /dms/thumbnail (Picker): Member bekommt 403', async () => {
+  session = { userId: adminId, role: 'admin' };
+  const accId = (await call('GET', '/accounts')).body.data[0].id;
+  session = { userId: memberId, role: 'member' };
+  const res = await fetch(`${base}/thumbnail?account_id=${accId}&dms_document_id=5`);
+  assert.equal(res.status, 403);
+  session = { userId: adminId, role: 'admin' };
+});
+
+test('GET /dms/thumbnail (Picker): fehlende dms_document_id → 400', async () => {
+  session = { userId: adminId, role: 'admin' };
+  const accId = (await call('GET', '/accounts')).body.data[0].id;
+  const res = await fetch(`${base}/thumbnail?account_id=${accId}`);
+  assert.equal(res.status, 400);
+});
+
+test('GET /dms/thumbnail (Picker): Nicht-Bild-MIME wird mit 415 verworfen', async () => {
+  session = { userId: adminId, role: 'admin' };
+  _setAdapterFactory(() => ({ async fetchThumbnail() { return { buffer: Buffer.from('<svg/>'), mime: 'image/svg+xml' }; } }));
+  const accId = (await call('GET', '/accounts')).body.data[0].id;
+  const res = await fetch(`${base}/thumbnail?account_id=${accId}&dms_document_id=5`);
+  assert.equal(res.status, 415);
+});
+
+test('GET /dms/thumbnail (Picker): Adapter ohne fetchThumbnail (Papra) → 415', async () => {
+  session = { userId: adminId, role: 'admin' };
+  _setAdapterFactory(() => ({ async search() { return []; } }));
+  const accId = (await call('GET', '/accounts')).body.data[0].id;
+  const res = await fetch(`${base}/thumbnail?account_id=${accId}&dms_document_id=5`);
+  assert.equal(res.status, 415);
+});
+
+test('GET /:id/thumbnail: verlinktes DMS-Dokument liefert Bild', async () => {
+  session = { userId: adminId, role: 'admin' };
+  _setAdapterFactory(() => ({
+    async getDocument(id) { return { id, title: 'ThumbDoc', filename: 't.pdf', url: `https://t/d/${id}`, correspondent: null, tags: [] }; },
+  }));
+  const accId = (await call('GET', '/accounts')).body.data[0].id;
+  const linked = (await call('POST', '/link', { account_id: accId, dms_document_id: '5330' })).body.data;
+  _setDmsAdapterFactory(() => ({ async fetchThumbnail() { return { buffer: PNG, mime: 'image/png' }; } }));
+  const res = await fetch(`http://127.0.0.1:${server.address().port}/api/v1/documents/${linked.id}/thumbnail`);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('content-type'), 'image/png');
+  assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+});
+
+test('GET /:id/thumbnail: lokales Dokument → 415 (nur DMS)', async () => {
+  session = { userId: adminId, role: 'admin' };
+  const content = Buffer.from('x').toString('base64');
+  const localId = db.prepare(`INSERT INTO family_documents
+    (name, category, visibility, original_name, mime_type, file_size, content_data, created_by)
+    VALUES ('Local','other','family','l.png','image/png',1,?,?)`).run(content, adminId).lastInsertRowid;
+  const res = await fetch(`http://127.0.0.1:${server.address().port}/api/v1/documents/${localId}/thumbnail`);
+  assert.equal(res.status, 415);
+});
+
+test('GET /:id/thumbnail: DMS-Adapter ohne fetchThumbnail → 415', async () => {
+  session = { userId: adminId, role: 'admin' };
+  _setAdapterFactory(() => ({
+    async getDocument(id) { return { id, title: 'NoThumb', filename: 'n.pdf', url: `https://t/d/${id}`, correspondent: null, tags: [] }; },
+  }));
+  const accId = (await call('GET', '/accounts')).body.data[0].id;
+  const linked = (await call('POST', '/link', { account_id: accId, dms_document_id: '5331' })).body.data;
+  _setDmsAdapterFactory(() => ({ async fetchContent() { return { buffer: PNG, mime: 'image/png' }; } }));
+  const res = await fetch(`http://127.0.0.1:${server.address().port}/api/v1/documents/${linked.id}/thumbnail`);
+  assert.equal(res.status, 415);
 });
 
 // Server schließen, damit der offene Listener die Event-Loop nicht offen hält

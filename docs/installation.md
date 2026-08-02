@@ -21,6 +21,8 @@ bash install.sh
 
 The script checks prerequisites, generates security keys, configures optional integrations, starts the container (Docker or Podman — auto-detected), and creates your admin account. Like the web installer, it is fully localized in 23 languages and auto-detects yours from the shell environment (`LANG`/`LC_ALL`).
 
+Running it again on an existing installation is safe: keys already present in your `.env` are kept instead of regenerated, so the database stays readable. Remove a key from `.env` if you deliberately want a new one.
+
 Force a specific language with `--lang` (one of `de en es fr it sv el ru tr zh ja ar hi pt uk pl nl cs vi hu ko id fa`):
 
 ```bash
@@ -54,7 +56,7 @@ podman compose -f podman-compose.yml up -d   # or: podman-compose -f podman-comp
 
 Then open the WebUI — the first visit guides you through creating your admin account in
 the browser. Headless deployments can instead create it from the container console with
-`docker compose exec oikos node setup.js` (or the matching `podman compose … exec`).
+`docker compose exec yuvomi node setup.js` (or the matching `podman compose … exec`).
 
 ---
 
@@ -171,14 +173,14 @@ node tools/installer/install-server.js
 Open your browser and navigate to **http://localhost:8090**. The wizard detects your browser language (23 languages supported), verifies that a container engine is available (Docker with Compose v2, or Podman with `podman compose` / `podman-compose`), and reports any existing `.env` file or running container before you start. It then guides you through:
 
 - Basics — timezone (`TZ`) and HTTP host port (`OIKOS_HTTP_PORT`)
-- Security key generation (`SESSION_SECRET`, `DB_ENCRYPTION_KEY`)
-- Optional integrations (weather, Google Calendar, Apple CalDAV, local folder or WebDAV document storage)
+- Security key generation (`SESSION_SECRET`, `DB_ENCRYPTION_KEY`) — on a re-run, keys already present in your `.env` are kept rather than regenerated, so running the wizard again on a live installation cannot lock you out of your encrypted database
+- Optional integrations (weather, Google Calendar, Apple CalDAV, local folder, WebDAV, or Google Drive document storage)
 - Advanced settings — reverse-proxy/HTTPS (`SESSION_SECURE`, `TRUST_PROXY`), Single Sign-On (OIDC), and automatic backups
 - Writing your `.env` file (an existing `.env` is backed up to `.env.bak-<timestamp>` first)
 - Starting the container (via Docker or Podman, whichever was detected)
 - Creating your admin account
 
-The final screen lets you **download a copy of your `.env`** — keep it safe, as it holds the encryption keys that cannot be recovered if lost.
+The final screen lets you **download a copy of your `.env`** — keep it safe, as it holds the encryption keys that cannot be recovered if lost. Keys carried over from an earlier run appear there as a comment instead of a value, because the browser never receives them; those keys are still in the `.env` on disk and in its backup copy.
 
 The installer server shuts down automatically after setup completes (or after 30 minutes of inactivity).
 
@@ -251,7 +253,7 @@ Open `.env` and set the two required secrets (see above). Generate them with `op
 docker compose up -d --build
 ```
 
-- `--build` compiles the Docker image locally (SQLCipher dependencies, npm packages).
+- `--build` builds the Docker image locally (npm packages, including the native database module).
 - `-d` runs the container in the background.
 
 The first build takes a few minutes. Subsequent starts are much faster.
@@ -267,9 +269,9 @@ docker compose logs -f
 You should see output like:
 
 ```
-oikos  | [Yuvomi] Server läuft auf Port 3000
-oikos  | [Yuvomi] Umgebung: production
-oikos  | [Sync] Auto-Sync alle 15 Minuten aktiv.
+yuvomi  | [Yuvomi] Server läuft auf Port 3000
+yuvomi  | [Yuvomi] Umgebung: production
+yuvomi  | [Sync] Auto-Sync alle 15 Minuten aktiv.
 ```
 
 Press `Ctrl+C` to stop following the logs (the container keeps running).
@@ -289,7 +291,7 @@ form is no longer reachable.
 a provisioning step — create the admin from the container console instead:
 
 ```bash
-docker compose exec oikos node setup.js
+docker compose exec yuvomi node setup.js
 ```
 
 ### 6. Open Yuvomi
@@ -361,7 +363,7 @@ In Unraid, open the **Apps** tab (the Community Applications plugin) and search 
 Click **Install**. In the template, set:
 
 - **SESSION_SECRET** (required) — a long random string
-- **DB_ENCRYPTION_KEY** (recommended) — generate with `openssl rand -hex 32`; back it up, it cannot be recovered or changed on an existing database
+- **DB_ENCRYPTION_KEY** (recommended) — generate with `openssl rand -hex 32`; back it up, it cannot be recovered or changed on an existing database. If you are upgrading an installation whose database is still unencrypted, it is encrypted once on the next start and the untouched original is kept as `<DB_PATH>.plaintext-backup`; delete that copy once you have verified the app starts and your data is complete
 - Adjust the WebUI port and the appdata path if needed
 
 #### 3. Apply and Open
@@ -383,8 +385,9 @@ All configuration happens in the `.env` file. The container reads these values o
 | `PORT` | Port the Express server listens on **inside the container** (rarely changed) | `3000` | No |
 | `OIKOS_HTTP_PORT` | Host port that the compose file maps to the container's port 3000. Change this to expose Yuvomi on a different host port; the app inside the container always listens on 3000. | `3000` | No |
 | `OIKOS_HTTP_BIND` | Host bind address for the published port (`podman-compose.yml` only). Set to `127.0.0.1` for rootless Podman behind a reverse proxy on the same host. | `0.0.0.0` | No |
-| `TZ` | Container timezone (e.g. `Europe/Berlin`). Affects timestamps and the automated-backup schedule. | `UTC` | No |
+| `TZ` | Container timezone (e.g. `Europe/Berlin`). Affects timestamps, the automated-backup schedule, and serves as the household zone wherever a time carries none of its own: events pushed to Google Calendar when the target calendar reports no zone, and the due times of CalDAV reminders synced into Tasks. | `UTC` | No |
 | `NODE_ENV` | Runtime environment | `production` | No |
+| `LOG_LEVEL` | Lowest severity written to the container log (`debug`, `info`, `warn`, `error`). Set to `debug` to see the per-run detail of the calendar, contact and holiday sync, which stays quiet at `info` when a run has nothing to do. | `info` | No |
 | `TRUST_PROXY` | Number of reverse-proxy hops to trust, or a subnet string (e.g. `1`, `172.16.0.0/12`, `loopback`). Set to `1` when running behind a single Traefik/Nginx hop so `req.ip` returns the real client IP. Numeric values are treated as a hop count; subnet strings and named values (`loopback`, `linklocal`, `uniquelocal`) work as expected. | `false` | No |
 
 ### Security
@@ -421,13 +424,45 @@ accepted for trusted internal networks such as a private LAN or container networ
 |----------|-------------|---------|----------|
 | `VAPID_PUBLIC_KEY` | VAPID public key. Auto-generated on first use and stored in the database if unset. | auto | No |
 | `VAPID_PRIVATE_KEY` | VAPID private key. Set together with the public key to pin a fixed pair across redeployments. | auto | No |
-| `VAPID_SUBJECT` | Contact URI (`mailto:` or `https:`) sent to push services. | `mailto:admin@localhost` | No |
+| `VAPID_SUBJECT` | Contact URI (`mailto:` address or `https:` origin) sent to push services. Must be routable — Apple rejects a `localhost`, `.local` or otherwise unreachable subject with `403 BadJwtToken`, which disables push on iOS while Android keeps working. Falls back to the sender address from Settings → Administration → Email, then to `BASE_URL`, then to a placeholder. | derived, see description | No |
 
 Generate a fixed key pair (optional):
 
 ```bash
 npx web-push generate-vapid-keys
 ```
+
+#### iOS and iPadOS
+
+Apple applies extra restrictions that do not exist on Android or desktop browsers:
+
+- **iOS/iPadOS 16.4 or newer** is required.
+- **The app must be installed to the Home Screen.** iOS delivers Web Push only to installed
+  home-screen web apps, never to a Safari tab. Open Yuvomi in Safari, then Share ->
+  "Add to Home Screen".
+- **Enable the toggle from inside the home-screen app.** The push subscription belongs to that
+  installation, so a toggle enabled in a Safari tab does not carry over.
+- **The certificate must be one iOS trusts.** A self-signed certificate or a private CA without an
+  installed profile stops the service worker from registering, which silently disables push. A
+  plain `http://` LAN address does not work either.
+- **Check iOS Settings -> Notifications -> Yuvomi**: "Allow Notifications" must be on, and a Focus
+  mode must not be filtering the app.
+- **The server needs outbound access to `web.push.apple.com`.** In LAN-only or egress-filtered
+  deployments the send fails server-side.
+- **The VAPID subject must be routable.** Apple validates the contact URI in the signed token and
+  answers `403 BadJwtToken` when it cannot be reached, so push fails on iOS while Android continues
+  to work. Yuvomi derives a usable value from the SMTP sender address or `BASE_URL`; set
+  [`VAPID_SUBJECT`](#web-push-optional) explicitly if neither is configured.
+
+If a test notification does not arrive, the server log is the authoritative source. Successful
+sends are silent; failures are logged as `[Push] Push send failed (host=... status=... body=...)`,
+where `host` identifies the push service (`web.push.apple.com` for iOS) and `status`/`body` carry
+that service's rejection reason. A rejected token additionally logs `sub=...` plus a line naming
+the subject as the likely cause.
+
+A subscription the server no longer knows about (removed after the push service reported it gone,
+or lost in a database restore) repairs itself: the app re-registers an existing subscription on
+every start, and the test button re-registers and retries once before reporting a failure.
 
 ### Email / SMTP (Optional)
 
@@ -464,7 +499,7 @@ optional `DB_ENCRYPTION_KEY`.
 | `DB_PATH` | Path to the SQLite database file inside the container | `/data/yuvomi.db` | No |
 | `DB_ENCRYPTION_KEY` | Encryption key for SQLCipher AES-256. **Change this!** | - | **Yes** |
 | `DATA_DIR` | Host directory mounted at `/data` inside the container (set in `.env` or `docker-compose.yml`). | `./data` | No |
-| `BACKUP_DIR` | Host directory mounted at `/backups` for scheduled backup files. | `./backups` | No |
+| `BACKUP_DIR` | In `.env`/`docker-compose.yml`: the **host** directory mounted at `/backups`. Inside the container the app reads the same name as the **container** path it writes to — the compose files pin it to `/backups`, and the image defaults to `/backups` as well. Only override it inside the container if you mount your backup volume somewhere else. | `./backups` (host) / `/backups` (container) | No |
 
 Generate a secure `DB_ENCRYPTION_KEY`:
 
@@ -506,7 +541,7 @@ environment:
 
 ### WebDAV Document Storage (Optional)
 
-Admins can configure **Settings → Documents → WebDAV Storage** as the global destination for all
+Admins can configure **Settings → Sync → Document storage** as the global destination for all
 new document files, including calendar attachments. Existing local documents are not migrated.
 Uploads fail closed: if WebDAV cannot accept the file, Yuvomi rejects the upload instead of silently
 storing it in SQLite. Disabling WebDAV changes only future uploads; existing WebDAV documents remain
@@ -518,8 +553,10 @@ UI. Empty values fall back to the database configuration.
 
 For SSRF protection, URLs entered through the admin UI must resolve only to public network
 addresses. Private, loopback, link-local, and internal DNS targets are rejected and rechecked when
-the connection is opened. To use a trusted WebDAV server on the local network, configure
-`DOCUMENT_STORAGE_WEBDAV_URL` through the deployment environment instead.
+the connection is opened. To use a trusted WebDAV server on the local network, either configure
+`DOCUMENT_STORAGE_WEBDAV_URL` through the deployment environment (env-provided URLs are trusted and
+may be private), or set `DOCUMENT_STORAGE_WEBDAV_ALLOW_PRIVATE_NETWORK=true` to lift the check for
+UI-managed URLs as well. Only enable the opt-in in controlled environments.
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
@@ -528,6 +565,7 @@ the connection is opened. To use a trusted WebDAV server on the local network, c
 | `DOCUMENT_STORAGE_WEBDAV_USERNAME` | Basic Auth username | — | No |
 | `DOCUMENT_STORAGE_WEBDAV_PASSWORD` | Basic Auth password or app password | — | No |
 | `DOCUMENT_STORAGE_WEBDAV_PATH` | Base folder for document objects | — | No |
+| `DOCUMENT_STORAGE_WEBDAV_ALLOW_PRIVATE_NETWORK` | Allow private/local network WebDAV targets (e.g. Nextcloud in the same Docker network); lifts SSRF protection (`true`/`false`) | `false` | No |
 
 When WebDAV documents already exist, changing the URL, username, password, or base path requires an
 explicit confirmation and a successful read test against an existing object. Required connection
@@ -538,9 +576,40 @@ PUT/GET/DELETE roundtrip in the target folder.
 > on WebDAV. Back up the WebDAV target separately and retain it together with the corresponding
 > database backup.
 
+### Google Drive Document Storage (Optional)
+
+Google Drive is a separate Documents OAuth connection, even when it reuses the same Cloud Console
+client ID and secret as Google Calendar. Enable the **Google Drive API**, add the exact redirect URI
+`https://<YOUR-DOMAIN>/api/v1/documents/storage/google-drive/callback`, and configure the variables
+below. Yuvomi requests only `https://www.googleapis.com/auth/drive.file`; it cannot browse arbitrary
+Drive files and never creates public permissions.
+
+| Variable | Description | Default | Required |
+|----------|-------------|---------|----------|
+| `GOOGLE_DRIVE_CLIENT_ID` | Optional Drive-specific OAuth client ID; set together with the secret | Reuses `GOOGLE_CLIENT_ID` | No |
+| `GOOGLE_DRIVE_CLIENT_SECRET` | Optional Drive-specific OAuth client secret | Reuses `GOOGLE_CLIENT_SECRET` | No |
+| `GOOGLE_DRIVE_REDIRECT_URI` | Exact Drive Documents callback URL | — | Yes when Drive is configured |
+
+After deployment, open **Settings → Sync → Document storage**, connect Google Drive, test the
+connection, then explicitly select Google Drive as the upload destination. Connecting does not
+activate it. New files are placed in the visible private `Yuvomi/Documents` folder; the opaque Drive
+file ID is stored in SQLite. The environment-managed local-folder backend still takes precedence.
+
+Drive access and refresh tokens use Drive-specific database records and never the Calendar token
+keys. They are encrypted at rest only when `DB_ENCRYPTION_KEY` enables SQLCipher; otherwise they are
+stored as plaintext in SQLite, so database encryption is strongly recommended. Reconnection validates
+the candidate account and an existing Drive-backed file before replacing working credentials.
+Disconnect is blocked while Drive is selected or Drive-backed rows exist, and it removes only local
+Drive token state without revoking shared Google credentials.
+
+> **Access and backup boundary:** Yuvomi visibility settings only control access through Yuvomi.
+> Anyone with access to the connected Google Drive folder can view all files stored there. SQLite backups contain
+> metadata and Drive file IDs, not binaries. Back up or export the Drive folder separately and restore
+> it with the matching database.
+
 ### Weather (Optional)
 
-The weather widget defaults to **Open-Meteo** — free, ECMWF-backed, and requiring **no API key**. Just set your coordinates (find them on [openstreetmap.org](https://www.openstreetmap.org) or Google Maps). You can also configure this in-app under **Settings → Modules → Overview** (admin only), which takes precedence over the environment variables and acts as the household default. Any user can additionally set their own personal location under **Settings → Personal → My Weather**, which overrides the household default just for their own dashboard widget.
+The weather widget defaults to **Open-Meteo** — free, ECMWF-backed, and requiring **no API key**. Just set your coordinates (find them on [openstreetmap.org](https://www.openstreetmap.org) or Google Maps). You can also configure this in-app under **Settings → Administration → Household weather** (admin only), which takes precedence over the environment variables and acts as the household default. Any user can additionally set their own personal location under **Settings → Personal → My Weather**, which overrides the household default just for their own dashboard widget.
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
@@ -558,6 +627,18 @@ The weather widget defaults to **Open-Meteo** — free, ECMWF-backed, and requir
 | `OPENWEATHER_UNITS` | Unit system (`metric` or `imperial`) | `metric` | No |
 | `OPENWEATHER_LANG` | Language for weather descriptions | `de` | No |
 
+### Calendar Subscriptions — ICS Feeds (Optional)
+
+ICS calendar subscriptions are added in the UI. For SSRF protection, feed URLs must use `https://`
+and resolve only to public network addresses; `http://`, private, loopback, link-local, and internal
+DNS targets are rejected. To subscribe to a feed on your local network (e.g. Sonarr/Radarr/Home
+Assistant, or a self-hosted calendar behind an internal DNS name), set the opt-in below. Only enable
+it in controlled environments.
+
+| Variable | Description | Default | Required |
+|----------|-------------|---------|----------|
+| `ICS_SUBSCRIPTION_ALLOW_PRIVATE_NETWORK` | Allow `http://` and private/local network ICS feeds; lifts SSRF protection (`true`/`false`) | `false` | No |
+
 ### Google Calendar Sync (Optional)
 
 | Variable | Description | Default | Required |
@@ -565,6 +646,20 @@ The weather widget defaults to **Open-Meteo** — free, ECMWF-backed, and requir
 | `GOOGLE_CLIENT_ID` | OAuth 2.0 Client ID from Google Cloud Console | - | No |
 | `GOOGLE_CLIENT_SECRET` | OAuth 2.0 Client Secret | - | No |
 | `GOOGLE_REDIRECT_URI` | OAuth callback URL | `https://<YOUR-DOMAIN>/api/v1/calendar/google/callback` | No |
+
+After connecting, enable the calendars to sync under **Settings → Sync**. The sync runs both ways:
+events created, edited, deleted, or moved to another calendar in Yuvomi are applied in Google as
+well, and changes made in Google flow back. Outbound changes are attempted immediately and retried
+by the next sync run (`SYNC_INTERVAL_MINUTES`) if Google is unreachable. A calendar is only written
+to when the connected account has write access to it, and the **read-only mode** checkbox stops
+Yuvomi from changing anything in Google while still importing normally.
+
+Recurring appointments are imported as one series with its repeat rule, and cancelled or moved
+occurrences are carried over individually. Upgrading to v1.56.0 makes the first sync run read every
+enabled calendar in full once, which takes longer than usual and then returns to the normal
+incremental runs. That run also merges appointments that earlier versions had stored as separate
+occurrences back into their series; an occurrence you had assigned to someone or given its own
+colour is kept as a separate entry instead.
 
 ### Apple Calendar Sync — Legacy Single-Account (Optional)
 
@@ -580,7 +675,14 @@ The weather widget defaults to **Open-Meteo** — free, ECMWF-backed, and requir
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
-| `SYNC_INTERVAL_MINUTES` | Calendar sync interval in minutes | `15` | No |
+| `SYNC_INTERVAL_MINUTES` | Sync interval in minutes for calendars and contacts | `15` | No |
+
+CalDAV and iCloud sync both ways: events created, edited, deleted, or moved to another calendar in
+Yuvomi are applied on the server as well, and changes made there flow back. An outbound change is
+attempted right when you save and retried by the next sync run if the server cannot be reached.
+Editing preserves everything the server holds that Yuvomi does not — attendees, alarms, categories
+and exceptions of a recurring series stay untouched. Events that were already synced before the
+upgrade to v1.52.0 need one sync run before edits and deletions can reach them.
 
 ### SSO / OpenID Connect (Optional)
 
@@ -615,9 +717,9 @@ Built-in cron-based database backup (default: 2 AM daily, keep last 7 copies). S
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
-| `BACKUP_ENABLED` | Enable scheduled backups (`true`/`false`) | `false` | No |
+| `BACKUP_ENABLED` | Enable scheduled backups (`true`/`false`) | `true` | No |
 | `BACKUP_SCHEDULE` | Cron expression for backup schedule | `0 2 * * *` | No |
-| `BACKUP_DIR` | Directory (inside container) where backup files are written | `/backups` | No |
+| `BACKUP_DIR` | Directory (inside container) where backup files are written. Must be a writable, mounted path, otherwise backups fail with `EACCES`. | `/backups` (container), `./backups` (bare metal) | No |
 | `BACKUP_KEEP` | Number of most-recent backup files to retain | `7` | No |
 
 **WebDAV backup target (optional):** After each local backup, Yuvomi can automatically upload the file to any WebDAV-compatible server (Nextcloud, ownCloud, Hetzner Storage Box, Infomaniak kDrive, etc.). Configure in **Settings → Administration → Backup and restore → WebDAV Backup Target**, or via environment variables (env vars take precedence over the UI):
@@ -737,6 +839,20 @@ in `/etc/containers/systemd/` and use `systemctl` without `--user`.
 
 ## Updates
 
+> **One-time step when upgrading past the container rename (Oikos → Yuvomi):** the Docker/Podman
+> service and container were renamed from `oikos` to `yuvomi`. Your data is safe - the database
+> volume is unchanged and the app migrates an existing `oikos.db` to `yuvomi.db` automatically on
+> first start. But the old `oikos` container lingers as an orphan and keeps holding host port 3000,
+> which prevents the new `yuvomi` container from starting. Run the update once with
+> `--remove-orphans`:
+>
+> ```bash
+> docker compose up -d --remove-orphans
+> # Podman: podman compose -f podman-compose.yml up -d --remove-orphans
+> ```
+>
+> TrueNAS, Unraid and Podman-Quadlet installs keep the legacy `oikos` slug and are unaffected.
+
 ### Option B — Pre-built Image
 
 Pull the latest published image and restart:
@@ -793,8 +909,8 @@ Scheduled backups are written to the host folder configured through `BACKUP_DIR`
 Use the built-in backup helper to create a consistent SQLite backup from the running container, then copy it to your host:
 
 ```bash
-docker compose exec oikos node -e "import('./server/db.js').then(async db => { await db.backupToFile('/data/yuvomi-backup.db'); process.exit(0); })"
-docker cp oikos:/data/yuvomi-backup.db ./yuvomi-backup-$(date +%Y%m%d).db
+docker compose exec yuvomi node -e "import('./server/db.js').then(async db => { await db.backupToFile('/data/yuvomi-backup.db'); process.exit(0); })"
+docker cp yuvomi:/data/yuvomi-backup.db ./yuvomi-backup-$(date +%Y%m%d).db
 ```
 
 Admins can also download a backup from **Settings → Administration → Backup and restore**.
@@ -811,7 +927,7 @@ BACKUP_DIR=./backups
 Admins can restore a backup from **Settings → Administration → Backup and restore**. For operational restores via Docker Compose, stop the running app, mount the backup into a temporary container that uses the same Docker volume, and replace the database file:
 
 ```bash
-SERVICE=oikos
+SERVICE=yuvomi
 BACKUP="$PWD/yuvomi-backup-20260401.db"
 docker compose stop "$SERVICE"
 docker compose run --rm -v "$BACKUP:/tmp/yuvomi-restore.db:ro" --entrypoint sh "$SERVICE" -c 'set -eu; target="${DB_PATH:-/data/yuvomi.db}"; case "$target" in */oikos.db) target="${target%/oikos.db}/yuvomi.db";; esac; stamp=$(date -u +%Y%m%dT%H%M%SZ); if [ -f "$target" ]; then cp "$target" "$target.pre-restore-$stamp"; fi; rm -f "$target-wal" "$target-shm"; cp /tmp/yuvomi-restore.db "$target"; chown node:node "$target" 2>/dev/null || true'
@@ -839,7 +955,7 @@ crontab -e
 Add this line:
 
 ```
-0 3 * * * docker compose exec -T oikos node -e "import('./server/db.js').then(async db => { await db.backupToFile('/data/yuvomi-cron-backup.db'); process.exit(0); })" && docker cp oikos:/data/yuvomi-cron-backup.db /path/to/backups/yuvomi-$(date +\%Y\%m\%d).db
+0 3 * * * docker compose exec -T yuvomi node -e "import('./server/db.js').then(async db => { await db.backupToFile('/data/yuvomi-cron-backup.db'); process.exit(0); })" && docker cp yuvomi:/data/yuvomi-cron-backup.db /path/to/backups/yuvomi-$(date +\%Y\%m\%d).db
 ```
 
 This creates a backup at 3:00 AM every day.
@@ -881,6 +997,28 @@ Log out and back in (or reboot) for the group change to take effect.
 </details>
 
 <details>
+<summary>Backup fails with <code>EACCES: permission denied, mkdir './backups'</code></summary>
+
+The relative path in the message is the giveaway: the app fell back to its bare-metal
+default (`./backups`, i.e. `/app/backups` in the container) instead of writing to the
+mounted `/backups` volume, and the unprivileged `node` user cannot create it there.
+Your host folder is fine — it just was never the target.
+
+This happened on deployments that mounted `/backups` without also setting `BACKUP_DIR`
+(Unraid before this fix, hand-rolled `docker run`). Update to the current image, which
+defaults `BACKUP_DIR` to `/backups`. If you build or run the container yourself, pass it
+explicitly:
+
+```bash
+docker run -e BACKUP_DIR=/backups -v /path/on/host/backups:/backups ...
+```
+
+Since this fix the error message names the resolved absolute path, so a genuinely
+unwritable mount is easy to tell apart from a misconfigured `BACKUP_DIR`.
+
+</details>
+
+<details>
 <summary>Permission denied on volumes (Podman / SELinux)</summary>
 
 If the container logs show `EACCES` / permission errors writing to `/data` or `/backups`
@@ -915,7 +1053,7 @@ chcon -Rt container_file_t ./data ./backups ./modules
 
 3. Verify the port mapping:
    ```bash
-   docker port oikos
+   docker port yuvomi
    ```
 
 4. Check your firewall rules if accessing from another device.
@@ -939,13 +1077,15 @@ If you have existing data, you need the original encryption key. There is no way
 </details>
 
 <details>
-<summary>SQLCipher build fails during Docker build</summary>
+<summary>Native module build fails during Docker build</summary>
 
-> **Tip**: If you hit build issues, switch to the pre-built image (Option B above) — it ships with SQLCipher already compiled and requires no local build step.
+> **Tip**: If you hit build issues, switch to the pre-built image (Option B above) — it ships the database module ready to run and requires no local build step.
 
-The Dockerfile installs these build dependencies: `python3`, `make`, `g++`, `libsqlcipher-dev`. If the build fails, ensure your Docker installation is up to date and has internet access to pull packages.
+The database encryption is built into the `better-sqlite3-multiple-ciphers` module, so no system SQLCipher is needed. The build normally downloads a prebuilt binary for your architecture from GitHub; if that download fails, `node-gyp` compiles the module from source instead. The Dockerfile keeps `python3`, `make` and `g++` installed for exactly that fallback.
 
-On resource-constrained systems, the native compilation may run out of memory. Ensure at least 1 GB of RAM is available during the build.
+So if the build fails, check both: your Docker installation is up to date, and the build has internet access to reach both the Debian package mirrors and GitHub.
+
+On resource-constrained systems, the source fallback may run out of memory. Ensure at least 1 GB of RAM is available during the build.
 
 </details>
 
@@ -965,6 +1105,28 @@ This means Nginx cannot reach the Docker container. Check:
    ```bash
    docker compose logs | grep "Server läuft"
    ```
+
+</details>
+
+<details>
+<summary>"Something went wrong" right after updating, mentioning a module export</summary>
+
+A tab that was left open while the container was updated can end up mixing versions: the
+browser keeps one module map per page, so a freshly loaded part of the new version binds
+against parts of the old one that are still in memory. The error names the mismatch, for
+example `The requested module '/utils/empty-state.js' does not provide an export named
+'mountLoadError'`.
+
+Reloading the page clears it - the state cannot survive a reload:
+
+- Desktop: <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> (<kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> on macOS)
+- Installed PWA: close and reopen the app
+
+Since v1.64.1 the app prevents this by itself: once it learns that a new version is
+available, it stops loading further parts of the old page and reloads instead. Updating
+**to** that version can still show the error once, because the safeguard only ships with
+the version it protects. It does not indicate a damaged database - unrelated errors in
+the container log, such as SQLite messages, are worth checking separately.
 
 </details>
 

@@ -1,4 +1,4 @@
-import { unfoldLines, unescapeICSText, parseICS, parseVTODO, expandRRULE } from '../server/services/ics-parser.js';
+import { unfoldLines, unescapeICSText, parseICS, parseVTODO, expandRRULE, tzLocalToUTC } from '../server/services/ics-parser.js';
 import { resolveIcalColor } from '../server/utils/ical-color.js';
 
 let passed = 0, failed = 0;
@@ -46,6 +46,29 @@ test('expandRRULE: WEEKLY 3-Wochen-Fenster', () => {
   assert(occ.length >= 3, `expected >=3, got ${occ.length}`);
   assert(occ[0].uid === 'weekly@x__2026-04-13', `uid: ${occ[0].uid}`);
   assert(occ[0].rrule === null, 'expanded events have null rrule');
+});
+
+test('parseICS: EXDATE wird als Instanz-Datum geparst (TZID, #513)', () => {
+  const ics = 'BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ex@x\r\nSUMMARY:Turnen\r\nDTSTART;TZID=Europe/Vienna:20240930T170000\r\nRRULE:FREQ=WEEKLY;COUNT=10\r\nEXDATE;TZID=Europe/Vienna:20241125T170000\r\nEND:VEVENT\r\nEND:VCALENDAR';
+  const [ev] = parseICS(ics);
+  assert(JSON.stringify(ev.exdates) === JSON.stringify(['2024-11-25']), `exdates: ${JSON.stringify(ev.exdates)}`);
+});
+
+test('parseICS: mehrere/komma-separierte EXDATE-Werte (#513)', () => {
+  const ics = 'BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ex2@x\r\nSUMMARY:Multi\r\nDTSTART:20260101T090000Z\r\nRRULE:FREQ=DAILY;COUNT=5\r\nEXDATE:20260102T090000Z,20260103T090000Z\r\nEXDATE:20260104T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR';
+  const [ev] = parseICS(ics);
+  assert(JSON.stringify(ev.exdates) === JSON.stringify(['2026-01-02', '2026-01-03', '2026-01-04']), `exdates: ${JSON.stringify(ev.exdates)}`);
+});
+
+test('expandRRULE: COUNT zählt EXDATE-Vorkommen mit (#513)', () => {
+  const vevent = {
+    uid: 'exc@x', summary: 'X', description: null, location: null,
+    dtstart: '2026-01-01', dtend: '2026-01-01', rrule: 'RRULE:FREQ=DAILY;COUNT=3',
+    allDay: true, exdates: ['2026-01-02'],
+  };
+  const occ = expandRRULE(vevent, '2026-01-01', '2026-12-31');
+  // COUNT=3 → 3 Instanzen (01,02,03), 02 ausgenommen → 2 sichtbar, NICHT bis 04.
+  assert(JSON.stringify(occ.map((e) => e.dtstart)) === JSON.stringify(['2026-01-01', '2026-01-03']), `got: ${JSON.stringify(occ.map((e) => e.dtstart))}`);
 });
 
 test('unescapeICSText: unescapes special sequences', () => {
@@ -244,6 +267,43 @@ test('expandRRULE: Event-Eigenfarbe wird auf alle Instanzen übertragen', () => 
   const occ = expandRRULE(vevent, '2026-06-01', '2026-06-10');
   assert(occ.length === 3, `count: ${occ.length}`);
   assert(occ.every((o) => o.color === '#FF6347'), 'all instances keep the color');
+});
+
+// #549-Folge: Die '24' -> 0 Sonderregel im TZID-Konverter galt für JEDES Feld,
+// nicht nur die Stunde. Dadurch wurde der Tages-Wert 24 zu 0 -> Date.UTC(...,0)
+// rutschte in den Vormonat -> ein Termin am 24. landete auf einem falschen Datum
+// (Leons Mittwochs-Serie am 24. erschien am Samstag).
+test('tzLocalToUTC: Tag 24 bleibt der 24. (nicht in den Vormonat)', () => {
+  const r = tzLocalToUTC('2025-09-24T07:25:00', 'Europe/Berlin');
+  assert(r === '2025-09-24T05:25:00Z', `24.09. 07:25 CEST -> ${r}`);
+});
+
+test('tzLocalToUTC: Minute 24 bleibt erhalten (Sonderregel nur für Stunde)', () => {
+  const r = tzLocalToUTC('2025-09-10T08:24:00', 'Europe/Berlin');
+  assert(r === '2025-09-10T06:24:00Z', `08:24 CEST -> ${r}`);
+});
+
+test('parseICS: TZID-Serie mit DTSTART am 24. behält Datum + Wochentag', () => {
+  const ics = 'BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:wed24@x\r\nSUMMARY:Schule\r\n'
+    + 'DTSTART;TZID=Europe/Berlin:20250924T072500\r\n'
+    + 'DTEND;TZID=Europe/Berlin:20250924T161000\r\n'
+    + 'RRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR';
+  const [ev] = parseICS(ics);
+  assert(ev.dtstart.slice(0, 10) === '2025-09-24', `dtstart-Datum: ${ev.dtstart}`);
+  // 24.09.2025 ist ein Mittwoch (UTC-Tag des gespeicherten 05:25Z-Instants).
+  assert(new Date(ev.dtstart).getUTCDay() === 3, `Wochentag sollte Mi(3) sein: ${ev.dtstart}`);
+});
+
+test('expandRRULE: TZID-Serie hält Ortszeit über die DST-Grenze (kein Winter-Drift)', () => {
+  const ics = 'BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:tzr@x\r\nSUMMARY:Schule\r\n'
+    + 'DTSTART;TZID=Europe/Berlin:20250924T072500\r\nDTEND;TZID=Europe/Berlin:20250924T081000\r\n'
+    + 'RRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR';
+  const [ev] = parseICS(ics);
+  const hm = (iso) => new Intl.DateTimeFormat('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit' }).format(new Date(iso));
+  const winter = expandRRULE(ev, '2025-12-10', '2025-12-10'); // CET
+  const summer = expandRRULE(ev, '2026-04-01', '2026-04-01'); // CEST
+  assert(winter.length === 1 && hm(winter[0].dtstart) === '07:25', `Winter 07:25 (nicht 06:25): ${winter[0] && hm(winter[0].dtstart)}`);
+  assert(summer.length === 1 && hm(summer[0].dtstart) === '07:25', `Sommer 07:25: ${summer[0] && hm(summer[0].dtstart)}`);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

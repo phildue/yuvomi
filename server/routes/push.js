@@ -68,8 +68,14 @@ export function buildRouter({ pushService = defaultPushService, database } = {})
       const userId = req.authUserId || req.session.userId;
       const title = typeof req.body?.title === 'string' ? req.body.title : 'Yuvomi';
       const body  = typeof req.body?.body === 'string' ? req.body.body : '';
+      // Vor dem Senden zählen: Wird das Abo beim Senden als "gone" entfernt,
+      // bleibt devices > 0 bei sent === 0 und der Client kann "abgelaufen"
+      // von "nie registriert" unterscheiden.
+      const devices = getDb()
+        .prepare('SELECT COUNT(*) AS n FROM push_subscriptions WHERE user_id = ?')
+        .get(userId)?.n ?? 0;
       const sent = await pushService.sendPushToUser(userId, { title, body, url: '/reminders', tag: 'push-test' });
-      res.json({ data: { sent } });
+      res.json({ data: { sent, devices } });
     } catch (err) {
       log.error('Error sending test push:', err.message);
       res.status(500).json({ error: 'Internal error.', code: 500 });

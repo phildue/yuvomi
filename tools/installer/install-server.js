@@ -84,6 +84,53 @@ export function renderEnvFile(env) {
   return lines.join('\n') + '\n';
 }
 
+/** Gegenstück zu encodeEnvValue(): eine .env-Zeile zurück in ihren Rohwert. */
+export function decodeEnvValue(raw) {
+  let value = raw.trim();
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    value = value.slice(1, -1).replace(/\\(["\\])/g, '$1');
+  }
+  return value.replace(/\$\$/g, '$');
+}
+
+/**
+ * Eine vorhandene .env einlesen. Nur für Werte gedacht, die erhalten bleiben
+ * müssen — der Rest der Datei wird beim Speichern ohnehin neu geschrieben.
+ * Fehlt oder bricht die Datei, ist das Ergebnis ein leeres Objekt.
+ */
+export function readEnvFile(envPath) {
+  if (!existsSync(envPath)) return {};
+  let content;
+  try {
+    content = readFileSync(envPath, 'utf8');
+  } catch {
+    return {};
+  }
+  const env = {};
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const separator = trimmed.indexOf('=');
+    if (separator < 1) continue;
+    env[trimmed.slice(0, separator).trim()] = decodeEnvValue(trimmed.slice(separator + 1));
+  }
+  return env;
+}
+
+/**
+ * Schlüssel, die einen Installer-Rerun überleben MÜSSEN.
+ *
+ * Ein einmal benutzter DB_ENCRYPTION_KEY verschlüsselt die Datenbank; mit einem
+ * neuen Wert bricht der Start ab und die Daten sind ohne den alten Schlüssel
+ * nicht mehr zu erreichen. Ein Rerun (Update, Portwechsel, nachgetragenes SMTP)
+ * darf eine laufende Installation nicht so zerlegen. SESSION_SECRET ist der
+ * harmlosere Fall: ein neuer Wert wirft nur alle Angemeldeten aus der App.
+ *
+ * Sendet der Client für einen dieser Schlüssel einen Wert, gewinnt der — dann
+ * hat der Nutzer ihn im Experten-Modus bewusst eingetragen.
+ */
+export const PRESERVED_KEYS = ['SESSION_SECRET', 'DB_ENCRYPTION_KEY'];
+
 /**
  * Resolve true/false for whether a command can be spawned successfully.
  * Spawn errors (ENOENT) and non-zero exit codes both count as unavailable.
@@ -328,9 +375,13 @@ async function route(req, res, server) {
 
   if (req.method === 'GET' && url.pathname === '/api/preflight') {
     try {
+      const existingEnv = readEnvFile(resolve(projectRoot(), '.env'));
       const envExists = existsSync(resolve(projectRoot(), '.env'));
+      // Nur die NAMEN der vorhandenen Schlüssel — die Werte bleiben auf dem
+      // Server. Das Frontend erzeugt für diese keinen neuen Wert mehr.
+      const preservedKeys = PRESERVED_KEYS.filter(key => Boolean(existingEnv[key]));
       const engine = await getEngine();
-      const { cmd, args } = inspectCommand(engine, ['inspect', '--format', '{{.State.Status}}', 'oikos']);
+      const { cmd, args } = inspectCommand(engine, ['inspect', '--format', '{{.State.Status}}', 'yuvomi']);
       return await new Promise(resolvePromise => {
         const inspect = spawn(cmd, args, { stdio: 'pipe' });
         let out = '';
@@ -338,7 +389,7 @@ async function route(req, res, server) {
         const reply = containerRunning => {
           if (settled) return;          // error + close can both fire
           settled = true;
-          resolvePromise(json(res, 200, { envExists, containerRunning }));
+          resolvePromise(json(res, 200, { envExists, preservedKeys, containerRunning }));
         };
         inspect.stdout.on('data', d => { out += d.toString().trim(); });
         inspect.on('error', () => reply(false));
@@ -356,6 +407,16 @@ async function route(req, res, server) {
       if (!result.ok) return json(res, 400, { error: result.error });
 
       const envPath = resolve(projectRoot(), '.env');
+
+      // Letzte Instanz gegen den zerstörerischen Rerun: schickt der Client für
+      // einen der bewahrten Schlüssel nichts, wird der bestehende Wert
+      // übernommen statt ein neuer erzeugt. Greift auch, wenn ein älteres
+      // Frontend aus dem Browser-Cache noch nichts von preservedKeys weiß.
+      const existingEnv = readEnvFile(envPath);
+      for (const key of PRESERVED_KEYS) {
+        if (!result.env[key] && existingEnv[key]) result.env[key] = existingEnv[key];
+      }
+
       let backup = null;
       try {
         backup = backupEnvFile(envPath);
@@ -385,8 +446,8 @@ async function route(req, res, server) {
 
   if (req.method === 'GET' && url.pathname === '/api/status') {
     const engine = await getEngine();
-    const health = inspectCommand(engine, ['inspect', '--format', '{{.State.Health.Status}}', 'oikos']);
-    const stateCmd = inspectCommand(engine, ['inspect', '--format', '{{.State.Status}}', 'oikos']);
+    const health = inspectCommand(engine, ['inspect', '--format', '{{.State.Health.Status}}', 'yuvomi']);
+    const stateCmd = inspectCommand(engine, ['inspect', '--format', '{{.State.Status}}', 'yuvomi']);
     const logsCmd = composeCommand(engine, ['logs', '--tail', '30']);
     return new Promise(resolvePromise => {
       let settled = false;

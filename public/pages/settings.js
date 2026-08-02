@@ -74,25 +74,22 @@ export async function render(container, { user } = {}) {
         }
       }
 
-      // Explizite Übersicht (Domänen oder einzelne Domäne) wird direkt gerendert.
-      if (OVERVIEW_VIEWS.has(view)) {
-        const domainId = view === 'domain' ? query.get('domain') : null;
-        const domains = filterSettingsDomains(currentUser);
-        const resolvedView = view === 'domain' && domains.some((domain) => domain.id === domainId)
-          ? 'domain'
-          : 'domains';
-        await renderSettingsShell(container, {
-          user: currentUser,
-          view: resolvedView,
-          domainId: resolvedView === 'domain' ? domainId : null,
-          query,
-        });
-        return;
-      }
+      // Zuletzt besuchtes Blatt wiederherstellen; ohne gespeichertes Ziel bleibt
+      // es bei der Übersicht, statt den ersten Besuch wortlos in einem Formular
+      // landen zu lassen (Critique 2026-07-27).
+      const destination = OVERVIEW_VIEWS.has(view)
+        ? null
+        : readStoredSettingsDestination(currentUser);
+      if (destination) { await redirectTo(destination); return; }
 
-      // Standard: zuletzt besuchtes (erlaubtes) Blatt wiederherstellen.
-      const destination = readStoredSettingsDestination(currentUser);
-      await redirectTo(destination);
+      const domainId = view === 'domain' ? query.get('domain') : null;
+      const known = filterSettingsDomains(currentUser).some((d) => d.id === domainId);
+      await renderSettingsShell(container, {
+        user: currentUser,
+        view: known ? 'domain' : 'domains',
+        domainId: known ? domainId : null,
+        query,
+      });
       return;
     }
 
@@ -103,6 +100,9 @@ export async function render(container, { user } = {}) {
       await redirectTo(ACCOUNT_LEAF);
       return;
     }
+    // Verschobenes Blatt: auf den kanonischen Pfad umleiten, sonst zeigte die
+    // Adresszeile die alte URL und der Breadcrumb die neue Domäne.
+    if (leaf.path !== path) { await redirectTo(leaf.path); return; }
 
     try {
       sessionStorage.setItem(SETTINGS_STORAGE_KEY, leaf.path);
@@ -152,7 +152,8 @@ export async function update({ user, path, query } = {}) {
   }
 
   const leaf = findSettingsLeaf(path, user);
-  if (!leaf) return false;
+  // Verschobenes Blatt nicht inkrementell rendern: der reguläre Pfad leitet um.
+  if (!leaf || leaf.path !== path) return false;
 
   try {
     sessionStorage.setItem(SETTINGS_STORAGE_KEY, leaf.path);

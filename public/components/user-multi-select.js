@@ -20,7 +20,10 @@ export function renderAvatarStack(users, { size = 28, maxVisible = 3 } = {}) {
   if (!users?.length) return '';
   const visible = users.slice(0, maxVisible);
   const overflow = users.length - visible.length;
-  const fs = Math.round(size * 0.4);
+  // Untergrenze 9px: die Gitter-Ansichten des Kalenders rufen mit size 14–16
+  // auf, wodurch size*0.4 auf 6px fiel — für Initialen und den "+N"-Zähler
+  // unter jeder Lesbarkeitsschwelle. Ab size 23 greift wieder die Proportion.
+  const fs = Math.max(9, Math.round(size * 0.4));
   const avatars = visible.map((u) => {
     const initials = (u.display_name ?? '')
       .split(' ')

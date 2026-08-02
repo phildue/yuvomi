@@ -7,7 +7,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 
 const { MIGRATIONS } = await import('../server/db.js');
 const { processDueMedications } = await import('../server/services/medication-scheduler.js');

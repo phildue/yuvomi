@@ -149,7 +149,9 @@ const MIGRATIONS_SQL = {
       recurrence_full_amount REAL,
       created_by      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-      updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      visibility      TEXT    NOT NULL DEFAULT 'shared' CHECK (visibility IN ('private', 'shared'))
     );
     CREATE TABLE IF NOT EXISTS budget_categories (
       key        TEXT PRIMARY KEY,
@@ -178,7 +180,9 @@ const MIGRATIONS_SQL = {
                                 CHECK(status IN ('active', 'paid')),
       created_by        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-      updated_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      updated_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      owner_id          INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      visibility        TEXT    NOT NULL DEFAULT 'shared' CHECK (visibility IN ('private', 'shared'))
     );
     CREATE TABLE IF NOT EXISTS budget_loan_payments (
       id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -264,6 +268,16 @@ const MIGRATIONS_SQL = {
       task_id  INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
       user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       PRIMARY KEY (task_id, user_id)
+    );
+    -- Aufgaben-Tags (Migration v115, #586). Steht hier wie task_assignments im
+    -- Basis-Schnappschuss und nicht als eigener Versions-Eintrag: die Suiten,
+    -- die die Aufgaben-Routen oder die MCP-Tools anfassen, brauchen die Tabelle
+    -- unabhängig davon, welche Versionen sie sonst anlegen.
+    CREATE TABLE IF NOT EXISTS task_tags (
+      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      tag     TEXT    NOT NULL,
+      tag_key TEXT    NOT NULL,
+      PRIMARY KEY (task_id, tag_key)
     );
     CREATE TABLE IF NOT EXISTS event_assignments (
       event_id INTEGER NOT NULL REFERENCES calendar_events(id) ON DELETE CASCADE,
@@ -889,6 +903,24 @@ const MIGRATIONS_SQL = {
       created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
       PRIMARY KEY (event_id, exception_date)
     );
+  `,
+
+  // SQL-String für Migration v86 (gespiegelt aus db.js MIGRATIONS)
+  86: `
+    CREATE TABLE IF NOT EXISTS task_documents (
+      task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      document_id INTEGER NOT NULL REFERENCES family_documents(id) ON DELETE CASCADE,
+      created_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      PRIMARY KEY (task_id, document_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_documents_document ON task_documents(document_id);
+  `,
+
+  // SQL-String für Migration v97 (gespiegelt aus db.js MIGRATIONS): tzid für
+  // DST-korrekte Recurrence-Expansion (#549).
+  97: `
+    ALTER TABLE calendar_events ADD COLUMN tzid TEXT;
   `,
 };
 

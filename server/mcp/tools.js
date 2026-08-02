@@ -25,6 +25,7 @@ import { readFileSync } from 'node:fs';
 import { buildOpenApiSpec } from '../openapi.js';
 import { tokenAllows } from '../scopes.js';
 import { visibilityWhere } from '../services/visibility.js';
+import { loadTagsFor, normalizeTags, setTags, tagKey } from '../utils/task-tags.js';
 
 const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
 
@@ -41,26 +42,54 @@ class ToolError extends Error {}
 // Kern-Tools: reine Funktionen (db, actorId, args)
 // --------------------------------------------------------
 
-function listTasks(db, args) {
+function listTasks(db, actorId, args) {
   let sql = `
-    SELECT id, title, status, priority, category, due_date, due_time
-    FROM tasks
-    WHERE parent_task_id IS NULL
+    SELECT t.id, t.title, t.status, t.priority, t.category, t.due_date, t.due_time
+    FROM tasks t
+    WHERE t.parent_task_id IS NULL
+      -- Sichtbarkeit (#474): kein Zugriff auf private/eingeschränkte Aufgaben
+      -- anderer. Stand hier bisher nicht, obwohl die Termin-Abfrage sie führt -
+      -- ein MCP-Token sah damit jede private Aufgabe des Haushalts, und mit den
+      -- Tags (#586) käme deren Freitext gleich mit.
+      AND ${visibilityWhere('t', 'task_assignments', 'task_id', '@me')}
   `;
-  const params = [];
+  const params = { me: actorId };
   if (args.status) {
     const s = v.oneOf(args.status, ['open', 'in_progress', 'done', 'archived'], 'status');
     if (s.error) throw new ToolError(s.error);
-    sql += ' AND status = ?';
-    params.push(args.status);
+    sql += ' AND t.status = @status';
+    params.status = args.status;
   } else {
-    sql += " AND status != 'archived'";
+    sql += " AND t.status != 'archived'";
   }
+  // Tag-Filter, gleiche Semantik wie GET /api/v1/tasks: mehrere Tags engen
+  // UND-verknüpft ein, die Schreibweise zählt nicht.
+  //
+  // Die Form wird ausdrücklich geprüft, statt sich auf das Schema zu verlassen:
+  // callTool erzwingt es zur Laufzeit nicht, und normalizeTags macht aus einem
+  // Unsinnswert stillschweigend eine leere Liste. Ein einschränkender Filter,
+  // der bei Unsinn die VOLLE Liste liefert, ist die gefährliche Richtung - eine
+  // Automatisierung handelte dann an fremden Aufgaben.
+  if (args.tag !== undefined && args.tag !== null
+      && !Array.isArray(args.tag) && typeof args.tag !== 'string') {
+    throw new ToolError('tag must be an array of strings or a single string.');
+  }
+  const tags = normalizeTags(args.tag === undefined ? [] : [args.tag].flat());
+  tags.forEach((tag, i) => {
+    sql += ` AND EXISTS (SELECT 1 FROM task_tags tt WHERE tt.task_id = t.id AND tt.tag_key = @tag${i})`;
+    params[`tag${i}`] = tagKey(tag);
+  });
   sql += `
-    ORDER BY CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date ASC, created_at DESC
+    ORDER BY CASE WHEN t.due_date IS NULL THEN 1 ELSE 0 END, t.due_date ASC, t.created_at DESC
     LIMIT 100
   `;
-  return db.prepare(sql).all(...params);
+  const rows = db.prepare(sql).all(params);
+  // Tags als Liste, nicht als group_concat-String: ein Tag darf selbst ein Komma
+  // enthalten ("Haus, Hof"), eine verbundene Zeichenkette wäre nicht mehr
+  // eindeutig trennbar.
+  const tagMap = loadTagsFor(db, rows.map((r) => r.id));
+  for (const row of rows) row.tags = tagMap.get(row.id) ?? [];
+  return rows;
 }
 
 function createTask(db, actorId, args) {
@@ -80,16 +109,26 @@ function createTask(db, actorId, args) {
   `).run(
     title.value,
     description.value,
-    category.value || 'Sonstiges',
+    // 'misc' ist der Key der Auffangkategorie, 'Sonstiges' war ihr Anzeigename
+    // vor v83. Der alte Fallback schrieb einen Key, den task_categories nie
+    // hatte: die Aufgabe fiel damit aus Dropdown und Filter und sprang beim
+    // ersten Speichern still auf die erste echte Kategorie. Migration v114
+    // hat den Bestand geputzt - diese Zeile hat ihn weiter nachgeliefert.
+    category.value || 'misc',
     priority.value || 'none',
     dueDate.value,
     dueTime.value,
     actorId,
   );
 
-  return db.prepare(
+  // Tags mitschreiben (#586). normalizeTags nimmt Array wie kommaseparierten
+  // String - ein LLM-Client schickt mal das eine, mal das andere.
+  const tags = setTags(db, result.lastInsertRowid, args.tags ?? []);
+
+  const task = db.prepare(
     'SELECT id, title, status, priority, category, due_date, due_time FROM tasks WHERE id = ?'
   ).get(result.lastInsertRowid);
+  return { ...task, tags };
 }
 
 function listShoppingItems(db, args) {
@@ -309,6 +348,26 @@ function contentBytes(contentData) {
   return Buffer.from(raw, 'base64');
 }
 
+// Serialisiert den JSON-Body. MCP-Clients, die Tool-Argumente typkoerzieren,
+// schicken das Payload bereits als JSON-Text — der wird durchgereicht statt ein
+// zweites Mal kodiert, sonst käme beim Server ein String-Primitive an, das
+// `express.json({ strict: true })` ablehnt.
+function jsonBody(payload) {
+  if (typeof payload !== 'string') return JSON.stringify(payload ?? {});
+  const trimmed = payload.trim();
+  if (!trimmed) return '{}';
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new ToolError('payload must be a JSON object (or a string containing one).');
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new ToolError('payload must be a JSON object (or a string containing one).');
+  }
+  return JSON.stringify(parsed);
+}
+
 function internalBaseUrl() {
   return (
     process.env.MCP_INTERNAL_BASE_URL
@@ -394,7 +453,7 @@ async function internalApiRequest(ctx, method, path, { query, payload, contentDa
     options.body = contentBytes(contentData);
     headers['Content-Type'] = contentType || 'application/octet-stream';
   } else if (!['GET', 'HEAD'].includes(method.toUpperCase()) && payload !== undefined) {
-    options.body = JSON.stringify(payload ?? {});
+    options.body = jsonBody(payload);
     headers['Content-Type'] = 'application/json';
   }
 
@@ -433,15 +492,20 @@ async function internalApiRequest(ctx, method, path, { query, payload, contentDa
 const CORE_TOOLS = [
   {
     name: 'list_tasks',
-    description: 'List the family\'s current top-level tasks (open by default). Optionally filter by status.',
+    description: 'List the family\'s current top-level tasks (open by default). Optionally filter by status and tags. Each task carries its tags; tags are free-form labels mirrored from CalDAV task lists and are distinct from the single category a task has.',
     scope: { module: 'tasks', access: 'read' },
     inputSchema: {
       type: 'object',
       properties: {
         status: { type: 'string', enum: ['open', 'in_progress', 'done', 'archived'], description: 'Filter by task status.' },
+        tag: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Filter by tags. Several tags narrow the list (a task must carry all of them). Case-insensitive.',
+        },
       },
     },
-    handler: (ctx, args) => listTasks(ctx.db, args),
+    handler: (ctx, args) => listTasks(ctx.db, ctx.actor.id, args),
   },
   {
     name: 'create_task',
@@ -456,6 +520,11 @@ const CORE_TOOLS = [
         priority:    { type: 'string', enum: VALID_PRIORITIES, description: 'Optional priority (default none).' },
         due_date:    { type: 'string', description: 'Optional due date, format YYYY-MM-DD.' },
         due_time:    { type: 'string', description: 'Optional due time, format HH:MM.' },
+        tags: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional free-form tags. Unlike the single category, a task can carry many. Mirrored to CATEGORIES on CalDAV task lists.',
+        },
       },
       required: ['title'],
     },
@@ -579,7 +648,7 @@ const OPENAPI_TOOLS = [
         path: { type: 'string', description: 'OpenAPI path, used with method when operation_key is omitted.' },
         path_params: { type: 'object', description: 'Values for path template parameters.' },
         query: { type: 'object', description: 'Query string parameters.' },
-        payload: { description: 'JSON request body.' },
+        payload: { type: 'object', description: 'JSON request body.' },
         content_data: { type: 'string', description: 'Base64 or base64 data URL for binary uploads.' },
       },
     },

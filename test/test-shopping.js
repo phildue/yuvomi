@@ -42,16 +42,38 @@ test('Einkaufslisten-Zeilen toggeln nur außerhalb interaktiver Controls', () =>
   assert(/data-item-id/.test(source), 'Zeilen-Toggle muss die Artikel-ID aus data-item-id lesen');
 });
 
+test('Shopping-Löschaktionen importieren den gemeinsamen Undo-Helper', () => {
+  const source = readFileSync(new URL('../public/pages/shopping.js', import.meta.url), 'utf8');
+  assert(
+    /import\s*\{[^}]*\bscheduleUndoableDelete\b[^}]*\}\s*from\s*'\/utils\/ux\.js'/.test(source),
+    'scheduleUndoableDelete muss aus /utils/ux.js importiert werden',
+  );
+  // Drei Löschwege, drei Male derselbe Helfer: Einzel-Artikel, „Abgehakt löschen"
+  // und - seit Critique 2026-07-30 - die ganze Liste. Der Sicherheitsgradient war
+  // invertiert: der einzelne Artikel hatte Undo und keine Rückfrage, die Liste des
+  // ganzen Haushalts eine Rückfrage und kein Undo.
+  const calls = source.match(/\bscheduleUndoableDelete\s*\(/g) ?? [];
+  assert(calls.length === 3, `Einzel-, Sammel- und Listenlöschung müssen den Undo-Helper nutzen, gefunden: ${calls.length}`);
+  // Die Liste behält ZUSÄTZLICH ihre Rückfrage - eine Rückfrage schützt vor dem
+  // Fehlgriff, ein Undo vor dem falschen Entschluss.
+  const deleteList = source.slice(source.indexOf("action === 'delete-list'"));
+  assert(/confirmModal\(/.test(deleteList.slice(0, 1200)), 'die Listenlöschung braucht weiter eine Rückfrage');
+  assert(/deleteListConfirm'?,?\s*\{[\s\S]{0,120}count/.test(deleteList.slice(0, 1600)),
+    'die Rückfrage muss die Artikelzahl nennen - „und alle Artikel löschen?" sagte nicht, wie viele');
+});
+
 // --------------------------------------------------------
 // Kategorie-Verwaltung wandert nach Shopping (Task 7)
 // --------------------------------------------------------
 test('Shopping-Seite importiert den Category-Manager und öffnet ihn bei manage=categories', () => {
   const source = readFileSync(new URL('../public/pages/shopping.js', import.meta.url), 'utf8');
-  assert(/components\/shopping-category-manager\.js/.test(source), 'shopping.js muss den Category-Manager importieren');
-  assert(/yuvomi-shopping-category-manager/.test(source), 'shopping.js muss das Custom Element verwenden');
+  // Seit Audit F-15 nutzt Einkauf die geteilte Komponente (wie Budget/Tasks/Kontakte).
+  assert(/components\/category-manager\.js/.test(source), 'shopping.js muss den geteilten Category-Manager importieren');
+  assert(/yuvomi-category-manager/.test(source), 'shopping.js muss das geteilte Custom Element verwenden');
+  assert(/basePath:\s*'\/shopping\/categories'/.test(source), 'shopping.js muss die Komponente auf /shopping/categories konfigurieren');
   assert(/manage.*===\s*'categories'|get\('manage'\)|manage=categories|'manage'/.test(source), 'shopping.js muss den manage-Query-Parameter auswerten');
   assert(/shopping\.manageCategories/.test(source), 'Eine übersetzte „Kategorien verwalten"-Aktion muss vorhanden sein');
-  assert(/shopping-categories-changed/.test(source), 'shopping.js muss auf das shopping-categories-changed-Event reagieren');
+  assert(/category-manager-changed/.test(source), 'shopping.js muss auf das category-manager-changed-Event reagieren');
 });
 
 test('Shopping-Seite bietet einen Essensplan-Import mit Datumsbereich an', () => {
@@ -65,44 +87,31 @@ test('Shopping-Seite bietet einen Essensplan-Import mit Datumsbereich an', () =>
   assert(/addLocalDays\(today, 6\)/.test(source), 'Import-Dialog muss standardmäßig 7 Tage (heute + 6) vorauswählen');
 });
 
-test('Shopping-Category-Manager-Komponente erfüllt die Web-Component-Verträge', () => {
-  const source = readFileSync(new URL('../public/components/shopping-category-manager.js', import.meta.url), 'utf8');
-  assert(/customElements\.define\(\s*'yuvomi-shopping-category-manager'/.test(source), 'Tag-Name muss yuvomi-shopping-category-manager sein');
-  assert(/connectedCallback/.test(source) && /disconnectedCallback/.test(source), 'Lifecycle-Callbacks müssen vorhanden sein');
-  assert(/api\.get\('\/shopping\/categories'\)/.test(source), 'Komponente muss Kategorien per API laden');
-  assert(/api\.post\('\/shopping\/categories'/.test(source), 'Hinzufügen muss POST nutzen');
-  assert(/api\.put\(`\/shopping\/categories\/\$\{[^}]+\}`/.test(source), 'Umbenennen muss PUT nutzen');
-  assert(/api\.patch\('\/shopping\/categories\/reorder'/.test(source), 'Reorder muss PATCH nutzen');
-  assert(/api\.delete\(`\/shopping\/categories\/\$\{[^}]+\}`/.test(source), 'Löschen muss DELETE nutzen');
-  assert(/shopping-categories-changed/.test(source), 'Mutationen müssen shopping-categories-changed dispatchen');
+test('Geteilter Category-Manager erfüllt die Web-Component-Verträge (Einkauf, Audit F-15)', () => {
+  const source = readFileSync(new URL('../public/components/category-manager.js', import.meta.url), 'utf8');
+  assert(/customElements\.define\(\s*'yuvomi-category-manager'/.test(source), 'Tag-Name muss yuvomi-category-manager sein');
+  assert(/disconnectedCallback/.test(source), 'Lifecycle-Cleanup muss vorhanden sein');
+  // Numerische Shopping-IDs und String-Keys (Budget/Tasks/Kontakte) laufen über
+  // denselben Schlüssel-Helper — die Route-Pfade bleiben basePath-relativ.
+  assert(/_keyOf\(item\)/.test(source), 'Komponente braucht den key/id-Schlüssel-Helper');
+  assert(/item\.key \?\? item\.id/.test(source), '_keyOf muss auf numerische ids zurückfallen');
+  assert(/api\.patch\(`\$\{this\._basePath\}\/reorder`/.test(source), 'Reorder muss PATCH auf basePath/reorder nutzen');
   assert(/import\s*\{\s*esc\s*\}\s*from\s*'\/utils\/html\.js'/.test(source), 'User-Daten müssen via esc() escaped werden');
   assert(!/\.innerHTML\s*=/.test(source), 'Komponente darf innerHTML nicht zuweisen');
-  // disconnectedCallback muss Listener wieder abräumen (kein Leak)
   const disconnectFn = source.match(/disconnectedCallback\(\)\s*\{[\s\S]*?\n  \}/)?.[0] ?? '';
   assert(/removeEventListener/.test(disconnectFn), 'disconnectedCallback muss Listener entfernen');
 });
 
-test('Shopping-Category-Manager rollt optimistisches Reorder bei API-Fehler zurück', () => {
-  const source = readFileSync(new URL('../public/components/shopping-category-manager.js', import.meta.url), 'utf8');
-  const moveFn = source.match(/async _move\([\s\S]*?\n  \}/)?.[0] ?? '';
-  assert(moveFn, '_move-Methode muss auffindbar sein');
-  // Snapshot vor der Mutation, Rollback im catch (analog zu den Task-5/6-Leaves).
-  assert(/const snapshot = \[\.\.\.this\._cats\]/.test(moveFn), '_move muss vor der Mutation einen Snapshot ziehen');
-  const catchBlock = moveFn.match(/catch \(err\) \{[\s\S]*?\n    \}/)?.[0] ?? '';
-  assert(catchBlock, '_move muss einen catch-Block besitzen');
-  assert(/this\._cats = snapshot/.test(catchBlock), 'catch muss this._cats auf den Snapshot zurücksetzen');
-  assert(/this\._renderList\(\)/.test(catchBlock), 'catch muss die wiederhergestellte Liste neu rendern');
-  assert(!/this\._notifyChanged\(\)/.test(catchBlock), 'catch darf kein shopping-categories-changed dispatchen');
-});
-
-test('Shopping-Seite räumt den shopping-categories-changed-Listener in onClose ab', () => {
+test('Shopping-Seite räumt den category-manager-changed-Listener in onClose ab', () => {
   const source = readFileSync(new URL('../public/pages/shopping.js', import.meta.url), 'utf8');
   const fn = source.match(/async function openCategoryManager[\s\S]*?\n\}/)?.[0] ?? '';
   assert(fn, 'openCategoryManager muss auffindbar sein');
   // Manager-Referenz im äußeren Scope, damit onClose ihn abräumen kann (kein Leak bei Modal-Reuse).
   assert(/let manager = null/.test(fn), 'Manager-Referenz muss im äußeren Scope gehalten werden');
-  assert(/manager\.addEventListener\('shopping-categories-changed'/.test(fn), 'onSave muss den Listener registrieren');
-  assert(/manager\?\.removeEventListener\('shopping-categories-changed'/.test(fn), 'onClose muss den Listener wieder entfernen');
+  assert(/manager\.addEventListener\('category-manager-changed'/.test(fn), 'onSave muss den Listener registrieren');
+  assert(/manager\.configure\(\{/.test(fn), 'onSave muss die geteilte Komponente konfigurieren');
+  assert(/labelResolver:\s*\(item\) => categoryLabel\(item\.name\)/.test(fn), 'labelResolver muss Default-Kategorien lokalisieren');
+  assert(/manager\?\.removeEventListener\('category-manager-changed'/.test(fn), 'onClose muss den Listener wieder entfernen');
 });
 
 let listId, list2Id, itemId1, itemId2, itemId3;
@@ -447,11 +456,20 @@ test('shopping.js rendert Detail-Button + Indikatoren und öffnet den Drawer', (
   assert(/action === 'item-details'/.test(source), 'wireListContentEvents muss die item-details-Aktion behandeln');
 });
 
-test('Detail-Refresh ersetzt nur die Meta-Indikatoren, nicht das .shopping-item (Swipe-Closures bleiben intakt)', () => {
+test('Detail-Refresh aktualisiert die Zeile, ohne das .shopping-item zu ersetzen (Swipe-Closures bleiben intakt)', () => {
   const source = readFileSync(new URL('../public/pages/shopping.js', import.meta.url), 'utf8');
-  const fn = source.match(/function refreshItemMeta[\s\S]*?\n\}/)?.[0] ?? '';
-  assert(fn, 'refreshItemMeta muss existieren');
-  assert(!/#items-list/.test(fn), 'refreshItemMeta darf die Liste nicht neu aufbauen');
+  // Hieß refreshItemMeta, solange der Dialog nur Link und Notiz bearbeiten konnte.
+  // Seit Name, Menge und Kategorie editierbar sind (Critique 2026-07-30, P2), muss
+  // die Zeile Name UND Menge mitziehen - die Funktion deckt beides ab.
+  const fn = source.match(/function refreshItemName[\s\S]*?\n\}/)?.[0] ?? '';
+  assert(fn, 'refreshItemName muss existieren');
+  assert(!/#items-list/.test(fn), 'refreshItemName darf die Liste nicht neu aufbauen');
+  assert(/kitchen-row__name/.test(fn), 'der Name muss aktualisiert werden');
+  assert(/kitchen-row__meta/.test(fn), 'die Menge muss aktualisiert werden - sie kann auch wegfallen');
+  // Ein Kategoriewechsel verschiebt die Zeile in eine andere Gruppe; das kann keine
+  // Zeilen-Auffrischung leisten, dafür muss die Liste neu gruppiert werden.
+  const details = source.match(/function openItemDetails[\s\S]*?\n\}\n/)?.[0] ?? '';
+  assert(/categoryChanged/.test(details), 'ein Kategoriewechsel muss die Gruppierung neu aufbauen');
 });
 
 // --------------------------------------------------------

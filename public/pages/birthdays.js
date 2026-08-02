@@ -1,6 +1,6 @@
 import { api } from '/api.js';
-import { openModal as openSharedModal, closeModal, confirmModal, advancedSection } from '/components/modal.js';
-import { stagger, deleteWithUndo } from '/utils/ux.js';
+import { openModal as openSharedModal, closeModal, advancedSection } from '/components/modal.js';
+import { stagger, scheduleUndoableDelete } from '/utils/ux.js';
 import { t, formatDate, parseDateInput, isDateInputValid } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
@@ -147,12 +147,12 @@ function birthdayItemHtml(birthday) {
         <div class="birthday-item__meta">${esc(ageMeta(birthday))}</div>
         ${birthday.notes ? `<div class="birthday-item__notes">${esc(birthday.notes)}</div>` : ''}
       </div>
-      <div class="birthday-item__actions">
-        <button class="birthday-action-btn" type="button" data-action="edit" data-id="${birthday.id}" aria-label="${t('common.edit')}">
-          <i data-lucide="pencil" style="width:18px;height:18px;" aria-hidden="true"></i>
+      <div class="row-actions birthday-item__actions">
+        <button class="row-action" type="button" data-action="edit" data-id="${birthday.id}" aria-label="${t('common.edit')}">
+          <i data-lucide="pencil" aria-hidden="true"></i>
         </button>
-        <button class="birthday-action-btn" type="button" data-action="delete" data-id="${birthday.id}" aria-label="${t('common.delete')}">
-          <i data-lucide="trash-2" style="width:18px;height:18px;" aria-hidden="true"></i>
+        <button class="row-action row-action--danger" type="button" data-action="delete" data-id="${birthday.id}" aria-label="${t('common.delete')}">
+          <i data-lucide="trash-2" aria-hidden="true"></i>
         </button>
       </div>
     </article>`;
@@ -209,6 +209,9 @@ function renderPage() {
       <div class="page-toolbar page-toolbar--wrap birthdays-toolbar">
         <h1 class="page-toolbar__title">${t('birthdays.title')}</h1>
         ${renderPageSearch({ id: 'birthdays-search', label: t('birthdays.searchPlaceholder'), placeholder: t('birthdays.searchPlaceholder'), value: state.query, clearLabel: t('common.searchClear'), className: 'birthdays-toolbar__search page-toolbar__center' })}
+        <button class="btn btn--secondary birthdays-toolbar__import" id="birthdays-import-btn" type="button" aria-label="${t('birthdays.importButton')}">
+          <i data-lucide="download" aria-hidden="true"></i><span>${t('birthdays.importButton')}</span>
+        </button>
       </div>
 
       <p class="birthdays-hint">${t('birthdays.calendarHint')}</p>
@@ -216,7 +219,7 @@ function renderPage() {
       <div class="birthdays-list" id="birthdays-list"></div>
 
       <button class="page-fab" id="fab-new-birthday" aria-label="${t('birthdays.addButton')}">
-        <i data-lucide="plus" style="width:24px;height:24px" aria-hidden="true"></i>
+        <i data-lucide="plus" class="icon-xl" aria-hidden="true"></i>
       </button>
     </div>
   `);
@@ -227,6 +230,16 @@ function renderPage() {
 
 function bindEvents() {
   _container.querySelector('#fab-new-birthday').addEventListener('click', () => openBirthdayModal({ mode: 'create' }));
+  _container.querySelector('#birthdays-import-btn')?.addEventListener('click', () => openImportModal());
+
+  // Deep-Link aus dem Kontakt-Import („Zu Geburtstagen"): Kandidaten-Modal direkt
+  // öffnen, statt den Nutzer den Import-Button selbst suchen zu lassen.
+  try {
+    if (sessionStorage.getItem('yuvomi:birthdays:autoImport')) {
+      sessionStorage.removeItem('yuvomi:birthdays:autoImport');
+      openImportModal();
+    }
+  } catch { /* sessionStorage evtl. nicht verfügbar */ }
 
   wirePageSearch(_container, {
     id: 'birthdays-search',
@@ -248,7 +261,7 @@ function bindEvents() {
       return;
     }
     if (action.dataset.action === 'delete') {
-      await deleteBirthday(id, birthday.name);
+      deleteBirthday(id);
     }
   });
 }
@@ -355,9 +368,14 @@ function openBirthdayModal({ mode, birthday = null }) {
       });
 
       panel.querySelector('#bd-cancel').addEventListener('click', closeModal);
+      // Löschen verwirft die Eingaben ohnehin mit dem Datensatz: der Dirty-Guard
+      // hätte hier erst nach dem Verwerfen von Feldern gefragt, die gleich mit
+      // weggehen - zwei Rückfragen für eine Entscheidung (#625-Muster). Der
+      // await hält das Löschen zurück, bis der Overlay-Slot wirklich frei ist;
+      // das Shared-Modal kennt kein Stacking (siehe _suspendActiveModal).
       panel.querySelector('#bd-delete')?.addEventListener('click', async () => {
-        closeModal();
-        await deleteBirthday(birthday.id, birthday.name);
+        await closeModal({ force: true });
+        deleteBirthday(birthday.id);
       });
       panel.querySelector('#bd-save').addEventListener('click', async () => {
         const saveBtn = panel.querySelector('#bd-save');
@@ -399,23 +417,140 @@ function openBirthdayModal({ mode, birthday = null }) {
   });
 }
 
-async function deleteBirthday(id, name) {
-  if (!await confirmModal(t('birthdays.deleteConfirm', { name }), { danger: true, confirmLabel: t('common.delete') })) return;
-  const birthday = state.birthdays.find((b) => b.id === id);
+function importCandidateRowHtml(c) {
+  if (c.already_imported) {
+    return `
+      <div class="bd-import-row bd-import-row--done">
+        <span class="bd-import-row__check" aria-hidden="true"><i data-lucide="check"></i></span>
+        <span class="bd-import-row__name">${esc(c.name)}</span>
+        <span class="bd-import-row__date">${esc(formatDate(c.birthday))}</span>
+        <span class="bd-import-row__badge">${t('birthdays.importAlreadyAdded')}</span>
+      </div>`;
+  }
+  return `
+    <label class="bd-import-row">
+      <input type="checkbox" value="${c.id}">
+      <span class="bd-import-row__name">${esc(c.name)}</span>
+      <span class="bd-import-row__date">${esc(formatDate(c.birthday))}</span>
+    </label>`;
+}
+
+async function openImportModal() {
+  let candidates;
+  try {
+    const res = await api.get('/birthdays/import/candidates');
+    candidates = res.data;
+  } catch (err) {
+    window.yuvomi?.showToast(err.message, 'danger');
+    return;
+  }
+
+  const withBirthday = candidates.withBirthday ?? [];
+  const withoutBirthday = candidates.withoutBirthday ?? [];
+  const hasCandidates = withBirthday.length > 0;
+
+  const listHtml = hasCandidates
+    ? `<div class="bd-import__list">${withBirthday.map(importCandidateRowHtml).join('')}</div>`
+    : `<div class="bd-import__empty">${t('birthdays.importEmpty')}</div>`;
+
+  const withoutHtml = withoutBirthday.length
+    ? `<details class="bd-import__without">
+         <summary>${t('birthdays.importNoBirthdaySection')} (${withoutBirthday.length})</summary>
+         <p class="bd-import__without-hint">${t('birthdays.importNoBirthdayHint')}</p>
+         <div class="bd-import__without-list">
+           ${withoutBirthday.map((c) => `<span class="bd-import__without-name">${esc(c.name)}</span>`).join('')}
+         </div>
+       </details>`
+    : '';
+
+  openSharedModal({
+    title: t('birthdays.importTitle'),
+    size: 'md',
+    content: `
+      <div class="bd-import">
+        <p class="bd-import__intro">${t('birthdays.importIntro')}</p>
+        <span class="sr-only" role="status" aria-live="polite" id="bd-import-status"></span>
+        ${listHtml}
+        ${withoutHtml}
+        <div class="bd-import__footer">
+          <button class="btn btn--secondary" type="button" id="bd-import-cancel">${t('common.cancel')}</button>
+          <button class="btn btn--primary" type="button" id="bd-import-submit" disabled>${t('birthdays.importSubmit', { count: 0 })}</button>
+        </div>
+      </div>
+    `,
+    onSave(panel) {
+      const submitBtn = panel.querySelector('#bd-import-submit');
+      const status = panel.querySelector('#bd-import-status');
+      const selectable = [...panel.querySelectorAll('.bd-import__list input:not(:disabled)')];
+
+      const selectedIds = () =>
+        selectable.filter((cb) => cb.checked).map((cb) => Number(cb.value));
+
+      const refresh = (announce = false) => {
+        const n = selectedIds().length;
+        submitBtn.textContent = t('birthdays.importSubmit', { count: n });
+        submitBtn.disabled = n === 0;
+        // Nur bei echter Interaktion ansagen, nicht beim initialen Öffnen.
+        if (announce && status) status.textContent = t('birthdays.importSelected', { count: n });
+      };
+      selectable.forEach((cb) => cb.addEventListener('change', () => refresh(true)));
+      refresh();
+
+      panel.querySelector('#bd-import-cancel').addEventListener('click', closeModal);
+
+      submitBtn.addEventListener('click', async () => {
+        const ids = selectedIds();
+        if (ids.length === 0) {
+          window.yuvomi?.showToast(t('birthdays.importNothingSelected'), 'warning');
+          return;
+        }
+        submitBtn.disabled = true;
+        try {
+          const res = await api.post('/birthdays/import', { contact_ids: ids });
+          window.yuvomi?.showToast(t('birthdays.importSuccess', { count: res.data.imported }), 'success');
+          await loadData();
+          renderList();
+          closeModal({ force: true });
+        } catch (err) {
+          window.yuvomi?.showToast(err.message, 'danger');
+          submitBtn.disabled = false;
+        }
+      });
+    },
+  });
+}
+
+// Löschen mit Undo statt Bestätigungsdialog: ein Geburtstag ist ein Datum ohne
+// Verlauf und hängt an nichts, was mitgelöscht würde. Damit folgt das Modul
+// demselben Modell wie Notizen, Kontakte und Rezepte; die Vorab-Bestätigung
+// bleibt nur, wo Löschen kaskadiert.
+//
+// scheduleUndoableDelete hält den Server-Delete bis zum Ablauf des Undo-
+// Fensters zurück. Das frühere deleteWithUndo löschte sofort und stellte bei
+// Undo nur den lokalen State wieder her — der Eintrag war serverseitig weg und
+// verschwand beim nächsten Reload still.
+function deleteBirthday(id) {
+  const index = state.birthdays.findIndex((b) => b.id === id);
+  if (index === -1) return;
+  const birthday = state.birthdays[index];
+
   state.birthdays = state.birthdays.filter((b) => b.id !== id);
   updateBirthdayBadge();
   renderList();
-  await deleteWithUndo({
-    onDelete: async () => { await api.delete(`/birthdays/${id}`); },
-    onUndo: async () => {
-      if (birthday) {
-        state.birthdays = [...state.birthdays, birthday];
-        updateBirthdayBadge();
-        renderList();
-      }
+
+  scheduleUndoableDelete({
+    message: t('birthdays.deletedToast'),
+    commit: ({ keepalive }) => api.delete(`/birthdays/${id}`, { keepalive }),
+    restore: (err) => {
+      state.birthdays = [
+        ...state.birthdays.slice(0, index),
+        birthday,
+        ...state.birthdays.slice(index),
+      ];
+      updateBirthdayBadge();
+      renderList();
+      if (err) window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
     },
-    toastMessage: t('birthdays.deletedToast'),
-    toastType: 'success',
   });
 }
 

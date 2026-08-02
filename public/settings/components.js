@@ -1,4 +1,5 @@
 import { t } from '/i18n.js';
+import { esc } from '/utils/html.js';
 
 let settingRowIdCounter = 0;
 
@@ -49,6 +50,48 @@ export function createDisclosure({
 
   section.append(trigger, panel);
   return section;
+}
+
+// Ein Schalter, eine Form. Vorher erfand jedes Blatt seine eigene: `toggle-row`,
+// `settings-toggle`, der iOS-Switch aus `toggle`/`toggle__track` und nackte
+// Checkboxen standen für dieselbe Boolean-Entscheidung nebeneinander (Critique
+// 2026-07-27). `attrs` nimmt alles auf, was ein Aufrufer sonst hartkodieren
+// müsste - id, name, value, data-*, aria-describedby -, sodass es genau einen
+// Escape-Pfad gibt. `true` rendert ein Boolean-Attribut, `false`/`null` lässt es weg.
+function attrsHtml(attrs) {
+  return Object.entries(attrs)
+    .filter(([, value]) => value !== false && value != null)
+    .map(([name, value]) => (value === true ? ` ${name}` : ` ${name}="${esc(String(value))}"`))
+    .join('');
+}
+
+export function toggleRowHtml({
+  label,
+  checked = false,
+  disabled = false,
+  className = '',
+  // Icon vor dem Text (Lucide-Name); der Platzhalter braucht wie überall ein
+  // `lucide.createIcons()` nach dem Einfügen.
+  icon = null,
+  // Zeilen, deren Kontext den Schalter schon benennt (Modul-Listen), tragen ihr
+  // Label nur für Screenreader.
+  labelVisible = true,
+  attrs = {},
+}) {
+  const rowClass = ['toggle-row', className].filter(Boolean).join(' ');
+  const iconHtml = icon ? `<i data-lucide="${esc(icon)}" aria-hidden="true"></i>` : '';
+  const labelClass = labelVisible ? '' : ' class="sr-only"';
+  return `<label class="${rowClass}">`
+    + `<input type="checkbox"${attrsHtml({ ...attrs, checked, disabled })}>`
+    + iconHtml
+    + `<span${labelClass}>${esc(String(label ?? ''))}</span>`
+    + '</label>';
+}
+
+export function createToggleRow(options) {
+  const host = document.createElement('div');
+  host.insertAdjacentHTML('afterbegin', toggleRowHtml(options));
+  return host.firstElementChild;
 }
 
 export function createSettingRow({ label, description, control }) {
@@ -103,13 +146,17 @@ export function createStatusSummary({
   details = [],
   action = null,
   tone = 'neutral',
+  // Überschriftenebene, nicht Größe: die trägt `settings-status-summary__title`.
+  // Blätter, in denen die Zusammenfassung direkt unter dem Leaf-Titel sitzt,
+  // brauchen 2, sonst springt das Outline von h1 auf h3.
+  level = 3,
 }) {
   const allowedTones = new Set(['neutral', 'success', 'warning', 'danger']);
   const resolvedTone = allowedTones.has(tone) ? tone : 'neutral';
   const summary = document.createElement('section');
   summary.className = `settings-status-summary settings-status-summary--${resolvedTone}`;
 
-  const heading = document.createElement('h3');
+  const heading = document.createElement(level === 2 ? 'h2' : 'h3');
   heading.className = 'settings-status-summary__title';
   heading.textContent = String(title ?? '');
 
@@ -124,7 +171,15 @@ export function createStatusSummary({
     list.className = 'settings-status-summary__details';
     for (const detail of details) {
       const item = document.createElement('li');
-      item.textContent = String(detail);
+      // Details sind entweder ein String oder { text, key }. Der Key macht eine
+      // Zeile adressierbar, damit Aufrufer sie später gezielt aktualisieren
+      // können, ohne die Karte neu zu bauen.
+      if (detail && typeof detail === 'object') {
+        item.textContent = String(detail.text ?? '');
+        if (detail.key) item.dataset.key = detail.key;
+      } else {
+        item.textContent = String(detail);
+      }
       list.appendChild(item);
     }
     summary.appendChild(list);

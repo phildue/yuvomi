@@ -88,6 +88,29 @@
   --color-surface-2:      var(--neutral-50);
   --_color-surface-3:     var(--_neutral-150);
   --color-surface-3:      var(--_color-surface-3);
+  /* OFFEN, BEWUSST NICHT GEÄNDERT (Stand 2026-07-30, Entscheidung des Betreibers):
+   * die Kanten der BEDIENELEMENTE erreichen den von WCAG 1.4.11 geforderten
+   * 3:1-Kontrast nicht. Selbst gemessen auf /shopping und /pantry, beide Themes:
+   *
+   *   Eingabefelder (.form-input, .quick-add__*, .page-search__input)
+   *                        #E8E7E2 auf #F5F4F1 = 1.13:1   dark #4A4A46 auf #1A1A18 = 1.96:1
+   *   Checkbox (.item-check::before)  1.24:1                dark 1.75:1
+   *   Stepper (.pantry-stepper__btn)  1.24:1                dark 1.75:1
+   *   Filter-Chip                     3.89:1 (hell, OK)     dark 1.11:1
+   *   Listen-Chip (.list-tab)         2.84:1                dark 1.15:1
+   *
+   * Für 3:1 müsste --color-border auf etwa #8A8A86 (hell) bzw. #666660 (dunkel).
+   *
+   * NICHT betroffen sind die Karten- und Gruppenkanten (.kitchen-rows 1.06:1 hell /
+   * 1.53:1 dunkel): 1.4.11 verlangt 3:1 für „visuelle Information, die
+   * BEDIENELEMENTE identifiziert", nicht für dekorative Gruppierung. Der Critique
+   * zählte 28 Werte unter 3:1 und warf beides zusammen - die tatsächliche
+   * Verstoßmenge sind die fünf Zeilen oben.
+   *
+   * Der saubere Weg wäre ein eigenes --color-border-control mit 3:1, das NUR
+   * interaktive Kanten benutzen; --color-border global anzuheben würde jede
+   * Kartenkante und jede Trennlinie der App mithärten. Der TEXT-Kontrast ist
+   * übrigens ohne einen einzigen Verstoß (niedrigster Wert 4.57 hell). */
   --color-border:         var(--neutral-200);
   --color-border-subtle:  var(--neutral-150);
   --color-border-strong:  var(--neutral-300);  /* kräftigere Trennlinie (Hover, betonte Rahmen) */
@@ -192,6 +215,27 @@
   --_toast-danger-text:  var(--color-text-on-accent);
   --toast-danger-text:   var(--_toast-danger-text);
 
+  /* Datenreihen-Palette für Diagramme (Donut, Kategorie-Segmente).
+   * Bewusst eigene Tokens statt geborgter Modul-Akzente: Modulfarben tragen
+   * eine Bedeutung ("das ist Einkauf"), die in einem Ausgaben-Donut falsch ist,
+   * und ihr Kontrast ist nur gegen ihre eigenen Flächen geprüft. Sieben klar
+   * getrennte Farbtöne — mehr Segmente sind ohnehin nicht mehr unterscheidbar,
+   * die Views fassen den Rest zu „Sonstige" zusammen. */
+  --_chart-series-1: #6C3AED;   /* Violett  */
+  --_chart-series-2: #0F766E;   /* Teal     */
+  --_chart-series-3: #C2410C;   /* Orange   */
+  --_chart-series-4: #0B66C3;   /* Blau     */
+  --_chart-series-5: #A16207;   /* Ocker    */
+  --_chart-series-6: #BE185D;   /* Magenta  */
+  --_chart-series-7: #15803D;   /* Grün     */
+  --chart-series-1: var(--_chart-series-1);
+  --chart-series-2: var(--_chart-series-2);
+  --chart-series-3: var(--_chart-series-3);
+  --chart-series-4: var(--_chart-series-4);
+  --chart-series-5: var(--_chart-series-5);
+  --chart-series-6: var(--_chart-series-6);
+  --chart-series-7: var(--_chart-series-7);
+
   /* --------------------------------------------------------
    * 4. Farben - Modul-Akzente
    *    Jedes Modul hat eine eigene dezente Akzentfarbe.
@@ -206,20 +250,36 @@
   --module-calendar:   var(--_module-calendar);    /* Violett - Termine, Zeit */
   --_module-meals:     #C2410C;
   --module-meals:      var(--_module-meals);       /* Orange-700 - Essen, Wärme */
-  --_module-recipes:   #109C6B;
-  --module-recipes:    var(--_module-recipes);     /* Teal-Grün - Rezepte (159°, von --module-budget 175° getrennt) */
-  --_module-shopping:  #DB2777;
-  --module-shopping:   var(--_module-shopping);    /* Pink-600 - Einkaufen (trennt von Meals) */
-  --_module-notes:     #A16207;
-  --module-notes:      var(--_module-notes);       /* Amber-700 - Notizen (4.92:1 auf weiß — WCAG AA) */
+  --_module-recipes:   #0C7C5B;
+  --module-recipes:    var(--_module-recipes);     /* Teal-Grün - Rezepte (166°, von --module-budget 186° und --module-tasks 150° getrennt); 5.19:1 auf weiß, 4.71:1 auf --color-bg — WCAG AA. Vorgänger #109C6B lag bei 3.51:1 auf weiß und verfehlte als Textfarbe AA. */
+  --_module-shopping:  #D12370;
+  --module-shopping:   var(--_module-shopping);    /* Pink-600 - Einkaufen (trennt von Meals); 5.02:1 auf weiß, 4.57:1 auf --color-bg — WCAG AA */
+  --_module-pantry:    #4D7C0F;
+  --module-pantry:     var(--_module-pantry);      /* Oliv-Grün (86°) - Vorrat. Besetzt die einzige freie Hue-Lücke zwischen notes (36°) und tasks (142°); 4.99:1 auf weiß, 4.54:1 auf --color-bg — WCAG AA. Erdig statt frisch: der Vorrat ist der Lagerort, nicht die Ernte. */
+  /* Akzent der KÜCHEN-GRUPPE. Mahlzeiten/Rezepte/Einkaufen/Vorrat sind EIN
+   * Modul mit vier Ansichten (router.js: `kitchenGroup: true`, ein einziger
+   * Sidebar-Eintrag) - also tragen sie einen Akzent, nicht vier. Vorher setzte
+   * jedes der vier Tab-CSS seinen eigenen `--module-accent`, wodurch derselbe
+   * Nav-Eintrag beim Tabwechsel die Farbe wechselte: orange → teal → pink →
+   * oliv. Ein Farbwechsel ist die stärkste „du hast den Kontext verlassen"-
+   * Botschaft, die die App hat; innerhalb einer Tab-Gruppe entwertet er den
+   * --module-*-Mechanismus für alle Module (Critique 2026-07-29).
+   * Orange, weil Mahlzeiten der Einstiegstab der Gruppe ist. Sub-Identität
+   * tragen die Tab-Icons, nicht der Hue. DESIGN.md-Prinzip 5 gilt weiter:
+   * ein Modul = eine Farbe - die Küche IST ein Modul.
+   * Die vier --module-{meals,recipes,shopping,pantry} bleiben bestehen: die
+   * Dashboard-Widgets und die Nav-Icons referenzieren sie einzeln. */
+  --module-kitchen:    var(--_module-meals);
+  --_module-notes:     #9F6107;
+  --module-notes:      var(--_module-notes);       /* Amber-700 - Notizen; 5.02:1 auf weiß, 4.57:1 auf --color-bg — WCAG AA */
   --_module-contacts:  #0969DA;
   --module-contacts:   var(--_module-contacts);    /* Kräftiges Blau - Kontakte */
-  --_module-birthdays: #D6336C;
-  --module-birthdays:  var(--_module-birthdays);   /* Rosé - Geburtstage (entkoppelt von --color-danger #B91C1C) */
+  --_module-birthdays: #D02A64;
+  --module-birthdays:  var(--_module-birthdays);   /* Rosé - Geburtstage (entkoppelt von --color-danger #B91C1C); 5.01:1 auf weiß, 4.56:1 auf --color-bg — WCAG AA */
   --_module-budget:    #0F766E;
   --module-budget:     var(--_module-budget);      /* Teal-700 - Finanzen, Stabilität */
-  --_module-split-expenses: #1A7BAE;
-  --module-split-expenses:  var(--_module-split-expenses); /* Azur-Cyan - geteilte Familienfinanzen (201°, von --module-reminders 193° getrennt) */
+  --_module-split-expenses: #1976A7;
+  --module-split-expenses:  var(--_module-split-expenses); /* Azur-Cyan - geteilte Familienfinanzen (201°, von --module-reminders 193° getrennt); 5.01:1 auf weiß, 4.56:1 auf --color-bg — WCAG AA */
   --_module-documents: #42587E;
   --module-documents:  var(--_module-documents);    /* Stahlblau - sichere Familiendokumente (aus dem Blau-Band gelöst) */
   --_module-housekeeping: #7C3AED;
@@ -232,12 +292,34 @@
   --cycle-period:    #C81E5A;   /* Menstruation/Blutung — Rosé-Rot (~5.0:1 auf weiß) */
   --cycle-fertile:   #0E8C74;   /* Fruchtbares Fenster — Teal-Grün (~4.5:1 auf weiß) */
   --cycle-ovulation: #0E7FB0;   /* Eisprung-Spitzentag — Cyan-Blau (~4.8:1 auf weiß) */
-  --_module-settings:   #6E7781;
-  --module-settings:    var(--_module-settings);   /* Grau - Konfiguration */
+  --_module-settings:   #677079;
+  --module-settings:    var(--_module-settings);   /* Grau - Konfiguration; 5.03:1 auf weiß, 4.58:1 auf --color-bg — WCAG AA */
   --_module-reminders:  #0E7490;
   --module-reminders:   var(--_module-reminders);  /* Cyan-700 - Erinnerungen, 5.36:1 auf weiß — WCAG AA */
-  --_module-rewards:    #BE4B6E;
-  --module-rewards:     var(--_module-rewards);     /* Rosé-Kupfer (342°) — Belohnungen. Warm-persönlich, klar von birthdays #E11D48 (350°) und shopping getrennt; 4.75:1 auf weiß — WCAG AA. */
+  --_module-rewards:    #BC4569;
+  --module-rewards:     var(--_module-rewards);     /* Rosé-Kupfer (342°) — Belohnungen. Warm-persönlich, klar von birthdays und shopping getrennt; 5.01:1 auf weiß, 4.56:1 auf --color-bg — WCAG AA. */
+
+  /* KONVENTION "Akzent-Text auf akzent-getöntem Grund" (Chips, Badges,
+   * Initialen-Avatare). Der rohe Akzent scheitert dort, weil der Grund eine
+   * Tönung derselben Farbe ist: der Kontrast hängt allein an der Akzent-
+   * Helligkeit, und gemessen verfehlten 13 von 17 Modulen AA (recipes 2.84:1,
+   * shopping 3.21:1). Stattdessen gilt:
+   *
+   *   color: color-mix(in srgb, var(--module-accent) 70%, var(--color-text-primary));
+   *
+   * Die 30%-Beimischung schiebt den Text themenrichtig vom Grund weg (Light
+   * dunkler, Dark heller), weil --color-text-primary mitschaltet: worst case
+   * 4.99:1 (Light, settings) und 5.32:1 (Dark, health).
+   *
+   * BEWUSST KEIN Token: ein hier definiertes --accent-on-tint würde bereits in
+   * :root ausgewertet, wo --module-accent noch nicht gesetzt ist (das setzen
+   * die Modul-Stylesheets auf ihrer Page-Root-Klasse). Der Fallback --color-
+   * accent würde eingefroren und als berechneter Wert vererbt — jeder Chip
+   * bekäme Dashboard-Violett statt seiner Modulfarbe. Die Formel muss dort
+   * stehen, wo --module-accent gilt. Fundstellen: `grep -rn "70%, var(--color-text-primary)" public/styles`.
+   *
+   * NUR für Text. Icons tragen weiter den vollen Akzent — dort gilt 3:1, und
+   * die Beimischung würde die Modulfarbe unnötig eintrüben. */
 
   /* --------------------------------------------------------
    * 5. Farben - Mahlzeit-Typen
@@ -260,6 +342,36 @@
   --_meal-snack-light:     #FFECE3;
   --meal-snack-light:      var(--_meal-snack-light);
 
+  /* GEPRÜFT UND BEWUSST SO GELASSEN (2026-07-30). Drei der vier Mahlzeit-Farben
+   * sind byte-gleich mit einem semantischen oder strukturellen Token:
+   *
+   *   --meal-breakfast  #A15C0A  ==  --color-warning   („läuft ab", „fast leer")
+   *   --meal-dinner     #6c3aed  ==  --color-accent    (App-Akzent)
+   *   --meal-snack      #C2410C  ==  --module-meals/--module-kitchen
+   *                                  (aktiver Tab, FAB, jeder Primär-CTA)
+   *
+   * Der Critique 2026-07-30 nennt das eine Semantik-Kollision: derselbe Amber heißt
+   * im Essensplan „Frühstück" und im Vorrat „läuft ab".
+   *
+   * Warum trotzdem nichts geändert wurde: die Farbe erscheint ausschließlich als
+   * 8px-Punkt in `.meal-slot__type-label` bzw. `.week-gutter-label`, und dort steht
+   * IMMER das ausgeschriebene Wort daneben (`.meal-slot__type-text`). Sie ist
+   * Scanhilfe, nie alleiniger Bedeutungsträger - anders als das Vorrats-Badge, wo
+   * derselbe Ton tatsächlich die Aussage trägt. Vier Markenfarben umzufärben ist
+   * eine Design-System-Entscheidung, kein Feinschliff, und die Zeitmetapher
+   * (Morgen-Amber, Mittag-Grün, Abend-Violett) ginge dabei verloren.
+   *
+   * Wer sie doch auflöst, braucht vier Töne, die untereinander UND gegen
+   * warning/danger/accent unterscheidbar sind - auch bei Rot-Grün-Schwäche. */
+
+  /* Badge für aus Mealie gespiegelte Rezepte (source: 'mealie') - eigener Teal-
+   * Ton statt einer der vier Mahlzeit-Farben, damit "gespiegelt" nicht wie ein
+   * fünfter Mahlzeit-Typ aussieht. */
+  --_source-mealie:        #0F766E;
+  --source-mealie:         var(--_source-mealie);
+  --_source-mealie-light:  #D9F5EE;
+  --source-mealie-light:   var(--_source-mealie-light);
+
   /* --------------------------------------------------------
    * 6. Farben - Prioritäten
    * -------------------------------------------------------- */
@@ -268,7 +380,12 @@
   --color-priority-low:      var(--_color-priority-low);
   --_color-priority-medium:  #854D0E;
   --color-priority-medium:   var(--_color-priority-medium);
-  --_color-priority-high:    #9A3412;
+  /* „Hoch" heller/oranger als „Dringend" (#991B1B): der Priority-Punkt auf
+   * Dashboard/Mobil-Kalender kodiert Rang nur per Farbe - #9A3412 war von
+   * Urgent-Rot kaum zu trennen (Helligkeit ~1,2x). #B4400E hebt die Helligkeit
+   * auf ~1,8x Urgent (auch bei Rot-Grün-Schwäche wahrnehmbar) und hält 4.79:1
+   * Badge-Text auf dem getönten Priority-Badge-Grund (WCAG AA). P3. */
+  --_color-priority-high:    #B4400E;
   --color-priority-high:     var(--_color-priority-high);
   --_color-priority-urgent:  #991B1B;
   --color-priority-urgent:   var(--_color-priority-urgent);
@@ -303,6 +420,43 @@
   --color-danger-translucent:  rgba(255, 59, 48, 0.35);
   --color-warning-translucent: rgba(245, 158, 11, 0.28);
   --color-soon: var(--color-warning);
+
+  /* --------------------------------------------------------
+   * 7b. Fokusring
+   *
+   * Der Fokusring ist das einzige Bauteil, das ein Tastaturnutzer
+   * ununterbrochen sieht. Er hatte sechs Spezifikationen: zwei konkurrierende
+   * Basisregeln (reset.css 2px/offset 2px, glass.css überschrieb den Offset
+   * global auf 3px) und rund 45 lokale Regeln darüber. Auf /shopping
+   * alternierte er beim Durchtabben violett → orange → violett → orange, sechs
+   * Farbwechsel in 15 Tabstops (Critique P1, 2026-07-30). Ein Farbwechsel liest
+   * sich als Kontextwechsel, wo keiner ist - und er entwertet die Akzent-Arbeit:
+   * das Modul HAT einen Akzent, die Tastatur sah ihn zur Hälfte.
+   *
+   * WARUM DREI TOKENS UND KEIN SHORTHAND. Ein `--focus-ring: 2px solid
+   * var(--focus-ring-color)` wäre bequemer, aber unbrauchbar: custom properties
+   * werden dort aufgelöst, wo sie DEKLARIERT sind. Ein Shorthand auf `:root`
+   * bäckt die Farbe von `:root` ein, und eine lokale Überschreibung von
+   * `--focus-ring-color` weiter unten im Baum bliebe wirkungslos. Genau die
+   * lokale Überschreibung brauchen aber die begründeten Ausnahmen (Konto-Farbe
+   * im Budget, Slot-Farbe im Dashboard, Kontrastring auf dem FAB). Deshalb
+   * schreiben Komponenten die zwei Zeilen aus, und die Ausnahme setzt
+   * `--focus-ring-color` statt eine eigene `outline` zu erfinden.
+   *
+   * FARBE: `--active-module-accent` setzt der Router auf `<html>`, also genau
+   * dort, wo `--focus-ring-color` deklariert ist - die Auflösung greift. Auf
+   * modullosen Seiten (Login, Setup) ist es undefiniert und der App-Akzent
+   * übernimmt.
+   *
+   * OFFSET: 2px ist der Ring außen. `--focus-ring-offset-inset` ist für
+   * Elemente an einer geclippten Kante (`overflow: hidden` am Elternteil) -
+   * dort schneidet ein positiver Offset den Ring an, ein negativer bleibt
+   * vollständig sichtbar. Das ist der einzige legitime Grund abzuweichen.
+   * -------------------------------------------------------- */
+  --focus-ring-width:        2px;
+  --focus-ring-color:        var(--active-module-accent, var(--color-accent));
+  --focus-ring-offset:       2px;
+  --focus-ring-offset-inset: -2px;
 
   /* --------------------------------------------------------
    * 8. Schatten
@@ -410,7 +564,41 @@
   --target-sm: 32px;    /* Visuelle Größe (z.B. Logos) — kein Touch-Target */
   --target-md: 40px;    /* Desktop Touch-Target (Maus) */
   --target-lg: 48px;    /* Mobile Touch-Target (Finger) */
-  --target-base: 44px;  /* iOS-Minimum Touch-Target (44pt) */
+  /* Die Standardgröße für Bedienelemente, die nicht selbst zwischen md und lg
+   * unterscheiden. 111 Fundstellen in 18 Modulen.
+   *
+   * WARUM SIE AUF TOUCH AUF 48px WÄCHST: DESIGN.md §„Do" fordert „48px (mobile) oder
+   * 40px (desktop) minimum" und nennt dafür genau zwei Token, --target-lg und
+   * --target-md. Ein festes 44px stand damit auf Touch 4px UNTER dem eigenen
+   * dokumentierten Minimum - und zwar an sechs der meistbenutzten Bedienelemente der
+   * Küche (.sub-tab, .item-check, das Mengenfeld, der Quick-Add-Knopf, der
+   * Stepper-Knopf, „Woche zufällig füllen"). Der Critique vom 2026-07-30 nannte das
+   * so: „Eine der beiden Zahlen ist falsch."
+   *
+   * Falsch war die 44 - aber nur auf Touch. Auf Zeigergeräten liegt sie mit 44px
+   * ÜBER der 40px-Untergrenze und ist dort keine Verletzung; sie zurückzunehmen
+   * würde 111 Bedienelemente ohne Not verkleinern. Deshalb kein neuer Wert, sondern
+   * ein Wert, der die Zeigerfähigkeit kennt: Desktop bleibt exakt wie bisher,
+   * Touch erfüllt das Minimum. Blast-Radius auf Desktop: null.
+   *
+   * Die 44pt aus der iOS-HIG bleiben als Untergrenze richtig - sie sind ein
+   * Minimum, kein Ziel, und DESIGN.md setzt für Finger ein höheres. */
+  --target-base: 44px;
+
+  /* --------------------------------------------------------
+   * 11b2. Icon-Größen
+   *
+   * VIER Stufen, lückenlos und kollisionsfrei — je Stufe genau ein Name.
+   * Vorher trugen sieben Klassennamen dieselben vier Werte
+   * (.icon-sm = .icon-xs = .icon-11 = 12px, .icon-md = .icon-base,
+   * .icon-xl = .icon-2xl), wodurch die Skala unter `md` keine echte
+   * Zwischenstufe hatte und `icon-sm` nicht das war, wonach es klingt.
+   * Die Utility-Klassen dazu stehen in layout.css.
+   * -------------------------------------------------------- */
+  --icon-sm: 12px;   /* Inline-Marker in Fließtext, Chips */
+  --icon-md: 16px;   /* Standard: Buttons, Listenzeilen */
+  --icon-lg: 20px;   /* Betonte Aktionen, Toolbar */
+  --icon-xl: 24px;   /* FAB, Empty-State, Dialog-Kopf */
 
   /* --------------------------------------------------------
    * 11c. Breakpoints — verbindlicher Kontrakt
@@ -444,11 +632,95 @@
   --content-max-width: 1280px;
   --content-max-width-narrow: 720px;
   /* Kanonisches horizontales Seiten-Padding. Ein Wert für den Gutter aller
-   * Modul-Roots, statt gestreuter --space-3/4/5/6 pro Modul. */
+   * Modul-Roots, statt gestreuter --space-3/4/5/6 pro Modul.
+   * Ab 1024px auf --space-8 angehoben (siehe Media-Query unter :root), damit
+   * Kopf und Inhalt dieselbe Fluchtlinie haben (Issue #577). */
   --page-gutter: var(--space-4);
+  /* Canonical Page Head — Bleed-Einrückung.
+   *
+   * Zieht den INHALT eines full-bleed Seiten-Kindes auf die zentrierte
+   * Content-Spalte (--content-max-width), während Hintergrund, Akzentstreifen
+   * und Trennlinien des Elements bis an die Shell-Kante laufen. Ersetzt das
+   * frühere `max-width` auf den Modul-Roots: dort saß das Chrome mit im
+   * gedeckelten Container und der 3px-Akzentstreifen endete mitten in der
+   * Fläche (Issue #577).
+   *
+   * ZWEI Bedingungen, beide zwingend:
+   *
+   * 1. BEZUG. Das `100%` löst gegen den Containing Block auf. Es muss also
+   *    exakt so breit sein wie die App-Shell — kein Vorfahre bis hinauf zu
+   *    `.page-transition` darf Inline-Padding, -Border, -Margin oder eine
+   *    Breitenbegrenzung beisteuern. Direkte Kinder eines Modul-Roots erfüllen
+   *    das; ein Enkel (`.rewards-content__inner`) auch, solange die Zwischen-
+   *    ebene selbst randlos bleibt. Der Modul-Root selbst (`.health-page`) und
+   *    die Geschwister-Rails (`.sub-tabs-bar` im Router-Wrapper) ebenso.
+   *
+   * 2. GENAU EINMAL PRO AHNENKETTE. Wer darunter noch einmal horizontal
+   *    polstert, addiert die Ränder. Genau so entstand der 16px-Versatz im
+   *    Budget-Modul, den #577 eigentlich beseitigen sollte (siehe den Reset
+   *    `#budget-body .split-page, #budget-body .subscriptions-page`).
+   *
+   * Beides ist per Guard `page-inline-pad contract` in
+   * test/test-frontend-audit.js abgesichert. */
+  --page-inline-pad: max(
+    var(--page-gutter),
+    calc((100% - var(--content-max-width)) / 2)
+  );
   --cal-hour-height: 56px;
+  /* Breite der Zeitspalte in Wochen-/Tagesansicht. Muss 12-Stunden-Labels
+   * („12:00 PM") aufnehmen, nicht nur 24h („08:00"), sonst wird das rechts-
+   * bündige Label links abgeschnitten. Header-Gutter + Body-Zeitspalte teilen
+   * diesen Wert, damit die Spalten fluchten. */
+  --cal-gutter-width: 64px;
   --sub-tabs-height: 52px;
   --kitchen-tabs-height: 56px;
+
+  /* Floating Action Button - Geometrie und Freiraum.
+   *
+   * Größe und Offset lagen als Literale in `.page-toolbar`s Nachbarschaft
+   * (layout.css `.page-fab`), der Freiraum darunter als je eigene Formel in
+   * vier Modul-CSS. Die Formeln drifteten: meals/shopping rechneten
+   * `--target-lg + --space-6 + --space-4` = 88px, pantry/recipes
+   * `--space-4 + --target-lg + --space-4` = 80px. Beide waren mobil um mehr
+   * als 60px zu klein, weil sie --nav-bottom-height nicht mitzählten - der
+   * FAB steht dort ÜBER der Bottom-Nav. Ergebnis: die letzte Listenzeile
+   * ließ sich auf keiner der vier Routen unter dem FAB hervorscrollen
+   * (Critique 2026-07-29, gemessen bis 69% Verdeckung bei 320px).
+   *
+   * --fab-clearance leitet sich deshalb aus den beiden Werten ab, die die
+   * Position tatsächlich bestimmen. Wer den FAB verschiebt, verschiebt den
+   * Freiraum automatisch mit.
+   *
+   * WAR NUR DAS LISTENENDE, IST JETZT IMMER. `--fab-clearance` lag als
+   * `padding-block-end` auf dem scrollenden Element - und Padding am Inhaltsende
+   * scrollt mit. Es wirkte deshalb nur, wenn der Nutzer schon unten war. Bei
+   * `scrollTop = 0` lag auf 5 von 6 geprüften Route/Viewport-Kombinationen eine
+   * Zeilenaktion unter dem FAB, bis zu 80,6% verdeckt (phoneSm /pantry, Critique
+   * P1 2026-07-30). Ein fixiertes Element über einem Scrollport überdeckt
+   * zwangsläufig, was gerade dort steht.
+   *
+   * `--fab-safe-zone` verkürzt statt dessen den SCROLLPORT (Marge an
+   * .app-content, layout.css). Der Streifen unter ihm gehört dem FAB allein,
+   * bei jedem Scrollstand. Der Platz ist derselbe, den das Padding vorher am
+   * Listenende reserviert hat - er wandert nur vom Inhalt in den Container.
+   *
+   * --fab-gap ist die gemeinsame Quelle: er bestimmt, wie weit der FAB über der
+   * Scrollport-Unterkante schwebt, und daraus folgen BEIDE anderen Werte. Wer
+   * den FAB verschiebt, verschiebt die Zone automatisch mit. Mobil sitzt die
+   * Bottom-Nav (position: relative, ein Flex-Kind) unter dem Scrollport, deshalb
+   * zählt --fab-offset-bottom sie mit und --fab-safe-zone nicht: die Zone misst
+   * ab Scrollport-Unterkante, der Offset ab Viewport-Unterkante.
+   *
+   * ENTFALLEN: --fab-lane, eine reservierte rechte Spur von
+   * `--fab-size + --space-4 + --space-2` = 76px. Sie war die zweite, gegenteilige
+   * Antwort auf dasselbe Problem und wurde von Einkauf und Vorrat auf JEDE Zeile
+   * gelegt: kollisionsfrei, aber bei 320px 24% der Viewportbreite, und
+   * Artikelnamen fielen auf rund vier lesbare Zeichen (Critique 2026-07-30, P0).
+   * Ein Guard in test-frontend-audit.js verbietet ihre Rückkehr. */
+  --fab-size: 52px;
+  --fab-gap: var(--space-6);
+  --fab-offset-bottom: calc(var(--nav-bottom-height) + var(--fab-gap));
+  --fab-safe-zone: calc(var(--fab-gap) + var(--fab-size) + var(--space-4));
 
   /* --------------------------------------------------------
    * 13. Sidebar
@@ -467,9 +739,22 @@
    * 14. Übergänge
    *     fast=150ms, base=250ms, slow=400ms (laut Redesign-Spec)
    * -------------------------------------------------------- */
-  --transition-fast: 0.15s ease;
-  --transition-base: 0.25s ease;
-  --transition-slow: 0.4s ease;
+  --transition-fast: 150ms ease;
+  --transition-base: 250ms ease;
+  --transition-slow: 400ms ease;
+
+  /* Motion-Dauern (Audit F-14): kanonische Stufen für nackte Dauern in
+   * transition-/animation-Werten, wo die --transition-*-Shorthands (Dauer +
+   * Easing) nicht passen. Konvention: Zeiten in ms, nie in s. Bewusste
+   * Ausreißer (z. B. 1.5s Skeleton-Shimmer, 800ms Swipe-Nudge) bleiben
+   * literale ms-Werte — die Skala deckt die Interaktions-Mikrodauern ab. */
+  --duration-2xs: 80ms;    /* Press-Feedback (Toast-Undo u. ä.) */
+  --duration-xs:  120ms;   /* Icon-/Well-Presses, Label-Fades */
+  --duration-sm:  150ms;   /* = fast (Hover, Farben) */
+  --duration-md:  200ms;   /* Seiten-/Panel-Einblendungen */
+  --duration-lg:  250ms;   /* = base (Sheets, Overlays) */
+  --duration-xl:  300ms;   /* betonte Einblendungen */
+  --duration-2xl: 400ms;   /* = slow (Layout-Umbauten, Sidebar) */
 
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
@@ -579,6 +864,10 @@
 
   /* g) Glass-Übergänge */
   --ease-glass:       cubic-bezier(0.34, 1.56, 0.64, 1);
+  /* Sidebar-Signature-Pille: bewusst sanftere Feder (geringerer Overshoot als
+   * --ease-glass), damit die gleitende Aktiv-Pille nicht über das Ziel-Item
+   * hinausschießt. Eigene benannte Kurve statt gestreuter cubic-bezier-Literale. */
+  --ease-sidebar-glide: cubic-bezier(0.28, 1.25, 0.36, 1);
   --transition-glass: 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
 
   /* h) Liquid-Glass-Backdrop (Section 17) — driftende Blobs + Specular.
@@ -594,6 +883,54 @@
   --lg-card-radius:    var(--radius-glass-card);
   --lg-density:        1;       /* multipliziert Schlüssel-Paddings (Reserve) */
   --lg-specular:       0.22;    /* Stärke des Inset-Top-Highlights */
+}
+
+/* ================================================================
+ * Desktop-Gutter
+ *
+ * Ab der App-Layout-Grenze (--bp-desktop) atmet der Seitenrand auf
+ * --space-8. Ein Wert für Kopf UND Inhalt: vorher hatte .page-toolbar
+ * --space-4 und die Body-Container --space-8, wodurch der sticky Titel
+ * dauerhaft 16px neben dem Inhalt darunter stand (Issue #577).
+ * ================================================================ */
+@media (min-width: 1024px) {
+  :root {
+    --page-gutter: var(--space-8);
+    /* Desktop hat keine Bottom-Nav: der FAB rückt näher an die Ecke und wird
+     * kleiner. Spiegelt den Media-Query auf `.page-fab` in layout.css;
+     * --fab-safe-zone rechnet beides automatisch mit.
+     *
+     * Ohne Bottom-Nav fallen Scrollport- und Viewport-Unterkante zusammen, der
+     * Offset ist also der Gap selbst - deshalb hier nur --fab-gap gesetzt und
+     * --fab-offset-bottom darauf zurückgeführt. */
+    --fab-size: var(--target-lg);
+    --fab-gap: var(--space-8);
+    --fab-offset-bottom: var(--fab-gap);
+  }
+}
+
+/* ================================================================
+ * Touch-Ziele auf Fingergeräten
+ *
+ * DESIGN.md fordert „48px (mobile) oder 40px (desktop) minimum" und kodiert das in
+ * --target-lg und --target-md. --target-base stand mit festen 44px auf Touch
+ * darunter - an 111 Fundstellen in 18 Modulen, darunter sechs der
+ * meistbenutzten Bedienelemente der Küche (Critique 2026-07-30: „Eine der beiden
+ * Zahlen ist falsch.").
+ *
+ * DAS KRITERIUM IST DIE ZEIGERFÄHIGKEIT, NICHT DIE BREITE. Ein 800px schmales
+ * Desktop-Fenster wird mit der Maus bedient und braucht keine Fingergröße; ein
+ * Tablet mit 1180px braucht sie sehr wohl. Dieselbe Unterscheidung, die im Modul
+ * schon das Zeilen-Löschen und den Vorrats-Stepper steuert.
+ *
+ * Auf Zeigergeräten bleibt es bei 44px: das liegt ÜBER der 40px-Untergrenze, ist
+ * also keine Verletzung, und eine Rücknahme auf 40 würde 111 Bedienelemente ohne
+ * Not verkleinern.
+ * ================================================================ */
+@media (hover: none) {
+  :root {
+    --target-base: var(--target-lg);
+  }
 }
 
 /* ================================================================
@@ -633,6 +970,17 @@
     --_color-surface-raised:   #2E2E2B;
     --_color-surface-glass:    rgba(34, 34, 32, 0.78);
 
+    /* Kanten: im Dark eigenständig gesetzt statt aus der Neutral-Rampe
+     * abgeleitet. Die Rampe liegt hier so dicht an --color-surface (#222220),
+     * dass --color-border-subtle exakt DIE FLÄCHENFARBE traf - eine Kartenkante
+     * in der Farbe ihrer eigenen Fläche (1.00:1). Karten, Listenzeilen und
+     * Formfelder hatten damit im Dark faktisch keine Begrenzung; gemessen
+     * Critique 2026-07-29 an .recipe-card, .pantry-row und .quick-add__qty.
+     * Ratios gegen --color-surface; gegen --color-bg (#1A1A18) jeweils höher. */
+    --color-border-subtle: #3A3A37;  /* 1.40:1 - Trenner, ruhige Kartenkante */
+    --color-border:        #4A4A46;  /* 1.79:1 - Standardkante, Formfelder */
+    --color-border-strong: #6B6B68;  /* 2.98:1 - Hover, betonte Rahmen */
+
     --_sidebar-bg:           #141413;
     --_sidebar-shadow-light: rgba(255, 255, 255, 0.04);
     --_sidebar-shadow-dark:  rgba(0, 0, 0, 0.4);
@@ -664,6 +1012,16 @@
     /* Dunkle Tinte auf den vividen Hell-Füllungen des Dark Mode (FAB, Badges, aktive Chips) */
     --_color-ink-on-vivid: #1A1A18;
 
+    /* Datenreihen: aufgehellte Varianten, damit die Segmente auf dunkler
+     * Kartenfläche ≥3:1 tragen (Grafik-Kontrast, WCAG 1.4.11). */
+    --_chart-series-1: #A78BFA;
+    --_chart-series-2: #2DD4BF;
+    --_chart-series-3: #FB923C;
+    --_chart-series-4: #60A5FA;
+    --_chart-series-5: #FCD34D;
+    --_chart-series-6: #F472B6;
+    --_chart-series-7: #4ADE80;
+
     --_module-dashboard: #a78bfa;
     --_module-tasks:     #4ADE80;
     --_module-calendar:  #818CF8;
@@ -674,6 +1032,7 @@
     --_module-birthdays: #FB7185;
     --_module-budget:      #2DD4BF;
     --_module-recipes:     #2ECC99;
+    --_module-pantry:      #A3E635;   /* Lime-400 — Oliv im Dark; 11.3:1 auf #1C1C1A, Hue 83° (37° zu notes, 59° zu tasks) */
     --_module-split-expenses: #2FB6E8;
     --_module-documents:   #7E9BCC;
     --_module-housekeeping: #C4B5FD;
@@ -702,6 +1061,9 @@
     --_meal-snack:           #FB923C;
     --_meal-snack-light:     #3D2010;
 
+    --_source-mealie:        #2DD4BF;
+    --_source-mealie-light:  #0F2E2A;
+
     --_color-priority-low:       #C8C7C3;
     --_color-priority-medium:    #FBBF24;
     --_color-priority-high:      #FB923C;
@@ -725,7 +1087,7 @@
     --_glass-bg-hover:         rgba(38, 38, 36, 0.82);
     --_glass-bg-elevated:      rgba(46, 46, 44, 0.90);
     --_glass-border:           rgba(255, 255, 255, 0.10);
-    --_glass-border-subtle:    rgba(255, 255, 255, 0.06);
+    --_glass-border-subtle:    rgba(255, 255, 255, 0.12);  /* 1.5:1 statt 1.18:1 - trägt Formfeld-Kanten (page-search, quick-add) */
     --_glass-highlight:        rgba(255, 255, 255, 0.09);
     --_glass-highlight-subtle: rgba(255, 255, 255, 0.05);
     --_glass-shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.30), 0 0 0 1px rgba(255, 255, 255, 0.07);
@@ -767,6 +1129,17 @@
     --_color-surface-raised:   #2E2E2B;
     --_color-surface-glass:    rgba(34, 34, 32, 0.78);
 
+    /* Kanten: im Dark eigenständig gesetzt statt aus der Neutral-Rampe
+     * abgeleitet. Die Rampe liegt hier so dicht an --color-surface (#222220),
+     * dass --color-border-subtle exakt DIE FLÄCHENFARBE traf - eine Kartenkante
+     * in der Farbe ihrer eigenen Fläche (1.00:1). Karten, Listenzeilen und
+     * Formfelder hatten damit im Dark faktisch keine Begrenzung; gemessen
+     * Critique 2026-07-29 an .recipe-card, .pantry-row und .quick-add__qty.
+     * Ratios gegen --color-surface; gegen --color-bg (#1A1A18) jeweils höher. */
+    --color-border-subtle: #3A3A37;  /* 1.40:1 - Trenner, ruhige Kartenkante */
+    --color-border:        #4A4A46;  /* 1.79:1 - Standardkante, Formfelder */
+    --color-border-strong: #6B6B68;  /* 2.98:1 - Hover, betonte Rahmen */
+
     /* Sidebar */
     --_sidebar-bg:           #141413;
     --_sidebar-shadow-light: rgba(255, 255, 255, 0.04);
@@ -801,6 +1174,16 @@
     /* Dunkle Tinte auf den vividen Hell-Füllungen des Dark Mode (FAB, Badges, aktive Chips) */
     --_color-ink-on-vivid: #1A1A18;
 
+    /* Datenreihen: aufgehellte Varianten, damit die Segmente auf dunkler
+     * Kartenfläche ≥3:1 tragen (Grafik-Kontrast, WCAG 1.4.11). */
+    --_chart-series-1: #A78BFA;
+    --_chart-series-2: #2DD4BF;
+    --_chart-series-3: #FB923C;
+    --_chart-series-4: #60A5FA;
+    --_chart-series-5: #FCD34D;
+    --_chart-series-6: #F472B6;
+    --_chart-series-7: #4ADE80;
+
     /* Modul-Akzente (Entflechtung Meals/Shopping spiegelt Light-Mode) */
     --_module-dashboard: #a78bfa;   /* Violet-400 */
     --_module-tasks:     #4ADE80;   /* Grün-400 — lebendig */
@@ -812,6 +1195,7 @@
     --_module-birthdays: #FB7185;   /* Rosé-400 */
     --_module-budget:      #2DD4BF;   /* Teal-400 */
     --_module-recipes:     #2ECC99;   /* Teal-Grün — Dark-Override, von budget 172° entkoppelt (161°) */
+    --_module-pantry:      #A3E635;   /* Lime-400 — Oliv im Dark; 11.3:1 auf #1C1C1A, Hue 83° (37° zu notes, 59° zu tasks) */
     --_module-split-expenses: #2FB6E8;   /* Cyan — von reminders 188° getrennt (196°) */
     --_module-documents:   #7E9BCC;   /* Stahlblau — Dark-Override (vorher fehlend, erbte 2.38:1) */
     --_module-housekeeping: #C4B5FD;
@@ -842,6 +1226,9 @@
     --_meal-snack:           #FB923C;
     --_meal-snack-light:     #3D2010;
 
+    --_source-mealie:        #2DD4BF;
+    --_source-mealie-light:  #0F2E2A;
+
     /* Priority-Badge Hintergründe */
     --_color-priority-low:       #C8C7C3;
     --_color-priority-medium:    #FBBF24;
@@ -869,7 +1256,7 @@
     --_glass-bg-hover:        rgba(38, 38, 36, 0.82);
     --_glass-bg-elevated:     rgba(46, 46, 44, 0.90);
     --_glass-border:          rgba(255, 255, 255, 0.10);
-    --_glass-border-subtle:   rgba(255, 255, 255, 0.06);
+    --_glass-border-subtle:   rgba(255, 255, 255, 0.12);  /* 1.5:1 statt 1.18:1 - trägt Formfeld-Kanten (page-search, quick-add) */
     --_glass-highlight:       rgba(255, 255, 255, 0.09);
     --_glass-highlight-subtle: rgba(255, 255, 255, 0.05);
     --_glass-shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.30), 0 0 0 1px rgba(255, 255, 255, 0.07);

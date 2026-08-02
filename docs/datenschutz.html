@@ -7,7 +7,7 @@
        Note: X-Frame-Options / CSP frame-ancestors only take effect as HTTP headers, not via meta. -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
   <meta name="referrer" content="strict-origin-when-cross-origin">
-  <title>Datenschutzerklärung — Yuvomi</title>
+  <title>Datenschutzerklärung - Yuvomi</title>
   <meta name="description" content="Datenschutzerklärung nach Art. 13 DSGVO für yuvomi.cloud.">
   <meta name="robots" content="index, follow">
   <meta name="theme-color" content="#fafaf8" media="(prefers-color-scheme: light)">
@@ -31,6 +31,7 @@
 
     :root {
       --ff: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --ff-mono: 'SF Mono', 'Fira Code', 'JetBrains Mono', ui-monospace, monospace;
       --bg: #FAFAF8;
       --bg-alt: #F2F1ED;
       --surface: #FFFFFF;
@@ -38,7 +39,7 @@
       --border-strong: #D8D7D1;
       --text-1: #1C1C1A;
       --text-2: #56554F;
-      --text-3: #8B8A85;
+      --text-3: #6E6D67;
       --accent: #6c3aed;
       --accent-hover: #5b2fd4;
       --accent-soft: #EDE9FE;
@@ -48,8 +49,24 @@
       --maxw: 820px;
     }
 
+    /* Dark tokens - applied when the visitor explicitly chose dark on the main
+       pages (persisted in localStorage and read by the inline <head> script). */
+    [data-theme="dark"] {
+      --bg: #1A1A18;
+      --bg-alt: #141413;
+      --surface: #222220;
+      --border: #2A2A28;
+      --border-strong: #3A3A37;
+      --text-1: #F5F4F1;
+      --text-2: #B4B3B0;
+      --text-3: #8E8D89;
+      --accent: #a78bfa;
+      --accent-hover: #9066f5;
+      --accent-soft: #1E1040;
+    }
+    /* OS preference - but never override an explicit light choice. */
     @media (prefers-color-scheme: dark) {
-      :root {
+      :root:not([data-theme="light"]) {
         --bg: #1A1A18;
         --bg-alt: #141413;
         --surface: #222220;
@@ -101,6 +118,9 @@
     }
     .nav-logo svg { width: 28px; height: 28px; }
     .back-link {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
       color: var(--text-2);
       text-decoration: none;
       font-size: 14px;
@@ -151,7 +171,7 @@
     ul { margin: 0 0 12px 22px; }
     li { margin-bottom: 4px; }
     address { font-style: normal; }
-    code { font-family: ui-monospace, 'SF Mono', monospace; font-size: 13px; background: var(--bg-alt); padding: 1px 5px; border-radius: 4px; }
+    code { font-family: var(--ff-mono); font-size: 13px; background: var(--bg-alt); padding: 1px 5px; border-radius: 4px; }
 
     a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; word-break: break-word; }
     a:hover { color: var(--accent-hover); }
@@ -213,8 +233,27 @@
     footer.bot a { color: var(--text-2); text-decoration: none; }
     footer.bot a:hover { color: var(--accent); }
     footer.bot nav { display: flex; gap: 14px; flex-wrap: wrap; }
-    footer.bot nav a { padding: 6px 2px; }
+    footer.bot nav a { padding: 6px 2px; min-height: 44px; display: inline-flex; align-items: center; }
+
+    /* In-page table of contents (navigation aid; legal text unchanged) */
+    main h2 { scroll-margin-top: 24px; }
+    .toc { margin: 28px 0 10px; padding: 20px 22px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); }
+    .toc-title { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); margin: 0 0 12px; }
+    .toc-list { margin: 0; padding-left: 1.5em; display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 5px 24px; }
+    .toc-list li { margin: 0; }
+    .toc-list a { color: var(--text-2); font-size: 0.9rem; line-height: 1.5; text-decoration: none; }
+    .toc-list a:hover { color: var(--accent); text-decoration: underline; }
+    @media (max-width: 560px) { .toc-list { grid-template-columns: 1fr; } }
   </style>
+  <script>
+    /* Honor the theme the visitor picked on the main pages (no toggle here). */
+    (function(){
+      try {
+        var t = localStorage.getItem('yuvomi-theme') || localStorage.getItem('oikos-theme');
+        if (t === 'dark' || t === 'light') document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {}
+    })();
+  </script>
 </head>
 <body>
 
@@ -247,7 +286,7 @@
     <div class="legal-disclaimer">
       <strong>Hinweis:</strong> Diese Datenschutzerklärung gilt für die Website unter
       <code>yuvomi.cloud</code>. Sie betrifft <strong>nicht</strong> die selbstgehostete
-      Yuvomi-Anwendung, die auf Ihrem eigenen Server läuft — dafür ist der jeweilige Betreiber
+      Yuvomi-Anwendung, die auf Ihrem eigenen Server läuft - dafür ist der jeweilige Betreiber
       verantwortlich (siehe Hinweise für Selfhoster im Projekt-Repository).
     </div>
 
@@ -258,7 +297,27 @@
       theme locally (localStorage). The self-hosted Yuvomi app runs on your own server and is not covered here.
     </p>
 
-    <h2>1. Verantwortlicher im Sinne der DSGVO</h2>
+    <nav class="toc" aria-label="Inhaltsverzeichnis">
+      <p class="toc-title">Inhalt</p>
+      <ol class="toc-list">
+        <li><a href="#ds-1">Verantwortlicher im Sinne der DSGVO</a></li>
+        <li><a href="#ds-2">Datenschutzbeauftragter</a></li>
+        <li><a href="#ds-3">Allgemeines zur Datenverarbeitung</a></li>
+        <li><a href="#ds-4">Hosting über GitHub Pages (Drittland-Transfer USA)</a></li>
+        <li><a href="#ds-5">Speicherung im lokalen Browser-Speicher (LocalStorage)</a></li>
+        <li><a href="#ds-6">Keine Cookies, kein Tracking, keine Analyse-Tools, keine externen Requests</a></li>
+        <li><a href="#ds-7">Kontaktaufnahme per E-Mail</a></li>
+        <li><a href="#ds-8">Empfänger personenbezogener Daten</a></li>
+        <li><a href="#ds-9">Speicherdauer</a></li>
+        <li><a href="#ds-10">Ihre Rechte als betroffene Person</a></li>
+        <li><a href="#ds-11">Beschwerderecht bei einer Aufsichtsbehörde</a></li>
+        <li><a href="#ds-12">Pflicht zur Bereitstellung der Daten</a></li>
+        <li><a href="#ds-13">Automatisierte Entscheidungsfindung und Profiling</a></li>
+        <li><a href="#ds-14">Aktualität und Änderung dieser Datenschutzerklärung</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="ds-1">1. Verantwortlicher im Sinne der DSGVO</h2>
     <p>Verantwortlich für die Datenverarbeitung auf dieser Website ist:</p>
     <div class="info-block">
       <address>
@@ -273,7 +332,7 @@
     </div>
     <p>Weitere Angaben finden Sie im <a href="impressum.html">Impressum</a>.</p>
 
-    <h2>2. Datenschutzbeauftragter</h2>
+    <h2 id="ds-2">2. Datenschutzbeauftragter</h2>
     <p>
       Ein Datenschutzbeauftragter ist gesetzlich nicht erforderlich (§ 38 BDSG: weniger als
       20 Personen, die ständig mit der automatisierten Verarbeitung personenbezogener Daten
@@ -281,7 +340,7 @@
       Bei Fragen zum Datenschutz wenden Sie sich bitte direkt an den oben genannten Verantwortlichen.
     </p>
 
-    <h2>3. Allgemeines zur Datenverarbeitung</h2>
+    <h2 id="ds-3">3. Allgemeines zur Datenverarbeitung</h2>
     <p>
       Wir verarbeiten personenbezogene Daten unserer Besucherinnen und Besucher grundsätzlich nur,
       soweit dies zur Bereitstellung einer funktionsfähigen Website sowie unserer Inhalte
@@ -289,10 +348,10 @@
       Interessen) sowie § 25 TDDDG (Schutz der Privatsphäre in Endeinrichtungen).
     </p>
 
-    <h2>4. Hosting über GitHub Pages (Drittland-Transfer USA)</h2>
+    <h2 id="ds-4">4. Hosting über GitHub Pages (Drittland-Transfer USA)</h2>
     <p>
       Diese Website wird über den Dienst <strong>GitHub Pages</strong> ausgeliefert. Anbieter ist die
-      <strong>GitHub, Inc.</strong>, 88 Colin P Kelly Jr Street, San Francisco, CA 94107, USA — eine
+      <strong>GitHub, Inc.</strong>, 88 Colin P Kelly Jr Street, San Francisco, CA 94107, USA - eine
       Tochtergesellschaft der Microsoft Corporation.
     </p>
     <p>
@@ -331,7 +390,7 @@
       <a href="https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement" target="_blank" rel="noopener noreferrer">docs.github.com/site-policy/privacy-policies/github-general-privacy-statement</a>.
     </p>
 
-    <h2>5. Speicherung im lokalen Browser-Speicher (LocalStorage)</h2>
+    <h2 id="ds-5">5. Speicherung im lokalen Browser-Speicher (LocalStorage)</h2>
     <p>
       Damit Ihre Anzeige-Präferenzen über Seitenaufrufe hinweg erhalten bleiben, speichert die Website
       folgende Werte im <em>localStorage</em> Ihres Browsers:
@@ -362,8 +421,8 @@
     </table>
     <p>
       <strong>Rechtsgrundlage:</strong> § 25 Abs. 2 Nr. 2 TDDDG. Die Speicherung dieser Präferenzen ist
-      unbedingt erforderlich, damit der von Ihnen ausdrücklich gewünschte Telemediendienst — die
-      Darstellung der Website in der von Ihnen ausgewählten Sprache und Farbgebung — bereitgestellt
+      unbedingt erforderlich, damit der von Ihnen ausdrücklich gewünschte Telemediendienst - die
+      Darstellung der Website in der von Ihnen ausgewählten Sprache und Farbgebung - bereitgestellt
       werden kann. Eine Einwilligung ist daher nicht erforderlich. Eine Übermittlung dieser Werte an
       Dritte oder an Server findet nicht statt.
     </p>
@@ -377,7 +436,7 @@
       <code>oikos-lang</code>. Diese werden weiterhin ausgelesen, bis Sie Sprache oder Farbschema erneut umschalten.
     </p>
 
-    <h2>6. Keine Cookies, kein Tracking, keine Analyse-Tools, keine externen Requests</h2>
+    <h2 id="ds-6">6. Keine Cookies, kein Tracking, keine Analyse-Tools, keine externen Requests</h2>
     <p>
       Diese Website setzt <strong>keine</strong> Cookies im rechtstechnischen Sinne ein. Es werden
       insbesondere <strong>keine</strong> Analyse- oder Tracking-Dienste (z. B. Google Analytics,
@@ -385,12 +444,12 @@
       <strong>keine</strong> Social-Media-Einbettungen und <strong>kein</strong> reCAPTCHA verwendet.
       Schriftarten werden ausschließlich von unserem Server ausgeliefert (selbst-gehostete
       WOFF2-Dateien); Google Fonts wird <strong>nicht</strong> nachgeladen. Es findet beim Seitenaufruf
-      <strong>kein</strong> Abruf externer Dienste statt — etwaige angezeigte Werte (z. B. die Anzahl
+      <strong>kein</strong> Abruf externer Dienste statt - etwaige angezeigte Werte (z. B. die Anzahl
       der GitHub-„Stars") werden bereits vor der Veröffentlichung statisch in die Seite eingebettet,
       sodass Ihr Browser hierfür keine Verbindung zu Dritten aufbauen muss.
     </p>
 
-    <h2>7. Kontaktaufnahme per E-Mail</h2>
+    <h2 id="ds-7">7. Kontaktaufnahme per E-Mail</h2>
     <p>
       Wenn Sie uns per E-Mail kontaktieren, verarbeiten wir die in der E-Mail enthaltenen
       personenbezogenen Daten (Absenderadresse, Inhalt) zum Zweck der Bearbeitung Ihrer Anfrage.
@@ -400,11 +459,11 @@
       gesetzlichen Aufbewahrungsfristen (z. B. § 257 HGB, § 147 AO) entgegenstehen.
     </p>
 
-    <h2>8. Empfänger personenbezogener Daten</h2>
+    <h2 id="ds-8">8. Empfänger personenbezogener Daten</h2>
     <p>Empfänger Ihrer personenbezogenen Daten ist:</p>
     <ul>
       <li>
-        <strong>GitHub, Inc.</strong>, 88 Colin P Kelly Jr Street, San Francisco, CA 94107, USA — als
+        <strong>GitHub, Inc.</strong>, 88 Colin P Kelly Jr Street, San Francisco, CA 94107, USA - als
         Hosting-Dienstleister (Server-Logs).
       </li>
     </ul>
@@ -413,14 +472,14 @@
       Stelle dieser Erklärung darüber informieren oder Sie ausdrücklich einwilligen.
     </p>
 
-    <h2>9. Speicherdauer</h2>
+    <h2 id="ds-9">9. Speicherdauer</h2>
     <ul>
       <li><strong>Server-Logs bei GitHub:</strong> Speicherdauer wird von GitHub festgelegt (siehe verlinkte GitHub-Datenschutzerklärung).</li>
       <li><strong>LocalStorage-Einträge:</strong> bis zur Löschung durch Sie im Browser.</li>
       <li><strong>E-Mail-Korrespondenz:</strong> bis zur abschließenden Bearbeitung der Anfrage, längstens im Rahmen gesetzlicher Aufbewahrungspflichten.</li>
     </ul>
 
-    <h2>10. Ihre Rechte als betroffene Person</h2>
+    <h2 id="ds-10">10. Ihre Rechte als betroffene Person</h2>
     <p>Soweit wir personenbezogene Daten über Sie verarbeiten, stehen Ihnen folgende Rechte zu:</p>
     <ul>
       <li><strong>Auskunft</strong> nach Art. 15 DSGVO</li>
@@ -443,7 +502,7 @@
       der Geltendmachung, Ausübung oder Verteidigung von Rechtsansprüchen.
     </p>
 
-    <h2>11. Beschwerderecht bei einer Aufsichtsbehörde</h2>
+    <h2 id="ds-11">11. Beschwerderecht bei einer Aufsichtsbehörde</h2>
     <p>
       Sie haben unbeschadet anderweitiger Rechtsbehelfe das Recht, sich bei einer
       Datenschutz-Aufsichtsbehörde zu beschweren, insbesondere in dem Mitgliedstaat Ihres
@@ -460,20 +519,20 @@
       </address>
     </div>
 
-    <h2>12. Pflicht zur Bereitstellung der Daten</h2>
+    <h2 id="ds-12">12. Pflicht zur Bereitstellung der Daten</h2>
     <p>
       Die Bereitstellung personenbezogener Daten ist weder gesetzlich noch vertraglich vorgeschrieben.
       Sie sind nicht verpflichtet, personenbezogene Daten anzugeben. Eine Nichtbereitstellung kann
       jedoch dazu führen, dass wir Anfragen nicht beantworten können.
     </p>
 
-    <h2>13. Automatisierte Entscheidungsfindung und Profiling</h2>
+    <h2 id="ds-13">13. Automatisierte Entscheidungsfindung und Profiling</h2>
     <p>
       Eine automatisierte Entscheidungsfindung einschließlich Profiling gemäß Art. 22 DSGVO findet auf
       dieser Website nicht statt.
     </p>
 
-    <h2>14. Aktualität und Änderung dieser Datenschutzerklärung</h2>
+    <h2 id="ds-14">14. Aktualität und Änderung dieser Datenschutzerklärung</h2>
     <p>
       Diese Datenschutzerklärung hat den Stand vom <strong>09.06.2026</strong>. Durch die
       Weiterentwicklung der Website oder aufgrund geänderter gesetzlicher bzw. behördlicher Vorgaben

@@ -9,9 +9,9 @@
 
 import assert from 'node:assert/strict';
 import test, { beforeEach } from 'node:test';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { MIGRATIONS, _setTestDatabase, _resetTestDatabase } from '../server/db.js';
-import { sync, getForRange, getCountries, getSubdivisions, __setFetchImpl } from '../server/services/holidays.js';
+import { sync, getForRange, getCountries, getSubdivisions, getGroups, __setFetchImpl } from '../server/services/holidays.js';
 
 // In-Memory-DB mit allen Migrationen (inkl. v49 holiday_cache) aufbauen.
 function buildTestDb() {
@@ -49,13 +49,31 @@ function setConfig(cfg) {
   }
 }
 
-function seedHoliday({ type, country = 'DE', subdivision = null, start, end, name = 'Test', year }) {
-  db.prepare(`INSERT INTO holiday_cache (type, country, subdivision, start_date, end_date, name, year)
-              VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .run(type, country, subdivision, start, end, name, year ?? Number(start.slice(0, 4)));
+function seedHoliday({ type, country = 'DE', subdivision = null, group = null, start, end, name = 'Test', year }) {
+  db.prepare(`INSERT INTO holiday_cache (type, country, subdivision, start_date, end_date, name, year, group_code)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(type, country, subdivision, start, end, name, year ?? Number(start.slice(0, 4)), group);
 }
 
 const okJson = (data) => ({ ok: true, json: async () => data });
+
+// Fängt alle console-Kanäle ab, damit ein Lauf beobachtbar wird, welche
+// Log-Level der Service tatsächlich benutzt. Der Logger schreibt debug über
+// console.log und info über console.info (server/logger.js), sodass eine
+// leere info-Liste beweist: nichts landet im Standard-Log-Level.
+async function captureConsole(fn) {
+  const original = { log: console.log, info: console.info, warn: console.warn, error: console.error };
+  const lines = { log: [], info: [], warn: [], error: [] };
+  for (const level of Object.keys(original)) {
+    console[level] = (...args) => lines[level].push(args.join(' '));
+  }
+  try {
+    await fn();
+  } finally {
+    Object.assign(console, original);
+  }
+  return lines;
+}
 
 // fetch-Mock, das je nach OpenHolidays-Endpoint deterministische Daten liefert.
 function makeApiMock() {
@@ -205,6 +223,83 @@ test('getForRange: keeps non-overlapping same-name entries separate (movable day
   assert.deepEqual(rows.map((r) => r.start_date), ['2026-03-02', '2026-06-15']);
 });
 
+// ---- Schulferien-Gruppen (#434) ---------------------------------------------
+
+test('getForRange: configured group shows only that regime, not the union (#434, CH-BE-VS)', () => {
+  // Deutschsprachiger Kantonsteil (CH-BE-VS) endet am 09.08.; die
+  // französischsprachige Variante (CH-BE-EO) bis 14.08. muss ausgeblendet
+  // bleiben, statt zu einer falschen Union-Spanne zu verschmelzen.
+  setConfig({ holiday_country: 'CH', holiday_subdivision: 'CH-BE',
+    holiday_group: 'CH-BE-VS', holiday_show_school: '1' });
+  seedHoliday({ type: 'school', country: 'CH', subdivision: 'CH-BE', group: 'CH-BE-VS',
+    start: '2026-07-04', end: '2026-08-09', name: 'Sommerferien' });
+  seedHoliday({ type: 'school', country: 'CH', subdivision: 'CH-BE', group: 'CH-BE-EO',
+    start: '2026-07-06', end: '2026-08-14', name: 'Sommerferien' });
+
+  const rows = getForRange('2026-07-01', '2026-08-31');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].end_date, '2026-08-09'); // nur das VS-Regime
+});
+
+test('getForRange: configured group still shows group-less rows (public holidays) (#434)', () => {
+  // Feiertage tragen keine Gruppe (group_code NULL) und gelten für die ganze
+  // Subdivision – sie dürfen trotz gewählter Schulferien-Gruppe erscheinen.
+  setConfig({ holiday_country: 'CH', holiday_subdivision: 'CH-BE',
+    holiday_group: 'CH-BE-EO', holiday_show_public: '1', holiday_show_school: '1' });
+  seedHoliday({ type: 'public', country: 'CH', subdivision: 'CH-BE', group: null,
+    start: '2026-08-01', end: '2026-08-01', name: 'Bundesfeier' });
+  seedHoliday({ type: 'school', country: 'CH', subdivision: 'CH-BE', group: 'CH-BE-VS',
+    start: '2026-01-31', end: '2026-02-08', name: 'Februarwoche' }); // nur VS
+  const names = getForRange('2026-01-01', '2026-12-31').map((r) => r.name).sort();
+  assert.deepEqual(names, ['Bundesfeier']); // Februarwoche (VS) ausgeblendet
+});
+
+test('getGroups: returns groups for a multilingual subdivision, sorted', async () => {
+  __setFetchImpl(async (url) => {
+    assert.equal(new URL(String(url)).pathname, '/Subdivisions');
+    return okJson([
+      { code: 'CH-BE', name: [], shortName: 'BE', groups: [
+        { code: 'CH-BE-VS', shortName: 'BE-VS' },
+        { code: 'CH-BE-EO', shortName: 'BE-EO' },
+      ] },
+      { code: 'CH-ZH', name: [], shortName: 'ZH', groups: [] },
+    ]);
+  });
+  const groups = await getGroups('CH', 'CH-BE');
+  assert.deepEqual(groups, [
+    { code: 'CH-BE-EO', name: 'BE-EO' },
+    { code: 'CH-BE-VS', name: 'BE-VS' },
+  ]);
+});
+
+test('getGroups: [] for a subdivision without groups', async () => {
+  __setFetchImpl(async () => okJson([
+    { code: 'CH-ZH', name: [], shortName: 'ZH', groups: [] },
+  ]));
+  assert.deepEqual(await getGroups('CH', 'CH-ZH'), []);
+});
+
+test('sync: stores group_code from the OpenHolidays groups field (#434)', async () => {
+  __setFetchImpl(async (url) => {
+    const path = new URL(String(url)).pathname;
+    if (path === '/SchoolHolidays') {
+      return okJson([
+        { startDate: '2026-07-04', endDate: '2026-08-09',
+          name: [{ language: 'DE', text: 'Sommerferien' }], groups: [{ code: 'CH-BE-VS' }] },
+        { startDate: '2026-07-06', endDate: '2026-08-14',
+          name: [{ language: 'DE', text: 'Sommerferien' }], groups: [{ code: 'CH-BE-EO' }] },
+      ]);
+    }
+    return okJson([]);
+  });
+  setConfig({ holiday_country: 'CH', holiday_subdivision: 'CH-BE', holiday_show_school: '1' });
+  await sync(true);
+  const stored = db.prepare(
+    "SELECT group_code FROM holiday_cache WHERE end_date = '2026-08-09'",
+  ).get();
+  assert.equal(stored.group_code, 'CH-BE-VS');
+});
+
 // ---- sync --------------------------------------------------------------------
 
 test('sync: no country → no fetch, synced 0', async () => {
@@ -222,6 +317,33 @@ test('sync: both layers off → no fetch, synced 0', async () => {
   const res = await sync();
   assert.deepEqual(res, { synced: 0 });
   assert.equal(mock.calls.length, 0);
+});
+
+// Die drei Skip-Pfade laufen bei jedem Scheduler-Tick. Sie dürfen im
+// Standard-Log-Level (info) nichts ausgeben, sonst rauscht das Log zu.
+test('sync: no country → schweigt im Standard-Log-Level', async () => {
+  __setFetchImpl(makeApiMock());
+  const lines = await captureConsole(() => sync());
+  assert.deepEqual(lines.info, []);
+});
+
+test('sync: both layers off → schweigt im Standard-Log-Level', async () => {
+  __setFetchImpl(makeApiMock());
+  setConfig({ holiday_country: 'DE', holiday_show_public: '0', holiday_show_school: '0' });
+  const lines = await captureConsole(() => sync());
+  assert.deepEqual(lines.info, []);
+});
+
+test('sync: throttled run → schweigt im Standard-Log-Level', async () => {
+  const mock = makeApiMock();
+  __setFetchImpl(mock);
+  setConfig({
+    holiday_country: 'DE', holiday_show_public: '1', holiday_show_school: '0',
+    holiday_last_sync: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const lines = await captureConsole(() => sync());
+  assert.equal(mock.calls.length, 0, 'throttled run darf nicht fetchen');
+  assert.deepEqual(lines.info, []);
 });
 
 test('sync: public-only fetches PublicHolidays per year, caches them, sets last_sync', async () => {

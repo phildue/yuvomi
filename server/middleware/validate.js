@@ -17,7 +17,8 @@ const TIME_RE     = /^\d{2}:\d{2}$/;
 const DATETIME_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
 const COLOR_RE    = /^#[0-9A-Fa-f]{6}$/;
 const MONTH_RE    = /^\d{4}-\d{2}$/;
-const RRULE_RE    = /^(FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)(;INTERVAL=\d{1,2})?(;BYDAY=[A-Z,]{2,}(,[A-Z]{2})*)?(;UNTIL=\d{8}(T\d{6}Z)?)?)?$/;
+// UNTIL und COUNT schließen sich laut RFC 5545 gegenseitig aus (#513).
+const RRULE_RE    = /^(FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)(;INTERVAL=\d{1,2})?(;BYDAY=[A-Z,]{2,}(,[A-Z]{2})*)?(;(UNTIL=\d{8}(T\d{6}Z)?|COUNT=\d{1,4}))?)?$/;
 
 /**
  * Bereinigt und validiert einen Pflicht-String.
@@ -92,14 +93,23 @@ function num(val, field, { required = false } = {}) {
   return { value: n, error: null };
 }
 
+// Theme-aware Akzent-Tokens, die einige Module (Budget-Konten, #542) statt eines
+// festen Hex speichern, damit die Farbe im Dark Mode mit aufgehellt wird. Bewusst
+// eng auf die `--chart-series-*`-Palette begrenzt: Die Validierung bleibt damit
+// eine dichte Sicherheitsgrenze - es landet kein beliebiger CSS-Ausdruck in einem
+// style-Attribut, sondern nur eine bekannte Custom-Property-Referenz.
+const SERIES_TOKEN_RE = /^var\(--chart-series-[1-9][0-9]?\)$/;
+
 /**
- * Validiert eine Hex-Farbe (#RRGGBB).
+ * Validiert eine Hex-Farbe (#RRGGBB). Mit `{ allowTokens: true }` werden zusätzlich
+ * die theme-aware `var(--chart-series-N)`-Akzent-Tokens akzeptiert (siehe #542).
  */
-function color(val, field) {
+function color(val, field, { allowTokens = false } = {}) {
   if (!val) return { value: null, error: null };
-  if (!/^#[0-9A-Fa-f]{6}$/.test(String(val)))
-    return { value: null, error: `${field} must be a valid HEX color (#RRGGBB).` };
-  return { value: String(val), error: null };
+  const str = String(val);
+  if (/^#[0-9A-Fa-f]{6}$/.test(str)) return { value: str, error: null };
+  if (allowTokens && SERIES_TOKEN_RE.test(str)) return { value: str, error: null };
+  return { value: null, error: `${field} must be a valid HEX color (#RRGGBB).` };
 }
 
 /**

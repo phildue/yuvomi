@@ -123,9 +123,10 @@ class ApiError extends Error {
 const api = {
   get: (path) => apiFetch(path, { method: 'GET' }),
 
-  post: (path, body) => apiFetch(path, {
+  post: (path, body, opts = {}) => apiFetch(path, {
     method: 'POST',
     body: JSON.stringify(body),
+    ...opts,
   }),
 
   rawPost: (path, body, headers = {}) => apiFetch(path, {
@@ -137,17 +138,27 @@ const api = {
     body,
   }),
 
-  put: (path, body) => apiFetch(path, {
+  // opts (z. B. { keepalive: true }) siehe delete unten — auch Serien-Scope-
+  // Löschungen committen per PUT/POST (UNTIL-Kürzung, EXDATE).
+  put: (path, body, opts = {}) => apiFetch(path, {
     method: 'PUT',
     body: JSON.stringify(body),
+    ...opts,
   }),
 
-  patch: (path, body) => apiFetch(path, {
+  // opts wie bei put/delete: { keepalive: true } für Writes, die beim
+  // Tab-Schließen noch rausgehen müssen - genutzt vom pagehide-Flush des
+  // Vorrats-Steppers, dessen PATCH 450ms gedebounced ist.
+  patch: (path, body, opts = {}) => apiFetch(path, {
     method: 'PATCH',
     body: JSON.stringify(body),
+    ...opts,
   }),
 
-  delete: (path) => apiFetch(path, { method: 'DELETE' }),
+  // opts erlaubt fetch-Optionen wie { keepalive: true } — genutzt vom
+  // pagehide-Flush des Undo-Löschmusters (utils/ux.js, Audit F-13), damit der
+  // Request auch beim Schließen/Neuladen des Tabs noch abgesetzt wird.
+  delete: (path, opts = {}) => apiFetch(path, { method: 'DELETE', ...opts }),
 };
 
 // --------------------------------------------------------
@@ -206,4 +217,18 @@ const notifications = {
   testChannel: (id) => api.post(`/notifications/channels/${id}/test`, {}),
 };
 
-export { api, auth, email, notifications, ApiError };
+// --------------------------------------------------------
+// Mealie – Rezept-Mirror-Sync
+// --------------------------------------------------------
+
+const mealie = {
+  listAccounts: () => api.get('/mealie/accounts'),
+  createAccount: (body) => api.post('/mealie/accounts', body),
+  updateAccount: (id, body) => api.patch(`/mealie/accounts/${id}`, body),
+  deleteAccount: (id) => api.delete(`/mealie/accounts/${id}`),
+  testAccount: (id) => api.post(`/mealie/accounts/${id}/test`, {}),
+  syncAccount: (id) => api.post(`/mealie/accounts/${id}/sync`, {}),
+  getStatus: () => api.get('/mealie/status'),
+};
+
+export { api, auth, email, notifications, mealie, ApiError };

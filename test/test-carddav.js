@@ -5,8 +5,17 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import Database from 'better-sqlite3';
-import { MIGRATIONS } from '../server/db.js';
+import Database from 'better-sqlite3-multiple-ciphers';
+import { MIGRATIONS, _setTestDatabase, _resetTestDatabase } from '../server/db.js';
+import {
+  sync,
+  pruneRemovedContacts,
+  fetchVCardsResilient,
+  unescapeVCardValue,
+  splitVCardValue,
+  deriveScalarContactFields,
+  resolveContactCategory,
+} from '../server/services/cardav-sync.js';
 
 const TEST_DB = ':memory:';
 
@@ -29,6 +38,7 @@ describe('CardDAV Contacts Schema (Migration 30)', () => {
       CREATE TABLE contacts (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         name       TEXT NOT NULL,
+        first_name TEXT, last_name TEXT, middle_name TEXT, name_prefix TEXT, name_suffix TEXT,
         category   TEXT NOT NULL DEFAULT 'Sonstiges',
         phone      TEXT,
         email      TEXT,
@@ -50,6 +60,12 @@ describe('CardDAV Contacts Schema (Migration 30)', () => {
 
     // Apply Migration 30 (it's a string, not a function)
     db.exec(migration30.up);
+
+    // Additive value_e164-Spalte (#Phase 2 / Migration 95) nachziehen, damit die
+    // Sync-/Routen-Schreibpfade die Spalte finden. Nur die DDL (kein afterUp-Backfill
+    // nötig, da beim Setup noch keine Telefon-Zeilen existieren).
+    const migration95 = MIGRATIONS.find(m => m.version === 95);
+    if (migration95) db.exec(migration95.up);
   });
 
   // ========================================
@@ -473,6 +489,7 @@ describe('CardDAV Sync Service', () => {
       CREATE TABLE contacts (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         name       TEXT NOT NULL,
+        first_name TEXT, last_name TEXT, middle_name TEXT, name_prefix TEXT, name_suffix TEXT,
         category   TEXT NOT NULL DEFAULT 'Sonstiges',
         phone      TEXT,
         email      TEXT,
@@ -526,6 +543,47 @@ END:VCARD`;
       assert.strictEqual(result.uid, 'urn:uuid:12345');
       assert.ok(result.name.includes('Doe'));
       assert.ok(result.name.includes('John'));
+    });
+
+    it('should decode QUOTED-PRINTABLE names (vCard 2.1, Turkish chars)', () => {
+      // "ı" = U+0131 = UTF-8 C4 B1 ; "ş" = U+015F = UTF-8 C5 9F. Without QP
+      // decoding the whole name arrived literally as "Kalayc=C4=B1".
+      const vCardText = `BEGIN:VCARD
+VERSION:2.1
+N;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:Kalayc=C4=B1;Ula=C5=9F;;;
+FN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:Ula=C5=9F Kalayc=C4=B1
+END:VCARD`;
+
+      const result = parseVCard(vCardText);
+      assert.strictEqual(result.lastName, 'Kalaycı');
+      assert.strictEqual(result.firstName, 'Ulaş');
+      assert.strictEqual(result.name, 'Ulaş Kalaycı');
+    });
+
+    it('should join QUOTED-PRINTABLE soft line breaks', () => {
+      // QP value spans two physical lines; the first ends with a soft '='.
+      const vCardText = `BEGIN:VCARD
+VERSION:2.1
+N;ENCODING=QUOTED-PRINTABLE;CHARSET=UTF-8:Kalayc=C4=B1;Ula=C5=
+=9F;;;
+END:VCARD`;
+
+      const result = parseVCard(vCardText);
+      assert.strictEqual(result.lastName, 'Kalaycı');
+      assert.strictEqual(result.firstName, 'Ulaş');
+    });
+
+    it('should leave literal "=" untouched without QP declaration', () => {
+      // Regression: only decode when ENCODING=QUOTED-PRINTABLE is declared,
+      // otherwise ordinary values containing "=" would be corrupted.
+      const vCardText = `BEGIN:VCARD
+VERSION:3.0
+FN:Formula
+NOTE:a=C4=B1 stays raw
+END:VCARD`;
+
+      const result = parseVCard(vCardText);
+      assert.strictEqual(result.notes, 'a=C4=B1 stays raw');
     });
 
     it('should parse TEL fields with types', () => {
@@ -691,6 +749,116 @@ END:VCARD`;
 
       const workPhone = result.phones.find(p => p.label === 'work');
       assert.ok(workPhone);
+    });
+
+    // #531: mailbox.org & Co. liefern FN/N/ADR mit literalen vCard-Escapes.
+    it('should unescape vCard sequences in FN', () => {
+      const vCardText = `BEGIN:VCARD
+VERSION:3.0
+UID:urn:uuid:esc
+FN:Surname\\, Given
+END:VCARD`;
+
+      const result = parseVCard(vCardText);
+      assert.strictEqual(result.name, 'Surname, Given');
+    });
+
+    it('should unescape and split N without breaking on escaped separators', () => {
+      const vCardText = `BEGIN:VCARD
+VERSION:3.0
+UID:urn:uuid:esc-n
+N:von M\\;ller;Anna\\,Marie;;;
+END:VCARD`;
+
+      const result = parseVCard(vCardText);
+      // Escaped ';' und ',' bleiben Teil der Komponente, echte ';' trennen.
+      assert.strictEqual(result.lastName, 'von M;ller');
+      assert.strictEqual(result.firstName, 'Anna,Marie');
+      // Anzeige einheitlich "Vorname Nachname" (#535).
+      assert.strictEqual(result.name, 'Anna,Marie von M;ller');
+    });
+
+    it('should unescape ADR components', () => {
+      const vCardText = `BEGIN:VCARD
+VERSION:3.0
+UID:urn:uuid:esc-adr
+FN:John Doe
+ADR;TYPE=HOME:;;Main St\\, 12;Spring\\;field;;62701;USA
+END:VCARD`;
+
+      const result = parseVCard(vCardText);
+      assert.strictEqual(result.addresses[0].street, 'Main St, 12');
+      assert.strictEqual(result.addresses[0].city, 'Spring;field');
+    });
+  });
+
+  // ========================================
+  // vCard Helper Functions (#531)
+  // ========================================
+
+  describe('unescapeVCardValue', () => {
+    it('should unescape comma, semicolon, backslash and newline', () => {
+      assert.strictEqual(unescapeVCardValue('a\\,b'), 'a,b');
+      assert.strictEqual(unescapeVCardValue('a\\;b'), 'a;b');
+      assert.strictEqual(unescapeVCardValue('a\\\\b'), 'a\\b');
+      assert.strictEqual(unescapeVCardValue('a\\nb'), 'a\nb');
+      assert.strictEqual(unescapeVCardValue('a\\Nb'), 'a\nb');
+    });
+
+    it('should leave unescaped text untouched and tolerate non-strings', () => {
+      assert.strictEqual(unescapeVCardValue('plain text'), 'plain text');
+      assert.strictEqual(unescapeVCardValue(null), null);
+    });
+  });
+
+  describe('splitVCardValue', () => {
+    it('should split on unescaped separators only', () => {
+      assert.deepStrictEqual(splitVCardValue('a;b;c', ';'), ['a', 'b', 'c']);
+      assert.deepStrictEqual(splitVCardValue('a\\;b;c', ';'), ['a\\;b', 'c']);
+      assert.deepStrictEqual(splitVCardValue('solo', ';'), ['solo']);
+    });
+  });
+
+  describe('deriveScalarContactFields', () => {
+    it('should pick primary phone/email and compose an address string', () => {
+      const scalar = deriveScalarContactFields({
+        phones: [{ value: '+49 111' }, { value: '+49 222' }],
+        emails: [{ value: 'a@example.com' }],
+        addresses: [{ street: 'Main St 1', city: 'Berlin', state: null, postalCode: '10115', country: 'DE' }],
+      });
+      assert.strictEqual(scalar.phone, '+49 111');
+      assert.strictEqual(scalar.email, 'a@example.com');
+      assert.strictEqual(scalar.address, 'Main St 1, 10115 Berlin, DE');
+    });
+
+    it('should return nulls when no multi-value data exists', () => {
+      const scalar = deriveScalarContactFields({ phones: [], emails: [], addresses: [] });
+      assert.deepStrictEqual(scalar, { phone: null, email: null, address: null });
+    });
+  });
+
+  describe('resolveContactCategory', () => {
+    const KNOWN = [{ key: 'doctor', name: null }, { key: 'misc', name: null }, { key: 'vip', name: 'Wichtig' }];
+
+    it('should fall back to misc for empty or unmapped values', () => {
+      assert.strictEqual(resolveContactCategory(null, KNOWN), 'misc');
+      assert.strictEqual(resolveContactCategory('', KNOWN), 'misc');
+      assert.strictEqual(resolveContactCategory('Sonstiges', KNOWN), 'misc');
+      assert.strictEqual(resolveContactCategory('Friends', KNOWN), 'misc');
+    });
+
+    it('should match a known key case-insensitively and use the first list entry', () => {
+      assert.strictEqual(resolveContactCategory('Doctor', KNOWN), 'doctor');
+      assert.strictEqual(resolveContactCategory('doctor,vip', KNOWN), 'doctor');
+      assert.strictEqual(resolveContactCategory('wichtig', KNOWN), 'vip');
+    });
+
+    it('should fall back to the first known key when misc is absent', () => {
+      const noMisc = [{ key: 'doctor', name: null }, { key: 'vip', name: null }];
+      assert.strictEqual(resolveContactCategory(null, noMisc), 'doctor');
+      assert.strictEqual(resolveContactCategory('unmapped', noMisc), 'doctor');
+      // Leere Kategorie-Liste: letzter Rückfall bleibt der literale Key 'misc'.
+      assert.strictEqual(resolveContactCategory('x', []), 'misc');
     });
   });
 
@@ -1226,6 +1394,49 @@ END:VCARD`;
       assert.strictEqual(updated.organization, 'SyncCorp');
     });
   });
+
+  // ========================================
+  // Migration 91: heal contacts synced before the #531 fix
+  // ========================================
+
+  describe('Migration 91: heal broken CardDAV contacts (#531)', () => {
+    it('unescapes names, maps Sonstiges→misc and backfills primary phone/email', () => {
+      // Broken contact as produced before the fix: escaped name, localized
+      // fallback category, NULL scalar fields, but multi-value rows present.
+      const broken = testDb.prepare(`
+        INSERT INTO contacts (name, category, phone, email, carddav_uid)
+        VALUES (?, 'Sonstiges', NULL, NULL, ?)
+      `).run('Surname\\, Given', 'urn:uuid:heal-1');
+      const id = broken.lastInsertRowid;
+
+      testDb.prepare(`
+        INSERT INTO contact_phones (contact_id, label, value, is_primary)
+        VALUES (?, 'cell', '+49 30 111', 1), (?, 'work', '+49 30 222', 0)
+      `).run(id, id);
+      testDb.prepare(`
+        INSERT INTO contact_emails (contact_id, label, value, is_primary)
+        VALUES (?, 'home', 'heal@example.com', 1)
+      `).run(id);
+
+      // A manual (non-CardDAV) contact with the same category must stay untouched.
+      const manual = testDb.prepare(`
+        INSERT INTO contacts (name, category, carddav_uid) VALUES ('Manual', 'Sonstiges', NULL)
+      `).run();
+
+      const migration91 = MIGRATIONS.find(m => m.version === 91);
+      assert.ok(migration91, 'Migration 91 exists');
+      testDb.exec(migration91.up);
+
+      const healed = testDb.prepare('SELECT * FROM contacts WHERE id = ?').get(id);
+      assert.strictEqual(healed.name, 'Surname, Given');
+      assert.strictEqual(healed.category, 'misc');
+      assert.strictEqual(healed.phone, '+49 30 111');
+      assert.strictEqual(healed.email, 'heal@example.com');
+
+      const untouched = testDb.prepare('SELECT * FROM contacts WHERE id = ?').get(manual.lastInsertRowid);
+      assert.strictEqual(untouched.category, 'Sonstiges', 'manual contact category unchanged');
+    });
+  });
 });
 
 // ========================================
@@ -1490,6 +1701,7 @@ describe('CardDAV API Routes', () => {
       CREATE TABLE contacts (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         name       TEXT NOT NULL,
+        first_name TEXT, last_name TEXT, middle_name TEXT, name_prefix TEXT, name_suffix TEXT,
         category   TEXT NOT NULL DEFAULT 'Sonstiges',
         phone      TEXT,
         email      TEXT,
@@ -1509,6 +1721,18 @@ describe('CardDAV API Routes', () => {
       throw new Error('Migration 30 not found');
     }
     apiTestDb.exec(migration30.up);
+
+    // Spätere Migrationen, die die CardDAV-Tabellen erweitern, müssen hier
+    // mitlaufen - sonst testet die Routen-Schicht gegen ein Schema, das es nicht
+    // mehr gibt. 92: last_error/last_error_at am Konto, 93: last_error je
+    // Adressbuch (sichtbare Sync-Fehler, #534).
+    for (const version of [92, 93]) {
+      const migration = MIGRATIONS.find(m => m.version === version);
+      if (!migration) {
+        throw new Error(`Migration ${version} not found`);
+      }
+      apiTestDb.exec(migration.up);
+    }
 
     // Override db.get() to use our test database
     const dbModule = await import('../server/db.js');
@@ -2108,6 +2332,7 @@ describe('Contacts API - Multi-Value Fields', () => {
       CREATE TABLE contacts (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         name       TEXT NOT NULL,
+        first_name TEXT, last_name TEXT, middle_name TEXT, name_prefix TEXT, name_suffix TEXT,
         category   TEXT NOT NULL DEFAULT 'Sonstiges',
         phone      TEXT,
         email      TEXT,
@@ -2138,6 +2363,11 @@ describe('Contacts API - Multi-Value Fields', () => {
       throw new Error('Migration 30 not found');
     }
     contactsApiDb.exec(migration30.up);
+
+    // Additive value_e164-Spalte (#Phase 2 / Migration 95) nachziehen, damit die
+    // Contacts-Routen-Schreibpfade (POST/PUT phones) die Spalte finden.
+    const migration95ApiDb = MIGRATIONS.find(m => m.version === 95);
+    if (migration95ApiDb) contactsApiDb.exec(migration95ApiDb.up);
 
     // Override db.get() to use our test database
     const dbModule = await import('../server/db.js');
@@ -2652,5 +2882,435 @@ describe('Contacts API - Multi-Value Fields', () => {
       assert.strictEqual(updated.phones.length, 1);
       assert.strictEqual(updated.phones[0].value, '+49171111111');
     });
+  });
+});
+
+describe('pruneRemovedContacts: server-side contact deletions', () => {
+  let db;
+  const ABOOK = 'https://dav.example.com/abook/';
+
+  function setup() {
+    db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE contacts (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        name                    TEXT NOT NULL,
+        first_name TEXT, last_name TEXT, middle_name TEXT, name_prefix TEXT, name_suffix TEXT,
+        notes                   TEXT,
+        carddav_account_id      INTEGER,
+        carddav_uid             TEXT,
+        carddav_addressbook_url TEXT,
+        carddav_origin          TEXT CHECK (carddav_origin IN ('remote', 'merged'))
+      );
+    `);
+  }
+
+  function addContact(name, uid, origin, accountId = 1, abook = ABOOK) {
+    db.prepare(`
+      INSERT INTO contacts (name, carddav_uid, carddav_origin, carddav_account_id, carddav_addressbook_url)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(name, uid, origin, accountId, abook);
+  }
+
+  const names = () => db.prepare('SELECT name FROM contacts ORDER BY id').all().map(r => r.name);
+
+  it('deletes a purely remote contact the server no longer returns', () => {
+    setup();
+    addContact('Bleibt', 'uid-1', 'remote');
+    addContact('Remote geloescht', 'uid-2', 'remote');
+
+    const result = pruneRemovedContacts(db, 1, ABOOK, new Set(['uid-1']));
+
+    assert.deepStrictEqual(result, { deleted: 1, decoupled: 0 });
+    assert.deepStrictEqual(names(), ['Bleibt']);
+  });
+
+  it('only decouples an adopted contact instead of deleting it (no data loss)', () => {
+    setup();
+    // Lokal angelegt, mit Notizen gepflegt, spaeter per Smart-Merge adoptiert.
+    addContact('Oma Erna', 'uid-2', 'merged');
+    db.prepare(`UPDATE contacts SET notes = 'Lieblingskuchen: Bienenstich' WHERE carddav_uid = 'uid-2'`).run();
+    addContact('Anker', 'uid-1', 'remote');
+
+    const result = pruneRemovedContacts(db, 1, ABOOK, new Set(['uid-1']));
+
+    assert.deepStrictEqual(result, { deleted: 0, decoupled: 1 });
+
+    const erna = db.prepare(`SELECT * FROM contacts WHERE name = 'Oma Erna'`).get();
+    assert.ok(erna, 'Der adoptierte Kontakt muss erhalten bleiben');
+    assert.strictEqual(erna.notes, 'Lieblingskuchen: Bienenstich', 'Lokale Daten bleiben erhalten');
+    assert.strictEqual(erna.carddav_uid, null, 'CardDAV-Verknuepfung ist geloest');
+    assert.strictEqual(erna.carddav_account_id, null);
+    assert.strictEqual(erna.carddav_addressbook_url, null);
+    assert.strictEqual(erna.carddav_origin, null);
+  });
+
+  it('treats pre-v89 contacts (origin merged) conservatively', () => {
+    setup();
+    // Bestand aus der Zeit vor der Migration: Herkunft unbekannt -> 'merged'.
+    addContact('Altkontakt', 'uid-old', 'merged');
+    addContact('Anker', 'uid-1', 'remote');
+
+    const result = pruneRemovedContacts(db, 1, ABOOK, new Set(['uid-1']));
+
+    assert.deepStrictEqual(result, { deleted: 0, decoupled: 1 });
+    assert.deepStrictEqual(names(), ['Altkontakt', 'Anker']);
+  });
+
+  it('does nothing when the addressbook returned no contacts (fetch-error guard)', () => {
+    setup();
+    addContact('A', 'uid-1', 'remote');
+    addContact('B', 'uid-2', 'remote');
+
+    const result = pruneRemovedContacts(db, 1, ABOOK, new Set());
+
+    assert.deepStrictEqual(result, { deleted: 0, decoupled: 0 });
+    assert.deepStrictEqual(names(), ['A', 'B']);
+  });
+
+  it('never touches purely local contacts', () => {
+    setup();
+    db.prepare(`INSERT INTO contacts (name) VALUES ('Nur lokal')`).run();
+    addContact('Remote geloescht', 'uid-2', 'remote');
+
+    const result = pruneRemovedContacts(db, 1, ABOOK, new Set(['uid-1']));
+
+    assert.deepStrictEqual(result, { deleted: 1, decoupled: 0 });
+    assert.deepStrictEqual(names(), ['Nur lokal']);
+  });
+
+  it('never touches contacts of another addressbook or account', () => {
+    setup();
+    addContact('Anderes Adressbuch', 'uid-x', 'remote', 1, 'https://dav.example.com/other/');
+    addContact('Anderer Account', 'uid-y', 'remote', 2, ABOOK);
+    addContact('Remote geloescht', 'uid-2', 'remote');
+
+    const result = pruneRemovedContacts(db, 1, ABOOK, new Set(['uid-1']));
+
+    assert.deepStrictEqual(result, { deleted: 1, decoupled: 0 });
+    assert.deepStrictEqual(names(), ['Anderes Adressbuch', 'Anderer Account']);
+  });
+
+  it('does nothing when the server still has every contact', () => {
+    setup();
+    addContact('A', 'uid-1', 'remote');
+    addContact('B', 'uid-2', 'merged');
+
+    const result = pruneRemovedContacts(db, 1, ABOOK, new Set(['uid-1', 'uid-2']));
+
+    assert.deepStrictEqual(result, { deleted: 0, decoupled: 0 });
+    assert.deepStrictEqual(names(), ['A', 'B']);
+  });
+});
+
+// ========================================================
+// fetchVCardsResilient: FN-Filter-Fallback (Issue #529, mailbox.org)
+// ========================================================
+
+describe('fetchVCardsResilient (#529 mailbox.org FN-filter fallback)', () => {
+  const addressBook = { url: 'https://dav.example.com/carddav/abook/' };
+
+  it('gibt das Ergebnis der Standard-Abfrage zurück, wenn es nicht leer ist', async () => {
+    let propfindCalled = false;
+    const client = {
+      fetchVCards: async () => [{ url: 'c1', data: 'BEGIN:VCARD' }],
+      propfind: async () => { propfindCalled = true; return []; },
+    };
+    const out = await fetchVCardsResilient(client, addressBook);
+    assert.equal(out.length, 1);
+    assert.equal(propfindCalled, false, 'kein Fallback, wenn die Standard-Abfrage liefert');
+  });
+
+  it('fällt bei 0 Ergebnissen auf PROPFIND + Multiget zurück (mailbox.org)', async () => {
+    const calls = [];
+    const client = {
+      fetchVCards: async (params) => {
+        calls.push(params);
+        // Erster Aufruf (ohne objectUrls) = FN-gefilterte Query → leer.
+        if (!params.objectUrls) return [];
+        // Zweiter Aufruf (mit objectUrls) = Multiget → liefert die Karten.
+        return params.objectUrls.map((u) => ({ url: u, data: `BEGIN:VCARD\nUID:${u}` }));
+      },
+      propfind: async () => ([
+        // Die Kollektion selbst wird von PROPFIND depth:1 mitgeliefert und muss raus.
+        { href: '/carddav/abook/' },
+        { href: '/carddav/abook/1.vcf' },
+        { href: 'https://dav.example.com/carddav/abook/2.vcf' },
+      ]),
+    };
+    const out = await fetchVCardsResilient(client, addressBook);
+    assert.equal(out.length, 2, 'zwei Kontakte über den Fallback');
+    // Zweiter fetchVCards-Aufruf bekommt exakt die zwei Objekt-URLs (Kollektion gefiltert).
+    assert.deepStrictEqual(calls[1].objectUrls, [
+      'https://dav.example.com/carddav/abook/1.vcf',
+      'https://dav.example.com/carddav/abook/2.vcf',
+    ]);
+  });
+
+  it('bleibt leer, wenn PROPFIND nur die Kollektion selbst liefert', async () => {
+    const client = {
+      fetchVCards: async () => [],
+      propfind: async () => ([{ href: 'https://dav.example.com/carddav/abook/' }]),
+    };
+    const out = await fetchVCardsResilient(client, addressBook);
+    assert.deepStrictEqual(out, []);
+  });
+
+  it('gibt leer zurück, wenn der PROPFIND-Fallback fehlschlägt (kein Wurf)', async () => {
+    const client = {
+      fetchVCards: async () => [],
+      propfind: async () => { throw new Error('PROPFIND 500'); },
+    };
+    const out = await fetchVCardsResilient(client, addressBook);
+    assert.deepStrictEqual(out, []);
+  });
+});
+
+// ========================================
+// parseAndMergeContact: Skalar- & Kategorie-Verdrahtung (#531)
+// Gegen das echte, voll migrierte DB-Modul, damit die INSERT-/UPDATE-Pfade
+// (nicht nur die reinen Helfer) abgedeckt sind.
+// ========================================
+
+describe('parseAndMergeContact scalar + category wiring (#531 DB integration)', () => {
+  let database;
+  let parseAndMergeContact;
+  let accountId;
+  const abUrl = 'https://dav.example.com/abook/';
+  const vcf = (uid, ...lines) =>
+    ['BEGIN:VCARD', 'VERSION:3.0', `UID:${uid}`, ...lines, 'END:VCARD'].join('\r\n');
+
+  before(async () => {
+    // Das db-Modul bindet DB_PATH beim Laden (oben statisch importiert), daher muss
+    // die Isolation über die Prozess-Env kommen: das npm-Script setzt DB_PATH=:memory:.
+    // Ohne das würde db.init() die echte Repo-Datei öffnen und verschmutzen.
+    const dbModule = await import('../server/db.js');
+    dbModule.init();
+    database = dbModule.get();
+    ({ parseAndMergeContact } = await import('../server/services/cardav-sync.js'));
+
+    accountId = database.prepare(
+      "INSERT INTO carddav_accounts (name, carddav_url, username, password) VALUES ('t', 'https://dav.example.com', 'u', 'p')"
+    ).run().lastInsertRowid;
+  });
+
+  it('populates base phone/email/address, unescapes the name and resolves an unmapped category to misc', async () => {
+    const id = await parseAndMergeContact(
+      vcf('int-1', 'FN:Erika\\, Mustermann', 'TEL;TYPE=CELL:+49 30 123',
+        'EMAIL;TYPE=HOME:erika@example.com', 'ADR;TYPE=HOME:;;Hauptstr 5;Berlin;;10115;DE',
+        'CATEGORIES:Friends'),
+      accountId, abUrl
+    );
+    const c = database.prepare('SELECT * FROM contacts WHERE id = ?').get(id);
+    assert.strictEqual(c.name, 'Erika, Mustermann');
+    assert.strictEqual(c.phone, '+49 30 123');
+    assert.strictEqual(c.email, 'erika@example.com');
+    assert.strictEqual(c.address, 'Hauptstr 5, 10115 Berlin, DE');
+    assert.strictEqual(c.category, 'misc');
+  });
+
+  it('maps a known category key from CATEGORIES', async () => {
+    const id = await parseAndMergeContact(
+      vcf('int-2', 'FN:Some Doctor', 'CATEGORIES:doctor'), accountId, abUrl
+    );
+    const c = database.prepare('SELECT category FROM contacts WHERE id = ?').get(id);
+    assert.strictEqual(c.category, 'doctor');
+  });
+
+  it('does not downgrade an existing category to misc when adopting a local contact (fillAll)', async () => {
+    // Rein lokaler Kontakt mit Kategorie + passender E-Mail, noch nicht CardDAV-verknüpft.
+    const localId = database.prepare(
+      "INSERT INTO contacts (name, category, email) VALUES ('Local Person', 'school', 'adopt@example.com')"
+    ).run().lastInsertRowid;
+
+    const returnedId = await parseAndMergeContact(
+      vcf('int-adopt', 'FN:Local Person', 'EMAIL;TYPE=HOME:adopt@example.com', 'CATEGORIES:RandomGroup'),
+      accountId, abUrl
+    );
+
+    assert.strictEqual(returnedId, localId, 'adoptierte den bestehenden lokalen Kontakt');
+    const c = database.prepare('SELECT category, carddav_uid FROM contacts WHERE id = ?').get(localId);
+    assert.strictEqual(c.category, 'school', 'Kategorie nicht auf misc herabgestuft');
+    assert.strictEqual(c.carddav_uid, 'int-adopt', 'CardDAV-Verknüpfung gesetzt');
+  });
+
+  // ------------------------------------------------------------------
+  // #535: strukturierte N-Komponenten
+  // ------------------------------------------------------------------
+
+  it('speichert die N-Komponenten und zeigt "Vorname Nachname" statt der FN-Formatierung', async () => {
+    const id = await parseAndMergeContact(
+      vcf('name-1', 'FN:Mustermann, Erika Dr.', 'N:Mustermann;Erika;Maria;Dr.;M.A.'),
+      accountId, abUrl
+    );
+    const c = database.prepare('SELECT * FROM contacts WHERE id = ?').get(id);
+    assert.strictEqual(c.first_name, 'Erika');
+    assert.strictEqual(c.last_name, 'Mustermann');
+    assert.strictEqual(c.middle_name, 'Maria');
+    assert.strictEqual(c.name_prefix, 'Dr.');
+    assert.strictEqual(c.name_suffix, 'M.A.');
+    assert.strictEqual(c.name, 'Erika Maria Mustermann');
+  });
+
+  it('faellt auf FN zurueck, wenn N keine Namensteile traegt', async () => {
+    const id = await parseAndMergeContact(
+      vcf('name-2', 'FN:Bäckerei Schmidt', 'N:;;;;'), accountId, abUrl
+    );
+    const c = database.prepare('SELECT name, first_name, last_name FROM contacts WHERE id = ?').get(id);
+    assert.strictEqual(c.name, 'Bäckerei Schmidt');
+    assert.strictEqual(c.first_name, null);
+    assert.strictEqual(c.last_name, null);
+  });
+
+  it('hebt den Anzeigenamen eines rein entfernten Altkontakts einmalig auf das einheitliche Format', async () => {
+    const legacyId = database.prepare(`
+      INSERT INTO contacts (name, carddav_account_id, carddav_uid, carddav_addressbook_url, carddav_origin)
+      VALUES ('Doe, John', ?, 'name-legacy', ?, 'remote')
+    `).run(accountId, abUrl).lastInsertRowid;
+
+    await parseAndMergeContact(
+      vcf('name-legacy', 'FN:Doe, John', 'N:Doe;John;;;'), accountId, abUrl
+    );
+
+    const c = database.prepare('SELECT name, first_name, last_name FROM contacts WHERE id = ?').get(legacyId);
+    assert.strictEqual(c.name, 'John Doe');
+    assert.strictEqual(c.first_name, 'John');
+    assert.strictEqual(c.last_name, 'Doe');
+  });
+
+  it('laesst den Namen eines adoptierten (merged) Kontakts unangetastet', async () => {
+    const mergedId = database.prepare(`
+      INSERT INTO contacts (name, carddav_account_id, carddav_uid, carddav_addressbook_url, carddav_origin)
+      VALUES ('Mein eigener Name', ?, 'name-merged', ?, 'merged')
+    `).run(accountId, abUrl).lastInsertRowid;
+
+    await parseAndMergeContact(
+      vcf('name-merged', 'FN:Schmidt, Anna', 'N:Schmidt;Anna;;;'), accountId, abUrl
+    );
+
+    const c = database.prepare('SELECT name, last_name FROM contacts WHERE id = ?').get(mergedId);
+    assert.strictEqual(c.name, 'Mein eigener Name', 'lokaler Name bleibt erhalten');
+    assert.strictEqual(c.last_name, 'Schmidt', 'Struktur wird trotzdem nachgetragen');
+  });
+
+  // --- Wiederholte Syncs derselben vCard ------------------------------------
+  // updateContactMultiValues nimmt den primären Eintrag von der Löschung aus,
+  // fügte aber die komplette vCard erneut ein. Der primäre Wert landete damit
+  // bei jedem Sync zusätzlich als nicht-primäre Kopie in der Tabelle.
+
+  const phonesOf = (id) => database.prepare(
+    'SELECT label, value, is_primary FROM contact_phones WHERE contact_id = ? ORDER BY id'
+  ).all(id);
+
+  it('legt bei wiederholtem Sync derselben vCard keine Dubletten an', async () => {
+    const card = vcf('dup-1', 'FN:Alex Beispiel',
+      'TEL;TYPE=CELL:+49 170 1234567', 'TEL;TYPE=WORK:+49 30 9876543',
+      'EMAIL;TYPE=HOME:alex@example.org');
+
+    const id = await parseAndMergeContact(card, accountId, abUrl);
+    await parseAndMergeContact(card, accountId, abUrl);
+    await parseAndMergeContact(card, accountId, abUrl);
+
+    assert.deepStrictEqual(phonesOf(id), [
+      { label: 'cell', value: '+49 170 1234567', is_primary: 1 },
+      { label: 'work', value: '+49 30 9876543',  is_primary: 0 },
+    ]);
+    const mails = database.prepare(
+      'SELECT COUNT(*) AS n FROM contact_emails WHERE contact_id = ?'
+    ).get(id).n;
+    assert.strictEqual(mails, 1, 'die Mailadresse darf sich nicht vervielfachen');
+  });
+
+  it('räumt eine bereits vorhandene Dublette beim nächsten Sync ab', async () => {
+    const card = vcf('dup-2', 'FN:Bea Beispiel', 'TEL;TYPE=CELL:+49 170 2222222');
+    const id = await parseAndMergeContact(card, accountId, abUrl);
+
+    // Zustand, den der alte Code hinterlassen hat: der primäre Wert steht ein
+    // zweites Mal als nicht-primäre Zeile daneben.
+    database.prepare(
+      'INSERT INTO contact_phones (contact_id, label, value, is_primary) VALUES (?, ?, ?, 0)'
+    ).run(id, 'cell', '+49 170 2222222');
+    assert.strictEqual(phonesOf(id).length, 2, 'Vorbedingung: Dublette liegt vor');
+
+    await parseAndMergeContact(card, accountId, abUrl);
+
+    assert.deepStrictEqual(phonesOf(id), [
+      { label: 'cell', value: '+49 170 2222222', is_primary: 1 },
+    ]);
+  });
+
+  it('schreibt beim Sync einer unveränderten vCard gar nicht mehr', async () => {
+    const card = vcf('dup-3', 'FN:Cem Beispiel',
+      'TEL;TYPE=CELL:+49 170 3333333', 'TEL;TYPE=WORK:+49 30 3333333');
+    await parseAndMergeContact(card, accountId, abUrl);
+    await parseAndMergeContact(card, accountId, abUrl); // Bestand einschwingen lassen
+
+    const changes = () => database.prepare('SELECT total_changes() AS n').get().n;
+    const before = changes();
+    await parseAndMergeContact(card, accountId, abUrl);
+    assert.strictEqual(changes() - before, 0, 'unveränderter Kontakt darf nichts schreiben');
+  });
+
+  // Gegenprobe: der Vergleich darf echte Änderungen nicht verschlucken.
+  it('übernimmt eine neu hinzugekommene Nummer', async () => {
+    const id = await parseAndMergeContact(
+      vcf('dup-4', 'FN:Dana Beispiel', 'TEL;TYPE=CELL:+49 170 4444444'), accountId, abUrl
+    );
+    await parseAndMergeContact(
+      vcf('dup-4', 'FN:Dana Beispiel', 'TEL;TYPE=CELL:+49 170 4444444',
+        'TEL;TYPE=WORK:+49 30 4444444'),
+      accountId, abUrl
+    );
+
+    assert.deepStrictEqual(phonesOf(id), [
+      { label: 'cell', value: '+49 170 4444444', is_primary: 1 },
+      { label: 'work', value: '+49 30 4444444',  is_primary: 0 },
+    ]);
+  });
+});
+
+// --------------------------------------------------------
+// No-op-Syncs laufen bei jedem Scheduler-Tick durch und dürfen im
+// Standard-Log-Level (info) nichts ausgeben, sonst rauscht das Log zu.
+// --------------------------------------------------------
+describe('CardDAV: No-op-Sync bleibt im Standard-Log-Level still', () => {
+  // Der Logger schreibt debug über console.log und info über console.info
+  // (server/logger.js) - ein leerer info-Kanal beweist, dass die Meldung
+  // unterhalb des Standard-Levels bleibt.
+  async function captureConsole(fn) {
+    const original = { log: console.log, info: console.info, warn: console.warn, error: console.error };
+    const lines = { log: [], info: [], warn: [], error: [] };
+    for (const level of Object.keys(original)) {
+      console[level] = (...args) => lines[level].push(args.join(' '));
+    }
+    try {
+      await fn();
+    } finally {
+      Object.assign(console, original);
+    }
+    return lines;
+  }
+
+  it('sagt nichts, wenn gar kein Account konfiguriert ist', async () => {
+    const d = new Database(':memory:');
+    d.exec(`
+      CREATE TABLE carddav_accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT, carddav_url TEXT, username TEXT, password TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_sync TEXT, last_error TEXT, last_error_at TEXT
+      );
+    `);
+    _setTestDatabase(d);
+    try {
+      const lines = await captureConsole(async () => {
+        const res = await sync();
+        assert.deepStrictEqual(res, { success: true, syncedAccounts: 0, syncedContacts: 0 });
+      });
+      assert.deepStrictEqual(lines.info, []);
+    } finally {
+      _resetTestDatabase();
+      d.close();
+    }
   });
 });

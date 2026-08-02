@@ -2,6 +2,8 @@ import { api } from '/api.js';
 import { formatDate, formatTime, t } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { weekStartIndex, weekdayOrder } from '/utils/date.js';
+import { toggleRowHtml } from '/settings/components.js';
+import { getPreferences, savePreferences } from '/settings/preferences-cache.js';
 
 // Wochenstart-Optionen; Labels aus dem bestehenden Kalender-i18n (kein neuer
 // Übersetzungsbedarf für die Wochentagsnamen).
@@ -41,60 +43,11 @@ function durationOptionLabel(minutes) {
   return t('settings.calendarDurationMinutes', { count: minutes });
 }
 
-// Standard-Erinnerungs-Offsets (Minuten) für neue Termine (#497). Labels aus dem
-// bestehenden reminders.offset*-Wortschatz (kein neuer Übersetzungsbedarf dafür).
-const DEFAULT_REMINDER_OPTIONS = [
-  { value: 0,     labelKey: 'reminders.offsetAtTime' },
-  { value: 15,    labelKey: 'reminders.offset15min' },
-  { value: 60,    labelKey: 'reminders.offset1hour' },
-  { value: 1440,  labelKey: 'reminders.offset1day' },
-  { value: 2880,  labelKey: 'reminders.offset2days' },
-  { value: 10080, labelKey: 'reminders.offset1week' },
-  { value: 20160, labelKey: 'reminders.offset2weeks' },
-];
-const MAX_DEFAULT_REMINDERS = 5;
-
-// Kleiner lokaler Debounce (kein geteilter Util im Projekt): koaleziert schnelle
-// Mehrfach-Auswahl zu einem einzigen Speichern + einem Toast.
-function debounce(fn, ms) {
-  let timer = null;
-  return (...args) => {
-    clearTimeout(timer);
-    timer = setTimeout(() => fn(...args), ms);
-  };
-}
-
-function defaultRemindersCardHtml(preferences) {
-  const selected = new Set(
-    Array.isArray(preferences.calendar_default_reminders) ? preferences.calendar_default_reminders.map(Number) : []
-  );
-  const assignMe = !!preferences.calendar_default_assign_me;
-  const checkboxes = DEFAULT_REMINDER_OPTIONS.map((o) => `
-    <label class="reminder-preset">
-      <input type="checkbox" class="js-default-reminder" value="${o.value}"${selected.has(o.value) ? ' checked' : ''}>
-      <span>${esc(t(o.labelKey))}</span>
-    </label>`).join('');
-  return `
-    <div class="settings-card">
-      <h3 class="settings-card__title">${t('settings.calendarDefaultsTitle')}</h3>
-      <p class="settings-card-description">${t('settings.calendarDefaultsDescription')}</p>
-
-      <div class="form-group">
-        <label class="toggle-row">
-          <input type="checkbox" id="calendar-default-assign-me"${assignMe ? ' checked' : ''}>
-          <span>${t('settings.calendarAssignMeLabel')}</span>
-        </label>
-      </div>
-
-      <div class="form-group">
-        <span class="form-label" id="calendar-default-reminders-label">${t('settings.calendarDefaultRemindersLabel')}</span>
-        <p class="settings-card-description">${t('settings.calendarDefaultRemindersHint')}</p>
-        <div id="calendar-default-reminders" class="reminder-preset-group" role="group" aria-labelledby="calendar-default-reminders-label">
-          ${checkboxes}
-        </div>
-      </div>
-    </div>`;
-}
+// Die per-user-Vorgaben für neue Termine (#497) sitzen in `personal-calendar`:
+// `calendar_default_reminders` und `calendar_default_assign_me` schreiben per
+// `cfgUserSet`, hinter diesem adminOnly-Blatt kam kein Mitglied an sie heran
+// (Critique 2026-07-27). Hier bleibt, was haushaltweit gilt.
+const PERSONAL_CALENDAR_PATH = '/settings/personal/calendar';
 
 function renderPage(container, preferences) {
   const currentDuration = Number(preferences.calendar_default_duration) || 60;
@@ -115,9 +68,12 @@ function renderPage(container, preferences) {
             ${DURATION_OPTIONS.map((m) => `<option value="${m}"${m === currentDuration ? ' selected' : ''}>${esc(durationOptionLabel(m))}</option>`).join('')}
           </select>
         </div>
-      </div>
 
-      ${defaultRemindersCardHtml(preferences)}
+        <p class="form-hint">
+          ${t('settings.calendarPersonalDefaultsHint')}
+          <a href="${PERSONAL_CALENDAR_PATH}" id="calendar-personal-link">${t('settings.pageCalendarDefaults')}</a>
+        </p>
+      </div>
     </section>
 
     <section class="settings-section">
@@ -159,11 +115,19 @@ function renderPage(container, preferences) {
               <option value="">${t('settings.holidaySubdivisionNone')}</option>
             </select>
           </div>
+          <div class="form-group" id="holiday-group-group" hidden>
+            <label class="form-label" for="holiday-group">${t('settings.holidayGroupLabel')}</label>
+            <select class="form-input" id="holiday-group" disabled>
+              <option value="">${t('settings.holidayGroupNone')}</option>
+            </select>
+            <p class="settings-card-description">${t('settings.holidayGroupHint')}</p>
+          </div>
           <div class="form-group">
-            <label class="toggle-row">
-              <input type="checkbox" id="holiday-show-public"${preferences.holiday_show_public ? ' checked' : ''}>
-              <span>${t('settings.holidayPublicLabel')}</span>
-            </label>
+            ${toggleRowHtml({
+              label: t('settings.holidayPublicLabel'),
+              checked: !!preferences.holiday_show_public,
+              attrs: { id: 'holiday-show-public' },
+            })}
           </div>
           <div class="form-group" id="holiday-public-color-group"${preferences.holiday_show_public ? '' : ' hidden'}>
             <label class="form-label" for="holiday-public-color">${t('settings.holidayPublicColor')}</label>
@@ -171,10 +135,11 @@ function renderPage(container, preferences) {
               value="${esc(preferences.holiday_public_color)}">
           </div>
           <div class="form-group">
-            <label class="toggle-row">
-              <input type="checkbox" id="holiday-show-school"${preferences.holiday_show_school ? ' checked' : ''}>
-              <span>${t('settings.holidaySchoolLabel')}</span>
-            </label>
+            ${toggleRowHtml({
+              label: t('settings.holidaySchoolLabel'),
+              checked: !!preferences.holiday_show_school,
+              attrs: { id: 'holiday-show-school' },
+            })}
           </div>
           <div class="form-group" id="holiday-school-color-group"${preferences.holiday_show_school ? '' : ' hidden'}>
             <label class="form-label" for="holiday-school-color">${t('settings.holidaySchoolColor')}</label>
@@ -314,6 +279,53 @@ async function loadSubdivisions(
   }
 }
 
+/**
+ * Schulferien-Gruppen einer Subdivision laden und den Picker nur einblenden,
+ * wenn es mindestens zwei Regimes gibt (mehrsprachige Kantone, #434). Bei 0/1
+ * Gruppe bleibt er verborgen, weil keine Mehrdeutigkeit besteht.
+ */
+async function loadGroups(
+  select,
+  groupContainer,
+  countryCode,
+  subdivisionCode,
+  selectedCode,
+  requestState,
+) {
+  const requestId = ++requestState.latestRequestId;
+  const noneOption = document.createElement('option');
+  noneOption.value = '';
+  noneOption.textContent = t('settings.holidayGroupNone');
+  select.replaceChildren(noneOption);
+  select.disabled = true;
+  groupContainer.hidden = true;
+
+  if (!countryCode || !subdivisionCode) return;
+
+  try {
+    const response = await api.get(
+      `/preferences/holidays/groups/${countryCode}/${subdivisionCode}`,
+    );
+    // Zwischenzeitlich neu gewählt → verworfene Antwort ignorieren.
+    if (requestId !== requestState.latestRequestId) return;
+
+    const groups = Array.isArray(response?.data) ? response.data : [];
+    if (groups.length < 2) return;
+
+    for (const g of groups) {
+      const option = document.createElement('option');
+      option.value = g.code;
+      option.textContent = g.name;
+      option.selected = g.code === selectedCode;
+      select.appendChild(option);
+    }
+    select.disabled = false;
+    groupContainer.hidden = false;
+  } catch {
+    // Gruppen sind optional – Fehler still schlucken, Picker bleibt verborgen.
+  }
+}
+
 function holidayPreferenceData(container, discoveryState) {
   const location = resolveHolidayLocation({
     countryReady: discoveryState.countryReady,
@@ -324,9 +336,13 @@ function holidayPreferenceData(container, discoveryState) {
     persistedSubdivision: discoveryState.persistedSubdivision,
   });
 
+  const groupEl = container.querySelector('#holiday-group');
+
   return {
     holiday_country: location.country,
     holiday_subdivision: location.subdivision,
+    // Ohne Subdivision kann es keine Gruppe geben.
+    holiday_group: location.subdivision ? (groupEl?.value || null) : null,
     holiday_show_public: container.querySelector('#holiday-show-public')?.checked ?? false,
     holiday_show_school: container.querySelector('#holiday-show-school')?.checked ?? false,
     holiday_public_color: container.querySelector('#holiday-public-color').value,
@@ -365,7 +381,7 @@ function bindWeekStart(container, preferences) {
     current = value;
     paint(value); // optimistisch – Klick fühlt sich sofort an
     try {
-      await api.put('/preferences', { week_start: value });
+      await savePreferences({ week_start: value });
       // Parität zu date-format-changed/time-format-changed: erlaubt offenen
       // Ansichten, den Wochenstart ohne Neuladen zu übernehmen.
       window.dispatchEvent(new CustomEvent('week-start-changed', { detail: { weekStart: value } }));
@@ -378,65 +394,14 @@ function bindWeekStart(container, preferences) {
   });
 }
 
-// Standardwerte für neue Termine (#497/#498): Instant-Save wie beim Wochenstart.
-function bindCalendarDefaults(container) {
-  const assignMe = container.querySelector('#calendar-default-assign-me');
-  assignMe?.addEventListener('change', async () => {
-    const value = assignMe.checked;
-    assignMe.disabled = true;
-    try {
-      await api.put('/preferences', { calendar_default_assign_me: value });
-      window.yuvomi?.showToast(t('settings.calendarDefaultsSaved'), 'success');
-    } catch (error) {
-      assignMe.checked = !value; // Rollback
-      window.yuvomi?.showToast(error.message || t('common.errorGeneric'), 'danger');
-    } finally {
-      if (assignMe.isConnected) assignMe.disabled = false;
-    }
-  });
-
-  const remindersBox = container.querySelector('#calendar-default-reminders');
-  if (!remindersBox) return;
-  let persisted = collectDefaultReminders(remindersBox);
-
-  // Debounced: schnelle Mehrfach-Auswahl erzeugt EIN Speichern + EINEN Toast,
-  // statt einen pro Klick. Rollback auf den letzten persistierten Stand bei Fehler.
-  const persistReminders = debounce(async () => {
-    const selected = collectDefaultReminders(remindersBox);
-    try {
-      await api.put('/preferences', { calendar_default_reminders: selected });
-      persisted = selected;
-      if (remindersBox.isConnected) window.yuvomi?.showToast(t('settings.calendarDefaultsSaved'), 'success');
-    } catch (error) {
-      const keep = new Set(persisted);
-      remindersBox.querySelectorAll('.js-default-reminder').forEach((el) => {
-        el.checked = keep.has(Number(el.value));
-      });
-      window.yuvomi?.showToast(error.message || t('common.errorGeneric'), 'danger');
-    }
-  }, 500);
-
-  remindersBox.addEventListener('change', (event) => {
-    const box = event.target.closest('.js-default-reminder');
-    if (!box) return;
-    if (collectDefaultReminders(remindersBox).length > MAX_DEFAULT_REMINDERS) {
-      box.checked = false; // Cap: die gerade gesetzte Auswahl zurücknehmen
-      window.yuvomi?.showToast(t('settings.calendarDefaultRemindersMax', { count: MAX_DEFAULT_REMINDERS }), 'warning');
-      return;
-    }
-    persistReminders();
-  });
-}
-
-function collectDefaultReminders(box) {
-  return [...box.querySelectorAll('.js-default-reminder')]
-    .filter((el) => el.checked)
-    .map((el) => Number(el.value))
-    .sort((a, b) => a - b);
-}
-
 async function bindEvents(container, preferences) {
   bindWeekStart(container, preferences);
+
+  container.querySelector('#calendar-personal-link')?.addEventListener('click', (event) => {
+    if (!window.yuvomi?.navigate) return;
+    event.preventDefault();
+    window.yuvomi.navigate(PERSONAL_CALENDAR_PATH);
+  });
 
   // Instant-Save wie beim Wochenstart – ein einzelner Wert braucht keinen
   // separaten Speichern-Button (vereinheitlicht die beiden Ansicht-Controls).
@@ -448,7 +413,7 @@ async function bindEvents(container, preferences) {
     persistedDuration = durationSelect.value;
     durationSelect.disabled = true;
     try {
-      await api.put('/preferences', { calendar_default_duration: minutes });
+      await savePreferences({ calendar_default_duration: minutes });
       window.yuvomi?.showToast(t('settings.calendarDurationSaved'), 'success');
     } catch (error) {
       persistedDuration = previous;
@@ -459,11 +424,11 @@ async function bindEvents(container, preferences) {
     }
   });
 
-  bindCalendarDefaults(container);
-
   const form = container.querySelector('#holidays-form');
   const countrySelect = container.querySelector('#holiday-country');
   const subdivisionSelect = container.querySelector('#holiday-subdivision');
+  const groupSelect = container.querySelector('#holiday-group');
+  const groupGroup = container.querySelector('#holiday-group-group');
   const showPublic = container.querySelector('#holiday-show-public');
   const showSchool = container.querySelector('#holiday-show-school');
   const publicColorGroup = container.querySelector('#holiday-public-color-group');
@@ -471,11 +436,13 @@ async function bindEvents(container, preferences) {
   const syncButton = container.querySelector('#holiday-sync-btn');
   const errorElement = container.querySelector('#holidays-form-error');
   const subdivisionRequests = { latestRequestId: 0 };
+  const groupRequests = { latestRequestId: 0 };
   const discoveryState = {
     countryReady: false,
     subdivisionReady: false,
     persistedCountry: preferences.holiday_country || null,
     persistedSubdivision: preferences.holiday_subdivision || null,
+    persistedGroup: preferences.holiday_group || null,
   };
 
   const showDiscoveryError = (error) => {
@@ -516,11 +483,19 @@ async function bindEvents(container, preferences) {
     if (result.ok && result.value) {
       discoveryState.subdivisionReady = result.value.selectedResolved;
     }
+    // Land gewechselt → Subdivision zurückgesetzt → Gruppen-Picker leeren.
+    await loadGroups(groupSelect, groupGroup, countryCode, subdivisionSelect.value, '', groupRequests);
     updateSyncState();
   });
 
-  subdivisionSelect.addEventListener('change', () => {
+  subdivisionSelect.addEventListener('change', async () => {
     applyHolidaySubdivisionSelection(discoveryState);
+    updateSyncState();
+    // Subdivision gewechselt → passende Ferien-Gruppen neu laden, Auswahl zurück.
+    await loadGroups(groupSelect, groupGroup, countrySelect.value, subdivisionSelect.value, '', groupRequests);
+  });
+
+  groupSelect.addEventListener('change', () => {
     updateSyncState();
   });
 
@@ -536,9 +511,10 @@ async function bindEvents(container, preferences) {
     errorElement.hidden = true;
     try {
       const preferenceData = holidayPreferenceData(container, discoveryState);
-      await api.put('/preferences', {
+      await savePreferences({
         holiday_country: preferenceData.holiday_country,
         holiday_subdivision: preferenceData.holiday_subdivision,
+        holiday_group: preferenceData.holiday_group,
         holiday_show_public: preferenceData.holiday_show_public,
         holiday_show_school: preferenceData.holiday_show_school,
         holiday_public_color: preferenceData.holiday_public_color,
@@ -546,6 +522,7 @@ async function bindEvents(container, preferences) {
       });
       discoveryState.persistedCountry = preferenceData.holiday_country;
       discoveryState.persistedSubdivision = preferenceData.holiday_subdivision;
+      discoveryState.persistedGroup = preferenceData.holiday_group;
       window.yuvomi?.showToast(t('settings.holidaySaved'), 'success');
     } catch (error) {
       errorElement.textContent = error.message || t('common.errorGeneric');
@@ -572,9 +549,10 @@ async function bindEvents(container, preferences) {
     const preferenceData = holidayPreferenceData(container, discoveryState);
     syncButton.disabled = true;
     try {
-      await api.put('/preferences', {
+      await savePreferences({
         holiday_country: preferenceData.holiday_country,
         holiday_subdivision: preferenceData.holiday_subdivision,
+        holiday_group: preferenceData.holiday_group,
         holiday_show_public: preferenceData.holiday_show_public,
         holiday_show_school: preferenceData.holiday_show_school,
         holiday_public_color: preferenceData.holiday_public_color,
@@ -582,6 +560,7 @@ async function bindEvents(container, preferences) {
       });
       discoveryState.persistedCountry = preferenceData.holiday_country;
       discoveryState.persistedSubdivision = preferenceData.holiday_subdivision;
+      discoveryState.persistedGroup = preferenceData.holiday_group;
       const response = await api.post('/preferences/holidays/sync', {});
       const lastSyncLabel = container.querySelector('#holiday-last-sync-label');
       if (lastSyncLabel && response?.data?.last_sync) {
@@ -631,14 +610,23 @@ async function bindEvents(container, preferences) {
     if (subdivisionsResult.ok && subdivisionsResult.value) {
       discoveryState.subdivisionReady = subdivisionsResult.value.selectedResolved;
     }
+    if (preferences.holiday_subdivision) {
+      await loadGroups(
+        groupSelect,
+        groupGroup,
+        preferences.holiday_country,
+        preferences.holiday_subdivision,
+        preferences.holiday_group || '',
+        groupRequests,
+      );
+    }
   }
   updateSyncState();
 }
 
 export async function render(container, { user }) {
   void user;
-  const response = await api.get('/preferences');
-  const preferences = response?.data ?? {};
+  const preferences = await getPreferences();
   renderPage(container, preferences);
   await bindEvents(container, preferences);
   window.lucide?.createIcons({ el: container });

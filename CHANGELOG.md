@@ -7,6 +7,1239 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.73.0] - 2026-08-02
+
+### Added
+
+- Recipes can now mirror from a self-hosted Mealie instance. Add a Mealie account under Settings → Kitchen and its recipes appear alongside your own, with a "Mealie" badge and a link back to view them there. Mealie stays the source of truth for their content, so mirrored recipes are read-only here - editing and deleting are blocked, though you can still duplicate one into an editable native copy. They slot straight into the meal planner and shopping list like any other recipe, sync automatically, and a rename in Mealie updates the mirrored copy in place instead of losing its meal-plan links. A broken connection to Mealie never wipes the local copies. A Mealie account also accepts an optional public link URL, separate from the (possibly Docker-internal or LAN-only) address used for syncing, so the "Open in Mealie" links actually work from your browser.
+- Subtasks can start expanded. A task's checklist was always folded away behind its progress bar, so a household that plans in subtasks reopened the same lists on every visit. A new switch under Settings → Modules → Module options makes them open by default; folding one shut by hand still works, the setting only decides where a task starts.
+
+### Fixed
+
+- The module list in the sidebar no longer jumps while you use it. Rebuilding the navigation - which happens on every route change, and when the language or the module list changes - reset its scroll position to the top, and the mechanism that keeps the current module in view immediately pulled it somewhere else, so a long list appeared to jump between its first and last entry. The position now survives the rebuild, and the current module is only scrolled into view when it genuinely sits outside it.
+
+## [1.72.0] - 2026-08-02
+
+### Added
+
+- Tapping a contact now shows it to you before it lets you change it. Until now it opened the edit form straight away, while the chevron at the end of the row promised a detail view that did not exist - so looking up the paediatrician's number put you in a form with the keyboard in the way. The new view holds no input field at all, and "Edit" in the header is a separate step. Creating a contact still starts in the form. The same applies when you arrive from search: a hit is something you want to see first.
+- Every number, mail and address a contact has is now reachable. The list only ever showed and offered the first of each, so a contact with a work and a mobile number gave you exactly one to tap although the second had long been stored - it was only ever visible inside the edit form. Each value now sits in the detail view with its label, ready to call, mail or open on a map.
+- Contacts show their organisation and job title. Both arrive over CardDAV and had no display anywhere in the app, because the contact form does not manage them.
+
+## [1.71.2] - 2026-08-02
+
+### Fixed
+
+- The button for adding a task no longer disappears the moment you enter the module. It slid away whenever you scrolled down, to clear the row sitting underneath it, and it came back only once you scrolled again - so a single downward nudge could leave the module without its one way to add anything. On an iPhone the address bar produces such a nudge on its own, and so does a list still growing as it loads, which is why it looked like the button vanished on its own. The free space below the button is held open at every scroll position anyway since v1.60.0, so the sliding had nothing left to do.
+- Opening a module now starts at the top of the page, instead of wherever you left the previous one. The scrolling area belongs to the whole app rather than to a page, and nothing reset it, so stepping from a long dashboard into the task list dropped you into the middle of the list. Browser back and forward still take you to where you were. That part covers the pages that scroll as a whole; the eight modules with a list of their own (Budget, Calendar, Contacts, Meals, Notes, Pantry, Recipes, Shopping) come back to the top for now.
+
+## [1.71.1] - 2026-08-02
+
+### Fixed
+
+- Changes to a birthday now reach the calendar you sync it to. Editing one detached its appointment from the copy in iCloud, Google or Nextcloud: the new name showed up in Yuvomi while the external calendar kept the old one forever. Deleting a birthday, or setting its reminder to "none", now removes the appointment there too instead of leaving it behind for the next sync to bring back.
+- Moving or deleting a housekeeping visit reaches the external calendar as well. A visit shifted to another day showed the new date in Yuvomi and the old one everywhere else.
+- Visit and payment entries that Yuvomi writes for you now follow the household data language, with the amount formatted as currency and the date in your chosen format. Only the app sent translated text before; anything else - the API, scripts, integrations - got English and a raw date.
+
+## [1.71.0] - 2026-08-01
+
+### Fixed
+
+- Birthday appointments no longer read "Birthday: Grandma" outside the app. The title was stored in English and only translated while the page was drawn, so everything that reads the stored appointment showed English: the API, the calendar feed you subscribe to elsewhere, the sync to iCloud, Google and Nextcloud, and the search index.
+- Names containing a dollar sign are no longer mangled where the app writes them into a sentence. A contact called "A $& B" showed up as "A {{name}} B", and some combinations pulled a piece of the surrounding sentence into the name. Affected every screen that puts a name, title or note into a phrase - birthday appointments, assignment labels, confirmation prompts.
+
+### Added
+
+- Settings → Personal → Appearance → Language now carries a second setting: the language Yuvomi writes into the entries it creates for you. It is separate from the language of the app itself, because a saved appointment has one wording no matter which member opens it later. Households that picked a region already get it for free - a German region means German birthday appointments, with nothing to configure. A household that never picked a region keeps the English wording it has today until someone chooses a language, so nothing changes underfoot on update.
+
+## [1.70.0] - 2026-08-01
+
+### Added
+
+- Tapping an appointment or a task now shows it to you before it lets you change it. Until now the edit form opened straight away, so the on-screen keyboard rose over roughly 40 % of the display for someone who only wanted to know when the dentist appointment is - and tasks had no reading path at all, every one of the five ways in ended in the form. The new view contains no input field whatsoever, so the keyboard cannot come up, and "Edit" in the header is a separate, deliberate step. Creating something new still starts in the form, because there typing is the point. On a wide screen an appointment opens as a small card anchored to the entry you tapped, so the short path stays short.
+- The appointment view states three things the old popup kept to itself: how the appointment repeats, written out ("Every 2 weeks (Mon, Thu), until 31.12.2026"), which reminders are set, and who can see it.
+- A task's status can be moved on straight from its detail view, instead of going through a form with seven select fields just to tick something off.
+
+### Fixed
+
+- Switching between light and dark mode now also recolours the status bar of the installed app. It kept the module colour of the theme that had been active when the page was opened, so after a switch it sat there in the old shade until the next navigation.
+
+## [1.69.3] - 2026-08-01
+
+### Fixed
+
+- A confirmation asked from inside a form no longer throws the form away. Deleting a shared expense, an account, a reward, a medication, a lab report, an activity, a cycle entry or a subscription category opened its confirmation *in place of* the form, so pressing "Cancel" - the only reason the question exists - was the one path that destroyed everything typed in. Cancelling now hands the form back exactly as it was.
+- Deleting a birthday from the edit dialog no longer asks whether to discard the changes first. Those fields go with the entry anyway, so the question stood between the user and a single decision. Cancelling it could even bring the edit dialog back for an entry that had already been removed from the list.
+- Confirmation dialogs are announced with their own question again. When one opened over a form, screen readers read the heading of the form underneath instead, because both carried the same title id. While the dialog is up, the form beneath is now also out of the reading order rather than only out of the tab order.
+- Keyboard focus returns to the button that opened a confirmation once it is closed, instead of falling back to the top of the page.
+
+## [1.69.2] - 2026-08-01
+
+### Fixed
+
+- Switching between light and dark mode now recolours the whole app right away. The colour a module lends to its buttons, focus rings and the active navigation pill kept the shade of the theme that was active when the page was opened, so after switching to dark mode that text sat at 2.7:1 against the background - below the readable minimum. Reloading fixed it, which is why it was easy to miss. The same went for "Automatic": when the system moved to dark mode on its own, the accent stayed behind.
+
+## [1.69.1] - 2026-08-01
+
+### Fixed
+
+- Saving an edited shopping item no longer asks whether to discard the changes. The item was already stored at that point, so the question described the opposite of what had happened - and pressing "Discard" kept the save. The same dialog appeared after importing ingredients from the meal plan.
+
+## [1.69.0] - 2026-08-01
+
+### Added
+
+- Tasks can carry tags. A task still sits in exactly one category, but it can wear any number of labels on top - "garden", "before the holidays", "for grandma". Tags are free text with no list to maintain: one exists because a task carries it, and it disappears with the last one. The dialog has a tag field with suggestions, and tags show as chips on the task card and on the Kanban board.
+- Clicking a tag on a card filters the list by it, and picking several narrows it further, the same way the status and person filters already do. The filter bar offers every tag in use.
+- Tags can be managed for the whole household. "Manage tags" in the tasks toolbar renames a tag everywhere at once, merges it into another by renaming it onto an existing name, or detaches it from every task. Fixing a typo no longer means opening every task that carries it.
+- Several tasks can be tagged at once. With multiple tasks selected, the bulk bar adds or removes a tag on all of them in one step.
+- Tags travel both ways with CalDAV reminder lists, as that list's categories. A label you set in Nextcloud Tasks, Radicale or another reminder app shows up here, and one you set here reaches the server. Until now those categories were read past and lost.
+- Shopping items show the categories of the reminder list they came from as tags. A reminder list can feed either the task list or the shopping list, and on the shopping side those labels used to be dropped without a trace. They are shown, not managed here: they belong to the source list, so nothing Yuvomi does overwrites them on the server.
+- The global search finds tasks and shopping items by their tags, so the same word leads to a hit whether you type it into the search or the filter bar.
+- An AI or automation client connected over MCP sees a task's tags, can filter by them, and can set them when creating a task.
+
+### Fixed
+
+- The tags of a private task no longer show up for anyone else. Tag names are free text and can give away what a task is about, so the filter bar and the suggestion list now only offer tags from tasks you are allowed to see - counts included. A task hidden while you prepare a surprise no longer announces itself through its label.
+- An AI or automation client connected over MCP could list every private task in the household. The task list it receives now follows the same visibility rules as the app, matching the calendar list, which always did.
+- A recurring task no longer loses its tags. The follow-up instance created when you tick one off kept the title, category and assignees but silently dropped the labels; tags belong to the task, not to a single run.
+- Renaming a tag to a name containing a comma kept only the part before it, and reported success anyway.
+- A tag consisting only of dots could not be renamed or removed: the address for it dissolved before the request was sent. Such tags are no longer created.
+- A tag ending in a backslash arrived from a reminder list glued to the tag after it.
+- Filtering by a tag that contains a comma, such as `Haus, Hof` from a reminder list, found nothing. A single tag in the address was read as a comma-separated list and split into two, so the search asked for two tags at once.
+- Tags with umlauts ignored capitalization only by half: a task tagged `Äpfel` was not found by `äpfel`, although `ÄPFEL` worked. The database's built-in comparison folds only the English alphabet; tags are now compared through a key that understands the whole alphabet.
+- A private subtask under a shared task was handed out to everyone, title and all. Subtasks never followed the visibility rule of their own; now they do, and their tags with them.
+- On upgrade, a household that had deleted its most recent task could see that task's ID handed out again, which could attach an old reminder to an unrelated new task.
+- An AI or automation client that sent a malformed tag filter received the full task list instead of an error, so an automation could act on tasks it never asked for.
+- The API description declared the category and tag path parameters as numbers, although both are names. A client generated from it refused an address like `/tasks/tags/garden` or sent a number instead. Only generated clients were affected; the API itself always accepted the name.
+- Tasks created over MCP landed in a category that appeared in no dropdown and no filter, and jumped to some other category the first time they were saved. This was a leftover from the category rework: the fallback still wrote the old display name instead of the key. Existing tasks affected by it, including every task that arrived through a reminder list, are repaired on upgrade.
+
+## [1.68.2] - 2026-08-01
+
+### Changed
+
+- The reminder sync settings no longer present reminder lists as an Apple feature. List discovery has always worked with any CalDAV server that serves reminder collections, and the wording now says so instead of naming Apple Reminders.
+
+## [1.68.1] - 2026-08-01
+
+### Fixed
+
+- Reminder lists stayed empty. A list you picked in the settings appeared there, but no task or shopping item ever arrived from it: the request asked the server for calendar events rather than reminders, and a standards-compliant server (Nextcloud, Radicale) correctly answered with nothing. Reminders now arrive from any such list. Nothing was lost while this was broken - the safeguard against deleting on an empty answer kept existing items untouched.
+
+## [1.68.0] - 2026-07-31
+
+### Added
+
+- Reminder lists sync both ways now. A task or shopping item that came from a CalDAV list follows you back to the server when you tick it off, rename it, change its due date or priority, or delete it. Until now the mirror was one-way: the change stayed local and the next sync run quietly undid it. This works with any CalDAV server that serves reminder collections - iCloud, Radicale, Nextcloud - not only Apple Reminders.
+- A change is written into the existing item on the server instead of replacing it, so alarms, categories and whatever else your other apps put there survive the round trip. Tasks created in Yuvomi stay local: unlike an event, a task has no target list it could be created in.
+
+### Fixed
+
+- Reminders with a due time arrived shifted by the time-zone offset - a task due at 16:30 showed up as 14:30. Due times are now read into, and written back out of, the household time zone (`TZ`).
+- A task set to "in progress" or archived fell back to "open" on every sync run, and an "urgent" priority dropped to "high", because neither has an exact counterpart in the reminder format. Both now survive unless the server genuinely moves the item to another level.
+
+## [1.67.0] - 2026-07-31
+
+### Added
+
+- Transactions in Budget can carry receipts. The entry dialog, under "More options", lets you either upload a new file or pick a document you already filed under Documents - several per transaction, since one purchase can produce a till receipt, an invoice and a warranty. A transaction with a receipt shows a paperclip in the list, and a receipt's name opens its preview. Until now the only way to keep a receipt near a transaction was to file it under Documents and remember the connection yourself.
+- Picking an existing document is new everywhere. The three places that could attach a file - Documents, Calendar, Housekeeping - could only ever upload a new one, so filing the same receipt twice was the only way to reuse it. The new receipt field does both and is shared, rather than being built a fourth time.
+- Shared expenses take receipts the same way, and a settle-up can record one payment proof. The database columns for this had existed since the module was written, but nothing in the interface ever filled them.
+- Uploads only leave the browser when you save the transaction, so an abandoned dialog leaves no stray file behind. New receipts are filed under Documents in a "Receipts" folder.
+
+### Security
+
+- A receipt keeps the visibility it has in Documents. A document filed as private stays invisible to everyone else even when it hangs on a shared transaction or a group expense, and administrators are no exception - the Documents module has never had an override, and attaching a document does not create one. You can only attach what you are allowed to see, so a guessed document ID cannot be used to read back a stranger's file name.
+- Saving a shared transaction or expense no longer removes attachments you cannot see. Only the links visible to you are replaced, so another member's private receipt survives your edit instead of being silently dropped.
+- Shared expenses previously handed out the names of attached documents to every group member without checking that document's visibility, and a payment proof was accepted by ID without any check at all. Both now run through the same rule as everything else. No installation was exposed by this, because nothing in the interface could attach a document until now.
+
+### Changed
+
+- The rule for who may see a document lived in three modules as three copies. It now lives in one place, which Budget, shared expenses, Documents, Tasks and the DMS integration all read from.
+
+## [1.66.2] - 2026-07-31
+
+### Fixed
+
+- Web Push reaches iPhone and iPad again. Every push is signed with a contact address, and without a configured email sender or `VAPID_SUBJECT` that address defaulted to `admin@localhost`. Apple checks it and refuses a token it cannot reach, answering `403 BadJwtToken`, so pushes to Apple devices failed while the very same installation kept delivering to Android. The address is now taken from the first reachable source, in order: `VAPID_SUBJECT`, the sender address from the email settings, then `BASE_URL`. A value that cannot work, such as a `localhost` or `.local` address or one without a domain ending, is discarded instead of being sent. Nothing has to be configured for this to take effect.
+- A rejected push now names the contact address it was signed with in the log, alongside the push service and status code it already carried, plus a line pointing at the address as the likely cause. A `403` was previously indistinguishable from any other server-side failure, which is what made the cause above so hard to find.
+- Unraid users can set the Web Push variables at all. `VAPID_SUBJECT`, `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` were missing from the template, and since Unraid lists every variable by hand and has no fallback, there was simply no field to enter them in.
+- The installation guide's iOS and iPadOS section now covers the contact address as well, next to the home-screen and certificate requirements already listed there.
+
+## [1.66.1] - 2026-07-31
+
+### Fixed
+
+- Family members can pick a sync target for a calendar event again. Anyone who was not an administrator only ever saw "Store locally" in the dropdown, even with a CalDAV server or Google account connected and its calendars switched on. The list of calendars was read through the account settings, which only administrators may open, so everyone else got nothing back. Saving a target was never restricted, only the list you pick it from.
+- A Google account whose access has expired no longer empties the CalDAV calendars in that same dropdown. Both lists now arrive together and each one falls back to empty on its own.
+
+## [1.66.0] - 2026-07-31
+
+### Added
+
+- A weekly repeating meal can now be given an end date. The field sits next to the repeat switch when you create the meal and can be changed later by editing the series; leaving it empty keeps the series running without an end, the way it behaved before. Until now every repeat ran forever, and since the planner writes a real meal into the week the moment you open it, paging a year ahead planted 52 copies that then stayed there.
+- Deleting a repeating meal offers a third choice: this and all following. It ends the series the day before the meal you are looking at, keeps every earlier occurrence, and stops new ones from appearing. Deleting the very first occurrence this way removes the series outright. Before this, the only ways out were deleting a single date, which the next week undid by generating a fresh copy, or deleting the whole series including its history.
+
+## [1.65.0] - 2026-07-31
+
+### Changed
+
+- The Meals tab in the Kitchen no longer carries a number. It counted free meal slots for the current week, that is the meal types you have switched on times seven days minus the slots you had filled, so an empty week showed 28: the loudest number in the whole tab bar, for the state "nothing planned yet". It also counted days that had already gone by and could no longer be planned, so on a Friday it still asked for Monday's breakfast. The two numbers that remain, open shopping items and pantry items that need attention, count things that are genuinely waiting for you. What is missing from the meal plan is better told by the empty slots on the planner itself, because those also say which day and which meal it is missing from. The shared kitchen request behind the tab bar no longer computes the figure either, which removes a query over the meal table from every kitchen page load.
+
+### Fixed
+
+- Controls in the header of Recipes, Shopping and Pantry no longer sit far to the right of the list they belong to. Those three pages hold their content in a reading column that ends well before the window edge, but their headers ran the full width: on a 1280 pixel window the storage-location button in Pantry sat 276 pixels past the right edge of the list underneath it, and the three header actions in Shopping did the same, hovering over empty space. Header and body now end on the same line at every window size. Recipes never had the rule at all, and the version Shopping and Pantry did have only applied above 1024 pixels, so the gap stayed on smaller laptops and tablets, where it measured 148 pixels at a window width of 900.
+
+## [1.64.1] - 2026-07-31
+
+### Fixed
+
+- Updating the container while the app was open in a browser tab could leave that tab on an error screen naming a module, for example "The requested module '/utils/empty-state.js' does not provide an export named 'mountLoadError'". A browser keeps one set of loaded building blocks per open page and cannot exchange them, so a part of the app fetched after the update was assembled against parts of the previous version that were still in memory. Opening a section that had not been visited yet in that tab, most often Recipes, was enough. The app now stops loading further parts of a page as soon as it knows a new version is available and reloads instead, and it treats a failed load of this kind as a reason to reload once rather than to give up. Reloading the page had always cleared it; the point is that it no longer happens. Updating **to** this version can still show the error once in a tab that was open across the update, because the safeguard only arrives with the version it protects. It never indicated a damaged database, although the message in the container log at the time suggested one.
+- The offline cache stored the pages of the app without the shared building blocks they are made of: 52 of them, among those the module every page uses to insert text safely, were missing. After an update a page could therefore be present in its new form while its foundation was not, which is what made the error above possible in the first place, and offline a page could be complete but unusable. Pages and the modules they rely on are now cached together, and a test walks the whole dependency graph so the next added module cannot quietly reopen the gap.
+- The colour field in the appointment dialog was labelled "Color {{color}}" in 16 of the 23 languages, with the placeholder spelled out. It was written into the label as if a value would be filled in there, and nothing ever filled it. English, Spanish, French, Italian, Swedish, Greek, Russian, Turkish, Chinese, Japanese, Arabic, Hindi, Portuguese, Ukrainian, Vietnamese and Hungarian were affected; German and six others had it right, as did the identical label in Notes. A test now compares the placeholders of every translation against the German reference, so a text that promises a value the app does not supply cannot be added again.
+
+## [1.64.0] - 2026-07-31
+
+### Changed
+- The Budget header now keeps its place on every tab. The month stepper used to disappear without a word on five of the seven tabs, leaving a gap where the date had been, so it was never clear whether the month you had picked still applied. Tabs that have no time frame now say so quietly in the same spot: "Current balances", "All active subscriptions", "All loans", "All groups". "Current month" also moved behind the stepper instead of sitting between the back arrow and the date, where a reset button had no business being.
+- Statistics no longer keeps a second, separate period picker. It had its own stepper at a different position, in a different format (`01/07/2026 - 31/07/2026` instead of `July 2026`) and with its own anchor that was never in sync: picking March on the Budget tab and switching to Statistics showed July. Statistics now steps through the shared header, its Week/Month/Year switcher only picks how wide a step is, and both ends are reconciled when you switch tabs, in either direction. Week bounds still come from the server, so there is only one definition of a week.
+- Every switcher bar in the Budget module looks and behaves the same. There were four looks for the same question - a tinted capsule, a square accent-filled rectangle, a white tile and an outlined pill - and two of them offered no arrow-key navigation at all, so the keyboard handling you learned on Budget and Statistics was silently lost on Loans and Split Expenses. Loan status, group status and the account colour picker now share one appearance and one behaviour; the colour picker gained arrow keys in the process. Their touch targets grew from 40 and 28 pixels to the shared minimum of 44 (48 on touch devices).
+
+### Fixed
+- Subscription monograms were unreadable for many brands. The letters and the tile behind them were drawn from the same brand colour, so how legible a subscription was came down to which services a household happens to pay for: ten contrast failures across the seven demo brands, the worst at 1.83:1 where 4.5:1 is required, and nothing a user could do about it short of changing the brand colour. The brand now carries the tile and its border while the letters come from the regular text colour, which measures 12.9:1 in light mode and 10.7:1 in dark. The same flaw sat unnoticed in the account tiles on the Accounts tab and was fixed with it.
+
+## [1.63.0] - 2026-07-31
+
+### Changed
+- The seven Budget tabs now look like one module instead of three. They already shared the toolbar, the tab bar and the accent colour, but from the panel edge inward they had drifted into five different metric-card designs, four names for the same panel header, three container patterns and three different paddings, so every tab switch meant relearning where the number sits. There is now one metric card for the whole module, left aligned so each amount starts at the same position in a row, with room for a footnote below the figure. Accounts, Loans, Subscriptions and Split Expenses use it too: net worth and the loan figures are ordinary cards, the Loans tab no longer frames itself as a card full of cards, and Subscriptions and Split Expenses stop painting their own page background inside the Budget page, which used to appear as a tinted band that broke off at the container edge.
+- Money is written the same way everywhere in the Budget module. Each amount now carries one of four roles, and the role decides sign and colour together: a single account movement is always signed and coloured, a sum whose direction is already in its label is unsigned, a balance is signed only when negative, and an invoice amount such as a subscription price or a shared expense carries no sign at all. Before this, the same tab could show a signed amount on a transaction row and an unsigned one on the summary card directly above it. Signs come from the locale's own number format, so they stay on the correct side in right-to-left languages.
+- Work surfaces in the Budget module are opaque. The module had documented that rule for itself, that translucent glass belongs to overlays and modals so content stays readable, and then broke it on its own subscription cards, charts, list sections, group header, one search field and two row hover states.
+
+### Fixed
+- The subscription category donut kept its light-mode colours in dark mode. It used fixed colour values instead of the theme's data-series tokens, so it stayed saturated while the identical donut on the Statistics tab next to it lightened correctly.
+- A net worth of exactly zero was shown in green, as if it were good news, and on an empty Accounts tab it was the only coloured thing on the screen. Zero is now neutral.
+- The subscription budget bar could not show that the budget was exceeded. It capped at full width and stayed in the accent colour while the figure beside it already read over budget; it now turns red past 100 percent.
+
+## [1.62.0] - 2026-07-30
+
+### Added
+- Sending things to a shopping list can now be taken back, from all three places that do it: the cart button on a pantry row, a recipe's ingredients, and a planned meal. Until now only the pantry offered it, although a recipe moves the most at once, a whole ingredient list, into a list you are not looking at. The confirmation stays on screen for five seconds everywhere, and taking it back removes exactly what was just added and nothing else. For a meal, the ingredients count as not yet transferred again afterwards, so the meal can be sent a second time.
+
+### Changed
+- "There is no shopping list yet" now says the same thing wherever you meet it, and it offers a way out. There were four different answers to the same situation: one in the pantry that told you where to go, two in red that only named the state and left you standing, and a fourth in the meal editor that was a greyed-out dropdown next to a button that did nothing. Red claims something is broken, while a list you have not created yet is simply a step you have not taken. All four are now one sentence in the same colour, with a button that takes you straight to the shopping list.
+
+## [1.61.0] - 2026-07-30
+
+### Added
+- The Malaysian ringgit is now one of the currencies a household can pick, in the household settings as well as in subscriptions and in split expenses. Malaysian households had to record their money under a currency that was not theirs. Choosing Malaysia as the region sets the ringgit together with the local date and time format in one step, and amounts are then written the way they are written there: RM 1,234.56.
+
+### Fixed
+- The South Korean won, the Indonesian rupiah and the Iranian rial could be chosen as the household currency, but subscriptions did not offer them and split expenses refused them. A household on one of those three currencies could set it once in the settings and then had to leave it behind in two modules. All four places now work from the same list of currencies, and a test keeps them that way.
+
+## [1.60.1] - 2026-07-30
+
+### Fixed
+- Turning a module off under Settings, Navigation did nothing: the checkbox switched itself back on a fraction of a second later, so there was no way to hide anything from the navigation. The setting was in fact saved every time, but the page redrew itself from an empty set of preferences right afterwards and therefore drew every box as switched on again. The same empty read also meant the module order and the three mobile navigation slots were never loaded, so the page opened on the default arrangement instead of yours.
+
+## [1.60.0] - 2026-07-30
+
+### Fixed
+- When the server could not be reached, the four kitchen tabs each did something different, and two of them lied. The shopping list and the meal plan showed their empty state, complete with the button that creates a first entry, while the items were still there on the server. The pantry showed a correct error whose explanation read "[object Object]". Recipes took the whole app down to the error screen because one list had failed. All four now show the same thing: what could not be loaded, and a button to try again.
+- The round button in the bottom corner covered part of a row's controls at every scroll position, up to four fifths of one on a small phone. The free space it needs was reserved at the end of the list, where it only helped once you had already scrolled to the bottom. The area below the button now belongs to it alone, wherever you are in the list.
+- Searching the pantry or the recipes had no way to clear the field again, no magnifier to mark it as a search, and the only label vanished as soon as you typed the first character. Both fields also re-filtered the entire list on every keystroke.
+
+### Changed
+- The focus outline that appears when moving through the app with the keyboard now has one colour: the one of the module you are in. There were six competing definitions, and tabbing through the shopping list alternated between purple and orange six times in fifteen stops. A change of colour reads as a change of context, and there was none.
+- Searching the pantry and the recipes now works like searching notes, contacts, documents or birthdays, because it is now the same component: a magnifier in front, a button to clear the field, a name that stays readable to a screen reader while you type, and a short pause before filtering so that typing stays smooth on a long list.
+
+## [1.59.0] - 2026-07-30
+
+### Added
+- The kitchen tab bar now shows what is waiting in the other three tabs: free meal slots this week, items still to buy, and stores that have run out or are about to. Until now that connection was spelled out only while a tab was still empty, and it vanished with the first entry you made. The tab you are on stays without a number, because the page itself already shows it in more detail.
+
+### Changed
+- The shopping list on a phone starts with the list, not with the controls above it. The three permanent actions moved into a menu and now carry their names, among them "Delete list", which had been an unlabelled icon between two other unlabelled icons. "Move to pantry" and "Delete ticked" moved out of the header into a bar above the list that says what they act on. The quick-add field folds away and opens with the round button in the corner, which now does the same thing there as in the other three tabs. Together that is a little over half the height above the first item, and six fewer stops when moving through the page with the keyboard.
+- Editing a shopping item is now the same dialog as in the pantry: it is called "Edit item" instead of showing the item name as its heading, it lets you change the name, the quantity and the category, and it has a Cancel button. Until now it offered only a link and a note, and correcting a mistyped name meant deleting the item and entering it again.
+- Deleting a shopping list now says how much it will delete and can be undone for five seconds afterwards. The safeguards used to be the wrong way round: a single item could be undone but was never queried, while the household's entire list was queried but could not be undone.
+- Buttons and fields are a little larger on touch devices, following the size the design guide asks for. Nothing changes with a mouse.
+- One word per thing across the kitchen. Moving something to the shopping list was called three different things internally, which had already drifted apart in English; a meal, a recipe and a stored item all call their name field the same now; and deleting something is called deleting everywhere, rather than removing in one tab and deleting in another. Messages after moving something now name where it went ("5 ingredients added to Weekly Shop") instead of only saying that it happened.
+
+### Fixed
+- On a 320 pixel screen a recipe name broke down to one letter per line, making a single row four hundred and fifty pixels tall and leaving room for one recipe on the screen. The three actions on the row take more than half its width there and now move into a menu, as they already do in the shopping list header.
+- In the pantry on narrow phones the quantity controls took two thirds of the row, leaving about thirty pixels for the name: "Olive oil extra virgin" ran over eight lines and rows grew to more than three hundred pixels. The quantity now sits above its buttons when the row is narrow, and stays next to the buttons that change it.
+- The numbers in the kitchen tab bar were too faint to meet the contrast minimum, and an empty one still took up space in its tab.
+- The checkbox that removes bought items from the shopping list, which is ticked by default, was a plain system checkbox in system size while the list next to it uses much larger controls of its own. The same applied to the meal types in the recipe form.
+- In the meal plan import, "Apply" stayed clickable when the chosen period held nothing to import, unlike its sibling action, which correctly greys itself out.
+- "Cancel" looked different in the delete confirmation than in every other dialog, which is where it matters most.
+
+## [1.58.0] - 2026-07-30
+
+### Changed
+- Putting a recipe into the meal plan now asks where it should go, right on the recipe card: a small dialog with the date and the meal, and the meal is already picked from what the recipe says it suits. Until now the button switched you to the meal planner and opened the full meal form there, twenty-seven fields with an empty date and a heading that did not mention the recipe you had just clicked. Leaving that form also left a marker in the address bar, so reloading the page opened it again. All five ways of moving something through the kitchen now work the same: pick the target in a small dialog, then a message telling you what moved.
+- The four kitchen tabs share one colour. The "Kitchen" entry in the sidebar used to change colour on every tab switch, from orange to green to pink to olive, which is the same signal the app uses to say "you have left this module" while you were in fact still in it. The individual colours stay in use for the dashboard cards and the navigation icons.
+
+### Fixed
+- The weekly planner did not show the first day of the week. On opening, the board scrolled to centre today, which pushed Monday behind the column carrying the meal labels, whose opaque background hid it completely; four of seven days were visible and nothing indicated that anything was to the left. The board now only scrolls if today is genuinely out of view, the label column shows an edge once you scroll, and the recipe panel folds itself away when the week would not otherwise fit.
+- The meal planner showed a week without meals as up to twenty-eight empty boxes and not a single word. It now explains what belongs there and offers a way to start, like the other three kitchen tabs.
+- In the pantry every item name started at a different position, up to eighty-nine pixels apart, and the best-before line was pushed around with it. A list you scan by name could not be read at a glance.
+- Invisible but clickable areas sat over the meal cards in the weekly planner. The same fault existed in notes, where one of them covered the delete button, and in documents.
+- The filter row in the pantry and the recipe grid on narrow phones scrolled sideways without showing it. The fourth pantry filter began one pixel beyond the right edge of a 393-pixel screen and was unreachable.
+- Shopping items could not be deleted from their row in a narrow desktop window. The rule depended on the window width rather than on whether a swipe gesture exists at all, so in a window without touch the swipe replacement was missing too.
+- Quantities in Czech, Polish, Russian and Ukrainian were declined wrongly for two to four items.
+- The kitchen tab labels were cut off by two pixels; the descender of the "p" in the German "Rezepte" lost its tip.
+- In the shopping list and the pantry the header ran up to five hundred pixels further right than the list beneath it, leaving the delete button hovering over empty page.
+- Empty states now carry a heading rather than a plain paragraph, so a screen reader announces the first screen of an empty module with structure.
+
+## [1.57.0] - 2026-07-29
+
+### Added
+- Recipes can now put their ingredients straight onto a shopping list. Every recipe card carries a second action next to "Add to meal plan"; with one list it transfers right away, with several it asks which one. Until now the only way there was to plan the recipe first, switch to the shopping tab and import the whole week from the meal plan. A recipe is a template you cook again and again, so nothing is marked as done on it: the transfer skips ingredients that are already on the list unticked and tells you how many it added and how many it left out. Things you ticked off during an earlier shop come along again.
+- The recipe column in the weekly planner can be folded away. It takes up the width the board needs for the last two days, so with it open Saturday and Sunday sat behind the scroll edge on most screens. The toggle sits in the week navigation and remembers your choice.
+
+### Fixed
+- After a shop, "Move to pantry" and "Delete ticked" were effectively invisible on a phone. Both buttons had been squeezed down to bare padding, so neither their label nor their icon was left, and they were far below a usable tap size. They now sit on a row of their own with their full labels, including the count.
+- Meals planned from a recipe could not send their ingredients to the shopping list. Such a meal only stored a reference to the recipe, so the transfer had nothing to hand over and its button never appeared. The ingredients are now taken from the recipe the first time you transfer them.
+- The Kitchen tab bar cut its labels mid-word on narrow phones, leaving "Reci…" and "Shopp…". All four labels are now readable, because the module title above them is dropped on mobile, where the bottom navigation already shows it.
+- Switching to Shopping made the whole page jump sideways. Its content sat 218 px further right than in Meals, Recipes and Pantry, even though the tab bar above it stayed put.
+- In the pantry, the quantity stepper stood in front of the item name, so a row read "minus 500 g plus Yoghurt" and the names started at a different spot on every row depending on how long the quantity was. The name now comes first and every row starts on the same edge. Best-before dates are no longer cut off when a row carries two status badges.
+- Cards, list rows and form fields had no visible edge in dark mode. The card outline resolved to exactly the colour of the surface behind it, which made an input field hard to make out as a field at all.
+- On a desktop screen the weekly planner hid Saturday and Sunday behind the scroll edge, the two days most likely to be planned.
+- The "Today" button in the meal planner did not meet the contrast minimum. It followed the module colour but kept the untinted text tone on top of it.
+- Recipe cards reserved an invisible 48 px strip below every card on desktop.
+- On the meal planner's action buttons the invisible tap areas overlapped, so aiming at the shopping-cart could land on the bin next to it.
+- The randomizer reported "1 meals planned" when it filled a single slot.
+
+### Changed
+- The meal planner now uses its own module colour throughout. Week navigation, the "Today" button and today's date marker were still drawn in the global violet, which put two different colour families side by side in one toolbar.
+- "Randomize plan" is no longer the loudest button in the meal planner. It keeps its place but steps back visually, and its dialog now says how many slots it will fill and how many existing meals it would overwrite before you confirm.
+
+## [1.56.1] - 2026-07-29
+
+### Fixed
+- Signing in with a password that contains umlauts or accented characters now works in every browser. Firefox on macOS hands such a password over in a different byte form than Safari and iOS do, and because the check compares those bytes, the same password was accepted in one browser and rejected in the other. Passwords are now brought into one common form before they are stored and before they are checked, so a password set in one browser opens the app in all of them. Existing passwords keep working and are quietly converted to the new form the next time you sign in, so no reset is needed. (#608)
+
+### Security
+- The eight character minimum for new passwords is now counted the same way in every browser. Depending on how the browser passed an umlaut along, a single character could count as two, which let a password through that was in fact shorter than the minimum.
+
+## [1.56.0] - 2026-07-29
+
+### Changed
+- Recurring appointments from Google are now held as one series with its repeat rule, the way appointments from CalDAV and iCloud have always been held. Google used to hand each occurrence over separately, so a weekly appointment arrived as dozens of individual entries that only looked like a series. Editing the repeat rule of such an appointment or moving it to another calendar was rejected, and a series created in Yuvomi and synced to Google was the odd one out among its own occurrences. Cancelled occurrences are carried over as gaps in the series, and an occurrence moved to another time becomes an entry of its own on its new date. (#593)
+- The first sync after this update reads every enabled Google calendar in full once, which takes longer than a normal run before returning to the usual incremental ones. That run also merges appointments stored as separate occurrences by earlier versions back into their series. An occurrence you had assigned to someone or given its own colour is not merged away: it stays as a separate appointment on its date, and the series skips that date so nothing appears twice.
+
+## [1.55.0] - 2026-07-29
+
+### Added
+- A new **Pantry** module tracks what is actually in the house. It sits as the fourth tab of the Kitchen group and closes its cycle: plan a meal, cook it from a recipe, buy what is missing, and now record what came home. Each entry carries an amount and unit, a storage location, an optional best-before date, an optional minimum stock and a note. A stepper books items in and out in a single tap, sized to the unit so that "plus" on flour adds half a kilo rather than a whole one. Status badges appear only on the rows that have something to say, so expired, expiring-within-a-week, running-low and out-of-stock items stand out instead of every row wearing a label. Filters narrow the list to exactly those, and a filter that has no hits is never offered in the first place. Without a filter the list groups by storage location; with one it goes flat and sorts by urgency. Storage locations can be renamed, reordered and deleted, and deleting one keeps the stock it held. One entry is one batch, so two packs with different dates stay two lines. (#596)
+- The pantry works in both directions with the shopping list. Empty or nearly empty items go onto the list from the row or all at once, pre-filled with the amount missing from the minimum stock. After a shop, everything ticked off can be booked into the pantry in one dialog with a shared storage location and a per-item amount, read from what you typed into the shopping list for the metric units.
+
+### Changed
+- The shopping list header now offers "Into pantry" next to "Remove checked" whenever something is ticked off. A finished shop ends on the shelf rather than in the wastebasket, and the transfer clears the list for you if you want it to.
+
+## [1.54.0] - 2026-07-29
+
+### Added
+- Subscriptions can now define when they end: never, on a specific date, or after a set number of payments. Once the final payment passes, the subscription is automatically marked completed: it drops out of the monthly total and the renewal forecast, and its renewal reminder is removed, while it stays visible with a distinct completed state. Existing subscriptions keep running indefinitely as before. (#594)
+
+## [1.53.2] - 2026-07-29
+
+### Fixed
+- A contact synced over CardDAV no longer collects a second copy of its main phone number and email address. Every sync removed the non-primary entries and then inserted the whole vCard again, which put the value already held as the primary entry back a second time. From the second sync onwards the affected contacts showed their main number twice, and their main address as well. Duplicates left behind by earlier syncs disappear on the next one, no action required.
+
+### Changed
+- Calendar and contact syncs no longer rewrite entries that have not changed. A calendar with 47 appointments was written back in full on every scheduler run, even when nothing had changed on the server, and reported "47 events" each time as though it had done work. Runs now compare before they write, so a run without changes touches nothing and stays out of the log. The summary reads "N events seen, M changed" and only reaches the normal log level when something actually changed. This covers CalDAV, Google Calendar, ICS subscriptions and CardDAV alike, and for calendar subscriptions it also stops the run from consuming a database row id per appointment.
+
+## [1.53.1] - 2026-07-29
+
+### Changed
+- Sync runs no longer report an idle pass in the log. A scheduler tick that had nothing to do still wrote several lines every single time: the CalDAV progress line, its per-account tally and its "0/1 accounts, 0 events" summary, plus an account with no enabled calendar or address book, a holiday sync with nothing to import, and a Google account in read-only mode. The container log now stays quiet unless a run actually processed something. Failures are unaffected and still reported, and the full detail remains available under `LOG_LEVEL=debug`, which is now documented in the installation guide.
+
+### Fixed
+- The MCP endpoint can create and change data again through its OpenAPI bridge. Every write via `call_api_operation` failed with "Invalid JSON in request body" for AI clients that pass tool arguments as text, because the request body was encoded a second time on its way to the API. Reading was unaffected, and so were the built-in tools for tasks, shopping and calendar, which do not go through the bridge. (#599)
+
+## [1.53.0] - 2026-07-28
+
+### Security
+- `DB_ENCRYPTION_KEY` now actually encrypts the database. Both installers generate the key and the documentation promised AES-256 at rest, but the SQLite binding that shipped carried no cipher layer and silently ignored the key, so installations stored their data in plaintext while the configuration said otherwise. Saved CalDAV, CardDAV and WebDAV credentials were affected the same way. Setting the key now encrypts the file for real, and the app refuses to start rather than carry on unencrypted if the binding cannot encrypt or the file on disk is still plaintext.
+- An existing unencrypted database is encrypted once on the next start. The original is left untouched as `<DB_PATH>.plaintext-backup`; delete that copy once you have checked that the app starts and your data is complete. If another process still holds the database open, the migration stops rather than encrypt an incomplete copy, and your data is left exactly as it was.
+
+### Changed
+- Replaced `better-sqlite3` with the API-compatible `better-sqlite3-multiple-ciphers`, which carries the cipher inside its own binary. Docker and bare-metal installs are covered alike and no system SQLCipher is needed.
+- Re-running either installer now keeps a `SESSION_SECRET` or `DB_ENCRYPTION_KEY` that is already in your `.env` instead of generating a new one. A regenerated encryption key would leave the app unable to open its own database. Typing a value by hand still replaces it, which is the deliberate way to start over.
+- Updated the production dependencies and the development-only `puppeteer`, and realigned the `allowScripts` build-script pins to match. (#587, #588)
+
+### Fixed
+- Backups work again once encryption is enabled. The SQLite backup API refuses an encrypted source, so with a key set every backup failed, the scheduled ones and the WebDAV upload included.
+- Backups written before encryption took effect stay restorable. The restore check applied the key to every candidate file and therefore read those older plaintext backups as unreadable.
+- A restore no longer leaves an unencrypted copy of the database behind. Restoring a backup from before the switch encrypts it on the way in, and that step used to drop a full plaintext copy next to the database on every single restore.
+- Installations still on the legacy `oikos.db` filename that also have an encryption key set now start correctly. The rename to `yuvomi.db` was skipped on the first boot and reported "file is not a database" for a database that was perfectly intact.
+
+## [1.52.1] - 2026-07-28
+
+### Fixed
+- A recurring event created in Yuvomi and synced to Google appeared twice in the calendar, once per occurrence. Yuvomi kept the series as a single entry with its repeat rule and worked out the occurrences itself, while Google returned the same series as separate events for every occurrence, and both were shown. Google's copies are now recognised as belonging to the series Yuvomi already has. Duplicates left behind by earlier syncs disappear on the next one, except where you had given a copy its own colour or assigned someone to it, since that would throw away your own edit. (#593)
+
+## [1.52.0] - 2026-07-28
+
+### Added
+- Deleting or editing an event in Yuvomi now reaches CalDAV and iCloud servers too, the same way it already reached Google. Outbound sync could only ever create events there; once an event had been uploaded, nothing that happened to it in Yuvomi arrived on the server again. Editing a synced event preserves everything the server holds that Yuvomi does not: attendees, alarms, categories, and the exceptions of a recurring series stay exactly as they were, because only the fields Yuvomi manages are replaced. (#593)
+- A synced event can be moved to a different CalDAV calendar by picking another target. Since CalDAV cannot move an object between calendars, Yuvomi creates it in the destination first and removes it from the source afterwards, so a failure at the second step leaves the event twice rather than not at all.
+
+### Changed
+- Outbound changes are attempted the moment you save, for every provider. For CalDAV and iCloud this fetches only the affected calendar object instead of whole calendars, so a deletion is a single request. Anything that does not succeed right away is retried by the next sync run.
+- Events that were synced with a CalDAV or iCloud calendar before this release need one sync run before edits and deletions can reach them: the address of their calendar object was not stored until now. The next sync fills it in automatically, no action required.
+
+## [1.51.0] - 2026-07-28
+
+### Added
+- An event that already lives in a Google calendar can be moved to a different one. Choosing another calendar in the event dialog moves it in Google as well, instead of leaving it where it was. Moving requires write access to both calendars; if the destination is read-only, the event simply stays where it is.
+
+### Changed
+- Changes headed for Google are attempted the moment you save and retried by the next sync run if Google cannot be reached, so a brief outage no longer means the change is lost. A change that is rejected five times in a row is given up on and written to the log.
+
+### Fixed
+- Deleting an event in Yuvomi left it standing in Google Calendar. Outbound sync only ever created events; once an event had been pushed to Google, nothing that happened to it in Yuvomi reached Google again. Deletions now follow. The other direction was never affected: events deleted or edited in Google kept arriving in Yuvomi. (#593)
+- Editing an event that is synced to Google changed nothing in Google, for the same reason. Title, notes, location, colour, all-day, start and end time and the repeat rule are now sent along. Assignment, visibility, icon and attachments stay in Yuvomi, as before. A local edit that has not reached Google yet is no longer overwritten by an incoming sync before it gets its chance. (#593)
+- An event moved between two synced calendars inside Google could vanish from Yuvomi. The source calendar reports it as cancelled while the destination still lists it under the same identifier, and the deletion was applied by identifier alone, so it could remove the entry the destination had just written. The event stays now. (#593)
+
+## [1.50.1] - 2026-07-28
+
+### Fixed
+- The medication widget on the dashboard showed other people's medicines. It aggregated every medication marked family-visible across all members, so the "taken/total" bar, the next open dose and the refill chip mixed the whole household into what is meant to be a personal glance, while your own private medicines never appeared there at all. The widget now counts only your own medications, private and family-visible alike. Shared medicines stay on the Health page, whose visibility rules are unchanged.
+
+## [1.50.0] - 2026-07-27
+
+### Added
+- Settings can be searched. With 23 pages across four domains, the taxonomy was the only way to reach a setting whose domain you did not know. The search field filters every page you may see by title, description and domain name, ignoring case and accents, and replaces the groups with a flat result list in which every hit names its own domain.
+- Half-filled settings forms are no longer discarded without a word. Until now only the permissions page warned before losing changes; the other 22 pages threw away what you had typed the moment you clicked another entry in the sidebar. Settings now asks first. Switches that save immediately are unaffected, because they never hold an unsaved state.
+- Switching between settings pages shows a loading state instead of an empty box while the page and its data arrive. Pages that load instantly do not flash a skeleton.
+
+### Changed
+- The backup schedule is written out. The administration page showed the raw cron line, "Schedule 0 2 * * *", which tells you nothing unless you read cron. It now says "Daily at 02:00" and keeps the expression alongside as evidence. Unusual schedules that cannot be summarised accurately keep their raw form.
+- The account page shows one profile picture instead of two. The same avatar appeared twice within the first mobile screen: once in a display card with your name, and directly below it in the editor with the same name as an input field. The display card is gone; the username, its only unique content, is now a read-only field in the form.
+- The account page names its own parts. The card was titled "Profile picture" but held display name, colour, phone, email and birthday. It is called "Profile" now, and the three contact fields are grouped under "Contact details".
+
+### Fixed
+- Importing a calendar file with a single event reported "1 events imported". German, English and the other 21 languages now have a singular form for both import messages.
+- Six module colours were too light to read as text on the page background: secondary buttons take their colour from the active module, so "Add channel" in the notification settings sat at 4.13:1 and "Import from contacts" in Birthdays at 4.20:1, both below the 4.5:1 the standard requires. All six are darkened slightly in the light theme, keeping their hue; the dark theme already passed.
+- The coloured dots in the permission matrix are no longer announced to screen readers. Eleven empty spans appeared as separate items, although their colour only repeats the module accent that the icon and name next to them already state.
+
+## [1.49.0] - 2026-07-27
+
+### Changed
+- Settings has one domain fewer. "Documents" held two admin-only pages that both do the same thing, connect an external service, while Calendar with its 729 lines of configuration had no domain of its own. Both pages now live under Synchronisation. Old bookmarks and the last visited page stored in the session are redirected to the new paths instead of quietly falling back to the account page.
+- Navigation settings moved from Modules to Personal and are open to every household member. The module order and the three mobile navigation slots are stored per user and the server never required admin rights for them, but the page sat behind the admin gate, so five of six family members could not reach their own settings. Which modules the household uses stays an admin decision: those switches are not rendered for members, and the server rejects them either way.
+- Budget, Health and Housekeeping each had their own settings page carrying a single checkbox, which cost three sidebar entries, three navigation steps and three requests. They share one "Module options" page now. Settings is down to 23 pages in four domains.
+- The settings root shows one navigation instead of three. On desktop the tile overview and the sidebar were rendered at the same time, both listing the same 23 destinations, next to the global app sidebar. The overview now belongs to the tiles, which carry each page's description, and the sidebar appears only inside a page. Opening Settings without a previously visited page lands on that overview rather than silently on the account form, and the collapsed sidebar no longer keeps a different domain open than the one being shown.
+- The back link inside a settings page names where it goes ("Back to Administration") instead of repeating "Back to Settings", which is what the link one level up says while leading somewhere else.
+- Every switch in Settings looks the same. Four different controls had grown for the same yes/no decision, so the WebDAV backup switch looked like iOS while its twin on the document storage page looked like a checkbox. They share one component now, which also lifts the backup switch from 26 to 48 pixels.
+- The two weather pages share one location form. Household and personal weather rendered the same five fields with the same translations, and the location lookup plus coordinate validation existed twice.
+
+### Fixed
+- Deleting a family member now says what that does. The dialog asked "Really delete X?" without naming that everything the person created goes with them (events, tasks, notes, transactions and lists) while items merely assigned to them stay and become unassigned. Revoking an API token now says that connected clients, including AI integrations, lose access immediately, and restoring a backup says that data created since that backup is lost and that files stored outside the database are not part of backups. Resetting a role's permissions was the only confirmation not marked as destructive.
+- Assigning permissions is usable on a phone. The three access levels were icon-only buttons of 34 by 30 pixels whose plain text lived in a tooltip, and tooltips never appear on touch. The levels now carry their words below 1024 pixels and on any touch device, the rows stack, and no control on that page is under 44 pixels any more. It stays compact for a mouse.
+- The module list shows its status colours again. A more specific rule further down the stylesheet overrode the badges, so "Enabled" and "Built-in" were grey instead of green and violet, at 4.41:1 contrast. They are now 5.90:1 and 5.05:1.
+- Backup pages no longer fail silently. Both the scheduler status and the WebDAV configuration wrote load errors to the console only, leaving "Automatic backups" with a heading and an empty body, which reads as "there are none". Both now say that the state is unknown and offer a retry. The WebDAV form disappears while unknown, because an empty form looks like "nothing configured" and its save button would have overwritten a connection nobody saw.
+- The API token can be copied. It is shown exactly once and sat in a read-only field that had to be selected by hand, while the WebDAV password reveal button next to it already existed.
+- Deleting a housekeeping task showed the literal text `Aufgabe "{name}" wirklich löschen?`. The translation used single braces, which the interpolation never substitutes, in all 23 languages. A test now checks every translated string for that mistake.
+- Initials on avatars pick a readable colour. They were always white regardless of the colour the member picked, which measured 3.5:1 and 2.8:1 on lighter ones. Dark ink is used where white misses the threshold; where white passes, it stays.
+- Body text in Settings no longer runs the full width of the content column. Lines reached about 125 characters at 1440 pixels; the limit is calibrated against actual German prose rather than the usual `ch` rule of thumb, which would have allowed 104.
+- The permission mode switch was labelled with the page title for screen readers, describing the page rather than the switch.
+
+### Removed
+- 174 lines of stylesheet for three systems that were never wired up: inline help tooltips, status badges and an empty state. None of their classes ever appeared in the markup.
+- Two translation keys with no remaining call site, and a stale breadcrumb rule that styled a class the shell never produces.
+
+## [1.48.2] - 2026-07-27
+
+### Fixed
+- Text that sits on a tint of its own module colour now stays readable. Active filter chips, count badges, module badges and initials avatars used the raw module accent as their text colour on a tint of that same accent, so the contrast depended solely on how light that particular accent happened to be: measured across all 17 modules, 13 missed the WCAG AA threshold, with Recipes at 2.84:1 and Shopping at 3.21:1. The text now carries a 30% admixture of the primary ink colour, which shifts it away from the ground in a theme aware direction, darker in the light theme and lighter in the dark one. The hue is unchanged, so each module keeps its own colour. Icons are deliberately excluded because the 3:1 rule applies to them and the admixture would only mute the module colour.
+- The Recipes accent colour missed AA as text even on plain white (3.51:1), the only one of the 17 module accents to do so, and is now a darker teal green (5.19:1 on white, 4.71:1 on the page background). Its hue moved from 162 degrees to 166, which also widens the gap to the Tasks green from 12 to 16 degrees and keeps the two modules easier to tell apart.
+- Reward avatars picked white initials regardless of the member colour, which left them at 2.80:1 on a light orange. They now choose the stronger of light or dark ink from the colour's luminance, the same shared helper the dashboard, calendar, notes and member picker already used.
+- Budget category amounts no longer spill out of their column. The fixed 64px column was too narrow for every formatted amount in the demo data, which needed 75 to 91px; the column is now sized in character units so it scales with the font and stays identical across rows, which keeps the bars comparable.
+- Assignee initials and the "+N" counter in the calendar grid views were rendered at 6px. They now have a 9px floor.
+- The separator between phone number and email in a contact row used the disabled-text colour at 1.54:1, which let the two values run together visually. It now uses the tertiary text colour.
+- The install banner's install and dismiss buttons were 36px and 32px on touch devices, below the 44pt minimum the rest of the app follows. They now match on `(hover: none)`, unchanged for mouse pointers.
+
+### Changed
+- The Recipes module accent changed from `#109C6B` to `#0C7C5B`, which is visible wherever the Kitchen section carries its colour.
+
+## [1.48.1] - 2026-07-27
+
+### Changed
+- A subscription reminder now states the amount and the renewal date, not just the subscription name. Knowing that something renews is of little use without knowing when and for how much, which is what decides whether it needs attention at all. The notification body reads `Netflix - 12.99 EUR - 2026-08-03` and drops the amount or the date individually when a subscription does not carry them. The line deliberately holds data only and no formulated sentence: notifications are assembled on the server, which cannot know the recipient's language because locale, date format and number format live in the browser, so any sentence would reach all 23 languages in only one of them (#581).
+
+## [1.48.0] - 2026-07-27
+
+### Added
+- The loan report of an interest loan now lists the loan amount, the outstanding balance, what is still to pay, the amount paid and the instalments left, so both the open capital and the remaining payment total are visible in one place instead of only one of them.
+
+### Changed
+- An interest loan now leads with its outstanding balance instead of the sum of its outstanding instalments. The latter still contains the interest of the remaining term and was therefore several hundred euros above the open amount the bank reports, while carrying only the label "Outstanding". The card now shows the open capital from the amortisation schedule, labelled as such and set against the loan amount rather than the total repayment, and the summary card switches to the same figure as soon as one interest loan is present. Interest-free loans are unchanged, as both figures are identical there.
+
+## [1.47.1] - 2026-07-27
+
+### Fixed
+- Undoing the deletion of a birthday now actually keeps the entry. The delete was sent to the server immediately and "Undo" only restored the entry in the open view, so it reappeared in the list and was silently gone again after the next reload. Deletion now follows the same model as Notes, Contacts and Recipes: the server delete is held back until the undo window closes, so "Undo" prevents it instead of trying to recreate the record afterwards. The preceding confirmation dialog is gone, since a birthday cascades to nothing.
+- Deleting a housekeeping chore now asks through the app's own dialog instead of the browser's native confirmation box, which ignored the design, held no keyboard focus and gave the destructive action no danger colour.
+
+### Changed
+- Icon sizes come from one scale with a single name per step. Seven class names had been carrying the same four values, so `icon-sm` was not actually smaller than `icon-xs`, and 17 places set their size inline instead of using the scale at all. Icons in the Notes formatting toolbar are now 16px instead of 14px, and four buttons lost 4px of extra icon spacing that had been added on top of the standard gap.
+- Every stylesheet breakpoint follows the four canonical thresholds. The DMS preview tile, the CalDAV action row and the cycle hero switch to their narrow layout at 640px instead of 480px or 560px, and the cycle calendar's grid gap now shrinks fluidly rather than jumping at 380px.
+- Modal footers inside a scrolling dialog body use a shared class instead of 20 inline styles that reproduced the same rule with three different spacings; eight of them now sit at the common distance.
+- The specification documents the actual breakpoint contract (640/768/1024/1440), the icon scale, and the full set of 23 shipped languages. The breakpoint section still described a 768px mobile threshold that the stylesheets had not used for some time.
+
+## [1.47.0] - 2026-07-27
+
+### Added
+- A loan can now run in its own currency instead of always following the household budget currency. The loan dialog offers a currency and, as soon as it differs from the budget currency, a fixed conversion rate; the hint spells out the direction (1 loan currency = x budget currency), and switching the currency clears the rate so the previous one is never carried over unnoticed. Loan cards, the loan report and the instalment transactions lead with the loan's own currency and show the budget equivalent quietly underneath (#582).
+- The loan summary card converts foreign-currency loans into the budget currency at their fixed rate and says so, because it is the one place that adds up across loans and would otherwise sum unrelated currencies (#582).
+- Recording an instalment on a foreign-currency loan books the converted amount into the budget while the instalment itself stays in the loan's currency, so the amortisation schedule and remaining balance stay exact. The rate is applied at booking time, so changing it later leaves already booked instalments untouched (#582).
+- The conversion rate is fixed and maintained by hand rather than fetched daily, so a schedule running for decades does not move its remaining balance every day and the feature works without an exchange-rate API key (#582).
+
+### Fixed
+- Editing the budget entry that belongs to a loan instalment no longer corrupts the remaining balance of a foreign-currency loan. The entry is kept in the budget currency while the instalment is kept in the loan's currency, and the amount was previously written back between the two without conversion; the remaining-balance check was comparing the two currencies against each other as well (#582).
+
+## [1.46.3] - 2026-07-27
+
+### Fixed
+- Reminders for a subscription now name the subscription in the notification. Web Push, Gotify and ntfy received a notification whose title and body both read "Yuvomi", so a due renewal was indistinguishable from any other alert and gave no hint which subscription it was about. The reminder centre inside the app had shown the name correctly all along, and delivery itself always worked, which is why the server log reported sent notifications and the test button looked healthy (#581).
+- A reminder whose task, event or subscription has been deleted no longer arrives as a notification consisting only of the app name. It now carries a neutral fallback text, so the body never just repeats the title (#581).
+- Medication reminders use the same fallback, instead of repeating the app name when a medication has no name to show (#581).
+
+## [1.46.2] - 2026-07-27
+
+### Fixed
+- The "Send test notification" button now reports whether anything was actually delivered. It previously said "sent" as soon as the server accepted the request, so a device that received nothing looked exactly like one that worked, and there was no way to tell a missing subscription from a rejected push without reading the server log. It now distinguishes between a delivered push, a registered device that could not be reached, and no registered device at all (#580).
+- A push subscription the server no longer knows about repairs itself instead of going silent forever. When a push service reports a subscription as gone, or a database restore loses it, the browser still considers push enabled while the server has no record of the device, so reminders stopped arriving with the toggle showing "active". The app now re-registers an existing subscription every time it starts, and the test button additionally detects a subscription bound to an outdated VAPID key, re-subscribes and retries once (#580).
+- Notification settings explain why push is unavailable on iPhone and iPad instead of claiming the browser does not support it. iOS only delivers Web Push to a web app installed on the Home Screen, so the previous message pointed at the wrong cause and left no path forward. Opened from Safari on iOS, the settings page now names the Home Screen requirement (#580).
+- Failed push deliveries are now diagnosable from the server log. The log recorded only the error message, which for a rejection from Apple or Google carries no usable detail. It now also records the push service host, the HTTP status and the response body, while still keeping the device token out of the log (#580).
+
+### Changed
+- The installation guide documents Apple's Web Push requirements: iOS/iPadOS 16.4 or newer, installation to the Home Screen, enabling the toggle from inside the installed app, a certificate iOS trusts, and outbound server access to Apple's push service (#580).
+
+## [1.46.1] - 2026-07-26
+
+### Fixed
+- Backups no longer fail with `EACCES: permission denied, mkdir './backups'`. Container deployments that mounted a backup folder but did not also set `BACKUP_DIR` fell back to the app's bare-metal default `./backups`, which resolves to `/app/backups` inside the container. That path sits outside the mounted volume and the unprivileged user the app runs as cannot create it, so scheduled and manual backups both failed while the correctly mounted host folder stayed untouched. The image now defaults `BACKUP_DIR` to `/backups`, so every container writes to the mounted volume even when the deployment does not set the variable itself (#579).
+- Unraid installs write their backups to the folder configured in the template. The template mapped a host folder to `/backups` but never passed `BACKUP_DIR` along, so the app wrote somewhere else entirely. The variable is now part of the template (#579).
+- Portainer stacks keep their backups across updates. The standalone Portainer compose file carried no backup volume at all, so backup files only ever lived inside the container layer and were lost with the next image pull (#579).
+- A failing backup now names the directory it could not write to. The previous message only showed the relative path, which sent people looking at their host folder instead of at the setting; it now reports the resolved absolute path, the error code, and which variable to change (#579).
+
+## [1.46.0] - 2026-07-26
+
+### Added
+- Tasks can now start with a point value instead of it being typed in every time. Settings → Modules → Rewards has a "Standard-Punkte" field: set it once and every new task is prefilled with that value, still overridable per task, and a 0 entered by hand still means no points. Leaving it at 0 keeps the previous behaviour, where the points field starts empty (#578).
+- Changing the default offers to carry existing tasks over. After saving, the settings page reports how many tasks still sit on the old default and asks whether to move them to the new one. Tasks that were given their own point value keep it, and tasks already marked as done keep theirs too, because their points have already been credited to the ledger. Which tasks are affected is decided by their point value, and the count is shown before confirming, so nothing changes unseen (#578).
+- Subtasks stay at zero points. They are checklist items of their parent task, so applying the household default to each of them would multiply the parent's value (#578).
+
+## [1.45.15] - 2026-07-26
+
+### Fixed
+- Module headers now span the full width of the content area. The coloured 3px accent stripe that identifies each module used to stop about 200px short of the right edge on a wide screen, leaving the header floating in the middle of an otherwise empty band. Header background, divider and accent stripe now run to the edge, while the title and controls stay in the same centred column as the content below, so nothing gets harder to read on ultra-wide monitors (#577).
+- Module headers are the same width everywhere. Birthdays was half as wide as Contacts right next to it in the navigation, and Calendar was narrower than every other module, so the page visibly changed size when switching between them (#577).
+- The module title now lines up with the content beneath it. Title and content sat 16px apart, which stayed visible the whole time while scrolling because the header is sticky (#577).
+- Recipes no longer draws two accent stripes on top of each other. It was the only Kitchen tab that added a second stripe in the same colour directly below the shared one (#577).
+- The calendar header no longer sits detached from the top edge and jumps into place on the first scroll (#577).
+- Long module titles are now shortened with an ellipsis instead of running out of the header. This affected languages with longer words than German (#577).
+
+### Fixed
+- Shared expenses: the "Aufteilen" tab no longer overlaps its own cards on desktop. The layout used to switch to a single column at a fixed window width, which ignored the space the expanded sidebar takes up, so at a 1024px window the balances card was squeezed to a sliver and its "simplified debts" subtitle ran across the neighbouring card. Panel and card grid now each reflow from the width actually available to them, which also means collapsing the sidebar widens the content as expected (#575).
+- Shared expenses: the activity feed showed raw text such as `splitExpenses.activityType.expense_added` instead of a readable entry. Removing a member from a group had never been translated in any of the 23 languages, and the demo data recorded two activity types the app itself never writes (#575).
+- Shared expenses: a single long unbreakable word in the activity feed no longer stretches the card past the right edge of the screen on narrow phones (#575).
+
+## [1.45.13] - 2026-07-26
+
+### Fixed
+- Shared expenses: archived groups can be opened again. The group list has an Active/Archived filter, an archived group stays fully readable with its balances, expenses and activity feed, and a Restore action puts it back into the active list. Archiving used to be a one-way trip: the API already served archived groups, but no control in the interface led to them (#574).
+- Shared expenses: on narrow screens the group panel no longer reaches past the right edge of the screen. It grew to the width of the widest group card, which cut off the search field (#574).
+
+## [1.45.12] - 2026-07-26
+
+### Added
+- Budget loans can be entered with a purely variable interest rate, for loans that have no fixed-interest period at all. Payment, term and total interest are derived exactly as for a fixed rate, but the rate field is labelled as the current rate, a hint states that payment and term move with it, and the loan card reads "3.6 % variable" instead of claiming a fixed rate (#569).
+
+### Fixed
+- Mobile navigation: the active tab capsule now sits behind the icon only. It used to span the full bar height and the whole slot width, so its rounding was cropped against the bar edge on the first and last tab, its lower edge cut through the label, and on devices with a bottom safe area it reached into the home zone (#569).
+
+## [1.45.11] - 2026-07-26
+
+### Fixed
+- Google Calendar: timed events pushed from Yuvomi no longer arrive at the wrong time outside Central European Time. The outbound sync used to declare a fixed `Europe/Berlin` zone, which shifted every event for households in other regions (7.5 hours in Australia). Events now carry the target calendar's own time zone, so Google shows the same clock time as Yuvomi. If Google reports no zone for that calendar, the container's `TZ` is used, then the host zone, then UTC (#572).
+
+## [1.45.10] - 2026-07-25
+
+### Added
+- Budget loans can optionally be modelled as a German-style annuity: enter the principal, nominal interest rate and initial repayment rate instead of a fixed total, and the constant monthly payment, term and total interest are derived and previewed live while typing. A "fixed then variable" mode continues after the fixed-interest period with a forecast follow-up rate, and the loan card shows the annuity rate and interest phase (#569).
+
+### Fixed
+- Calendar: the current-day badge number is now vertically centred instead of sitting too low (#569).
+- Contacts: filter chips have more horizontal padding so short active labels no longer look cramped (#569).
+- Category manager: nested sub-category lists (budget expenses) no longer squash the category name to zero width; they wrap onto their own indented line (#569).
+- Dashboard: widget edit controls no longer overlap the widget content when they wrap onto a second row on narrow tiles in edit mode (#569).
+- Mobile: the modal drag handle renders as a thin line again in glass mode instead of a full block (#569).
+
+## [1.45.9] - 2026-07-25
+
+### Added
+- Budget: a dedicated "Expenses only" toggle on the month summary that hides the income and net-balance cards, so pure expense tracking no longer shows a red minus balance. The choice is remembered per device; the transaction list, category chart and CSV export are unaffected (#504).
+
+### Changed
+- Docker/Podman: renamed the compose service and container from `oikos` to `yuvomi`. Existing data is preserved - the database volume is unchanged and an existing `oikos.db` is migrated to `yuvomi.db` automatically on first start. When upgrading, run the update once with `docker compose up -d --remove-orphans` so the old `oikos` container releases port 3000. Named volumes and the TrueNAS/Unraid/Quadlet slugs keep the legacy `oikos` name so those installs upgrade in place.
+
+## [1.45.8] - 2026-07-25
+
+### Changed
+- Budget: in a month with no income recorded, the monthly balance card is now shown in a neutral colour instead of red. Without income, the balance always equals the negated expense total, so tracking expenses only no longer looks like being in the red. The card returns to its green/red semantics as soon as any income exists (#504).
+
+## [1.45.7] - 2026-07-25
+
+### Added
+- Split Expenses: each group can now store a default split method and, for percentage or shares splits, default per-member values. New shared expenses in the group open pre-filled with that split, so households and couples that always divide costs the same way no longer re-enter it each time (#517).
+
+## [1.45.6] - 2026-07-25
+
+### Added
+- Subtask visualization on the tasks page: related subtasks are loaded with the task list and can be expanded directly inside the main task cards via the progress toggle, so task relationships are visible without opening the task detail.
+
+### Changed
+- Budget loans now accept a repayment term of up to 360 installments (30 years) instead of the previous limit of 240 (20 years), making it possible to track long-term home loans and mortgages (#545).
+
+## [1.45.5] - 2026-07-24
+
+### Fixed
+- On mobile, tapping a calendar view tab (Agenda, Week, Day) when the toolbar was too wide to fit could shift the entire calendar page sideways off-screen, with no way to scroll it back except switching to Month view and restarting the app. The active tab is now brought into view by scrolling only its own tab bar, so the page no longer slides away (#565).
+
+## [1.45.4] - 2026-07-24
+
+### Fixed
+- In Budget → Subscriptions, the "Manage categories and payment methods" dialog no longer squishes its two columns on iPad and narrow screens: the categories and payment-methods lists now sit side by side only when there is room and stack into a single column otherwise, so each row's name and action buttons stay on one line instead of overlapping.
+- Renaming a default subscription category now pre-fills the edit field with the localized name shown in the list (for example "Bildung") instead of the internal English name ("Education"). Editing only the color of a default category keeps its localization intact.
+
+## [1.45.3] - 2026-07-24
+
+### Fixed
+- In Budget → Subscriptions, pressing Enter while renaming a category or payment method in the "Manage categories and payment methods" dialog now saves the change and Escape cancels it, instead of triggering an unrelated action or doing nothing. Keyboard focus also returns to the row after cancelling an inline edit.
+
+### Changed
+- Editing or removing a subscription category or payment method now shows a confirmation, and the manage dialog lays out its per-row actions more comfortably on narrow screens.
+
+## [1.45.2] - 2026-07-24
+
+### Added
+- Subscription categories and payment methods can now be renamed, recolored (categories only), and removed from the "Manage categories and payment methods" dialog in Budget → Subscriptions, in addition to being added and reordered. Removing one detaches any subscriptions still using it (they fall back to uncategorized or unspecified) and the confirmation shows how many are affected; removing a category also cleans up its mirrored Budget subcategory and detaches the linked expense entries (#551).
+
+## [1.45.1] - 2026-07-24
+
+### Changed
+- The Documents storage settings page now reads top to bottom for first-time setup: provider setup (WebDAV, Google Drive) appears above the upload-destination selector, and the provider that needs attention expands automatically. When Google Drive OAuth credentials are not configured, the page now explains which environment variables to set and links to the guide, and Connect is the primary action while disconnected.
+- Google Drive documents now use their own badge color in the Documents list, distinct from the DMS badge.
+
+### Fixed
+- The landing page and the setup wizard now list Google Drive alongside local folder and WebDAV as a document storage option (previously omitted).
+
+## [1.45.0] - 2026-07-24
+
+### Added
+- Add Google Drive as an explicitly selected storage destination for new Documents files and Calendar attachments, with least-privilege OAuth connection, testing, account safeguards, and provider status. Existing files stay on their recorded backend, and SQLite backups contain Drive metadata and file IDs rather than Drive-hosted binaries.
+
+### Fixed
+- Keep Calendar attachment access aligned with event visibility and assignees, including existing linked attachments, so private or restricted files cannot become household-visible through Documents.
+
+## [1.44.5] - 2026-07-24
+
+### Fixed
+- Deleting an individual shopping item or using "Remove checked" now permanently removes the item instead of showing an error and restoring it on refresh. Both actions used the shared undo-delete helper without importing it, so the browser stopped before scheduling the server request (#558).
+
+## [1.44.4] - 2026-07-23
+
+### Fixed
+- Custom budget categories can now be found and managed on iPad and other touch devices. The entry point for renaming, reordering and deleting categories was a bare, unlabelled icon above the transaction list; it is now a clearly labelled "Manage categories" button. The rename and delete actions themselves already existed - only the way in was hard to discover (#551).
+- Deleting a task works again. A missing import in the previous release made every task deletion fail with an error; the import was restored (#556, #553).
+
+## [1.44.3] - 2026-07-22
+
+### Fixed
+- The read-only calendar export feed (webcal/ICS) now keeps the local start time of recurring events across daylight-saving changes. Series synced from CalDAV with a time zone are exported with that zone (`DTSTART;TZID` plus a generated `VTIMEZONE`) instead of a fixed UTC time, so calendar apps subscribing to the feed no longer show them an hour off in the opposite season (#549).
+
+## [1.44.2] - 2026-07-22
+
+### Fixed
+- Calendar events synced from CalDAV or an ICS subscription that start on the 24th of a month in a specific time zone no longer jump to a wrong date and weekday. A time-zone conversion helper mishandled the day value 24 and shifted such events by weeks (for example a Wednesday series showed up on Saturday) (#549).
+- Recurring calendar events synced with a time zone now keep their local start time across daylight-saving changes. Previously every occurrence reused the series' original UTC time, so the displayed time drifted by an hour in the opposite season (for example a 07:25 event appeared as 06:25 in winter). Affected calendars correct themselves on the next sync (#549).
+
+## [1.44.1] - 2026-07-22
+
+### Fixed
+- Recurring weekday calendar events (for example a Monday to Friday school schedule) synced from CalDAV or an ICS subscription no longer disappear when the series contains individually edited occurrences. Such a modified occurrence (iCalendar `RECURRENCE-ID`) previously overwrote the whole series and collapsed it into a single stray event on an unexpected date; modified occurrences are now kept as their own entries, the original time slot is suppressed, and excluded dates (`EXDATE`, for example public holidays) are now honored on CalDAV calendars too. Affected calendars repair themselves on the next sync (#549).
+
+## [1.44.0] - 2026-07-22
+
+### Added
+- Cycle tracking now has a per-member default-visibility setting: choose whether newly logged periods and day logs start Private or Family-visible, and the choice is pre-selected in every cycle entry dialog. The visibility of any single entry stays overridable (#550).
+- Cycle settings gained an "apply to all" action that bulk-updates every existing period and day log to the chosen visibility in one step, so switching a whole history between Private and Family no longer means editing each entry by hand (#550).
+
+### Fixed
+- The example cycle data in the demo seed is now Family-visible, so period predictions no longer appear broken when viewed from another family member's account (#550).
+
+### Accessibility
+- The cycle settings hints (auto-calculation, default visibility, pregnancy mode) are now linked to their controls via `aria-describedby`, and the "apply to all" confirmation moves focus to the confirm button and is announced to screen readers.
+
+## [1.43.1] - 2026-07-22
+
+### Fixed
+- Recurring calendar events that repeat on weekdays (for example Monday to Friday) synced from CalDAV or an ICS subscription now expand correctly. Apple and iOS serialize these as `FREQ=DAILY;BYDAY=...`, which was previously treated as a plain daily repeat and produced extra instances on Saturdays and Sundays.
+- A recurring series whose start date does not fall on one of the rule's weekdays (for example a series anchored on a weekend) no longer shows a phantom instance on that start date.
+
+## [1.43.0] - 2026-07-21
+
+### Added
+- Global search empty state now shows quick-launch tiles that jump straight to a module (tasks, calendar, notes, contacts, shopping, health).
+- Global search shows a loading skeleton while fetching and announces progress and the result count to screen readers.
+
+### Changed
+- On desktop, global search opens as a centred command palette over a blurred backdrop instead of taking over the whole screen; mobile keeps its full-screen sheet.
+
+### Fixed
+- Global search no longer fires a stale request or screen-reader announcement when it is closed mid-typing.
+- The global search error message is no longer announced twice by screen readers.
+
+## [1.42.0] - 2026-07-21
+
+### Added
+- Phone numbers in Contacts are now shown formatted (national for your household's country, international otherwise), call links use the full international number, and the edit form offers a live formatting preview plus a non-blocking "looks incomplete" hint. Numbers you type are always saved and displayed exactly as entered; anything the formatter cannot parse falls back to the raw text. This is powered by a self-hosted libphonenumber-js bundle (no CDN, no new configuration).
+
+### Changed
+- CardDAV contact sync now matches existing contacts by normalized phone number, so the same number stored in different formats (for example "+49 30 12345678" and "030 12345678") no longer creates duplicate contacts. Stored numbers are never rewritten, and the previous exact-match comparison remains as a fallback.
+
+## [1.41.0] - 2026-07-21
+
+### Added
+- Categories can now be reordered by drag-and-drop in the "Manage categories" dialog (Tasks, Budget, Contacts, and Shopping), including Budget subcategories. Drag a row by its handle to move it; the up/down buttons stay as the keyboard-accessible path and each move is announced to screen readers. The new order is saved immediately and rolls back to the server order if the save fails.
+
+### Fixed
+- Dashboard widget customisation now persists variable-length layouts and future widget IDs without a duplicated backend allow-list. The preferences API validates the safe storage shape instead of owning a fixed widget registry, so adding or removing dashboard widgets no longer requires a matching server change and malformed layouts return an error instead of being silently discarded.
+
+## [1.40.7] - 2026-07-21
+
+### Fixed
+- Contacts imported via vCard now sort alphabetically within their category instead of being appended at the end in import order. Every other way of adding a contact (single create, quick-add, undoing a delete) already re-sorted the in-memory list afterward; the vCard import path was the one exception, so imported contacts could appear out of order until the page was reloaded.
+
+## [1.40.6] - 2026-07-21
+
+Follow-up to the #543 modal-save fix: the document settings dialog still failed to save.
+
+### Fixed
+- Editing a document's settings and clicking "Save" now applies the change instead of showing "An unexpected error occurred". The v1.40.3 fix that lifts the modal footer out of its form (to keep the primary action above the fold) moved the submit button out of the form element, but the document dialog still looked it up inside the form and got nothing; the resulting error was thrown before the save handler's try/catch and surfaced as a generic error toast with the dialog stuck open. The button is now resolved from the modal panel, matching every other modal, and saving works on both desktop and mobile. (#543)
+
+Fix for contact-card import corrupting names that use non-ASCII letters.
+
+### Fixed
+- Importing a contact card (.vcf) whose name is QUOTED-PRINTABLE encoded (common in vCard 2.1 exports from phone and mail apps) now decodes non-ASCII letters correctly. A name such as "Kalaycı" with the Turkish "ı" was previously imported literally as "Kalayc=C4=B1"; it now imports as written. Soft line breaks and the declared charset are honored, and the CardDAV sync parser decodes the same encoding. Plain values containing "=" (without a QUOTED-PRINTABLE declaration) are left untouched.
+
+## [1.40.4] - 2026-07-21
+
+Follow-up pass on the accessibility and interaction findings surfaced by the design critique.
+
+### Fixed
+- On phones the month calendar is no longer a dead end: every day cell is now a button (keyboard-operable with a visible focus ring and a screen-reader label such as "23 July, 4 entries"), and tapping a day - including one of its event dots - opens that day instead of only showing a popup. Desktop keeps opening an event popover from an event chip.
+- The "Latest vitals" cards on the Health overview no longer break a long metric name in the middle of the word (for example "Sauerstoffsättigung") in the narrow two-column layout; long names now break at a syllable. The vitals tab is unchanged.
+- The budget statistics trend chart now tells income and expenses apart by line style (solid vs dashed) in addition to color, so the two series stay separable for viewers with red-green color-vision deficiency; the legend mirrors the same pattern.
+- The "High" and "Urgent" priority dots (dashboard task widget and mobile calendar) are now clearly distinguishable: "High" is a brighter orange with a real lightness gap from urgent red, which reads even with color-vision deficiency, and each dot now has a tooltip naming its priority.
+- The Kanban board now shows a single "No results" state naming the search term, with a reset action, when a search matches nothing, instead of a board of empty "No tasks" columns.
+
+### Changed
+- The delete button in the calendar event popover is now visually lighter than "Edit", so the destructive action no longer carries equal weight.
+- Truncated budget category names in the mobile statistics bars now reveal the full name on hover or long-press.
+
+## [1.40.3] - 2026-07-21
+
+Bug-fix pass on three reported issues: modal saves, finance account colors, and silent reminder-delivery failures.
+
+### Fixed
+- Editing a task or document and clicking "Save"/"Apply" now applies the change. The modal footer is lifted out of its form to stay pinned above the fold, which detached the submit button from the form so the click silently did nothing. The button now keeps its form association and submits as before. (#543)
+- Creating or editing a finance account with a color no longer fails with "Color must be a valid HEX color". The account color picker stores theme-aware accent tokens (so the swatch also lightens in dark mode), and the server now accepts those tokens alongside plain hex colors, while still rejecting arbitrary CSS. (#542)
+- Reminder and notification delivery (Web Push, Gotify, ntfy) no longer breaks silently when the `reminders.pushed_at` column is missing after inconsistent migration history (e.g. a backup restored mid-migration). The database now self-heals the known critical column on startup and logs the repair, instead of the scheduler failing every 60 seconds on "no such column". (#538)
+
+Polish pass clearing the remaining P2/P3 findings from the design critique (design health 33 to 34), plus a Kanban board fix uncovered along the way.
+
+### Fixed
+- The Kanban board now shows tasks of every status. The default "open" filter was still being applied in Kanban, so the "In progress" and "Done" columns stayed empty even when tasks existed. The columns already are the status, so the filter no longer applies there, the view reloads all tasks on switch, and the filter badge counts only the filters shown as chips.
+- The month calendar no longer clips the last event mid-cell in short rows: visible capacity is measured from the real cell height (recomputed on resize) and the "+N more" row is always reserved, so nothing is cut off.
+- Empty Kanban columns show a "No tasks" hint that turns into a "Drag here" drop target while a card is being dragged, so empty columns read as valid destinations.
+- Budget tabs on narrow screens reveal the next tab (about a third peeking in) with a sharper edge fade, instead of ending flush and hiding three tabs behind an invisible one.
+- The active person chip in the Health module scrolls into view on mobile instead of sitting off-screen.
+- Recipe cards in the meal-planner sidebar show meal-type chips only for a real subset of meal types, not when a recipe fits every type (or none) where the chips carry no information.
+- Budget category bars keep a visible minimum width for non-zero amounts instead of rounding a tiny value down to an empty bar.
+- Accessibility: the mobile "More" button announces its popup (aria-haspopup), and the quick-actions FAB exposes its keyboard shortcut (aria-keyshortcuts "n" plus a tooltip); the sidebar active-pill easing moved to a single named token.
+
+## [1.40.1] - 2026-07-21
+
+Follow-up to the audit round: the two remaining P1 findings from the design critique - broken word wrapping in primary surfaces and detached form errors - plus the resulting board redesign.
+
+### Changed
+- The desktop meal planner is now a true week board: each meal-type label (breakfast, lunch, dinner, snack) sits once per row in a sticky left gutter instead of repeating in up to 28 slots, and the rows stay aligned across all days. Day columns keep a readable minimum width - when the week does not fit, the board becomes a horizontal scroll-snap window with an edge fade as scroll affordance instead of squeezing the columns.
+- Labels and titles are never hyphen-broken anymore: meal-type labels and dish names in the week board, module names in the mobile "More" sheet and health metric card labels always render whole words. The "More" sheet switched to a 3-column launcher grid so every module name fits on one line, with larger touch targets as a side effect.
+
+### Fixed
+- Required-field and validation errors in modal forms now appear directly at the offending field - message below the input (screen-reader linked and announced), error border, focus and scroll to the field - instead of a toast in the bottom corner that overlapped the modal buttons. Wired across the event modal and the meals, notes, recipes, budget, budget-plans, subscriptions and health forms; errors clear themselves while typing.
+- The demo seed script no longer crashes on a freshly migrated database.
+
+## [1.40.0] - 2026-07-20
+
+Second app-wide UX/UI audit round (51 findings across all modules, desktop/mobile), fully verified in the browser. Alongside the polish, several existing features got the visible entry points they were missing.
+
+### Added
+- Recipes open in a read view when tapping the card - ingredients and notes formatted for cooking, with editing as a deliberate follow-up action - and the recipes page gained a search box that matches titles, notes and ingredients.
+- The shopping meal-plan import shows a live preview ("4 ingredients from 1 meal will be added") for the chosen date range before anything is written, and the import button keeps its label on phones.
+- Housekeeping reports can be marked as paid directly in the list; the open/paid totals update immediately.
+- The health module surfaces its data history: vitals show a "recent measurements" list with delete actions, and the medication tab carries a collapsible intake log, so the adherence percentage finally has visible evidence.
+- Every task row offers an inline subtask quick-add; the calendar day view greets an empty day with a hint at the current time and defaults new events to the next half hour.
+- The global search overlay explains itself before typing, shows result metadata (due dates, event times, medication dosages) and is fully arrow-key navigable; the close control no longer sits between the input and the results in tab order.
+
+### Changed
+- Enabling one of the opt-in dashboard widgets (rewards, health, cycle, housekeeping) now survives a reload: the server silently dropped unknown widget ids when saving. Fresh installations also get the dense bento layout again - the server's default widget order differed from the client's and made every household look "user-sorted".
+- One accent per module now leads consistently through shared components; the quick-capture button on the health overview is called "Einnahme" to match its singular siblings, and the import preview is grammatically correct for a single meal in all 23 languages.
+- On phones, the budget summary is a true compact row (the compact styles were shadowed by rule order and never applied - the balance card overflowed the viewport), and the dashboard no longer parks ~200px of dead space before the bottom bar.
+- Switching tasks to the kanban view clears the status filter instead of applying it invisibly; the kitchen keyboard chords list their concrete destinations (meal plan, recipes, shopping) in the help dialog.
+- Settings show a breadcrumb on desktop and a back link on phones, the WebDAV backup warning only appears while WebDAV is enabled, the family list uses the shared row-action grammar, the signed-in account carries no self-delete button, and housekeeping staff are labeled as such instead of as members.
+
+### Fixed
+- Documents no longer strand an unclosable ghost context menu over the grid after switching folders or opening a second row menu in quick succession (the popover close event races the new menu's registration).
+- Budget entry rows are keyboard-accessible: focusable, Enter opens editing, with a visible focus ring; notes with a color outside the palette preselect that color as a tabbable swatch instead of losing the keyboard entirely.
+- Month cells budget their space honestly: holidays, events and tasks share the slots and everything beyond shows as a "+N more" line at the end of the cell instead of being silently swallowed.
+- Modal footers stay pinned to the panel on phones across all six creation dialogs (including subscriptions, whose footer was trapped inside the metadata grid).
+- Mobile health tabs signal hidden siblings with an edge fade and scroll the active tab into view after a reload; the rewards history keeps its side padding and no longer hides its last row behind the floating button.
+- The budget statistics chart draws three gridlines with a labeled midpoint and starts its readout on the newest day that has data; the blood-pressure axis uses integer ticks; an empty activity week shows a single message instead of two stacked empty states.
+- Active filter chips tell screen readers how to remove them, and the task status chip announces its action.
+
+## [1.39.0] - 2026-07-19
+
+App-wide UX/UI audit (all modules, light/dark, desktop/mobile). The findings, the priorities and what was deliberately left alone are documented in `docs/ux-audit/`.
+
+### Added
+- Every horizontally scrolling chip and tab row signals hidden content with a soft edge fade: budget tabs, document category chips, contact categories, the health person switcher and the mobile calendar view switcher share one mechanism that reacts to scrolling, resizing and content changes. The budget tab bar previously clipped its last tab on narrow desktops without any hint that more tabs existed.
+
+### Changed
+- The desktop sidebar keeps the active module in view: navigating to a module below the fold scrolls it into sight, soft fades at the top and bottom edges replace the hidden scrollbar as an overflow hint, and a tighter item height lets all modules fit on common laptop screens. Previously Budget, Health and Settings were simply invisible on a 1440x900 display, with nothing suggesting the list scrolls.
+- Deleting a whole shopping list now asks for confirmation, since it takes all its items with it; single items and the checked-items sweep keep the 5-second undo toast. This mirrors the Budget convention where confirmation is reserved for cascading deletions.
+- The shopping category dialog uses the same shared category manager as Tasks, Contacts and Budget, including the category icons in its rows and localized in-use/last-category error messages.
+- The add button in the shopping quick-add row follows the module color instead of the global accent, matching the floating action button on the same screen.
+
+### Fixed
+- The edit and delete actions on shopping items are visible again. They used the disabled text color with additional transparency (roughly 1.2:1 contrast) and were effectively invisible on phones, where the hover reveal never happens.
+- The shopping list header no longer collapses into ragged rows on phones: the list name gets its own line, all actions share a single row, and the "clear checked" label shortens with an ellipsis instead of pushing an orphaned icon onto a third row.
+- The meal plan week board is readable on smaller desktops (1024-1439px): day headers show a compact date without the year, meal type labels truncate with a real ellipsis, entry titles wrap to two hyphenated lines, and the recipe sidebar narrows so seven day columns keep usable width. Headers previously collided ("MO13.07.202") and entries were cut after a handful of characters.
+- Deleting something and closing or reloading the tab within the undo window no longer loses the deletion. The server call only ran after the 5-second undo period, so leaving early meant the entry quietly reappeared on the next visit; pending deletions are now flushed with a keepalive request when the page is left. Undoing the deletion of a recurring budget series also restores the view immediately instead of leaving it empty until the next reload.
+- Keyboard focus is clearly visible on the shopping quantity and category fields, the profile picture button in Settings, subscription provider suggestions and contact row menus. The checkbox "pop" animation respects the reduced-motion preference.
+- Module names in the mobile "More" sheet hyphenate at proper syllable boundaries with a visible hyphen instead of breaking mid-word at whatever character happened to hit the edge.
+- The "Sauerstoffsättigung" label no longer overflows its tile on the health overview.
+- The one remaining formal-address string in the German locale (geolocation not supported, "Ihrem Browser") now uses the informal address like the rest of the app.
+
+## [1.38.0] - 2026-07-19
+
+### Added
+- Contacts keep the structured name components of a vCard (given, family, additional, prefix, suffix) instead of only the combined `FN` string. CardDAV sources format that string however they like — `Given Family` on one server, `Family, Given` on the next, sometimes with a title mixed in — which made the list read and sort differently depending on where a contact came from. The display name is now composed as `First [Middle] Last` from the components, and the list sorts by last name. `FN` remains the fallback for cards whose `N` carries no name parts, such as organisation entries.
+- The contact dialog has separate fields for first and last name, grouped under one required marker: at least one of them must be filled. A contact that has no components yet is pre-filled by splitting its display name at the last word, and that guess is only saved once a name field is actually edited — so changing a phone number never invents a surname for a company contact.
+- The vCard export writes real `N` components where they exist, and the import reads them, so a contact exported from Yuvomi and read back elsewhere keeps its name structure.
+
+### Changed
+- Existing CardDAV contacts are picked up on the next sync: contacts created purely from a vCard also get their display name normalised once, while contacts that were adopted from a local entry keep the name the household gave them.
+- The duplicate check during vCard import compares both name orders and the comma form, so re-importing a contact that is already synced under `Family, Given` is recognised instead of silently offered as new.
+
+### Fixed
+- Editing a contact whose category is not in the managed list no longer moves it to a different category. The dropdown had no matching entry, silently displayed the first category and wrote it on save; the contact's actual category is now offered as its own option and left untouched unless it is changed deliberately.
+- Family and shared-expense guest contacts drop stale name components when the member's display name changes, so the list no longer sorts them under a surname that is no longer part of their name.
+
+## [1.37.1] - 2026-07-19
+
+### Fixed
+- The document preview in the DMS link dialog is large enough to recognise a document by. At 40×40 it showed a grey smudge and the filename remained the only way to tell two documents apart; the tile is now page-shaped and cropped from the top, so the header of the page stays readable. Selecting it opens a full-size preview over the dialog, with "open in DMS" and "link" right there — Escape closes the preview first, not the whole dialog. Where no thumbnail exists (Papra, or a failed fetch), the tile falls back to the direct link into the DMS as before.
+
+## [1.37.0] - 2026-07-19
+
+### Added
+- The trend chart in Budget → Statistics gives up its values. It drew two coloured lines without a single readable number; it now labels its scale maximum and the period bounds, and every data point can be selected to show its income and expenses — by pointer, by touch and by keyboard. The whole curve is one tab stop: arrow keys walk the points, Home and End jump to the ends, and each point carries its values in its accessible name, so the readout does not depend on hovering.
+- Budget → Subscriptions can clear its filters. Four filters and a search could be combined, with no way back other than resetting each control; a "Reset filters" button now appears whenever something is narrowing the list. A list filtered down to nothing says so and offers the reset, instead of showing the "no subscriptions yet" state with its "add subscription" button.
+
+### Changed
+- Every Budget tab now declares whether the month is its frame of reference. Month navigation appears as a whole or not at all — previously the Loans tab hid the arrows but kept the month label and the "current month" button, which did nothing there.
+- The floating action button creates what belongs to the tab in view: an entry, an account, a budget, a subscription, a loan or a shared expense. On Loans it opened the entry dialog rather than the loan dialog, and on Statistics — a tab with nothing to create — it offered to add an entry.
+- A new entry is dated in the month being viewed. Paging back to March and adding an entry filed it under today, so it disappeared from the list at the moment it was created. In the current month the date still defaults to today.
+- Deleting a monthly budget or savings goal is undo-based like every other deletion in the module, instead of asking for confirmation first. Within Budget, a confirmation dialog is now reserved for deletions that cascade, such as accounts.
+- The expense donut uses its own data-series palette instead of borrowing the accent colours of Shopping and Meals, and draws at most seven slices, aggregating the rest into "Other". Beyond eight categories it previously reused colours, so two slices could look identical. The palette carries at least 3:1 contrast against the page background in both light and dark themes.
+- Account colours are chosen by name — "Teal", "Blue", "Violet" — where screen readers previously read out the hex code. The swatches come from theme tokens, so they lighten in dark mode.
+- Budget filters no longer outlive a visit to the module. The account drill-down and the loan status filter stayed active after navigating away and back, the latter without any visible sign.
+- Statistics and Plan show a loading skeleton instead of an empty area while their data arrives, matching the Budget tab.
+
+### Fixed
+- The range switcher in Budget → Statistics can be operated with a keyboard. It was marked up as a tablist whose buttons were not tabs, so assistive technology announced an empty tablist and the arrow keys did nothing. The same applies to the My budget / Household switcher, whose single tab stop had no arrow-key navigation — a keyboard trap in which only one of the two options was reachable.
+- The trend chart and the donut carry a text summary for screen readers, as the category chart on the Budget tab already did. Both were purely visual: their accessible name was the chart title and nothing else.
+- The loan status filters and the per-loan filter button report their state through `aria-pressed` instead of colour alone.
+- `hidden` is honoured on shared controls. The floating action button and `.btn` elements set `display` at the same specificity as the browser's own rule for hidden elements, so an element hidden by a page stayed on screen. The same trap had already been patched separately in Documents, Contacts and Budget; the guard now sits once for all shared controls.
+- The "all categories already budgeted" notice in Budget → Plan is styled again. It requested an `'info'` toast, a variant that does not exist — the same defect class as the eight modules corrected in 1.36.0, of which this call was the last survivor.
+- Loan repayments no longer fall back to an English title and a German category name in all 23 languages.
+- The month-comparison line under the summary cards is fully translated and uses icons rather than the ▲ and ▼ text characters, which fall outside the icon family and vary in width between fonts.
+- Opening an account statement keeps the keyboard focus in the page instead of dropping it to the top, and the inline "new category" dialog traps focus, closes on Escape and on a click outside, and returns focus to the control that opened it.
+
+## [1.36.0] - 2026-07-19
+
+### Added
+- Tasks has a search field in the module head. It filters the list and the Kanban board instantly by title and description, on top of the existing status, priority and person filters. Tasks was the only list-heavy module without one. A search without hits names the query instead of claiming the module is empty and offering a "create task" button.
+- Notes can be filtered by author. A chip row below the module head narrows the board to one person's notes; it appears only once at least two people have written notes, and clicking the active chip clears the filter again.
+- Pinned notes sit under their own "Pinned" heading, the rest under "Other notes". They were always sorted first, but the boundary was only inferable from the ring drawn around the card.
+
+### Changed
+- The Tasks toolbar keeps its secondary controls visible instead of folding them into an overflow panel. View switch, grouping and bulk selection sat behind a `<details>` trigger on phone and tablet widths, which hid both the controls and their current state — the same pattern that was discarded in Documents in 1.22.2. Tasks now follows the layout Documents and Contacts already use: a wrapping module head above a permanently visible filter row that carries the filter chips and the grouping choice.
+- A note can be deleted from the opened note. In reading mode the entire dialog footer was hidden, so an opened note offered no action other than closing it — unlike the task dialog, which carries its delete action inline. Cancel and Save stay editor-only.
+- Long notes no longer crowd out the board. A note's preview is height-capped; the full text stays one click away in reading mode.
+
+### Fixed
+- Every filter in Tasks can be operated with a keyboard. The chips for status, priority, person, "assigned to me", "show scheduled" and the recently-used filter sets were `<span>` elements with click handlers, so the entire filter row was reachable by pointer only — while Documents and Contacts already rendered the same shared chip class as buttons. The chips now report their state via `aria-pressed`.
+- The subtask list can be opened without a mouse. Its only opener was the progress bar, a `<div>`, and the list itself is hidden by default, so there was no keyboard path to the subtasks at all. The bar is now a button reporting `aria-expanded`.
+- A task can be opened from its title in both the list and the Kanban board, and a note from a new open button on its card. All three were non-focusable containers; on the note card only pinning and deleting were reachable, so a note could not be read or edited by keyboard at all.
+- The view and grouping switches report the active option to assistive technology instead of signalling it through colour alone.
+- The last row of notes is no longer covered by the floating add button. The notes grid scrolls on its own and reserved no room for it, unlike the tasks list.
+- Error toasts show as errors again. Eight modules passed an unsupported `'error'` variant to the toast helper, which knows only `default`, `success`, `warning` and `danger`. Those messages rendered as neutral notices and were announced politely rather than assertively; 49 calls corrected across Budget, Budget plans, Calendar, Contacts, Dashboard, Meals, Notes and Recipes.
+
+## [1.35.0] - 2026-07-19
+
+### Added
+- Documents can be uploaded several at a time. Picking or dropping multiple files creates one document per file, each taking its file name as the title while sharing the chosen category, folder and visibility; the submit button reports which file is currently being uploaded.
+- The document list can be sorted by last modified, name or size. The choice is remembered per browser.
+- Documents has a bulk selection mode. A toolbar toggle turns cards and rows into checkboxes and reveals actions to move the selection into a folder, archive or restore it, or delete it — deletion with the same five-second undo as a single delete.
+- The list view now carries the modification date and file size as their own columns. Previously it showed neither, so switching from grid to list removed information instead of adding it.
+- The document overflow menu gained a "move" action, so a document can be filed into a folder without opening the edit dialog.
+- The upload dialog links to the document storage settings for admins. Those settings were not reachable from the Documents page at all.
+
+### Changed
+- Category filters are now facets over the actual data: only categories that hold documents appear, each with its hit count, and the category row scrolls horizontally in a single line. Fifteen permanently expanded filter chips previously consumed 461px of height on a narrow window and pushed the first document below the fold; the filter area is now 66% shorter there and 34% shorter on the desktop.
+- Category and folder counts are computed against each other but not against themselves, so no visible count leads to an empty result. Filtering by category no longer reloads from the server and takes effect immediately.
+- The upload dialog asks for the file first, since the file supplies the name. The name field is optional and falls back to the file name, the category defaults to "other" instead of "medical" (the first list entry), and the file picker is restricted to the accepted MIME types with the size limit taken from the server rather than a client-side copy.
+- Visibility moved out of the collapsed "more settings" section into the visible form. It is the module's central promise and was hidden behind a disclosure.
+- The document overflow action for editing is labelled "edit" rather than "settings", matching every other module and the pencil icon next to it.
+- Documents share the filter chip styling with Tasks instead of maintaining a fourth near-identical copy. The shared definition now lives in `public/styles/filter-chip.css`.
+- The document and folder context menus use the browser's native popover, which brings light dismiss, Escape handling and focus return without hand-written event management.
+- Linking a document from a DMS no longer silently inherits the currently active category filter; it is filed under "other" and can be changed afterwards.
+
+### Fixed
+- The empty state told the truth. A search without hits, an empty filter and an empty archive all showed "No documents yet" and offered an upload button, while the folder browser next to it counted six documents. There are now four distinguishable states, each naming its actual cause and offering the action that resolves it.
+- Document dialogs lost the module accent colour. They render outside the page root where `--module-accent` is undefined, which made every declaration built on it invalid: the drop zone stayed grey and its keyboard focus ring disappeared entirely.
+- The drop zone shows keyboard focus. Its file input is visually hidden but tabbable, so the focus vanished without a trace when tabbing through the dialog.
+- The "link from DMS" button was visible even without a configured DMS account, because the button's own `display` overrode the `hidden` attribute. It also no longer shifts the toolbar when the account list finishes loading.
+- Compact filter chips keep a 44px touch target on tablets. The rule was tied to viewport width rather than pointer accuracy, leaving 32px chips between 768 and 1023px.
+- A failed DMS search is no longer disguised as an empty result. An unreachable DMS reported "no matches"; it now shows an error with a retry, and the search field has a visible label instead of a placeholder alone.
+- Undoing a document deletion restores the sort order instead of forcing an alphabetical one, and a pending deletion no longer redraws a page that has since been left.
+
+## [1.34.1] - 2026-07-19
+
+### Fixed
+- A failing page no longer takes the navigation down with it. When a module threw during rendering, the error card replaced the entire app container - including the sidebar and the bottom navigation - so the message spread across the navigation column and the only way out was a reload. The error is now rendered into the content area alone; the navigation stays usable and the failing page can simply be left.
+- The error card names the actual failure. "An unexpected error occurred" was all a user got, while the only usable information (error type, message, stack) sat in the browser console. A collapsed "Technical details" section now carries it, readable and copyable without opening developer tools.
+- The time suffix is no longer appended to 12-hour times. Calendar and Overview rendered "3:00 PM Uhr", mixing both notations; the suffix belongs to the 24-hour form only. A shared `timeSuffix()` helper now returns an empty string when the 12-hour clock is selected, and both pages use it instead of reading the translation key directly.
+- `public/i18n.js` contained a raw NUL byte as a cache-key separator, which made git treat the file as binary and rendered every diff on it unreadable. It is now written as an escape sequence; behavior is unchanged.
+
+## [1.34.0] - 2026-07-19
+
+### Fixed
+- Unchecking an address book in Settings → Sync → Contact sync no longer fails with "HTTP 404" (#534). The page called an endpoint that never existed (`POST /accounts/:id/addressbooks/toggle`) while the API offers `PUT /contacts/cardav/addressbooks/:id` — the request was rejected before reaching any handler, which is why nothing appeared in the server log. Toggling now persists and affects only the selected address book.
+- Contact sync showed raw server URLs instead of address book names, and the account card left out the server URL and last-sync time. All three read fields the API does not send (`display_name`, `cardav_url`, `last_sync` instead of `name`, `cardavUrl`, `lastSync`). The same field-name bug also made Calendar sync and Reminder sync report "Not connected / Never synced" for every CalDAV account regardless of state.
+- Sync failures are no longer invisible. A failing address book (for example a server answering `501 Not Implemented`) previously left the account reporting "Connected"; the error only existed in the container log. The failure is now stored per account and per address book, outranks the success state, and is shown on the row that caused it with the list expanded.
+- Destructive actions in Settings had no danger styling: `.btn--danger-outline` was used in ten places but never defined, so "Disconnect", "Delete" and "Log out" fell back to the browser default — black text on a near-black surface in dark mode (1.3:1). The same audit found `.btn--active` (bulk-select in Tasks) equally undefined, leaving its active state invisible.
+- Contact sync was unusable on phones: a long account URL stretched the card to 582 px inside a 309 px column, pushing "Disconnect" out of the viewport with no way to scroll to it. Address book names are no longer truncated on narrow screens.
+- Toggling an address book or calendar no longer drops keyboard focus to the top of the page, and the sync button stays reachable by keyboard while it is inactive.
+- Server error messages reached the interface in German regardless of the selected language. Responses now carry a stable `errorCode` that the client translates.
+
+### Added
+- CardDAV accounts can be edited (name, server URL, username, password). A rotated password no longer means deleting the account and re-selecting every address book; leaving the password field empty keeps the stored one. A URL and username that already belong to another account are rejected with a clear message.
+- "Enable all" / "Disable all" for accounts with more than one address book — one bundled request instead of one click per entry. If a single request fails, only that row stays unchanged.
+- Sync status now distinguishes a real server error from an expected setup gap: an account without any enabled address book is shown neutrally and its sync action is disabled instead of reporting success for a non-event.
+
+### Changed
+- `t()` selects plural forms via `Intl.PluralRules`, so counted strings read correctly ("1 address book enabled" instead of "1 address books enabled"). Locales that need no distinction are unaffected.
+- Contact sync and Calendar sync now share one visual grammar: identical card structure, one disclosure component, one status vocabulary, and a three-step button hierarchy (sync, maintenance, destructive).
+- The confirmation for disconnecting an account names the account and states the consequence separately, and canceling the edit dialog now runs through the same unsaved-changes guard as pressing Escape.
+
+## [1.33.0] - 2026-07-19
+
+### Added
+- Calendar recurring events now offer the standard scope choice when you edit or delete a single occurrence — this event, this and following, or the whole series (#532). Previously deleting an occurrence removed the entire series and editing always rewrote it. Both actions now use one shared control that defaults to "only this event" (the least-destructive option) and shows which occurrences the choice affects. "Only this event" edits create a detached single event and record an exception; "this and following" splits the series (truncating it with an `UNTIL` bound and starting a new series from the occurrence with the edited fields); "whole series" edits keep the series' original start instead of re-anchoring it to the edited instance. Offered for local series only — externally synced series (Google/Apple/CalDAV/ICS) keep whole-series behavior, since the change would return on the next sync.
+
+## [1.32.0] - 2026-07-19
+
+### Added
+- Linked DMS documents now show a compact first-page thumbnail so the right file can be recognized without opening it (#533). In the documents list, Paperless-linked documents render a thumbnail over the category glyph, and the "Link from DMS" picker previews each hit with a thumbnail plus filename and file type before linking. The picker preview also opens the original document in the DMS in a new tab. Thumbnails are proxied server-side (visibility-enforced for the list, admin-only for the picker), restricted to a raster-image allowlist with `nosniff` and a strict CSP, and gracefully fall back to the category icon whenever a preview cannot be generated (for example providers without a thumbnail endpoint, such as Papra).
+
+## [1.31.6] - 2026-07-19
+
+### Fixed
+- Follow-up hardening for the CardDAV contact import (#531): imported contacts whose category could not be mapped no longer downgrade an existing, manually chosen category when an already-local contact is adopted during sync; the category fallback now also stays valid when the household has deleted the default "misc" category. The manual `.vcf` file importer's vCard unescaping was switched to the same single-pass logic as the CardDAV sync, closing an ordering edge case with `\\` escape sequences. Behavior is unchanged for normal contacts; this only affects the edge cases above.
+
+## [1.31.5] - 2026-07-19
+
+### Fixed
+- CardDAV contacts synced from servers such as mailbox.org were imported but displayed incorrectly (follow-up to #529). Three issues are fixed: (1) names and other fields kept literal vCard escapes such as `Surname\, Given` — values are now unescaped (`\,`, `\;`, `\\`, `\n`) and structured fields (N, ADR) are split only on unescaped separators; (2) phone numbers, email addresses and postal addresses were missing in the list and edit dialog because sync only populated the multi-value tables — the primary phone/email/address are now also written to the base contact fields the list reads; (3) contacts with no mapped category were stored under the localized fallback `Sonstiges` instead of the stable key `misc`, causing them to group under "Other" while the edit dialog fell back to its first option — unmapped categories now consistently resolve to `misc`. A migration heals already-synced contacts on upgrade (escaped names, `Sonstiges` → `misc`, missing primary phone/email); manually created contacts are left untouched. (#531)
+
+## [1.31.4] - 2026-07-19
+
+### Fixed
+- Calendar day and week views: the hour labels in the left time gutter were clipped when using the 12-hour clock, dropping the leading digit (e.g. "8:00 AM" showed as ":00 AM"). The gutter was a fixed 48px, too narrow for right-aligned 12-hour labels like "10:00 AM"/"12:00 PM", so the overflow was cut off at the edge. The gutter now uses a shared `--cal-gutter-width` token wide enough to hold 12-hour labels; 24-hour clock is unaffected. (#526)
+
+## [1.31.3] - 2026-07-19
+
+### Fixed
+- Adding a medication failed with a generic "An unexpected error occurred" toast and never saved, even with a fully valid form. The medication form's `<form>` element and its "Form" input shared the same id, so reading the field value threw before the request was ever sent (no server-side log). The input now has a unique id and the value reader is null-safe. (#528)
+- Paperless connection test returned "406 Not Acceptable" behind reverse proxies such as Traefik. The test hit the API root `/api/`, which redirects to the Swagger HTML view and rejects the JSON `Accept` header. It now tests the real JSON endpoint `/api/documents/?page_size=1`, which avoids the redirect and also verifies the token and document access. (#527)
+- CardDAV sync reported "0 contacts synced" with servers such as mailbox.org. The default address-book query filters on `FN`, which some servers answer with an empty result even when the address book is full. When the filtered query returns nothing, sync now enumerates the contact URLs via a filter-free PROPFIND and fetches them by multiget. (#529)
+
+### Fixed
+- Birthday calendar entries now show the birthday label in your own language (e.g. "Geburtstag: …" in German) instead of always "Birthday: …". The entry title and description are translated on display across the calendar (month, week, day, agenda), the event popup, the dashboard's upcoming-events widget, and search results, in all 23 supported languages. Existing birthdays are covered automatically; nothing needs re-importing.
+
+## [1.31.1] - 2026-07-19
+
+### Fixed
+- Documents page: the category filter chips could not be reached on desktop when they overflowed the row, because the horizontal scroll had no visible scrollbar and desktop has no swipe gesture. On desktop the filters now wrap onto multiple lines so every category stays reachable; touch devices keep the swipeable single-row strip.
+- Documents page: the "Link from DMS" button was oversized on mobile. It now collapses to a compact icon button next to the view toggle (its label is preserved as an accessible name and tooltip).
+
+## [1.31.0] - 2026-07-18
+
+### Added
+- Mobile PDF preview: PDFs now render inline in the document viewer on iOS Safari and other mobile browsers that leave `<iframe>`/`<embed>` blank, using a self-hosted pdf.js canvas renderer (no CDN). Pages render lazily with a memory cap, the modal body is the single scroller, and a sticky page indicator shows position. Desktop browsers keep their native inline PDF viewer.
+- PDF preview accessibility: a screen-reader note explains the graphical preview and points to the always-available "open in new tab" and download actions; load completion is announced, and a single unrenderable page shows an inline error instead of loading forever.
+
+### Changed
+- PDFs with non-embedded standard fonts (Helvetica/Times/Courier) now render correctly on mobile via self-hosted pdf.js standard font data.
+
+## [1.30.0] - 2026-07-18
+
+### Added
+- vCard import now handles files that contain multiple contacts (previously only the first contact was imported) and reads each contact's birthday. Nothing is created silently: a selection dialog lists the parsed contacts with checkboxes so you choose exactly who to import, entries whose name already exists are pre-unchecked and flagged as likely duplicates, and cards without a name are reported as skipped. Imported birthdays become available in the Birthdays module, and when a birthday is present the result offers a one-click shortcut straight into the Birthdays "Import from contacts" dialog.
+
+### Changed
+- Contact import now reports its result in a single toast (imported / with birthday / failed) instead of up to four stacked toasts, with correct singular/plural wording across all 23 languages. Failed creations name the reason and offer a one-click retry of only the failures.
+- Exported contact vCards now include the birthday (BDAY) when the contact has one, so an export/import round-trip preserves it.
+
+## [1.29.0] - 2026-07-18
+
+### Added
+- Number and currency formatting now follows your selected Region, not just the display language (#521). Picking "Deutsch (Schweiz)" (or any region) under Settings > Personal > Appearance now formats amounts with that region's grouping and decimal separators, for example the Swiss `123'456.78` instead of `123.456,78`, across Budget, Subscriptions, Split Expenses, Housekeeping, Rewards, Health and the Dashboard. This is independent of the interface language, so a German-language household can still display Swiss-formatted numbers. Previously formatting was tied to the two-letter language code and there was no way to reach the Swiss (or any region-specific) number format.
+
+### Changed
+- The Region setting's hint now states that it also controls the number format and shows a Swiss example, so the feature above is discoverable at the point of decision (all 23 languages). The hint is now announced to screen readers together with the selector, and non-admin members see a short "only administrators can change region and format" note instead of an empty heading.
+- Number formatters are now cached per region and options instead of being rebuilt for every displayed value, reducing redundant work on money-heavy screens.
+
+### Fixed
+- Budget CSV export no longer risks splitting the amount into two columns. The amount was formatted with a comma decimal separator inside a comma-delimited file, which could break the column in spreadsheet imports; it now uses a dot decimal without thousands grouping, which is unambiguous and matches the region-aware on-screen format for dot-decimal locales (#521).
+
+## [1.28.0] - 2026-07-18
+
+### Added
+- Import birthdays directly from your contacts instead of retyping them (#518). A new "Import from contacts" action on the Birthdays screen opens a selection dialog listing every contact - synced via CardDAV or entered locally - that already has a birthday stored. You tick the individual people you want and only those are added, so the rest of the address book stays out. Already-imported contacts are shown with a check mark and an "already added" label and cannot be added twice; contacts without a stored birthday are listed separately so you can fill them in by hand. Manual birthday entry stays fully available. Each imported birthday is linked to its source contact, and photos are intentionally not carried over.
+
+## [1.27.18] - 2026-07-18
+
+### Changed
+- Documented the two existing SSRF opt-in environment variables that let internally-resolving (LAN / private IP / internal-DNS) URLs be used, which were previously only mentioned in `.env.example` and the Unraid template (#520). `ICS_SUBSCRIPTION_ALLOW_PRIVATE_NETWORK` (for ICS calendar subscriptions) and `DOCUMENT_STORAGE_WEBDAV_ALLOW_PRIVATE_NETWORK` (for WebDAV document storage) are now covered in the README (EN and DE) and the installation guide's environment-variable tables, including why the check exists and why it stays an environment-level rather than a web-UI setting. Documentation only; no behaviour, data model or configuration changes.
+
+## [1.27.17] - 2026-07-18
+
+### Fixed
+- CalDAV inbound sync no longer freezes the whole app while a calendar is being synced (#519). The per-object parse-and-upsert loop ran entirely synchronously, blocking Node's single-threaded event loop - and therefore every navigation and API request - for the full duration of the sync (1-2 minutes for a sizeable calendar). The loop now yields to the event loop in batches, so requests keep being served while a sync runs, and its SQL statements are prepared once instead of re-prepared per event, shortening the work window. No data model, API contract or configuration changes.
+
+## [1.27.16] - 2026-07-18
+
+### Changed
+- Internal quality hardening: split the oversized calendar route module (`server/routes/calendar.js`, ~1515 lines) into a thin orchestrator plus focused cluster routers under `server/routes/calendar/` (shared helpers, read/list/search, Google sync, Apple sync, ICS subscriptions and import, export feed and holidays, event CRUD, CalDAV events and reminders). The mount point, all 45 route paths, their registration order (specific paths stay ahead of the `/:id` catch-all), request validation and response shapes are byte-identical, proven by the unchanged green calendar test suites plus a new structure guard that pins the full route table, cluster disjointness, the catch-all ordering and the re-exported test surface. This is a pure code reorganisation; no data model, API contract, configuration or upgrade steps change.
+
+## [1.27.15] - 2026-07-18
+
+### Changed
+- Internal quality hardening: split the oversized health route module (`server/routes/health.js`, ~1280 lines) into a thin orchestrator plus focused per-tab cluster routers under `server/routes/health/` (shared helpers, vitals, medications, labs, activities, CSV export, cycle). The mount point, all 41 route paths, request validation and response shapes are byte-identical, proven by the unchanged green health test suites plus a new structure guard that pins the full route table and cluster disjointness. This is a pure code reorganisation; no data model, API contract, configuration or upgrade steps change.
+
+## [1.27.14] - 2026-07-18
+
+### Changed
+- Internal quality hardening: added end-to-end test coverage for two previously undertested route layers. Housekeeping (the dashboard aggregation, the monthly summary, the work-sessions and visits read handlers with their month and worker filters and validation, the decay-task urgency sorting, the payment-task coupling path - creating and updating the linked to-do and calendar event and marking it done on payment - and the hourly-billing branches for check-out and edit). Subscriptions (the metadata and settings endpoints, payment-method creation with its duplicate guard, the sort-order endpoint with its budget-subcategory cascade, the full payload-validation sweep, subscription deletion with reminder and budget-entry cleanup, the list filters, the budget-expense update branch, and the personal-mode authorization path that blocks editing another member's private subscription with no admin bypass). This is tests only; no user-facing behaviour, configuration or upgrade steps change.
+
+## [1.27.13] - 2026-07-18
+
+### Changed
+- Internal quality hardening: added end-to-end test coverage for two previously undertested route layers. Dashboard (the data-populated widget branches that the existing tests never exercised: urgent tasks with assignments, upcoming events with assignments, shopping lists with open items, the monthly savings-goal budget field, and the medication-schedule branches covering non-null day masks, future and expired schedule windows, taken/skipped dose logs and next-dose selection, plus the critical error path). Contacts (multi-value phone/email/address fields on create and update with replacement semantics, list filtering by category and query, the vCard 3.0 export with character escaping, the address-field validation branches, and the 404/403 paths including the family-member deletion guard). This is tests only; no user-facing behaviour, configuration or upgrade steps change.
+
+## [1.27.12] - 2026-07-18
+
+### Changed
+- Internal quality hardening: added end-to-end test coverage for three previously undertested route layers. Split expenses (group metadata, the personal dashboard with guest confinement, member candidates, the paginated expense list with search/category/recurring filters, comments, the activity log, cross-entity search, recurring-expense create/pause, and the guest/contact provisioning paths including collision-free username assignment and contact-to-guest adoption). Health (a 400 sweep for non-numeric ids across every id route, from/to range filters, the full partial-update field set for medications, schedules, labs, activities and cycle periods, dose-log schedule linkage, the activities CSV export with range and person filters, cycle-log deletion, and non-owner deletion guards). Tasks (the full task update endpoint with assignment replacement and point clamping, the filter options endpoint excluding housekeeping workers, category rename/delete with in-use and conflict guards, list filters, nesting-depth limits and status transitions). This is tests only; no user-facing behaviour, configuration or upgrade steps change.
+- Removed an unused internal helper (`subtaskProgress`) from the tasks route module; subtask progress is already computed inline in the list query. No behaviour change.
+
+## [1.27.11] - 2026-07-18
+
+### Changed
+- Internal quality hardening: added end-to-end test coverage for two previously undertested route layers. Reminders (the due-reminder feed with its task/event/subscription title joins and birthday-sync side effect, the create/read/update validation paths, dismissing a reminder, and deleting one or all reminders of an entity, all with per-user isolation and no admin bypass). Household preferences (the field-by-field settings update with per-field validation and admin-only gates for module toggles, health, rewards, weather and holiday configuration, the per-user weather override object, the holiday configuration block with its cascade cleanup, the holiday lookup routes, and the defensive fallbacks when stored settings are corrupt). This is tests only; no user-facing behaviour, configuration or upgrade steps change.
+
+## [1.27.10] - 2026-07-18
+
+### Fixed
+- Editing or deleting another member's calendar subscription (iCal feed) as a non-owner now correctly returns HTTP 403 instead of 500. The action was already rejected and no data was touched; only the reported status code was wrong.
+
+### Changed
+- Internal quality hardening: added end-to-end test coverage for the previously untested route layers of the calendar (date-range listing with assignee/source filters and visibility enforcement, recurring-series expansion, full-text search, admin-only sync gates, ICS subscriptions, one-time ICS import, the export feed, holidays, single-event CRUD, reset and single-occurrence exceptions), the family members endpoint (housekeeping-worker exclusion, case-insensitive sorting, contact and birthday joins), and the rewards module (admin gates, redemption authorisation, the parent-approval flow, decision idempotency, and point reservation/reversal integrity). Apart from the status-code fix above this is tests only; no data model, configuration or upgrade steps change.
+
+## [1.27.9] - 2026-07-18
+
+### Changed
+- Internal quality hardening: added end-to-end test coverage for the previously untested third-party module registry (manifest validation, path-traversal protection, error fallback for broken manifests, admin visibility filter, enable/disable persistence, asset delivery) and for the budget entry route layer (monthly summary, CSV export with formula-injection protection, filters, virtual budgeting, loan-repayment coupling, recurring-series visibility propagation and skip marking). This is tests only; no user-facing behaviour, configuration or upgrade steps change.
+
+## [1.27.8] - 2026-07-18
+
+### Changed
+- Internal quality hardening: added end-to-end test coverage for the previously untested database backup and restore route layer (admin-only access gates, status, manual backup trigger, database download, restore validation and size limits, a full backup-restore round-trip, and WebDAV backup configuration). This is tests only; no user-facing behaviour, configuration or upgrade steps change.
+
+## [1.27.7] - 2026-07-18
+
+### Changed
+- Internal quality hardening: added end-to-end test coverage for the previously untested route layers of recipes and birthdays (authorisation gates, validation, ingredient rules, partial updates, calendar-artefact cleanup), keeping the birthday tests independent of the system clock. This is tests only; no user-facing behaviour, configuration or upgrade steps change.
+
+## [1.27.6] - 2026-07-18
+
+### Changed
+- Internal quality hardening: added end-to-end test coverage for the previously untested route layers of the meal planner, shopping lists, notes and budget categories, and made one meal-planner test independent of the system clock. This is tests only; no user-facing behaviour, configuration or upgrade steps change.
+
+## [1.27.5] - 2026-07-17
+
+### Changed
+- Internal quality hardening: added end-to-end test coverage for the previously untested route layers of shared expenses, access permissions, budget loans and housekeeping, and introduced a dependency-free code-coverage reporter (`npm run coverage`). This is tests and tooling only; no user-facing behaviour, configuration or upgrade steps change.
+
+## [1.27.4] - 2026-07-17
+
+### Changed
+- Internal code organisation: the large budget routes file was split into per-domain modules (entries, categories, loans, accounts, plans, statistics) behind a thin orchestrator. This is a refactor only; every budget endpoint, request and response is unchanged, and no configuration or upgrade steps are required.
+
+## [1.27.3] - 2026-07-17
+
+### Changed
+- Internal code organisation: the large OpenAPI specification builder was split into per-module files behind a thin orchestrator. This is a refactor only; the generated API specification and every endpoint are byte-for-byte identical, and no configuration or upgrade steps are required.
+
+## [1.27.2] - 2026-07-17
+
+### Changed
+- Replaced the `node-fetch` dependency with a small built-in HTTP client. Outbound requests (ICS calendar subscriptions, subscription logo lookup and WebDAV document storage) behave the same as before, including transparent gzip/deflate/br response decompression; no configuration change is required.
+
+### Security
+- Consolidated the SSRF (server-side request forgery) protection shared by ICS subscriptions, subscription logo lookup and WebDAV document storage into a single hardened check. It now blocks a broader set of non-public destinations (carrier-grade NAT, benchmarking and reserved ranges, and additional IPv6 special-use prefixes) and closes a gap where the logo lookup did not recognise IPv4-mapped IPv6 addresses.
+
+## [1.27.1] - 2026-07-17
+
+### Fixed
+- The date picker popover in the calendar (and everywhere else) showed the wrong month name and misaligned weekday headers for users in time zones west of UTC: the month label read one month behind (e.g. "June" in July) and the weekday row started on the wrong day, while the day cells and the selected date stayed correct. The calendar and weekday labels are now formatted in UTC to match how their dates are constructed (#515).
+
+## [1.27.0] - 2026-07-17
+
+### Added
+- Recurring calendar events can now end after a fixed number of occurrences (`COUNT`). The event dialog offers an *Ends: Never / On date / After N occurrences* selector, and the limit is preserved through storage, rendering, editing and ICS export (#513).
+
+### Fixed
+- Importing an ICS file (e.g. a Google Calendar export) no longer turned a finite recurring event into an endless series. The one-time import and ICS subscriptions now keep the `RRULE` `COUNT` limit and apply `EXDATE` exclusions, so a `COUNT=10` series with one excluded date shows exactly nine occurrences and stops afterwards instead of repeating forever (#513).
+- Google and CalDAV synced recurring events that carry a `COUNT` limit are now correctly bounded on every calendar view; previously the count was ignored and they appeared to recur indefinitely (#513).
+
+## [1.26.0] - 2026-07-16
+
+### Added
+- Linking a Paperless-ngx document can now target it directly by its Archive Serial Number (ASN) (#511). In the DMS link dialog, a search term that is a bare number (e.g. `123456`) or carries an `asn:` prefix (e.g. `asn:123`) is resolved as an exact ASN lookup against Paperless instead of a full-text search, so a number stamped on a physical document maps straight to the single matching entry rather than a noisy title/content result set. A hint below the search field explains this, shown only for Paperless accounts (Papra has no ASN concept).
+
+### Fixed
+- The DMS link dialog's help text and "no results" messages rendered as unstyled black default text instead of the muted hint style, because the shared `.form-hint` style was only loaded on the Settings page. The muted styling is now scoped to the Documents page as well.
+
+## [1.25.1] - 2026-07-16
+
+### Changed
+- Notes reader mode refinements (follow-up to #507). The Read/Edit switch now reuses the app's shared segmented-tab component instead of a bespoke one, so it looks and behaves like the toggles elsewhere (budget, kitchen) and gains full keyboard support: arrow keys and Home/End move between Read and Edit, with focus staying on the control. The reader surface now carries a subtle tint of the note's own colour, so an opened note reads as the same coloured card enlarged rather than a plain grey document, and the note's title now appears in the modal header (updating live as you type). Switching views cross-fades gently (respecting reduced-motion), and opening a note places focus on the mode switch rather than the close button.
+
+## [1.25.0] - 2026-07-16
+
+### Added
+- Notes now open in a rendered Markdown reader by default instead of jumping straight into the editor (#507). Opening an existing note shows the formatted content; a segmented Read/Edit toggle switches to the editor and back within the same modal, and new notes still open directly in the editor. Both views stay mounted, so switching never discards unsaved input and the reader always reflects the latest edits. This makes longer notes comfortable to read, keeps Markdown formatting useful day to day, and reduces the chance of accidental edits on mobile. The editor footer (Cancel/Save) is hidden while reading.
+
+## [1.24.2] - 2026-07-16
+
+### Added
+- Chilean Peso (CLP) is now a selectable currency everywhere a currency can be chosen: the household base currency, budget subscriptions, and split expenses (#510). As a zero-decimal currency it is formatted without cents. A Chile (es-CL) region preset was added alongside it, so picking the region sets CLP, day/month/year dates, and 24-hour time in one step.
+
+## [1.24.1] - 2026-07-16
+
+### Fixed
+- Calendar event date and time pickers did not open on mobile devices (#512). Tapping the calendar or clock icon in the event modal did nothing on iOS, while the same pickers worked on desktop. On touch devices the datepicker tried to open the native OS sheet via `showPicker()` on a hidden proxy input; on WebKit (iOS Safari and iOS Chrome) `showPicker()` on such a hidden input is a silent no-op that never throws, so the built-in fallback to the in-app popover never triggered and nothing appeared. The in-app calendar/time popover, which already works identically on desktop and touch, is now the primary path on every pointer type. The native OS sheet remains only as a fallback for touch browsers without the Popover API (older iOS).
+
+## [1.24.0] - 2026-07-15
+
+### Added
+- Contacts now sync automatically. CardDAV addressbooks only ever synced when "Sync now" was pressed in Settings → Synchronization; they now run on the same `SYNC_INTERVAL_MINUTES` schedule (default 15) as calendars, with the manual trigger still available. This was documented behaviour rather than a bug, but it meant a contact added on the phone did not appear in Yuvomi until someone remembered to press a button.
+- Contacts deleted on the CardDAV server are now removed from Yuvomi as well, instead of lingering forever. Contacts that Yuvomi imported purely from CardDAV are deleted. A contact that already existed locally and was only adopted by the smart-merge logic (matched via email or phone) is **kept**: it carries locally maintained data that never existed on the server, so only its CardDAV link is dropped and it stays as a plain local contact. Contacts from before this release are treated as adopted, since their origin cannot be reconstructed — they are never deleted automatically, only unlinked. Deletion is suspended entirely, with a warning, whenever the addressbook returns nothing, its fetch fails, or a single vCard cannot be parsed: an incomplete list of contacts must never be read as "everything else was deleted".
+
+### Changed
+- Migration v89 adds `contacts.carddav_origin` (`remote` / `merged`) to record how a contact's CardDAV link came about. Existing linked contacts are backfilled to `merged`. No data is removed.
+
+### Fixed
+- CalDAV reminders: a single failed fetch could delete every mirrored reminder of an account. The sync mirrors Apple Reminders lists into Tasks or Shopping and prunes rows that vanished remotely, but it treated "the server returned nothing" as "everything was deleted remotely" — including when the fetch had just failed and the sync had already skipped that list. One transient iCloud error was therefore enough to wipe all imported tasks or shopping items of that account, taking their subtasks, assignments and document links with them via CASCADE; a re-import could not restore those, since it creates new rows. An empty result now never deletes anything and logs a warning instead, and a list that could not be fetched suspends deletion for its whole target module. Found while auditing the other sync providers for the issues fixed in #508.
+- Apple Calendar (legacy single-account sync via `APPLE_*`): events deleted in iCloud stayed in Yuvomi forever, the same defect fixed for multi-account CalDAV in v1.23.1. The inbound sync only ever inserted and updated. It now runs the same deletion pass, with the same guards: only synced Apple events of that calendar are affected, calendars whose fetch failed are never pruned, and a calendar returning no events at all is left alone with a warning.
+
+### Fixed
+- CalDAV calendars never synced automatically (#508). The auto-sync scheduler ran Google, Apple, ICS, CalDAV reminders and holidays, but the CalDAV calendar sync was never wired into it. Calendars therefore only updated when "Sync now" was pressed in Settings, even though the log announced "Auto-sync active every 15 minutes". CalDAV calendars now sync on the same `SYNC_INTERVAL_MINUTES` schedule (default 15) as every other provider.
+- CalDAV: events deleted on the server stayed in Yuvomi forever (#508). The inbound sync only ever inserted and updated events, so deleting an event in iCloud or Nextcloud never reached Yuvomi. Each sync now also removes local events that the calendar no longer returns. Only synced CalDAV events of that calendar are affected: local events and events still waiting to be uploaded are never touched, and an event moved between two calendars of the same account keeps its assignments instead of being deleted and re-created. If a calendar returns no events at all while local events still reference it, nothing is deleted and a warning is logged, since an empty response is far more often a server or auth error than a genuinely emptied calendar.
+
+## [1.23.0] - 2026-07-14
+
+### Added
+- Budget: optional personal budget mode (Discussions #476/#505). An admin can switch the household from a single shared budget into personal budgets in Settings → Modules → Budget. Every entry, loan and subscription then has a fixed owner (its creator) and a visibility of private or shared. In personal mode the Budget page gains a "My budget / Household" view switcher, the entry modal gains a "Share with the household" toggle (new entries default to private), and shared rows carry a "Household" badge. Visibility is enforced server-side on every read path (entry list, summary, statistics, CSV export, account balances, loans, subscriptions, and the dashboard widget) with no admin bypass, so a private entry stays hidden even from an admin. The default shared mode keeps the previous behaviour and is fully backward compatible.
+
+## [1.22.2] - 2026-07-14
+
+### Fixed
+- Documents toolbar: on desktop the search box overlapped the title, the category chips were cut off at the right edge, and the status filters landed in the wrong row. The toolbar had crammed the title, search, view toggle, status filters, and all category chips into a single header row behind a collapsible slider, with no layout rule for wide screens. The filters now live in their own row beneath the header (matching the Contacts module): the header holds the title, search, and view toggle, while the status and category chips share a separate horizontally scrolling filter bar.
+
+## [1.22.1] - 2026-07-14
+
+### Fixed
+- Category manager (Contacts, Budget, Tasks): category names were shown in black and became unreadable in dark mode. The reusable category-manager component's styles lived only in the settings stylesheet, which is not loaded on those pages, so the names fell back to the browser default color. The styles are now loaded globally, so category names use the correct theme text color everywhere.
+
+## [1.22.0] - 2026-07-14
+
+### Added
+- Calendar holidays: multilingual regions with more than one school-holiday schedule (such as the Swiss canton Bern, split into a German-speaking and a French-speaking Bernese Jura schedule) can now be narrowed to the correct one. When such a region is selected in Settings → Modules → Calendar, an optional school-holiday-region picker appears; the chosen region filters the overlay to its own dates instead of merging both into one longer span.
+
+### Fixed
+- Calendar holidays: fixed school-holiday dates for multilingual Swiss cantons being shown too long. Previously the two language-region schedules were merged into their combined span (e.g. Bern ending 14 August instead of 9 August for the German-speaking part); with the new region picker each part now shows its real dates. Public holidays remain visible regardless of the selected region.
+
+## [1.21.0] - 2026-07-14
+
+### Added
+- Tasks: documents from the Documents module can now be linked to a task and opened directly from it. Linked documents appear as chips in the task dialog (opening the document preview or download), and the task card shows a paperclip badge with the count. Only documents you are allowed to see are listed or linkable.
+
+## [1.20.4] - 2026-07-14
+
+### Fixed
+- Navigation sidebar (collapsed): section titles no longer leave empty gaps between the icon groups, and the three footer icons (help, changes, logout) now line up on the same vertical rail as the navigation icons above instead of each sitting at a different horizontal position.
+
+## [1.20.3] - 2026-07-14
+
+### Fixed
+- Documents: the viewer modal now shows document names with special characters (such as `&`) correctly, instead of displaying HTML escape sequences. The title was being escaped twice.
+
+## [1.20.2] - 2026-07-13
+
+### Changed
+- Row actions (edit, delete, call, more) across all lists and cards now share one consistent style: bare icon buttons with a 48px touch target. This replaces the previous mix of filled circle buttons (Birthdays, Contacts) and bare icons of varying visibility elsewhere.
+- Statistics cards in Housekeeping and Subscriptions now use a compact two-column layout on mobile instead of four full-width stacked cards, so more information is visible without scrolling.
+
+### Fixed
+- Budget: the recurring-entry indicator now uses a monochrome icon consistent with the calendar, instead of a colored emoji.
+- Documents: on mobile, the filter button now sits beside the page title instead of alone below it.
+- Subscriptions: the two toolbar action buttons no longer stretch into full-width empty pills on mobile; they now share one compact row.
+- Housekeeping: the "recorded today" state now shows a readable label with a green check instead of a near-invisible checkmark.
+- Recipes: the "open recipe link" now carries an external-link icon so it reads as a link rather than plain text.
+- Shopping: the edit button on each item is now fully visible on touch devices instead of staying dimmed until hover.
+- Meals: the floating action button no longer overlaps the last "add meal" button at the end of the week.
+
 ## [1.20.1] - 2026-07-13
 
 ### Fixed

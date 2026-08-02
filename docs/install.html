@@ -7,8 +7,15 @@
        Note: X-Frame-Options / CSP frame-ancestors only take effect as HTTP headers, not via meta. -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
   <meta name="referrer" content="strict-origin-when-cross-origin">
-  <title>Install Yuvomi — Self-Hosted Family Planner</title>
-  <meta name="description" content="Step-by-step installation guide for Yuvomi. Docker, Podman, TrueNAS, Umbrel or Unraid — get your self-hosted family planner running in minutes.">
+  <title>Install Yuvomi - Self-Hosted Family Planner</title>
+  <meta name="description" content="Step-by-step installation guide for Yuvomi. Docker, Podman, TrueNAS, Umbrel or Unraid - get your self-hosted family planner running in minutes.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Install Yuvomi - Self-Hosted Family Planner">
+  <meta property="og:description" content="Get Yuvomi running in minutes: guided web installer, Docker, Podman, TrueNAS, Umbrel or Unraid.">
+  <meta property="og:image" content="https://yuvomi.cloud/og-image.png">
+  <meta property="og:url" content="https://yuvomi.cloud/install.html">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:image" content="https://yuvomi.cloud/twitter-image.png">
   <meta name="theme-color" content="#fafaf8" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#1a1a18" media="(prefers-color-scheme: dark)">
   <link rel="canonical" href="https://yuvomi.cloud/install.html">
@@ -40,7 +47,7 @@
       --border-strong: #D8D7D1;
       --text-1: #1C1C1A;
       --text-2: #56554F;
-      --text-3: #8B8A85;
+      --text-3: #6E6D67;
 
       --accent: #6c3aed;
       --accent-hover: #5b2fd4;
@@ -197,6 +204,13 @@
 
     /* Tabs */
     .tab-bar { display: flex; flex-wrap: wrap; gap: 8px; margin: 36px 0 28px; }
+    /* Full-width caption forces a flex line break, splitting the six options into
+       two graspable clusters (terminal vs one-click). aria-hidden: the JS tablist
+       still owns only the six .tab-btn elements. */
+    .tab-group { flex-basis: 100%; display: flex; align-items: center; gap: 12px; margin: 2px 2px 0;
+      font-size: 0.7rem; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--text-3); }
+    .tab-group:not(:first-of-type) { margin-top: 12px; }
+    .tab-group::after { content: ''; flex: 1; height: 1px; background: var(--border); }
     .tab-btn { display: inline-flex; align-items: center; gap: 9px; background: var(--surface); border: 1px solid var(--border);
       color: var(--text-2); font-family: var(--ff); font-size: 0.85rem; font-weight: 600; cursor: pointer;
       padding: 10px 15px; min-height: 44px; border-radius: var(--r-full); transition: all .18s var(--ease-spring); box-shadow: var(--shadow-sm); }
@@ -247,6 +261,7 @@
       padding: 7px 11px; min-height: 36px; border-radius: var(--r-sm); font-family: var(--ff); font-size: 0.75rem; font-weight: 600; transition: all .15s; }
     .copy-btn:hover { background: rgba(255,255,255,0.16); color: #fff; }
     .copy-btn.copied { background: var(--success); border-color: var(--success); color: #fff; }
+    .copy-btn.failed { background: var(--warning); border-color: var(--warning); color: #fff; }
     .copy-btn svg { width: 13px; height: 13px; }
 
     /* Success */
@@ -255,7 +270,8 @@
     .success-box::before { content: ''; position: absolute; top: -120px; left: 50%; transform: translateX(-50%); width: 520px; height: 360px;
       background: radial-gradient(50% 50% at 50% 50%, var(--accent-glow), transparent 70%); pointer-events: none; }
     .success-box > * { position: relative; }
-    .success-emoji { font-size: 2.6rem; margin-bottom: 12px; }
+    .success-emoji { margin-bottom: 12px; color: var(--success); line-height: 0; }
+    .success-emoji svg { width: 3rem; height: 3rem; }
     .success-box h2 { font-size: clamp(1.5rem, 3vw, 2rem); font-weight: 700; letter-spacing: -0.03em; margin-bottom: 10px; }
     .success-box p { color: var(--text-2); margin-bottom: 18px; }
     .success-url { display: inline-block; font-family: var(--ff-mono); font-size: 1.05rem; font-weight: 600; color: var(--accent);
@@ -298,7 +314,7 @@
     footer { border-top: 1px solid var(--border); padding: 44px 0; text-align: center; }
     .footer-heart { font-size: 0.9rem; color: var(--text-2); margin-bottom: 14px; }
     .footer-links { display: flex; justify-content: center; gap: 14px; flex-wrap: wrap; font-size: 0.85rem; }
-    .footer-links a { color: var(--text-2); padding: 6px 4px; }
+    .footer-links a { color: var(--text-2); padding: 6px 4px; min-height: 44px; display: inline-flex; align-items: center; }
     .footer-links a:hover { color: var(--accent); }
 
     /* Reveal */
@@ -368,7 +384,7 @@
         <div class="prereq-card reveal">
           <div class="prereq-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg></div>
           <h3 data-t="prereq_docker_title">Docker or Podman</h3>
-          <p data-t="prereq_docker_desc">Packages the app so you don't need to install anything else. Free for personal use. Podman (RHEL/Fedora/CentOS Stream) works too — rootless and SELinux-ready.</p>
+          <p data-t="prereq_docker_desc">Packages the app so you don't need to install anything else. Free for personal use. Podman (RHEL/Fedora/CentOS Stream) works too - rootless and SELinux-ready.</p>
           <div class="prereq-links">
             <a href="https://docs.docker.com/desktop/install/mac-install/" target="_blank" rel="noopener" class="prereq-link">macOS</a>
             <a href="https://docs.docker.com/desktop/install/windows-install/" target="_blank" rel="noopener" class="prereq-link">Windows</a>
@@ -379,7 +395,7 @@
         <div class="prereq-card reveal reveal-delay-1">
           <div class="prereq-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div>
           <h3 data-t="prereq_terminal_title">Terminal</h3>
-          <p data-t="prereq_terminal_desc">A command-line interface to type a few commands. Built into every OS — no extra install needed.</p>
+          <p data-t="prereq_terminal_desc">A command-line interface to type a few commands. Built into every OS - no extra install needed.</p>
           <p class="prereq-hint" data-t="prereq_terminal_hint">macOS: Terminal · Windows: PowerShell · Linux: bash</p>
         </div>
         <div class="prereq-card reveal reveal-delay-2">
@@ -399,6 +415,7 @@
       <p class="section-desc reveal" data-t="steps_desc">Six ways to install. Pick the one that matches your setup; the result is the same private Yuvomi instance.</p>
 
       <div class="tab-bar reveal" role="tablist" aria-label="Installation options">
+        <span class="tab-group" aria-hidden="true" data-t="tab_group_terminal">In a terminal</span>
         <button class="tab-btn active" role="tab" aria-selected="true" aria-controls="panel-installer" id="tab-installer" type="button">
           <span class="tb-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span><span data-t="tab_installer">Web Installer</span>
         </button>
@@ -408,6 +425,7 @@
         <button class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-source" id="tab-source" type="button">
           <span class="tb-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></span><span data-t="tab_source">From source</span>
         </button>
+        <span class="tab-group" aria-hidden="true" data-t="tab_group_store">One-click app store</span>
         <button class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-truenas" id="tab-truenas" type="button" style="--pc:#0095D5">
           <span class="tb-logo"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M24 10.049v5.114l-10.949 6.324v-5.114L24 10.049zm-24 0v5.114l10.956 6.324v-5.114L0 10.049zm12.004-.605l-4.433 2.559 4.433 2.559 4.429-2.559-4.429-2.559zm10.952-1.207l-9.905-5.723v5.118l5.473 3.164 4.432-2.559zm-12-.605V2.513L1.044 8.236l4.432 2.555 5.48-3.159z"/></svg></span><span data-t="tab_truenas">TrueNAS</span> <span class="tb-one" data-t="tab_one">1-click</span>
         </button>
@@ -460,7 +478,7 @@ cd yuvomi</div><button class="copy-btn" data-copy="git clone https://github.com/
       <div class="tab-panel" id="panel-docker" role="tabpanel" aria-labelledby="tab-docker">
         <div class="callout callout-info">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-          <span data-t="opt_docker_info">No Git, no build step — just two files and a single command. Requires only Docker or Podman (Podman: use podman-compose.yml).</span>
+          <span data-t="opt_docker_info">No Git, no build step - just two files and a single command. Requires only Docker or Podman (Podman: use podman-compose.yml).</span>
         </div>
         <div class="step">
           <div class="step-num">1</div>
@@ -477,7 +495,7 @@ curl -O https://raw.githubusercontent.com/ulsklyc/yuvomi/main/.env.example</div>
             <h3 class="step-title" data-t="step_a2_title">Create your configuration</h3>
             <p class="step-desc" data-t="step_a2_desc">Copy the template, then open <code>.env</code> in a text editor and set the two required secrets.</p>
             <div class="code-wrap"><div class="code-block">cp .env.example .env</div><button class="copy-btn" data-copy="cp .env.example .env" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span data-t="copy">Copy</span></button></div>
-            <p class="step-desc" data-t="step_a2_gen">Generate a secure value for each secret by running this twice — paste one result as <code>SESSION_SECRET</code> and one as <code>DB_ENCRYPTION_KEY</code>:</p>
+            <p class="step-desc" data-t="step_a2_gen">Generate a secure value for each secret by running this twice - paste one result as <code>SESSION_SECRET</code> and one as <code>DB_ENCRYPTION_KEY</code>:</p>
             <div class="code-wrap"><div class="code-block">openssl rand -hex 32</div><button class="copy-btn" data-copy="openssl rand -hex 32" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span data-t="copy">Copy</span></button></div>
             <div class="callout callout-warning">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
@@ -502,7 +520,7 @@ curl -O https://raw.githubusercontent.com/ulsklyc/yuvomi/main/.env.example</div>
           <div class="step-content">
             <h3 class="step-title" data-t="step_setup_title">Create your admin account</h3>
             <p class="step-desc" data-t="step_setup_desc">On the first visit, Yuvomi walks you through creating your admin account right in the browser. Prefer the command line? Run the setup wizard instead:</p>
-            <div class="code-wrap"><div class="code-block"><span class="cmd">docker compose exec oikos node setup.js</span></div><button class="copy-btn" data-copy="docker compose exec oikos node setup.js" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span data-t="copy">Copy</span></button></div>
+            <div class="code-wrap"><div class="code-block"><span class="cmd">docker compose exec yuvomi node setup.js</span></div><button class="copy-btn" data-copy="docker compose exec yuvomi node setup.js" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span data-t="copy">Copy</span></button></div>
           </div>
         </div>
       </div>
@@ -543,7 +561,7 @@ openssl rand -hex 32  <span class="comment"># run twice → SESSION_SECRET + DB_
           <div class="step-content">
             <h3 class="step-title" data-t="step_setup_title">Create your admin account</h3>
             <p class="step-desc" data-t="step_setup_desc">On the first visit, Yuvomi walks you through creating your admin account right in the browser. Prefer the command line? Run the setup wizard instead:</p>
-            <div class="code-wrap"><div class="code-block"><span class="cmd">docker compose exec oikos node setup.js</span></div><button class="copy-btn" data-copy="docker compose exec oikos node setup.js" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span data-t="copy">Copy</span></button></div>
+            <div class="code-wrap"><div class="code-block"><span class="cmd">docker compose exec yuvomi node setup.js</span></div><button class="copy-btn" data-copy="docker compose exec yuvomi node setup.js" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span data-t="copy">Copy</span></button></div>
           </div>
         </div>
       </div>
@@ -552,10 +570,10 @@ openssl rand -hex 32  <span class="comment"># run twice → SESSION_SECRET + DB_
       <div class="tab-panel" id="panel-truenas" role="tabpanel" aria-labelledby="tab-truenas">
         <div class="callout callout-success">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-          <span data-t="opt_truenas_info">No terminal required. Yuvomi is in the TrueNAS SCALE Community Apps Catalog — install it directly from the TrueNAS web UI in a few clicks.</span>
+          <span data-t="opt_truenas_info">No terminal required. Yuvomi is in the TrueNAS SCALE Community Apps Catalog - install it directly from the TrueNAS web UI in a few clicks.</span>
         </div>
         <div class="step"><div class="step-num">1</div><div class="step-content"><h3 class="step-title" data-t="step_tn1_title">Open the Apps Catalog</h3><p class="step-desc" data-t="step_tn1_desc">In your TrueNAS SCALE web UI, go to Apps → Discover Apps and search for Yuvomi.</p></div></div>
-        <div class="step"><div class="step-num">2</div><div class="step-content"><h3 class="step-title" data-t="step_tn2_title">Configure and install</h3><p class="step-desc" data-t="step_tn2_desc">Click Install. Set a strong value for Session Secret (required) and Database Encryption Key (recommended — back it up, it cannot be recovered). Adjust the port and storage paths if needed, then Install.</p></div></div>
+        <div class="step"><div class="step-num">2</div><div class="step-content"><h3 class="step-title" data-t="step_tn2_title">Configure and install</h3><p class="step-desc" data-t="step_tn2_desc">Click Install. Set a strong value for Session Secret (required) and Database Encryption Key (recommended - back it up, it cannot be recovered). Adjust the port and storage paths if needed, then Install.</p></div></div>
         <div class="step"><div class="step-num">3</div><div class="step-content"><h3 class="step-title" data-t="step_tn3_title">Open the WebUI</h3><p class="step-desc" data-t="step_tn3_desc">Once the app status shows Running, click WebUI in the Apps overview. The first visit walks you through creating your admin account directly in the browser.</p></div></div>
       </div>
 
@@ -563,10 +581,10 @@ openssl rand -hex 32  <span class="comment"># run twice → SESSION_SECRET + DB_
       <div class="tab-panel" id="panel-umbrel" role="tabpanel" aria-labelledby="tab-umbrel">
         <div class="callout callout-success">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-          <span data-t="opt_umbrel_info">No terminal required. Install Yuvomi straight from the Umbrel App Store — everything runs on, and stays on, your Umbrel.</span>
+          <span data-t="opt_umbrel_info">No terminal required. Install Yuvomi straight from the Umbrel App Store - everything runs on, and stays on, your Umbrel.</span>
         </div>
         <div class="step"><div class="step-num">1</div><div class="step-content"><h3 class="step-title" data-t="step_um1_title">Open the App Store</h3><p class="step-desc" data-t="step_um1_desc">In your Umbrel dashboard, open the App Store and search for Yuvomi.</p></div></div>
-        <div class="step"><div class="step-num">2</div><div class="step-content"><h3 class="step-title" data-t="step_um2_title">Install with one click</h3><p class="step-desc" data-t="step_um2_desc">Click Install. Umbrel pulls the image and starts the container for you — no configuration files to edit.</p></div></div>
+        <div class="step"><div class="step-num">2</div><div class="step-content"><h3 class="step-title" data-t="step_um2_title">Install with one click</h3><p class="step-desc" data-t="step_um2_desc">Click Install. Umbrel pulls the image and starts the container for you - no configuration files to edit.</p></div></div>
         <div class="step"><div class="step-num">3</div><div class="step-content"><h3 class="step-title" data-t="step_um3_title">Open Yuvomi</h3><p class="step-desc" data-t="step_um3_desc">Launch Yuvomi from your Umbrel home screen. The first visit walks you through creating your admin account directly in the browser.</p></div></div>
       </div>
 
@@ -574,10 +592,10 @@ openssl rand -hex 32  <span class="comment"># run twice → SESSION_SECRET + DB_
       <div class="tab-panel" id="panel-unraid" role="tabpanel" aria-labelledby="tab-unraid">
         <div class="callout callout-success">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-          <span data-t="opt_unraid_info">No terminal required. Yuvomi ships as a Community Applications template — add it straight from the Unraid Apps tab.</span>
+          <span data-t="opt_unraid_info">No terminal required. Yuvomi ships as a Community Applications template - add it straight from the Unraid Apps tab.</span>
         </div>
         <div class="step"><div class="step-num">1</div><div class="step-content"><h3 class="step-title" data-t="step_ur1_title">Open Community Applications</h3><p class="step-desc" data-t="step_ur1_desc">In Unraid, open the Apps tab (the Community Applications plugin) and search for Yuvomi.</p></div></div>
-        <div class="step"><div class="step-num">2</div><div class="step-content"><h3 class="step-title" data-t="step_ur2_title">Configure the template</h3><p class="step-desc" data-t="step_ur2_desc">Click Install. Set SESSION_SECRET (required) and DB_ENCRYPTION_KEY (recommended — back it up). Adjust the WebUI port and the appdata path if needed.</p></div></div>
+        <div class="step"><div class="step-num">2</div><div class="step-content"><h3 class="step-title" data-t="step_ur2_title">Configure the template</h3><p class="step-desc" data-t="step_ur2_desc">Click Install. Set SESSION_SECRET (required) and DB_ENCRYPTION_KEY (recommended - back it up). Adjust the WebUI port and the appdata path if needed.</p></div></div>
         <div class="step"><div class="step-num">3</div><div class="step-content"><h3 class="step-title" data-t="step_ur3_title">Apply and open</h3><p class="step-desc" data-t="step_ur3_desc">Click Apply. Once the container is running, click the Yuvomi icon → WebUI. The first visit walks you through creating your admin account.</p></div></div>
       </div>
     </div>
@@ -587,7 +605,7 @@ openssl rand -hex 32  <span class="comment"># run twice → SESSION_SECRET + DB_
   <section id="open">
     <div class="container">
       <div class="success-box reveal">
-        <div class="success-emoji" aria-hidden="true">🎉</div>
+        <div class="success-emoji" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.801 10A10 10 0 1 1 17 3.335"/><path d="m9 11 3 3L22 4"/></svg></div>
         <h2 data-t="success_title">You're all set</h2>
         <p data-t="success_desc">Open your browser and navigate to:</p>
         <div class="success-url">http://localhost:3000</div>
@@ -616,7 +634,7 @@ openssl rand -hex 32  <span class="comment"># run twice → SESSION_SECRET + DB_
         <div class="env-card reveal reveal-delay-1">
           <div class="env-name">DB_ENCRYPTION_KEY</div>
           <div class="env-label"><span data-t="env_db_label">Database Key</span> <span class="env-req" data-t="env_required">Required</span></div>
-          <div class="env-desc" data-t="env_db_desc">Encrypts your entire database with AES-256. Generate with <code>openssl rand -hex 32</code>. Back this up — without it, data is unrecoverable.</div>
+          <div class="env-desc" data-t="env_db_desc">Encrypts your entire database with AES-256. Generate with <code>openssl rand -hex 32</code>. Back this up - without it, data is unrecoverable.</div>
         </div>
       </div>
     </div>
@@ -633,7 +651,7 @@ openssl rand -hex 32  <span class="comment"># run twice → SESSION_SECRET + DB_
         <div class="opt-card reveal reveal-delay-2"><h3 data-t="opt_cal_title">Calendar &amp; contact sync</h3><p data-t="opt_cal_desc">Two-way sync with Google Calendar (OAuth) and multi-account CalDAV/CardDAV (iCloud, Nextcloud, Radicale). Apple Reminders can mirror read-only into Tasks or Shopping. <a href="https://github.com/ulsklyc/yuvomi/blob/main/docs/installation.md#environment-variables" target="_blank" rel="noopener" data-t="opt_guide">Guide →</a></p></div>
         <div class="opt-card reveal"><h3 data-t="opt_sso_title">SSO / OpenID Connect</h3><p data-t="opt_sso_desc">Single sign-on via any OIDC provider (Authentik, Keycloak, Google, Microsoft Entra). Set the four <code>OIDC_*</code> vars and a "Sign in with SSO" button appears automatically. <a href="https://github.com/ulsklyc/yuvomi/blob/main/docs/installation.md#sso--openid-connect-optional" target="_blank" rel="noopener" data-t="opt_guide">Guide →</a></p></div>
         <div class="opt-card reveal reveal-delay-1"><h3 data-t="opt_backup_title">Automated backups</h3><p data-t="opt_backup_desc">Enable scheduled backups via <code>BACKUP_ENABLED=true</code>; daily at 2 AM, 7 copies kept. Manage and restore in Settings → Administration → Backup and restore. <a href="https://github.com/ulsklyc/yuvomi/blob/main/docs/installation.md#backup--restore" target="_blank" rel="noopener" data-t="opt_guide">Guide →</a></p></div>
-        <div class="opt-card reveal reveal-delay-2"><h3 data-t="opt_doc_storage_title">Document storage</h3><p data-t="opt_doc_storage_desc">Store new document files, including calendar attachments, outside SQLite. The simplest option is a mounted host folder via <code>DOCUMENT_STORAGE_LOCAL_ENABLED=true</code>; alternatively use WebDAV with the five <code>DOCUMENT_STORAGE_WEBDAV_*</code> variables (deployment variables for private or LAN targets; UI-managed URLs must be public). Database backups do not contain these binaries, so back up that folder or WebDAV target separately. <a href="https://github.com/ulsklyc/yuvomi/blob/main/docs/installation.md#local-folder-document-storage-optional" target="_blank" rel="noopener" data-t="opt_guide">Guide →</a></p></div>
+        <div class="opt-card reveal reveal-delay-2"><h3 data-t="opt_doc_storage_title">Document storage</h3><p data-t="opt_doc_storage_desc">Store new document files and calendar attachments outside SQLite in a mounted host folder, on WebDAV, or in Google Drive. Drive OAuth is connected and explicitly selected later in Settings. Database backups contain metadata only, so back up every external binary target separately. <a href="https://github.com/ulsklyc/yuvomi/blob/main/docs/installation.md#local-folder-document-storage-optional" target="_blank" rel="noopener" data-t="opt_guide">Guide →</a></p></div>
         <div class="opt-card reveal"><h3 data-t="opt_email_title">Email / SMTP</h3><p data-t="opt_email_desc">Configure an outgoing SMTP server to enable the self-service "Forgot password" flow. Set the <code>EMAIL_SMTP_*</code> vars and <code>BASE_URL</code> for reset links, or configure it later in Settings → Administration → Email. <a href="https://github.com/ulsklyc/yuvomi/blob/main/docs/installation.md#email--smtp-optional" target="_blank" rel="noopener" data-t="opt_guide">Guide →</a></p></div>
         <div class="opt-card reveal reveal-delay-2"><h3 data-t="opt_fixer_title">Live currency conversion</h3><p data-t="opt_fixer_desc">Budget → Subscriptions works fully without external services. Set <code>FIXER_API_KEY</code> to convert subscriptions billed in foreign currencies into your household base currency, with a 12-hour rate cache. <a href="https://github.com/ulsklyc/yuvomi/blob/main/docs/installation.md#subscription-currency-conversion-optional" target="_blank" rel="noopener" data-t="opt_guide">Guide →</a></p></div>
         <div class="opt-card reveal reveal-delay-1"><h3 data-t="opt_update_title">Updates</h3><p data-t="opt_update_desc">Pull the latest image and restart: <code>docker compose pull &amp;&amp; docker compose up -d</code>. Your data persists across updates.</p></div>
@@ -698,45 +716,46 @@ docker compose logs | grep "Server läuft"</div></div><p data-t="trouble_nginx_p
         hero_time:'~10 minutes',
         prereq_label:'Before you start', prereq_title:'What you need',
         prereq_desc:"Yuvomi runs as a Docker or Podman container, so you don't need to install Node.js or any other runtime. Just a container engine, and you're good to go. (App-store installs handle even this for you.)",
-        prereq_docker_title:'Docker or Podman', prereq_docker_desc:"Packages the app so you don't need to install anything else. Free for personal use. Podman (RHEL/Fedora/CentOS Stream) works too — rootless and SELinux-ready.",
-        prereq_terminal_title:'Terminal', prereq_terminal_desc:'A command-line interface to type a few commands. Built into every OS — no extra install needed.',
+        prereq_docker_title:'Docker or Podman', prereq_docker_desc:"Packages the app so you don't need to install anything else. Free for personal use. Podman (RHEL/Fedora/CentOS Stream) works too - rootless and SELinux-ready.",
+        prereq_terminal_title:'Terminal', prereq_terminal_desc:'A command-line interface to type a few commands. Built into every OS - no extra install needed.',
         prereq_terminal_hint:'macOS: Terminal · Windows: PowerShell · Linux: bash',
         prereq_sys_title:'System', prereq_sys_desc:'256 MB RAM minimum. Runs on a Raspberry Pi, NAS, home server, or any desktop machine.',
         prereq_sys_hint:'~500 MB disk for the Docker image',
         steps_label:'Step by step', steps_title:'Choose your platform', steps_desc:'Six ways to install. Pick the one that matches your setup; the result is the same private Yuvomi instance.',
+        tab_group_terminal:'In a terminal', tab_group_store:'One-click app store',
         tab_installer:'Web Installer', tab_docker:'Docker image', tab_source:'From source', tab_truenas:'TrueNAS', tab_umbrel:'Umbrel', tab_unraid:'Unraid', tab_one:'1-click',
         opt_installer_info:"Recommended if you're comfortable running one command in a terminal. A localized browser wizard (23 languages) detects your container engine (Docker or Podman), configures your .env (optional reverse proxy/HTTPS, Single Sign-On, automatic backups), starts the container, and creates your admin account. Requires Git and Node.js 18+ on the host. Want zero terminal? Use a one-click app-store install (TrueNAS, Umbrel, Unraid).",
         step_inst1_title:'Clone the repository', step_inst1_desc:'Open your terminal and clone Yuvomi to a folder of your choice.',
         step_inst2_title:'Start the installer', step_inst2_desc:'Run this command from the repository root. The installer server starts on port 8090.',
         step_inst3_title:'Open the wizard in your browser', step_inst3_desc:'Navigate to the following address. The wizard guides you through configuration, container startup, and admin account creation.',
         step_inst3_info:'The installer shuts down automatically after setup completes. Your Yuvomi instance keeps running via Docker or Podman.',
-        opt_docker_info:'No Git, no build step — just two files and a single command. Requires only Docker or Podman (Podman: use podman-compose.yml).',
+        opt_docker_info:'No Git, no build step - just two files and a single command. Requires only Docker or Podman (Podman: use podman-compose.yml).',
         step_a1_title:'Download the configuration files', step_a1_desc:'Run these two commands. They download the Docker configuration and the template for your settings.',
         step_a2_title:'Create your configuration', step_a2_desc:'Copy the template, then open .env in a text editor and set the two required secrets.',
-        step_a2_gen:'Generate a secure value for each secret by running this twice — paste one result as SESSION_SECRET and one as DB_ENCRYPTION_KEY:',
+        step_a2_gen:'Generate a secure value for each secret by running this twice - paste one result as SESSION_SECRET and one as DB_ENCRYPTION_KEY:',
         step_a2_warning:'Keep a backup of your .env file somewhere safe. If you lose the DB_ENCRYPTION_KEY, your data cannot be recovered.',
         step_a3_title:'Start the container', step_a3_desc:'Docker downloads the Yuvomi image and starts it in the background. The first download takes a minute.',
         step_a3_success:'Check the logs with docker compose logs -f. You should see Server läuft auf Port 3000. The container keeps running in the background.',
         step_setup_title:'Create your admin account', step_setup_desc:'On the first visit, Yuvomi walks you through creating your admin account right in the browser. Prefer the command line? Run the setup wizard instead:',
         opt_source_info:'For contributors or anyone who wants to run a custom version. Requires Git. The first build takes a few minutes.',
         step_b1_title:'Clone the repository', step_b3_title:'Build and start', step_b3_desc:'The --build flag compiles the Docker image locally. This takes a few minutes the first time.',
-        opt_truenas_info:'No terminal required. Yuvomi is in the TrueNAS SCALE Community Apps Catalog — install it directly from the TrueNAS web UI in a few clicks.',
+        opt_truenas_info:'No terminal required. Yuvomi is in the TrueNAS SCALE Community Apps Catalog - install it directly from the TrueNAS web UI in a few clicks.',
         step_tn1_title:'Open the Apps Catalog', step_tn1_desc:'In your TrueNAS SCALE web UI, go to Apps → Discover Apps and search for Yuvomi.',
-        step_tn2_title:'Configure and install', step_tn2_desc:'Click Install. Set a strong value for Session Secret (required) and Database Encryption Key (recommended — back it up, it cannot be recovered). Adjust the port and storage paths if needed, then Install.',
+        step_tn2_title:'Configure and install', step_tn2_desc:'Click Install. Set a strong value for Session Secret (required) and Database Encryption Key (recommended - back it up, it cannot be recovered). Adjust the port and storage paths if needed, then Install.',
         step_tn3_title:'Open the WebUI', step_tn3_desc:'Once the app status shows Running, click WebUI in the Apps overview. The first visit walks you through creating your admin account directly in the browser.',
-        opt_umbrel_info:'No terminal required. Install Yuvomi straight from the Umbrel App Store — everything runs on, and stays on, your Umbrel.',
+        opt_umbrel_info:'No terminal required. Install Yuvomi straight from the Umbrel App Store - everything runs on, and stays on, your Umbrel.',
         step_um1_title:'Open the App Store', step_um1_desc:'In your Umbrel dashboard, open the App Store and search for Yuvomi.',
-        step_um2_title:'Install with one click', step_um2_desc:'Click Install. Umbrel pulls the image and starts the container for you — no configuration files to edit.',
+        step_um2_title:'Install with one click', step_um2_desc:'Click Install. Umbrel pulls the image and starts the container for you - no configuration files to edit.',
         step_um3_title:'Open Yuvomi', step_um3_desc:'Launch Yuvomi from your Umbrel home screen. The first visit walks you through creating your admin account directly in the browser.',
-        opt_unraid_info:'No terminal required. Yuvomi ships as a Community Applications template — add it straight from the Unraid Apps tab.',
+        opt_unraid_info:'No terminal required. Yuvomi ships as a Community Applications template - add it straight from the Unraid Apps tab.',
         step_ur1_title:'Open Community Applications', step_ur1_desc:'In Unraid, open the Apps tab (the Community Applications plugin) and search for Yuvomi.',
-        step_ur2_title:'Configure the template', step_ur2_desc:'Click Install. Set SESSION_SECRET (required) and DB_ENCRYPTION_KEY (recommended — back it up). Adjust the WebUI port and the appdata path if needed.',
+        step_ur2_title:'Configure the template', step_ur2_desc:'Click Install. Set SESSION_SECRET (required) and DB_ENCRYPTION_KEY (recommended - back it up). Adjust the WebUI port and the appdata path if needed.',
         step_ur3_title:'Apply and open', step_ur3_desc:'Click Apply. Once the container is running, click the Yuvomi icon → WebUI. The first visit walks you through creating your admin account.',
         success_title:"You're all set", success_desc:'Open your browser and navigate to:', success_hint:'Log in with the admin credentials you just created. You can add more family members from the Settings page.',
         success_full_guide:'Full technical guide',
         env_label:'Configuration', env_title:'Required settings', env_desc:'Two variables in your .env file are mandatory. Everything else is optional.',
         env_session_label:'Session Secret', env_session_desc:'Signs and verifies login cookies. Use openssl rand -hex 32 to generate a secure value.',
-        env_db_label:'Database Key', env_db_desc:'Encrypts your entire database with AES-256. Generate with openssl rand -hex 32. Back this up — without it, data is unrecoverable.',
+        env_db_label:'Database Key', env_db_desc:'Encrypts your entire database with AES-256. Generate with openssl rand -hex 32. Back this up - without it, data is unrecoverable.',
         env_required:'Required',
         optional_label:'Optional', optional_title:'Go further', optional_desc:'Once Yuvomi is running, you can set up these extras. All are configured in your .env file.',
         opt_https_title:'HTTPS & network access', opt_https_desc:"Reach Yuvomi from other devices or the internet: set up Nginx as a reverse proxy with a free Let's Encrypt certificate.",
@@ -745,7 +764,7 @@ docker compose logs | grep "Server läuft"</div></div><p data-t="trouble_nginx_p
         opt_cal_title:'Calendar & contact sync', opt_cal_desc:'Two-way sync with Google Calendar (OAuth) and multi-account CalDAV/CardDAV (iCloud, Nextcloud, Radicale). Apple Reminders can mirror read-only into Tasks or Shopping.',
         opt_sso_title:'SSO / OpenID Connect', opt_sso_desc:'Single sign-on via any OIDC provider (Authentik, Keycloak, Google, Microsoft Entra). Set the four OIDC_* vars and a "Sign in with SSO" button appears automatically.',
         opt_backup_title:'Automated backups', opt_backup_desc:'Enable scheduled backups via BACKUP_ENABLED=true; daily at 2 AM, 7 copies kept. Optionally upload each backup to a WebDAV server (Nextcloud, ownCloud, Hetzner, etc.). Manage and restore in Settings → Administration → Backup and restore.',
-        opt_doc_storage_title:'Document storage', opt_doc_storage_desc:'Store new document files, including calendar attachments, outside SQLite. The simplest option is a mounted host folder via DOCUMENT_STORAGE_LOCAL_ENABLED=true; alternatively use WebDAV with the five DOCUMENT_STORAGE_WEBDAV_* variables (deployment variables for private or LAN targets; UI-managed URLs must be public). Database backups do not contain these binaries, so back up that folder or WebDAV target separately.',
+        opt_doc_storage_title:'Document storage', opt_doc_storage_desc:'Store new document files and calendar attachments outside SQLite in a mounted host folder, on WebDAV, or in Google Drive. Drive OAuth is connected and explicitly selected later in Settings. Database backups contain metadata only, so back up every external binary target separately.',
         opt_email_title:'Email / SMTP', opt_email_desc:'Configure an outgoing SMTP server to enable the self-service "Forgot password" flow. Set the EMAIL_SMTP_* vars and BASE_URL for reset links, or configure it later in Settings → Administration → Email.',
         opt_fixer_title:'Live currency conversion', opt_fixer_desc:'Budget → Subscriptions works fully without external services. Set FIXER_API_KEY to convert subscriptions billed in foreign currencies into your household base currency, with a 12-hour rate cache.',
         opt_update_title:'Updates', opt_update_desc:'Pull the latest image and restart: docker compose pull && docker compose up -d. Your data persists across updates.',
@@ -759,53 +778,54 @@ docker compose logs | grep "Server läuft"</div></div><p data-t="trouble_nginx_p
         trouble_nginx_title:'Nginx shows 502 Bad Gateway', trouble_nginx_desc:"Nginx can't reach the container. Check it's running and the port matches:",
         trouble_nginx_port:'Ensure the proxy_pass port in your Nginx config matches the host port in docker-compose.yml (default: 3000).',
         footer_home:'Home', footer_heart:'Built with care for families who value privacy and simplicity.', footer_contrib:'Contributing', footer_impressum:'Imprint', footer_privacy:'Privacy',
-        backLabel:'Overview', copy:'Copy', copied:'Copied!'
+        backLabel:'Overview', copy:'Copy', copied:'Copied!', copyfail:'Press Ctrl+C'
       },
       de: {
-        hero_eyebrow:'Installation', hero_title_pre:'Yuvomi installieren', hero_title_em:'– euer Weg.',
+        hero_eyebrow:'Installation', hero_title_pre:'Yuvomi installieren', hero_title_em:'- euer Weg.',
         hero_desc:'Euren selbstgehosteten Familienplaner in wenigen Minuten zum Laufen bringen. Wählt eine App-Store-Installation mit einem Klick, ein Docker-Setup mit zwei Befehlen oder den geführten Web-Installer.',
         hero_time:'~10 Minuten',
         prereq_label:'Voraussetzungen', prereq_title:'Was ihr braucht',
         prereq_desc:'Yuvomi läuft als Docker- oder Podman-Container. Node.js oder andere Laufzeiten müsst ihr nicht installieren. Nur eine Container-Engine, und ihr seid startklar. (App-Store-Installationen übernehmen sogar das für euch.)',
-        prereq_docker_title:'Docker oder Podman', prereq_docker_desc:'Verpackt die App, sodass ihr nichts weiter installieren müsst. Für den privaten Gebrauch kostenlos. Podman (RHEL/Fedora/CentOS Stream) funktioniert ebenfalls — rootless und SELinux-fähig.',
-        prereq_terminal_title:'Terminal', prereq_terminal_desc:'Eine Befehlszeile, um ein paar Befehle einzugeben. In jedem Betriebssystem eingebaut — kein Extra-Install nötig.',
+        prereq_docker_title:'Docker oder Podman', prereq_docker_desc:'Verpackt die App, sodass ihr nichts weiter installieren müsst. Für den privaten Gebrauch kostenlos. Podman (RHEL/Fedora/CentOS Stream) funktioniert ebenfalls - rootless und SELinux-fähig.',
+        prereq_terminal_title:'Terminal', prereq_terminal_desc:'Eine Befehlszeile, um ein paar Befehle einzugeben. In jedem Betriebssystem eingebaut - kein Extra-Install nötig.',
         prereq_terminal_hint:'macOS: Terminal · Windows: PowerShell · Linux: bash',
         prereq_sys_title:'System', prereq_sys_desc:'Mindestens 256 MB RAM. Läuft auf einem Raspberry Pi, NAS, Heimserver oder jedem Desktop-Rechner.',
         prereq_sys_hint:'~500 MB Speicher für das Docker-Image',
         steps_label:'Schritt für Schritt', steps_title:'Wählt eure Plattform', steps_desc:'Sechs Installationswege. Wählt den, der zu eurem Setup passt; das Ergebnis ist dieselbe private Yuvomi-Instanz.',
+        tab_group_terminal:'Im Terminal', tab_group_store:'Per App-Store · 1 Klick',
         tab_installer:'Web-Installer', tab_docker:'Docker-Image', tab_source:'Aus Quellcode', tab_truenas:'TrueNAS', tab_umbrel:'Umbrel', tab_unraid:'Unraid', tab_one:'1 Klick',
         opt_installer_info:'Empfohlen, wenn ihr einen Befehl im Terminal ausführen könnt. Ein lokalisierter Browser-Assistent (23 Sprachen) erkennt eure Container-Engine (Docker oder Podman), konfiguriert eure .env (optional Reverse-Proxy/HTTPS, Single Sign-On, automatische Backups), startet den Container und erstellt euer Admin-Konto. Erfordert Git und Node.js 18+ auf dem Host. Ganz ohne Terminal? Nutzt eine App-Store-Installation mit einem Klick (TrueNAS, Umbrel, Unraid).',
         step_inst1_title:'Repository klonen', step_inst1_desc:'Öffnet euer Terminal und klont Yuvomi in einen Ordner eurer Wahl.',
         step_inst2_title:'Installer starten', step_inst2_desc:'Führt diesen Befehl vom Projektordner aus. Der Installer-Server startet auf Port 8090.',
         step_inst3_title:'Assistenten im Browser öffnen', step_inst3_desc:'Navigiert zur folgenden Adresse. Der Assistent führt euch durch Konfiguration, Container-Start und Admin-Konto-Erstellung.',
         step_inst3_info:'Der Installer beendet sich automatisch nach Abschluss der Einrichtung. Eure Yuvomi-Instanz läuft weiter über Docker oder Podman.',
-        opt_docker_info:'Kein Git, kein Build-Schritt — nur zwei Dateien und ein einziger Befehl. Nur Docker oder Podman erforderlich (Podman: podman-compose.yml verwenden).',
+        opt_docker_info:'Kein Git, kein Build-Schritt - nur zwei Dateien und ein einziger Befehl. Nur Docker oder Podman erforderlich (Podman: podman-compose.yml verwenden).',
         step_a1_title:'Konfigurationsdateien herunterladen', step_a1_desc:'Führt diese zwei Befehle aus. Sie laden die Docker-Konfiguration und die Vorlage für eure Einstellungen herunter.',
         step_a2_title:'Konfiguration erstellen', step_a2_desc:'Kopiert die Vorlage, öffnet dann .env in einem Texteditor und setzt die zwei erforderlichen Secrets.',
-        step_a2_gen:'Generiert einen sicheren Wert für jedes Secret, indem ihr dies zweimal ausführt — ein Ergebnis als SESSION_SECRET, eines als DB_ENCRYPTION_KEY:',
+        step_a2_gen:'Generiert einen sicheren Wert für jedes Secret, indem ihr dies zweimal ausführt - ein Ergebnis als SESSION_SECRET, eines als DB_ENCRYPTION_KEY:',
         step_a2_warning:'Behaltet eine Sicherungskopie eurer .env-Datei an einem sicheren Ort. Wenn ihr den DB_ENCRYPTION_KEY verliert, können eure Daten nicht wiederhergestellt werden.',
         step_a3_title:'Container starten', step_a3_desc:'Docker lädt das Yuvomi-Image herunter und startet es im Hintergrund. Der erste Download dauert eine Minute.',
         step_a3_success:'Prüft die Logs mit docker compose logs -f. Ihr solltet sehen: Server läuft auf Port 3000. Der Container läuft im Hintergrund weiter.',
         step_setup_title:'Admin-Konto erstellen', step_setup_desc:'Beim ersten Aufruf führt euch Yuvomi direkt im Browser durch die Erstellung eures Admin-Kontos. Lieber per Kommandozeile? Führt stattdessen den Einrichtungsassistenten aus:',
         opt_source_info:'Für Mitwirkende oder wer eine eigene Version ausführen möchte. Erfordert Git. Der erste Build dauert einige Minuten.',
         step_b1_title:'Repository klonen', step_b3_title:'Bauen und starten', step_b3_desc:'Das Flag --build kompiliert das Docker-Image lokal. Das dauert beim ersten Mal einige Minuten.',
-        opt_truenas_info:'Kein Terminal erforderlich. Yuvomi ist im TrueNAS SCALE Community Apps Catalog — direkt über das TrueNAS-Web-UI in wenigen Klicks installierbar.',
+        opt_truenas_info:'Kein Terminal erforderlich. Yuvomi ist im TrueNAS SCALE Community Apps Catalog - direkt über das TrueNAS-Web-UI in wenigen Klicks installierbar.',
         step_tn1_title:'Apps-Catalog öffnen', step_tn1_desc:'Im TrueNAS SCALE Web-UI zu Apps → Apps entdecken navigieren und nach Yuvomi suchen.',
-        step_tn2_title:'Konfigurieren und installieren', step_tn2_desc:'Auf Installieren klicken. Einen starken Wert für Session-Secret (erforderlich) und Datenbank-Verschlüsselungsschlüssel (empfohlen — sichern, da nicht wiederherstellbar) setzen. Port und Speicherpfade nach Bedarf anpassen, dann Installieren.',
+        step_tn2_title:'Konfigurieren und installieren', step_tn2_desc:'Auf Installieren klicken. Einen starken Wert für Session-Secret (erforderlich) und Datenbank-Verschlüsselungsschlüssel (empfohlen - sichern, da nicht wiederherstellbar) setzen. Port und Speicherpfade nach Bedarf anpassen, dann Installieren.',
         step_tn3_title:'WebUI öffnen', step_tn3_desc:'Sobald der App-Status Aktiv anzeigt, in der App-Übersicht auf WebUI klicken. Beim ersten Aufruf führt Yuvomi direkt im Browser durch die Erstellung des Admin-Kontos.',
-        opt_umbrel_info:'Kein Terminal erforderlich. Installiert Yuvomi direkt aus dem Umbrel App Store — alles läuft auf und bleibt auf eurem Umbrel.',
+        opt_umbrel_info:'Kein Terminal erforderlich. Installiert Yuvomi direkt aus dem Umbrel App Store - alles läuft auf und bleibt auf eurem Umbrel.',
         step_um1_title:'App Store öffnen', step_um1_desc:'Im Umbrel-Dashboard den App Store öffnen und nach Yuvomi suchen.',
-        step_um2_title:'Mit einem Klick installieren', step_um2_desc:'Auf Installieren klicken. Umbrel holt das Image und startet den Container für euch — keine Konfigurationsdateien zu bearbeiten.',
+        step_um2_title:'Mit einem Klick installieren', step_um2_desc:'Auf Installieren klicken. Umbrel holt das Image und startet den Container für euch - keine Konfigurationsdateien zu bearbeiten.',
         step_um3_title:'Yuvomi öffnen', step_um3_desc:'Startet Yuvomi über den Umbrel-Startbildschirm. Beim ersten Aufruf führt Yuvomi direkt im Browser durch die Erstellung des Admin-Kontos.',
-        opt_unraid_info:'Kein Terminal erforderlich. Yuvomi kommt als Community-Applications-Template — direkt über den Unraid-Apps-Tab hinzufügbar.',
+        opt_unraid_info:'Kein Terminal erforderlich. Yuvomi kommt als Community-Applications-Template - direkt über den Unraid-Apps-Tab hinzufügbar.',
         step_ur1_title:'Community Applications öffnen', step_ur1_desc:'In Unraid den Apps-Tab (das Community-Applications-Plugin) öffnen und nach Yuvomi suchen.',
-        step_ur2_title:'Template konfigurieren', step_ur2_desc:'Auf Installieren klicken. SESSION_SECRET (erforderlich) und DB_ENCRYPTION_KEY (empfohlen — sichern) setzen. WebUI-Port und appdata-Pfad bei Bedarf anpassen.',
+        step_ur2_title:'Template konfigurieren', step_ur2_desc:'Auf Installieren klicken. SESSION_SECRET (erforderlich) und DB_ENCRYPTION_KEY (empfohlen - sichern) setzen. WebUI-Port und appdata-Pfad bei Bedarf anpassen.',
         step_ur3_title:'Anwenden und öffnen', step_ur3_desc:'Auf Anwenden klicken. Sobald der Container läuft, auf das Yuvomi-Icon → WebUI klicken. Beim ersten Aufruf führt Yuvomi durch die Erstellung des Admin-Kontos.',
         success_title:'Alles bereit', success_desc:'Öffnet euren Browser und geht zu:', success_hint:'Meldet euch mit den Admin-Zugangsdaten an, die ihr gerade erstellt habt. Weitere Familienmitglieder könnt ihr auf der Einstellungsseite hinzufügen.',
         success_full_guide:'Technische Vollständiganleitung',
         env_label:'Konfiguration', env_title:'Pflichteinstellungen', env_desc:'Zwei Variablen in eurer .env-Datei sind Pflicht. Alles andere ist optional.',
         env_session_label:'Session-Secret', env_session_desc:'Signiert und verifiziert Anmelde-Cookies. Mit openssl rand -hex 32 einen sicheren Wert generieren.',
-        env_db_label:'Datenbank-Schlüssel', env_db_desc:'Verschlüsselt die gesamte Datenbank mit AES-256. Mit openssl rand -hex 32 generieren. Unbedingt sichern — ohne diesen Schlüssel sind die Daten nicht wiederherstellbar.',
+        env_db_label:'Datenbank-Schlüssel', env_db_desc:'Verschlüsselt die gesamte Datenbank mit AES-256. Mit openssl rand -hex 32 generieren. Unbedingt sichern - ohne diesen Schlüssel sind die Daten nicht wiederherstellbar.',
         env_required:'Pflicht',
         optional_label:'Optional', optional_title:'Mehr entdecken', optional_desc:'Sobald Yuvomi läuft, könnt ihr diese Extras einrichten. Alles wird in eurer .env-Datei konfiguriert.',
         opt_https_title:'HTTPS & Netzwerkzugang', opt_https_desc:"Yuvomi von anderen Geräten oder aus dem Internet erreichbar machen: Nginx als Reverse Proxy mit kostenlosem Let's-Encrypt-Zertifikat einrichten.",
@@ -814,7 +834,7 @@ docker compose logs | grep "Server läuft"</div></div><p data-t="trouble_nginx_p
         opt_cal_title:'Kalender- & Kontakt-Sync', opt_cal_desc:'Zwei-Wege-Sync mit Google Calendar (OAuth) und Multi-Account-CalDAV/CardDAV (iCloud, Nextcloud, Radicale). Apple-Erinnerungen lassen sich schreibgeschützt in Aufgaben oder Einkauf spiegeln.',
         opt_sso_title:'SSO / OpenID Connect', opt_sso_desc:'Single Sign-On über jeden OIDC-Provider (Authentik, Keycloak, Google, Microsoft Entra). Die vier OIDC_*-Variablen setzen, und ein „Anmelden mit SSO"-Button erscheint automatisch.',
         opt_backup_title:'Automatische Backups', opt_backup_desc:'Geplante Backups \xfcber BACKUP_ENABLED=true aktivieren; t\xe4glich um 2:00\xa0Uhr, 7\xa0Kopien. Optional jedes Backup auf einen WebDAV-Server hochladen (Nextcloud, ownCloud, Hetzner usw.). Verwalten und Wiederherstellen in Einstellungen → Administration → Backup und Wiederherstellung.',
-        opt_doc_storage_title:'Dokumentspeicher', opt_doc_storage_desc:'Neue Dokumentdateien einschlie\xdflich Kalenderanh\xe4ngen au\xdferhalb von SQLite speichern. Die einfachste Option ist ein gemounteter Host-Ordner \xfcber DOCUMENT_STORAGE_LOCAL_ENABLED=true; alternativ WebDAV mit den f\xfcnf DOCUMENT_STORAGE_WEBDAV_*-Variablen (f\xfcr private oder LAN-Ziele die Deployment-Variablen verwenden; in der UI verwaltete URLs m\xfcssen \xf6ffentlich sein). Datenbank-Backups enthalten diese Bin\xe4rdateien nicht; den Ordner bzw. das WebDAV-Ziel daher separat sichern.',
+        opt_doc_storage_title:'Dokumentspeicher', opt_doc_storage_desc:'Neue Dokumentdateien und Kalenderanh\xe4nge au\xdferhalb von SQLite in einem gemounteten Host-Ordner, auf WebDAV oder in Google Drive speichern. Drive wird sp\xe4ter in den Einstellungen per OAuth verbunden und ausdr\xfccklich ausgew\xe4hlt. Datenbank-Backups enthalten nur Metadaten; jedes externe Bin\xe4rziel separat sichern.',
         opt_email_title:'E-Mail / SMTP', opt_email_desc:'Einen ausgehenden SMTP-Server konfigurieren, um die Selbstbedienungsfunktion „Passwort vergessen" zu aktivieren. Die EMAIL_SMTP_*-Variablen und BASE_URL f\xfcr Reset-Links setzen, oder sp\xe4ter in Einstellungen → Administration → E-Mail konfigurieren.',
         opt_fixer_title:'Live-W\xe4hrungsumrechnung', opt_fixer_desc:'Budget → Abonnements funktioniert vollst\xe4ndig ohne externe Dienste. FIXER_API_KEY setzen, um in Fremdw\xe4hrung abgerechnete Abonnements in die Basisw\xe4hrung des Haushalts umzurechnen, mit 12-Stunden-Kurs-Cache.',
         opt_update_title:'Updates', opt_update_desc:'Neuestes Image holen und neu starten: docker compose pull && docker compose up -d. Eure Daten bleiben bei Updates erhalten.',
@@ -828,7 +848,7 @@ docker compose logs | grep "Server läuft"</div></div><p data-t="trouble_nginx_p
         trouble_nginx_title:'Nginx zeigt 502 Bad Gateway', trouble_nginx_desc:'Nginx kann den Container nicht erreichen. Prüfen, ob er läuft und der Port stimmt:',
         trouble_nginx_port:'Sicherstellen, dass der proxy_pass-Port in der Nginx-Konfiguration mit dem Host-Port in docker-compose.yml übereinstimmt (Standard: 3000).',
         footer_home:'Startseite', footer_heart:'Mit Sorgfalt gebaut für Familien, die Privatsphäre und Einfachheit schätzen.', footer_contrib:'Mitmachen', footer_impressum:'Impressum', footer_privacy:'Datenschutz',
-        backLabel:'Übersicht', copy:'Kopieren', copied:'Kopiert!'
+        backLabel:'Übersicht', copy:'Kopieren', copied:'Kopiert!', copyfail:'Strg+C drücken'
       }
     };
 
@@ -855,32 +875,75 @@ docker compose logs | grep "Server läuft"</div></div><p data-t="trouble_nginx_p
       lt.setAttribute('aria-label', lang === 'en' ? 'Auf Deutsch umschalten' : 'Switch to English');
       lt.setAttribute('title', lang === 'en' ? 'Auf Deutsch umschalten' : 'Switch to English');
       document.getElementById('backLabel').textContent = s.backLabel;
-      document.title = lang === 'en' ? 'Install Yuvomi — Self-Hosted Family Planner' : 'Yuvomi installieren — Selbstgehosteter Familienplaner';
+      document.title = lang === 'en' ? 'Install Yuvomi - Self-Hosted Family Planner' : 'Yuvomi installieren - Selbstgehosteter Familienplaner';
     }
     document.getElementById('themeToggle').addEventListener('click', function(){ theme = isDark() ? 'light' : 'dark'; lsSet('theme', theme); applyTheme(); });
     document.getElementById('langToggle').addEventListener('click', function(){ lang = lang === 'en' ? 'de' : 'en'; lsSet('lang', lang); applyLang(); });
     matchMedia('(prefers-color-scheme:dark)').addEventListener('change', function(){ if (!theme) applyTheme(); });
 
-    /* Tabs */
-    document.querySelectorAll('.tab-btn').forEach(function(btn){
-      btn.addEventListener('click', function(){
-        var panelId = btn.getAttribute('aria-controls');
-        document.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); b.setAttribute('aria-selected','false'); });
+    /* Tabs - ARIA tabs pattern: roving tabindex + Arrow/Home/End keys with
+       automatic activation. Only the selected tab stays in the tab order. */
+    (function(){
+      var tabs = Array.prototype.slice.call(document.querySelectorAll('.tab-btn'));
+      if (!tabs.length) return;
+      function activate(btn, setFocus){
+        tabs.forEach(function(b){
+          var on = b === btn;
+          b.classList.toggle('active', on);
+          b.setAttribute('aria-selected', on ? 'true' : 'false');
+          b.setAttribute('tabindex', on ? '0' : '-1');
+        });
         document.querySelectorAll('.tab-panel').forEach(function(p){ p.classList.remove('active'); });
-        btn.classList.add('active'); btn.setAttribute('aria-selected','true');
-        document.getElementById(panelId).classList.add('active');
+        var panel = document.getElementById(btn.getAttribute('aria-controls'));
+        if (panel) panel.classList.add('active');
+        if (setFocus) btn.focus();
+      }
+      tabs.forEach(function(btn, i){
+        btn.setAttribute('tabindex', btn.classList.contains('active') ? '0' : '-1');
+        btn.addEventListener('click', function(){ activate(btn, false); });
+        btn.addEventListener('keydown', function(e){
+          var idx = -1;
+          if (e.key === 'ArrowRight' || e.key === 'ArrowDown') idx = (i + 1) % tabs.length;
+          else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') idx = (i - 1 + tabs.length) % tabs.length;
+          else if (e.key === 'Home') idx = 0;
+          else if (e.key === 'End') idx = tabs.length - 1;
+          else return;
+          e.preventDefault();
+          activate(tabs[idx], true);
+        });
       });
-    });
+    })();
 
-    /* Copy */
+    /* Copy - Clipboard API with a legacy execCommand fallback, plus a visible
+       failure state so it never fails silently (e.g. on insecure origins). */
+    function flashCopyBtn(btn, cls, msgKey){
+      var span = btn.querySelector('span');
+      btn.classList.add(cls);
+      if (span) span.textContent = i18n[lang][msgKey] || msgKey;
+      setTimeout(function(){
+        btn.classList.remove(cls);
+        if (span) span.textContent = i18n[lang].copy || 'Copy';
+      }, 2000);
+    }
+    function legacyCopy(text){
+      try {
+        var ta = document.createElement('textarea');
+        ta.value = text; ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed'; ta.style.top = '-9999px';
+        document.body.appendChild(ta); ta.select();
+        var ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return ok;
+      } catch (e) { return false; }
+    }
     document.querySelectorAll('.copy-btn').forEach(function(btn){
       btn.addEventListener('click', function(){
         var text = btn.getAttribute('data-copy'); if (!text) return;
-        navigator.clipboard.writeText(text).then(function(){
-          var span = btn.querySelector('span');
-          btn.classList.add('copied'); span.textContent = i18n[lang].copied || 'Copied!';
-          setTimeout(function(){ btn.classList.remove('copied'); span.textContent = i18n[lang].copy || 'Copy'; }, 2000);
-        }).catch(function(){});
+        var onOk = function(){ flashCopyBtn(btn, 'copied', 'copied'); };
+        var onFail = function(){ if (legacyCopy(text)) onOk(); else flashCopyBtn(btn, 'failed', 'copyfail'); };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(onOk).catch(onFail);
+        } else { onFail(); }
       });
     });
 

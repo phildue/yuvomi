@@ -26,7 +26,7 @@
  * Login for all demo users: <username> / demo1234
  */
 
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import bcrypt from 'bcrypt';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -93,6 +93,11 @@ const WIPE = [
   'contact_phones', 'contact_emails', 'contact_addresses', 'contacts',
   'notes',
   'meal_ingredients', 'meals', 'recipe_ingredients', 'recipes',
+  // Nur der Bestand, NICHT pantry_locations: die Lagerorte sind Referenzdaten
+  // aus der Migration (wie shopping_categories, das hier ebenfalls fehlt).
+  // Sie zu leeren ließ den Haushalt ohne einen einzigen Lagerort zurück -
+  // niemand legt sie danach wieder an.
+  'pantry_items',
   'reminders',
   'event_assignments', 'task_assignments', 'calendar_events', 'tasks',
   'birthdays',
@@ -113,7 +118,9 @@ const wipe = db.transaction(() => {
   for (const t of WIPE) {
     try { db.prepare(`DELETE FROM ${t}`).run(); } catch (e) { /* table may not exist */ }
   }
-  db.prepare("DELETE FROM sqlite_sequence").run();
+  // sqlite_sequence existiert erst, wenn je eine AUTOINCREMENT-Tabelle Daten
+  // hatte - auf einer frisch migrierten DB fehlt sie und der Seed bräche hier.
+  try { db.prepare("DELETE FROM sqlite_sequence").run(); } catch (e) { /* fresh db */ }
 });
 wipe();
 db.pragma('foreign_keys = ON');
@@ -361,14 +368,28 @@ const insertItem = db.prepare('INSERT INTO shopping_items (list_id, name, quanti
 
 // ── Contacts ─────────────────────────────────────────────────────────────────
 
+// Die Demo nutzt zwei Kategorien, die der Standardsatz nicht kennt. Sie werden
+// hier angelegt, wie ein Haushalt sie anlegen würde - sonst tragen die Kontakte
+// Keys ohne Eintrag in contact_categories, und der Bearbeiten-Dialog hätte für
+// sie keine Option (das Select fiele stumm auf die erste Kategorie zurück).
+console.log('Adding custom contact categories…');
+const insertContactCat = db.prepare(`
+  INSERT OR IGNORE INTO contact_categories (key, name, label_key, icon, sort_order)
+  VALUES (?, ?, NULL, ?, ?)
+`);
+[
+  ['family',   'Family',   'heart',     10],
+  ['services', 'Services', 'briefcase', 11],
+].forEach(row => insertContactCat.run(...row));
+
 console.log('Inserting contacts…');
 const insertContact = db.prepare(`
   INSERT INTO contacts (name, category, phone, email, address, notes, organization, job_title)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `);
 [
-  ['Dr. Anna Weber',            'medical',  '+49 231 445 2210', 'praxis@dr-weber.de',            'Bürgerstraße 12, Dortmund',      'GP — appointments Mon–Thu',                  'City Practice',          'General Practitioner'],
-  ['Dr. Thomas Müller',         'medical',  '+49 231 887 0034', 'info@zahnarzt-mueller.de',      'Hansastraße 55, Dortmund',       'Family dentist',                             'Dental Practice Müller', 'Dentist'],
+  ['Dr. Anna Weber',            'doctor',   '+49 231 445 2210', 'praxis@dr-weber.de',            'Bürgerstraße 12, Dortmund',      'GP — appointments Mon–Thu',                  'City Practice',          'General Practitioner'],
+  ['Dr. Thomas Müller',         'doctor',   '+49 231 887 0034', 'info@zahnarzt-mueller.de',      'Hansastraße 55, Dortmund',       'Family dentist',                             'Dental Practice Müller', 'Dentist'],
   ['Grandma & Grandpa Johnson', 'family',   '+49 2304 78 221',  'oma.johnson@gmail.com',         'Ahornweg 4, Castrop-Rauxel',     "Emma & Leo's grandparents",                  null,                     null],
   ['Westpark Primary School',   'school',   '+49 231 556 8810', 'office@westpark-grundschule.de','Westparkstraße 20, Dortmund',    "Emma's school — Mrs Bauer is class teacher", 'Westpark Primary School', null],
   ['AutoHaus König',            'services', '+49 231 997 1100', 'service@autohaus-koenig.de',    'Industriestraße 88, Dortmund',   'VW service partner — Ref: Golf TDI 2021',    'AutoHaus König',         'Service Centre'],
@@ -444,7 +465,7 @@ console.log('Inserting notes…');
 const insertNote = db.prepare('INSERT INTO notes (title, content, color, pinned, created_by) VALUES (?, ?, ?, ?, ?)');
 [
   ['Holiday Checklist 🌍', 'Passports (exp. 2028)\nTravel insurance — check!\nEuro cash — €300\nBook airport parking\nAsk Mike to water the plants\nPack sunscreen SPF 50', '#0EA5E9', 1, alexId],
-  ['WiFi & Smart Home',    'WiFi: Yuvomi_Home_5G\nPassword: sunshine2024!\nPhilips Hue: bridge 192.168.1.42\nThermostat: eco mode 18°C', '#F59E0B', 1, alexId],
+  ['WiFi & Smart Home',    'WiFi: Yuvomi_Home_5G (password in the router app)\nPhilips Hue: bridge 192.168.1.42\nThermostat: eco mode 18°C\nRouter admin: fritz.box', '#F59E0B', 1, alexId],
   ["Emma's School Info",   "Class: 3b — Mrs Bauer\nSchool starts: 08:10\nCollection: 13:30 (Tue/Thu 15:00)\nAllergy: mild lactose intolerance\nBest friends: Lena, Sophie, Tim", '#EC4899', 1, lindaId],
   ["Leo's Activities",     'Football: Tue & Sat 17:00 — SV West\nSwimming: Fri 16:00 — Westbad\nNeeds: boots size 35, goggles\nCoach: Herr Krüger', '#F97316', 1, lindaId],
   ['Emergency Numbers',    'Police: 110\nFire / Ambulance: 112\nPoison Control: 0800 192 11 10\nGP out-of-hours: 116 117\nNearest A&E: Klinikum Dortmund', '#EF4444', 1, alexId],
@@ -602,7 +623,10 @@ function addExpense(groupId, payerId, memberIds, title, description, euros, cate
   // Ledger: payer +full, each member -their share
   insertLedger.run(groupId, expId, payerId, null, amount, title, payerId);
   for (const s of shares) insertLedger.run(groupId, expId, s.uid, payerId, -s.amount_minor, title, payerId);
-  insertActivity.run(groupId, payerId, 'expense_added', 'expense', expId, JSON.stringify({ title, amount_minor: amount }));
+  // Typ muss exakt einer der Typen sein, die server/routes/split-expenses.js
+  // schreibt — der Feed übersetzt über splitExpenses.activityType.<type>, ein
+  // erfundener Typ rendert als roher Key.
+  insertActivity.run(groupId, payerId, 'expense_created', 'expense', expId, JSON.stringify({ title, amount_minor: amount }));
   return expId;
 }
 
@@ -644,7 +668,7 @@ db.prepare(`
   INSERT INTO expense_ledger_entries (group_id, source_type, source_id, user_id, counterparty_id, amount_minor, currency, memo, created_by)
   VALUES (?, 'settlement', ?, ?, ?, ?, 'EUR', ?, ?)
 `).run(houseGroup, settlementId, alexId, lindaId, -5000, 'Settle-up', lindaId);
-insertActivity.run(houseGroup, lindaId, 'settlement_added', 'settlement', settlementId, JSON.stringify({ amount_minor: 5000 }));
+insertActivity.run(houseGroup, lindaId, 'payment_registered', 'settlement', settlementId, JSON.stringify({ amount_minor: 5000 }));
 
 // ── Health: Vitals ───────────────────────────────────────────────────────────
 // All health data belongs to Linda (the demo login) so it renders on her own
@@ -750,21 +774,25 @@ const labReportOld = insertLabReport.run(lindaId, daysFromNow(-200), 'City Pract
 // ── Health: Cycle ────────────────────────────────────────────────────────────
 
 console.log('Inserting cycle data…');
+// Demo-Zyklus familienweit sichtbar seeden: sonst sind die Perioden aus jeder
+// anderen Account-Perspektive unsichtbar und die Vorhersage rechnet auf Lücken
+// (Discussion #550). default_visibility bleibt 'private' - nur die Beispieldaten
+// selbst sind bewusst geteilt.
 db.prepare(`
   INSERT INTO cycle_settings (user_id, cycle_length_avg, period_length_avg, luteal_length, track_fertility)
   VALUES (?, 28, 5, 14, 1)
 `).run(lindaId);
-const insertPeriod = db.prepare('INSERT INTO cycle_periods (user_id, start_date, end_date, note) VALUES (?, ?, ?, ?)');
+const insertPeriod = db.prepare('INSERT INTO cycle_periods (user_id, start_date, end_date, note, visibility) VALUES (?, ?, ?, ?, ?)');
 [[-6, -2, 'Current cycle'], [-34, -30, null], [-62, -58, null], [-90, -86, null]]
-  .forEach(([s, e, note]) => insertPeriod.run(lindaId, daysFromNow(s), daysFromNow(e), note));
-const insertCycleLog = db.prepare('INSERT INTO cycle_day_logs (user_id, log_date, flow, symptoms, mood, note) VALUES (?, ?, ?, ?, ?, ?)');
+  .forEach(([s, e, note]) => insertPeriod.run(lindaId, daysFromNow(s), daysFromNow(e), note, 'family'));
+const insertCycleLog = db.prepare('INSERT INTO cycle_day_logs (user_id, log_date, flow, symptoms, mood, note, visibility) VALUES (?, ?, ?, ?, ?, ?, ?)');
 [
   [-6, 'heavy',    'cramps,fatigue',       'sensitive', null],
   [-5, 'heavy',    'cramps,backache',      'irritable', 'Tough day'],
   [-4, 'medium',   'headache',             'neutral',   null],
   [-3, 'light',    'fatigue',              'good',      null],
   [-2, 'spotting', '',                     'good',      null],
-].forEach(([d, flow, symptoms, mood, note]) => insertCycleLog.run(lindaId, daysFromNow(d), flow, symptoms, mood, note));
+].forEach(([d, flow, symptoms, mood, note]) => insertCycleLog.run(lindaId, daysFromNow(d), flow, symptoms, mood, note, 'family'));
 
 // ── Rewards ──────────────────────────────────────────────────────────────────
 

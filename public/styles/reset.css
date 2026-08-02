@@ -61,10 +61,15 @@ h1, h2, h3, h4, h5, h6 {
   line-height: var(--line-height-tight);
 }
 
-/* Fokus-Styles (Accessibility) */
+/* Fokus-Styles (Accessibility)
+ *
+ * Die einzige Basisregel. Sie liest die Tokens aus tokens.css §7b; wer den Ring
+ * anders will, überschreibt dort `--focus-ring-color`, statt hier eine zweite
+ * Spezifikation danebenzustellen - genau so entstanden die sechs, die es vorher
+ * gab (Critique P1, 2026-07-30). */
 :focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
   border-radius: var(--radius-xs);
 }
 

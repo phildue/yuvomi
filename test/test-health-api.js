@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import test from 'node:test';
 import express from 'express';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 
 process.env.DB_PATH = ':memory:';
 
@@ -571,6 +571,49 @@ test('Cycle-Settings: ungültiges Entbindungsdatum wird abgelehnt', async () => 
   assert.equal(res.status, 400);
 });
 
+test('Cycle-Settings: default_visibility – Default privat, Upsert, Validierung (#550)', async () => {
+  asB();
+  const def = await call('GET', '/cycle/settings');
+  assert.equal(def.body.data.default_visibility, 'private');
+
+  const saved = await call('PUT', '/cycle/settings', { default_visibility: 'family' });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.body.data.default_visibility, 'family');
+
+  const bad = await call('PUT', '/cycle/settings', { default_visibility: 'public' });
+  assert.equal(bad.status, 400);
+});
+
+test('Cycle: Bulk-Sichtbarkeit flippt eigene Einträge, fremde bleiben unberührt (#550)', async () => {
+  asA();
+  const foreign = await call('POST', '/cycle/periods', { start_date: '2026-09-01', note: 'bulk-foreign-A' });
+
+  asB();
+  const p = await call('POST', '/cycle/periods', { start_date: '2026-09-02', note: 'bulk-B-period' });
+  const l = await call('POST', '/cycle/logs', { log_date: '2026-09-02', flow: 'light' });
+  assert.equal(p.body.data.visibility, 'private');
+  assert.equal(l.body.data.visibility, 'private');
+
+  const bulk = await call('PATCH', '/cycle/visibility', { visibility: 'family' });
+  assert.equal(bulk.status, 200);
+  assert.ok(bulk.body.data.periods >= 1);
+  assert.ok(bulk.body.data.logs >= 1);
+
+  const periods = await call('GET', '/cycle/periods');
+  assert.equal(periods.body.data.find((x) => x.id === p.body.data.id).visibility, 'family');
+  const logs = await call('GET', '/cycle/logs');
+  assert.equal(logs.body.data.find((x) => x.id === l.body.data.id).visibility, 'family');
+
+  // Bulk ist strikt eigen-scoped: Alices Periode bleibt privat.
+  asA();
+  const aPeriods = await call('GET', '/cycle/periods');
+  assert.equal(aPeriods.body.data.find((x) => x.id === foreign.body.data.id).visibility, 'private');
+
+  // Ungültiger Wert wird abgelehnt.
+  const badVal = await call('PATCH', '/cycle/visibility', { visibility: 'public' });
+  assert.equal(badVal.status, 400);
+});
+
 test('Export cycle: CSV mit Perioden- und Zykluslänge', async () => {
   asA();
   await call('POST', '/cycle/periods', { start_date: '2026-01-05', end_date: '2026-01-09', note: 'exp-cyc-1' });
@@ -581,6 +624,268 @@ test('Export cycle: CSV mit Perioden- und Zykluslänge', async () => {
   assert.ok(res.text.includes('"start_date","end_date","period_length_days","cycle_length_days"'));
   assert.ok(res.text.includes('exp-cyc-1'));
   assert.ok(res.text.includes('"28"')); // Abstand 05.01 → 02.02
+});
+
+// ========================================================
+// Ungültige IDs, Filter, partielle Updates, Edge-Validierung (Härtung)
+// ========================================================
+
+test('Invalid-ID: nicht-numerische IDs liefern 400 auf allen :id-Routen', async () => {
+  asA();
+  const cases = [
+    ['PATCH', '/vitals/abc'], ['DELETE', '/vitals/abc'],
+    ['PATCH', '/medications/abc'], ['DELETE', '/medications/abc'],
+    ['GET', '/medications/abc/schedules'], ['POST', '/medications/abc/schedules'],
+    ['PATCH', '/schedules/abc'], ['DELETE', '/schedules/abc'],
+    ['GET', '/medications/abc/logs'], ['POST', '/medications/abc/logs'],
+    ['POST', '/logs/abc/take'], ['POST', '/logs/abc/skip'],
+    ['GET', '/labs/abc'], ['PATCH', '/labs/abc'], ['DELETE', '/labs/abc'],
+    ['POST', '/labs/abc/results'], ['DELETE', '/results/abc'],
+    ['PATCH', '/activities/abc'], ['DELETE', '/activities/abc'],
+    ['PATCH', '/cycle/periods/abc'], ['DELETE', '/cycle/periods/abc'],
+    ['DELETE', '/cycle/logs/abc'],
+  ];
+  for (const [m, p] of cases) {
+    const body = (m === 'GET' || m === 'DELETE') ? undefined : {};
+    const r = await call(m, p, body);
+    assert.equal(r.status, 400, `${m} ${p} sollte 400 liefern`);
+  }
+});
+
+test('Vitals: GET from/to grenzt auf Zeitfenster ein', async () => {
+  asA();
+  await call('POST', '/vitals', { type: 'hr', value_num: 60, measured_at: '2027-07-01T08:00', note: 'flt-in-hr' });
+  await call('POST', '/vitals', { type: 'hr', value_num: 61, measured_at: '2027-07-20T08:00', note: 'flt-out-hr' });
+  const r = await call('GET', '/vitals?type=hr&from=2027-07-01T00:00&to=2027-07-10T00:00');
+  const notes = r.body.data.map((x) => x.note);
+  assert.ok(notes.includes('flt-in-hr'));
+  assert.ok(!notes.includes('flt-out-hr'));
+});
+
+test('Medications: PATCH aktualisiert alle Kopf-Felder + Bool-Flags', async () => {
+  asA();
+  const med = await call('POST', '/medications', { name: 'PatchMed', stock_qty: 10 });
+  const id = med.body.data.id;
+  const r = await call('PATCH', `/medications/${id}`, {
+    name: 'PatchMed2', dosage_text: '500mg', form: 'capsule', stock_qty: 42, stock_unit: 'Stk',
+    refill_threshold: 7, note: 'Notiz', visibility: 'family', active: false, prn: true,
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.data.name, 'PatchMed2');
+  assert.equal(r.body.data.form, 'capsule');
+  assert.equal(r.body.data.stock_qty, 42);
+  assert.equal(r.body.data.active, 0);
+  assert.equal(r.body.data.prn, 1);
+  assert.equal(r.body.data.visibility, 'family');
+});
+
+test('Medications: PATCH mit nicht-boolescher active → 400', async () => {
+  asA();
+  const med = await call('POST', '/medications', { name: 'BoolMed' });
+  const r = await call('PATCH', `/medications/${med.body.data.id}`, { active: 'vielleicht' });
+  assert.equal(r.status, 400);
+});
+
+test('Schedules: PATCH aktualisiert alle Felder inkl. days_mask (Zahl und null)', async () => {
+  asA();
+  const med = await call('POST', '/medications', { name: 'SchedMed' });
+  const medId = med.body.data.id;
+  const sched = await call('POST', `/medications/${medId}/schedules`, { time_of_day: '07:00', dose_qty: 1 });
+  const sid = sched.body.data.id;
+  const full = await call('PATCH', `/schedules/${sid}`, {
+    time_of_day: '20:00', dose_qty: 2, start_date: '2026-06-01', end_date: '2026-12-31', active: false, days_mask: 31,
+  });
+  assert.equal(full.status, 200);
+  assert.equal(full.body.data.time_of_day, '20:00');
+  assert.equal(full.body.data.dose_qty, 2);
+  assert.equal(full.body.data.days_mask, 31);
+  assert.equal(full.body.data.active, 0);
+  const cleared = await call('PATCH', `/schedules/${sid}`, { days_mask: null });
+  assert.equal(cleared.body.data.days_mask, null);
+});
+
+test('Schedules: PATCH mit leerem time_of_day → 400', async () => {
+  asA();
+  const med = await call('POST', '/medications', { name: 'SchedMed2' });
+  const sched = await call('POST', `/medications/${med.body.data.id}/schedules`, { time_of_day: '07:00' });
+  const r = await call('PATCH', `/schedules/${sched.body.data.id}`, { time_of_day: '' });
+  assert.equal(r.status, 400);
+});
+
+test('Logs: POST mit gültiger schedule_id verknüpft, fremde schedule_id → 400', async () => {
+  asA();
+  const medA = await call('POST', '/medications', { name: 'LogMedA' });
+  const medAId = medA.body.data.id;
+  const schedA = await call('POST', `/medications/${medAId}/schedules`, { time_of_day: '08:00' });
+  const ok = await call('POST', `/medications/${medAId}/logs`, { scheduled_at: '2026-06-10T08:00', schedule_id: schedA.body.data.id, status: 'taken', taken_at: '2026-06-10T08:03' });
+  assert.equal(ok.status, 201);
+  assert.equal(ok.body.data.schedule_id, schedA.body.data.id);
+  assert.equal(ok.body.data.status, 'taken');
+
+  const medB = await call('POST', '/medications', { name: 'LogMedB' });
+  const schedB = await call('POST', `/medications/${medB.body.data.id}/schedules`, { time_of_day: '09:00' });
+  const bad = await call('POST', `/medications/${medAId}/logs`, { scheduled_at: '2026-06-11T08:00', schedule_id: schedB.body.data.id });
+  assert.equal(bad.status, 400, 'schedule_id fremder Medikamente wird abgelehnt');
+});
+
+test('Logs: GET from/to-Filter + take mit ungültigem taken_at → 400', async () => {
+  asA();
+  const med = await call('POST', '/medications', { name: 'FilterLogMed' });
+  const medId = med.body.data.id;
+  await call('POST', `/medications/${medId}/logs`, { scheduled_at: '2026-08-01T08:00', note: 'log-in' });
+  const out = await call('POST', `/medications/${medId}/logs`, { scheduled_at: '2026-08-20T08:00', note: 'log-out' });
+  const list = await call('GET', `/medications/${medId}/logs?from=2026-08-01T00:00&to=2026-08-05T00:00`);
+  const notes = list.body.data.map((x) => x.note);
+  assert.ok(notes.includes('log-in') && !notes.includes('log-out'));
+
+  const bad = await call('POST', `/logs/${out.body.data.id}/take`, { taken_at: 'kein-datum' });
+  assert.equal(bad.status, 400);
+});
+
+test('Labs: GET :id für Unbekanntes → 404; POST mit ungültigem Analyt → 400', async () => {
+  asA();
+  const notFound = await call('GET', '/labs/999999');
+  assert.equal(notFound.status, 404);
+  const bad = await call('POST', '/labs', { report_date: '2026-06-01', results: [{ analyte: '', value_num: 1 }] });
+  assert.equal(bad.status, 400);
+});
+
+test('Labs: PATCH aktualisiert Kopf-Felder', async () => {
+  asA();
+  const lab = await call('POST', '/labs', { report_date: '2026-06-01', lab_name: 'Alt' });
+  const id = lab.body.data.id;
+  const r = await call('PATCH', `/labs/${id}`, { report_date: '2026-06-02', lab_name: 'Neu', note: 'Kommentar', visibility: 'family' });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.data.lab_name, 'Neu');
+  assert.equal(r.body.data.report_date, '2026-06-02');
+  assert.equal(r.body.data.visibility, 'family');
+});
+
+test('Labs: from/to-Filter auf GET /labs', async () => {
+  asA();
+  await call('POST', '/labs', { report_date: '2026-09-05', lab_name: 'lab-in-range' });
+  await call('POST', '/labs', { report_date: '2026-09-25', lab_name: 'lab-out-range' });
+  const r = await call('GET', '/labs?from=2026-09-01&to=2026-09-10');
+  const names = r.body.data.map((x) => x.lab_name);
+  assert.ok(names.includes('lab-in-range') && !names.includes('lab-out-range'));
+});
+
+test('Activities: PATCH aller Felder + type/from/to-Filter', async () => {
+  asA();
+  const a = await call('POST', '/activities', { type: 'run', duration_min: 30, performed_at: '2026-10-01T18:00' });
+  const id = a.body.data.id;
+  const patched = await call('PATCH', `/activities/${id}`, {
+    type: 'bike', distance_km: 12, intensity: 'high', calories: 400, performed_at: '2026-10-02T18:00', note: 'Tour', visibility: 'family',
+  });
+  assert.equal(patched.status, 200);
+  assert.equal(patched.body.data.type, 'bike');
+  assert.equal(patched.body.data.distance_km, 12);
+  assert.equal(patched.body.data.calories, 400);
+  assert.equal(patched.body.data.visibility, 'family');
+
+  await call('POST', '/activities', { type: 'swim', duration_min: 20, performed_at: '2026-10-20T09:00', note: 'act-out' });
+  const filtered = await call('GET', '/activities?type=bike&from=2026-10-01T00:00&to=2026-10-10T00:00');
+  assert.ok(filtered.body.data.every((x) => x.type === 'bike'));
+  assert.ok(filtered.body.data.some((x) => x.id === id));
+});
+
+test('Export activities: text/csv-Header mit eigener Zeile', async () => {
+  asA();
+  await call('POST', '/activities', { type: 'yoga', duration_min: 45, performed_at: '2026-11-01T07:00', note: 'exp-act-marker' });
+  const res = await callCsv('/export/activities');
+  assert.equal(res.status, 200);
+  assert.match(res.contentType, /text\/csv/);
+  assert.match(res.disposition, /attachment; filename="health-activities/);
+  assert.ok(res.text.includes('exp-act-marker'));
+});
+
+test('Export: from/to-Zeitraum + Personen-Filter über alle CSV-Endpunkte', async () => {
+  asA();
+  const labsRange = await callCsv('/export/labs?from=2026-09-01&to=2026-09-10');
+  assert.equal(labsRange.status, 200);
+  assert.match(labsRange.disposition, /health-labs-2026-09-01_2026-09-10/);
+  const medsRange = await callCsv('/export/meds-logs?from=2026-08-01&to=2026-08-05');
+  assert.equal(medsRange.status, 200);
+  const cycleRange = await callCsv('/export/cycle?from=2026-01-01&to=2026-12-31');
+  assert.equal(cycleRange.status, 200);
+  // Personen-Filter (user_id) auf Export: Bob sieht nur family-Vitals von Alice.
+  asB();
+  const vitalsPerson = await callCsv(`/export/vitals?user_id=${userA}`);
+  assert.equal(vitalsPerson.status, 200);
+});
+
+test('Cycle: Perioden from/to-Filter + Log löschen', async () => {
+  asA();
+  await call('POST', '/cycle/periods', { start_date: '2028-03-01', note: 'per-in' });
+  await call('POST', '/cycle/periods', { start_date: '2028-04-15', note: 'per-out' });
+  const filtered = await call('GET', '/cycle/periods?from=2028-03-01&to=2028-03-31');
+  const notes = filtered.body.data.map((x) => x.note);
+  assert.ok(notes.includes('per-in') && !notes.includes('per-out'));
+
+  const logged = await call('POST', '/cycle/logs', { log_date: '2028-03-05', flow: 'light' });
+  const logsFiltered = await call('GET', '/cycle/logs?from=2028-03-01&to=2028-03-31');
+  assert.ok(logsFiltered.body.data.some((l) => l.id === logged.body.data.id));
+  const del = await call('DELETE', `/cycle/logs/${logged.body.data.id}`);
+  assert.equal(del.status, 204);
+});
+
+test('Cycle-Log: zu lange Symptomliste → 400', async () => {
+  asA();
+  const many = Array.from({ length: 40 }, (_, i) => `symptomlongtoken${i}`);
+  const r = await call('POST', '/cycle/logs', { log_date: '2028-05-01', symptoms: many });
+  assert.equal(r.status, 400);
+});
+
+test('Cycle-Periode: PATCH aller Felder + Fremdzugriff-404', async () => {
+  asA();
+  const p = await call('POST', '/cycle/periods', { start_date: '2028-06-01' });
+  const id = p.body.data.id;
+  const r = await call('PATCH', `/cycle/periods/${id}`, { start_date: '2028-06-02', end_date: '2028-06-08', note: 'Update', visibility: 'family' });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.data.end_date, '2028-06-08');
+  assert.equal(r.body.data.visibility, 'family');
+});
+
+test('Cycle-Settings: nicht-boolesche track_fertility/pregnancy_mode → 400', async () => {
+  asA();
+  const bad1 = await call('PUT', '/cycle/settings', { track_fertility: 'ja' });
+  assert.equal(bad1.status, 400);
+  const bad2 = await call('PUT', '/cycle/settings', { pregnancy_mode: 'ja' });
+  assert.equal(bad2.status, 400);
+});
+
+test('Nicht-Eigentümer: DELETE auf Schedule/Result/Cycle-Period/Cycle-Log → 404', async () => {
+  asA();
+  const med = await call('POST', '/medications', { name: 'OwnMed' });
+  const sched = await call('POST', `/medications/${med.body.data.id}/schedules`, { time_of_day: '06:00' });
+  const lab = await call('POST', '/labs', { report_date: '2026-07-01', results: [{ analyte: 'X', value_num: 1 }] });
+  const resultId = lab.body.data.results[0].id;
+  const period = await call('POST', '/cycle/periods', { start_date: '2029-01-01' });
+  const log = await call('POST', '/cycle/logs', { log_date: '2029-01-02', flow: 'light' });
+
+  asB();
+  assert.equal((await call('DELETE', `/schedules/${sched.body.data.id}`)).status, 404);
+  assert.equal((await call('DELETE', `/results/${resultId}`)).status, 404);
+  assert.equal((await call('DELETE', `/cycle/periods/${period.body.data.id}`)).status, 404);
+  assert.equal((await call('DELETE', `/cycle/logs/${log.body.data.id}`)).status, 404);
+});
+
+test('Logs: take ohne taken_at setzt Zeitstempel automatisch', async () => {
+  asA();
+  const med = await call('POST', '/medications', { name: 'TakeNowMed' });
+  const logRow = await call('POST', `/medications/${med.body.data.id}/logs`, { scheduled_at: '2026-06-15T08:00' });
+  const r = await call('POST', `/logs/${logRow.body.data.id}/take`);
+  assert.equal(r.status, 200);
+  assert.equal(r.body.data.status, 'taken');
+  assert.ok(r.body.data.taken_at, 'taken_at automatisch gesetzt');
+});
+
+test('Labs: POST /results mit explizitem flag übernimmt diesen', async () => {
+  asA();
+  const lab = await call('POST', '/labs', { report_date: '2026-07-02' });
+  const r = await call('POST', `/labs/${lab.body.data.id}/results`, { analyte: 'TSH', value_num: 2, flag: 'high' });
+  assert.equal(r.status, 201);
+  assert.equal(r.body.data.flag, 'high', 'expliziter Flag überschreibt Ableitung');
 });
 
 test.after(() => { server.close(); });

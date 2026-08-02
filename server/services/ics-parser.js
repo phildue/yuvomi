@@ -5,8 +5,9 @@
  * Abhängigkeiten: server/services/recurrence.js
  */
 
-import { nextOccurrence } from './recurrence.js';
+import { nextOccurrence, matchesRRuleByday } from './recurrence.js';
 import { resolveIcalColor } from '../utils/ical-color.js';
+import { localToUTC, utcToWall } from '../utils/timezone.js';
 
 function unfoldLines(ics) {
   return ics.replace(/\r?\n[ \t]/g, '');
@@ -19,6 +20,70 @@ function unescapeICSText(str) {
     .replace(/\\,/g, ',')
     .replace(/\\;/g, ';')
     .replace(/\\\\/g, '\\');
+}
+
+// Maximal übernommene Tags je Aufgabe und Zeichen je Tag. Die Werte kommen von
+// fremden Servern; ohne Deckel wandert ein absurd getaggtes VTODO ungebremst in
+// die Datenbank und in jede Filterleiste. Beide Grenzen gelten identisch in der
+// Route (server/routes/tasks.js).
+const MAX_CATEGORIES = 32;
+const MAX_CATEGORY_LEN = 64;
+
+/**
+ * CATEGORIES eines Komponenten-Blocks als Liste (#586).
+ *
+ * Zwei Eigenheiten, die ein naives `get('CATEGORIES')` verfehlt:
+ *
+ * 1. Die Property darf mehrfach vorkommen. RFC 5545 erlaubt sowohl
+ *    `CATEGORIES:a,b` als auch zwei getrennte CATEGORIES-Zeilen, und Clients
+ *    nutzen beides. Deshalb alle Vorkommen einsammeln statt nur des ersten.
+ * 2. `\,` ist ein escaptes Komma **im Wert**, kein Trenner. Erst am unescapten
+ *    Komma splitten, dann jedes Element einzeln unescapen - andersherum zerfiele
+ *    ein Tag wie „Haus\, Garten" in zwei.
+ */
+/**
+ * Eine CATEGORIES-Zeile am Trenner-Komma zerlegen.
+ *
+ * Ein Lookbehind auf ein einzelnes Zeichen reicht dafür nicht: `\\` ist ein
+ * escapter Backslash **im Wert**, und `foo\\,bar` meint die Tags `foo\` und
+ * `bar`. Der Blick auf nur ein vorangehendes Zeichen sähe dort einen Escape und
+ * verweigerte die Trennung. Also Zeichen für Zeichen: eine Escape-Sequenz wird
+ * am Stück übernommen, danach ist das nächste Komma wieder ein Trenner.
+ */
+function splitCategoryList(value) {
+  const out = [];
+  let current = '';
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (ch === '\\' && i + 1 < value.length) {
+      current += ch + value[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === ',') { out.push(current); current = ''; continue; }
+    current += ch;
+  }
+  out.push(current);
+  return out;
+}
+
+function parseCategories(block) {
+  const re  = /^CATEGORIES(?:;[^:\n]*)?:(.*)$/gim;
+  const out = [];
+  const seen = new Set();
+  let m;
+  while ((m = re.exec(block)) !== null) {
+    for (const raw of splitCategoryList(m[1])) {
+      const tag = unescapeICSText(raw.trim())?.trim().slice(0, MAX_CATEGORY_LEN);
+      if (!tag) continue;
+      const key = tag.toLowerCase();
+      if (seen.has(key)) continue;   // Groß-/Kleinschreibung eint, erste Schreibweise gewinnt
+      seen.add(key);
+      out.push(tag);
+      if (out.length >= MAX_CATEGORIES) return out;
+    }
+  }
+  return out;
 }
 
 function parseICS(ics) {
@@ -65,10 +130,92 @@ function parseICS(ics) {
       const durMatch = /^DURATION(?:;[^:]*)?:(.*)$/im.exec(block);
       if (durMatch) dtend = applyDuration(dtstart, durMatch[1].trim(), allDay);
     }
+    // EXDATE: ausgenommene Einzel-Vorkommen einer Serie (RFC 5545). Mehrere
+    // EXDATE-Zeilen und komma-separierte Werte sind erlaubt; TZID/VALUE=DATE
+    // werden wie DTSTART aufgelöst und auf das Instanz-Datum (YYYY-MM-DD)
+    // reduziert – so matcht die date-basierte Recurrence-Engine (#513/#489).
+    const exdates = [];
+    const exRe = /^EXDATE((?:;[^:;]*)*):(.*)$/gim;
+    let exMatch;
+    while ((exMatch = exRe.exec(block)) !== null) {
+      const params  = exMatch[1];
+      const tzMatch = params.match(/;TZID=([^;:]+)/i);
+      const exTz    = tzMatch ? tzMatch[1].trim() : null;
+      const isDate  = /;VALUE=DATE(?=[;:]|$)/i.test(params);
+      for (const rawVal of exMatch[2].split(',')) {
+        const v = rawVal.trim();
+        if (!v) continue;
+        const conv = formatICSDate(v, isDate, exTz);
+        if (conv) exdates.push(conv.slice(0, 10));
+      }
+    }
+    // RECURRENCE-ID (RFC 5545 §3.8.4.4): markiert diesen VEVENT als geändertes
+    // Einzel-Vorkommen der Serie mit gleicher UID (nicht als eigene Serie). Auf
+    // das Instanz-Datum (YYYY-MM-DD) reduziert – wie EXDATE, damit die
+    // date-basierte Recurrence-Engine matcht (#549).
+    const recIdLine = parseDTLine('RECURRENCE-ID');
+    let recurrenceId = null;
+    if (recIdLine.value) {
+      const recIsDate = /^\d{8}$/.test(recIdLine.value);
+      const conv = formatICSDate(recIdLine.value, recIsDate, recIdLine.tzid);
+      recurrenceId = conv ? conv.slice(0, 10) : null;
+    }
     if (!uid || !dtstart) continue;
-    events.push({ uid, summary, description, location, dtstart, dtend, rrule, allDay, color });
+    // TZID des Serien-Starts merken (nur zeitgebunden): erlaubt DST-korrekte
+    // Expansion, die die lokale Uhrzeit über die Sommer-/Winterzeit hält (#549).
+    const tzid = (!allDay && dtStartLine.tzid) ? dtStartLine.tzid : null;
+    events.push({ uid, summary, description, location, dtstart, dtend, rrule, allDay, color, exdates, recurrenceId, tzid });
   }
   return events;
+}
+
+/**
+ * Normalisiert die VEVENTs eines Kalenderobjekts/Feeds nach RFC 5545 §3.8.4.4.
+ * Ein VEVENT mit RECURRENCE-ID ist ein geändertes Einzel-Vorkommen der Serie mit
+ * gleicher UID – KEINE eigene Serie. Ohne Sonderbehandlung upserten alle VEVENTs
+ * derselben UID auf dieselbe DB-Zeile: das (RRULE-lose) Override überschreibt die
+ * Serie und macht aus der Wochentags-Wiederholung einen Einzeltermin (#549).
+ *
+ * Ergebnis:
+ *  - Master (VEVENT ohne RECURRENCE-ID) behält seine RRULE; sein `exdates`-Set
+ *    wird um die RECURRENCE-IDs seiner Overrides ergänzt, damit das ersetzte
+ *    Original-Vorkommen unterdrückt wird (sonst Doppel: Original + verschobenes).
+ *  - Jedes Override wird zu einem eigenständigen Termin mit eindeutiger
+ *    external-UID (`${uid}::${recurrenceId}`) und ohne RRULE – so kollidiert der
+ *    UID-basierte Upsert nicht mehr und die verschobene Instanz bleibt sichtbar.
+ *
+ * Overrides ohne Master (z. B. losgelöste Einzel-Instanz) bleiben als
+ * eigenständige Termine erhalten.
+ * @param {object[]} events  Ergebnis von parseICS()
+ * @returns {object[]}
+ */
+function normalizeRecurrenceOverrides(events) {
+  const groups = new Map();
+  const order  = [];
+  for (const ev of events) {
+    if (!groups.has(ev.uid)) { groups.set(ev.uid, { master: null, overrides: [] }); order.push(ev.uid); }
+    const g = groups.get(ev.uid);
+    if (ev.recurrenceId) g.overrides.push(ev);
+    else if (!g.master)  g.master = ev;
+    else                 g.overrides.push(ev); // zweiter Nicht-Override (unüblich) → wie Override behandeln
+  }
+  const out = [];
+  for (const uid of order) {
+    const { master, overrides } = groups.get(uid);
+    if (master) {
+      const exSet = new Set(master.exdates || []);
+      for (const ov of overrides) {
+        const key = ov.recurrenceId || ov.dtstart?.slice(0, 10);
+        if (key) exSet.add(key);
+      }
+      out.push({ ...master, exdates: [...exSet] });
+    }
+    for (const ov of overrides) {
+      const key = ov.recurrenceId || ov.dtstart?.slice(0, 10);
+      out.push({ ...ov, uid: `${uid}::${key}`, rrule: null, exdates: [] });
+    }
+  }
+  return out;
 }
 
 function parseVTODO(ics) {
@@ -106,29 +253,15 @@ function parseVTODO(ics) {
     const prioRaw = get('PRIORITY');
     let priority  = prioRaw !== null ? parseInt(prioRaw, 10) : null;
     if (priority === 0 || Number.isNaN(priority)) priority = null;
-    todos.push({ uid, summary, description, completed, status, due, priority });
+    const tags = parseCategories(block);
+    todos.push({ uid, summary, description, completed, status, due, priority, tags });
   }
   return todos;
 }
 
+// Beibehaltener Export: delegiert an den geteilten Zeitzonen-Helfer (utils/timezone.js).
 function tzLocalToUTC(localStr, tzid) {
-  try {
-    const fakeUTC = new Date(localStr + 'Z');
-    const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone: tzid, year: 'numeric', month: 'numeric', day: 'numeric',
-      hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false,
-    }).formatToParts(fakeUTC);
-    const get = (type) => {
-      const part = parts.find(p => p.type === type);
-      const v = part ? part.value : '0';
-      return v === '24' ? 0 : parseInt(v, 10);
-    };
-    const tzDisplayedAsUTC = Date.UTC(
-      get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second')
-    );
-    const offsetMs = fakeUTC.getTime() - tzDisplayedAsUTC;
-    return new Date(fakeUTC.getTime() + offsetMs).toISOString().replace('.000Z', 'Z');
-  } catch { return localStr; }
+  return localToUTC(localStr, tzid);
 }
 
 function formatICSDate(val, allDay, tzid) {
@@ -171,14 +304,24 @@ function expandRRULE(vevent, windowStart, windowEnd) {
   }
   const countMatch = /;COUNT=(\d+)/i.exec(vevent.rrule);
   const maxCount   = countMatch ? parseInt(countMatch[1], 10) : null;
+  // EXDATE zählt für COUNT mit (RFC 5545: COUNT vor Exclusion), erzeugt aber
+  // keine Instanz – daher innerhalb der Schleife filtern, nicht die Zählung (#513).
+  const exdateSet  = new Set(vevent.exdates || []);
+  // DST-korrekte Expansion: bei bekannter TZID pro Vorkommen die lokale Wanduhrzeit
+  // des Masters neu nach UTC rechnen, statt den festen UTC-Suffix zu wiederholen
+  // (sonst driftet die Uhrzeit über die Sommer-/Winterzeit, #549). Nur für
+  // Tagtermine, deren lokales Datum == UTC-Datum ist (kein Mitternachts-Überlauf).
+  const wall = vevent.tzid ? utcToWall(vevent.dtstart, vevent.tzid) : null;
+  const tzAware = wall && wall.date === startDate;
   let current = startDate, iterations = 0;
   const MAX_ITER = 1500;
   while (current <= windowEnd && iterations < MAX_ITER) {
     iterations++;
     if (maxCount !== null && iterations > maxCount) break;
 
-    if (current >= windowStart) {
-      const occStart = current + timeSuffix;
+    if (current >= windowStart && !exdateSet.has(current)
+        && matchesRRuleByday(current, vevent.rrule)) {
+      const occStart = tzAware ? localToUTC(`${current}T${wall.time}`, vevent.tzid) : current + timeSuffix;
       let occEnd = null;
       if (durationMs !== null) {
         if (vevent.allDay) {
@@ -204,4 +347,4 @@ function expandRRULE(vevent, windowStart, windowEnd) {
   return results;
 }
 
-export { unfoldLines, unescapeICSText, parseICS, parseVTODO, formatICSDate, tzLocalToUTC, applyDuration, expandRRULE };
+export { unfoldLines, unescapeICSText, parseICS, parseVTODO, parseCategories, MAX_CATEGORIES, MAX_CATEGORY_LEN, formatICSDate, tzLocalToUTC, applyDuration, expandRRULE, normalizeRecurrenceOverrides };

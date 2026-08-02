@@ -47,14 +47,18 @@ function todayIso() {
 // Wochentagskürzel (Montag-first) und Monats-/Jahres-Label rein aus Intl —
 // keine eigenen Locale-Strings für Kalenderbeschriftung nötig.
 function weekdayLabels(locale) {
-  const fmt = new Intl.DateTimeFormat(locale, { weekday: 'short' });
+  // timeZone:'UTC', weil die Tage per Date.UTC() gebaut werden — ohne das würde
+  // Intl westlich von UTC auf den Vortag zurückrutschen und die Kürzel verschieben.
+  const fmt = new Intl.DateTimeFormat(locale, { weekday: 'short', timeZone: 'UTC' });
   // 2024-01-01 war ein Montag → 7 aufeinanderfolgende Tage ab Montag.
   return Array.from({ length: 7 }, (_, i) =>
     fmt.format(new Date(Date.UTC(2024, 0, 1 + i))));
 }
 
 function monthLabel(locale, year, month) {
-  return new Intl.DateTimeFormat(locale, { month: 'long', year: 'numeric' })
+  // timeZone:'UTC' passend zur Date.UTC()-Konstruktion: sonst zeigt das Label
+  // westlich von UTC den Vormonat (UTC-Mitternacht des 1. fällt lokal auf den 30./31.).
+  return new Intl.DateTimeFormat(locale, { month: 'long', year: 'numeric', timeZone: 'UTC' })
     .format(new Date(Date.UTC(year, month, 1)));
 }
 
@@ -254,11 +258,16 @@ class YuvomiDatepicker extends HTMLElement {
       this._emit();
     });
 
-    // Trigger: Touch → natives Sheet, Desktop → eigenes Popover
+    // Trigger: das DOM-Popover ist auf jedem Pointer-Typ der Primärpfad - es ist
+    // vollständig DOM-getrieben und öffnet auf Desktop wie Touch zuverlässig.
+    // Das native OS-Sheet (showPicker) bleibt nur Fallback für Touch-Browser
+    // ohne Popover-API (sehr altes iOS <17): auf iOS ist showPicker() bei einem
+    // versteckten Proxy-Input (opacity:0/aria-hidden) ein stilles No-op ohne
+    // Exception, weshalb es nicht als Primärpfad taugt.
     sub.trigger.addEventListener('click', () => {
       if (this.hasAttribute('disabled')) return;
       const coarse = window.matchMedia?.('(pointer: coarse)').matches;
-      if (coarse && this._openNative(sub)) return;
+      if (coarse && !this._supportsPopover() && this._openNative(sub)) return;
       this._openPopover(sub);
     });
 
@@ -266,6 +275,13 @@ class YuvomiDatepicker extends HTMLElement {
     sub.native.addEventListener('change', () => {
       if (sub.native.value) this._setSubIso(sub, sub.native.value, true);
     });
+  }
+
+  // Popover-API vorhanden? (Top-Layer-Popover ist der bevorzugte Pfad; nur ohne
+  // sie greift auf Touch das native OS-Sheet.)
+  _supportsPopover() {
+    return typeof HTMLElement !== 'undefined'
+      && typeof HTMLElement.prototype.showPopover === 'function';
   }
 
   _openNative(sub) {

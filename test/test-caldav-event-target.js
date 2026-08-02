@@ -4,6 +4,9 @@
  *        target_caldav_account_id + target_caldav_calendar_url speichern.
  *        Vor dem Fix wurden sie vom Route-Handler ignoriert -> Auswahl
  *        sprang nach dem Speichern zurück auf "Lokal".
+ *        Zweite Invariante (Issue #618): GET /calendar/sync-targets liefert die
+ *        Auswahlliste des Dropdowns auch Nicht-Admins - vorher hing sie an den
+ *        admin-only Verwaltungsrouten und blieb fuer Familienmitglieder leer.
  * Ausführen: node --experimental-sqlite test/test-caldav-event-target.js
  */
 
@@ -27,6 +30,7 @@ describe('CalDAV-Ziel an Events (Issue #241)', () => {
   let baseUrl;
   let userId;
   let accountId;
+  let role = 'admin';
   const calUrl = 'https://caldav.example.com/cal/familie/';
 
   before(async () => {
@@ -43,7 +47,9 @@ describe('CalDAV-Ziel an Events (Issue #241)', () => {
     const app = express();
     app.use(express.json({ limit: '10mb' }));
     // Auth-Middleware aus index.js wird hier durch eine Stub-Injection ersetzt.
-    app.use((req, _res, next) => { req.authUserId = userId; req.authRole = 'admin'; next(); });
+    // authRole ist umschaltbar, damit derselbe Server auch die Sicht eines
+    // Familienmitglieds (Rolle "user", Issue #618) abbilden kann.
+    app.use((req, _res, next) => { req.authUserId = userId; req.authRole = role; next(); });
     app.use('/calendar', calendarRouter);
 
     await new Promise((resolve) => {
@@ -138,5 +144,59 @@ describe('CalDAV-Ziel an Events (Issue #241)', () => {
       }),
     });
     assert.strictEqual(res.status, 400, `Status sollte 400 sein, war ${res.status}`);
+  });
+
+  // ------------------------------------------------------------------
+  // Sync-Ziele auch ohne Admin-Rolle (Issue #618)
+  // ------------------------------------------------------------------
+
+  describe('GET /calendar/sync-targets (Issue #618)', () => {
+    before(() => {
+      const d = db.get();
+      d.prepare(
+        `INSERT INTO caldav_calendar_selection (account_id, calendar_url, calendar_name, calendar_color, enabled)
+         VALUES (?, ?, 'Familie', '#4A90E2', 1)`
+      ).run(accountId, calUrl);
+      d.prepare(
+        `INSERT INTO caldav_calendar_selection (account_id, calendar_url, calendar_name, calendar_color, enabled)
+         VALUES (?, ?, 'Archiv', '#4A90E2', 0)`
+      ).run(accountId, 'https://caldav.example.com/cal/archiv/');
+      role = 'user';
+    });
+
+    after(() => { role = 'admin'; });
+
+    it('liefert einem Familienmitglied die aktivierten CalDAV-Kalender', async () => {
+      const res = await fetch(`${baseUrl}/calendar/sync-targets`);
+      assert.strictEqual(res.status, 200, `Status sollte 200 sein, war ${res.status}`);
+      const { data } = await res.json();
+
+      assert.deepStrictEqual(
+        data.caldav,
+        [{ accountId, accountName: 'mailbox', calendarUrl: calUrl, calendarName: 'Familie' }],
+        'Nicht-Admins müssen die aktivierten CalDAV-Ziele sehen'
+      );
+      // Ohne Google-Verbindung bleibt die Gruppe leer statt die Antwort zu kippen.
+      assert.deepStrictEqual(data.google, [], 'Google-Gruppe ohne Verbindung leer');
+    });
+
+    it('gibt keine Zugangsdaten oder Server-URLs preis', async () => {
+      const res = await fetch(`${baseUrl}/calendar/sync-targets`);
+      const body = await res.text();
+      assert.ok(!body.includes('"password"'), 'Antwort darf kein Passwort-Feld enthalten');
+      assert.ok(!body.includes('"username"'), 'Antwort darf keinen Benutzernamen enthalten');
+      assert.ok(!body.includes('"caldavUrl"'), 'Antwort darf die Konto-Server-URL nicht enthalten');
+    });
+
+    it('lässt die Kontenverwaltung für Nicht-Admins weiterhin gesperrt', async () => {
+      const res = await fetch(`${baseUrl}/calendar/caldav/accounts`);
+      assert.strictEqual(res.status, 403, `Verwaltungsroute muss 403 bleiben, war ${res.status}`);
+    });
+
+    it('wird nicht vom CRUD-Router /:id verschluckt', async () => {
+      const res = await fetch(`${baseUrl}/calendar/sync-targets`);
+      const { data } = await res.json();
+      assert.ok(data && Array.isArray(data.caldav), 'Antwort muss die Sync-Ziel-Form haben, nicht die eines Events');
+    });
   });
 });

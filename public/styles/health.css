@@ -9,9 +9,12 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  max-width: var(--content-max-width);
-  margin: 0 auto;
-  padding: 0 var(--space-4) calc(var(--nav-bottom-height) + var(--space-6));
+  /* Full-bleed-Root (Issue #577): die Health-Tab-Leiste hängt außerhalb dieses
+   * Roots im Router-Wrapper und lief schon immer voll durch — der Inhalt
+   * darunter saß aber in einer 1280er-Insel. Beide teilen jetzt dieselbe
+   * Content-Spalte über --page-inline-pad. */
+  padding-inline: var(--page-inline-pad);
+  padding-bottom: calc(var(--nav-bottom-height) + var(--space-6));
 }
 
 /* Geteilte Tabs-Leiste trägt den Modul-Akzent-Streifen (wechselt je aktivem Tab
@@ -109,7 +112,7 @@
   color: var(--color-text-secondary);
   font-size: var(--text-sm);
   cursor: pointer;
-  transition: border-color var(--transition-fast, 150ms), color var(--transition-fast, 150ms), background var(--transition-fast, 150ms);
+  transition: border-color var(--transition-fast, var(--duration-sm)), color var(--transition-fast, var(--duration-sm)), background var(--transition-fast, var(--duration-sm));
 }
 
 .health-person-chip:hover {
@@ -170,10 +173,12 @@
   margin-inline-start: auto;
 }
 
-/* Karten-Grid je Metrik */
+/* Karten-Grid je Metrik. Mindestbreite 160px: die schmalste Karte muss den
+ * längsten Metrik-Namen („Sauerstoffsättigung") einzeilig tragen können,
+ * seit Labels nicht mehr silbengetrennt werden (Critique P1). */
 .health-vitals__cards {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   gap: var(--space-3);
 }
 
@@ -187,7 +192,7 @@
   background: var(--color-surface);
   text-align: start;
   cursor: pointer;
-  transition: border-color var(--transition-fast, 150ms), box-shadow var(--transition-fast, 150ms);
+  transition: border-color var(--transition-fast, var(--duration-sm)), box-shadow var(--transition-fast, var(--duration-sm));
 }
 
 .health-metric-card:hover {
@@ -199,14 +204,43 @@
   box-shadow: 0 0 0 1px var(--module-accent);
 }
 
+/* Flex mit Umbruch: passt der Metrik-Name nicht mehr NEBEN das Icon, wrappt
+ * er als ganzes Flex-Item auf eine eigene, volle Kartenzeile — erst dort darf
+ * der break-word-Backstop überhaupt greifen. (Ein Float-Ansatz scheitert:
+ * break-word füllt sonst die neben dem Icon verkürzte Zeile und chopt
+ * „Sauerstoffsättigu|ng" wortmittig.) */
 .health-metric-card__head {
-  display: inline-flex;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
   color: var(--color-text-secondary);
+  min-width: 0;
+}
+
+/* Metrik-Namen werden nicht mehr silbengetrennt: hyphens:auto (F-11) zerhackte
+ * „Sauerstoffsättigung" mitten im Wort (Critique P1). Die 160px-Mindestspalte
+ * des Karten-Grids trägt den längsten Namen auf der vollen Zeile; break-word
+ * bleibt reiner Backstop für Extremfälle jenseits der Kartenbreite. */
+.health-metric-card__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: break-word;
+  hyphens: manual;
+  text-align: left;
+}
+
+/* Übersichts-Widget „Letzte Vitalwerte": das 2-Spalten-Raster (minmax(0,1fr))
+ * schrumpft die Karte mobil auf ~119px - zu schmal für „Sauerstoffsättigung".
+ * Hier trennt hyphens:auto sprachkorrekt an Silbengrenzen (<html lang> ist die
+ * Nutzer-Locale) statt overflow-wrap das Wort mittig zu zerhacken (Critique P2).
+ * Nur dieser Kontext; die breitere Vitalwerte-Tab-Karte bleibt bei manual. */
+.health-overview__vitals-grid .health-metric-card__label {
+  hyphens: auto;
 }
 
 .health-metric-card__icon {
+  flex-shrink: 0;
   width: 18px;
   height: 18px;
   color: var(--module-accent);
@@ -548,7 +582,7 @@
   background: var(--color-surface);
   text-align: start;
   cursor: pointer;
-  transition: border-color var(--transition-fast, 150ms), box-shadow var(--transition-fast, 150ms);
+  transition: border-color var(--transition-fast, var(--duration-sm)), box-shadow var(--transition-fast, var(--duration-sm));
 }
 
 button.health-med-card:hover {
@@ -588,7 +622,7 @@ button.health-med-card:hover {
   border-radius: var(--radius-full);
   font-size: var(--text-2xs);
   background: color-mix(in srgb, var(--module-accent) 14%, transparent);
-  color: var(--module-accent);
+  color: color-mix(in srgb, var(--module-accent, var(--color-accent)) 70%, var(--color-text-primary));
 }
 
 .health-med-badge--muted {
@@ -797,7 +831,7 @@ button.health-med-card:hover {
   background: var(--color-surface);
   text-align: start;
   cursor: pointer;
-  transition: border-color var(--transition-fast, 150ms), box-shadow var(--transition-fast, 150ms);
+  transition: border-color var(--transition-fast, var(--duration-sm)), box-shadow var(--transition-fast, var(--duration-sm));
 }
 
 .health-lab-card:hover {
@@ -1234,9 +1268,10 @@ button.health-med-card:hover {
 }
 
 @media (max-width: 640px) {
-  .health-page {
-    padding-inline: var(--space-3);
-  }
+  /* .health-page bekommt hier BEWUSST keinen eigenen padding-inline mehr:
+   * --space-3 (12px) schlug --page-inline-pad (16px) und setzte den Inhalt
+   * mobil 4px neben die eigene Tab-Leiste — genau der Versatz, den #577
+   * beseitigt. Der Gutter kommt aus dem geteilten Token. */
 
   .health-empty {
     padding: var(--space-6) var(--space-3);
@@ -1519,7 +1554,7 @@ button.health-med-card:hover {
   gap: var(--space-3);
 }
 
-@media (max-width: 560px) {
+@media (max-width: 640px) {
   .cycle-skeleton { flex-direction: column; }
   .cycle-skeleton__ring { width: 200px; height: 200px; }
 }
@@ -1643,7 +1678,7 @@ button.health-med-card:hover {
   font-weight: 600;
   padding: 2px var(--space-2);
   border-radius: var(--radius-full);
-  color: var(--module-accent);
+  color: color-mix(in srgb, var(--module-accent, var(--color-accent)) 70%, var(--color-text-primary));
   background: color-mix(in srgb, var(--module-accent) 14%, transparent);
 }
 
@@ -1659,9 +1694,14 @@ button.health-med-card:hover {
 .cycle-preg__bar-fill {
   display: block;
   height: 100%;
+  width: 100%;
   border-radius: inherit;
   background: var(--module-accent);
-  transition: width var(--transition-base, 240ms) ease;
+  /* transform statt width: layout-frei animierbar (Detector layout-transition);
+   * der Füllstand kommt als --cycle-fill (0..1) aus dem Markup. */
+  transform-origin: left center;
+  transform: scaleX(var(--cycle-fill, 0));
+  transition: transform var(--duration-md) ease;
 }
 
 .cycle-preg__due { font-size: var(--text-sm); color: var(--color-text-secondary); }
@@ -1767,11 +1807,16 @@ button.health-med-card:hover {
   text-transform: capitalize;
 }
 
+/* Sieben Spalten auf Phone-Breite: der Gap schrumpft stufenlos mit, damit die
+   Zellen auf schmalen Geräten so breit wie möglich bleiben und näher an ein
+   komfortables Daumen-Ziel kommen. Fluid statt eigener Viewport-Schwelle — ein
+   380px-Breakpoint hätte den Kontrakt aus tokens.css §11c gebrochen und
+   zwischen 380 und 640px hart gesprungen. */
 .cycle-cal__weekdays,
 .cycle-cal__grid {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
-  gap: var(--space-1);
+  gap: clamp(var(--space-0h), 0.53vw, var(--space-1));
 }
 
 .cycle-cal__wd {
@@ -1796,7 +1841,7 @@ button.health-med-card:hover {
   font-size: var(--text-sm);
   color: var(--color-text-primary);
   cursor: pointer;
-  transition: background 120ms ease;
+  transition: background var(--duration-xs) ease;
 }
 
 .cycle-cal__day:disabled { cursor: default; }
@@ -1966,7 +2011,7 @@ button.cycle-cal__day:not(:disabled):hover { background: var(--color-surface-2);
   font-size: var(--text-sm);
   cursor: pointer;
   min-height: var(--target-base);
-  transition: background 120ms ease, border-color 120ms ease;
+  transition: background var(--duration-xs) ease, border-color var(--duration-xs) ease;
 }
 
 .cycle-choice svg { width: 15px; height: 15px; }
@@ -1989,20 +2034,136 @@ button.cycle-cal__day:not(:disabled):hover { background: var(--color-surface-2);
 
 .cycle-hint { font-size: var(--text-xs); color: var(--color-text-secondary); margin: 0; }
 
-@media (max-width: 560px) {
+/* Bulk-Sichtbarkeit: Sekundär-Button plus ausklappbare Inline-Bestätigung. */
+.cycle-bulk { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); }
+.cycle-bulk__confirm {
+  width: 100%;
+  padding: var(--space-3);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  flex-direction: column;
+  gap: var(--space-3);
+}
+/* display erst wenn sichtbar - sonst überschreibt der Flex das UA-[hidden]. */
+.cycle-bulk__confirm:not([hidden]) { display: flex; }
+.cycle-bulk__question { color: var(--color-text-primary); }
+.cycle-bulk__actions { display: flex; justify-content: flex-end; gap: var(--space-2); }
+
+@media (max-width: 640px) {
   .cycle-hero { flex-direction: column; }
   .cycle-ring { width: 200px; height: 200px; }
-}
-
-/* Schmale Phones: Grid-Gap verdichten, damit die Kalender-Zellen so breit wie
-   möglich werden und näher an ein komfortables Daumen-Ziel kommen. */
-@media (max-width: 380px) {
-  .cycle-cal__weekdays,
-  .cycle-cal__grid { gap: var(--space-0h); }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .cycle-ring__now { animation: none; }
   .cycle-cal__day { transition: none; }
   .cycle-choice { transition: none; }
+}
+
+/* Messwert-Historie unter dem Vitals-Chart (Audit R2, A2-08): kompakte Zeilen,
+ * Löschen als row-action nur in der eigenen Ansicht. */
+.health-recent {
+  margin-top: var(--space-3);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-work);
+  padding: var(--space-2) var(--space-3);
+}
+
+.health-recent__title {
+  font-size: var(--text-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-secondary);
+  margin-bottom: var(--space-1);
+}
+
+.health-recent__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.health-recent__row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: var(--target-md);
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+.health-recent__row:first-child { border-top: none; }
+
+.health-recent__date {
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  min-width: 96px;
+}
+
+.health-recent__value {
+  flex: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.health-recent__value small {
+  color: var(--color-text-tertiary);
+}
+
+/* Einnahmeprotokoll-Aufklapper unter der Adhärenz (Audit R2, A2-22). */
+.health-medlog {
+  margin-top: var(--space-2);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-work);
+  padding: var(--space-2) var(--space-3);
+}
+
+.health-medlog summary {
+  cursor: pointer;
+  font-size: var(--text-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-secondary);
+  min-height: var(--target-md);
+  display: flex;
+  align-items: center;
+}
+
+.health-medlog__list {
+  list-style: none;
+  margin: var(--space-1) 0 0;
+  padding: 0;
+}
+
+.health-medlog__row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--target-md);
+  border-top: 1px solid var(--color-border-subtle);
+  font-size: var(--text-sm);
+}
+
+.health-medlog__row svg {
+  width: 14px;
+  height: 14px;
+  color: var(--color-success);
+  flex-shrink: 0;
+}
+
+.health-medlog__row.is-skipped svg {
+  color: var(--color-text-tertiary);
+}
+
+.health-medlog__med {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.health-medlog__time,
+.health-medlog__status {
+  color: var(--color-text-secondary);
+  white-space: nowrap;
 }

@@ -5,7 +5,7 @@
  */
 
 import { api } from '/api.js';
-import { t, formatDate, formatTime, getLocale } from '/i18n.js';
+import { t, formatDate, formatTime, getLocale, getNumberFormat } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
 import { openModal, closeModal, confirmModal } from '/components/modal.js';
@@ -16,6 +16,13 @@ const MAX_FILE_SIZE = 5 * 1024 * 1024;
 
 function localDate(d = new Date()) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// "2026-07" ist ein API-Schlüssel, kein Anzeigetext: Leser bekommen den
+// lokalisierten Monatsnamen (Audit A2-23).
+function formatMonthLabel(ym, opts = { month: 'long', year: 'numeric' }) {
+  if (!/^\d{4}-\d{2}$/.test(String(ym || ''))) return String(ym || '');
+  return new Intl.DateTimeFormat(getLocale(), opts).format(new Date(`${ym}-01T00:00:00`));
 }
 
 function localDayParams() {
@@ -42,7 +49,7 @@ let state = {
 };
 
 function money(value) {
-  return new Intl.NumberFormat(getLocale(), { style: 'currency', currency: state.currency }).format(Number(value || 0));
+  return getNumberFormat({ style: 'currency', currency: state.currency }).format(Number(value || 0));
 }
 
 function initials(name = '') {
@@ -278,10 +285,13 @@ function renderDashboard(content) {
   const maxPayment = Math.max(1, ...(data.monthly_payments || []).map((row) => row.total));
   const bars = (data.monthly_payments || []).map((row) => {
     const height = Math.max(8, Math.round((row.total / maxPayment) * 88));
+    // Wert sichtbar am Balken statt nur im Hover-title: das Chart trug sonst
+    // keine ablesbare Achse oder Zahl (Audit A2-23).
     return `
       <div class="housekeeping-chart__bar-wrap">
-        <div class="housekeeping-chart__bar" style="height:${height}px" title="${esc(row.month)} ${esc(money(row.total))}"></div>
-        <span>${esc(row.month.slice(5))}</span>
+        <span class="housekeeping-chart__value">${esc(money(row.total))}</span>
+        <div class="housekeeping-chart__bar" style="height:${height}px" title="${esc(formatMonthLabel(row.month))} ${esc(money(row.total))}"></div>
+        <span>${esc(formatMonthLabel(row.month, { month: 'short' }))}</span>
       </div>
     `;
   }).join('');
@@ -383,17 +393,17 @@ function renderTasks(content) {
         <p>${esc(task.area)} · ${esc(t('housekeeping.everyDays', { days: task.frequency_days }))}</p>
         <span>${esc(urgencyLabel(task.urgency_status))}</span>
       </div>
-      <div class="housekeeping-task__actions">
+      <div class="housekeeping-task__actions row-actions">
         ${task.last_completed ? `
-          <button class="btn btn--secondary btn--icon" type="button" data-undo-task="${esc(task.id)}"
+          <button class="row-action" type="button" data-undo-task="${esc(task.id)}"
                   aria-label="${esc(t('housekeeping.undoTask'))}">
             <i data-lucide="rotate-ccw" aria-hidden="true"></i>
           </button>` : ''}
-        <button class="btn btn--secondary btn--icon" type="button" data-edit-task="${esc(task.id)}"
+        <button class="row-action" type="button" data-edit-task="${esc(task.id)}"
                 aria-label="${esc(t('housekeeping.editTask'))}">
           <i data-lucide="edit-2" aria-hidden="true"></i>
         </button>
-        <button class="btn btn--danger-outline btn--icon" type="button" data-delete-task="${esc(task.id)}"
+        <button class="row-action row-action--danger" type="button" data-delete-task="${esc(task.id)}"
                 aria-label="${esc(t('housekeeping.deleteTask'))}">
           <i data-lucide="trash-2" aria-hidden="true"></i>
         </button>
@@ -493,7 +503,10 @@ function renderTasks(content) {
     btn.addEventListener('click', async () => {
       const task = state.tasks.find((it) => String(it.id) === btn.dataset.deleteTask);
       if (!task) return;
-      if (!window.confirm(t('housekeeping.deleteTaskConfirm', { name: task.name }))) return;
+      if (!await confirmModal(
+        t('housekeeping.deleteTaskConfirm', { name: task.name }),
+        { danger: true, confirmLabel: t('common.delete') },
+      )) return;
       try {
         await api.delete(`/housekeeping/decay-tasks/${task.id}`);
         window.yuvomi?.showToast(t('housekeeping.taskDeletedToast'), 'success');
@@ -528,6 +541,10 @@ function renderReports(content) {
         <strong>${esc(visit.worker_name || t('housekeeping.staff'))}</strong>
         <span>${esc(formatDate(visit.check_in))} · ${esc(money(visit.total_amount))} · ${esc(paid ? t('housekeeping.paymentPaid') : t('housekeeping.paymentPending'))}</span>
       </div>
+      ${paid ? '' : `
+      <button class="btn btn--secondary" type="button" data-pay-report="${visit.id}">
+        <i data-lucide="check" class="icon-sm" aria-hidden="true"></i>${esc(t('housekeeping.markPaid'))}
+      </button>`}
       <button class="btn btn--secondary btn--icon" type="button" data-visit-report="${visit.id}" aria-label="${esc(t('housekeeping.openVisitReport'))}">
         <i data-lucide="file-text" aria-hidden="true"></i>
       </button>
@@ -539,7 +556,7 @@ function renderReports(content) {
     <section class="housekeeping-card">
       <div class="housekeeping-section-heading">
         <h2>${esc(t('housekeeping.visitReports'))}</h2>
-        <span>${esc(state.visitReport?.month || '')}</span>
+        <span>${esc(formatMonthLabel(state.visitReport?.month || ''))}</span>
       </div>
       <section class="housekeeping-metrics housekeeping-metrics--compact">
         <article class="housekeeping-metric">
@@ -564,12 +581,29 @@ function renderReports(content) {
   content.querySelectorAll('[data-visit-report]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const visit = visits.find((item) => String(item.id) === btn.dataset.visitReport);
-      if (visit) openVisitReportModal(visit);
+      if (visit) openVisitReportModal(visit, content);
+    });
+  });
+
+  // Bezahlen direkt an der Ausstehend-Zeile (Audit R2, A2-14): derselbe Flow
+  // wie im Personal-Einsatzlog, hier gegen die Berichtsliste.
+  content.querySelectorAll('[data-pay-report]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const visit = visits.find((item) => String(item.id) === btn.dataset.payReport);
+      if (!visit) return;
+      try {
+        await api.post(`/housekeeping/visits/${visit.id}/pay`, {});
+        window.yuvomi?.showToast(t('housekeeping.visitPaidToast'), 'success');
+        await loadData();
+        renderReports(content);
+      } catch (err) {
+        window.yuvomi?.showToast(err.message, 'danger');
+      }
     });
   });
 }
 
-function openVisitReportModal(visit) {
+function openVisitReportModal(visit, content = null) {
   const paid = !!visit.paid_at;
   openModal({
     title: t('housekeeping.visitReportDetails'),
@@ -591,11 +625,31 @@ function openVisitReportModal(visit) {
           <div><dt>${esc(t('housekeeping.extras'))}</dt><dd>${esc(money(visit.extras))}</dd></div>
           <div><dt>${esc(t('housekeeping.totalPayment'))}</dt><dd>${esc(money(visit.total_amount))}</dd></div>
           <div><dt>${esc(t('housekeeping.paymentStatus'))}</dt><dd>${esc(paid ? t('housekeeping.paymentPaid') : t('housekeeping.paymentPending'))}</dd></div>
-          <div><dt>${esc(t('housekeeping.paymentTask'))}</dt><dd>${esc(visit.payment_task_id ? `#${visit.payment_task_id}` : t('housekeeping.notAvailable'))}</dd></div>
-          <div><dt>${esc(t('housekeeping.calendarEvent'))}</dt><dd>${esc(visit.calendar_event_id ? `#${visit.calendar_event_id}` : t('housekeeping.notAvailable'))}</dd></div>
+          ${visit.payment_task_id ? `<div><dt>${esc(t('housekeeping.paymentTask'))}</dt><dd>#${esc(visit.payment_task_id)}</dd></div>` : ''}
+          ${visit.calendar_event_id ? `<div><dt>${esc(t('housekeeping.calendarEvent'))}</dt><dd>#${esc(visit.calendar_event_id)}</dd></div>` : ''}
         </dl>
+        ${paid ? '' : `
+        <div class="modal-panel__footer modal-panel__footer--plain">
+          <button class="btn btn--ghost" type="button" data-action="close-modal">${esc(t('common.cancel'))}</button>
+          <button class="btn btn--primary" type="button" id="visit-report-pay">
+            <i data-lucide="check" class="icon-sm" aria-hidden="true"></i>${esc(t('housekeeping.markPaid'))}
+          </button>
+        </div>`}
       </div>
     `,
+    onSave(panel) {
+      panel.querySelector('#visit-report-pay')?.addEventListener('click', async () => {
+        try {
+          await api.post(`/housekeeping/visits/${visit.id}/pay`, {});
+          window.yuvomi?.showToast(t('housekeeping.visitPaidToast'), 'success');
+          closeModal({ force: true });
+          await loadData();
+          if (content?.isConnected) renderReports(content);
+        } catch (err) {
+          window.yuvomi?.showToast(err.message, 'danger');
+        }
+      });
+    },
   });
 }
 
@@ -916,7 +970,7 @@ function openVisitEditModal(visit, content, { onDone } = {}) {
       const mins = Math.max(0, Number(minutesInput.value) || 0);
       const rounded = Math.round(mins / 15) * 15;
       const amount = (rounded / 60) * (Number(visit.hourly_rate) || 0);
-      const fmt = new Intl.NumberFormat(getLocale(), { style: 'currency', currency: state.currency || 'EUR' });
+      const fmt = getNumberFormat({ style: 'currency', currency: state.currency || 'EUR' });
       computedOutput.textContent = fmt.format(amount);
     }
     minutesInput?.addEventListener('input', updateComputed);

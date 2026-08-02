@@ -9,6 +9,8 @@ import express from 'express';
 import * as db from '../db.js';
 import * as holidays from '../services/holidays.js';
 import { str, MAX_SHORT } from '../middleware/validate.js';
+import { getSupportedLocales, isSupportedLocale, resolveHouseholdLocale } from '../utils/i18n.js';
+import { retitleBirthdayEvents } from '../services/birthdays.js';
 
 const log = createLogger('Preferences');
 
@@ -17,7 +19,7 @@ const router = express.Router();
 const VALID_MEAL_TYPES = ['breakfast', 'lunch', 'dinner', 'snack'];
 const DEFAULT_MEAL_TYPES = VALID_MEAL_TYPES.join(',');
 
-const VALID_CURRENCIES = ['AED', 'AUD', 'BRL', 'CAD', 'CHF', 'CNY', 'CZK', 'DKK', 'EUR', 'GBP', 'HUF', 'IDR', 'INR', 'IRR', 'JPY', 'KRW', 'KZT', 'NOK', 'PLN', 'RUB', 'SAR', 'SEK', 'TRY', 'UAH', 'USD', 'ZAR'];
+const VALID_CURRENCIES = ['AED', 'AUD', 'BRL', 'CAD', 'CHF', 'CLP', 'CNY', 'CZK', 'DKK', 'EUR', 'GBP', 'HUF', 'IDR', 'INR', 'IRR', 'JPY', 'KRW', 'KZT', 'MYR', 'NOK', 'PLN', 'RUB', 'SAR', 'SEK', 'TRY', 'UAH', 'USD', 'ZAR'];
 const DEFAULT_CURRENCY = 'EUR';
 const DEFAULT_APP_NAME = 'Yuvomi';
 
@@ -33,6 +35,18 @@ const VALID_TIME_FORMATS = ['24h', '12h'];
 // (#484, #465). Als Klartext gespeichert – der Client mappt auf den getDay()-Index.
 const VALID_WEEK_STARTS = ['monday', 'sunday', 'saturday'];
 const DEFAULT_WEEK_START = 'monday';
+// Budget-Modus (#476/#505): 'shared' = ein Haushaltsbudget (Altverhalten),
+// 'personal' = persönliche/geteilte Einträge mit Mein/Haushalt-Ansicht.
+const VALID_BUDGET_MODES = ['shared', 'personal'];
+const DEFAULT_BUDGET_MODE = 'shared';
+
+// Datensprache des Haushalts (#631, #632): in welcher Sprache der Server Inhalte
+// *speichert*, die er selbst erzeugt - heute die Titel und Beschreibungen der
+// Geburtstags-Termine. Anders als die UI-Sprache (per-user im localStorage) muss
+// das haushaltweit sein: eine calendar_events-Zeile hat genau einen Titel, und
+// den lesen REST-API, ICS-Feed, CalDAV-/Google-Outbound und die Suche.
+// Nicht gesetzt = aus der Region abgeleitet, sonst Englisch (resolveHouseholdLocale).
+const VALID_LANGUAGES = getSupportedLocales();
 
 // Region ist nur ein Anzeige-Hinweis (Locale-Code wie "fr-FR" oder "custom").
 // Der Client fällt bei unbekanntem Wert ohnehin auf detectRegion() zurück, daher
@@ -52,6 +66,12 @@ const MAX_CALENDAR_DURATION = 1440;
 const VALID_REMINDER_OFFSETS = [0, 15, 60, 1440, 2880, 10080, 20160];
 const MAX_DEFAULT_REMINDERS = 5;
 
+// Standard-Punktwert für neue Aufgaben (#578, haushaltweit). 0 = kein Standard,
+// das Punktefeld bleibt wie bisher leer. Obergrenze spiegelt MAX_POINTS in
+// server/routes/tasks.js.
+const DEFAULT_TASK_POINTS = 0;
+const MAX_TASK_POINTS = 10000;
+
 // Persistierte Default-Reminder als sortiertes Zahlen-Array lesen (leer = keine).
 function parseDefaultReminders(raw) {
   if (!raw) return [];
@@ -65,6 +85,13 @@ function parseDefaultReminders(raw) {
   }
 }
 
+/** Persistierten Standard-Punktwert als ganze Zahl im gültigen Bereich lesen. */
+function parseTaskDefaultPoints(raw) {
+  const n = Math.trunc(Number(raw));
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_TASK_POINTS;
+  return Math.min(n, MAX_TASK_POINTS);
+}
+
 const VALID_WEATHER_PROVIDERS = ['open-meteo', 'openweathermap'];
 const VALID_WEATHER_UNITS = ['metric', 'imperial'];
 
@@ -72,34 +99,23 @@ const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const COUNTRY_ISO_RE = /^[A-Z]{2}$/;
 const SUBDIVISION_RE = /^[A-Z]{2}-[A-Z0-9-]{1,10}$/;
 
-// Order defines the default dashboard layout (weather first, then primary content).
-// Must stay in sync with WIDGET_IDS in public/pages/dashboard.js.
-const VALID_WIDGET_IDS = ['weather', 'tasks', 'calendar', 'meals', 'shopping', 'birthdays', 'budget', 'family', 'notes'];
+// Widget identifiers are client-owned. The server validates only a safe storage shape,
+// so adding or removing dashboard widgets never requires a matching backend registry change.
+const WIDGET_ID_RE = /^[a-z][a-z0-9-]{0,63}$/;
+const MAX_DASHBOARD_WIDGETS = 64;
 const VALID_WIDGET_SIZES = ['1x1', '1x2', '1x3', '1x4', '2x1', '2x2', '2x3', '2x4', '3x1', '3x2', '3x3', '3x4', '4x1', '4x2', '4x3', '4x4'];
+const DEFAULT_WIDGET_CONFIG = '[]';
 
 // Modul-Slugs, die per Settings deaktiviert werden können.
 // Dashboard und Settings sind absichtlich nicht enthalten — sie sind essentiell.
 const TOGGLEABLE_MODULES = [
-  'tasks', 'calendar', 'meals', 'recipes', 'shopping',
+  'tasks', 'calendar', 'meals', 'recipes', 'shopping', 'pantry',
   'birthdays', 'notes', 'contacts', 'budget', 'documents',
   'housekeeping', 'rewards', 'health',
 ];
-const MODULE_ORDER_RE = /^(dashboard|tasks|calendar|meals|recipes|shopping|birthdays|notes|contacts|budget|documents|housekeeping|rewards|health|third-party-[a-z0-9][a-z0-9-]{1,62}[a-z0-9])$/;
-const MOBILE_NAV_ORDER_RE = /^(tasks|calendar|kitchen|meals|recipes|shopping|birthdays|notes|contacts|budget|documents|housekeeping|rewards|health|third-party-[a-z0-9][a-z0-9-]{1,62}[a-z0-9])$/;
-const KITCHEN_NAV_IDS = new Set(['kitchen', 'meals', 'recipes', 'shopping']);
-
-function defaultWidgetSize(id) {
-  if (['tasks', 'calendar'].includes(id)) return '2x2';
-  if (['weather', 'shopping', 'notes'].includes(id)) return '2x1';
-  return '1x1';
-}
-
-const DEFAULT_WIDGET_CONFIG = JSON.stringify(VALID_WIDGET_IDS.map((id, order) => ({
-  id,
-  visible: true,
-  order,
-  size: defaultWidgetSize(id),
-})));
+const MODULE_ORDER_RE = /^(dashboard|tasks|calendar|meals|recipes|shopping|pantry|birthdays|notes|contacts|budget|documents|housekeeping|rewards|health|third-party-[a-z0-9][a-z0-9-]{1,62}[a-z0-9])$/;
+const MOBILE_NAV_ORDER_RE = /^(tasks|calendar|kitchen|meals|recipes|shopping|pantry|birthdays|notes|contacts|budget|documents|housekeeping|rewards|health|third-party-[a-z0-9][a-z0-9-]{1,62}[a-z0-9])$/;
+const KITCHEN_NAV_IDS = new Set(['kitchen', 'meals', 'recipes', 'shopping', 'pantry']);
 
 // --------------------------------------------------------
 // Hilfsfunktionen
@@ -156,7 +172,7 @@ function weatherUserOverride(userId) {
 function parseWidgetConfig(raw) {
   try {
     const parsed = JSON.parse(raw ?? DEFAULT_WIDGET_CONFIG);
-    return normalizeWidgetConfig(parsed);
+    return normalizeWidgetConfig(parsed) ?? [];
   } catch {
     return JSON.parse(DEFAULT_WIDGET_CONFIG);
   }
@@ -207,27 +223,29 @@ function parseMobileNavOrder(raw) {
 }
 
 function normalizeWidgetConfig(input) {
-  const valid = Array.isArray(input)
-    ? input
-      .filter((w) => w && typeof w === 'object' && VALID_WIDGET_IDS.includes(w.id))
-      .map((w, order) => ({
-        id: w.id,
-        visible: w.visible !== false,
-        order: Number.isFinite(Number(w.order)) ? Number(w.order) : order,
-        size: VALID_WIDGET_SIZES.includes(w.size) ? w.size : defaultWidgetSize(w.id),
-      }))
-    : [];
+  if (!Array.isArray(input) || input.length > MAX_DASHBOARD_WIDGETS) return null;
 
-  // Fehlende Widget-IDs am Ende ergänzen
-  const presentIds = new Set(valid.map((w) => w.id));
-  for (const id of VALID_WIDGET_IDS) {
-    if (!presentIds.has(id)) {
-      valid.push({ id, visible: true, order: valid.length, size: defaultWidgetSize(id) });
-    }
+  const seenIds = new Set();
+  const normalized = [];
+  for (const [index, widget] of input.entries()) {
+    if (!widget || typeof widget !== 'object' || Array.isArray(widget)) return null;
+    if (typeof widget.id !== 'string' || !WIDGET_ID_RE.test(widget.id) || seenIds.has(widget.id)) return null;
+    if (widget.visible !== undefined && typeof widget.visible !== 'boolean') return null;
+    if (widget.order !== undefined && !Number.isFinite(Number(widget.order))) return null;
+    if (widget.size !== undefined && !VALID_WIDGET_SIZES.includes(widget.size)) return null;
+
+    seenIds.add(widget.id);
+    normalized.push({
+      id: widget.id,
+      visible: widget.visible !== false,
+      order: widget.order === undefined ? index : Number(widget.order),
+      size: widget.size ?? '1x1',
+    });
   }
-  return valid
+
+  return normalized
     .sort((a, b) => a.order - b.order)
-    .map((w, order) => ({ ...w, order }));
+    .map((widget, order) => ({ ...widget, order }));
 }
 
 // --------------------------------------------------------
@@ -258,12 +276,19 @@ router.get('/', (req, res) => {
         time_format: timeFormat,
         week_start: weekStart,
         region: cfgGet('region') || null,
+        // Drei Sichten auf dieselbe Einstellung, weil drei verschiedene Fragen
+        // dahinterstecken: was ist gewählt (Select-Zustand), was gilt gerade
+        // (API-Konsument), und was ergäbe die Automatik (Label der ersten Option).
+        language: isSupportedLocale(cfgGet('language')) ? cfgGet('language') : null,
+        language_effective: resolveHouseholdLocale(db.get()),
+        language_auto: resolveHouseholdLocale(db.get(), { ignoreExplicit: true }),
         app_name: appName,
         dashboard_widgets: dashboardWidgets,
         disabled_modules: disabledModules,
         module_order: moduleOrder,
         mobile_nav_order: mobileNavOrder,
         housekeeping_payment_tasks: cfgGet('housekeeping_payment_tasks') === '1',
+        budget_mode: VALID_BUDGET_MODES.includes(cfgGet('budget_mode')) ? cfgGet('budget_mode') : DEFAULT_BUDGET_MODE,
         calendar_default_duration: Number(cfgGet('calendar_default_duration')) || DEFAULT_CALENDAR_DURATION,
         // Standardwerte für neue Termine (per-user, #497/#498).
         calendar_default_reminders: parseDefaultReminders(cfgUserGet('calendar_default_reminders', req.authUserId)),
@@ -272,6 +297,8 @@ router.get('/', (req, res) => {
         // Feature aktiv, damit Bestandshaushalte ihr Verhalten behalten.
         health_cycle_enabled: cfgGet('health_cycle_enabled') !== '0',
         rewards_require_approval: cfgGet('rewards_require_approval') !== '0',
+        tasks_subtasks_expanded: cfgGet('tasks_subtasks_expanded') === '1',
+        tasks_default_points: parseTaskDefaultPoints(cfgGet('tasks_default_points')),
         weather_provider: cfgGet('weather_provider') ?? null,
         weather_lat:      cfgGet('weather_lat')      ?? null,
         weather_lon:      cfgGet('weather_lon')      ?? null,
@@ -281,6 +308,7 @@ router.get('/', (req, res) => {
         weather_user: weatherUserOverride(req.authUserId),
         holiday_country:       cfgGet('holiday_country')       ?? null,
         holiday_subdivision:   cfgGet('holiday_subdivision')   ?? null,
+        holiday_group:         cfgGet('holiday_group')         ?? null,
         holiday_show_public:   cfgGet('holiday_show_public')   === '1',
         holiday_show_school:   cfgGet('holiday_show_school')   === '1',
         holiday_public_color:  cfgGet('holiday_public_color')  ?? '#FF3B30',
@@ -303,7 +331,7 @@ router.get('/', (req, res) => {
 
 router.put('/', (req, res) => {
   try {
-    const { visible_meal_types, currency, date_format, time_format, week_start, region, app_name, dashboard_widgets, disabled_modules, module_order, mobile_nav_order, housekeeping_payment_tasks, calendar_default_duration, calendar_default_reminders, calendar_default_assign_me, health_cycle_enabled, rewards_require_approval, weather_provider, weather_lat, weather_lon, weather_city, weather_units, weather_auto_locate, weather_user, holiday_country, holiday_subdivision, holiday_show_public, holiday_show_school, holiday_public_color, holiday_school_color } = req.body;
+    const { visible_meal_types, currency, date_format, time_format, week_start, region, language, app_name, dashboard_widgets, disabled_modules, module_order, mobile_nav_order, housekeeping_payment_tasks, budget_mode, calendar_default_duration, calendar_default_reminders, calendar_default_assign_me, health_cycle_enabled, rewards_require_approval, tasks_subtasks_expanded, tasks_default_points, weather_provider, weather_lat, weather_lon, weather_city, weather_units, weather_auto_locate, weather_user, holiday_country, holiday_subdivision, holiday_group, holiday_show_public, holiday_show_school, holiday_public_color, holiday_school_color } = req.body;
 
     if (visible_meal_types !== undefined) {
       if (!Array.isArray(visible_meal_types)) {
@@ -345,14 +373,47 @@ router.put('/', (req, res) => {
       cfgSet('week_start', week_start);
     }
 
-    // Reine Anzeige-Hilfe: welche Region-Vorlage der Nutzer gewählt hat. Nötig,
-    // weil sich mehrere Regionen dasselbe currency/date/time-Triple teilen und
-    // der Dropdown sonst nach dem Speichern auf die falsche Region springt (#486).
+    // Budget-Modus — haushaltweite Grundsatzentscheidung, nur Admin (#476/#505).
+    if (budget_mode !== undefined) {
+      if (req.authRole !== 'admin') {
+        return res.status(403).json({ error: 'Admin access required.', code: 403 });
+      }
+      if (!VALID_BUDGET_MODES.includes(budget_mode)) {
+        return res.status(400).json({ error: `Ungültiger Budget-Modus. Erlaubt: ${VALID_BUDGET_MODES.join(', ')}`, code: 400 });
+      }
+      cfgSet('budget_mode', budget_mode);
+    }
+
+    // Welche Region-Vorlage der Nutzer gewählt hat. Nötig, weil sich mehrere
+    // Regionen dasselbe currency/date/time-Triple teilen und der Dropdown sonst
+    // nach dem Speichern auf die falsche Region springt (#486).
+    //
+    // Seit die Datensprache aus der Region abgeleitet wird, ist das keine reine
+    // Anzeige-Hilfe mehr: eine Region schiebt die Sprache, in der Geburtstags-
+    // Termine gespeichert werden. Deshalb dasselbe Admin-Gate wie bei `language`
+    // - sonst wäre der dortige Schutz über diesen Umweg zu umgehen. Die Oberfläche
+    // behandelte die Region ohnehin immer als Admin-Feld, nur die Route nicht.
     if (region !== undefined) {
+      if (req.authRole !== 'admin') {
+        return res.status(403).json({ error: 'Admin access required.', code: 403 });
+      }
       if (region !== null && (typeof region !== 'string' || !VALID_REGION.test(region))) {
         return res.status(400).json({ error: 'Ungültige Region.', code: 400 });
       }
       cfgSet('region', region ?? '');
+    }
+
+    // Datensprache — haushaltweite Grundsatzentscheidung wie Region und Währung,
+    // deshalb nur Admin. null/'' stellt auf "automatisch" zurück (aus der Region).
+    if (language !== undefined) {
+      if (req.authRole !== 'admin') {
+        return res.status(403).json({ error: 'Admin access required.', code: 403 });
+      }
+      if (language !== null && language !== '' && !isSupportedLocale(language)) {
+        return res.status(400).json({ error: `Ungültige Sprache. Erlaubt: ${VALID_LANGUAGES.join(', ')}`, code: 400 });
+      }
+      if (language === null || language === '') cfgDelete('language');
+      else cfgSet('language', language);
     }
 
     if (app_name !== undefined) {
@@ -367,6 +428,9 @@ router.put('/', (req, res) => {
         return res.status(400).json({ error: 'dashboard_widgets muss ein Array sein', code: 400 });
       }
       const normalized = normalizeWidgetConfig(dashboard_widgets);
+      if (normalized === null) {
+        return res.status(400).json({ error: 'dashboard_widgets enthält ungültige Einträge', code: 400 });
+      }
       cfgSet('dashboard_widgets', JSON.stringify(normalized));
     }
 
@@ -457,6 +521,28 @@ router.put('/', (req, res) => {
         return res.status(400).json({ error: 'rewards_require_approval must be a boolean', code: 400 });
       }
       cfgSet('rewards_require_approval', rewards_require_approval ? '1' : '0');
+    }
+
+    if (tasks_subtasks_expanded !== undefined) {
+      if (req.authRole !== 'admin') {
+        return res.status(403).json({ error: 'Admin access required.', code: 403 });
+      }
+      if (typeof tasks_subtasks_expanded !== 'boolean') {
+        return res.status(400).json({ error: 'tasks_subtasks_expanded must be a boolean', code: 400 });
+      }
+      cfgSet('tasks_subtasks_expanded', tasks_subtasks_expanded ? '1' : '0');
+    }
+
+    // Standard-Punktwert für neue Aufgaben (#578). 0 schaltet den Standard ab.
+    if (tasks_default_points !== undefined) {
+      if (req.authRole !== 'admin') {
+        return res.status(403).json({ error: 'Admin access required.', code: 403 });
+      }
+      const points = Number(tasks_default_points);
+      if (!Number.isInteger(points) || points < 0 || points > MAX_TASK_POINTS) {
+        return res.status(400).json({ error: `tasks_default_points must be an integer between 0 and ${MAX_TASK_POINTS}`, code: 400 });
+      }
+      cfgSet('tasks_default_points', String(points));
     }
 
     // Weather configuration — admin only
@@ -571,6 +657,7 @@ router.put('/', (req, res) => {
     if (
       holiday_country      !== undefined ||
       holiday_subdivision  !== undefined ||
+      holiday_group        !== undefined ||
       holiday_show_public  !== undefined ||
       holiday_show_school  !== undefined ||
       holiday_public_color !== undefined ||
@@ -586,6 +673,7 @@ router.put('/', (req, res) => {
         if (holiday_country === null) {
           cfgDelete('holiday_country');
           cfgDelete('holiday_subdivision');
+          cfgDelete('holiday_group');
         } else {
           cfgSet('holiday_country', holiday_country);
         }
@@ -594,8 +682,22 @@ router.put('/', (req, res) => {
         if (holiday_subdivision !== null && !SUBDIVISION_RE.test(holiday_subdivision)) {
           return res.status(400).json({ error: 'Ungültiger Regionscode (z. B. DE-BY).', code: 400 });
         }
-        if (holiday_subdivision === null) cfgDelete('holiday_subdivision');
-        else cfgSet('holiday_subdivision', holiday_subdivision);
+        // Ohne Subdivision gibt es keine Schulferien-Gruppe mehr → mit aufräumen.
+        if (holiday_subdivision === null) {
+          cfgDelete('holiday_subdivision');
+          cfgDelete('holiday_group');
+        } else {
+          cfgSet('holiday_subdivision', holiday_subdivision);
+        }
+      }
+      // Schulferien-Gruppe (z. B. CH-BE-VS) mehrsprachiger Kantone. Nutzt dieselbe
+      // Grammatik wie ein Regionscode. NULL/leer = keine Gruppe gewählt. (#434)
+      if (holiday_group !== undefined) {
+        if (holiday_group !== null && holiday_group !== '' && !SUBDIVISION_RE.test(holiday_group)) {
+          return res.status(400).json({ error: 'Ungültiger Gruppencode (z. B. CH-BE-VS).', code: 400 });
+        }
+        if (holiday_group === null || holiday_group === '') cfgDelete('holiday_group');
+        else cfgSet('holiday_group', holiday_group);
       }
       if (holiday_show_public !== undefined) {
         if (typeof holiday_show_public !== 'boolean') {
@@ -644,17 +746,23 @@ router.put('/', (req, res) => {
         time_format: savedTimeFormat,
         week_start: savedWeekStart,
         region: cfgGet('region') || null,
+        language: isSupportedLocale(cfgGet('language')) ? cfgGet('language') : null,
+        language_effective: resolveHouseholdLocale(db.get()),
+        language_auto: resolveHouseholdLocale(db.get(), { ignoreExplicit: true }),
         app_name: savedAppName,
         dashboard_widgets: savedWidgets,
         disabled_modules: savedDisabledModules,
         module_order: savedModuleOrder,
         mobile_nav_order: savedMobileNavOrder,
         housekeeping_payment_tasks: savedHousekeepingPaymentTasks,
+        budget_mode: VALID_BUDGET_MODES.includes(cfgGet('budget_mode')) ? cfgGet('budget_mode') : DEFAULT_BUDGET_MODE,
         calendar_default_duration: Number(cfgGet('calendar_default_duration')) || DEFAULT_CALENDAR_DURATION,
         calendar_default_reminders: parseDefaultReminders(cfgUserGet('calendar_default_reminders', req.authUserId)),
         calendar_default_assign_me: cfgUserGet('calendar_default_assign_me', req.authUserId) === '1',
         health_cycle_enabled: cfgGet('health_cycle_enabled') !== '0',
         rewards_require_approval: cfgGet('rewards_require_approval') !== '0',
+        tasks_subtasks_expanded: cfgGet('tasks_subtasks_expanded') === '1',
+        tasks_default_points: parseTaskDefaultPoints(cfgGet('tasks_default_points')),
         weather_provider: cfgGet('weather_provider') ?? null,
         weather_lat:      cfgGet('weather_lat')      ?? null,
         weather_lon:      cfgGet('weather_lon')      ?? null,
@@ -664,6 +772,7 @@ router.put('/', (req, res) => {
         weather_user: weatherUserOverride(req.authUserId),
         holiday_country:       cfgGet('holiday_country')       ?? null,
         holiday_subdivision:   cfgGet('holiday_subdivision')   ?? null,
+        holiday_group:         cfgGet('holiday_group')         ?? null,
         holiday_show_public:   cfgGet('holiday_show_public')   === '1',
         holiday_show_school:   cfgGet('holiday_show_school')   === '1',
         holiday_public_color:  cfgGet('holiday_public_color')  ?? '#FF3B30',
@@ -674,6 +783,28 @@ router.put('/', (req, res) => {
   } catch (err) {
     log.error('PUT /', err);
     res.status(500).json({ error: 'Interner Fehler', code: 500 });
+  } finally {
+    // Gespeicherte Geburtstags-Termine an die geltende Datensprache angleichen.
+    //
+    // Unbedingt statt nur bei erkannter Verschiebung: retitleBirthdayEvents
+    // vergleicht ohnehin pro Zeile und schreibt nur, was abweicht. Ein Vergleich
+    // vorher/nachher wäre ein zweiter Ort, an dem alle Wege zur Datensprache
+    // (language, region, date_format) vollständig aufgezählt sein müssten.
+    //
+    // Im finally, weil der Handler schreibt und validiert, während er durch die
+    // Felder läuft: ein Batch aus gültiger `language` und einem später
+    // abgelehnten Feld verlässt ihn über ein `return res.status(400)`, hat die
+    // Sprache aber schon geschrieben. Am Ende des try-Blocks bliebe der Haushalt
+    // dann auf einer neuen Sprache mit alten Titeln sitzen.
+    //
+    // Fehler beenden die Anfrage nicht: die Antwort ist zu diesem Zeitpunkt
+    // längst gesendet, und die Präferenzen sind geschrieben. Der nächste PUT
+    // versucht es erneut - der Lauf ist idempotent.
+    try {
+      db.transaction(() => retitleBirthdayEvents(db.get()));
+    } catch (err) {
+      log.error('PUT / - Geburtstags-Termine konnten nicht umbenannt werden', err);
+    }
   }
 });
 
@@ -700,6 +831,26 @@ router.get('/holidays/subdivisions/:countryCode', async (req, res) => {
   } catch (err) {
     log.error('GET /holidays/subdivisions/:countryCode', err);
     res.status(502).json({ error: 'Fehler beim Abrufen der Regionsliste.', code: 502 });
+  }
+});
+
+// GET /api/v1/preferences/holidays/groups/:countryCode/:subdivisionCode
+// Schulferien-Gruppen einer Subdivision (mehrsprachige Kantone). Leere Liste,
+// wenn die Subdivision nur ein Ferien-Regime kennt. (#434)
+router.get('/holidays/groups/:countryCode/:subdivisionCode', async (req, res) => {
+  const { countryCode, subdivisionCode } = req.params;
+  if (!COUNTRY_ISO_RE.test(countryCode)) {
+    return res.status(400).json({ error: 'Ungültiger Ländercode.', code: 400 });
+  }
+  if (!SUBDIVISION_RE.test(subdivisionCode)) {
+    return res.status(400).json({ error: 'Ungültiger Regionscode.', code: 400 });
+  }
+  try {
+    const groups = await holidays.getGroups(countryCode, subdivisionCode);
+    res.json({ data: groups });
+  } catch (err) {
+    log.error('GET /holidays/groups/:countryCode/:subdivisionCode', err);
+    res.status(502).json({ error: 'Fehler beim Abrufen der Ferien-Gruppen.', code: 502 });
   }
 });
 

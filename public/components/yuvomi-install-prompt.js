@@ -176,7 +176,7 @@ class YuvomiInstallPrompt extends HTMLElement {
       .btn-install {
         flex-shrink: 0;
         padding: var(--space-2, 8px) var(--space-4, 16px);
-        background: var(--color-btn-primary, #4338CA);
+        background: var(--color-btn-primary, #5b2fd4);
         color: var(--color-text-on-accent, #fff);
         border: none;
         border-radius: var(--radius-sm, 8px);
@@ -190,7 +190,7 @@ class YuvomiInstallPrompt extends HTMLElement {
       }
 
       .btn-install:hover {
-        background: var(--color-btn-primary-hover, #1E429A);
+        background: var(--color-btn-primary-hover, #4a26bb);
       }
 
       .btn-dismiss {
@@ -226,6 +226,23 @@ class YuvomiInstallPrompt extends HTMLElement {
         width: 1em;
         height: 1em;
         vertical-align: -0.1em;
+      }
+
+      /* Touch-Maß an (hover: none) statt an der Viewport-Breite — dieselbe
+       * Konvention wie bei .filter-chip--sm: das Banner erscheint vor allem auf
+       * Mobil und Tablet, wo 32px/36px unter dem 44pt-Minimum lagen. Desktop
+       * (Maus) bleibt bei der kompakteren Größe. */
+      @media (hover: none) {
+        .btn-install {
+          min-height: var(--target-base, 44px);
+        }
+
+        .btn-dismiss {
+          width: var(--target-base, 44px);
+          height: var(--target-base, 44px);
+          min-width: var(--target-base, 44px);
+          min-height: var(--target-base, 44px);
+        }
       }
 
       @media (min-width: 1024px) {

@@ -5,13 +5,25 @@
  */
 
 import express from 'express';
-import bcrypt from 'bcrypt';
 import crypto from 'node:crypto';
 import { createLogger } from '../logger.js';
+import { hashPassword } from '../utils/password.js';
 import * as db from '../db.js';
 import { normalizeAvatarData, syncFamilyMemberArtifacts } from '../auth.js';
 import { collectErrors, color, date, datetime, month, num, oneOf, str, id as validateId, MAX_SHORT, MAX_TEXT, MAX_TITLE } from '../middleware/validate.js';
 import { minutesBetween, computeHourlyAmount } from '../services/housekeeping-billing.js';
+import {
+  formatDateKey,
+  formatMoney,
+  householdRegion,
+  resolveHouseholdFormats,
+  translate,
+} from '../utils/i18n.js';
+import {
+  OUTBOUND_SOURCES,
+  mirroredFieldsChanged,
+  queueEventDeletion,
+} from '../services/calendar-outbound.js';
 
 const log = createLogger('Housekeeping');
 const router = express.Router();
@@ -236,6 +248,31 @@ function loadWorkers() {
   `).all();
 }
 
+// Die Oberfläche schickt Titel und Beschreibung fertig übersetzt mit
+// (`visitTextPayload` in public/pages/housekeeping.js). Diese Fallbacks greifen
+// für alles, was die API direkt anspricht - MCP, Skripte, Integrationen. Sie
+// standen fest auf Englisch, obwohl die Texte in `calendar_events`/`tasks`
+// landen und von dort in API, ICS-Feed und Sync gehen; deshalb dieselbe
+// Datensprache wie bei den Geburtstags-Terminen (#631, #632). Die Locale-Keys
+// sind dieselben, die der Client benutzt - eine Formulierung, zwei Aufrufer.
+function visitTitleFallback(database, worker) {
+  const { locale } = resolveHouseholdFormats(database);
+  return translate(locale, 'housekeeping.calendarVisitTitle', { name: worker.display_name });
+}
+
+function paymentTitleFallback(database, worker) {
+  const { locale } = resolveHouseholdFormats(database);
+  return translate(locale, 'housekeeping.paymentTaskTitle', { name: worker.display_name });
+}
+
+function paymentDescriptionFallback(database, visitDate, amount) {
+  const { locale, dateFormat, currency } = resolveHouseholdFormats(database);
+  return translate(locale, 'housekeeping.paymentTaskDescription', {
+    date: formatDateKey(visitDate, dateFormat),
+    amount: formatMoney(amount, { locale, currency, region: householdRegion(database) }),
+  });
+}
+
 function createVisitCalendarEvent(database, worker, checkIn, actorId, title = null, visitDateOverride = null) {
   const visitDate = visitDateOverride || checkIn.slice(0, 10);
   const result = database.prepare(`
@@ -243,7 +280,7 @@ function createVisitCalendarEvent(database, worker, checkIn, actorId, title = nu
       (title, start_datetime, end_datetime, all_day, color, icon, assigned_to, created_by, external_source)
     VALUES (?, ?, NULL, 1, ?, ?, ?, ?, 'local')
   `).run(
-    title || `Housekeeping: ${worker.display_name}`,
+    title || visitTitleFallback(database, worker),
     visitDate,
     worker.calendar_color || DEFAULT_CALENDAR_COLOR,
     HOUSEKEEPING_EVENT_ICON,
@@ -261,8 +298,8 @@ function createPaymentTask(database, worker, checkIn, amount, actorId, title = n
     INSERT INTO tasks (title, description, due_date, priority, category, status, created_by)
     VALUES (?, ?, ?, 'medium', 'household', 'open', ?)
   `).run(
-    title || `Pay ${worker.display_name} for housekeeping`,
-    description || `Housekeeping visit on ${visitDate}. Amount due: ${amount.toFixed(2)}.`,
+    title || paymentTitleFallback(database, worker),
+    description || paymentDescriptionFallback(database, visitDate, amount),
     visitDate,
     actorId,
   );
@@ -272,6 +309,12 @@ function createPaymentTask(database, worker, checkIn, amount, actorId, title = n
 function updateVisitLinks(database, session, worker, checkIn, dailyRate, extras, eventTitle = null, paymentTitle = null, paymentDescription = null) {
   const visitDate = checkIn.slice(0, 10);
   if (session.calendar_event_id) {
+    // Datum, Titel und Farbe des Termins stehen in MIRRORED_FIELDS. Ein Besuch,
+    // den der Apple-Sync bereits hochgeladen hat, trägt external_source='apple'
+    // und erreicht den Provider nur noch über outbound_dirty - ohne die
+    // Vormerkung bliebe die Verschiebung eines Besuchs lokal (dieselbe Lücke wie
+    // bei den Geburtstags-Titeln in #632).
+    const before = database.prepare('SELECT * FROM calendar_events WHERE id = ?').get(session.calendar_event_id);
     database.prepare(`
       UPDATE calendar_events
       SET title = COALESCE(?, title),
@@ -288,6 +331,25 @@ function updateVisitLinks(database, session, worker, checkIn, dailyRate, extras,
       HOUSEKEEPING_EVENT_ICON,
       session.calendar_event_id,
     );
+    const after = database.prepare('SELECT * FROM calendar_events WHERE id = ?').get(session.calendar_event_id);
+    // Marker inline statt über markEventOutbound, aus zwei Gründen:
+    //
+    //   - markEventOutbound lehnt einen schreibgeschützten Provider ab
+    //     (`google_readonly`). Der Marker ist aber nicht nur ein Push-Auftrag,
+    //     sondern auch der Schutz davor, dass der Inbound die lokale Änderung
+    //     überschreibt - `if (existing?.outbound_dirty) continue`. Ohne ihn
+    //     verlöre ein verschobener Besuch sein Datum an den alten Serverstand,
+    //     sobald jemand den Nur-Lesen-Modus einschaltet.
+    //   - Es schreibt über db.get() und umginge die hier übergebene Connection.
+    //
+    // Der Feldvergleich bleibt derselbe: mirroredFieldsChanged prüft genau die
+    // Felder, die zum Provider gespiegelt werden.
+    const mirrored = after && OUTBOUND_SOURCES.includes(after.external_source) && !!after.external_calendar_id;
+    if (before && mirrored && mirroredFieldsChanged(before, after)) {
+      database.prepare(
+        'UPDATE calendar_events SET outbound_dirty = 1, outbound_attempts = 0 WHERE id = ?'
+      ).run(session.calendar_event_id);
+    }
   }
   if (session.payment_task_id) {
     const totalAmount = Number(dailyRate || 0) + Number(extras || 0);
@@ -299,7 +361,7 @@ function updateVisitLinks(database, session, worker, checkIn, dailyRate, extras,
       WHERE id = ?
     `).run(
       paymentTitle,
-      paymentDescription || `Housekeeping visit on ${visitDate}. Amount due: ${totalAmount.toFixed(2)}.`,
+      paymentDescription || paymentDescriptionFallback(database, visitDate, totalAmount),
       visitDate,
       session.payment_task_id,
     );
@@ -307,7 +369,14 @@ function updateVisitLinks(database, session, worker, checkIn, dailyRate, extras,
 }
 
 function deleteVisitLinks(database, session) {
-  if (session.calendar_event_id) database.prepare('DELETE FROM calendar_events WHERE id = ?').run(session.calendar_event_id);
+  if (session.calendar_event_id) {
+    // Beim Provider liegende Kopie mit abräumen: ein reines DELETE hier ließe
+    // den Termin in iCloud/Google/Nextcloud stehen, und der nächste Inbound-Lauf
+    // spielte ihn womöglich wieder ein.
+    const event = database.prepare('SELECT * FROM calendar_events WHERE id = ?').get(session.calendar_event_id);
+    if (event) queueEventDeletion(event, database);
+    database.prepare('DELETE FROM calendar_events WHERE id = ?').run(session.calendar_event_id);
+  }
   if (session.payment_task_id) database.prepare('DELETE FROM tasks WHERE id = ?').run(session.payment_task_id);
 }
 
@@ -421,7 +490,7 @@ function assertAdmin(req, res) {
 async function createWorkerUser({ username, displayName, avatarColor, avatarData, actorUserId }) {
   const finalUsername = username || `housekeeper_${Date.now()}`;
   const password = crypto.randomBytes(24).toString('base64url');
-  const hash = await bcrypt.hash(password, 12);
+  const hash = await hashPassword(password);
   const result = db.get().prepare(`
     INSERT INTO users (username, display_name, password_hash, avatar_color, avatar_data, role, family_role)
     VALUES (?, ?, ?, ?, ?, 'member', 'other')

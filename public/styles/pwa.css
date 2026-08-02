@@ -48,13 +48,13 @@ body {
 }
 
 /* ── Kein Text-Selection in UI-Elementen (nur in Content-Bereichen) ── */
+/* Geteilte Kopf-Klassen statt einer Vier-Modul-Namensliste: sonst haben nur
+ * vier der dreizehn Modul-Köpfe kein Text-Select (Issue #577). */
 nav,
 .nav-bottom,
 .nav-sidebar,
-.cal-toolbar,
-.tasks-toolbar,
-.notes-toolbar,
-.contacts-toolbar,
+.page-toolbar,
+.sub-tabs-bar,
 .modal-panel__header {
   -webkit-user-select: none;
   user-select: none;

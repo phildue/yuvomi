@@ -7,13 +7,31 @@
 import { createLogger } from '../logger.js';
 import express from 'express';
 import * as db from '../db.js';
+import { documentVisibleSql } from '../services/document-access.js';
 import { nextOccurrenceAfter } from '../services/recurrence.js';
 import { syncTaskRewards } from '../services/rewards.js';
 import { normalizeVisibility, visibilityWhere } from '../services/visibility.js';
+import {
+  flushOutbound, markTodoOutbound, queueTodoDeletion,
+} from '../services/caldav-todo-outbound.js';
 import { uniqueKey } from '../utils/category-slug.js';
+import {
+  allTags, applyTagChanges, loadTags, loadTagsFor, normalizeTags,
+  removeTagEverywhere, renameTag, setTags, tagKey, tagsKey, taskIdsWithTag,
+} from '../utils/task-tags.js';
 import * as v from '../middleware/validate.js';
 
 const log = createLogger('Tasks');
+
+/**
+ * Ausgehende Arbeit an einem CalDAV-Spiegel anstoßen (#617). Bewusst nach der
+ * Antwort und ohne await: der Server-Aufruf darf die Antwort weder verzögern
+ * noch scheitern lassen. Schlägt er fehl, bleibt die Vormerkung liegen und der
+ * nächste Sync-Lauf holt sie nach.
+ */
+function pushToCalDAV(what) {
+  flushOutbound().catch((err) => log.warn(`${what} vorgemerkt, Sofortversuch fehlgeschlagen:`, err.message));
+}
 
 const router = express.Router();
 
@@ -50,6 +68,34 @@ function clampPoints(val) {
   return Math.min(n, MAX_POINTS);
 }
 
+/**
+ * Haushaltweiter Standard-Punktwert für neue Aufgaben (#578). 0 = kein Standard.
+ * Liegt in sync_config, damit die Einstellung im selben Speicher wie die
+ * übrigen Haushalt-Präferenzen liegt (siehe server/routes/preferences.js).
+ */
+function defaultTaskPoints() {
+  const row = db.get().prepare("SELECT value FROM sync_config WHERE key = 'tasks_default_points'").get();
+  return clampPoints(row?.value);
+}
+
+// Erledigte Aufgaben dürfen nicht umbepunktet werden: genau für 'done' hält der
+// reward_ledger eine earn-Buchung über den damaligen Punktwert
+// (awardForCompletion in server/services/rewards.js); ein nachträglicher Wechsel
+// ließe Aufgabenwert und Gutschrift auseinanderlaufen.
+// Alle übrigen Status sind buchungsfrei — auch 'archived': eine archivierte
+// Aufgabe war entweder nie 'done', oder der Übergang 'done' → 'archived' hat die
+// Buchung über reverseTaskEarnings wieder entfernt. Sie mitzuziehen verhindert,
+// dass eine später reaktivierte Aufgabe einen veralteten Wert auszahlt.
+const REBASE_EXCLUDED_STATUS = 'done';
+
+/** Nicht erledigte Hauptaufgaben, die exakt auf einem Punktwert stehen. */
+function countRebasableTasks(points) {
+  return db.get().prepare(`
+    SELECT COUNT(*) AS n FROM tasks
+    WHERE points = ? AND parent_task_id IS NULL AND status != ?
+  `).get(points, REBASE_EXCLUDED_STATUS).n;
+}
+
 // --------------------------------------------------------
 // Hilfsfunktionen
 // --------------------------------------------------------
@@ -67,6 +113,36 @@ function addAssignedUsers(task) {
   task.assigned_users = task.assigned_users_json ? JSON.parse(task.assigned_users_json) : [];
   delete task.assigned_users_json;
   return task;
+}
+
+/**
+ * Hängt jedem Task die Anzahl der für die Person sichtbaren, verknüpften
+ * Dokumente an (document_count, #503). Eine einzige gruppierte Abfrage statt
+ * pro-Task, damit die Listen-Route günstig bleibt.
+ */
+function attachDocumentCounts(tasks, me) {
+  if (!tasks.length) return tasks;
+  const counts = db.get().prepare(`
+    SELECT td.task_id AS id, COUNT(*) AS n
+    FROM task_documents td
+    JOIN family_documents d ON d.id = td.document_id
+    WHERE d.status != 'archived' AND ${DOC_VISIBLE_SQL}
+    GROUP BY td.task_id
+  `).all({ me });
+  const map = new Map(counts.map((r) => [r.id, r.n]));
+  for (const task of tasks) task.document_count = map.get(task.id) ?? 0;
+  return tasks;
+}
+
+/**
+ * Hängt jeder Aufgabe ihre Tags an (#586). Eine Abfrage für die ganze Liste,
+ * aus demselben Grund wie attachDocumentCounts.
+ */
+function attachTags(tasks) {
+  if (!tasks.length) return tasks;
+  const map = loadTagsFor(db.get(), tasks.map((t) => t.id));
+  for (const task of tasks) task.tags = map.get(task.id) ?? [];
+  return tasks;
 }
 
 function parseAssignedTo(val) {
@@ -95,27 +171,37 @@ function syncHousekeepingPaymentStatus(d, taskId, status) {
 }
 
 /** Alle Subtasks einer Aufgabe laden (eine Ebene tief). */
-function loadSubtasks(taskId) {
-  return db.get().prepare(`
+function loadSubtasks(taskId, me) {
+  // Eine Unteraufgabe trägt eine eigene Sichtbarkeit (POST nimmt das Feld
+  // entgegen). Sie hing hier noch nie an der Regel: unter einer geteilten
+  // Elternaufgabe wurde eine private Unteraufgabe samt Titel ausgeliefert.
+  // Mit den Tags käme deren Freitext dazu.
+  const rows = db.get().prepare(`
     SELECT t.*, u.display_name AS assigned_name, u.avatar_color AS assigned_color,
       u.avatar_data AS assigned_avatar, ${ASSIGNED_USERS_SQL}
     FROM tasks t
     LEFT JOIN users u ON t.assigned_to = u.id
     WHERE t.parent_task_id = ?
+      AND ${visibilityWhere('t', 'task_assignments', 'task_id', '@me')}
     ORDER BY t.created_at ASC
-  `).all(taskId).map(addAssignedUsers);
+  `).all(taskId, { me }).map(addAssignedUsers);
+  // Unteraufgaben sind Aufgaben und können Tags tragen - über den CalDAV-Spiegel
+  // bekommen sie welche, ohne dass jemand sie hier vergibt. Ohne das Anhängen
+  // wären sie in der Antwort einfach nicht da, und ein PUT auf Basis dieser
+  // Zeile schriebe sie still weg.
+  return attachTags(rows);
 }
 
-/** Fortschritt der Subtasks berechnen (erledigte / gesamt). */
-function subtaskProgress(taskId) {
-  const row = db.get().prepare(`
-    SELECT
-      COUNT(*)                          AS total,
-      SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done
-    FROM tasks
-    WHERE parent_task_id = ?
-  `).get(taskId);
-  return { total: row.total ?? 0, done: row.done ?? 0 };
+/**
+ * Tags dürfen fehlen oder ein Array/kommaseparierter String sein. Zahl und Länge
+ * begrenzt normalizeTags still - abgelehnt wird nur, was gar keine Tag-Liste ist,
+ * damit ein Tippfehler im Client nicht als leere Liste durchgeht und die
+ * vorhandenen Tags löscht.
+ */
+function validateTags(value) {
+  if (value === undefined || value === null) return {};
+  if (Array.isArray(value) || typeof value === 'string') return {};
+  return { error: 'tags must be an array or a comma-separated string.' };
 }
 
 /** Eingabe-Validierung für Task-Felder (zentralisiert über validate.js). */
@@ -131,6 +217,7 @@ function validateTaskInput(body, isCreate = true) {
     v.time(body.due_time,   'due_time'),
     v.rrule(body.recurrence_rule, 'recurrence_rule'),
     v.num(body.points,      'points'),
+    validateTags(body.tags),
   ]);
 }
 
@@ -146,6 +233,142 @@ router.get('/categories', (_req, res) => {
     res.json({ data: loadTaskCategories() });
   } catch (err) {
     log.error('GET /categories error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// GET /api/v1/tasks/tags → { data: [{ tag, count }] }
+// Die sichtbaren Tags für Filterleiste und Vorschläge (#586). Anders als
+// Kategorien gibt es keine Registry - die Liste ergibt sich aus dem Bestand,
+// und zwar aus dem Teil davon, den die fragende Person sehen darf: ein Tag ist
+// Freitext und verriete sonst den Inhalt einer privaten Aufgabe (#474).
+// Muss wie /categories vor den /:id-Routen stehen, sonst matcht „tags" als :id.
+router.get('/tags', (req, res) => {
+  try {
+    res.json({ data: allTags(db.get(), req.authUserId || req.session.userId) });
+  } catch (err) {
+    log.error('GET /tags error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+/**
+ * Merkt geänderte Aufgaben für den CalDAV-Push vor und stößt ihn an (#586).
+ * Die Tags reisen als kanonischer Schlüssel mit: sie liegen in task_tags, der
+ * Feldvergleich in markTodoOutbound sieht aber nur die Zeile selbst.
+ */
+function pushTagChanges(changed, what) {
+  if (!changed.length) return;
+  const rows = db.get().prepare(
+    `SELECT * FROM tasks WHERE id IN (${changed.map(() => '?').join(',')})`
+  ).all(...changed.map((c) => c.id));
+  const byId = new Map(rows.map((r) => [r.id, r]));
+
+  let pending = 0;
+  for (const { id, before, after } of changed) {
+    const row = byId.get(id);
+    if (!row) continue;
+    if (markTodoOutbound('tasks',
+      { ...row, tags_key: tagsKey(before) },
+      { ...row, tags_key: tagsKey(after) })) pending++;
+  }
+  if (pending) pushToCalDAV(what);
+}
+
+/** Aus einer Liste von IDs die, die `me` sehen darf. */
+function visibleTaskIds(ids, me) {
+  if (!ids.length) return [];
+  const placeholders = ids.map(() => '?').join(',');
+  return db.get().prepare(`
+    SELECT t.id AS id FROM tasks t
+    WHERE t.id IN (${placeholders})
+      AND ${visibilityWhere('t', 'task_assignments', 'task_id', '@me')}
+  `).all(...ids, { me }).map((r) => r.id);
+}
+
+// Obergrenze für eine Bulk-Vergabe. Die Auswahl entsteht per Hand in der Liste,
+// alles darüber ist ein Skript - und ein Skript soll die Aufgaben einzeln
+// anfassen statt einen Sync-Lauf mit einem Schlag zu füllen.
+const MAX_BULK_TASKS = 500;
+
+// POST /api/v1/tasks/tags/apply  Body: { ids, add?, remove? }
+// Vergibt oder entfernt Tags an mehreren Aufgaben auf einmal (#586). Eigener
+// Endpunkt statt einer Schleife über PUT /:id im Client: zum Anhängen müsste der
+// Client jede Aufgabe erst lesen, die Liste mischen und die ganze Aufgabe
+// zurückschreiben - und überschriebe dabei jede parallele Änderung.
+router.post('/tags/apply', (req, res) => {
+  try {
+    const ids = Array.isArray(req.body.ids) ? req.body.ids.map(Number).filter(Number.isInteger) : [];
+    if (!ids.length)
+      return res.status(400).json({ error: 'ids must be a non-empty array of task IDs.', code: 400 });
+    if (ids.length > MAX_BULK_TASKS)
+      return res.status(400).json({ error: `At most ${MAX_BULK_TASKS} tasks at a time.`, code: 400 });
+
+    const errors = v.collectErrors([validateTags(req.body.add), validateTags(req.body.remove)]);
+    if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
+
+    const add    = normalizeTags(req.body.add ?? []);
+    const remove = normalizeTags(req.body.remove ?? []);
+    if (!add.length && !remove.length)
+      return res.status(400).json({ error: 'Nothing to add or remove.', code: 400 });
+
+    const me = req.authUserId || req.session.userId;
+    const changed = db.get().transaction(() =>
+      applyTagChanges(db.get(), { taskIds: visibleTaskIds(ids, me), add, remove }))();
+
+    res.json({ data: { updated: changed.length, tags: allTags(db.get(), me) } });
+    pushTagChanges(changed, 'Tag-Vergabe');
+  } catch (err) {
+    log.error('POST /tags/apply error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// PUT /api/v1/tasks/tags/:tag  Body: { name }
+// Benennt einen Tag auf allen sichtbaren Aufgaben um. Zielt der neue Name auf
+// einen vorhandenen Tag, führt das die beiden zusammen - das ist gewollt und der
+// übliche Weg, ein versehentliches Duplikat einzusammeln.
+router.put('/tags/:tag', (req, res) => {
+  try {
+    // Als Array-Element, nicht als String: die String-Form von normalizeTags
+    // trennt am Komma, und ein Umbenennen auf "Haus, Hof" behielte nur "Haus" -
+    // bei gemeldetem Erfolg. Denselben Fehler hatte der Filter eine Funktion
+    // weiter oben.
+    const [to] = normalizeTags([req.body.name ?? '']);
+    if (!to) return res.status(400).json({ error: 'name must be a non-empty tag.', code: 400 });
+
+    const me = req.authUserId || req.session.userId;
+    if (!taskIdsWithTag(db.get(), req.params.tag, me).length)
+      return res.status(404).json({ error: 'Tag not found.', code: 404 });
+
+    const changed = db.get().transaction(() =>
+      renameTag(db.get(), { from: req.params.tag, to, me }))();
+
+    res.json({ data: { updated: changed.length, tag: to, tags: allTags(db.get(), me) } });
+    pushTagChanges(changed, 'Tag-Umbenennung');
+  } catch (err) {
+    log.error('PUT /tags/:tag error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// DELETE /api/v1/tasks/tags/:tag
+// Nimmt den Tag von allen sichtbaren Aufgaben. Anders als bei Kategorien gibt es
+// keine 409-Sperre "noch in Benutzung": ein Tag IST nur seine Verwendungen, und
+// ihn zu löschen heißt genau, sie zu lösen. Die Aufgaben selbst bleiben.
+router.delete('/tags/:tag', (req, res) => {
+  try {
+    const me = req.authUserId || req.session.userId;
+    if (!taskIdsWithTag(db.get(), req.params.tag, me).length)
+      return res.status(404).json({ error: 'Tag not found.', code: 404 });
+
+    const changed = db.get().transaction(() =>
+      removeTagEverywhere(db.get(), { tag: req.params.tag, me }))();
+
+    res.json({ data: { updated: changed.length, tags: allTags(db.get(), me) } });
+    pushTagChanges(changed, 'Tag-Löschung');
+  } catch (err) {
+    log.error('DELETE /tags/:tag error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
@@ -241,7 +464,7 @@ router.delete('/categories/:key', (req, res) => {
 // --------------------------------------------------------
 router.get('/', (req, res) => {
   try {
-    const { status, priority, assigned_to, category, include_future } = req.query;
+    const { status, priority, assigned_to, category, tag, include_future } = req.query;
 
     let sql = `
       SELECT
@@ -251,7 +474,9 @@ router.get('/', (req, res) => {
         u.avatar_data AS assigned_avatar,
         ${ASSIGNED_USERS_SQL},
         (SELECT COUNT(*) FROM tasks s WHERE s.parent_task_id = t.id)                           AS subtask_total,
-        (SELECT COUNT(*) FROM tasks s WHERE s.parent_task_id = t.id AND s.status = 'done')     AS subtask_done
+        (SELECT COUNT(*) FROM tasks s WHERE s.parent_task_id = t.id AND s.status = 'done')     AS subtask_done,
+        (SELECT json_group_array(json_object('id', s.id, 'title', s.title, 'status', s.status))
+           FROM (SELECT id, title, status FROM tasks WHERE parent_task_id = t.id ORDER BY created_at ASC) s) AS subtasks
       FROM tasks t
       LEFT JOIN users u ON t.assigned_to = u.id
       WHERE t.parent_task_id IS NULL
@@ -269,6 +494,22 @@ router.get('/', (req, res) => {
       params.push(Number(assigned_to));
     }
     if (category)    { sql += ' AND t.category = ?';    params.push(category); }
+    // Tag-Filter ohne Rücksicht auf Groß-/Kleinschreibung: die Werte kommen von
+    // fremden Servern, dort ist „Garten" und „garten" dasselbe Etikett.
+    //
+    // Mehrere Tags verbinden sich mit UND, nicht mit ODER: jeder weitere Filter
+    // in dieser Leiste engt ein (Status UND Priorität UND Person), und ein Tag,
+    // der die Liste plötzlich wachsen ließe, wäre in derselben Reihe ein Bruch.
+    // Jedes `tag`-Vorkommen ist genau EIN Tag, nie eine kommaseparierte Liste.
+    // Der frühere CSV-Komfort war ein Fehler: Express liefert bei einem einzigen
+    // `?tag=` einen String statt eines Arrays, und "Haus, Hof" - ein Tag, den
+    // CATEGORIES ausdrücklich erlaubt - zerfiel dabei in zwei, sodass die Suche
+    // nach ihm garantiert leer ausging.
+    const tagFilters = normalizeTags(tag === undefined ? [] : [tag].flat());
+    for (const value of tagFilters) {
+      sql += ' AND EXISTS (SELECT 1 FROM task_tags tt WHERE tt.task_id = t.id AND tt.tag_key = ?)';
+      params.push(tagKey(value));
+    }
 
     // Sichtbarkeit (#474): eigene + für alle sichtbare + zugewiesene-sichtbare.
     const me = req.authUserId || req.session.userId;
@@ -284,7 +525,8 @@ router.get('/', (req, res) => {
         t.created_at DESC
     `;
 
-    res.json({ data: db.get().prepare(sql).all(...params).map(addAssignedUsers) });
+    const rows = db.get().prepare(sql).all(...params).map(task => ({ ...task, subtasks: JSON.parse(task.subtasks || '[]') })).map(addAssignedUsers);
+    res.json({ data: attachTags(attachDocumentCounts(rows, me)) });
   } catch (err) {
     log.error('GET / error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -311,7 +553,9 @@ router.get('/:id', (req, res) => {
     if (!task) return res.status(404).json({ error: 'Task not found.', code: 404 });
 
     addAssignedUsers(task);
-    task.subtasks = loadSubtasks(task.id);
+    task.subtasks = loadSubtasks(task.id, me);
+    attachDocumentCounts([task], me);
+    attachTags([task]);
     res.json({ data: task });
   } catch (err) {
     log.error('GET /:id error:', err);
@@ -322,7 +566,7 @@ router.get('/:id', (req, res) => {
 // --------------------------------------------------------
 // POST /api/v1/tasks
 // Neue Aufgabe erstellen.
-// Body: { title, description?, category?, priority?, due_date?, due_time?,
+// Body: { title, description?, category?, tags?, priority?, due_date?, due_time?,
 //         assigned_to?, parent_task_id? }
 // Response: { data: Task }
 // --------------------------------------------------------
@@ -343,7 +587,12 @@ router.post('/', (req, res) => {
       is_recurring    = 0,
       recurrence_rule = null,
     } = req.body;
-    const points = clampPoints(req.body.points);
+    // Ohne expliziten Wert greift der Haushalt-Standard (#578) — aber nur für
+    // Hauptaufgaben: Subtasks sind Checklisten-Punkte der Elternaufgabe und
+    // würden den Punktewert sonst vervielfachen. Eine ausdrückliche 0 bleibt 0.
+    const points = req.body.points === undefined && !parent_task_id
+      ? defaultTaskPoints()
+      : clampPoints(req.body.points);
     const visibility = normalizeVisibility(req.body.visibility);
 
     const userIds  = parseAssignedTo(req.body.assigned_to);
@@ -370,6 +619,7 @@ router.post('/', (req, res) => {
         is_recurring ? 1 : 0, recurrence_rule, points, visibility
       );
       setAssignments(db.get(), result.lastInsertRowid, userIds);
+      if (req.body.tags !== undefined) setTags(db.get(), result.lastInsertRowid, req.body.tags);
       return result.lastInsertRowid;
     })();
 
@@ -380,7 +630,9 @@ router.post('/', (req, res) => {
       WHERE t.id = ?
     `).get(taskId);
 
-    res.status(201).json({ data: addAssignedUsers(task) });
+    addAssignedUsers(task);
+    attachTags([task]);
+    res.status(201).json({ data: task });
   } catch (err) {
     log.error('POST / error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -390,9 +642,10 @@ router.post('/', (req, res) => {
 // --------------------------------------------------------
 // PUT /api/v1/tasks/:id
 // Aufgabe vollständig aktualisieren.
-// Body: { title, description?, category?, priority?, status?,
+// Body: { title, description?, category?, tags?, priority?, status?,
 //         due_date?, due_time?, assigned_to? }
 // Response: { data: Task }
+// tags fehlt → bleiben unangetastet; tags: [] → alle entfernt.
 // --------------------------------------------------------
 router.put('/:id', (req, res) => {
   try {
@@ -425,6 +678,10 @@ router.put('/:id', (req, res) => {
           .all(task.id).map((r) => r.user_id);
     const firstUid = userIds[0] ?? null;
 
+    // Vor dem Update festhalten: die Rückrichtung vergleicht damit, ob sich die
+    // Tags wirklich geändert haben (#586).
+    const tagsBefore = loadTags(db.get(), task.id);
+
     db.get().transaction(() => {
       db.get().prepare(`
         UPDATE tasks SET
@@ -436,6 +693,7 @@ router.put('/:id', (req, res) => {
              status, start_date, due_date, due_time, firstUid,
              is_recurring ? 1 : 0, recurrence_rule, points, visibility, req.params.id);
       setAssignments(db.get(), task.id, userIds);
+      if (req.body.tags !== undefined) setTags(db.get(), task.id, req.body.tags);
       syncHousekeepingPaymentStatus(db.get(), req.params.id, status);
       // Punkte erst nach setAssignments: die Zuständigen werden daraus abgeleitet.
       syncTaskRewards(db.get(), task.id, task.status, status, req.authUserId || req.session.userId);
@@ -448,9 +706,21 @@ router.put('/:id', (req, res) => {
       WHERE t.id = ?
     `).get(req.params.id);
     addAssignedUsers(updated);
-    updated.subtasks = loadSubtasks(updated.id);
+    updated.subtasks = loadSubtasks(updated.id, req.authUserId || req.session.userId);
+    attachTags([updated]);
+
+    // Änderung an einer gespiegelten Aufgabe auf dem CalDAV-Server nachziehen (#617).
+    // Die Tags reisen als kanonischer Schlüssel mit, weil sie in einer eigenen
+    // Tabelle liegen und der Feldvergleich nur die Zeile selbst sieht (#586).
+    const pending = markTodoOutbound(
+      'tasks',
+      { ...task,    tags_key: tagsKey(tagsBefore) },
+      { ...updated, tags_key: tagsKey(updated.tags) },
+    );
 
     res.json({ data: updated });
+
+    if (pending) pushToCalDAV('Änderung');
   } catch (err) {
     log.error('PUT /:id error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -469,11 +739,14 @@ router.patch('/:id/status', (req, res) => {
     if (!VALID_STATUSES.includes(status))
       return res.status(400).json({ error: `Invalid status. Allowed: ${VALID_STATUSES.join(', ')}`, code: 400 });
 
-    const prev = db.get().prepare('SELECT status FROM tasks WHERE id = ?').get(req.params.id);
+    // Ganze Zeile, nicht nur der Status: die Rückrichtung (#617) braucht die
+    // externen Kennungen, um den Statuswechsel dem CalDAV-Objekt zuzuordnen.
+    const prev = db.get().prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
     if (!prev)
       return res.status(404).json({ error: 'Task not found.', code: 404 });
 
     db.get().prepare('UPDATE tasks SET status = ? WHERE id = ?').run(status, req.params.id);
+    const pending = markTodoOutbound('tasks', prev, { ...prev, status });
 
     syncHousekeepingPaymentStatus(db.get(), req.params.id, status);
     // Punkte-Gutschrift/Storno an den Aufgaben-Statuswechsel koppeln.
@@ -492,6 +765,11 @@ router.patch('/:id/status', (req, res) => {
           const existingAssignments = db.get()
             .prepare('SELECT user_id FROM task_assignments WHERE task_id = ?')
             .all(task.id).map((r) => r.user_id);
+          // Die Tags gehören zur Aufgabe, nicht zum einzelnen Durchlauf (#586).
+          // Ohne das Mitnehmen verlöre eine wöchentliche Aufgabe ihre Etiketten
+          // beim ersten Abhaken - und zwar lautlos, weil die Folgeinstanz sonst
+          // vollständig aussieht.
+          const existingTags = loadTags(db.get(), task.id);
           db.get().transaction(() => {
             const newTask = db.get().prepare(`
               INSERT INTO tasks (title, description, category, priority, status,
@@ -503,12 +781,15 @@ router.patch('/:id/status', (req, res) => {
               task.recurrence_rule, task.points, task.visibility
             );
             setAssignments(db.get(), newTask.lastInsertRowid, existingAssignments);
+            setTags(db.get(), newTask.lastInsertRowid, existingTags);
           })();
         }
       }
     }
 
     res.json({ data: { id: Number(req.params.id), status } });
+
+    if (pending) pushToCalDAV('Statuswechsel');
   } catch (err) {
     log.error('PATCH /:id/status error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -522,10 +803,21 @@ router.patch('/:id/status', (req, res) => {
 // --------------------------------------------------------
 router.delete('/:id', (req, res) => {
   try {
+    // Vor dem DELETE vormerken (#617): danach sind UID und Objekt-URL weg. Die
+    // per CASCADE mitgelöschten Unteraufgaben gehören dazu - eine gespiegelte
+    // Aufgabe kann lokal welche bekommen haben, und die stammen dann selbst aus
+    // keiner Liste, aber der Fall kostet nichts.
+    const doomed = db.get().prepare(
+      `SELECT * FROM tasks WHERE (id = ? OR parent_task_id = ?) AND external_source = 'caldav'`
+    ).all(req.params.id, req.params.id);
+    const queued = doomed.reduce((n, row) => n + (queueTodoDeletion('tasks', row) ? 1 : 0), 0);
+
     const result = db.get().prepare('DELETE FROM tasks WHERE id = ?').run(req.params.id);
     if (result.changes === 0)
       return res.status(404).json({ error: 'Task not found.', code: 404 });
     res.json({ ok: true });
+
+    if (queued) pushToCalDAV('Löschung');
   } catch (err) {
     log.error('DELETE /:id error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -533,9 +825,91 @@ router.delete('/:id', (req, res) => {
 });
 
 // --------------------------------------------------------
+// Verknüpfte Dokumente (#503)
+// Dokumente aus dem Dokumente-Modul können optional mit einer Aufgabe
+// verbunden werden. Die Sichtbarkeit spiegelt documents.js: sichtbar ist ein
+// Dokument nur für Ersteller:in, bei visibility='family' oder über einen
+// expliziten Freigabe-Eintrag (family_document_access).
+// --------------------------------------------------------
+
+// Sichtbarkeits-Fragment für ein Dokument (Alias `d`, benannter Bind @me).
+const DOC_VISIBLE_SQL = documentVisibleSql('d', 'me');
+
+/** Aufgabe nur zurückgeben, wenn sie für die betrachtende Person sichtbar ist. */
+function findVisibleTask(id, me) {
+  return db.get().prepare(`
+    SELECT t.id FROM tasks t
+    WHERE t.id = ? AND ${visibilityWhere('t', 'task_assignments', 'task_id')}
+  `).get(id, me, me);
+}
+
+/** Für die Person sichtbare, mit der Aufgabe verknüpfte Dokumente. */
+function loadTaskDocuments(taskId, me) {
+  return db.get().prepare(`
+    SELECT d.id, d.name, d.category, d.original_name, d.mime_type, d.file_size,
+           d.storage_backend, td.created_at AS linked_at
+    FROM task_documents td
+    JOIN family_documents d ON d.id = td.document_id
+    WHERE td.task_id = @taskId AND d.status != 'archived' AND ${DOC_VISIBLE_SQL}
+    ORDER BY d.name COLLATE NOCASE ASC
+  `).all({ taskId, me });
+}
+
+// GET /api/v1/tasks/:id/documents → { data: LinkedDocument[] }
+router.get('/:id/documents', (req, res) => {
+  try {
+    const me = req.authUserId || req.session.userId;
+    const task = findVisibleTask(req.params.id, me);
+    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404 });
+    res.json({ data: loadTaskDocuments(task.id, me) });
+  } catch (err) {
+    log.error('GET /:id/documents error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// PUT /api/v1/tasks/:id/documents  Body: { document_ids: number[] }
+// Replace-Set: setzt die Verknüpfungen neu. Es werden nur für die Person
+// sichtbare Dokumente verknüpft; ebenso werden nur sichtbare Alt-Verknüpfungen
+// ersetzt — unsichtbare (z.B. private Dokumente anderer) bleiben unberührt.
+router.put('/:id/documents', (req, res) => {
+  try {
+    const me = req.authUserId || req.session.userId;
+    const task = findVisibleTask(req.params.id, me);
+    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404 });
+
+    const requested = Array.isArray(req.body.document_ids)
+      ? [...new Set(req.body.document_ids.map(Number).filter((n) => Number.isInteger(n) && n > 0))]
+      : [];
+
+    const canSee = db.get().prepare(`SELECT 1 FROM family_documents d WHERE d.id = @id AND ${DOC_VISIBLE_SQL}`);
+    const visibleIds = requested.filter((id) => canSee.get({ id, me }));
+
+    db.get().transaction(() => {
+      // Nur die für diese Person sichtbaren Alt-Verknüpfungen entfernen.
+      db.get().prepare(`
+        DELETE FROM task_documents
+        WHERE task_id = @taskId AND document_id IN (
+          SELECT d.id FROM family_documents d WHERE ${DOC_VISIBLE_SQL}
+        )
+      `).run({ taskId: task.id, me });
+      const ins = db.get().prepare(
+        'INSERT OR IGNORE INTO task_documents (task_id, document_id, created_by) VALUES (?, ?, ?)'
+      );
+      for (const id of visibleIds) ins.run(task.id, id, me);
+    })();
+
+    res.json({ data: loadTaskDocuments(task.id, me) });
+  } catch (err) {
+    log.error('PUT /:id/documents error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// --------------------------------------------------------
 // GET /api/v1/tasks/meta/options
 // Liefert Filteroptionen: alle User + gültige Werte für Dropdowns.
-// Response: { users, priorities, statuses, categories }
+// Response: { users, priorities, statuses, categories, tags }
 // --------------------------------------------------------
 router.get('/meta/options', (req, res) => {
   try {
@@ -544,9 +918,79 @@ router.get('/meta/options', (req, res) => {
        WHERE NOT EXISTS (SELECT 1 FROM housekeeping_workers hw WHERE hw.user_id = u.id)
        ORDER BY display_name`
     ).all();
-    res.json({ users, priorities: VALID_PRIORITIES, statuses: VALID_STATUSES, categories: loadTaskCategories() });
+    res.json({
+      users,
+      priorities: VALID_PRIORITIES,
+      statuses: VALID_STATUSES,
+      categories: loadTaskCategories(),
+      // Sichtbare Tags für Filterleiste und Vorschläge - beim Seitenaufbau
+      // mitgeliefert, damit dafür kein zweiter Aufruf nötig ist (#586).
+      tags: allTags(db.get(), req.authUserId || req.session.userId),
+      default_points: defaultTaskPoints(),
+    });
   } catch (err) {
     log.error('GET /meta/options error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// --------------------------------------------------------
+// Standard-Punkte nachziehen (#578)
+// Zweisegmentige Pfade — kollidieren nicht mit der /:id-Route.
+// --------------------------------------------------------
+
+// GET /api/v1/tasks/points/affected?points=N
+// Wie viele nicht erledigte Hauptaufgaben stehen exakt auf diesem Punktwert?
+// Vorschau für die Einstellungsseite, bevor sie den Wechsel anbietet — deshalb
+// dasselbe Admin-Gate wie beim Setzen des Standards und beim Nachziehen.
+router.get('/points/affected', (req, res) => {
+  try {
+    if (req.authRole !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required.', code: 403 });
+    }
+    const points = Number(req.query.points);
+    if (!Number.isInteger(points) || points < 0 || points > MAX_POINTS) {
+      return res.status(400).json({ error: `points must be an integer between 0 and ${MAX_POINTS}`, code: 400 });
+    }
+    res.json({ data: { count: countRebasableTasks(points) } });
+  } catch (err) {
+    log.error('GET /points/affected error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// POST /api/v1/tasks/points/rebase  Body: { from, to } → { data: { updated } }
+// Hebt alle nicht erledigten Hauptaufgaben, die auf dem alten Standard stehen,
+// auf den neuen. „Steht noch auf dem Standard" wird bewusst über den Zahlenwert
+// bestimmt statt über ein verstecktes Flag: eine Aufgabe, der jemand von Hand
+// exakt den alten Standardwert gegeben hat, wandert deshalb mit. Die Anzahl
+// steht vorab im Bestätigungsdialog, der Wechsel ist also nie verdeckt.
+router.post('/points/rebase', (req, res) => {
+  try {
+    if (req.authRole !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required.', code: 403 });
+    }
+    const from = Number(req.body.from);
+    const to   = Number(req.body.to);
+    const inRange = (n) => Number.isInteger(n) && n >= 0 && n <= MAX_POINTS;
+    if (!inRange(from) || !inRange(to)) {
+      return res.status(400).json({ error: `from and to must be integers between 0 and ${MAX_POINTS}`, code: 400 });
+    }
+    // 0 als Quelle würde jede punktelose Aufgabe erfassen — das ist kein
+    // „nutzt noch den Standard", sondern schlicht „hat keine Punkte".
+    if (from === 0) {
+      return res.status(400).json({ error: 'from must be greater than 0.', code: 400 });
+    }
+    if (from === to) return res.json({ data: { updated: 0 } });
+
+    const result = db.get().prepare(`
+      UPDATE tasks SET points = ?
+      WHERE points = ? AND parent_task_id IS NULL AND status != ?
+    `).run(to, from, REBASE_EXCLUDED_STATUS);
+
+    res.json({ data: { updated: result.changes } });
+  } catch (err) {
+    log.error('POST /points/rebase error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });

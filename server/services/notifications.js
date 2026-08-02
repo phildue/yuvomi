@@ -13,6 +13,9 @@ import { syncAllBirthdayReminders } from './birthdays.js';
 
 const log = createLogger('Notifications');
 const APP_NAME = 'Yuvomi';
+// Greift nur, wenn die verknuepfte Entitaet inzwischen geloescht wurde: nie den
+// App-Namen als Body wiederholen, sonst besteht die Notification nur aus "Yuvomi" (#581).
+const FALLBACK_BODY = 'Reminder';
 const RETRY_DELAY_MS = 5 * 60 * 1000;
 const MAX_ATTEMPTS = 3;
 const PROVIDER_TIMEOUT_MS = 8_000;
@@ -30,10 +33,29 @@ function safeError(error) {
   return String(error?.message || error || 'Notification delivery failed.').slice(0, 500);
 }
 
+/**
+ * Body einer Abo-Erinnerung: Name, Betrag und Verlaengerungsdatum (#581).
+ * Bewusst nur Daten, kein Satzbau - der Server kennt die Sprache des Empfaengers
+ * nicht (Locale und Zahlen-/Datumsformat liegen im localStorage des Clients),
+ * deshalb ISO-Datum und Betrag mit Waehrungscode statt formulierter Text.
+ */
+function subscriptionBody(reminder) {
+  const parts = [reminder.entity_title];
+  const amount = Number(reminder.sub_amount);
+  if (Number.isFinite(amount) && reminder.sub_currency) {
+    parts.push(`${amount.toFixed(2)} ${reminder.sub_currency}`);
+  }
+  if (reminder.sub_next_payment_date) parts.push(String(reminder.sub_next_payment_date).slice(0, 10));
+  return parts.join(' - ');
+}
+
 function reminderPayload(reminder) {
+  const title = reminder.entity_title || FALLBACK_BODY;
   return {
     title: APP_NAME,
-    body: reminder.entity_title || APP_NAME,
+    body: reminder.entity_type === 'subscription' && reminder.entity_title
+      ? subscriptionBody(reminder)
+      : title,
     url: '/reminders',
     tag: `reminder-${reminder.id}`,
     priority: 'default',
@@ -168,11 +190,19 @@ export async function processDueNotifications({
   }
 
   const due = activeDb.prepare(`
-    SELECT r.id, r.created_by,
+    SELECT r.id, r.created_by, r.entity_type,
       CASE r.entity_type
         WHEN 'task'  THEN (SELECT title FROM tasks           WHERE id = r.entity_id)
         WHEN 'event' THEN (SELECT title FROM calendar_events WHERE id = r.entity_id)
-      END AS entity_title
+        WHEN 'subscription' THEN (SELECT name FROM budget_subscriptions WHERE id = r.entity_id)
+      END AS entity_title,
+      CASE WHEN r.entity_type = 'subscription'
+        THEN (SELECT amount FROM budget_subscriptions WHERE id = r.entity_id) END AS sub_amount,
+      CASE WHEN r.entity_type = 'subscription'
+        THEN (SELECT currency FROM budget_subscriptions WHERE id = r.entity_id) END AS sub_currency,
+      CASE WHEN r.entity_type = 'subscription'
+        THEN (SELECT next_payment_date FROM budget_subscriptions WHERE id = r.entity_id)
+        END AS sub_next_payment_date
     FROM reminders r
     WHERE r.dismissed = 0 AND r.pushed_at IS NULL AND r.remind_at <= ?
     ORDER BY r.remind_at ASC

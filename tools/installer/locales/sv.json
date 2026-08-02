@@ -32,7 +32,9 @@
     "dbLabel": "Krypteringsnyckel för databasen",
     "dbHint": "Krypterar SQLite-databasen i vila.",
     "errBoth": "Båda nycklarna krävs.",
-    "dangerWarn": "Spara dessa nycklar nu. Om du förlorar dem går dina krypterade data inte att återställa — det finns ingen återställning."
+    "dangerWarn": "Spara dessa nycklar nu. Om du förlorar dem går dina krypterade data inte att återställa — det finns ingen återställning.",
+    "preserved": "Dina befintliga nycklar behålls, så den här installationen låser dig inte ute från den nuvarande databasen. Lämna ett fält tomt för att behålla dess nyckel; ett nytt värde ersätter den.",
+    "keepPlaceholder": "Befintlig nyckel behålls"
   },
   "weather": {
     "title": "Väder-widget",
@@ -93,7 +95,8 @@
     "backups": "Säkerhetskopior",
     "webdavBackup": "Externa säkerhetskopior",
     "on": "aktiverad",
-    "off": "inaktiverad"
+    "off": "inaktiverad",
+    "documentGoogleDrive": "Google Drive-dokument"
   },
   "docker": {
     "title": "Startar Yuvomi",
@@ -178,7 +181,16 @@
     "fixerLabel": "Fixer-API-nyckel (valutakurser i realtid)",
     "fixerHint": "Valfritt. Konverterar prenumerationsvalutor med realtidskurser. Prenumerationer fungerar utan den.",
     "pushSubjectLabel": "Push-kontaktadress",
-    "pushSubjectHint": "Skickas till push-tjänster som kontakt för din server. Lämna tomt för standardvärdet."
+    "pushSubjectHint": "Skickas till push-tjänster som kontakt för din server. Lämna tomt för standardvärdet.",
+    "documentGoogleDrive": "Dokumentlagring på Google Drive",
+    "documentGoogleDriveHint": "Konfigurera OAuth-uppgifter här. Anslut sedan Google Drive och välj det uttryckligen i dokumentinställningarna efter installationen.",
+    "documentGoogleDriveEnable": "Konfigurera Google Drive för dokument",
+    "documentGoogleDriveClientIdLabel": "Eget klient-ID (valfritt)",
+    "documentGoogleDriveClientSecretLabel": "Egen klienthemlighet (valfritt)",
+    "documentGoogleDriveReuseHint": "Lämna båda fälten tomma för att återanvända OAuth-uppgifterna för Google Kalender. För egna uppgifter skapar du dem i Google Cloud Console (som i Kalender-steget).",
+    "documentGoogleDriveRedirectLabel": "Omdirigerings-URI",
+    "errDocumentGoogleDrivePair": "Klient-ID och klienthemlighet för Google Drive måste antingen anges båda eller lämnas tomma.",
+    "errDocumentGoogleDriveCredentials": "Google Drive kräver antingen ett eget klient-ID och en egen klienthemlighet eller konfigurerade uppgifter för Google Kalender."
   },
   "welcome": {
     "title": "Välkommen till Yuvomi",

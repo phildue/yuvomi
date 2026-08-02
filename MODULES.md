@@ -85,7 +85,7 @@ Modules must follow the same frontend security rules as core Yuvomi:
 
 Yuvomi scans `modules/` and validates each `module.json`. Invalid modules are shown as errored in Settings and are not loaded. Disabled modules are not served to the browser and do not appear in navigation. If a module page fails while rendering, Yuvomi shows an error for that page without changing core application code.
 
-Admins can enable, disable, and order modules in Settings -> Modules -> Navigation. Copying a new folder into `modules/` makes it appear there automatically.
+Admins can enable, disable, and order modules in Settings -> Personal -> Navigation. Ordering is per user and open to every member; the enable/disable switches are admin-only. Copying a new folder into `modules/` makes it appear there automatically.
 
 ## Docker / Podman
 

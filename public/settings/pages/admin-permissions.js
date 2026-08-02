@@ -13,6 +13,7 @@
 import { api } from '/api.js';
 import { t } from '/i18n.js';
 import { esc } from '/utils/html.js';
+import { prefersInkText } from '/utils/contrast.js';
 import { confirmModal } from '/components/modal.js';
 import { createRetryState } from '/settings/components.js';
 
@@ -25,6 +26,7 @@ const MODULE_ACCENT = {
   contacts: 'var(--module-contacts)',
   meals: 'var(--module-meals)',
   shopping: 'var(--module-shopping)',
+  pantry: 'var(--module-pantry)',
   budget: 'var(--module-budget)',
   documents: 'var(--module-documents)',
   housekeeping: 'var(--module-housekeeping)',
@@ -124,8 +126,13 @@ function accessShort(value) {
   }
 }
 
-// ── Segment-Control (Icon + Tooltip + gleitende Aktiv-Pille) ───────────────────
-
+// ── Segment-Control (Icon + Label + gleitende Aktiv-Pille) ────────────────────
+//
+// Die Zugriffsstufen waren reine Icon-Segmente; ihr Klartext stand nur in
+// `title`, und `title` erscheint auf Touch nie (Critique 2026-07-27). Genau
+// die Aufgabe mit den groessten sozialen Folgen war damit auf dem Telefon
+// unbeschriftet. Das Label steht jetzt im Markup und wird unter 768px
+// sichtbar; am Zeiger bleibt der Tooltip die kompaktere Antwort.
 function segControl({ group, label, current, options, disabled = false }) {
   const activeIdx = Math.max(0, options.findIndex((o) => o.value === current));
   const opts = options.map((o) => {
@@ -137,6 +144,7 @@ function segControl({ group, label, current, options, disabled = false }) {
         aria-label="${esc(label || group)}: ${esc(o.label)}"
         tabindex="${checked ? '0' : '-1'}"${disabled ? ' disabled' : ''}>
         <i data-lucide="${esc(o.icon)}" aria-hidden="true"></i>
+        <span class="perm-seg__label">${esc(o.label)}</span>
       </button>
     `;
   }).join('');
@@ -170,7 +178,7 @@ function moduleRowHtml(mod) {
   return `
     <div class="perm-row perm-row--module" data-module="${esc(mod.key)}">
       <div class="perm-row__label">
-        <span class="perm-row__dot" style="background:${MODULE_ACCENT[mod.key] || 'var(--color-accent)'}"></span>
+        <span class="perm-row__dot" aria-hidden="true" style="background:${MODULE_ACCENT[mod.key] || 'var(--color-accent)'}"></span>
         <i data-lucide="${esc(mod.icon)}" aria-hidden="true"></i>
         <span class="perm-row__name">${esc(moduleLabel(mod.key))}</span>
         ${inheritedHint}
@@ -364,7 +372,8 @@ function renderSubjectSelector(container) {
       return `
         <button type="button" class="perm-chip${String(m.id) === String(state.subjectId) ? ' is-active' : ''}"
           data-user="${esc(m.id)}">
-          <span class="perm-chip__avatar" style="background:${esc(m.avatar_color) || 'var(--color-accent)'}">${
+          <span class="perm-chip__avatar${prefersInkText(m.avatar_color) ? ' perm-chip__avatar--ink' : ''}"
+            style="background:${esc(m.avatar_color) || 'var(--color-accent)'}">${
             m.avatar_data ? `<img src="${esc(m.avatar_data)}" alt="">` : esc(initials(m.display_name))
           }</span>
           <span class="perm-chip__name">${esc(m.display_name)}</span>${badge}
@@ -510,8 +519,12 @@ function applySegment(container, opt) {
 }
 
 async function resetSubject(container) {
+  // War der einzige Confirm ohne `danger`, obwohl er Zugriffsbeschraenkungen
+  // aufhebt - und bei einer Rolle gleich fuer mehrere Personen.
   const ok = await confirmModal(t('settings.permResetConfirm', { name: subjectTitle() }), {
+    danger: true,
     confirmLabel: t('settings.permResetSubject'),
+    detail: t('settings.permResetConfirmDetail'),
   });
   if (!ok) return;
   state.draft = { modules: {}, widgets: {} };
@@ -525,10 +538,11 @@ function renderShell(container) {
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
     <section class="settings-section perm-page">
-      <h2 class="settings-section__title">${esc(t('settings.permTitle'))}</h2>
       <p class="settings-section__intro">${esc(t('settings.permIntro'))}</p>
 
-      <div class="perm-modeswitch" role="tablist" aria-label="${esc(t('settings.permTitle'))}">
+      <!-- Trug bis zum Copy-Durchgang den Seitentitel als Label: der beschreibt
+           die Seite, nicht die Umschaltung (Critique 2026-07-27). -->
+      <div class="perm-modeswitch" role="tablist" aria-label="${esc(t('settings.permModeLabel'))}">
         <button type="button" class="perm-modeswitch__btn is-active" role="tab" aria-selected="true" data-mode="role">
           <i data-lucide="users-round" aria-hidden="true"></i>${esc(t('settings.permByRole'))}
         </button>

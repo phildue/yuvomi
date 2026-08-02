@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { readdir } from 'node:fs/promises';
 import {
   CUSTOM_REGION,
   REGION_CODES,
   REGION_PRESETS,
   detectRegion,
   resolveRegion,
+  numberLocaleFor,
 } from '../public/settings/region-presets.js';
 
 async function backendList(name) {
@@ -84,6 +86,84 @@ test('resolveRegion falls back to detectRegion for stale, empty or unknown regio
   assert.equal(resolveRegion({ region: '', ...REGION_PRESETS['fr-FR'] }), 'es-ES');
   assert.equal(resolveRegion({ region: 'zz-ZZ', ...REGION_PRESETS['fr-FR'] }), 'es-ES');
   assert.equal(resolveRegion(), CUSTOM_REGION);
+});
+
+test('numberLocaleFor yields a region tag that drives Intl number grouping (#521)', () => {
+  // Kernfall des Issues: Schweizer Region → Tausender-Apostroph + Punkt-Dezimal.
+  const chLocale = numberLocaleFor({ region: 'de-CH', ...REGION_PRESETS['de-CH'] });
+  assert.equal(chLocale, 'de-CH');
+  assert.equal(new Intl.NumberFormat(chLocale).format(123456.78), "123'456.78");
+  // Währung: nur die Gruppierung prüfen; das Leerzeichen vor dem Betrag ist je
+  // nach ICU-Version ein schmales geschütztes Leerzeichen (U+202F/U+00A0).
+  assert.ok(
+    new Intl.NumberFormat(chLocale, { style: 'currency', currency: 'CHF' })
+      .format(123456.78)
+      .includes("123'456.78"),
+  );
+  // Deutsche Region bleibt beim gewohnten Format (kein Regressionswechsel).
+  assert.equal(
+    new Intl.NumberFormat(numberLocaleFor({ region: 'de-DE', ...REGION_PRESETS['de-DE'] })).format(123456.78),
+    '123.456,78',
+  );
+});
+
+test('Malaysia preset formats MYR amounts with the local currency symbol', () => {
+  const locale = numberLocaleFor({ region: 'ms-MY', ...REGION_PRESETS['ms-MY'] });
+  const formatted = new Intl.NumberFormat(locale, { style: 'currency', currency: 'MYR' })
+    .format(1234.56);
+
+  assert.equal(locale, 'ms-MY');
+  assert.ok(formatted.includes('RM'));
+  assert.ok(formatted.includes('1,234.56'));
+});
+
+test('numberLocaleFor derives the tag even without a stored region, and empties for custom', () => {
+  // Region nicht gesetzt, aber Formate entsprechen einem Preset → abgeleiteter Tag.
+  assert.equal(numberLocaleFor({ ...REGION_PRESETS['de-CH'] }), 'de-CH');
+  // Kein passendes Preset → leerer String (App fällt auf die UI-Sprache zurück).
+  assert.equal(numberLocaleFor({ currency: 'EUR', date_format: 'mdy', time_format: '12h' }), '');
+  assert.equal(numberLocaleFor({}), '');
+  assert.equal(numberLocaleFor(), '');
+  // Jeder gelieferte Tag muss ein gültiger BCP-47-Regionscode sein (getFormatLocale-Regex).
+  for (const code of REGION_CODES) {
+    const tag = numberLocaleFor({ region: code, ...REGION_PRESETS[code] });
+    assert.match(tag, /^[a-z]{2}-[A-Z]{2}$/, `${code}: numberLocaleFor tag not BCP-47`);
+  }
+});
+
+test('money/number formatting uses getFormatLocale, never getLocale (#521 regression guard)', async () => {
+  // Zahlen/Währungen MÜSSEN über getFormatLocale() (region-abhängig, z. B. de-CH
+  // → 123'456.78) formatiert werden, nicht über getLocale() (nur UI-Sprache).
+  // Ein Intl.NumberFormat(getLocale()) irgendwo unter public/ ist ein Rückfall
+  // in den #521-Bug. (Intl.DateTimeFormat(getLocale()) für Monats-/Wochentags-
+  // namen bleibt korrekt sprachgebunden und wird hier nicht erfasst.)
+  const dir = new URL('../public/', import.meta.url);
+  const files = [];
+  async function walk(url) {
+    for (const ent of await readdir(url, { withFileTypes: true })) {
+      if (ent.name === 'lucide.min.js') continue;
+      const child = new URL(ent.name + (ent.isDirectory() ? '/' : ''), url);
+      if (ent.isDirectory()) await walk(child);
+      else if (ent.name.endsWith('.js')) files.push(child);
+    }
+  }
+  await walk(dir);
+
+  const offenders = [];
+  for (const file of files) {
+    const src = await readFile(file, 'utf8');
+    if (/NumberFormat\(\s*getLocale\(\)/.test(src)) {
+      offenders.push(file.pathname.replace(/.*\/public\//, 'public/'));
+    }
+  }
+  assert.deepEqual(offenders, [], `Intl.NumberFormat(getLocale()) muss getFormatLocale() sein: ${offenders.join(', ')}`);
+});
+
+test('i18n.js exports getFormatLocale + gecachten getNumberFormat als Zahl-Formatier-Quelle', async () => {
+  const src = await readFile(new URL('../public/i18n.js', import.meta.url), 'utf8');
+  assert.match(src, /export function getFormatLocale\(/, 'getFormatLocale muss existieren');
+  assert.match(src, /export function getNumberFormat\(/, 'gecachter getNumberFormat muss existieren');
+  assert.match(src, /NUMBER_LOCALE_KEY\s*=\s*'yuvomi-number-locale'/, 'localStorage-Schlüssel gepinnt');
 });
 
 test('preferences route validates the region field shape', async () => {

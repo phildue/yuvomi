@@ -32,7 +32,9 @@
     "dbLabel": "Kunci enkripsi basis data",
     "dbHint": "Mengenkripsi basis data SQLite saat diam.",
     "errBoth": "Kedua kunci diperlukan.",
-    "dangerWarn": "Simpan kunci ini sekarang. Jika hilang, data terenkripsi Anda tidak dapat dipulihkan — tidak ada penyetelan ulang."
+    "dangerWarn": "Simpan kunci ini sekarang. Jika hilang, data terenkripsi Anda tidak dapat dipulihkan — tidak ada penyetelan ulang.",
+    "preserved": "Kunci yang sudah ada tetap dipertahankan, sehingga penyiapan ini tidak akan mengunci Anda dari basis data saat ini. Biarkan kolom kosong untuk mempertahankan kuncinya; memasukkan nilai baru akan menggantinya.",
+    "keepPlaceholder": "Kunci yang ada dipertahankan"
   },
   "weather": {
     "title": "Widget cuaca",
@@ -114,7 +116,16 @@
     "fixerLabel": "Kunci API Fixer (kurs mata uang langsung)",
     "fixerHint": "Opsional. Mengonversi mata uang langganan dengan kurs langsung. Langganan tetap berfungsi tanpanya.",
     "pushSubjectLabel": "Alamat kontak push",
-    "pushSubjectHint": "Dikirim ke layanan push sebagai kontak untuk server Anda. Biarkan kosong untuk nilai default."
+    "pushSubjectHint": "Dikirim ke layanan push sebagai kontak untuk server Anda. Biarkan kosong untuk nilai default.",
+    "documentGoogleDrive": "Dokumen Google Drive",
+    "documentGoogleDriveHint": "Konfigurasikan kredensial OAuth di sini, lalu setelah instalasi hubungkan dan pilih Google Drive secara eksplisit di pengaturan Dokumen.",
+    "documentGoogleDriveEnable": "Konfigurasikan Google Drive untuk Dokumen",
+    "documentGoogleDriveClientIdLabel": "ID klien sendiri (opsional)",
+    "documentGoogleDriveClientSecretLabel": "Rahasia klien sendiri (opsional)",
+    "documentGoogleDriveReuseHint": "Biarkan kedua kolom kosong untuk menggunakan kembali kredensial OAuth Google Calendar. Untuk kredensial khusus, buat di Google Cloud Console (seperti pada langkah Calendar).",
+    "documentGoogleDriveRedirectLabel": "URI pengalihan",
+    "errDocumentGoogleDrivePair": "ID klien dan rahasia klien Google Drive harus diisi keduanya atau dikosongkan keduanya.",
+    "errDocumentGoogleDriveCredentials": "Google Drive memerlukan ID dan rahasia klien sendiri atau kredensial Google Calendar yang telah dikonfigurasi."
   },
   "review": {
     "title": "Tinjauan",
@@ -142,7 +153,8 @@
     "backups": "Pencadangan",
     "webdavBackup": "Cadangan eksternal",
     "on": "aktif",
-    "off": "nonaktif"
+    "off": "nonaktif",
+    "documentGoogleDrive": "Dokumen Google Drive"
   },
   "docker": {
     "title": "Yuvomi sedang dimulai",

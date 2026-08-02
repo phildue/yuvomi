@@ -9,7 +9,10 @@ import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-const TEST_BACKUP_DIR = './test-backups';
+// Nested under a root we control, so one test can revoke write access on the
+// parent and exercise the "backup directory is not writable" path (issue #579).
+const TEST_BACKUP_ROOT = './test-backups';
+const TEST_BACKUP_DIR = path.join(TEST_BACKUP_ROOT, 'store');
 
 // Mock environment variables
 process.env.BACKUP_ENABLED = 'false'; // Disable scheduler for tests
@@ -109,7 +112,36 @@ describe('Backup Scheduler', () => {
     assert.ok(existsSecond, 'newest backup file should exist on disk');
   });
 
-  it('should cleanup test directory', async () => {
+  it('should surface an actionable error when the backup directory is not writable', async (t) => {
+    // Regression (issue #579): container deployments that left BACKUP_DIR unset fell
+    // back to the relative default './backups' under /app, where the unprivileged
+    // node user cannot create anything. The raw EACCES only named the relative path,
+    // which sent people looking at their (correctly mounted) host folder.
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+      t.skip('running as root bypasses directory permissions');
+      return;
+    }
+
     await fs.rm(TEST_BACKUP_DIR, { recursive: true, force: true });
+    await fs.chmod(TEST_BACKUP_ROOT, 0o500);
+
+    try {
+      const result = await backupScheduler.triggerBackup();
+
+      assert.strictEqual(result.success, false, 'backup must fail on an unwritable directory');
+      assert.match(
+        result.error,
+        new RegExp(path.resolve(TEST_BACKUP_DIR).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+        'error must name the absolute path, not the relative one'
+      );
+      assert.match(result.error, /BACKUP_DIR/, 'error must point at the BACKUP_DIR setting');
+      assert.match(result.error, /EACCES|EPERM|EROFS/, 'error must keep the original errno');
+    } finally {
+      await fs.chmod(TEST_BACKUP_ROOT, 0o755);
+    }
+  });
+
+  it('should cleanup test directory', async () => {
+    await fs.rm(TEST_BACKUP_ROOT, { recursive: true, force: true });
   });
 });

@@ -35,7 +35,7 @@ git clone https://github.com/ulsklyc/yuvomi.git
 cd yuvomi
 npm install
 cp .env.example .env
-# Set SESSION_SECRET - leave DB_ENCRYPTION_KEY empty (no SQLCipher needed locally)
+# Set SESSION_SECRET - leave DB_ENCRYPTION_KEY empty to work on an unencrypted DB locally
 npm run dev
 ```
 
@@ -76,6 +76,8 @@ npm run test:frontend-audit
 npm run test:docker-publish
 ```
 
+This is a representative selection - run `npm run` to see the full list of suites.
+
 Tests use the Node.js built-in test runner with in-memory SQLite (`--experimental-sqlite`). No running server or database required — tests import route handlers directly.
 
 ---
@@ -97,7 +99,7 @@ public/
   api.js               # Fetch wrapper (auth, CSRF, error handling)
   styles/
     tokens.css         # Design tokens - all colors, radii, shadows, fonts
-  components/          # Reusable Web Components (oikos-* prefix)
+  components/          # Reusable Web Components (yuvomi-* prefix)
   pages/               # Page modules - each exports a render() function
   sw.js                # Service worker
   offline.html         # Offline fallback page (served by service worker)
@@ -162,7 +164,7 @@ Follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/):
 
 **Types:** `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `style` (formatting, not CSS)
 
-**Scope:** The module or area affected - `tasks`, `shopping`, `meals`, `calendar`, `budget`, `notes`, `contacts`, `auth`, `db`, `ui`, `pwa`
+**Scope:** The module or area affected - `tasks`, `shopping`, `meals`, `calendar`, `budget`, `notes`, `contacts`, `health`, `documents`, `auth`, `db`, `ui`, `pwa`
 
 **Examples:**
 
@@ -207,7 +209,7 @@ PRs are reviewed by the maintainer. Expect feedback within a few days. Once appr
 - ES modules everywhere (`import`/`export`, never `require`)
 - Semicolons: **yes**
 - `try/catch` in every route handler - no unhandled promise rejections
-- No dynamic code execution. Never write user data directly into an HTML string — use `esc()` from `public/utils/html.js` in template literals, or DOM API (`createElement`, `textContent`). Use `insertAdjacentHTML` to append HTML fragments, `replaceChildren()` to replace content. Direct `innerHTML` writes are blocked by a pre-commit hook.
+- No dynamic code execution. Never write user data directly into an HTML string — use `esc()` from `public/utils/html.js` in template literals, or DOM API (`createElement`, `textContent`). Use `insertAdjacentHTML` to append HTML fragments, `replaceChildren()` to replace content. Direct `innerHTML` assignments are rejected by the frontend audit (`npm run test:frontend-audit`), which runs as part of `npm test`.
 
 ### Frontend
 

@@ -8,6 +8,7 @@ import * as db from '../db.js';
 import { createLogger } from '../logger.js';
 import { str, MAX_TITLE } from '../middleware/validate.js';
 import { getAdapter as defaultGetAdapter, SUPPORTED_PROVIDERS } from '../services/dms/index.js';
+import { documentVisibleSql } from '../services/document-access.js';
 import { StorageError, readDocumentContent } from '../services/document-storage.js';
 
 let adapterFactory = defaultGetAdapter;
@@ -18,6 +19,11 @@ const router = express.Router();
 
 const CATEGORIES = ['medical', 'school', 'identity', 'insurance', 'finance', 'home', 'vehicle', 'legal', 'travel', 'pets', 'warranty', 'taxes', 'work', 'other'];
 const VISIBILITIES = ['family', 'restricted', 'private'];
+
+// Bild-Typen, die als Vorschau im Verknüpfungs-Picker (Issue #533) inline
+// ausgeliefert werden dürfen. Nur nicht-skriptfähige Rasterformate (kein SVG).
+const THUMBNAIL_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+function normalizeMime(value) { return String(value || '').split(';')[0].trim().toLowerCase(); }
 
 // Bestmögliche MIME-Ableitung aus der DMS-Dateiendung beim Verlinken. Der echte
 // Content-Type wird ohnehin beim Preview/Download live aus dem DMS geliefert; dieser
@@ -129,6 +135,38 @@ router.get('/search', async (req, res) => {
   }
 });
 
+router.get('/thumbnail', async (req, res) => {
+  try {
+    // Admin-only wie /search: der Picker durchsucht das gesamte DMS ungescoped,
+    // bevor ein Dokument in die sichtbarkeitsgebundene Dokumentenliste übernommen wird.
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Not authorized.', code: 403 });
+    const account = getAccount(Number(req.query.account_id));
+    if (!account) return res.status(404).json({ error: 'DMS account not found.', code: 404 });
+    const dmsId = String(req.query.dms_document_id || '').trim();
+    if (!dmsId) return res.status(400).json({ error: 'dms_document_id is required.', code: 400 });
+
+    const adapter = adapterFactory(account);
+    if (typeof adapter.fetchThumbnail !== 'function') {
+      return res.status(415).json({ error: 'Thumbnail not available for this document.', code: 415 });
+    }
+    const thumb = await adapter.fetchThumbnail(dmsId);
+    const mime = normalizeMime(thumb?.mime);
+    if (!thumb?.buffer?.length || !THUMBNAIL_MIME.has(mime)) {
+      return res.status(415).json({ error: 'Thumbnail not available for this document.', code: 415 });
+    }
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Content-Length', String(thumb.buffer.length));
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'");
+    res.end(thumb.buffer);
+  } catch (err) {
+    if (err.status === 404) return res.status(404).json({ error: 'DMS document not found.', code: 404 });
+    log.error('GET /thumbnail error:', err);
+    res.status(502).json({ error: 'Failed to load thumbnail.', code: 502 });
+  }
+});
+
 router.post('/link', async (req, res) => {
   try {
     if (!isAdmin(req)) return res.status(403).json({ error: 'Not authorized.', code: 403 });
@@ -177,10 +215,7 @@ router.post('/push', async (req, res) => {
     const docId = Number(req.body.document_id);
     const doc = db.get().prepare(`
       SELECT d.* FROM family_documents d
-      WHERE d.id = @id AND (
-        d.created_by = @userId OR d.visibility = 'family'
-        OR EXISTS (SELECT 1 FROM family_document_access a WHERE a.document_id = d.id AND a.user_id = @userId)
-      )
+      WHERE d.id = @id AND ${documentVisibleSql('d')}
     `).get({ id: docId, userId: userId(req) });
     if (!doc) return res.status(404).json({ error: 'Document not found.', code: 404 });
     if (doc.storage_backend === 'dms') {

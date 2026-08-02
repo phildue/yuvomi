@@ -6,8 +6,9 @@ import {
   t,
 } from '/i18n.js';
 import { esc } from '/utils/html.js';
+import { prefersInkText } from '/utils/contrast.js';
 import { openModal, closeModal, confirmModal } from '/components/modal.js';
-import { createRetryState } from '/settings/components.js';
+import { createRetryState, toggleRowHtml } from '/settings/components.js';
 
 const FAMILY_ROLES = ['dad', 'mom', 'parent', 'child', 'grandparent', 'relative', 'other'];
 const AVATAR_COLORS = ['#007AFF', '#34C759', '#FF9500', '#FF3B30', '#AF52DE', '#FF2D55'];
@@ -39,8 +40,11 @@ function avatarHtml(user, className = 'settings-avatar') {
   const safeName = esc(user?.display_name || '');
   const fallback = esc(initials(user?.display_name || ''));
   const background = esc(user?.avatar_color) || 'var(--color-accent)';
+  // Die Farbe waehlt das Mitglied selbst; auf hellen Toenen lagen die weissen
+  // Initialen bei 3,5:1 und 2,8:1 (Critique 2026-07-27).
+  const inkClass = prefersInkText(user?.avatar_color) ? ' settings-avatar--ink' : '';
   return `
-    <div class="${className}" style="background:${background}" title="${safeName}">
+    <div class="${className}${inkClass}" style="background:${background}" title="${safeName}">
       ${user?.avatar_data ? `<img src="${esc(user.avatar_data)}" alt="${safeName}" loading="lazy">` : fallback}
     </div>
   `;
@@ -108,14 +112,23 @@ async function readImageAsDataUrl(file) {
   return cropped;
 }
 
-function memberHtml(u) {
-  const familyRole = familyRoleLabel(u.family_role);
+function memberHtml(u, currentUserId) {
+  // Konten der Haushaltshilfe sind keine Familienmitglieder: sie tragen das
+  // Personal-Label statt einer Familienrolle (Audit A2-25e).
+  const familyRole = u.is_worker ? t('housekeeping.staff') : familyRoleLabel(u.family_role);
   const systemRole = u.role === 'admin' ? ` · ${esc(t('settings.systemAdminBadge'))}` : '';
   const profileMeta = [
     u.phone ? t('settings.memberPhoneMeta', { value: u.phone }) : '',
     u.email || '',
     u.birth_date ? t('settings.memberBirthdayMeta', { date: formatDate(u.birth_date) }) : '',
   ].filter(Boolean).map(esc).join(' · ');
+  // Row-Action-Grammatik statt dauerhaft rotem Outline-Button: Löschen wird
+  // erst bei Hover/Fokus laut. Der eigene Account bekommt keine Lösch-Aktion
+  // in der Mitgliederliste (Audit A2-25d).
+  const deleteBtn = u.id === currentUserId ? '' : `
+      <button class="row-action row-action--danger" data-delete-user="${u.id}" data-name="${esc(u.display_name)}" aria-label="${esc(u.display_name)} ${t('settings.deleteMemberLabel')}" title="${t('settings.deleteMemberLabel')}">
+        <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>
+      </button>`;
   return `
     <li class="settings-member" data-id="${u.id}">
       ${avatarHtml(u, 'settings-avatar settings-avatar--sm')}
@@ -124,12 +137,9 @@ function memberHtml(u) {
         <span class="settings-member__meta">@${esc(u.username)} · ${esc(familyRole)}${systemRole}</span>
         ${profileMeta ? `<span class="settings-member__meta">${profileMeta}</span>` : ''}
       </div>
-      <button class="btn btn--icon btn--secondary" data-edit-user="${u.id}" aria-label="${esc(u.display_name)} ${t('settings.editMemberLabel')}" title="${t('settings.editMemberLabel')}">
-        <i data-lucide="edit-2" aria-hidden="true"></i>
-      </button>
-      <button class="btn btn--icon btn--danger-outline" data-delete-user="${u.id}" data-name="${esc(u.display_name)}" aria-label="${esc(u.display_name)} ${t('settings.deleteMemberLabel')}" title="${t('settings.deleteMemberLabel')}">
-        <i data-lucide="trash-2" aria-hidden="true"></i>
-      </button>
+      <button class="row-action" data-edit-user="${u.id}" aria-label="${esc(u.display_name)} ${t('settings.editMemberLabel')}" title="${t('settings.editMemberLabel')}">
+        <i data-lucide="edit-2" class="icon-md" aria-hidden="true"></i>
+      </button>${deleteBtn}
     </li>
   `;
 }
@@ -186,10 +196,10 @@ function renderPage(container) {
             <yuvomi-datepicker type="date" id="new-member-birth-date"></yuvomi-datepicker>
             <p class="form-hint">${t('settings.memberContactBirthdayHint')}</p>
           </div>
-          <label class="toggle-row">
-            <input type="checkbox" id="new-system-admin" />
-            <span>${t('settings.systemAdminLabel')}</span>
-          </label>
+          ${toggleRowHtml({
+            label: t('settings.systemAdminLabel'),
+            attrs: { id: 'new-system-admin' },
+          })}
           <p class="form-hint">${t('settings.systemAdminHint')}</p>
           <div id="member-error" class="form-error" role="alert" hidden></div>
           <div class="settings-form-actions">
@@ -202,7 +212,7 @@ function renderPage(container) {
   `);
 }
 
-function renderMemberList(container, users) {
+function renderMemberList(container, users, currentUserId) {
   const list = container.querySelector('#members-list');
   if (!list) return;
   list.replaceChildren();
@@ -212,7 +222,7 @@ function renderMemberList(container, users) {
     empty.textContent = t('settings.familyEmpty');
     list.appendChild(empty);
   } else {
-    list.insertAdjacentHTML('beforeend', users.map(memberHtml).join(''));
+    list.insertAdjacentHTML('beforeend', users.map((u) => memberHtml(u, currentUserId)).join(''));
   }
   window.lucide?.createIcons({ el: list });
 }
@@ -225,9 +235,13 @@ function bindDeleteButtons(container) {
     btn.addEventListener('click', async () => {
       const id = parseInt(btn.dataset.deleteUser, 10);
       const name = btn.dataset.name;
+      // Die Folgen stehen im Dialog, nicht in der Dokumentation: `created_by`
+      // kaskadiert (server/db.js), `assigned_to` wird auf NULL gesetzt. In
+      // einer selbstgehosteten Instanz gibt es weder Support noch Undo.
       if (!await confirmModal(t('settings.deleteMemberConfirm', { name }), {
         danger: true,
         confirmLabel: t('common.delete'),
+        detail: t('settings.deleteMemberConfirmDetail', { name }),
       })) return;
       try {
         await auth.deleteUser(id);
@@ -305,10 +319,11 @@ function openEditMemberModal(member, currentUser, users, container) {
           <input class="form-input" type="password" id="edit-member-password" minlength="8" autocomplete="new-password" placeholder="${t('settings.resetPasswordPlaceholder')}" />
           <p class="form-hint">${t('settings.resetPasswordHint')}</p>
         </div>
-        <label class="toggle-row">
-          <input type="checkbox" id="edit-member-system-admin" ${member.role === 'admin' ? 'checked' : ''} />
-          <span>${t('settings.systemAdminLabel')}</span>
-        </label>
+        ${toggleRowHtml({
+          label: t('settings.systemAdminLabel'),
+          checked: member.role === 'admin',
+          attrs: { id: 'edit-member-system-admin' },
+        })}
         <p class="form-hint">${t('settings.systemAdminHint')}</p>
         <div id="edit-member-error" class="form-error" role="alert" hidden></div>
         <div class="settings-form-actions">
@@ -382,7 +397,7 @@ function openEditMemberModal(member, currentUser, users, container) {
           if (currentUser?.id === member.id) Object.assign(currentUser, res.user);
           closeModal({ force: true });
           window.yuvomi?.showToast(t('settings.memberUpdatedToast', { name: res.user.display_name }), 'success');
-          renderMemberList(container, users);
+          renderMemberList(container, users, currentUser?.id);
           bindDeleteButtons(container);
           bindEditButtons(container, currentUser, users);
         } catch (err) {
@@ -445,7 +460,7 @@ function bindEvents(container, currentUser, users) {
       try {
         const res = await auth.createUser(data);
         users.push(res.user);
-        renderMemberList(container, users);
+        renderMemberList(container, users, currentUser?.id);
         addMemberForm.reset();
         container.querySelector('#new-avatar-color').value = randomAvatarColor();
         container.querySelector('#add-member-form-card').classList.add('settings-card--hidden');
@@ -483,7 +498,7 @@ async function loadMembers(container, currentUser) {
     return;
   }
 
-  renderMemberList(container, users);
+  renderMemberList(container, users, currentUser?.id);
   bindEvents(container, currentUser, users);
   window.lucide?.createIcons({ el: container });
 }

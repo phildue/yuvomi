@@ -32,7 +32,9 @@
     "dbLabel": "Klucz szyfrowania bazy danych",
     "dbHint": "Szyfruje bazę danych SQLite w spoczynku.",
     "errBoth": "Oba klucze są wymagane.",
-    "dangerWarn": "Zapisz te klucze teraz. Jeśli je utracisz, Twoje zaszyfrowane dane będą nie do odzyskania — nie ma resetu."
+    "dangerWarn": "Zapisz te klucze teraz. Jeśli je utracisz, Twoje zaszyfrowane dane będą nie do odzyskania — nie ma resetu.",
+    "preserved": "Istniejące klucze zostają zachowane, więc ta instalacja nie odetnie Ci dostępu do bieżącej bazy danych. Zostaw pole puste, aby zachować jego klucz; wpisanie nowej wartości go zastąpi.",
+    "keepPlaceholder": "Zachowano istniejący klucz"
   },
   "weather": {
     "title": "Widget pogodowy",
@@ -93,7 +95,8 @@
     "backups": "Kopie zapasowe",
     "webdavBackup": "Kopie zewnętrzne",
     "on": "włączone",
-    "off": "wyłączone"
+    "off": "wyłączone",
+    "documentGoogleDrive": "Dokumenty Google Drive"
   },
   "docker": {
     "title": "Uruchamianie Yuvomi",
@@ -178,7 +181,16 @@
     "fixerLabel": "Klucz API Fixer (kursy walut na żywo)",
     "fixerHint": "Opcjonalne. Przelicza waluty subskrypcji po kursach na żywo. Subskrypcje działają bez niego.",
     "pushSubjectLabel": "Adres kontaktowy push",
-    "pushSubjectHint": "Wysyłany do usług push jako kontakt Twojego serwera. Zostaw puste, aby użyć domyślnego."
+    "pushSubjectHint": "Wysyłany do usług push jako kontakt Twojego serwera. Zostaw puste, aby użyć domyślnego.",
+    "documentGoogleDrive": "Przechowywanie dokumentów w Google Drive",
+    "documentGoogleDriveHint": "Skonfiguruj tutaj dane logowania OAuth, a po instalacji połącz Google Drive i wybierz go w ustawieniach Dokumentów.",
+    "documentGoogleDriveEnable": "Skonfiguruj Google Drive dla Dokumentów",
+    "documentGoogleDriveClientIdLabel": "Własny identyfikator klienta (opcjonalnie)",
+    "documentGoogleDriveClientSecretLabel": "Własny klucz tajny klienta (opcjonalnie)",
+    "documentGoogleDriveReuseHint": "Pozostaw oba pola puste, aby ponownie użyć danych logowania OAuth Kalendarza Google. Aby użyć własnych, utwórz je w Google Cloud Console (jak w kroku Kalendarz).",
+    "documentGoogleDriveRedirectLabel": "Identyfikator URI przekierowania",
+    "errDocumentGoogleDrivePair": "Identyfikator klienta i klucz tajny Google Drive muszą być ustawione razem albo oba pozostawione puste.",
+    "errDocumentGoogleDriveCredentials": "Google Drive wymaga własnego identyfikatora klienta i klucza tajnego albo skonfigurowanych danych logowania Kalendarza Google."
   },
   "welcome": {
     "title": "Witamy w Yuvomi",
