@@ -20,7 +20,7 @@
 import Database from 'better-sqlite3-multiple-ciphers';
 import path from 'path';
 import fs from 'node:fs/promises';
-import { mkdirSync, existsSync, renameSync, rmSync, copyFileSync, openSync, readSync, closeSync } from 'node:fs';
+import { mkdirSync, existsSync, renameSync, linkSync, rmSync, copyFileSync, openSync, readSync, closeSync, statSync } from 'node:fs';
 import { createLogger } from './logger.js';
 import { decodeHtmlEntities } from './utils/html-entities.js';
 import { toE164, defaultCountryFromConfig } from './utils/phone.js';
@@ -152,6 +152,252 @@ let db;
 // --------------------------------------------------------
 
 /**
+ * Meldung für eine Datenbank, die sich mit dem gesetzten Key nicht öffnen lässt.
+ *
+ * Zwei verschiedene Ursachen erzeugen denselben SQLCipher-Fehler, und die alte
+ * Meldung nannte nur die erste. Die zweite hat einen Melder zwei Tage gekostet
+ * (#1267): er hatte die Datenbankdatei von Hand ersetzt, das Write-Ahead-Log der
+ * VORHERIGEN Datenbank lag daneben, und SQLite liest dessen Frames beim Öffnen
+ * mit - verschlüsselt mit dem alten Key. Die Datei selbst ist dann einwandfrei
+ * und der Key stimmt; nur das Journal gehört nicht dazu.
+ *
+ * Der zweite Absatz ist bewusst BEDINGT formuliert, und das ist der Kern seiner
+ * Fassung: ein `-wal` neben der Datenbank ist KEIN Hinweis auf einen Dateitausch.
+ * `journal_mode = WAL` steht dauerhaft, und es gibt nirgends einen SIGTERM- oder
+ * SIGINT-Handler, der die Verbindung vor dem Stoppen schließt - SQLite räumt das
+ * Journal aber nur beim sauberen Schließen weg. Nach einem gewöhnlichen
+ * Container-Stop liegt es also da, und zwar als EIGENES Journal dieser Datenbank.
+ * Ein unbedingtes „lösch es" würde hier bestätigte, nur noch nicht
+ * gecheckpointete Transaktionen verwerfen und den eigentlichen Schlüsselfehler
+ * nicht einmal berühren - derselbe Fehlertyp, gegen den dieser ganze Vorgang
+ * geht (Review-Befund auf PR #1275). Deshalb: die Bedingung kennt nur der Admin
+ * („hast du die Datei von Hand ersetzt?"), und der Rat lautet beiseitelegen,
+ * nicht löschen.
+ *
+ * Der dritte Satz ist der eigentliche Grund für #1267: die Restore-Meldung
+ * riet dazu, den Key zu tauschen und neu zu starten. Wer das auf einer Instanz
+ * mit eigener verschlüsselter Datenbank tut, landet genau hier und kommt nicht
+ * mehr an die Oberfläche - der Weg zurück gehört deshalb in die Meldung.
+ *
+ * Dieser Rückweg gilt aber NUR, wenn allein der Key getauscht wurde, und so
+ * steht er auch da. Wer Datei UND Key zusammen ersetzt hat - der richtige Weg
+ * für eine Übernahme -, würde mit „change it back" in denselben Abbruch
+ * zurückgeschickt: die eingesetzte Datei öffnet sich mit dem alten Key genauso
+ * wenig (#1267, zweite Runde). Für ihn ist einer der beiden Eingänge nicht das,
+ * wofür er ihn hält, und der Rat trennt beides mit einer Probe, die nichts
+ * verändert: Größe und Prüfsumme der Datei gegen das Original. Stimmen sie, ist
+ * es der Key, und dann meist nicht der Wert selbst, sondern sein Weg in den
+ * Prozess - eine Env-Datei wird geparst, nicht kopiert.
+ * @returns {string}
+ */
+function undecryptableDatabaseError() {
+  const lines = [
+    `[DB] Wrong encryption key - ${DB_PATH} could not be decrypted with DB_ENCRYPTION_KEY.`,
+    'The key that opens this file is the one it was created with.',
+    'If you changed only DB_ENCRYPTION_KEY and left the database file as it was - for example to '
+    + 'take over a backup from another installation - change it back: this database belongs to '
+    + 'this instance, and a key swap alone does not import anything - it only locks you out of '
+    + 'what is here.',
+    'If you replaced the database file and the key together, changing the key back will not help: '
+    + 'the file you put in place does not open with the old key either. Then one of the two is not '
+    + `what you think it is. Compare the size and sha256sum of ${DB_PATH} with the original file; `
+    + 'if they differ, copy the file again. If they match, the key Yuvomi was started with is not, '
+    + 'byte for byte, the one the file was written with. Compare it character by character with the '
+    + 'source, and check how it reaches Yuvomi: an environment file is parsed, not copied - '
+    + 'systemd\'s EnvironmentFile, for one, drops a backslash in an unquoted value, reads a quote '
+    + 'right after "=" as quoting and trims spaces at both ends.',
+  ];
+  if (existsSync(`${DB_PATH}-wal`)) {
+    lines.push(
+      `A write-ahead log is lying next to the database (${DB_PATH}-wal). On its own that means `
+      + 'nothing is wrong with it: after any stop that was not a clean shutdown the log stays, and '
+      + 'it then belongs to THIS database and can hold committed transactions that are not in the '
+      + 'main file yet. Do not delete it in that case - it would throw those away and would not fix '
+      + 'the key. It is only a cause of this error if you replaced the database file by hand, '
+      + 'because then the log belongs to the database you replaced and is still read on open. If '
+      + `that is what happened, stop Yuvomi and move ${DB_PATH}-wal and ${DB_PATH}-shm aside `
+      + 'before starting again.'
+    );
+  }
+  return lines.join(' ');
+}
+
+/**
+ * Meldung für den ersten Lesezugriff nach dem Öffnen, getrennt nach dem, was
+ * SQLite tatsächlich sagt.
+ *
+ * Der `catch` in `init()` hat jeden Fehler an dieser Stelle als falschen Key
+ * gemeldet (#1267). Gemessen sind drei Fälle, die sich nicht vertragen:
+ *   - `SQLITE_NOTADB`: Seite 1 lässt sich nicht entschlüsseln. Das ist der
+ *     falsche Key, aber ebenso eine Datei, die gar keine Datenbank ist (HTML,
+ *     gzip, verstümmelte Übertragung) - deshalb nennt die Key-Meldung auch die
+ *     Probe gegen das Original.
+ *   - `SQLITE_CORRUPT`: gibt es NUR mit dem richtigen Key. Dieselbe
+ *     abgeschnittene Datei liefert mit falschem Key `SQLITE_NOTADB`, denn
+ *     Seite 1 muss erst entschlüsselt werden und ihre HMAC-Prüfung bestehen.
+ *     Hier ist der Key also belegt richtig, und ein Rat zum Key wäre falsch.
+ *   - alles andere: die Meldung behauptet nichts über den Key und reicht Code
+ *     und Text weiter. Gemessen sind hier zwei Rechteprobleme, beide mit
+ *     richtigem Key: `SQLITE_READONLY_DIRECTORY` (WAL-Datenbank in einem
+ *     Verzeichnis ohne Schreibrecht) und `SQLITE_CANTOPEN` (ein `-wal`, auf das
+ *     der Dienst nicht zugreifen darf). Nur für diese beiden Familien kommt der
+ *     Hinweis auf die Dateirechte dazu.
+ * @param {unknown} err
+ * @returns {string}
+ */
+function unreadableAtStartError(err) {
+  const code = typeof err?.code === 'string' ? err.code : '';
+  const detail = `${code || 'no SQLite error code'}: ${err?.message ?? String(err)}`;
+
+  if (code === 'SQLITE_NOTADB') return undecryptableDatabaseError();
+
+  if (code.startsWith('SQLITE_CORRUPT')) {
+    return `[DB] ${DB_PATH} is damaged or incomplete (${detail}). DB_ENCRYPTION_KEY is not the `
+      + 'problem: it does open this file - its first page decrypted and passed the integrity '
+      + 'check, which a wrong key never does - so changing the key will not help. If the file was '
+      + 'copied or downloaded from another machine, the copy most likely stopped short: copy it '
+      + 'again from the original and compare its size and sha256sum with the original before '
+      + 'starting Yuvomi.';
+  }
+
+  const lines = [`[DB] ${DB_PATH} could not be read (${detail}).`];
+  if (code.startsWith('SQLITE_READONLY') || code.startsWith('SQLITE_CANTOPEN')) {
+    lines.push(
+      `Yuvomi needs read and write access to the database file, to ${DB_PATH}-wal and `
+      + `${DB_PATH}-shm next to it and to the directory they are in - even just to read, because `
+      + 'SQLite keeps its write-ahead log there. Check the owner and permissions of '
+      + `${path.dirname(DB_PATH)} and of the files in it for the user Yuvomi runs as.`
+    );
+  }
+  return lines.join(' ');
+}
+
+/** Größe einer regulären Datei, `null` wenn sie fehlt oder keine ist. */
+function regularFileSize(filePath) {
+  try {
+    const stat = statSync(filePath);
+    return stat.isFile() ? stat.size : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Die Datei, die `init()` gleich öffnen wird: `DB_PATH`, oder im „managed"
+ * Layout die Legacy-Datei, solange es `DB_PATH` noch nicht gibt - die öffnet
+ * `migrateLegacyDbFile()` als Erstes. `null` heißt: frische Installation.
+ */
+function databaseFileAboutToOpen() {
+  if (DB_PATH === ':memory:') return null;
+  if (existsSync(DB_PATH)) return DB_PATH;
+  if (LEGACY_DB_PATH && existsSync(LEGACY_DB_PATH)) return LEGACY_DB_PATH;
+  return null;
+}
+
+/**
+ * Meldung für eine vorhandene, aber leere Datenbankdatei (#1282).
+ *
+ * SQLite nimmt eine Datei mit 0 Byte als neue Datenbank, die Migrationen
+ * laufen von vorn, und Yuvomi steht als leere Instanz da - genau in dem
+ * Moment, in dem jemand gerade Daten bewegt. Gemessen mit diesem Treiber:
+ * eine frische Installation hat gar keine Datei, und `journal_mode = WAL`
+ * schreibt Seite 1 (4096 Byte) in die Hauptdatei, bevor es überhaupt ein
+ * `-wal` gibt. Eine leere Datei kommt also von außen (abgebrochene Kopie,
+ * `cp` auf eine volle Platte, falscher Quellpfad) oder aus einem Erststart,
+ * der vor dieser ersten Seite abgebrochen wurde: mit Key liegen zwischen dem
+ * Anlegen der Datei und Seite 1 rund 150 ms Schlüsselableitung, und ein
+ * SIGKILL dort hinterlässt genau diese Datei ohne jede Nebendatei. Beide
+ * Fälle stehen deshalb in der Meldung, jeder mit dem Schritt, der ihn löst.
+ *
+ * Das `-wal` ist KEINE Ausnahme von der Verweigerung, sondern ihr zweiter
+ * Grund. Gemessen: liegt neben einer 0-Byte-Hauptdatei ein `-wal` mit Daten,
+ * löscht SQLite es beim ersten Lesen und startet leer - `init()` hat so ein
+ * Journal bisher stumm vernichtet, und `migrateLegacyDbFile()` tat es bei einer
+ * leeren `oikos.db` schon vor dem Umbenennen. Zu der leeren Datei kann es nicht
+ * gehören (siehe oben), es stammt von der Datenbank, die vorher hier lag, und
+ * ohne Key trug es in der Messung deren kompletten Inhalt. Wer die Datei wie
+ * geraten neu kopiert und das Journal liegen lässt, bekommt ohne Key still die
+ * ALTEN Daten statt des Originals, mit Key den Abbruch „Wrong encryption key"
+ * aus #1267. Deshalb: beiseitelegen, vor beiden Schritten.
+ *
+ * Der Absatz zur Legacy-Datei steht nur da, wenn sie Daten hat: dann führt
+ * „leere Datei löschen" nicht zu einer neuen Instanz, sondern zu `oikos.db`,
+ * die der nächste Start umbenennt.
+ * @param {string} filePath die leere Datei
+ * @returns {string}
+ */
+function emptyDatabaseFileError(filePath) {
+  const lines = [
+    `[DB] ${filePath} exists but is empty (0 bytes). Yuvomi refuses to start on it: SQLite would `
+    + 'take an empty file for a new database, and Yuvomi would come up as a fresh, empty instance '
+    + 'as if your data were gone. Nothing has been written to the file.',
+    'A new installation has no database file at all, and Yuvomi never empties its own. An empty '
+    + 'file is left behind by a copy or restore that failed or stopped short - an interrupted '
+    + 'transfer, cp onto a full disk, a wrong source path - or by a very first start that was '
+    + 'stopped before it had written anything.',
+    'If you copied or restored a database to this path, copy it again from the original and '
+    + `compare the size and sha256sum of ${filePath} with the original before starting Yuvomi.`,
+    'If you want a new, empty instance - you created the file on purpose, or the first start of a '
+    + `new installation was interrupted - delete ${filePath} and start again: Yuvomi then creates `
+    + 'the database itself.',
+  ];
+  if (filePath === DB_PATH && LEGACY_DB_PATH && regularFileSize(LEGACY_DB_PATH) > 0) {
+    lines.push(
+      `An older database file from before the rename lies next to it (${LEGACY_DB_PATH}). `
+      + `Deleting the empty ${path.basename(DB_PATH)} does not give you a new instance then: on the `
+      + `next start Yuvomi moves ${path.basename(LEGACY_DB_PATH)} to ${path.basename(DB_PATH)} and `
+      + 'starts with the data in it. Move it aside first if that is not what you want.'
+    );
+  }
+  const wal = `${filePath}-wal`;
+  if (regularFileSize(wal) > 0) {
+    lines.push(
+      `A write-ahead log with data lies next to it (${wal}). It does not belong to the empty file - `
+      + 'SQLite writes the first page of a database into the main file before it ever creates the '
+      + 'log - so it is left over from the database that was at this path before, and it can hold '
+      + 'changes that exist nowhere else. Starting on the empty file would delete it, and a database '
+      + 'copied back in next to it would be read together with a log that belongs to another file. '
+      + `Before either step above, move ${wal} and ${filePath}-shm aside and keep them - do not `
+      + 'delete them.'
+    );
+  }
+  return lines.join(' ');
+}
+
+/**
+ * `code` des Fehlers aus `assertDatabaseFileNotEmpty()`: daran erkennen der
+ * Auto-Init am Dateiende und der Rollback in `restoreFromFile()` den Leer-Fall,
+ * ohne die Meldung zu lesen.
+ */
+const EMPTY_DATABASE_FILE = 'YUVOMI_EMPTY_DATABASE_FILE';
+
+/**
+ * Handschlag des Restore-CLI (`scripts/restore-backup.js`), gesetzt VOR dem
+ * Import dieses Moduls. Das CLI ist der eine Aufrufer, für den eine leere
+ * `DB_PATH` kein Grund zum Abbruch ist: es ersetzt genau diese Datei - der Rat
+ * der Meldung („copy it again") führt dorthin. Ein Symbol auf `globalThis`
+ * statt einer Env-Variable, weil es kein Schalter für Betreiber ist: der Server
+ * darf den Leer-Fall nie überspringen, und eine Variable in der Umgebung würde
+ * er erben.
+ */
+const RESTORE_TARGET_HANDSHAKE = Symbol.for('yuvomi.db.restoreTarget');
+
+/**
+ * Bricht den Start ab, wenn die Datei, die gleich geöffnet wird, existiert und
+ * leer ist. Läuft VOR allem, was die Datei anfasst - auch vor
+ * `migrateLegacyDbFile()`, die eine leere `oikos.db` samt Journal sonst schon
+ * öffnet und umbenennt. Eine fehlende Datei ist die frische Installation und
+ * bleibt, wie sie war.
+ */
+function assertDatabaseFileNotEmpty() {
+  const filePath = databaseFileAboutToOpen();
+  if (!filePath || regularFileSize(filePath) !== 0) return;
+  const err = new Error(emptyDatabaseFileError(filePath));
+  err.code = EMPTY_DATABASE_FILE;
+  throw err;
+}
+
+/**
  * Datenbankverbindung öffnen, SQLCipher-Key setzen, Migrations ausführen.
  * Einmalig beim Serverstart aufrufen.
  * @param {{ plaintextBackup?: boolean }} [options] `plaintextBackup: false`
@@ -169,15 +415,25 @@ function init({ plaintextBackup = true } = {}) {
       `Data will be lost on container restart. Use an absolute path, e.g. DB_PATH=/data/yuvomi.db`
     );
   }
+  // Vor allem anderen: eine leere Datei würde ab hier still zur frischen
+  // Instanz, und ein Journal daneben ginge dabei verloren (#1282).
+  assertDatabaseFileNotEmpty();
   mkdirSync(path.dirname(DB_PATH), { recursive: true });
   migrateLegacyDbFile();
 
   // Beide Prüfungen laufen VOR dem Öffnen: fehlt der Cipher-Support, darf gar
   // nicht erst eine unverschlüsselte Datei entstehen.
   if (DB_KEY) {
+    assertKeyIsNotPlaceholder();
     assertCipherSupport();
     encryptPlaintextDatabase({ backup: plaintextBackup });
   }
+
+  // Gibt es DB_PATH noch nicht, entsteht die Datenbank unter einem
+  // Arbeitsnamen daneben und wird erst fertig umgehängt (#1287). Erst NACH
+  // den Key-Prüfungen oben: `assertKeyIsNotPlaceholder()` unterscheidet
+  // Abbruch und Warnung daran, ob es DB_PATH schon gibt.
+  createDatabaseFile();
 
   db = new Database(DB_PATH);
 
@@ -187,11 +443,8 @@ function init({ plaintextBackup = true } = {}) {
     // Sicherstellen dass die Datenbank tatsächlich entschlüsselbar ist
     try {
       assertReadable(db);
-    } catch {
-      throw new Error(
-        `[DB] Wrong encryption key — ${DB_PATH} could not be decrypted. ` +
-        'Check DB_ENCRYPTION_KEY against the value used when the database was created.'
-      );
+    } catch (err) {
+      throw new Error(unreadableAtStartError(err), { cause: err });
     }
   }
 
@@ -203,12 +456,78 @@ function init({ plaintextBackup = true } = {}) {
   migrate();
   reconcileCriticalSchema();
 
+  // Ältere App auf neuerer Datenbank: nicht starten. Die Gefahr ist nicht,
+  // dass diese Version scheitert, sondern was sie zwischendurch schreibt -
+  // Daten in einer Form, die eine schon angewendete Migration verlassen hat
+  // und die nach dem erneuten Update nie nachgezogen werden, weil die
+  // Migration als erledigt gilt. Der Rückweg ist das Backup vor dem Update
+  // (docs/installation.md, "Going back"). DB_ALLOW_NEWER_SCHEMA=1 ist der
+  // ausdrückliche Notfallschalter und wird bei jedem Start als Warnung
+  // genannt, damit er kein Dauerzustand wird.
+  const unknown = unknownMigrationVersions(db);
+  if (unknown.length > 0) {
+    const detail =
+      `This database was written by a newer Yuvomi: it carries migration ${unknown.join(', ')} ` +
+      `and this build knows up to v${latestKnownVersion()}.`;
+    if (!allowNewerSchema()) {
+      db.close();
+      db = null;
+      throw new Error(
+        `[DB] ${detail} Running an older version on a newer database is not supported: what it ` +
+        'writes in the meantime can be lost on the next update. Update Yuvomi to the version ' +
+        'that wrote this database, or restore the backup taken before that update. To start ' +
+        'anyway, at your own risk, set DB_ALLOW_NEWER_SCHEMA=1.'
+      );
+    }
+    log.warn(
+      `${detail} Started anyway because DB_ALLOW_NEWER_SCHEMA is set. What this version writes ` +
+      'can be lost on the next update: take a backup now and update as soon as you can.'
+    );
+  }
+
   // Erst hier steht garantiert eine beschriebene Datei auf der Platte. Der
   // Header ist der einzige Beleg, der nicht auf einer API-Zusage beruht.
   if (DB_KEY) assertStoredEncrypted();
 
   log.info(`Connected: ${DB_PATH} | Schema v${currentVersion()}`);
   return db;
+}
+
+/**
+ * Ein Platzhalter aus `.env.example` ist kein Schlüssel.
+ *
+ * `.env.example` liefert `DB_ENCRYPTION_KEY=REPLACE_WITH_A_STRONG_ENCRYPTION_KEY`
+ * (nicht etwa eine leere Zeile). Wer die Quick-Start-Zeilen am Stück kopiert und
+ * das Bearbeiten von `.env` überspringt, verschlüsselt seine Datenbank damit
+ * gegen eine Konstante, die im Repository und auf der Landingpage abgedruckt
+ * steht - also gegen nichts. Der Fehler ist zusätzlich unumkehrbar, weil ein
+ * späterer echter Schlüssel die Datei nicht mehr öffnet.
+ *
+ * Der Guard bricht NUR ab, solange die Datenbank noch nicht existiert. Genau
+ * dann ist der Fehler vermeidbar. Bestandsinstallationen, die diesen Weg schon
+ * gegangen sind, laufen weiter: ein Startfehler würde ihnen eine funktionierende
+ * Instanz nehmen, statt einen Fehler zu verhindern, der dort längst passiert
+ * ist. Sie bekommen die Warnung samt konkretem Ausweg bei jedem Start.
+ */
+function assertKeyIsNotPlaceholder() {
+  if (!DB_KEY.startsWith('REPLACE_WITH_')) return;
+
+  if (!existsSync(DB_PATH)) {
+    throw new Error(
+      '[DB] DB_ENCRYPTION_KEY is still the placeholder from .env.example ' +
+      `(${DB_KEY}). That value is published in this repository, so it protects ` +
+      'nothing. Generate a real one with `openssl rand -hex 32` and put it in ' +
+      '.env, or clear the line entirely to run without encryption.'
+    );
+  }
+
+  log.warn(
+    'DB_ENCRYPTION_KEY is the placeholder from .env.example, so this database is ' +
+    'encrypted with a publicly known value and is not protected. To rotate: stop ' +
+    `the app, copy ${DB_PATH} somewhere safe, then open the database with the old ` +
+    'key and run `PRAGMA rekey` with a value from `openssl rand -hex 32` before ' +
+    'putting that same value into .env.'
+  );
 }
 
 function applyEncryptionKey(database) {
@@ -372,6 +691,164 @@ function encryptPlaintextDatabase({ backup = true } = {}) {
     `${backupPath} still contains UNENCRYPTED data — delete it once you have ` +
     'verified that the app starts and your data is complete.'
   );
+}
+
+/**
+ * Arbeitsname, unter dem eine neue Datenbank entsteht.
+ *
+ * Er liegt NEBEN `DB_PATH`, nicht im Temp-Verzeichnis. Nur im selben
+ * Verzeichnis ist der abschließende Zug ein Umhängen innerhalb eines
+ * Dateisystems und damit unteilbar; über eine Dateisystemgrenze wäre er ein
+ * Kopieren - also wieder ein Zeitraum, in dem `DB_PATH` unfertig existiert,
+ * genau der Zustand, gegen den dieser ganze Vorgang geht.
+ * @returns {string}
+ */
+function creatingFilePath() {
+  return `${DB_PATH}.creating`;
+}
+
+/** Arbeitsdatei samt Nebendateien entfernen; best effort. */
+function removeCreatingFiles(workingPath) {
+  for (const suffix of ['', '-wal', '-shm']) {
+    try { rmSync(`${workingPath}${suffix}`, { force: true }); } catch { /* Aufräumen ist best-effort */ }
+  }
+}
+
+/**
+ * Die Arbeitsdatei zu einer vollständigen, leeren Datenbank machen: Key setzen
+ * und Seite 1 schreiben.
+ *
+ * Geschrieben wird mit `user_version`, nicht mit `journal_mode = WAL`. Beide
+ * legen gemessen dieselben 4096 Byte an und hinterlassen keine Nebendatei,
+ * aber ein Wechsel des Journal-Modus verlangt eine exklusive Sperre und kennt
+ * dabei den Busy-Timeout des Treibers nicht: startet ein zweiter Prozess
+ * gleichzeitig, scheitert er sofort mit „database is locked", statt zu warten.
+ * Ein `user_version`-Schreibvorgang ist eine gewöhnliche Transaktion und
+ * wartet. Den Journal-Modus setzt `init()` ohnehin gleich danach auf der
+ * fertigen Datenbank.
+ *
+ * Der Wert 0 ist der, den eine neue Datenbank ohnehin hat - die Datei bekommt
+ * also nur ihre Seite 1, keinen Inhalt. Auf einer bereits beschriebenen
+ * Arbeitsdatei bleibt sie dadurch, wie sie ist. `user_version` gehört Yuvomi
+ * nicht anderweitig: die Schema-Version steht in `schema_migrations`.
+ */
+function writeFirstDatabasePage(workingPath) {
+  const fresh = new Database(workingPath);
+  try {
+    applyEncryptionKey(fresh);
+    fresh.pragma('user_version = 0');
+  } finally {
+    fresh.close();
+  }
+}
+
+/**
+ * Eine neue Datenbank entsteht unter dem Arbeitsnamen und wird erst fertig an
+ * `DB_PATH` gehängt (#1287).
+ *
+ * `new Database(DB_PATH)` legt die Datei sofort an - mit 0 Byte. Beschrieben
+ * wird sie erst durch `journal_mode = WAL`, das Seite 1 (4096 Byte) in die
+ * Hauptdatei schreibt. Ohne Key liegt dazwischen weniger als 1 ms, mit Key
+ * rund 150 ms Schlüsselableitung (gemessen 147 ms, einmalig beim Anlegen), und
+ * ein Erststart, der in diesem Fenster getötet wird, hinterlässt genau eine
+ * leere `DB_PATH` ohne jede Nebendatei. Vor #1282 begann der nächste Start
+ * darauf einfach frisch - hier das richtige Ergebnis. Seit #1282 verweigert er
+ * ihn, zu Recht für jede andere Herkunft einer leeren Datei, und eine an
+ * dieser Stelle unterbrochene Installation kommt nicht mehr von allein hoch.
+ *
+ * Deshalb entsteht die Datei unter `<DB_PATH>.creating`, bekommt dort den Key
+ * und Seite 1, wird geschlossen - `close()` checkpointet und räumt `-wal` und
+ * `-shm` weg, übrig bleibt genau die eine fertige Datei - und erst dann an
+ * `DB_PATH` gehängt. Stirbt der Start irgendwo davor, liegt nur die
+ * Arbeitsdatei da: `DB_PATH` fehlt, und der nächste Start ist wieder eine
+ * frische Installation. `DB_PATH` ist damit entweder abwesend oder eine
+ * vollständige Datenbank, nie leer.
+ *
+ * Gemessene Randfälle:
+ *   - Eine liegengebliebene Arbeitsdatei ist der Rest genau so eines
+ *     Abbruchs. Sie wird NICHT weggeräumt, sondern weiterbeschrieben: eine
+ *     0-Byte-Datei ist für SQLite eine neue Datenbank, eine mit Seite 1 ist
+ *     schon fertig, und `journal_mode = WAL` ist dort ein No-op. Erst wenn sie
+ *     sich nicht verwenden lässt (kein SQLite, anderer Key, halb geschrieben),
+ *     wird sie entfernt und der Vorgang genau einmal wiederholt. Dass beides
+ *     im Log steht, ist Absicht: sie ist die einzige Spur, dass ein Erststart
+ *     abbrach. Nutzerdaten können nicht darin liegen - der Vorgang läuft nur,
+ *     solange es `DB_PATH` noch nicht gibt, und endet vor der ersten
+ *     Migration.
+ *   - Verzeichnis nicht schreibbar: das Anlegen scheitert beim Öffnen mit
+ *     `SQLITE_CANTOPEN`, wie bisher beim Öffnen von `DB_PATH`. Der Fehler
+ *     bleibt der von SQLite - ein eigener Rat wäre hier geraten, nicht
+ *     gemessen, und der Rechte-Hinweis steht schon in
+ *     `unreadableAtStartError()`.
+ *   - Zwei Prozesse gleichzeitig: beide arbeiten auf DERSELBEN Arbeitsdatei,
+ *     und SQLite serialisiert sie dort genau so, wie es bisher zwei Öffnungen
+ *     von `DB_PATH` serialisiert hat (Busy-Timeout des Treibers: 5 s). Genau
+ *     deshalb wird die liegengebliebene Datei nicht blind gelöscht - gemessen
+ *     riss das dem anderen Prozess die offene Datei unter den Händen weg
+ *     („disk I/O error"), und in 1 von 4 Läufen kam danach KEINER von beiden
+ *     hoch. Der letzte Zug ist `link()`: ist `DB_PATH` inzwischen da,
+ *     scheitert er mit `EEXIST`, statt die Datenbank des anderen Prozesses
+ *     stillschweigend zu überschreiben - was ein `rename()` täte, und zwar
+ *     noch nachdem der andere schon Daten hineingeschrieben hat. Der Verlierer
+ *     räumt seine Arbeitsdatei weg und startet auf der fremden Datenbank
+ *     weiter. Nur wenn das Dateisystem gar keine harten Links kennt (manche
+ *     Netzfreigaben), fällt der Vorgang auf `rename()` zurück, mit vorheriger
+ *     Probe auf `DB_PATH`.
+ */
+function createDatabaseFile() {
+  if (DB_PATH === ':memory:') return;
+  if (existsSync(DB_PATH)) return;
+
+  const workingPath = creatingFilePath();
+  const leftover = existsSync(workingPath);
+  if (leftover) {
+    log.info(
+      `${workingPath} is left over from a first start that was interrupted - ` +
+      'creating the database in it again.'
+    );
+  }
+
+  try {
+    writeFirstDatabasePage(workingPath);
+  } catch (err) {
+    // Ein zweiter Start kann genau jetzt fertig geworden sein; dann gilt seine
+    // Datenbank und hier ist nichts schiefgegangen.
+    if (existsSync(DB_PATH)) {
+      removeCreatingFiles(workingPath);
+      return;
+    }
+    if (!leftover) {
+      removeCreatingFiles(workingPath);
+      throw err;
+    }
+    log.warn(
+      `${workingPath} could not be used (${err?.message}) - removing it and creating ` +
+      'the database again.'
+    );
+    removeCreatingFiles(workingPath);
+    try {
+      writeFirstDatabasePage(workingPath);
+    } catch (retryErr) {
+      removeCreatingFiles(workingPath);
+      throw retryErr;
+    }
+  }
+
+  try {
+    linkSync(workingPath, DB_PATH);
+  } catch (err) {
+    if (err?.code !== 'EEXIST' && !existsSync(DB_PATH)) {
+      try {
+        renameSync(workingPath, DB_PATH);
+      } catch (renameErr) {
+        removeCreatingFiles(workingPath);
+        // Der andere Prozess kann genau hier fertig geworden sein; dann ist
+        // seine Datenbank da und nichts ist schiefgegangen.
+        if (!existsSync(DB_PATH)) throw renameErr;
+      }
+    }
+  }
+  removeCreatingFiles(workingPath);
 }
 
 /**
@@ -4569,6 +5046,4245 @@ const MIGRATIONS = [
       ALTER TABLE recipes ADD COLUMN mealie_has_image INTEGER NOT NULL DEFAULT 0;
     `,
   },
+  {
+    version: 121,
+    description: 'Invite links: admins invite members instead of setting their password',
+    up: `
+      -- Bauplan wie password_resets: nur der Hash liegt in der DB, der Klartext-
+      -- Token verlässt den Server genau einmal. Anders als beim Reset wird der
+      -- Datensatz beim Einlösen NICHT gelöscht, sondern markiert: das hält die
+      -- Spur "wer hat wen eingeladen" und trägt den Zustand fürs Admin-UI.
+      CREATE TABLE IF NOT EXISTS invites (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        token_hash       TEXT    NOT NULL,
+        email            TEXT,
+        username         TEXT,
+        display_name     TEXT,
+        role             TEXT    NOT NULL DEFAULT 'member'
+                                 CHECK(role IN ('admin', 'member')),
+        -- kein CHECK: FAMILY_ROLES wächst, eine append-only-Migration darf das
+        -- nicht einfrieren. Validierung passiert in der Route.
+        family_role      TEXT    NOT NULL DEFAULT 'other',
+        created_by       INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        expires_at       INTEGER NOT NULL,
+        accepted_at      TEXT,
+        accepted_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        revoked_at       TEXT,
+        created_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_invites_hash ON invites(token_hash);
+      CREATE INDEX IF NOT EXISTS idx_invites_open ON invites(expires_at)
+        WHERE accepted_at IS NULL AND revoked_at IS NULL;
+    `,
+  },
+  {
+    version: 122,
+    description: 'Tasks: link a recurring follow-up instance to the completion that created it (#650)',
+    up: `
+      -- Ohne diese Spur ist das Abhaken einer Serie nicht umkehrbar: die beim
+      -- Erledigen erzeugte Folgeinstanz war von einer regulaeren Aufgabe nicht
+      -- zu unterscheiden, blieb beim Zuruecknehmen stehen und stand dann neben
+      -- der wieder geoeffneten Aufgabe (#650). parent_task_id kann das nicht
+      -- tragen, das bedeutet "Unteraufgabe".
+      ALTER TABLE tasks ADD COLUMN recurrence_origin_id INTEGER
+        REFERENCES tasks(id) ON DELETE SET NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_tasks_recurrence_origin
+        ON tasks(recurrence_origin_id) WHERE recurrence_origin_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 123,
+    description: 'CalDAV: detach mirrored tasks and shopping items from deleted accounts (#617)',
+    up: `
+      -- tasks.external_account_id und shopping_items.external_account_id sind
+      -- bloße INTEGER-Spalten (v45): löscht jemand ein CalDAV-Konto, nimmt
+      -- CASCADE nur mit, was dem Konto selbst gehört - Kalender- und
+      -- Listenauswahl und die offenen VTODO-Löschungen. Die gespiegelten
+      -- Zeilen bleiben stehen, mit einer Kennung, die auf nichts mehr zeigt.
+      --
+      -- Das war nicht nur unsauber, sondern eine Sackgasse: beim Löschen so
+      -- einer Zeile merkt queueTodoDeletion() sie in
+      -- caldav_todo_pending_deletions vor - und DIE Tabelle hat den
+      -- Fremdschlüssel sehr wohl. Der INSERT scheiterte, der Eintrag ließ sich
+      -- lokal gar nicht mehr löschen, während die entfernte Kopie ohne Konto
+      -- ohnehin unerreichbar ist.
+      --
+      -- Der Fremdschlüssel lässt sich in SQLite nicht nachträglich an eine
+      -- bestehende Spalte hängen; das hieße beide Tabellen samt Indizes,
+      -- Suchtriggern und den auf sie zeigenden Tabellen neu bauen. Diese
+      -- Migration räumt darum den Bestand, und caldavSync.deleteAccount
+      -- entkoppelt künftig selbst, bevor das Konto verschwindet.
+      --
+      -- Entkoppelt heißt lokal, nicht halb-extern: ohne Konto gibt es keine
+      -- Liste, in die etwas zurückginge, keinen Inbound, der die Zeile noch
+      -- anfasst, und keine UID, die noch etwas bedeutet. Was bleibt, ist eine
+      -- gewöhnliche Aufgabe bzw. ein gewöhnlicher Einkaufsposten.
+      UPDATE tasks
+         SET external_source     = 'local',
+             external_uid        = NULL,
+             external_account_id = NULL,
+             external_object_url = NULL,
+             outbound_dirty      = 0,
+             outbound_attempts   = 0
+       WHERE external_account_id IS NOT NULL
+         AND external_account_id NOT IN (SELECT id FROM caldav_accounts);
+
+      UPDATE shopping_items
+         SET external_source     = 'local',
+             external_uid        = NULL,
+             external_account_id = NULL,
+             external_object_url = NULL,
+             outbound_dirty      = 0,
+             outbound_attempts   = 0
+       WHERE external_account_id IS NOT NULL
+         AND external_account_id NOT IN (SELECT id FROM caldav_accounts);
+    `,
+  },
+  {
+    version: 124,
+    description: 'Split guests stay confined when their group is deleted (group_id ON DELETE SET NULL)',
+    up: `
+      -- Rechteausweitung: split_expense_guest_users traegt zwei Aussagen in
+      -- einer Zeile - DASS ein Konto beschraenkt ist (die Existenz der Zeile,
+      -- die server/index.js abfragt) und WORAUF (group_id). Das CASCADE aus
+      -- v40 hat beim Loeschen der Gruppe die ganze Zeile mitgenommen und damit
+      -- auch die erste Aussage geloescht. Der zugehoerige users-Eintrag blieb
+      -- unveraendert bestehen: aus einem Gast wurde ein haushaltsweit
+      -- berechtigtes Konto, das die uebrige API erreicht. Eine Gruppe ohne
+      -- Ausgaben und Ausgleiche laesst sich loeschen (409-Guard in
+      -- routes/split-expenses.js), der Weg dorthin stand also jedem
+      -- Gruppen-Owner offen.
+      --
+      -- SET NULL loescht nur noch die Zuordnung. Der Gast bleibt ein Gast und
+      -- sieht nichts mehr - die Routen behandeln group_id IS NULL als "keine
+      -- Gruppe", nicht als "keine Beschraenkung".
+      --
+      -- SQLite kann eine FK-Aktion nicht per ALTER aendern, daher der Rebuild.
+      -- Keine Tabelle referenziert split_expense_guest_users, das DROP zieht
+      -- also nichts mit sich; foreignKeysOff ist dafuer nicht noetig.
+      CREATE TABLE split_expense_guest_users_new (
+        user_id    INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        group_id   INTEGER REFERENCES expense_groups(id) ON DELETE SET NULL,
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      INSERT INTO split_expense_guest_users_new (user_id, group_id, created_by, created_at)
+        SELECT user_id, group_id, created_by, created_at FROM split_expense_guest_users;
+
+      DROP TABLE split_expense_guest_users;
+      ALTER TABLE split_expense_guest_users_new RENAME TO split_expense_guest_users;
+
+      -- Der Index hing an der gedroppten Tabelle und muss neu angelegt werden.
+      CREATE INDEX IF NOT EXISTS idx_split_guest_group ON split_expense_guest_users(group_id);
+    `,
+  },
+  {
+    version: 125,
+    description: 'CalDAV: remember that a reminder-list discovery ran, even when it found nothing (#617)',
+    up: `
+      -- Die Aufgabenseite sucht beim ersten Oeffnen selbst nach Listen, statt
+      -- einen leeren Zustand zu zeigen. "Zum ersten Mal" liess sich bisher nur
+      -- daran ablesen, dass caldav_reminder_selection fuer das Konto leer ist -
+      -- fuer einen Server ohne VTODO-Sammlungen bleibt sie das aber fuer immer,
+      -- und jeder Aufruf der Seite haette erneut den Server befragt.
+      --
+      -- Der Zeitstempel trennt die beiden Faelle: NULL heisst "nie gesucht",
+      -- gesetzt heisst "gesucht, Ergebnis gilt". Bestandskonten starten auf NULL
+      -- und suchen damit genau einmal.
+      ALTER TABLE caldav_accounts ADD COLUMN reminders_discovered_at TEXT;
+    `,
+  },
+  {
+    version: 126,
+    description: 'Budget loans: lending direction (lent vs. borrowed) and an optional account for the installments (#638)',
+    up: `
+      -- Das Darlehensmodul wurde fuer verliehenes Geld gebaut: die Rate war immer
+      -- eine Einnahme (positiver Betrag, income-Kategorie). Mit den Zinsfeldern
+      -- aus #569 kam der aufgenommene Kredit dazu, ohne dass die Buchung nachzog -
+      -- eine Hypothekenrate erschien deshalb als Einnahme (#638).
+      --
+      -- 'lent'     = der Haushalt hat verliehen, die Rate kommt herein (Einnahme).
+      -- 'borrowed' = der Haushalt hat aufgenommen, die Rate geht raus (Ausgabe).
+      -- Default 'lent', damit Bestandsdaten ihr heutiges Verhalten behalten; wer
+      -- ein Darlehen auf 'borrowed' umstellt, bekommt die bereits gebuchten Raten
+      -- von der Route mit umgebucht.
+      ALTER TABLE budget_loans ADD COLUMN direction TEXT NOT NULL DEFAULT 'lent';
+
+      -- Bis hierher hatte der Raten-Eintrag nie eine Kontozuordnung, eine Rate
+      -- konnte also kein Konto belasten. Das Konto haengt am Darlehen und wird auf
+      -- neue Raten vererbt (rueckwirkend umbuchen wuerde historische Kontosalden
+      -- verfaelschen, ein Bankwechsel mitten in der Laufzeit ist legitim).
+      ALTER TABLE budget_loans ADD COLUMN account_id INTEGER REFERENCES budget_accounts(id) ON DELETE SET NULL;
+    `,
+  },
+  {
+    version: 127,
+    description: 'Tasks: repeat from the completion day instead of the due date (#658)',
+    up: `
+      -- Bis hierher rechnete die Serie ausschliesslich vom Faelligkeitsdatum:
+      -- eine woechentliche Aufgabe, faellig Samstag und erst Montag erledigt, war
+      -- wieder am Samstag faellig - also fuenf Tage spaeter, nicht sieben. Fuer
+      -- Termine ist das richtig (der Muellabfuhrtag verschiebt sich nicht, weil
+      -- man die Tonne spaeter rausstellt), fuer Pflegeintervalle ist es falsch
+      -- (der Filter haelt ab dem Wechsel, nicht ab dem geplanten Wechsel).
+      --
+      -- Beides ist legitim, also entscheidet es die Aufgabe selbst. Default 0:
+      -- Bestandsserien behalten ihre faelligkeitsverankerte Rechnung.
+      ALTER TABLE tasks ADD COLUMN recurrence_from_completion INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
+  {
+    version: 128,
+    description: 'Budget: recurrence as unit + count, weekly included, skips keyed by day (#636)',
+    up: `
+      -- Das Intervall war eine Liste aus drei Rhythmen (monthly/half_year/yearly).
+      -- Alle zwei Wochen, alle drei Monate, alle zwei Jahre: nicht abbildbar,
+      -- obwohl genau solche Vertraege der Alltag sind (#636). Es wird deshalb zu
+      -- Einheit + Anzahl.
+      ALTER TABLE budget_entries ADD COLUMN recurrence_interval_count INTEGER NOT NULL DEFAULT 1;
+
+      -- 'half_year' faellt als eigener Schluessel weg: es IST monatlich x 6. Zwei
+      -- Schreibweisen fuer denselben Rhythmus haetten sonst dauerhaft
+      -- nebeneinander gestanden, und jede Auswertung muesste beide kennen.
+      -- Verlustfrei: derselbe Abstand, dieselbe Glaettung.
+      UPDATE budget_entries
+         SET recurrence_interval = 'monthly', recurrence_interval_count = 6
+       WHERE recurrence_interval = 'half_year';
+
+      -- Eine geloeschte Instanz wurde als uebersprungener MONAT vermerkt. Das war
+      -- richtig, solange eine Serie hoechstens ein Vorkommen pro Monat hatte -
+      -- bei einer Wochenserie haette das Loeschen eines Dienstags die drei
+      -- uebrigen Wochen gleich mit unterdrueckt. Der Vermerk haengt jetzt am
+      -- Faelligkeitstag, wie das Vorkommen selbst.
+      CREATE TABLE budget_recurrence_skipped_new (
+        parent_id INTEGER NOT NULL REFERENCES budget_entries(id) ON DELETE CASCADE,
+        date      TEXT    NOT NULL,
+        PRIMARY KEY (parent_id, date)
+      );
+
+      -- Bestand umrechnen: der Tag ergibt sich aus dem Starttag der Serie, am
+      -- Monatsende gekappt - dieselbe Regel, nach der die Instanz entstanden waere.
+      INSERT OR IGNORE INTO budget_recurrence_skipped_new (parent_id, date)
+      SELECT s.parent_id,
+             s.month || '-' || substr('0' || MIN(
+               CAST(strftime('%d', p.date) AS INTEGER),
+               CAST(strftime('%d', date(s.month || '-01', '+1 month', '-1 day')) AS INTEGER)
+             ), -2)
+        FROM budget_recurrence_skipped s
+        JOIN budget_entries p ON p.id = s.parent_id;
+
+      DROP TABLE budget_recurrence_skipped;
+      ALTER TABLE budget_recurrence_skipped_new RENAME TO budget_recurrence_skipped;
+    `,
+  },
+  {
+    version: 129,
+    description: 'Budget: recurring series can book only after confirmation (#637)',
+    up: `
+      -- Nicht jeder Dienst bucht am selben Tag und auf den Cent genau ab. Eine
+      -- Serie kann deshalb verlangen, dass jede erzeugte Buchung erst bestaetigt
+      -- wird - mit der Moeglichkeit, Betrag und Datum dabei zu korrigieren (#637).
+      ALTER TABLE budget_entries ADD COLUMN recurrence_confirm INTEGER NOT NULL DEFAULT 0;
+
+      -- 1 = erwartet, noch nicht gebucht. Solche Zeilen sind sichtbar, zaehlen
+      -- aber in keiner Summe mit: genau die Diskrepanz zum Kontoauszug, die den
+      -- Wunsch ausgeloest hat, entstuende sonst weiter.
+      --
+      -- Default 0 und die Zustimmung je Serie sind zusammen die Ruecksicht auf
+      -- den Bestand: ohne beides fielen bestehende Serien beim Update aus den
+      -- Summen, und jeder Haushalt saehe ueber Nacht andere Zahlen.
+      ALTER TABLE budget_entries ADD COLUMN is_pending INTEGER NOT NULL DEFAULT 0;
+
+      CREATE INDEX IF NOT EXISTS idx_budget_pending
+        ON budget_entries(is_pending) WHERE is_pending = 1;
+    `,
+  },
+  {
+    version: 130,
+    description: 'health: caregivers may record for a dependent member (#584)',
+    up: `
+      -- Fieber messen und Medikamente geben tut im Alltag ein Elternteil, nicht
+      -- das Kind selbst. Bis hierher war das unmoeglich: jedes INSERT im
+      -- Gesundheitsmodul setzte user_id hart auf den angemeldeten Nutzer, also
+      -- konnte jede Person ausschliesslich fuer sich selbst eintragen (#584).
+      --
+      -- Die Beziehung ist gerichtet und explizit: subject_id ist die betreute
+      -- Person, caregiver_id die eintragende. Sie wird NICHT aus family_role
+      -- abgeleitet ("dad/mom duerfen fuer alle child"), obwohl die Rollen es
+      -- hergaeben. Eine solche Automatik haette bestehenden Installationen beim
+      -- Update stillschweigend Mitleser fuer die privaten Gesundheitsdaten jeder
+      -- Person mit der Rolle 'child' gegeben - auch fuer den 17-Jaehrigen, der
+      -- die Rolle nur traegt, weil sie am besten passte. Wer fuer wen eintragen
+      -- darf, entscheidet ein Admin pro Person; ohne Eintrag aendert sich nichts.
+      --
+      -- Das Recht umfasst Lesen UND Schreiben der Daten der betreuten Person,
+      -- auch der als 'private' markierten. Nur schreiben zu duerfen waere
+      -- unbrauchbar: der eingetragene Fieberwert verschwaende fuer die
+      -- eintragende Person im selben Moment aus der Ansicht.
+      CREATE TABLE IF NOT EXISTS health_care_grants (
+        subject_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        caregiver_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        PRIMARY KEY (subject_id, caregiver_id),
+        -- Niemand ist sein eigener Betreuer: der Eigentuemer darf ohnehin alles,
+        -- und eine solche Zeile waere eine zweite Wahrheit ueber dasselbe Recht.
+        CHECK (subject_id <> caregiver_id)
+      );
+
+      -- Die haeufigste Abfrage ist "fuer wen darf ich eintragen?" (Sicht des
+      -- Betreuers); der Primaerschluessel deckt nur die Gegenrichtung ab.
+      CREATE INDEX IF NOT EXISTS idx_health_care_grants_caregiver
+        ON health_care_grants(caregiver_id);
+    `,
+  },
+  {
+    version: 131,
+    description: 'Budget: issuing bank and credit limit on credit-card accounts (#541)',
+    up: `
+      -- Nur die beiden Felder, die für sich stehen: die Bank als Beschriftung, das
+      -- Limit als Bezugsgröße für den verfügbaren Rahmen. Abrechnungs- und
+      -- Fälligkeitstag kommen mit der Abrechnungslogik, weil erst die festlegt,
+      -- welchen Zeitraum ein solcher Tag begrenzt.
+      ALTER TABLE budget_accounts ADD COLUMN credit_bank TEXT;
+      ALTER TABLE budget_accounts ADD COLUMN credit_limit REAL;
+    `,
+  },
+  {
+    version: 132,
+    description: 'Tasks: archive as its own axis instead of a status value (#688)',
+    up: `
+      -- Das Archiv lag bisher IM Statusfeld. Wer eine erledigte Aufgabe ablegte,
+      -- überschrieb damit ihr 'done' - die Aufgabe kam als unerledigt zurück, und
+      -- syncTaskRewards stornierte im selben Zug die Punkte-Gutschrift (#688).
+      -- Ablegen und Erledigen sind zwei Aussagen; sie brauchen zwei Felder.
+      ALTER TABLE tasks ADD COLUMN archived_at TEXT;
+
+      -- Bestandsdaten: der frühere Status ist nicht mehr rekonstruierbar. 'done'
+      -- ist die einzige belastbare Annahme - archiviert wird, was durch ist (so
+      -- beschreibt es auch docs/SPEC.md), und das Archiv blendet die Zeile ohnehin
+      -- aus. Ein Zurückholen zeigt sie dann als erledigt statt als offen, was der
+      -- gemeldeten Erwartung entspricht. Punkte werden bewusst NICHT nachgebucht:
+      -- reward_ledger hat für diese Aufgaben keine offene Buchung, und ein
+      -- nachträglicher Geldsegen aus einer Migration wäre die schlechtere Überraschung.
+      UPDATE tasks
+         SET archived_at = COALESCE(updated_at, created_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+             status      = 'done'
+       WHERE status = 'archived';
+
+      CREATE INDEX IF NOT EXISTS idx_tasks_archived ON tasks(archived_at);
+    `,
+  },
+  {
+    version: 133,
+    description: 'Shopping: manual item order within a category (#678)',
+    up: `
+      -- Die Artikelreihenfolge war bisher die Eingabereihenfolge: die Liste
+      -- sortierte nach Kategorie, dann created_at. Wer seine Liste nach dem
+      -- Ladenlayout ordnen will, konnte bisher nur die KATEGORIEN umsortieren
+      -- (shopping_categories.sort_order) - innerhalb einer Kategorie gab es
+      -- keinen Griff. Diese Spalte ist dieser Griff.
+      ALTER TABLE shopping_items ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
+
+      -- Bestand durchnummerieren, damit die heute sichtbare Reihenfolge exakt
+      -- erhalten bleibt. Ab 1, weil 0 dem Trigger unten als Marke "noch nicht
+      -- eingeordnet" dient.
+      UPDATE shopping_items SET sort_order = (
+        SELECT COUNT(*) + 1 FROM shopping_items AS prev
+         WHERE prev.list_id  = shopping_items.list_id
+           AND prev.category = shopping_items.category
+           AND (prev.created_at < shopping_items.created_at
+                OR (prev.created_at = shopping_items.created_at AND prev.id < shopping_items.id))
+      );
+
+      -- Neue Artikel ans Ende ihrer Kategorie. Bewusst als Trigger und nicht in
+      -- den Insert-Aufrufen: es gibt NEUN Einfügewege (shopping, meals, recipes,
+      -- housekeeping, mcp/tools, caldav-reminders-sync). Als Regel an der Tabelle
+      -- gilt sie auch für den zehnten, der sie sonst vergessen hätte; ein Artikel
+      -- mit sort_order 0 wäre sonst still nach oben gesprungen.
+      CREATE TRIGGER IF NOT EXISTS trg_shopping_items_sort_order
+        AFTER INSERT ON shopping_items FOR EACH ROW WHEN NEW.sort_order = 0
+        BEGIN
+          UPDATE shopping_items SET sort_order = COALESCE((
+            SELECT MAX(sort_order) FROM shopping_items
+             WHERE list_id = NEW.list_id AND category = NEW.category AND id != NEW.id
+          ), 0) + 1 WHERE id = NEW.id;
+        END;
+
+      CREATE INDEX IF NOT EXISTS idx_shopping_items_sort
+        ON shopping_items(list_id, category, sort_order);
+    `,
+  },
+  {
+    version: 134,
+    description: 'Recipe provider mirrors: generalize Mealie-only schema for multiple providers (#530)',
+    up: `
+      -- mealie_accounts -> recipe_provider_accounts, mit Provider-Diskriminator.
+      -- ADD COLUMN mit CHECK ist hier unproblematisch, weil der DEFAULT
+      -- ('mealie') die Bedingung erfuellt und kein Bestandsdatensatz ein
+      -- Backfill braucht. Eine spaetere Erweiterung des CHECKs (z.B. um
+      -- 'recipesage') braucht das Rebuild-Muster (CREATE+COPY+DROP+RENAME) wie
+      -- an anderer Stelle in dieser Datei, da SQLite einen CHECK nicht per
+      -- ALTER erweitern kann - hier nicht noetig, da nur 'mealie' und
+      -- 'tandoor' mit dieser Migration ausgeliefert werden.
+      ALTER TABLE mealie_accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 'mealie'
+        CHECK(provider IN ('mealie', 'tandoor'));
+
+      -- Echtes RENAME TO (kein CREATE+DROP): bei aktivem foreign_keys schreibt
+      -- SQLite jede REFERENCES mealie_accounts(...) Klausel im Schema auf den
+      -- neuen Namen um - recipes.mealie_account_id's FK-Ziel wird dabei
+      -- automatisch mitgezogen, ohne dass recipes hier angefasst wird.
+      ALTER TABLE mealie_accounts RENAME TO recipe_provider_accounts;
+
+      -- Spalten-Umbenennung auf recipes: RENAME COLUMN erhaelt die Daten, die
+      -- (nun umgeleitete) FK, und schreibt auch die Spaltenliste des
+      -- partiellen UNIQUE-Index um.
+      ALTER TABLE recipes RENAME COLUMN mealie_account_id TO provider_account_id;
+      ALTER TABLE recipes RENAME COLUMN mealie_recipe_id TO provider_recipe_id;
+      ALTER TABLE recipes RENAME COLUMN mealie_updated_at TO provider_updated_at;
+      -- provider_slug's Bedeutung ist ab jetzt adapterabhaengig: Mealie legt
+      -- hier seinen eigenen Rezept-Slug ab (fuer /g/{groupSlug}/r/{slug}
+      -- Links); Tandoor legt hier den relativen Bildpfad ab (fuer den
+      -- Thumbnail-Proxy), da Tandoors Rezept-Link nur die numerische Id
+      -- braucht, die bereits in provider_recipe_id steht.
+      ALTER TABLE recipes RENAME COLUMN mealie_slug TO provider_slug;
+      ALTER TABLE recipes RENAME COLUMN mealie_has_image TO provider_has_image;
+    `,
+  },
+  {
+    version: 135,
+    description: 'API integration tokens may act as an explicitly selected family member',
+    up: `
+      -- The creator remains the administrator responsible for the credential;
+      -- the subject is the family member whose permissions and ownership apply
+      -- to requests made with it. Existing tokens keep their current behaviour.
+      ALTER TABLE api_tokens
+        ADD COLUMN subject_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;
+      UPDATE api_tokens SET subject_user_id = created_by WHERE subject_user_id IS NULL;
+      CREATE INDEX idx_api_tokens_subject_user_id ON api_tokens(subject_user_id);
+    `,
+  },
+  {
+    version: 136,
+    description: 'Outbound target for locally created tasks (CalDAV reminder list, #695)',
+    up: `
+      -- Mirrors the shape calendar events have carried since the CalDAV sync was
+      -- built (target_caldav_account_id + target_caldav_calendar_url): a locally
+      -- created row names where it wants to go, and the sync run uploads it and
+      -- turns it into a mirror. Without a target nothing changes - a task with
+      -- NULL here stays local, which is every task that exists today.
+      ALTER TABLE tasks ADD COLUMN target_caldav_account_id INTEGER;
+      ALTER TABLE tasks ADD COLUMN target_caldav_list_url   TEXT;
+
+      CREATE INDEX idx_tasks_target_caldav
+        ON tasks(target_caldav_account_id)
+        WHERE target_caldav_account_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 137,
+    description: 'Inventory: locations, categories, items (Stage 1 of the full design)',
+    up: `
+      -- Zwei-Ebenen-Hierarchie ueber parent_id. Kein Umhaengen zwischen Eltern in der
+      -- API (siehe Plan), daher ist ein Zyklus ueber diese Spalte nicht erreichbar -
+      -- die Spalte existiert trotzdem als echte Selbstreferenz, falls eine spaetere
+      -- Stufe das Umhaengen doch braucht.
+      CREATE TABLE IF NOT EXISTS inventory_locations (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        name       TEXT    NOT NULL,
+        parent_id  INTEGER REFERENCES inventory_locations(id) ON DELETE SET NULL,
+        icon       TEXT    NOT NULL DEFAULT 'package',
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_inventory_locations_parent ON inventory_locations(parent_id);
+
+      CREATE TRIGGER IF NOT EXISTS trg_inventory_locations_updated_at
+        AFTER UPDATE ON inventory_locations FOR EACH ROW
+        BEGIN UPDATE inventory_locations SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+
+      -- 'key' ist der stabile Fremdschluessel fuer inventory_items.category (siehe
+      -- dort) - unabhaengig vom (umbenennbaren) Anzeigenamen.
+      CREATE TABLE IF NOT EXISTS inventory_categories (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        key        TEXT    NOT NULL UNIQUE,
+        name       TEXT    NOT NULL,
+        icon       TEXT    NOT NULL DEFAULT 'package',
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      INSERT INTO inventory_categories (key, name, icon, sort_order) VALUES
+        ('electronics', 'Elektronik', 'cpu',      0),
+        ('vehicles',    'Fahrzeuge',  'car',      1),
+        ('household',   'Haushalt',   'home',     2),
+        ('sports',      'Sport',      'dumbbell', 3),
+        ('other',       'Sonstiges',  'package',  4);
+
+      CREATE TABLE IF NOT EXISTS inventory_items (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        name            TEXT    NOT NULL,
+        brand           TEXT,
+        model           TEXT,
+        serial_number   TEXT,
+        -- Kein echter FK auf inventory_categories.key - siehe Plan (Global
+        -- Constraints): Loeschen einer Kategorie haengt Gegenstaende per Route auf
+        -- 'other' um, das kann eine DB-Constraint nicht mit einem konkreten
+        -- Rueckfallwert (nur mit NULL).
+        category        TEXT    NOT NULL DEFAULT 'other',
+        location_id     INTEGER REFERENCES inventory_locations(id) ON DELETE SET NULL,
+        purchase_date   TEXT,
+        purchase_price  REAL    CHECK (purchase_price IS NULL OR purchase_price >= 0),
+        currency        TEXT,
+        vendor          TEXT,
+        warranty_months INTEGER CHECK (warranty_months IS NULL OR (warranty_months >= 0 AND warranty_months <= 600)),
+        condition       TEXT    NOT NULL DEFAULT 'good' CHECK (condition IN ('new','good','fair','poor')),
+        status          TEXT    NOT NULL DEFAULT 'active' CHECK (status IN ('active','sold','disposed','lost')),
+        notes           TEXT,
+        -- SET NULL von Anfang an, nicht CASCADE: Inventar ist Haushaltseigentum wie
+        -- der Vorrat. pantry_items brauchte dafuer eine Nachfolgemigration (v109) -
+        -- hier wird der gleiche Fehler nicht wiederholt.
+        created_by      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_inventory_items_location ON inventory_items(location_id);
+      CREATE INDEX IF NOT EXISTS idx_inventory_items_category ON inventory_items(category);
+      CREATE INDEX IF NOT EXISTS idx_inventory_items_status   ON inventory_items(status);
+
+      CREATE TRIGGER IF NOT EXISTS trg_inventory_items_updated_at
+        AFTER UPDATE ON inventory_items FOR EACH ROW
+        BEGIN UPDATE inventory_items SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+    `,
+  },
+  {
+    version: 138,
+    description: 'Inventory: link items to documents from the Documents module (Stage 2)',
+    up: `
+      -- Spiegelt budget_entry_attachments 1:1 (server/db.js, Migration 112):
+      -- gleiche Spaltenform, gleiche CASCADE-Begruendung. Das Dokument selbst
+      -- bleibt beim Loeschen des Gegenstands im Dokumente-Modul erhalten -
+      -- CASCADE steht nur auf der Verknuepfungszeile, nicht auf family_documents.
+      CREATE TABLE IF NOT EXISTS inventory_item_documents (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id     INTEGER NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+        document_id INTEGER NOT NULL REFERENCES family_documents(id) ON DELETE CASCADE,
+        created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE(item_id, document_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_inventory_item_documents_item
+        ON inventory_item_documents(item_id);
+      CREATE INDEX IF NOT EXISTS idx_inventory_item_documents_document
+        ON inventory_item_documents(document_id);
+    `,
+  },
+  {
+    version: 139,
+    description: 'Inventory: link items to budget entries with a role (Stage 3)',
+    up: `
+      -- created_by ist SET NULL, NICHT CASCADE wie bei inventory_item_documents
+      -- (Migration 138): eine Buchungsverknuepfung ist Haushaltseigentum wie
+      -- der Gegenstand selbst (gleiche Begruendung wie inventory_items.created_by),
+      -- keine persoenliche Handlungsnotiz wie ein Dokument-Anhang.
+      --
+      -- amount_share existiert schon jetzt (nichts in Stufe 3 schreibt je einen
+      -- Wert hinein), damit Stufe 5 kein ALTER TABLE mehr braucht - "volles
+      -- Schema jetzt, gestufte Umsetzung" (Design-Doc §1).
+      CREATE TABLE IF NOT EXISTS inventory_item_entries (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id      INTEGER NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+        entry_id     INTEGER NOT NULL REFERENCES budget_entries(id) ON DELETE CASCADE,
+        role         TEXT    NOT NULL DEFAULT 'purchase'
+                     CHECK (role IN ('purchase','refund','instalment','maintenance','accessory')),
+        amount_share REAL    CHECK (amount_share IS NULL OR amount_share >= 0),
+        created_by   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE(item_id, entry_id, role)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_inventory_item_entries_item ON inventory_item_entries(item_id);
+      CREATE INDEX IF NOT EXISTS idx_inventory_item_entries_entry ON inventory_item_entries(entry_id);
+    `,
+  },
+  {
+    version: 140,
+    description: 'Allow inventory_item entities in the existing reminder center (Stage 4)',
+    foreignKeysOff: true,
+    up: `
+      -- SQLite kann einen Spalten-CHECK nicht per ALTER erweitern, daher Tabelle
+      -- neu erstellen (Muster wie v98/v101). foreignKeysOff ist Pflicht: mit
+      -- aktiver FK-Durchsetzung wuerde DROP TABLE reminders die gekoppelten
+      -- Zustellprotokolle (notification_deliveries.reminder_id ... ON DELETE
+      -- CASCADE) auf jeder bestehenden Installation mitloeschen.
+      CREATE TABLE reminders_new (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type TEXT    NOT NULL CHECK(entity_type IN ('task', 'event', 'subscription', 'inventory_item')),
+        entity_id   INTEGER NOT NULL,
+        remind_at   TEXT    NOT NULL,
+        dismissed   INTEGER NOT NULL DEFAULT 0,
+        created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        pushed_at   TEXT
+      );
+      INSERT INTO reminders_new (id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at)
+        SELECT id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at FROM reminders;
+      DROP TABLE reminders;
+      ALTER TABLE reminders_new RENAME TO reminders;
+      CREATE INDEX idx_reminders_entity ON reminders(entity_type, entity_id);
+      CREATE INDEX idx_reminders_remind ON reminders(remind_at);
+      CREATE INDEX idx_reminders_user ON reminders(created_by);
+    `,
+  },
+  {
+    version: 141,
+    description: 'Inventory: custom tracked dates per item, widen reminders for inventory_tracked_date',
+    foreignKeysOff: true,
+    up: `
+      -- Neue Tabelle fuer frei definierbare Fristen je Gegenstand (TÜV, Service, ...).
+      CREATE TABLE IF NOT EXISTS inventory_item_dates (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id              INTEGER NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+        label                TEXT    NOT NULL,
+        date                 TEXT    NOT NULL,
+        reminder_offset_days INTEGER NOT NULL DEFAULT 30 CHECK (reminder_offset_days BETWEEN 0 AND 365),
+        created_by           INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_inventory_item_dates_item ON inventory_item_dates(item_id);
+
+      CREATE TRIGGER IF NOT EXISTS trg_inventory_item_dates_updated_at
+        AFTER UPDATE ON inventory_item_dates FOR EACH ROW
+        BEGIN UPDATE inventory_item_dates SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+
+      -- reminders.entity_type erneut erweitern (Muster wie v137): SQLite kann
+      -- einen Spalten-CHECK nicht per ALTER erweitern, daher Tabelle neu
+      -- erstellen. foreignKeysOff bleibt Pflicht - gleicher Grund wie v137
+      -- (notification_deliveries.reminder_id ... ON DELETE CASCADE wuerde sonst
+      -- beim DROP TABLE mitgeloescht).
+      CREATE TABLE reminders_new (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type TEXT    NOT NULL CHECK(entity_type IN ('task', 'event', 'subscription', 'inventory_item', 'inventory_tracked_date')),
+        entity_id   INTEGER NOT NULL,
+        remind_at   TEXT    NOT NULL,
+        dismissed   INTEGER NOT NULL DEFAULT 0,
+        created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        pushed_at   TEXT
+      );
+      INSERT INTO reminders_new (id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at)
+        SELECT id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at FROM reminders;
+      DROP TABLE reminders;
+      ALTER TABLE reminders_new RENAME TO reminders;
+      CREATE INDEX idx_reminders_entity ON reminders(entity_type, entity_id);
+      CREATE INDEX idx_reminders_remind ON reminders(remind_at);
+      CREATE INDEX idx_reminders_user ON reminders(created_by);
+    `,
+  },
+  {
+    version: 142,
+    description: 'Inventory: add optional photo per item',
+    up: `
+      -- Ein Foto je Gegenstand, kein Galerie-Bedarf (Mockup-Vergleich, Design-
+      -- Doc §2) - gleiches Speichermuster wie birthdays.photo_data: Data-URL,
+      -- serverseitig validiert (server/routes/inventory/items.js), keine
+      -- eigene Tabelle noetig fuer ein einzelnes optionales Feld.
+      ALTER TABLE inventory_items ADD COLUMN photo_data TEXT;
+    `,
+  },
+  {
+    version: 143,
+    description: 'Inventory: localize the five seeded categories via label_key (matches Task Categories, migration 83)',
+    up: `
+      -- Gleiches Muster wie task_categories: label_key traegt den i18n-Key fuer
+      -- Seed-Kategorien (name = NULL -> lokalisiert), Custom-Kategorien tragen
+      -- weiterhin name (label_key = NULL). name war seit Migration 136 NOT NULL
+      -- (anders als bei task_categories) - Tabellen-Neubau statt einem simplen
+      -- ADD COLUMN, sonst schlaegt die folgende UPDATE...SET name = NULL fehl.
+      -- Kein FK verweist auf inventory_categories (inventory_items.category ist
+      -- bewusst kein echter FK, siehe Migration 136), foreignKeysOff also nicht noetig.
+      CREATE TABLE inventory_categories_new (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        key        TEXT    NOT NULL UNIQUE,
+        name       TEXT,
+        label_key  TEXT,
+        icon       TEXT    NOT NULL DEFAULT 'package',
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      INSERT INTO inventory_categories_new (id, key, name, icon, sort_order, created_at)
+        SELECT id, key, name, icon, sort_order, created_at FROM inventory_categories;
+      DROP TABLE inventory_categories;
+      ALTER TABLE inventory_categories_new RENAME TO inventory_categories;
+
+      -- Nur unveraendert gebliebene Seed-Zeilen umstellen: WHERE name = '<Seed-Wert>'
+      -- laesst eine bereits umbenannte Kategorie (jetzt effektiv custom) in Ruhe,
+      -- statt ihr die Benutzer-Umbenennung beim naechsten Sprachwechsel zu ueberschreiben.
+      UPDATE inventory_categories SET label_key = 'inventory.categoryElectronics', name = NULL
+        WHERE key = 'electronics' AND name = 'Elektronik';
+      UPDATE inventory_categories SET label_key = 'inventory.categoryVehicles', name = NULL
+        WHERE key = 'vehicles' AND name = 'Fahrzeuge';
+      UPDATE inventory_categories SET label_key = 'inventory.categoryHousehold', name = NULL
+        WHERE key = 'household' AND name = 'Haushalt';
+      UPDATE inventory_categories SET label_key = 'inventory.categorySports', name = NULL
+        WHERE key = 'sports' AND name = 'Sport';
+      UPDATE inventory_categories SET label_key = 'inventory.categoryOther', name = NULL
+        WHERE key = 'other' AND name = 'Sonstiges';
+    `,
+  },
+  {
+    version: 144,
+    description: 'add per-user read-only inventory deadlines feed token',
+    up: `
+      -- Gleiches Muster wie Migration 61 (calendar_feed_token): das Token haengt
+      -- an der users-Zeile, nicht haushaltweit in sync_config. Der Feed-Inhalt
+      -- bleibt haushaltweit - Gegenstaende haben keinen Eigentuemer -, aber ein
+      -- haushaltweites Token laesst sich nicht einzeln zurueckziehen: wer einmal
+      -- abonniert hat, behaelt Zugriff, bis er allen genommen wird.
+      ALTER TABLE users ADD COLUMN inventory_deadlines_feed_token TEXT;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_inventory_deadlines_feed_token
+        ON users(inventory_deadlines_feed_token)
+        WHERE inventory_deadlines_feed_token IS NOT NULL;
+
+      -- Das alte haushaltweite Token faellt weg. Genau das ist der Rueckzug, den
+      -- es vorher nicht gab: eine bestehende Abo-URL wird ungueltig, statt als
+      -- verwaiste Zeile weiterzugelten.
+      DELETE FROM sync_config WHERE key = 'inventory_deadlines_feed_token';
+    `,
+  },
+  {
+    version: 145,
+    description: 'ship the Inventory module disabled by default (households opt in)',
+    up(db) {
+      // Erstes Modul, das abgeschaltet ausgeliefert wird. Grund ist nicht die
+      // Qualitaet, sondern die Reichweite: jedes Modul ist ein dauerhafter
+      // Eintrag in der Navigation *jedes* Haushalts, auch derer, die nie ein
+      // Fahrrad erfassen werden (Diskussion #696). Wer es will, schaltet es
+      // einmal ein; wer nicht, sieht es nie. Sollte sich zeigen, dass die
+      // Haelfte es nutzt, ist der Default eine Zeile weit zurueckdrehbar.
+      //
+      // Kein separater Seed-Pfad noetig: migrate() faehrt auf einer frischen
+      // Datenbank die komplette MIGRATIONS-Liste, dieser Eintrag deckt also
+      // Neuinstallation und Bestandshaushalt gleichermassen ab.
+      const row = db.prepare("SELECT value FROM sync_config WHERE key = 'disabled_modules'").get();
+
+      // Defensiv genau wie parseDisabledModules (server/routes/preferences.js):
+      // fehlend, kein Array oder kaputtes JSON zaehlen als "nichts abgeschaltet".
+      let disabled = [];
+      if (row?.value) {
+        try {
+          const parsed = JSON.parse(row.value);
+          if (Array.isArray(parsed)) disabled = parsed.filter((m) => typeof m === 'string');
+        } catch { /* kaputter Wert wird ersetzt, nicht respektiert */ }
+      }
+
+      // Mergen statt ersetzen: ein Haushalt kann bereits Module abgeschaltet
+      // haben, die ihm ein blindes INSERT OR REPLACE stillschweigend
+      // wieder einschalten wuerde.
+      if (disabled.includes('inventory')) return;
+      disabled.push('inventory');
+
+      db.prepare(`
+        INSERT INTO sync_config (key, value) VALUES ('disabled_modules', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                       updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      `).run(JSON.stringify(disabled));
+    },
+  },
+  {
+    version: 146,
+    description: 'rename the shared-expenses receipt folder to the canonical module name',
+    up(db) {
+      // EIN MODUL, EIN NAME - nachgezogen fuer den Ordner, in dem die Belege
+      // liegen. Das Modul heisst `splitExpenses.title` ("Gemeinsame Ausgaben"),
+      // der Zielordner hiess `documents.splitExpensesFolder` und war in elf von
+      // vierundzwanzig Sprachen ein anderes Wort. Der Locale-Wert ist mit
+      // diesem Release auf den Modulnamen gezogen - ohne diese Migration
+      // entstuende bei jedem Bestandshaushalt beim naechsten Beleg ein ZWEITER
+      // Ordner, weil `ensureFolder` (server/routes/documents.js) den Ordner
+      // ueber seinen NAMEN sucht und sonst anlegt. Die alten Belege blieben im
+      // alten.
+      //
+      // Die Paare stehen hier ausgeschrieben und werden NICHT aus den
+      // Locale-Dateien gelesen: eine Migration ist ein historischer Fakt und
+      // muss in fuenf Jahren dasselbe tun wie heute. Ein Blick in die dann
+      // aktuellen Uebersetzungen wuerde in einem spaeteren Rename still etwas
+      // anderes umbenennen als hier gemeint war.
+      const RENAMES = [
+        ['النفقات المشتركة', 'المصاريف المشتركة'],   // ar
+        ['Sdílené výdaje', 'Společné výdaje'],       // cs
+        ['Geteilte Ausgaben', 'Gemeinsame Ausgaben'], // de
+        ['Κοινές δαπάνες', 'Κοινά έξοδα'],           // el
+        ['Közös kiadások', 'Megosztott költségek'],  // hu
+        ['Pengeluaran bersama', 'Pengeluaran Bersama'], // id
+        ['共同の支出', '共有費用'],                    // ja
+        ['Despesas partilhadas', 'Despesas compartilhadas'], // pt
+        ['Paylaşılan harcamalar', 'Paylaşılan giderler'],    // tr
+        ['Chi tiêu chung', 'Chi phí chung'],         // vi
+        ['共同支出', '共享支出'],                      // zh
+      ];
+
+      // Der Ordner traegt die Sprache, in der er entstanden ist, und ein
+      // Haushalt kann die Sprache gewechselt haben - deshalb wird jede der elf
+      // Zeilen geprueft statt nur die des aktuellen Locales. Getroffen wird
+      // hoechstens eine.
+      // Der Quellordner wird EXAKT gesucht, der Konflikt dagegen mit
+      // `COLLATE NOCASE` - und dort mit `id <> ?`, statt einen beliebigen
+      // Treffer hinterher gegen die eigene id zu halten.
+      //
+      // Der Unterschied ist der Startabbruch: `name` traegt ein `UNIQUE`
+      // (Migration 60). Bei `id` unterscheiden sich alt und neu NUR in der
+      // Grossschreibung, ein Haushalt kann also beide Ordner besitzen -
+      // "Pengeluaran bersama" und "Pengeluaran Bersama" nebeneinander, vom
+      // case-sensitiven UNIQUE ausdruecklich erlaubt. Ein NOCASE-Blick auf
+      // den Zielnamen liefert dann dieselbe erste Zeile wie der Blick auf den
+      // Quellnamen, ein Vergleich `clash.id !== source.id` haelte das faelsch-
+      // licherweise fuer konfliktfrei, und das folgende UPDATE liefe in die
+      // UNIQUE-Verletzung. Migration v146 braeche ab, und mit ihr der Start.
+      const findExact = db.prepare('SELECT id FROM family_document_folders WHERE name = ?');
+      const findClash = db.prepare('SELECT id FROM family_document_folders WHERE name = ? COLLATE NOCASE AND id <> ?');
+      const rename = db.prepare('UPDATE family_document_folders SET name = ? WHERE id = ?');
+
+      for (const [from, to] of RENAMES) {
+        const source = findExact.get(from);
+        if (!source) continue;
+
+        // Zielname schon vergeben? Dann NICHT umbenennen. Zwei Ordner mit
+        // demselben Namen waeren schlimmer als ein Ordner mit dem alten:
+        // `ensureFolder` nimmt den ersten Treffer, und welcher das ist, haengt
+        // an der Zeilenreihenfolge.
+        if (findClash.get(to, source.id)) continue;
+
+        rename.run(to, source.id);
+      }
+    },
+  },
+  {
+    version: 147,
+    description: 'repair reward icons and descriptions stored as the text null',
+    up(db) {
+      // Issue #789: der PATCH-Handler fuer den Praemienkatalog unterschied
+      // `undefined` (Feld fehlt, unveraendert lassen) nicht von `null` (Feld
+      // leer abgeschickt) und schickte das gesendete `null` durch `String()`.
+      // Jede Praemie ohne Icon bekam beim ersten Bearbeiten deshalb den
+      // vierstelligen Text "null" als Icon - und wer eine Beschreibung leerte,
+      // bekam sie als "null" zurueck. Die Route ist repariert, die bereits
+      // geschriebenen Zeilen bleiben ohne diese Migration stehen.
+      //
+      // Getroffen wird ausschliesslich der exakte Wert - kein LIKE, kein TRIM.
+      // Eine Beschreibung, die "null" nur ENTHAELT, ist echter Text.
+      db.prepare("UPDATE reward_catalog SET icon = NULL WHERE icon = 'null'").run();
+      db.prepare("UPDATE reward_catalog SET description = NULL WHERE description = 'null'").run();
+
+      // Der Einloese-Verlauf haelt Name/Icon/Kosten als Snapshot (siehe
+      // Migration 1). Wer eine bereits verdorbene Praemie eingeloest hat, traegt
+      // das "null" auch dort - und der Verlauf wird aus dem Katalog nicht mehr
+      // nachgezogen, muss also eigens repariert werden.
+      db.prepare("UPDATE reward_redemptions SET reward_icon = NULL WHERE reward_icon = 'null'").run();
+    },
+  },
+  {
+    version: 148,
+    description: 'PRN medications: minimum interval and default dose per dose (#700)',
+    up: `
+      -- Discussion #700: "bei Bedarf" stand seit v65 als Spalte, im Formular und
+      -- als Abzeichen in der Liste - nur gebucht werden konnte so eine Dosis
+      -- nicht, weil beide Buchungspfade an einem Knopf hingen, den erst ein
+      -- Zeitplan erzeugt. Ein Bedarfsmedikament hat definitionsgemaess keinen.
+      --
+      -- min_interval_hours ist der Mindestabstand zweier Dosen in Stunden. Er
+      -- ist der eigentliche Wunsch aus der Meldung: aus ihm und der letzten
+      -- Einnahme faellt der Zeitpunkt, ab dem die naechste erlaubt ist. REAL,
+      -- weil "alle 4,5 Stunden" auf Beipackzetteln vorkommt. NULL = kein
+      -- Abstand hinterlegt, dann bleibt der Countdown aus.
+      --
+      -- prn_dose_qty ist die uebliche Menge je Bedarfseinnahme - das Gegenstueck
+      -- zu medication_schedules.dose_qty, das es fuer eine geplante Dosis schon
+      -- gibt. Ohne sie wuesste die Bedarfsbuchung keine Menge und koennte den
+      -- Bestand nicht mitfuehren, waehrend die geplante das seit jeher tut.
+      ALTER TABLE medications ADD COLUMN min_interval_hours REAL;
+      ALTER TABLE medications ADD COLUMN prn_dose_qty REAL;
+    `,
+  },
+  {
+    version: 149,
+    description: 'comments on tasks (#734)',
+    up: `
+      -- Discussion #734: über eine Aufgabe wird geredet - bisher woanders.
+      -- Das Vorbild steht im selben Schema: expense_comments (Migration 44)
+      -- führt dieselben vier Spalten für die geteilten Ausgaben.
+      --
+      -- Abweichung an einer Stelle: updated_at. Ein Kommentar ist Fließtext, in
+      -- dem sich vertippt wird, und ein stillschweigend geänderter Beitrag ist
+      -- in einer Unterhaltung etwas anderes als ein korrigierter Betrag. Die
+      -- Spalte bleibt NULL, solange niemand nachbessert - so trägt nur der
+      -- geänderte Kommentar den Hinweis.
+      --
+      -- CASCADE auf beiden Wegen, wie beim Vorbild: mit der Aufgabe geht ihre
+      -- Unterhaltung, mit dem Konto gehen dessen Beiträge.
+      CREATE TABLE IF NOT EXISTS task_comments (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id    INTEGER NOT NULL REFERENCES tasks(id)  ON DELETE CASCADE,
+        user_id    INTEGER NOT NULL REFERENCES users(id)  ON DELETE CASCADE,
+        comment    TEXT    NOT NULL,
+        created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at TEXT
+      );
+
+      -- Gelesen wird immer je Aufgabe und in Reihenfolge.
+      CREATE INDEX IF NOT EXISTS idx_task_comments_task ON task_comments(task_id, id);
+    `,
+  },
+  {
+    version: 150,
+    description: 'countdown flag on events and tasks (#647)',
+    up: `
+      -- Discussion #647: "XX Tage bis ..." - und die eigentliche Arbeit war die
+      -- Frage, WO das lebt. Der Thread hat sie zu Ende diskutiert und kommt auf
+      -- ein Flag an dem, was es ohnehin schon gibt, statt auf ein zweites
+      -- System:
+      --
+      --   @Kyrodan zaehlt bis zu Terminen, die er sowieso im Kalender fuehrt
+      --   (Urlaub, "Disney+ verlaengern"). Ein eigenes Objekt hiesse fuer ihn,
+      --   dasselbe Datum zweimal zu pflegen.
+      --
+      --   @jamespurnama1 zaehlt bis zum Fuehrerschein und bis zum Luftfilter -
+      --   nichts davon ist ein Termin, und sein Punkt ist die RUECKSETZUNG auf
+      --   dieselbe DAUER, nicht auf dasselbe Datum. Das ist genau
+      --   tasks.recurrence_from_completion (Migration 137, #658), das es hier
+      --   schon gibt. Er hat als Aufloesung ein Uebersichts-Widget
+      --   vorgeschlagen, das aus BEIDEN Quellen einsammelt.
+      --
+      -- Ein drittes Objekt haette also nur eine dritte Schreibweise fuer eine
+      -- Faelligkeit hinzugefuegt, die zweimal existiert. Zwei Flags und ein
+      -- Widget kommen ohne aus.
+      --
+      -- Bei calendar_events gehoert das Flag in dieselbe Gruppe wie icon (v53)
+      -- und visibility (v83): Yuvomi-eigene Felder ohne CalDAV-/Google-
+      -- Gegenstueck. Es steht nicht in MIRRORED_FIELDS
+      -- (services/calendar-outbound.js), loest also keinen Push aus, und der
+      -- Rueckweg schreibt eine feste Spaltenliste, laesst es also stehen - eine
+      -- Anzeigeeinstellung, die nur hier etwas bedeutet, ueberlebt damit jeden
+      -- Sync-Lauf.
+      ALTER TABLE calendar_events ADD COLUMN countdown INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE tasks           ADD COLUMN countdown INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
+  {
+    version: 151,
+    description: 'search index: drop duplicate shopping item rows and make their insert trigger idempotent',
+    up: `
+      -- JEDER NEU ANGELEGTE EINKAUFSARTIKEL STAND ZWEIMAL IM VOLLTEXT-INDEX.
+      --
+      -- Zwei AFTER-INSERT-Trigger auf shopping_items, und SQLite sichert die
+      -- Reihenfolge zweier Trigger desselben Typs nicht zu. Die tatsaechliche
+      -- war:
+      --   1. trg_shopping_items_sort_order (Migration 133) macht ein UPDATE auf
+      --      dieselbe Zeile, sobald sort_order beim Einfuegen 0 ist - das ist
+      --      der Normalfall, denn keiner der neun Einfuegewege setzt sie.
+      --   2. Dieses UPDATE loest trg_search_items_au aus. Der loescht (noch
+      --      nichts) und schreibt eine Index-Zeile.
+      --   3. Erst DANACH laeuft trg_search_items_ai und schreibt eine zweite.
+      --
+      -- WARUM ES NIE JEMAND GEMERKT HAT: es heilte sich beim ersten Anfassen
+      -- selbst, denn trg_search_items_au loescht ueber (entity, entity_id) und
+      -- erwischt damit beide Zeilen. Abhaken genuegte. Doppelt waren also genau
+      -- die frisch angelegten, unberuehrten Artikel - und das sind die, nach
+      -- denen jemand sucht. runSearch deckelt bei fuenf Treffern je Art, also
+      -- kamen von fuenf angelegten Artikeln zweieinhalb an.
+      --
+      -- DER FIX SITZT AM INSERT-TRIGGER UND NICHT AM SORT-ORDER-TRIGGER, obwohl
+      -- der das UPDATE ausloest: eine Reihenfolge, die SQLite nicht zusichert,
+      -- laesst sich nicht reparieren, indem man sie anders herum annimmt. Mit
+      -- DELETE vor INSERT ist der Trigger idempotent und stimmt in BEIDER
+      -- Richtung - und er bleibt richtig, wenn morgen ein dritter
+      -- AFTER-INSERT-Trigger dazukommt. Es ist derselbe Griff, den der
+      -- _au-Trigger nebenan schon macht.
+      DROP TRIGGER IF EXISTS trg_search_items_ai;
+      CREATE TRIGGER trg_search_items_ai AFTER INSERT ON shopping_items BEGIN
+        DELETE FROM search_index WHERE entity = 'item' AND entity_id = NEW.id;
+        INSERT INTO search_index (entity, entity_id, title, body)
+        SELECT 'item', i.id, COALESCE(i.name, ''),
+               TRIM(COALESCE(i.notes, '') || ' ' ||
+                    COALESCE((SELECT group_concat(tag, ' ') FROM shopping_item_tags WHERE item_id = i.id), ''))
+        FROM shopping_items i WHERE i.id = NEW.id;
+      END;
+
+      -- Bestandsdaten: die schon geschriebenen Dubletten wegraeumen.
+      --
+      -- Ueber die rowid und NICHT ueber einen Neuaufbau des item-Anteils, wie
+      -- ihn Migration 77 fuer den ganzen Index gemacht hat. Ein Neuaufbau
+      -- muesste die Trigger-Logik ein zweites Mal hinschreiben (inklusive der
+      -- Tags im body), und eine Abweichung zwischen beiden Fassungen waere ein
+      -- stiller Verlust im Index - hier faellt nur weg, was doppelt ist.
+      --
+      -- Welche der beiden Zeilen bleibt, ist gleichgueltig: beide Trigger lesen
+      -- dieselbe Zeile im selben Zustand und schreiben denselben Inhalt.
+      --
+      -- Ohne Einschraenkung auf 'item', weil (entity, entity_id) im ganzen
+      -- Index eindeutig sein MUSS - genau davon geht jeder _au-Trigger aus,
+      -- wenn er vor dem Neuschreiben ueber diese beiden Spalten loescht. Was
+      -- sonst noch doppelt liegt, ist derselbe Fehler und geht mit.
+      DELETE FROM search_index WHERE rowid NOT IN (
+        SELECT MIN(rowid) FROM search_index GROUP BY entity, entity_id
+      );
+    `,
+  },
+  {
+    version: 152,
+    description: 'contact categories carry their own colour instead of a css name list',
+    up: `
+      -- DER TON EINER KATEGORIE GEHOERT IN DIE DATEN, NICHT IN EINE
+      -- SELEKTORLISTE. Er stand als sieben Regeln \`.contact-group--<key>\` in
+      -- contacts.css, und der Selektor kann per Konstruktion nur die
+      -- SEED-Schluessel treffen: seit #357 legt der Haushalt eigene Kategorien
+      -- an, und die fielen deshalb alle auf den Modulton zurueck - im
+      -- Demo-Haushalt sahen "Familie" und "Dienstleistungen" gleich aus. Eine
+      -- Farbe, die zwei Dinge meint, ist keine (Vollton-Regel, DESIGN.md).
+      --
+      -- GESPEICHERT WIRD DER TOKEN-AUSDRUCK, NICHT EIN HEX-WERT, und das ist
+      -- keine Bequemlichkeit: die sieben Toene sind THEMENABHAENGIG
+      -- (--color-success ist #1E7B35 im Light und #30D158 im Dark). Ein Hex in
+      -- der Datenbank koennte den Dunkelmodus nicht bedienen. Dasselbe Muster
+      -- fuehren die Kontofarben des Budgets seit ihrer Einfuehrung
+      -- (\`var(--chart-series-2)\` als gespeicherter Wert).
+      --
+      -- NULL heisst NEUTRAL, nicht "Vorgabe": eine Kategorie ohne kuratierten
+      -- Ton traegt bewusst keine Farbe, statt sich eine zu borgen.
+      ALTER TABLE contact_categories ADD COLUMN color TEXT;
+
+      UPDATE contact_categories SET color = 'var(--color-success)'      WHERE key = 'doctor'    AND color IS NULL;
+      UPDATE contact_categories SET color = 'var(--color-warning)'      WHERE key = 'school'    AND color IS NULL;
+      UPDATE contact_categories SET color = 'var(--color-accent)'       WHERE key = 'authority' AND color IS NULL;
+      UPDATE contact_categories SET color = 'var(--module-budget)'      WHERE key = 'insurance' AND color IS NULL;
+      UPDATE contact_categories SET color = 'var(--module-meals)'       WHERE key = 'craftsman' AND color IS NULL;
+      UPDATE contact_categories SET color = 'var(--color-danger)'       WHERE key = 'emergency' AND color IS NULL;
+      UPDATE contact_categories SET color = 'var(--color-text-secondary)' WHERE key = 'misc'    AND color IS NULL;
+    `,
+  },
+  {
+    version: 153,
+    description: 'idempotency keys for retry-safe POST requests on the public api',
+    up: `
+      -- RETRY-SICHERES ANLEGEN UEBER DIE OEFFENTLICHE API (#822).
+      --
+      -- Das Problem ist aelter als jeder Endpoint: ein Client schickt POST,
+      -- die Antwort geht auf dem Weg verloren, und er kann danach nicht mehr
+      -- unterscheiden, ob angelegt wurde oder nicht. Wiederholt er, hat er
+      -- womoeglich zwei Aufgaben; wiederholt er nicht, womoeglich keine. Ohne
+      -- serverseitiges Gedaechtnis ist das nicht aufloesbar - deshalb steht es
+      -- hier und nicht im Prozessspeicher: es muss einen Neustart ueberleben,
+      -- sonst ist die Zusage genau dann wertlos, wenn sie zaehlt.
+      --
+      -- DER SCHLUESSEL GEHOERT DEM AKTEUR, nicht dem Pfad: derselbe
+      -- Schluesselwert von zwei Konten sind zwei Vorgaenge, und ein Konto, das
+      -- einen Schluessel fuer zwei verschiedene Anfragen benutzt, hat einen
+      -- Fehler - den soll es als Konflikt zu sehen bekommen, nicht als still
+      -- zurueckgespielte fremde Antwort. Deshalb UNIQUE ueber (user_id, key)
+      -- und nicht ueber (user_id, key, path).
+      --
+      -- request_hash ist der Fingerabdruck aus Methode, Pfad und Rumpf. Er
+      -- entscheidet ueber Wiedergabe oder Konflikt.
+      --
+      -- status NULL heisst LAEUFT NOCH: der Datensatz entsteht, bevor die
+      -- Route arbeitet, damit ein gleichzeitiger zweiter Versuch sich am
+      -- eindeutigen Index stoesst statt danebenzulaufen.
+      CREATE TABLE IF NOT EXISTS idempotency_keys (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id       INTEGER NOT NULL,
+        key           TEXT    NOT NULL,
+        method        TEXT    NOT NULL,
+        path          TEXT    NOT NULL,
+        request_hash  TEXT    NOT NULL,
+        status        INTEGER,
+        response_body TEXT,
+        created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+        completed_at  TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency_keys_actor
+        ON idempotency_keys(user_id, key);
+
+      -- Abgelaufenes wird beim naechsten Schluessel-Request weggeraeumt; der
+      -- Index haelt dieses Aufraeumen billig, damit es keinen Cron braucht.
+      CREATE INDEX IF NOT EXISTS idx_idempotency_keys_created
+        ON idempotency_keys(created_at);
+    `,
+  },
+  {
+    version: 154,
+    description: 'Outlook (Microsoft Graph) one-way push: accounts, calendar selection, event links, event target columns',
+    up: `
+      -- Outlook.com spricht kein CalDAV mehr - der einzige Schreibweg ist die
+      -- Microsoft Graph API. Neuer Provider "Outlook-Push": one-way
+      -- Yuvomi -> Outlook fuer persoenliche Microsoft-Konten (outlook.com /
+      -- M365 Family), Multi-Account wie caldav_accounts.
+
+      -- Ein verbundenes Microsoft-Konto. OAuth-Tokens liegen pro Konto-Zeile,
+      -- NICHT in sync_config (Multi-Account). auto_sync_calendar_id +
+      -- owner_user_id aktivieren den Auto-Sync: alle fuer den Owner sichtbaren
+      -- lokalen Termine werden automatisch in diesen einen Kalender gepusht.
+      CREATE TABLE outlook_accounts (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        name                  TEXT NOT NULL,
+        ms_user_id            TEXT,
+        email                 TEXT,
+        access_token          TEXT NOT NULL,
+        refresh_token         TEXT NOT NULL,
+        token_expiry          TEXT,
+        needs_reauth          INTEGER NOT NULL DEFAULT 0,
+        auto_sync_calendar_id TEXT,
+        owner_user_id         INTEGER REFERENCES users(id),
+        created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        last_sync             TEXT,
+        last_error            TEXT
+      );
+      -- Reconnect desselben Microsoft-Kontos ersetzt die Tokens statt zu duplizieren.
+      CREATE UNIQUE INDEX idx_outlook_accounts_ms_user
+        ON outlook_accounts(ms_user_id) WHERE ms_user_id IS NOT NULL;
+
+      -- Beim Verbinden von Graph geladene Kalender; enabled = als Push-Ziel
+      -- waehlbar. Neue Kalender starten deaktiviert: der Connect-Flow fuehrt
+      -- erst zur Anlage eines dedizierten Zielkalenders.
+      CREATE TABLE outlook_calendar_selection (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id     INTEGER NOT NULL REFERENCES outlook_accounts(id) ON DELETE CASCADE,
+        calendar_id    TEXT NOT NULL,
+        calendar_name  TEXT NOT NULL,
+        calendar_color TEXT,
+        can_edit       INTEGER NOT NULL DEFAULT 1,
+        enabled        INTEGER NOT NULL DEFAULT 1,
+        created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE(account_id, calendar_id)
+      );
+
+      -- Push-Zustand je (Event, Konto): ein Termin kann in mehrere Konten
+      -- gepusht werden (je Familienmitglied ein eigener Zielkalender).
+      -- BEWUSST KEIN FK auf calendar_events: die Zeile muss das Loeschen des
+      -- lokalen Events ueberleben, damit der naechste Sync das Remote-Event in
+      -- Outlook loescht (Tombstone). Anders als Google/CalDAV gibt es keinen
+      -- Handoff zu external_source='outlook' - ohne Inbound-Sync wuerde das
+      -- Event danach einfrieren; es bleibt dauerhaft 'local'.
+      CREATE TABLE outlook_event_links (
+        event_id            INTEGER NOT NULL,
+        account_id          INTEGER NOT NULL REFERENCES outlook_accounts(id) ON DELETE CASCADE,
+        outlook_calendar_id TEXT NOT NULL,
+        outlook_event_id    TEXT NOT NULL,
+        content_hash        TEXT,
+        -- Graph-ETag des Events nach dem letzten eigenen Schreibzugriff. Der Sync
+        -- listet je Kalender einmal id+changeKey: weicht der Key ab, wurde der
+        -- Termin in Outlook veraendert und wird auf den Yuvomi-Stand zurueckgesetzt;
+        -- fehlt die id, wurde er in Outlook geloescht und wird neu angelegt.
+        outlook_change_key  TEXT,
+        last_pushed_at      TEXT,
+        last_error          TEXT,
+        PRIMARY KEY (event_id, account_id)
+      );
+      CREATE INDEX idx_outlook_links_account ON outlook_event_links(account_id);
+
+      -- Explizites Push-Ziel am Event (Muster target_caldav_* /
+      -- target_google_calendar_id); gewinnt gegen den Auto-Sync-Kalender.
+      -- Keine external_source-CHECK-Erweiterung noetig (kein Handoff, s. o.).
+      ALTER TABLE calendar_events ADD COLUMN target_outlook_account_id INTEGER;
+      ALTER TABLE calendar_events ADD COLUMN target_outlook_calendar_id TEXT;
+    `,
+  },
+  {
+    version: 155,
+    description: 'Tasks: locked flag - a locked task keeps its definition closed to everyone but its creator and admins (#830)',
+    up: `
+      -- AUFGABE SPERREN (#830).
+      --
+      -- Der Wunsch: Eltern legen eine Aufgabe fest, Kinder sollen sie erledigen
+      -- koennen, aber nicht umschreiben. Die Modulrechte koennen das nicht
+      -- ausdruecken - sie kennen nur read-only fuers GANZE Modul, und read-only
+      -- verhindert auch das Abhaken, womit der Zweck entfaellt.
+      --
+      -- Der Riegel sitzt deshalb an der einzelnen Aufgabe und trennt zwei Dinge,
+      -- die bisher eines waren: die DEFINITION (Titel, Beschreibung, Kategorie,
+      -- Termine, Wiederholung, Punkte, Sichtbarkeit, Tags, Dokumente, Loeschen)
+      -- ist zu, waehrend die INTERAKTION (Ansehen, Abhaken, Kommentieren,
+      -- eigene Erinnerung, sich selbst zuweisen) offen bleibt.
+      --
+      -- BEWUSST KEINE ABLEITUNG AUS family_role. Eine Familienrolle sagt, wer
+      -- jemand IST, nicht was er DARF - und "Elternteil" ist dort kein einzelner
+      -- Wert: dad/mom/parent sicher, grandparent je nach Haushalt, relative
+      -- nicht. Jede Regel darauf muesste diese Liste raten. #584 hat dieselbe
+      -- Ableitung bereits einmal durch explizite Grants ersetzt; berechtigt sind
+      -- hier Ersteller:in und Admins.
+      --
+      -- Default 0: bestehende Aufgaben verhalten sich unveraendert.
+      ALTER TABLE tasks ADD COLUMN locked INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
+  {
+    version: 156,
+    description: 'Budget: third visibility shared_amount - the amount counts towards balances while title, category and notes stay private (#659)',
+    foreignKeysOff: true,
+    up: `
+      -- BETRAG ZAEHLT, ZWECK BLEIBT PRIVAT (#659).
+      --
+      -- Bisher beantwortet visibility zwei Fragen mit einem Wort: ob ein Eintrag
+      -- in die Summen einfliesst UND ob er seine Details zeigt. Fuer geteilte
+      -- Konten ist das zu grob. Wer eine private Ausgabe bucht, verschweigt
+      -- meistens den ZWECK, nicht den Abfluss - der Kontostand der anderen ist
+      -- dadurch aber schlicht falsch, weil ihr Konto real weniger enthaelt.
+      --
+      -- Die dritte Stufe trennt die beiden Fragen: 'shared_amount' zaehlt wie
+      -- 'shared' in Kontostand, Vermoegen und Summen, zeigt aber wie 'private'
+      -- keine Details. Fremde sehen die Zeile mit Datum und Betrag, statt Titel,
+      -- Kategorie und Notizen aber eine neutrale Maske - der Saldo bleibt so aus
+      -- der Liste nachvollziehbar, statt um einen unerklaerten Betrag daneben zu
+      -- liegen.
+      --
+      -- BEWUSST KEINE HAUSHALTS-EINSTELLUNG. Ein Schalter waere billiger, aber
+      -- wer ihn umlegt, nimmt die Zusage ALLEN im Haushalt weg, auch denen, die
+      -- sie wollten - ein Admin sogar im Alleingang. Eine Zusage, die ein Dritter
+      -- abschalten kann, ist keine. Die Wahl bleibt deshalb am einzelnen Eintrag,
+      -- bei der Person, um deren Privatsphaere es geht.
+      --
+      -- SQLite kann einen Spalten-CHECK nicht per ALTER erweitern, daher Tabelle
+      -- neu erstellen (Muster wie v140/v141). foreignKeysOff ist Pflicht: mit
+      -- aktiver FK-Durchsetzung wuerde DROP TABLE budget_entries die gekoppelten
+      -- Belege (budget_entry_attachments.entry_id), die Wiederholungs-Ausnahmen
+      -- (budget_recurrence_skipped.parent_id) und die Inventar-Verknuepfungen
+      -- (inventory_item_entries.entry_id) auf jeder bestehenden Installation
+      -- mitloeschen - alle drei haengen per ON DELETE CASCADE daran.
+      CREATE TABLE budget_entries_new (
+        id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+        title                     TEXT    NOT NULL,
+        amount                    REAL    NOT NULL,
+        category                  TEXT    NOT NULL DEFAULT 'Sonstiges',
+        date                      TEXT    NOT NULL,
+        is_recurring              INTEGER NOT NULL DEFAULT 0,
+        recurrence_rule           TEXT,
+        created_by                INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at                TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at                TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        recurrence_parent_id      INTEGER REFERENCES budget_entries(id) ON DELETE SET NULL,
+        subcategory               TEXT    NOT NULL DEFAULT '',
+        recurrence_interval       TEXT    NOT NULL DEFAULT 'monthly',
+        recurrence_virtual        INTEGER NOT NULL DEFAULT 0,
+        recurrence_full_amount    REAL,
+        account_id                INTEGER REFERENCES budget_accounts(id) ON DELETE SET NULL,
+        owner_id                  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        visibility                TEXT    NOT NULL DEFAULT 'shared'
+                                          CHECK (visibility IN ('private', 'shared', 'shared_amount')),
+        recurrence_interval_count INTEGER NOT NULL DEFAULT 1,
+        recurrence_confirm        INTEGER NOT NULL DEFAULT 0,
+        is_pending                INTEGER NOT NULL DEFAULT 0
+      );
+
+      -- Spalten explizit und vollstaendig: v57 hat bei genau diesem Schritt
+      -- reminders.pushed_at verloren, v62 musste es nachtragen.
+      INSERT INTO budget_entries_new (
+        id, title, amount, category, date, is_recurring, recurrence_rule,
+        created_by, created_at, updated_at, recurrence_parent_id, subcategory,
+        recurrence_interval, recurrence_virtual, recurrence_full_amount,
+        account_id, owner_id, visibility, recurrence_interval_count,
+        recurrence_confirm, is_pending
+      )
+      SELECT
+        id, title, amount, category, date, is_recurring, recurrence_rule,
+        created_by, created_at, updated_at, recurrence_parent_id, subcategory,
+        recurrence_interval, recurrence_virtual, recurrence_full_amount,
+        account_id, owner_id, visibility, recurrence_interval_count,
+        recurrence_confirm, is_pending
+      FROM budget_entries;
+
+      DROP TABLE budget_entries;
+      ALTER TABLE budget_entries_new RENAME TO budget_entries;
+
+      CREATE INDEX idx_budget_date       ON budget_entries(date);
+      CREATE INDEX idx_budget_created_by ON budget_entries(created_by);
+      CREATE INDEX idx_budget_parent     ON budget_entries(recurrence_parent_id);
+      CREATE INDEX idx_budget_account    ON budget_entries(account_id);
+      CREATE INDEX idx_budget_owner      ON budget_entries(owner_id);
+      CREATE INDEX idx_budget_pending    ON budget_entries(is_pending) WHERE is_pending = 1;
+
+      CREATE TRIGGER trg_budget_entries_updated_at
+        AFTER UPDATE ON budget_entries FOR EACH ROW
+        BEGIN UPDATE budget_entries SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+    `,
+  },
+  {
+    version: 157,
+    description: 'Document folders: a module folder is found by a stable key instead of its translated name',
+    up(db) {
+      // EIN SYSTEMORDNER, EINE ZEILE - unabhaengig von Sprache und Wortwahl.
+      //
+      // Sechs Module legen ihre Belege in einem eigenen Ordner ab: Budget,
+      // Aufgaben, Gemeinsame Ausgaben, Inventar, Haushaltshilfe und die
+      // Kalender-Anhaenge. Bisher war die IDENTITAET dieses Ordners sein
+      // uebersetzter Anzeigename, und den schickte der Client mit. Daraus
+      // folgten drei Fehler derselben Sorte:
+      //
+      //   1. Zwei Personen im selben Haushalt mit verschiedener Sprache legten
+      //      ZWEI Ordner an - "Belege" und "Receipts" nebeneinander, jeder mit
+      //      der Haelfte der Belege. Das war kein Randfall, sondern der
+      //      Normalfall in einem mehrsprachigen Haushalt.
+      //   2. Jede Korrektur an einer Uebersetzung spaltete den Ordner erneut.
+      //      Migration v146 musste das einmal aufraeumen, und beim naechsten
+      //      Sprachdurchgang stand dasselbe wieder an.
+      //   3. Ein Tippfehler im Anzeigetext war ein DATEN-Fehler, nicht nur ein
+      //      Schoenheitsfehler.
+      //
+      // `module_key` traegt die Identitaet ab jetzt. Der Name bleibt reine
+      // Anzeige und darf sich frei aendern - eine Migration wie v146 wird
+      // deshalb nie wieder noetig.
+      db.exec('ALTER TABLE family_document_folders ADD COLUMN module_key TEXT');
+      db.exec(`CREATE UNIQUE INDEX idx_family_document_folders_module_key
+                 ON family_document_folders(module_key) WHERE module_key IS NOT NULL`);
+
+      // Die Namen stehen hier AUSGESCHRIEBEN und werden nicht aus den
+      // Locale-Dateien gelesen - dieselbe Ueberlegung wie in v146: eine
+      // Migration ist ein historischer Fakt und muss in fuenf Jahren dasselbe
+      // tun wie heute. Ein Blick in die dann aktuellen Uebersetzungen wuerde
+      // still etwas anderes zuordnen als hier gemeint ist.
+      const FOLDER_NAMES = [
+        ['budget', [
+          "الإيصالات", // ar
+          "Doklady", // cs
+          "Belege", // de
+          "Αποδείξεις", // el
+          "Receipts", // en
+          "Comprobantes", // es
+          "رسیدها", // fa
+          "Mga Resibo", // fil
+          "Justificatifs", // fr
+          "रसीदें", // hi
+          "Bizonylatok", // hu
+          "Bukti", // id
+          "Ricevute", // it
+          "領収書", // ja
+          "영수증", // ko
+          "Bonnen", // nl
+          "Dowody", // pl
+          "Comprovativos", // pt
+          "Чеки", // ru, uk
+          "Kvitton", // sv
+          "Fişler", // tr
+          "Chứng từ", // vi
+          "凭证", // zh
+        ]],
+        ['tasks', [
+          "المهام", // ar
+          "Úkoly", // cs
+          "Aufgaben", // de
+          "Εργασίες", // el
+          "Tasks", // en
+          "Tareas", // es
+          "کارها", // fa
+          "Mga gawain", // fil
+          "Tâches", // fr
+          "कार्य", // hi
+          "Feladatok", // hu
+          "Tugas", // id
+          "Attività", // it
+          "タスク", // ja
+          "할 일", // ko
+          "Taken", // nl
+          "Zadania", // pl
+          "Tarefas", // pt
+          "Задачи", // ru
+          "Uppgifter", // sv
+          "Görevler", // tr
+          "Завдання", // uk
+          "Công việc", // vi
+          "任务", // zh
+        ]],
+        ['splitExpenses', [
+          "المصاريف المشتركة", // ar
+          "Společné výdaje", // cs
+          "Gemeinsame Ausgaben", // de
+          "Κοινά έξοδα", // el
+          "Shared expenses", // en
+          "Gastos compartidos", // es
+          "هزینه‌های مشترک", // fa
+          "Mga hinating gastos", // fil
+          "Dépenses partagées", // fr
+          "साझा खर्च", // hi
+          "Megosztott költségek", // hu
+          "Pengeluaran Bersama", // id
+          "Spese condivise", // it
+          "共有費用", // ja
+          "공동 지출", // ko
+          "Gedeelde uitgaven", // nl
+          "Wspólne wydatki", // pl
+          "Despesas compartilhadas", // pt
+          "Общие расходы", // ru
+          "Delade utgifter", // sv
+          "Paylaşılan giderler", // tr
+          "Спільні витрати", // uk
+          "Chi phí chung", // vi
+          "共享支出", // zh
+        ]],
+        ['inventory', [
+          // Bis 5bd02b26 hiess der Ordner in 21 Sprachen "Inventory", weil das
+          // Modul mit englischen Texten ausgeliefert wurde. Seit der
+          // Uebersetzung traegt er den Modulnamen der Sprache - beide
+          // Schreibweisen stehen hier, nach derselben Regel wie bei der
+          // Haushaltshilfe unten: die alte fuer Bestandsordner, die neue fuer
+          // einen von Hand so benannten Ordner in einer nie migrierten Datenbank.
+          "المقتنيات", // ar, seit der Uebersetzung des Moduls (5bd02b26)
+          "Inventář", // cs, seit der Uebersetzung des Moduls (5bd02b26)
+          "Απογραφή", // el, seit der Uebersetzung des Moduls (5bd02b26)
+          "Inventario", // es, seit der Uebersetzung des Moduls (5bd02b26)
+          "اموال", // fa, seit der Uebersetzung des Moduls (5bd02b26)
+          "Inventaire", // fr, seit der Uebersetzung des Moduls (5bd02b26)
+          "इन्वेंटरी", // hi, seit der Uebersetzung des Moduls (5bd02b26)
+          "Leltár", // hu, seit der Uebersetzung des Moduls (5bd02b26)
+          "Inventaris", // id, seit der Uebersetzung des Moduls (5bd02b26)
+          "Inventario", // it, seit der Uebersetzung des Moduls (5bd02b26)
+          "持ち物", // ja, seit der Uebersetzung des Moduls (5bd02b26)
+          "소지품", // ko, seit der Uebersetzung des Moduls (5bd02b26)
+          "Inventaris", // nl, seit der Uebersetzung des Moduls (5bd02b26)
+          "Inwentarz", // pl, seit der Uebersetzung des Moduls (5bd02b26)
+          "Inventário", // pt, seit der Uebersetzung des Moduls (5bd02b26)
+          "Инвентарь", // ru, seit der Uebersetzung des Moduls (5bd02b26)
+          "Inventarier", // sv, seit der Uebersetzung des Moduls (5bd02b26)
+          "Envanter", // tr, seit der Uebersetzung des Moduls (5bd02b26)
+          "Інвентар", // uk, seit der Uebersetzung des Moduls (5bd02b26)
+          "Tài sản", // vi, seit der Uebersetzung des Moduls (5bd02b26)
+          "物品", // zh, seit der Uebersetzung des Moduls (5bd02b26)
+          "Inventory", // ar, cs, el, en, es, fa, fil, fr, hi, hu, id, it, ja, ko, nl, pl, pt, ru, sv, tr, uk, vi, zh
+          "Imbentaryo", // fil
+          "Inventar", // de
+        ]],
+        ['housekeeping', [
+          // Der Ordner hiess in ZWOELF von vierundzwanzig Sprachen anders als
+          // das Modul, dessen Belege er traegt. Seit diesem Release traegt er
+          // ueberall den Modulnamen - beide Schreibweisen stehen deshalb hier,
+          // die alte fuer Bestandsordner und die neue fuer den Fall, dass
+          // jemand seinen Ordner schon von Hand so genannt hat.
+          //
+          // Eine Namensliste NACHTRAEGLICH zu ergaenzen ist erlaubt, obwohl
+          // Migrationen sonst unantastbar sind: bei einer Bestandsinstallation
+          // ist v157 laengst gelaufen und die Liste wirkungslos, bei einer
+          // neuen ist die Tabelle leer. Was sich aendern darf, ist also nur,
+          // wen eine noch nie migrierte Datenbank findet - und da hilft jeder
+          // zusaetzliche Name.
+          "التدبير المنزلي", // ar, seit dem Angleich an den Modulnamen
+          "Domácí práce", // cs, seit dem Angleich an den Modulnamen
+          "Haushaltshilfe", // de, seit dem Angleich an den Modulnamen
+          "Νοικοκυριό", // el, seit dem Angleich an den Modulnamen
+          "خدمتکار خانه", // fa, seit dem Angleich an den Modulnamen
+          "गृहकार्य", // hi, seit dem Angleich an den Modulnamen
+          "Asisten Rumah Tangga", // id, seit dem Angleich an den Modulnamen
+          "家事", // ja, seit dem Angleich an den Modulnamen
+          "가사 도우미", // ko, seit dem Angleich an den Modulnamen
+          "Ev işleri", // tr, seit dem Angleich an den Modulnamen
+          "家务", // zh, seit dem Angleich an den Modulnamen
+          "التنظيف المنزلي", // ar
+          "Úklid domácnosti", // cs
+          "Hausreinigung", // de
+          "Καθαριότητα", // el
+          "HouseKeeping", // en
+          "Limpieza", // es
+          "نظافت خانه", // fa
+          "Gawaing-bahay", // fil
+          "Ménage", // fr
+          "हाउसकीपिंग", // hi
+          "HázTartás", // hu
+          "Háztartás", // hu, nach der Tippfehler-Korrektur - SQLites COLLATE
+                       // NOCASE gilt nur fuer ASCII und haelt die beiden
+                       // Schreibweisen fuer zwei verschiedene Namen
+          "Pembersihan rumah", // id
+          "Pulizie", // it
+          "ハウスキーピング", // ja
+          "집 청소", // ko
+          "Huishouden", // nl
+          "Sprzątanie", // pl
+          "Faxina", // pt
+          "Уборка", // ru
+          "Städning", // sv
+          "Ev temizliği", // tr
+          "Прибирання", // uk
+          "Dọn dẹp", // vi
+          "家政清洁", // zh
+        ]],
+        ['calendarItems', [
+          "عناصر التقويم", // ar
+          "Položky kalendáře", // cs
+          "Kalendereinträge", // de
+          "Στοιχεία ημερολογίου", // el
+          "Calendar items", // en
+          "Elementos del calendario", // es
+          "مدخل‌های تقویم", // fa
+          "Mga item sa kalendaryo", // fil
+          "Éléments du calendrier", // fr
+          "कैलेंडर आइटम", // hi
+          "Naptár elemei", // hu
+          "Entri kalender", // id
+          "Elementi del calendario", // it
+          "カレンダー項目", // ja
+          "캘린더 항목", // ko
+          "Kalenderitems", // nl
+          "Wpisy kalendarza", // pl
+          "Itens do calendário", // pt
+          "Элементы календаря", // ru
+          "Kalenderobjekt", // sv
+          "Takvim öğeleri", // tr
+          "Елементи календаря", // uk
+          "Mục trên lịch", // vi
+          "日历项目", // zh
+        ]],
+      ];
+
+      const findAll = db.prepare(`SELECT id FROM family_document_folders
+                                   WHERE name = ? COLLATE NOCASE ORDER BY id`);
+      const claim = db.prepare('UPDATE family_document_folders SET module_key = ? WHERE id = ?');
+
+      for (const [key, names] of FOLDER_NAMES) {
+        // Der AELTESTE Ordner bekommt den Schluessel - ueber alle Sprachen
+        // hinweg, nicht der erste Name, der zufaellig einen Treffer hat. Ein
+        // Haushalt, der auf Englisch angefangen und spaeter auf Deutsch
+        // umgestellt hat, besitzt "Receipts" UND "Belege"; der aeltere traegt
+        // die Historie, und die Reihenfolge dieser Liste ist alphabetisch nach
+        // Sprachkuerzel und damit ohne jede Bedeutung.
+        //
+        // Weitere Ordner desselben Zwecks bleiben bewusst stehen: sie
+        // zusammenzulegen waere eine Entscheidung ueber fremde Dokumente, und
+        // die trifft eine Migration nicht. Neue Belege landen ab jetzt alle im
+        // aeltesten, der zweite bleibt als das liegen, was er ist.
+        let oldest = null;
+        for (const name of names) {
+          for (const row of findAll.all(name)) {
+            if (oldest === null || row.id < oldest) oldest = row.id;
+            break;
+          }
+        }
+        if (oldest !== null) claim.run(key, oldest);
+      }
+    },
+  },
+  {
+    version: 158,
+    description: 'Google calendar: drop the sync token where the first user was deleted, so the missed events come back',
+    up(db) {
+      // DER FIX ALLEIN HOLT NICHTS NACH.
+      //
+      // Bis #839 stand der Besitzer eines importierten Termins als feste ID 1
+      // im INSERT, und `created_by` ist ein Fremdschluessel auf `users`. Wer den
+      // bei der Installation angelegten Nutzer geloescht hatte, bei dem scheiterte
+      // jeder einzelne Insert - der Lauf selbst lief aber weiter und speicherte
+      // am Ende brav seinen syncToken. Fuer Google sind diese Termine damit
+      // zugestellt: der naechste inkrementelle Lauf fragt nur nach Aenderungen
+      // SEIT dem Token und liefert sie nie wieder. Der Kalender bliebe also
+      // dauerhaft luecken behaftet, obwohl der Fehler behoben ist.
+      //
+      // Ohne Token faellt der naechste Lauf auf einen Full-Resync zurueck und
+      // holt den vollen Zeitraum erneut. Das ist gefahrlos: der Upsert
+      // vergleicht Werte und fasst keine Zeile an, die sich nicht unterscheidet.
+      //
+      // Nur fuer betroffene Installationen: fehlt der Nutzer mit der ID 1, ist
+      // genau die Bedingung erfuellt, unter der der Fehler zuschlug. Wo er noch
+      // existiert, hat nie etwas gefehlt, und ein unnoetiger Full-Resync kostete
+      // Kontingent bei Googles API.
+      const hasFirstUser = db.prepare('SELECT 1 FROM users WHERE id = 1').get();
+      if (hasFirstUser) return;
+
+      db.prepare(`UPDATE google_calendar_selection
+                     SET sync_token = NULL, last_sync = NULL
+                   WHERE sync_token IS NOT NULL`).run();
+    },
+  },
+  {
+    version: 159,
+    description: 'Two-factor authentication: TOTP secrets and recovery codes per user (#672)',
+    up: `
+      -- Ein Nutzer hat hoechstens ein Geheimnis, deshalb ist user_id der
+      -- Schluessel und keine eigene id noetig.
+      --
+      -- confirmed_at NULL bedeutet: die Einrichtung laeuft, das Geheimnis ist
+      -- erzeugt und angezeigt, aber noch nicht durch einen Code bestaetigt.
+      -- Dieser Zwischenstand gehoert bewusst in die Datenbank und nicht in die
+      -- Session: wer den QR scannt und dann die Seite neu laedt, soll nicht von
+      -- vorn anfangen - und ein unbestaetigtes Geheimnis schuetzt nichts, kann
+      -- also gefahrlos liegen bleiben, bis es ersetzt wird.
+      --
+      -- last_step haelt den zuletzt eingeloesten Zeitschritt fest. RFC 6238
+      -- Abschnitt 5.2 verlangt diese Sperre: ohne sie bleibt ein abgefangener
+      -- Code das volle Toleranzfenster lang ein zweites Mal gueltig.
+      CREATE TABLE IF NOT EXISTS user_totp (
+        user_id      INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        secret       TEXT    NOT NULL,
+        confirmed_at TEXT,
+        last_step    INTEGER,
+        created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      -- Wiederherstellungscodes stehen nur als Hash hier. Ein eingeloester Code
+      -- wird nicht geloescht, sondern mit used_at gestempelt: so kann die
+      -- Oberflaeche "noch 7 von 10 uebrig" sagen, ohne mitzuzaehlen.
+      CREATE TABLE IF NOT EXISTS user_recovery_codes (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        code_hash  TEXT    NOT NULL,
+        used_at    TEXT,
+        created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_recovery_codes_user ON user_recovery_codes(user_id);
+    `,
+  },
+  {
+    version: 160,
+    description: 'Quick links: household links as a tile row on the overview (#469)',
+    up: `
+      -- EINE KACHELREIHE, KEIN MODUL - und deshalb auch keine zweite Tabelle
+      -- fuer Sammlungen, Tags oder Ordner. Der Thread zu #469 lief ueber beide
+      -- Ambitionen: Schnellzugriff auf die anderen Dienste im Haus (#469) und
+      -- eine Lesezeichen-Bibliothek (#759). Die zweite ist zugunsten der ersten
+      -- geschlossen worden, weil vier Melder dasselbe wollten: Name, Adresse,
+      -- Bild, und der Weg dorthin von der Startseite aus.
+      --
+      -- Wer spaeter doch eine Bibliothek will, findet hier die Zeilen, die er
+      -- braucht - eine Sammlung waere eine Spalte, kein Umbau.
+      CREATE TABLE IF NOT EXISTS quick_links (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT    NOT NULL,
+        url         TEXT    NOT NULL,
+
+        -- WARUM EIN BILD UND KEIN FAVICON. Ein Favicon zu holen hiesse, dass
+        -- der Haushalt bei jedem Aufbau der Startseite jeden verlinkten Host
+        -- anspricht - also genau der leise Aussenverkehr, den diese App nicht
+        -- macht. Ein hochgeladenes Bild bleibt hier liegen und spricht mit
+        -- niemandem. Es steht als Data-URL in der Zeile, wie users.avatar_data
+        -- schon seit v58: ein zweiter Dateispeicher fuer ein paar Kilobyte
+        -- Kachelbild waere Betriebsaufwand ohne Gegenwert.
+        icon_data   TEXT,
+
+        -- Ohne Bild traegt die Kachel den Anfangsbuchstaben ihres Namens auf
+        -- dieser Farbe - dieselbe Antwort, die ein Mitglied ohne Foto bekommt.
+        -- Ein generisches Symbol waere die schlechtere: zwoelf gleiche Weltkugeln
+        -- unterscheiden nichts, "J" auf Violett schon.
+        color       TEXT,
+
+        -- all | private. Die dritte Stufe der Aufgaben und Termine
+        -- ("assignees") fehlt hier mit Absicht: ein Link wird niemandem
+        -- zugewiesen, und eine Stufe, die nichts bedeuten kann, waere ein
+        -- Versprechen, das die Oberflaeche nicht einloest.
+        visibility  TEXT    NOT NULL DEFAULT 'all',
+
+        created_by  INTEGER REFERENCES users(id),
+
+        -- Die Reihenfolge ist Haushaltssache und wird gezogen, nicht sortiert:
+        -- welcher Dienst zuerst steht, weiss nur die Familie.
+        position    INTEGER NOT NULL DEFAULT 0,
+
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      -- Der Lesepfad sortiert immer nach position und filtert ueber visibility
+      -- plus created_by; das ist der eine Index, den er braucht.
+      CREATE INDEX IF NOT EXISTS idx_quick_links_position ON quick_links(position);
+    `,
+  },
+  {
+    version: 161,
+    description: 'Task completions: erledigen wird ein Ereignis, nicht nur ein Zustand (#791)',
+    up: `
+      -- WARUM EINE TABELLE UND NICHT ZWEI SPALTEN. Eine Aufgabe traegt heute
+      -- 'done' - und 'done' ist ein Zustand, kein Ereignis. Es beantwortet
+      -- "steht das noch an", aber keine der vier Fragen aus #791: was habe ich
+      -- heute erledigt, was gestern, wann war eine wiederkehrende Sache zuletzt
+      -- dran, und wer hat sie gemacht.
+      --
+      -- Zwei Spalten (completed_at, completed_by) am Datensatz waeren die
+      -- billigere Antwort und die falsche: eine wiederkehrende Aufgabe legt
+      -- beim Abhaken eine Folgeinstanz an (recurrence_origin_id), und die
+      -- Historie einer Serie verteilt sich damit ueber eine Kette von Zeilen,
+      -- deren Glieder einzeln geloescht werden koennen. Genau die Frage "wann
+      -- war das zuletzt dran" haengt an dieser Kette.
+      --
+      -- WAS HIER NICHT STEHT: kein Titel, keine Kategorie, kein Name. Ein
+      -- Schnappschuss waere eine zweite Wahrheit neben der Aufgabe - und die
+      -- gefaehrliche davon, weil auch die SICHTBARKEIT eine ist. Wer eine
+      -- Aufgabe nachtraeglich auf privat stellt, hat sie versteckt; ein
+      -- Verlaufseintrag, der seine eigene Kopie der alten Stufe mitbringt,
+      -- verriete sie weiter. Der Lesepfad joint deshalb immer die Aufgabe und
+      -- haengt dasselbe visibilityWhere an wie jede andere Aufgabenliste.
+      --
+      -- DER PREIS, bewusst bezahlt: ON DELETE CASCADE. Wer eine Aufgabe
+      -- loescht, loescht ihre Erledigungen mit. Das ist die Kehrseite der einen
+      -- Wahrheit, und sie ist die richtige Seite - eine Zeile, die ueberlebt,
+      -- was sie beschreibt, muesste ihre eigene Antwort auf "wer darf das
+      -- sehen" mitbringen.
+      CREATE TABLE IF NOT EXISTS task_completions (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id      INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+
+        -- Die Wurzel der Wiederholungskette, sonst die Aufgabe selbst. Einmal
+        -- beim Schreiben ermittelt statt bei jedem Lesen: der Wert ist ab dann
+        -- stabil, auch wenn spaeter ein Glied der Kette wegfaellt und die
+        -- rekursive Suche eine andere Wurzel faende. Kein Fremdschluessel - die
+        -- Wurzel darf verschwinden, ohne die spaeteren Eintraege mitzureissen.
+        series_id    INTEGER NOT NULL,
+
+        -- WER ABGEHAKT HAT, nicht wer zustaendig war. Der reward_ledger
+        -- entscheidet das bewusst anders (rewardTargets: die Zustaendigen, sonst
+        -- die handelnde Person), weil Punkte ein Verdienst sind und sich teilen
+        -- lassen. Eine Erledigung ist ein Vorgang: sie passiert einmal, und sie
+        -- passiert durch genau einen Klick. SET NULL statt CASCADE, damit das
+        -- Ausscheiden eines Mitglieds nicht den Verlauf des Haushalts loescht.
+        user_id      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+
+        completed_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      -- Eine Aufgabe ist einmal erledigt. Das Zuruecknehmen loescht die Zeile,
+      -- statt eine Gegenbuchung zu schreiben - dasselbe Muster wie
+      -- reverseTaskEarnings, und aus demselben Grund: ein Haken, der dreimal
+      -- hin und her geht, ist kein Verlauf, sondern Rauschen. Der Index ist
+      -- zugleich das Idempotenz-Netz, falls derselbe Statuswechsel zweimal
+      -- ankommt.
+      CREATE UNIQUE INDEX IF NOT EXISTS uniq_task_completion ON task_completions(task_id);
+
+      -- Der Verlauf liest absteigend nach Zeit; die Serienansicht liest eine
+      -- Serie, ebenfalls nach Zeit. Zwei Lesepfade, zwei Indizes.
+      CREATE INDEX IF NOT EXISTS idx_task_completions_at     ON task_completions(completed_at);
+      CREATE INDEX IF NOT EXISTS idx_task_completions_series ON task_completions(series_id, completed_at);
+    `,
+  },
+  {
+    version: 162,
+    description: 'Pantry: widen reminders for pantry_item so a best-before date can notify (#811)',
+    foreignKeysOff: true,
+    up: `
+      -- DIE VIERTE ERWEITERUNG DERSELBEN SPALTE, und deshalb keine neue Mechanik.
+      -- entity_type ist gewachsen: ('task','event') -> +'subscription' (v137)
+      -- -> +'inventory_item','inventory_tracked_date' (v141). Ein Vorratsartikel
+      -- traegt sein Mindesthaltbarkeitsdatum seit #596; gefehlt hat nur der
+      -- Eintrag in dieser Liste.
+      --
+      -- KEINE eigene Tabelle und KEIN Vorlauf je Artikel: inventory_item_dates
+      -- traegt reminder_offset_days, weil eine Frist dort einzeln gepflegt wird
+      -- (TUEV, Service - eine Handvoll je Haushalt). Ein Vorrat ist Massenware;
+      -- ein Feld, das niemand pro Joghurt pflegt, waere ein halb gefuelltes
+      -- Feld. Der Vorlauf ist stattdessen die Schwelle, die der Haushalt schon
+      -- kennt: EXPIRY_SOON_DAYS aus public/utils/pantry-status.js, dieselbe
+      -- Zahl, die den Chip "laeuft bald ab" gelb faerbt. Die Meldung sagt genau
+      -- diesen Zustandswechsel an; zwei Zahlen dafuer waeren zwei Wahrheiten.
+      --
+      -- foreignKeysOff bleibt Pflicht - gleicher Grund wie v137 und v141:
+      -- notification_deliveries.reminder_id haengt mit ON DELETE CASCADE an
+      -- dieser Tabelle und wuerde beim DROP TABLE leerlaufen.
+      CREATE TABLE reminders_new (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type TEXT    NOT NULL CHECK(entity_type IN ('task', 'event', 'subscription', 'inventory_item', 'inventory_tracked_date', 'pantry_item')),
+        entity_id   INTEGER NOT NULL,
+        remind_at   TEXT    NOT NULL,
+        dismissed   INTEGER NOT NULL DEFAULT 0,
+        created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        pushed_at   TEXT
+      );
+      INSERT INTO reminders_new (id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at)
+        SELECT id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at FROM reminders;
+      DROP TABLE reminders;
+      ALTER TABLE reminders_new RENAME TO reminders;
+      CREATE INDEX idx_reminders_entity ON reminders(entity_type, entity_id);
+      CREATE INDEX idx_reminders_remind ON reminders(remind_at);
+      CREATE INDEX idx_reminders_user ON reminders(created_by);
+    `,
+  },
+  {
+    version: 163,
+    description: 'Quick links: a built-in symbol as a third face, next to image and monogram (#873)',
+    up: `
+      -- DAS DRITTE GESICHT EINER KACHEL (#873).
+      --
+      -- Gemeldet war: "It's just an icon and as heavy self-hoster I don't want
+      -- to search and fetch icons from somewhere, I would like to have it just
+      -- built-in Yuvomi." Bisher gab es zwei Gesichter - ein hochgeladenes Bild
+      -- (icon_data, v160) oder den Anfangsbuchstaben auf der gewaehlten Farbe.
+      -- Wer weder das eine wollte noch das andere, hatte keine dritte Wahl.
+      --
+      -- WARUM EIN NAME UND KEIN ZWEITES BILD. Hier steht der Lucide-Name des
+      -- Symbols ("film", "server", "cloud"), nicht seine Zeichnung: den Vorrat
+      -- bringt public/lucide.min.js ohnehin mit, auf jeder Seite, fuer die
+      -- ganze App. Ein Symbol kostet damit die Laenge seines Namens statt der
+      -- zwanzig bis vierzig Kilobyte einer Data-URL - und es bleibt scharf,
+      -- faerbt mit und folgt dem Hell/Dunkel-Wechsel, was ein Rasterbild nicht
+      -- kann.
+      --
+      -- KEIN CHECK AUF EINE NAMENSLISTE. Der Server kennt den Lucide-Vorrat
+      -- nicht und soll ihn nicht kennen: eine Liste von 1743 Namen in der
+      -- Datenbank waere eine zweite Wahrheit, die bei jedem Lucide-Update
+      -- veraltet. Ein unbekannter Name bricht nichts - die Kachel zeigt dann
+      -- ihren Buchstaben, genau wie ohne Eintrag. Geprueft wird nur die FORM
+      -- (Kleinbuchstaben, Ziffern, Bindestriche), und die ist die
+      -- Sicherheitsgrenze; siehe iconName() in server/routes/quick-links.js.
+      --
+      -- WELCHES GESICHT GEWINNT, wenn beide Spalten gefuellt sind, entscheidet
+      -- der Lesepfad und nicht das Schema: das Bild. Wer eines hochgeladen hat,
+      -- hat die aufwendigere Wahl getroffen. Ein CHECK, der nur eine der beiden
+      -- Spalten zulaesst, waere strenger als noetig und machte aus dem Wechsel
+      -- zwischen den Gesichtern zwei Schreibvorgaenge statt einem.
+      ALTER TABLE quick_links ADD COLUMN icon_name TEXT;
+    `,
+  },
+  {
+    version: 164,
+    description: 'Document folders: a folder may live inside a folder (#785)',
+    foreignKeysOff: true,
+    up: `
+      -- AUS ZWEI FLACHEN FILTERREIHEN WIRD EIN BAUM (#785).
+      --
+      -- Das Dokumentenmodul fuehrt zwei Achsen nebeneinander: category (eine
+      -- feste Liste von 14 uebersetzten Schluesseln, als Spalte am Dokument)
+      -- und folder_id (diese Tabelle). Beide filtern dieselbe flache Liste,
+      -- und nichts in der Oberflaeche zeigt, wie sie zueinander stehen -
+      -- gemeldet als "zwei getrennte UI-Zonen, die man beide kennen muss".
+      --
+      -- Der Vorschlag war, die Ordner UNTER die Kategorien zu haengen. Das geht
+      -- nicht: die beiden Achsen sind unabhaengig. Ein Ordner "Wohnung" haelt
+      -- Dokumente der Kategorien home, insurance und legal gleichzeitig; unter
+      -- einer Kategorie aufgehaengt stuende er entweder dreimal da oder truege
+      -- eine Zugehoerigkeit, die es nicht gibt und die beim Migrieren erfunden
+      -- werden muesste.
+      --
+      -- Also die Hierarchie dort, wo sie hingehoert: Ordner in Ordnern. Die
+      -- Kategorie bleibt, was sie ist - ein Querschnitts-Etikett am Dokument,
+      -- das ueber den ganzen Baum hinweg filtert.
+      --
+      -- ── WARUM EIN TABELLEN-NEUBAU UND KEIN ALTER TABLE ────────────────────
+      --
+      -- name traegt seit Migration 60 ein globales UNIQUE. In einem Baum ist
+      -- das genau die falsche Zusicherung: "Rechnungen" unter "Auto" und
+      -- "Rechnungen" unter "Wohnung" sind zwei verschiedene Ordner, und ein
+      -- Baum, in dem jeder Name nur einmal im ganzen Haushalt vorkommen darf,
+      -- ist keiner. Ein Constraint laesst sich in SQLite nicht loesen, ohne die
+      -- Tabelle neu zu bauen.
+      --
+      -- DIE MIGRATION KANN AN BESTANDSDATEN NICHT SCHEITERN, und das ist keine
+      -- Hoffnung, sondern eine Ableitung: alle uebernommenen Zeilen bekommen
+      -- parent_id NULL, also COALESCE(parent_id, 0) = 0 fuer alle. Der neue
+      -- Index prueft damit exakt dieselbe Bedingung wie das alte globale
+      -- UNIQUE - was vorher hineinpasste, passt weiter hinein. Der Index ist
+      -- deshalb auch bewusst NICHT COLLATE NOCASE: das waere strenger als
+      -- bisher und koennte an einem Bestand mit "Auto" neben "auto" brechen.
+      --
+      -- COALESCE UND KEIN SCHLICHTES UNIQUE(parent_id, name): SQLite behandelt
+      -- NULL in einem UNIQUE als jeweils verschieden. Ein UNIQUE(parent_id,
+      -- name) liesse also beliebig viele Wurzelordner desselben Namens zu -
+      -- also genau auf der Ebene keine Zusicherung, auf der es sie heute gibt.
+      --
+      -- ── ON DELETE CASCADE, UND WARUM DAS HIER NICHTS VERLIERT ─────────────
+      --
+      -- Ein geloeschter Ordner nimmt seine Unterordner mit, wie in jedem
+      -- Dateibrowser. Die DOKUMENTE darin bleiben: family_documents.folder_id
+      -- traegt seit jeher ON DELETE SET NULL, sie landen also unter "ohne
+      -- Ordner" statt im Nichts. Diese Zusicherung ist aelter als dieser Baum
+      -- und bleibt seine Untergrenze - kein Loeschen in diesem Modul kann ein
+      -- Dokument kosten.
+      --
+      -- foreignKeysOff ist Pflicht (gleicher Grund wie v137, v141, v162):
+      -- family_documents.folder_id haengt an dieser Tabelle und liefe beim
+      -- DROP TABLE leer.
+      --
+      -- module_key bleibt unangetastet. Er traegt die IDENTITAET eines
+      -- Modulordners (v157), nicht seine Position - ein Modulordner darf
+      -- deshalb verschoben werden, ohne dass die sechs Module ihn verlieren.
+      CREATE TABLE family_document_folders_new (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT    NOT NULL,
+        parent_id   INTEGER REFERENCES family_document_folders_new(id) ON DELETE CASCADE,
+        module_key  TEXT,
+        created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      INSERT INTO family_document_folders_new (id, name, module_key, created_by, created_at, updated_at)
+        SELECT id, name, module_key, created_by, created_at, updated_at FROM family_document_folders;
+
+      DROP TABLE family_document_folders;
+      ALTER TABLE family_document_folders_new RENAME TO family_document_folders;
+
+      CREATE UNIQUE INDEX idx_family_document_folders_sibling_name
+        ON family_document_folders(COALESCE(parent_id, 0), name);
+
+      -- Unveraendert aus v157 uebernommen: der Schluessel bleibt haushaltsweit
+      -- eindeutig, egal wo im Baum der Ordner haengt.
+      CREATE UNIQUE INDEX idx_family_document_folders_module_key
+        ON family_document_folders(module_key) WHERE module_key IS NOT NULL;
+
+      -- Der Lesepfad holt die Kinder eines Ordners; das ist der eine Index,
+      -- den der Baum braucht.
+      CREATE INDEX idx_family_document_folders_parent
+        ON family_document_folders(parent_id);
+
+      CREATE TRIGGER trg_family_document_folders_updated_at
+        AFTER UPDATE ON family_document_folders FOR EACH ROW
+        BEGIN UPDATE family_document_folders SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+    `,
+  },
+  {
+    version: 165,
+    description: 'Schedule: cycle patterns and per-day overrides (#786)',
+    up: `
+      CREATE TABLE IF NOT EXISTS schedule_shift_types (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, short_code TEXT,
+        start_time TEXT, end_time TEXT, color TEXT NOT NULL DEFAULT '#6C3AED',
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        CHECK ((start_time IS NULL) = (end_time IS NULL))
+      );
+      CREATE TABLE IF NOT EXISTS schedule_patterns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL, anchor_date TEXT NOT NULL,
+        cycle_length INTEGER NOT NULL CHECK (cycle_length BETWEEN 1 AND 366),
+        valid_from TEXT, valid_until TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE TABLE IF NOT EXISTS schedule_pattern_days (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pattern_id INTEGER NOT NULL REFERENCES schedule_patterns(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL CHECK (position >= 0),
+        shift_type_id INTEGER REFERENCES schedule_shift_types(id) ON DELETE RESTRICT,
+        UNIQUE (pattern_id, position)
+      );
+      CREATE TABLE IF NOT EXISTS schedule_overrides (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        date_key TEXT NOT NULL, shift_type_id INTEGER REFERENCES schedule_shift_types(id) ON DELETE RESTRICT,
+        note TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (user_id, date_key)
+      );
+      CREATE INDEX idx_schedule_patterns_user ON schedule_patterns(user_id);
+      CREATE INDEX idx_schedule_overrides_user ON schedule_overrides(user_id, date_key);
+      CREATE TRIGGER trg_schedule_shift_types_updated_at AFTER UPDATE ON schedule_shift_types FOR EACH ROW BEGIN
+        UPDATE schedule_shift_types SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+      CREATE TRIGGER trg_schedule_patterns_updated_at AFTER UPDATE ON schedule_patterns FOR EACH ROW BEGIN
+        UPDATE schedule_patterns SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+    `,
+    afterUp(db) {
+      const row = db.prepare("SELECT value FROM sync_config WHERE key = 'disabled_modules'").get();
+      let disabled = [];
+      try { const parsed = JSON.parse(row?.value || '[]'); if (Array.isArray(parsed)) disabled = parsed.filter((key) => typeof key === 'string'); } catch { /* replace invalid legacy value */ }
+      if (!disabled.includes('schedule')) disabled.push('schedule');
+      db.prepare("INSERT INTO sync_config (key, value) VALUES ('disabled_modules', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')").run(JSON.stringify(disabled));
+    },
+  },
+  {
+    version: 166,
+    description: 'Calendar: an event may have no colour of its own, so the assignee can lend theirs (#891)',
+    // WARUM DIE SPALTE NULLABLE WIRD. `resolveEventColor` faellt seit jeher auf
+    // die Farbe der zugewiesenen Person zurueck - nur konnte der Zweig nie
+    // erreicht werden: `color` war NOT NULL DEFAULT '#007AFF' und lehnte auch
+    // den Leerstring ab, jeder Termin trug also immer eine eigene Farbe. Seit
+    // #815 die Eigenfarbe VOR die abgeleitete stellt, hat das die Personenfarbe
+    // und `cal_color` zu totem Code gemacht (#856). NULL ist der Zustand, der
+    // gefehlt hat: "dieser Termin hat keine eigene Farbe".
+    //
+    // SQLite kennt kein DROP NOT NULL, deshalb das Rebuild-Muster wie v98/v137.
+    // foreignKeysOff ist Pflicht: vier Tabellen zeigen auf calendar_events, zwei
+    // davon (event_assignments, calendar_event_exceptions) mit ON DELETE CASCADE
+    // - ein DROP TABLE bei aktiver Durchsetzung wuerde ihre Zeilen mitnehmen.
+    //
+    // BESTANDSDATEN BLEIBEN UNVERAENDERT. Verlockend waere, '#007AFF' als "nie
+    // gewaehlt" zu lesen - der Wert steht heute in keiner Palette. Er stand aber
+    // bis zum OKLCH-Wechsel an erster Stelle von EVENT_COLORS, ein Termin aus der
+    // v1-Zeit kann ihn also bewusst tragen. Eine Migration, die eine bewusste
+    // Wahl wegwirft, ist teurer als eine, die nichts tut: synchronisierte Termine
+    // normalisieren sich beim naechsten Sync von selbst (der Import schreibt die
+    // geerbte Farbe nicht mehr in die Eigenfarb-Spalte), und lokale Termine
+    // bekommen im Dialog die ausdrueckliche Wahl "Farbe der zugewiesenen Person".
+    foreignKeysOff: true,
+    // WARUM HIER EINE FUNKTION STEHT UND NICHT NUR SQL. Der Rebuild liest unten
+    // eine feste Liste von 36 Spalten. Genau eine davon ist nicht garantiert:
+    // `tzid` steht in CRITICAL_COLUMNS, weil es DBs gibt, auf denen Migration 97
+    // als angewendet gilt, die Spalte aber fehlt (#549 - derselbe Fall wie
+    // reminders.pushed_at in #538). `reconcileCriticalSchema()` repariert das,
+    // laeuft aber NACH `migrate()` - auf so einer DB waere dieser Rebuild also
+    // schon an `no such column: tzid` gescheitert, und zwar beim Update einer
+    // Bestandsinstallation. Die Absicherung gehoert deshalb VOR das SQL.
+    up(db) {
+      const spalten = new Set(db.prepare('PRAGMA table_info(calendar_events)').all().map((c) => c.name));
+      if (!spalten.has('tzid')) db.exec('ALTER TABLE calendar_events ADD COLUMN tzid TEXT');
+
+      db.exec(`
+      CREATE TABLE calendar_events_new (
+        id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+        title                        TEXT    NOT NULL,
+        description                  TEXT,
+        start_datetime               TEXT    NOT NULL,
+        end_datetime                 TEXT,
+        all_day                      INTEGER NOT NULL DEFAULT 0,
+        location                     TEXT,
+        color                        TEXT,
+        assigned_to                  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_by                   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        external_calendar_id         TEXT,
+        external_source              TEXT    NOT NULL DEFAULT 'local'
+                                             CHECK(external_source IN ('local', 'google', 'apple', 'ics', 'caldav')),
+        recurrence_rule              TEXT,
+        subscription_id              INTEGER REFERENCES ics_subscriptions(id) ON DELETE CASCADE,
+        user_modified                INTEGER NOT NULL DEFAULT 0,
+        calendar_ref_id              INTEGER REFERENCES external_calendars(id) ON DELETE SET NULL,
+        icon                         TEXT    NOT NULL DEFAULT 'calendar',
+        attachment_name              TEXT,
+        attachment_mime              TEXT,
+        attachment_size              INTEGER,
+        attachment_data              TEXT,
+        target_caldav_account_id     INTEGER,
+        target_caldav_calendar_url   TEXT,
+        created_at                   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at                   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        attachment_document_id       INTEGER REFERENCES family_documents(id) ON DELETE SET NULL,
+        target_google_calendar_id    TEXT,
+        visibility                   TEXT    NOT NULL DEFAULT 'all',
+        tzid                         TEXT,
+        outbound_dirty               INTEGER NOT NULL DEFAULT 0,
+        outbound_attempts            INTEGER NOT NULL DEFAULT 0,
+        outbound_move_to             TEXT,
+        external_object_url          TEXT,
+        countdown                    INTEGER NOT NULL DEFAULT 0,
+        target_outlook_account_id    INTEGER,
+        target_outlook_calendar_id   TEXT
+      );
+
+      INSERT INTO calendar_events_new
+        (id, title, description, start_datetime, end_datetime, all_day, location, color,
+         assigned_to, created_by, external_calendar_id, external_source, recurrence_rule,
+         subscription_id, user_modified, calendar_ref_id, icon,
+         attachment_name, attachment_mime, attachment_size, attachment_data,
+         target_caldav_account_id, target_caldav_calendar_url, created_at, updated_at,
+         attachment_document_id, target_google_calendar_id, visibility, tzid,
+         outbound_dirty, outbound_attempts, outbound_move_to, external_object_url,
+         countdown, target_outlook_account_id, target_outlook_calendar_id)
+      SELECT id, title, description, start_datetime, end_datetime, all_day, location, color,
+             assigned_to, created_by, external_calendar_id, external_source, recurrence_rule,
+             subscription_id, user_modified, calendar_ref_id, icon,
+             attachment_name, attachment_mime, attachment_size, attachment_data,
+             target_caldav_account_id, target_caldav_calendar_url, created_at, updated_at,
+             attachment_document_id, target_google_calendar_id, visibility, tzid,
+             outbound_dirty, outbound_attempts, outbound_move_to, external_object_url,
+             countdown, target_outlook_account_id, target_outlook_calendar_id
+      FROM calendar_events;
+
+      -- Die Trigger haengen an der alten Tabelle und gehen mit ihr; der
+      -- Suchindex bleibt dabei unberuehrt, weil DROP TABLE keinen DELETE-Trigger
+      -- ausloest und der INSERT oben auf der noch triggerlosen neuen Tabelle lief.
+      DROP TRIGGER IF EXISTS trg_calendar_events_updated_at;
+      DROP TRIGGER IF EXISTS trg_search_events_ai;
+      DROP TRIGGER IF EXISTS trg_search_events_au;
+      DROP TRIGGER IF EXISTS trg_search_events_ad;
+      DROP TABLE calendar_events;
+      ALTER TABLE calendar_events_new RENAME TO calendar_events;
+
+      CREATE TRIGGER trg_calendar_events_updated_at
+        AFTER UPDATE ON calendar_events FOR EACH ROW
+        BEGIN UPDATE calendar_events SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+
+      CREATE TRIGGER trg_search_events_ai AFTER INSERT ON calendar_events BEGIN
+        INSERT INTO search_index (entity, entity_id, title, body)
+        VALUES ('event', NEW.id,
+                COALESCE(NEW.title, ''),
+                TRIM(COALESCE(NEW.description, '') || ' ' || COALESCE(NEW.location, '')));
+      END;
+
+      CREATE TRIGGER trg_search_events_au AFTER UPDATE ON calendar_events BEGIN
+        DELETE FROM search_index WHERE entity = 'event' AND entity_id = OLD.id;
+        INSERT INTO search_index (entity, entity_id, title, body)
+        VALUES ('event', NEW.id,
+                COALESCE(NEW.title, ''),
+                TRIM(COALESCE(NEW.description, '') || ' ' || COALESCE(NEW.location, '')));
+      END;
+
+      CREATE TRIGGER trg_search_events_ad AFTER DELETE ON calendar_events BEGIN
+        DELETE FROM search_index WHERE entity = 'event' AND entity_id = OLD.id;
+      END;
+
+      CREATE INDEX idx_calendar_start ON calendar_events(start_datetime);
+      CREATE INDEX idx_calendar_assigned ON calendar_events(assigned_to);
+      CREATE INDEX idx_calendar_external_id ON calendar_events(external_calendar_id);
+      CREATE INDEX idx_calendar_sub ON calendar_events(subscription_id);
+      CREATE INDEX idx_cal_events_ref ON calendar_events(calendar_ref_id);
+      CREATE UNIQUE INDEX idx_calendar_sub_extid ON calendar_events (subscription_id, external_calendar_id);
+      CREATE INDEX idx_calendar_attachment_document ON calendar_events(attachment_document_id);
+      CREATE INDEX idx_calendar_recurring ON calendar_events(start_datetime) WHERE recurrence_rule IS NOT NULL;
+      CREATE INDEX idx_calendar_outbound_dirty ON calendar_events(outbound_dirty) WHERE outbound_dirty = 1;
+      `);
+    },
+  },
+  {
+    version: 167,
+    description: 'Calendar: color_modified tells a local recolour apart from any other edit (#899)',
+    // WARUM EINE ZWEITE SPALTE UND NICHT WEITER user_modified. Das Flag wird bei
+    // JEDER Bearbeitung eines gespiegelten Termins gesetzt (routes/calendar/
+    // crud.js), der Inbound aller drei Anbieter liest es aber als "die Farbe
+    // wird ab jetzt lokal gefuehrt". Wer den Titel aendert, friert damit die
+    // Farbspalte dauerhaft ein: faerbt danach jemand denselben Termin auf dem
+    // Server, erfaehrt Yuvomi es nie mehr (#899).
+    //
+    // Und weil dadurch "keine eigene Farbe" (#891) nicht von "wir haben nie eine
+    // gelernt" zu unterscheiden war, konnte der Ausgang das Leeren einer Farbe
+    // nicht spiegeln - ein hinausgeschicktes null haette die Farbe eines anderen
+    // Clients abgeraeumt (#897/#898). Mit einem eigenen Zustand ist
+    // `color IS NULL AND color_modified = 1` eindeutig "geleert".
+    //
+    // DER BACKFILL IST BEWUSST KONSERVATIV. `color_modified = user_modified`
+    // uebernimmt die bisherige Bedeutung wortwoertlich: jede Zeile, deren Farbe
+    // heute geschuetzt ist, bleibt geschuetzt. Ein pauschales 0 waere
+    // verlockend - es nimmt genau den Fehler zurueck, um den es hier geht -,
+    // ueberschriebe beim naechsten Sync aber auch jede Farbe, die jemand
+    // absichtlich gesetzt hat. Die beiden sind in Bestandsdaten nicht
+    // auseinanderzuhalten, und die absichtliche wegzuwerfen ist der teurere
+    // Fehler: sie kommt von selbst nicht zurueck, die eingefrorene schon, sobald
+    // der Termin einmal umgefaerbt wird.
+    up: `
+      ALTER TABLE calendar_events ADD COLUMN color_modified INTEGER NOT NULL DEFAULT 0;
+      UPDATE calendar_events SET color_modified = user_modified;
+    `,
+  },
+  {
+    version: 168,
+    description: 'Users: onboarding walkthrough remembered per account instead of per browser',
+    // WARUM PRO KONTO UND NICHT PRO GERAET. Der Merker lag bisher allein in
+    // localStorage: ein neues Geraet oder ein privates Fenster kennt ihn nicht
+    // und zeigt die Einfuehrung erneut, obwohl das Konto sie laengst gesehen
+    // hat - genau das war gemeldet.
+    //
+    // EINE ZAHL STATT EINES SCHALTERS, weil "gesehen" allein keine spaetere
+    // Erweiterung erlaubt: bringt eine kuenftige Version eine grosse
+    // Verhaltensaenderung, die eine erneute Einfuehrung rechtfertigt, hebt ein
+    // Wartungscommit nur CURRENT_ONBOARDING_VERSION in server/auth.js an, und
+    // jedes Konto mit einer kleineren gespeicherten Zahl sieht sie erneut -
+    // ohne eine weitere Migration.
+    //
+    // DER BACKFILL LAEUFT AUF 1, NICHT AUF 0: Bestandskonten haben die
+    // Einfuehrung (in ihrer bisherigen, geraetegebundenen Form) bereits
+    // gesehen und sollen sie nicht erneut bekommen, nur weil der Merker jetzt
+    // im Konto statt im Browser lebt. Die Spalten-DEFAULT bleibt 0 (= "noch
+    // nicht gesehen"), damit jedes kuenftige INSERT INTO users - und davon
+    // gibt es mehrere Stellen im Code - ohne eigene Aenderung das richtige
+    // Verhalten fuer ein neues Konto bekommt.
+    up: `
+      ALTER TABLE users ADD COLUMN onboarding_version INTEGER NOT NULL DEFAULT 0;
+      UPDATE users SET onboarding_version = 1;
+    `,
+  },
+  {
+    version: 169,
+    description: 'Reminders: a reminder on a shared event reaches its assignees, not only its author (#921)',
+    // GEMELDET WAR EIN VERPASSTER TERMIN, KEIN FEHLBEDIENUNGSFALL. Eine Frau
+    // legt einen Termin an, weist ihn beiden zu und setzt eine Erinnerung. Sie
+    // bekommt sie, er bekommt nichts - und wenn er denselben Termin oeffnet,
+    // steht das Erinnerungsfeld LEER da. Beide hielten sie fuer geteilt.
+    //
+    // Der Grund steht im Schema: `reminders` kennt nur `created_by`. Es gab
+    // keine Zeile fuer ihn, also gab es auch nichts zu zeigen und nichts
+    // zuzustellen. Das Feld log nicht - es hatte schlicht keine Auskunft, und
+    // genau das ist der Schaden: eine leere Anzeige liest sich als "es ist
+    // keine gesetzt", nicht als "deine ist keine gesetzt".
+    //
+    // EINE ZEILE JE PERSON, NICHT EINE ZEILE MIT MEHREREN EMPFAENGERN. Was an
+    // einer Erinnerung haengt, ist durchweg persoenlich: `dismissed` (wer sie
+    // weggewischt hat), `pushed_at` (wem sie schon zugestellt wurde) und die
+    // Uhrzeit selbst, die jeder fuer sich verschieben darf. Eine geteilte Zeile
+    // mit einer Empfaengerliste braeuchte fuer jedes dieser drei Felder eine
+    // zweite Tabelle - und die Abfragen, die heute auf `created_by` stehen,
+    // muessten alle umgeschrieben werden.
+    //
+    // WOFUER assigned_from GEBRAUCHT WIRD. Die Spalte haelt fest, aus WESSEN
+    // Geste eine Zeile entstanden ist; NULL heisst "selbst gesetzt", und das
+    // sind alle Bestandszeilen. Ohne sie liessen sich zwei Faelle nicht
+    // auseinanderhalten, die verschieden ausgehen muessen: eine Erinnerung, die
+    // jemand sich SELBST auf 10 Minuten gestellt hat, darf beim naechsten
+    // Speichern des Erstellers nicht auf dessen Wert zurueckspringen - eine
+    // geerbte darf es. Der Fremdschluessel steht auf SET NULL: verlaesst die
+    // Person den Haushalt, bleibt die Erinnerung ihres Kollegen bestehen und
+    // gilt ab dann als seine eigene.
+    up: `
+      ALTER TABLE reminders ADD COLUMN assigned_from INTEGER REFERENCES users(id) ON DELETE SET NULL;
+      CREATE INDEX IF NOT EXISTS idx_reminders_assigned_from ON reminders(assigned_from);
+    `,
+  },
+  {
+    version: 170,
+    description: 'Subscriptions: seed categories and payment methods carry a label key, so they speak the reader language (#950)',
+    // GEMELDET WAR EINE HALBE UEBERSETZUNG. Im Feld "Kategorien und
+    // Zahlungsarten verwalten" standen die Kategorien auf Spanisch und die
+    // Zahlungsarten daneben auf Englisch - dieselbe Liste, zwei Sprachen.
+    //
+    // Der Grund: BEIDE Tabellen speichern ihre sieben bzw. sechs Vorgaben als
+    // englischen TEXT ('Credit Card', 'Entertainment'). Die Kategorien hatten
+    // im Frontend eine Karte, die diesen Text auf einen i18n-Schluessel abbog;
+    // die Zahlungsarten hatten keine. Es war also nie eine zweite Uebersetzung
+    // noetig, sondern die erste an der falschen Stelle: eine Karte im Frontend
+    // kann nur raten, ob 'Other' die Vorgabe oder eine selbst angelegte Zeile
+    // desselben Namens meint.
+    //
+    // DIE ANTWORT STEHT IM PROJEKT SCHON VIERMAL: task_categories,
+    // contact_categories, inventory_categories und die Dokumentordner tragen
+    // ihren uebersetzten Namen als `label_key` und ihren freien Namen als
+    // `name`. Gelesen wird `label_key ? t(label_key) : name`. Damit ist die
+    // Frage "Vorgabe oder eigene Zeile" eine Eigenschaft der ZEILE, keine
+    // Namensuebereinstimmung - und Umbenennen loescht den Schluessel, womit
+    // der eigene Name gilt (so machen es die drei Routen oben auch).
+    //
+    // SCHLUESSEL UND NAME MUESSEN ZUSAMMENGEHOEREN, nicht bloss je einzeln
+    // vorkommen. Der Name allein reicht nicht: wer eine Vorgabe geloescht und
+    // danach eine EIGENE Kategorie 'Entertainment' angelegt hat, bekaeme sonst
+    // einen Schluessel aufgedrueckt, und sein gewaehlter Name waere still durch
+    // Uebersetzungen ersetzt. `budget_subcategory_key` ist der Anker dafuer -
+    // Migration 145 hat den Vorgaben feste Schluessel gegeben
+    // ('subscription_entertainment'), waehrend jede spaeter angelegte Zeile
+    // 'subscription_category_<id>' traegt.
+    //
+    // Der Schluessel ALLEIN reicht auch nicht: er bleibt an der Zeile, wenn
+    // jemand 'Entertainment' in 'Filme' umbenennt - dann waere ihr Name genauso
+    // weg.
+    //
+    // UND ZWEI GETRENNTE IN-LISTEN REICHEN EBENFALLS NICHT: wer 'Other'
+    // loescht und 'Entertainment' in 'Other' umbenennt, erfuellt beide Listen
+    // und bekaeme die Beschriftung seines ALTEN Schluessels - die Zeile hiesse
+    // fortan "Unterhaltung", obwohl er "Other" geschrieben hat. Beide Befunde
+    // kamen aus der PR-Durchsicht, der zweite erst, nachdem der erste behoben
+    // war. Deshalb steht hier je ein UPDATE pro Vorgabe: die Paarung ist damit
+    // nicht zu uebersehen und nicht versehentlich aufzutrennen.
+    //
+    // BEI DEN ZAHLUNGSARTEN GIBT ES KEINEN SOLCHEN ANKER, und der Name traegt
+    // dort auch allein: die sechs uebrigen Bezeichnungen sind Marken oder
+    // feste Begriffe, deren Uebersetzung dasselbe meint ('PayPal' bleibt
+    // 'PayPal', 'Credit Card' wird 'Kreditkarte'). Wer 'Credit Card' laengst
+    // umbenannt hat, wird nicht getroffen und behaelt seinen Namen - das ist
+    // der gewuenschte Ausgang, nicht der verpasste. Eine Annahme ueber die
+    // vergebenen id-Werte waere der scheinbar schaerfere, in Wahrheit
+    // fragilere Anker: sie steht nirgends im Schema.
+    up: `
+      ALTER TABLE subscription_categories     ADD COLUMN label_key TEXT;
+      ALTER TABLE subscription_payment_methods ADD COLUMN label_key TEXT;
+
+      UPDATE subscription_categories SET label_key = 'budget.subcatSubscriptionEntertainment'
+        WHERE budget_subcategory_key = 'subscription_entertainment' AND name = 'Entertainment';
+      UPDATE subscription_categories SET label_key = 'budget.subcatSubscriptionProductivity'
+        WHERE budget_subcategory_key = 'subscription_productivity'  AND name = 'Productivity';
+      UPDATE subscription_categories SET label_key = 'budget.subcatSubscriptionUtilities'
+        WHERE budget_subcategory_key = 'subscription_utilities'     AND name = 'Utilities';
+      UPDATE subscription_categories SET label_key = 'budget.subcatSubscriptionHealth'
+        WHERE budget_subcategory_key = 'subscription_health'        AND name = 'Health';
+      UPDATE subscription_categories SET label_key = 'budget.subcatSubscriptionEducation'
+        WHERE budget_subcategory_key = 'subscription_education'     AND name = 'Education';
+      UPDATE subscription_categories SET label_key = 'budget.subcatSubscriptionOther'
+        WHERE budget_subcategory_key = 'subscription_other'         AND name = 'Other';
+
+      UPDATE subscription_payment_methods SET label_key = CASE name
+        WHEN 'Credit Card'   THEN 'subscriptions.paymentMethodCreditCard'
+        WHEN 'Debit Card'    THEN 'subscriptions.paymentMethodDebitCard'
+        WHEN 'PayPal'        THEN 'subscriptions.paymentMethodPaypal'
+        WHEN 'Apple Pay'     THEN 'subscriptions.paymentMethodApplePay'
+        WHEN 'Google Pay'    THEN 'subscriptions.paymentMethodGooglePay'
+        WHEN 'Bank Transfer' THEN 'subscriptions.paymentMethodBankTransfer'
+        WHEN 'Other'         THEN 'subscriptions.paymentMethodOther'
+      END
+      WHERE name IN ('Credit Card', 'Debit Card', 'PayPal', 'Apple Pay', 'Google Pay', 'Bank Transfer', 'Other');
+    `,
+  },
+  {
+    version: 171,
+    description: 'Invites carry the starting permissions the admin chose, applied at first login (#869)',
+    // DER STANDARD WAR FUER DIE MIGRATION ENTSCHIEDEN, NICHT FUER DIE
+    // EINLADUNG. `access_permissions` speichert sparsam: keine Zeile heisst
+    // voller Zugriff (v74). Das war richtig, damit bestehende Haushalte sich
+    // nach dem Update genauso verhalten wie vorher - und es wurde still zur
+    // Antwort auf jede kuenftige Einladung mit. Der Melder in #869 hat den
+    // Satz geliefert, an dem das kippt: Rechte lassen sich spaeter oeffnen,
+    // aber wer einmal etwas gesehen hat, hat es gesehen.
+    //
+    // WARUM DIE ANTWORT HIER STEHT UND NICHT IM STANDARD: den Standard
+    // umzudrehen wuerde beim naechsten Update genau die Haushalte aussperren,
+    // die v74 schuetzen sollte. Diese Spalte aendert dagegen nur, was eine
+    // NEUE Einladung mitbringt. Bestehende Konten, bestehende Zeilen und der
+    // Standard selbst bleiben unberuehrt; eine Einladung ohne Wert (alle
+    // bestehenden) verhaelt sich exakt wie bisher.
+    //
+    // GESPEICHERT WIRD DAS AUFGELOESTE SET, nicht der Name der Vorlage. Was
+    // der Admin im Formular gesehen und abgeschickt hat, ist das, was beim
+    // ersten Login gilt - auch wenn jemand das Rollenprofil in der Woche
+    // dazwischen aendert. Form: `{"modules":{...},"widgets":{...}}`, dieselbe
+    // wie `normalizePermissionInput()` sie annimmt, sparsam wie die Tabelle
+    // selbst (nur Abweichungen).
+    up: `
+      ALTER TABLE invites ADD COLUMN permissions TEXT;
+    `,
+  },
+  {
+    version: 172,
+    description: 'Personal default visibility per health area, so new entries follow a choice instead of a fixed value (#958)',
+    // GEMELDET WAR EIN ANDERER WUNSCH: Blutdruck moege standardmaessig
+    // `family` sein, weil im Notfall jemand die ueblichen Werte kennen muss.
+    // Den ausgelieferten Standard umzudrehen waere die kleine Aenderung
+    // gewesen und die falsche: gespeicherte Zeilen tragen ihre Sichtbarkeit
+    // selbst, es leckt also nichts rueckwirkend - aber wer gelernt hat, dass
+    // Gesundheitswerte privat sind, teilt nach dem Update, ohne etwas getan zu
+    // haben. Eine Oeffnung, die niemand ausgeloest hat, ist die eine Sorte
+    // Aenderung, die sich nicht zuruecknehmen laesst: der Standard ist in
+    // einer Zeile zurueckgedreht, die inzwischen geschriebenen Zeilen nicht.
+    //
+    // DIE ANTWORT STEHT IM MODUL SCHON: `cycle_settings.default_visibility`
+    // (v153) laesst die PERSON entscheiden, was neue Zyklus-Eintraege sind,
+    // und `PATCH /cycle/visibility` zieht die bestehenden mit. Der
+    // sensibelste Bereich hat den Schalter, die vier anderen haben ihn nicht -
+    // das ist die eigentliche Ungereimtheit, nicht der Wert des Standards.
+    //
+    // JE METRIK UND NICHT JE BEREICH bei den Vitalwerten: wer den Blutdruck
+    // teilen will, will damit nicht die Stimmung teilen. Beide stehen in
+    // derselben Liste (`VITAL_METRICS`), und eine Voreinstellung fuer
+    // "Vitalwerte" haette genau die Vermengung erzeugt, gegen die der
+    // ausgelieferte Standard verteidigt wurde. Medikamente, Laborbefunde und
+    // Aktivitaeten haben je eine, weil sie je EINE Sorte Eintrag sind.
+    //
+    // SPARSE wie `access_permissions`: gespeichert wird nur, was vom
+    // ausgelieferten `private` abweicht. Eine fehlende Zeile ist damit kein
+    // Sonderfall, sondern der Normalfall, und ein Konto ohne jede Zeile
+    // verhaelt sich exakt wie vor dieser Migration.
+    //
+    //   scope_key  'vital:<type>' aus VITAL_METRICS, sonst 'meds' | 'labs'
+    //              | 'activities'. Kein CHECK: die Metrikliste waechst, und
+    //              eine append-only-Migration darf sie nicht einfrieren -
+    //              dieselbe Ueberlegung wie bei `invites.family_role`.
+    up: `
+      CREATE TABLE IF NOT EXISTS health_visibility_defaults (
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        scope_key  TEXT    NOT NULL,
+        visibility TEXT    NOT NULL CHECK(visibility IN ('private', 'family')),
+        updated_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        PRIMARY KEY (user_id, scope_key)
+      );
+    `,
+  },
+  {
+    version: 173,
+    description: 'Users: the changelog marks are remembered per account instead of per browser (#496)',
+    // DIESELBE LEHRE WIE BEI MIGRATION 168. Der Merker lag allein in
+    // localStorage, also weiss ein zweites Geraet nichts davon: wer die
+    // Aenderungen am Rechner gelesen hat, bekommt auf dem Tablet denselben
+    // Punkt und dieselbe "Neu in deiner App"-Liste noch einmal. Beim Onboarding
+    // war genau das gemeldet worden; hier habe ich es im Thread selbst als
+    // offene Kante benannt, bevor es jemand melden musste.
+    //
+    // ZWEI SPALTEN, WEIL ES ZWEI FRAGEN SIND:
+    //   changelog_seen_version  die INSTALLIERTE Version beim letzten Blick.
+    //                           Beantwortet "was hat sich fuer mich geaendert" -
+    //                           die Liste zaehlt nur Releases, die hier auch
+    //                           laufen.
+    //   changelog_seen_latest   die zuletzt bekannte VEROEFFENTLICHTE Version.
+    //                           Beantwortet "gibt es draussen etwas Neueres" -
+    //                           der Punkt an der Navigation.
+    // Sie in eine zu legen hiesse, eine der beiden Fragen falsch zu
+    // beantworten, sobald die Instanz hinter dem Release herlaeuft.
+    //
+    // WAS NICHT WANDERT: der zuletzt von GitHub gemeldete Stand und der
+    // Zeitpunkt der letzten Abfrage. Das ist ein Zwischenspeicher fuer eine
+    // Auskunft des Servers, kein Zustand einer Person - er darf je Geraet
+    // eigenstaendig altern.
+    //
+    // NULL heisst "noch nie hingesehen", und das ist ein anderer Zustand als
+    // "alles gesehen": die "Neu bei dir"-Liste bleibt beim ersten Blick
+    // bewusst leer, statt die gesamte Geschichte als verpasst auszugeben.
+    up: `
+      ALTER TABLE users ADD COLUMN changelog_seen_version TEXT;
+      ALTER TABLE users ADD COLUMN changelog_seen_latest  TEXT;
+    `,
+  },
+  {
+    version: 174,
+    description: 'Birthdays: optional name day with its own generated calendar event',
+    // A name day is an anniversary, not a birth date. Inventing a year would
+    // produce false information in APIs, exports, and date formatting, so it is
+    // stored canonically as MM-DD. Its event link is separate from the birthday
+    // so either occurrence can move, be removed, or be deleted at a provider.
+    up: `
+      ALTER TABLE birthdays ADD COLUMN name_day TEXT;
+      ALTER TABLE birthdays ADD COLUMN name_day_calendar_event_id INTEGER
+        REFERENCES calendar_events(id) ON DELETE SET NULL;
+      CREATE INDEX IF NOT EXISTS idx_birthdays_name_day_calendar_ref
+        ON birthdays(name_day_calendar_event_id);
+    `,
+  },
+  {
+    version: 175,
+    description: 'Permissions: allow fine-grained capability resources',
+    // `access_permissions.resource_type` is protected by a CHECK constraint.
+    // SQLite cannot extend that constraint in place, so the table is rebuilt
+    // while preserving every existing module and widget override verbatim.
+    // No concrete capability is registered here; features can add one without
+    // having to change this core table again.
+    up: `
+      CREATE TABLE access_permissions_new (
+        subject_type  TEXT NOT NULL CHECK(subject_type IN ('role', 'user')),
+        subject_id    TEXT NOT NULL,
+        resource_type TEXT NOT NULL CHECK(resource_type IN ('module', 'widget', 'capability')),
+        resource_key  TEXT NOT NULL,
+        access        TEXT NOT NULL CHECK(access IN ('none', 'read', 'write', 'allow')),
+        updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        PRIMARY KEY (subject_type, subject_id, resource_type, resource_key)
+      );
+      INSERT INTO access_permissions_new
+        (subject_type, subject_id, resource_type, resource_key, access, updated_at)
+      SELECT subject_type, subject_id, resource_type, resource_key, access, updated_at
+      FROM access_permissions;
+      DROP TABLE access_permissions;
+      ALTER TABLE access_permissions_new RENAME TO access_permissions;
+      CREATE INDEX IF NOT EXISTS idx_access_permissions_subject
+        ON access_permissions(subject_type, subject_id);
+    `,
+  },
+  {
+    version: 176,
+    description: 'Notes: user-defined personal and household categories',
+    // PERSOENLICHE KATEGORIEN sind Metadaten ihres Besitzers. Sie duerfen an
+    // einer geteilten Notiz haengen, bleiben fuer andere Betrachter aber
+    // unsichtbar. Deshalb steht der Besitzer an der Kategorie und nicht an der
+    // Zuordnung. Beim Loeschen des Kontos verschwinden seine Kategorien samt
+    // Zuordnungen; die geteilten Notizen bleiben bestehen.
+    //
+    // HAUSHALTSKATEGORIEN haben bewusst keinen Besitzer. `created_by` ist nur
+    // Audit-Metadatum und steht auf SET NULL, damit eine Kategorie nicht mit
+    // dem Konto ihres Erstellers verschwindet.
+    //
+    // ZWEI PARTIELLE UNIQUE-INDIZES bilden die beiden Namensraeume exakt ab:
+    // einmal pro Haushalt, einmal pro Besitzer. `name_key` verwendet die
+    // eingebaute Unicode-Normalisierung und Kleinschreibung der Laufzeit.
+    up: `
+      CREATE TABLE note_categories (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        name          TEXT    NOT NULL CHECK(length(trim(name)) BETWEEN 1 AND 80),
+        name_key      TEXT    NOT NULL,
+        scope         TEXT    NOT NULL CHECK(scope IN ('personal', 'household')),
+        owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        created_by    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        sort_order    INTEGER NOT NULL DEFAULT 0,
+        created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        CHECK(
+          (scope = 'personal' AND owner_user_id IS NOT NULL)
+          OR (scope = 'household' AND owner_user_id IS NULL)
+        )
+      );
+
+      CREATE TABLE note_category_assignments (
+        note_id     INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+        category_id INTEGER NOT NULL REFERENCES note_categories(id) ON DELETE CASCADE,
+        assigned_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        PRIMARY KEY (note_id, category_id)
+      );
+
+      CREATE UNIQUE INDEX idx_note_categories_household_name
+        ON note_categories(name_key)
+        WHERE scope = 'household';
+      CREATE UNIQUE INDEX idx_note_categories_personal_name
+        ON note_categories(owner_user_id, name_key)
+        WHERE scope = 'personal';
+      CREATE INDEX idx_note_categories_visible
+        ON note_categories(scope, owner_user_id, sort_order, name COLLATE NOCASE);
+      CREATE INDEX idx_note_category_assignments_category
+        ON note_category_assignments(category_id, note_id);
+      CREATE TRIGGER trg_note_categories_updated_at
+        AFTER UPDATE OF name, name_key, sort_order ON note_categories
+      BEGIN
+        UPDATE note_categories
+        SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        WHERE id = NEW.id;
+      END;
+    `,
+  },
+  {
+    version: 177,
+    description: 'Health: cycle reminders - widen reminders for cycle_period/cycle_log_nudge, add an anchor table',
+    foreignKeysOff: true,
+    up: `
+      -- DIE FUENFTE ERWEITERUNG DERSELBEN SPALTE, gleiche Bauart wie v137/v141/v148/v162.
+      -- foreignKeysOff bleibt Pflicht - notification_deliveries.reminder_id
+      -- haengt mit ON DELETE CASCADE an dieser Tabelle und wuerde beim
+      -- DROP TABLE leerlaufen.
+      CREATE TABLE reminders_new (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type   TEXT    NOT NULL CHECK(entity_type IN ('task', 'event', 'subscription', 'inventory_item', 'inventory_tracked_date', 'pantry_item', 'cycle_period', 'cycle_log_nudge')),
+        entity_id     INTEGER NOT NULL,
+        remind_at     TEXT    NOT NULL,
+        dismissed     INTEGER NOT NULL DEFAULT 0,
+        created_by    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        pushed_at     TEXT,
+        assigned_from INTEGER REFERENCES users(id) ON DELETE SET NULL
+      );
+      INSERT INTO reminders_new (id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from)
+        SELECT id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from FROM reminders;
+      DROP TABLE reminders;
+      ALTER TABLE reminders_new RENAME TO reminders;
+      CREATE INDEX idx_reminders_entity ON reminders(entity_type, entity_id);
+      CREATE INDEX idx_reminders_remind ON reminders(remind_at);
+      CREATE INDEX idx_reminders_user ON reminders(created_by);
+      CREATE INDEX idx_reminders_assigned_from ON reminders(assigned_from);
+
+      -- Weder ein vorhergesagter naechster Periodenbeginn noch "heute noch
+      -- nicht geloggt" ist eine gespeicherte Zeile - predictCycle() berechnet
+      -- den ersten rein aus der Perioden-Historie, der zweite ist die
+      -- Abwesenheit einer Zeile in cycle_day_logs. Beides hat also keine
+      -- stabile Id, an die reminders.entity_id haengen koennte (gleicher
+      -- Grund wie schedule_reminder_entries fuer Musterzyklus-Tage). Ein
+      -- Anker je (Person, Datum, Art) loest das einheitlich fuer beide
+      -- Erinnerungsarten in einer Tabelle statt zwei fast identischen.
+      CREATE TABLE cycle_reminder_anchors (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        anchor_date TEXT    NOT NULL,
+        kind        TEXT    NOT NULL CHECK(kind IN ('period_predicted', 'log_nudge')),
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE(user_id, anchor_date, kind)
+      );
+
+      -- NULL = aus (Standard). Tage Vorlauf vor dem vorhergesagten
+      -- Periodenbeginn, ab dem eine Erinnerung erscheint.
+      ALTER TABLE cycle_settings ADD COLUMN remind_period_days_before INTEGER;
+      -- Taeglicher Hinweis, den heutigen Tag einzutragen, falls noch kein Log
+      -- vorliegt. Eigener Schalter statt an remind_period_days_before
+      -- gekoppelt: wer nur an die Periode erinnert werden will, ist damit
+      -- nicht automatisch jemand, der jeden Tag protokollieren will.
+      ALTER TABLE cycle_settings ADD COLUMN remind_log_daily INTEGER NOT NULL DEFAULT 0 CHECK(remind_log_daily IN (0, 1));
+    `,
+  },
+  {
+    version: 178,
+    description: 'Health: graded symptom logging - normalized cycle_day_log_symptoms table, backfilled from the legacy CSV column',
+    // Die alte Komma-Spalte (cycle_day_logs.symptoms) bleibt UNVERAENDERT
+    // stehen - kein DROP COLUMN, kein Rebuild. Sie ist ab hier nur noch
+    // historisch: neue Schreibvorgaenge (server/routes/health/cycle.js)
+    // fuellen sie nicht mehr, und die API liest sie nicht mehr aus. Ein
+    // rohes DB-Backup aus der Zeit vor dieser Migration bleibt trotzdem
+    // lesbar, ohne dass ein zweiter Migrationspfad noetig waere.
+    up: (database) => {
+      database.exec(`
+        CREATE TABLE cycle_day_log_symptoms (
+          id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          day_log_id  INTEGER NOT NULL REFERENCES cycle_day_logs(id) ON DELETE CASCADE,
+          symptom_key TEXT    NOT NULL,
+          intensity   INTEGER CHECK(intensity IS NULL OR intensity BETWEEN 1 AND 3),
+          UNIQUE(day_log_id, symptom_key)
+        );
+        CREATE INDEX idx_cycle_day_log_symptoms_day_log ON cycle_day_log_symptoms(day_log_id);
+      `);
+
+      // Rueckwirkend aus der Komma-Liste befuellen, ohne Intensitaet (NULL) -
+      // die gab es vor dieser Migration nicht, und sie zu erraten waere eine
+      // erfundene Angabe, keine migrierte.
+      const rows = database.prepare(
+        "SELECT id, symptoms FROM cycle_day_logs WHERE symptoms IS NOT NULL AND symptoms <> ''"
+      ).all();
+      const insert = database.prepare(
+        'INSERT OR IGNORE INTO cycle_day_log_symptoms (day_log_id, symptom_key, intensity) VALUES (?, ?, NULL)'
+      );
+      for (const row of rows) {
+        const keys = new Set(String(row.symptoms).split(',').map((s) => s.trim()).filter(Boolean));
+        for (const key of keys) insert.run(row.id, key);
+      }
+    },
+  },
+  {
+    version: 179,
+    description: 'Health: optional basal body temperature per day log, for temperature-shift ovulation confirmation',
+    // Ein Skalarwert je Tag wie flow/mood - keine eigene Tabelle noetig, die
+    // Zeile existiert schon. Kein CHECK auf basal_temp_unit: dieselbe
+    // Freitext-Konvention wie health_vitals.unit (kein haushaltweiter
+    // C/F-Schalter existiert). Die Wertebereichs-/Einheiten-Pruefung (nur
+    // 'c'/'f', plausibler Koerpertemperatur-Bereich) liegt in der Route, nicht
+    // im Schema - dieselbe Aufteilung wie ueberall sonst in diesem Modul.
+    up: `
+      ALTER TABLE cycle_day_logs ADD COLUMN basal_temp REAL;
+      ALTER TABLE cycle_day_logs ADD COLUMN basal_temp_unit TEXT;
+    `,
+  },
+  {
+    version: 180,
+    description: 'Health: per-user read-only predicted-cycle ICS feed token',
+    // Gleiches Muster wie Migration 61 (calendar_feed_token) und 144
+    // (inventory_deadlines_feed_token): das Token haengt an der users-Zeile.
+    // Anders als beim Inventar-Feed ist der INHALT hier ohnehin schon
+    // personengebunden (cycle_periods.user_id) - kein haushaltweiter
+    // Rueckzugs-Nachteil zu vermeiden, aber dieselbe Konvention trotzdem
+    // richtig: ein Feed, ein Token, ein Ort, an dem er lebt.
+    up: `
+      ALTER TABLE users ADD COLUMN cycle_feed_token TEXT;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_cycle_feed_token
+        ON users(cycle_feed_token)
+        WHERE cycle_feed_token IS NOT NULL;
+    `,
+  },
+  {
+    version: 181,
+    description: 'Budget: materialisierte Serien-Instanzen erben das Konto ihrer Serie nach (#973)',
+    // Der Code-Fix in generateRecurringInstances wirkt nur auf NEUE Zeilen. Jeder
+    // Monat, der vor dem Update schon einmal geoeffnet wurde, traegt seine
+    // Instanzen bereits - mit account_id NULL, und die Materialisierung
+    // ueberspringt vorhandene Zeilen. Ohne diese Nachbesserung bliebe der
+    // gemeldete Fehler fuer genau die Daten stehen, an denen er aufgefallen ist.
+    //
+    // BEWUSST EINMALIG statt im Lesepfad: eine Regel "Instanz erbt das Konto der
+    // Serie", die bei jedem Lesen greift, koennte nie wieder unterschieden werden
+    // von "diese eine Buchung lief ausdruecklich ueber kein Konto". Einmal
+    // reparieren laesst das Modell danach in Ruhe.
+    //
+    // Drei Einschraenkungen, jede mit Grund:
+    //   - nur Instanzen (recurrence_parent_id IS NOT NULL); das Original ist eine
+    //     von Hand angelegte Buchung und hat sein Konto immer selbst getragen.
+    //   - nur wo bisher NULL steht; ein abweichend gesetztes Konto ist eine
+    //     Entscheidung und wird nicht ueberschrieben.
+    //   - NICHT bei virtuellen Serien: deren Instanzen sind geglaettete
+    //     Planwerte, und ein Konto an ihnen bewegte den Kontosaldo fuer eine
+    //     Abbuchung, die so nie stattfindet.
+    up: `
+      UPDATE budget_entries
+      SET account_id = (
+        SELECT p.account_id FROM budget_entries p
+        WHERE p.id = budget_entries.recurrence_parent_id
+      )
+      WHERE recurrence_parent_id IS NOT NULL
+        AND account_id IS NULL
+        AND EXISTS (
+          SELECT 1 FROM budget_entries p
+          WHERE p.id = budget_entries.recurrence_parent_id
+            AND p.account_id IS NOT NULL
+            AND p.recurrence_virtual = 0
+        );
+    `,
+  },
+  {
+    version: 182,
+    description: 'Schedule: an optional icon alongside a shift type\'s color (#786 follow-up)',
+    // Ein Lucide-Name wie ueberall sonst, wo ein Symbol erst zur Laufzeit
+    // feststeht (quick-links, Kalender-Termine) - nullable, weil bestehende
+    // Schichtarten schon ohne Icon leben und weiterhin duerfen.
+    up: `
+      ALTER TABLE schedule_shift_types ADD COLUMN icon TEXT;
+    `,
+  },
+  {
+    version: 183,
+    description: 'add per-user read-only schedule feed token',
+    up: `
+      -- Gleiches Muster wie Migration 61/144, aber hier ist der Inhalt selbst
+      -- schon persoenlich (die eigenen aufgeloesten Schichten), nicht nur der
+      -- Zugriff - anders als beim haushaltweiten Inventar-Fristen-Feed.
+      ALTER TABLE users ADD COLUMN schedule_feed_token TEXT;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_schedule_feed_token
+        ON users(schedule_feed_token)
+        WHERE schedule_feed_token IS NOT NULL;
+    `,
+  },
+  {
+    version: 184,
+    description: 'Schedule: shift-start reminders - widen reminders for schedule_entry, add an anchor table for pattern days',
+    foreignKeysOff: true,
+    // DIE SECHSTE ERWEITERUNG DERSELBEN SPALTE, gleiche Bauart wie v137/v141/v148/v162/v177.
+    up: `
+      CREATE TABLE reminders_new (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type TEXT    NOT NULL CHECK(entity_type IN ('task', 'event', 'subscription', 'inventory_item', 'inventory_tracked_date', 'pantry_item', 'cycle_period', 'cycle_log_nudge', 'schedule_entry')),
+        entity_id   INTEGER NOT NULL,
+        remind_at   TEXT    NOT NULL,
+        dismissed   INTEGER NOT NULL DEFAULT 0,
+        created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        pushed_at   TEXT,
+        assigned_from INTEGER REFERENCES users(id) ON DELETE SET NULL
+      );
+      INSERT INTO reminders_new (id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from)
+        SELECT id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from FROM reminders;
+      DROP TABLE reminders;
+      ALTER TABLE reminders_new RENAME TO reminders;
+      CREATE INDEX idx_reminders_entity ON reminders(entity_type, entity_id);
+      CREATE INDEX idx_reminders_remind ON reminders(remind_at);
+      CREATE INDEX idx_reminders_user ON reminders(created_by);
+      CREATE INDEX idx_reminders_assigned_from ON reminders(assigned_from);
+
+      -- Ein Musterzyklus-Tag ist keine gespeicherte Zeile (das ist der ganze
+      -- Punkt von "computed on read", siehe resolveEntries()) und hat deshalb
+      -- keine stabile Id, an die reminders.entity_id haengen koennte - anders
+      -- als bei jedem bisherigen entity_type, wo die Zeile schon existiert.
+      -- Diese Tabelle ist NICHT die Wahrheit ueber den Schichtplan (die bleibt
+      -- resolveEntries()); sie ist nur ein Anker je (Nutzer, Tag), den der
+      -- periodische Sync (server/services/schedule-reminders.js) fuer sein
+      -- rollierendes Fenster anlegt und wieder abraeumt, sobald der Tag aus
+      -- dem Fenster faellt oder keine Erinnerung mehr braucht.
+      --
+      -- pattern_day_id steht von Anfang an hier (nicht erst ab Migration 188):
+      -- ein Musterzyklus-Tag kann mehrere Klassen tragen (Stundenplan, siehe
+      -- schedule_pattern_days weiter unten), jede mit ihrem eigenen Anker, und
+      -- diese Tabelle hat vor dem allerersten Release noch nie eine andere
+      -- Form gehabt - ein Rebuild in einer spaeteren Migration haette nur eine
+      -- Tabelle abgerissen, die niemand je mit der alten Form befuellt hat.
+      -- NULL bleibt fuer einen Override-Anker (hoechstens einer je Tag).
+      CREATE TABLE schedule_reminder_entries (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        date_key       TEXT    NOT NULL,
+        shift_type_id  INTEGER NOT NULL REFERENCES schedule_shift_types(id) ON DELETE CASCADE,
+        pattern_day_id INTEGER
+      );
+      CREATE UNIQUE INDEX idx_schedule_reminder_entries_slot
+        ON schedule_reminder_entries(user_id, date_key, COALESCE(pattern_day_id, 0));
+
+      -- NULL = abgeschaltet (Standard), sonst der Vorlauf in Minuten vor
+      -- Schichtbeginn. Anders als calendar_feed_token keine eigene
+      -- Aktiv/Inaktiv-Spalte: der Vorlauf selbst ist der Schalter, wie schon
+      -- bei den Vorrats-Ablauferinnerungen (EXPIRY_REMINDER_OFFSET_DAYS).
+      ALTER TABLE users ADD COLUMN schedule_reminder_offset_minutes INTEGER;
+    `,
+  },
+  {
+    version: 185,
+    description: 'Schedule: a personal weekly-hours target for the overtime flag',
+    up: `
+      -- NULL faellt auf den bisherigen festen Wert (40) zurueck - ein
+      -- Bestandshaushalt sieht also keinen stillen Wechsel. Personenbezogen
+      -- statt haushaltweit: ein Teilzeit- und ein Vollzeit-Mitglied im
+      -- selben Haushalt haben unterschiedliche Sollstunden, und die
+      -- Ueberstundenkarte in der Statistik rechnet je Person.
+      ALTER TABLE users ADD COLUMN schedule_weekly_hours INTEGER;
+    `,
+  },
+  {
+    version: 186,
+    description: 'Schedule: extra shifts, additive to the primary pattern/override slot (on-call alongside a regular shift)',
+    // Bewusst OHNE UNIQUE(user_id, date_key) - anders als schedule_overrides,
+    // dessen genau eine Zeile je Tag der ganze Punkt ist. Ein "extra" ist
+    // additiv zu dem, was resolveEntries() fuer den Tag ohnehin ausgibt (auch
+    // wenn das nichts ist - ein reiner Bereitschaftstag ohne regulaere Schicht
+    // braucht keine Sonderbehandlung), nie ein Ersatz dafuer, daher beliebig
+    // viele Zeilen je Nutzer und Tag, auch mit demselben shift_type_id.
+    // shift_type_id ist NOT NULL, weil ein Extra nur existiert, um eine
+    // zusaetzliche Schicht hinzuzufuegen - anders als bei einem Override gibt
+    // es kein "Extra, das ausdruecklich frei bedeutet".
+    up: `
+      CREATE TABLE schedule_extra_shifts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        date_key TEXT NOT NULL,
+        shift_type_id INTEGER NOT NULL REFERENCES schedule_shift_types(id) ON DELETE RESTRICT,
+        note TEXT,
+        reminder_offset_minutes INTEGER,
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE INDEX idx_schedule_extra_shifts_user ON schedule_extra_shifts(user_id, date_key);
+    `,
+  },
+  {
+    version: 187,
+    description: 'Reminders: widen for schedule_extra_entry, extra shifts get their own independent reminders',
+    foreignKeysOff: true,
+    // DIE SIEBTE ERWEITERUNG DERSELBEN SPALTE, gleiche Bauart wie v137/v141/v148/v162/v177/v184.
+    // Anders als schedule_entry (Migration 184) braucht dieser Typ KEINE
+    // Anker-Tabelle: eine schedule_extra_shifts-Zeile ist schon eine echte,
+    // gespeicherte Zeile mit eigener stabiler Id, sobald sie angelegt wird -
+    // reminders.entity_id zeigt direkt darauf.
+    up: `
+      CREATE TABLE reminders_new (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type TEXT    NOT NULL CHECK(entity_type IN ('task', 'event', 'subscription', 'inventory_item', 'inventory_tracked_date', 'pantry_item', 'cycle_period', 'cycle_log_nudge', 'schedule_entry', 'schedule_extra_entry')),
+        entity_id   INTEGER NOT NULL,
+        remind_at   TEXT    NOT NULL,
+        dismissed   INTEGER NOT NULL DEFAULT 0,
+        created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        pushed_at   TEXT,
+        assigned_from INTEGER REFERENCES users(id) ON DELETE SET NULL
+      );
+      INSERT INTO reminders_new (id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from)
+        SELECT id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from FROM reminders;
+      DROP TABLE reminders;
+      ALTER TABLE reminders_new RENAME TO reminders;
+      CREATE INDEX idx_reminders_entity ON reminders(entity_type, entity_id);
+      CREATE INDEX idx_reminders_remind ON reminders(remind_at);
+      CREATE INDEX idx_reminders_user ON reminders(created_by);
+      CREATE INDEX idx_reminders_assigned_from ON reminders(assigned_from);
+    `,
+  },
+  {
+    version: 188,
+    description: 'Schedule: multiple pattern days at the same cycle position (timetables, not just one shift/day)',
+    foreignKeysOff: true,
+    // schedule_pattern_days trug bisher UNIQUE(pattern_id, position) - genau
+    // EIN Schichttyp je Zyklustag. Fuer einen Stunden-/Vorlesungsplan reicht
+    // das nicht: ein Wochentag traegt dort mehrere Bloecke zu verschiedenen
+    // Zeiten (Mathe 8-9, Bio 9-10, ...), jeder sein eigener shift_type_id.
+    // SQLite kennt kein ALTER TABLE ... DROP CONSTRAINT, daher der Neubau -
+    // rein additiv/rueckwirkungsfrei, jede bestehende Zeile erfuellt die
+    // lockerere Form schon 1:1.
+    //
+    // schedule_reminder_entries traegt pattern_day_id bereits seit ihrer
+    // Entstehung (Migration 184) - kein zweiter Rebuild hier noetig, siehe
+    // deren eigener Kommentar.
+    up: `
+      CREATE TABLE schedule_pattern_days_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pattern_id INTEGER NOT NULL REFERENCES schedule_patterns(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL CHECK (position >= 0),
+        shift_type_id INTEGER REFERENCES schedule_shift_types(id) ON DELETE RESTRICT
+      );
+      INSERT INTO schedule_pattern_days_new (id, pattern_id, position, shift_type_id)
+        SELECT id, pattern_id, position, shift_type_id FROM schedule_pattern_days;
+      DROP TABLE schedule_pattern_days;
+      ALTER TABLE schedule_pattern_days_new RENAME TO schedule_pattern_days;
+      CREATE INDEX idx_schedule_pattern_days_pattern_position ON schedule_pattern_days(pattern_id, position);
+    `,
+  },
+  {
+    version: 189,
+    description: 'Schedule: custom field registry, per-shift-type assignment, and per-occurrence values',
+    up: `
+      CREATE TABLE schedule_custom_fields (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT    NOT NULL,
+        created_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE TRIGGER trg_schedule_custom_fields_updated_at AFTER UPDATE ON schedule_custom_fields FOR EACH ROW BEGIN
+        UPDATE schedule_custom_fields SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+
+      -- Welche Felder an welchem Schichttyp haengen, in welcher Reihenfolge und
+      -- ob der Wert in der Kalender-Overlay-Zeile mitgezeigt wird. Ein Feld
+      -- (z.B. "Raum") ist einmal definiert und kann an vielen Schichttypen
+      -- haengen - deshalb eine eigene Zuordnungstabelle statt einer Spalte an
+      -- schedule_custom_fields.
+      CREATE TABLE schedule_shift_type_fields (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        shift_type_id    INTEGER NOT NULL REFERENCES schedule_shift_types(id) ON DELETE CASCADE,
+        custom_field_id  INTEGER NOT NULL REFERENCES schedule_custom_fields(id) ON DELETE CASCADE,
+        position         INTEGER NOT NULL DEFAULT 0,
+        show_in_overlay  INTEGER NOT NULL DEFAULT 0 CHECK (show_in_overlay IN (0, 1)),
+        UNIQUE (shift_type_id, custom_field_id)
+      );
+      CREATE INDEX idx_schedule_shift_type_fields_type ON schedule_shift_type_fields(shift_type_id, position);
+
+      -- Der eigentliche Wert je Vorkommen. entry_id ist bewusst OHNE echten
+      -- Fremdschluessel (polymorph ueber drei Elterntabellen - schedule_pattern_days,
+      -- schedule_overrides, schedule_extra_shifts - dasselbe Zugestaendnis wie
+      -- reminders.entity_id). custom_field_id zeigt dagegen immer auf genau eine
+      -- Tabelle und traegt deshalb einen echten Fremdschluessel. "Keine Zeile"
+      -- heisst "nicht gesetzt" - eine leere Zeichenkette wird nie gespeichert.
+      CREATE TABLE schedule_custom_field_values (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        entry_type       TEXT    NOT NULL CHECK (entry_type IN ('pattern_day', 'override', 'extra_shift')),
+        entry_id         INTEGER NOT NULL,
+        custom_field_id  INTEGER NOT NULL REFERENCES schedule_custom_fields(id) ON DELETE CASCADE,
+        value            TEXT    NOT NULL CHECK (length(value) BETWEEN 1 AND 500),
+        UNIQUE (entry_type, entry_id, custom_field_id)
+      );
+      CREATE INDEX idx_schedule_custom_field_values_entry ON schedule_custom_field_values(entry_type, entry_id);
+    `,
+  },
+  {
+    version: 190,
+    description: 'account username on inventory items and subscriptions',
+    up: `
+      -- DIE KONTOANGABE OHNE DAS GEHEIMNIS (#1004).
+      --
+      -- Unter welcher Adresse oder welchem Benutzernamen ein Geraet oder ein Abo
+      -- registriert ist. Das ist KEIN Passwortfeld und wird es nie: ein
+      -- Benutzername ohne sein Passwort ist ein Telefonbucheintrag, und genau
+      -- deshalb darf er unverschluesselt in der normalen Datenbank stehen. Die
+      -- Grenze dazu steht dauerhaft in docs/SCOPE.md, Abschnitt 2.
+      --
+      -- HAUSHALTSWEIT IM INVENTAR, und das ist eine Entscheidung, keine
+      -- Nachlaessigkeit: inventory_items traegt weder owner_id noch visibility,
+      -- der Zugriff faellt einmal je Mitglied auf Modulebene (#467). Ein
+      -- eigentuemer-gebundenes Feld haette also bedeutet, dem Inventar ein
+      -- Besitzmodell zu geben, nur um eine Spalte zu halten. Der Melder hat das
+      -- in #1004 selbst so entschieden: Kontonamen sind meist E-Mail-Adressen,
+      -- und wer im Netz und auf dem Server ohnehin vertraut ist, kennt sie.
+      --
+      -- Bei budget_subscriptions liegt die Spalte dagegen in einer Zeile, die
+      -- owner_id und visibility schon hat - sie folgt ihnen ohne Zutun.
+      ALTER TABLE inventory_items      ADD COLUMN account_username TEXT;
+      ALTER TABLE budget_subscriptions ADD COLUMN account_username TEXT;
+    `,
+  },
+  {
+    version: 191,
+    description: 'responsible members per budget entry',
+    up: `
+      -- WER SICH UM EINE BUCHUNG KUEMMERT (#1057) - ein Etikett, das kein Geld
+      -- bewegt.
+      --
+      -- NICHT owner_id, und das ist der Kern der Sache: jene Spalte ist die
+      -- Datenschutz-Achse. Sie steht auf der anlegenden Person fest und ist
+      -- bewusst nicht aenderbar, weil die Sichtbarkeit privater Buchungen an ihr
+      -- haengt. Wer sie zum Zustaendigkeitsfeld umwidmet, gibt der zustaendigen
+      -- Person die Privatsemantik der Zeile mit - ein Rechtefehler, der wie ein
+      -- Feature aussieht. Zustaendigkeit ist eine ZWEITE Achse.
+      --
+      -- EIGENE TABELLE statt einer Spalte, weil mehrere Personen sich eine
+      -- Buchung teilen koennen ("die Versicherung laeuft auf uns beide") -
+      -- dieselbe Form wie event_assignments und task_assignments.
+      --
+      -- UND KEINE FORDERUNG: hier entsteht nichts, was jemand schuldet. Das
+      -- Abrechnen zwischen Personen bleibt in den geteilten Ausgaben; diese
+      -- Tabelle traegt nur das Etikett.
+      CREATE TABLE budget_entry_responsibles (
+        entry_id INTEGER NOT NULL REFERENCES budget_entries(id) ON DELETE CASCADE,
+        user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        PRIMARY KEY (entry_id, user_id)
+      );
+      -- Fuer "zeig mir alles, wofuer Person X zustaendig ist" - die Richtung,
+      -- die der Primaerschluessel nicht bedient.
+      CREATE INDEX idx_budget_entry_responsibles_user ON budget_entry_responsibles(user_id);
+    `,
+  },
+  {
+    version: 192,
+    description: 'own image for recipes typed into yuvomi',
+    up: `
+      -- EIN BILD JE REZEPT (#1059, Schritt 2).
+      --
+      -- Schritt 1 zeigte im Planer und auf der Uebersichtskachel das Bild eines
+      -- gespiegelten Provider-Rezepts; wer keinen Mealie- oder Tandoor-Server
+      -- betreibt - die Mehrheit - sah dort weiter nur Text. Diese Spalte traegt
+      -- das selbst hochgeladene Bild.
+      --
+      -- ALS DATA-URL IN DER ZEILE, wie das Gegenstandsfoto (Migration 142) und
+      -- das Geburtstagsbild: ein Bild je Datensatz, dieselbe Groessengrenze,
+      -- derselbe Zuschnitt im Client. Ein eigener Speicherort waere die dritte
+      -- Bauart fuer dieselbe Sache - und die Dokumentenablage ist fuer Dateien
+      -- da, die der Haushalt VERWALTET, nicht fuer eine Vorschau, die zu ihrer
+      -- Zeile gehoert und mit ihr verschwindet.
+      ALTER TABLE recipes ADD COLUMN image_data TEXT;
+    `,
+  },
+  {
+    version: 193,
+    description: 'price and shop on a shopping item, managed shop list',
+    up: `
+      -- WAS HAT ES GEKOSTET, UND WO (#1003, erster Schnitt).
+      --
+      -- Ein Preis ist eine Tatsache ueber einen EINKAUF: einmal bezahlt, in
+      -- einem Laden, an einem Tag - und danach fuer immer wahr. Niemand muss
+      -- ihn pflegen, damit er richtig bleibt, und ein alter Preis ist ein
+      -- brauchbarer alter Preis. Genau diese Probe besteht ein Naehrwert oder
+      -- eine Packungsgroesse nicht, und deshalb steht hier kein Produktkatalog
+      -- (#714).
+      --
+      -- DER LADEN ALS TABELLE, NICHT ALS FREITEXT. Ein Haushalt besucht wenige
+      -- genug Laeden, dass Pflegen billig ist; Freitext ist ab der ersten Woche
+      -- unordentlich (REWE, Rewe, rewe City sind dann drei Laeden).
+      CREATE TABLE shopping_stores (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        name       TEXT    NOT NULL,
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (name)
+      );
+
+      -- Der Preis in CENT als ganze Zahl, nicht als Gleitkomma: Geld in einem
+      -- REAL zu fuehren summiert sich sichtbar falsch, und die Historie, die
+      -- spaeter darauf aufbaut, addiert genau solche Zahlen.
+      --
+      -- KEIN FREMDSCHLUESSEL-CASCADE auf den Laden, sondern SET NULL: ein
+      -- geloeschter Laden darf den bezahlten Preis nicht mitnehmen. Was einmal
+      -- bezahlt wurde, bleibt wahr, auch wenn der Laden aus der Liste
+      -- verschwindet.
+      ALTER TABLE shopping_items ADD COLUMN price_cents INTEGER;
+      ALTER TABLE shopping_items ADD COLUMN store_id INTEGER REFERENCES shopping_stores(id) ON DELETE SET NULL;
+      CREATE INDEX idx_shopping_items_store ON shopping_items(store_id);
+    `,
+  },
+  {
+    version: 194,
+    description: 'Calendar: linked overrides for local recurring occurrences (#975)',
+    up: `
+      ALTER TABLE calendar_events ADD COLUMN recurrence_parent_id INTEGER
+        REFERENCES calendar_events(id) ON DELETE CASCADE;
+      ALTER TABLE calendar_events ADD COLUMN recurrence_id TEXT;
+      ALTER TABLE calendar_events ADD COLUMN overridden_fields TEXT;
+      CREATE UNIQUE INDEX idx_calendar_occurrence_override_slot
+        ON calendar_events(recurrence_parent_id, recurrence_id)
+        WHERE recurrence_parent_id IS NOT NULL;
+      CREATE INDEX idx_calendar_occurrence_override_range
+        ON calendar_events(recurrence_parent_id, start_datetime)
+        WHERE recurrence_parent_id IS NOT NULL;
+
+      -- A child inherits text it did not override, so indexing its stored copy
+      -- would duplicate the master for ordinary searches and consume LIMIT.
+      DROP TRIGGER IF EXISTS trg_search_events_ai;
+      DROP TRIGGER IF EXISTS trg_search_events_au;
+      DROP TRIGGER IF EXISTS trg_search_events_ad;
+      CREATE TRIGGER trg_search_events_ai AFTER INSERT ON calendar_events BEGIN
+        INSERT INTO search_index (entity, entity_id, title, body)
+        VALUES ('event', NEW.id,
+          CASE WHEN NEW.recurrence_parent_id IS NULL
+                 OR EXISTS (SELECT 1 FROM json_each(
+                      CASE WHEN json_valid(NEW.overridden_fields) THEN
+                        CASE WHEN json_type(NEW.overridden_fields) = 'array' THEN NEW.overridden_fields END
+                      END) WHERE type = 'text' AND value = 'title')
+               THEN COALESCE(NEW.title, '') ELSE '' END,
+          TRIM(
+            CASE WHEN NEW.recurrence_parent_id IS NULL
+                    OR EXISTS (SELECT 1 FROM json_each(
+                         CASE WHEN json_valid(NEW.overridden_fields) THEN
+                           CASE WHEN json_type(NEW.overridden_fields) = 'array' THEN NEW.overridden_fields END
+                         END) WHERE type = 'text' AND value = 'description')
+                 THEN COALESCE(NEW.description, '') ELSE '' END
+            || ' ' ||
+            CASE WHEN NEW.recurrence_parent_id IS NULL
+                    OR EXISTS (SELECT 1 FROM json_each(
+                         CASE WHEN json_valid(NEW.overridden_fields) THEN
+                           CASE WHEN json_type(NEW.overridden_fields) = 'array' THEN NEW.overridden_fields END
+                         END) WHERE type = 'text' AND value = 'location')
+                 THEN COALESCE(NEW.location, '') ELSE '' END));
+      END;
+      CREATE TRIGGER trg_search_events_au AFTER UPDATE ON calendar_events BEGIN
+        DELETE FROM search_index WHERE entity = 'event' AND entity_id = OLD.id;
+        INSERT INTO search_index (entity, entity_id, title, body)
+        VALUES ('event', NEW.id,
+          CASE WHEN NEW.recurrence_parent_id IS NULL
+                 OR EXISTS (SELECT 1 FROM json_each(
+                      CASE WHEN json_valid(NEW.overridden_fields) THEN
+                        CASE WHEN json_type(NEW.overridden_fields) = 'array' THEN NEW.overridden_fields END
+                      END) WHERE type = 'text' AND value = 'title')
+               THEN COALESCE(NEW.title, '') ELSE '' END,
+          TRIM(
+            CASE WHEN NEW.recurrence_parent_id IS NULL
+                    OR EXISTS (SELECT 1 FROM json_each(
+                         CASE WHEN json_valid(NEW.overridden_fields) THEN
+                           CASE WHEN json_type(NEW.overridden_fields) = 'array' THEN NEW.overridden_fields END
+                         END) WHERE type = 'text' AND value = 'description')
+                 THEN COALESCE(NEW.description, '') ELSE '' END
+            || ' ' ||
+            CASE WHEN NEW.recurrence_parent_id IS NULL
+                    OR EXISTS (SELECT 1 FROM json_each(
+                         CASE WHEN json_valid(NEW.overridden_fields) THEN
+                           CASE WHEN json_type(NEW.overridden_fields) = 'array' THEN NEW.overridden_fields END
+                         END) WHERE type = 'text' AND value = 'location')
+                 THEN COALESCE(NEW.location, '') ELSE '' END));
+      END;
+      CREATE TRIGGER trg_search_events_ad AFTER DELETE ON calendar_events BEGIN
+        DELETE FROM search_index WHERE entity = 'event' AND entity_id = OLD.id;
+      END;
+      DELETE FROM search_index WHERE entity = 'event';
+      INSERT INTO search_index (entity, entity_id, title, body)
+      SELECT 'event', id,
+        CASE WHEN recurrence_parent_id IS NULL
+               OR EXISTS (SELECT 1 FROM json_each(
+                    CASE WHEN json_valid(overridden_fields) THEN
+                      CASE WHEN json_type(overridden_fields) = 'array' THEN overridden_fields END
+                    END) WHERE type = 'text' AND value = 'title')
+             THEN COALESCE(title, '') ELSE '' END,
+        TRIM(
+          CASE WHEN recurrence_parent_id IS NULL
+                  OR EXISTS (SELECT 1 FROM json_each(
+                       CASE WHEN json_valid(overridden_fields) THEN
+                         CASE WHEN json_type(overridden_fields) = 'array' THEN overridden_fields END
+                       END) WHERE type = 'text' AND value = 'description')
+               THEN COALESCE(description, '') ELSE '' END
+          || ' ' ||
+          CASE WHEN recurrence_parent_id IS NULL
+                  OR EXISTS (SELECT 1 FROM json_each(
+                       CASE WHEN json_valid(overridden_fields) THEN
+                         CASE WHEN json_type(overridden_fields) = 'array' THEN overridden_fields END
+                       END) WHERE type = 'text' AND value = 'location')
+               THEN COALESCE(location, '') ELSE '' END)
+      FROM calendar_events;    `,
+  },
+  {
+    version: 195,
+    description: 'heal contacts auto-created for family/guest members with the legacy Sonstiges category (#1140)',
+    up: `
+      -- Die Kontakte, die beim Anlegen eines Haushaltsmitglieds oder Gasts
+      -- gespiegelt werden (server/auth.js, server/routes/split-expenses.js),
+      -- schrieben weiterhin die alte, deutsche Kategorie 'Sonstiges' statt des
+      -- stabilen Keys 'misc'. Da 'Sonstiges' kein Key in contact_categories
+      -- ist, gab die UI ihn unuebersetzt aus (#1140).
+      --
+      -- BEWUSST BREITER ALS MIGRATION 91: die beschraenkte sich auf
+      -- carddav_uid IS NOT NULL, um manuell angelegte Kontakte zu schonen.
+      -- Diese Vorsicht traegt hier nichts mehr: die Spalte hat
+      -- DEFAULT 'Sonstiges', und das Kontaktformular bietet nur Keys aus
+      -- contact_categories an - kein Nutzer kann den rohen Wert von Hand
+      -- eingegeben haben. Jede verbliebene 'Sonstiges'-Zeile ist ein
+      -- liegengebliebener Legacy-Default, keine Nutzerentscheidung.
+      UPDATE contacts SET category = 'misc' WHERE category = 'Sonstiges';
+    `,
+  },
+  {
+    version: 196,
+    description: 'change counter per shopping list, fed by triggers, for live updates',
+    up: `
+      -- WER GEAENDERT HAT, IST EGAL - DASS SICH ETWAS GEAENDERT HAT, ZAEHLT.
+      --
+      -- Eine Laufnummer je Liste, die bei jeder Aenderung an der Liste oder
+      -- ihren Artikeln steigt. GET /shopping/versions liest nur diese Tabelle;
+      -- ein offener Einkaufszettel fragt sie im Takt und laedt eine Liste nach,
+      -- deren Nummer sich bewegt hat. Zwei Leute im selben Laden sahen bis
+      -- dahin zwei verschiedene Listen, bis einer die Seite neu lud.
+      --
+      -- ALS TRIGGER, NICHT ALS AUFRUF IN DEN ROUTEN: shopping_items wird aus
+      -- sechs Modulen beschrieben (Einkauf, Essensplan, Rezepte, Haushaltshilfe,
+      -- MCP, CalDAV-Sync). Ein Vermerk an jeder Schreibstelle waere sechs
+      -- Gelegenheiten, ihn zu vergessen, und die siebte Stelle vergaesse ihn
+      -- sicher. Hier steht die Regel einmal, und wer immer schreibt, loest sie
+      -- aus (docs/DECISIONS.md, Eintrag 2).
+      CREATE TABLE shopping_list_changes (
+        list_id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL DEFAULT 0
+      );
+      -- JEDE LISTE HAT VON ANFANG AN EINE ZEILE. Der Client merkt sich die
+      -- Nummer, die er zuerst sieht, als Ausgangsstand - eine Liste ohne Zeile
+      -- taucht erst mit ihrer ersten Aenderung auf, und genau die ginge dann
+      -- als "Ausgangsstand" verloren. Bestand hier, Neuanlage per Trigger.
+      INSERT INTO shopping_list_changes (list_id, version) SELECT id, 0 FROM shopping_lists;
+      CREATE TRIGGER trg_shopping_lists_change_ai AFTER INSERT ON shopping_lists BEGIN
+        INSERT OR IGNORE INTO shopping_list_changes (list_id, version) VALUES (NEW.id, 0);
+      END;
+      -- Umbenennen ist eine Aenderung, die die anderen Geraete sehen sollen.
+      CREATE TRIGGER trg_shopping_lists_change_au AFTER UPDATE ON shopping_lists BEGIN
+        INSERT INTO shopping_list_changes (list_id, version) VALUES (NEW.id, 1)
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      CREATE TRIGGER trg_shopping_items_change_ai AFTER INSERT ON shopping_items BEGIN
+        INSERT INTO shopping_list_changes (list_id, version) VALUES (NEW.list_id, 1)
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      -- NUR EINE AENDERUNG, DIE DER ZETTEL ZEIGT, ZAEHLT. Ein UPDATE ohne
+      -- WHEN bewegte die Nummer auch fuer die Buchhaltung: fuer outbound_dirty
+      -- (der CalDAV-Push setzt es nach dem eigenen Haken auf 1 und nach dem
+      -- Versand auf 0 - zwei Schritte, die keine Quittung deckt, und der
+      -- eigene Haken kostete auf einer gespiegelten Liste doch ein Nachladen),
+      -- fuer updated_at (trg_shopping_items_updated_at schreibt es in einem
+      -- zweiten UPDATE - jede Aenderung zaehlte doppelt) und fuer den
+      -- Inbound-Sync, der jede gespiegelte Zeile bei jedem Lauf unveraendert
+      -- neu schreibt. IS NOT statt <>, damit NULL gegen NULL gleich ist.
+      -- Die Liste nennt genau die Spalten, die der Zettel zeigt; eine neue
+      -- Spalte, die er zeigen soll, braucht eine Migration mit dem Trigger.
+      CREATE TRIGGER trg_shopping_items_change_au AFTER UPDATE ON shopping_items
+        WHEN NEW.list_id IS NOT OLD.list_id OR NEW.name IS NOT OLD.name
+          OR NEW.quantity IS NOT OLD.quantity OR NEW.category IS NOT OLD.category
+          OR NEW.is_checked IS NOT OLD.is_checked OR NEW.notes IS NOT OLD.notes
+          OR NEW.url IS NOT OLD.url OR NEW.sort_order IS NOT OLD.sort_order
+          OR NEW.price_cents IS NOT OLD.price_cents OR NEW.store_id IS NOT OLD.store_id
+        BEGIN
+        INSERT INTO shopping_list_changes (list_id, version) VALUES (NEW.list_id, 1)
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      -- Ein Artikel, der die Liste wechselt (der CalDAV-Sync schreibt list_id
+      -- um, wenn die Zielliste einer Auswahl wechselt), ist auch fuer die
+      -- Liste eine Aenderung, die er VERLAESST.
+      CREATE TRIGGER trg_shopping_items_change_au_moved AFTER UPDATE OF list_id ON shopping_items
+        WHEN OLD.list_id <> NEW.list_id BEGIN
+        INSERT INTO shopping_list_changes (list_id, version) VALUES (OLD.list_id, 1)
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      CREATE TRIGGER trg_shopping_items_change_ad AFTER DELETE ON shopping_items BEGIN
+        INSERT INTO shopping_list_changes (list_id, version) VALUES (OLD.list_id, 1)
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      -- AUCH DIE TAGS EINES ARTIKELS ZAEHLEN. Der Client vergleicht sie beim
+      -- Nachladen (liveRefreshPlan), und ihr einziger Schreiber heute - der
+      -- CalDAV-To-do-Sync ueber setItemTags() - schreibt zwar gleich nach einem
+      -- UPDATE desselben Artikels, aber ein Trigger jetzt kostet weniger als
+      -- eine Migration spaeter, wenn der zweite Schreiber kommt. Die Tabelle
+      -- traegt keine list_id; die kommt vom Artikel. Faellt der Artikel selbst
+      -- (Kaskade), ist seine Zeile schon weg, das SELECT liefert nichts, und
+      -- die Loeschung zaehlt nur einmal - ueber den Trigger des Artikels.
+      -- Das WHERE im SELECT ist Pflicht: ohne eines liest SQLite das ON
+      -- CONFLICT als Teil des SELECT (Parser-Mehrdeutigkeit der Upsert-Syntax).
+      CREATE TRIGGER trg_shopping_item_tags_change_ai AFTER INSERT ON shopping_item_tags BEGIN
+        INSERT INTO shopping_list_changes (list_id, version)
+          SELECT list_id, 1 FROM shopping_items WHERE id = NEW.item_id
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      CREATE TRIGGER trg_shopping_item_tags_change_ad AFTER DELETE ON shopping_item_tags BEGIN
+        INSERT INTO shopping_list_changes (list_id, version)
+          SELECT list_id, 1 FROM shopping_items WHERE id = OLD.item_id
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      -- KEIN FREMDSCHLUESSEL auf shopping_lists: der Loesch-Trigger der Artikel
+      -- feuert waehrend der Kaskade einer Listenloeschung, und ein Fremdschluessel
+      -- liesse genau dieses Einfuegen scheitern. Aufgeraeumt wird stattdessen
+      -- hinter der Liste her - und dass die Zeile fehlt, ist fuer den Client
+      -- die Nachricht, dass die Liste weg ist.
+      CREATE TRIGGER trg_shopping_lists_change_ad AFTER DELETE ON shopping_lists BEGIN
+        DELETE FROM shopping_list_changes WHERE list_id = OLD.id;
+      END;
+    `,
+  },
+  {
+    version: 197,
+    description: 'Waste collection: types, manual schedules, per-occurrence overrides, and one-off pickups (#1063)',
+    up: `
+      CREATE TABLE waste_types (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT    NOT NULL,
+        icon        TEXT    NOT NULL DEFAULT 'trash-2',
+        color       TEXT    NOT NULL,
+        archived    INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+        sort_order  INTEGER NOT NULL DEFAULT 0,
+        created_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE TRIGGER trg_waste_types_updated_at AFTER UPDATE ON waste_types FOR EACH ROW BEGIN
+        UPDATE waste_types SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+      CREATE INDEX idx_waste_types_sort ON waste_types(archived, sort_order);
+
+      -- recurrence_kind picks which of weekdays / month_day is authoritative for a
+      -- schedule; the trailing CHECK keeps the other one NULL so a row can never
+      -- carry both or neither. month_day=-1 means "last day of the month" (mirrors
+      -- recurrence.js's own BYMONTHDAY=-1 convention); 1..31 means a fixed day, and
+      -- anchor_date's own day-of-month must equal it (enforced in waste-domain.js,
+      -- not here, since SQLite CHECK can't read a substring of another column
+      -- portably across the two representations the codebase already has).
+      CREATE TABLE waste_schedules (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        type_id          INTEGER NOT NULL REFERENCES waste_types(id),
+        recurrence_kind  TEXT    NOT NULL CHECK (recurrence_kind IN ('weekly', 'monthly_fixed_day')),
+        anchor_date      TEXT    NOT NULL,
+        interval         INTEGER NOT NULL DEFAULT 1 CHECK (interval BETWEEN 1 AND 52),
+        weekdays         TEXT,
+        month_day        INTEGER CHECK (month_day IS NULL OR month_day = -1 OR month_day BETWEEN 1 AND 31),
+        valid_until      TEXT,
+        active           INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+        created_by       INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        CHECK (
+          (recurrence_kind = 'weekly' AND weekdays IS NOT NULL AND month_day IS NULL)
+          OR (recurrence_kind = 'monthly_fixed_day' AND month_day IS NOT NULL AND weekdays IS NULL)
+        )
+      );
+      CREATE TRIGGER trg_waste_schedules_updated_at AFTER UPDATE ON waste_schedules FOR EACH ROW BEGIN
+        UPDATE waste_schedules SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+      CREATE INDEX idx_waste_schedules_type_active ON waste_schedules(type_id, active);
+
+      -- One row per exception to a schedule's calculated occurrences.
+      -- replacement_date NULL = explicit skip; a date = moved. UNIQUE(schedule_id,
+      -- original_date) keeps a single calculated occurrence from carrying two
+      -- contradictory overrides.
+      CREATE TABLE waste_schedule_overrides (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        schedule_id       INTEGER NOT NULL REFERENCES waste_schedules(id) ON DELETE CASCADE,
+        original_date     TEXT    NOT NULL,
+        replacement_date  TEXT,
+        note              TEXT,
+        created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (schedule_id, original_date),
+        CHECK (replacement_date IS NULL OR replacement_date <> original_date)
+      );
+      CREATE TRIGGER trg_waste_schedule_overrides_updated_at AFTER UPDATE ON waste_schedule_overrides FOR EACH ROW BEGIN
+        UPDATE waste_schedule_overrides SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+      CREATE INDEX idx_waste_schedule_overrides_schedule ON waste_schedule_overrides(schedule_id);
+
+      -- A one-off is a domain fact (irregular/special collection), not a schedule
+      -- with a fake recurrence. UNIQUE(type_id, date) keeps re-adding the same
+      -- manual fact from silently duplicating an occurrence.
+      CREATE TABLE waste_one_off_pickups (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        type_id     INTEGER NOT NULL REFERENCES waste_types(id),
+        date        TEXT    NOT NULL,
+        note        TEXT,
+        created_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (type_id, date)
+      );
+      CREATE TRIGGER trg_waste_one_off_pickups_updated_at AFTER UPDATE ON waste_one_off_pickups FOR EACH ROW BEGIN
+        UPDATE waste_one_off_pickups SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+      CREATE INDEX idx_waste_one_off_pickups_type_date ON waste_one_off_pickups(type_id, date);
+    `,
+  },
+  {
+    version: 198,
+    description: 'ship the Waste collection module disabled by default (households opt in, #1063)',
+    up(db) {
+      // Same merge-not-replace pattern as migration 145 (Inventory) and 166
+      // (Schedule): a household may already have disabled other modules, and a
+      // blind INSERT OR REPLACE would silently re-enable them.
+      const row = db.prepare("SELECT value FROM sync_config WHERE key = 'disabled_modules'").get();
+
+      let disabled = [];
+      if (row?.value) {
+        try {
+          const parsed = JSON.parse(row.value);
+          if (Array.isArray(parsed)) disabled = parsed.filter((m) => typeof m === 'string');
+        } catch { /* a broken value is replaced, not honored */ }
+      }
+
+      if (disabled.includes('waste')) return;
+      disabled.push('waste');
+
+      db.prepare(`
+        INSERT INTO sync_config (key, value) VALUES ('disabled_modules', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                       updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      `).run(JSON.stringify(disabled));
+    },
+  },
+  {
+    version: 199,
+    description: 'Waste collection: ICS import sources with health tracking (#1063 Phase 3)',
+    up: `
+      -- One row per imported file. version starts at 1 and is bumped on every
+      -- committed (re)import; content_hash is the sha256 of the raw ICS text
+      -- that produced the current committed snapshot, so a re-import preview
+      -- can tell "nothing changed" from "this differs" without diffing rows.
+      -- last_success_at is only touched on a successful commit (never cleared
+      -- by a later failed attempt), so "needs refresh" reads as
+      -- last_success_at stale/absent while last_error is set - never merely
+      -- from file age (invariant #6).
+      CREATE TABLE waste_sources (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind             TEXT    NOT NULL DEFAULT 'file' CHECK (kind IN ('file')),
+        name             TEXT    NOT NULL,
+        content_hash     TEXT    NOT NULL,
+        version          INTEGER NOT NULL DEFAULT 1,
+        coverage_start   TEXT,
+        coverage_end     TEXT,
+        last_import_at   TEXT,
+        last_success_at  TEXT,
+        last_error       TEXT,
+        created_by       INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE TRIGGER trg_waste_sources_updated_at AFTER UPDATE ON waste_sources FOR EACH ROW BEGIN
+        UPDATE waste_sources SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+      CREATE INDEX idx_waste_sources_name ON waste_sources(name);
+    `,
+  },
+  {
+    version: 200,
+    description: 'Waste collection: ICS source label-to-type mappings (#1063 Phase 3)',
+    up: `
+      -- One row per distinct label (CATEGORIES tag, or SUMMARY when a feed
+      -- carries no categories) seen for a source. Exactly one of
+      -- (type_id set) / (ignored=1) is valid - a label is always either
+      -- mapped or explicitly excluded, never left ambiguous. Rows persist
+      -- across re-imports (UNIQUE on source_id+normalized_label) so a
+      -- reviewed decision is remembered and only resurfaced for review, not
+      -- re-asked, unless the label itself is new.
+      CREATE TABLE waste_source_mappings (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_id         INTEGER NOT NULL REFERENCES waste_sources(id) ON DELETE CASCADE,
+        original_label    TEXT    NOT NULL,
+        normalized_label  TEXT    NOT NULL,
+        type_id           INTEGER REFERENCES waste_types(id),
+        ignored           INTEGER NOT NULL DEFAULT 0 CHECK (ignored IN (0, 1)),
+        created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (source_id, normalized_label),
+        CHECK (
+          (ignored = 1 AND type_id IS NULL) OR (ignored = 0 AND type_id IS NOT NULL)
+        )
+      );
+      CREATE TRIGGER trg_waste_source_mappings_updated_at AFTER UPDATE ON waste_source_mappings FOR EACH ROW BEGIN
+        UPDATE waste_source_mappings SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+      CREATE INDEX idx_waste_source_mappings_source ON waste_source_mappings(source_id);
+    `,
+  },
+  {
+    version: 201,
+    description: 'Waste collection: committed imported pickups (#1063 Phase 3)',
+    up: `
+      -- One row per concrete pickup fact accepted by a committed import.
+      -- identity_key is the stable cross-reimport identity used to diff a
+      -- re-import into additions/changes/removals: the ICS UID (optionally
+      -- suffixed with the concrete date, for a recurring or overridden
+      -- VEVENT) when present, otherwise a deterministic fingerprint over the
+      -- label and date (opt-in allowMissingUid mode - see waste-import.js).
+      -- external_uid is kept separately, nullable, purely for display/
+      -- diagnostics. type_id carries no cascade: an imported pickup is a
+      -- reference that blocks type deletion exactly like a schedule or
+      -- one-off (invariant #5); only source_id cascades, so deleting a
+      -- source never touches another source's or manual data.
+      CREATE TABLE waste_imported_pickups (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_id          INTEGER NOT NULL REFERENCES waste_sources(id) ON DELETE CASCADE,
+        type_id            INTEGER NOT NULL REFERENCES waste_types(id),
+        identity_key       TEXT    NOT NULL,
+        external_uid       TEXT,
+        original_summary   TEXT,
+        date_key           TEXT    NOT NULL,
+        tz_note            TEXT,
+        created_at         TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at         TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (source_id, identity_key)
+      );
+      CREATE TRIGGER trg_waste_imported_pickups_updated_at AFTER UPDATE ON waste_imported_pickups FOR EACH ROW BEGIN
+        UPDATE waste_imported_pickups SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+      CREATE INDEX idx_waste_imported_pickups_source ON waste_imported_pickups(source_id);
+      CREATE INDEX idx_waste_imported_pickups_type_date ON waste_imported_pickups(type_id, date_key);
+    `,
+  },
+  {
+    version: 202,
+    description: 'Waste collection: automatic ICS URL sources (#1063 Phase 7)',
+    // kind's CHECK only allowed 'file' (migration 199); widening it to add
+    // 'url' needs the CREATE+COPY+DROP+RENAME rebuild pattern used elsewhere
+    // in this file, since SQLite cannot ALTER an existing CHECK. The DROP
+    // TABLE step would otherwise cascade-delete every waste_source_mappings/
+    // waste_imported_pickups row through their ON DELETE CASCADE (the same
+    // hazard noted at migration 52's dms_accounts rebuild) - foreignKeysOff
+    // suspends FK enforcement for this migration only, and the framework's
+    // own foreign_key_check afterward fails the migration if anything was
+    // actually left dangling.
+    foreignKeysOff: true,
+    up(db) {
+      db.exec(`
+        CREATE TABLE waste_sources_new (
+          id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind                     TEXT    NOT NULL DEFAULT 'file' CHECK (kind IN ('file', 'url')),
+          name                     TEXT    NOT NULL,
+          content_hash             TEXT    NOT NULL,
+          version                  INTEGER NOT NULL DEFAULT 1,
+          coverage_start           TEXT,
+          coverage_end             TEXT,
+          last_import_at           TEXT,
+          last_success_at          TEXT,
+          last_error               TEXT,
+          -- URL-only fields (NULL for kind='file'). url is the subscription
+          -- credential (invariant: never expose it to a user without write
+          -- access) - server/routes/waste/sources.js redacts it on read for
+          -- read-only callers, the same way caldav-sync.js keeps a password
+          -- out of its own list responses.
+          url                      TEXT,
+          etag                     TEXT,
+          last_modified            TEXT,
+          refresh_interval_minutes INTEGER NOT NULL DEFAULT 1440,
+          next_attempt_at          TEXT,
+          consecutive_failures     INTEGER NOT NULL DEFAULT 0,
+          -- Set when an auto-refresh fetched new content but could not
+          -- auto-commit (an unmapped label, or an unresolved blocking
+          -- diagnostic - neither may be decided automatically). The
+          -- scheduler skips a source while this is set; only a reviewed
+          -- manual refresh (same mapping wizard as file re-import) clears it.
+          needs_mapping            INTEGER NOT NULL DEFAULT 0 CHECK (needs_mapping IN (0, 1)),
+          created_by               INTEGER REFERENCES users(id) ON DELETE SET NULL,
+          created_at               TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+          updated_at               TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        );
+        INSERT INTO waste_sources_new (
+          id, kind, name, content_hash, version, coverage_start, coverage_end,
+          last_import_at, last_success_at, last_error, created_by, created_at, updated_at
+        )
+        SELECT id, kind, name, content_hash, version, coverage_start, coverage_end,
+               last_import_at, last_success_at, last_error, created_by, created_at, updated_at
+        FROM waste_sources;
+        DROP TABLE waste_sources;
+        ALTER TABLE waste_sources_new RENAME TO waste_sources;
+        CREATE TRIGGER trg_waste_sources_updated_at AFTER UPDATE ON waste_sources FOR EACH ROW BEGIN
+          UPDATE waste_sources SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+        CREATE INDEX idx_waste_sources_name ON waste_sources(name);
+        -- The scheduler's own "which sources are due" query (kind='url',
+        -- needs_mapping=0, next_attempt_at due).
+        CREATE INDEX idx_waste_sources_due ON waste_sources(kind, needs_mapping, next_attempt_at);
+      `);
+    },
+  },
+  {
+    version: 203,
+    description: 'Waste collection: per-user, per-type pickup reminders (#1063 Phase 8)',
+    // Same reminders-table rebuild pattern as migrations 137/141/148/162/177/
+    // 184/187 (widening entity_type's CHECK, which SQLite cannot ALTER) - this
+    // is the eighth. foreignKeysOff IS load-bearing here (audit finding M-11
+    // corrected this comment, which previously claimed otherwise):
+    // notification_deliveries.reminder_id REFERENCES reminders(id) ON DELETE
+    // CASCADE (see line ~2614) - without foreignKeysOff, this rebuild's own
+    // `DROP TABLE reminders` would cascade-delete every row in
+    // notification_deliveries, wiping delivery history for every reminder
+    // that had ever actually been pushed, not just the ones this migration
+    // touches.
+    foreignKeysOff: true,
+    up(db) {
+      db.exec(`
+        CREATE TABLE reminders_new (
+          id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          entity_type TEXT    NOT NULL CHECK(entity_type IN ('task', 'event', 'subscription', 'inventory_item', 'inventory_tracked_date', 'pantry_item', 'cycle_period', 'cycle_log_nudge', 'schedule_entry', 'schedule_extra_entry', 'waste_pickup')),
+          entity_id   INTEGER NOT NULL,
+          remind_at   TEXT    NOT NULL,
+          dismissed   INTEGER NOT NULL DEFAULT 0,
+          created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+          pushed_at   TEXT,
+          assigned_from INTEGER REFERENCES users(id) ON DELETE SET NULL
+        );
+        INSERT INTO reminders_new (id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from)
+          SELECT id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from FROM reminders;
+        DROP TABLE reminders;
+        ALTER TABLE reminders_new RENAME TO reminders;
+        CREATE INDEX idx_reminders_entity ON reminders(entity_type, entity_id);
+        CREATE INDEX idx_reminders_remind ON reminders(remind_at);
+        CREATE INDEX idx_reminders_user ON reminders(created_by);
+        CREATE INDEX idx_reminders_assigned_from ON reminders(assigned_from);
+
+        -- Per (user, waste type) opt-in: enabled defaults on once a row
+        -- exists, but a row only exists once a user has touched this type's
+        -- settings at all (GET .../reminder-settings synthesizes an
+        -- all-disabled default for every type without a row - no household-
+        -- wide default-on that would silently start pushing to someone).
+        -- offset_days/delivery_time are this preference's own lead-time and
+        -- household-local delivery time, independent of any other module's
+        -- reminder settings (Schedule's users.schedule_reminder_offset_minutes
+        -- is a single household-wide-shaped scalar; Waste needs one lead time
+        -- PER TYPE PER USER, so it gets its own table instead of widening
+        -- that column's meaning).
+        CREATE TABLE waste_reminder_settings (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          type_id       INTEGER NOT NULL REFERENCES waste_types(id) ON DELETE CASCADE,
+          enabled       INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+          offset_days   INTEGER NOT NULL DEFAULT 1,
+          delivery_time TEXT    NOT NULL DEFAULT '08:00',
+          created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+          updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+          UNIQUE (user_id, type_id)
+        );
+        CREATE TRIGGER trg_waste_reminder_settings_updated_at AFTER UPDATE ON waste_reminder_settings FOR EACH ROW BEGIN
+          UPDATE waste_reminder_settings SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+
+        -- Anchor table (same purpose as schedule_reminder_entries/
+        -- cycle_reminder_anchors): a Waste occurrence is computed on read,
+        -- not a stored row, so reminders.entity_id has nothing stable to
+        -- point at without this. One anchor per (user, type, date_key) -
+        -- exactly the coalesced occurrence identity waste-domain.js already
+        -- uses, so a moved/skipped/coalesced occurrence maps onto the same
+        -- or a cleanly different anchor, never a duplicate.
+        CREATE TABLE waste_reminder_entries (
+          id         INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          type_id    INTEGER NOT NULL REFERENCES waste_types(id) ON DELETE CASCADE,
+          date_key   TEXT    NOT NULL,
+          created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+          UNIQUE (user_id, type_id, date_key)
+        );
+        CREATE INDEX idx_waste_reminder_entries_user ON waste_reminder_entries(user_id);
+      `);
+    },
+  },
+  {
+    version: 204,
+    description: 'Waste collection: ordinal-weekday monthly schedules (#1063 Phase 9)',
+    // recurrence_kind's CHECK only allowed 'weekly'/'monthly_fixed_day' -
+    // widening it (and the compound CHECK below it) to add
+    // 'monthly_ordinal_weekday' needs the same CREATE+COPY+DROP+RENAME rebuild
+    // as every other CHECK-widening in this file. foreignKeysOff avoids the
+    // DROP TABLE step cascade-deleting every waste_schedule_overrides row
+    // through its own ON DELETE CASCADE (same hazard as migrations 52/202/203).
+    //
+    // NO NEW COLUMNS: an ordinal-weekday schedule reuses `weekdays` (exactly
+    // one code, e.g. 'MO' - not the CSV list a weekly schedule stores) and
+    // `month_day` (the ordinal position: -1 for "last", 1-4 for "nth" - its
+    // own CHECK already allows exactly this range, since 1-4 sits inside the
+    // existing "1 BETWEEN 1 AND 31" bound). `server/services/waste-domain.js`
+    // is what gives these two columns their new, kind-dependent meaning;
+    // `server/services/recurrence.js`'s own `bydayOrdinal` shape (added
+    // earlier in this same phase) is what actually computes the date.
+    foreignKeysOff: true,
+    up(db) {
+      db.exec(`
+        CREATE TABLE waste_schedules_new (
+          id               INTEGER PRIMARY KEY AUTOINCREMENT,
+          type_id          INTEGER NOT NULL REFERENCES waste_types(id),
+          recurrence_kind  TEXT    NOT NULL CHECK (recurrence_kind IN ('weekly', 'monthly_fixed_day', 'monthly_ordinal_weekday')),
+          anchor_date      TEXT    NOT NULL,
+          interval         INTEGER NOT NULL DEFAULT 1 CHECK (interval BETWEEN 1 AND 52),
+          weekdays         TEXT,
+          month_day        INTEGER CHECK (month_day IS NULL OR month_day = -1 OR month_day BETWEEN 1 AND 31),
+          valid_until      TEXT,
+          active           INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+          created_by       INTEGER REFERENCES users(id) ON DELETE SET NULL,
+          created_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+          updated_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+          CHECK (
+            (recurrence_kind = 'weekly' AND weekdays IS NOT NULL AND month_day IS NULL)
+            OR (recurrence_kind = 'monthly_fixed_day' AND month_day IS NOT NULL AND weekdays IS NULL)
+            OR (recurrence_kind = 'monthly_ordinal_weekday' AND month_day IS NOT NULL AND weekdays IS NOT NULL)
+          )
+        );
+        INSERT INTO waste_schedules_new SELECT * FROM waste_schedules;
+        DROP TABLE waste_schedules;
+        ALTER TABLE waste_schedules_new RENAME TO waste_schedules;
+        CREATE TRIGGER trg_waste_schedules_updated_at AFTER UPDATE ON waste_schedules FOR EACH ROW BEGIN
+          UPDATE waste_schedules SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+        CREATE INDEX idx_waste_schedules_type_active ON waste_schedules(type_id, active);
+      `);
+    },
+  },
+  {
+    version: 205,
+    description: 'Waste collection: revocable read-only ICS feed (#1063 Phase 10)',
+    // Same personal-token-over-household-content pattern as migrations 61
+    // (calendar_feed_token), 144 (inventory_deadlines_feed_token) and 176
+    // (schedule_feed_token): Waste types/schedules/pickups have no owner or
+    // visibility column, so the FEED CONTENT stays household-wide, but the
+    // TOKEN is per-user - a revoke costs exactly one subscription, not every
+    // subscriber's.
+    //
+    // waste_feed_type_ids is a nullable JSON array of waste_types.id, stored
+    // alongside the token (not as a query-string parameter on the public feed
+    // URL): a subscription URL is meant to stay stable across edits, and
+    // putting mutable selection state in the URL would force a new URL - and
+    // therefore a broken existing subscription - every time the selection
+    // changes. NULL means "every active type", mirroring the reminder
+    // settings default (no row = not yet touched = show everything).
+    up: `
+      ALTER TABLE users ADD COLUMN waste_feed_token TEXT;
+      ALTER TABLE users ADD COLUMN waste_feed_type_ids TEXT;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_waste_feed_token
+        ON users(waste_feed_token)
+        WHERE waste_feed_token IS NOT NULL;
+    `,
+  },
+  {
+    version: 206,
+    description: 'Waste collection: index waste types in the global FTS5 search_index (#1063 Phase 10)',
+    // Same trigger shape as migration 66 (medications/health_activities) and
+    // 68 (shopping_items). Deliberately indexes ONLY waste_types (the finite,
+    // stored catalog) - never anything waste-domain.js's expandSchedule()/
+    // resolveOccurrences() computes at read time. Those occurrences are
+    // unbounded (a weekly schedule has no last date until valid_until) and
+    // never materialize as rows; indexing them would mean either truncating
+    // the index at an arbitrary horizon or growing it forever. A concrete,
+    // dated pickup (waste_one_off_pickups/waste_imported_pickups) is the one
+    // other kind of stored, searchable Waste fact, but it has no independent
+    // title of its own (its "title" IS the type name) and Phase 10 asks for
+    // stable deep links to "types, sources, and concrete pickups" via the
+    // existing occurrence list, not a second index entity - so only the type
+    // catalog gets indexed here; concrete pickups are still reachable by
+    // searching their type's name and confirmed present in the Upcoming list.
+    up: `
+      CREATE TRIGGER trg_search_waste_types_ai AFTER INSERT ON waste_types BEGIN
+        INSERT INTO search_index (entity, entity_id, title, body)
+        VALUES ('waste_type', NEW.id, COALESCE(NEW.name, ''), '');
+      END;
+      CREATE TRIGGER trg_search_waste_types_ad AFTER DELETE ON waste_types BEGIN
+        DELETE FROM search_index WHERE entity = 'waste_type' AND entity_id = OLD.id;
+      END;
+      CREATE TRIGGER trg_search_waste_types_au AFTER UPDATE ON waste_types BEGIN
+        DELETE FROM search_index WHERE entity = 'waste_type' AND entity_id = OLD.id;
+        INSERT INTO search_index (entity, entity_id, title, body)
+        VALUES ('waste_type', NEW.id, COALESCE(NEW.name, ''), '');
+      END;
+
+      INSERT INTO search_index (entity, entity_id, title, body)
+        SELECT 'waste_type', id, COALESCE(name, ''), '' FROM waste_types;
+    `,
+  },
+  {
+    version: 207,
+    description: 'Waste collection: covering index for per-source pickup-health lookups (audit finding, no data change)',
+    // waste-store.js#decorateSourceHealth/listSources both run
+    // `WHERE source_id = ? AND date_key >= ?` (single source) or
+    // `WHERE date_key >= ? GROUP BY source_id` (every source) against
+    // waste_imported_pickups - neither existing index covers that:
+    // idx_waste_imported_pickups_source is source_id alone (no date_key), and
+    // idx_waste_imported_pickups_type_date (migration 201) is keyed on
+    // type_id, not source_id. Both queries fell back to the source-only
+    // index plus a per-row filter - fine at today's row counts (measured
+    // 18-36ms, see the audit report), a table scan by source count that grows
+    // with import history otherwise. A new index alongside the old ones
+    // (not a replacement - idx_waste_imported_pickups_source still serves
+    // deleteSource's un-filtered "does this source have any rows" shape).
+    up: `
+      CREATE INDEX idx_waste_imported_pickups_source_date ON waste_imported_pickups(source_id, date_key);
+    `,
+  },
+  {
+    version: 208,
+    description: 'Schedule: an explicit toggle to turn overtime tracking off entirely (UX audit S-24)',
+    up: `
+      -- NULL/1 = an (Vorgabe, kein stiller Verhaltenswechsel fuer Bestandshaushalte),
+      -- 0 = aus. Ein eigener Schalter statt schedule_weekly_hours selbst auf 0 zu
+      -- erlauben: 0 als "aus" gelesen zwingt jede lesende Stelle, sich diese
+      -- Sonderbedeutung zu merken, und ein Sollwert von 0 Stunden ist ohnehin keine
+      -- gueltige Vollzeit-/Teilzeit-Angabe (der Server weist 0 seit jeher als
+      -- ungueltig zurueck - das bewusst NICHT umgedeutet, siehe PLAN.md D-C).
+      ALTER TABLE users ADD COLUMN schedule_overtime_enabled INTEGER;
+    `,
+  },
+  {
+    version: 209,
+    description: 'Health: fasting records, sparse settings, and safety acknowledgement',
+    up: `
+      CREATE TABLE health_fasts (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        start_at     TEXT NOT NULL,
+        end_at       TEXT,
+        start_tzid   TEXT NOT NULL,
+        goal_minutes INTEGER CHECK(goal_minutes IS NULL OR (goal_minutes BETWEEN 60 AND 20160 AND goal_minutes % 60 = 0)),
+        rating       INTEGER CHECK(rating IS NULL OR rating BETWEEN 1 AND 5),
+        note         TEXT CHECK(note IS NULL OR length(note) <= 2000),
+        visibility   TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('private', 'family')),
+        revision     INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+        created_by   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        updated_by   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        CHECK(end_at IS NULL OR end_at > start_at)
+      );
+      CREATE UNIQUE INDEX idx_health_fasts_one_active ON health_fasts(user_id) WHERE end_at IS NULL;
+      CREATE INDEX idx_health_fasts_owner_interval ON health_fasts(user_id, start_at, end_at);
+
+      CREATE TABLE health_fasting_settings (
+        user_id                 INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        default_goal_minutes   INTEGER CHECK(default_goal_minutes IS NULL OR (default_goal_minutes BETWEEN 60 AND 20160 AND default_goal_minutes % 60 = 0)),
+        zone_mode              TEXT NOT NULL DEFAULT 'timer' CHECK(zone_mode IN ('timer', 'educational')),
+        safety_acknowledged_at TEXT,
+        safety_acknowledged_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+    `,
+  },
+  {
+    version: 210,
+    description: 'Health: cervical mucus, LH/pregnancy test results and intimacy as optional day-log scalars',
+    // Vier weitere Skalarwerte je Tag, gleiche Bauart wie Migration 179
+    // (basal_temp): ein ALTER TABLE ADD COLUMN KANN durchaus einen
+    // spalten-eigenen CHECK tragen (siehe Migration 212, perimenopause_mode/
+    // show_pms) - das ist hier nicht der Grund, warum diese vier Werte-Listen
+    // stattdessen in der Route leben. Der eigentliche Grund ist Konsistenz mit
+    // dem bestehenden Vorbild `basal_temp_unit` (Migration 179): dieselbe Zeile
+    // (cycle_day_logs) validiert alle ihre geschlossenen, aber nullbaren
+    // Text-Skalare an derselben Stelle, statt manche per CHECK und manche per
+    // Route zu pruefen.
+    //
+    // `intimacy` ist bewusst KEIN sichtbarkeitsgesteuertes Feld wie die
+    // anderen drei: die Route liefert es nur an den Eigentuemer selbst zurueck,
+    // unabhaengig von `visibility` (siehe cycle.js GET /cycle/logs) - ein
+    // Sexualleben-Eintrag soll nicht ueber "family" fuer andere
+    // Haushaltsmitglieder mitlesbar werden, nur weil der restliche Tag geteilt
+    // ist.
+    up: `
+      ALTER TABLE cycle_day_logs ADD COLUMN cervix_mucus TEXT;
+      ALTER TABLE cycle_day_logs ADD COLUMN lh_test TEXT;
+      ALTER TABLE cycle_day_logs ADD COLUMN pregnancy_test TEXT;
+      ALTER TABLE cycle_day_logs ADD COLUMN intimacy TEXT;
+    `,
+  },
+  {
+    version: 211,
+    description: 'Health: multi-select feelings per day log - normalized cycle_day_log_feelings table, backfilled from the legacy mood column',
+    // Gleiches Muster wie Migration 178 (cycle_day_log_symptoms): die alte
+    // Skalar-Spalte (cycle_day_logs.mood) bleibt UNVERAENDERT stehen - kein
+    // DROP COLUMN, kein Rebuild. Sie ist ab hier nur noch historisch: neue
+    // Schreibvorgaenge (server/routes/health/cycle.js) fuellen sie nicht mehr.
+    // Die API liest sie zur Abwaertskompatibilitaet zwar noch zurueck, aber ihr
+    // Wert wandert nach dieser Migration nie wieder in die Datenbank. Ein
+    // rohes Backup von vor dieser Migration bleibt trotzdem lesbar, ohne einen
+    // zweiten Migrationspfad zu brauchen.
+    //
+    // DER BACKFILL NORMALISIERT UND FILTERT: `mood` war freier Text (keine
+    // Werte-Liste erzwungen), `feelings` ist seit dieser Migration ein
+    // GESCHLOSSENES Set (MOOD_VALUES, sieben Schluessel: great/good/neutral/
+    // sensitive/sad/irritable/anxious - public/utils/health-cycle.js). Nur
+    // Werte, die (nach LOWER(TRIM(...))) in dieser Liste stehen, werden
+    // uebernommen; alles andere bleibt AUSSCHLIESSLICH in der eingefrorenen
+    // `mood`-Spalte lesbar. Zwei Gruende, keine Kompromisse: freier Text war
+    // als Chip nie darstellbar (die UI kennt nur die sieben Presets), und eine
+    // erfundene Zuordnung (z. B. "tired" -> "sensitive") waere ein Datensatz,
+    // den die Person nie eingetragen hat - eine fabrizierte Aussage ist
+    // schlimmer als eine fehlende.
+    up: `
+      CREATE TABLE cycle_day_log_feelings (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        day_log_id  INTEGER NOT NULL REFERENCES cycle_day_logs(id) ON DELETE CASCADE,
+        feeling_key TEXT    NOT NULL,
+        UNIQUE(day_log_id, feeling_key)
+      );
+      CREATE INDEX idx_cycle_day_log_feelings_day_log ON cycle_day_log_feelings(day_log_id);
+
+      -- Rueckwirkend aus der alten Skalar-Spalte befuellen: genau eine Zeile
+      -- je Tages-Log mit gesetztem, GUELTIGEM mood-Wert. Anders als bei
+      -- Migration 178 (Komma-Liste, mehrere Symptome je Zeile) ist hier keine
+      -- Zerlegung noetig - mood trug schon immer genau einen Wert.
+      INSERT INTO cycle_day_log_feelings (day_log_id, feeling_key)
+      SELECT id, LOWER(TRIM(mood)) FROM cycle_day_logs
+      WHERE mood IS NOT NULL AND TRIM(mood) <> ''
+        AND LOWER(TRIM(mood)) IN ('great', 'good', 'neutral', 'sensitive', 'sad', 'irritable', 'anxious');
+    `,
+  },
+  {
+    version: 212,
+    description: 'Health: cycle_settings extensions - contraception, perimenopause mode, PMS toggle, opt-in partner notification',
+    up: `
+      -- Kein CHECK auf der Spalte: die Werte-Liste lebt in der Route (gleiche
+      -- Aufteilung wie basal_temp_unit/flow ueberall sonst in diesem Modul).
+      -- Eine Teilmenge dieser Werte (hormonell) schaltet clientseitig die
+      -- Eisprung-/Fruchtbarkeitsvorhersage ab (siehe public/utils/health-cycle.js,
+      -- suppressesFertility()).
+      ALTER TABLE cycle_settings ADD COLUMN contraception TEXT;
+
+      -- Standard 0 (aus): ein Bestandshaushalt sieht ohne aktives Zutun keine
+      -- geaenderte Vorhersage-Darstellung.
+      ALTER TABLE cycle_settings ADD COLUMN perimenopause_mode INTEGER NOT NULL DEFAULT 0
+        CHECK(perimenopause_mode IN (0, 1));
+
+      -- Standard 1 (an): die PMS-Einblendung ist rein abgeleitet (kein
+      -- gespeicherter Zeitraum) und rendert ohnehin nur bei einem echten
+      -- erkannten Muster - ein Bestandshaushalt sieht also nur dann ueberhaupt
+      -- etwas Neues, wenn die eigenen Daten es hergeben.
+      ALTER TABLE cycle_settings ADD COLUMN show_pms INTEGER NOT NULL DEFAULT 1
+        CHECK(show_pms IN (0, 1));
+
+      -- Opt-in-Benachrichtigung: der Eigentuemer veroeffentlicht, die
+      -- Partnerperson braucht keine eigene Freigabe - deshalb genuegt ein
+      -- einfacher Verweis ohne Gegenzeichnung. SET NULL statt CASCADE:
+      -- verlaesst die verwiesene Person den Haushalt, verliert die
+      -- Einstellung nur ihr Ziel, nicht die eigene Zeile.
+      ALTER TABLE cycle_settings ADD COLUMN notify_partner_user_id INTEGER
+        REFERENCES users(id) ON DELETE SET NULL;
+      ALTER TABLE cycle_settings ADD COLUMN notify_partner_days_before INTEGER;
+    `,
+  },
+  {
+    version: 213,
+    description: 'Health: widen cycle_reminder_anchors.kind to add partner_period',
+    // SQLite kennt kein ALTER auf einen CHECK - derselbe Tabellen-Rebuild wie
+    // v137/v141/v148/v162/v177 fuer reminders.entity_type, nur hier fuer die
+    // Anker-Art. `foreignKeysOff` ist NICHT noetig: anders als reminders (an
+    // dem notification_deliveries.reminder_id mit ON DELETE CASCADE haengt)
+    // referenziert keine andere Tabelle cycle_reminder_anchors per FK - nur
+    // reminders.entity_id, und das ist das ueberall gleiche polymorphe Muster
+    // ohne echten Fremdschluessel.
+    up: `
+      CREATE TABLE cycle_reminder_anchors_new (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        anchor_date TEXT    NOT NULL,
+        kind        TEXT    NOT NULL CHECK(kind IN ('period_predicted', 'log_nudge', 'partner_period')),
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE(user_id, anchor_date, kind)
+      );
+      INSERT INTO cycle_reminder_anchors_new (id, user_id, anchor_date, kind, created_at)
+        SELECT id, user_id, anchor_date, kind, created_at FROM cycle_reminder_anchors;
+      DROP TABLE cycle_reminder_anchors;
+      ALTER TABLE cycle_reminder_anchors_new RENAME TO cycle_reminder_anchors;
+    `,
+  },
+  {
+    version: 214,
+    description: 'Tasks: record who did a completed task, next to who ticked it off (#1205)',
+    // ZWEI PERSONEN AN EINER ERLEDIGUNG, WEIL ES ZWEI FRAGEN SIND. `user_id`
+    // beantwortet weiter "wer hat abgehakt" und behaelt seine Bedeutung
+    // unveraendert - jede Stelle, die es heute liest, bleibt richtig. Die neue
+    // Spalte beantwortet "wer hat es getan". Auf einem geteilten Tablett (#913)
+    // sind das regelmaessig verschiedene Personen, und bis hierher konnte die
+    // zweite Frage gar nicht gestellt werden (#1205).
+    //
+    // NULL IST DER NORMALFALL UND BEDEUTET "NICHT BENANNT", NICHT "NIEMAND".
+    // Ohne Angabe bleibt alles wie bisher: die Anzeige faellt auf `user_id`
+    // zurueck, die Punkte folgen weiter der Zuweisungsregel. Bestandszeilen
+    // bekommen deshalb bewusst KEINEN Backfill auf `user_id` - das waere eine
+    // erfundene Behauptung ueber Erledigungen, bei denen nie jemand gefragt
+    // wurde, wer sie getan hat.
+    //
+    // SET NULL wie bei `user_id` daneben: verlaesst die Person den Haushalt,
+    // verliert der Eintrag seinen Verweis, nicht seine Existenz - der Vorgang
+    // hat stattgefunden.
+    up: `
+      ALTER TABLE task_completions ADD COLUMN done_by_user_id INTEGER
+        REFERENCES users(id) ON DELETE SET NULL;
+
+      -- Der Verlauf filtert nach der Person, die er ANZEIGT, also nach
+      -- COALESCE(done_by_user_id, user_id). Ein Index auf der neuen Spalte
+      -- allein traegt diesen Ausdruck nicht; er steht hier fuer den zweiten
+      -- Leser, der "was hat diese Person getan" direkt fragt.
+      CREATE INDEX IF NOT EXISTS idx_task_completions_done_by
+        ON task_completions(done_by_user_id);
+    `,
+  },
+  {
+    version: 215,
+    description: 'Display accounts: a non-member users row that only a paired device can use (#1208)',
+    // EIN DISPLAY IST EINE users-ZEILE, KEIN ZWEITER KONTOTYP. Genau so steht es
+    // in docs/DECISIONS.md 4: welche Art Mensch eine Zeile ist, ist eine
+    // Eigenschaft der Zeile, und Yuvomi hat das schon zweimal so beantwortet -
+    // Hauspersonal per `housekeeping_workers`, Ausgaben-Gaeste per
+    // `split_expense_guest_users`. `display_accounts` ist die dritte
+    // Markierungstabelle desselben Musters, nicht ein neuer Mechanismus daneben.
+    //
+    // DREI TABELLEN, WEIL ES DREI DINGE SIND: welches Konto ein Display IST,
+    // welcher Kopplungscode gerade offen ist, und welches Geraet tatsaechlich
+    // gekoppelt wurde. Sie in eine Zeile zu falten hiesse, zwei verschiedene
+    // Geheimnisse (Code und Credential) in denselben Spalten zu fuehren und die
+    // Regel "ein Code gilt genau einmal" an einem NULL-Vergleich aufzuhaengen.
+    up: `
+      -- Welche users-Zeile ist ein Display. Nur der Verweis; alles andere
+      -- (Name, Farbe) steht wie bei jedem anderen Konto in users.
+      CREATE TABLE IF NOT EXISTS display_accounts (
+        user_id    INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
+      -- Der Kopplungscode. GEHASHT wie ein API-Token, weil er fuer seine
+      -- Lebensdauer einem Credential gleichkommt: wer ihn liest, koppelt sein
+      -- eigenes Geraet. used_at statt Loeschen, damit "einmal gueltig" eine
+      -- gepruefte Tatsache bleibt und nicht die Abwesenheit einer Zeile.
+      CREATE TABLE IF NOT EXISTS display_pairing_codes (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        code_hash  TEXT    NOT NULL UNIQUE,
+        expires_at TEXT    NOT NULL,
+        used_at    TEXT,
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_display_pairing_codes_user
+        ON display_pairing_codes(user_id);
+
+      -- Das Geraete-Credential. KEIN expires_at: an einer Wand meldet sich
+      -- niemand an, und ein Ablauf, den erst das dunkle Tablett am
+      -- Sonntagmorgen verraet, ist keine Sicherheit, sondern eine Stoerung
+      -- (Entscheidung 16.09.). Die Kontrolle ist der Widerruf, und damit er
+      -- eine informierte Entscheidung sein kann, steht last_seen_at daneben.
+      -- Widerruf setzt revoked_at, es loescht nichts - dieselbe Regel wie bei
+      -- api_tokens, damit ein Widerruf nachweisbar bleibt.
+      CREATE TABLE IF NOT EXISTS display_devices (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_hash   TEXT    NOT NULL UNIQUE,
+        label        TEXT,
+        last_seen_at TEXT,
+        revoked_at   TEXT,
+        created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_display_devices_user
+        ON display_devices(user_id);
+    `,
+  },
+  {
+    version: 216,
+    description: 'Display devices remember when their cookie was last re-dated, separate from last seen (#1208)',
+    // ZWEI UHREN, WEIL ES ZWEI FRAGEN SIND.
+    //
+    // `last_seen_at` beantwortet "wann war dieses Tablett zuletzt da" - es ist
+    // die Begruendung des Widerruf-Knopfs in den Einstellungen und wird bei
+    // JEDEM Request neu gesetzt. Die Frage "muss das Cookie nachdatiert werden"
+    // daran zu haengen, war ein Zirkelschluss: der erste Zugriff setzt
+    // last_seen_at auf jetzt, damit ist die Frist nie wieder um, und das Cookie
+    // wurde nach der ersten Auffrischung nie mehr angefasst - die Jahresfrist
+    // lief also doch ab, genau wie vor dem Fix (Codex-Review zu #1241).
+    //
+    // Deshalb eine eigene Spalte. NULL heisst "noch nie nachdatiert" und faellt
+    // damit sofort faellig - richtig fuer jedes Bestandsgeraet, das vor dieser
+    // Migration gekoppelt wurde.
+    up: `
+      ALTER TABLE display_devices ADD COLUMN cookie_refreshed_at TEXT;
+    `,
+  },
+  {
+    version: 217,
+    description: 'Reminders of a deleted task or event are removed with it',
+    // DIE ERINNERUNG GEHOERT DEM DING, NICHT DEM FENSTER, DAS ES GELOESCHT HAT.
+    //
+    // `reminders.entity_type`/`entity_id` sind ein WEICHER Verweis - die einzige
+    // Fremdschluesselspalte der Tabelle ist `created_by`. Aufgeraeumt hat bisher
+    // allein der Client: `deleteTaskWithUndo` schickte hinter dem DELETE der
+    // Aufgabe noch ein `DELETE /reminders?entity_type=task&entity_id=...`, mit
+    // stummem `catch`. Drei Wege liessen die Zeile stehen, und alle drei kamen
+    // vor: der `keepalive`-Aufruf beim Zuklappen des Tabs geht verloren; die
+    // Aufgabe wird ueber /api/v1 oder MCP geloescht, wo kein Client mitraeumt;
+    // oder der Aufrufer hat `tasks: write` und `calendar: read`, dann antwortet
+    // der Loeschweg mit 403 und das `catch` verschluckt ihn. Uebrig blieb eine
+    // Erinnerung an eine Aufgabe, die es nicht mehr gibt - sie feuert als
+    // Benachrichtigung mit leerem Text (entity_title ist dann NULL, siehe
+    // services/notifications.js) und steht in /reminders/pending.
+    //
+    // Ein VIERTER Fall, den der Client gar nicht abdecken KONNTE: er loescht nur
+    // die eigenen Zeilen (`AND created_by = ?`). Die Erinnerung, die sich ein
+    // anderes Haushaltsmitglied auf dieselbe Aufgabe gesetzt hatte, ueberlebte
+    // sie auch bei perfektem Netz.
+    //
+    // WARUM EIN TRIGGER UND NICHT EINE ZEILE IN DER ROUTE: Aufgaben und Termine
+    // verschwinden an mehr als einer Stelle. DELETE /tasks/:id, die per CASCADE
+    // mitgehenden Unteraufgaben, discardRecurrenceFollowup() beim Zuruecknehmen
+    // eines Hakens, deleteVisitLinks() in housekeeping.js, dazu bei Terminen der
+    // Google-/ICS-/CalDAV-Abgleich und calendar-prune.js. Eine Regel, die in
+    // einer Route WOHNT, deckt genau diese eine Route ab; die naechste Stelle
+    // erbt sie nicht. Im Trigger gilt sie fuer jedes DELETE, auch fuer das per
+    // Fremdschluessel ausgeloeste (nachgemessen: AFTER-DELETE feuert auch fuer
+    // CASCADE-Zeilen, ohne dass `recursive_triggers` noetig waere).
+    //
+    // WAS EIN KUENFTIGER TABELLEN-REBUILD BEACHTEN MUSS: `ALTER TABLE ... RENAME
+    // TO tasks` verliert die Trigger der alten Tabelle - genau wie bei
+    // `trg_search_tasks_ad`, das die Rebuilds in v114/v117 (tasks) und v166/v194
+    // (calendar_events) deshalb jedes Mal neu anlegen.
+    // test/test-reminder-orphans.js faehrt die volle Migrationskette und loescht
+    // danach wirklich eine Aufgabe, faellt also auf, wenn es jemand vergisst.
+    up: `
+      DELETE FROM reminders
+      WHERE entity_type = 'task'
+        AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.id = reminders.entity_id);
+
+      DELETE FROM reminders
+      WHERE entity_type = 'event'
+        AND NOT EXISTS (SELECT 1 FROM calendar_events WHERE calendar_events.id = reminders.entity_id);
+
+      CREATE TRIGGER IF NOT EXISTS trg_reminders_tasks_ad
+      AFTER DELETE ON tasks BEGIN
+        DELETE FROM reminders WHERE entity_type = 'task' AND entity_id = OLD.id;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_reminders_events_ad
+      AFTER DELETE ON calendar_events BEGIN
+        DELETE FROM reminders WHERE entity_type = 'event' AND entity_id = OLD.id;
+      END;
+    `,
+  },
+  {
+    version: 218,
+    description: 'Documents: optional expiry date + reminder lead, widen reminders for document_expiry',
+    foreignKeysOff: true,
+    up: `
+      -- YYYY-MM-DD, nullable. Range validation (0-365 for the lead) lives in
+      -- the route, not here - ADD COLUMN cannot carry a useful CHECK for it.
+      ALTER TABLE family_documents ADD COLUMN expires_at TEXT;
+      ALTER TABLE family_documents ADD COLUMN expiry_reminder_days INTEGER;
+
+      -- reminders.entity_type erneut erweitern (Muster wie v137/v140/v141):
+      -- SQLite kann einen Spalten-CHECK nicht per ALTER erweitern, daher
+      -- Tabelle neu erstellen. foreignKeysOff bleibt Pflicht - gleicher Grund
+      -- wie dort: notification_deliveries.reminder_id ... ON DELETE CASCADE
+      -- wuerde sonst beim DROP TABLE auf jeder bestehenden Installation
+      -- mitgeloescht. Nur der hier auch tatsaechlich geschriebene Typ kommt
+      -- dazu - 'health_prevention_due' bleibt Sache der Migration, die ihn
+      -- zuerst beschreibt (Review-Feedback #1256: ein CHECK laesst sich unter
+      -- der Anhaenge-Regel nie wieder verengen, ein Wert ohne Schreiber waere
+      -- also dauerhaft fest, ohne Issue und ohne SCOPE-/DECISIONS-Eintrag).
+      --
+      -- ERST DIE ZWEI TRIGGER AUS V217 ABRAEUMEN. Sie haengen an tasks/
+      -- calendar_events, nicht an reminders, ueberleben also strukturell -
+      -- aber ihr KOERPER nennt 'reminders' beim Namen, und genau das bringt
+      -- SQLites CREATE-TABLE-RENAME-Ablauf hier zum Absturz: waehrend ALTER
+      -- TABLE reminders_new RENAME TO reminders laeuft, parst SQLite jeden
+      -- Trigger/View der Datenbank neu durch, und trifft dabei fuer einen
+      -- kurzen Moment auf einen Trigger, dessen Textkoerper eine Tabelle
+      -- nennt, die gerade nicht existiert (das alte reminders ist schon weg,
+      -- das neue noch nicht umbenannt) - "no such table: main.reminders",
+      -- mitten in dieser Migration, auf jeder Installation, reproduziert
+      -- ausserhalb dieser Datei mit einem Fuenfzeiler gegen better-sqlite3.
+      -- Abraeumen vor dem Umbau und am Ende neu anlegen umgeht das - derselbe
+      -- Kniff wie bei trg_search_tasks_ad in v114/v117/v166/v194, nur in der
+      -- umgekehrten Richtung (dort verlor die umgebaute Tabelle ihre EIGENEN
+      -- Trigger, hier verliert ein FREMDER Trigger kurzzeitig sein Ziel).
+      DROP TRIGGER IF EXISTS trg_reminders_tasks_ad;
+      DROP TRIGGER IF EXISTS trg_reminders_events_ad;
+
+      CREATE TABLE reminders_new (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type TEXT    NOT NULL CHECK(entity_type IN ('task', 'event', 'subscription', 'inventory_item', 'inventory_tracked_date', 'pantry_item', 'cycle_period', 'cycle_log_nudge', 'schedule_entry', 'schedule_extra_entry', 'waste_pickup', 'document_expiry')),
+        entity_id   INTEGER NOT NULL,
+        remind_at   TEXT    NOT NULL,
+        dismissed   INTEGER NOT NULL DEFAULT 0,
+        created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        pushed_at   TEXT,
+        assigned_from INTEGER REFERENCES users(id) ON DELETE SET NULL
+      );
+      INSERT INTO reminders_new (id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from)
+        SELECT id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from FROM reminders;
+      DROP TABLE reminders;
+      ALTER TABLE reminders_new RENAME TO reminders;
+      CREATE INDEX idx_reminders_entity ON reminders(entity_type, entity_id);
+      CREATE INDEX idx_reminders_remind ON reminders(remind_at);
+      CREATE INDEX idx_reminders_user ON reminders(created_by);
+      CREATE INDEX idx_reminders_assigned_from ON reminders(assigned_from);
+
+      CREATE TRIGGER trg_reminders_tasks_ad
+      AFTER DELETE ON tasks BEGIN
+        DELETE FROM reminders WHERE entity_type = 'task' AND entity_id = OLD.id;
+      END;
+
+      CREATE TRIGGER trg_reminders_events_ad
+      AFTER DELETE ON calendar_events BEGIN
+        DELETE FROM reminders WHERE entity_type = 'event' AND entity_id = OLD.id;
+      END;
+    `,
+  },
+  {
+    version: 219,
+    description: 'Health: preventive care & vaccinations log (household type registry + per-person records)',
+    foreignKeysOff: true,
+    up: `
+      -- reminders.entity_type erneut erweitern (Muster wie v137/v140/v141):
+      -- SQLite kann einen Spalten-CHECK nicht per ALTER erweitern, daher
+      -- Tabelle neu erstellen. foreignKeysOff bleibt Pflicht - gleicher Grund
+      -- wie dort: notification_deliveries.reminder_id ... ON DELETE CASCADE
+      -- wuerde sonst beim DROP TABLE auf jeder bestehenden Installation
+      -- mitgeloescht. 'health_prevention_due' ist der einzige neue Wert hier -
+      -- v218 (Dokumente) hat 'document_expiry' bereits eigenstaendig
+      -- nachgezogen, statt beide Werte in einem Schritt zu buendeln
+      -- (Review-Feedback #1255/#1256: ein Wert ohne Schreiber waere unter der
+      -- Anhaenge-Regel dauerhaft im CHECK fest gewesen, ohne Issue und ohne
+      -- SCOPE-/DECISIONS-Eintrag).
+      --
+      -- ERST DIE ZWEI TRIGGER AUS V217 ABRAEUMEN, aus demselben Grund wie
+      -- bereits in v218 dokumentiert: ihr Koerper nennt "reminders" beim
+      -- Namen, und SQLites ALTER TABLE ... RENAME TO reminders reparst dabei
+      -- die ganze Schema, was mitten in diesem Umbau auf ein momentan
+      -- fehlendes "reminders" trifft ("no such table: main.reminders").
+      -- Abraeumen vor dem Umbau und am Ende neu anlegen umgeht das. IF EXISTS
+      -- wie in v218 (Review #1255 nice-to-have): kostet hier nichts, haelt
+      -- aber eine Installation nicht auf 218 stecken, falls diese Annahme je
+      -- nicht mehr gilt.
+      DROP TRIGGER IF EXISTS trg_reminders_tasks_ad;
+      DROP TRIGGER IF EXISTS trg_reminders_events_ad;
+
+      CREATE TABLE reminders_new (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type TEXT    NOT NULL CHECK(entity_type IN ('task', 'event', 'subscription', 'inventory_item', 'inventory_tracked_date', 'pantry_item', 'cycle_period', 'cycle_log_nudge', 'schedule_entry', 'schedule_extra_entry', 'waste_pickup', 'document_expiry', 'health_prevention_due')),
+        entity_id   INTEGER NOT NULL,
+        remind_at   TEXT    NOT NULL,
+        dismissed   INTEGER NOT NULL DEFAULT 0,
+        created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        pushed_at   TEXT,
+        assigned_from INTEGER REFERENCES users(id) ON DELETE SET NULL
+      );
+      INSERT INTO reminders_new (id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from)
+        SELECT id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from FROM reminders;
+      DROP TABLE reminders;
+      ALTER TABLE reminders_new RENAME TO reminders;
+      CREATE INDEX idx_reminders_entity ON reminders(entity_type, entity_id);
+      CREATE INDEX idx_reminders_remind ON reminders(remind_at);
+      CREATE INDEX idx_reminders_user ON reminders(created_by);
+      CREATE INDEX idx_reminders_assigned_from ON reminders(assigned_from);
+
+      CREATE TRIGGER trg_reminders_tasks_ad
+      AFTER DELETE ON tasks BEGIN
+        DELETE FROM reminders WHERE entity_type = 'task' AND entity_id = OLD.id;
+      END;
+
+      CREATE TRIGGER trg_reminders_events_ad
+      AFTER DELETE ON calendar_events BEGIN
+        DELETE FROM reminders WHERE entity_type = 'event' AND entity_id = OLD.id;
+      END;
+
+      -- Haushalts-Register der Vorsorge-Arten (D2) - NICHTS VORBEFUELLT.
+      -- docs/SCOPE.md schliesst mitgelieferte Kataloge aus, die veralten
+      -- (deutsche U-Untersuchungen etc.); der Haushalt legt seine eigenen an.
+      CREATE TABLE health_prevention_types (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        name                    TEXT    NOT NULL,
+        kind                    TEXT    NOT NULL CHECK (kind IN ('vaccination', 'checkup')),
+        default_interval_months INTEGER CHECK (default_interval_months IS NULL OR (default_interval_months BETWEEN 1 AND 600)),
+        icon                    TEXT    NOT NULL DEFAULT 'syringe',
+        sort_order              INTEGER NOT NULL DEFAULT 0,
+        created_at              TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at              TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE TRIGGER trg_health_prevention_types_updated_at AFTER UPDATE ON health_prevention_types FOR EACH ROW BEGIN
+        UPDATE health_prevention_types SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+
+      -- Das eine Modell fuer Impfung UND Vorsorgeuntersuchung (D1) - eine
+      -- Tetanus-Auffrischung alle 10 Jahre und ein Zahnarzttermin alle 6 Monate
+      -- sind dieselbe Zeile: Person + Art + wann es war + Intervall zum
+      -- naechsten Mal. Zwei Tabellen wuerden docs/DECISIONS.md #6 ("ein
+      -- Modell, nicht zwei") erneut aufmachen.
+      CREATE TABLE health_prevention_records (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id              INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type_id              INTEGER REFERENCES health_prevention_types(id) ON DELETE SET NULL,
+        -- Momentaufnahme/Ausweich-Name: bleibt lesbar, wenn der Typ umbenannt
+        -- oder geloescht wird (SET NULL oben) - Loeschen eines Typs darf seine
+        -- Historie nicht mitreissen.
+        name                 TEXT,
+        given_on             TEXT    NOT NULL,
+        dose_number          INTEGER,
+        batch                TEXT,
+        provider             TEXT,
+        note                 TEXT,
+        -- NULL = der Typ-Standard gilt; ein Wert hier ueberschreibt ihn nur
+        -- fuer DIESEN Datensatz.
+        interval_months      INTEGER CHECK (interval_months IS NULL OR (interval_months BETWEEN 1 AND 600)),
+        -- Explizite Faelligkeit; NULL = aus given_on + Intervall abgeleitet
+        -- (server/services/prevention-due.js, die einzige Stelle, die das rechnet).
+        next_due_on          TEXT,
+        -- NULL = Modul-Standard (30 Tage, DEFAULT_REMINDER_OFFSET_DAYS).
+        reminder_offset_days INTEGER CHECK (reminder_offset_days IS NULL OR (reminder_offset_days BETWEEN 0 AND 365)),
+        visibility           TEXT    NOT NULL CHECK (visibility IN ('private', 'family')),
+        created_by           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE TRIGGER trg_health_prevention_records_updated_at AFTER UPDATE ON health_prevention_records FOR EACH ROW BEGIN
+        UPDATE health_prevention_records SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+      CREATE INDEX idx_health_prevention_records_user_date ON health_prevention_records(user_id, given_on);
+    `,
+  },
+  {
+    version: 220,
+    description: 'Health: configurable fasting reminders and reminder entity types',
+    foreignKeysOff: true,
+    up: `
+      -- Carries v219's 'health_prevention_due' forward: this rebuild replaces
+      -- the table v219 just created, so every value it allowed has to be listed
+      -- here again or an existing preventive-care reminder stops inserting.
+      -- Reminders are polymorphic; SQLite requires a table rebuild to widen
+      -- the CHECK constraint while preserving all delivery state columns.
+      -- Migration 217 added triggers on tasks/events that reference reminders;
+      -- SQLite validates their SQL during the rename, so suspend and restore
+      -- them around the interval where the old reminders table is absent.
+      DROP TRIGGER IF EXISTS trg_reminders_tasks_ad;
+      DROP TRIGGER IF EXISTS trg_reminders_events_ad;
+      CREATE TABLE reminders_new (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type TEXT    NOT NULL CHECK(entity_type IN ('task', 'event', 'subscription', 'inventory_item', 'inventory_tracked_date', 'pantry_item', 'cycle_period', 'cycle_log_nudge', 'schedule_entry', 'schedule_extra_entry', 'waste_pickup', 'document_expiry', 'health_prevention_due', 'fasting_goal', 'fasting_next_start')),
+        entity_id   INTEGER NOT NULL,
+        remind_at   TEXT    NOT NULL,
+        dismissed   INTEGER NOT NULL DEFAULT 0,
+        created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        pushed_at   TEXT,
+        assigned_from INTEGER REFERENCES users(id) ON DELETE SET NULL
+      );
+      INSERT INTO reminders_new (id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from)
+        SELECT id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from FROM reminders;
+      DROP TABLE reminders;
+      ALTER TABLE reminders_new RENAME TO reminders;
+      CREATE INDEX idx_reminders_entity ON reminders(entity_type, entity_id);
+      CREATE INDEX idx_reminders_remind ON reminders(remind_at);
+      CREATE INDEX idx_reminders_user ON reminders(created_by);
+      CREATE INDEX idx_reminders_assigned_from ON reminders(assigned_from);
+
+      CREATE TRIGGER trg_reminders_tasks_ad
+      AFTER DELETE ON tasks BEGIN
+        DELETE FROM reminders WHERE entity_type = 'task' AND entity_id = OLD.id;
+      END;
+      CREATE TRIGGER trg_reminders_events_ad
+      AFTER DELETE ON calendar_events BEGIN
+        DELETE FROM reminders WHERE entity_type = 'event' AND entity_id = OLD.id;
+      END;
+
+      ALTER TABLE health_fasting_settings ADD COLUMN remind_goal INTEGER NOT NULL DEFAULT 0 CHECK(remind_goal IN (0, 1));
+      ALTER TABLE health_fasting_settings ADD COLUMN remind_next_start INTEGER NOT NULL DEFAULT 0 CHECK(remind_next_start IN (0, 1));
+    `,
+  },
 ];
 
 /**
@@ -4634,6 +9350,37 @@ function migrate() {
       }
     }
   }
+}
+
+/**
+ * Migrationsnummern, die diese Datenbank trägt und dieser Build nicht kennt.
+ *
+ * Das ist die Signatur einer NEUEREN Yuvomi-Version auf dieser Datei - nach
+ * einem Rollback des Images (Umbrel, Unraid) oder mit einem Backup aus einer
+ * neueren Installation. `migrate()` sieht nur die Gegenrichtung: es führt
+ * nach, was fehlt, und übergeht stumm, was es nicht kennt. Eine ältere App
+ * liefe damit gegen Tabellen und Spalten, die sie nicht kennt, und fiele erst
+ * dort auf, wo sie schreibt. Migrationen sind einbahnig
+ * (test:migrations-append-only); der Rückweg ist das Backup vor dem Update.
+ * @param {import('better-sqlite3-multiple-ciphers').Database} database
+ * @returns {number[]} aufsteigend, leer wenn alles bekannt ist
+ */
+function unknownMigrationVersions(database) {
+  const known = new Set(MIGRATIONS.map((m) => m.version));
+  return database
+    .prepare('SELECT version FROM schema_migrations ORDER BY version')
+    .all()
+    .map((row) => row.version)
+    .filter((version) => !known.has(version));
+}
+
+function latestKnownVersion() {
+  return Math.max(0, ...MIGRATIONS.map((m) => m.version));
+}
+
+/** Notfallschalter: nur ein ausdrückliches 1/true/yes zählt, ein leerer Wert nicht. */
+function allowNewerSchema() {
+  return /^(1|true|yes)$/i.test(String(process.env.DB_ALLOW_NEWER_SCHEMA || '').trim());
 }
 
 /**
@@ -4725,16 +9472,150 @@ async function backupToFile(destinationPath) {
   return destinationPath;
 }
 
+/**
+ * Warum eine Backup-Datei nicht lesbar ist - so genau, wie es hier zu wissen ist.
+ *
+ * SQLite sagt zu jeder Datei, die es nicht entziffern kann, denselben Satz:
+ * `file is not a database`. Für ein Backup aus einer ANDEREN Installation ist
+ * das die häufigste und zugleich die irreführendste Auskunft - die Datei ist
+ * heil, es fehlt nur der Schlüssel, mit dem sie geschrieben wurde. Gemeldet
+ * als #1267: der Umzug von einer Instanz mit selbst gesetzten Secrets auf eine,
+ * die sich ihre eigenen erzeugt, endete im Restore-Dialog bei „is not a file",
+ * und der Nutzer schloss daraus auf ein kaputtes Backup. Danach hat er die
+ * Datenbankdatei von Hand ersetzt und die Instanz zerlegt - der teure Teil des
+ * Fehlers steckt nicht im Abbruch, sondern in dem, wozu die Auskunft einlädt.
+ *
+ * Unterschieden wird am Dateikopf, nicht geraten: eine unverschlüsselte
+ * SQLite-Datei beginnt mit `SQLite format 3\0`. Fehlt der Kopf, ist die Datei
+ * verschlüsselt ODER überhaupt keine Datenbank - beides kann von hier aus nicht
+ * auseinandergehalten werden, deshalb nennt die Meldung den wahrscheinlichen
+ * Fall zuerst und den anderen im letzten Satz.
+ *
+ * Die Auskunft hat es beim zweiten Anlauf erneut getan, und das ist der Grund
+ * fuer die Fassung von jetzt: sie riet, DB_ENCRYPTION_KEY auf den Key der
+ * Quellinstanz zu setzen und neu zu starten. Auf einer Instanz OHNE eigenen Key
+ * stimmt das - ihre Klartextdatenbank wird beim Start mitverschluesselt, und
+ * danach passt der Key zu beidem. Auf einer Instanz MIT eigenem Key ist es eine
+ * Sackgasse: die eigene Datenbank ist mit dem alten Key verschluesselt, `init()`
+ * bricht beim naechsten Start ab, und der Dialog, der den Rat gegeben hat, ist
+ * nicht mehr erreichbar. Deshalb steht der Rat nur noch im `!DB_KEY`-Zweig; der
+ * andere verweist auf den Weg ueber die Kommandozeile, der Datei und Key
+ * zusammen umstellt (#1267).
+ *
+ * Beide Texte gelten nur fuer `SQLITE_NOTADB` - die Weiche davor steht in
+ * `unreadableBackupError()` (#1283).
+ */
+function undecryptableBackupError(cause) {
+  if (!DB_KEY) {
+    return new Error(
+      'Backup file could not be read: it has no plain SQLite header, so it is likely encrypted - '
+      + 'and DB_ENCRYPTION_KEY is not set on this instance, so there is nothing to decrypt it with. '
+      + 'A backup carries the encryption of the instance that wrote it: set DB_ENCRYPTION_KEY to '
+      + "that instance's key and restart Yuvomi, then restore again. If the file was never "
+      + 'encrypted, it is not a valid Yuvomi database.',
+      { cause }
+    );
+  }
+  return new Error(
+    "Backup file could not be decrypted with this instance's DB_ENCRYPTION_KEY. A backup carries "
+    + 'the encryption of the instance that wrote it, so a backup from another installation cannot '
+    + 'be read here. Do NOT just set DB_ENCRYPTION_KEY to that installation\'s key and restart: '
+    + "this instance's own database is encrypted with the key it has now, so after the swap Yuvomi "
+    + 'would not start at all and this dialog would be out of reach. Taking over a backup from '
+    + 'another installation replaces the database file and sets the key together, with Yuvomi '
+    + 'stopped - see "CLI / Docker Compose restore" on this page. If both installations really do '
+    + 'have the same key, the file is not a Yuvomi database.',
+    { cause }
+  );
+}
+
+/**
+ * Meldung für eine Backup-Datei, an der das Öffnen oder das erste Lesen
+ * scheitert - getrennt nach dem, was SQLite tatsächlich sagt (#1283).
+ *
+ * Vor #1283 wurde jeder Fehler an dieser Stelle zur Schlüssel-Meldung, ohne
+ * auf `err.code` zu sehen - dieselbe Lücke, die #1281 am Startpfad geschlossen
+ * hat. Gemessen über die echte Restore-Route und das CLI-Skript:
+ *   - `SQLITE_NOTADB`: fremder Key, eine Instanz ohne Key vor einem
+ *     verschlüsselten Backup, und ebenso eine Datei, die schon innerhalb der
+ *     ersten Seite abreißt (100 B, 2 KiB) - von einem falschen Key ist das von
+ *     hier aus nicht zu unterscheiden, deshalb nennen beide Key-Texte die
+ *     zweite Möglichkeit mit.
+ *   - `SQLITE_CORRUPT`: das EIGENE Backup, abgeschnitten nach 4 KiB, 8 KiB,
+ *     der Hälfte, allen Seiten bis auf eine, einem Byte zu wenig. Das gibt es
+ *     nur mit dem richtigen Key: dieselbe Datei liefert mit falschem Key
+ *     `SQLITE_NOTADB`, weil Seite 1 erst entschlüsselt werden und ihre
+ *     HMAC-Prüfung bestehen muss. Die Schlüssel-Meldung schickte diesen Admin
+ *     zur Übernahme eines fremden Backups über die Kommandozeile, die ihm
+ *     nichts nützt. Ohne Key kann ein Backup ohne Klartext-Kopf gar nicht
+ *     `SQLITE_CORRUPT` liefern (SQLite scheitert schon am Kopf, gemessen:
+ *     `SQLITE_NOTADB`), und der Satz „der Key öffnet sie" wäre dort falsch -
+ *     deshalb hängt der Zweig an `DB_KEY`.
+ *   - alles andere: Code und SQLite-Text, kein Wort über den Key. Gemessen ist
+ *     `SQLITE_CANTOPEN` für eine Datei ohne Leserecht (CLI-Restore einer als
+ *     root kopierten Datei). Der Kopf ist dann gar nicht lesbar, `encrypted`
+ *     steht deshalb auf true, und ohne diese Weiche sagte die Meldung mit Key
+ *     „falscher Schlüssel" und ohne Key „wahrscheinlich verschlüsselt, setz
+ *     DB_ENCRYPTION_KEY" - beides über eine Klartextdatei, die nur nicht
+ *     lesbar war.
+ * Eine Upload-Übertragung, die abreißt, kommt hier nie an: `express.raw()`
+ * verwirft den Request mit `request.aborted`, bevor die Route läuft. Eine
+ * unvollständige Datei ist also schon unvollständig hochgeladen worden -
+ * meist ein Download oder eine Kopie, die zu früh aufgehört hat.
+ *
+ * Die Klartext-Auskunft bleibt ohne Weiche: sie sagt nichts über den Key.
+ * @param {boolean} encrypted  Datei hat keinen Klartext-SQLite-Kopf
+ * @param {unknown} cause      Fehler beim Öffnen oder ersten Lesen
+ * @returns {Error}
+ */
+function unreadableBackupError(encrypted, cause) {
+  if (!encrypted) {
+    return new Error('Backup file is not a valid Yuvomi database.', { cause });
+  }
+  const code = typeof cause?.code === 'string' ? cause.code : '';
+  if (code === 'SQLITE_NOTADB') return undecryptableBackupError(cause);
+
+  const detail = `${code || 'no SQLite error code'}: ${cause?.message ?? String(cause)}`;
+  if (DB_KEY && code.startsWith('SQLITE_CORRUPT')) {
+    return new Error(
+      `Backup file is damaged or incomplete (${detail}). DB_ENCRYPTION_KEY is not the problem: it `
+      + 'does open this file - its first page decrypted and passed the integrity check, which a '
+      + 'wrong key never does. Most likely the file was cut short before it got here, by a download '
+      + 'or copy that stopped early. Nothing on this instance was changed. Get the backup again from '
+      + 'where it is stored - download or copy it once more - and check that its size and sha256sum '
+      + 'match the stored original, then restore that copy.',
+      { cause }
+    );
+  }
+
+  const lines = [`Backup file could not be read (${detail}).`];
+  if (code.startsWith('SQLITE_CANTOPEN')) {
+    lines.push('Check that the file is there and that the user this restore runs as may read it.');
+  }
+  return new Error(lines.join(' '), { cause });
+}
+
 function validateBackupFile(sourcePath) {
   // Backups, die vor der Verschlüsselungs-Umstellung entstanden sind, liegen im
   // Klartext vor. Sie müssen einspielbar bleiben — würden wir ihnen den Key
   // aufsetzen, läse SQLite sie als verschlüsselt und die Validierung schlüge
   // fehl. Nach dem Restore verschlüsselt init() sie ohnehin.
   const encrypted = !isPlaintextDatabase(sourcePath);
-  const candidate = new Database(sourcePath, { readonly: true, fileMustExist: true });
+  let candidate;
+  try {
+    candidate = new Database(sourcePath, { readonly: true, fileMustExist: true });
+  } catch (err) {
+    // Das Öffnen zählt mit: eine Datei, an der schon der Konstruktor scheitert,
+    // liefe sonst an der Diagnose vorbei und käme als rohe SQLite-Zeile heraus.
+    throw unreadableBackupError(encrypted, err);
+  }
   try {
     if (encrypted) applyEncryptionKey(candidate);
-    assertReadable(candidate);
+    try {
+      assertReadable(candidate);
+    } catch (err) {
+      throw unreadableBackupError(encrypted, err);
+    }
     const row = candidate.prepare(`
       SELECT name
       FROM sqlite_master
@@ -4742,6 +9623,16 @@ function validateBackupFile(sourcePath) {
     `).get();
     if (!row) {
       throw new Error('Backup file is not a valid Yuvomi database.');
+    }
+    // Backup aus einer neueren Yuvomi-Version: ablehnen, bevor irgendetwas
+    // kopiert wird. Eingespielt liefe diese App stumm gegen ein Schema, das
+    // sie nicht kennt; der richtige erste Schritt ist das Update.
+    const unknown = unknownMigrationVersions(candidate);
+    if (unknown.length > 0) {
+      throw new Error(
+        `Backup was written by a newer Yuvomi (schema v${unknown[unknown.length - 1]}; this ` +
+        `version knows up to v${latestKnownVersion()}). Update Yuvomi first, then restore.`
+      );
     }
     return candidate.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()?.version ?? 0;
   } finally {
@@ -4757,11 +9648,37 @@ async function unlinkIfExists(filePath) {
   }
 }
 
+/** Datei umbenennen; `false`, wenn es sie nicht gibt. */
+async function renameIfExists(from, to) {
+  try {
+    await fs.rename(from, to);
+    return true;
+  } catch (err) {
+    if (err?.code !== 'ENOENT') throw err;
+    return false;
+  }
+}
+
+/**
+ * Wohin `restoreFromFile()` das Journal einer leeren Datei legt: neben die
+ * Rollback-Kopie, aber unter einem Namen, den SQLite nicht von selbst aufgreift
+ * (`<kopie>.wal-kept`, nicht `<kopie>-wal`).
+ */
+function keptJournalName(rollbackPath, kind) {
+  return `${rollbackPath}.${kind}-kept`;
+}
+
 async function restoreFromFile(sourcePath) {
   const backupVersion = validateBackupFile(sourcePath);
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const rollbackPath = `${DB_PATH}.pre-restore-${timestamp}`;
   let rollbackCreated = false;
+  // Offen ist die Verbindung, außer im Leer-Fall des Restore-CLI (#1282, siehe
+  // Auto-Init am Dateiende). Nur eine offene Verbindung wird unten per
+  // TRUNCATE gecheckpointet; danach trägt die Rollback-Kopie alles, und ein
+  // Rest-Journal zu löschen verliert nichts.
+  const wasOpen = Boolean(db);
+  let keptJournalPath = null;
 
   try {
     if (db) {
@@ -4778,6 +9695,21 @@ async function restoreFromFile(sourcePath) {
       if (err?.code !== 'ENOENT') throw err;
     }
 
+    // Ohne offene Verbindung hat niemand das Journal gecheckpointet. Ein `-wal`
+    // mit Daten neben der leeren Datei gehört zur Datenbank, die vorher hier
+    // lag, und kann Änderungen tragen, die nirgends sonst stehen - die Meldung
+    // aus `emptyDatabaseFileError()` sagt „keep them". Also nicht löschen,
+    // sondern neben die Rollback-Kopie legen, wohin es als Vorgänger gehört.
+    //
+    // NICHT unter `-wal`: die Rollback-Kopie ist hier selbst die leere Datei,
+    // und SQLite verwirft ein `-wal` neben einer leeren Hauptdatei beim ersten
+    // Lesen. Wer die Kopie ansieht (`sqlite3 <kopie>`, der naheliegende
+    // nächste Schritt), vernichtete sonst genau das, was hier bewahrt wird.
+    if (!wasOpen && regularFileSize(`${DB_PATH}-wal`) > 0) {
+      await fs.rename(`${DB_PATH}-wal`, keptJournalName(rollbackPath, 'wal'));
+      keptJournalPath = keptJournalName(rollbackPath, 'wal');
+      await renameIfExists(`${DB_PATH}-shm`, keptJournalName(rollbackPath, 'shm'));
+    }
     await unlinkIfExists(`${DB_PATH}-wal`);
     await unlinkIfExists(`${DB_PATH}-shm`);
     await fs.copyFile(sourcePath, DB_PATH);
@@ -4794,6 +9726,7 @@ async function restoreFromFile(sourcePath) {
     return {
       schemaVersion: currentVersion(),
       rollbackPath: rollbackCreated ? rollbackPath : null,
+      keptJournalPath,
     };
   } catch (err) {
     if (rollbackCreated) {
@@ -4805,7 +9738,19 @@ async function restoreFromFile(sourcePath) {
         await unlinkIfExists(`${DB_PATH}-wal`);
         await unlinkIfExists(`${DB_PATH}-shm`);
         await fs.copyFile(rollbackPath, DB_PATH);
-        init({ plaintextBackup: false });
+        if (keptJournalPath) {
+          // Der Rollback stellt den Stand vor dem Restore her: das Journal
+          // gehört wieder neben die (leere) Datei, an der die Meldung es nennt.
+          await renameIfExists(keptJournalName(rollbackPath, 'wal'), `${DB_PATH}-wal`);
+          await renameIfExists(keptJournalName(rollbackPath, 'shm'), `${DB_PATH}-shm`);
+        }
+        try {
+          init({ plaintextBackup: false });
+        } catch (reopenErr) {
+          // Die leere Datei verweigert init() wie vor dem Restore - das ist der
+          // alte Stand, kein gescheiterter Rollback.
+          if (reopenErr?.code !== EMPTY_DATABASE_FILE) throw reopenErr;
+        }
       } catch (rollbackErr) {
         log.error('Rollback after failed restore also failed:', rollbackErr);
       }
@@ -4860,6 +9805,20 @@ function _resetTestDatabase() {
   }
 }
 
-init();   // auto-initialise when module is first imported
+// Auto-Init beim ersten Import. Eine Ausnahme: das Restore-CLI setzt vorher den
+// Handschlag (RESTORE_TARGET_HANDSHAKE), und nur für GENAU den Leer-Fall bleibt
+// `db` dann `null` - `restoreFromFile()` ersetzt die leere Datei ohnehin, und
+// ohne diese Ausnahme endete der Rat der Meldung („copy it again") per CLI in
+// einer ungefangenen Ausnahme (#1282). Alles andere wirft weiter, auch im CLI.
+// Eine gesunde Datenbank öffnet das CLI bewusst wie bisher: nur eine offene
+// Verbindung checkpointet `restoreFromFile()` vor der Rollback-Kopie, ein
+// pauschal aufgeschobenes init() kürzte die Kopie um nicht gecheckpointete
+// Transaktionen und löschte danach das `-wal`. Ohne Handschlag (Server, Tests,
+// andere Skripte) bricht der Leer-Fall ab wie zuvor.
+try {
+  init();
+} catch (err) {
+  if (!(err?.code === EMPTY_DATABASE_FILE && globalThis[RESTORE_TARGET_HANDSHAKE] === true)) throw err;
+}
 
-export { init, get, transaction, currentVersion, getPath, backupToFile, restoreFromFile, MIGRATIONS, reconcileCriticalSchema, _setTestDatabase, _resetTestDatabase };
+export { init, get, transaction, currentVersion, getPath, backupToFile, restoreFromFile, unknownMigrationVersions, MIGRATIONS, reconcileCriticalSchema, _setTestDatabase, _resetTestDatabase };

@@ -24,6 +24,14 @@
  *   - jeder gelistete Pfad existiert (c.addAll() ist All-or-Nothing: eine
  *     fehlende Datei lässt den kompletten SW-Install scheitern)
  *   - der transitive Import-Graph aller precachten Module ist selbst precacht
+ *   - jedes von index.html eager geladene Stylesheet ist precacht. Der
+ *     Modulgraph oben sieht nur JS; CSS hängt an keinem `import`, und so lagen
+ *     11 der 18 eager geladenen Stylesheets außerhalb des Precache, ohne dass
+ *     eine Zeile dieser Datei das bemerken konnte
+ *   - jedes von index.html geladene Skript ist precacht. Der Modulgraph oben
+ *     beginnt erst bei den Einträgen der Precache-Liste; ein Skript, das dort
+ *     fehlt, wird von keinem `import` erreicht und fällt deshalb durch beide
+ *     Netze
  *   - Precache-Bucket und fetch-Routing stimmen überein (ein im SHELL_CACHE
  *     abgelegtes Modul darf nicht aus dem PAGES_CACHE bedient werden)
  *   - keine Doppeleinträge zwischen den Listen
@@ -33,6 +41,8 @@ import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createContext, runInContext } from 'node:vm';
+import { posix } from 'node:path';
+import { withoutHtmlComments } from './source-text.js';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
 const SRC = readFileSync(new URL('../public/sw.js', import.meta.url), 'utf8');
@@ -81,11 +91,39 @@ function loadSwLists() {
 
 const { APP_SHELL, PAGE_MODULES, APP_LOCALES, PAGE_MODULE_SET } = loadSwLists();
 
-/** Statische `from '/pfad'`-Importe einer Datei. Dynamische Importe stehen bewusst außen vor: sie sind zur Laufzeit auflösbar und blockieren keinen Modulgraph. */
+/**
+ * Statische Importe einer Datei, als absolute Pfade.
+ *
+ * JEDE SCHREIBWEISE ZAEHLT, NICHT NUR DIE HAEUFIGSTE. Der Ausdruck sah lange
+ * `from '/pfad'` und sonst nichts. Unsichtbar blieben damit zwei Formen, die
+ * der Browser genauso laedt:
+ *
+ *   - relative Specifier - `from './nachbar.js'`
+ *   - Seiteneffekt-Importe ohne Bindung - `import '/components/datepicker.js'`
+ *
+ * Beide Luecken haben je einen echten Fehler getragen, der jahrelang gruen war:
+ * `settings/dirty-guard.js` (relativ, aus der Settings-Shell) und
+ * `components/datepicker.js` (Seiteneffekt, aus dem Router). Online faellt so
+ * etwas nie auf, weil das Netz die Luecke fuellt; offline scheitert der Import
+ * und nimmt alles mit, was von der Datei abhaengt.
+ *
+ * Dynamische Importe stehen weiter bewusst aussen vor: sie sind zur Laufzeit
+ * aufloesbar und blockieren keinen Modulgraph.
+ */
 function staticImports(pathname) {
   const file = PUBLIC_DIR + pathname.replace(/^\//, '');
   if (!existsSync(file)) return [];
-  return [...readFileSync(file, 'utf8').matchAll(/from\s+'(\/[^']+)'/g)].map((m) => m[1]);
+  const code = readFileSync(file, 'utf8');
+  const dir = posix.dirname(pathname);
+  const specs = [
+    ...[...code.matchAll(/from\s+'([^']+)'/g)].map((m) => m[1]),
+    // `import 'x';` am Zeilenanfang - ohne `from`, ohne Klammer (das waere ein
+    // dynamischer Import und bleibt draussen).
+    ...[...code.matchAll(/^\s*import\s+'([^']+)'/gm)].map((m) => m[1]),
+  ];
+  return specs
+    .filter((spec) => spec.startsWith('/') || spec.startsWith('.'))
+    .map((spec) => (spec.startsWith('/') ? spec : posix.resolve(dir, spec)));
 }
 
 const precached = new Set([...APP_SHELL, ...PAGE_MODULES, ...APP_LOCALES]);
@@ -120,6 +158,69 @@ test('der transitive Modulgraph ist vollständig precacht (#616)', () => {
   );
 });
 
+test('jedes eager geladene Stylesheet aus index.html ist precacht', () => {
+  const html = readFileSync(PUBLIC_DIR + 'index.html', 'utf8');
+  // Nur `rel="stylesheet"` ohne `media`/`onload`-Umweg: das sind die, die den
+  // ersten Render blockieren. Ein per Router nachgeladenes Seiten-CSS zählt
+  // nicht - es kommt erst, wenn die Shell schon steht.
+  // Schreibungstoleranz durchgehend, und "durchgehend" heisst JEDER Schritt.
+  // Sobald der Regex `<LINK REL=...>` findet, muessen die Ausschluesse `MEDIA=`
+  // /`ONLOAD=` genauso finden - sonst zaehlt ein grossgeschriebenes
+  // Print-Stylesheet als eager. Und `HREF=` muss es auch: ein Treffer, dessen
+  // Adresse nicht gelesen wird, faellt hier als `undefined` durch `filter(Boolean)`
+  // und wird nie gegen APP_SHELL geprueft - der Guard verliert ihn lautlos,
+  // waehrend die Reichweiten-Schwelle darunter weiter erfuellt ist.
+  const eager = [...html.matchAll(/<link\b[^>]*\brel=["']stylesheet["'][^>]*>/gi)]
+    .map((m) => m[0])
+    .filter((tag) => !/\bmedia=/i.test(tag) && !/\bonload=/i.test(tag))
+    .map((tag) => tag.match(/\bhref=["']([^"']+)["']/i)?.[1])
+    .filter(Boolean);
+
+  // Reichweiten-Nachweis: findet das Muster nichts, prüft die Assertion nichts.
+  assert.ok(eager.length >= 10, `Nur ${eager.length} eager geladene Stylesheets gefunden - das Muster greift nicht mehr`);
+
+  const shell = new Set(APP_SHELL);
+  const missing = eager.filter((href) => !shell.has(href));
+  assert.deepEqual(
+    missing, [],
+    'Diese Stylesheets lädt index.html eager, der Service Worker precacht sie aber nicht. '
+    + `Der allererste Offline-Start rendert damit ungestylt:\n  ${missing.join('\n  ')}`,
+  );
+});
+
+// Dieselbe Lücke wie oben, nur für JS: der Modulgraph-Test folgt `import`-Kanten
+// ab der Precache-Liste und sieht deshalb nie, was index.html per <script> lädt
+// und die Liste vergisst. `lucide-scope.js` ist genau so ein Fall - es hängt an
+// keinem Import, sondern gibt `createIcons({ el })` an über zweihundert
+// Aufrufstellen seinen Ausschnitt (siehe Dateikopf). Offline fehlte es, und die
+// App liefe sichtbar unverändert weiter, nur langsamer.
+test('jedes von index.html geladene Skript ist precacht', () => {
+  // `i`, weil Tagname und Attribute in HTML schreibungsegal sind: eine
+  // grossgeschriebene Fassung faende der Guard sonst nicht und meldete gruen,
+  // obwohl er nichts gesehen hat (CodeQL js/bad-tag-filter). Und ohne
+  // Kommentare, damit ein auskommentiertes Tag nicht als geladen zaehlt.
+  const html = withoutHtmlComments(readFileSync(PUBLIC_DIR + 'index.html', 'utf8'));
+  const scripts = [...html.matchAll(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi)]
+    .map((m) => m[1])
+    // Ausgeschlossen wird nur echte Fremdherkunft (Schema oder protokollrelativ).
+    // Ein relatives `src="analytics.js"` ist same-origin und muss genauso
+    // precacht sein; ein Filter auf fuehrenden Slash haette es stillschweigend
+    // uebersprungen und den Guard fuer genau diesen Fall gruen gelassen.
+    .filter((src) => !/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(src))
+    .map((src) => (src.startsWith('/') ? src : posix.resolve('/', src)));
+
+  // Reichweiten-Nachweis: findet das Muster nichts, prüft die Assertion nichts.
+  assert.ok(scripts.length >= 5, `Nur ${scripts.length} Skripte gefunden - das Muster greift nicht mehr`);
+
+  const shell = new Set(APP_SHELL);
+  const missing = scripts.filter((src) => !shell.has(src));
+  assert.deepEqual(
+    missing, [],
+    'Diese Skripte lädt index.html, der Service Worker precacht sie aber nicht. '
+    + `Offline fehlen sie ersatzlos:\n  ${missing.join('\n  ')}`,
+  );
+});
+
 test('Precache-Bucket und fetch-Routing stimmen überein', () => {
   // Der fetch-Handler leitet /pages/, /settings/ und alles in PAGE_MODULE_SET in
   // den PAGES_CACHE, den Rest über isMutableAppResource() in den SHELL_CACHE.
@@ -138,4 +239,31 @@ test('keine Doppeleinträge zwischen den Precache-Listen', () => {
   const all = [...APP_SHELL, ...PAGE_MODULES, ...APP_LOCALES];
   const dupes = all.filter((p, i) => all.indexOf(p) !== i);
   assert.deepEqual([...new Set(dupes)], [], `Mehrfach precacht: ${dupes.join(', ')}`);
+});
+
+test('jedes Settings-Blatt der Registry ist precacht', () => {
+  // Schwesterregel zum Modulgraph-Guard oben, und die Lücke, die er offen
+  // lässt: er folgt Importen ab den precachten Modulen, ein Blatt aber wird
+  // per dynamischem `loader: () => import(...)` geladen und steht damit in
+  // keinem statischen Importbaum. Ein nicht precachtes Blatt ist deshalb kein
+  // Mischzustand, sondern schlicht offline nicht erreichbar - stumm, weil es
+  // online immer geht. Gemessen am 2026-08-15 fehlten sechs von 28, vier davon
+  // seit längerem: admin-email, admin-permissions, personal-health und
+  // personal-weather.
+  //
+  // Kanonische Quelle ist die Registry, nicht das Verzeichnis: ein Blatt, das
+  // dort nicht steht, ist tot und muss nicht precacht sein.
+  const registry = readFileSync(new URL('../public/settings/registry.js', import.meta.url), 'utf8');
+  const leaves = [...registry.matchAll(/loader:\s*\(\)\s*=>\s*import\('([^']+)'\)/g)].map((m) => m[1]);
+
+  assert.ok(leaves.length >= 20,
+    `Nur ${leaves.length} Blätter in der Registry gefunden - das Muster greift nicht mehr`);
+
+  const precached = new Set([...APP_SHELL, ...PAGE_MODULES]);
+  const missing = leaves.filter((path) => !precached.has(path));
+  assert.deepEqual(
+    missing, [],
+    'Diese Settings-Blätter stehen in der Registry, werden aber nicht precacht '
+    + `und sind damit offline nicht erreichbar:\n  ${missing.join('\n  ')}`,
+  );
 });

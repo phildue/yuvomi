@@ -8,13 +8,21 @@ import { createLogger } from '../logger.js';
 const log = createLogger('CalDAV');
 
 import * as db from '../db.js';
-import { decodeHtmlEntities } from '../utils/html-entities.js';
+import { upsertExternalCalendar } from './external-calendars.js';
 import { assignDefaultToEvent } from './sync-assignment.js';
-import { pruneDeletedEvents } from './calendar-prune.js';
+import { pruneDeletedEvents, countMirroredEvents, deleteMirroredEvents } from './calendar-prune.js';
 import * as outbound from './calendar-outbound.js';
 import { processPendingDeletions, processPendingUpdates, flushAccount } from './caldav-outbound.js';
+import { detachAccountRows } from './caldav-todo-outbound.js';
+import { runSerialized } from '../utils/sync-lock.js';
 import { toICSDatetime, escapeICSText } from '../utils/ics-format.js';
-import { createCalDAVClient } from '../utils/caldav-client.js';
+import { eventDateTimeFields } from '../utils/ics-datetime.js';
+import { vtimezoneFor } from '../utils/vtimezone.js';
+import { householdTimeZone } from '../utils/timezone.js';
+import { createCalDAVClient, supportsComponent } from '../utils/caldav-client.js';
+import { rruleLine } from './recurrence.js';
+import { nearestIcalColorName } from '../utils/ical-color.js';
+import { outboundEvent } from './outbound-dtstart.js';
 
 // Reused functions from apple-calendar.js
 import {
@@ -29,39 +37,41 @@ import {
 // hält die bestehenden Importpfade (Tests, ics-Export) gültig.
 export { toICSDatetime };
 
-function buildCalDAVICS(event) {
+function buildCalDAVICS(event, householdZone = null) {
   const uid  = `oikos-${event.id}@oikos.local`;
   const now  = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+  // Die Zeiten und ihre Zone bestimmt eventDateTimeFields; bis #938 stand hier
+  // ein blankes `DTSTART:20260830T100000`, das keinen Zeitpunkt bezeichnet,
+  // sondern eine Uhrzeit ohne Uhr.
+  // Start/Ende mit der eigenen Wiederholungsregel in Einklang (#986); ein
+  // importiertes DTSTART bleibt unberuehrt (#756).
+  const when = eventDateTimeFields(outboundEvent(event), householdZone);
   const lines = [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
     'PRODID:-//Yuvomi//CalDAV Sync//EN',
+  ];
+  // RFC 5545: ein TZID-Parameter braucht sein VTIMEZONE im selben VCALENDAR,
+  // und zwar bevor es benutzt wird.
+  if (when.tzid) lines.push(...vtimezoneFor(when.tzid, Number(String(event.start_datetime).slice(0, 4))));
+  lines.push(
     'BEGIN:VEVENT',
     `UID:${uid}`,
     `DTSTAMP:${now}`,
     `SUMMARY:${escapeICSText(event.title)}`,
-  ];
-
-  if (event.all_day) {
-    const startDate = event.start_datetime.slice(0, 10).replace(/-/g, '');
-    const endSrc    = (event.end_datetime || event.start_datetime).slice(0, 10);
-    const endD      = new Date(endSrc + 'T00:00:00');
-    endD.setDate(endD.getDate() + 1);
-    const endDate = `${endD.getFullYear()}${String(endD.getMonth() + 1).padStart(2, '0')}${String(endD.getDate()).padStart(2, '0')}`;
-    lines.push(`DTSTART;VALUE=DATE:${startDate}`);
-    lines.push(`DTEND;VALUE=DATE:${endDate}`);
-  } else {
-    lines.push(`DTSTART:${toICSDatetime(event.start_datetime)}`);
-    lines.push(`DTEND:${toICSDatetime(event.end_datetime || event.start_datetime)}`);
-  }
+    `DTSTART${when.dtstart.params}:${when.dtstart.value}`,
+    `DTEND${when.dtend.params}:${when.dtend.value}`,
+  );
 
   if (event.description)     lines.push(`DESCRIPTION:${escapeICSText(event.description)}`);
   if (event.location)        lines.push(`LOCATION:${escapeICSText(event.location)}`);
+  // Eigenfarbe als CSS3-Name (RFC 7986, #897). Ein Termin ohne eigene Farbe
+  // bekommt keine Zeile und erbt beim Anbieter die des Kalenders.
+  const colorName = nearestIcalColorName(event.color);
+  if (colorName) lines.push(`COLOR:${colorName}`);
+
   if (event.recurrence_rule) {
-    const rule = event.recurrence_rule.startsWith('RRULE:')
-      ? event.recurrence_rule
-      : `RRULE:${event.recurrence_rule}`;
-    lines.push(rule);
+    lines.push(rruleLine(event.recurrence_rule));
   }
 
   lines.push('END:VEVENT', 'END:VCALENDAR');
@@ -77,20 +87,6 @@ function normalizeCalColor(c) {
   if (/^#[0-9a-fA-F]{8}$/.test(c)) return c.slice(0, 7); // strip alpha
   if (/^#[0-9a-fA-F]{6}$/.test(c)) return c;
   return null;
-}
-
-function upsertExternalCalendar(source, externalId, name, color) {
-  // Provider-Namen können HTML-entity-encoded sein — zu Klartext normalisieren,
-  // sonst escaped die UI doppelt (z. B. literales "&amp;").
-  const row = db.get().prepare(`
-    INSERT INTO external_calendars (source, external_id, name, color)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(source, external_id) DO UPDATE SET
-      name  = excluded.name,
-      color = excluded.color
-    RETURNING id
-  `).get(source, externalId, decodeHtmlEntities(name), color);
-  return row.id;
 }
 
 // --------------------------------------------------------
@@ -109,15 +105,27 @@ function getAllAccounts() {
 // Connection Testing
 // --------------------------------------------------------
 
-async function testConnection(caldavUrl, username, password) {
+/**
+ * Nur Collections, die Termine aufnehmen. `fetchCalendars()` liefert jede
+ * Kalender-Collection des Kontos, also auch reine Aufgabenlisten - die landeten
+ * ungefiltert in der Kalenderauswahl und wurden als Speicherziel für Termine
+ * angeboten. Sabre/Nextcloud weist ein VEVENT darin mit 403 ab, Radicale nimmt es
+ * an und verschmutzt damit die Aufgabenliste anderer Clients (#617).
+ */
+function eventCalendars(calendars) {
+  return (calendars || []).filter(cal => supportsComponent(cal, 'VEVENT'));
+}
+
+/**
+ * `createClient` wie bei sync(): injizierbare Factory für Tests, Vorgabe ist der
+ * echte tsdav-Client. Ohne sie ließe sich der Auffrischungspfad der
+ * Kalenderliste nur über die Schreibweise prüfen, nicht über sein Verhalten -
+ * und genau dort saß der Fehler, der die Abwahl überschrieb (#732).
+ */
+async function testConnection(caldavUrl, username, password, { createClient } = {}) {
   try {
-    const { createDAVClient } = await import('tsdav');
-    const client = await createDAVClient({
-      serverUrl:          caldavUrl,
-      credentials:        { username, password },
-      authMethod:         'Basic',
-      defaultAccountType: 'caldav',
-    });
+    const makeClient = createClient || createCalDAVClient;
+    const client = await makeClient({ caldav_url: caldavUrl, username, password });
 
     const calendars = await client.fetchCalendars();
     if (!calendars.length) {
@@ -135,14 +143,15 @@ async function testConnection(caldavUrl, username, password) {
 // Account Management
 // --------------------------------------------------------
 
-async function addAccount(name, caldavUrl, username, password) {
+async function addAccount(name, caldavUrl, username, password, { createClient } = {}) {
   // Validate inputs
   if (!name || !caldavUrl || !username || !password) {
     throw new Error('All fields required: name, caldavUrl, username, password');
   }
 
-  // Test connection first
-  const { calendars } = await testConnection(caldavUrl, username, password);
+  // Test connection first (createClient injizierbar wie bei getCalendars/
+  // updateAccount - ohne sie ginge dieser Pfad im Test ans echte Netz).
+  const { calendars } = await testConnection(caldavUrl, username, password, { createClient });
 
   // Check for duplicate
   const existing = db.get().prepare(
@@ -166,21 +175,26 @@ async function addAccount(name, caldavUrl, username, password) {
 
   const accountId = result.lastInsertRowid;
 
-  // Insert calendar selections (all enabled by default)
+  // OPT-IN, NICHT OPT-OUT (#732): Ein neues Konto bringt seine Kalender
+  // abgewaehlt mit. Vorher lief nach dem Verbinden sofort jeder gefundene
+  // Kalender in den Haushalt - bei einem Konto mit Arbeits-, Geburtstags- und
+  // Feiertagskalendern also drei Kalender, die niemand bestellt hat, und deren
+  // Termine man einzeln wieder loswerden musste. Wer verbindet, waehlt danach
+  // aus; das ist ein Klick mehr und eine Ueberraschung weniger.
   const calendarData = [];
-  for (const cal of calendars) {
+  for (const cal of eventCalendars(calendars)) {
     const calColor = normalizeCalColor(cal.calendarColor) || '#4A90E2';
     const calName = cal.displayName || 'Unnamed Calendar';
 
     db.get().prepare(`
       INSERT INTO caldav_calendar_selection (account_id, calendar_url, calendar_name, calendar_color, enabled)
-      VALUES (?, ?, ?, ?, 1)
+      VALUES (?, ?, ?, ?, 0)
     `).run(accountId, cal.url, calName, calColor);
 
-    calendarData.push({ url: cal.url, name: calName, color: calColor, enabled: true });
+    calendarData.push({ url: cal.url, name: calName, color: calColor, enabled: false });
   }
 
-  log.info(`Added CalDAV account "${name}" with ${calendars.length} calendars.`);
+  log.info(`Added CalDAV account "${name}" with ${calendarData.length} calendars.`);
 
   return { accountId, calendars: calendarData };
 }
@@ -200,10 +214,13 @@ function listAccounts() {
     username: acc.username,
     createdAt: acc.created_at,
     lastSync: acc.last_sync,
+    // Für die Rückfrage vor dem Löschen des Kontos (#732) - dieselbe Zahl, die
+    // der Nutzer danach vermissen würde.
+    eventCount: countAccountEvents(acc.id),
   }));
 }
 
-async function updateAccount(accountId, { name, caldavUrl, username, password }) {
+async function updateAccount(accountId, { name, caldavUrl, username, password, createClient }) {
   const account = getAccountById(accountId);
   if (!account) {
     throw new Error(`Account ${accountId} not found.`);
@@ -220,22 +237,30 @@ async function updateAccount(accountId, { name, caldavUrl, username, password })
     const testUser = username || account.username;
     const testPwd = password || account.password;
 
-    const { calendars } = await testConnection(testUrl, testUser, testPwd);
+    const { calendars } = await testConnection(testUrl, testUser, testPwd, { createClient });
 
     // If credentials changed, refresh calendar list
     if (calendars) {
+      // Wie in getCalendars({ refresh: true }): neue Zugangsdaten heißen neue
+      // Kalenderliste, nicht neue Auswahl. Ein geändertes Passwort darf einen
+      // abgewählten Kalender nicht wieder in den Sync holen (#732).
+      const previous = new Map(
+        db.get().prepare('SELECT calendar_url, enabled FROM caldav_calendar_selection WHERE account_id = ?')
+          .all(accountId).map((row) => [row.calendar_url, row.enabled === 1])
+      );
+
       // Delete old selections
       db.get().prepare('DELETE FROM caldav_calendar_selection WHERE account_id = ?').run(accountId);
 
       // Insert new selections
-      for (const cal of calendars) {
+      for (const cal of eventCalendars(calendars)) {
         const calColor = normalizeCalColor(cal.calendarColor) || '#4A90E2';
         const calName = cal.displayName || 'Unnamed Calendar';
 
         db.get().prepare(`
           INSERT INTO caldav_calendar_selection (account_id, calendar_url, calendar_name, calendar_color, enabled)
-          VALUES (?, ?, ?, ?, 1)
-        `).run(accountId, cal.url, calName, calColor);
+          VALUES (?, ?, ?, ?, ?)
+        `).run(accountId, cal.url, calName, calColor, (previous.get(cal.url) ?? false) ? 1 : 0);
       }
     }
   }
@@ -264,27 +289,55 @@ async function updateAccount(accountId, { name, caldavUrl, username, password })
   return { success: true };
 }
 
-function deleteAccount(accountId) {
+/**
+ * `deleteEvents` nimmt die gespiegelten Termine mit (#732). Ohne die Option war
+ * das Loeschen eines Kontos der einzige Weg, bei dem Termine sichtbar liegen
+ * blieben, aber ihre Kalenderzuordnung verloren (`calendar_ref_id ON DELETE SET
+ * NULL`) - Waisen, denen niemand mehr ansieht, woher sie kamen.
+ *
+ * Die URLs muessen VOR dem Loeschen des Kontos gelesen werden: die Auswahlzeilen
+ * haengen per CASCADE am Konto und sind danach fort.
+ */
+function deleteAccount(accountId, { deleteEvents = false } = {}) {
   const account = getAccountById(accountId);
   if (!account) {
     throw new Error(`Account ${accountId} not found.`);
   }
 
-  // CASCADE will delete caldav_calendar_selection entries
-  db.get().prepare('DELETE FROM caldav_accounts WHERE id = ?').run(accountId);
+  // CASCADE räumt nur, was dem Konto selbst gehört: Kalender- und
+  // Listenauswahl und die offenen VTODO-Löschungen. Die gespiegelten Aufgaben
+  // und Einkaufsposten sind Nutzerdaten und bleiben - aber ihre
+  // external_account_id trägt keinen Fremdschlüssel und zeigte danach ins Leere
+  // (#617). Beim nächsten Löschen so einer Zeile scheiterte der Tombstone am
+  // Fremdschlüssel von caldav_todo_pending_deletions: die Aufgabe ließe sich
+  // lokal nicht mehr löschen, während die entfernte Kopie ohne Konto ohnehin
+  // unerreichbar ist. Also entkoppeln, bevor das Konto verschwindet - beides in
+  // einem Zug, damit keine Hälfte allein stehen bleibt.
+  const calendarUrls = accountCalendarUrls(accountId);
 
-  // Events with calendar_ref_id to deleted account remain (orphaned but visible)
+  const { detached, removed } = db.get().transaction(() => {
+    // Ohne deleteEvents bleiben die Termine sichtbar stehen, verlieren aber ihre
+    // Kalenderzuordnung - das war bis #732 der einzige Ausgang und ist jetzt der
+    // ausdruecklich gewaehlte.
+    const cleared = deleteEvents ? deleteMirroredEvents(db.get(), calendarUrls) : 0;
+    const rows = detachAccountRows(accountId);
+    db.get().prepare('DELETE FROM caldav_accounts WHERE id = ?').run(accountId);
+    return { detached: rows, removed: cleared };
+  })();
 
-  log.info(`Deleted CalDAV account ${accountId} ("${account.name}").`);
+  log.info(
+    `Deleted CalDAV account ${accountId} ("${account.name}"), detached ${detached} mirrored row(s).`
+    + (removed ? `, ${removed} mirrored event(s) removed` : '')
+  );
 
-  return { success: true };
+  return { success: true, removed };
 }
 
 // --------------------------------------------------------
 // Calendar Selection
 // --------------------------------------------------------
 
-async function getCalendars(accountId, { refresh = false } = {}) {
+async function getCalendars(accountId, { refresh = false, createClient } = {}) {
   const account = getAccountById(accountId);
   if (!account) {
     throw new Error(`Account ${accountId} not found.`);
@@ -312,30 +365,49 @@ async function getCalendars(accountId, { refresh = false } = {}) {
       enabled: cal.enabled === 1,
       default_assignee_user_id: assigneeMap.get(cal.calendar_url) ?? null,
       synced: assigneeMap.has(cal.calendar_url),
+      // Die Zahl reist mit der Liste, damit die Rückfrage beim Abwählen sie
+      // sofort nennen kann (#732). Ein eigener Endpunkt dafür wäre ein zweiter
+      // Roundtrip genau in dem Moment, in dem der Nutzer auf eine Antwort wartet.
+      eventCount: countMirroredEvents(db.get(), [cal.calendar_url]),
     }));
   }
 
   // Refresh from server
-  const { calendars } = await testConnection(account.caldav_url, account.username, account.password);
+  const { calendars } = await testConnection(
+    account.caldav_url, account.username, account.password, { createClient }
+  );
 
-  // Update DB
+  // DIE ABWAHL ÜBERLEBT DIE AKTUALISIERUNG: „Kalender aktualisieren" holt die
+  // Liste vom Server, es ist keine Zurücksetzung. Vorher lief hier ein DELETE
+  // mit anschließendem INSERT auf enabled=1, und jeder bewusst abgewählte
+  // Kalender kam ungefragt zurück in den Sync - beim nächsten Lauf mitsamt
+  // seinen Terminen (#732). Deshalb den Stand je calendar_url vorher sichern
+  // und nur für NEUE Kalender die Vorgabe „an" setzen.
+  const previous = new Map(
+    db.get().prepare('SELECT calendar_url, enabled FROM caldav_calendar_selection WHERE account_id = ?')
+      .all(accountId).map((row) => [row.calendar_url, row.enabled === 1])
+  );
+
   db.get().prepare('DELETE FROM caldav_calendar_selection WHERE account_id = ?').run(accountId);
 
   const result = [];
-  for (const cal of calendars) {
+  for (const cal of eventCalendars(calendars)) {
     const calColor = normalizeCalColor(cal.calendarColor) || '#4A90E2';
     const calName = cal.displayName || 'Unnamed Calendar';
+    // Bekannter Kalender behaelt seinen Stand, ein neu gemeldeter kommt
+    // abgewaehlt - dieselbe Opt-in-Regel wie beim Anlegen des Kontos (#732).
+    const enabled = previous.get(cal.url) ?? false;
 
     db.get().prepare(`
       INSERT INTO caldav_calendar_selection (account_id, calendar_url, calendar_name, calendar_color, enabled)
-      VALUES (?, ?, ?, ?, 1)
-    `).run(accountId, cal.url, calName, calColor);
+      VALUES (?, ?, ?, ?, ?)
+    `).run(accountId, cal.url, calName, calColor, enabled ? 1 : 0);
 
     result.push({
       calendarUrl: cal.url,
       calendarName: calName,
       calendarColor: calColor,
-      enabled: true,
+      enabled,
     });
   }
 
@@ -344,7 +416,13 @@ async function getCalendars(accountId, { refresh = false } = {}) {
   return result;
 }
 
-function updateCalendarSelection(accountId, calendarUrl, enabled) {
+/**
+ * `deleteEvents` räumt beim ABWÄHLEN zusätzlich die bereits gespiegelten Termine
+ * weg (#732). Nur beim Abwählen: beim Einschalten gibt es nichts aufzuräumen,
+ * und ein Flag, das in beide Richtungen etwas täte, wäre eine Falle für jeden
+ * künftigen Aufrufer.
+ */
+function updateCalendarSelection(accountId, calendarUrl, enabled, { deleteEvents = false } = {}) {
   const account = getAccountById(accountId);
   if (!account) {
     throw new Error(`Account ${accountId} not found.`);
@@ -362,9 +440,26 @@ function updateCalendarSelection(accountId, calendarUrl, enabled) {
     throw new Error(`Calendar not found for account ${accountId}.`);
   }
 
-  log.info(`Calendar selection updated: account ${accountId}, calendar ${calendarUrl}, enabled=${enabled}`);
+  const removed = (!enabled && deleteEvents)
+    ? deleteMirroredEvents(db.get(), [calendarUrl])
+    : 0;
 
-  return { success: true };
+  log.info(`Calendar selection updated: account ${accountId}, calendar ${calendarUrl}, enabled=${enabled}`
+    + (removed ? `, ${removed} mirrored event(s) removed` : ''));
+
+  return { success: true, removed };
+}
+
+/** Die Kalender-URLs eines Kontos - Grundlage für Zählen und Aufräumen (#732). */
+function accountCalendarUrls(accountId) {
+  return db.get().prepare(
+    'SELECT calendar_url FROM caldav_calendar_selection WHERE account_id = ?'
+  ).all(accountId).map((r) => r.calendar_url);
+}
+
+/** Wie viele gespiegelte Termine hängen an diesem Konto? Für die Rückfrage. */
+function countAccountEvents(accountId) {
+  return countMirroredEvents(db.get(), accountCalendarUrls(accountId));
 }
 
 // --------------------------------------------------------
@@ -380,7 +475,16 @@ const YIELD_EVERY = 50;
 /** Echter tsdav-Client für einen Account; in Tests durch eine Factory ersetzbar. */
 const defaultClientFactory = createCalDAVClient;
 
-async function sync({ createClient } = {}) {
+/**
+ * Ein Sync-Lauf, serialisiert gegen den Sofortversuch und gegen sich selbst
+ * (#593): beide führen dieselbe ausgehende Buchhaltung, und ein Tick, der in
+ * einen laufenden Durchgang hineinliefe, läse deren Zwischenstand.
+ */
+async function sync(opts = {}) {
+  return runSerialized('caldav', 'sync', () => runSync(opts));
+}
+
+async function runSync({ createClient } = {}) {
   const accounts = getAllAccounts();
 
   if (accounts.length === 0) {
@@ -413,13 +517,18 @@ async function sync({ createClient } = {}) {
   // Normalfall (nichts hat sich geändert) erzeugt keine WAL-Writes mehr.
   // `IS NOT` statt `<>`, weil der Vergleich NULL-sicher sein muss, und die
   // beiden abgeleiteten Spalten wiederholen ihren SET-Ausdruck, damit eine
-  // lokale Umfärbung (user_modified) bzw. ein fehlendes obj.url nicht als
+  // lokale Umfärbung (color_modified) bzw. ein fehlendes obj.url nicht als
   // Unterschied zählt. Die Bindings der SET-Liste kommen dafür ein zweites Mal.
+  //
+  // Die Farbe gattert auf `color_modified`, NICHT auf `user_modified` (#899):
+  // letzteres wird bei jeder Bearbeitung gesetzt, eine Titeländerung hätte die
+  // Farbspalte also für immer eingefroren und eine Umfärbung auf dem Server
+  // wäre nie mehr angekommen.
   const updEvent = conn.prepare(`
     UPDATE calendar_events
     SET title = ?, description = ?, start_datetime = ?, end_datetime = ?,
         all_day = ?, location = ?, recurrence_rule = ?, tzid = ?,
-        color = CASE WHEN user_modified = 0 THEN ? ELSE color END,
+        color = CASE WHEN color_modified = 0 THEN ? ELSE color END,
         calendar_ref_id = ?,
         external_object_url = COALESCE(?, external_object_url)
     WHERE id = ?
@@ -431,7 +540,7 @@ async function sync({ createClient } = {}) {
            OR location            IS NOT ?
            OR recurrence_rule     IS NOT ?
            OR tzid                IS NOT ?
-           OR color               IS NOT CASE WHEN user_modified = 0 THEN ? ELSE color END
+           OR color               IS NOT CASE WHEN color_modified = 0 THEN ? ELSE color END
            OR calendar_ref_id     IS NOT ?
            OR external_object_url IS NOT COALESCE(?, external_object_url)
           )
@@ -502,6 +611,22 @@ async function sync({ createClient } = {}) {
           continue;
         }
 
+        // Konten, die vor dem Komponentenfilter angelegt wurden, tragen die
+        // Aufgabenlisten weiter als aktivierte Kalender: das Filtern beim Anlegen
+        // erreicht sie nicht mehr, und bis jemand von Hand aktualisiert bleibt eine
+        // Aufgabenliste ein Ziel für Termine (#617). Der Lauf hat die Komponenten
+        // ohnehin schon geladen, also wird die Auswahl hier nachgezogen. Vor dem
+        // Vermerken in `fetchedCalendars`, damit der Prune die bereits gespiegelten
+        // Termine dieses Kalenders in Ruhe lässt.
+        if (!supportsComponent(serverCal, 'VEVENT')) {
+          log.warn(`Calendar ${selCal.calendar_name} does not accept events, disabling.`);
+          db.get().prepare(`
+            UPDATE caldav_calendar_selection SET enabled = 0
+            WHERE account_id = ? AND calendar_url = ?
+          `).run(account.id, selCal.calendar_url);
+          continue;
+        }
+
         // Fetch calendar objects
         let calObjects;
         try {
@@ -527,7 +652,15 @@ async function sync({ createClient } = {}) {
         for (const obj of calObjects) {
           // RECURRENCE-ID-Overrides zusammenführen, sonst überschreibt ein
           // geändertes Einzel-Vorkommen die Serie derselben UID (#549).
-          const parsed = normalizeRecurrenceOverrides(parseICS(obj.data || ''));
+          // Was der Parser verwirft, wird benannt: ein still fehlender Termin
+          // sah bisher aus wie einer, den der Server nie geliefert hat (#883).
+          const parsed = normalizeRecurrenceOverrides(parseICS(obj.data || '', {
+            onSkip: ({ uid, reason }) =>
+              log.warn(`Skipped VEVENT (${reason}) uid=${uid ?? '(none)'} at ${obj.url ?? '(unknown URL)'}`),
+          }));
+          if (!parsed.length && !String(obj.data || '').includes('BEGIN:VEVENT')) {
+            log.warn(`Calendar object without any VEVENT at ${obj.url ?? '(unknown URL)'}`);
+          }
 
           for (const ev of parsed) {
             try {
@@ -540,8 +673,14 @@ async function sync({ createClient } = {}) {
                   url: obj.url, etag: obj.etag, data: obj.data, calendarUrl: selCal.calendar_url,
                 });
               }
-              // Event-Eigenfarbe (RFC 7986) hat Vorrang, sonst Kalenderfarbe.
-              const evColor = ev.color || selCal.calendar_color;
+              // NUR die Eigenfarbe des Termins (RFC 7986 COLOR). Die Kalenderfarbe
+              // gehoert NICHT hierher: sie ist geerbt, gilt fuer jeden Termin des
+              // Kalenders und sagt ueber diesen einen nichts aus. Sie hier
+              // einzusetzen hat sie ununterscheidbar von einer ausdruecklichen
+              // Angabe gemacht und damit die Farbe der zugewiesenen Person
+              // dauerhaft verdraengt (#891). Die Anzeige holt sie weiterhin - als
+              // cal_color ueber calendar_ref_id, wo sie als geerbt erkennbar ist.
+              const evColor = ev.color ?? null;
 
               // Vom Nutzer gelöscht und noch nicht auf dem Server: nicht wieder
               // anlegen, sonst kehrt der Termin bei jedem Sync zurück (#593).
@@ -562,7 +701,7 @@ async function sync({ createClient } = {}) {
               let changed = false;
               if (existing) {
                 // Update: color nur überschreiben, solange der Nutzer nicht lokal
-                // umgefärbt hat (user_modified = 0); Titel/Zeit bleiben remote-geführt.
+                // umgefärbt hat (color_modified = 0); Titel/Zeit bleiben remote-geführt.
                 // Dieselben Werte binden die SET-Liste und den Vergleich in der
                 // WHERE-Klausel, weshalb sie zweimal übergeben werden.
                 const values = [
@@ -645,6 +784,9 @@ async function sync({ createClient } = {}) {
         WHERE external_source = 'local' AND target_caldav_account_id = ?
       `).all(account.id);
 
+      // Einmal je Lauf: die Zone, an der naive Zeiten haengen (#938).
+      const householdZone = householdTimeZone(db.get());
+
       for (const event of localEvents) {
         try {
           // Find target calendar
@@ -656,7 +798,7 @@ async function sync({ createClient } = {}) {
           }
 
           const uid     = `oikos-${event.id}@oikos.local`;
-          const icsData = buildCalDAVICS(event);
+          const icsData = buildCalDAVICS(event, householdZone);
 
           // Upload to CalDAV
           await client.createCalendarObject({
@@ -673,10 +815,18 @@ async function sync({ createClient } = {}) {
             'caldav', event.target_caldav_calendar_url,
             targetCal.displayName || event.target_caldav_calendar_url, null
           );
+          // `color_modified` mit hoch: die Farbe, die gerade als CSS3-Name
+          // hinausging, ist unsere. Der Name ist eine verlustbehaftete Abbildung
+          // des Hex-Werts, und ohne das Flag holte der nächste Inbound-Lauf
+          // genau ihn zurück und überschriebe den exakten Wert mit dem
+          // gerundeten (#899). Ein Termin, der gar keine eigene Farbe trägt,
+          // behält seinen Zustand - dann ist nichts hinausgegangen, was wir
+          // verteidigen müssten.
           db.get().prepare(`
             UPDATE calendar_events
             SET external_source = 'caldav', external_calendar_id = ?,
-                external_object_url = ?, calendar_ref_id = ?
+                external_object_url = ?, calendar_ref_id = ?,
+                color_modified = CASE WHEN color IS NOT NULL THEN 1 ELSE color_modified END
             WHERE id = ?
           `).run(uid, objectUrl, calRefId, event.id);
 
@@ -733,7 +883,11 @@ async function sync({ createClient } = {}) {
  * Migration v106) bleiben vorgemerkt und laufen im nächsten Sync mit.
  * @returns {Promise<{deleted:number,updated:number}>}
  */
-async function flushOutbound({ createClient } = {}) {
+async function flushOutbound(opts = {}) {
+  return runSerialized('caldav', 'flush', () => runFlushOutbound(opts));
+}
+
+async function runFlushOutbound({ createClient } = {}) {
   const idle = { deleted: 0, updated: 0 };
   const deletions = outbound.pendingDeletions('caldav');
   const updates   = outbound.pendingUpdates('caldav');
@@ -831,7 +985,13 @@ export {
   deleteAccount,
   getCalendars,
   updateCalendarSelection,
+  countAccountEvents,
   sync,
   flushOutbound,
   getStatus
 };
+
+// Nur fuer Tests: der ICS-Builder ist der einzige Weg, auf dem ein rein lokaler
+// Termin zum Anbieter kommt, und der Sync-Pfad drumherum ist zu gross, um ihn
+// dafuer nachzustellen.
+export const __test = { buildCalDAVICS };

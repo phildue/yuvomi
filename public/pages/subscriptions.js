@@ -4,7 +4,7 @@
  */
 
 import { api } from '/api.js';
-import { closeModal, confirmModal, confirmOverModal, openModal, advancedSection, reportFieldError } from '/components/modal.js';
+import { closeModal, confirmModal, confirmOverModal, openModal, advancedSection, reportFieldError, refocusAfterRender } from '/components/modal.js';
 import {
   formatDate,
   getLocale,
@@ -14,8 +14,12 @@ import {
 } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
-import { toLocalDateKey } from '/utils/date.js';
-import { formatMoney } from '/utils/money.js';
+import { emptyStateHTML, mountLoadError } from '/utils/empty-state.js';
+import { todayKey } from '/utils/date.js';
+import { CURRENCY_CODES } from '/utils/currency-codes.js';
+import { wireSwipeRows, maybeShowSwipeHint } from '/utils/swipe-row.js';
+import { formatMoney, amountPlaceholder, amountStep, applyAmountFormat, amountIsSavable, smallestUnitLabel } from '/utils/money.js';
+import { attachOverlay } from '/utils/overlay-history.js';
 
 let state = {
   subscriptions: [],
@@ -31,21 +35,6 @@ let state = {
   user: null,
 };
 let container = null;
-// Muss mit VALID_CURRENCIES in server/routes/preferences.js übereinstimmen,
-// sonst ist die Haushaltswährung hier nicht wählbar (per Test abgesichert).
-const CURRENCIES = [
-  'AED', 'AUD', 'BRL', 'CAD', 'CHF', 'CLP', 'CNY', 'CZK', 'DKK', 'EUR', 'GBP',
-  'HUF', 'IDR', 'INR', 'IRR', 'JPY', 'KRW', 'KZT', 'MYR', 'NOK', 'PLN', 'RUB',
-  'SAR', 'SEK', 'TRY', 'UAH', 'USD', 'ZAR',
-];
-const DEFAULT_CATEGORY_LABELS = {
-  Entertainment: 'budget.subcatSubscriptionEntertainment',
-  Productivity: 'budget.subcatSubscriptionProductivity',
-  Utilities: 'budget.subcatSubscriptionUtilities',
-  Health: 'budget.subcatSubscriptionHealth',
-  Education: 'budget.subcatSubscriptionEducation',
-  Other: 'budget.subcatSubscriptionOther',
-};
 
 function setHtml(element, html) {
   element.replaceChildren();
@@ -61,9 +50,39 @@ function money(amount, currency = state.summary?.base_currency || state.settings
   return formatMoney(amount, currency);
 }
 
+// EINE ZEILE SAGT SELBST, WIE SIE HEISST. Vorher stand hier eine Karte von
+// englischen Vorgabe-NAMEN auf i18n-Schluessel, und daneben - fuer die
+// Zahlungsarten - gar nichts: dieselbe Liste stand halb uebersetzt da (#950).
+// Eine Namenskarte kann auch nicht wissen, ob 'Other' die Vorgabe oder eine
+// selbst angelegte Zeile desselben Namens meint. Seit Migration 170 tragen
+// beide Tabellen `label_key`, wie task_categories, contact_categories und
+// inventory_categories es laengst tun; Umbenennen loescht ihn, dann gilt der
+// eigene Name. Der Rueckfall ist das leere Fach, nicht ein englisches Wort.
+function metaLabel(item, emptyKey) {
+  if (item?.label_key) return t(item.label_key);
+  return item?.name || t(emptyKey);
+}
+
 function categoryLabel(category) {
-  const name = typeof category === 'object' ? category?.name : category;
-  return DEFAULT_CATEGORY_LABELS[name] ? t(DEFAULT_CATEGORY_LABELS[name]) : (name || t('subscriptions.uncategorized'));
+  return metaLabel(category, 'subscriptions.uncategorized');
+}
+
+function paymentMethodLabel(method) {
+  return metaLabel(method, 'subscriptions.unspecified');
+}
+
+// Ein Abo traegt Kategorie und Zahlungsart denormalisiert (JOIN in
+// routes/subscriptions.js), also als zwei lose Felder statt als Zeile. Diese
+// beiden setzen sie wieder zusammen, damit dieselbe Regel greift wie ueberall
+// sonst - genau so macht es inventory.js mit `itemCategoryLabel`. Ohne sie
+// laesst sich ein Aufrufer leicht mit dem nackten `*_name` abspeisen, und
+// genau daran hing #950.
+function rowCategoryLabel(row) {
+  return categoryLabel({ name: row?.category_name, label_key: row?.category_label_key });
+}
+
+function rowPaymentMethodLabel(row) {
+  return paymentMethodLabel({ name: row?.payment_method_name, label_key: row?.payment_method_label_key });
 }
 
 function addMonths(date, count) {
@@ -122,7 +141,7 @@ function cycleLabel(subscription) {
 }
 
 function daysUntil(date) {
-  const today = new Date(`${toLocalDateKey(new Date())}T00:00:00`);
+  const today = new Date(`${todayKey()}T00:00:00`);
   const due = new Date(`${date}T00:00:00`);
   return Math.round((due - today) / 86400000);
 }
@@ -158,8 +177,14 @@ async function load({ refreshRates = false } = {}) {
 export async function render(target, { user } = {}) {
   container = target;
   state.user = user || null;
+  // `full`, nicht `reading`: die Seite ist nicht auf das Mass migriert. Ihr
+  // Analytik-Raster (drei Spalten, zusammen mindestens 724px) und die Liste
+  // kennen kein Lesemass; als `reading` haette nur das Kennzahlenband die
+  // 720px angenommen und den Sprung zu den Diagrammen darunter erzeugt - als
+  // Budget-Reiter wie als Gast-Route. Zielmodus ist `dashboard`, sobald
+  // Werkzeugzeile, Raster und Liste dasselbe Mass lesen.
   setHtml(container, `
-    <div class="subscriptions-page" aria-busy="true">
+    <div class="subscriptions-page app-page app-page--full" data-composition="full" aria-busy="true">
       <div class="subscriptions-toolbar">
         <label class="subscriptions-search">
           <i data-lucide="search" aria-hidden="true"></i>
@@ -177,7 +202,7 @@ export async function render(target, { user } = {}) {
         <label class="subscriptions-filter-field">
           <span class="subscriptions-filter-field__label">${t('subscriptions.filterLabelStatus')}</span>
           <select class="form-input subscriptions-filter" id="subscriptions-status-filter">
-            <option value="all">${t('subscriptions.statusAll')}</option>
+            <option value="all">${t('common.all')}</option>
             <option value="active">${t('subscriptions.statusActive')}</option>
             <option value="paused">${t('subscriptions.statusDisabled')}</option>
             <option value="completed">${t('subscriptions.completed')}</option>
@@ -215,12 +240,16 @@ export async function render(target, { user } = {}) {
     bindToolbar();
   } catch (err) {
     console.error('[Subscriptions] load error:', err);
-    setHtml(container.querySelector('#subscriptions-content'), `
-      <div class="empty-state">
-        <i data-lucide="circle-alert" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${t('subscriptions.loadError')}</div>
-      </div>
-    `);
+    // Vorher stand hier ein Leerzustands-Markup ohne Rolle und ohne CTA: der
+    // Fehler war fuer Screenreader stumm und die Seite eine Sackgasse - neu
+    // laden ging nur ueber den Browser. `mountLoadError` erzwingt beides.
+    mountLoadError(container.querySelector('#subscriptions-content'), {
+      title: t('subscriptions.loadError'),
+      description: t('common.loadErrorDescription'),
+      error: err,
+      retryLabel: t('common.retry'),
+      onRetry: () => render(container, { user: state.user }),
+    });
   } finally {
     container.querySelector('.subscriptions-page')?.setAttribute('aria-busy', 'false');
     if (window.lucide) window.lucide.createIcons({ el: container });
@@ -228,15 +257,20 @@ export async function render(target, { user } = {}) {
 }
 
 function renderFilters() {
+  // Die Neutral-Option jedes Filters heisst „Alle", nicht „Alle Kategorien" /
+  // „Alle Zahlungsarten" / „Alle Status": das Feldlabel steht sichtbar darueber
+  // und der Wert wiederholte es nur. Die Wiederholung forderte fuer alle vier
+  // Selects dieselbe Breite und kappte am Ende den einzigen Wert, der wirklich
+  // Platz braucht (die Sortierung).
   const category = container.querySelector('#subscriptions-category-filter');
   const method = container.querySelector('#subscriptions-method-filter');
   setHtml(category, `
-    <option value="">${t('subscriptions.allCategories')}</option>
+    <option value="">${t('common.all')}</option>
     ${state.meta.categories.map((item) => `<option value="${item.id}">${esc(categoryLabel(item))}</option>`).join('')}
   `);
   setHtml(method, `
-    <option value="">${t('subscriptions.allPaymentMethods')}</option>
-    ${state.meta.payment_methods.map((item) => `<option value="${item.id}">${esc(item.name)}</option>`).join('')}
+    <option value="">${t('common.all')}</option>
+    ${state.meta.payment_methods.map((item) => `<option value="${item.id}">${esc(paymentMethodLabel(item))}</option>`).join('')}
   `);
   category.value = state.categoryId;
   method.value = state.paymentMethodId;
@@ -342,7 +376,7 @@ function renderContent() {
               <i data-lucide="refresh-cw" aria-hidden="true"></i>${t('subscriptions.refreshRates')}
             </button>`}
       </div>
-      <div class="subscriptions-list" id="subscriptions-list">
+      <div class="subscriptions-list row-divided" id="subscriptions-list">
         ${rows.length ? rows.map(renderCard).join('') : renderEmpty()}
       </div>
     </section>
@@ -371,29 +405,30 @@ function renderSummary() {
   // Bauarten im selben Modul (Critique 2026-07-30, P0).
   // Rolle `plain`: Abo-Kosten sind Rechnungsbeträge ohne Kontorichtung.
   return `
-    <section class="budget-summary budget-summary--quad">
-      <article class="budget-summary-card">
-        <div class="budget-summary-card__label">${t('subscriptions.monthlyCost')}</div>
-        <div class="budget-summary-card__amount">${money(used)}</div>
-        <div class="budget-summary-card__note">${t('subscriptions.activeCount', { count: summary.active_count })}</div>
+    <section class="metric-grid metric-grid--quad">
+      <article class="metric-card">
+        <div class="metric-card__label">${t('subscriptions.monthlyCost')}</div>
+        <div class="metric-card__value">${money(used)}</div>
+        <div class="metric-card__note">${t('subscriptions.activeCount', { count: summary.active_count })}</div>
       </article>
-      <article class="budget-summary-card">
-        <div class="budget-summary-card__label">${t('subscriptions.monthlyBudget')}</div>
-        <div class="budget-summary-card__amount">${money(budget)}</div>
-        <div class="budget-summary-card__progress${isOverBudget ? ' budget-summary-card__progress--over' : ''}"
-             role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percentage}" aria-valuetext="${realPercentage}%">
+      <article class="metric-card">
+        <div class="metric-card__label">${t('subscriptions.monthlyBudget')}</div>
+        <div class="metric-card__value">${money(budget)}</div>
+        <div class="metric-card__progress${isOverBudget ? ' metric-card__progress--over' : ''}"
+             role="progressbar" aria-label="${esc(t('subscriptions.monthlyBudget'))}"
+             aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percentage}" aria-valuetext="${realPercentage}%">
           <span style="--fill:${percentage / 100}"></span>
         </div>
       </article>
-      <article class="budget-summary-card${isOverBudget ? ' budget-summary-card--negative' : ''}">
-        <div class="budget-summary-card__label">${hasBudget ? (isOverBudget ? t('subscriptions.overBudget') : t('subscriptions.remainingBudget')) : t('subscriptions.noBudgetLimit')}</div>
-        <div class="budget-summary-card__amount">${hasBudget ? money(Math.abs(summary.remaining_budget)) : t('subscriptions.unlimited')}</div>
-        <div class="budget-summary-card__note${isOverBudget ? ' budget-summary-card__note--danger' : ''}">${hasBudget ? `${realPercentage}% ${t('subscriptions.budgetUsed')}` : t('subscriptions.setBudgetHint')}</div>
+      <article class="metric-card${isOverBudget ? ' metric-card--negative' : ''}">
+        <div class="metric-card__label">${hasBudget ? (isOverBudget ? t('subscriptions.overBudget') : t('subscriptions.remainingBudget')) : t('subscriptions.noBudgetLimit')}</div>
+        <div class="metric-card__value">${hasBudget ? money(Math.abs(summary.remaining_budget)) : t('subscriptions.unlimited')}</div>
+        <div class="metric-card__note${isOverBudget ? ' metric-card__note--danger' : ''}">${hasBudget ? `${realPercentage}% ${t('subscriptions.budgetUsed')}` : t('subscriptions.setBudgetHint')}</div>
       </article>
-      <article class="budget-summary-card">
-        <div class="budget-summary-card__label">${t('subscriptions.yearlyProjection')}</div>
-        <div class="budget-summary-card__amount">${money(used * 12)}</div>
-        <div class="budget-summary-card__note">${esc(summary.base_currency)}</div>
+      <article class="metric-card">
+        <div class="metric-card__label">${t('subscriptions.yearlyProjection')}</div>
+        <div class="metric-card__value">${money(used * 12)}</div>
+        <div class="metric-card__note">${esc(summary.base_currency)}</div>
       </article>
     </section>
   `;
@@ -401,7 +436,7 @@ function renderSummary() {
 
 function renderAnalytics() {
   const categories = amountRows(state.summary?.by_category || [], categoryLabel);
-  const methods = amountRows(state.summary?.by_payment_method || []);
+  const methods = amountRows(state.summary?.by_payment_method || [], paymentMethodLabel);
   const forecast = renewalForecast();
   return `
     <section class="subscriptions-analytics">
@@ -412,9 +447,9 @@ function renderAnalytics() {
   `;
 }
 
-function amountRows(rows, labelFor = (name) => name) {
+function amountRows(rows, labelFor) {
   return rows
-    .map((row) => ({ ...row, label: labelFor(row.name), amount: Number(row.amount || 0) }))
+    .map((row) => ({ ...row, label: labelFor(row), amount: Number(row.amount || 0) }))
     .filter((row) => row.amount > 0)
     .sort((a, b) => b.amount - a.amount);
 }
@@ -428,7 +463,7 @@ function dueAmount(subscription) {
 }
 
 function renewalForecast() {
-  const today = new Date(`${toLocalDateKey(new Date())}T00:00:00`);
+  const today = new Date(`${todayKey()}T00:00:00`);
   const start = new Date(today.getFullYear(), today.getMonth(), 1);
   const months = Array.from({ length: 6 }, (_, index) => {
     const date = addMonths(start, index);
@@ -449,6 +484,16 @@ function renewalForecast() {
   return months.map((row) => ({ ...row, amount: Number(row.amount.toFixed(2)) }));
 }
 
+// KEINE geteilte Chart-Geometrie (utils/chart.js), und das ist Absicht: die
+// traegt einen 40px-Gutter fuer eine Werteachse, und diese Flaeche hat keine.
+// Sie ist 72px flach, beschriftet alle sechs Monate statt drei Marken und liegt
+// damit naeher an der Sparkline der Kennzahlkarte als am Trend-Chart. Eine
+// andere FORM, keine andere Fassung derselben.
+//
+// `vector-effect` ist dagegen faellig: `preserveAspectRatio="none"` streckt
+// einen 100x52-viewBox auf rund 300x72, also X um Faktor 3 und Y um 1,4 - ohne
+// den Ausschalter wird die 2,5px-Linie in einer Achse dicker als in der
+// anderen. Dieselbe Zeile steht an jeder anderen gestreckten Kurve der App.
 function renderAreaChart(title, rows) {
   const max = Math.max(...rows.map((row) => row.amount), 1);
   const points = rows.map((row, index) => {
@@ -465,7 +510,7 @@ function renderAreaChart(title, rows) {
       </div>
       <svg class="subscriptions-area-chart" viewBox="0 0 100 52" preserveAspectRatio="none" aria-hidden="true">
         <polygon points="${areaPoints}"></polygon>
-        <polyline points="${points}"></polyline>
+        <polyline points="${points}" vector-effect="non-scaling-stroke"></polyline>
       </svg>
       <div class="subscriptions-chart-axis">
         ${rows.map((row) => `<span>${esc(row.label)}</span>`).join('')}
@@ -550,6 +595,20 @@ function endInfoLabel(subscription) {
   return null;
 }
 
+// Die Zeile fuehrt ZWEI Aktionen, und welche, sagt der Rang (§2, Session 16):
+// der Zeilenanfang die primaere positive - eine Zahlung buchen -, das Zeilenende
+// das Destruktive. Bearbeiten liegt auf dem TAP, nicht auf einer Wischrichtung
+// und nicht mehr auf einem eigenen Knopf; der Zustandsschalter ist ganz
+// entfallen, weil dasselbe Feld im Bearbeiten-Formular steht. Vier Icon-Knoepfe
+// je Zeile waren die lauteste Stelle des Bildschirms, uebrig sind zwei.
+//
+// BEWUSST kein aria-label am Zeilenkoerper: `role=button` ist per ARIA "children
+// presentational", das Label haette also den ganzen Inhalt ersetzt - Name,
+// Status, Faelligkeit, Zyklus, Zahlungsart und Betrag zusammen zu "Bearbeiten,
+// Schaltfläche". Genau derselbe Beschluss steht in `pantry.js` (Critique P1,
+// WCAG 1.3.1/4.1.2) und `contacts.js`. Aus demselben Grund tragen Name und
+// Beschreibung `<span>` statt `<h3>`/`<p>`: Content-Model eines `<button>` ist
+// Phrasing Content. Was der Knopf TUT, kommt als sr-only Zusatz ans Ende.
 function renderCard(subscription) {
   const brandColor = subscription.brand_color || subscription.category_color || '#0F766E';
   const converted = subscription.monthly_base === null
@@ -558,92 +617,149 @@ function renderCard(subscription) {
   const status = statusMeta(subscription);
   const endInfo = endInfoLabel(subscription);
   return `
+    <div class="swipe-row" data-swipe-id="${subscription.id}">
+      <div class="swipe-reveal swipe-reveal--done swipe-reveal--leading" aria-hidden="true">
+        <i data-lucide="calendar-check" class="icon-md"></i>
+        <span>${t('subscriptions.markRenewed')}</span>
+      </div>
+      <div class="swipe-reveal swipe-reveal--delete swipe-reveal--trailing" aria-hidden="true">
+        <i data-lucide="trash-2" class="icon-md"></i>
+        <span>${t('common.delete')}</span>
+      </div>
     <article class="subscription-card ${status.cardClass}"
              data-id="${subscription.id}" style="--subscription-color:${esc(brandColor)}">
-      <div class="subscription-card__brand">
-        ${subscription.logo_data
-          ? `<img src="${esc(subscription.logo_data)}" alt="">`
-          : `<span>${esc(subscription.name.slice(0, 2).toUpperCase())}</span>`}
-      </div>
-      <div class="subscription-card__body">
-        <div class="subscription-card__title-row">
-          <div>
-            <h3>${esc(subscription.name)}</h3>
-            <p>${esc(subscription.description || categoryLabel(subscription.category_name))}</p>
-          </div>
-          <span class="subscription-status ${status.badgeClass}">
-            ${status.label}
+      <button type="button" class="subscription-card__main list-row__main--interactive"
+              data-action="edit">
+        <span class="subscription-card__brand">
+          ${subscription.logo_data
+            ? `<img src="${esc(subscription.logo_data)}" alt="">`
+            : `<span>${esc(subscription.name.slice(0, 2).toUpperCase())}</span>`}
+        </span>
+        <span class="subscription-card__body">
+          <span class="subscription-card__title-row">
+            <span>
+              <span class="subscription-card__name">${esc(subscription.name)}</span>
+              <span class="subscription-card__desc">${esc(subscription.description || rowCategoryLabel(subscription))}</span>
+            </span>
+            <span class="subscription-status ${status.badgeClass}">
+              ${status.label}
+            </span>
           </span>
-        </div>
-        <div class="subscription-card__meta">
-          <span><i data-lucide="calendar-clock" aria-hidden="true"></i>${formatDate(subscription.next_payment_date)} · ${dueLabel(subscription)}</span>
-          <span><i data-lucide="repeat-2" aria-hidden="true"></i>${cycleLabel(subscription)}</span>
-          <span><i data-lucide="wallet-cards" aria-hidden="true"></i>${esc(subscription.payment_method_name || t('subscriptions.unspecified'))}</span>
-          <span><i data-lucide="bell" aria-hidden="true"></i>${t('subscriptions.reminderMeta', { count: subscription.reminder_days })}</span>
-          ${endInfo ? `<span><i data-lucide="${endInfo.icon}" aria-hidden="true"></i>${esc(endInfo.text)}</span>` : ''}
-        </div>
-      </div>
-      <div class="subscription-card__cost">
-        <strong>${money(subscription.amount, subscription.currency)}</strong>
-        <span>${converted}</span>
-      </div>
+          <span class="subscription-card__meta">
+            <span><i data-lucide="calendar-clock" aria-hidden="true"></i>${formatDate(subscription.next_payment_date)} · ${dueLabel(subscription)}</span>
+            <span><i data-lucide="repeat-2" aria-hidden="true"></i>${cycleLabel(subscription)}</span>
+            <span><i data-lucide="wallet-cards" aria-hidden="true"></i>${esc(rowPaymentMethodLabel(subscription))}</span>
+            <span><i data-lucide="bell" aria-hidden="true"></i>${t('subscriptions.reminderMeta', { count: subscription.reminder_days })}</span>
+            ${endInfo ? `<span><i data-lucide="${endInfo.icon}" aria-hidden="true"></i>${esc(endInfo.text)}</span>` : ''}
+          </span>
+        </span>
+        <span class="subscription-card__cost">
+          <strong>${money(subscription.amount, subscription.currency)}</strong>
+          <span>${converted}</span>
+        </span>
+        <span class="sr-only">${t('common.edit')}</span>
+      </button>
       <div class="subscription-card__actions">
-        <button class="btn btn--secondary btn--icon" data-action="toggle" aria-label="${subscription.enabled ? t('subscriptions.disable') : t('subscriptions.enable')}">
-          <i data-lucide="${subscription.enabled ? 'pause' : 'play'}" aria-hidden="true"></i>
-        </button>
         <button class="btn btn--secondary btn--icon" data-action="renew" aria-label="${t('subscriptions.markRenewed')}">
           <i data-lucide="calendar-check" aria-hidden="true"></i>
-        </button>
-        <button class="btn btn--secondary btn--icon" data-action="edit" aria-label="${t('subscriptions.edit')}">
-          <i data-lucide="pencil" aria-hidden="true"></i>
         </button>
         <button class="btn btn--secondary btn--icon" data-action="delete" aria-label="${t('subscriptions.delete')}">
           <i data-lucide="trash-2" aria-hidden="true"></i>
         </button>
       </div>
     </article>
+    </div>
   `;
+}
+
+/**
+ * Die Wischgesten der Abo-Liste. Zuordnung nach dem app-weiten Rang: der
+ * Zeilenanfang traegt die primaere positive Aktion (eine Zahlung buchen), das
+ * Zeilenende das Destruktive.
+ *
+ * KEINE der beiden Richtungen laesst die Zeile hinausfliegen. Beide fuehren
+ * ueber eine Bestaetigung, und was danach kommt, entscheidet der Nutzer - eine
+ * Zeile, die schon weg ist, waehrend der Dialog noch fragt, hat die Antwort
+ * vorweggenommen. Der Knopf daneben ruft dieselbe Funktion, damit die Geste
+ * keine zweite Schreibweise derselben Arbeit wird.
+ */
+function wireSubscriptionSwipe(host) {
+  wireSwipeRows(host, {
+    card: '.subscription-card',
+    leading: {
+      reveal: '.swipe-reveal--done',
+      run: (row) => {
+        const subscription = subscriptionFor(row);
+        if (subscription) renewSubscription(subscription);
+      },
+    },
+    trailing: {
+      reveal: '.swipe-reveal--delete',
+      run: (row) => {
+        const subscription = subscriptionFor(row);
+        if (subscription) deleteSubscription(subscription);
+      },
+    },
+  });
+}
+
+// Beide Richtungen RUFEN ihre Funktion, statt sie einem Helfer zu uebergeben.
+// Der Guard auf Ebene 3 folgt von der Wischrichtung der Aufrufkante zu der
+// Funktion, in der der Rueckweg steht - eine als Argument durchgereichte
+// Referenz waere fuer ihn keine Kante, und er haette den Rueckweg nicht
+// gefunden, obwohl er da ist. Eine Verdrahtung, die ein Guard nicht lesen kann,
+// ist eine, die beim naechsten Mal niemand prueft.
+function subscriptionFor(row) {
+  return state.subscriptions.find((item) => item.id === Number(row.dataset.swipeId));
 }
 
 function renderEmpty() {
   // „Keine Abos" und „nichts passt zum Filter" sind verschiedene Zustände: der
-  // erste braucht eine Anlegen-Aktion, der zweite einen Weg zurück.
+  // erste braucht eine Anlegen-Aktion, der zweite einen Weg zurück. Die
+  // Variante traegt den Unterschied jetzt mit: `no-results` wird als
+  // `role="status"` angesagt und fuehrt einen sekundaeren CTA.
   if (hasActiveFilters()) {
-    return `
-      <div class="empty-state">
-        <i data-lucide="filter-x" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${t('subscriptions.noMatchesTitle')}</div>
-        <div class="empty-state__description">${t('subscriptions.noMatchesDescription')}</div>
-        <button class="btn btn--primary empty-state__cta" id="subscriptions-empty-reset" type="button">
-          ${t('subscriptions.resetFilters')}
-        </button>
-      </div>`;
+    return emptyStateHTML({
+      variant: 'no-results',
+      icon: 'filter-x',
+      title: t('subscriptions.noMatchesTitle'),
+      description: t('subscriptions.noMatchesDescription'),
+      action: { label: t('subscriptions.resetFilters'), attrs: { id: 'subscriptions-empty-reset' } },
+    });
   }
-  return `
-    <div class="empty-state">
-      <i data-lucide="repeat-2" class="empty-state__icon" aria-hidden="true"></i>
-      <div class="empty-state__title">${t('subscriptions.emptyTitle')}</div>
-      <div class="empty-state__description">${t('subscriptions.emptyDescription')}</div>
-      <button class="btn btn--primary empty-state__cta" id="subscriptions-empty-add">${t('subscriptions.add')}</button>
-    </div>
-  `;
+  return emptyStateHTML({
+    icon: 'repeat-2',
+    title: t('subscriptions.emptyTitle'),
+    description: t('subscriptions.emptyDescription'),
+    action: { label: t('subscriptions.add'), attrs: { id: 'subscriptions-empty-add' } },
+  });
 }
 
 function bindContent() {
   container.querySelector('#subscriptions-refresh-rates')?.addEventListener('click', () => reload({ refreshRates: true }));
   container.querySelector('#subscriptions-empty-add')?.addEventListener('click', () => openSubscriptionModal());
   container.querySelector('#subscriptions-empty-reset')?.addEventListener('click', resetFilters);
-  container.querySelector('#subscriptions-list')?.addEventListener('click', async (event) => {
+  const list = container.querySelector('#subscriptions-list');
+  list?.addEventListener('click', async (event) => {
     const action = event.target.closest('[data-action]');
-    if (!action) return;
-    const card = action.closest('[data-id]');
+    const card = event.target.closest('.subscription-card');
     const subscription = state.subscriptions.find((row) => row.id === Number(card?.dataset.id));
     if (!subscription) return;
+
+    if (!action) return;
+    // Der Zeilenkoerper OEFFNET das Bearbeiten und ist dafuer ein echter
+    // `<button>` (`.list-row__main--interactive`, das app-weite Vokabular fuer
+    // eine klickbare Zeile). Ein blosser Tap-Handler auf dem `<article>` haette
+    // den Bearbeiten-Knopf entfernt, ohne einen Tastaturweg an seine Stelle zu
+    // setzen - das waere kein Aufraeumen, sondern ein Regress.
     if (action.dataset.action === 'edit') openSubscriptionModal(subscription);
-    if (action.dataset.action === 'toggle') await toggleSubscription(subscription);
     if (action.dataset.action === 'renew') await renewSubscription(subscription);
     if (action.dataset.action === 'delete') await deleteSubscription(subscription);
   });
+  if (list) {
+    wireSubscriptionSwipe(list);
+    maybeShowSwipeHint(list);
+  }
 }
 
 function currencyItems() {
@@ -653,7 +769,7 @@ function currencyItems() {
   } catch {
     names = null;
   }
-  return CURRENCIES.map((code) => ({
+  return CURRENCY_CODES.map((code) => ({
     value: code,
     label: `${code} · ${names?.of(code) || code}`,
   }));
@@ -700,6 +816,10 @@ function wireCombobox(panel, id) {
     search.value = option.textContent.trim();
     options.forEach((item) => item.setAttribute('aria-selected', String(item === option)));
     close();
+    // Das Wertfeld ist ein verstecktes Input, das nur programmatisch gesetzt
+    // wird - ohne dieses Event erfährt niemand von der Auswahl. Die Betragsfelder
+    // hängen an der Währungs-Combobox und müssen dabei nachziehen.
+    value.dispatchEvent(new Event('change', { bubbles: true }));
   };
   const selectFromKeyboard = (option) => {
     select(option);
@@ -766,6 +886,9 @@ function wireCombobox(panel, id) {
 
 export function openSubscriptionModal(subscription = null) {
   const edit = Boolean(subscription);
+  // Jedes Abo trägt seine eigene Währung; das Betragsfeld richtet sich danach
+  // und wird beim Wechsel der Währungs-Combobox nachgezogen.
+  const formCurrency = subscription?.currency || state.settings.base_currency;
   const cycleItems = state.meta.billing_cycles.map((cycle) => ({
     value: cycle,
     label: t(`subscriptions.cycle.${cycle}`),
@@ -776,7 +899,7 @@ export function openSubscriptionModal(subscription = null) {
   ];
   const methodItems = [
     { value: '', label: t('subscriptions.unspecified') },
-    ...state.meta.payment_methods.map((item) => ({ value: item.id, label: item.name })),
+    ...state.meta.payment_methods.map((item) => ({ value: item.id, label: paymentMethodLabel(item) })),
   ];
   const initialLogo = subscription?.logo_data || '';
   const initialName = subscription?.name || '';
@@ -819,6 +942,12 @@ export function openSubscriptionModal(subscription = null) {
       <section class="subscription-form__section">
         <h3><i data-lucide="panel-top" aria-hidden="true"></i>${t('subscriptions.serviceDetails')}</h3>
         <div class="form-group">
+          <label class="form-label" for="subscription-account">${t('subscriptions.accountUsernameLabel')}</label>
+          <input class="form-input" type="text" id="subscription-account" maxlength="200"
+                 autocomplete="off" spellcheck="false" value="${esc(subscription?.account_username || '')}">
+          <p class="form-hint">${t('subscriptions.accountUsernameHint')}</p>
+        </div>
+        <div class="form-group">
           <label class="form-label" for="subscription-notes">${t('subscriptions.notesLabel')}</label>
           <textarea class="form-input" id="subscription-notes" rows="3">${esc(subscription?.notes || '')}</textarea>
         </div>
@@ -848,7 +977,7 @@ export function openSubscriptionModal(subscription = null) {
             <input id="subscription-logo" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml">
           </label>
           <button class="btn btn--secondary subscription-find-logo-btn" type="button" id="subscription-find-logo">
-            <i data-lucide="image-search" aria-hidden="true"></i>${t('subscriptions.findLogo')}
+            <i data-lucide="scan-search" aria-hidden="true"></i>${t('subscriptions.findLogo')}
           </button>
         </div>
         <div class="subscription-form__identity-fields">
@@ -868,7 +997,11 @@ export function openSubscriptionModal(subscription = null) {
         <div class="subscription-form__billing-grid">
           <div class="form-group">
             <label class="form-label" for="subscription-amount">${t('subscriptions.amountLabel')}</label>
-            <input class="form-input" id="subscription-amount" type="number" min="0" step="0.01" inputmode="decimal" required value="${subscription?.amount ?? ''}">
+            <input class="form-input" id="subscription-amount" type="number"
+                   min="0"
+                   step="${amountStep(formCurrency, subscription?.amount ?? '')}"
+                   placeholder="${amountPlaceholder(formCurrency)}"
+                   inputmode="decimal" required value="${subscription?.amount ?? ''}">
           </div>
           ${comboboxMarkup({
             id: 'subscription-currency',
@@ -897,7 +1030,7 @@ export function openSubscriptionModal(subscription = null) {
           <div class="form-group">
             <label class="form-label" for="subscription-next-date">${t('subscriptions.nextPaymentLabel')}</label>
             <yuvomi-datepicker id="subscription-next-date" type="date"
-                   value="${esc(subscription?.next_payment_date || toLocalDateKey(new Date()))}"></yuvomi-datepicker>
+                   value="${esc(subscription?.next_payment_date || todayKey())}"></yuvomi-datepicker>
           </div>
           <div class="form-group">
             <label class="form-label" for="subscription-reminder">${t('subscriptions.reminderDaysLabel')}</label>
@@ -948,6 +1081,12 @@ export function openSubscriptionModal(subscription = null) {
         }
       };
       wireCombobox(panel, 'subscription-currency');
+      // Ohne `required`: ein Abo darf 0 kosten (Gratis-Tarif, Server prüft
+      // amount >= 0), die Untergrenze bleibt also bei null statt bei einer
+      // kleinsten Einheit.
+      panel.querySelector('#subscription-currency').addEventListener('change', (event) => {
+        applyAmountFormat(panel.querySelector('#subscription-amount'), event.target.value);
+      });
       wireCombobox(panel, 'subscription-cycle');
       wireCombobox(panel, 'subscription-category');
       wireCombobox(panel, 'subscription-method');
@@ -990,13 +1129,22 @@ export function openSubscriptionModal(subscription = null) {
   });
 }
 
+/* Muss dem accept-Attribut des Logo-Felds entsprechen (test/test-image-picker.js
+ * hält beide deckungsgleich). Bewusst NICHT pickCroppedImage() (#901): ein Logo
+ * lebt von Transparenz und darf SVG sein - der Zuschnitt gibt immer ein
+ * 256-px-JPEG zurück und zerstörte beides. */
+const LOGO_ACCEPTED_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/svg+xml'];
+
 async function fileToDataUrl(file) {
   if (!file) return null;
+  if (!LOGO_ACCEPTED_TYPES.includes(file.type)) throw new Error(t('subscriptions.logoTypeError'));
   if (file.size > 500000) throw new Error(t('subscriptions.logoTooLarge'));
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
+    // Roh weitergereicht war das der ProgressEvent - `err.message` im Toast
+    // des Aufrufers zeigte dann `undefined`.
+    reader.onerror = () => reject(new Error(t('documents.fileReadError')));
     reader.readAsDataURL(file);
   });
 }
@@ -1035,6 +1183,24 @@ async function saveSubscription(panel, existing, searchedLogoData = null) {
     }
     occurrenceCount = count;
   }
+  // Bei einem Bestandsbetrag neben dem Raster liefert amountStep "any", damit
+  // sich das vorhandene Abo überhaupt noch speichern lässt. Das gilt aber fürs
+  // ganze Feld: ohne diese Prüfung wäre aus 12,5 JPY anschliessend auch
+  // 12,555 JPY speicherbar, also mehr Bruch als die feste Schrittweite zuliess.
+  const amountInput = panel.querySelector('#subscription-amount');
+  const amountValue = Number(amountInput.value);
+  const targetCurrency = currencyInput.value.trim().toUpperCase();
+  if (!amountIsSavable(amountValue, targetCurrency, {
+    original: existing?.amount ?? null,
+    originalCurrency: existing?.currency ?? null,
+  })) {
+    reportFieldError(amountInput, t('common.amountPrecisionRequired', {
+      currency: targetCurrency,
+      step: smallestUnitLabel(targetCurrency),
+    }));
+    return;
+  }
+
   const submit = panel.querySelector('[type="submit"]');
   submit.disabled = true;
   try {
@@ -1055,6 +1221,9 @@ async function saveSubscription(panel, existing, searchedLogoData = null) {
       brand_color: panel.querySelector('#subscription-color').value,
       logo_data: logoData,
       notes: panel.querySelector('#subscription-notes').value.trim() || null,
+      // Konto/Benutzername des Dienstes (#1004) - unverschluesselt und
+      // absichtlich KEIN Passwortfeld; die Grenze steht in docs/SCOPE.md.
+      account_username: panel.querySelector('#subscription-account').value.trim() || null,
       enabled: panel.querySelector('#subscription-enabled').checked,
       end_type: endType,
       end_date: endDate,
@@ -1064,6 +1233,7 @@ async function saveSubscription(panel, existing, searchedLogoData = null) {
     else await api.post('/budget/subscriptions', payload);
     await closeModal({ force: true });
     await reload();
+    refocusAfterRender();
     window.yuvomi?.showToast(t(existing ? 'subscriptions.savedToast' : 'subscriptions.addedToast'), 'success');
   } catch (err) {
     window.yuvomi?.showToast(err.data?.error || err.message || t('common.unknownError'), 'danger');
@@ -1113,6 +1283,8 @@ function openLogoPickerModal(panel, initialQuery, onSelect) {
   const input = overlay.querySelector('#subscription-logo-search-input');
   let options = [];
   const close = () => overlay.remove();
+  // Der Picker liegt ueber dem Abo-Formular; die Zurueck-Geste meint ihn (#871).
+  attachOverlay(overlay, close);
   const search = async () => {
     const query = input.value.trim();
     if (!query) return;
@@ -1154,20 +1326,21 @@ function openLogoPickerModal(panel, initialQuery, onSelect) {
   setTimeout(() => input.focus(), 50);
 }
 
-async function toggleSubscription(subscription) {
-  try {
-    await api.put(`/budget/subscriptions/${subscription.id}`, { enabled: !subscription.enabled });
-    await reload();
-    window.yuvomi?.showToast(t(subscription.enabled ? 'subscriptions.disabledToast' : 'subscriptions.enabledToast'), 'success');
-  } catch (err) {
-    window.yuvomi?.showToast(err.data?.error || t('common.unknownError'), 'danger');
-  }
-}
-
+// Eine Zahlung zu buchen schiebt das Faelligkeitsdatum und legt einen
+// Budget-Eintrag an. Beides ist mit einem zweiten Wisch NICHT umkehrbar - anders
+// als das Abhaken einer Aufgabe, das dieselbe Kante traegt. Deshalb fragt die
+// Aktion nach, und deshalb fragt sie an BEIDEN Wegen nach, Geste wie Knopf: eine
+// Bestaetigung, die nur an einem der beiden haengt, ist keine Regel, sondern
+// eine Eigenschaft des Wegs.
 async function renewSubscription(subscription) {
+  const confirmed = await confirmModal(
+    t('subscriptions.renewConfirm', { name: subscription.name }),
+    { detail: t('subscriptions.renewConfirmDetail', { date: formatDate(subscription.next_payment_date) }) });
+  if (!confirmed) return;
   try {
     const response = await api.post(`/budget/subscriptions/${subscription.id}/renew`, {});
     await reload();
+    refocusAfterRender();
     const completed = response.data?.status === 'completed';
     window.yuvomi?.showToast(t(completed ? 'subscriptions.completedToast' : 'subscriptions.renewedToast'), 'success');
   } catch (err) {
@@ -1176,11 +1349,13 @@ async function renewSubscription(subscription) {
 }
 
 async function deleteSubscription(subscription) {
-  const confirmed = await confirmModal(t('subscriptions.deleteConfirm', { name: subscription.name }), { danger: true });
+  const confirmed = await confirmModal(t('subscriptions.deleteConfirm', { name: subscription.name }),
+    { danger: true, detail: t('subscriptions.deleteConfirmDetail') });
   if (!confirmed) return;
   try {
     await api.delete(`/budget/subscriptions/${subscription.id}`);
     await reload();
+    refocusAfterRender();
     window.yuvomi?.showToast(t('subscriptions.deletedToast'), 'success');
   } catch (err) {
     window.yuvomi?.showToast(err.data?.error || t('common.unknownError'), 'danger');
@@ -1192,7 +1367,10 @@ async function openSettingsModal() {
     <form id="subscriptions-settings-form">
       <div class="form-group">
         <label class="form-label" for="subscriptions-budget">${t('subscriptions.monthlyBudgetLabel')}</label>
-        <input class="form-input" id="subscriptions-budget" type="number" min="0" step="0.01" value="${state.settings.monthly_budget}">
+        <input class="form-input" id="subscriptions-budget" type="number" min="0"
+               step="${amountStep(state.settings.base_currency, state.settings.monthly_budget)}"
+               placeholder="${amountPlaceholder(state.settings.base_currency)}"
+               value="${state.settings.monthly_budget}">
       </div>
       ${comboboxMarkup({
         id: 'subscriptions-base-currency',
@@ -1216,12 +1394,28 @@ async function openSettingsModal() {
     size: 'sm',
     onSave(panel) {
       wireCombobox(panel, 'subscriptions-base-currency');
+      panel.querySelector('#subscriptions-base-currency').addEventListener('change', (event) => {
+        applyAmountFormat(panel.querySelector('#subscriptions-budget'), event.target.value);
+      });
       panel.querySelector('#subscriptions-settings-cancel').addEventListener('click', closeModal);
       panel.querySelector('#subscriptions-settings-form').addEventListener('submit', async (event) => {
         event.preventDefault();
         const baseCurrency = panel.querySelector('#subscriptions-base-currency').value;
         if (!baseCurrency) {
           reportFieldError(panel.querySelector('#subscriptions-base-currency-search'), t('subscriptions.currencyRequired'));
+          return;
+        }
+        // Auch hier gilt: bei einem Bestandsbudget neben dem Raster steht das
+        // Feld auf step="any", die Prüfung muss also hier stattfinden.
+        const budgetInput = panel.querySelector('#subscriptions-budget');
+        if (!amountIsSavable(Number(budgetInput.value), baseCurrency, {
+          original: state.settings.monthly_budget ?? null,
+          originalCurrency: state.settings.base_currency ?? null,
+        })) {
+          reportFieldError(budgetInput, t('common.amountPrecisionRequired', {
+            currency: baseCurrency,
+            step: smallestUnitLabel(baseCurrency),
+          }));
           return;
         }
         try {
@@ -1231,6 +1425,7 @@ async function openSettingsModal() {
           });
           await closeModal({ force: true });
           await reload({ refreshRates: true });
+          refocusAfterRender();
           window.yuvomi?.showToast(t('subscriptions.settingsSaved'), 'success');
         } catch (err) {
           window.yuvomi?.showToast(err.data?.error || t('common.unknownError'), 'danger');
@@ -1248,7 +1443,7 @@ function metadataRows(items, kind) {
     <li data-id="${item.id}" data-kind="${kind}">
       <div class="subscriptions-metadata-row__view">
         ${isCat ? `<i style="background:${esc(item.color)}"></i>` : '<i data-lucide="credit-card" aria-hidden="true"></i>'}
-        <span>${esc(isCat ? categoryLabel(item) : item.name)}</span>
+        <span>${esc(isCat ? categoryLabel(item) : paymentMethodLabel(item))}</span>
         <div class="subscriptions-metadata-row__actions">
           <button class="btn btn--icon" data-move="-1" ${index === 0 ? 'aria-disabled="true"' : ''} aria-label="${t('subscriptions.moveUp')}">
             <i data-lucide="chevron-up" aria-hidden="true"></i>
@@ -1265,7 +1460,7 @@ function metadataRows(items, kind) {
         </div>
       </div>
       <div class="subscriptions-metadata-row__edit" hidden>
-        <input class="form-input subscriptions-metadata-edit-name" value="${esc(isCat ? categoryLabel(item) : item.name)}" data-original-name="${esc(item.name)}" maxlength="100" aria-label="${editLabel}">
+        <input class="form-input subscriptions-metadata-edit-name" value="${esc(isCat ? categoryLabel(item) : paymentMethodLabel(item))}" data-original-name="${esc(item.name ?? '')}" maxlength="100" aria-label="${editLabel}">
         ${isCat ? `<input class="form-input form-input--color subscriptions-metadata-edit-color" type="color" value="${esc(item.color)}" aria-label="${t('subscriptions.brandColorLabel')}">` : ''}
         <div class="subscriptions-metadata-row__actions">
           <button class="btn btn--icon" data-act="save" aria-label="${t('common.save')}">
@@ -1320,6 +1515,7 @@ function openMetadataModal() {
         });
         await closeModal({ force: true });
         await reload();
+        refocusAfterRender();
         openMetadataModal();
       });
       panel.querySelector('#subscription-add-method').addEventListener('click', async () => {
@@ -1328,6 +1524,7 @@ function openMetadataModal() {
         await api.post('/budget/subscriptions/payment-methods', { name });
         await closeModal({ force: true });
         await reload();
+        refocusAfterRender();
         openMetadataModal();
       });
       panel.querySelectorAll('[data-move]').forEach((button) => {
@@ -1344,6 +1541,7 @@ function openMetadataModal() {
           await api.put('/budget/subscriptions/meta/order', { [key]: rows.map((row) => Number(row.dataset.id)) });
           await closeModal({ force: true });
           await reload();
+          refocusAfterRender();
           openMetadataModal();
         });
       });
@@ -1408,6 +1606,7 @@ function openMetadataModal() {
             }
             await closeModal({ force: true });
             await reload();
+            refocusAfterRender();
             openMetadataModal();
             window.yuvomi?.showToast(t('subscriptions.metaSavedToast'), 'success');
           } catch (err) {
@@ -1422,19 +1621,30 @@ function openMetadataModal() {
           const isCat = li.dataset.kind === 'categories';
           const item = state.meta[isCat ? 'categories' : 'payment_methods'].find((row) => row.id === id);
           const inUse = item?.usage_count || 0;
-          const name = item ? (isCat ? categoryLabel(item) : item.name) : '';
+          const name = item ? (isCat ? categoryLabel(item) : paymentMethodLabel(item)) : '';
           // confirmOverModal parkt das Verwalten-Modal, statt es zu ersetzen:
           // „Abbrechen" gibt es mitsamt Scrollposition und Fokus zurück. Nur
           // nach echtem Löschen wird es neu aufgebaut - die Liste hat sich
           // geändert.
+          // Der Folgentext haengt nicht daran, ob gerade ein Abo zugeordnet ist:
+          // bei einer Kategorie faellt die verknuepfte Budget-Unterkategorie in
+          // jedem Fall mit (routes/subscriptions.js). Frueher stand `detail` bei
+          // usage_count 0 auf null - dann nannte der Dialog gar keine Folge.
+          const warnung = inUse ? `${t('subscriptions.metaInUseWarning', { count: inUse })} ` : '';
           const confirmed = await confirmOverModal(
             t(isCat ? 'subscriptions.deleteCategoryConfirm' : 'subscriptions.deletePaymentMethodConfirm', { name }),
-            { danger: true, detail: inUse ? t('subscriptions.metaInUseWarning', { count: inUse }) : null },
+            {
+              danger: true,
+              detail: isCat
+                ? `${warnung}${t('subscriptions.deleteCategoryConfirmDetail')}`
+                : `${warnung}${t('subscriptions.deletePaymentMethodConfirmDetail')}`,
+            },
           );
           if (!confirmed) return;
           try {
             await api.delete(`/budget/subscriptions/${isCat ? 'categories' : 'payment-methods'}/${id}`);
             await reload();
+            refocusAfterRender();
             window.yuvomi?.showToast(t('subscriptions.metaDeletedToast'), 'success');
           } catch (err) {
             window.yuvomi?.showToast(err.data?.error || err.message || t('common.unknownError'), 'danger');

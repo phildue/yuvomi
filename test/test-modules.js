@@ -42,7 +42,9 @@ function writeModule(folder, manifest, files = {}) {
     fs.writeFileSync(path.join(dir, 'module.json'), body);
   }
   for (const [name, content] of Object.entries(files)) {
-    fs.writeFileSync(path.join(dir, name), content);
+    const filePath = path.join(dir, name);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, content);
   }
 }
 
@@ -79,9 +81,56 @@ writeModule('no-style-file-mod', { id: 'no-style-file-mod', entry: 'index.js', s
 // Loser Nicht-Ordner-Eintrag im MODULES_DIR → muss weggefiltert werden.
 fs.writeFileSync(path.join(MODULES_DIR, 'loose.txt'), 'not a module');
 
-const VALID_IDS = ['alpha-mod', 'beta-mod', 'omega-mod'];
+writeModule('cap-mod', {
+  id: 'cap-mod',
+  name: 'Capabilities Module',
+  entry: 'index.js',
+  capabilities: {
+    permissions: {
+      module: { label: 'Cap Module', icon: 'star' },
+      widgets: [{ id: 'tile', label: 'Tile' }],
+    },
+    widgets: [{
+      id: 'tile',
+      entry: 'widgets/tile.js',
+      label: 'Tile',
+      defaultSize: '2x1',
+      optionsSchema: {
+        show_title: { type: 'boolean', title: 'Show title', default: true },
+      },
+    }],
+    api: { prefix: '/api/extensions/cap-mod' },
+  },
+}, {
+  'index.js': 'export async function render() {}\n',
+  'widgets/tile.js': 'export async function renderWidget(c) { c.textContent = "ok"; }\n',
+});
+
+writeModule('bad-cap-mod', {
+  id: 'bad-cap-mod',
+  entry: 'index.js',
+  capabilities: {
+    permissions: { module: { label: 'Bad', icon: 'box' } },
+    widgets: [{ id: 'tile', entry: 'widgets/missing.js', label: 'Tile' }],
+  },
+}, { 'index.js': 'export async function render() {}\n' });
+
+writeModule('i18n-mod', {
+  id: 'i18n-mod',
+  name: 'I18n Module',
+  entry: 'index.js',
+  i18n: { defaultLocale: 'en' },
+  menu: { label: 'I18n', labelKey: 'menu', show: false },
+}, {
+  'index.js': 'export async function render() {}\n',
+  'locales/en.json': JSON.stringify({ menu: 'Menu EN' }),
+  'locales/de.json': JSON.stringify({ menu: 'Menu DE' }),
+  'locales/xx.json': JSON.stringify({ menu: 'Invalid' }),
+});
+
+const VALID_IDS = ['alpha-mod', 'beta-mod', 'omega-mod', 'cap-mod', 'i18n-mod'];
 const ERROR_IDS = ['broken-json-mod', 'mismatch-mod', 'no-entry-mod', 'bad-entry-mod',
-  'bad-style-mod', 'no-style-file-mod'];
+  'bad-style-mod', 'no-style-file-mod', 'bad-cap-mod'];
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -89,6 +138,8 @@ import express from 'express';
 
 const dbmod = await import('../server/db.js');
 const svc = await import('../server/services/modules.js');
+const { SUPPORTED_MANIFEST_VERSION } = svc;
+const { normalizeCapabilities, fullWidgetId, isWidgetId, isNamespacedWidgetId, MODULE_ID_RE, WIDGET_SHORT_ID_RE } = await import('../server/services/module-capabilities.js');
 const { default: modulesRouter } = await import('../server/routes/modules.js');
 const db = dbmod.get();
 
@@ -103,7 +154,7 @@ app.use((req, _res, next) => {
 });
 app.use(express.json());
 app.use('/', modulesRouter);
-const server = app.listen(0);
+const server = app.listen(0, '127.0.0.1');
 const baseUrl = await new Promise((r) => server.on('listening', () => r(`http://127.0.0.1:${server.address().port}`)));
 
 const ADM = { id: 1, role: 'admin' };
@@ -127,7 +178,12 @@ async function call(method, route, { actor: a, body } = {}) {
 
 function disabledConfig() {
   const row = db.prepare("SELECT value FROM sync_config WHERE key = 'third_party_disabled_modules'").get();
-  return row ? JSON.parse(row.value) : null;
+  if (!row) return null;
+  try {
+    return JSON.parse(row.value);
+  } catch {
+    return null;
+  }
 }
 
 test.after(() => {
@@ -164,6 +220,85 @@ test('listModules(admin): valide Manifeste werden vollständig normalisiert', as
   assert.equal(beta.enabled, true, 'menu.show=false lässt das Modul dennoch enabled');
 });
 
+// ── Formatvertrag des Manifests (#919 Folgearbeit) ──────────────────────────────
+// `capabilities` ist seit #919 eine ZUGESAGTE Oberflaeche, und `modules/` ist
+// gitignored: die Module kommen zur Laufzeit, niemand hier sieht, wer sie mit
+// welchen Annahmen benutzt. Ohne eine Formatversion waere jede Umbenennung
+// eines Feldes ein stiller Bruch - das Modul laedt, das Feld fehlt, und der
+// Haushalt merkt es an einem Widget, das nichts mehr tut.
+//
+// Geprueft wird DIREKT an den beiden Funktionen, die den Vertrag tragen, nicht
+// ueber angelegte Ordner: ein Test, der dafuer Module auf die Platte schreibt,
+// veraendert die Liste, die sieben andere Tests hier zaehlen. (Beim ersten
+// Versuch genau so passiert.)
+
+test('ein Manifest ohne manifestVersion gilt als Version 1', () => {
+  // Der einzige Wert, der die Manifeste nicht bricht, die es seit #919 schon
+  // geben kann: sie beschreiben genau dieses Format.
+  const m = svc.normalizeManifest({ id: 'x-mod', entry: 'index.js' }, 'x-mod');
+  assert.equal(m.manifestVersion, SUPPORTED_MANIFEST_VERSION);
+});
+
+test('ein Manifest fuer ein neueres Format wird abgewiesen, nicht halb gelesen', () => {
+  const zuNeu = SUPPORTED_MANIFEST_VERSION + 1;
+  assert.throws(
+    () => svc.normalizeManifest({ id: 'x-mod', entry: 'index.js', manifestVersion: zuNeu }, 'x-mod'),
+    (err) => {
+      // Die Meldung nennt BEIDE Zahlen - wer sie liest, weiss sofort, wer wen
+      // ueberholt hat, und muss nicht im Quelltext nachsehen.
+      assert.match(err.message, new RegExp(String(zuNeu)));
+      assert.match(err.message, new RegExp(`${SUPPORTED_MANIFEST_VERSION}\\b`));
+      return true;
+    },
+  );
+});
+
+test('eine unsinnige manifestVersion wird abgewiesen', () => {
+  for (const bad of ['zwei', 0, -1, 1.5]) {
+    assert.throws(
+      () => svc.normalizeManifest({ id: 'x-mod', entry: 'index.js', manifestVersion: bad }, 'x-mod'),
+      /manifestVersion/,
+      `manifestVersion ${JSON.stringify(bad)} haette abgewiesen werden muessen`,
+    );
+  }
+});
+
+test('jedes zugesagte capabilities-Feld kommt beim Modul auch an', async () => {
+  // DER EIGENTLICHE VERTRAG, und er prueft VERHALTEN statt Schreibweise: ein
+  // Manifest mit allen dokumentierten Feldern geht durch den echten
+  // Normalisierer, und jedes Feld muss im Ergebnis ankommen. Wer eines
+  // entfernt oder umbenennt, macht diesen Test rot - und die Reparatur ist
+  // nicht, ihn anzupassen, sondern SUPPORTED_MANIFEST_VERSION anzuheben und
+  // die alte Fassung weiter zu lesen. Ein Guard ueber den Quelltext haette
+  // denselben Namen an anderer Stelle akzeptiert.
+  const caps = await normalizeCapabilities(
+    {
+      capabilities: {
+        permissions: { module: { labelKey: 'contract.title', icon: 'box' } },
+        widgets: [{
+          id: 'panel', entry: 'widget.js', titleKey: 'contract.panel',
+          optionsSchema: { properties: { rows: { type: 'number' } } },
+        }],
+        api: { prefix: '/api/extensions/contract-mod' },
+      },
+    },
+    'contract-mod',
+    '/nowhere',
+    (id, rel) => `/api/v1/modules/assets/${id}/${rel}`,
+    async () => true,        // jede Datei existiert
+    () => true,              // jeder Pfad ist sicher
+  );
+
+  assert.ok(caps, 'capabilities duerfen nicht ganz wegfallen');
+  assert.equal(caps.permissionModuleKey, 'ext:contract-mod', 'ext:<id> ist der zugesagte Namensraum');
+  assert.ok(caps.permissionModule, 'permissions.module');
+  assert.equal(caps.apiPrefix, '/api/extensions/contract-mod', 'api.prefix');
+  assert.equal(caps.widgets.length, 1, 'widgets');
+  assert.equal(caps.widgets[0].shortId, 'panel');
+  assert.equal(caps.widgets[0].id, 'contract-mod:panel', '<module-id>:<widget-id> ist zugesagt');
+  assert.ok(caps.widgets[0].optionsSchema, 'widgets[].optionsSchema');
+});
+
 // ── Service: error-Fallback bei ungültigem Manifest ──────────────────────────────
 test('listModules(admin): jedes kaputte Modul wird zum error-Eintrag (kein Wurf)', async () => {
   const mods = await svc.listModules({ admin: true });
@@ -185,8 +320,8 @@ test('listModules(admin): jedes kaputte Modul wird zum error-Eintrag (kein Wurf)
 // ── Service: non-admin filtert + Sortierung ──────────────────────────────────────
 test('listModules(): non-admin zeigt nur enabled+ok, sortiert nach order dann name', async () => {
   const mods = await svc.listModules({ admin: false });
-  assert.deepEqual(mods.map((m) => m.id), ['beta-mod', 'alpha-mod', 'omega-mod'],
-    'order 5 < 10 < 1000');
+  assert.deepEqual(mods.map((m) => m.id), ['beta-mod', 'alpha-mod', 'cap-mod', 'i18n-mod', 'omega-mod'],
+    'order 5 < 10 < 1000, dann name');
   assert.ok(mods.every((m) => m.status === 'enabled'), 'keine error-Module für Nutzer');
 });
 
@@ -194,7 +329,7 @@ test('listModules(): korrupter disabled-Eintrag in sync_config → als leer beha
   // parseDisabledModules fängt ungültiges JSON ab und liefert [] (kein Wurf).
   db.prepare("INSERT INTO sync_config (key, value) VALUES ('third_party_disabled_modules', '{kaputt')").run();
   const mods = await svc.listModules({ admin: false });
-  assert.deepEqual(mods.map((m) => m.id), ['beta-mod', 'alpha-mod', 'omega-mod'],
+  assert.deepEqual(mods.map((m) => m.id), ['beta-mod', 'alpha-mod', 'cap-mod', 'i18n-mod', 'omega-mod'],
     'nichts gilt als deaktiviert, wenn der Eintrag unlesbar ist');
   // Wieder entfernen: die folgenden PATCH-Tests erwarten einen jungfräulichen Zustand.
   db.prepare("DELETE FROM sync_config WHERE key = 'third_party_disabled_modules'").run();
@@ -204,7 +339,7 @@ test('listModules(): korrupter disabled-Eintrag in sync_config → als leer beha
 test('GET /: member erhält nur enabled Module', async () => {
   const r = await call('GET', '/', { actor: MEM });
   assert.equal(r.status, 200);
-  assert.deepEqual(r.body.data.map((m) => m.id), ['beta-mod', 'alpha-mod', 'omega-mod']);
+  assert.deepEqual(r.body.data.map((m) => m.id), ['beta-mod', 'alpha-mod', 'cap-mod', 'i18n-mod', 'omega-mod']);
 });
 
 test('GET /?admin=1: member wird NICHT als admin behandelt (kein Bypass)', async () => {
@@ -338,4 +473,100 @@ test('PATCH /:id: reaktivieren ist idempotent und stellt das Modul wieder her', 
 
   const list = await call('GET', '/', { actor: MEM });
   assert.ok(list.body.data.some((m) => m.id === 'alpha-mod'), 'wieder sichtbar');
+});
+
+test('listModules: capabilities werden normalisiert und exponiert', async () => {
+  const mods = await svc.listModules({ admin: true });
+  const cap = mods.find((m) => m.id === 'cap-mod');
+  assert.ok(cap, 'cap-mod vorhanden');
+  assert.equal(cap.capabilities.permissionModuleKey, 'ext:cap-mod');
+  assert.equal(cap.capabilities.widgets[0].id, 'cap-mod:tile');
+  assert.equal(cap.capabilities.apiPrefix, '/api/extensions/cap-mod');
+  assert.equal(cap.capabilities.widgets[0].optionsSchema.show_title.type, 'boolean');
+});
+
+test('listModules: i18n metadata scans locales/ and filters unsupported codes', async () => {
+  const mods = await svc.listModules({ admin: true });
+  const i18nMod = mods.find((m) => m.id === 'i18n-mod');
+  assert.ok(i18nMod, 'i18n-mod vorhanden');
+  assert.equal(i18nMod.i18n.defaultLocale, 'en');
+  assert.deepEqual(i18nMod.i18n.availableLocales, ['de', 'en']);
+  assert.ok(Array.isArray(i18nMod.i18n.coreLocales) && i18nMod.i18n.coreLocales.includes('de'));
+});
+
+test('listModules: fehlende widget entry datei → error status', async () => {
+  const mods = await svc.listModules({ admin: true });
+  const bad = mods.find((m) => m.id === 'bad-cap-mod');
+  assert.equal(bad.status, 'error');
+  assert.match(bad.error, /does not exist/i);
+});
+
+// Die Seitenerklaerung (`page.composition`, `page.width`) ist seit #929 Teil
+// des Manifests. Sie zaehlt nur, wenn der Router sie auch anwendet - der Guard
+// dafuer steht in test-frontend-audit.js (PAGE-012); hier wird die Normalisierung
+// festgehalten, auf die er sich verlaesst.
+test('page.composition wird normalisiert und page.width folgt dem Modus', () => {
+  const norm = (page) => svc.normalizeManifest({ id: 'x-mod', entry: 'index.js', page }, 'x-mod').page;
+  assert.deepEqual(norm(undefined), { composition: 'reading', width: 'reading', navigation: 'standard', responsive: 'standard' },
+    'ohne page-Block: reading in Lesebreite');
+  assert.equal(norm({ composition: 'data' }).width, 'content', 'data liest --layout-content');
+  assert.equal(norm({ composition: 'dashboard' }).width, 'wide', 'dashboard liest --layout-wide');
+  assert.equal(norm({ composition: 'full' }).width, 'reading',
+    'full traegt den Rueckfall reading - layout.css wendet width auf full/split nicht an');
+  assert.equal(norm({ composition: 'data', width: 'wide' }).width, 'wide', 'eine erklaerte Breite gewinnt');
+  assert.equal(norm({ composition: 'tabelle' }).composition, 'reading', 'ein unbekannter Modus faellt auf reading');
+  assert.equal(norm({ composition: 'data', width: 'riesig' }).width, 'content', 'eine unbekannte Breite faellt auf die des Modus');
+  // navigation/responsive folgen derselben Regel: MODULES.md nennt nur
+  // `standard`, und ein Tippfehler darf nicht als eigener Zustand ankommen
+  // (Codex, dritte Runde an #995 - die erste Fassung reichte ihn roh durch).
+  assert.equal(norm({ navigation: 'tabs' }).navigation, 'standard', 'eine unbekannte navigation faellt auf standard');
+  assert.equal(norm({ responsive: 'collapse' }).responsive, 'standard', 'ein unbekanntes responsive faellt auf standard');
+  assert.equal(norm({ navigation: 'standard', responsive: 'standard' }).navigation, 'standard', 'standard bleibt standard');
+});
+
+// ── Die Speicherform einer Widget-Id (#1013) ─────────────────────────────────
+//
+// DER EIGENTLICHE GUARD IST DER ERSTE: was `fullWidgetId()` baut, muss
+// `isWidgetId()` annehmen - und zwar an den LAENGENGRENZEN, nicht an einem
+// huebschen Beispiel. Genau daran ist #1013 gescheitert: die Speicherform stand
+// in einer anderen Datei und kannte den Doppelpunkt nicht, den die
+// Zusammensetzung erzeugt. Ein Beispiel-Test mit 'my-addon:chart' waere auch mit
+// einer Schranke von 64 Zeichen gruen geblieben, obwohl eine legale volle Id 97
+// erreichen kann.
+test('was fullWidgetId baut, nimmt die Speicherform an - auch am Rand (#1013)', () => {
+  const maxModuleId = 'm'.repeat(64);
+  const maxShortId = 'w'.repeat(32);
+  assert.ok(MODULE_ID_RE.test(maxModuleId), 'Voraussetzung: 64 Zeichen sind eine legale Modul-Id');
+  assert.ok(WIDGET_SHORT_ID_RE.test(maxShortId), 'Voraussetzung: 32 Zeichen sind eine legale Kurz-Id');
+
+  const longest = fullWidgetId(maxModuleId, maxShortId);
+  assert.equal(longest.length, 97, 'die laengste legale Widget-Id ist 97 Zeichen lang');
+  assert.ok(isWidgetId(longest), 'die laengste legale Id muss speicherbar sein');
+
+  // Eine Modul-Id darf mit einer ZIFFER beginnen (ID_RE), eine Kern-Widget-Id
+  // nicht. Wer die Namensraum-Form aus der Kern-Form ableitet, verliert das.
+  assert.ok(MODULE_ID_RE.test('7up'), 'Voraussetzung: eine Modul-Id darf mit einer Ziffer beginnen');
+  assert.ok(isWidgetId(fullWidgetId('7up', 'chart')), 'auch eine Modul-Id mit fuehrender Ziffer bleibt speicherbar');
+});
+
+test('isWidgetId nimmt Kern- und Namensraum-Ids an und weist kaputte ab (#1013)', () => {
+  for (const id of ['weather', 'tasks', 'my-addon', 'my-addon:chart', '7up:chart']) {
+    assert.ok(isWidgetId(id), `${id} muss angenommen werden`);
+  }
+  for (const id of [
+    'mo:chart',                       // Modul-Id kuerzer als drei Zeichen
+    `${'m'.repeat(65)}:chart`,        // Modul-Id zu lang
+    `my-addon:${'w'.repeat(33)}`,     // Kurz-Id zu lang
+    'a:b:c',                          // zweiter Doppelpunkt: kaputt, nicht verschachtelt
+    'my-addon:', ':chart', '::',
+    '../weather', 'My-Addon:chart', 'my-addon:Chart', 'my-addon:1chart',
+    '-my-addon:chart', 'my-addon-:chart',
+    null, undefined, 42, {},
+  ]) {
+    assert.equal(isWidgetId(id), false, `${String(id)} darf nicht angenommen werden`);
+  }
+  // Eine Kern-Id ist NICHT namensraumbehaftet - sonst wuerde jede Kachel als
+  // Fremdmodul-Widget gelten, sobald jemand die beiden Pruefungen verwechselt.
+  assert.equal(isNamespacedWidgetId('weather'), false);
+  assert.equal(isNamespacedWidgetId('my-addon:chart'), true);
 });

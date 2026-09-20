@@ -1,13 +1,15 @@
 import { api } from '/api.js';
 import { formatDate, formatTime, t } from '/i18n.js';
 import { esc } from '/utils/html.js';
-import { confirmModal } from '/components/modal.js';
+import { confirmModal, refocusAfterRender } from '/components/modal.js';
 import { createRetryState, toggleRowHtml } from '/settings/components.js';
+import { getExtensionModules } from '/utils/extension-widgets.js';
+import { moduleDisplayLabel } from '/utils/extension-i18n.js';
 
-// Muss mit MODULE_KEYS in server/scopes.js übereinstimmen (gleiche Reihenfolge).
-const SCOPE_MODULE_KEYS = [
-  'tasks', 'shopping', 'meals', 'pantry', 'calendar', 'notes', 'contacts', 'budget',
-  'documents', 'health', 'rewards', 'housekeeping', 'weather', 'family',
+// Core scope keys — extension modules are appended from /permissions/catalog at render time.
+const CORE_SCOPE_MODULE_KEYS = [
+  'tasks', 'shopping', 'meals', 'pantry', 'inventory', 'calendar', 'schedule', 'notes', 'contacts', 'budget',
+  'documents', 'health', 'rewards', 'housekeeping', 'waste', 'weather', 'family',
   'dashboard', 'search',
 ];
 
@@ -46,6 +48,7 @@ function apiTokenHtml(token) {
     ? t('settings.apiTokenScopeSummary', { count: token.scopes.length })
     : t('settings.apiTokenScopeFull');
   const meta = [
+    token.subject_name,
     `${t('settings.apiTokenPrefix')}: ${token.token_prefix}...`,
     scopeSummary,
     token.expires_at
@@ -89,7 +92,28 @@ function renderApiTokenList(container, tokens) {
   window.lucide?.createIcons({ el: list });
 }
 
-function renderPage(container) {
+function scopeModuleLabel(key) {
+  if (String(key).startsWith('ext:')) {
+    const moduleId = key.slice(4);
+    const mod = getExtensionModules().find((m) => m.id === moduleId);
+    if (mod) return moduleDisplayLabel(mod);
+  }
+  const i18nKey = `settings.apiTokenScopeModules.${key}`;
+  const label = t(i18nKey);
+  return label === i18nKey ? key : label;
+}
+
+function renderScopeRows(scopeKeys) {
+  return scopeKeys.map((key) => `
+    <div class="api-token-scopes__row">
+      <span class="api-token-scopes__name">${esc(scopeModuleLabel(key))}</span>
+      <label class="api-token-scopes__cell"><input type="checkbox" data-scope="${key}:read" aria-label="${esc(scopeModuleLabel(key))} ${t('settings.apiTokenScopeRead')}" /></label>
+      <label class="api-token-scopes__cell"><input type="checkbox" data-scope="${key}:write" aria-label="${esc(scopeModuleLabel(key))} ${t('settings.apiTokenScopeWrite')}" /></label>
+    </div>
+  `).join('');
+}
+
+function renderPage(container, scopeKeys = CORE_SCOPE_MODULE_KEYS) {
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
     <section class="settings-section">
@@ -103,6 +127,10 @@ function renderPage(container) {
           <div class="form-group">
             <label class="form-label" for="api-token-name">${t('settings.apiTokenNameLabel')}</label>
             <input class="form-input" type="text" id="api-token-name" maxlength="100" required />
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="api-token-subject">${t('settings.apiTokenSubjectLabel')}</label>
+            <select class="form-input" id="api-token-subject" required></select>
           </div>
           <div class="form-group">
             <label class="form-label" for="api-token-expires">${t('settings.apiTokenExpiresLabel')}</label>
@@ -122,13 +150,7 @@ function renderPage(container) {
                 <span>${t('settings.apiTokenScopeRead')}</span>
                 <span>${t('settings.apiTokenScopeWrite')}</span>
               </div>
-              ${SCOPE_MODULE_KEYS.map((key) => `
-                <div class="api-token-scopes__row">
-                  <span class="api-token-scopes__name">${t(`settings.apiTokenScopeModules.${key}`)}</span>
-                  <label class="api-token-scopes__cell"><input type="checkbox" data-scope="${key}:read" aria-label="${t(`settings.apiTokenScopeModules.${key}`)} ${t('settings.apiTokenScopeRead')}" /></label>
-                  <label class="api-token-scopes__cell"><input type="checkbox" data-scope="${key}:write" aria-label="${t(`settings.apiTokenScopeModules.${key}`)} ${t('settings.apiTokenScopeWrite')}" /></label>
-                </div>
-              `).join('')}
+              ${renderScopeRows(scopeKeys)}
             </div>
           </div>
           <div id="api-token-created" class="settings-token-output" hidden>
@@ -150,12 +172,21 @@ function renderPage(container) {
   `);
 }
 
-function bindEvents(container, initialTokens) {
+function bindEvents(container, initialTokens, users, currentUserId) {
   const form = container.querySelector('#api-token-form');
   const list = container.querySelector('#api-token-list');
   if (!form || !list) return;
 
   let tokens = [...initialTokens];
+
+  const subject = container.querySelector('#api-token-subject');
+  for (const member of users) {
+    const option = document.createElement('option');
+    option.value = String(member.id);
+    option.textContent = member.display_name || member.username;
+    option.selected = Number(member.id) === Number(currentUserId);
+    subject.appendChild(option);
+  }
 
   const scopeLimit = container.querySelector('#api-token-scope-limit');
   const scopeGrid = container.querySelector('#api-token-scope-grid');
@@ -190,7 +221,7 @@ function bindEvents(container, initialTokens) {
     }
 
     // scopes: nur senden, wenn „auf Module beschränken" aktiv ist. Sonst voller Zugriff.
-    const payload = { name, expires_at };
+    const payload = { name, expires_at, subject_user_id: Number(subject.value) };
     if (scopeLimit && scopeLimit.checked) {
       const scopes = [...scopeGrid.querySelectorAll('input[data-scope]:checked')]
         .map((box) => box.dataset.scope);
@@ -256,6 +287,7 @@ function bindEvents(container, initialTokens) {
         token.id === id ? { ...token, revoked_at: new Date().toISOString() } : token
       ));
       renderApiTokenList(container, tokens);
+      refocusAfterRender();
       window.yuvomi?.showToast(t('settings.apiTokenRevokedToast'), 'default');
     } catch (err) {
       window.yuvomi?.showToast(err.message, 'danger');
@@ -263,16 +295,18 @@ function bindEvents(container, initialTokens) {
   });
 }
 
-async function loadTokens(container) {
+async function loadTokens(container, currentUserId) {
   const list = container.querySelector('#api-token-list');
   if (!list) return;
 
-  const reload = () => loadTokens(container);
+  const reload = () => loadTokens(container, currentUserId);
 
   let tokens;
+  let users;
   try {
-    const res = await api.get('/auth/api-tokens');
-    tokens = res.data ?? [];
+    const tokenResponse = await api.get('/auth/api-tokens');
+    tokens = tokenResponse.data ?? [];
+    users = tokenResponse.subjects ?? [];
   } catch (err) {
     list.replaceChildren(createRetryState({
       message: err.message || t('common.errorGeneric'),
@@ -282,12 +316,17 @@ async function loadTokens(container) {
   }
 
   renderApiTokenList(container, tokens);
-  bindEvents(container, tokens);
+  bindEvents(container, tokens, users, currentUserId);
   window.lucide?.createIcons({ el: container });
 }
 
 export async function render(container, { user } = {}) {
-  renderPage(container);
-  await loadTokens(container);
+  let scopeKeys = [...CORE_SCOPE_MODULE_KEYS];
+  try {
+    const catalog = await api.get('/permissions/catalog');
+    if (Array.isArray(catalog.data?.scopeModuleKeys)) scopeKeys = catalog.data.scopeModuleKeys;
+  } catch { /* core keys only */ }
+  renderPage(container, scopeKeys);
+  await loadTokens(container, user?.id);
   window.lucide?.createIcons({ el: container });
 }

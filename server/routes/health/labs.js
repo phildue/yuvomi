@@ -7,24 +7,28 @@
 import express from 'express';
 import * as db from '../../db.js';
 import * as v from '../../middleware/validate.js';
+import { defaultVisibilityFor } from './visibility-defaults.js';
 import {
   log, VISIBILITIES, MAX_UNIT,
-  viewerId, visibilityClause, applyUpdate, badRequest, deriveFlag, attachResults,
+  viewerId, careAwareClause, applyUpdate, badRequest, deriveFlag, attachResults,
+  resolveOwner, writableClause, writableChild,
 } from './helpers.js';
 
 const router = express.Router();
 
 /** Lädt einen Laborbefund, wenn der Betrachter ihn lesen darf; sonst null. */
 function reportForRead(reportId, viewer) {
+  const w = writableClause('', viewer);
   return db.get().prepare(
-    `SELECT * FROM health_lab_reports WHERE id = ? AND (user_id = ? OR visibility = 'family')`
-  ).get(reportId, viewer) || null;
+    `SELECT * FROM health_lab_reports WHERE id = ? AND (visibility = 'family' OR ${w.sql})`
+  ).get(reportId, ...w.params) || null;
 }
 
 /** Lädt einen dem Betrachter gehörenden Laborbefund; sonst null. */
-function reportOwned(reportId, viewer) {
-  return db.get().prepare('SELECT * FROM health_lab_reports WHERE id = ? AND user_id = ?')
-    .get(reportId, viewer) || null;
+function reportWritable(reportId, viewer) {
+  const w = writableClause('', viewer);
+  return db.get().prepare(`SELECT * FROM health_lab_reports WHERE id = ? AND ${w.sql}`)
+    .get(reportId, ...w.params) || null;
 }
 
 // GET /labs?user_id=&from=&to=
@@ -32,7 +36,7 @@ router.get('/labs', (req, res) => {
   try {
     const viewer   = viewerId(req);
     const personId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
-    const clause   = visibilityClause('r', viewer, personId);
+    const clause   = careAwareClause('r', viewer, personId);
     const params   = [...clause.params];
     let sql = `SELECT r.* FROM health_lab_reports r WHERE ${clause.sql}`;
 
@@ -110,6 +114,10 @@ router.post('/labs', (req, res) => {
       preparedResults.push(row);
     }
 
+    // Optionales user_id: eine betreuende Person trägt für die betreute ein (#584).
+    const owner = resolveOwner(req, viewer);
+    if (owner.error) return res.status(owner.status).json({ error: owner.error, code: owner.status });
+
     const insertReport = db.get().prepare(`
       INSERT INTO health_lab_reports (user_id, report_date, lab_name, note, visibility)
       VALUES (?, ?, ?, ?, ?)
@@ -120,7 +128,8 @@ router.post('/labs', (req, res) => {
     `);
 
     const tx = db.get().transaction(() => {
-      const rep = insertReport.run(viewer, reportDate.value, labName.value, note.value, visibility.value || 'private');
+      const rep = insertReport.run(owner.ownerId, reportDate.value, labName.value, note.value,
+        visibility.value || defaultVisibilityFor(db.get(), owner.ownerId, 'labs'));
       const reportId = rep.lastInsertRowid;
       for (const r of preparedResults) {
         insertResult.run(reportId, r.analyte, r.value_num, r.unit, r.ref_low, r.ref_high, r.flag);
@@ -144,7 +153,7 @@ router.patch('/labs/:id', (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'Ungültige ID.', code: 400 });
 
-    const existing = reportOwned(id, viewer);
+    const existing = reportWritable(id, viewer);
     if (!existing) return res.status(404).json({ error: 'Befund nicht gefunden.', code: 404 });
 
     const b = req.body || {};
@@ -174,7 +183,7 @@ router.delete('/labs/:id', (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'Ungültige ID.', code: 400 });
 
-    const existing = reportOwned(id, viewer);
+    const existing = reportWritable(id, viewer);
     if (!existing) return res.status(404).json({ error: 'Befund nicht gefunden.', code: 404 });
 
     db.get().prepare('DELETE FROM health_lab_reports WHERE id = ?').run(id);
@@ -191,7 +200,7 @@ router.post('/labs/:id/results', (req, res) => {
     const viewer = viewerId(req);
     const reportId = parseInt(req.params.id, 10);
     if (!reportId) return res.status(400).json({ error: 'Ungültige ID.', code: 400 });
-    if (!reportOwned(reportId, viewer)) return res.status(404).json({ error: 'Befund nicht gefunden.', code: 404 });
+    if (!reportWritable(reportId, viewer)) return res.status(404).json({ error: 'Befund nicht gefunden.', code: 404 });
 
     const { row, error } = validateResult(req.body || {});
     if (error) return badRequest(res, [error]);
@@ -215,11 +224,11 @@ router.delete('/results/:id', (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'Ungültige ID.', code: 400 });
 
-    const existing = db.get().prepare(`
+    const existing = writableChild(`
       SELECT res.id FROM health_lab_results res
       JOIN health_lab_reports r ON r.id = res.report_id
-      WHERE res.id = ? AND r.user_id = ?
-    `).get(id, viewer);
+      WHERE res.id = ?
+    `, 'r', id, viewer);
     if (!existing) return res.status(404).json({ error: 'Analyt nicht gefunden.', code: 404 });
 
     db.get().prepare('DELETE FROM health_lab_results WHERE id = ?').run(id);

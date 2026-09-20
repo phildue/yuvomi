@@ -79,3 +79,15 @@ test('all locales define the new notes reader keys (non-empty)', async () => {
     }
   }
 });
+
+test('der Notiz-Dialog bekommt die Breite fuer inhaltsreiche Dialoge (#826)', async () => {
+  // Eine Notiz ist fast nur Textflaeche und stand in 'md' - derselben Breite wie
+  // ein Formular aus vier kurzen Feldern. Beide Panes haengen daran: die
+  // Textflaeche zum Schreiben und die Leseansicht derselben Notiz.
+  const src = await notesSrc();
+  assert.match(src, /size: 'lg'/, 'der Notiz-Dialog steht nicht auf lg');
+  assert.doesNotMatch(src, /size: 'md'/, 'ein Notiz-Dialog steht wieder auf der Formularbreite');
+  // Gegenprobe zur Obergrenze: 'xl' waere 960px, und eine Zeile dieser Laenge
+  // liest sich schlechter, nicht besser - der Wunsch war Platz, nicht Maximum.
+  assert.doesNotMatch(src, /size: 'xl'/, 'xl macht die Zeile zu lang zum Lesen');
+});

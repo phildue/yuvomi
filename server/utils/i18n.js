@@ -208,7 +208,7 @@ export function resolveHouseholdLocale(database, { ignoreExplicit = false } = {}
     if (isSupportedLocale(explicit)) return explicit;
   }
 
-  const regionLanguage = /^([a-z]{2})-[A-Z]{2}$/.exec(cfgValue(database, 'region') ?? '')?.[1];
+  const regionLanguage = /^([a-z]{2,3})-[A-Z]{2}$/.exec(cfgValue(database, 'region') ?? '')?.[1];
   if (isSupportedLocale(regionLanguage)) return regionLanguage;
 
   return DEFAULT_LOCALE;
@@ -245,7 +245,7 @@ export function resolveHouseholdFormats(database) {
  * @returns {string}
  */
 export function formatMoney(amount, { locale, currency, region = null }) {
-  const numberLocale = /^[a-z]{2}-[A-Z]{2}$/.test(region ?? '') ? region : locale;
+  const numberLocale = /^[a-z]{2,3}-[A-Z]{2}$/.test(region ?? '') ? region : locale;
   try {
     return new Intl.NumberFormat(numberLocale, { style: 'currency', currency }).format(amount);
   } catch {
@@ -256,7 +256,7 @@ export function formatMoney(amount, { locale, currency, region = null }) {
 /** Gespeicherte Region des Haushalts (voller BCP-47-Tag) oder null. */
 export function householdRegion(database) {
   const region = cfgValue(database, 'region');
-  return /^[a-z]{2}-[A-Z]{2}$/.test(region ?? '') ? region : null;
+  return /^[a-z]{2,3}-[A-Z]{2}$/.test(region ?? '') ? region : null;
 }
 
 export { DEFAULT_LOCALE, REFERENCE_LOCALE };

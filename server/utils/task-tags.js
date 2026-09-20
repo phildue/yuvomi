@@ -282,14 +282,17 @@ export function mutateTags(database, taskIds, mutate) {
  * NOCASE) mit einer Beschriftung, die davon abhängt, welche Zeile SQLite zuerst
  * greift.
  */
-export function renameTag(database, { from, to, me = null }) {
+export function renameTag(database, { from, to, me = null, ids = null }) {
   const fromKey = tagKey(from);
   const toKey   = tagKey(to);
-  const ids = [...new Set([
+  // `ids` vorgeben heisst: die Auswahl ist schon getroffen. Die Aufgaben-Route
+  // nutzt das, um gesperrte Aufgaben auszunehmen (#830) - sie kennt die
+  // Berechtigungsregel, diese Datei soll sie nicht kennen muessen.
+  const targets = ids ?? [...new Set([
     ...taskIdsWithTag(database, from, me),
     ...taskIdsWithTag(database, to, me),
   ])];
-  return mutateTags(database, ids, (tags) =>
+  return mutateTags(database, targets, (tags) =>
     tags.map((tag) => {
       const key = tagKey(tag);
       return key === fromKey || key === toKey ? to : tag;
@@ -297,9 +300,9 @@ export function renameTag(database, { from, to, me = null }) {
 }
 
 /** Entfernt einen Tag von allen sichtbaren Aufgaben. */
-export function removeTagEverywhere(database, { tag, me = null }) {
+export function removeTagEverywhere(database, { tag, me = null, ids = null }) {
   const key = tagKey(tag);
-  return mutateTags(database, taskIdsWithTag(database, tag, me), (tags) =>
+  return mutateTags(database, ids ?? taskIdsWithTag(database, tag, me), (tags) =>
     tags.filter((existing) => tagKey(existing) !== key));
 }
 

@@ -13,10 +13,11 @@ const log = createLogger('CalDAV-Reminders');
 
 import * as db from '../db.js';
 import { parseVTODO } from './ics-parser.js';
-import { createCalDAVClient } from '../utils/caldav-client.js';
-import { serverTimeZone, utcToWall } from '../utils/timezone.js';
+import { createCalDAVClient, supportsComponent } from '../utils/caldav-client.js';
+import { householdTimeZone, utcToWall } from '../utils/timezone.js';
 import { setItemTags, setTags } from '../utils/task-tags.js';
 import * as todoOutbound from './caldav-todo-outbound.js';
+import { runSerialized } from '../utils/sync-lock.js';
 
 // --------------------------------------------------------
 // Pure Mapping Helpers
@@ -44,10 +45,11 @@ function mapVtodoPriority(p, current = null) {
 }
 
 // Lokale Zustände, die VTODO nicht ausdrückt und die ein „nicht erledigt" vom
-// Server deshalb nicht zurücksetzen darf. `archived` ist kein Erledigt-Zustand,
-// sondern eine lokale Ablage; `in_progress` schreibt kaum ein Client als
-// IN-PROCESS heraus.
-const LOCAL_OPEN_STATES = new Set(['in_progress', 'archived']);
+// Server deshalb nicht zurücksetzen darf: `in_progress` schreibt kaum ein Client
+// als IN-PROCESS heraus.
+// Die Ablage steht seit #688 nicht mehr im Statusfeld, sondern in archived_at -
+// der Sync fasst sie gar nicht mehr an und kann sie also auch nicht überschreiben.
+const LOCAL_OPEN_STATES = new Set(['in_progress']);
 
 /**
  * VTODO-Status → Yuvomi-Aufgabenstatus, unter Rücksicht auf den lokalen Stand:
@@ -72,7 +74,7 @@ function mapVtodoStatus(todo, current = null) {
  * Zonenoffset. Eine Fälligkeit ohne Zonenangabe (floating) ist bereits Wanduhr
  * und bleibt unangetastet.
  */
-function splitDue(due, tz = serverTimeZone()) {
+function splitDue(due, tz = householdTimeZone(null)) {
   if (!due) return { date: null, time: null };
   if (due.length === 10) return { date: due, time: null };
 
@@ -96,8 +98,7 @@ function getAllAccounts() {
 }
 
 function isReminderCollection(cal) {
-  const comps = cal.components || [];
-  return Array.isArray(comps) && comps.map(c => String(c).toUpperCase()).includes('VTODO');
+  return supportsComponent(cal, 'VTODO');
 }
 
 /**
@@ -121,13 +122,19 @@ const createClient = createCalDAVClient;
 // Reminder-List Discovery & Selection
 // --------------------------------------------------------
 
-async function getReminderLists(accountId, { refresh = false } = {}) {
+async function getReminderLists(accountId, { refresh = false, createClient: makeClient } = {}) {
   const account = getAccountById(accountId);
   if (!account) {
     throw new Error(`Account ${accountId} not found.`);
   }
 
-  if (!refresh) {
+  // Ohne gelaufene Suche entdeckt ein frisch angelegtes Konto nur Kalender: die
+  // Seite zeigte einen leeren Zustand, bis jemand "Aktualisieren" drückte, und wer
+  // den Knopf nicht fand, hielt den Aufgaben-Abgleich für kaputt (#617). Deshalb
+  // sucht der erste Aufruf selbst. Der Zeitstempel (v125) merkt sich, dass die
+  // Suche lief, auch wenn sie nichts fand - sonst befragte ein Server ohne
+  // VTODO-Sammlungen bei jedem Seitenaufruf erneut das Netz.
+  if (!refresh && account.reminders_discovered_at) {
     const rows = db.get().prepare(`
       SELECT list_url, list_name, target_module, enabled
       FROM caldav_reminder_selection
@@ -144,7 +151,7 @@ async function getReminderLists(accountId, { refresh = false } = {}) {
   }
 
   // Refresh from server, preserving existing enabled/target_module settings
-  const client    = await createClient(account);
+  const client    = await (makeClient || createClient)(account);
   const calendars = await client.fetchCalendars();
   const lists     = calendars.filter(isReminderCollection);
 
@@ -166,6 +173,12 @@ async function getReminderLists(accountId, { refresh = false } = {}) {
 
     result.push({ listUrl: cal.url, listName: name, targetModule, enabled: enabled === 1 });
   }
+
+  db.get().prepare(`
+    UPDATE caldav_accounts
+       SET reminders_discovered_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+     WHERE id = ?
+  `).run(accountId);
 
   log.info(`Discovered ${result.length} reminder list(s) for account ${accountId}.`);
   return result;
@@ -228,7 +241,7 @@ function updateReminderSelection(accountId, listUrl, { enabled, targetModule } =
 // (#617). COALESCE, weil ein Abruf ohne URL den gespeicherten Wert nicht
 // entwerten darf.
 function upsertTask(todo, accountId, createdBy, objectUrl = null) {
-  const { date, time } = splitDue(todo.due);
+  const { date, time } = splitDue(todo.due, householdTimeZone(db.get()));
 
   const existing = db.get().prepare(
     `SELECT id, priority, status FROM tasks WHERE external_uid = ? AND external_source = 'caldav' AND external_account_id = ?`
@@ -261,6 +274,59 @@ function upsertTask(todo, accountId, createdBy, objectUrl = null) {
   // lokale Bearbeitung, die noch aussteht, kommt hier gar nicht an - der
   // Aufrufer überspringt dirty markierte Einträge (#617).
   setTags(db.get(), taskId, todo.tags);
+  return taskId;
+}
+
+/**
+ * Löst RELATED-TO in `tasks.parent_task_id` auf (#671).
+ *
+ * Läuft als zweite Phase, nachdem alle Listen eines Kontos verarbeitet sind:
+ * ein VTODO kann seinen Elternteil vor sich selbst im Objektstrom haben oder
+ * danach, und über Listengrenzen hinweg ohnehin. Erst wenn alle UIDs eine
+ * lokale ID haben, ist die Zuordnung entscheidbar.
+ *
+ * Yuvomi kennt genau eine Ebene (die POST-Route weist ein Enkelkind ab), CalDAV
+ * kennt beliebig tiefe Ketten. Ein Enkel wird deshalb an den obersten Vorfahren
+ * gehängt statt fallen gelassen - flach unter dem falschen Kopf ist immer noch
+ * eine Hierarchie, gar keine wäre der gemeldete Zustand.
+ *
+ * @param {Map<string, {taskId: number, parentUid: string|null, childUids: string[]}>} seen
+ */
+function applyTaskRelations(seen) {
+  const idByUid = new Map([...seen].map(([uid, entry]) => [uid, entry.taskId]));
+
+  // Beide Richtungen auf dieselbe Aussage bringen: Kind -> Elternteil.
+  const parentUidOf = new Map();
+  for (const [uid, entry] of seen) {
+    if (entry.parentUid && idByUid.has(entry.parentUid)) parentUidOf.set(uid, entry.parentUid);
+  }
+  for (const [uid, entry] of seen) {
+    for (const childUid of entry.childUids || []) {
+      // Ein am Kind gesetztes PARENT ist die genauere Angabe und bleibt stehen.
+      if (idByUid.has(childUid) && !parentUidOf.has(childUid)) parentUidOf.set(childUid, uid);
+    }
+  }
+
+  /** Oberster Vorfahre, oder null bei Zyklus/Selbstbezug. */
+  const rootOf = (uid) => {
+    const path = new Set([uid]);
+    let current = parentUidOf.get(uid);
+    while (current && parentUidOf.has(current)) {
+      if (path.has(current)) return null;      // Zyklus: lieber flach als falsch
+      path.add(current);
+      current = parentUidOf.get(current);
+    }
+    return current && current !== uid ? current : null;
+  };
+
+  const update = db.get().prepare('UPDATE tasks SET parent_task_id = ? WHERE id = ? AND parent_task_id IS NOT ?');
+  for (const [uid, entry] of seen) {
+    const rootUid = parentUidOf.has(uid) ? rootOf(uid) : null;
+    const parentId = rootUid ? idByUid.get(rootUid) ?? null : null;
+    // Auch der NULL-Fall muss geschrieben werden: wer auf dem Server aus der
+    // Unterliste gezogen wurde, ist sonst in Yuvomi für immer ein Kind.
+    update.run(parentId, entry.taskId, parentId);
+  }
 }
 
 function upsertShoppingItem(sel, todo, accountId, objectUrl = null) {
@@ -355,7 +421,16 @@ export function pruneRemoved(database, table, accountId, seenUids) {
 // Sync (inbound + Rückrichtung, #617)
 // --------------------------------------------------------
 
-async function sync({ createClient: makeClient } = {}) {
+/**
+ * Ein Sync-Lauf, serialisiert gegen den Sofortversuch der VTODO-Rückrichtung und
+ * gegen sich selbst (#593) - dieselbe Regel wie beim Kalender, eigener
+ * Schlüssel: Aufgaben und Einkauf führen ihre Buchhaltung in eigenen Tabellen.
+ */
+async function sync(opts = {}) {
+  return runSerialized('caldav-todo', 'sync', () => runSync(opts));
+}
+
+async function runSync({ createClient: makeClient } = {}) {
   const accounts = getAllAccounts();
   if (accounts.length === 0) {
     return { success: true, syncedAccounts: 0, syncedItems: 0 };
@@ -404,6 +479,9 @@ async function sync({ createClient: makeClient } = {}) {
       // UID → Kalenderobjekt dieses Laufs. Ausgehende Löschungen brauchen dessen
       // URL, Änderungen zusätzlich seinen Originalinhalt zum Patchen.
       const objectsByModule = { tasks: new Map(), shopping: new Map() };
+      // UID → lokale Aufgabe dieses Laufs, für die Hierarchie-Auflösung nach
+      // allen Listen (#671). Nur Aufgaben: der Einkauf kennt keine Unterposten.
+      const taskRelations = new Map();
 
       for (const sel of enabledLists) {
         const module = sel.target_module === 'shopping' ? 'shopping' : 'tasks';
@@ -447,13 +525,28 @@ async function sync({ createClient: makeClient } = {}) {
               if (module === 'shopping') {
                 upsertShoppingItem(sel, todo, account.id, obj.url || null);
               } else {
-                upsertTask(todo, account.id, createdBy, obj.url || null);
+                const taskId = upsertTask(todo, account.id, createdBy, obj.url || null);
+                taskRelations.set(todo.uid, {
+                  taskId,
+                  parentUid: todo.parentUid || null,
+                  childUids: todo.childUids || [],
+                });
               }
               totalItems++;
             } catch (err) {
               log.error(`Failed to upsert VTODO ${todo.uid}:`, err.message);
             }
           }
+        }
+      }
+
+      // Unteraufgaben verdrahten, sobald alle Listen des Kontos gelesen sind
+      // (#671) - vorher ist die UID des Elternteils womöglich noch keine ID.
+      if (taskRelations.size > 0) {
+        try {
+          applyTaskRelations(taskRelations);
+        } catch (err) {
+          log.error(`Failed to apply VTODO relations for account ${account.id}:`, err.message);
         }
       }
 
@@ -500,6 +593,49 @@ async function sync({ createClient: makeClient } = {}) {
         } catch (err) {
           log.error(`Outbound VTODO changes failed for account ${account.id} (${module}):`, err.message);
         }
+      }
+
+      // Hier angelegte Aufgaben hochladen (#695). Bewusst als LETZTER Schritt:
+      // bis hierher ist der Prune gelaufen, und der sieht eine Aufgabe, die
+      // gerade erst zum Spiegel geworden ist, in diesem Lauf noch nicht auf dem
+      // Server - er würde sie also sofort wieder entfernen. Die Listen stammen
+      // aus dem Abruf oben, es kommt kein zweiter hinzu.
+      try {
+        const taskLists = new Map(
+          enabledLists
+            .filter((s) => s.target_module !== 'shopping')
+            .map((s) => [s.list_url, serverCals.find((c) => c.url === s.list_url)])
+            .filter(([, cal]) => cal)
+        );
+        const created = await todoOutbound.processPendingCreations(
+          client, account.id, 'tasks', taskLists
+        );
+        totalPushed += created;
+        if (created) log.info(`${created} locally created task(s) uploaded to the server.`);
+      } catch (err) {
+        log.error(`Uploading local tasks failed for account ${account.id}:`, err.message);
+      }
+
+      // Dasselbe für den Einkauf (#831). Ein Artikel trägt kein eigenes Ziel -
+      // die Zuordnung Server-Liste ↔ Yuvomi-Liste ist die Zielangabe, also
+      // reicht sie hier hinein.
+      try {
+        const shoppingSelections = enabledLists.filter((s) => s.target_module === 'shopping');
+        const shoppingLists = new Map(
+          shoppingSelections
+            .map((s) => [s.list_url, serverCals.find((c) => c.url === s.list_url)])
+            .filter(([, cal]) => cal)
+        );
+        const created = await todoOutbound.processPendingShoppingCreations(
+          client,
+          account.id,
+          shoppingSelections.map((s) => ({ listUrl: s.list_url, targetListId: s.target_list_id })),
+          shoppingLists
+        );
+        totalPushed += created;
+        if (created) log.info(`${created} locally created shopping item(s) uploaded to the server.`);
+      } catch (err) {
+        log.error(`Uploading local shopping items failed for account ${account.id}:`, err.message);
       }
 
       db.get().prepare('UPDATE caldav_accounts SET last_sync = ? WHERE id = ?')
@@ -553,6 +689,7 @@ export {
   mapVtodoPriority,
   mapVtodoStatus,
   splitDue,
+  applyTaskRelations,
   getReminderLists,
   updateReminderSelection,
   sync,

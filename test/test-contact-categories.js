@@ -61,12 +61,47 @@ console.log('\n[Contact-Categories-Test] Migration + CRUD-Routen\n');
 // --------------------------------------------------------
 // 2) CRUD-Routen (echte db.js + Express + fetch)
 // --------------------------------------------------------
-process.env.DB_PATH = path.join(os.tmpdir(), `yuvomi-contactcat-${process.pid}.db`);
+import { freshTestDbPath } from './tmp-db.js';
+freshTestDbPath('contactcat');
 process.env.SESSION_SECRET = 'contact-categories-test-secret-32bytes';
 const db = await import('../server/db.js');
 const { default: contactsRouter } = await import('../server/routes/contacts.js');
 db.init();
 const database = db.get();
+
+// --------------------------------------------------------
+// 1b) Heilung der Migration v195 (#1140) - bewusst gegen die ECHTEN
+//     MIGRATIONS aus db.js gefahren, nicht gegen den Spiegel: die
+//     Spiegel-Schreibpfade (server/auth.js, server/routes/split-expenses.js)
+//     schrieben bis v195 das rohe 'Sonstiges' statt des Keys 'misc', und ohne
+//     diese Probe haelt kein Test das UPDATE der Migration selbst fest.
+// --------------------------------------------------------
+{
+  const V195 = db.MIGRATIONS.find((m) => m.version === 195);
+  test('Migration v195 existiert und fasst die Sonstiges-Kategorie an', () => {
+    assert(V195, 'Migration 195 fehlt in db.js MIGRATIONS');
+    assert(/Sonstiges/.test(V195.up), 'v195 muss die Kategorie Sonstiges anfassen');
+  });
+
+  // Vor-v195-Stand: Schema + Kategorien-Seed (v84), dann Zeilen, wie die
+  // fehlerhaften Schreibpfade sie NACH v84 weiter hinterlassen haben.
+  const mig = new DatabaseSync(':memory:');
+  mig.exec(MIGRATIONS_SQL[1]);
+  mig.exec(MIGRATIONS_SQL[84]);
+  mig.prepare("INSERT INTO contacts (name, category) VALUES ('Mitglied', 'Sonstiges')").run();
+  mig.prepare("INSERT INTO contacts (name, category) VALUES ('Gast', 'Sonstiges')").run();
+  mig.prepare("INSERT INTO contacts (name, category) VALUES ('Dr. Meier', 'doctor')").run();
+
+  test('v195 heilt Sonstiges-Kontakte auf misc, andere Kategorien bleiben', () => {
+    mig.exec(V195.up);
+    const byName = Object.fromEntries(
+      mig.prepare('SELECT name, category FROM contacts').all().map((r) => [r.name, r.category]));
+    assert(byName['Mitglied'] === 'misc', `Mitglied: erwartet misc, war ${byName['Mitglied']}`);
+    assert(byName['Gast'] === 'misc', `Gast: erwartet misc, war ${byName['Gast']}`);
+    assert(byName['Dr. Meier'] === 'doctor', `Dr. Meier: doctor muss unberuehrt bleiben, war ${byName['Dr. Meier']}`);
+  });
+  mig.close();
+}
 
 const app = express();
 app.use(express.json());
@@ -126,6 +161,66 @@ try {
     assert(def.status === 201 && def.body.data.category === 'misc', 'ohne Angabe → misc');
     const bad = await jsend(`${base}`, 'POST', { name: 'Kontakt C', category: 'gibt_es_nicht' });
     assert(bad.status === 400, `unbekannte Kategorie sollte 400 sein, war ${bad.status}`);
+  });
+
+  // --------------------------------------------------------
+  // Kategorie-Toene (Migration 152, Vollton-Regel)
+  //
+  // Der Ton stand bis dahin als sieben CSS-Regeln `.contact-group--<key>` und
+  // konnte per Konstruktion nur die SEED-Schluessel treffen: eine selbst
+  // angelegte Kategorie fiel auf den Modulton zurueck, und zwei davon sahen
+  // damit gleich aus. Diese Proben halten die drei Aussagen, an denen das haengt.
+  // --------------------------------------------------------
+  await asyncTest('die sieben Seed-Kategorien tragen ihren Ton aus der Migration', async () => {
+    const { body } = await jsend(`${base}/categories`, 'GET');
+    const byKey = Object.fromEntries(body.data.map((c) => [c.key, c.color]));
+    assert(byKey.doctor === 'var(--color-success)', `doctor: ${byKey.doctor}`);
+    assert(byKey.emergency === 'var(--color-danger)', `emergency: ${byKey.emergency}`);
+    assert(byKey.misc === 'var(--color-text-secondary)', `misc: ${byKey.misc}`);
+  });
+
+  await asyncTest('eine neue Kategorie startet OHNE Ton und bleibt damit neutral', async () => {
+    const { body } = await jsend(`${base}/categories`, 'POST', { name: 'Nachbarn' });
+    assert(body.data.color === null, `neue Kategorie sollte keinen Ton haben, hatte ${body.data.color}`);
+    database.prepare('DELETE FROM contact_categories WHERE key = ?').run(body.data.key);
+  });
+
+  await asyncTest('der Ton laesst sich setzen und wieder entfernen, ohne den Namen zu beruehren', async () => {
+    // NUR die Farbe schicken: die Seed-Kategorien tragen ihren Namen als
+    // label_key, und ein mitgeschickter `name` wuerde sie auf die Sprache
+    // dieses Klienten festnageln.
+    // `emergency` und nicht `doctor`: den hat die Umbenenn-Probe weiter oben
+    // schon auf einen freien Namen gezogen, sein label_key ist also bereits
+    // NULL. Genau darum geht es hier aber - eine Kategorie, die ihren Namen noch
+    // aus der Uebersetzung bezieht, darf ihn beim Farbwechsel nicht verlieren.
+    const set = await jsend(`${base}/categories/emergency`, 'PUT', { color: 'var(--module-budget)' });
+    assert(set.status === 200, `Status ${set.status}`);
+    assert(set.body.data.color === 'var(--module-budget)', 'Ton gesetzt');
+    assert(set.body.data.label_key === 'contacts.categoryEmergency', `label_key bleibt unberuehrt, war ${set.body.data.label_key}`);
+    assert(set.body.data.name === null, 'name bleibt NULL');
+
+    const clear = await jsend(`${base}/categories/emergency`, 'PUT', { color: null });
+    assert(clear.body.data.color === null, 'Ton wieder entfernt');
+    assert(clear.body.data.label_key === 'contacts.categoryEmergency', 'label_key immer noch unberuehrt');
+
+    await jsend(`${base}/categories/emergency`, 'PUT', { color: 'var(--color-danger)' });
+  });
+
+  await asyncTest('ein Ton ausserhalb der Palette wird abgewiesen', async () => {
+    const { status } = await jsend(`${base}/categories/emergency`, 'PUT', { color: '#ff00ff' });
+    assert(status === 400, `freie Farbe sollte 400 sein, war ${status}`);
+  });
+
+  await asyncTest('die waehlbare Palette kommt vom Server, nicht aus dem Klienten', async () => {
+    const { body } = await jsend(`${base}/meta`, 'GET');
+    const colors = body.data.categoryColors;
+    assert(Array.isArray(colors) && colors.length === 7, `Palette: ${JSON.stringify(colors)}`);
+    // Jeder Seed-Ton muss in der Palette stehen - sonst koennte der Haushalt
+    // eine bestehende Kategorie nicht auf ihren eigenen Ton zuruecksetzen.
+    const seeds = (await jsend(`${base}/categories`, 'GET')).body.data
+      .map((c) => c.color).filter(Boolean);
+    const missing = seeds.filter((c) => !colors.includes(c));
+    assert(missing.length === 0, `nicht waehlbar: ${missing.join(', ')}`);
   });
 
   await asyncTest('DELETE blockiert, wenn Kategorie in Benutzung → 409', async () => {

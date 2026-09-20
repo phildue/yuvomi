@@ -52,8 +52,40 @@ function namePartChecks(parts) {
 /** Verwaltbare Kontakt-Kategorien aus der DB (nach sort_order). */
 function loadContactCategories() {
   return db.get().prepare(
-    'SELECT key, name, label_key, icon, sort_order FROM contact_categories ORDER BY sort_order ASC, key ASC'
+    'SELECT key, name, label_key, icon, sort_order, color FROM contact_categories ORDER BY sort_order ASC, key ASC'
   ).all();
+}
+
+/**
+ * Die kuratierten Toene, aus denen eine Kategorie waehlen darf.
+ *
+ * EINE ALLOWLIST, KEIN FREIER FARBWAEHLER, und der Grund ist gemessen: die
+ * Kategoriescheibe ist eine VOLLTON-Marke, ihre Tinte ist die feste
+ * `--color-ink-on-vivid` (Vollton-Regel, DESIGN.md). Das haelt nur ueber
+ * kuratierten Toenen - eine frei gewaehlte Farbe hat unbestimmte Helligkeit und
+ * muesste als Kante statt als Flaeche erscheinen, also als zweites Gesicht
+ * derselben Marke. Sieben Toene sind fuer ein Kategorie-Vokabular reichlich,
+ * und es sind exakt die sieben, die vorher in contacts.css standen: bestehende
+ * Haushalte sehen nach der Migration genau dasselbe wie davor.
+ *
+ * Der leere Wert gehoert dazu und heisst NEUTRAL - siehe Migration 152.
+ */
+const CONTACT_CATEGORY_COLORS = Object.freeze([
+  'var(--color-success)',
+  'var(--color-warning)',
+  'var(--color-accent)',
+  'var(--module-budget)',
+  'var(--module-meals)',
+  'var(--color-danger)',
+  'var(--color-text-secondary)',
+]);
+
+/** '' und null bedeuten beide "kein Ton"; alles ausserhalb der Liste wird abgewiesen. */
+function normalizeCategoryColor(value) {
+  if (value === undefined) return { skip: true };
+  if (value === null || value === '') return { value: null };
+  if (!CONTACT_CATEGORY_COLORS.includes(value)) return { error: 'Unknown category colour.' };
+  return { value };
 }
 
 /** Nur die Keys — für die dynamische Kategorie-Validierung. */
@@ -226,13 +258,16 @@ router.post('/categories', (req, res) => {
     `).get(vName.value);
     if (conflict) return res.status(409).json({ error: 'Category already exists.', code: 409, reason: 'category_exists' });
 
+    const vColor = normalizeCategoryColor(req.body.color);
+    if (vColor.error) return res.status(400).json({ error: vColor.error, code: 400 });
+
     const maxOrder = db.get().prepare('SELECT COALESCE(MAX(sort_order), -1) AS m FROM contact_categories').get().m;
     const key = uniqueKey(db.get(), 'contact_categories', vName.value);
     db.get().prepare(
-      "INSERT INTO contact_categories (key, name, label_key, icon, sort_order) VALUES (?, ?, NULL, 'tag', ?)"
-    ).run(key, vName.value, maxOrder + 1);
+      "INSERT INTO contact_categories (key, name, label_key, icon, sort_order, color) VALUES (?, ?, NULL, 'tag', ?, ?)"
+    ).run(key, vName.value, maxOrder + 1, vColor.skip ? null : vColor.value);
 
-    const cat = db.get().prepare('SELECT key, name, label_key, icon, sort_order FROM contact_categories WHERE key = ?').get(key);
+    const cat = db.get().prepare('SELECT key, name, label_key, icon, sort_order, color FROM contact_categories WHERE key = ?').get(key);
     res.status(201).json({ data: cat });
   } catch (err) {
     log.error('POST /categories error:', err);
@@ -259,6 +294,19 @@ router.put('/categories/:key', (req, res) => {
     const cat = db.get().prepare('SELECT * FROM contact_categories WHERE key = ?').get(req.params.key);
     if (!cat) return res.status(404).json({ error: 'Category not found.', code: 404 });
 
+    const vColor = normalizeCategoryColor(req.body.color);
+    if (vColor.error) return res.status(400).json({ error: vColor.error, code: 400 });
+
+    // NUR die Farbe aendern, ohne den Namen mitzuschicken: die sieben
+    // Seed-Kategorien tragen ihren Namen als `label_key` (uebersetzt), und ein
+    // Umweg ueber `name` wuerde sie beim Farbwechsel stillschweigend auf die
+    // Sprache des Klienten festnageln - genau der Verlust, den Migration 143
+    // beim Inventar behoben hat.
+    if (req.body.name === undefined && !vColor.skip) {
+      db.get().prepare('UPDATE contact_categories SET color = ? WHERE key = ?').run(vColor.value, cat.key);
+      return res.json({ data: db.get().prepare('SELECT key, name, label_key, icon, sort_order, color FROM contact_categories WHERE key = ?').get(cat.key) });
+    }
+
     const vName = str(req.body.name, 'Name', { max: MAX_SHORT });
     if (vName.error) return res.status(400).json({ error: vName.error, code: 400 });
 
@@ -268,7 +316,8 @@ router.put('/categories/:key', (req, res) => {
     if (conflict) return res.status(409).json({ error: 'Category already exists.', code: 409, reason: 'category_exists' });
 
     db.get().prepare('UPDATE contact_categories SET name = ?, label_key = NULL WHERE key = ?').run(vName.value, cat.key);
-    const updated = db.get().prepare('SELECT key, name, label_key, icon, sort_order FROM contact_categories WHERE key = ?').get(cat.key);
+    if (!vColor.skip) db.get().prepare('UPDATE contact_categories SET color = ? WHERE key = ?').run(vColor.value, cat.key);
+    const updated = db.get().prepare('SELECT key, name, label_key, icon, sort_order, color FROM contact_categories WHERE key = ?').get(cat.key);
     res.json({ data: updated });
   } catch (err) {
     log.error('PUT /categories/:key error:', err);
@@ -298,6 +347,36 @@ router.delete('/categories/:key', (req, res) => {
 });
 
 /**
+ * EIN MENSCH, EINE FARBE - auch hier.
+ *
+ * Ein Kontakt mit `family_user_id` IST ein Haushaltsmitglied, und die
+ * Identitaetsfarben-Regel (DESIGN.md) sagt, dass eine Person ueberall in ihrer
+ * eigenen Farbe erscheint. Die Kontaktzeile konnte das nicht: sie kannte nur
+ * die Id und zeigte deshalb den Modulton - dieselbe rosa Scheibe fuer jedes
+ * Mitglied, waehrend dieselben Menschen auf dem Dashboard, im Kalender und in
+ * den Aufgaben ihre eigene tragen. Derselbe Befund, den v2.19 an der
+ * Geburtstagskachel behoben hat, ein Modul weiter.
+ *
+ * DER JOIN KOSTET FAST NICHTS AN NUTZLAST: `avatar_data` entsteht nur fuer
+ * Zeilen MIT Verknuepfung, und davon gibt es hoechstens so viele wie
+ * Haushaltsmitglieder. Die drei Felder sind additiv, fuer `/api/v1`-Verbraucher
+ * also unkritisch.
+ *
+ * EIN AUSDRUCK FUER ALLE LESER, und das ist der Punkt: Liste, Detail und die
+ * Antwort des Schreibens holen denselben Kontakt: laege der Join nur in der
+ * Liste, zeigte die Zeile die Mitgliedsfarbe und die geoeffnete Karte daneben
+ * wieder den Modulton (`reference_codebase_gotchas`: die Reichweite einer
+ * Korrektur ist nicht ihre Datei).
+ */
+const CONTACT_SELECT = `
+  SELECT contacts.*,
+         u.display_name  AS family_display_name,
+         u.avatar_color  AS family_avatar_color,
+         u.avatar_data   AS family_avatar_data
+    FROM contacts
+    LEFT JOIN users u ON u.id = contacts.family_user_id`;
+
+/**
  * GET /api/v1/contacts
  * Alle Kontakte, optional nach Kategorie gefiltert und nach Name gesucht.
  * Query: ?category=<cat>&q=<search>
@@ -305,24 +384,26 @@ router.delete('/categories/:key', (req, res) => {
  */
 router.get('/', (req, res) => {
   try {
-    let sql    = 'SELECT * FROM contacts';
+    let sql    = CONTACT_SELECT;
     const params = [];
     const where  = ['NOT EXISTS (SELECT 1 FROM housekeeping_workers hw WHERE hw.user_id = contacts.family_user_id)'];
 
     if (req.query.category && validContactCategoryKeys().includes(req.query.category)) {
-      where.push('category = ?');
+      where.push('contacts.category = ?');
       params.push(req.query.category);
     }
 
     if (req.query.q) {
-      where.push('(name LIKE ? OR phone LIKE ? OR email LIKE ?)');
+      where.push('(contacts.name LIKE ? OR contacts.phone LIKE ? OR contacts.email LIKE ?)');
       const like = `%${req.query.q}%`;
       params.push(like, like, like);
     }
 
     if (where.length) sql += ' WHERE ' + where.join(' AND ');
     // Sortiert nach Nachname, wo er bekannt ist; sonst nach dem Anzeigenamen (#535).
-    sql += ' ORDER BY category ASC, COALESCE(NULLIF(last_name, \'\'), name) COLLATE NOCASE ASC, name COLLATE NOCASE ASC';
+    // Spalten qualifiziert: seit dem Join auf `users` waeren `name` und
+    // `category` sonst mehrdeutig.
+    sql += ' ORDER BY contacts.category ASC, COALESCE(NULLIF(contacts.last_name, \'\'), contacts.name) COLLATE NOCASE ASC, contacts.name COLLATE NOCASE ASC';
 
     const contacts = db.get().prepare(sql).all(...params);
     res.json({ data: contacts });
@@ -596,7 +677,7 @@ router.put('/:id', (req, res) => {
     transaction();
 
     // Query the updated contact with multi-value fields
-    const updated = db.get().prepare('SELECT * FROM contacts WHERE id = ?').get(id);
+    const updated = db.get().prepare(`${CONTACT_SELECT} WHERE contacts.id = ?`).get(id);
     const multiValueFields = loadMultiValueFields(id);
 
     res.json({
@@ -638,12 +719,17 @@ router.delete('/:id', (req, res) => {
 
 /**
  * GET /api/v1/contacts/meta
- * Kategorien-Liste für Dropdowns.
- * Response: { data: { categories } }
+ * Kategorien-Liste für Dropdowns, dazu die waehlbaren Kategorie-Toene.
+ *
+ * `categoryColors` steht hier und nicht im Klienten, damit die Auswahl und die
+ * Annahme dieselbe Liste sind: eine zweite Aufzaehlung im Frontend waere beim
+ * naechsten Ton stumm veraltet und der Server wiese sie mit 400 ab.
+ *
+ * Response: { data: { categories, categoryColors } }
  */
 router.get('/meta', (_req, res) => {
   try {
-    res.json({ data: { categories: loadContactCategories() } });
+    res.json({ data: { categories: loadContactCategories(), categoryColors: CONTACT_CATEGORY_COLORS } });
   } catch (err) {
     log.error('', err);
     res.status(500).json({ error: 'Interner Fehler', code: 500 });
@@ -658,7 +744,7 @@ router.get('/meta', (_req, res) => {
 router.get('/:id', (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
-    const contact = db.get().prepare('SELECT * FROM contacts WHERE id = ?').get(id);
+    const contact = db.get().prepare(`${CONTACT_SELECT} WHERE contacts.id = ?`).get(id);
     if (!contact) return res.status(404).json({ error: 'Kontakt nicht gefunden', code: 404 });
 
     // Load multi-value fields

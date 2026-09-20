@@ -38,4 +38,59 @@
   } else {
     document.documentElement.removeAttribute('data-theme');
   }
+
+  // DIE STATUSBAR GEHOERT ZUR THEME-ENTSCHEIDUNG, ALSO HIERHER.
+  //
+  // Beide `<meta name="theme-color">` tragen ein `media="(prefers-color-scheme:
+  // …)"`: welche gilt, entscheidet das SYSTEM - waehrend die Zeilen darueber es
+  // gerade ueber `data-theme` entschieden haben. Wer auf einem hellen Geraet
+  // ausdruecklich Dunkel waehlt, bekam eine helle Statusbar ueber einer dunklen
+  // Seite. Bei ausdruecklicher Wahl tragen deshalb beide Metas die AKTIVE
+  // Farbe; dann ist gleichgueltig, welche der Browser nimmt. Im
+  // Automatik-Modus bleibt das Paar ein Paar - dort ist das System die richtige
+  // Quelle.
+  //
+  // HIER UND NICHT NUR IM ROUTER: dieses Skript laeuft in index.html UND in
+  // offline.html, und die Offline-Huelle hat keinen Router, der es nachholen
+  // koennte. Der Router korrigiert weiter beim Theme- und Routenwechsel; das
+  // ist die Bewegung, das hier der Anfangszustand.
+  //
+  // Die Werte kommen aus den Metas selbst, nicht als Literale: eine vierte
+  // Kopie von #F5F3ED/#191816 waere eine vierte Stelle, an der die Farbe der
+  // Seite und die ihrer Statusbar auseinanderlaufen koennen.
+  try {
+    var metas = document.querySelectorAll('meta[name="theme-color"]');
+    if (metas.length >= 2 && (stored === 'dark' || stored === 'light')) {
+      var active = metas[stored === 'dark' ? 1 : 0].getAttribute('content');
+      metas[0].setAttribute('content', active);
+      metas[1].setAttribute('content', active);
+    }
+  } catch (e) { /* ohne Metas bleibt es beim Systemverhalten */ }
+})();
+
+// DER WAND-MODUS GEHOERT ZUM ERSTZUSTAND, ALSO HIERHER.
+//
+// Er blendet Sidebar und Tab-Leiste aus und uebernimmt die ganze Flaeche. Ohne
+// diesen Block laedt ein Wandtablet sichtbar erst das normale Dashboard und
+// klappt die Navigation dann weg - genau das Flackern, gegen das der Theme-Block
+// darueber existiert, nur eine Etage groesser. Der Router haelt es danach beim
+// Routenwechsel nach (utils/wall-mode.js, syncWallMode), das hier ist der
+// Anfangszustand.
+//
+// Die Werte stehen als Literale da und nicht als Import: dieses Skript laeuft
+// als klassisches <script> im <head>, vor jedem Modul. Die eine Quelle bleibt
+// `utils/wall-mode.js`; dass die beiden nicht auseinanderlaufen, haelt ein Guard
+// in test-frontend-audit.js.
+(function () {
+  try {
+    if (localStorage.getItem('yuvomi-wall-mode') !== '1') return;
+    if (location.pathname !== '/') return;
+    document.documentElement.setAttribute('data-wall-mode', '');
+    var hour = new Date().getHours();
+    if (hour >= 22 || hour < 6) {
+      document.documentElement.setAttribute('data-wall-night', '');
+      // Nachts erzwungen dunkel - ohne `yuvomi-theme` anzufassen.
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }
+  } catch (e) { /* Storage nicht verfuegbar → kein Wand-Modus in dieser Sitzung */ }
 })();

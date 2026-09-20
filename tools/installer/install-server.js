@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Yuvomi Web Installer — temporary setup server.
+ * Yuvomi Web Installer - temporary setup server.
  * Zero npm dependencies. Node.js built-ins only.
  * Run: node tools/installer/install-server.js
  */
@@ -8,6 +8,7 @@
 import http from 'node:http';
 import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { resolve, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,12 +30,30 @@ const WRITABLE_KEYS = new Set(ENV_SCHEMA.filter(e => e.writeToEnv).map(e => e.ke
 
 let idleTimer = null;
 
+/**
+ * Nachlauf nach dem Anlegen des Admin-Kontos.
+ *
+ * Vorher waren das harte zwei Sekunden. Solange der Download eine Blob-Kopie im
+ * Browser war, ging das: er brauchte den Server nicht. Seit er die echte Datei
+ * von /api/env-file holt, war der Knopf fuer jeden tot, der laenger als zwei
+ * Sekunden auf dem Abschlussbildschirm brauchte - und die Seite meldete
+ * trotzdem "gesichert" und gab den Link zur App frei. Ausgerechnet die
+ * Sicherung der einzigen Verschluesselungsschluessel.
+ *
+ * Fuenf Minuten, und jeder weitere Request setzt sie zurueck: genug fuer den
+ * Download, aber der Installer bleibt nicht die vollen 30 Minuten offen,
+ * nachdem seine Arbeit getan ist.
+ */
+const POST_SETUP_IDLE_MS = 5 * 60 * 1000;
+let idleMs = IDLE_TIMEOUT_MS;
+export function beginPostSetupShutdown() { idleMs = POST_SETUP_IDLE_MS; }
+
 function resetIdle(server) {
   clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
-    console.log('\nIdle timeout — shutting down installer server.');
+    console.log('\nIdle timeout - shutting down installer server.');
     server.close(() => process.exit(0));
-  }, IDLE_TIMEOUT_MS);
+  }, idleMs);
   // Don't let the idle timer keep the process (or a test runner) alive.
   idleTimer.unref?.();
 }
@@ -95,7 +114,7 @@ export function decodeEnvValue(raw) {
 
 /**
  * Eine vorhandene .env einlesen. Nur für Werte gedacht, die erhalten bleiben
- * müssen — der Rest der Datei wird beim Speichern ohnehin neu geschrieben.
+ * müssen - der Rest der Datei wird beim Speichern ohnehin neu geschrieben.
  * Fehlt oder bricht die Datei, ist das Ergebnis ein leeres Objekt.
  */
 export function readEnvFile(envPath) {
@@ -118,6 +137,42 @@ export function readEnvFile(envPath) {
 }
 
 /**
+ * Die Zuweisungen einer bestehenden .env, die der Client nicht selbst schickt -
+ * als ROHE Zeilen, Zeichen für Zeichen.
+ *
+ * Das ist der Unterschied zu readEnvFile(): dort wird dekodiert, hier nicht.
+ * Eine Zeile, die niemand ändern will, soll die Datei genauso wieder verlassen,
+ * wie sie hineingekommen ist. Parsen und neu rendern hiesse, Compose-Syntax zu
+ * interpretieren, die decodeEnvValue gar nicht kennt (einfache
+ * Anführungszeichen, angehängte Kommentare) - der Rerun änderte damit still
+ * Passwörter und Pfade.
+ *
+ * Kommentare und Leerzeilen fallen weg: sie beziehen sich auf den alten Aufbau
+ * der Datei und stünden im neuen an der falschen Stelle.
+ */
+export function preserveUnmanagedLines(envPath, written) {
+  if (!existsSync(envPath)) return [];
+  let content;
+  try {
+    content = readFileSync(envPath, 'utf8');
+  } catch {
+    return [];
+  }
+  const lines = [];
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const separator = trimmed.indexOf('=');
+    if (separator < 1) continue;
+    const key = trimmed.slice(0, separator).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    if (written[key]) continue;
+    lines.push(trimmed);
+  }
+  return lines;
+}
+
+/**
  * Schlüssel, die einen Installer-Rerun überleben MÜSSEN.
  *
  * Ein einmal benutzter DB_ENCRYPTION_KEY verschlüsselt die Datenbank; mit einem
@@ -126,7 +181,7 @@ export function readEnvFile(envPath) {
  * darf eine laufende Installation nicht so zerlegen. SESSION_SECRET ist der
  * harmlosere Fall: ein neuer Wert wirft nur alle Angemeldeten aus der App.
  *
- * Sendet der Client für einen dieser Schlüssel einen Wert, gewinnt der — dann
+ * Sendet der Client für einen dieser Schlüssel einen Wert, gewinnt der - dann
  * hat der Nutzer ihn im Experten-Modus bewusst eingetragen.
  */
 export const PRESERVED_KEYS = ['SESSION_SECRET', 'DB_ENCRYPTION_KEY'];
@@ -221,19 +276,185 @@ function getEngine() {
  * launch without waiting for compose to finish; 'error' (e.g. ENOENT when
  * docker is missing) surfaces the failure to the caller instead of swallowing it.
  */
-export function spawnStart(cmd, args, opts = {}) {
+export function spawnStart(cmd, args, opts = {}, onOutput = null, onExit = null) {
   return new Promise(resolvePromise => {
     let settled = false;
     const done = v => { if (!settled) { settled = true; resolvePromise(v); } };
     let child;
     try {
-      child = spawn(cmd, args, { stdio: 'ignore', ...opts });
+      // Ohne onOutput bleibt es bei 'ignore' wie bisher. Mit Callback werden
+      // stdout/stderr mitgelesen: das ist die einzige Stelle, an der der
+      // Fortschritt des Image-Pulls überhaupt entsteht - `up -d` läuft
+      // detached weiter, während der Wizard pollt.
+      const stdio = onOutput ? ['ignore', 'pipe', 'pipe'] : 'ignore';
+      child = spawn(cmd, args, { stdio, ...opts });
     } catch (err) {
       return done({ ok: false, error: err.message });
     }
+    if (onOutput) {
+      child.stdout?.on('data', d => onOutput(d.toString()));
+      child.stderr?.on('data', d => onOutput(d.toString()));
+    }
     child.on('error', err => done({ ok: false, error: err.message }));
+    // Bewusst beim spawn-Event aufloesen, nicht beim Exit: `up -d` laeuft
+    // detached weiter, waehrend das Image geladen wird, und der Request darf
+    // darauf nicht warten. Der Exit-Code interessiert trotzdem - er ist das
+    // einzige Signal dafuer, dass aus diesem Start kein Container mehr wird.
+    //
+    // 'close' statt 'exit': 'exit' feuert, sobald der Prozess endet, waehrend die
+    // letzten stdout/stderr-Chunks noch unterwegs sein koennen. Der Wizard haette
+    // dann einen Fehler-Exit-Code, aber die erklaerende Zeile stuende noch nicht im
+    // Startprotokoll - "Erneut versuchen" ohne die Begruendung daneben. 'close'
+    // feuert erst, wenn alle stdio-Streams zu sind, also nach dem letzten Chunk.
+    child.on('close', code => onExit?.(code));
     child.on('spawn', () => done({ ok: true }));
   });
+}
+
+/**
+ * Ringpuffer für die Ausgabe des laufenden `compose up -d`. Der Prozess ist
+ * detached und lebt länger als der Request, der ihn gestartet hat; ohne diesen
+ * Puffer bliebe der längste Moment der Installation (Image laden) ohne jede
+ * Rückmeldung. Begrenzt, damit ein hängender Pull den Speicher nicht füllt.
+ */
+const START_LOG_LIMIT = 8000;
+let startLog = '';
+export function resetStartLog() { startLog = ''; startExit = null; }
+export function getStartLog() { return startLog; }
+function appendStartLog(chunk) {
+  startLog = (startLog + chunk).slice(-START_LOG_LIMIT);
+}
+
+/**
+ * Exit-Code des letzten `compose up -d`, oder null solange er laeuft.
+ *
+ * spawnStart loest beim spawn-Event auf, damit der Request nicht auf den
+ * Image-Pull wartet. Damit war der Exit-Code aber niemandes Zustaendigkeit:
+ * beendete sich der Befehl danach mit einem Fehler (belegter Port, Image nicht
+ * gefunden, fehlende Rechte), sah /api/status weiterhin nur einen fehlenden
+ * Container - und der galt als laufender Pull. Der Wizard drehte dann bis zum
+ * 15-Minuten-Timeout, statt sofort „Erneut versuchen" anzubieten.
+ */
+let startExit = null;
+export function getStartExit() { return startExit; }
+function recordStartExit(code) { startExit = code; }
+
+// Nur diese beiden Zustände sind endgültig. `created` und `restarting` sind
+// Durchgangsstationen, und eine leere Ausgabe heisst „den Container gibt es noch
+// gar nicht" - der Normalfall, solange `up -d` das Image lädt.
+const DEAD_STATES = new Set(['exited', 'dead']);
+
+/**
+ * Verdikt aus dem Health-Check, oder null, wenn er keine Aussage trifft (kein
+ * Healthcheck definiert, Container nicht vorhanden). Dann entscheidet der
+ * Container-Zustand.
+ * @returns {{ status: string, phase: string }|null}
+ */
+export function classifyHealth(healthCode, health) {
+  if (healthCode !== 0) return null;
+  if (health === 'healthy') return { status: 'running', phase: 'running' };
+  if (health === 'starting' || health === 'unhealthy') return { status: 'starting', phase: 'health' };
+  return null;
+}
+
+/**
+ * Verdikt aus `{{.State.Status}}`.
+ *
+ * Eigene, reine Funktion, weil genau hier der teuerste Fehler des
+ * Wartebildschirms sass: ein noch nicht existierender Container (leere Ausgabe)
+ * galt als Fehlschlag. Bei jeder Erstinstallation über einer langsamen Leitung
+ * sah der Nutzer „Container konnte nicht gestartet werden", während der Pull
+ * ganz normal lief. Ohne Prozesse, damit dieser Fall auch auf einer Maschine
+ * ohne Container-Engine prüfbar bleibt.
+ * @returns {{ status: 'running'|'starting'|'error', phase: 'pull'|'boot' }}
+ */
+export function classifyContainerState(state, startExitCode = null) {
+  if (!state) {
+    // Kein Container. Solange `up -d` laeuft (startExitCode === null), ist das
+    // der Normalfall waehrend des Pulls. Hat sich der Befehl dagegen schon mit
+    // einem Fehler beendet, entsteht hier nie mehr ein Container - dann ist
+    // Warten sinnlos und der Nutzer soll es sofort erfahren.
+    if (startExitCode !== null && startExitCode !== 0) return { status: 'error', phase: 'boot' };
+    return { status: 'starting', phase: 'pull' };
+  }
+  if (DEAD_STATES.has(state)) return { status: 'error', phase: 'boot' };
+  return { status: 'starting', phase: 'boot' };
+}
+
+/**
+ * spawn() that never throws synchronously.
+ *
+ * Without a container engine, detectEngine() reports `composeBin: null`, so
+ * composeCommand() hands us `cmd: null` and node's normalizeSpawnArguments
+ * throws a TypeError *synchronously*. An `.on('error')` handler cannot catch
+ * that, and inside a child-process callback there is no try/catch above us
+ * either - the throw escapes route() and kills the whole installer process.
+ * That is worst for the users who have no engine, i.e. exactly the ones the
+ * UI tells to "install it and reload the page".
+ *
+ * Returns a stand-in that emits 'error' asynchronously instead, so every call
+ * site keeps its existing error path.
+ */
+export function safeSpawn(cmd, args, opts = {}) {
+  try {
+    return spawn(cmd, args, opts);
+  } catch (err) {
+    const stub = new EventEmitter();
+    stub.stdout = new EventEmitter();
+    stub.stderr = new EventEmitter();
+    queueMicrotask(() => { stub.emit('error', err); stub.emit('close', null); });
+    return stub;
+  }
+}
+
+/** Obergrenze fuer die Container-Frage im Preflight. */
+export const PREFLIGHT_PROBE_TIMEOUT_MS = 3000;
+
+/**
+ * Laeuft der yuvomi-Container? Mit Zeitlimit.
+ *
+ * Der Wizard wartet auf den Preflight, bevor er den Einfach-Pfad freigibt oder
+ * Schluessel erzeugt. Engine-Erkennung und `inspect` fragen den Daemon, und
+ * eine Engine, die nicht antwortet (Daemon haengt, entfernter Kontext), liess
+ * die Antwort nie kommen - obwohl envExists laengst feststand. Nach dem Limit
+ * gilt der Container als nicht laufend, und ein haengender Prozess wird
+ * beendet. `resolveEngine` und `spawnFn` sind fuer Tests injizierbar.
+ */
+export async function probeContainerRunning({
+  timeoutMs = PREFLIGHT_PROBE_TIMEOUT_MS,
+  resolveEngine = getEngine,
+  spawnFn = safeSpawn,
+} = {}) {
+  let timer;
+  let child = null;
+  let timedOut = false;
+  const timeout = new Promise(done => {
+    timer = setTimeout(() => { timedOut = true; done(false); }, timeoutMs);
+  });
+  const probe = (async () => {
+    const engine = await resolveEngine();
+    // Kam die Engine erst nach dem Zeitlimit, ist die Funktion schon zurueck und
+    // ihr finally gelaufen: ein jetzt gestarteter inspect wuerde nie beendet.
+    if (timedOut) return false;
+    const { cmd, args } = inspectCommand(engine, ['inspect', '--format', '{{.State.Status}}', 'yuvomi']);
+    return new Promise(done => {
+      child = spawnFn(cmd, args, { stdio: 'pipe' });
+      let out = '';
+      let settled = false;
+      const finish = running => { if (!settled) { settled = true; done(running); } };
+      child.stdout?.on('data', d => { out += d.toString().trim(); });
+      child.on('error', () => finish(false));
+      child.on('close', code => finish(code === 0 && out === 'running'));
+    });
+  })().catch(() => false);
+  try {
+    return await Promise.race([probe, timeout]);
+  } finally {
+    clearTimeout(timer);
+    if (child && child.exitCode === null) {
+      try { child.kill(); } catch { /* bereits beendet */ }
+    }
+  }
 }
 
 /**
@@ -270,7 +491,7 @@ function isTrustedRequest(req) {
     try {
       if (!LOOPBACK_HOSTS.has(new URL(source).hostname)) return false;
     } catch {
-      return false; // unparseable Origin/Referer — reject
+      return false; // unparseable Origin/Referer - reject
     }
   }
   return true;
@@ -321,8 +542,12 @@ async function route(req, res, server) {
   resetIdle(server);
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
-  // State-changing requests must originate from the loopback installer page.
-  if (req.method === 'POST' && !isTrustedRequest(req)) {
+  // Jeder API-Zugriff muss von der Loopback-Installerseite kommen, nicht nur der
+  // schreibende: /api/status hat den Prozess beendet, und ein GET darauf kann
+  // jede beliebige Seite absetzen, die der Nutzer während der Installation
+  // offen hat. Die statische Auslieferung (/, tokens.css, Fonts) bleibt frei,
+  // sonst scheiterte schon der erste Seitenaufruf.
+  if ((req.method === 'POST' || url.pathname.startsWith('/api/')) && !isTrustedRequest(req)) {
     return json(res, 403, { error: 'Cross-origin request rejected' });
   }
 
@@ -338,12 +563,15 @@ async function route(req, res, server) {
     return serveStatic(res, resolve(projectRoot(), 'public', 'styles', 'tokens.css'), 'text/css; charset=utf-8');
   }
 
-  // Selbstgehostete Variable Fonts. basename() neutralisiert Path-Traversal;
-  // nur .woff2 aus public/fonts wird ausgeliefert.
-  if (req.method === 'GET' && url.pathname.startsWith('/fonts/') && url.pathname.endsWith('.woff2')) {
-    const name = basename(url.pathname);
-    return serveStatic(res, resolve(projectRoot(), 'public', 'fonts', name), 'font/woff2');
-  }
+  // HIER STAND EINE /fonts/-ROUTE. Sie lieferte Plus Jakarta Sans aus
+  // public/fonts, damit der Installer dieselbe Schrift trug wie die App. Mit dem
+  // HIG-Redesign ist die Schrift aus der App gefallen: public/ enthaelt kein
+  // @font-face mehr, weder sw.js noch das Manifest nennen die Dateien, und der
+  // Installer nimmt seit v2.0.0 den System-Stack. Uebrig war eine Route auf zwei
+  // Binaerdateien, die niemand anforderte - und ein Test, der ihr 200 zusicherte.
+  //
+  // Die Dateien sind mitentfallen. Wer die Route zurueckholt, braucht wieder
+  // beides: eine Schrift, die die App auch benutzt, und einen Grund.
 
   // i18n-Mini-Modul des Installers (Phase 4: i18n-Verdrahtung).
   if (req.method === 'GET' && url.pathname === '/i18n-mini.js') {
@@ -377,24 +605,43 @@ async function route(req, res, server) {
     try {
       const existingEnv = readEnvFile(resolve(projectRoot(), '.env'));
       const envExists = existsSync(resolve(projectRoot(), '.env'));
-      // Nur die NAMEN der vorhandenen Schlüssel — die Werte bleiben auf dem
+      // Nur die NAMEN der vorhandenen Schlüssel - die Werte bleiben auf dem
       // Server. Das Frontend erzeugt für diese keinen neuen Wert mehr.
       const preservedKeys = PRESERVED_KEYS.filter(key => Boolean(existingEnv[key]));
-      const engine = await getEngine();
-      const { cmd, args } = inspectCommand(engine, ['inspect', '--format', '{{.State.Status}}', 'yuvomi']);
-      return await new Promise(resolvePromise => {
-        const inspect = spawn(cmd, args, { stdio: 'pipe' });
-        let out = '';
-        let settled = false;
-        const reply = containerRunning => {
-          if (settled) return;          // error + close can both fire
-          settled = true;
-          resolvePromise(json(res, 200, { envExists, preservedKeys, containerRunning }));
-        };
-        inspect.stdout.on('data', d => { out += d.toString().trim(); });
-        inspect.on('error', () => reply(false));
-        inspect.on('close', code => reply(code === 0 && out === 'running'));
+      // Mit Zeitlimit: der Wizard wartet auf diese Antwort (siehe probeContainerRunning).
+      const containerRunning = await probeContainerRunning();
+      return json(res, 200, { envExists, preservedKeys, containerRunning });
+    } catch (err) {
+      return json(res, 500, { error: err.message });
+    }
+  }
+
+  /**
+   * Die tatsächlich geschriebene .env zum Herunterladen.
+   *
+   * Die Abschlussseite baute ihre Kopie aus dem Browser-Zustand
+   * (`renderEnvClient(buildEnv())`). Seit der Server beim Rerun bewahrt, was der
+   * Client nicht schickt, ist dieser Zustand die falsche Quelle: der Download
+   * enthielt weder die übernommenen Schlüssel noch die beiden bewahrten Secrets,
+   * die der Wizard bewusst nie zu sehen bekommt. Wer die Datei als Sicherung
+   * beiseitelegte und später zurückspielte, warf damit genau das weg, was der
+   * Rerun gerettet hatte - und die Sicherung der einzigen
+   * Verschlüsselungsschlüssel war gar keine.
+   *
+   * Die Secrets verlassen den Server damit nur auf ausdrückliche Anforderung
+   * und über dieselbe Loopback-Schranke wie jede andere API-Route; in den
+   * JS-Zustand der Seite gelangen sie weiterhin nicht.
+   */
+  if (req.method === 'GET' && url.pathname === '/api/env-file') {
+    try {
+      const envPath = resolve(projectRoot(), '.env');
+      if (!existsSync(envPath)) return json(res, 404, { error: '.env not found' });
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Disposition': 'attachment; filename=".env"',
+        'Cache-Control': 'no-store',
       });
+      return res.end(readFileSync(envPath, 'utf8'));
     } catch (err) {
       return json(res, 500, { error: err.message });
     }
@@ -408,14 +655,35 @@ async function route(req, res, server) {
 
       const envPath = resolve(projectRoot(), '.env');
 
-      // Letzte Instanz gegen den zerstörerischen Rerun: schickt der Client für
-      // einen der bewahrten Schlüssel nichts, wird der bestehende Wert
-      // übernommen statt ein neuer erzeugt. Greift auch, wenn ein älteres
-      // Frontend aus dem Browser-Cache noch nichts von preservedKeys weiß.
-      const existingEnv = readEnvFile(envPath);
-      for (const key of PRESERVED_KEYS) {
-        if (!result.env[key] && existingEnv[key]) result.env[key] = existingEnv[key];
-      }
+      // Letzte Instanz gegen den zerstörerischen Rerun. Das war eine Allowlist
+      // aus zwei Schlüsseln, und damit deckte sie zwei Schlüssel ab statt der
+      // Regel: die Datei wird komplett neu geschrieben, sanitizeEnv verwirft
+      // leere Werte, und der Wizard startet JEDES Feld leer (er lädt bestehende
+      // Werte nie nach). Ein Rerun löschte deshalb alles ausser den beiden
+      // Secrets - gemessen 7 von 10 Schlüsseln, darunter DATA_DIR mit dem
+      // Datenbankpfad, EMAIL_SMTP_PASS, OIDC_ISSUER und BASE_URL. Die
+      // Installation lief danach mit Standardpfad weiter und sah aus, als wären
+      // die Daten weg.
+      //
+      // Die Regel: was der Client nicht mit einem nicht-leeren Wert schickt,
+      // bleibt stehen. Auch Schlüssel ausserhalb des Schemas (LOG_LEVEL,
+      // OPENWEATHER_*, von Hand ergänzte) - der Installer ist ein
+      // Einrichtungswerkzeug und darf keine Zeile verlieren, die er nicht
+      // versteht. Dasselbe leistet preserve_unmanaged() in install.sh.
+      //
+      // Preis: über den Wizard lässt sich ein Wert nicht mehr LEEREN, nur
+      // überschreiben. Das ist der richtige Tausch, solange die Felder leer
+      // starten - dann hat niemand einen Wert bewusst entfernt, er hat ihn nie
+      // gesehen. Zum Löschen dient die .env selbst.
+      // ... und zwar VERBATIM, nicht ueber readEnvFile geparst und neu
+      // gerendert. decodeEnvValue kennt nur doppelte Anfuehrungszeichen: ein
+      // `EMAIL_SMTP_PASS='a b'` oder ein `DATA_DIR=./data # storage` sind
+      // gueltige Compose-Syntax, kaemen aber als Wert MIT Quotes bzw. MIT
+      // Kommentar zurueck und wuerden beim Rendern erneut maskiert. Der Rerun
+      // haette so still das Passwort geaendert oder ein anderes Verzeichnis
+      // gemountet. Der Parser war nie fuer diesen Zweck gedacht - sein eigener
+      // Kommentar sagt "nur fuer Werte, die erhalten bleiben muessen".
+      const preserved = preserveUnmanagedLines(envPath, result.env);
 
       let backup = null;
       try {
@@ -425,7 +693,14 @@ async function route(req, res, server) {
         return json(res, 500, { error: `Could not back up existing .env: ${err.message}` });
       }
 
-      writeFileSync(envPath, renderEnvFile(result.env), 'utf8');
+      const rendered = renderEnvFile(result.env);
+      writeFileSync(
+        envPath,
+        preserved.length
+          ? `${rendered}\n# Carried over from the previous .env\n${preserved.join('\n')}\n`
+          : rendered,
+        'utf8',
+      );
       return json(res, 200, { ok: true, backup, path: envPath });
     } catch (err) {
       return json(res, 500, { error: err.message });
@@ -436,7 +711,8 @@ async function route(req, res, server) {
     try {
       const engine = await getEngine();
       const { cmd, args } = composeCommand(engine, ['up', '-d']);
-      const result = await spawnStart(cmd, args, { cwd: projectRoot() });
+      resetStartLog();
+      const result = await spawnStart(cmd, args, { cwd: projectRoot() }, appendStartLog, recordStartExit);
       if (!result.ok) console.error(`${cmd} compose error:`, result.error);
       return json(res, result.ok ? 200 : 500, result);
     } catch (err) {
@@ -446,6 +722,12 @@ async function route(req, res, server) {
 
   if (req.method === 'GET' && url.pathname === '/api/status') {
     const engine = await getEngine();
+    // Ohne Engine gibt es keinen Container, dessen Status man abfragen könnte,
+    // und composeCommand() lieferte hier `cmd: null`. Früh und ehrlich
+    // antworten, statt einen Spawn zu versuchen, den es nicht geben kann.
+    if (!engine.engine) {
+      return json(res, 200, { status: 'error', phase: 'engine', logs: `Missing: ${engine.missing.join(', ')}` });
+    }
     const health = inspectCommand(engine, ['inspect', '--format', '{{.State.Health.Status}}', 'yuvomi']);
     const stateCmd = inspectCommand(engine, ['inspect', '--format', '{{.State.Status}}', 'yuvomi']);
     const logsCmd = composeCommand(engine, ['logs', '--tail', '30']);
@@ -455,26 +737,28 @@ async function route(req, res, server) {
       // A spawn 'error' (engine binary vanished mid-poll) fires on an
       // EventEmitter that would otherwise throw and crash the process outside
       // route()'s catch. Treat any spawn failure here as a transient "starting".
-      const onSpawnError = () => reply({ status: 'starting' });
-      const inspect = spawn(health.cmd, health.args, { stdio: 'pipe' });
+      const onSpawnError = () => reply({ status: 'starting', phase: 'pull', logs: getStartLog() });
+      const inspect = safeSpawn(health.cmd, health.args, { stdio: 'pipe' });
       let out = '';
       inspect.on('error', onSpawnError);
       inspect.stdout.on('data', d => { out += d.toString().trim(); });
       inspect.on('close', code => {
-        if (code === 0 && out === 'healthy') return reply({ status: 'running' });
-        if (code === 0 && (out === 'starting' || out === 'unhealthy')) return reply({ status: 'starting' });
-        const state = spawn(stateCmd.cmd, stateCmd.args, { stdio: 'pipe' });
+        const byHealth = classifyHealth(code, out);
+        if (byHealth?.status === 'running') return reply(byHealth);
+        if (byHealth) return reply({ ...byHealth, logs: getStartLog() });
+        const state = safeSpawn(stateCmd.cmd, stateCmd.args, { stdio: 'pipe' });
         let stateOut = '';
         state.on('error', onSpawnError);
         state.stdout.on('data', d => { stateOut += d.toString().trim(); });
         state.on('close', () => {
-          if (stateOut === 'running') return reply({ status: 'starting' });
-          const logs = spawn(logsCmd.cmd, logsCmd.args, { cwd: projectRoot(), stdio: 'pipe' });
+          const verdict = classifyContainerState(stateOut, getStartExit());
+          if (verdict.status !== 'error') return reply({ ...verdict, logs: getStartLog() });
+          const logs = safeSpawn(logsCmd.cmd, logsCmd.args, { cwd: projectRoot(), stdio: 'pipe' });
           let logsOut = '';
-          logs.on('error', () => reply({ status: 'error', logs: 'Container engine unavailable.' }));
+          logs.on('error', () => reply({ ...verdict, logs: 'Container engine unavailable.' }));
           logs.stdout.on('data', d => { logsOut += d.toString(); });
           logs.stderr.on('data', d => { logsOut += d.toString(); });
-          logs.on('close', () => reply({ status: 'error', logs: logsOut }));
+          logs.on('close', () => reply({ ...verdict, logs: logsOut || getStartLog() }));
         });
       });
     });
@@ -513,11 +797,18 @@ async function route(req, res, server) {
 
       json(res, result.status, result.body);
 
-      if (result.status === 201 || result.status === 403) {
-        setTimeout(() => {
-          console.log('\nSetup complete — shutting down installer server.');
-          server.close(() => process.exit(0));
-        }, 2000);
+      // 404 gehoert dazu: /auth/setup antwortet bei bereits vorhandenem Konto
+      // in production mit 404 und nur ausserhalb davon mit 403 (server/auth.js).
+      // Jedes reale Deployment setzt NODE_ENV=production, der 403-Zweig war hier
+      // also toter Code - und ein Rerun beendete den Installer nie, weil dieser
+      // Block nicht lief.
+      if (result.status === 201 || result.status === 403 || result.status === 404) {
+        // Nicht sofort schliessen: die Abschlussseite bietet den Download der
+        // .env an, und der holt die Datei von hier. Ab jetzt gilt der kurze
+        // Nachlauf, den jeder weitere Request verlaengert.
+        console.log('\nSetup complete - installer will shut down once idle.');
+        beginPostSetupShutdown();
+        resetIdle(server);
       }
     } catch (err) {
       json(res, 500, { error: err.message });
@@ -537,6 +828,13 @@ export function createInstallerServer() {
 
 // Only start listening when run directly (not when imported by tests).
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  // Letztes Netz: ein Wurf aus einem Kind-Prozess-Callback liegt ausserhalb
+  // jedes try/catch und beendete den Installer mitten in der Einrichtung. Der
+  // Nutzer verlöre damit den Wizard und sähe nur noch eine tote Seite.
+  // Lieber weiterlaufen und den Fehler sichtbar machen.
+  process.on('uncaughtException', err => {
+    console.error('Installer server error (kept running):', err);
+  });
   const server = createInstallerServer();
   server.listen(PORT, '127.0.0.1', () => {
     console.log(`\n  Yuvomi Web Installer`);

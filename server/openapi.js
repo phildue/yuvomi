@@ -1,6 +1,35 @@
 import { buildPaths } from './openapi/paths/index.js';
+import { idempotencyHeaderParam } from './openapi/helpers.js';
 import { apiTags } from './openapi/tags.js';
 import { schemas } from './openapi/schemas.js';
+
+/**
+ * Traegt den `Idempotency-Key`-Header an jeder POST-Operation nach, die von der
+ * Middleware ueberhaupt erreicht wird (#822).
+ *
+ * `/api/v1/auth/*` bleibt aussen vor, und das ist keine Feinheit: der
+ * Auth-Router haengt in `index.js` VOR `requireAuth`, also vor der Middleware.
+ * Ein dort dokumentierter Header waere eine Zusage, die niemand einloest.
+ *
+ * @param {Record<string, any>} paths
+ * @returns {Record<string, any>} dieselben Pfade, POSTs angereichert
+ */
+function withIdempotency(paths) {
+  for (const [path, item] of Object.entries(paths)) {
+    if (!item?.post) continue;
+    if (!path.startsWith('/api/v1/') || path.startsWith('/api/v1/auth/')) continue;
+    item.post.parameters = [...(item.post.parameters ?? []), idempotencyHeaderParam()];
+    item.post.responses = {
+      ...item.post.responses,
+      409: {
+        description: 'Idempotency-Key conflict: reused for a different request, or the first attempt is still running',
+        content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        ...(item.post.responses?.[409] ?? {}),
+      },
+    };
+  }
+  return paths;
+}
 
 function buildOpenApiSpec(req, appVersion) {
   return {
@@ -12,7 +41,7 @@ function buildOpenApiSpec(req, appVersion) {
     },
     servers: [{ url: '/', description: 'Current origin' }],
     tags: apiTags,
-    paths: buildPaths(),
+    paths: withIdempotency(buildPaths()),
     components: {
       securitySchemes: {
         bearerAuth: {

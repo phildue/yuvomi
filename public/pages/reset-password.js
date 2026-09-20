@@ -12,14 +12,52 @@ function wireLinks(container) {
     a.addEventListener('click', (e) => { e.preventDefault(); window.yuvomi.navigate(a.getAttribute('href')); }));
 }
 
+/**
+ * Zeigt, dass dieser Server keinen Passwort-Reset anbieten kann, und schickt
+ * den Weg zurueck mit. Geteilt von beiden Reset-Seiten (#847).
+ * @param {HTMLElement} container
+ */
+function renderUnavailable(container) {
+  container.replaceChildren();
+  container.insertAdjacentHTML('beforeend', `
+    <main class="auth-page" id="main-content">
+      <div class="auth-card card card--padded">
+        <h1 class="auth-card__title">${esc(t('forgotPassword.title'))}</h1>
+        <p class="auth-card__intro">${esc(t('forgotPassword.unavailable'))}</p>
+        <p class="auth-form__forgot"><a href="/login" data-link>${esc(t('forgotPassword.backToLogin'))}</a></p>
+      </div>
+    </main>
+  `);
+  wireLinks(container);
+}
+
 export async function render(container) {
+  // Hier zaehlt NICHT die Zustellbarkeit einer Mail, sondern ob es ueberhaupt
+  // Passwoerter gibt (#847). Der Unterschied ist der eigentliche Zweck dieser
+  // Seite: wer sie aufruft, hat seine Mail bereits bekommen. Haetten wir wie
+  // die Vorgaengerseite auf `password_reset_enabled` geprueft, sperrte eine
+  // zwischenzeitlich abgeschaltete oder kurz nicht erreichbare SMTP einen
+  // gueltigen Token aus, den der Server bereitwillig eingeloest haette.
+  //
+  // Bewusst eine Auskunft und kein `navigate('/login')`: der Router verwirft
+  // eine Navigation, die aus einem laufenden `render()` heraus startet
+  // (`isNavigating`), und zurueck bliebe eine leere Seite.
+  if (!(await auth.passwordLoginEnabled())) {
+    renderUnavailable(container);
+    return;
+  }
+
   const token = new URLSearchParams(window.location.search).get('token') || '';
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
-    <main class="login-page" id="main-content">
-      <div class="login-card card card--padded">
-        <h1 class="login-card__title">${esc(t('resetPassword.title'))}</h1>
-        <form class="login-form" id="reset-form" novalidate>
+    <main class="auth-page" id="main-content">
+      <div class="auth-card card card--padded">
+        <h1 class="auth-card__title">${esc(t('resetPassword.title'))}</h1>
+        <!-- Beide Meldungen stehen außerhalb des Formulars: der Erfolgsfall
+             blendet das Formular aus, und ein Kind davon wäre mit ihm weg. -->
+        <div class="form-error" id="reset-error" role="alert" aria-live="polite" hidden></div>
+        <div class="form-success" id="reset-success" role="status" aria-live="polite" hidden></div>
+        <form class="auth-form" id="reset-form" novalidate>
           <div class="form-group">
             <label class="label" for="password">${esc(t('resetPassword.passwordLabel'))}</label>
             <input class="input" type="password" id="password" name="password"
@@ -30,13 +68,11 @@ export async function render(container) {
             <input class="input" type="password" id="confirm" name="confirm"
               autocomplete="new-password" required />
           </div>
-          <div class="login-error" id="reset-error" role="alert" aria-live="polite" hidden></div>
-          <div class="login-success" id="reset-success" role="status" aria-live="polite" hidden></div>
-          <button type="submit" class="btn btn--primary login-form__submit" id="reset-btn">
+          <button type="submit" class="btn btn--primary auth-form__submit" id="reset-btn">
             ${esc(t('resetPassword.submit'))}
           </button>
         </form>
-        <p class="login-form__forgot"><a href="/login" data-link>${esc(t('forgotPassword.backToLogin'))}</a></p>
+        <p class="auth-form__forgot"><a href="/login" data-link>${esc(t('forgotPassword.backToLogin'))}</a></p>
       </div>
     </main>
   `);

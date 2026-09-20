@@ -5,9 +5,15 @@
   <!-- Viewport: edge-to-edge, kein Zoom (PWA-native feel) -->
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=5" />
 
-  <!-- PWA / Theme -->
-  <meta name="theme-color" content="#6c3aed" media="(prefers-color-scheme: light)" />
-  <meta name="theme-color" content="#222220" media="(prefers-color-scheme: dark)" />
+  <!-- PWA / Theme.
+       Die Werte SIND --color-bg aus tokens.css (hell --neutral-100 #F5F3ED,
+       dunkel #191816). Ein Meta-Attribut nimmt an keiner Kaskade teil, also
+       muessen sie hier als Literal stehen - dass sie es bleiben, haelt der
+       Guard "the status bar colour is the page background" im frontend-audit.
+       Vorher stand hier dunkel #0C0C0E, zwei Stufen neben der Seite, die die
+       Statusleiste rahmt. -->
+  <meta name="theme-color" content="#F5F3ED" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#191816" media="(prefers-color-scheme: dark)" />
   <meta name="mobile-web-app-capable" content="yes" />
 
   <!-- iOS-spezifisch -->
@@ -18,7 +24,7 @@
   <title>Yuvomi</title>
 
   <!-- PWA -->
-  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
   <link rel="apple-touch-icon" href="/icons/icon-192.png" />
   <link rel="icon" type="image/x-icon" href="/favicon.ico" />
   <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32.png" />
@@ -51,17 +57,24 @@
   <link rel="stylesheet" href="/styles/sub-tabs.css" />
   <link rel="stylesheet" href="/styles/page-search.css" />
   <link rel="stylesheet" href="/styles/kitchen-tabs.css" />
-  <link rel="stylesheet" href="/styles/kitchen-row.css" />
+  <link rel="stylesheet" href="/styles/list-row.css" />
+  <link rel="stylesheet" href="/styles/markdown-toolbar.css" />
+  <link rel="stylesheet" href="/styles/panel.css" />
   <link rel="stylesheet" href="/styles/user-multi-select.css" />
   <link rel="stylesheet" href="/styles/datepicker.css" />
   <link rel="stylesheet" href="/styles/category-manager.css" />
+  <link rel="stylesheet" href="/styles/icon-picker.css" />
   <link rel="stylesheet" href="/styles/document-attach.css" />
   <link rel="stylesheet" href="/styles/detail-view.css" />
-  <link rel="stylesheet" href="/styles/login.css" />
+  <link rel="stylesheet" href="/styles/auth.css" />
   <link rel="stylesheet" href="/styles/typography.css" />
+  <link rel="stylesheet" href="/styles/screensaver.css" />
 
   <!-- Lucide Icons (lokal, v0.469.0) -->
   <script src="/lucide.min.js" defer></script>
+  <!-- Direkt nach dem Bundle: gibt createIcons({ el }) echtes Scoping,
+       siehe Dateikopf von lucide-scope.js. -->
+  <script src="/lucide-scope.js" defer></script>
 </head>
 <body>
   <!-- Offline-Banner: sichtbar wenn navigator.onLine === false -->
@@ -91,6 +104,7 @@
   <!-- Module (ES-Module, kein Bundler) -->
   <script type="module" src="/api.js"></script>
   <script type="module" src="/router.js"></script>
+  <script type="module" src="/components/photo-screensaver.js"></script>
 
   <!-- Install-Prompt (PWA) -->
   <yuvomi-install-prompt></yuvomi-install-prompt>

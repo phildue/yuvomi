@@ -7,6 +7,9 @@ import {
 import { esc } from '/utils/html.js';
 import { appendCurrencyOptions, persistCurrencySelection } from '/settings/currency.js';
 import { getPreferences, savePreferences } from '/settings/preferences-cache.js';
+import { toggleRowHtml } from '/settings/components.js';
+import { isWallModeEnabled, setWallModeEnabled } from '/utils/wall-mode.js';
+import { setDisplayTimeZone } from '/utils/timezone.js';
 import {
   CUSTOM_REGION,
   REGION_CODES,
@@ -61,11 +64,75 @@ function formatOptions(selected) {
   )).join('');
 }
 
+/**
+ * Die Zeitzonen-Optionen: "Automatisch" plus alle IANA-Zonen, nach Region
+ * gruppiert.
+ *
+ * Die Liste kommt aus dem ICU des BROWSERS und nicht vom Server - sie hat
+ * einige hundert Einträge, und sie über die Preferences-Antwort zu schicken
+ * hiesse, diesen Ballast in jeden Settings-Aufruf zu legen, obwohl jeder
+ * Browser sie selbst besitzt. Der Server prüft den gewählten Wert trotzdem
+ * gegen sein eigenes ICU (#829); eine Zone, die nur der Browser kennt,
+ * bekommt ein 400 statt still zu landen.
+ *
+ * Die erste Option speichert den leeren Wert und stellt damit auf den Rückfall
+ * zurück (TZ → Systemzone → UTC). Ihr Label nennt die Zone, die dann tatsächlich
+ * gilt - sonst wäre "Automatisch" eine Zusage ohne Inhalt.
+ */
+function timeZoneOptions(selected, effective) {
+  let zones = [];
+  try { zones = Intl.supportedValuesOf('timeZone'); } catch { zones = []; }
+  // Eine gespeicherte Zone, die dieses ICU nicht (mehr) kennt, muss sichtbar
+  // bleiben: sonst zeigte das Feld "Automatisch", während der Server weiter die
+  // alte Zone benutzt - ein Select, das die Wahrheit verschweigt.
+  if (selected && !zones.includes(selected)) zones = [...zones, selected].sort();
+
+  const auto = `<option value=""${selected ? '' : ' selected'}>`
+    + `${esc(t('settings.timezoneAuto', { zone: effective || 'UTC' }))}</option>`;
+
+  // UTC von Hand davor. `Intl.supportedValuesOf('timeZone')` fuehrt WEDER `UTC`
+  // NOCH ein einziges `Etc/*` - und UTC ist ausgerechnet der Auslieferungs-
+  // Default dieser App. Ohne diese Zeile ist die eine Zone nicht waehlbar, die
+  // ein Admin ausdruecklich festnageln will, damit die Anzeige nicht mit `TZ`
+  // mitwandert. Steht vor den Gruppen statt in einer eigenen "Other"-Gruppe mit
+  // genau einem Eintrag: sie ist der Sonderfall, nicht eine Region.
+  const utc = `<option value="UTC"${selected === 'UTC' ? ' selected' : ''}>UTC</option>`;
+
+  const groups = new Map();
+  for (const zone of zones) {
+    if (zone === 'UTC') continue; // steht schon oben
+    const area = zone.includes('/') ? zone.slice(0, zone.indexOf('/')) : 'Other';
+    if (!groups.has(area)) groups.set(area, []);
+    groups.get(area).push(zone);
+  }
+  const body = [...groups.entries()].map(([area, list]) => {
+    const opts = list.map((zone) => {
+      // Das Label laesst die Region weg - die steht schon an der optgroup, und
+      // "America > America/New York" liest sich wie ein Fehler. Was uebrig
+      // bleibt, behaelt seine restlichen Schraegstriche
+      // ("Argentina/Buenos Aires"); der VALUE bleibt die volle IANA-Kennung.
+      const label = (zone.includes('/') ? zone.slice(zone.indexOf('/') + 1) : zone).replace(/_/g, ' ');
+      return `<option value="${esc(zone)}"${zone === selected ? ' selected' : ''}>${esc(label)}</option>`;
+    }).join('');
+    return `<optgroup label="${esc(area)}">${opts}</optgroup>`;
+  }).join('');
+
+  return auto + utc + body;
+}
+
 function regionOptions(selectedRegion) {
   const locale = getLocale();
-  const presets = REGION_CODES.map((code) => (
-    `<option value="${esc(code)}"${selectedRegion === code ? ' selected' : ''}>${esc(regionLabel(code, locale))}</option>`
-  )).join('');
+  // Nach dem angezeigten Namen sortieren, nicht nach der Reihenfolge in
+  // REGION_PRESETS: die ist nach Sprachfamilie gruppiert und war bei einem
+  // Dutzend Einträgen noch überschaubar. Mit der Amerika-Abdeckung sind es
+  // über 60 - da findet man "Spanisch (Peru)" nur alphabetisch wieder.
+  // detectRegion() bleibt von der Sortierung unberührt, es liest das Objekt.
+  const presets = [...REGION_CODES]
+    .map((code) => ({ code, label: regionLabel(code, locale) }))
+    .sort((a, b) => a.label.localeCompare(b.label, locale))
+    .map(({ code, label }) => (
+      `<option value="${esc(code)}"${selectedRegion === code ? ' selected' : ''}>${esc(label)}</option>`
+    )).join('');
   const custom = `<option value="${CUSTOM_REGION}"${selectedRegion === CUSTOM_REGION ? ' selected' : ''}>${t('settings.regionCustom')}</option>`;
   return presets + custom;
 }
@@ -168,6 +235,21 @@ function renderPage(container, preferences, isAdmin) {
           </button>
         </div>
       </div>
+      <!-- DER WAND-MODUS WOHNT HIER UND NICHT IM ANPASSEN-PANEL.
+           Er ist wie Theme und Sprache GERÄTELOKAL (localStorage) - das
+           Anpassen-Panel schreibt dagegen die haushaltweite Widget-Konfiguration
+           auf den Server. Ein gerätelokaler Schalter dort wäre eine zweite
+           Speicher-Semantik im selben Panel; und der Anpassen-Modus bearbeitet
+           das Raster, während dieser Schalter eine Betriebsart wählt. -->
+      <div class="settings-card">
+        ${toggleRowHtml({
+          label: t('settings.wallModeLabel'),
+          checked: isWallModeEnabled(),
+          icon: 'tablet',
+          attrs: { id: 'wall-mode-toggle', 'aria-describedby': 'wall-mode-hint' },
+        })}
+        <p class="form-hint" id="wall-mode-hint">${t('settings.wallModeHint')}</p>
+      </div>
     </section>
 
     <section class="settings-section">
@@ -210,17 +292,49 @@ function renderPage(container, preferences, isAdmin) {
           </select>
         </div>
         <div id="region-error" class="form-error" role="alert" hidden></div>
+        <!-- Die Waehrung stand bis #934 in der Formatkarte darunter, die
+             ausgeblendet ist, solange eine Region-Voreinstellung genau passt.
+             Das ergab eine Falle mit Ansage: sichtbar wurde das Feld erst, WENN
+             man die Waehrung schon einmal geaendert hatte (dann passt kein
+             Preset mehr und die Karte klappt auf) - wer sie suchte, fand sie
+             also nie. Der Wegweiser aus den Modul-Optionen fuehrte genau
+             dorthin, wo nichts zu sehen war.
+
+             Sie steht jetzt hier, weil sie kein Format ist: Datum und Uhrzeit
+             sagen, WIE ein Wert dasteht, und folgen dem Ort. Die Waehrung folgt
+             dem Geld, und das ist nicht dasselbe - ein Haushalt kann sehr wohl
+             deutsche Formate und ein Konto in Dollar haben. Die Region belegt
+             sie weiterhin vor; das bleibt der bequeme Weg, nur nicht mehr der
+             einzige. -->
+        <div class="form-group">
+          <label class="form-label" for="currency-select">${t('settings.currencyLabel')}</label>
+          <select class="form-input" id="currency-select" aria-describedby="currency-hint currency-error"></select>
+        </div>
+        <p class="form-hint" id="currency-hint">${t('settings.currencyHint')}</p>
+        <div id="currency-error" class="form-error" role="alert" hidden></div>
       </div>` : `
       <div class="settings-card">
         <p class="form-hint">${t('settings.regionAdminOnly')}</p>
       </div>`}
-      <div class="settings-card" id="custom-formats"${customHidden ? ' hidden' : ''}>
+      <!-- Eigene Karte, nicht in den Formatblock darunter: die Zeitzone ist
+           keine Formatierung. Datum und Uhrzeit dort ändern nur, WIE ein Wert
+           dasteht; die Zone ändert, WELCHER Tag "heute" ist, wann Erinnerungen
+           auslösen und mit welcher Uhrzeit ein Termin bei Google ankommt. -->
+      <div class="settings-card">
+        <h3 class="settings-card__title">${t('settings.timezoneTitle')}</h3>
         ${isAdmin ? `
+        <p class="form-hint" id="timezone-hint">${t('settings.timezoneHint')}</p>
         <div class="form-group">
-          <label class="form-label" for="currency-select">${t('settings.currencyLabel')}</label>
-          <select class="form-input" id="currency-select" aria-describedby="currency-error"></select>
+          <label class="form-label" for="timezone-select">${t('settings.timezoneLabel')}</label>
+          <select class="form-input" id="timezone-select" aria-describedby="timezone-hint timezone-error">
+            ${timeZoneOptions(preferences.timezone, preferences.timezone_effective)}
+          </select>
         </div>
-        <div id="currency-error" class="form-error" role="alert" hidden></div>` : ''}
+        <div id="timezone-error" class="form-error" role="alert" hidden></div>` : `
+        <p class="form-hint">${t('settings.timezoneAdminOnly')}</p>
+        <p class="form-hint">${esc(t('settings.timezoneAuto', { zone: preferences.timezone_effective || 'UTC' }))}</p>`}
+      </div>
+      <div class="settings-card" id="custom-formats"${customHidden ? ' hidden' : ''}>
         <p class="form-hint" id="formats-household-hint">${t('settings.formatsHouseholdHint')}</p>
         <div class="form-group">
           <label class="form-label" for="date-format-select">${t('settings.dateFormatLabel')}</label>
@@ -284,14 +398,49 @@ function readFormatState(container) {
 
 // Hält den Region-Dropdown mit den drei Einzel-Selects synchron (Preset oder
 // "Benutzerdefiniert"), nachdem ein Einzelwert manuell geändert wurde.
-function syncRegionSelect(container) {
+/**
+ * Blendet die Formatkarte passend zur aufgeloesten Region ein oder aus.
+ *
+ * Eine eigene Funktion, weil zwei verschiedene Wege hier hineinfuehren und nur
+ * einer von beiden `detectRegion` benutzen darf: der Regionswechsel kennt die
+ * gewaehlte Region und muss sie behalten (sonst springt der Select auf die
+ * erste Region mit gleichem Format-Triple, #486), waehrend eine Aenderung an
+ * einem Einzelfeld die Region erst herleiten muss.
+ */
+function applyCustomVisibility(container, region) {
+  const customBlock = container.querySelector('#custom-formats');
+  if (customBlock) customBlock.hidden = region !== CUSTOM_REGION;
+}
+
+/**
+ * Zieht den Region-Select den Einzelfeldern nach.
+ *
+ * @param {HTMLElement} container
+ * @param {object} [opts]
+ * @param {boolean} [opts.mayHide] Darf die Formatkarte dabei zugehen?
+ *        `false` fuer Aenderungen, die AUS der Karte kommen: wer ein eigenes
+ *        Format zusammenstellt, laeuft unterwegs durch Zwischenstaende, und
+ *        einer davon trifft leicht zufaellig ein Preset. `EUR/mdy/24h` auf
+ *        `EUR/dmy/12h` umzustellen geht ueber `EUR/dmy/24h` - also durch
+ *        `de-DE`. Die Karte waere nach dem ersten Schritt verschwunden, mitsamt
+ *        dem Feld, in dem der Fokus gerade stand.
+ * @param {string} [opts.region] Erzwungene Region statt der hergeleiteten.
+ */
+function syncRegionSelect(container, { mayHide = true, region = null } = {}) {
   const regionSelect = container.querySelector('#region-select');
   if (!regionSelect) return;
-  regionSelect.value = detectRegion({
+  regionSelect.value = region ?? detectRegion({
     currency: container.querySelector('#currency-select')?.value,
     date_format: container.querySelector('#date-format-select')?.value,
     time_format: container.querySelector('#time-format-select')?.value,
   });
+  // Die Karte muss der Anzeige folgen. Seit die Waehrung ausserhalb von ihr
+  // steht (#934), kann eine Aenderung die Region auf "Benutzerdefiniert"
+  // schieben, ohne dass der Nutzer die Karte je gesehen hat - stuende sie dann
+  // weiter auf `hidden`, behauptete der Select etwas, das die Seite nicht zeigt.
+  if (mayHide || regionSelect.value === CUSTOM_REGION) {
+    applyCustomVisibility(container, regionSelect.value);
+  }
 }
 
 /**
@@ -323,6 +472,20 @@ function bindEvents(container, user) {
       candidate.classList.toggle('theme-toggle__btn--active', active);
       candidate.setAttribute('aria-pressed', String(active));
     });
+  });
+
+  // Gerätelokal wie das Theme darüber: kein Server-Request, keine Preference.
+  // Wirksam wird er auf der Dashboard-Route - der Toast sagt das, statt den
+  // Nutzer wortlos aus den Einstellungen zu werfen.
+  const wallToggle = container.querySelector('#wall-mode-toggle');
+  wallToggle?.addEventListener('change', () => {
+    setWallModeEnabled(wallToggle.checked);
+    window.yuvomi?.showToast(
+      wallToggle.checked
+        ? t('settings.wallModeOn', { page: t('nav.dashboard') })
+        : t('settings.wallModeOff'),
+      'success',
+    );
   });
 
   const localeSelect = container.querySelector('#locale-select');
@@ -374,11 +537,41 @@ function bindEvents(container, user) {
     }
   });
 
+  const timezoneSelect = container.querySelector('#timezone-select');
+  timezoneSelect?.addEventListener('change', async () => {
+    const errorElement = container.querySelector('#timezone-error');
+    clearError(errorElement);
+    timezoneSelect.disabled = true;
+    try {
+      const saved = await savePreferences({ timezone: timezoneSelect.value || null });
+      // Neu beschriften statt nur zu speichern: das Label der ersten Option
+      // nennt die Zone, die bei "Automatisch" GILT. Wer von einer gesetzten Zone
+      // auf Automatisch zurückstellt, sieht sonst weiter den alten Rückfallwert.
+      // Genommen wird die PUT-Antwort, nicht ein zweiter GET - beide Felder
+      // stehen dort, und der Server hat sie gerade frisch aufgelöst.
+      timezoneSelect.replaceChildren();
+      timezoneSelect.insertAdjacentHTML(
+        'beforeend', timeZoneOptions(saved?.data?.timezone, saved?.data?.timezone_effective)
+      );
+      // Die Anzeige folgt der neuen Zone sofort - dasselbe Paar aus Spiegeln und
+      // Neuzeichnen wie bei Datums- und Zeitformat. Ohne das Ereignis blieben die
+      // bereits gezeichneten Uhrzeiten bis zum naechsten Seitenwechsel stehen.
+      setDisplayTimeZone(saved?.data?.timezone ?? null);
+      window.dispatchEvent(new CustomEvent('timezone-changed', {
+        detail: { timezone: saved?.data?.timezone ?? null },
+      }));
+      window.yuvomi?.showToast(t('settings.timezoneSaved'), 'success');
+    } catch (error) {
+      showError(errorElement, error.message);
+    } finally {
+      if (timezoneSelect.isConnected) timezoneSelect.disabled = false;
+    }
+  });
+
   const regionSelect = container.querySelector('#region-select');
   regionSelect?.addEventListener('change', async () => {
-    const customBlock = container.querySelector('#custom-formats');
     if (regionSelect.value === CUSTOM_REGION) {
-      if (customBlock) customBlock.hidden = false;
+      applyCustomVisibility(container, CUSTOM_REGION);
       return;
     }
     const preset = REGION_PRESETS[regionSelect.value];
@@ -386,6 +579,14 @@ function bindEvents(container, user) {
     const errorElement = container.querySelector('#region-error');
     clearError(errorElement);
     regionSelect.disabled = true;
+    // Die Waehrung mitsperren: der Regionswechsel schreibt sie mit und setzt das
+    // Feld nach der Antwort auf den Preset-Wert. Wer waehrenddessen eine andere
+    // waehlt, hat je nach Reihenfolge der Antworten entweder seine Wahl serverseitig
+    // verloren oder sieht die des Presets, obwohl gespeichert wurde, was er wollte.
+    // Zwei unabhaengige PUTs auf dasselbe Feld sind kein Zustand, den eine
+    // Fehlermeldung heilt - also erst gar nicht zulassen.
+    const currencyDuringRegion = container.querySelector('#currency-select');
+    if (currencyDuringRegion) currencyDuringRegion.disabled = true;
     try {
       await savePreferences({
         currency: preset.currency,
@@ -415,7 +616,7 @@ function bindEvents(container, user) {
       window.dispatchEvent(new CustomEvent('time-format-changed', {
         detail: { timeFormat: preset.time_format },
       }));
-      if (customBlock) customBlock.hidden = true;
+      applyCustomVisibility(container, regionSelect.value);
       // Scheitert das Nachladen, bleibt nur das Automatik-Label stale - kein
       // Grund, den erfolgreichen Regionswechsel als Fehler zu melden.
       await refreshDataLanguageOptions(container).catch(() => {});
@@ -424,6 +625,7 @@ function bindEvents(container, user) {
       showError(errorElement, error.message);
     } finally {
       if (regionSelect.isConnected) regionSelect.disabled = false;
+      if (currencyDuringRegion?.isConnected) currencyDuringRegion.disabled = false;
     }
   });
 
@@ -440,7 +642,24 @@ function bindEvents(container, user) {
         () => savePreferences({ currency: currencySelect.value }),
       );
       persistedCurrency = currencySelect.value;
-      syncRegionSelect(container);
+      // EINE WAEHRUNGSAENDERUNG DARF DIE REGION NICHT WECHSELN. `detectRegion`
+      // liest die Waehrung als Unterscheidungsmerkmal mit, also traf ein
+      // de-DE-Haushalt, der EUR auf CHF stellt, formal exakt `de-CH` - und
+      // `applyNumberLocale` stellte daraufhin die Betraege von deutscher auf
+      // Schweizer Gruppierung um (1.234,50 → 1'234.50). Das ist das Gegenteil
+      // dessen, was dieses Feld verspricht: die Waehrung sollte sich UNABHAENGIG
+      // vom regionalen Format aendern lassen (#934).
+      //
+      // Bestaetigen darf die Herleitung die Region also, wechseln nicht. Passt
+      // sie nicht mehr, ist der Zustand ehrlicherweise "benutzerdefiniert" -
+      // Datum und Uhrzeit bleiben dabei unangetastet.
+      const regionBefore = container.querySelector('#region-select')?.value;
+      const derived = detectRegion({
+        currency: currencySelect.value,
+        date_format: container.querySelector('#date-format-select')?.value,
+        time_format: container.querySelector('#time-format-select')?.value,
+      });
+      syncRegionSelect(container, { region: derived === regionBefore ? regionBefore : CUSTOM_REGION });
       applyNumberLocale(readFormatState(container));
       window.yuvomi?.showToast(t('settings.currencySaved'), 'success');
     } catch (error) {
@@ -459,7 +678,7 @@ function bindEvents(container, user) {
       window.dispatchEvent(new CustomEvent('date-format-changed', {
         detail: { dateFormat: dateFormatSelect.value },
       }));
-      syncRegionSelect(container);
+      syncRegionSelect(container, { mayHide: false });
       applyNumberLocale(readFormatState(container));
       window.yuvomi?.showToast(t('settings.dateFormatSavedToast'), 'success');
     } catch (error) {
@@ -480,7 +699,7 @@ function bindEvents(container, user) {
       window.dispatchEvent(new CustomEvent('time-format-changed', {
         detail: { timeFormat: timeFormatSelect.value },
       }));
-      syncRegionSelect(container);
+      syncRegionSelect(container, { mayHide: false });
       applyNumberLocale(readFormatState(container));
       window.yuvomi?.showToast(t('settings.timeFormatSavedToast'), 'success');
     } catch (error) {
@@ -501,10 +720,17 @@ export async function render(container, { user }) {
       region: loaded.region || null,
       language: loaded.language || null,
       language_auto: loaded.language_auto || 'en',
+      // Beide Zonen-Felder gehoeren hier durchgereicht: renderPage() liest sie
+      // (Auswahlzustand und Automatik-Label), und ohne sie stand das Feld nach
+      // dem Speichern beim naechsten Oeffnen wieder auf "Automatisch (UTC)" -
+      // die Zone WAR gesetzt, das Formular zeigte sie nur nicht.
+      timezone: loaded.timezone || null,
+      timezone_effective: loaded.timezone_effective || null,
     };
 
     safeStorageSet('yuvomi-date-format', preferences.date_format);
     safeStorageSet('yuvomi-time-format', preferences.time_format);
+    setDisplayTimeZone(preferences.timezone);
     applyNumberLocale(preferences);
     const isAdmin = user?.role === 'admin';
     renderPage(container, preferences, isAdmin);

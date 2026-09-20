@@ -1,12 +1,5 @@
 import { getLocale } from '/i18n.js';
-
-// Haushaltweite Währungsauswahl. Muss exakt mit VALID_CURRENCIES in
-// server/routes/preferences.js übereinstimmen (per Test abgesichert).
-export const SUPPORTED_CURRENCIES = [
-  'AED', 'AUD', 'BRL', 'CAD', 'CHF', 'CLP', 'CNY', 'CZK', 'DKK', 'EUR', 'GBP',
-  'HUF', 'IDR', 'INR', 'IRR', 'JPY', 'KRW', 'KZT', 'MYR', 'NOK', 'PLN', 'RUB', 'SAR',
-  'SEK', 'TRY', 'UAH', 'USD', 'ZAR',
-];
+import { CURRENCY_CODES } from '/utils/currency-codes.js';
 
 export async function persistCurrencySelection(select, previousCurrency, save) {
   select.disabled = true;
@@ -28,7 +21,7 @@ export function appendCurrencyOptions(select, selectedCurrency) {
     // Currency codes remain usable when DisplayNames is unavailable.
   }
 
-  for (const currency of SUPPORTED_CURRENCIES) {
+  for (const currency of CURRENCY_CODES) {
     const option = document.createElement('option');
     option.value = currency;
     const displayName = displayNames?.of(currency);

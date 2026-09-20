@@ -15,11 +15,13 @@ import { ingredientRowHTML } from '/utils/ingredient-row.js';
 import { scheduleUndoableDelete } from '/utils/ux.js';
 import { normalizeRecipeMealTypes, RECIPE_MEAL_TYPE_KEYS } from '/utils/recipe-meal-types.js';
 import { mealPayloadFromRecipe } from '/utils/recipe-to-meal.js';
-import { toLocalDateKey } from '/utils/date.js';
+import { todayKey } from '/utils/date.js';
 import '/components/datepicker.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
 import { mountEmptyState, mountLoadError } from '/utils/empty-state.js';
 import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
+import { mealTypeList, ensureMealTypeNames } from '/utils/meal-types.js';
+import { recipeThumbEl } from '/utils/recipe-thumb.js';
 
 let _container = null;
 /** Handle des geteilten Suchfelds (setValue/clear), gesetzt in render(). */
@@ -33,9 +35,12 @@ const state = {
   query: '',
   /** Gefangener Fehler des letzten Rezept-Ladevorgangs, sonst null. */
   loadError: null,
-  // 'all' | 'native' | 'mealie' - Filter-Pille ist nur sichtbar, sobald
-  // mindestens ein gespiegeltes Rezept existiert (siehe renderSourceFilter).
+  // 'all' | 'native' | 'mealie' | 'tandoor' | ... - Filter-Pille ist nur
+  // sichtbar, sobald mindestens ein gespiegeltes Rezept existiert (siehe
+  // renderSourceFilter).
   sourceFilter: 'all',
+  // Rezept-IDs, die im Wochenplan der AKTUELLEN Woche stehen (loadPlannedRecipes).
+  plannedRecipeIds: new Set(),
 };
 
 // Client-seitige Suche über Titel, Notizen und Zutaten (Audit A1-21):
@@ -55,53 +60,32 @@ function mealCategories() {
   return state.categories.filter((c) => c.name !== 'Haushalt' && c.name !== 'Drogerie');
 }
 
-// Kleines Badge für aus Mealie gespiegelte Rezepte (source: 'mealie'). Der
-// Account-Name als Tooltip hilft bei mehreren Mealie-Accounts zu unterscheiden.
-function mealieSourceBadge(recipe) {
+// Kleines Badge für gespiegelte Rezepte (source: 'mealie'/'tandoor'/...). Der
+// Account-Name als Tooltip hilft bei mehreren Accounts desselben Providers zu
+// unterscheiden.
+function sourceBadge(recipe) {
   const badge = document.createElement('span');
-  badge.className = 'source-badge source-badge--mealie';
-  badge.textContent = t('recipes.sourceMealie');
-  if (recipe.mealie_account_name) badge.title = recipe.mealie_account_name;
+  badge.className = `source-badge source-badge--${recipe.source}`;
+  badge.textContent = t(`recipes.source${recipe.source[0].toUpperCase()}${recipe.source.slice(1)}`);
+  if (recipe.provider_account_name) badge.title = recipe.provider_account_name;
   return badge;
 }
 
-// Vorschaubild für ein gespiegeltes Rezept. Ohne Bild in Mealie (kein
-// mealie_has_image aus dem letzten Sync) direkt der Platzhalter - kein
-// Thumbnail-Request, der ohnehin nur in einem 404 endet (bekannter Mealie-
-// eigener Logspam, siehe mealie-recipes/mealie#4804). Mit Bild wird echt
-// geladen, fällt aber per onerror auf denselben Platzhalter zurück, falls das
-// Bild zwischen dem letzten Sync und jetzt in Mealie gelöscht wurde - sonst
-// stünde ein kaputtes Bild-Icon in der Zeile, bis der nächste Sync es merkt.
+// Vorschaubild fuer ein gespiegeltes Rezept. Die beiden Faelle - kein Bild beim
+// Provider, Bild seit dem letzten Sync verschwunden - stehen samt Begruendung in
+// utils/recipe-thumb.js; seit #1059 zeigen auch Planer und Uebersichtskachel
+// dasselbe Bild und teilen sich denselben Ruecksturz.
 function recipeThumb(recipe) {
-  const slot = document.createElement('span');
-  slot.className = 'recipe-row__thumb';
-  if (!recipe.mealie_has_image) {
-    slot.classList.add('recipe-row__thumb--placeholder');
-    slot.insertAdjacentHTML('beforeend', '<i data-lucide="utensils" class="icon-sm" aria-hidden="true"></i>');
-    return slot;
-  }
-  const img = document.createElement('img');
-  img.className = 'recipe-row__thumb-img';
-  img.src = `/api/v1/recipes/${recipe.id}/mealie-thumbnail`;
-  img.alt = '';
-  img.loading = 'lazy';
-  img.addEventListener('error', () => {
-    img.remove();
-    slot.classList.add('recipe-row__thumb--placeholder');
-    slot.insertAdjacentHTML('beforeend', '<i data-lucide="utensils" class="icon-sm" aria-hidden="true"></i>');
-    if (window.lucide) window.lucide.createIcons({ el: slot });
-  }, { once: true });
-  slot.appendChild(img);
-  return slot;
+  return recipeThumbEl({
+    recipeId: recipe.id,
+    hasImage: recipe.provider_has_image,
+    hasOwnImage: recipe.has_own_image,
+    className: 'recipe-row__thumb',
+  });
 }
 
 function mealTypeOptions() {
-  return [
-    { key: 'breakfast', label: t('meals.typeBreakfast') },
-    { key: 'lunch', label: t('meals.typeLunch') },
-    { key: 'dinner', label: t('meals.typeDinner') },
-    { key: 'snack', label: t('meals.typeSnack') },
-  ];
+  return mealTypeList().map(({ key, label }) => ({ key, label }));
 }
 
 /**
@@ -149,11 +133,69 @@ async function loadShoppingLists() {
   }
 }
 
+// „Diese Woche geplant": die Rezepteliste kannte ihren eigenen Wochenplan
+// nicht - die Verbindung der beiden Kuechen-Raeume war nur im Meals-Tab
+// sichtbar, und die Liste las sich als kontextlose CRUD-Ablage (Critique
+// 2026-08-27, P2). Die Zuordnung steht laengst in meals.recipe_id; der Server
+// liefert ohne week-Parameter die aktuelle Woche. Ein Fehler laesst die
+// Angabe schlicht weg - die Liste haengt nicht an ihr.
+async function loadPlannedRecipes() {
+  if (window.yuvomi?.isModuleDisabled?.('meals')) {
+    state.plannedRecipeIds = new Set();
+    return;
+  }
+  try {
+    const res = await api.get('/meals');
+    state.plannedRecipeIds = new Set((res.data ?? []).map((m) => m.recipe_id).filter(Boolean));
+  } catch {
+    state.plannedRecipeIds = new Set();
+  }
+}
+
+/**
+ * Oeffnet das per ?open=<id> benannte Rezept, wenn es in der geladenen Liste steht.
+ *
+ * Aufklappen statt Bearbeiten: wer aus dem Essensplan kommt, will kochen, nicht
+ * aendern - dieselbe Entscheidung wie beim Antippen einer Zeile.
+ *
+ * Ein Rezept ohne Detailinhalt (keine Zutaten, keine Notiz, keine Quelle) hat
+ * gar kein Aufklapp-Panel. Dann bleibt das Scrollen als das, was zu holen ist:
+ * die Zeile zeigen, statt still nichts zu tun.
+ */
+function openRecipeFromQuery() {
+  const raw = new URLSearchParams(window.location.search).get('open');
+  const id = Number.parseInt(raw ?? '', 10);
+  if (!Number.isInteger(id)) return;
+
+  const row = _container?.querySelector(`.recipe-row-item[data-id="${id}"]`);
+  if (!row) return;
+
+  const toggle = row.querySelector('[data-action="toggle-detail"]');
+  const panel = _container.querySelector(`#recipe-detail-${id}`);
+  if (toggle && panel) {
+    toggle.setAttribute('aria-expanded', 'true');
+    panel.hidden = false;
+  }
+  row.scrollIntoView({ block: 'nearest' });
+}
+
 export async function render(container) {
   _container = container;
 
+  // `state` ueberlebt den Seitenwechsel. Wer zuletzt nach "Suppe" gesucht oder
+  // auf Mealie gefiltert hat, kaeme sonst per Deep-Link auf eine Liste zurueck,
+  // in der das verlangte Rezept gar nicht steht - und der Sprung endete
+  // wortlos im Nichts. Ein benanntes Ziel schlaegt einen alten Filter, also
+  // faellt der weg, und zwar VOR dem Bau des Suchfelds, damit die Zeile darueber
+  // nicht einen Begriff zeigt, nach dem die Liste nicht mehr filtert (#936).
+  if (new URLSearchParams(window.location.search).has('open')) {
+    state.query = '';
+    state.sourceFilter = 'all';
+  }
+
   const page = document.createElement('div');
-  page.className = 'recipes-page';
+  page.className = 'recipes-page app-page app-page--reading page-measure--narrow';
+  page.dataset.composition = 'reading';;
 
   // sr-only Titel: die geteilte Kitchen-Tabs-Leiste labelt das Modul bereits
   // sichtbar — konsistent mit Mahlzeiten/Einkauf. Der FAB ist die einzige
@@ -171,7 +213,7 @@ export async function render(container) {
   // alle vier Küchen-Tabs eine andere Kopf-Grammatik hatten (Critique
   // 2026-07-29). Die Variante löst den Konflikt, ohne den Kopf zu meiden.
   const toolbar = document.createElement('div');
-  // --narrow: der Kopf endet beim Lesemaß der Liste darunter (.kitchen-list),
+  // --narrow: der Kopf endet beim Lesemaß der Liste darunter (.list-scroller),
   // nicht an der Content-Spalte. Siehe layout.css.
   toolbar.className = 'page-toolbar page-toolbar--in-group page-toolbar--narrow';
   const center = document.createElement('div');
@@ -206,7 +248,7 @@ export async function render(container) {
   toolbar.appendChild(actions);
 
   const list = document.createElement('div');
-  list.className = 'kitchen-list recipes-list';
+  list.className = 'list-scroller page-scrollport recipes-list';
   list.id = 'recipes-list';
   // Lade-Skeleton bis loadRecipes() aufgelöst ist (Router blendet den Wrapper
   // bereits vor dem Daten-await ein).
@@ -221,6 +263,7 @@ export async function render(container) {
   fab.type = 'button';
   fab.id = 'fab-new-recipe';
   fab.setAttribute('aria-label', t('recipes.addRecipe'));
+  fab.dataset.dockLabel = t('newLabel.recipes');
   const fabIcon = document.createElement('i');
   fabIcon.dataset.lucide = 'plus';
   fabIcon.setAttribute('aria-hidden', 'true');
@@ -235,9 +278,19 @@ export async function render(container) {
 
   if (window.lucide) window.lucide.createIcons({ el: container });
 
-  await Promise.all([loadRecipes(), loadCategories(), loadShoppingLists()]);
+  await Promise.all([loadRecipes(), loadCategories(), loadShoppingLists(), loadPlannedRecipes(), ensureMealTypeNames()]);
   renderSourceFilter();
   renderRecipeList();
+
+  // Deep-Link: ?open=<id> klappt das Rezept auf und scrollt es ins Bild.
+  // Dieselbe Schreibweise wie in Kontakten und auf der Startseite, damit nicht
+  // jedes Modul seinen eigenen Parameter erfindet.
+  //
+  // Gebraucht wird er von den Essenskarten (#936): ein Essen liess sich mit
+  // einem Rezept verknuepfen, aber die Verknuepfung hatte keinen Ausgang - der
+  // Aktionsknopf gab es nur fuer eine externe `recipe_url`, nicht fuer ein
+  // Rezept aus dem eigenen Haus.
+  openRecipeFromQuery();
 
   fab.addEventListener('click', () => openRecipeModal('create'));
 
@@ -305,17 +358,17 @@ export async function render(container) {
   // Bedienelementen darin war.
 }
 
-// Drei-Wege-Filter (Alle/Nativ/Mealie) als Trigger + Popover-Menü im
+// Mehrwege-Filter (Alle/Nativ/pro Provider) als Trigger + Popover-Menü im
 // __actions-Slot, dieselbe Behandlung wie „Lagerorte verwalten" im Vorrat -
 // ein btn--icon im Kopf statt einer eigenen Zeile, die auf schmalen
-// Bildschirmen für drei Optionen (fast immer "Alle" aktiv) eine ganze
-// Kopf-Zeile kostete. Bleibt versteckt, solange kein Mealie-Account
+// Bildschirmen für wenige Optionen (fast immer "Alle" aktiv) eine ganze
+// Kopf-Zeile kostete. Bleibt versteckt, solange kein Provider-Account
 // gespiegelte Rezepte liefert - der Filter wäre sonst leere Ornamentik.
 function renderSourceFilter() {
   const el = _container.querySelector('#recipes-source-filter');
   if (!el) return;
 
-  const hasMirrored = state.recipes.some((r) => r.source === 'mealie');
+  const hasMirrored = state.recipes.some((r) => r.source !== 'native');
   if (!hasMirrored) {
     el.hidden = true;
     state.sourceFilter = 'all';
@@ -326,14 +379,16 @@ function renderSourceFilter() {
   const options = [
     { value: 'all', label: t('recipes.sourceAll') },
     { value: 'native', label: t('recipes.sourceNative') },
-    { value: 'mealie', label: t('recipes.sourceMealie') },
+    ...[...new Set(state.recipes.map((r) => r.source).filter((s) => s !== 'native'))].sort().map((s) => ({
+      value: s, label: t(`recipes.source${s[0].toUpperCase()}${s.slice(1)}`),
+    })),
   ];
   const activeLabel = options.find((o) => o.value === state.sourceFilter)?.label ?? '';
 
   el.replaceChildren();
   el.insertAdjacentHTML('beforeend', `
     <button type="button" class="btn btn--ghost btn--icon popover-menu__trigger"
-            popovertarget="recipes-source-filter-menu"
+            popovertarget="recipes-source-filter-menu" aria-haspopup="menu" aria-expanded="false"
             aria-label="${esc(t('recipes.sourceFilterLabel'))}: ${esc(activeLabel)}"
             title="${esc(t('recipes.sourceFilterLabel'))}: ${esc(activeLabel)}">
       <i data-lucide="filter" class="icon-md" aria-hidden="true"></i>
@@ -441,12 +496,12 @@ function renderRecipeList() {
   // 48px Bodenversatz in derselben Rasterzeile). Als Zeile teilt es Fläche,
   // Trennlinie, Textspalte und Bedienzone mit Einkauf und Vorrat.
   const rows = document.createElement('ul');
-  rows.className = 'kitchen-rows';
+  rows.className = 'list-rows';
 
   for (const recipe of visible) {
-    // Mirror-Rezepte sind read-only (Mealie bleibt Quelle der Wahrheit); steuert
+    // Mirror-Rezepte sind read-only (der Provider bleibt Quelle der Wahrheit); steuert
     // weiter unten sowohl die Zeilenaktionen als auch das Aufklapp-Detail.
-    const isMirrored = recipe.source === 'mealie';
+    const isMirrored = recipe.source !== 'native';
     const ingredients = recipe.ingredients ?? [];
     const detailId = `recipe-detail-${recipe.id}`;
     const hasDetail = Boolean(ingredients.length || recipe.notes || recipe.recipe_url);
@@ -456,29 +511,29 @@ function renderRecipeList() {
     li.dataset.id = String(recipe.id);
 
     const row = document.createElement('div');
-    row.className = 'kitchen-row recipe-row';
+    row.className = 'list-row recipe-row';
 
     // Kanonisches Accordion-Muster: Überschrift umschließt den Button. Die
     // Überschrift trägt die Dokumentstruktur, der Button den Zustand - vorher
     // war die ganze Karte ein role="button" MIT Buttons darin, was für
     // Hilfsmittel ein verschachteltes Bedienelement ist.
     const heading = document.createElement('h2');
-    heading.className = 'kitchen-row__main recipe-row__heading';
+    heading.className = 'list-row__main recipe-row__heading';
 
     const toggle = document.createElement('button');
     toggle.type = 'button';
-    toggle.className = 'kitchen-row__main--interactive recipe-row__toggle';
+    toggle.className = 'list-row__main--interactive recipe-row__toggle';
     toggle.dataset.action = 'toggle-detail';
     toggle.dataset.id = String(recipe.id);
 
     // Herkunft ist Teil der Identität der Zeile, nicht erst ein Detail: wer
     // durch eine gemischte Liste scrollt, muss vor dem Aufklappen sehen können,
-    // welche Rezepte aus Mealie kommen (und schreibgeschützt sind), nicht erst
+    // welche Rezepte gespiegelt (und schreibgeschützt) sind, nicht erst
     // danach.
     if (isMirrored) toggle.appendChild(recipeThumb(recipe));
 
     const name = document.createElement('span');
-    name.className = 'kitchen-row__name';
+    name.className = 'list-row__name';
     name.textContent = recipe.title;
     toggle.appendChild(name);
 
@@ -492,7 +547,7 @@ function renderRecipeList() {
       // ihrer Inhaltsbreite treu.
       const badgeSlot = document.createElement('span');
       badgeSlot.className = 'recipe-row__badge-slot';
-      badgeSlot.appendChild(mealieSourceBadge(recipe));
+      badgeSlot.appendChild(sourceBadge(recipe));
       toggle.appendChild(badgeSlot);
     }
 
@@ -501,11 +556,25 @@ function renderRecipeList() {
     // Klick nachweislich nichts tat (Kartenhöhe 408 → 408px an sechs Karten
     // gemessen, Critique 2026-07-30). Jetzt ist die Zahl die Beschriftung
     // dessen, was das Aufklappen zeigt.
-    if (ingredients.length) {
-      const meta = document.createElement('span');
-      meta.className = 'kitchen-row__meta';
-      meta.textContent = t('meals.ingredientCount', { count: ingredients.length });
-      toggle.appendChild(meta);
+    //
+    // IMMER gerendert, auch bei 0: die Mindestbreite von .list-row__meta
+    // (15ch, siehe recipes.css) hält alles davor - das Mealie/Tandoor-Badge -
+    // an derselben Stelle. Fehlte das Element ganz, würde der Name per
+    // flex-grow den freiwerdenden Platz schlucken und das Badge nach rechts
+    // schieben, sobald ein Rezept ganz ohne Zutaten in der Liste steht.
+    const meta = document.createElement('span');
+    meta.className = 'list-row__meta';
+    meta.textContent = t('meals.ingredientCount', { count: ingredients.length });
+    toggle.appendChild(meta);
+
+    // Zweite Meta-Angabe, getrennt ueber den Mittelpunkt des +-Kombinators
+    // (Hausform, Vorrat): neutraler Sekundaertext, keine Flaeche - der
+    // Zustand ist eine Meldung, keine Identitaet (Skalen-Regel).
+    if (state.plannedRecipeIds.has(recipe.id)) {
+      const planned = document.createElement('span');
+      planned.className = 'recipe-row__planned';
+      planned.textContent = t('recipes.plannedThisWeek');
+      toggle.appendChild(planned);
     }
 
     if (hasDetail) {
@@ -524,16 +593,22 @@ function renderRecipeList() {
       // bliebe sonst interaktiv aussehend, ohne dass ein Klick etwas täte -
       // oder schlimmer, er würde über den generischen edit-Handler ein
       // Bearbeitungsformular öffnen, dessen Speichern serverseitig ohnehin
-      // mit 403 abgewiesen wird (mealie_account_id-Guard, routes/recipes.js).
+      // mit 403 abgewiesen wird (provider_account_id-Guard, routes/recipes.js).
       delete toggle.dataset.action;
-      toggle.classList.remove('kitchen-row__main--interactive');
+      toggle.classList.remove('list-row__main--interactive');
       toggle.tabIndex = -1;
+      // Trotzdem einen (unsichtbaren) Chevron-Platzhalter einfügen: sonst
+      // wächst der Name per flex-grow um genau dessen Breite, und das Badge
+      // vor ihm rutscht gegenüber jeder anderen gespiegelten Zeile nach
+      // rechts - derselbe Mechanismus wie bei der Zutatenzahl oben.
+      toggle.insertAdjacentHTML('beforeend',
+        '<i data-lucide="chevron-down" class="icon-sm recipe-row__chevron recipe-row__chevron--placeholder" aria-hidden="true"></i>');
     }
 
     heading.appendChild(toggle);
     row.appendChild(heading);
 
-    // Mirror-Rezepte sind read-only (Mealie bleibt Quelle der Wahrheit) - Edit
+    // Mirror-Rezepte sind read-only (der Provider bleibt Quelle der Wahrheit) - Edit
     // und Delete entfallen, Duplizieren bleibt: das legt eine eigenständige,
     // frei bearbeitbare Kopie an (duplicateRecipe() postet immer als natives
     // Rezept, unabhängig von der Quelle des Originals). Eine Liste speist
@@ -546,7 +621,7 @@ function renderRecipeList() {
     ].filter(Boolean);
 
     const actions = document.createElement('div');
-    actions.className = 'kitchen-row__actions';
+    actions.className = 'list-row__actions';
 
     // Drei Zeilenaktionen kosten 152px von 262px Zeilenbreite bei 320px - 58% der
     // Zeile für Sekundäraktionen. Für den Namen blieben 98px, und weil er in einem
@@ -596,7 +671,7 @@ function renderRecipeList() {
       const mealTypes = normalizeRecipeMealTypes(recipe.meal_types);
       // Chips nur, wenn sie unterscheiden: gilt ein Rezept für alle Mahlzeiten,
       // ist die volle Chip-Reihe reine Ornamentik (Audit A1-21). Das
-      // Mealie-Badge sitzt jetzt schon in der Zeilenüberschrift (immer sichtbar,
+      // Herkunfts-Badge sitzt jetzt schon in der Zeilenüberschrift (immer sichtbar,
       // nicht erst nach dem Aufklappen) und wird hier nicht noch einmal gezeigt.
       const showMealTypeBadges = mealTypes.length && mealTypes.length < mealTypeOptions().length;
       if (showMealTypeBadges) {
@@ -611,6 +686,18 @@ function renderRecipeList() {
             return badge;
           }));
         detail.appendChild(badges);
+      } else if (!mealTypes.length) {
+        // Keine Mahlzeit ist eine Aussage und braucht ein Wort: Das Rezept fällt
+        // aus Menüplan und Zufallsauswahl heraus (#750). Ohne Hinweis wäre der
+        // Zustand von „gilt für alle" nur daran zu unterscheiden, dass hier
+        // nichts steht - und genau diese Stille war der gemeldete Fehler.
+        const none = document.createElement('div');
+        none.className = 'recipe-card__meal-types';
+        const badge = document.createElement('span');
+        badge.className = 'meal-type-badge meal-type-badge--none';
+        badge.textContent = t('recipes.mealTypeNone');
+        none.appendChild(badge);
+        detail.appendChild(none);
       }
 
       // VOLLSTÄNDIGE Zutatenliste, nicht die ersten vier: das Kürzen war nur
@@ -698,8 +785,8 @@ function renderRecipeList() {
  * eine Karte mit role="button", die Buttons enthielt.
  *
  * Der Zweck bleibt erfüllt: Lesen erzwingt weiter kein Bearbeiten-Formular. Das
- * Mealie-Badge, das hier stand, sitzt jetzt in der Zeilenüberschrift selbst -
- * sichtbar, bevor man überhaupt aufklappt (siehe mealieSourceBadge() weiter oben).
+ * Herkunfts-Badge, das hier stand, sitzt jetzt in der Zeilenüberschrift selbst -
+ * sichtbar, bevor man überhaupt aufklappt (siehe sourceBadge() weiter oben).
  */
 
 function openRecipeModal(mode, recipe = null) {
@@ -734,6 +821,20 @@ function openRecipeModal(mode, recipe = null) {
           <label class="form-label" for="recipe-notes">${t('recipes.notesLabel')}</label>
           <textarea id="recipe-notes" class="form-input" rows="3" placeholder="${t('recipes.notesPlaceholder')}"></textarea>
         </div>
+        ${/* Ein eigenes Bild (#1059, Schritt 2) - fuer gespiegelte Rezepte
+            * ausgeblendet: die sind hier ohnehin schreibgeschuetzt, ihr Inhalt
+            * gehoert dem Provider. */ ''}
+        <div class="form-group" id="recipe-image-group"${isEdit && recipe?.source !== 'native' ? ' hidden' : ''}>
+          <label class="form-label">${t('recipes.imageLabel')}</label>
+          <div class="recipe-image-editor">
+            <button type="button" class="recipe-image-preview" id="recipe-image-preview"
+                    aria-label="${esc(t('recipes.imageLabel'))}"></button>
+            <input class="sr-only" id="recipe-image" type="file" accept="image/png,image/jpeg,image/webp">
+            <button type="button" class="btn btn--secondary btn--sm" id="recipe-image-pick">${t('recipes.imageChoose')}</button>
+            <button type="button" class="btn btn--ghost btn--sm" id="recipe-image-remove">${t('recipes.imageRemove')}</button>
+          </div>
+          <p class="form-hint">${t('recipes.imageHint')}</p>
+        </div>
         <div class="form-group">
           <label class="form-label" for="recipe-url">${t('recipes.urlLabel')}</label>
           <input id="recipe-url" class="form-input" type="url" placeholder="${t('recipes.urlPlaceholder')}">
@@ -748,6 +849,64 @@ function openRecipeModal(mode, recipe = null) {
       panel.querySelector('#recipe-title').value = isEdit ? recipe.title : '';
       panel.querySelector('#recipe-notes').value = isEdit && recipe.notes ? recipe.notes : '';
       panel.querySelector('#recipe-url').value = isEdit && recipe.recipe_url ? recipe.recipe_url : '';
+
+      /* BILD (#1059, Schritt 2) - dasselbe Vorgehen wie beim Gegenstandsfoto:
+       * Auswahl, Zuschnitt und Groessenpruefung macht `pickCroppedImage`.
+       *
+       * `bildStand` traegt DREI Zustaende, und die dritte ist der Grund fuer die
+       * Fallunterscheidung beim Speichern: `undefined` heisst "nicht angefasst"
+       * (der Server laesst das gespeicherte Bild stehen), `null` heisst "entfernt",
+       * eine Data-URL heisst "das hier". Ohne den Unterschied schickte jedes
+       * Speichern eines bebilderten Rezepts entweder null (Bild weg) oder muesste
+       * die ganze Data-URL erneut hochladen. */
+      let bildStand;
+      const bildVorschau = panel.querySelector('#recipe-image-preview');
+      const bildInput = panel.querySelector('#recipe-image');
+      const zeigeBild = () => {
+        if (!bildVorschau) return;
+        bildVorschau.replaceChildren();
+        // Beim Bearbeiten kommt das gespeicherte Bild ueber die Route, nicht aus
+        // den Listendaten - dort steht nur das Flag (die Data-URL waere zu gross).
+        const quelle = bildStand !== undefined
+          ? bildStand
+          : (isEdit && recipe?.has_own_image ? `/api/v1/recipes/${recipe.id}/image` : null);
+        if (quelle) {
+          const img = document.createElement('img');
+          img.className = 'recipe-image-preview__img';
+          img.src = quelle;
+          img.alt = '';
+          bildVorschau.appendChild(img);
+        } else {
+          bildVorschau.insertAdjacentHTML('beforeend', '<i data-lucide="image-plus" class="icon-md" aria-hidden="true"></i>');
+          if (window.lucide) window.lucide.createIcons({ el: bildVorschau });
+        }
+      };
+      zeigeBild();
+      bildVorschau?.addEventListener('click', () => bildInput?.click());
+      panel.querySelector('#recipe-image-pick')?.addEventListener('click', () => bildInput?.click());
+      bildInput?.addEventListener('change', async (e) => {
+        const datei = e.target.files?.[0];
+        // Sofort zuruecksetzen: sonst feuert dieselbe Datei nach einem
+        // abgebrochenen Zuschnitt kein zweites `change`.
+        e.target.value = '';
+        try {
+          const { pickCroppedImage } = await import('/utils/avatar-crop.js');
+          const zugeschnitten = await pickCroppedImage(datei, {
+            messageKeys: { dataTooLarge: 'recipes.imageTooLarge' },
+          });
+          if (zugeschnitten === undefined) return; // abgebrochen
+          bildStand = zugeschnitten;
+          zeigeBild();
+        } catch (err) {
+          window.yuvomi?.showToast(err.message, 'danger');
+        }
+      });
+      panel.querySelector('#recipe-image-remove')?.addEventListener('click', () => {
+        bildStand = null;
+        zeigeBild();
+      });
+      panel.dataset.bildGesetzt = '';
+      panel._bildStand = () => bildStand;
       const selectedMealTypes = normalizeRecipeMealTypes(isEdit ? recipe.meal_types : RECIPE_MEAL_TYPE_KEYS);
       panel.querySelectorAll('#recipe-meal-types input[type="checkbox"]').forEach((input) => {
         input.checked = selectedMealTypes.includes(input.value);
@@ -809,14 +968,19 @@ async function saveRecipe(panel, mode, recipe) {
     if (name) ingredients.push({ name, quantity, category });
   });
 
+  // Nur mitschicken, wenn der Nutzer das Bild angefasst hat: ein fehlendes Feld
+  // laesst das gespeicherte stehen (#1059).
+  const bildStand = panel._bildStand?.();
+  const bildFeld = bildStand === undefined ? {} : { image_data: bildStand };
+
   saveBtn.disabled = true;
 
   try {
     if (mode === 'create') {
-      const res = await api.post('/recipes', { title, notes, recipe_url, meal_types, ingredients });
+      const res = await api.post('/recipes', { title, notes, recipe_url, meal_types, ingredients, ...bildFeld });
       state.recipes.push(res.data);
     } else {
-      const res = await api.put(`/recipes/${recipe.id}`, { title, notes, recipe_url, meal_types, ingredients });
+      const res = await api.put(`/recipes/${recipe.id}`, { title, notes, recipe_url, meal_types, ingredients, ...bildFeld });
       const idx = state.recipes.findIndex((r) => r.id === recipe.id);
       if (idx >= 0) state.recipes[idx] = res.data;
     }
@@ -858,7 +1022,12 @@ async function saveRecipe(panel, mode, recipe) {
  * bearbeiten, wie bei jeder anderen Mahlzeit.
  */
 async function planRecipe(recipe, btn) {
-  const types = normalizeRecipeMealTypes(recipe.meal_types);
+  const declared = normalizeRecipeMealTypes(recipe.meal_types);
+  // Erklärt das Rezept keine Mahlzeit, stehen hier trotzdem alle zur Wahl: Der
+  // leere Zustand hält es aus der Zufallsauswahl heraus (#750), nicht aus dem
+  // Menüplan. Ohne diesen Rückgriff bliebe das Auswahlfeld leer und der Dialog
+  // hätte nichts anzubieten, was der Nutzer bestätigen könnte.
+  const types = declared.length ? declared : RECIPE_MEAL_TYPE_KEYS.slice();
   // Vorauswahl: erklärt das Rezept genau einen Typ, ist die Sache klar. Erklärt
   // es mehrere - was der Default ist, wenn niemand etwas gesetzt hat -, dann
   // stand bisher „Frühstück" da, weil es in der Liste zuerst kommt: der Dialog
@@ -872,7 +1041,7 @@ async function planRecipe(recipe, btn) {
       `<option value="${key}"${key === vorauswahl ? ' selected' : ''}>${esc(label)}</option>`)
     .join('');
 
-  const today = toLocalDateKey(new Date());
+  const today = todayKey();
 
   openSharedModal({
     title: t('recipes.planTitle', { name: recipe.title }),

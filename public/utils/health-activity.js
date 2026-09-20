@@ -12,7 +12,7 @@
  *        damit die Funktionen in Node ohne Browser-Umgebung getestet werden.
  */
 
-import { toLocalDateKey, addLocalDays, startOfLocalWeekKey } from '/utils/date.js';
+import { addLocalDays, startOfLocalWeekKey, todayKey } from '/utils/date.js';
 
 // --------------------------------------------------------
 // Preset-Definitionen (Trainingsarten)
@@ -64,7 +64,7 @@ function toFiniteOrNull(value) {
  */
 export function weekSummary(activities, opts = {}) {
   const { anchor, weekStartsOn = 1 } = opts;
-  const start = startOfLocalWeekKey(anchor || toLocalDateKey(new Date()), weekStartsOn);
+  const start = startOfLocalWeekKey(anchor || todayKey(), weekStartsOn);
 
   const buckets = [];
   const index = new Map();

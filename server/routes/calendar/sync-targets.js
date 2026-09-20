@@ -17,10 +17,12 @@
  */
 
 import express from 'express';
+import { mayWriteModule } from '../../permissions.js';
 
 import { createLogger } from '../../logger.js';
 import * as googleCalendar from '../../services/google-calendar.js';
 import * as caldavSync from '../../services/caldav-sync.js';
+import * as outlookCalendar from '../../services/outlook-calendar.js';
 
 const log = createLogger('Calendar');
 const router = express.Router();
@@ -29,19 +31,31 @@ const router = express.Router();
  * Google-Ziele: nur aktivierte und beschreibbare Kalender - dieselbe Auswahl,
  * die das Frontend bisher clientseitig aus /google/calendars gefiltert hat.
  * Ohne Verbindung wird gar nicht erst gegen die Google-API gerufen.
- * @returns {Promise<Array<{id: string, summary: string}>>}
+ *
+ * `defaultAssigneeUserId` ist die Standard-Zuweisung des Kalenders (#459). Das
+ * Formular liest sie RUECKWAERTS (#1060): ein neuer Termin, der genau dieser
+ * Person zugewiesen ist, bekommt diesen Kalender als Ziel.
+ * @returns {Promise<Array<{id: string, summary: string, defaultAssigneeUserId: number|null}>>}
  */
 async function listGoogleTargets() {
   if (!googleCalendar.getStatus().connected) return [];
   const calendars = await googleCalendar.listCalendars();
   return calendars
     .filter((cal) => cal.enabled && cal.writable)
-    .map((cal) => ({ id: cal.id, summary: cal.summary || cal.id }));
+    .map((cal) => ({
+      id: cal.id,
+      summary: cal.summary || cal.id,
+      defaultAssigneeUserId: cal.default_assignee_user_id ?? null,
+    }));
 }
 
 /**
  * CalDAV-Ziele: alle aktivierten Kalender je Konto, aus der DB (kein Netzzugriff).
- * @returns {Promise<Array<{accountId: number, accountName: string, calendarUrl: string, calendarName: string}>>}
+ *
+ * Die Standard-Zuweisung haengt an der Kalender-URL, nicht am Konto
+ * (`external_calendars.external_id`). Fuehren zwei Konten dieselbe URL, tragen
+ * beide Ziele dieselbe Person - das Formular waehlt dann keines von selbst.
+ * @returns {Promise<Array<{accountId: number, accountName: string, calendarUrl: string, calendarName: string, defaultAssigneeUserId: number|null}>>}
  */
 async function listCaldavTargets() {
   const targets = [];
@@ -55,6 +69,7 @@ async function listCaldavTargets() {
           accountName: account.name,
           calendarUrl: cal.calendarUrl,
           calendarName: cal.calendarName || cal.calendarUrl,
+          defaultAssigneeUserId: cal.default_assignee_user_id ?? null,
         });
       }
     } catch (err) {
@@ -65,16 +80,45 @@ async function listCaldavTargets() {
 }
 
 /**
+ * Outlook-Ziele: alle aktivierten UND beschreibbaren Kalender je Konto, aus der
+ * DB (kein Netzzugriff). Konten im Reauth-Zustand bleiben wählbar - der Push
+ * holt nach dem Reconnect nach.
+ * @returns {Array<{accountId: number, accountName: string, calendarId: string, calendarName: string}>}
+ */
+function listOutlookTargets() {
+  const targets = [];
+  for (const account of outlookCalendar.listAccounts()) {
+    for (const cal of outlookCalendar.listCalendarSelection(account.id)) {
+      if (!cal.enabled || !cal.canEdit) continue;
+      targets.push({
+        accountId: account.id,
+        accountName: account.name,
+        calendarId: cal.calendarId,
+        calendarName: cal.calendarName || cal.calendarId,
+      });
+    }
+  }
+  return targets;
+}
+
+/**
  * GET /api/v1/calendar/sync-targets
  * Fuer alle angemeldeten Nutzer. Response:
- * { data: { google: [{ id, summary }],
- *           caldav: [{ accountId, accountName, calendarUrl, calendarName }] } }
+ * { data: { google: [{ id, summary, defaultAssigneeUserId }],
+ *           caldav: [{ accountId, accountName, calendarUrl, calendarName, defaultAssigneeUserId }],
+ *           outlook: [{ accountId, accountName, calendarId, calendarName }] } }
  *
  * Jede Quelle faellt einzeln auf eine leere Liste zurueck: ein abgelaufenes
  * Google-Token darf die CalDAV-Ziele nicht verschlucken (und umgekehrt).
  */
 router.get('/sync-targets', async (req, res) => {
   try {
+    // Dieselbe Erwaegung wie bei /tasks/sync-targets: die Liste fuellt das
+    // Ziel-Feld des Termindialogs und nennt dabei die angebundenen Konten mit
+    // ihren Kalender-URLs. Wer nicht schreiben darf, braucht sie nicht.
+    if (!mayWriteModule(req, 'calendar')) {
+      return res.status(403).json({ error: 'Write access to the calendar is required.', code: 403 });
+    }
     const [google, caldav] = await Promise.all([
       listGoogleTargets().catch((err) => {
         log.warn('Sync targets: Google list failed:', err);
@@ -85,7 +129,13 @@ router.get('/sync-targets', async (req, res) => {
         return [];
       }),
     ]);
-    res.json({ data: { google, caldav } });
+    let outlook = [];
+    try {
+      outlook = listOutlookTargets();
+    } catch (err) {
+      log.warn('Sync targets: Outlook list failed:', err);
+    }
+    res.json({ data: { google, caldav, outlook } });
   } catch (err) {
     log.error('Sync target list failed:', err);
     res.status(500).json({ error: 'Failed to list sync targets.', code: 500 });

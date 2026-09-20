@@ -16,6 +16,7 @@ import {
   advancedSection,
   wireBlurValidation,
   reportFieldError,
+  refocusAfterRender,
 } from '/components/modal.js';
 import { renderKitchenTabsBar } from '/utils/kitchen-tabs.js';
 import { resolveShoppingTarget, announceTransfer } from '/utils/kitchen-transfer.js';
@@ -25,9 +26,10 @@ import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
 // Renderer mit den Vorrats-Texten füllt.
 import { emptyStateEl as emptyStateComponentEl, mountLoadError } from '/utils/empty-state.js';
 import { scheduleUndoableDelete, vibrate, wireScrollFade } from '/utils/ux.js';
-import { toLocalDateKey } from '/utils/date.js';
+import { todayKey } from '/utils/date.js';
 import { DEFAULT_CATEGORY_NAME, categoryLabel } from '/utils/shopping-categories.js';
 import { locationLabel } from '/utils/pantry-locations.js';
+import { setBulkPill, clearBulkPill } from '/utils/bulk-pill.js';
 import { PANTRY_UNITS, normalizePantryQuantity, pantryUnitStep } from '/utils/pantry-units.js';
 import {
   PANTRY_FILTERS,
@@ -51,14 +53,58 @@ const state = {
   filter: 'all',
   /** Einmal pro Render eingefroren: sonst könnte ein über Mitternacht offener
    *  Tab Zeilen unterschiedlich bewerten, je nachdem wann sie gezeichnet wurden. */
-  todayKey: toLocalDateKey(),
+  todayKey: todayKey(),
 };
 
-/** Ausstehende Mengen-PATCHes je Artikel (Stepper-Entprellung). */
-const pendingQuantity = new Map();
+/**
+ * DIE ABSICHT, NICHT DER STAND - dieselbe Trennung wie im Einkauf.
+ *
+ * `state.items` traegt ausschliesslich, was der Server zuletzt gesagt hat. Was
+ * der Nutzer WILL, steht hier: id -> { quantity, seq, timer, flush }. Die Zeile
+ * zeigt die Ueberlagerung (`withIntent`).
+ *
+ * Der Vorlaeufer vermischte beides in `item.quantity`. Dann braucht ein
+ * Fehlschlag eine Ruecksprung-Grundlage, und die wurde ueber vier
+ * Review-Runden hinweg immer wieder falsch: mal vom alten Schnappschuss
+ * ueberschrieben, mal am bestaetigten Wert vorbei, mal aus dem Offline-Cache.
+ * Getrennt gehalten gibt es sie nicht mehr - ein Ruecksprung ist das ENTFERNEN
+ * der Absicht.
+ *
+ * Drei Regeln:
+ *   - Ein Schritt setzt die Absicht (entprellt, deshalb Timer und `flush`).
+ *   - Scheitert der Schreibvorgang, faellt sie.
+ *   - Bestaetigt der Server, wandert der Wert in den Serverstand und die
+ *     Absicht faellt - geschuetzt von `settledAt`, damit eine Antwort, die
+ *     vorher losgeschickt wurde, ihn nicht zurueckdreht.
+ */
+const intents = new Map();
+let QUANTITY_DEBOUNCE_MS_OVERRIDE = null; // nur fuer Tests, siehe __test unten
 const QUANTITY_DEBOUNCE_MS = 450;
 /** Monotone Folgenummer, die überholte PATCH-Antworten erkennbar macht. */
 let _quantitySeq = 0;
+/** Monotone Nummer je Ladevorgang, und wann ein Artikel zuletzt bestaetigt wurde. */
+let _pantryLoadSeq = 0;
+let _pantryAppliedLoad = 0;
+const settledAt = new Map();
+
+/** Die Menge, die die Zeile ZEIGT: die Absicht, sonst der Serverstand. */
+function quantityOf(item) {
+  const intent = intents.get(item?.id);
+  return intent ? intent.quantity : Number(item?.quantity ?? 0);
+}
+
+/**
+ * Der Artikel, wie ihn die Zeile zeigt.
+ *
+ * Als Kopie statt als Einzelwert, weil die Menge in abgeleitete Angaben
+ * einfliesst - Badges, Bestandsstatus, Fehlmenge. So bleiben `quantityText`,
+ * `pantryItemStatus` und `shortfallText` unveraendert und bekommen einfach den
+ * ueberlagerten Artikel.
+ */
+function withIntent(item) {
+  const intent = intents.get(item?.id);
+  return intent ? { ...item, quantity: intent.quantity } : item;
+}
 
 // --------------------------------------------------------
 // Formatierung
@@ -124,9 +170,29 @@ function stockBadge(item) {
 // Laden
 // --------------------------------------------------------
 
+
 async function loadPantry() {
+  const startedAt = ++_pantryLoadSeq;
   const res = await api.get('/pantry');
-  state.items = res.data ?? [];
+  // Wer aelter ist als das, was schon steht, fasst den Stand nicht mehr an.
+  if (startedAt < _pantryAppliedLoad) return;
+  _pantryAppliedLoad = startedAt;
+  // Anders als der Einkauf liest der Vorrat mit `api.get`: `/pantry` steht
+  // NICHT in `API_CACHE_WHITELIST` (sw.js), es gibt hier also keine Antwort aus
+  // dem Cache. Haelt der Guard in `test-frontend-audit.js` fest.
+
+  // EIN BESTAETIGTER ARTIKEL WIRD VON EINER AELTEREN ANTWORT NICHT
+  // ZURUECKGEDREHT - alles andere an ihr wird gebraucht und landet.
+  const vorherige = new Map(state.items.map((i) => [i.id, i]));
+  const frisch = res.data ?? [];
+  for (const item of frisch) {
+    const bestaetigt = settledAt.get(item.id);
+    if (bestaetigt != null && bestaetigt >= startedAt) {
+      const alt = vorherige.get(item.id);
+      if (alt) item.quantity = alt.quantity;
+    }
+  }
+  state.items = frisch;
   state.locations = res.locations ?? [];
   state.categories = res.categories ?? [];
 }
@@ -145,7 +211,9 @@ async function ensureLists() {
 
 function visibleItems() {
   const q = state.query.toLowerCase();
-  return state.items.filter((item) => {
+  // Gefiltert wird nach dem, was die Zeile ZEIGT - sonst faellt ein Artikel aus
+  // „Fast leer", waehrend die Zeile ihn noch dort zeigt.
+  return state.items.map(withIntent).filter((item) => {
     if (!matchesPantryFilter(item, state.filter, state.todayKey)) return false;
     if (!q) return true;
     return item.name?.toLowerCase().includes(q)
@@ -196,12 +264,13 @@ function groupedItems(items) {
 
 export async function render(container) {
   _container = container;
-  state.todayKey = toLocalDateKey();
+  state.todayKey = todayKey();
   // Frische Seite: die Chip-Leiste darf beim ersten Zeichnen wieder scrollen.
   _scrolledFilter = null;
 
   const page = document.createElement('div');
-  page.className = 'pantry-page';
+  page.className = 'pantry-page app-page app-page--reading page-measure--narrow';
+  page.dataset.composition = 'reading';
 
   // sr-only: die Küchen-Tab-Leiste benennt das Modul bereits sichtbar -
   // dieselbe Kopf-Grammatik wie Mahlzeiten/Rezepte/Einkauf.
@@ -220,7 +289,7 @@ export async function render(container) {
   // layout.css): Suche im __center-Slot, Lagerort-Verwaltung im __actions-Slot -
   // dieselbe Slot-Ordnung wie in den drei Geschwister-Tabs.
   const toolbar = document.createElement('div');
-  // --narrow: der Kopf endet beim Lesemaß der Liste darunter (.kitchen-list),
+  // --narrow: der Kopf endet beim Lesemaß der Liste darunter (.list-scroller),
   // nicht an der Content-Spalte. Siehe layout.css.
   toolbar.className = 'page-toolbar page-toolbar--in-group page-toolbar--narrow';
   toolbar.insertAdjacentHTML('beforeend', `
@@ -248,17 +317,13 @@ export async function render(container) {
   filters.className = 'pantry-filters';
   filters.id = 'pantry-filters';
 
-  // Slot für die Sammelaktions-Leiste, ÜBER dem Scroller. Sie lag vorher als
-  // erstes Kind in #pantry-list und scrollte damit weg - die Aktion betrifft aber
-  // die ganze gefilterte Liste und muss erreichbar bleiben, während man sie
-  // durchgeht. Der Slot trägt die Content-Spalte (siehe .pantry-bulkbar-slot) und
-  // verschwindet leer, damit er keine Zeile beansprucht.
-  const bulk = document.createElement('div');
-  bulk.className = 'pantry-bulkbar-slot';
-  bulk.id = 'pantry-bulkbar-slot';
+  // Hier stand der Slot für die Sammelaktions-Leiste. Sie ist seit Etappe 5
+  // eine Pille in der unteren Shell-Zone (utils/bulk-pill.js) und braucht in
+  // dieser Seite gar keinen Platz mehr - weder im Scroller, wo sie bis
+  // 2026-07-30 wegscrollte, noch darüber, wo sie eine Zeile kostete.
 
   const list = document.createElement('div');
-  list.className = 'kitchen-list pantry-list';
+  list.className = 'list-scroller page-scrollport pantry-list';
   list.id = 'pantry-list';
   list.setAttribute('aria-busy', 'true');
   list.insertAdjacentHTML('beforeend', renderSkeletonList({ rows: 6, lines: 2 }));
@@ -268,9 +333,10 @@ export async function render(container) {
   fab.type = 'button';
   fab.id = 'fab-new-pantry-item';
   fab.setAttribute('aria-label', t('pantry.addItem'));
+  fab.dataset.dockLabel = t('newLabel.pantry');
   fab.insertAdjacentHTML('beforeend', '<i data-lucide="plus" aria-hidden="true"></i>');
 
-  page.append(title, live, toolbar, filters, bulk, list, fab);
+  page.append(title, live, toolbar, filters, list, fab);
   container.replaceChildren(page);
   renderKitchenTabsBar(container, '/pantry');
 
@@ -369,7 +435,7 @@ function renderFilters() {
     wireScrollFade(bar);
   }
 
-  const counts = pantryFilterCounts(state.items, state.todayKey);
+  const counts = pantryFilterCounts(state.items.map(withIntent), state.todayKey);
   const active = PANTRY_FILTERS.filter((key) => counts[key] > 0);
 
   // Der aktive Filter hat gerade seinen letzten Treffer verloren → zurück auf Alle.
@@ -425,43 +491,49 @@ function renderFilters() {
 }
 
 /**
- * Sammelaktion des „Fast leer"-Filters. Bewusst eine eigene Zeile über der
- * Liste statt als letztes Element der Chip-Leiste: dort lag sie hinter dem
- * horizontalen Scroll und war faktisch unsichtbar.
+ * Sammelaktion des „Fast leer"-Filters, seit Etappe 5 als Pille in der unteren
+ * Shell-Zone (utils/bulk-pill.js) statt als Block über der Liste. Sie lag davor
+ * schon zweimal falsch: zuerst als letztes Element der Chip-Leiste (hinter dem
+ * horizontalen Scroll, faktisch unsichtbar), dann als eigene Zeile darüber, die
+ * dem Einkauf gemessene 103px Listenfläche kostete.
  *
- * Geteilte Grammatik `.kitchen-bulkbar` (styles/kitchen-row.css) - der Einkauf
- * trägt seine Abschluss-Aktionen jetzt in derselben Leiste.
- */
-function bulkBarEl() {
-  const bar = document.createElement('div');
-  bar.className = 'kitchen-bulkbar';
-
-  const label = document.createElement('span');
-  label.className = 'kitchen-bulkbar__label';
-  label.textContent = t('pantry.bulkHint');
-
-  const bulk = document.createElement('button');
-  bulk.type = 'button';
-  bulk.className = 'btn btn--secondary kitchen-bulkbar__action';
-  bulk.insertAdjacentHTML('beforeend', '<i data-lucide="shopping-cart" class="icon-sm" aria-hidden="true"></i>');
-  bulk.append(document.createTextNode(t('pantry.toShoppingAll')));
-  bulk.addEventListener('click', () => sendToShopping(visibleItems(), bulk));
-
-  bar.append(label, bulk);
-  return bar;
-}
-
-/**
- * Füllt den Slot über dem Scroller. Getrennt von renderList(), weil der Slot ein
- * Geschwister der Liste ist - er darf nicht mit ihr geleert werden.
+ * DAS LABEL IST DIE ZAHL, NICHT DIE ERKLÄRUNG. Es stand hier „Diese Artikel
+ * sind aufgebraucht oder unter dem Mindestbestand." - ein Satz, den der aktive
+ * Filterchip („Fast leer") daneben schon sagt, und der auf einer einzeiligen
+ * Fläche nichts als eine Ellipse hinterlässt. Was die Pille beitragen muss,
+ * ist der Umfang von „Alles": worauf der Knopf wirkt. Dieselbe Antwort gibt der
+ * Einkauf mit „3 Artikel abgehakt".
+ *
+ * UND BEI 320px IST GENAU DIESER UMFANG WEG (Etappe 7, 2026-08-13). Dort fällt
+ * das Subjekt weg - gemessen verlangt „10 Artikel fast leer" 116,2px, frei
+ * bleiben neben der Kapsel 86,9 von 264px Innenbreite. Übrig steht dann „Alles
+ * auf die Einkaufsliste" allein auf einer dunklen Fläche: ein Quantor ohne
+ * Bezugswort, lesbar als „der ganze Vorrat" statt als die zehn Artikel des
+ * aktiven Filters.
+ *
+ * DIE GEFAHR IST EINE ANDERE ALS IM EINKAUF, DIE LÜCKE DIESELBE. Dort trägt die
+ * Löschen-Kapsel die Marke, weil ein fehlendes Objekt vor einer nicht
+ * rückfragenden Löschung teuer ist; hier ist die Aktion harmlos und trotzdem
+ * mehrdeutig - „In den Vorrat" wäre es nicht, „Alles" ist es. Gemessen misst
+ * die Kapsel mit Marke rund 194 von 264px, die Pille bleibt einzeilig.
+ *
+ * Die Zahl ist dieselbe, die das Subjekt nennt: `visibleItems()` ist der
+ * gefilterte UND gesuchte Satz, und `sendToShopping` bekommt genau ihn.
  */
 function renderBulkBar() {
-  const slot = _container?.querySelector('#pantry-bulkbar-slot');
-  if (!slot) return;
-  slot.replaceChildren();
-  if (state.filter !== 'low' || !state.items.length || !visibleItems().length) return;
-  slot.appendChild(bulkBarEl());
-  if (window.lucide) window.lucide.createIcons({ el: slot });
+  const items = visibleItems();
+  if (state.filter !== 'low' || !state.items.length || !items.length) {
+    clearBulkPill();
+    return;
+  }
+  setBulkPill({
+    label: t('pantry.bulkPillLabel', { count: items.length }),
+    actions: [{
+      label: t('pantry.toShoppingAll'),
+      count: items.length,
+      onClick: (btn) => sendToShopping(visibleItems(), btn),
+    }],
+  });
 }
 
 function renderList() {
@@ -499,27 +571,27 @@ function renderList() {
 
   for (const group of groupedItems(items)) {
     const section = document.createElement('section');
-    // Geteilte Gruppen-Grammatik (styles/kitchen-row.css): die Gruppe trägt die
+    // Geteilte Gruppen-Grammatik (styles/list-row.css): die Gruppe trägt die
     // weiße Fläche, die Zeilen darin nur Trennlinien.
-    section.className = 'kitchen-group pantry-group';
+    section.className = 'list-group pantry-group';
 
     if (group.label) {
       const heading = document.createElement('h2');
-      heading.className = 'kitchen-group__title';
+      heading.className = 'list-group__title';
       heading.insertAdjacentHTML('beforeend',
         `<i data-lucide="${esc(group.icon || 'package')}" class="icon-sm" aria-hidden="true"></i>`);
       const name = document.createElement('span');
       name.textContent = group.label;
       const count = document.createElement('span');
-      count.className = 'kitchen-group__count';
+      count.className = 'list-group__count';
       count.textContent = String(group.items.length);
       heading.append(name, count);
       section.appendChild(heading);
     }
 
     const rows = document.createElement('ul');
-    rows.className = 'kitchen-rows pantry-rows';
-    for (const item of group.items) rows.appendChild(rowEl(item));
+    rows.className = 'list-rows pantry-rows';
+    for (const item of group.items) rows.appendChild(rowEl(withIntent(item)));
     section.appendChild(rows);
     list.appendChild(section);
   }
@@ -579,10 +651,10 @@ function rowEl(item) {
   const status = pantryItemStatus(item, state.todayKey);
 
   const li = document.createElement('li');
-  // Geteilte Zeilen-Grammatik (styles/kitchen-row.css). Ohne --reserve-end: der
+  // Geteilte Zeilen-Grammatik (styles/list-row.css). Ohne --reserve-end: der
   // Warenkorb sitzt nicht mehr an der Zeilenkante, sondern in einem festen Slot
   // am Anfang der Bedienzone (siehe unten).
-  li.className = 'kitchen-row pantry-row';
+  li.className = 'list-row pantry-row';
   li.dataset.id = String(item.id);
   if (status.out) li.classList.add('pantry-row--out');
 
@@ -596,7 +668,7 @@ function rowEl(item) {
   // Zusatz ans Ende.
   const main = document.createElement('button');
   main.type = 'button';
-  main.className = 'kitchen-row__main kitchen-row__main--interactive pantry-row__main';
+  main.className = 'list-row__main list-row__main--interactive pantry-row__main';
   main.dataset.action = 'edit';
 
   // Name und Status in EINER Zeile: das Badge qualifiziert den Artikel, es ist
@@ -606,15 +678,26 @@ function rowEl(item) {
   headline.className = 'pantry-row__headline';
 
   const name = document.createElement('span');
-  name.className = 'kitchen-row__name';
+  name.className = 'list-row__name';
   name.textContent = item.name;
   headline.appendChild(name);
 
-  for (const badge of [expiryBadge(item), stockBadge(item)].filter(Boolean)) {
-    const el = document.createElement('span');
-    el.className = `pantry-badge pantry-badge--${badge.tone}`;
-    el.textContent = badge.text;
-    headline.appendChild(el);
+  // DIE BADGES SIND EIN PAAR, ALSO EIN KNOTEN (Critique 2026-08-13).
+  // Ohne ihn entscheidet die Restbreite, WIE VIELE von ihnen umbrechen: gemessen
+  // stand „Vollmilch" mit „Läuft heute ab" in Zeile zwei und „Fast leer" in
+  // Zeile drei, also 109,5px gegen 86,3px derselben Liste mit zwei Badges
+  // nebeneinander. Was zusammen gelesen wird, bricht zusammen um.
+  const badges = [expiryBadge(item), stockBadge(item)].filter(Boolean);
+  if (badges.length) {
+    const wrap = document.createElement('span');
+    wrap.className = 'pantry-row__badges';
+    for (const badge of badges) {
+      const el = document.createElement('span');
+      el.className = `pantry-badge pantry-badge--${badge.tone}`;
+      el.textContent = badge.text;
+      wrap.appendChild(el);
+    }
+    headline.appendChild(wrap);
   }
   main.appendChild(headline);
 
@@ -625,21 +708,58 @@ function rowEl(item) {
   // Das MHD steht VOR dem Lagerort: die Zeile ellipsiert am Ende, und bei einem
   // langen Ortsnamen fiel sonst genau das Kerndatum weg - dieselbe Trunkierung,
   // gegen die die Kategorie hier schon gewichen ist (Critique, Riley-Fund).
-  const metaParts = [];
+  // DIE MENGE FÜHRT DIE META-ZEILE, sie steht nicht mehr zwischen den Knöpfen.
+  //
+  // Bis zum 12.08.2026 sass sie im Stepper und rückte unter 30rem Trägerbreite
+  // ÜBER die beiden Knöpfe (`flex-wrap` an .pantry-stepper). Das gab dem Namen
+  // die Breite, die er braucht, kostete aber rund 25px Höhe in JEDER Zeile:
+  // gemessen 89,4px bei 390x844, die höchste Zeile der App nach dem Budget.
+  //
+  // Der Umzug kostet KEINEN Pixel Breite. Der umgebrochene Stepper war bereits
+  // exakt so breit wie seine Knopfzeile (100px), und ohne den Wert ist er es
+  // weiterhin - die Bedienzone bleibt gleich breit, der Name behält seine
+  // 168px. Was wegfällt, ist nur die zweite Zeile.
+  //
+  // UND DER EINKAUF MACHT ES SEIT JEHER SO: `.list-row__meta` trägt dort
+  // `item.quantity`. Zwei Tabs derselben Küchenleiste schrieben dieselbe Angabe
+  // an zwei Orte.
+  //
+  // Sie steht VORN, obwohl das MHD dahinter dadurch seitlich wandert, wenn sich
+  // die Menge ändert: die Menge ist die Frage, die eine Vorratsliste
+  // beantwortet, und die Zeile ellipsiert am Ende. Hinten stünde sie genau
+  // dort, wo bei langem Ortsnamen gekappt wird.
+  const meta = document.createElement('span');
+  meta.className = 'list-row__meta';
+  const quantity = document.createElement('span');
+  quantity.className = 'pantry-row__quantity';
+  quantity.textContent = quantityText(item);
+  meta.appendChild(quantity);
+
+  /* MHD und Lagerort sind EIGENE Knoten, keine zusammengefügte Zeichenkette.
+   *
+   * Grund ist die Regel gleich daneben (pantry.css): auf einer schmalen Zeile
+   * MIT Warenkorb bleiben 168px statt 220px, und dort passt das MHD nicht mehr.
+   * Weggelassen wird es dann, nicht abgeschnitten - ein halbes Datum
+   * („MHD 23.12….") ist keine Angabe, sondern sieht aus wie ein Fehler. Damit
+   * CSS das entscheiden kann, muss es ein eigenes Element sein.
+   *
+   * Das Trennzeichen steht IM Knoten, sonst bliebe es beim Weglassen als
+   * einsames „·" zurück. */
   if (item.expires_on) {
-    metaParts.push(t('pantry.bestBefore', { date: formatDate(item.expires_on) }));
+    const expiry = document.createElement('span');
+    expiry.className = 'pantry-row__expiry';
+    expiry.textContent = ` · ${t('pantry.bestBefore', { date: formatDate(item.expires_on) })}`;
+    meta.appendChild(expiry);
   }
   // Im gefilterten (flachen) Modus trägt die Meta-Zeile den Lagerort, den sonst
   // die Gruppen-Überschrift zeigt.
   if (state.filter !== 'all') {
-    metaParts.push(item.location_name ? locationLabel(item.location_name) : t('pantry.unlocated'));
+    const place = document.createElement('span');
+    place.className = 'pantry-row__place';
+    place.textContent = ` · ${item.location_name ? locationLabel(item.location_name) : t('pantry.unlocated')}`;
+    meta.appendChild(place);
   }
-  if (metaParts.length) {
-    const meta = document.createElement('span');
-    meta.className = 'kitchen-row__meta';
-    meta.textContent = metaParts.join(' · ');
-    main.appendChild(meta);
-  }
+  main.appendChild(meta);
 
   // Was der Button tut - nur für Screenreader, am Ende des Namens.
   const action = document.createElement('span');
@@ -659,7 +779,7 @@ function rowEl(item) {
   // deshalb wandert der Knoten selbst. Jeder Button trägt den Artikelnamen im
   // Label, die Tab-Folge bleibt also auch ohne vorangehenden Namen eindeutig.
   const actions = document.createElement('div');
-  actions.className = 'kitchen-row__actions';
+  actions.className = 'list-row__actions';
 
   // Der Warenkorb sitzt am ANFANG der Bedienzone, nicht an der rechten
   // Zeilenkante.
@@ -694,12 +814,12 @@ function rowEl(item) {
   minus.setAttribute('aria-label', `${t('pantry.decrease')}: ${item.name}`);
   minus.insertAdjacentHTML('beforeend', '<i data-lucide="minus" class="icon-sm" aria-hidden="true"></i>');
 
-  const value = document.createElement('span');
-  value.className = 'pantry-stepper__value';
-  value.textContent = quantityText(item);
-  // BEWUSST keine eigene Live-Region je Zeile: bei 60 Artikeln wären das 60
-  // Live-Regionen, und Screenreader behandeln eine solche Wolke unzuverlässig.
-  // Die Ansage übernimmt die eine geteilte Region der Seite (#pantry-live).
+  // Der Wert steht in der Meta-Zeile (siehe dort). BEWUSST keine eigene
+  // Live-Region je Zeile: bei 60 Artikeln wären das 60 Live-Regionen, und
+  // Screenreader behandeln eine solche Wolke unzuverlässig. Die Ansage
+  // übernimmt die eine geteilte Region der Seite (#pantry-live) - sie ist auch
+  // der Grund, aus dem der Wert nicht neben den Knöpfen stehen MUSS, um die
+  // Änderung zu melden.
 
   const plus = document.createElement('button');
   plus.type = 'button';
@@ -709,7 +829,7 @@ function rowEl(item) {
   plus.insertAdjacentHTML('beforeend', '<i data-lucide="plus" class="icon-sm" aria-hidden="true"></i>');
 
   stepper.dataset.step = String(step);
-  stepper.append(minus, value, plus);
+  stepper.append(minus, plus);
   actions.appendChild(stepper);
 
   // Name zuerst, Bedienung danach: eine Vorratsliste wird nach Namen gescannt,
@@ -762,60 +882,74 @@ function onListClick(e) {
  */
 function adjustQuantity(item, direction, row) {
   const step = Number(row.querySelector('.pantry-stepper')?.dataset.step) || 1;
-  const previous = Number(item.quantity);
+  // Der Ausgangspunkt ist, was die Zeile ZEIGT - eine schon laufende Absicht
+  // eingeschlossen, sonst zaehlte jeder Schritt vom Serverstand aus neu.
+  const previous = quantityOf(item);
   const next = normalizePantryQuantity(previous + direction * step, { fallback: previous });
   if (next === previous) return;
 
-  item.quantity = next;
-  vibrate(8);
-  refreshRowQuantity(row, item);
-  if (renderFilters().wasReset) renderList();
-
-  const pending = pendingQuantity.get(item.id);
-  if (pending) clearTimeout(pending.timer);
-  // Rollback ist der letzte serverbestätigte Wert, nicht der letzte optimistische:
-  // der Eintrag bleibt bis zum Settle in der Map, deshalb überlebt er auch einen
-  // Tap während des laufenden Requests.
-  const rollback = pending?.rollback ?? previous;
+  const vorher = intents.get(item.id);
+  if (vorher) clearTimeout(vorher.timer);
   const seq = ++_quantitySeq;
 
   const timer = setTimeout(async () => {
     try {
-      const res = await api.patch(`/pantry/${item.id}`, { quantity: item.quantity });
-      // Überholte Antwort verwerfen. Ohne diese Prüfung überschrieb eine
-      // langsame Antwort den neueren optimistischen Stand, die Menge sprang
-      // sichtbar zurück und der nächste PATCH schrieb die veraltete Zahl fest.
-      if (pendingQuantity.get(item.id)?.seq !== seq) return;
-      pendingQuantity.delete(item.id);
-      Object.assign(item, res.data);
-      refreshRowQuantity(row, item);
+      const res = await api.patch(`/pantry/${item.id}`, { quantity: next });
+      // Ueberholt: ein spaeterer Schritt hat die Absicht ersetzt, sein Ausgang
+      // entscheidet. Der Server steht trotzdem auf `next` - das gehoert in den
+      // SERVERSTAND, damit ein Fehlschlag des spaeteren nicht daran vorbei
+      // zurueckfaellt.
+      const aktuell = intents.get(item.id);
+      // NUR die Menge aus der Antwort. Sie ist ein Schnappschuss vom Zeitpunkt
+      // DIESES Schreibvorgangs und fuer nichts anderes autoritativ - hat jemand
+      // Name, Ort oder Notiz geaendert, holt die naechste Auffrischung das.
+      const bestaetigt = normalizePantryQuantity(res.data?.quantity, { fallback: next });
+      const current = state.items.find((i) => i.id === item.id);
+      if (current) current.quantity = bestaetigt;
+      settledAt.set(item.id, _pantryLoadSeq);
+      if (aktuell?.seq !== seq) return;
+      // Die eigene Absicht ist erfuellt und faellt - was die Zeile danach
+      // zeigt, ist der bestaetigte Serverstand.
+      intents.delete(item.id);
+      const rowNow = liveRow(item.id, row);
+      if (rowNow && current) refreshRowQuantity(rowNow, withIntent(current));
     } catch (err) {
-      if (pendingQuantity.get(item.id)?.seq !== seq) return;
-      pendingQuantity.delete(item.id);
-      item.quantity = rollback;
+      const aktuell = intents.get(item.id);
+      if (aktuell?.seq !== seq) return;
+      // DIE ABSICHT FAELLT, mehr passiert nicht. Was die Zeile danach zeigt,
+      // ist der Serverstand - der aktuellste, den wir haben. Es gibt keinen
+      // gemerkten Ruecksprungwert mehr, der dabei veralten koennte.
+      intents.delete(item.id);
+      const current = state.items.find((i) => i.id === item.id);
       // Die Seite wurde inzwischen verlassen: kein Zurückzeichnen einer
       // abgehängten Zeile und kein Vorrats-Toast auf einer fremden Seite.
-      if (!row.isConnected) return;
-      refreshRowQuantity(row, item);
+      const rowNow = liveRow(item.id, row);
+      if (!rowNow) return;
+      if (current) refreshRowQuantity(rowNow, withIntent(current));
       if (renderFilters().wasReset) renderList();
       window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
     }
-  }, QUANTITY_DEBOUNCE_MS);
+  }, QUANTITY_DEBOUNCE_MS_OVERRIDE ?? QUANTITY_DEBOUNCE_MS);
 
-  // `flush` schickt den gedebouncten Wert sofort ab, wenn die Seite verschwindet.
-  pendingQuantity.set(item.id, {
-    timer,
-    rollback,
+  intents.set(item.id, {
+    quantity: next,
     seq,
+    timer,
+    // `flush` schickt den gedebouncten Wert sofort ab, wenn die Seite
+    // verschwindet. Die Absicht faellt dabei nicht - der Rundlauf laeuft ja
+    // noch, nur ohne Timer.
     flush: () => {
       clearTimeout(timer);
-      pendingQuantity.delete(item.id);
       // keepalive: der Request muss den Seitenwechsel überleben. Ohne ihn
       // bricht der Browser ihn mit dem Dokument ab.
-      api.patch(`/pantry/${item.id}`, { quantity: item.quantity }, { keepalive: true })
+      api.patch(`/pantry/${item.id}`, { quantity: next }, { keepalive: true })
         .catch(() => { /* Die Seite ist weg; ein Toast hätte kein Ziel mehr. */ });
     },
   });
+
+  vibrate(8);
+  refreshRowQuantity(row, withIntent(item));
+  if (renderFilters().wasReset) renderList();
   bindQuantityFlush();
 }
 
@@ -837,7 +971,7 @@ function bindQuantityFlush() {
   if (_quantityFlushBound) return;
   _quantityFlushBound = true;
   window.addEventListener('pagehide', () => {
-    for (const entry of [...pendingQuantity.values()]) entry.flush?.();
+    for (const intent of [...intents.values()]) intent.flush?.();
   });
 }
 
@@ -848,8 +982,22 @@ function announce(message) {
 }
 
 /** Aktualisiert Menge, Badges und Leer-Zustand einer Zeile ohne Listen-Rebuild. */
+/**
+ * Die Zeile eines Artikels, wie sie JETZT im Dokument steht.
+ *
+ * Nach einer Auffrischung hat `renderList()` die Liste neu gebaut; die beim
+ * Schritt festgehaltene Zeile haengt dann an nichts mehr, und ein
+ * Zurueckzeichnen darauf waere unsichtbar. Findet sich keine angehaengte
+ * Zeile, ist die Seite verlassen - dann bleibt es beim State.
+ */
+function liveRow(id, fallback) {
+  const el = _container?.querySelector(`.pantry-row[data-id="${id}"]`);
+  if (el?.isConnected) return el;
+  return fallback?.isConnected ? fallback : null;
+}
+
 function refreshRowQuantity(row, item) {
-  const value = row.querySelector('.pantry-stepper__value');
+  const value = row.querySelector('.pantry-row__quantity');
   if (value) value.textContent = quantityText(item);
   announce(`${item.name}: ${quantityText(item)}`);
 
@@ -1036,6 +1184,7 @@ function openItemModal(mode, item = null) {
       panel.querySelector('#pantry-delete')?.addEventListener('click', async () => {
         closeSharedModal({ force: true });
         await removeItem(item);
+        refocusAfterRender();
       });
 
       wireBlurValidation(panel);
@@ -1117,20 +1266,32 @@ async function removeItem(item) {
 async function openLocationManager() {
   await import('/components/category-manager.js');
 
-  let changed = false;
+  // Die Auffrischung haengt am Ereignis, nicht am Schliessen: beim Loeschen
+  // raeumt `confirmOverModal` das Modal darunter ab, bevor `api.delete` laeuft
+  // (siehe `_notifyChanged` in components/category-manager.js). Ein in onClose
+  // ausgewerteter Merker stuende hier auf false, und die Filterleiste boete
+  // weiter einen Lagerort an, den es nicht mehr gibt.
   const onChanged = async () => {
-    changed = true;
     try {
       await loadPantry();
-    } catch { /* Fehler meldet der Manager selbst */ }
+      renderFilters();
+      renderList();
+      refocusAfterRender();
+    } catch (err) {
+      // NICHT „meldet der Manager selbst": der quittiert nur seine eigene
+      // Mutation, und `_notifyChanged()` kommt erst nach deren Erfolg. Was hier
+      // ankommt, ist immer ein Fehler DIESER Auffrischung - und der erklaert als
+      // einziger, warum die Seite den alten Stand behaelt.
+      console.error('[Pantry] Auffrischen nach Ort-Aenderung fehlgeschlagen:', err);
+      window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+    }
   };
 
-  let manager = null;
   openSharedModal({
     title: t('pantry.manageLocations'),
     content: '<yuvomi-category-manager></yuvomi-category-manager>',
     onSave: (panel) => {
-      manager = panel.querySelector('yuvomi-category-manager');
+      const manager = panel.querySelector('yuvomi-category-manager');
       if (!manager) return;
       manager.addEventListener('category-manager-changed', onChanged);
       // Dieselbe geteilte Komponente wie Einkaufskategorien: die Lagerort-API
@@ -1142,16 +1303,34 @@ async function openLocationManager() {
         titleKey: 'pantry.manageLocations',
         hintKey: 'pantry.manageLocationsHint',
         addPlaceholderKey: 'pantry.addLocation',
+        // Lagerorte, keine Kategorien: der Server loescht auch belegte und
+        // laesst die Artikel unzugeordnet zurueck (`orphaned` in der Antwort).
+        deleteDetailKey: 'pantry.locationDeleteConfirmDetail',
         groups: [{ key: '', labelKey: '', addLabelKey: 'common.add' }],
       });
     },
-    onClose: () => {
-      manager?.removeEventListener('category-manager-changed', onChanged);
-      manager = null;
-      if (changed) {
-        renderFilters();
-        renderList();
-      }
-    },
+    // Bewusst KEIN onClose, das den Listener abmeldet - es liefe vor dem
+    // Loeschen. Das Element entsteht je Oeffnen neu und geht mit dem Overlay.
   });
 }
+
+// Testfläche: die Mengen-Entprellung ist nur verhaltensgetrieben pruefbar - der
+// Fehler steckt in der REIHENFOLGE von Schritt und Auffrischung, nicht im
+// Vorhandensein einer Wache. `state` bleibt ERREICHBAR, nicht ERSETZBAR
+// (dasselbe Muster wie in shopping.js).
+export const __test = {
+  state,
+  adjustQuantity,
+  loadPantry,
+  intents,
+  quantityOf,
+  withIntent,
+  setContainerForTest: (el) => { _container = el; },
+  // Eine echte, aber knapp bemessene Frist statt eines Uhr-Objekts - wie beim
+  // Sammelaktions-Automaten des Einkaufs.
+  setQuantityDebounceMsForTest: (ms) => { QUANTITY_DEBOUNCE_MS_OVERRIDE = ms; },
+  // Aufraeumen am ANFANG: `_pantryLoadSeq` waechst global weiter, und eine
+  // Bestaetigung aus einem frueheren Fall schuetzt sonst den Artikel des
+  // naechsten vor seiner eigenen Auffrischung.
+  resetLoadOrderForTest: () => { _pantryAppliedLoad = 0; settledAt.clear(); },
+};

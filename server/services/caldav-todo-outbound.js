@@ -14,10 +14,22 @@
 // nicht durchgeht, bleibt vorgemerkt und läuft im nächsten Sync mit
 // (at-least-once).
 //
-// Ein Umzug zwischen Listen fehlt bewusst - anders als ein Termin trägt eine
-// Aufgabe kein wählbares Ziel, sie gehört zu der Liste, aus der sie kam. Aus
-// demselben Grund geht auch nichts hinaus, was hier neu entstanden ist: ohne
-// Zielwahl gäbe es keine Liste, in die es gehörte.
+// Ein Umzug zwischen Listen fehlt weiterhin bewusst: eine Aufgabe gehört zu der
+// Liste, aus der sie kam.
+//
+// Das Anlegen dagegen gibt es seit #695. Die alte Begründung ("ohne Zielwahl
+// gäbe es keine Liste, in die es gehörte") stimmte nicht mehr: die Zielwahl gibt
+// es seit v1.79.0 bei den Terminen (#620), und die Oberfläche versprach die
+// Rückrichtung die ganze Zeit über in beide Richtungen. Eine in Yuvomi angelegte
+// Aufgabe trägt jetzt ihr Ziel selbst (tasks.target_caldav_account_id +
+// target_caldav_list_url, Migration 136) und wird beim nächsten Lauf hochgeladen:
+//
+//   Anlegen → Zielspalten auf der Zeile, external_source bleibt 'local'
+//   Ändern  → outbound_dirty auf der Zeile selbst
+//   Löschen → Zeile in caldav_todo_pending_deletions (überlebt den Eintrag)
+//
+// Nach erfolgreichem Upload ist die Zeile ein gewöhnlicher Spiegel und läuft ab
+// da über dieselben Pfade wie eine vom Server geholte Aufgabe.
 // --------------------------------------------------------
 
 import { createLogger } from '../logger.js';
@@ -25,8 +37,9 @@ import * as db from '../db.js';
 import { outboundFailureAction } from './calendar-outbound.js';
 import { patchICSTodo } from '../utils/ics-patch.js';
 import { createCalDAVClient, collectionUrlOf } from '../utils/caldav-client.js';
-import { localToUTC, serverTimeZone } from '../utils/timezone.js';
+import { householdTimeZone, localToUTC } from '../utils/timezone.js';
 import { loadTags } from '../utils/task-tags.js';
+import { runSerialized } from '../utils/sync-lock.js';
 
 const log = createLogger('CalDAV-Todo-Outbound');
 
@@ -104,7 +117,7 @@ export function priorityToVtodo(priority) {
  * splitDue). Ein ungeprüft als UTC verschicktes „14:30" verschöbe die Aufgabe auf
  * dem Server um den Zonenoffset.
  */
-export function dueField(date, time, tz = serverTimeZone()) {
+export function dueField(date, time, tz = householdTimeZone(null)) {
   if (!date) return null; // Property entfernen
   const day = String(date).slice(0, 10);
   if (!time) return { value: day.replace(/-/g, ''), params: ';VALUE=DATE' };
@@ -141,11 +154,11 @@ function completionFields(done, inProgress, hadCompleted) {
  * der eine rohe Zeile aus `SELECT *` durchreicht, die Tags des Servers
  * stillschweigend löschen - `reloadRow` hängt sie deshalb an.
  */
-export function icsFieldsForTask(task, hadCompleted = false) {
+export function icsFieldsForTask(task, hadCompleted = false, tz = householdTimeZone(null)) {
   const fields = {
     SUMMARY:     task.title,
     DESCRIPTION: task.description || null,
-    DUE:         dueField(task.due_date, task.due_time),
+    DUE:         dueField(task.due_date, task.due_time, tz),
     PRIORITY:    priorityToVtodo(task.priority),
     ...completionFields(task.status === 'done', task.status === 'in_progress', hadCompleted),
   };
@@ -170,12 +183,54 @@ function hasCompleted(icsText) {
 // Vormerkung: Löschung
 // --------------------------------------------------------
 
+/** Gibt es das Konto noch? */
+function accountExists(accountId) {
+  return !!db.get().prepare('SELECT 1 FROM caldav_accounts WHERE id = ?').get(accountId);
+}
+
 /**
  * Ist dieser Eintrag ein CalDAV-Spiegel, für den die Rückrichtung überhaupt gilt?
  * Lokale Aufgaben haben external_source = 'local' und gehen nirgendwohin.
+ *
+ * Das Konto muss es noch geben. `external_account_id` trägt keinen
+ * Fremdschlüssel (v45), eine gedriftete Datenbank kann also auf ein längst
+ * gelöschtes Konto zeigen - und der Tombstone darauf scheiterte am
+ * Fremdschlüssel von caldav_todo_pending_deletions, womit sich die Aufgabe
+ * lokal nicht mehr löschen ließe. Ohne Konto gibt es keinen Rückweg, also ist
+ * hier nichts vorzumerken: dieselbe Vorprüfung wie acceptsOutbound() bei den
+ * Terminen. Der Regelfall ist ohnehin abgedeckt - caldavSync.deleteAccount
+ * entkoppelt seine Zeilen (detachAccountRows), Migration v123 den Bestand.
  */
 function isMirrored(row) {
-  return !!row && row.external_source === 'caldav' && !!row.external_uid && !!row.external_account_id;
+  if (!row || row.external_source !== 'caldav') return false;
+  if (!row.external_uid || !row.external_account_id) return false;
+  return accountExists(row.external_account_id);
+}
+
+/**
+ * Löst die gespiegelten Zeilen eines Kontos von ihm ab - zu rufen, bevor das
+ * Konto verschwindet. Was hier steht, sind Nutzerdaten und bleibt; nur die
+ * Verbindung zum Server geht. Danach ist es eine gewöhnliche Aufgabe bzw. ein
+ * gewöhnlicher Einkaufsposten: kein Tombstone, kein Push, und der Prune-Lauf
+ * eines anderen Kontos fasst sie nicht an.
+ *
+ * @returns {number} Anzahl entkoppelter Zeilen
+ */
+export function detachAccountRows(accountId) {
+  let detached = 0;
+  for (const def of Object.values(MODULES)) {
+    detached += db.get().prepare(`
+      UPDATE ${def.table}
+         SET external_source     = 'local',
+             external_uid        = NULL,
+             external_account_id = NULL,
+             external_object_url = NULL,
+             outbound_dirty      = 0,
+             outbound_attempts   = 0
+       WHERE external_source = 'caldav' AND external_account_id = ?
+    `).run(accountId).changes;
+  }
+  return detached;
 }
 
 /**
@@ -323,6 +378,260 @@ function reloadRow(module, id) {
 }
 
 // --------------------------------------------------------
+// Vormerkung: Anlegen (#695)
+// --------------------------------------------------------
+
+/**
+ * UID einer in Yuvomi entstandenen Aufgabe.
+ *
+ * Bewusst aus der Zeilen-Id abgeleitet und nicht zufällig: scheitert der Schritt
+ * NACH dem Upload (die Zeile auf 'caldav' umzuschreiben), nimmt der nächste Lauf
+ * dieselbe UID und überschreibt das Objekt, statt ein zweites anzulegen. Eine
+ * Zufalls-UID hätte an derselben Stelle eine Dublette hinterlassen.
+ *
+ * Neuer Namensraum, deshalb `yuvomi`: die oikos-Kennungen der Termine bleiben aus
+ * Rückwärtskompatibilität stehen, sie werden aber nicht fortgeschrieben.
+ */
+export function todoUidFor(module, id) {
+  return `yuvomi-${module === 'shopping' ? 'item' : 'task'}-${id}@yuvomi.local`;
+}
+
+/**
+ * Vollständiges VTODO-Objekt für einen Eintrag, den es auf dem Server noch nicht
+ * gibt. Gebaut wird ein Gerüst mit UID und DTSTAMP, das anschließend durch
+ * denselben Patcher läuft wie jede spätere Änderung - so gibt es genau EINE
+ * Stelle, die Yuvomi-Felder in VTODO-Properties übersetzt. Eine zweite
+ * Serialisierung neben icsFieldsForTask wäre die Sorte Doppelung, die
+ * auseinanderläuft, sobald ein Feld dazukommt.
+ */
+export function buildTodoICS(module, row, uid) {
+  const def = moduleDef(module);
+  const skeleton = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//Yuvomi//CalDAV Sync//EN',
+    'BEGIN:VTODO',
+    `UID:${uid}`,
+    `DTSTAMP:${utcStamp()}`,
+    'END:VTODO',
+    'END:VCALENDAR',
+  ].join('\r\n');
+
+  return patchICSTodo(skeleton, uid, def.icsFields(row, false, householdTimeZone(db.get())));
+}
+
+/**
+ * Einträge, die hier entstanden sind und auf ihren ersten Upload warten.
+ *
+ * Unteraufgaben bleiben ausgenommen: sie sind Punkte einer Checkliste, und als
+ * eigenständige VTODOs stünden sie auf dem Server gleichrangig neben ihrer
+ * Elternaufgabe - der Zusammenhang, der sie überhaupt zu Unteraufgaben macht,
+ * ginge dabei verloren. VTODO kennt zwar RELATED-TO, aber der Inbound wertet es
+ * nicht aus; die Rundreise würde sie also als lose Aufgaben zurückbringen.
+ */
+export function pendingCreations(accountId, module = 'tasks') {
+  const def = moduleDef(module);
+  if (module !== 'tasks') return [];
+  return db.get().prepare(`
+    SELECT * FROM ${def.table}
+     WHERE external_source          = 'local'
+       AND target_caldav_account_id = ?
+       AND target_caldav_list_url IS NOT NULL
+       AND parent_task_id IS NULL
+     ORDER BY id
+  `).all(accountId);
+}
+
+/**
+ * Einkaufsartikel einer gespiegelten Liste, die es auf dem Server noch nicht gibt.
+ *
+ * `external_source = 'local'` ist der Spalten-Default, trennt also genau die
+ * hier angelegten Artikel von den vom Server geholten Spiegeln.
+ */
+export function pendingShoppingCreations(listId) {
+  return db.get().prepare(`
+    SELECT * FROM shopping_items
+     WHERE external_source = 'local'
+       AND list_id         = ?
+     ORDER BY id
+  `).all(listId);
+}
+
+/**
+ * Konten, unter denen ein hier angelegter Einkaufsartikel auf seinen Upload
+ * wartet (#831). Anders als eine Aufgabe merkt sich ein Artikel kein Ziel - die
+ * offene Arbeit ist deshalb nur über die Listenzuordnung sichtbar.
+ */
+function accountsWithPendingShoppingCreations() {
+  try {
+    return db.get().prepare(`
+      SELECT DISTINCT sel.account_id AS account_id
+        FROM caldav_reminder_selection sel
+        JOIN shopping_items i ON i.list_id = sel.target_list_id
+       WHERE sel.enabled = 1
+         AND sel.target_module = 'shopping'
+         AND sel.target_list_id IS NOT NULL
+         AND i.external_source = 'local'
+    `).all().map((r) => r.account_id).filter(Boolean);
+  } catch (err) {
+    log.warn(`Pending shopping creations are not readable (${err.message}); treating them as none.`);
+    return [];
+  }
+}
+
+/** Konten mit wartenden Uploads. */
+function accountsWithPendingCreations() {
+  try {
+    return db.get().prepare(`
+      SELECT DISTINCT target_caldav_account_id AS account_id FROM tasks
+       WHERE external_source = 'local' AND target_caldav_account_id IS NOT NULL
+    `).all().map((r) => r.account_id).filter(Boolean);
+  } catch (err) {
+    // Gedriftete Datenbank ohne Migration 136: kein Grund, den ganzen
+    // Sofortversuch scheitern zu lassen.
+    log.warn(`Pending creations are not readable (${err.message}); treating them as none.`);
+    return [];
+  }
+}
+
+/** Das Ziel wieder abräumen - nach dem Upload und wenn es unerreichbar ist. */
+function clearCreationTarget(id) {
+  db.get().prepare(
+    'UPDATE tasks SET target_caldav_account_id = NULL, target_caldav_list_url = NULL WHERE id = ?'
+  ).run(id);
+}
+
+/**
+ * Einen lokalen Eintrag auf dem Server anlegen und die Zeile zum Spiegel machen.
+ *
+ * Gemeinsamer Kern beider Anlege-Wege: Aufgaben tragen ihr Ziel selbst, ein
+ * Einkaufsartikel erbt es von der Listenzuordnung (siehe unten). Was danach
+ * passiert, ist identisch - deshalb steht es hier nur einmal.
+ *
+ * Die Objekt-URL wird gleich festgehalten: ohne sie wäre der frisch
+ * hochgeladene Eintrag für Änderungen und Löschungen unerreichbar, bis der
+ * nächste Inbound-Lauf ihn wiederfindet (dieselbe Lehre wie bei den Terminen,
+ * #593).
+ *
+ * @returns {Promise<boolean>} false, wenn sich kein VTODO bauen ließ
+ */
+async function uploadNewTodo(client, collection, module, row, accountId) {
+  const def = moduleDef(module);
+  const uid = todoUidFor(module, row.id);
+  const ics = buildTodoICS(module, row, uid);
+  if (!ics) return false;
+
+  await client.createCalendarObject({
+    calendar:   collection,
+    filename:   `${uid}.ics`,
+    iCalString: ics,
+  });
+
+  const objectUrl = `${String(collection.url).replace(/\/?$/, '/')}${uid}.ics`;
+  db.get().prepare(`
+    UPDATE ${def.table}
+       SET external_source     = 'caldav',
+           external_uid        = ?,
+           external_account_id = ?,
+           external_object_url = ?,
+           outbound_dirty      = 0,
+           outbound_attempts   = 0
+     WHERE id = ?
+  `).run(uid, accountId, objectUrl, row.id);
+  return true;
+}
+
+/**
+ * Legt wartende Aufgaben auf dem Server an und macht sie damit zu Spiegeln.
+ *
+ * @param {object} client       tsdav-Client
+ * @param {number} accountId
+ * @param {string} module
+ * @param {Map}    listsByUrl   Listen-URL → Collection des Servers
+ * @returns {Promise<number>} erfolgreich hochgeladene Einträge
+ */
+export async function processPendingCreations(client, accountId, module, listsByUrl) {
+  const rows = pendingCreations(accountId, module);
+  if (rows.length === 0) return 0;
+
+  let done = 0;
+  for (const row of rows) {
+    const collection = listsByUrl.get(row.target_caldav_list_url);
+    if (!collection) {
+      // Die Liste ist weg oder wurde abgewählt. Das Ziel stehen zu lassen hieße,
+      // es bei jedem Lauf erneut zu versuchen; die Aufgabe bleibt lokal, was der
+      // Zustand vor #695 war und keine Daten kostet.
+      log.warn(`Reminder list ${row.target_caldav_list_url} is not available, keeping task ${row.id} local.`);
+      clearCreationTarget(row.id);
+      continue;
+    }
+
+    const fresh = reloadRow(module, row.id);
+    if (!fresh) continue; // zwischenzeitlich gelöscht
+
+    try {
+      if (await uploadNewTodo(client, collection, module, fresh, accountId)) {
+        clearCreationTarget(fresh.id);
+        done++;
+      } else {
+        log.error(`Could not build a VTODO for task ${fresh.id}, keeping it local.`);
+        clearCreationTarget(fresh.id);
+      }
+    } catch (err) {
+      // Kein Zähler und kein Aufgeben: anders als eine Änderung hat ein Upload
+      // keinen Stand, der veralten könnte. Er bleibt vorgemerkt und läuft im
+      // nächsten Lauf mit, so lange bis er durchgeht oder das Ziel verschwindet.
+      log.warn(`Could not upload task ${fresh.id} to ${row.target_caldav_list_url}: ${err.message}`);
+    }
+  }
+  return done;
+}
+
+/**
+ * Hier angelegte Einkaufsartikel einer gespiegelten Liste hochladen (#831).
+ *
+ * Ein Einkaufsartikel trägt - anders als eine Aufgabe - kein eigenes Ziel: die
+ * Zuordnung Server-Liste ↔ Yuvomi-Liste steht schon in
+ * caldav_reminder_selection, und genau sie ist die Zielangabe. Deshalb braucht
+ * dieser Weg weder Zielspalten noch eine Migration; Kandidat ist jeder Artikel
+ * der zugeordneten Liste, der noch kein Spiegel ist.
+ *
+ * Ohne das war die Rückrichtung für den Einkauf halb da: Umbenennen, Abhaken und
+ * Löschen liefen über processPendingUpdates/-Deletions zum Server, ein neu
+ * angelegter Artikel blieb aber für immer lokal - die Liste lief nach jedem
+ * neuen Eintrag auseinander, obwohl die Oberfläche einen Zwei-Wege-Sync
+ * verspricht.
+ *
+ * @param {object} client      tsdav-Client
+ * @param {number} accountId
+ * @param {Array<{listUrl: string, targetListId: number}>} targets  aktive Zuordnungen
+ * @param {Map}    listsByUrl  Listen-URL → Collection des Servers
+ * @returns {Promise<number>} erfolgreich hochgeladene Artikel
+ */
+export async function processPendingShoppingCreations(client, accountId, targets, listsByUrl) {
+  let done = 0;
+  for (const { listUrl, targetListId } of targets) {
+    if (!targetListId) continue;
+    const collection = listsByUrl.get(listUrl);
+    if (!collection) continue;
+
+    for (const row of pendingShoppingCreations(targetListId)) {
+      const fresh = reloadRow('shopping', row.id);
+      if (!fresh) continue; // zwischenzeitlich gelöscht
+
+      try {
+        if (await uploadNewTodo(client, collection, 'shopping', fresh, accountId)) done++;
+        else log.error(`Could not build a VTODO for shopping item ${fresh.id}, keeping it local.`);
+      } catch (err) {
+        // Wie oben: bleibt lokal und läuft im nächsten Lauf wieder mit.
+        log.warn(`Could not upload shopping item ${fresh.id} to ${listUrl}: ${err.message}`);
+      }
+    }
+  }
+  return done;
+}
+
+// --------------------------------------------------------
 // Ausführung
 // --------------------------------------------------------
 
@@ -416,7 +725,7 @@ export async function processPendingUpdates(client, accountId, module, objectInd
     if (!fresh) continue; // parallel gelöscht - der Tombstone-Pfad übernimmt
 
     const patched = patchICSTodo(
-      known.data, row.external_uid, def.icsFields(fresh, hasCompleted(known.data))
+      known.data, row.external_uid, def.icsFields(fresh, hasCompleted(known.data), householdTimeZone(db.get()))
     );
     if (!patched) {
       log.warn(`VTODO ${row.external_uid} has no editable component in its calendar object, dropping its update.`);
@@ -473,7 +782,52 @@ function accountsWithPendingWork() {
       add(row.account_id, module);
     }
   }
+  for (const accountId of accountsWithPendingCreations()) add(accountId, 'tasks');
+  for (const accountId of accountsWithPendingShoppingCreations()) add(accountId, 'shopping');
   return buckets;
+}
+
+/**
+ * Die für Aufgaben freigeschalteten Listen eines Kontos als Collection-Objekte.
+ *
+ * Der Umweg über die Auswahltabelle ist Absicht: hochgeladen wird nur in eine
+ * Liste, die der Haushalt für Aufgaben freigegeben hat. Ein Ziel, das inzwischen
+ * abgewählt wurde, taucht hier nicht mehr auf, und processPendingCreations gibt
+ * die Aufgabe dann wieder frei, statt sie ewig zu versuchen.
+ */
+async function taskListsOf(client, accountId) {
+  const selected = db.get().prepare(`
+    SELECT list_url FROM caldav_reminder_selection
+     WHERE account_id = ? AND enabled = 1 AND target_module = 'tasks'
+  `).all(accountId).map((r) => r.list_url);
+  if (!selected.length) return new Map();
+
+  const allowed = new Set(selected);
+  const calendars = await client.fetchCalendars();
+  return new Map(
+    (calendars || []).filter((c) => allowed.has(c.url)).map((c) => [c.url, c])
+  );
+}
+
+/**
+ * Die für den Einkauf freigeschalteten Zuordnungen eines Kontos (#831).
+ * Gegenstück zu taskListsOf: dort steht das Ziel am Eintrag, hier an der
+ * Zuordnung. Bewusst ohne Netzzugriff, damit der Aufrufer erst prüfen kann, ob
+ * überhaupt etwas wartet - der Listenabruf ist der teure Teil.
+ */
+function shoppingSelectionsOf(accountId) {
+  return db.get().prepare(`
+    SELECT list_url, target_list_id FROM caldav_reminder_selection
+     WHERE account_id = ? AND enabled = 1 AND target_module = 'shopping'
+       AND target_list_id IS NOT NULL
+  `).all(accountId).map((r) => ({ listUrl: r.list_url, targetListId: r.target_list_id }));
+}
+
+/** Collection-Objekte zu den Zuordnungen - ein Listenabruf. */
+async function collectionsForTargets(client, targets) {
+  const allowed   = new Set(targets.map((tgt) => tgt.listUrl));
+  const calendars = await client.fetchCalendars();
+  return new Map((calendars || []).filter((c) => allowed.has(c.url)).map((c) => [c.url, c]));
 }
 
 /**
@@ -522,8 +876,12 @@ async function fetchObjectsByUrl(client, wanted) {
  * @param {{createClient?: Function}} [opts] Client-Factory (Tests)
  * @returns {Promise<{deleted:number,updated:number}>}
  */
-export async function flushOutbound({ createClient } = {}) {
-  const total  = { deleted: 0, updated: 0 };
+export async function flushOutbound(opts = {}) {
+  return runSerialized('caldav-todo', 'flush', () => runFlushOutbound(opts));
+}
+
+async function runFlushOutbound({ createClient } = {}) {
+  const total  = { deleted: 0, updated: 0, created: 0 };
   const work   = accountsWithPendingWork();
   if (work.size === 0) return total;
 
@@ -553,6 +911,24 @@ export async function flushOutbound({ createClient } = {}) {
         // bleibt für den Sync liegen.
         total.deleted += await processPendingDeletions(client, accountId, module, objectIndex, false);
         total.updated += await processPendingUpdates(client, accountId, module, objectIndex);
+
+        // Uploads brauchen die Collection selbst, nicht einzelne Objekte - und
+        // damit den einzigen Listenabruf in diesem Pfad. Er läuft deshalb nur,
+        // wenn wirklich etwas wartet.
+        if (module === 'tasks' && pendingCreations(accountId, module).length) {
+          total.created += await processPendingCreations(
+            client, accountId, module, await taskListsOf(client, accountId)
+          );
+        }
+        if (module === 'shopping') {
+          const targets = shoppingSelectionsOf(accountId)
+            .filter((tgt) => pendingShoppingCreations(tgt.targetListId).length);
+          if (targets.length) {
+            total.created += await processPendingShoppingCreations(
+              client, accountId, targets, await collectionsForTargets(client, targets)
+            );
+          }
+        }
       }
     } catch (err) {
       log.warn(`[Account ${accountId}] Immediate outbound attempt failed: ${err.message}`);

@@ -11,7 +11,11 @@ import { hashPassword } from '../utils/password.js';
 import * as db from '../db.js';
 import { normalizeAvatarData, syncFamilyMemberArtifacts } from '../auth.js';
 import { collectErrors, color, date, datetime, month, num, oneOf, str, id as validateId, MAX_SHORT, MAX_TEXT, MAX_TITLE } from '../middleware/validate.js';
+import { isAdminRequest } from '../middleware/require-admin.js';
 import { minutesBetween, computeHourlyAmount } from '../services/housekeeping-billing.js';
+import { sendDocumentDeletionConflict } from '../services/document-deletion-lock.js';
+import { assertDocumentLinkTargetsAvailable } from '../services/document-links.js';
+import { dataUrlContentMatches } from '../utils/file-signature.js';
 import {
   formatDateKey,
   formatMoney,
@@ -24,6 +28,8 @@ import {
   mirroredFieldsChanged,
   queueEventDeletion,
 } from '../services/calendar-outbound.js';
+import { moduleAccessVerdict, MODULE_ACCESS_ALLOW } from '../permissions.js';
+import { tokenAllows } from '../scopes.js';
 
 const log = createLogger('Housekeeping');
 const router = express.Router();
@@ -128,7 +134,12 @@ function publicWorker(row, context = localDayContext()) {
     hourly_rate: Number(row.hourly_rate || 0),
     payment_schedule: row.payment_schedule,
     calendar_color: row.calendar_color || DEFAULT_CALENDAR_COLOR,
-    current_session: publicSession(todaySession),
+    // Zwei verschiedene Fragen, die vorher dieselbe Zeile beantworteten:
+    // `current_session` heisst "arbeitet gerade" und traegt den Auscheck-Knopf,
+    // `today_session` heisst "war heute da" und traegt die Zeitangabe darunter.
+    // Solange beide die letzte Sitzung des Tages lieferten, blieb ein Arbeiter
+    // nach dem Auschecken "eingecheckt" (#1133).
+    current_session: publicSession(loadOpenSession(row.id)),
     today_session: publicSession(todaySession),
     notes: row.notes ?? null,
     created_at: row.created_at,
@@ -180,6 +191,8 @@ function validatePhotoUrl(value) {
   const trimmed = value.trim();
   if (trimmed.length > MAX_PHOTO_DATA_LENGTH) return { value: null, error: 'Photo is too large.' };
   if (!IMAGE_DATA_RE.test(trimmed)) return { value: null, error: 'Photo must be PNG, JPEG, or WebP.' };
+  // Der Regex prueft die Deklaration, diese Zeile den Inhalt (#937).
+  if (!dataUrlContentMatches(trimmed)) return { value: null, error: 'Photo content does not match its image type.' };
   return { value: trimmed, error: null };
 }
 
@@ -322,6 +335,12 @@ function updateVisitLinks(database, session, worker, checkIn, dailyRate, extras,
           end_datetime = NULL,
           all_day = 1,
           color = ?,
+          -- Die Farbe kommt von der Betreuungskraft, nicht vom Provider: mit dem
+          -- Flag daneben führt Yuvomi sie auch weiter (#899). Ohne es schriebe
+          -- der Outbound sie als CSS3-Namen hinaus und der nächste Inbound-Lauf
+          -- holte den gerundeten Wert zurück - der Besuch wechselte still seine
+          -- Farbe, obwohl niemand sie angefasst hat.
+          color_modified = 1,
           icon = ?
       WHERE id = ?
     `).run(
@@ -482,9 +501,57 @@ function housekeepingDashboard() {
 }
 
 function assertAdmin(req, res) {
-  if (req.authRole === 'admin') return true;
+  if (isAdminRequest(req)) return true;
   res.status(403).json({ error: 'Permission denied.', code: 403 });
   return false;
+}
+
+// Ein bezahlter Besuch ist abgerechnet: der Betrag ist an eine reale Person
+// geflossen. Bis zur Bezahlung darf jedes Mitglied Datum, Satz und Extras
+// pflegen - wer die Hilfe ein- und auscheckt, korrigiert auch den Zettel.
+// Danach gilt dieselbe Grenze wie beim Anlegen des Arbeitsverhaeltnisses
+// (POST /worker): nur ein Admin aendert, loescht oder bucht einen bezahlten
+// Besuch erneut (GHSA-4p5w-5346-8598).
+function mayTouchSettled(row, req) {
+  return !row.paid_at || isAdminRequest(req);
+}
+
+function assertMayTouchSettled(existing, req, res) {
+  if (mayTouchSettled(existing, req)) return true;
+  return assertAdmin(req, res);
+}
+
+// Praesentationsfelder je Besuch (#1136, #1135): die Seite zeigt Bearbeiten,
+// Loeschen und "Zahlung zuruecknehmen" nur, wenn der Server es anbietet, statt
+// die Admin-Regel selbst nachzubauen. `can_edit`/`can_delete` lesen DIESELBE
+// Funktion wie assertMayTouchSettled - aendert sich die Regel, wandern Sperre
+// und Anzeige zusammen. Die Routen pruefen beim Schreiben trotzdem selbst: die
+// Felder sind ein Hinweis fuer die Oberflaeche, keine Berechtigung.
+//
+// Dazu die beiden Schreibgrenzen VOR den Routen, beide aus server/index.js und
+// mit derselben Pruefung, kein Nachbau: die Modulrechte eines Mitglieds
+// (moduleAccessVerdict; Housekeeping nur zum Lesen) und die Scopes eines
+// API-Tokens (tokenAllows; ein housekeeping:read-Token darf nicht schreiben,
+// auch wenn sein Nutzer es duerfte). Wer an GET /visits herankommt, aber an
+// einer der beiden scheitert, bekommt keine Aktion angeboten - auch nicht das
+// Bezahlen (`can_mark_paid`).
+function mayWriteHousekeeping(req) {
+  if (moduleAccessVerdict(req.sessionModuleAccess, 'housekeeping', 'write') !== MODULE_ACCESS_ALLOW) return false;
+  if (req.authMethod === 'api_token' && req.authScopes != null) {
+    return tokenAllows(req.authScopes, 'housekeeping', 'write');
+  }
+  return true;
+}
+
+function visitCapabilities(row, req) {
+  const writable = mayWriteHousekeeping(req);
+  const touchable = writable && mayTouchSettled(row, req);
+  return {
+    can_edit: touchable,
+    can_delete: touchable,
+    can_mark_paid: writable && !row.paid_at,
+    can_mark_unpaid: writable && Boolean(row.paid_at) && isAdminRequest(req),
+  };
 }
 
 async function createWorkerUser({ username, displayName, avatarColor, avatarData, actorUserId }) {
@@ -730,6 +797,7 @@ router.get('/visits', (req, res) => {
       payment_task_title: row.payment_task_title ?? null,
       receipt_document_name: row.receipt_document_name ?? null,
       total_amount: Number(row.daily_rate || 0) + Number(row.extras || 0),
+      ...visitCapabilities(row, req),
     }));
     const totals = visits.reduce((acc, visit) => {
       acc.total += visit.total_amount;
@@ -756,7 +824,11 @@ router.post('/work-sessions/check-in', (req, res) => {
     const workerRateType = worker.rate_type || 'daily';
     const workerHourlyRate = worker.hourly_rate ?? 0;
     const context = localDayContext(req.body);
-    if (loadTodaySession(worker.id, context)) return res.status(409).json({ error: 'A visit is already recorded today for this housekeeper.', code: 409 });
+    // Nur eine OFFENE Sitzung sperrt. Vorher sperrte jede Sitzung des Tages,
+    // auch eine laengst abgeschlossene - geteilte Schichten, eine Pause mit
+    // Wiederaufnahme und zwei getrennte Besuche am selben Tag waren damit
+    // unmoeglich (#1138).
+    if (loadOpenSession(worker.id)) return res.status(409).json({ error: 'This housekeeper is already checked in.', code: 409 });
 
     const vDailyRate = num(req.body.daily_rate, 'daily_rate', { required: true });
     const vExtras = num(req.body.extras, 'extras');
@@ -821,6 +893,7 @@ router.get('/visits/:id', (req, res) => {
       payment_task_title: row.payment_task_title ?? null,
       receipt_document_name: row.receipt_document_name ?? null,
       total_amount: Number(row.daily_rate || 0) + Number(row.extras || 0),
+      ...visitCapabilities(row, req),
     };
     res.json({ data: visit });
   } catch (err) {
@@ -835,6 +908,7 @@ router.put('/visits/:id', (req, res) => {
     if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
     const existing = db.get().prepare('SELECT * FROM housekeeping_work_sessions WHERE id = ?').get(vId.value);
     if (!existing) return res.status(404).json({ error: 'Visit not found.', code: 404 });
+    if (!assertMayTouchSettled(existing, req, res)) return;
 
     const vDate = date(req.body.date, 'date', true);
     const isHourly = existing.rate_type === 'hourly';
@@ -852,6 +926,13 @@ router.put('/visits/:id', (req, res) => {
     if (vMinutesWorked.error) return res.status(400).json({ error: vMinutesWorked.error, code: 400 });
     const errors = collectErrors([vDate, vDailyRate, vExtras, vEventTitle, vPaymentTitle, vPaymentDescription, vReceiptId]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
+    const receiptDocumentId = req.body.receipt_document_id !== undefined && vReceiptId.value !== null
+      ? assertDocumentLinkTargetsAvailable(
+        db.get(),
+        [vReceiptId.value],
+        req.authUserId || req.session.userId,
+      )[0] ?? null
+      : vReceiptId.value;
     if (vDailyRate.value < 0 || (vExtras.value ?? 0) < 0) {
       return res.status(400).json({ error: 'Amounts must be greater than or equal to zero.', code: 400 });
     }
@@ -874,7 +955,7 @@ router.put('/visits/:id', (req, res) => {
         checkIn,
         effectiveDailyRate,
         vExtras.value ?? 0,
-        req.body.receipt_document_id !== undefined ? vReceiptId.value : existing.receipt_document_id,
+        req.body.receipt_document_id !== undefined ? receiptDocumentId : existing.receipt_document_id,
         vMinutesWorked.value !== null ? vMinutesWorked.value : existing.minutes_worked,
         existing.id,
       );
@@ -893,6 +974,7 @@ router.put('/visits/:id', (req, res) => {
     const row = db.get().prepare('SELECT * FROM housekeeping_work_sessions WHERE id = ?').get(existing.id);
     res.json({ data: publicSession(row), summary: monthlySummary(row.check_in.slice(0, 7)) });
   } catch (err) {
+    if (sendDocumentDeletionConflict(res, err)) return;
     log.error('PUT /visits/:id error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
@@ -904,6 +986,7 @@ router.post('/visits/:id/pay', (req, res) => {
     if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
     const existing = db.get().prepare('SELECT * FROM housekeeping_work_sessions WHERE id = ?').get(vId.value);
     if (!existing) return res.status(404).json({ error: 'Visit not found.', code: 404 });
+    if (!assertMayTouchSettled(existing, req, res)) return;
     const paidAt = nowIso();
     db.get().transaction(() => {
       db.get().prepare('UPDATE housekeeping_work_sessions SET paid_at = ? WHERE id = ?').run(paidAt, existing.id);
@@ -919,12 +1002,43 @@ router.post('/visits/:id/pay', (req, res) => {
   }
 });
 
+// Der Rueckweg zu /pay (#1136), nur fuer Admins: ein bezahlter Besuch ist
+// abgerechnet (assertMayTouchSettled), und wer die Zahlung zuruecknimmt, gibt
+// ihn wieder fuer jedes Mitglied frei. Spiegelbildlich zu /pay wird die
+// verknuepfte Zahlungsaufgabe direkt wieder geoeffnet, ohne Punkte- oder
+// Verlaufsbuchung - sie spiegelt einen Zahlungsstand, niemand hat dort etwas
+// abgehakt (services/task-completions.js). Bliebe sie 'done', setzte
+// reconcilePaymentTasks() beim naechsten GET /visits paid_at sofort wieder.
+router.post('/visits/:id/unpay', (req, res) => {
+  try {
+    const vId = validateId(req.params.id, 'id');
+    if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
+    const existing = db.get().prepare('SELECT * FROM housekeeping_work_sessions WHERE id = ?').get(vId.value);
+    if (!existing) return res.status(404).json({ error: 'Visit not found.', code: 404 });
+    if (!assertAdmin(req, res)) return;
+    if (existing.paid_at) {
+      db.get().transaction(() => {
+        db.get().prepare('UPDATE housekeeping_work_sessions SET paid_at = NULL WHERE id = ?').run(existing.id);
+        if (existing.payment_task_id) {
+          db.get().prepare('UPDATE tasks SET status = ? WHERE id = ? AND status = ?').run('open', existing.payment_task_id, 'done');
+        }
+      })();
+    }
+    const row = db.get().prepare('SELECT * FROM housekeeping_work_sessions WHERE id = ?').get(existing.id);
+    res.json({ data: publicSession(row), summary: monthlySummary(row.check_in.slice(0, 7)) });
+  } catch (err) {
+    log.error('POST /visits/:id/unpay error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
 router.delete('/visits/:id', (req, res) => {
   try {
     const vId = validateId(req.params.id, 'id');
     if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
     const existing = db.get().prepare('SELECT * FROM housekeeping_work_sessions WHERE id = ?').get(vId.value);
     if (!existing) return res.status(404).json({ error: 'Visit not found.', code: 404 });
+    if (!assertMayTouchSettled(existing, req, res)) return;
     db.get().transaction(() => {
       deleteVisitLinks(db.get(), existing);
       db.get().prepare('DELETE FROM housekeeping_work_sessions WHERE id = ?').run(existing.id);

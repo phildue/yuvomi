@@ -14,14 +14,24 @@
 import { api } from '/api.js';
 import { t, formatDate, formatTime, getLocale, getNumberFormat } from '/i18n.js';
 import { esc } from '/utils/html.js';
-import { wireScrollFade, scheduleUndoableDelete } from '/utils/ux.js';
-import { toLocalDateKey, parseLocalDateKey, addLocalDays } from '/utils/date.js';
-import { openModal, closeModal, confirmOverModal, reportFieldError } from '/components/modal.js';
+import { CHART, chartScales, chartGridMarkup, chartXLabelsMarkup, chartX, chartY } from '/utils/chart.js';
+import { scheduleUndoableDelete } from '/utils/ux.js';
+import { toLocalDateKey, parseLocalDateKey, addLocalDays, todayKey} from '/utils/date.js';
+import { zonedDateKey } from '/utils/timezone.js';
+import { DATE_STATUS_ALERT_DAYS } from '/utils/date-status.js';
+import { nowFields } from '/utils/timezone.js';
+import { trendMarkup } from '/utils/metric-card.js';
+import { openModal, closeModal, confirmModal, confirmOverModal, reportFieldError, advancedSection, refocusAfterRender } from '/components/modal.js';
 import { createPageFab, setPageFabAction } from '/utils/fab.js';
-import { computeVitalSeries, VITAL_METRICS, vitalMetric } from '/utils/health-vitals.js';
+import { installPopoverMenus } from '/utils/popover-menu.js';
+import {
+  computeVitalSeries, VITAL_METRICS, vitalMetric,
+  MOOD_SCALE, moodStep, splitDuration, durationToHours,
+} from '/utils/health-vitals.js';
 import {
   computeDueDoses, computeAdherence, refillState,
-  daysMaskToIndices, indicesToDaysMask, WEEKDAY_COUNT,
+  daysMaskToIndices, indicesToDaysMask, WEEKDAY_COUNT, weekdayIndex,
+  prnDoseState, splitRemaining, toLocalStamp, parseLogInstant, scheduledLogs,
 } from '/utils/health-meds.js';
 import {
   deriveFlag, summarizeReport, analyteNames, analyteTrend, LAB_FLAGS,
@@ -30,26 +40,132 @@ import {
   ACTIVITY_TYPES, activityType, weekSummary, activityTotals,
 } from '/utils/health-activity.js';
 import { upcomingDoses, computeAdherenceStreak } from '/utils/health-overview.js';
+import { withChosenPeople } from '/utils/people-picker.js';
 import {
-  FLOW_LEVELS, flowLevel, SYMPTOM_TYPES, symptomType, MOOD_TYPES, PHASE,
-  predictCycle, cycleStats, buildCycleCalendar, cycleRing,
+  FLOW_LEVELS, flowLevel, SYMPTOM_TYPES, symptomType, MOOD_TYPES, moodType, PHASE,
+  predictCycle, cycleStats, buildCycleCalendar, cycleRing, MIN_HISTORY_GAPS,
+  normalizeSymptomEntries, symptomIntensityLabelKey,
+  cycleLengthTrend, symptomFrequencyByPhase, feelingFrequencyByPhase,
+  bbtSeries, symptomIntensityTrend,
+  symptomCyclePattern, TYPICAL_CYCLE_RANGE, isTypicalCycleLength,
+  predictSymptomLikelihood, pmsWindow, periodFlowSummary,
+  sortPeriodsAsc, periodFlowLoad, heavyBleedingSignal, painSummary, peakPainDay, daysBetween,
+  CERVIX_MUCUS_TYPES, TEST_RESULT_VALUES, INTIMACY_TYPES, CONTRACEPTION_TYPES,
 } from '/utils/health-cycle.js';
 import { HEALTH_ROUTES, renderHealthTabsBar } from '/utils/health-tabs.js';
+import { canUseFasting } from '/permissions.js';
+import { emptyStateHTML, emptyHintHTML, mountLoadError } from '/utils/empty-state.js';
+import { intervalMonthsToInput, intervalInputToMonths } from '/utils/health-prevention.js';
 
 let _container = null;
 
-// Haushaltweiter Opt-in für den Zyklus-Tab (Settings → Module → Gesundheit).
-// Default an, damit Bestandshaushalte ihr Verhalten behalten; wird in render()
-// aus /preferences aufgefrischt.
+/**
+ * Ladefehler eines Gesundheits-Bereichs.
+ *
+ * Die sechs Bereiche (Werte, Medikamente, Labor, Aktivitaet, Uebersicht,
+ * Zyklus) trugen denselben Block sechsmal als Kopie - und alle sechs waren
+ * dieselbe halbe Sache: ein `.empty-state` ohne `role="alert"`, also fuer einen
+ * Screenreader stumm, und ohne die technische Zeile, obwohl der gefangene
+ * Fehler danebenstand. Sechs Kopien heisst auch: eine Korrektur haette sechsmal
+ * gemacht werden muessen.
+ *
+ * Die Textschluessel folgen dem Bereichsnamen (`health.<area>.loadError`,
+ * `.loadErrorDesc`, `.retry`); das war schon vorher so und traegt den Helfer.
+ *
+ * @param {{root: HTMLElement, error: unknown}} area   Bereichs-State.
+ * @param {string}   name    Schluessel-Praefix, z. B. 'vitals'.
+ * @param {Function} onRetry Der Mount des Bereichs.
+ */
+function mountAreaLoadError(area, name, onRetry) {
+  mountLoadError(area.root, {
+    title: t(`health.${name}.loadError`),
+    description: t(`health.${name}.loadErrorDesc`),
+    error: area.error,
+    retryLabel: t(`health.${name}.retry`),
+    onRetry,
+  });
+}
+
+// Sichtbarkeit des Zyklus-Tabs. Zwei Schalter greifen ineinander: der Haushalt
+// erlaubt ihn (Settings → Module → Gesundheit, Admin), und jede Person kann ihn
+// für sich abwählen (Settings → Persönlich → Gesundheit, #760). `_effective` ist
+// die bereits verrechnete Sicht - der Client verrechnet sie NICHT selbst nach,
+// damit die Regel an genau einer Stelle steht. Default an, damit Bestandskonten
+// ihr Verhalten behalten; wird in render() aus /preferences aufgefrischt.
 let cycleEnabled = true;
+let fastingEnabled = false;
 
 async function loadHealthPrefs() {
   try {
     const res = await api.get('/preferences');
-    cycleEnabled = res?.data?.health_cycle_enabled !== false;
+    cycleEnabled = res?.data?.health_cycle_effective !== false;
+    fastingEnabled = canUseFasting();
   } catch {
     cycleEnabled = true;
+    fastingEnabled = canUseFasting();
   }
+}
+
+// Die persoenliche Standard-Sichtbarkeit je Bereich (#958). Wie `careFor`
+// einmal je Seitenaufruf geladen und von allen vier Tabs geteilt: sie haengt an
+// der Person, nicht am Tab.
+//
+// SPARSE wie serverseitig - was hier fehlt, ist 'private'. Faellt die Abfrage
+// aus, bleibt die Karte leer und jedes Formular steht auf 'privat': der engere
+// Wert ist der richtige Ausgang, wenn man die Wahl gerade nicht kennt.
+let visibilityDefaults = {};
+
+/** Was das Formular dieses Bereichs vorauswaehlt. */
+function defaultVisibility(scopeKey) {
+  return visibilityDefaults[scopeKey] === 'family' ? 'family' : 'private';
+}
+
+/** Scope-Schluessel einer Vitalmetrik - dieselbe Schreibweise wie im Server. */
+function vitalScopeKey(type) {
+  return `vital:${String(type || '')}`;
+}
+
+async function loadVisibilityDefaults() {
+  try {
+    visibilityDefaults = (await api.get('/health/visibility-defaults'))?.data?.defaults || {};
+  } catch {
+    visibilityDefaults = {};
+  }
+}
+
+// Personen, für die diese Person eintragen darf (#584). Einmal je Seitenaufruf
+// geladen und für alle Tabs geteilt - die Betreuung hängt am Nutzer, nicht am Tab.
+let careFor = [];
+
+async function loadCareGrants() {
+  try {
+    const res = await api.get('/health/caregivers/me');
+    careFor = Array.isArray(res?.data) ? res.data : [];
+  } catch {
+    // Keine Auskunft heißt keine Betreuung: im Zweifel weniger Rechte anzeigen,
+    // nicht mehr. Ein Schreibversuch scheiterte ohnehin serverseitig.
+    careFor = [];
+  }
+}
+
+/**
+ * Darf in der Ansicht dieser Person geschrieben werden - eigene Daten oder die
+ * einer betreuten Person? Ersetzt die fünf gleichlautenden `isOwn*View()`, die
+ * jeder Tab für sich trug; geblieben ist `isOwnCycleView()`, denn dort stellt
+ * sich weiterhin die andere Frage ("bin ich das selbst?") - der Zyklus-Tab ist
+ * von der Betreuung bewusst ausgenommen.
+ */
+function canEditFor(personId, meId) {
+  if (personId == null) return false;
+  return personId === meId || careFor.includes(personId);
+}
+
+/**
+ * Eigentümer-Feld für einen POST: nur gesetzt, wenn für eine andere Person
+ * eingetragen wird. Ohne das Feld verhält sich die API wie bisher.
+ */
+function ownerField(personId, meId) {
+  return personId != null && personId !== meId ? { user_id: personId } : {};
 }
 
 // Vitalwerte-View-Zustand. Eine einzige Messungs-Liste (alle Typen) je Person;
@@ -60,7 +176,7 @@ const vitals = {
   members: [],
   rows: [],
   range: 'month',
-  anchor: toLocalDateKey(new Date()),
+  anchor: todayKey(),
   selectedType: 'bp',
   loaded: false,
   error: false,
@@ -76,51 +192,33 @@ const RANGE_LABELS = {
 // Kanal-Farben (Trend-Chart). Nur Tokens — keine Wertung, rein zur Unterscheidung.
 const CHANNEL_COLORS = ['var(--module-health)', 'var(--color-info)', 'var(--color-warning)'];
 
-// Gemeinsame Chart-Geometrie: linker Gutter für Y-Wert-Labels, unterer für
-// X-Datumslabels. Alle drei Health-Charts (Vitalwerte, Laborwerte, Aktivität)
-// teilen denselben 600×200-viewBox und dieselben Ränder, damit sie als EIN
-// lesbares System wirken statt als drei verschiedene Kurven-Kästen.
-const CHART = Object.freeze({ W: 600, H: 200, PAD_L: 40, PAD_R: 12, PAD_T: 14, PAD_B: 26 });
+// Die Chart-Geometrie STAND HIER und ist nach `utils/chart.js` gezogen: sie
+// loeste den Fall fuer die drei Charts dieses Moduls, und dieselbe Aufgabe
+// stellte sich dem Budget-Trend und dem Abo-Flaechenchart - beide haben sie je
+// eigen und je falscher beantwortet (Achse ausserhalb des SVG, verzerrende
+// Skalierung). Was hier bleibt, ist das VOKABULAR: wie ein Achsenwert dieses
+// Moduls aussieht, weiss nur dieses Modul.
+const chartGridFor = (min, max, metric) => chartGridMarkup(min, max, (val, wholeTicks) => axisTickText(metric, val, wholeTicks));
 
-function chartScales() {
-  const { W, H, PAD_L, PAD_R, PAD_T, PAD_B } = CHART;
-  return { left: PAD_L, right: W - PAD_R, top: PAD_T, bottom: H - PAD_B };
-}
-
-// Fünf horizontale Gitterlinien mit Y-Wert-Beschriftung am linken Rand — ersetzt
-// die früheren zwei frei schwebenden Min-/Max-Zahlen durch eine echte Werteachse.
-function chartGridMarkup(min, max) {
-  const { W, PAD_L, PAD_R } = CHART;
-  const { top, bottom } = chartScales();
-  const out = [];
-  // Bei Spannen ab 4 Einheiten sind Dezimal-Ticks Pseudo-Präzision
-  // ("125,9 mmHg", Audit A2-21) - dort runden die Labels auf Ganzzahlen.
-  // Kleine Labor-Spannen (z. B. 0,5-1,2) behalten ihre Nachkommastellen.
-  const wholeTicks = (max - min) >= 4;
-  for (let k = 0; k <= 4; k++) {
-    const gy = top + (k * (bottom - top)) / 4;
-    const val = max - (k * (max - min)) / 4;
-    out.push(`<line class="health-chart__grid" x1="${PAD_L}" y1="${gy.toFixed(1)}" x2="${W - PAD_R}" y2="${gy.toFixed(1)}" />`);
-    out.push(`<text x="${PAD_L - 6}" y="${(gy + 3.5).toFixed(1)}" class="health-chart__axis health-chart__axis--y" text-anchor="end">${esc(fmtNum(wholeTicks ? Math.round(val) : val))}</text>`);
+// Achsen-Tick. Eine Dauer darf hier nicht dezimal stehen: „8,4" neben einer
+// Verlaufszeile mit „8 Std. 24 Min." wäre dieselbe Größe in zwei Zahlensystemen.
+// Kompakt (8:24) statt ausgeschrieben, weil eine Y-Achse keinen Platz für Wörter
+// hat - die Zahl bleibt dabei dieselbe.
+function axisTickText(metric, value, wholeTicks) {
+  if (metric?.format === 'duration') {
+    const parts = splitDuration(value);
+    if (!parts) return '–';
+    return `${fmtNum(parts.hours, { maximumFractionDigits: 0 })}:${String(parts.minutes).padStart(2, '0')}`;
   }
-  return out.join('');
+  // Die Stimmungs-Skala kennt nur ganze Stufen; Zwischenwerte an der Achse
+  // wären eine Genauigkeit, die es in der Erfassung nicht gibt.
+  if (metric?.format === 'scale') return fmtNum(Math.round(value), { maximumFractionDigits: 0 });
+  return fmtNum(wholeTicks ? Math.round(value) : value);
 }
 
-// X-Achsen-Datumslabels (erstes, mittleres, letztes Datum) unter dem Plot,
-// an den Plotgrenzen ausgerichtet (erstes linksbündig, letztes rechtsbündig).
-function chartXLabelsMarkup(dates) {
-  if (!dates.length) return '';
-  const { H, W, PAD_L, PAD_R } = CHART;
-  const y = H - 7;
-  const picks = dates.length <= 2
-    ? dates.map((d, i) => ({ d, i }))
-    : [dates[0], dates[Math.floor((dates.length - 1) / 2)], dates[dates.length - 1]].map((d, i) => ({ d, i }));
-  return picks.map(({ d }, idx) => {
-    const anchor = idx === 0 ? 'start' : idx === picks.length - 1 ? 'end' : 'middle';
-    const px = anchor === 'start' ? PAD_L : anchor === 'end' ? W - PAD_R : (PAD_L + (W - PAD_R)) / 2;
-    return `<text x="${px.toFixed(1)}" y="${y}" class="health-chart__axis" text-anchor="${anchor}">${esc(formatDate(d))}</text>`;
-  }).join('');
-}
+// Die Auswahl der drei Marken und ihre Ausrichtung stehen in `utils/chart.js`;
+// hier steht nur, dass die Beschriftung dieses Moduls ein DATUM ist.
+const chartXLabels = (dates) => chartXLabelsMarkup(dates.map((d) => formatDate(d)));
 
 // Panel-Definitionen je Route. Icons folgen den Sub-Tab-Icons (health-tabs.js).
 const PANELS = () => [
@@ -146,11 +244,25 @@ const PANELS = () => [
     emptyDescKey: 'health.cycle.emptyDesc',
   },
   {
+    route: '/health/fasting',
+    icon: 'timer',
+    titleKey: 'health.fasting.title',
+    emptyTitleKey: 'health.fasting.emptyTitle',
+    emptyDescKey: 'health.fasting.emptyDesc',
+  },
+  {
     route: '/health/meds',
     icon: 'pill',
     titleKey: 'health.meds.title',
     emptyTitleKey: 'health.meds.emptyTitle',
     emptyDescKey: 'health.meds.emptyDesc',
+  },
+  {
+    route: '/health/prevention',
+    icon: 'syringe',
+    titleKey: 'health.prevention.title',
+    emptyTitleKey: 'health.prevention.emptyTitle',
+    emptyDescKey: 'health.prevention.emptyDesc',
   },
   {
     route: '/health/labs',
@@ -171,6 +283,7 @@ const PANELS = () => [
 function normalizeHealthPath(path) {
   // Zyklus deaktiviert → Deep-Link auf die Übersicht umleiten (kein leeres Panel).
   if (path === '/health/cycle' && !cycleEnabled) return '/health';
+  if (path === '/health/fasting' && !fastingEnabled) return '/health';
   return HEALTH_ROUTES.includes(path) ? path : '/health';
 }
 
@@ -184,41 +297,52 @@ function panelMarkup(panel, activeRoute) {
     ? '<div class="health-vitals" data-vitals-root></div>'
     : panel.route === '/health/cycle'
     ? '<div class="health-cycle" data-cycle-root></div>'
+    : panel.route === '/health/fasting'
+    ? '<div class="health-fasting" data-fasting-root></div>'
     : panel.route === '/health/meds'
     ? '<div class="health-meds" data-meds-root></div>'
+    : panel.route === '/health/prevention'
+    ? '<div class="health-prevention" data-prevention-root></div>'
     : panel.route === '/health/labs'
     ? '<div class="health-labs" data-labs-root></div>'
     : panel.route === '/health/activity'
     ? '<div class="health-activity" data-activity-root></div>'
-    : `
-      <div class="empty-state health-empty">
-        <div class="health-empty__icon" aria-hidden="true">
-          <i data-lucide="${esc(panel.icon)}"></i>
-        </div>
-        <div class="empty-state__title">${esc(t(panel.emptyTitleKey))}</div>
-        <div class="empty-state__description">${esc(t(panel.emptyDescKey))}</div>
-      </div>`;
+    : emptyStateHTML({
+      icon: panel.icon,
+      title: t(panel.emptyTitleKey),
+      description: t(panel.emptyDescKey),
+    });
 
   // Eigenes data-health-panel-Attribut statt des (per Frontend-Audit gesperrten)
-  // Legacy-„data-panel". Die Sichtbarkeit steuert showPanel() lokal — renderSubTabs
-  // synchronisiert bewusst keine Panels für dieses Modul.
+  // Legacy-„data-panel". Über dieses Attribut reicht health-tabs.js die Panels an
+  // renderSubTabs weiter (`panelFor`); von dort kommen `id`, `aria-labelledby` zum
+  // zugehörigen Tab und der Hidden-Zustand. Rolle und `aria-label` stehen hier
+  // trotzdem: sie tragen das Panel in dem Moment zwischen Markup-Einbau und
+  // Leisten-Render, in dem die Verknüpfung noch nicht steht. Danach ersetzt der
+  // Tabname das Label (zwei Namen wären einer zu viel).
   return `
     <section class="health-panel" data-health-panel="${esc(panel.route)}"
              role="tabpanel" aria-label="${esc(t(panel.titleKey))}" ${hidden}>
-      <header class="health-panel__head">
-        <h2 class="health-panel__title u-toolbar-title">${esc(t(panel.titleKey))}</h2>
-      </header>
+      <!-- Der Panel-Titel steht sichtbar schon in der Sub-Tab-Leiste darueber:
+           alle sechs Panels wiederholten ihn wortgleich als h2 direkt darunter
+           ("Uebersicht" ueber "Uebersicht"), also verdoppelte der Kopf
+           Information, statt eine Ebene zu benennen (Finish-Review Runde 4,
+           Befund 6). Dieselbe Regel hat die Einstellungen schon einmal
+           eingeholt - der Guard dazu prueft sie jetzt fuer beide.
+           Als Ueberschrift bleibt er stehen, nur unsichtbar: er haelt die
+           Dokumentgliederung zwischen dem h1 des Moduls und den h3 der
+           Abschnitte, und das tabpanel traegt denselben Namen im aria-label. -->
+      <h2 class="health-panel__title sr-only">${esc(t(panel.titleKey))}</h2>
       ${body}
     </section>
   `;
 }
 
-function showPanel(activeRoute) {
-  if (!_container) return;
-  _container.querySelectorAll('[data-health-panel]').forEach((panel) => {
-    panel.hidden = panel.dataset.healthPanel !== activeRoute;
-  });
-}
+// Kein eigenes showPanel() mehr: Auswahl und Panel-Sichtbarkeit sind EINE
+// Operation (WAI-ARIA APG „Tabs"), und sie gehört dorthin, wo auch
+// `aria-selected` gesetzt wird - in renderSubTabs. Zwei Besitzer für denselben
+// Zustand sind genau die Naht, an der `aria-selected` und `hidden` auseinander
+// laufen können.
 
 // Routen-basierter Kontext-FAB: die Primäraktion folgt der aktiven Health-Route.
 // Auf der Übersicht (keine Erstellen-Aktion) ausgeblendet.
@@ -226,19 +350,23 @@ let _fab = null;
 
 function updateHealthFab(activeRoute) {
   if (!_fab) return;
-  // Gating spiegelt die früheren Inline-„Hinzufügen"-Buttons: Erstellen nur in
-  // der eigenen Ansicht (isOwn*View), in fremden (read-only) Ansichten kein FAB.
+  // Gating spiegelt die früheren Inline-„Hinzufügen"-Buttons: Erstellen in der
+  // eigenen Ansicht und in der einer betreuten Person (#584), in allen übrigen
+  // (read-only) Ansichten kein FAB. Der Zyklus-Tab bleibt bei isOwnCycleView() -
+  // er ist von der Betreuung ausgenommen.
   switch (activeRoute) {
     case '/health/vitals':
-      setPageFabAction(_fab, { hidden: !isOwnView(), label: t('health.vitals.add'), onClick: () => openVitalModal() }); break;
+      setPageFabAction(_fab, { hidden: !canEditFor(vitals.personId, vitals.meId), label: t('health.vitals.add'), onClick: () => openVitalModal() }); break;
     case '/health/cycle':
       setPageFabAction(_fab, { hidden: !isOwnCycleView(), label: t('health.cycle.add'), onClick: () => openPeriodModal(null) }); break;
     case '/health/meds':
-      setPageFabAction(_fab, { hidden: !isOwnMedsView(), label: t('health.meds.add'), onClick: () => openMedModal(null) }); break;
+      setPageFabAction(_fab, { hidden: !canEditFor(meds.personId, meds.meId), label: t('health.meds.add'), onClick: () => openMedModal(null) }); break;
+    case '/health/prevention':
+      setPageFabAction(_fab, { hidden: !canEditFor(prevention.personId, prevention.meId), label: t('health.prevention.add'), onClick: () => openPreventionModal(null) }); break;
     case '/health/labs':
-      setPageFabAction(_fab, { hidden: !isOwnLabsView(), label: t('health.labs.add'), onClick: () => openLabModal(null) }); break;
+      setPageFabAction(_fab, { hidden: !canEditFor(labs.personId, labs.meId), label: t('health.labs.add'), onClick: () => openLabModal(null) }); break;
     case '/health/activity':
-      setPageFabAction(_fab, { hidden: !isOwnActivityView(), label: t('health.activity.add'), onClick: () => openActivityModal(null) }); break;
+      setPageFabAction(_fab, { hidden: !canEditFor(activity.personId, activity.meId), label: t('health.activity.add'), onClick: () => openActivityModal(null) }); break;
     default:
       setPageFabAction(_fab, { hidden: true });
   }
@@ -251,6 +379,7 @@ function refreshHealthFab() {
 
 export async function render(container, ctx = {}) {
   _container = container;
+  healthUser = ctx.user ?? healthUser;
   vitals.meId = ctx.user?.id ?? vitals.meId;
   vitals.root = null;
   vitals.loaded = false;
@@ -260,6 +389,9 @@ export async function render(container, ctx = {}) {
   labs.meId = ctx.user?.id ?? labs.meId;
   labs.root = null;
   labs.loaded = false;
+  prevention.meId = ctx.user?.id ?? prevention.meId;
+  prevention.root = null;
+  prevention.loaded = false;
   activity.meId = ctx.user?.id ?? activity.meId;
   activity.root = null;
   activity.loaded = false;
@@ -269,14 +401,21 @@ export async function render(container, ctx = {}) {
   overview.meId = ctx.user?.id ?? overview.meId;
   overview.root = null;
   overview.loaded = false;
-  await loadHealthPrefs();
+  await Promise.all([loadHealthPrefs(), loadCareGrants(), loadVisibilityDefaults()]);
   const activeRoute = normalizeHealthPath(window.location.pathname);
-  const panels = PANELS().filter((panel) => cycleEnabled || panel.route !== '/health/cycle');
+  const panels = PANELS().filter((panel) => (cycleEnabled || panel.route !== '/health/cycle') && (fastingEnabled || panel.route !== '/health/fasting'));
 
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
-    <div class="health-page">
-      <h1 class="sr-only">${esc(t('nav.health'))}</h1>
+    <div class="health-page app-page app-page--dashboard" data-composition="dashboard">
+      <!-- Kanonischer Modulkopf: die Sub-Tab-Leiste wechselt eine SICHT
+           innerhalb der Gesundheit (alle Health-Routen tragen module: 'health'),
+           also steht der Modulname als Large Title ueber ihr - dasselbe Muster
+           wie Budget, Belohnungen und Haushaltshilfe. renderHealthTabsBar haengt
+           die Leiste als zweite Zeile in diesen Kopf. -->
+      <header class="page-toolbar health-toolbar">
+        <h1 class="page-toolbar__title">${esc(t('nav.health'))}</h1>
+      </header>
       ${panels.map((panel) => panelMarkup(panel, activeRoute)).join('')}
     </div>
   `);
@@ -285,13 +424,14 @@ export async function render(container, ctx = {}) {
   container.querySelector('.health-page').appendChild(_fab);
 
   if (window.lucide) window.lucide.createIcons({ el: container });
-  showPanel(activeRoute);
-  renderHealthTabsBar(container, activeRoute, { cycleEnabled });
+  renderHealthTabsBar(container, activeRoute, { cycleEnabled, fastingEnabled });
   updateHealthFab(activeRoute);
   maybeMountOverview(activeRoute);
   maybeMountVitals(activeRoute);
   maybeMountCycle(activeRoute);
+  maybeMountFasting(activeRoute);
   maybeMountMeds(activeRoute);
+  maybeMountPrevention(activeRoute);
   maybeMountLabs(activeRoute);
   maybeMountActivity(activeRoute);
 }
@@ -301,17 +441,19 @@ export async function render(container, ctx = {}) {
 // + Panel-Sync) aus — kein Full-Reload. Rückgabe false erzwingt volles Rendern.
 export async function update({ path, user } = {}) {
   if (!_container?.isConnected) return false;
-  if (user?.id) { vitals.meId = user.id; meds.meId = user.id; labs.meId = user.id; activity.meId = user.id; cycle.meId = user.id; overview.meId = user.id; }
+  if (user?.id) healthUser = user;
+  if (user?.id) { vitals.meId = user.id; meds.meId = user.id; labs.meId = user.id; activity.meId = user.id; cycle.meId = user.id; overview.meId = user.id; prevention.meId = user.id; }
   const activeRoute = normalizeHealthPath(path || window.location.pathname);
 
-  showPanel(activeRoute);
   _container.querySelector('.sub-tabs-bar')?.remove();
-  renderHealthTabsBar(_container, activeRoute, { cycleEnabled });
+  renderHealthTabsBar(_container, activeRoute, { cycleEnabled, fastingEnabled });
   updateHealthFab(activeRoute);
   maybeMountOverview(activeRoute);
   maybeMountVitals(activeRoute);
   maybeMountCycle(activeRoute);
+  maybeMountFasting(activeRoute);
   maybeMountMeds(activeRoute);
+  maybeMountPrevention(activeRoute);
   maybeMountLabs(activeRoute);
   maybeMountActivity(activeRoute);
   return true;
@@ -331,22 +473,36 @@ function maybeMountVitals(activeRoute) {
   mountVitals();
 }
 
+// Das angemeldete Konto der Seite (render/update), fuer die Personenliste.
+let healthUser = null;
+
+/**
+ * Personenliste und Startperson einer Health-Ansicht - einmal fuer alle sechs
+ * Ansichten statt sechs Kopien. Die Liste sind die Haushaltsmitglieder (#1207)
+ * und dazu das angemeldete Konto: ist es kein Mitglied, liest und schreibt die
+ * Ansicht trotzdem unter ihm (personId = meId), und der Personen-Umschalter
+ * muss dann genau diese Person nennen - nicht das erste Mitglied der Liste.
+ */
+async function loadHealthMembers(view, user) {
+  if (!view.members.length) {
+    const res = await api.get('/family/members');
+    view.members = withChosenPeople(res.data || [], user?.id ? [user] : []);
+  }
+  if (!view.personId) view.personId = view.meId ?? view.members[0]?.id ?? null;
+}
+
 async function mountVitals() {
   vitals.root.replaceChildren();
   vitals.root.insertAdjacentHTML('beforeend',
     `<div class="health-vitals__loading">${esc(t('common.loading'))}</div>`);
 
   try {
-    if (!vitals.members.length) {
-      const res = await api.get('/family/members');
-      vitals.members = res.data || [];
-    }
-    if (!vitals.personId) vitals.personId = vitals.meId ?? vitals.members[0]?.id ?? null;
+    await loadHealthMembers(vitals, healthUser);
     await loadVitals();
     vitals.error = false;
   } catch (err) {
     console.error('[Health] vitals mount error:', err);
-    vitals.error = true;
+    vitals.error = err;
   }
   vitals.loaded = true;
   renderVitalsShell();
@@ -358,36 +514,19 @@ async function loadVitals() {
   vitals.rows = res.data || [];
 }
 
-function isOwnView() {
-  return vitals.personId != null && vitals.personId === vitals.meId;
-}
-
 function renderVitalsShell() {
   if (!vitals.root?.isConnected) return;
   vitals.root.replaceChildren();
 
   if (vitals.error) {
-    vitals.root.insertAdjacentHTML('beforeend', `
-      <div class="empty-state">
-        <i data-lucide="cloud-off" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${esc(t('health.vitals.loadError'))}</div>
-        <div class="empty-state__description">${esc(t('health.vitals.loadErrorDesc'))}</div>
-        <button class="btn btn--primary empty-state__cta" data-action="vitals-retry">
-          <i data-lucide="refresh-cw" class="icon-md" aria-hidden="true"></i>
-          ${esc(t('health.vitals.retry'))}
-        </button>
-      </div>`);
-    if (window.lucide) window.lucide.createIcons({ el: vitals.root });
-    vitals.root.querySelector('[data-action="vitals-retry"]')
-      ?.addEventListener('click', () => mountVitals());
+    mountAreaLoadError(vitals, 'vitals', mountVitals);
     return;
   }
 
   vitals.root.insertAdjacentHTML('beforeend', `
-    <div class="health-persons" role="tablist" aria-label="${esc(t('health.vitals.personsLabel'))}">
-      ${personChipsMarkup(vitals.members, vitals.personId, vitals.meId)}
-    </div>
-    ${readOnlyBannerMarkup(vitals.members, vitals.personId, isOwnView())}
+    ${personSwitcherMarkup(vitals.members, vitals.personId, vitals.meId,
+      { menuId: 'health-person-menu-vitals', label: t('health.vitals.personsLabel') })}
+    ${readOnlyBannerMarkup(vitals.members, vitals.personId, canEditFor(vitals.personId, vitals.meId), vitals.meId)}
     <div class="health-vitals__toolbar">
       <div class="health-vitals__ranges" role="tablist" aria-label="${esc(t('health.vitals.chartTitle'))}">
         ${['week', 'month', 'year'].map((r) => `
@@ -405,31 +544,87 @@ function renderVitalsShell() {
   renderDetail();
 }
 
-// Geteilter Personen-Umschalter (Vitalwerte + Medikamente): identisches Markup,
-// die aktive Person und „Ich"-Markierung kommen je Tab per Argument.
-function personChipsMarkup(members, activeId, meId) {
-  return (members || []).map((m) => {
-    const active = m.id === activeId;
-    const label = m.id === meId
-      ? `${m.display_name} · ${t('health.vitals.you')}`
-      : m.display_name;
-    return `
-      <button type="button" class="health-person-chip${active ? ' is-active' : ''}"
-        data-person-id="${esc(m.id)}" role="tab" aria-selected="${active}">
-        <span class="health-person-chip__dot" aria-hidden="true"
-          style="background:${esc(m.avatar_color) || 'var(--module-health)'}"></span>
-        <span class="health-person-chip__name">${esc(label)}</span>
-      </button>`;
-  }).join('');
+// Geteilter Personen-Umschalter: EIN Knopf mit der aktiven Person statt einer
+// Dauer-Pillenzeile (Critique 2026-08-31: 6 Ansichts-Tabs + 4 Personen-Pillen
+// = 10 Wahlmoeglichkeiten vor dem ersten Inhalt, mobil eine volle 48px-Zeile).
+// Die aktive Person bleibt am Knopf sichtbar (Wiedererkennen statt Erinnern);
+// das Menue ist das geteilte popover-menu-Vokabular mit role=menuitemradio -
+// dieselbe Bauart wie der Rezepte-Quellenfilter. Ein Haushalt mit nur einer
+// sichtbaren Person bekommt keinen Umschalter: die eigene Ansicht ist die
+// einzige, und ein Menue mit einem Eintrag waere Chrome ohne Auskunft.
+function personSwitcherMarkup(members, activeId, meId, { menuId, label }) {
+  const list = members || [];
+  if (list.length <= 1) return '';
+  const nameOf = (m) => (m.id === meId
+    ? `${m.display_name} · ${t('health.vitals.you')}`
+    : m.display_name);
+  const dotOf = (m) => `<span class="health-person-chip__dot" aria-hidden="true"
+          style="background:${esc(m.avatar_color) || 'var(--module-health)'}"></span>`;
+  const active = list.find((m) => m.id === activeId) ?? list[0];
+  return `
+    <div class="health-person-switcher">
+      <button type="button" class="health-person-switcher__trigger popover-menu__trigger"
+              popovertarget="${esc(menuId)}" aria-haspopup="menu" aria-expanded="false"
+              aria-label="${esc(label)}: ${esc(nameOf(active))}">
+        ${dotOf(active)}
+        <span class="health-person-switcher__name">${esc(nameOf(active))}</span>
+        <i data-lucide="chevron-down" class="icon-sm health-person-switcher__chevron" aria-hidden="true"></i>
+      </button>
+      <div class="popover-menu" id="${esc(menuId)}" popover role="menu" aria-label="${esc(label)}">
+        ${list.map((m) => `
+          <button type="button" role="menuitemradio" aria-checked="${m.id === activeId}"
+                  class="popover-menu__item" data-person-id="${esc(m.id)}">
+            <i data-lucide="check" class="icon-md popover-menu__item-check${m.id === activeId ? '' : ' popover-menu__item-check--hidden'}" aria-hidden="true"></i>
+            ${dotOf(m)}
+            <span>${esc(nameOf(m))}</span>
+          </button>`).join('')}
+      </div>
+    </div>`;
 }
 
-// Nur-Lesen-Hinweis beim Betrachten der Daten einer anderen Person. Das bloße
-// Fehlen der Bearbeiten-Buttons ist leicht zu übersehen — der Banner macht den
-// View-Only-Zustand explizit. Gibt '' für die eigene Ansicht zurück.
-function readOnlyBannerMarkup(members, personId, own) {
-  if (own) return '';
+/**
+ * Verdrahtet den Personen-Umschalter - und gibt den Fokus zurueck.
+ *
+ * DER RUECKWEG IST DER HALBE FIX. Die Auswahl laedt neu und rendert die ganze
+ * Ansicht samt Umschalter neu; der Browser gibt den Fokus beim Schliessen des
+ * Popovers zwar an den Trigger zurueck, aber den gibt es dann nicht mehr - der
+ * neue ist ein anderer Knoten mit derselben Rolle, und der Fokus faellt auf
+ * <body>. Wer per Tastatur die Person wechselt, faengt sonst jedes Mal von
+ * vorn an zu tabben, und die Pfeiltasten im Menue waeren eine Bedienung, die
+ * beim ersten Gebrauch endet.
+ *
+ * EINMAL FUER ALLE SECHS ANSICHTEN: dieselben sieben Zeilen standen sechsmal
+ * da, einmal je Ansicht - genau die Bauart, an der dieser PR sein
+ * Nachzuegler-Muster gemessen hat.
+ */
+function wirePersonSwitcher(view, onSwitch) {
+  view.root.querySelectorAll('.health-person-switcher [data-person-id]').forEach((item) =>
+    item.addEventListener('click', async () => {
+      const id = Number(item.dataset.personId);
+      if (id === view.personId) return;
+      view.personId = id;
+      await onSwitch();
+      view.root.querySelector('.health-person-switcher__trigger')?.focus();
+    }));
+}
+
+// Hinweis auf den Zustand einer fremden Ansicht. Zwei Fälle, ein Baustein:
+// ohne Schreibrecht der bisherige Nur-Lesen-Hinweis (das bloße Fehlen der
+// Bearbeiten-Buttons ist leicht zu übersehen), mit Betreuung (#584) stattdessen
+// die Ansage, für wen gerade eingetragen wird. Letzteres ist kein Schmuck: die
+// Ansicht sieht sonst aus wie die eigene, und ein Fieberwert landet lautlos beim
+// falschen Kind. Gibt '' für die eigene Ansicht zurück.
+function readOnlyBannerMarkup(members, personId, canEdit, meId) {
+  if (personId == null || personId === meId) return '';
   const m = (members || []).find((x) => x.id === personId);
   const name = m ? m.display_name : '';
+  if (canEdit) {
+    return `
+      <div class="health-readonly-banner health-readonly-banner--care" role="status">
+        <i data-lucide="pencil-line" aria-hidden="true"></i>
+        <span>${esc(t('health.careBanner', { name }))}</span>
+      </div>`;
+  }
   return `
     <div class="health-readonly-banner" role="status">
       <i data-lucide="eye" aria-hidden="true"></i>
@@ -441,6 +636,31 @@ function readOnlyBannerMarkup(members, personId, own) {
 // Modals, die Werte interpretieren. `modal` unterdrückt den oberen Abstand.
 function disclaimerMarkup(modal = false) {
   return `<p class="health-disclaimer${modal ? ' health-disclaimer--modal' : ''}">${esc(t('health.disclaimer'))}</p>`;
+}
+
+// Einfachauswahl über eine .health-choices-Reihe: ein Klick wählt, ein zweiter
+// auf dieselbe Stufe wählt wieder ab. `optional: false` lässt die getroffene
+// Wahl stehen - für Skalen, bei denen „nichts" keine Aussage ist.
+// Delegiert am Container, damit ein neu aufgebauter Inhalt (Metrikwechsel im
+// Erfassungs-Dialog) nicht jedes Mal neu verdrahtet werden muss.
+function wireChoiceGroup(root, group, { optional = true } = {}) {
+  const host = root.querySelector(`[data-group="${group}"]`);
+  if (!host) return;
+  host.addEventListener('click', (e) => {
+    const btn = e.target.closest('.health-choice');
+    if (!btn || !host.contains(btn)) return;
+    const on = btn.getAttribute('aria-pressed') === 'true';
+    host.querySelectorAll('.health-choice').forEach((b) => b.setAttribute('aria-pressed', 'false'));
+    btn.setAttribute('aria-pressed', on && optional ? 'false' : 'true');
+    // Eine getroffene Wahl beantwortet eine zuvor gemeldete Pflichtfeld-Meldung.
+    // reportFieldError() räumt selbst nur bei input/change auf - Ereignisse, die
+    // eine Buttonreihe nie feuert, sodass die Meldung sonst rot stehen bliebe.
+    const field = host.closest('.form-field');
+    if (field?.classList.contains('form-field--error')) {
+      field.classList.remove('form-field--error');
+      host.querySelectorAll('.health-choice[aria-invalid]').forEach((b) => b.setAttribute('aria-invalid', 'false'));
+    }
+  });
 }
 
 // Screenreader-Alternative zu den nativen SVG-Charts: eine visuell versteckte
@@ -467,16 +687,9 @@ function chartTableMarkup(caption, headers, rows) {
 // so löst nicht jeder Tastendruck einen Personen-Reload aus. Der Haupt-Tab-Balken
 // (.health-tabs-bar) liegt außerhalb der Panels und bringt eigene Tastatur mit.
 function wireTablistKeys(root) {
-  // Personen-Chipzeile: Rand-Fade-Affordanz beim Überlaufen (geteilte
-  // has-fade-*-Konvention, Audit F-06). Hier zentral, weil alle sechs Tabs
-  // diesen Helfer nach jedem Panel-Render aufrufen.
-  const persons = root.querySelector('.health-persons');
-  wireScrollFade(persons);
-  // Aktive Person ins Sichtfeld holen: mobil kann der ausgewählte Chip außerhalb
-  // des Viewports liegen (Audit P2 "Sichtbarkeit vor Scroll-Position", Muster wie
-  // tablist.js/sub-tabs.js). role="tab"+aria-selected trägt den Gedrückt-Zustand.
-  persons?.querySelector('.health-person-chip.is-active')
-    ?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+  // Die Personen-Chipzeile (Fade-Affordanz + scrollIntoView) ist hier raus:
+  // der Umschalter ist seit 2026-08-31 ein popover-menu-Knopf, keine
+  // scrollende Tabliste mehr - siehe personSwitcherMarkup.
   root.querySelectorAll('[role="tablist"]:not(.health-tabs-bar)').forEach((list) => {
     const tabs = () => [...list.querySelectorAll('[role="tab"]')];
     tabs().forEach((el) => { el.tabIndex = el.getAttribute('aria-selected') === 'true' ? 0 : -1; });
@@ -502,13 +715,8 @@ function wireTablistKeys(root) {
 
 function wireVitals() {
   wireTablistKeys(vitals.root);
-  vitals.root.querySelectorAll('.health-person-chip').forEach((chip) =>
-    chip.addEventListener('click', () => {
-      const id = Number(chip.dataset.personId);
-      if (id === vitals.personId) return;
-      vitals.personId = id;
-      switchPerson();
-    }));
+  installPopoverMenus(vitals.root);
+  wirePersonSwitcher(vitals, switchPerson);
 
   vitals.root.querySelectorAll('.health-vitals__range').forEach((btn) =>
     btn.addEventListener('click', () => {
@@ -519,13 +727,13 @@ function wireVitals() {
 }
 
 async function switchPerson() {
-  vitals.anchor = toLocalDateKey(new Date());
+  vitals.anchor = todayKey();
   try {
     await loadVitals();
     vitals.error = false;
   } catch (err) {
     console.error('[Health] vitals load error:', err);
-    vitals.error = true;
+    vitals.error = err;
   }
   renderVitalsShell();
 }
@@ -547,11 +755,16 @@ function renderCards() {
   host.insertAdjacentHTML('beforeend', cards);
   if (window.lucide) window.lucide.createIcons({ el: host });
 
-  host.querySelectorAll('.health-metric-card').forEach((card) =>
+  host.querySelectorAll('.metric-card--select').forEach((card) =>
     card.addEventListener('click', () => {
       vitals.selectedType = card.dataset.type;
-      host.querySelectorAll('.health-metric-card').forEach((c) =>
-        c.classList.toggle('is-active', c.dataset.type === vitals.selectedType));
+      host.querySelectorAll('.metric-card--select').forEach((c) => {
+        const on = c.dataset.type === vitals.selectedType;
+        c.classList.toggle('is-active', on);
+        // aria-pressed muss den Toggle mitgehen - vorher blieb der beim
+        // Render gesetzte Wert stehen und log nach dem ersten Klick.
+        c.setAttribute('aria-pressed', String(on));
+      });
       renderDetail();
     }));
 }
@@ -562,35 +775,30 @@ function cardMarkup(metric, series) {
   const label = t(metric.labelKey);
 
   let valueHtml;
-  let metaHtml = `<div class="health-metric-card__empty">${esc(t('health.vitals.noValue'))}</div>`;
+  let metaHtml = `<span class="metric-card__note">${esc(t('health.vitals.noValue'))}</span>`;
 
   if (latest) {
-    const unit = esc(latest.unit || '');
-    let valueText;
-    if (metric.type === 'bp') {
-      valueText = `${fmtNum(latest.value_num)}/${fmtNum(latest.value_num2)}`;
-    } else {
-      valueText = fmtNum(latest.value_num);
-    }
-    valueHtml = `<span class="health-metric-card__value">${esc(valueText)}</span>${unit ? ` <span class="health-metric-card__unit">${unit}</span>` : ''}`;
+    const unit = esc(vitalUnitText(metric, latest));
+    const valueText = vitalValueText(metric, latest);
+    valueHtml = `<span class="metric-card__value">${esc(valueText)}</span>${unit ? ` <span class="metric-card__unit">${unit}</span>` : ''}`;
     metaHtml = `
-      <div class="health-metric-card__meta">
-        ${deltaMarkup(series.deltas.value_num)}
-        <span class="health-metric-card__date">${esc(formatDate(String(latest.measured_at).slice(0, 10)))}</span>
-      </div>`;
+      <span class="metric-card__meta">
+        ${deltaMarkup(series.deltas.value_num, metric)}
+        <span>${esc(formatDate(String(latest.measured_at).slice(0, 10)))}</span>
+      </span>`;
   } else {
-    valueHtml = '<span class="health-metric-card__value health-metric-card__value--empty">–</span>';
+    valueHtml = '<span class="metric-card__value metric-card__value--empty">–</span>';
   }
 
   return `
-    <button type="button" class="health-metric-card${active ? ' is-active' : ''}" data-type="${esc(metric.type)}"
+    <button type="button" class="metric-card metric-card--select${active ? ' is-active' : ''}" data-type="${esc(metric.type)}"
       aria-pressed="${active}">
-      <span class="health-metric-card__head">
-        <i data-lucide="${esc(metric.icon)}" class="health-metric-card__icon" aria-hidden="true"></i>
-        <span class="health-metric-card__label">${esc(label)}</span>
+      <span class="metric-card__head">
+        <i data-lucide="${esc(metric.icon)}" class="metric-card__icon" aria-hidden="true"></i>
+        <span class="metric-card__label">${esc(label)}</span>
       </span>
-      <span class="health-metric-card__body">${valueHtml}</span>
-      ${latest ? sparklineMarkup(series.points, 'value_num') : ''}
+      <span class="metric-card__body">${valueHtml}</span>
+      ${latest ? sparklineMarkup(series.points, 'value_num', metric) : ''}
       ${metaHtml}
     </button>`;
 }
@@ -598,7 +806,7 @@ function cardMarkup(metric, series) {
 // Mini-Trendlinie für die Metrik-Karte: gibt der Karte Sub-Domänen-Charakter, ohne
 // den vollen Chart zu wiederholen. Rein dekorativ (aria-hidden) — die exakten Werte
 // liefern Karte, Detail-Chart und Screenreader-Tabelle. Nur bei ≥2 Datenpunkten.
-function sparklineMarkup(points, key) {
+function sparklineMarkup(points, key, metric) {
   const withVal = points
     .map((p, i) => ({ v: p[key], i }))
     .filter((o) => o.v !== null && o.v !== undefined);
@@ -609,6 +817,9 @@ function sparklineMarkup(points, key) {
   const vals = withVal.map((o) => o.v);
   let min = Math.min(...vals);
   let max = Math.max(...vals);
+  // Feste Skala auch hier: sonst zeigte die Mini-Linie einer Karte einen
+  // anderen Verlauf als der Chart darunter, aus denselben Werten.
+  if (metric?.domain) ({ min, max } = metric.domain);
   if (min === max) { min -= 1; max += 1; }
   const n = withVal.length;
   const x = (idx) => PAD + (idx * (W - 2 * PAD)) / (n - 1);
@@ -616,21 +827,21 @@ function sparklineMarkup(points, key) {
   const pts = withVal.map((o, idx) => `${x(idx).toFixed(1)},${y(o.v).toFixed(1)}`).join(' ');
   const lastX = x(n - 1).toFixed(1);
   const lastY = y(withVal[n - 1].v).toFixed(1);
-  return `<svg class="health-metric-card__spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
-      <polyline points="${pts}" fill="none" stroke="var(--module-accent)" stroke-width="1.5"
+  // Farbe steht in panel.css am geteilten Bauteil, nicht hier: sie ist eine
+  // Aussage über den WERT und gehört deshalb der Karte, nicht dem Modul.
+  return `<svg class="metric-card__spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
+      <polyline points="${pts}" fill="none" stroke-width="1.5"
         stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke" />
-      <circle cx="${lastX}" cy="${lastY}" r="2" fill="var(--module-accent)" vector-effect="non-scaling-stroke" />
+      <circle cx="${lastX}" cy="${lastY}" r="2" vector-effect="non-scaling-stroke" />
     </svg>`;
 }
 
-function deltaMarkup(delta) {
-  if (delta === null || delta === undefined) return '<span class="health-metric-card__delta"></span>';
-  const icon = delta > 0 ? 'trending-up' : (delta < 0 ? 'trending-down' : 'minus');
-  const dir = delta > 0 ? 'up' : (delta < 0 ? 'down' : 'flat');
-  return `
-    <span class="health-metric-card__delta health-metric-card__delta--${dir}">
-      <i data-lucide="${icon}" aria-hidden="true"></i>${esc(fmtDelta(delta))}
-    </span>`;
+function deltaMarkup(delta, metric) {
+  if (delta === null || delta === undefined) return '<span class="metric-card__trend"></span>';
+  // betterWhen bleibt null: „hoch" ist je nach Metrik gut ODER schlecht
+  // (Gewichtsabnahme, SpO₂, Glukose-Kontrolle) - die Farbe bleibt neutral,
+  // die Richtung trägt allein der Pfeil (utils/metric-card.js).
+  return trendMarkup({ delta, text: esc(fmtVitalDelta(metric, delta)) });
 }
 
 // --------------------------------------------------------
@@ -656,10 +867,9 @@ function renderDetail() {
           <button class="btn btn--icon" data-step="1" aria-label="${esc(t('health.vitals.nextPeriod'))}"><i data-lucide="chevron-right" aria-hidden="true"></i></button>
         </div>
       </div>
-      ${series.hasData ? chartMarkup(metric, series) : `
-        <div class="empty-state health-chart-empty">
-          <div class="empty-state__title">${esc(t('health.vitals.noData'))}</div>
-        </div>`}
+      ${series.hasData
+    ? chartMarkup(metric, series)
+    : emptyHintHTML(t('health.vitals.noData'), { className: 'health-chart-empty' })}
     </div>
     ${recentMeasurementsMarkup(metric)}`);
   if (window.lucide) window.lucide.createIcons({ el: host });
@@ -695,10 +905,8 @@ function recentMeasurementsMarkup(metric) {
     .sort((a, b) => String(b.measured_at).localeCompare(String(a.measured_at)))
     .slice(0, 8);
   if (!rows.length) return '';
-  const own = isOwnView();
-  const valueText = (r) => metric.type === 'bp'
-    ? `${fmtNum(r.value_num)}/${fmtNum(r.value_num2)}`
-    : fmtNum(r.value_num);
+  const own = canEditFor(vitals.personId, vitals.meId);
+  const valueText = (r) => vitalValueText(metric, r);
   return `
     <div class="health-recent">
       <div class="health-recent__title">${esc(t('health.vitals.recentMeasurements'))}</div>
@@ -706,7 +914,7 @@ function recentMeasurementsMarkup(metric) {
         ${rows.map((r) => `
           <li class="health-recent__row">
             <span class="health-recent__date">${esc(formatDate(String(r.measured_at).slice(0, 10)))}</span>
-            <span class="health-recent__value">${esc(valueText(r))}${r.unit ? ` <small>${esc(r.unit)}</small>` : ''}</span>
+            <span class="health-recent__value">${esc(valueText(r))}${vitalUnitText(metric, r) ? ` <small>${esc(vitalUnitText(metric, r))}</small>` : ''}</span>
             ${own ? `
             <button type="button" class="row-action row-action--danger" data-delete-vital="${r.id}"
                     aria-label="${esc(t('health.vitals.deleteMeasurement'))}">
@@ -736,7 +944,7 @@ function chartMarkup(metric, series) {
     .map((key, idx) => ({ key, idx }))
     .filter(({ key }) => pts.some((p) => p[key] !== null));
   if (!channels.length) {
-    return `<div class="empty-state health-chart-empty"><div class="empty-state__title">${esc(t('health.vitals.noData'))}</div></div>`;
+    return emptyHintHTML(t('health.vitals.noData'), { className: 'health-chart-empty' });
   }
 
   // Buckets mit mindestens einem Messwert. Weniger als zwei ergeben keine Kurve —
@@ -746,16 +954,23 @@ function chartMarkup(metric, series) {
     .filter(({ p }) => channels.some(({ key }) => p[key] !== null))
     .map(({ i }) => i);
   if (dataIdx.length < 2) {
-    return `<div class="empty-state health-chart-empty"><div class="empty-state__title">${esc(t('health.vitals.sparse'))}</div></div>`;
+    return emptyHintHTML(t('health.vitals.sparse'), { className: 'health-chart-empty' });
   }
 
   const allValues = channels.flatMap(({ key }) => pts.map((p) => p[key]).filter((v) => v !== null));
-  let min = Math.min(...allValues);
-  let max = Math.max(...allValues);
-  if (min === max) { min -= 1; max += 1; }
-  const span = max - min;
-  const pad = span * 0.1;
-  min -= pad; max += pad;
+  let min;
+  let max;
+  if (metric.domain) {
+    // Feste Skala: keine Polsterung, die Grenzen sind die Aussage.
+    ({ min, max } = metric.domain);
+  } else {
+    min = Math.min(...allValues);
+    max = Math.max(...allValues);
+    if (min === max) { min -= 1; max += 1; }
+    const span = max - min;
+    const pad = span * 0.1;
+    min -= pad; max += pad;
+  }
 
   const { W, H } = CHART;
   const { left, right, top, bottom } = chartScales();
@@ -790,7 +1005,7 @@ function chartMarkup(metric, series) {
       const px = x(i).toFixed(1);
       const py = y(p[key]).toFixed(1);
       linePts.push(`${px},${py}`);
-      dots.push(`<circle cx="${px}" cy="${py}" r="3.5" fill="${color}"><title>${esc(`${chName} · ${formatDate(p.date)}: ${fmtNum(p[key])}`)}</title></circle>`);
+      dots.push(`<circle cx="${px}" cy="${py}" r="3.5" fill="${color}"><title>${esc(`${chName} · ${formatDate(p.date)}: ${fmtChannelValue(metric, p[key])}`)}</title></circle>`);
     });
     return `
       <polyline fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round"
@@ -806,16 +1021,16 @@ function chartMarkup(metric, series) {
         </span>`).join('')}</div>`
     : '';
 
-  const grid = chartGridMarkup(min, max);
+  const grid = chartGridFor(min, max, metric);
 
   // Screenreader-Datentabelle: nur Buckets mit mindestens einem Wert.
   const chLabel = (idx) => (metric.channelLabelKeys?.[idx] ? t(metric.channelLabelKeys[idx]) : t(metric.labelKey));
   const tableHeaders = [t('health.vitals.field.measuredAt'), ...channels.map(({ idx }) => chLabel(idx))];
   const dataPoints = pts.filter((p) => channels.some(({ key }) => p[key] !== null));
   const tableRows = dataPoints
-    .map((p) => [formatDate(p.date), ...channels.map(({ key }) => (p[key] !== null ? fmtNum(p[key]) : '–'))]);
+    .map((p) => [formatDate(p.date), ...channels.map(({ key }) => fmtChannelValue(metric, p[key]))]);
   const table = tableRows.length ? chartTableMarkup(t(metric.labelKey), tableHeaders, tableRows) : '';
-  const xLabels = chartXLabelsMarkup(dataPoints.map((p) => p.date));
+  const xLabels = chartXLabels(dataPoints.map((p) => p.date));
 
   return `
     <svg class="health-chart" viewBox="0 0 ${W} ${H}" role="img"
@@ -842,7 +1057,43 @@ function localDateTimeValue(date) {
 
 function valueFieldsMarkup(type) {
   const metric = vitalMetric(type) || VITAL_METRICS[0];
-  if (type === 'bp') {
+
+  // Schlaf wird in Stunden und Minuten erfasst, nicht als Dezimalzahl - „7,5"
+  // ist eine Rechnung, die der Erfassende sonst im Kopf machen müsste.
+  if (metric.format === 'duration') {
+    return `
+      <div class="modal-grid modal-grid--2">
+        <div class="form-field">
+          <label class="label" for="vital-hours">${esc(t('health.vitals.field.hours'))}</label>
+          <input class="input" id="vital-hours" type="number" inputmode="numeric" step="1" min="0" max="24" required>
+        </div>
+        <div class="form-field">
+          <label class="label" for="vital-minutes">${esc(t('health.vitals.field.minutes'))}</label>
+          <input class="input" id="vital-minutes" type="number" inputmode="numeric" step="1" min="0" max="59" value="0">
+        </div>
+      </div>
+      <input type="hidden" id="vital-unit" value="${esc(metric.units[0] || '')}">`;
+  }
+
+  // Stimmung als Skala: fünf Gesichter statt eines Zahlenfelds - derselbe
+  // Auswahl-Chip wie Flow und Symptome im Zyklus-Tagebuch (.health-choice).
+  if (metric.format === 'scale') {
+    return `
+      <div class="form-field">
+        <span class="label">${esc(t('health.vitals.field.mood'))}</span>
+        <div class="health-choices health-choices--scale" data-group="mood" role="group"
+             aria-label="${esc(t('health.vitals.field.mood'))}">
+          ${MOOD_SCALE.map((step) => `
+            <button type="button" class="health-choice" data-mood="${esc(step.value)}" aria-pressed="false">
+              <i data-lucide="${esc(step.icon)}" aria-hidden="true"></i>
+              <span class="health-choice-label">${esc(t(step.labelKey))}</span>
+            </button>`).join('')}
+        </div>
+      </div>
+      <input type="hidden" id="vital-unit" value="">`;
+  }
+
+  if (metric.format === 'pair') {
     return `
       <div class="modal-grid modal-grid--3">
         <div class="form-field">
@@ -901,8 +1152,8 @@ function openVitalModal(opts = {}) {
           <div class="form-field">
             <label class="label" for="vital-visibility">${esc(t('health.vitals.field.visibility'))}</label>
             <select class="input" id="vital-visibility">
-              <option value="private">${esc(t('health.vitals.visibility.private'))}</option>
-              <option value="family">${esc(t('health.vitals.visibility.family'))}</option>
+              <option value="private"${defaultVisibility(vitalScopeKey(vitals.selectedType)) === 'family' ? '' : ' selected'}>${esc(t('health.vitals.visibility.private'))}</option>
+              <option value="family"${defaultVisibility(vitalScopeKey(vitals.selectedType)) === 'family' ? ' selected' : ''}>${esc(t('health.vitals.visibility.family'))}</option>
             </select>
           </div>
         </div>
@@ -921,9 +1172,31 @@ function openVitalModal(opts = {}) {
       const typeSelect = panel.querySelector('#vital-type');
       const fieldsHost = panel.querySelector('#vital-value-fields');
 
+      // Die Stimmungs-Skala bringt Icons mit; nach jedem Feldwechsel neu zeichnen.
+      // Die Stimmungs-Skala ist eine Einfachauswahl, die stehen bleiben muss:
+      // eine abgewählte Stufe wäre kein Eintrag, sondern ein leeres Formular.
+      const paintFields = () => {
+        if (window.lucide) window.lucide.createIcons({ el: fieldsHost });
+        wireChoiceGroup(fieldsHost, 'mood', { optional: false });
+      };
+      paintFields();
+
+      // Die Voreinstellung haengt an der METRIK (#958): Blutdruck kann
+      // familiensichtbar sein und die Stimmung privat. Beim Typwechsel zieht
+      // das Feld deshalb mit - aber NUR, solange niemand es selbst angefasst
+      // hat. Eine bewusst getroffene Wahl darf ein Typwechsel nicht
+      // zurueckdrehen; sie waere sonst weg, ohne dass es jemand sieht.
+      const visibilitySelect = panel.querySelector('#vital-visibility');
+      let visibilityTouched = false;
+      visibilitySelect?.addEventListener('change', () => { visibilityTouched = true; });
+
       typeSelect.addEventListener('change', () => {
         fieldsHost.replaceChildren();
         fieldsHost.insertAdjacentHTML('beforeend', valueFieldsMarkup(typeSelect.value));
+        paintFields();
+        if (!visibilityTouched && visibilitySelect) {
+          visibilitySelect.value = defaultVisibility(vitalScopeKey(typeSelect.value));
+        }
       });
 
       panel.querySelector('[data-action="cancel"]')?.addEventListener('click', () => closeModal({ force: true }));
@@ -935,17 +1208,24 @@ function openVitalModal(opts = {}) {
         if (!body) {
           submitBtn.disabled = false;
           // Fehler am Wertefeld statt als ortloser Toast (geteiltes Muster,
-          // Critique P1): erstes Eingabefeld der Metrik markieren.
-          reportFieldError(panel.querySelector('#vital-value-fields input'), t('health.vitals.invalidValue'));
+          // Critique P1): erstes Eingabefeld der Metrik markieren. Bei der
+          // Stimmungs-Skala gibt es kein Eingabefeld - dort trägt die erste
+          // Stufe die Meldung, das versteckte Einheiten-Feld könnte sie nicht
+          // zeigen.
+          reportFieldError(
+            fieldsHost.querySelector('input:not([type="hidden"])') || fieldsHost.querySelector('.health-choice'),
+            t('health.vitals.invalidValue'),
+          );
           return;
         }
         submitBtn.disabled = true;
         try {
-          await api.post('/health/vitals', body);
+          await api.post('/health/vitals', { ...body, ...ownerField(vitals.personId, vitals.meId) });
           closeModal({ force: true });
           window.yuvomi?.showToast(t('health.vitals.saved'), 'success');
           await reloadAfterSave(body.type);
           await opts.onSaved?.();
+          refocusAfterRender();
         } catch (err) {
           console.error('[Health] vitals save error:', err);
           submitBtn.disabled = false;
@@ -969,8 +1249,30 @@ function collectVitalBody(panel, type) {
   if (!measuredAt) return null;
 
   const body = { type, measured_at: measuredAt, visibility, note };
+  const metric = vitalMetric(type);
 
-  if (type === 'bp') {
+  if (metric?.format === 'duration') {
+    const hours = numOrNull(panel.querySelector('#vital-hours'));
+    const minutes = numOrNull(panel.querySelector('#vital-minutes'));
+    if (Number.isNaN(hours) || Number.isNaN(minutes)) return null;
+    const total = durationToHours(hours || 0, minutes || 0);
+    // Null Stunden null Minuten ist keine Nacht, sondern ein leeres Formular.
+    if (total === null || total <= 0 || total > 24) return null;
+    body.value_num = total;
+    body.unit = panel.querySelector('#vital-unit')?.value || undefined;
+    return body;
+  }
+
+  if (metric?.format === 'scale') {
+    const chosen = panel.querySelector('[data-group="mood"] .health-choice[aria-pressed="true"]');
+    if (!chosen) return null;
+    const step = moodStep(chosen.dataset.mood);
+    if (!step) return null;
+    body.value_num = step.value;
+    return body;
+  }
+
+  if (metric?.format === 'pair') {
     const sys = numOrNull(panel.querySelector('#vital-sys'));
     const dia = numOrNull(panel.querySelector('#vital-dia'));
     const pulse = numOrNull(panel.querySelector('#vital-pulse'));
@@ -991,13 +1293,13 @@ function collectVitalBody(panel, type) {
 
 async function reloadAfterSave(savedType) {
   vitals.selectedType = savedType;
-  vitals.anchor = toLocalDateKey(new Date());
+  vitals.anchor = todayKey();
   try {
     await loadVitals();
     vitals.error = false;
   } catch (err) {
     console.error('[Health] vitals reload error:', err);
-    vitals.error = true;
+    vitals.error = err;
   }
   renderVitalsShell();
 }
@@ -1014,6 +1316,59 @@ function fmtNum(value, opts) {
 function fmtDelta(value) {
   if (value === null || value === undefined) return '';
   return getNumberFormat({ maximumFractionDigits: 1, signDisplay: 'exceptZero' }).format(value);
+}
+
+// --------------------------------------------------------
+// Metrik-abhängige Wertdarstellung
+// --------------------------------------------------------
+// Eine Metrik sagt über `format`, wie ihre Zahlen gelesen werden; Karten,
+// Verlaufsliste, Chart-Tooltips und Übersicht fragen ausschließlich hier nach.
+// Vorher trug jede dieser Stellen ihren eigenen `type === 'bp'`-Zweig - mit
+// Schlaf und Stimmung wären daraus fünf dreifache Verzweigungen geworden.
+
+/** Dezimalstunden als „7 h 30 min". */
+function fmtDuration(value) {
+  const parts = splitDuration(value);
+  if (!parts) return '–';
+  const hours = fmtNum(parts.hours, { maximumFractionDigits: 0 });
+  const minutes = fmtNum(parts.minutes, { maximumFractionDigits: 0 });
+  if (parts.hours && parts.minutes) return t('health.duration.hm', { hours, minutes });
+  if (parts.hours) return t('health.duration.h', { hours });
+  return t('health.duration.m', { minutes });
+}
+
+/** Ein einzelner Kanalwert (Chart-Punkt, Screenreader-Tabelle). */
+function fmtChannelValue(metric, value) {
+  if (value === null || value === undefined) return '–';
+  if (metric?.format === 'duration') return fmtDuration(value);
+  if (metric?.format === 'scale') return t(moodStep(value)?.labelKey || 'health.vitals.noValue');
+  return fmtNum(value);
+}
+
+/** Der Wert einer ganzen Messung, wie er auf Karte und Verlaufszeile steht. */
+function vitalValueText(metric, row) {
+  if (!row) return '–';
+  if (metric?.format === 'pair') return `${fmtNum(row.value_num)}/${fmtNum(row.value_num2)}`;
+  return fmtChannelValue(metric, row.value_num);
+}
+
+// Die Einheit steckt bei Dauer und Skala schon im Wertetext („7 h 30 min") oder
+// existiert gar nicht - sie ein zweites Mal danebenzusetzen ergäbe „7 h 30 min h".
+function vitalUnitText(metric, row) {
+  if (metric?.format === 'duration' || metric?.format === 'scale') return '';
+  return row?.unit || '';
+}
+
+/** Delta zum Vorwert. Bei Schlaf in Minuten, weil „+0,5" niemand als Zeit liest. */
+function fmtVitalDelta(metric, delta) {
+  if (delta === null || delta === undefined) return '';
+  if (metric?.format === 'duration') {
+    const minutes = Math.round(delta * 60);
+    return t('health.duration.m', {
+      minutes: getNumberFormat({ maximumFractionDigits: 0, signDisplay: 'exceptZero' }).format(minutes),
+    });
+  }
+  return fmtDelta(delta);
 }
 
 // ========================================================
@@ -1057,16 +1412,12 @@ async function mountMeds() {
     `<div class="health-meds__loading">${esc(t('common.loading'))}</div>`);
 
   try {
-    if (!meds.members.length) {
-      const res = await api.get('/family/members');
-      meds.members = res.data || [];
-    }
-    if (!meds.personId) meds.personId = meds.meId ?? meds.members[0]?.id ?? null;
+    await loadHealthMembers(meds, healthUser);
     await loadMeds();
     meds.error = false;
   } catch (err) {
     console.error('[Health] meds mount error:', err);
-    meds.error = true;
+    meds.error = err;
   }
   meds.loaded = true;
   renderMedsShell();
@@ -1079,9 +1430,9 @@ async function loadMeds() {
   meds.schedulesByMed = {};
   meds.logsByMed = {};
 
-  const today = toLocalDateKey(new Date());
-  const from = addLocalDays(today, -(meds.adherenceDays - 1));
+  const today = todayKey();
   await Promise.all(meds.list.map(async (m) => {
+    const from = addLocalDays(today, -(medLogWindowDays(m, meds.adherenceDays) - 1));
     const [sRes, lRes] = await Promise.all([
       api.get(`/health/medications/${m.id}/schedules`),
       api.get(`/health/medications/${m.id}/logs?from=${from}T00:00&to=${today}T23:59`),
@@ -1091,18 +1442,40 @@ async function loadMeds() {
   }));
 }
 
-function isOwnMedsView() {
-  return meds.personId != null && meds.personId === meds.meId;
+/**
+ * Wie weit zurueck die Dosis-Eintraege eines Medikaments gelesen werden muessen.
+ *
+ * Grundlage ist das Adhaerenz-Fenster. Ein Bedarfsmedikament braucht mehr, wenn
+ * sein Mindestabstand darueber hinausreicht (erlaubt sind bis zu 28 Tage): der
+ * Countdown rechnet aus der LETZTEN Einnahme, und was ausserhalb des Fensters
+ * liegt, kommt gar nicht erst an. Der Meds-Tab schriebe dann „Noch nicht
+ * genommen", waehrend die Uebersicht mit ihrem groesseren Fenster gleichzeitig
+ * den richtigen Zeitpunkt zeigt - und die Zeile, die vor einer zu fruehen Dosis
+ * warnen soll, waere die eine, die schweigt.
+ */
+function medLogWindowDays(med, baseDays) {
+  const hours = Number(med?.min_interval_hours);
+  if (!med?.prn || !Number.isFinite(hours) || hours <= 0) return baseDays;
+  return Math.max(baseDays, Math.ceil(hours / 24) + 1);
 }
 
 function allSchedules() {
   return meds.list.flatMap((m) => meds.schedulesByMed[m.id] || []);
 }
 
+/**
+ * Die Dosen, gegen die sich die Adhaerenz messen laesst - also die GEPLANTEN.
+ *
+ * `planned` zaehlt Eintraege aus den Einnahmeplaenen; eine Bedarfsdosis gehoert
+ * zu keinem und darf deshalb nicht im Zaehler stehen. Sichtbar wurde das erst
+ * mit #700: vorher fielen Bedarfsdosen schon am Zeitraumfilter der Route heraus,
+ * seit dem Fix kommen sie mit - und drei von sieben geplanten Dosen plus acht
+ * Kopfschmerztabletten haetten „100 %, 11 von 11" ergeben.
+ */
 function allLogsInRange(from, to) {
   const out = [];
   for (const m of meds.list) {
-    for (const l of (meds.logsByMed[m.id] || [])) {
+    for (const l of scheduledLogs(meds.logsByMed[m.id])) {
       const key = String(l.scheduled_at || l.taken_at || l.created_at || '').slice(0, 10);
       if (key >= from && key <= to) out.push(l);
     }
@@ -1121,32 +1494,27 @@ function renderMedsShell() {
   meds.root.replaceChildren();
 
   if (meds.error) {
-    meds.root.insertAdjacentHTML('beforeend', `
-      <div class="empty-state">
-        <i data-lucide="cloud-off" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${esc(t('health.meds.loadError'))}</div>
-        <div class="empty-state__description">${esc(t('health.meds.loadErrorDesc'))}</div>
-        <button class="btn btn--primary empty-state__cta" data-action="meds-retry">
-          <i data-lucide="refresh-cw" class="icon-md" aria-hidden="true"></i>
-          ${esc(t('health.meds.retry'))}
-        </button>
-      </div>`);
-    if (window.lucide) window.lucide.createIcons({ el: meds.root });
-    meds.root.querySelector('[data-action="meds-retry"]')?.addEventListener('click', () => mountMeds());
+    mountAreaLoadError(meds, 'meds', mountMeds);
     return;
   }
 
   meds.root.insertAdjacentHTML('beforeend', `
-    <div class="health-persons" role="tablist" aria-label="${esc(t('health.meds.personsLabel'))}">
-      ${personChipsMarkup(meds.members, meds.personId, meds.meId)}
-    </div>
-    ${readOnlyBannerMarkup(meds.members, meds.personId, isOwnMedsView())}
+    ${personSwitcherMarkup(meds.members, meds.personId, meds.meId,
+      { menuId: 'health-person-menu-meds', label: t('health.meds.personsLabel') })}
+    ${readOnlyBannerMarkup(meds.members, meds.personId, canEditFor(meds.personId, meds.meId), meds.meId)}
     <div class="health-meds__toolbar">
-      <h3 class="health-meds__section-title u-toolbar-title">${esc(t('health.meds.dueToday.title'))}</h3>
+      <h3 class="health-meds__section-title u-section-title">${esc(t('health.meds.dueToday.title'))}</h3>
     </div>
     <div class="health-meds__due">${dueTodayMarkup()}</div>
+    ${prnMeds('meds').length ? `
+    <h3 class="health-meds__section-title u-section-title">${esc(t('health.meds.prn.title'))}</h3>
+    <div class="health-meds__prn">${prnListMarkup('meds')}</div>` : ''}
     <div class="health-meds__adherence-wrap">${adherenceMarkup()}${medLogHistoryMarkup()}</div>
-    <h3 class="health-meds__section-title u-toolbar-title">${esc(t('health.meds.title'))}</h3>
+    <!-- „Alle Medikamente", nicht „Medikamente": der Abschnitt stand unter dem
+         gleichnamigen Tab und trug denselben Namen wie das Panel, benannte sich
+         also gegen „Heute faellig" gar nicht. Gefunden vom Guard, der die
+         Titelwiederholung seit Runde 5 fuer Leiste UND Abschnitt prueft. -->
+    <h3 class="health-meds__section-title u-section-title">${esc(t('health.meds.allTitle'))}</h3>
     <div class="health-meds__list" id="health-meds-list">${medListMarkup()}</div>
   `);
   if (window.lucide) window.lucide.createIcons({ el: meds.root });
@@ -1155,10 +1523,10 @@ function renderMedsShell() {
 }
 
 function dueTodayMarkup() {
-  const today = toLocalDateKey(new Date());
+  const today = todayKey();
   const due = computeDueDoses(allSchedules(), { from: today, to: today });
   if (!due.length) {
-    return `<div class="health-meds__due-empty">${esc(t('health.meds.dueToday.empty'))}</div>`;
+    return emptyHintHTML(t('health.meds.dueToday.empty'));
   }
   const rows = due.map((dose) => {
     const med = meds.list.find((m) => m.id === dose.medicationId);
@@ -1170,7 +1538,7 @@ function dueTodayMarkup() {
 function dueRowMarkup(dose, med, log) {
   const name = med ? med.name : '';
   const status = log?.status;
-  const own = isOwnMedsView();
+  const own = canEditFor(meds.personId, meds.meId);
   const doseText = dose.dose_qty != null ? ` · ${t('health.meds.doseQty', { count: fmtNum(dose.dose_qty) })}` : '';
 
   let actions;
@@ -1182,50 +1550,365 @@ function dueRowMarkup(dose, med, log) {
     const data = `data-med-id="${esc(dose.medicationId)}" data-schedule-id="${esc(dose.scheduleId ?? '')}" data-scheduled-at="${esc(dose.scheduledAt)}" data-log-id="${esc(log?.id ?? '')}" data-dose="${esc(dose.dose_qty ?? '')}"`;
     actions = `
       <div class="health-dose__actions">
-        <button type="button" class="btn btn--sm btn--primary" data-dose-take ${data}>${esc(t('health.meds.take'))}</button>
-        <button type="button" class="btn btn--sm btn--ghost" data-dose-skip ${data}>${esc(t('health.meds.skip'))}</button>
+        <button type="button" class="btn btn--sm btn--primary health-dose__take" data-dose-take ${data} aria-label="${esc(t('health.meds.take'))}"><i data-lucide="check" class="icon-sm" aria-hidden="true"></i><span class="health-dose__take-label">${esc(t('health.meds.take'))}</span></button>
+        <button type="button" class="btn btn--sm btn--ghost health-dose__skip" data-dose-skip ${data} aria-label="${esc(t('health.meds.skip'))}"><i data-lucide="skip-forward" class="icon-sm" aria-hidden="true"></i><span class="health-dose__skip-label">${esc(t('health.meds.skip'))}</span></button>
       </div>`;
   } else {
     actions = `<span class="health-dose__status">${esc(t('health.meds.status.pending'))}</span>`;
   }
 
   return `
-    <li class="health-dose">
+    <li class="list-row health-dose">
       <span class="health-dose__time">${esc(dose.time)}</span>
-      <span class="health-dose__name">${esc(name)}${esc(doseText)}</span>
+      <span class="list-row__name health-dose__name">${esc(name)}${esc(doseText)}</span>
       ${actions}
     </li>`;
 }
 
+// --------------------------------------------------------
+// Bedarfsmedikation (#700)
+//
+// „Bei Bedarf" gab es seit jeher als Feld, als Abzeichen und als Spalte - nur
+// keinen Knopf: beide Buchungspfade hingen an `data-schedule-id`, und ein
+// Bedarfsmedikament hat definitionsgemaess keinen Zeitplan. Yuvomi versprach
+// hier etwas, das es nicht einloeste.
+//
+// Der Abschnitt steht bewusst EINMAL da und wird von beiden Tabs benutzt
+// (Medikamente und Uebersicht). Die Datei fuehrt fuer die geplante Dosis zwei
+// getrennte Renderer - `dueRowMarkup` und `overviewDueRowMarkup` -, und genau
+// dort ist eine Korrektur schon einmal nur in einem der beiden gelandet.
+// --------------------------------------------------------
+
+/** Der Datenzugang eines Tabs, damit ein Renderer beiden dient. */
+function prnScope(scope) {
+  return scope === 'overview'
+    ? { list: overview.meds, logs: overview.logsByMed, own: canEditFor(overview.personId, overview.meId), reload: reloadOverview }
+    : { list: meds.list,     logs: meds.logsByMed,     own: canEditFor(meds.personId, meds.meId),         reload: reloadMeds };
+}
+
+/** Die aktiven Bedarfsmedikamente eines Tabs. */
+function prnMeds(scope) {
+  return prnScope(scope).list.filter((m) => m.prn && m.active);
+}
+
+/** Zeitpunkt lesbar: die Uhrzeit allein nur, wenn sie noch heute liegt. */
+function prnWhenLabel(at) {
+  // `at` ist ein Zeitpunkt: sein Kalendertag kommt aus der Anzeigezone, nicht aus
+  // den Browser-Gettern - sonst vergleicht die Zeile zwei verschiedene Uhren.
+  const sameDay = zonedDateKey(at) === todayKey();
+  return sameDay ? formatTime(at) : `${formatDate(at)} ${formatTime(at)}`;
+}
+
+/** Restdauer als „5 Std. 20 Min." bzw. „20 Min.". */
+function prnRemainingLabel(ms) {
+  const { hours, minutes } = splitRemaining(ms);
+  return hours > 0
+    ? t('health.meds.prn.remainingHm', { hours, minutes })
+    : t('health.meds.prn.remainingM', { minutes });
+}
+
+/**
+ * Der Stand als zwei Angaben - die handlungsleitende zuerst.
+ *
+ * Vorn steht immer die absolute Uhrzeit, weil sie auch in drei Stunden noch
+ * stimmt; „noch 5 Std. 20 Min." ist nur in dem Moment richtig, in dem man
+ * hinsieht. Die Zweitangabe faellt bei Enge weg (health.css) - dieselbe
+ * Antwort, die die geplante Dosis daneben schon gibt, und der volle Satz
+ * bleibt am `title`/`aria-label` haengen.
+ *
+ * @returns {{ lead:string, detail:string, full:string }}
+ */
+function prnStatusParts(state) {
+  if (!state.allowed && state.nextAllowedAt) {
+    const lead = t('health.meds.prn.nextAt', { time: prnWhenLabel(state.nextAllowedAt) });
+    const detail = prnRemainingLabel(state.remainingMs);
+    return { lead, detail, full: `${lead} · ${detail}` };
+  }
+  if (!state.lastTakenAt) {
+    const lead = t('health.meds.prn.never');
+    return { lead, detail: '', full: lead };
+  }
+  const lead = t('health.meds.prn.ready');
+  const detail = t('health.meds.prn.lastTaken', { time: prnWhenLabel(state.lastTakenAt) });
+  return { lead, detail, full: `${lead} · ${detail}` };
+}
+
+/** Die Statuszeile als Markup - eine Quelle fuer Erstaufbau und Minutentakt. */
+function prnStatusMarkup(state) {
+  const parts = prnStatusParts(state);
+  // Der Countdown wird aus `data-prn-next` neu geschrieben, nicht aus einem
+  // laufenden Zaehler - deshalb ueberlebt er Reload und Geraetewechsel.
+  //
+  // Der Zeitpunkt steht NUR am wartenden Stand. `nextAllowedAt` existiert auch,
+  // wenn er laengst verstrichen ist, und der Minutentakt liest jedes gesetzte
+  // Attribut: eine abgelaufene Zeile haette ihn bei jedem Tick als „gerade
+  // abgelaufen" gemeldet und damit im Minutenrhythmus beide Tabs neu gebaut -
+  // ein offenes Einnahmeprotokoll klappt dabei zu, Scrollstand und Fokus gehen
+  // verloren.
+  const countdown = state.allowed ? '' : state.nextAllowedAt.toISOString();
+  return `
+    <span class="health-prn__status" data-prn-countdown title="${esc(parts.full)}"
+          data-prn-next="${esc(countdown)}">
+      <span class="health-prn__lead">${esc(parts.lead)}</span>
+      ${parts.detail ? `<span class="health-prn__detail">${esc(parts.detail)}</span>` : ''}
+    </span>`;
+}
+
+function prnRowMarkup(med, scope, own) {
+  const s = prnScope(scope);
+  const state = prnDoseState(med, s.logs[med.id] || []);
+  const doseText = med.prn_dose_qty != null
+    ? t('health.meds.doseQty', { count: fmtNum(med.prn_dose_qty) })
+    : med.dosage_text || '';
+
+  const action = own
+    ? `<button type="button" class="btn btn--sm ${state.allowed ? 'btn--primary' : 'btn--ghost'} health-prn__take"
+               data-prn-take data-prn-scope="${esc(scope)}" data-med-id="${esc(med.id)}"
+               aria-label="${esc(t('health.meds.prn.takeFor', { medication: med.name }))}">
+         <i data-lucide="pill" class="icon-sm" aria-hidden="true"></i>
+         <span class="health-prn__take-label">${esc(t('health.meds.prn.take'))}</span>
+       </button>`
+    : '';
+
+  return `
+    <li class="list-row health-dose health-prn${state.allowed ? '' : ' is-waiting'}">
+      <span class="list-row__name health-dose__name">${esc(med.name)}${doseText ? ` · ${esc(doseText)}` : ''}</span>
+      ${prnStatusMarkup(state)}
+      ${action}
+    </li>`;
+}
+
+/** Die Liste selbst - ohne Ueberschrift, die setzt der jeweilige Tab. */
+function prnListMarkup(scope) {
+  const list = prnMeds(scope);
+  if (!list.length) return '';
+  const own = prnScope(scope).own;
+  return `<ul class="health-meds__due-list">${list.map((m) => prnRowMarkup(m, scope, own)).join('')}</ul>`;
+}
+
+/**
+ * Schreibt die Countdown-Zeilen neu, ohne die Seite anzufassen.
+ *
+ * Einmal pro Minute reicht: die Anzeige rundet ohnehin auf volle Minuten auf.
+ * Laeuft der Abstand waehrenddessen ab, holt der naechste Durchlauf den ganzen
+ * Abschnitt frisch, damit der Knopf seine Rolle wechselt.
+ */
+function refreshPrnCountdowns() {
+  const now = Date.now();
+  let expired = false;
+  for (const el of document.querySelectorAll('[data-prn-countdown]')) {
+    const next = parseLogInstant(el.dataset.prnNext);
+    if (!next) continue;
+    const remaining = next.getTime() - now;
+    if (remaining <= 0) { expired = true; continue; }
+    const lead = t('health.meds.prn.nextAt', { time: prnWhenLabel(next) });
+    const detail = prnRemainingLabel(remaining);
+    el.title = `${lead} · ${detail}`;
+    el.querySelector('.health-prn__lead').textContent = lead;
+    const detailEl = el.querySelector('.health-prn__detail');
+    if (detailEl) detailEl.textContent = detail;
+  }
+  return expired;
+}
+
+let prnTicker = null;
+
+/** Startet den Minutentakt, sobald ein Countdown auf der Seite steht. */
+function ensurePrnTicker() {
+  if (prnTicker) return;
+  prnTicker = window.setInterval(() => {
+    if (!document.querySelector('[data-prn-countdown]')) { stopPrnTicker(); return; }
+    if (!refreshPrnCountdowns()) return;
+    // Abgelaufen: der Abschnitt muss neu, sonst bliebe der Knopf im
+    // Warte-Zustand stehen, obwohl die Dosis erlaubt ist. Beide Tabs sind
+    // gleichzeitig im DOM (nur eines sichtbar) - deshalb kein `else if`, sonst
+    // bliebe das jeweils andere auf dem alten Stand stehen.
+    if (meds.root?.isConnected) renderMedsShell();
+    if (overview.root?.isConnected) renderOverviewShell();
+  }, 60_000);
+}
+
+function stopPrnTicker() {
+  if (!prnTicker) return;
+  window.clearInterval(prnTicker);
+  prnTicker = null;
+}
+
+// Welche Medikamente gerade gebucht werden. Denselben Knopf gibt es mehrfach -
+// je Tab einen, beide gleichzeitig gemountet, und bei einem Medikament mit Plan
+// UND Bedarf zusaetzlich den geplanten neben dem der Bedarfszeile. `btn.disabled`
+// sperrt nur den angeklickten: wer waehrend der laufenden Anfrage den Tab
+// wechselt oder die andere Zeile nimmt, bucht dieselbe Dosis ein zweites Mal,
+// samt zweitem Bestandsabzug.
+const doseInFlight = new Set();
+
+/** JEDEN Buchungsknopf eines Medikaments sperren oder freigeben. */
+function setDoseBusy(medId, busy) {
+  if (busy) doseInFlight.add(medId); else doseInFlight.delete(medId);
+  for (const el of doseButtonsFor(medId)) el.disabled = busy;
+}
+
+/** Alle Knoepfe, die fuer dieses Medikament eine Dosis buchen - geplant wie bei Bedarf. */
+function doseButtonsFor(medId) {
+  return document.querySelectorAll(
+    `[data-prn-take][data-med-id="${medId}"],`
+    + `[data-dose-take][data-med-id="${medId}"], [data-dose-skip][data-med-id="${medId}"],`
+    + `[data-ov-dose-take][data-med-id="${medId}"], [data-ov-dose-skip][data-med-id="${medId}"]`,
+  );
+}
+
+/** Eine Bedarfsdosis buchen. */
+async function handlePrnDose(btn) {
+  const scope = btn.dataset.prnScope;
+  const s = prnScope(scope);
+  const medId = Number(btn.dataset.medId);
+  const med = s.list.find((m) => m.id === medId);
+  if (!med) return;
+  if (doseInFlight.has(medId)) return;
+
+  const state = prnDoseState(med, s.logs[medId] || []);
+  // Nicht gesperrt, nur gefragt: der Mindestabstand ist eine Empfehlung vom
+  // Beipackzettel, kein Schloss - und wer eine Dosis wirklich frueher nimmt,
+  // soll sie eintragen koennen, statt sie zu verschweigen. Der Dialog nennt
+  // den Zeitpunkt, um den es geht.
+  const fruehGefragt = Boolean(!state.allowed && state.nextAllowedAt);
+  if (fruehGefragt) {
+    const ok = await confirmModal(t('health.meds.prn.earlyConfirm'), {
+      detail: t('health.meds.prn.earlyDetail', {
+        time: prnWhenLabel(state.nextAllowedAt),
+        remaining: prnRemainingLabel(state.remainingMs),
+      }),
+      confirmLabel: t('health.meds.prn.earlyConfirmAction'),
+    });
+    if (!ok) return;
+  }
+
+  setDoseBusy(medId, true);
+  const dose = med.prn_dose_qty != null ? Number(med.prn_dose_qty) : null;
+  try {
+    await api.post(`/health/medications/${medId}/logs`, {
+      status: 'taken',
+      // Wanduhrzeit, keine ISO-Zone: die Route kuerzt den Wert auf Minuten und
+      // wuerfe die Zone weg - die Einnahme stuende dann mit der UTC-Zahl im
+      // Protokoll und der Countdown rechnete daneben.
+      taken_at: toLocalStamp(),
+      ...(dose != null && Number.isFinite(dose) ? { dose_qty: dose } : {}),
+    });
+  } catch (err) {
+    console.error('[Health] prn dose error:', err);
+    setDoseBusy(medId, false);
+    window.yuvomi?.showToast(err?.data?.error || t('health.meds.doseError'), 'danger');
+    return;
+  }
+
+  // AB HIER IST DIE DOSIS GEBUCHT. Der Bestandsabzug ist ein zweiter Aufruf,
+  // und wenn er scheitert, darf das nicht als „Buchung fehlgeschlagen" dastehen:
+  // wer es dann noch einmal versucht, hat die Dosis zweimal im Protokoll. Der
+  // Bestand ist eine Nebenbuchhaltung, die Dosis die Aussage ueber den Koerper.
+  //
+  // Der Abzug wird beim Zuruecknehmen NICHT gutgeschrieben - so haelt es die
+  // geplante Dosis seit jeher (#701 korrigiert den Eintrag, nicht den Bestand).
+  // Das ist eine bekannte Grenze und keine Eigenheit der Bedarfsdosis; sie
+  // aufzuheben hiesse, jede Korrektur serverseitig gegenzubuchen, und das gehoert
+  // in einen eigenen Schritt statt in diesen.
+  if (dose != null && Number.isFinite(dose) && med.stock_qty != null) {
+    try {
+      const next = Math.max(0, Number(med.stock_qty) - dose);
+      await api.patch(`/health/medications/${medId}`, { stock_qty: next });
+    } catch (err) {
+      console.error('[Health] prn stock error:', err);
+      window.yuvomi?.showToast(t('health.meds.stockUpdateFailed'), 'danger');
+    }
+  }
+
+  window.yuvomi?.showToast(t('health.meds.doseSaved'), 'success');
+  // Erst nach dem Neuzeichnen freigeben: bis dahin darf kein Zwilling scharf
+  // sein. Freigegeben wird ueber `setDoseBusy` und nicht ueber das Set allein -
+  // die Knoepfe von eben sind beim Neuzeichnen verschwunden, und die neuen sind
+  // gerade erst durch `wirePrn` gesperrt worden, weil die Buchung da noch lief.
+  // Ein blosses `delete` haette den Eintrag geraeumt und den Knopf gesperrt
+  // gelassen: bei einem Medikament ohne Mindestabstand bis zum naechsten
+  // Seitenaufbau.
+  await reloadMedViews();
+  setDoseBusy(medId, false);
+  // Nur nach der Rueckfrage: ohne sie wurde auf diesem Weg kein Dialog
+  // geschlossen, und das Nachfassen griffe auf den Merker eines frueheren zurueck
+  // (#1083). Nach `setDoseBusy`, sonst traefe es den noch gesperrten Knopf.
+  if (fruehGefragt) refocusAfterRender();
+}
+
+/**
+ * BEIDE Ansichten auffrischen, die Medikamentendaten zeigen.
+ *
+ * Uebersicht und Medikamente sind gleichzeitig gemountet, und die weiche
+ * Tab-Navigation baut ein bereits geladenes Panel nicht neu auf. Nur den
+ * angefassten neu zu laden hiesse: der andere rechnet mit dem Stand von vorhin.
+ * Das faellt ueberall an, wo sich etwas an Medikamenten, Plaenen oder Dosen
+ * aendert - eine gebuchte Dosis verschiebt drueben den Countdown, ein
+ * abgeschalteter Bedarfshaken laesst drueben einen Knopf stehen, den es nicht
+ * mehr geben duerfte, und der bucht dann eine Dosis, vor der niemand mehr warnt.
+ * Geladen wird nur, was auch gemountet ist; wer die Uebersicht nie geoeffnet
+ * hat, zahlt nichts dafuer.
+ */
+async function reloadMedViews() {
+  const jobs = [];
+  if (meds.root?.isConnected && meds.loaded) jobs.push(reloadMeds());
+  if (overview.root?.isConnected && overview.loaded) jobs.push(reloadOverview());
+  await Promise.all(jobs);
+}
+
+/** Sperrt frisch gezeichnete Knoepfe, deren Buchung noch laeuft. */
+function respectDoseLock(root) {
+  // Ein Neuaufbau waehrend einer laufenden Buchung darf keinen Knopf wieder
+  // scharf machen - er entsteht ja frisch und wuesste sonst nichts davon.
+  root.querySelectorAll('[data-med-id]').forEach((btn) => {
+    if (typeof btn.disabled !== 'boolean') return;
+    if (doseInFlight.has(Number(btn.dataset.medId))) btn.disabled = true;
+  });
+}
+
+/** Bindet die Bedarfsknoepfe eines Wurzelelements. */
+function wirePrn(root) {
+  respectDoseLock(root);
+  root.querySelectorAll('[data-prn-take]').forEach((btn) => {
+    btn.addEventListener('click', () => handlePrnDose(btn));
+  });
+  if (root.querySelector('[data-prn-countdown]')) ensurePrnTicker();
+}
+
 function adherenceMarkup() {
-  const today = toLocalDateKey(new Date());
+  const today = todayKey();
   const from = addLocalDays(today, -(meds.adherenceDays - 1));
   const planned = computeDueDoses(allSchedules(), { from, to: today }).length;
   const a = computeAdherence(allLogsInRange(from, today), planned);
 
+  // Seit Block 2 die geteilte Kennzahlkarte: Titel + Zeitraum teilen sich die
+  // Meta-Zeile, der Balken ist der geteilte __progress (Zweitkanal zur Zahl).
   const head = `
-    <div class="health-adherence__head">
-      <span class="health-adherence__title">${esc(t('health.meds.adherence.title'))}</span>
-      <span class="health-adherence__period">${esc(t('health.meds.adherence.period', { days: meds.adherenceDays }))}</span>
+    <div class="metric-card__meta">
+      <span class="metric-card__label">${esc(t('health.meds.adherence.title'))}</span>
+      <span>${esc(t('health.meds.adherence.period', { days: meds.adherenceDays }))}</span>
     </div>`;
 
   if (a.rate === null) {
-    return `<div class="health-adherence">${head}
-      <div class="health-adherence__empty">${esc(t('health.meds.adherence.noData'))}</div></div>`;
+    return `<div class="metric-card">${head}
+      <div class="metric-card__note">${esc(t('health.meds.adherence.noData'))}</div></div>`;
   }
   // Geplant, aber noch nichts protokolliert: KEIN großes rotes „0 %" — das liest
   // sich als Vorwurf. Stattdessen ein neutraler Frühzustand (Adherence-Scham vermeiden).
   if (a.taken === 0) {
-    return `<div class="health-adherence">${head}
-      <div class="health-adherence__empty">${esc(t('health.meds.adherence.notStarted'))}</div></div>`;
+    return `<div class="metric-card">${head}
+      <div class="metric-card__note">${esc(t('health.meds.adherence.notStarted'))}</div></div>`;
   }
   const pct = Math.round(a.rate * 100);
   return `
-    <div class="health-adherence">
+    <div class="metric-card">
       ${head}
-      <div class="health-adherence__value">${esc(fmtNum(pct))}%</div>
-      <div class="health-adherence__bar"><span style="width:${pct}%"></span></div>
-      <div class="health-adherence__summary">${esc(t('health.meds.adherence.summary', { taken: a.taken, planned: a.planned }))}</div>
+      <div class="metric-card__value">${esc(fmtNum(pct))}%</div>
+      <div class="metric-card__progress" role="progressbar" aria-label="${esc(t('health.meds.adherence.title'))}"
+           aria-valuemin="0" aria-valuemax="100"
+           aria-valuenow="${pct}" aria-valuetext="${pct}%"><span style="--fill:${pct / 100}"></span></div>
+      <div class="metric-card__note">${esc(t('health.meds.adherence.summary', { taken: a.taken, planned: a.planned }))}</div>
     </div>`;
 }
 
@@ -1236,22 +1919,51 @@ function medLogHistoryMarkup() {
   const entries = [];
   for (const m of meds.list) {
     for (const l of (meds.logsByMed[m.id] || [])) {
-      entries.push({ med: m.name, at: l.taken_at || l.scheduled_at || l.created_at || '', status: l.status });
+      entries.push({
+        id: l.id, med: m.name, medId: m.id, scheduleId: l.schedule_id ?? null,
+        at: l.taken_at || l.scheduled_at || l.created_at || '', status: l.status,
+      });
     }
   }
   if (!entries.length) return '';
   entries.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+
+  // Dasselbe ausdrueckliche Betreuungsrecht wie beim Buchen und Abhaken gilt
+  // auch fuer die Korrektur (#999). Der Server zieht diese Grenze zentral ueber
+  // `ownLogRow` -> `writableChild`; die Oberflaeche muss deshalb denselben
+  // bereits geladenen Grant verwenden statt einer engeren Eigentuemerpruefung.
+  const own = canEditFor(meds.personId, meds.meId);
+
   const rows = entries.slice(0, 10).map((e) => {
-    const skipped = e.status === 'skipped';
+    // Uebersprungen und ausstehend sind beide "nicht genommen" und treten
+    // gleich weit zurueck; unterscheiden tut sie das Wort daneben.
+    const muted = e.status !== 'taken';
     const d = String(e.at);
     const timeLabel = d.length >= 16
       ? `${formatDate(d.slice(0, 10))} · ${formatTime(new Date(d))}`
       : formatDate(d.slice(0, 10));
-    return `<li class="health-medlog__row${skipped ? ' is-skipped' : ''}">
-        <i data-lucide="${skipped ? 'circle-slash' : 'check'}" aria-hidden="true"></i>
+    // Drei Staende, nicht zwei: das Protokoll kannte nur "uebersprungen" und
+    // "sonst genommen" und schrieb damit "Genommen" unter jede ausstehende
+    // Dosis. Solange es keinen Weg zurueck gab, fiel das kaum auf - seit es
+    // einen gibt (#701), waere es die Zeile, die der Korrektur widerspricht.
+    const statusLabel = {
+      skipped: t('health.meds.status.skipped'),
+      pending: t('health.meds.log.statusPending'),
+    }[e.status] ?? t('health.meds.status.taken');
+    const icon = { skipped: 'circle-slash', pending: 'circle-dashed' }[e.status] ?? 'check';
+    const body = `
+        <i data-lucide="${icon}" aria-hidden="true"></i>
         <span class="health-medlog__med">${esc(e.med)}</span>
         <span class="health-medlog__time">${esc(timeLabel)}</span>
-        <span class="health-medlog__status">${esc(skipped ? t('health.meds.status.skipped') : t('health.meds.status.taken'))}</span>
+        <span class="health-medlog__status">${esc(statusLabel)}</span>`;
+    if (!own) {
+      return `<li class="health-medlog__row${muted ? ' is-muted' : ''}">${body}</li>`;
+    }
+    return `<li class="health-medlog__row${muted ? ' is-muted' : ''}">
+        <button type="button" class="health-medlog__edit" data-medlog-edit="${esc(e.id)}"
+                aria-label="${esc(t('health.meds.log.correct', { medication: e.med, time: timeLabel }))}">
+          ${body}
+        </button>
       </li>`;
   }).join('');
   return `
@@ -1261,9 +1973,130 @@ function medLogHistoryMarkup() {
     </details>`;
 }
 
+/** Ein Log-Eintrag aus dem geladenen Bestand, samt Medikamentenname. */
+function findMedLog(logId) {
+  for (const m of meds.list) {
+    const hit = (meds.logsByMed[m.id] || []).find((l) => l.id === logId);
+    if (hit) return { ...hit, medName: m.name };
+  }
+  return null;
+}
+
+/**
+ * Einen Dosis-Eintrag korrigieren oder zurücknehmen (#701).
+ *
+ * Vorher gab es nur take/skip, also zwei Einbahnstraßen: ein Fehlgriff blieb
+ * für immer stehen, und zwar nicht nur in der App, sondern auch im Export.
+ *
+ * Gelöscht werden kann nur, was nicht aus einem Zeitplan stammt. Ein geplanter
+ * Eintrag wird zurückgenommen ("steht aus") statt entfernt, weil der Scheduler
+ * ihn sonst beim nächsten Lauf wieder anlegt - das Löschen sähe aus wie ein
+ * Erfolg und wäre eine Rückkehr auf Raten. Der Server weist es entsprechend ab.
+ */
+function openMedLogModal(logId) {
+  const entry = findMedLog(logId);
+  if (!entry) return;
+
+  const when = entry.taken_at || entry.scheduled_at || entry.created_at || '';
+  const dateValue = String(when).slice(0, 10);
+  const timeValue = String(when).length >= 16 ? String(when).slice(11, 16) : '';
+  const isScheduled = Boolean(entry.schedule_id);
+
+  openModal({
+    title: t('health.meds.log.editTitle'),
+    size: 'sm',
+    content: `
+      <form id="medlog-form" class="form-stack">
+        <p class="form-hint">${esc(entry.medName)}</p>
+        <div class="form-field">
+          <label class="label" for="medlog-status">${esc(t('health.meds.log.statusLabel'))}</label>
+          <select class="input" id="medlog-status">
+            <option value="taken"${entry.status === 'taken' ? ' selected' : ''}>${esc(t('health.meds.status.taken'))}</option>
+            <option value="skipped"${entry.status === 'skipped' ? ' selected' : ''}>${esc(t('health.meds.status.skipped'))}</option>
+            <option value="pending"${entry.status === 'pending' ? ' selected' : ''}>${esc(t('health.meds.log.statusPending'))}</option>
+          </select>
+        </div>
+        <div class="modal-grid modal-grid--2" id="medlog-when">
+          <div class="form-field">
+            <label class="label" for="medlog-date">${esc(t('health.meds.log.dateLabel'))}</label>
+            <yuvomi-datepicker id="medlog-date" type="date" value="${esc(dateValue)}"></yuvomi-datepicker>
+          </div>
+          <div class="form-field">
+            <label class="label" for="medlog-time">${esc(t('health.meds.log.timeLabel'))}</label>
+            <yuvomi-datepicker id="medlog-time" type="time" value="${esc(timeValue)}"></yuvomi-datepicker>
+          </div>
+        </div>
+        <p class="form-hint">${esc(isScheduled ? t('health.meds.log.scheduledHint') : t('health.meds.log.adhocHint'))}</p>
+
+        <div class="modal-actions">
+          ${isScheduled ? '' : `<button type="button" class="btn btn--danger btn--ghost" data-action="medlog-delete">${esc(t('common.delete'))}</button>`}
+          <button type="button" class="btn btn--ghost" data-action="cancel">${esc(t('common.cancel'))}</button>
+          <button type="submit" class="btn btn--primary">${esc(t('common.save'))}</button>
+        </div>
+      </form>`,
+    onSave(panel) {
+      if (window.lucide) window.lucide.createIcons({ el: panel });
+
+      const statusField = panel.querySelector('#medlog-status');
+      const whenBox = panel.querySelector('#medlog-when');
+      // Ein Zeitpunkt gehört zu "genommen". Bei den anderen beiden Ständen wäre
+      // er ein Widerspruch in derselben Zeile, deshalb tritt er dort weg.
+      //
+      // `style.display` statt des hidden-Attributs: `.modal-grid` setzt
+      // `display: grid`, und eine Klassenregel schlägt das Attribut - das Feld
+      // wäre trotz `hidden` sichtbar geblieben.
+      const syncWhen = () => { whenBox.style.display = statusField.value === 'taken' ? '' : 'none'; };
+      statusField.addEventListener('change', syncWhen);
+      syncWhen();
+
+      panel.querySelector('[data-action="cancel"]')?.addEventListener('click', () => closeModal({ force: true }));
+      panel.querySelector('[data-action="medlog-delete"]')?.addEventListener('click', () => deleteMedLog(entry));
+
+      panel.querySelector('#medlog-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const submitBtn = panel.querySelector('[type="submit"]');
+        const status = statusField.value;
+        const body = { status };
+        if (status === 'taken') {
+          const date = panel.querySelector('#medlog-date')?.value || dateValue;
+          const time = panel.querySelector('#medlog-time')?.value || '00:00';
+          if (date) body.taken_at = `${date}T${time.length === 5 ? time : '00:00'}:00`;
+        }
+        submitBtn.disabled = true;
+        try {
+          await api.patch(`/health/logs/${entry.id}`, body);
+          closeModal({ force: true });
+          window.yuvomi?.showToast(t('health.meds.log.saved'), 'success');
+          await reloadMedViews();
+          refocusAfterRender();
+        } catch (err) {
+          console.error('[Health] med log save error:', err);
+          submitBtn.disabled = false;
+          window.yuvomi?.showToast(err?.data?.error || t('health.meds.log.saveError'), 'danger');
+        }
+      });
+    },
+  });
+}
+
+async function deleteMedLog(entry) {
+  if (!(await confirmOverModal(t('health.meds.log.deleteConfirm'),
+    { danger: true, confirmLabel: t('common.delete'), detail: t('health.meds.log.deleteConfirmDetail') }))) return;
+  try {
+    await api.delete(`/health/logs/${entry.id}`);
+    closeModal({ force: true });
+    window.yuvomi?.showToast(t('health.meds.log.deleted'), 'success');
+    await reloadMedViews();
+    refocusAfterRender();
+  } catch (err) {
+    console.error('[Health] med log delete error:', err);
+    window.yuvomi?.showToast(err?.data?.error || t('health.meds.log.saveError'), 'danger');
+  }
+}
+
 function medListMarkup() {
   if (!meds.list.length) {
-    return `<div class="health-meds__empty">${esc(t('health.meds.noMeds'))}</div>`;
+    return emptyHintHTML(t('health.meds.noMeds'));
   }
   return meds.list.map(medCardMarkup).join('');
 }
@@ -1271,7 +2104,7 @@ function medListMarkup() {
 function medCardMarkup(med) {
   const rf = refillState(med);
   const subtitle = [med.dosage_text, med.form].filter(Boolean).join(' · ');
-  const own = isOwnMedsView();
+  const own = canEditFor(meds.personId, meds.meId);
 
   const badges = [];
   if (!med.active) badges.push(`<span class="health-med-badge health-med-badge--muted">${esc(t('health.meds.badge.inactive'))}</span>`);
@@ -1305,13 +2138,8 @@ function medCardMarkup(med) {
 
 function wireMeds() {
   wireTablistKeys(meds.root);
-  meds.root.querySelectorAll('.health-person-chip').forEach((chip) =>
-    chip.addEventListener('click', () => {
-      const id = Number(chip.dataset.personId);
-      if (id === meds.personId) return;
-      meds.personId = id;
-      switchMedsPerson();
-    }));
+  installPopoverMenus(meds.root);
+  wirePersonSwitcher(meds, switchMedsPerson);
 
 
   meds.root.querySelectorAll('[data-med-edit]').forEach((card) =>
@@ -1321,10 +2149,16 @@ function wireMeds() {
       if (med) openMedModal(med);
     }));
 
+  // Eine Zeile im Einnahmeprotokoll korrigieren (#701).
+  meds.root.querySelectorAll('[data-medlog-edit]').forEach((row) =>
+    row.addEventListener('click', () => openMedLogModal(Number(row.dataset.medlogEdit))));
+
   meds.root.querySelectorAll('[data-dose-take]').forEach((btn) =>
     btn.addEventListener('click', () => handleDose(btn, 'take')));
   meds.root.querySelectorAll('[data-dose-skip]').forEach((btn) =>
     btn.addEventListener('click', () => handleDose(btn, 'skip')));
+
+  wirePrn(meds.root);
 }
 
 async function switchMedsPerson() {
@@ -1333,7 +2167,7 @@ async function switchMedsPerson() {
     meds.error = false;
   } catch (err) {
     console.error('[Health] meds load error:', err);
-    meds.error = true;
+    meds.error = err;
   }
   renderMedsShell();
 }
@@ -1344,19 +2178,23 @@ async function reloadMeds() {
     meds.error = false;
   } catch (err) {
     console.error('[Health] meds reload error:', err);
-    meds.error = true;
+    meds.error = err;
   }
   renderMedsShell();
 }
 
 async function handleDose(btn, action) {
   const medId = Number(btn.dataset.medId);
+  // Dieselbe Sperre wie bei der Bedarfsdosis: bei einem Medikament mit Plan UND
+  // Bedarf stehen beide Knoepfe nebeneinander, und zwei angestossene Buchungen
+  // sehen beide den alten Bestand.
+  if (doseInFlight.has(medId)) return;
   const logId = btn.dataset.logId ? Number(btn.dataset.logId) : null;
   const scheduleId = btn.dataset.scheduleId ? Number(btn.dataset.scheduleId) : null;
   const scheduledAt = btn.dataset.scheduledAt || null;
   const dose = btn.dataset.dose !== '' ? Number(btn.dataset.dose) : null;
 
-  btn.disabled = true;
+  setDoseBusy(medId, true);
   try {
     if (logId) {
       await api.post(`/health/logs/${logId}/${action}`, {});
@@ -1365,7 +2203,11 @@ async function handleDose(btn, action) {
       if (scheduledAt) body.scheduled_at = scheduledAt;
       if (scheduleId) body.schedule_id = scheduleId;
       if (dose != null && Number.isFinite(dose)) body.dose_qty = dose;
-      if (action === 'take') body.taken_at = new Date().toISOString();
+      // Wanduhrzeit wie bei der Bedarfsdosis: `v.datetime` kuerzt den Wert auf
+      // Minuten und wirft die Zone weg, aus 22:41 MESZ wuerde 20:41. Sichtbar
+      // war das im Protokoll; seit ein Medikament Plan UND Bedarf haben kann,
+      // rechnet auch der Countdown daraus - und zwar zwei Stunden daneben.
+      if (action === 'take') body.taken_at = toLocalStamp();
       await api.post(`/health/medications/${medId}/logs`, body);
     }
 
@@ -1379,10 +2221,13 @@ async function handleDose(btn, action) {
     }
 
     window.yuvomi?.showToast(t('health.meds.doseSaved'), 'success');
-    await reloadMeds();
+    // Beide Tabs, nicht nur dieser: ein Medikament kann Plan UND Bedarf haben,
+    // und dann verschiebt auch die geplante Dosis den Countdown drueben.
+    await reloadMedViews();
+    setDoseBusy(medId, false);
   } catch (err) {
     console.error('[Health] dose error:', err);
-    btn.disabled = false;
+    setDoseBusy(medId, false);
     window.yuvomi?.showToast(err?.data?.error || t('health.meds.doseError'), 'danger');
   }
 }
@@ -1438,11 +2283,34 @@ function openMedModal(med) {
             <span>${esc(t('health.meds.field.prn'))}</span>
           </label>
         </div>
+        <!-- Nur fuer Bedarfsmedikamente sichtbar (#700): ein Mindestabstand an
+             einem Medikament mit Zeitplan waere eine zweite, widersprechende
+             Auskunft darueber, wann die naechste Dosis ansteht. -->
+        <div class="modal-grid modal-grid--2" id="med-prn-fields">
+          <div class="form-field">
+            <label class="label" for="med-interval">${esc(t('health.meds.field.minInterval'))}</label>
+            <!-- Die Grenzen sind die der Route: groesser als 0 (ein Abstand von
+                 0 waere ein Countdown, der immer abgelaufen ist) und hoechstens
+                 28 Tage. Nicht enger, sonst liesse sich ein ueber die API
+                 gesetzter Viertelstundenabstand hier nicht mehr speichern -
+                 auch dann nicht, wenn nur der Name geaendert wird. Leer bleiben
+                 darf das Feld weiterhin: das ist „kein Abstand hinterlegt". -->
+            <input class="input" id="med-interval" type="number" inputmode="decimal" step="any" min="0.01" max="672"
+                   value="${esc(val(med?.min_interval_hours))}">
+            <p class="form-hint">${esc(t('health.meds.field.minIntervalHint'))}</p>
+          </div>
+          <div class="form-field">
+            <label class="label" for="med-prn-dose">${esc(t('health.meds.field.prnDose'))}</label>
+            <input class="input" id="med-prn-dose" type="number" inputmode="decimal" step="any" min="0"
+                   value="${esc(val(med?.prn_dose_qty))}">
+            <p class="form-hint">${esc(t('health.meds.field.prnDoseHint'))}</p>
+          </div>
+        </div>
         <div class="form-field">
           <label class="label" for="med-visibility">${esc(t('health.meds.field.visibility'))}</label>
           <select class="input" id="med-visibility">
-            <option value="private" ${med?.visibility === 'family' ? '' : 'selected'}>${esc(t('health.meds.visibility.private'))}</option>
-            <option value="family" ${med?.visibility === 'family' ? 'selected' : ''}>${esc(t('health.meds.visibility.family'))}</option>
+            <option value="private" ${(med?.visibility || defaultVisibility('meds')) === 'family' ? '' : 'selected'}>${esc(t('health.meds.visibility.private'))}</option>
+            <option value="family" ${(med?.visibility || defaultVisibility('meds')) === 'family' ? 'selected' : ''}>${esc(t('health.meds.visibility.family'))}</option>
           </select>
         </div>
         <div class="form-field">
@@ -1465,6 +2333,15 @@ function openMedModal(med) {
       renderSchedEditor(panel, med);
       if (window.lucide) window.lucide.createIcons({ el: panel });
 
+      // Die Bedarfsfelder folgen dem Haken - `style.display` und nicht `hidden`,
+      // weil `.modal-grid` `display: grid` setzt und die Klassenregel das
+      // Attribut schlaegt (dieselbe Falle wie im Protokoll-Modal).
+      const prnBox = panel.querySelector('#med-prn-fields');
+      const prnFlag = panel.querySelector('#med-prn');
+      const syncPrn = () => { prnBox.style.display = prnFlag.checked ? '' : 'none'; };
+      prnFlag.addEventListener('change', syncPrn);
+      syncPrn();
+
       panel.querySelector('[data-action="cancel"]')?.addEventListener('click', () => closeModal({ force: true }));
       panel.querySelector('[data-action="med-delete"]')?.addEventListener('click', () => deleteMed(med));
 
@@ -1479,10 +2356,11 @@ function openMedModal(med) {
         submitBtn.disabled = true;
         try {
           if (isEdit) await api.patch(`/health/medications/${med.id}`, body);
-          else await api.post('/health/medications', body);
+          else await api.post('/health/medications', { ...body, ...ownerField(meds.personId, meds.meId) });
           closeModal({ force: true });
           window.yuvomi?.showToast(t('health.meds.saved'), 'success');
-          await reloadMeds();
+          await reloadMedViews();
+          refocusAfterRender();
         } catch (err) {
           console.error('[Health] med save error:', err);
           submitBtn.disabled = false;
@@ -1502,6 +2380,7 @@ function collectMedBody(panel) {
     return raw !== '' && raw != null ? Number(raw) : null;
   };
   const str = (sel) => panel.querySelector(sel)?.value?.trim() || undefined;
+  const isPrn = Boolean(panel.querySelector('#med-prn')?.checked);
 
   return {
     name,
@@ -1513,17 +2392,25 @@ function collectMedBody(panel) {
     note: str('#med-note'),
     visibility: panel.querySelector('#med-visibility')?.value || 'private',
     active: panel.querySelector('#med-active')?.checked ? 1 : 0,
-    prn: panel.querySelector('#med-prn')?.checked ? 1 : 0,
+    prn: isPrn ? 1 : 0,
+    // Faellt der Haken, raeumen die beiden Felder mit ab - sie stehen dann zwar
+    // noch ausgefuellt hinter `display: none`, beschreiben aber nichts mehr.
+    // Ein Medikament mit Zeitplan traege sonst weiter einen Mindestabstand,
+    // den keine Ansicht mehr zeigt und kein Formular mehr aendert.
+    min_interval_hours: isPrn ? num('#med-interval') : null,
+    prn_dose_qty: isPrn ? num('#med-prn-dose') : null,
   };
 }
 
 async function deleteMed(med) {
   if (!med?.id) return;
-  if (!(await confirmOverModal(t('health.meds.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
+  if (!(await confirmOverModal(t('health.meds.deleteConfirm'),
+    { danger: true, confirmLabel: t('common.delete'), detail: t('health.meds.deleteConfirmDetail') }))) return;
   try {
     await api.delete(`/health/medications/${med.id}`);
     window.yuvomi?.showToast(t('health.meds.deleted'), 'success');
-    await reloadMeds();
+    await reloadMedViews();
+    refocusAfterRender();
   } catch (err) {
     console.error('[Health] med delete error:', err);
     window.yuvomi?.showToast(err?.data?.error || t('health.meds.deleteError'), 'danger');
@@ -1684,16 +2571,12 @@ async function mountLabs() {
     `<div class="health-labs__loading">${esc(t('common.loading'))}</div>`);
 
   try {
-    if (!labs.members.length) {
-      const res = await api.get('/family/members');
-      labs.members = res.data || [];
-    }
-    if (!labs.personId) labs.personId = labs.meId ?? labs.members[0]?.id ?? null;
+    await loadHealthMembers(labs, healthUser);
     await loadLabs();
     labs.error = false;
   } catch (err) {
     console.error('[Health] labs mount error:', err);
-    labs.error = true;
+    labs.error = err;
   }
   labs.loaded = true;
   renderLabsShell();
@@ -1711,10 +2594,6 @@ async function loadLabs() {
   if (!names.includes(labs.trendAnalyte)) labs.trendAnalyte = names[0] ?? null;
 }
 
-function isOwnLabsView() {
-  return labs.personId != null && labs.personId === labs.meId;
-}
-
 function selectedReport() {
   return labs.reports.find((r) => r.id === labs.selectedReportId) || null;
 }
@@ -1727,7 +2606,7 @@ async function switchLabsPerson() {
     labs.error = false;
   } catch (err) {
     console.error('[Health] labs load error:', err);
-    labs.error = true;
+    labs.error = err;
   }
   renderLabsShell();
 }
@@ -1738,7 +2617,7 @@ async function reloadLabs() {
     labs.error = false;
   } catch (err) {
     console.error('[Health] labs reload error:', err);
-    labs.error = true;
+    labs.error = err;
   }
   renderLabsShell();
 }
@@ -1748,28 +2627,16 @@ function renderLabsShell() {
   labs.root.replaceChildren();
 
   if (labs.error) {
-    labs.root.insertAdjacentHTML('beforeend', `
-      <div class="empty-state">
-        <i data-lucide="cloud-off" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${esc(t('health.labs.loadError'))}</div>
-        <div class="empty-state__description">${esc(t('health.labs.loadErrorDesc'))}</div>
-        <button class="btn btn--primary empty-state__cta" data-action="labs-retry">
-          <i data-lucide="refresh-cw" class="icon-md" aria-hidden="true"></i>
-          ${esc(t('health.labs.retry'))}
-        </button>
-      </div>`);
-    if (window.lucide) window.lucide.createIcons({ el: labs.root });
-    labs.root.querySelector('[data-action="labs-retry"]')?.addEventListener('click', () => mountLabs());
+    mountAreaLoadError(labs, 'labs', mountLabs);
     return;
   }
 
   labs.root.insertAdjacentHTML('beforeend', `
-    <div class="health-persons" role="tablist" aria-label="${esc(t('health.labs.personsLabel'))}">
-      ${personChipsMarkup(labs.members, labs.personId, labs.meId)}
-    </div>
-    ${readOnlyBannerMarkup(labs.members, labs.personId, isOwnLabsView())}
+    ${personSwitcherMarkup(labs.members, labs.personId, labs.meId,
+      { menuId: 'health-person-menu-labs', label: t('health.labs.personsLabel') })}
+    ${readOnlyBannerMarkup(labs.members, labs.personId, canEditFor(labs.personId, labs.meId), labs.meId)}
     <div class="health-labs__toolbar">
-      <h3 class="health-labs__section-title u-toolbar-title">${esc(t('health.labs.reportsTitle'))}</h3>
+      <h3 class="health-labs__section-title u-section-title">${esc(t('health.labs.reportsTitle'))}</h3>
     </div>
     <div class="health-labs__list" id="health-labs-list">${labReportListMarkup()}</div>
     <div class="health-labs__detail" id="health-labs-detail">${labDetailMarkup()}</div>
@@ -1781,7 +2648,7 @@ function renderLabsShell() {
 
 function labReportListMarkup() {
   if (!labs.reports.length) {
-    return `<div class="health-labs__empty">${esc(t('health.labs.noReports'))}</div>`;
+    return emptyHintHTML(t('health.labs.noReports'));
   }
   return labs.reports.map(labReportCardMarkup).join('');
 }
@@ -1812,10 +2679,10 @@ function labReportCardMarkup(report) {
 function labDetailMarkup() {
   const report = selectedReport();
   if (!report) {
-    return `<div class="health-labs__detail-empty">${esc(t('health.labs.selectHint'))}</div>`;
+    return emptyHintHTML(t('health.labs.selectHint'));
   }
 
-  const own = isOwnLabsView();
+  const own = canEditFor(labs.personId, labs.meId);
   const results = Array.isArray(report.results) ? report.results : [];
   const dateLabel = formatDate(String(report.report_date).slice(0, 10));
 
@@ -1834,7 +2701,7 @@ function labDetailMarkup() {
           <tbody>${results.map(resultRowMarkup).join('')}</tbody>
         </table>
       </div>`
-    : `<div class="health-labs__detail-empty">${esc(t('health.labs.noAnalytes'))}</div>`;
+    : emptyHintHTML(t('health.labs.noAnalytes'));
 
   return `
     <div class="health-lab-detail">
@@ -1901,7 +2768,7 @@ function labTrendMarkup() {
 
   const body = points.length >= 2
     ? labTrendChart(points, selected)
-    : `<div class="health-labs__detail-empty">${esc(t('health.labs.trend.tooFew'))}</div>`;
+    : emptyHintHTML(t('health.labs.trend.tooFew'));
 
   return `
     <div class="health-lab-trend">
@@ -1986,8 +2853,8 @@ function labTrendChart(points, analyteName) {
     tableRows,
   );
 
-  const grid = chartGridMarkup(min, max);
-  const xLabels = chartXLabelsMarkup(points.map((p) => p.date));
+  const grid = chartGridFor(min, max);
+  const xLabels = chartXLabels(points.map((p) => p.date));
 
   return `
     <svg class="health-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(ariaLabel)}">
@@ -2011,13 +2878,8 @@ const FLAG_DOT_COLORS = {
 
 function wireLabs() {
   wireTablistKeys(labs.root);
-  labs.root.querySelectorAll('.health-person-chip').forEach((chip) =>
-    chip.addEventListener('click', () => {
-      const id = Number(chip.dataset.personId);
-      if (id === labs.personId) return;
-      labs.personId = id;
-      switchLabsPerson();
-    }));
+  installPopoverMenus(labs.root);
+  wirePersonSwitcher(labs, switchLabsPerson);
 
 
   labs.root.querySelectorAll('.health-lab-card').forEach((card) =>
@@ -2072,7 +2934,7 @@ function openLabModal(report) {
   const val = (v) => (v == null ? '' : String(v));
   const dateValue = isEdit
     ? String(report.report_date).slice(0, 10)
-    : toLocalDateKey(new Date());
+    : todayKey();
 
   openModal({
     title: isEdit ? t('health.labs.edit') : t('health.labs.add'),
@@ -2092,8 +2954,8 @@ function openLabModal(report) {
         <div class="form-field">
           <label class="label" for="lab-visibility">${esc(t('health.labs.field.visibility'))}</label>
           <select class="input" id="lab-visibility">
-            <option value="private" ${report?.visibility === 'family' ? '' : 'selected'}>${esc(t('health.labs.visibility.private'))}</option>
-            <option value="family" ${report?.visibility === 'family' ? 'selected' : ''}>${esc(t('health.labs.visibility.family'))}</option>
+            <option value="private" ${(report?.visibility || defaultVisibility('labs')) === 'family' ? '' : 'selected'}>${esc(t('health.labs.visibility.private'))}</option>
+            <option value="family" ${(report?.visibility || defaultVisibility('labs')) === 'family' ? 'selected' : ''}>${esc(t('health.labs.visibility.family'))}</option>
           </select>
         </div>
         <div class="form-field">
@@ -2133,7 +2995,7 @@ function openLabModal(report) {
           if (isEdit) {
             await api.patch(`/health/labs/${report.id}`, body);
           } else {
-            const created = await api.post('/health/labs', body);
+            const created = await api.post('/health/labs', { ...body, ...ownerField(labs.personId, labs.meId) });
             // Neu angelegten Befund direkt selektieren, damit das Detail nicht
             // beim zuvor gewählten Befund stehen bleibt.
             if (created?.data?.id != null) labs.selectedReportId = created.data.id;
@@ -2141,6 +3003,7 @@ function openLabModal(report) {
           closeModal({ force: true });
           window.yuvomi?.showToast(t('health.labs.saved'), 'success');
           await reloadLabs();
+          refocusAfterRender();
         } catch (err) {
           console.error('[Health] lab save error:', err);
           submitBtn.disabled = false;
@@ -2165,12 +3028,14 @@ function collectLabHead(panel) {
 
 async function deleteLabReport(report) {
   if (!report?.id) return;
-  if (!(await confirmOverModal(t('health.labs.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
+  if (!(await confirmOverModal(t('health.labs.deleteConfirm'),
+    { danger: true, confirmLabel: t('common.delete'), detail: t('health.labs.deleteConfirmDetail') }))) return;
   try {
     await api.delete(`/health/labs/${report.id}`);
     window.yuvomi?.showToast(t('health.labs.deleted'), 'success');
     if (labs.selectedReportId === report.id) labs.selectedReportId = null;
     await reloadLabs();
+    refocusAfterRender();
   } catch (err) {
     console.error('[Health] lab delete error:', err);
     window.yuvomi?.showToast(err?.data?.error || t('health.labs.deleteError'), 'danger');
@@ -2335,7 +3200,7 @@ const activity = {
   personId: null,
   members: [],
   rows: [],
-  anchor: toLocalDateKey(new Date()),
+  anchor: todayKey(),
   loaded: false,
   error: false,
   root: null,
@@ -2362,16 +3227,12 @@ async function mountActivity() {
     `<div class="health-activity__loading">${esc(t('common.loading'))}</div>`);
 
   try {
-    if (!activity.members.length) {
-      const res = await api.get('/family/members');
-      activity.members = res.data || [];
-    }
-    if (!activity.personId) activity.personId = activity.meId ?? activity.members[0]?.id ?? null;
+    await loadHealthMembers(activity, healthUser);
     await loadActivity();
     activity.error = false;
   } catch (err) {
     console.error('[Health] activity mount error:', err);
-    activity.error = true;
+    activity.error = err;
   }
   activity.loaded = true;
   renderActivityShell();
@@ -2383,18 +3244,14 @@ async function loadActivity() {
   activity.rows = res.data || [];
 }
 
-function isOwnActivityView() {
-  return activity.personId != null && activity.personId === activity.meId;
-}
-
 async function switchActivityPerson() {
-  activity.anchor = toLocalDateKey(new Date());
+  activity.anchor = todayKey();
   try {
     await loadActivity();
     activity.error = false;
   } catch (err) {
     console.error('[Health] activity load error:', err);
-    activity.error = true;
+    activity.error = err;
   }
   renderActivityShell();
 }
@@ -2405,7 +3262,7 @@ async function reloadActivity() {
     activity.error = false;
   } catch (err) {
     console.error('[Health] activity reload error:', err);
-    activity.error = true;
+    activity.error = err;
   }
   renderActivityShell();
 }
@@ -2434,18 +3291,7 @@ function renderActivityShell() {
   activity.root.replaceChildren();
 
   if (activity.error) {
-    activity.root.insertAdjacentHTML('beforeend', `
-      <div class="empty-state">
-        <i data-lucide="cloud-off" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${esc(t('health.activity.loadError'))}</div>
-        <div class="empty-state__description">${esc(t('health.activity.loadErrorDesc'))}</div>
-        <button class="btn btn--primary empty-state__cta" data-action="activity-retry">
-          <i data-lucide="refresh-cw" class="icon-md" aria-hidden="true"></i>
-          ${esc(t('health.activity.retry'))}
-        </button>
-      </div>`);
-    if (window.lucide) window.lucide.createIcons({ el: activity.root });
-    activity.root.querySelector('[data-action="activity-retry"]')?.addEventListener('click', () => mountActivity());
+    mountAreaLoadError(activity, 'activity', mountActivity);
     return;
   }
 
@@ -2457,10 +3303,9 @@ function renderActivityShell() {
   // Leer-Meldung im Log entfallen (Audit A2-09/A2-21).
 
   activity.root.insertAdjacentHTML('beforeend', `
-    <div class="health-persons" role="tablist" aria-label="${esc(t('health.activity.personsLabel'))}">
-      ${personChipsMarkup(activity.members, activity.personId, activity.meId)}
-    </div>
-    ${readOnlyBannerMarkup(activity.members, activity.personId, isOwnActivityView())}
+    ${personSwitcherMarkup(activity.members, activity.personId, activity.meId,
+      { menuId: 'health-person-menu-activity', label: t('health.activity.personsLabel') })}
+    ${readOnlyBannerMarkup(activity.members, activity.personId, canEditFor(activity.personId, activity.meId), activity.meId)}
     <div class="health-activity__toolbar">
       <div class="health-activity__stepper">
         <button class="btn btn--icon" data-step="-1" aria-label="${esc(t('health.activity.prevWeek'))}"><i data-lucide="chevron-left" aria-hidden="true"></i></button>
@@ -2485,10 +3330,12 @@ function activityStatsMarkup(totals) {
     { icon: 'flame', labelKey: 'health.activity.totals.calories', value: t('health.activity.unit.kcal', { value: fmtNum(totals.calories) }) },
   ];
   return cards.map((c) => `
-    <div class="health-activity-stat">
-      <i data-lucide="${esc(c.icon)}" class="health-activity-stat__icon" aria-hidden="true"></i>
-      <span class="health-activity-stat__value">${esc(c.value)}</span>
-      <span class="health-activity-stat__label">${esc(t(c.labelKey))}</span>
+    <div class="metric-card">
+      <span class="metric-card__head">
+        <i data-lucide="${esc(c.icon)}" class="metric-card__icon" aria-hidden="true"></i>
+        <span class="metric-card__label">${esc(t(c.labelKey))}</span>
+      </span>
+      <span class="metric-card__value">${esc(c.value)}</span>
     </div>`).join('');
 }
 
@@ -2497,7 +3344,7 @@ function activityChartMarkup(summary) {
   const buckets = summary.buckets;
   const max = Math.max(...buckets.map((b) => b.durationMin), 0);
   if (max <= 0) {
-    return `<div class="empty-state health-chart-empty"><div class="empty-state__title">${esc(t('health.activity.noData'))}</div></div>`;
+    return emptyHintHTML(t('health.activity.noData'), { className: 'health-chart-empty' });
   }
 
   const { W, H } = CHART;
@@ -2516,10 +3363,10 @@ function activityChartMarkup(summary) {
       ? `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" rx="3" fill="var(--module-health)"><title>${esc(`${label}: ${t('health.activity.unit.min', { value: fmtNum(b.durationMin) })}`)}</title></rect>`
       : '';
     return `${rect}
-      <text x="${(x + barW / 2).toFixed(1)}" y="${H - 8}" class="health-chart__axis" text-anchor="middle">${esc(label)}</text>`;
+      <text x="${(x + barW / 2).toFixed(1)}" y="${H - 8}" class="chart__axis" text-anchor="middle">${esc(label)}</text>`;
   }).join('');
 
-  const grid = chartGridMarkup(0, max);
+  const grid = chartGridFor(0, max);
 
   const tableRows = buckets.map((b, i) => [
     t(ACTIVITY_WEEKDAY_LABEL_KEYS[i]),
@@ -2542,11 +3389,11 @@ function activityChartMarkup(summary) {
 
 function activityLogMarkup(rows) {
   if (!rows.length) {
-    return `<div class="health-activity__empty">${esc(t('health.activity.noEntries'))}</div>`;
+    return emptyHintHTML(t('health.activity.noEntries'));
   }
-  const own = isOwnActivityView();
+  const own = canEditFor(activity.personId, activity.meId);
   return `
-    <h3 class="health-activity__log-title u-toolbar-title">${esc(t('health.activity.logTitle'))}</h3>
+    <h3 class="health-activity__log-title u-section-title">${esc(t('health.activity.logTitle'))}</h3>
     <ul class="health-activity-list">${rows.map((r) => activityRowMarkup(r, own)).join('')}</ul>`;
 }
 
@@ -2591,13 +3438,8 @@ function activityRowMarkup(row, own) {
 
 function wireActivity() {
   wireTablistKeys(activity.root);
-  activity.root.querySelectorAll('.health-person-chip').forEach((chip) =>
-    chip.addEventListener('click', () => {
-      const id = Number(chip.dataset.personId);
-      if (id === activity.personId) return;
-      activity.personId = id;
-      switchActivityPerson();
-    }));
+  installPopoverMenus(activity.root);
+  wirePersonSwitcher(activity, switchActivityPerson);
 
   activity.root.querySelectorAll('[data-step]').forEach((btn) =>
     btn.addEventListener('click', () => {
@@ -2681,8 +3523,8 @@ function openActivityModal(row, opts = {}) {
           <div class="form-field">
             <label class="label" for="activity-visibility">${esc(t('health.activity.field.visibility'))}</label>
             <select class="input" id="activity-visibility">
-              <option value="private" ${row?.visibility === 'family' ? '' : 'selected'}>${esc(t('health.activity.visibility.private'))}</option>
-              <option value="family" ${row?.visibility === 'family' ? 'selected' : ''}>${esc(t('health.activity.visibility.family'))}</option>
+              <option value="private" ${(row?.visibility || defaultVisibility('activities')) === 'family' ? '' : 'selected'}>${esc(t('health.activity.visibility.private'))}</option>
+              <option value="family" ${(row?.visibility || defaultVisibility('activities')) === 'family' ? 'selected' : ''}>${esc(t('health.activity.visibility.family'))}</option>
             </select>
           </div>
         </div>
@@ -2724,13 +3566,14 @@ function openActivityModal(row, opts = {}) {
           if (isEdit) {
             await api.patch(`/health/activities/${row.id}`, body);
           } else {
-            await api.post('/health/activities', body);
-            activity.anchor = toLocalDateKey(new Date(body.performed_at));
+            await api.post('/health/activities', { ...body, ...ownerField(activity.personId, activity.meId) });
+            activity.anchor = zonedDateKey(body.performed_at);
           }
           closeModal({ force: true });
           window.yuvomi?.showToast(t('health.activity.saved'), 'success');
           await reloadActivity();
           await opts.onSaved?.();
+          refocusAfterRender();
         } catch (err) {
           console.error('[Health] activity save error:', err);
           submitBtn.disabled = false;
@@ -2781,15 +3624,437 @@ function collectActivityBody(panel) {
 
 async function deleteActivity(row) {
   if (!row?.id) return;
-  if (!(await confirmOverModal(t('health.activity.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
+  if (!(await confirmOverModal(t('health.activity.deleteConfirm'),
+    { danger: true, confirmLabel: t('common.delete'), detail: t('health.activity.deleteConfirmDetail') }))) return;
   try {
     await api.delete(`/health/activities/${row.id}`);
     window.yuvomi?.showToast(t('health.activity.deleted'), 'success');
     await reloadActivity();
+    refocusAfterRender();
   } catch (err) {
     console.error('[Health] activity delete error:', err);
     window.yuvomi?.showToast(err?.data?.error || t('health.activity.deleteError'), 'danger');
   }
+}
+
+// ========================================================
+// VORSORGE & IMPFUNGEN-TAB
+// ========================================================
+
+// Vorsorge-View-Zustand. EIN Modell fuer Impfung und Vorsorgeuntersuchung (D1):
+// ein Datensatz je Ereignis, gruppiert nach Typ. `types` ist das
+// haushaltsweite Register (nicht personengebunden), `due` die abgeleitete
+// Liste aus GET /prevention/due (dieselbe Rechnung wie der Erinnerungs-Sync,
+// server/services/prevention-due.js - hier nur gelesen, nie zweimal gerechnet).
+const prevention = {
+  meId: null,
+  personId: null,
+  members: [],
+  types: [],
+  records: [],
+  due: [],
+  loaded: false,
+  error: false,
+  root: null,
+};
+
+function maybeMountPrevention(activeRoute) {
+  if (activeRoute !== '/health/prevention') return;
+  const root = _container?.querySelector('[data-prevention-root]');
+  if (!root) return;
+  if (prevention.root === root && prevention.loaded) return;
+  prevention.root = root;
+  mountPrevention();
+}
+
+async function mountPrevention() {
+  prevention.root.replaceChildren();
+  prevention.root.insertAdjacentHTML('beforeend',
+    `<div class="health-prevention__loading">${esc(t('common.loading'))}</div>`);
+
+  try {
+    await loadHealthMembers(prevention, healthUser);
+    await loadPreventionTypes();
+    await loadPreventionData();
+    prevention.error = false;
+  } catch (err) {
+    console.error('[Health] prevention mount error:', err);
+    prevention.error = err;
+  }
+  prevention.loaded = true;
+  renderPreventionShell();
+}
+
+async function loadPreventionTypes() {
+  const res = await api.get('/health/prevention/types');
+  prevention.types = res.data || [];
+}
+
+async function loadPreventionData() {
+  const query = prevention.personId ? `?user_id=${encodeURIComponent(prevention.personId)}` : '';
+  const [records, due] = await Promise.all([
+    api.get(`/health/prevention/records${query}`),
+    api.get(`/health/prevention/due${query}`),
+  ]);
+  prevention.records = records.data || [];
+  prevention.due = due.data || [];
+}
+
+async function switchPreventionPerson() {
+  try {
+    await loadPreventionData();
+    prevention.error = false;
+  } catch (err) {
+    console.error('[Health] prevention load error:', err);
+    prevention.error = err;
+  }
+  renderPreventionShell();
+}
+
+async function reloadPrevention() {
+  try {
+    await loadPreventionData();
+    prevention.error = false;
+  } catch (err) {
+    console.error('[Health] prevention reload error:', err);
+    prevention.error = err;
+  }
+  renderPreventionShell();
+}
+
+/** Anzeigename eines Datensatzes: der aktuelle Typname (lebt mit einer
+ *  Umbenennung mit) oder, wenn der Typ geloescht wurde, die name-Momentaufnahme. */
+function preventionRecordLabel(record) {
+  const type = prevention.types.find((t2) => t2.id === record.type_id);
+  return type?.name || record.name || '';
+}
+
+function preventionTypeIcon(record) {
+  const type = prevention.types.find((t2) => t2.id === record.type_id);
+  return type?.icon || 'syringe';
+}
+
+function renderPreventionShell() {
+  if (!prevention.root?.isConnected) return;
+  prevention.root.replaceChildren();
+
+  if (prevention.error) {
+    mountAreaLoadError(prevention, 'prevention', mountPrevention);
+    return;
+  }
+
+  const own = canEditFor(prevention.personId, prevention.meId);
+  const byType = new Map();
+  for (const record of prevention.records) {
+    const key = record.type_id ?? `name:${record.name}`;
+    if (!byType.has(key)) byType.set(key, []);
+    byType.get(key).push(record);
+  }
+  const groups = [...byType.values()].sort((a, b) => String(b[0].given_on).localeCompare(String(a[0].given_on)));
+
+  prevention.root.insertAdjacentHTML('beforeend', `
+    ${personSwitcherMarkup(prevention.members, prevention.personId, prevention.meId,
+      { menuId: 'health-person-menu-prevention', label: t('health.prevention.personsLabel') })}
+    ${readOnlyBannerMarkup(prevention.members, prevention.personId, own, prevention.meId)}
+    ${preventionDueSectionMarkup()}
+    ${groups.length
+      ? `<div class="health-prevention__records">${groups.map((rows) => preventionGroupMarkup(rows, own)).join('')}</div>`
+      : emptyHintHTML(t('health.prevention.noRecords'))}
+  `);
+  if (window.lucide) window.lucide.createIcons({ el: prevention.root });
+  wirePrevention();
+  refreshHealthFab();
+}
+
+/** "Faellig/ueberfaellig"-Abschnitt - nur, wenn es etwas zu zeigen gibt. */
+function preventionDueSectionMarkup() {
+  const items = [...prevention.due].sort((a, b) => a.days_left - b.days_left);
+  if (!items.length) return '';
+  return `
+    <h3 class="health-prevention__due-title u-section-title">${esc(t('health.prevention.dueTitle'))}</h3>
+    <ul class="health-prevention-due-list">${items.map(preventionDueRowMarkup).join('')}</ul>`;
+}
+
+function preventionDueRowMarkup(item) {
+  const overdue = item.days_left < 0;
+  const soon = !overdue && item.days_left <= DATE_STATUS_ALERT_DAYS;
+  const tone = overdue ? 'overdue' : soon ? 'soon' : 'ok';
+  const text = overdue
+    ? t('health.prevention.overdueDays', { count: Math.abs(item.days_left) })
+    : item.days_left === 0
+      ? t('health.prevention.dueToday')
+      : t('health.prevention.dueInDays', { count: item.days_left });
+  return `
+    <li class="health-prevention-due-row health-prevention-due-row--${tone}">
+      <span class="health-prevention-due-row__icon" aria-hidden="true"><i data-lucide="${esc(item.icon || 'syringe')}"></i></span>
+      <span class="health-prevention-due-row__body">
+        <span class="health-prevention-due-row__name">${esc(item.type_name)}</span>
+        <span class="health-prevention-due-row__date">${esc(formatDate(item.due_on))}</span>
+      </span>
+      <span class="health-prevention-due-row__chip">${esc(text)}</span>
+    </li>`;
+}
+
+function preventionGroupMarkup(rows, own) {
+  const sorted = [...rows].sort((a, b) => String(b.given_on).localeCompare(String(a.given_on)));
+  const label = preventionRecordLabel(sorted[0]);
+  const icon = preventionTypeIcon(sorted[0]);
+  return `
+    <div class="health-prevention-group">
+      <h3 class="health-prevention-group__title">
+        <i data-lucide="${esc(icon)}" aria-hidden="true"></i>
+        <span>${esc(label)}</span>
+      </h3>
+      <ul class="health-prevention-row-list">${sorted.map((r) => preventionRowMarkup(r, own)).join('')}</ul>
+    </div>`;
+}
+
+function preventionRowMarkup(row, own) {
+  const meta = [];
+  if (row.dose_number != null) meta.push(t('health.prevention.field.doseShort', { value: row.dose_number }));
+  if (row.provider) meta.push(row.provider);
+  if (row.batch) meta.push(row.batch);
+  // Eigene Klassen statt health-activity-row* (Review #1256): dieselben Regeln
+  // heute (siehe health.css), aber eine Aenderung an Aktivitaeten soll die
+  // Vorsorge-Zeilen nicht mehr stillschweigend mitziehen, und umgekehrt.
+  const metaHtml = meta.length
+    ? `<span class="health-prevention-row__meta">${meta.map((m) => `<span class="health-prevention-row__chip">${esc(m)}</span>`).join('')}</span>`
+    : '';
+  const noteHtml = row.note ? `<span class="health-prevention-row__note">${esc(row.note)}</span>` : '';
+  const editBtn = own
+    ? `<button type="button" class="btn btn--icon btn--sm health-prevention-row__edit" data-prevention-edit="${esc(row.id)}"
+         aria-label="${esc(t('health.prevention.edit'))}"><i data-lucide="pencil" aria-hidden="true"></i></button>`
+    : '';
+  return `
+    <li class="health-prevention-row" data-record-id="${esc(row.id)}">
+      <span class="health-prevention-row__body">
+        <span class="health-prevention-row__head">
+          <span class="health-prevention-row__when">${esc(formatDate(row.given_on))}</span>
+        </span>
+        ${metaHtml}
+        ${noteHtml}
+      </span>
+      ${editBtn}
+    </li>`;
+}
+
+function wirePrevention() {
+  installPopoverMenus(prevention.root);
+  wirePersonSwitcher(prevention, switchPreventionPerson);
+
+  prevention.root.querySelectorAll('[data-prevention-edit]').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      const id = Number(btn.dataset.preventionEdit);
+      const row = prevention.records.find((r) => r.id === id);
+      if (row) openPreventionModal(row);
+    }));
+}
+
+// --------------------------------------------------------
+// Erfassungs-Modal (Anlegen/Bearbeiten inkl. Löschen)
+// --------------------------------------------------------
+
+function preventionTypeSelectMarkup(current) {
+  const options = prevention.types.map((type) =>
+    `<option value="${esc(type.id)}"${type.id === current ? ' selected' : ''}>${esc(type.name)}</option>`).join('');
+  return `
+    <option value="">${esc(t('health.prevention.field.noType'))}</option>
+    ${options}`;
+}
+
+/** Monate/Jahre-Optionen fuer das Intervall-Override - dieselben Beschriftungen
+ *  wie der Wiederholungs-Editor (rrule.unitMonths/unitYears), kein zweites
+ *  Vokabular fuer denselben Begriff. */
+function preventionIntervalUnitOptions(selectedUnit) {
+  return [
+    ['months', t('rrule.unitMonths')],
+    ['years', t('rrule.unitYears')],
+  ].map(([value, label]) => `<option value="${value}" ${selectedUnit === value ? 'selected' : ''}>${esc(label)}</option>`).join('');
+}
+
+function openPreventionModal(row) {
+  const isEdit = Boolean(row && row.id);
+  const val = (v) => (v == null ? '' : String(v));
+  const advancedOpen = isEdit && (row.interval_months != null || row.next_due_on || row.reminder_offset_days != null);
+  const interval = intervalMonthsToInput(row?.interval_months ?? null);
+
+  const advancedFieldsHtml = `
+    <div class="modal-grid modal-grid--2">
+      <div class="form-field">
+        <label class="label" for="prevention-interval">${esc(t('health.prevention.field.intervalMonths'))}</label>
+        <div class="health-prevention-interval-row">
+          <input class="input health-prevention-interval-row__value" id="prevention-interval" type="number" inputmode="numeric" min="1" step="1" value="${esc(val(interval.value))}">
+          <select class="input health-prevention-interval-row__unit" id="prevention-interval-unit" aria-label="${esc(t('common.unit'))}">${preventionIntervalUnitOptions(interval.unit)}</select>
+        </div>
+      </div>
+      <div class="form-field">
+        <label class="label" for="prevention-next-due">${esc(t('health.prevention.field.nextDueOn'))}</label>
+        <input class="input" id="prevention-next-due" type="date" value="${esc(val(row?.next_due_on))}">
+      </div>
+    </div>
+    <div class="form-field">
+      <label class="label" for="prevention-offset">${esc(t('health.prevention.field.reminderOffsetDays'))}</label>
+      <input class="input" id="prevention-offset" type="number" inputmode="numeric" min="0" max="365" step="1"
+             value="${esc(val(row?.reminder_offset_days))}" placeholder="30">
+    </div>`;
+
+  openModal({
+    title: isEdit ? t('health.prevention.edit') : t('health.prevention.add'),
+    size: 'md',
+    content: `
+      <form id="prevention-form" class="form-stack">
+        <div class="modal-grid modal-grid--2">
+          <div class="form-field">
+            <label class="label" for="prevention-type">${esc(t('health.prevention.field.type'))}</label>
+            <select class="input" id="prevention-type">${preventionTypeSelectMarkup(row?.type_id ?? null)}</select>
+          </div>
+          <div class="form-field" id="prevention-name-field" ${row?.type_id ? 'hidden' : ''}>
+            <label class="label" for="prevention-name">${esc(t('health.prevention.field.name'))}</label>
+            <input class="input" id="prevention-name" type="text" maxlength="200" value="${esc(val(row?.name))}">
+          </div>
+        </div>
+        <div class="modal-grid modal-grid--2">
+          <div class="form-field">
+            <label class="label" for="prevention-given-on">${esc(t('health.prevention.field.givenOn'))}</label>
+            <input class="input" id="prevention-given-on" type="date" required value="${esc(row?.given_on || todayKey())}">
+          </div>
+          <div class="form-field">
+            <label class="label" for="prevention-dose">${esc(t('health.prevention.field.doseNumber'))}</label>
+            <input class="input" id="prevention-dose" type="number" inputmode="numeric" min="1" step="1" value="${esc(val(row?.dose_number))}">
+          </div>
+        </div>
+        <div class="modal-grid modal-grid--2">
+          <div class="form-field">
+            <label class="label" for="prevention-provider">${esc(t('health.prevention.field.provider'))}</label>
+            <input class="input" id="prevention-provider" type="text" maxlength="100" value="${esc(val(row?.provider))}">
+          </div>
+          <div class="form-field">
+            <label class="label" for="prevention-batch">${esc(t('health.prevention.field.batch'))}</label>
+            <input class="input" id="prevention-batch" type="text" maxlength="100" value="${esc(val(row?.batch))}">
+          </div>
+        </div>
+        <div class="form-field">
+          <label class="label" for="prevention-note">${esc(t('health.prevention.field.note'))}</label>
+          <textarea class="input" id="prevention-note" rows="2" maxlength="5000">${esc(val(row?.note))}</textarea>
+        </div>
+        <div class="form-field">
+          <label class="label" for="prevention-visibility">${esc(t('health.prevention.field.visibility'))}</label>
+          <select class="input" id="prevention-visibility">
+            <option value="private" ${(row?.visibility || defaultVisibility('prevention')) === 'family' ? '' : 'selected'}>${esc(t('health.prevention.visibility.private'))}</option>
+            <option value="family" ${(row?.visibility || defaultVisibility('prevention')) === 'family' ? 'selected' : ''}>${esc(t('health.prevention.visibility.family'))}</option>
+          </select>
+        </div>
+        ${advancedSection(advancedFieldsHtml, { open: advancedOpen })}
+        <div class="modal-actions">
+          ${isEdit ? `<button type="button" class="btn btn--danger btn--ghost" data-action="prevention-delete">${esc(t('common.delete'))}</button>` : ''}
+          <button type="button" class="btn btn--ghost" data-action="cancel">${esc(t('common.cancel'))}</button>
+          <button type="submit" class="btn btn--primary">${esc(t('common.save'))}</button>
+        </div>
+      </form>`,
+    onSave(panel) {
+      const typeSelect = panel.querySelector('#prevention-type');
+      const nameField = panel.querySelector('#prevention-name-field');
+      const syncName = () => { nameField.hidden = !!typeSelect.value; };
+      typeSelect.addEventListener('change', syncName);
+
+      panel.querySelector('[data-action="cancel"]')?.addEventListener('click', () => closeModal({ force: true }));
+      panel.querySelector('[data-action="prevention-delete"]')?.addEventListener('click', () => deletePreventionRecord(row));
+
+      panel.querySelector('#prevention-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const submitBtn = panel.querySelector('[type="submit"]');
+        const body = collectPreventionBody(panel);
+        if (!body) {
+          window.yuvomi?.showToast(t('health.prevention.invalid'), 'danger');
+          return;
+        }
+        submitBtn.disabled = true;
+        try {
+          if (isEdit) {
+            await api.patch(`/health/prevention/records/${row.id}`, body);
+          } else {
+            await api.post('/health/prevention/records', { ...body, ...ownerField(prevention.personId, prevention.meId) });
+          }
+          closeModal({ force: true });
+          window.yuvomi?.showToast(t('health.prevention.saved'), 'success');
+          await reloadPrevention();
+          refocusAfterRender();
+        } catch (err) {
+          console.error('[Health] prevention save error:', err);
+          submitBtn.disabled = false;
+          window.yuvomi?.showToast(err?.data?.error || t('health.prevention.saveError'), 'danger');
+        }
+      });
+    },
+  });
+}
+
+function collectPreventionBody(panel) {
+  const typeId = panel.querySelector('#prevention-type')?.value;
+  const name = panel.querySelector('#prevention-name')?.value.trim();
+  if (!typeId && !name) return null;
+  const givenOn = panel.querySelector('#prevention-given-on')?.value;
+  if (!givenOn) return null;
+
+  const numField = (sel) => {
+    const raw = panel.querySelector(sel)?.value.trim();
+    if (raw === '' || raw == null) return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : NaN;
+  };
+  const dose = numField('#prevention-dose');
+  const offset = numField('#prevention-offset');
+  const intervalRaw = panel.querySelector('#prevention-interval')?.value.trim();
+  const intervalUnit = panel.querySelector('#prevention-interval-unit')?.value || 'months';
+  // undefined (nicht mitgeschickt) wie bei den anderen numField()-Werten,
+  // wenn das Feld leer ist - sonst wuerde ein leer gelassenes Intervall bei
+  // JEDEM Speichern eine bestehende Override loeschen, nicht nur beim
+  // bewussten Zuruecksetzen.
+  const interval = intervalRaw === '' ? undefined : intervalInputToMonths(intervalRaw, intervalUnit);
+  if ([dose, interval, offset].some((n) => Number.isNaN(n))) return null;
+  if (typeof interval === 'number' && (interval < 1 || interval > 600)) return null;
+
+  const strField = (sel) => panel.querySelector(sel)?.value.trim() || undefined;
+  const body = {
+    type_id: typeId || null,
+    given_on: givenOn,
+    visibility: panel.querySelector('#prevention-visibility')?.value || 'private',
+  };
+  if (!typeId) body.name = name;
+  if (dose !== undefined) body.dose_number = dose;
+  if (interval !== undefined) body.interval_months = interval;
+  if (offset !== undefined) body.reminder_offset_days = offset;
+  // Der Input existiert nur, wenn die "Erweitert"-Sektion offen ist (siehe
+  // advancedOpen oben) - und die oeffnet sich ueberhaupt nur, wenn next_due_on
+  // (oder Intervall/Vorlauf) schon einen Wert traegt. Ist sie offen, ist das
+  // Feld also in Reichweite dieser Bearbeitung: ein geleertes Feld muss den
+  // Wert loeschen (`null`), nicht `undefined` senden und ihn dadurch fuer
+  // immer stehen lassen - anders als bei den anderen numField()-Werten oben,
+  // die absichtlich "nicht beruehrt" bedeuten, wenn das Formular sie nie
+  // gezeigt hat.
+  const nextDueInput = panel.querySelector('#prevention-next-due');
+  if (nextDueInput) body.next_due_on = nextDueInput.value || null;
+  const provider = strField('#prevention-provider');
+  if (provider) body.provider = provider;
+  const batch = strField('#prevention-batch');
+  if (batch) body.batch = batch;
+  const note = strField('#prevention-note');
+  if (note) body.note = note;
+  return body;
+}
+
+async function deletePreventionRecord(row) {
+  if (!row?.id) return;
+  closeModal({ force: true });
+  const idx = prevention.records.findIndex((r) => r.id === row.id);
+  if (idx === -1) return;
+  const [removed] = prevention.records.splice(idx, 1);
+  renderPreventionShell();
+  scheduleUndoableDelete({
+    commit: ({ keepalive } = {}) => api.delete(`/health/prevention/records/${row.id}`, { keepalive }),
+    restore: () => { prevention.records.splice(idx, 0, removed); renderPreventionShell(); },
+    message: t('health.prevention.deleted'),
+  });
 }
 
 // ========================================================
@@ -2808,6 +4073,12 @@ const overview = {
   meds: [],
   schedulesByMed: {},
   logsByMed: {},
+  // Zyklus-Kachel - dieselben drei Ressourcen wie der Zyklus-Tab
+  // (cycle.periods/logs/settings), nur unter eigenem Namen, weil Uebersicht
+  // und Zyklus-Tab getrennte Personen-Umschalter/State fuehren.
+  cyclePeriods: [],
+  cycleLogs: [],
+  cycleSettings: null,
   exportRange: { from: null, to: null },
   loaded: false,
   error: false,
@@ -2841,18 +4112,14 @@ async function mountOverview() {
     `<div class="health-overview__loading">${esc(t('common.loading'))}</div>`);
 
   try {
-    if (!overview.members.length) {
-      const res = await api.get('/family/members');
-      overview.members = res.data || [];
-    }
-    if (!overview.personId) overview.personId = overview.meId ?? overview.members[0]?.id ?? null;
-    const today = toLocalDateKey(new Date());
+    await loadHealthMembers(overview, healthUser);
+    const today = todayKey();
     overview.exportRange = { from: addLocalDays(today, -(OVERVIEW_EXPORT_DAYS - 1)), to: today };
     await loadOverview();
     overview.error = false;
   } catch (err) {
     console.error('[Health] overview mount error:', err);
-    overview.error = true;
+    overview.error = err;
   }
   overview.loaded = true;
   renderOverviewShell();
@@ -2869,9 +4136,34 @@ async function loadOverview() {
   overview.schedulesByMed = {};
   overview.logsByMed = {};
 
-  const today = toLocalDateKey(new Date());
-  const from = addLocalDays(today, -(OVERVIEW_ADHERENCE_DAYS - 1));
+  // Nur laden, wenn der Zyklus-Tab fuer DIESEN Betrachter ueberhaupt
+  // erreichbar waere (cycleEnabled, siehe Dateikopf) - sonst zwei zusaetzliche
+  // Anfragen fuer eine Kachel, die renderOverviewShell() ohnehin nie zeigt.
+  // Einstellungen (privat) nur in der eigenen Ansicht, exakt wie loadCycle()
+  // im Zyklus-Tab selbst - fuer eine fremde Person bleibt es bei der aus
+  // ihrer Perioden-Historie abgeleiteten Standardvorhersage.
+  if (cycleEnabled) {
+    const [cpRes, clRes] = await Promise.all([
+      api.get(`/health/cycle/periods${query}`),
+      api.get(`/health/cycle/logs${query}`),
+    ]);
+    overview.cyclePeriods = cpRes.data || [];
+    overview.cycleLogs = clRes.data || [];
+    if (overview.personId === overview.meId) {
+      try { overview.cycleSettings = (await api.get('/health/cycle/settings')).data || {}; }
+      catch { overview.cycleSettings = {}; }
+    } else {
+      overview.cycleSettings = null;
+    }
+  } else {
+    overview.cyclePeriods = [];
+    overview.cycleLogs = [];
+    overview.cycleSettings = null;
+  }
+
+  const today = todayKey();
   await Promise.all(overview.meds.map(async (m) => {
+    const from = addLocalDays(today, -(medLogWindowDays(m, OVERVIEW_ADHERENCE_DAYS) - 1));
     const [sRes, lRes] = await Promise.all([
       api.get(`/health/medications/${m.id}/schedules`),
       api.get(`/health/medications/${m.id}/logs?from=${from}T00:00&to=${today}T23:59`),
@@ -2881,16 +4173,22 @@ async function loadOverview() {
   }));
 }
 
-function isOwnOverviewView() {
-  return overview.personId != null && overview.personId === overview.meId;
-}
-
 function overviewAllSchedules() {
   return overview.meds.flatMap((m) => overview.schedulesByMed[m.id] || []);
 }
 
 function overviewAllLogs() {
   return overview.meds.flatMap((m) => overview.logsByMed[m.id] || []);
+}
+
+/**
+ * Nur die geplanten Dosen - dieselbe Grenze wie `allLogsInRange` im Meds-Tab.
+ * Adhaerenz misst die Einhaltung eines Plans, und eine Bedarfsdosis hat keinen;
+ * seit sie nicht mehr am Zeitraumfilter haengenbleibt (#700), muss sie hier
+ * ausdruecklich draussen bleiben. Auch der Streak rechnet nur mit ihnen.
+ */
+function overviewScheduledLogs() {
+  return scheduledLogs(overviewAllLogs());
 }
 
 function overviewFindLog(dose) {
@@ -2905,7 +4203,7 @@ async function switchOverviewPerson() {
     overview.error = false;
   } catch (err) {
     console.error('[Health] overview load error:', err);
-    overview.error = true;
+    overview.error = err;
   }
   renderOverviewShell();
 }
@@ -2916,7 +4214,7 @@ async function reloadOverview() {
     overview.error = false;
   } catch (err) {
     console.error('[Health] overview reload error:', err);
-    overview.error = true;
+    overview.error = err;
   }
   renderOverviewShell();
 }
@@ -2926,31 +4224,21 @@ function renderOverviewShell() {
   overview.root.replaceChildren();
 
   if (overview.error) {
-    overview.root.insertAdjacentHTML('beforeend', `
-      <div class="empty-state">
-        <i data-lucide="cloud-off" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${esc(t('health.overview.loadError'))}</div>
-        <div class="empty-state__description">${esc(t('health.overview.loadErrorDesc'))}</div>
-        <button class="btn btn--primary empty-state__cta" data-action="overview-retry">
-          <i data-lucide="refresh-cw" class="icon-md" aria-hidden="true"></i>
-          ${esc(t('health.overview.retry'))}
-        </button>
-      </div>`);
-    if (window.lucide) window.lucide.createIcons({ el: overview.root });
-    overview.root.querySelector('[data-action="overview-retry"]')?.addEventListener('click', () => mountOverview());
+    mountAreaLoadError(overview, 'overview', mountOverview);
     return;
   }
 
   overview.root.insertAdjacentHTML('beforeend', `
-    <div class="health-persons" role="tablist" aria-label="${esc(t('health.overview.personsLabel'))}">
-      ${personChipsMarkup(overview.members, overview.personId, overview.meId)}
-    </div>
-    ${readOnlyBannerMarkup(overview.members, overview.personId, isOwnOverviewView())}
+    ${personSwitcherMarkup(overview.members, overview.personId, overview.meId,
+      { menuId: 'health-person-menu-overview', label: t('health.overview.personsLabel') })}
+    ${readOnlyBannerMarkup(overview.members, overview.personId, canEditFor(overview.personId, overview.meId), overview.meId)}
     <div class="health-overview__grid">
       ${overviewCard('calendar-check', 'health.overview.dueToday.title', overviewDueMarkup())}
+      ${prnMeds('overview').length ? overviewCard('pill', 'health.meds.prn.title', prnListMarkup('overview')) : ''}
       ${overviewCard('trending-up', 'health.overview.adherence.title', overviewAdherenceMarkup())}
       ${overviewCard('activity', 'health.overview.vitals.title', overviewVitalsMarkup())}
-      ${isOwnOverviewView() ? overviewCard('plus-circle', 'health.overview.quick.title', quickCaptureMarkup()) : ''}
+      ${overviewCycleTileMarkup()}
+      ${canEditFor(overview.personId, overview.meId) ? overviewCard('plus-circle', 'health.overview.quick.title', quickCaptureMarkup()) : ''}
       ${overviewCard('bell', 'health.overview.reminders.title', overviewUpcomingMarkup())}
       ${overviewCard('download', 'health.export.title', overviewExportMarkup())}
     </div>
@@ -2965,21 +4253,81 @@ function overviewCard(icon, titleKey, body) {
     <section class="health-overview__card">
       <header class="health-overview__card-head">
         <i data-lucide="${esc(icon)}" class="health-overview__card-icon" aria-hidden="true"></i>
-        <h3 class="health-overview__card-title u-toolbar-title">${esc(t(titleKey))}</h3>
+        <h3 class="health-overview__card-title u-section-title">${esc(t(titleKey))}</h3>
       </header>
       <div class="health-overview__card-body">${body}</div>
     </section>`;
 }
 
+// --- Zyklus-Kachel ("Nächste Periode") ---
+//
+// Dieselbe predictCycle()-Funktion wie der Zyklus-Tab, keine zweite Rechnung -
+// nur mit den unter eigenem Namen geladenen Ressourcen (overview.cyclePeriods/
+// -Logs/-Settings, siehe loadOverview()). Sichtbarkeit ergibt sich allein aus
+// den Daten: cycleEnabled blendet die Kachel fuer einen Betrachter aus, dem
+// der Zyklus-Tab selbst schon verborgen waere, und `hasData` blendet sie aus,
+// wenn die gezeigte Person (eigene oder Familienperson) keine auswertbare
+// Perioden-Historie hat - die API filtert dabei schon nach Sichtbarkeit
+// (visibilityClause), hier ist keine zweite Pruefung noetig.
+function overviewCyclePrediction() {
+  if (!cycleEnabled) return null;
+  const settings = (overview.personId === overview.meId && overview.cycleSettings) ? overview.cycleSettings : {};
+  return predictCycle(overview.cyclePeriods, settings, todayKey(), overview.cycleLogs);
+}
+
+function overviewCycleTileMarkup() {
+  const prediction = overviewCyclePrediction();
+  if (!prediction || !prediction.hasData) return '';
+
+  let titleKey;
+  let value;
+  let sub = '';
+  if (prediction.isPregnant) {
+    // Schwangerschaft: SSW-Zeile statt Vorhersage (cyclePregnancyWeekText(),
+    // dieselbe Funktion wie cycleBubbleMarkup() - nicht zweimal ausrechnen).
+    // Ohne Entbindungstermin bleibt nur der Titel selbst, exakt wie dort.
+    const p = prediction.pregnancy || {};
+    titleKey = 'health.cycle.pregnancy.title';
+    value = p.hasDue ? cyclePregnancyWeekText(p) : t('health.cycle.pregnancy.title');
+  } else {
+    titleKey = 'health.cycle.status.nextPeriod';
+    // Perimenopause: Spanne statt Einzeldatum, mit dem Mittelwert als
+    // Unterzeile - dieselbe Fallunterscheidung wie cycleStatsMarkup() im
+    // Zyklus-Tab selbst (siehe dort für die ausführliche Begründung).
+    const range = (prediction.perimenopause && prediction.nextStartRange) ? prediction.nextStartRange : null;
+    value = range
+      ? `${formatDate(range.min)} - ${formatDate(range.max)}`
+      : formatDate(prediction.nextStart);
+    sub = range
+      ? t('health.cycle.status.nextPeriodRangeSub', { date: formatDate(prediction.nextStart) })
+      : cycleCountdownText(prediction);
+  }
+
+  // Ganze Kachel klickbar (button statt section) - deshalb Ueberschrift als
+  // <span>, kein <h3>: ein Button darf laut Inhaltsmodell keine
+  // Ueberschriften-Kindelemente tragen, nur Phrasing Content.
+  return `
+    <button type="button" class="health-overview__card health-overview__card--link" data-action="ov-go-cycle">
+      <span class="health-overview__card-head">
+        <i data-lucide="droplet" class="health-overview__card-icon" aria-hidden="true"></i>
+        <span class="health-overview__card-title u-section-title">${esc(t(titleKey))}</span>
+      </span>
+      <span class="health-overview__card-body">
+        <span class="health-overview__cycle-value">${esc(value)}</span>
+        ${sub ? `<span class="health-overview__cycle-sub">${esc(sub)}</span>` : ''}
+      </span>
+    </button>`;
+}
+
 // --- Heute fällig (identische Logik wie dueTodayMarkup im Meds-Tab) ---
 
 function overviewDueMarkup() {
-  const today = toLocalDateKey(new Date());
+  const today = todayKey();
   const due = computeDueDoses(overviewAllSchedules(), { from: today, to: today });
   if (!due.length) {
-    return `<div class="health-meds__due-empty">${esc(t('health.meds.dueToday.empty'))}</div>`;
+    return emptyHintHTML(t('health.meds.dueToday.empty'));
   }
-  const own = isOwnOverviewView();
+  const own = canEditFor(overview.personId, overview.meId);
   const rows = due.map((dose) => {
     const med = overview.meds.find((m) => m.id === dose.medicationId);
     return overviewDueRowMarkup(dose, med, overviewFindLog(dose), own);
@@ -2999,31 +4347,42 @@ function overviewDueRowMarkup(dose, med, log, own) {
     actions = `<span class="health-dose__status health-dose__status--skipped"><i data-lucide="x" aria-hidden="true"></i>${esc(t('health.meds.status.skipped'))}</span>`;
   } else if (own) {
     const data = `data-med-id="${esc(dose.medicationId)}" data-schedule-id="${esc(dose.scheduleId ?? '')}" data-scheduled-at="${esc(dose.scheduledAt)}" data-log-id="${esc(log?.id ?? '')}" data-dose="${esc(dose.dose_qty ?? '')}"`;
+    /* DIESELBE FORM WIE IN `dueRowMarkup` - hier fehlte sie, und der Fix von
+     * dort erreichte diese Zeile deshalb nicht. Der Knopf trug weder
+     * `health-dose__skip` noch den Label-Span, also hatte die Container-Query
+     * `@container list-rows (max-width: 26rem)` nichts zu verbergen: gemessen
+     * bei 390px lag "Ueberspringen" bei left=360 und damit zu 92 von 122px
+     * ausserhalb des Bildes, geclippt und ohne Scrollweg dorthin (Critique
+     * 2026-08-13, offen geblieben). Zwei Renderer fuer dieselbe Zeile, und die
+     * Korrektur landete in einem - dasselbe Muster, das dieser Branch schon
+     * dreimal produziert hat.
+     * Das `aria-label` traegt den ganzen Satz weiter, wenn der Text faellt. */
     actions = `
       <div class="health-dose__actions">
-        <button type="button" class="btn btn--sm btn--primary" data-ov-dose-take ${data}>${esc(t('health.meds.take'))}</button>
-        <button type="button" class="btn btn--sm btn--ghost" data-ov-dose-skip ${data}>${esc(t('health.meds.skip'))}</button>
+        <button type="button" class="btn btn--sm btn--primary health-dose__take" data-ov-dose-take ${data} aria-label="${esc(t('health.meds.take'))}"><i data-lucide="check" class="icon-sm" aria-hidden="true"></i><span class="health-dose__take-label">${esc(t('health.meds.take'))}</span></button>
+        <button type="button" class="btn btn--sm btn--ghost health-dose__skip" data-ov-dose-skip ${data} aria-label="${esc(t('health.meds.skip'))}"><i data-lucide="skip-forward" class="icon-sm" aria-hidden="true"></i><span class="health-dose__skip-label">${esc(t('health.meds.skip'))}</span></button>
       </div>`;
   } else {
     actions = `<span class="health-dose__status">${esc(t('health.meds.status.pending'))}</span>`;
   }
 
   return `
-    <li class="health-dose">
+    <li class="list-row health-dose">
       <span class="health-dose__time">${esc(dose.time)}</span>
-      <span class="health-dose__name">${esc(name)}${esc(doseText)}</span>
+      <span class="list-row__name health-dose__name">${esc(name)}${esc(doseText)}</span>
       ${actions}
     </li>`;
 }
 
 async function handleOverviewDose(btn, action) {
   const medId = Number(btn.dataset.medId);
+  if (doseInFlight.has(medId)) return;
   const logId = btn.dataset.logId ? Number(btn.dataset.logId) : null;
   const scheduleId = btn.dataset.scheduleId ? Number(btn.dataset.scheduleId) : null;
   const scheduledAt = btn.dataset.scheduledAt || null;
   const dose = btn.dataset.dose !== '' ? Number(btn.dataset.dose) : null;
 
-  btn.disabled = true;
+  setDoseBusy(medId, true);
   try {
     if (logId) {
       await api.post(`/health/logs/${logId}/${action}`, {});
@@ -3032,7 +4391,11 @@ async function handleOverviewDose(btn, action) {
       if (scheduledAt) body.scheduled_at = scheduledAt;
       if (scheduleId) body.schedule_id = scheduleId;
       if (dose != null && Number.isFinite(dose)) body.dose_qty = dose;
-      if (action === 'take') body.taken_at = new Date().toISOString();
+      // Wanduhrzeit wie bei der Bedarfsdosis: `v.datetime` kuerzt den Wert auf
+      // Minuten und wirft die Zone weg, aus 22:41 MESZ wuerde 20:41. Sichtbar
+      // war das im Protokoll; seit ein Medikament Plan UND Bedarf haben kann,
+      // rechnet auch der Countdown daraus - und zwar zwei Stunden daneben.
+      if (action === 'take') body.taken_at = toLocalStamp();
       await api.post(`/health/medications/${medId}/logs`, body);
     }
 
@@ -3045,10 +4408,11 @@ async function handleOverviewDose(btn, action) {
     }
 
     window.yuvomi?.showToast(t('health.meds.doseSaved'), 'success');
-    await reloadOverview();
+    await reloadMedViews();
+    setDoseBusy(medId, false);
   } catch (err) {
     console.error('[Health] overview dose error:', err);
-    btn.disabled = false;
+    setDoseBusy(medId, false);
     window.yuvomi?.showToast(err?.data?.error || t('health.meds.doseError'), 'danger');
   }
 }
@@ -3056,23 +4420,23 @@ async function handleOverviewDose(btn, action) {
 // --- Adherence-Quote + Streak ---
 
 function overviewAdherenceMarkup() {
-  const today = toLocalDateKey(new Date());
+  const today = todayKey();
   const from = addLocalDays(today, -(OVERVIEW_ADHERENCE_DAYS - 1));
   const schedules = overviewAllSchedules();
   const planned = computeDueDoses(schedules, { from, to: today }).length;
-  const logs = overviewAllLogs().filter((l) => {
+  const logs = overviewScheduledLogs().filter((l) => {
     const k = String(l.scheduled_at || l.taken_at || l.created_at || '').slice(0, 10);
     return k >= from && k <= today;
   });
   const a = computeAdherence(logs, planned);
-  const streak = computeAdherenceStreak(schedules, overviewAllLogs(), { today });
+  const streak = computeAdherenceStreak(schedules, overviewScheduledLogs(), { today });
 
   if (a.rate === null) {
-    return `<div class="health-adherence__empty">${esc(t('health.overview.adherence.noData'))}</div>`;
+    return `<div class="metric-card__note">${esc(t('health.overview.adherence.noData'))}</div>`;
   }
   // Frühzustand ohne Vorwurf: solange nichts protokolliert ist, kein „0 %".
   if (a.taken === 0) {
-    return `<div class="health-adherence__empty">${esc(t('health.overview.adherence.notStarted'))}</div>`;
+    return `<div class="metric-card__note">${esc(t('health.overview.adherence.notStarted'))}</div>`;
   }
   const pct = Math.round(a.rate * 100);
   // Die Streak-Kachel erscheint erst ab Tag 1 — eine „🔥 0"-Serie zu zeigen wäre
@@ -3090,7 +4454,7 @@ function overviewAdherenceMarkup() {
       <div class="health-overview__stat">
         <span class="health-overview__stat-value">${esc(fmtNum(pct))}%</span>
         <span class="health-overview__stat-label">${esc(t('health.overview.adherence.period', { days: OVERVIEW_ADHERENCE_DAYS }))}</span>
-        <div class="health-adherence__bar"><span style="width:${pct}%"></span></div>
+        <div class="metric-card__progress"><span style="--fill:${pct / 100}"></span></div>
       </div>
       ${streakStat}
     </div>`;
@@ -3099,7 +4463,7 @@ function overviewAdherenceMarkup() {
 // --- Letzte Vitalwerte (Karten, Klick navigiert zum Vitalwerte-Tab) ---
 
 function overviewVitalsMarkup() {
-  const today = toLocalDateKey(new Date());
+  const today = todayKey();
   const cards = VITAL_METRICS.map((metric) => {
     const series = computeVitalSeries(overview.vitals, { type: metric.type, range: 'month', anchor: today });
     return overviewVitalCardMarkup(metric, series);
@@ -3112,29 +4476,29 @@ function overviewVitalCardMarkup(metric, series) {
   const label = t(metric.labelKey);
 
   let valueHtml;
-  let metaHtml = `<div class="health-metric-card__empty">${esc(t('health.vitals.noValue'))}</div>`;
+  let metaHtml = `<span class="metric-card__note">${esc(t('health.vitals.noValue'))}</span>`;
   if (latest) {
-    const unit = esc(latest.unit || '');
-    const valueText = metric.type === 'bp'
-      ? `${fmtNum(latest.value_num)}/${fmtNum(latest.value_num2)}`
-      : fmtNum(latest.value_num);
-    valueHtml = `<span class="health-metric-card__value">${esc(valueText)}</span>${unit ? ` <span class="health-metric-card__unit">${unit}</span>` : ''}`;
+    const unit = esc(vitalUnitText(metric, latest));
+    const valueText = vitalValueText(metric, latest);
+    valueHtml = `<span class="metric-card__value">${esc(valueText)}</span>${unit ? ` <span class="metric-card__unit">${unit}</span>` : ''}`;
     metaHtml = `
-      <div class="health-metric-card__meta">
-        ${deltaMarkup(series.deltas.value_num)}
-        <span class="health-metric-card__date">${esc(formatDate(String(latest.measured_at).slice(0, 10)))}</span>
-      </div>`;
+      <span class="metric-card__meta">
+        ${deltaMarkup(series.deltas.value_num, metric)}
+        <span>${esc(formatDate(String(latest.measured_at).slice(0, 10)))}</span>
+      </span>`;
   } else {
-    valueHtml = '<span class="health-metric-card__value health-metric-card__value--empty">–</span>';
+    valueHtml = '<span class="metric-card__value metric-card__value--empty">–</span>';
   }
 
+  // --inset: die Kachel liegt IN der Übersichtskarte (Kasten-in-Kasten,
+  // Muster vorher .health-overview__card .health-metric-card).
   return `
-    <button type="button" class="health-metric-card" data-vital-nav="${esc(metric.type)}">
-      <span class="health-metric-card__head">
-        <i data-lucide="${esc(metric.icon)}" class="health-metric-card__icon" aria-hidden="true"></i>
-        <span class="health-metric-card__label">${esc(label)}</span>
+    <button type="button" class="metric-card metric-card--select metric-card--inset" data-vital-nav="${esc(metric.type)}">
+      <span class="metric-card__head">
+        <i data-lucide="${esc(metric.icon)}" class="metric-card__icon" aria-hidden="true"></i>
+        <span class="metric-card__label">${esc(label)}</span>
       </span>
-      <span class="health-metric-card__body">${valueHtml}</span>
+      <span class="metric-card__body">${valueHtml}</span>
       ${metaHtml}
     </button>`;
 }
@@ -3142,9 +4506,15 @@ function overviewVitalCardMarkup(metric, series) {
 // --- Nächste Erinnerungen (heute noch offene Zeitfenster, reine Anzeige) ---
 
 function overviewUpcomingMarkup() {
-  const now = new Date();
-  const today = toLocalDateKey(now);
-  const nowTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  // „Welche Dosis steht heute noch aus" ist eine Frage an die Uhr, also an die
+  // Anzeigezone. `toLocalDateKey(new Date())` war der Browser-Tag und
+  // `getHours()` die Browser-Stunde: auf einem Geraet in einer anderen Zone
+  // wurden Zeitfenster als verstrichen gefuehrt, die es noch gar nicht waren
+  // (#829, Nachlese #851).
+  const now = nowFields();
+  const p2 = (n) => String(n).padStart(2, '0');
+  const today = `${now.year}-${p2(now.month)}-${p2(now.day)}`;
+  const nowTime = `${p2(now.hour)}:${p2(now.minute)}`;
   const up = upcomingDoses(overviewAllSchedules(), overviewAllLogs(), { today, nowTime, limit: 5 });
   if (!up.length) {
     return `<div class="health-overview__reminders-empty">${esc(t('health.overview.reminders.empty'))}</div>`;
@@ -3153,9 +4523,9 @@ function overviewUpcomingMarkup() {
     const med = overview.meds.find((m) => m.id === dose.medicationId);
     const doseText = dose.dose_qty != null ? ` · ${t('health.meds.doseQty', { count: fmtNum(dose.dose_qty) })}` : '';
     return `
-      <li class="health-overview-reminder">
+      <li class="list-row health-overview-reminder">
         <span class="health-dose__time">${esc(dose.time)}</span>
-        <span class="health-dose__name">${esc(med ? med.name : '')}${esc(doseText)}</span>
+        <span class="list-row__name health-dose__name">${esc(med ? med.name : '')}${esc(doseText)}</span>
       </li>`;
   }).join('');
   return `<ul class="health-overview__reminders-list">${rows}</ul>`;
@@ -3164,7 +4534,7 @@ function overviewUpcomingMarkup() {
 // --- Schnell-Erfassung (nur eigene Person) ---
 
 function quickCaptureMarkup() {
-  if (!isOwnOverviewView()) return '';
+  if (!canEditFor(overview.personId, overview.meId)) return '';
   return `
     <div class="health-overview__quick">
       <button type="button" class="btn btn--secondary" data-action="ov-add-vital">
@@ -3228,18 +4598,15 @@ function rerenderExportButtons() {
 
 function wireOverview() {
   wireTablistKeys(overview.root);
-  overview.root.querySelectorAll('.health-person-chip').forEach((chip) =>
-    chip.addEventListener('click', () => {
-      const id = Number(chip.dataset.personId);
-      if (id === overview.personId) return;
-      overview.personId = id;
-      switchOverviewPerson();
-    }));
+  installPopoverMenus(overview.root);
+  wirePersonSwitcher(overview, switchOverviewPerson);
 
   overview.root.querySelectorAll('[data-ov-dose-take]').forEach((btn) =>
     btn.addEventListener('click', () => handleOverviewDose(btn, 'take')));
   overview.root.querySelectorAll('[data-ov-dose-skip]').forEach((btn) =>
     btn.addEventListener('click', () => handleOverviewDose(btn, 'skip')));
+
+  wirePrn(overview.root);
 
   overview.root.querySelectorAll('[data-vital-nav]').forEach((card) =>
     card.addEventListener('click', () => {
@@ -3253,6 +4620,8 @@ function wireOverview() {
     ?.addEventListener('click', () => openActivityModal(null, { onSaved: () => reloadOverview() }));
   overview.root.querySelector('[data-action="ov-go-meds"]')
     ?.addEventListener('click', () => window.yuvomi?.navigate('/health/meds'));
+  overview.root.querySelector('[data-action="ov-go-cycle"]')
+    ?.addEventListener('click', () => window.yuvomi?.navigate('/health/cycle'));
 
   const fromEl = overview.root.querySelector('#ov-export-from');
   const toEl = overview.root.querySelector('#ov-export-to');
@@ -3277,10 +4646,15 @@ const cycle = {
   periods: [],
   logs: [],
   settings: null,
-  anchor: toLocalDateKey(new Date()),
+  anchor: todayKey(),
   loaded: false,
   error: false,
   root: null,
+  // Im Trends-Abschnitt gewaehltes Symptom fuer das Wahrscheinlichkeits-Overlay
+  // (Phase 4e) - null heisst "kein Overlay", derselbe Monatskalender bleibt
+  // sonst unveraendert. Personen-/Monatswechsel setzen es zurueck (setzt
+  // sich sonst leise auf einer fremden Person/einem falschen Symptom fort).
+  likelihoodSymptom: null,
 };
 
 // Wochentags-/Phasen-Label-Keys als vollständige Konstanten (Frontend-Audit:
@@ -3310,6 +4684,17 @@ function maybeMountCycle(activeRoute) {
   mountCycle();
 }
 
+function maybeMountFasting(activeRoute) {
+  if (activeRoute !== '/health/fasting' || !fastingEnabled) return;
+  const root = _container?.querySelector('[data-fasting-root]');
+  if (!root) return;
+  root.dataset.fastingMounted = 'true';
+  import('/pages/health-fasting.js').then(({ mountFasting }) => mountFasting(root, { userId: vitals.meId })).catch((error) => {
+    root.replaceChildren();
+    root.insertAdjacentHTML('beforeend', `<div class="fasting-panel__error" role="alert"><h3>${esc(t('health.fasting.loadError'))}</h3><p>${esc(error?.message || '')}</p></div>`);
+  });
+}
+
 function cycleSkeletonMarkup() {
   // Skeleton statt Spinner/Text: spiegelt die Hero-Silhouette (Ring + Statistik),
   // damit der Layout-Sprung beim Laden ausbleibt (Product-Register).
@@ -3332,16 +4717,12 @@ async function mountCycle() {
   </div>`);
 
   try {
-    if (!cycle.members.length) {
-      const res = await api.get('/family/members');
-      cycle.members = res.data || [];
-    }
-    if (!cycle.personId) cycle.personId = cycle.meId ?? cycle.members[0]?.id ?? null;
+    await loadHealthMembers(cycle, healthUser);
     await loadCycle();
     cycle.error = false;
   } catch (err) {
     console.error('[Health] cycle mount error:', err);
-    cycle.error = true;
+    cycle.error = err;
   }
   cycle.loaded = true;
   renderCycleShell();
@@ -3374,15 +4755,16 @@ function cycleSettings() {
 }
 
 async function switchCyclePerson() {
-  cycle.anchor = toLocalDateKey(new Date());
+  cycle.anchor = todayKey();
+  cycle.likelihoodSymptom = null;
   try { await loadCycle(); cycle.error = false; }
-  catch (err) { console.error('[Health] cycle load error:', err); cycle.error = true; }
+  catch (err) { console.error('[Health] cycle load error:', err); cycle.error = err; }
   renderCycleShell();
 }
 
 async function reloadCycle() {
   try { await loadCycle(); cycle.error = false; }
-  catch (err) { console.error('[Health] cycle reload error:', err); cycle.error = true; }
+  catch (err) { console.error('[Health] cycle reload error:', err); cycle.error = err; }
   renderCycleShell();
 }
 
@@ -3397,29 +4779,31 @@ function renderCycleShell() {
   cycle.root.replaceChildren();
 
   if (cycle.error) {
-    cycle.root.insertAdjacentHTML('beforeend', `
-      <div class="empty-state">
-        <i data-lucide="cloud-off" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${esc(t('health.cycle.loadError'))}</div>
-        <div class="empty-state__description">${esc(t('health.cycle.loadErrorDesc'))}</div>
-        <button class="btn btn--primary empty-state__cta" data-action="cycle-retry">
-          <i data-lucide="refresh-cw" class="icon-md" aria-hidden="true"></i>
-          ${esc(t('health.cycle.retry'))}
-        </button>
-      </div>`);
-    if (window.lucide) window.lucide.createIcons({ el: cycle.root });
-    cycle.root.querySelector('[data-action="cycle-retry"]')?.addEventListener('click', () => mountCycle());
+    mountAreaLoadError(cycle, 'cycle', mountCycle);
     return;
   }
 
   const own = isOwnCycleView();
-  const prediction = predictCycle(cycle.periods, cycleSettings());
+  // dayLogs mitgeben: Phase 3, ein bestätigter Temperaturanstieg im laufenden
+  // Zyklus ersetzt das kalendarische Eisprungdatum (siehe predictCycle()-Doku).
+  const prediction = predictCycle(cycle.periods, cycleSettings(), todayKey(), cycle.logs);
+
+  // EINMAL pro Render berechnet (vorher zweimal - einmal
+  // in der Bubble, einmal im Kalender, macht zusammen ~21 redundante volle
+  // Symptom-Historie-Scans) UND NUR in der eigenen Ansicht. cycleSettings()
+  // liefert für eine fremde Person ohnehin {} zurück (s. dort) - der Opt-out
+  // (show_pms=0) und die luteal_length gehören aber der BEOBACHTETEN Person,
+  // nicht der betrachtenden; ohne diese Own-Gate wuerde die Fremdansicht ein
+  // PMS-Muster zeigen, dessen Opt-out gar nicht abgefragt werden konnte -
+  // dieselbe Konsens-/Datenschutz-Logik wie beim Intimitäts-Marker (own-gated
+  // in cycleCalendarMarkup()), hier nur zusätzlich vor der Berechnung selbst
+  // statt erst vor der Anzeige.
+  const pms = own ? pmsWindow(cycle.logs, cycle.periods, cycleSettings(), todayKey()) : null;
 
   const persons = `
-    <div class="health-persons" role="tablist" aria-label="${esc(t('health.cycle.personsLabel'))}">
-      ${personChipsMarkup(cycle.members, cycle.personId, cycle.meId)}
-    </div>
-    ${readOnlyBannerMarkup(cycle.members, cycle.personId, own)}`;
+    ${personSwitcherMarkup(cycle.members, cycle.personId, cycle.meId,
+      { menuId: 'health-person-menu-cycle', label: t('health.cycle.personsLabel') })}
+    ${readOnlyBannerMarkup(cycle.members, cycle.personId, own, cycle.meId)}`;
 
   // Schwangerschafts-Modus: Vorhersagen sind pausiert — statt Ring/Prognose wird
   // der Schwangerschafts-Status gezeigt. Logging, Kalender (ohne Projektion) und
@@ -3427,9 +4811,11 @@ function renderCycleShell() {
   if (prediction.isPregnant) {
     cycle.root.insertAdjacentHTML('beforeend', `
       ${persons}
+      ${own ? cycleBubbleMarkup(prediction, pms) : ''}
       ${cyclePregnancyMarkup(prediction, own)}
       ${own ? cycleTodayActionsMarkup(true) : ''}
-      ${cycleCalendarMarkup(own)}
+      ${cycleCalendarMarkup(own, pms)}
+      ${prediction.hasData ? cycleTrendsMarkup() : ''}
       ${prediction.hasData ? cycleHistoryMarkup(own) : ''}
       ${cycleFooterMarkup(own)}
     `);
@@ -3442,13 +4828,16 @@ function renderCycleShell() {
   if (!prediction.hasData) {
     cycle.root.insertAdjacentHTML('beforeend', `
       ${persons}
-      <div class="empty-state health-empty">
-        <div class="health-empty__icon" aria-hidden="true"><i data-lucide="droplet"></i></div>
-        <div class="empty-state__title">${esc(t('health.cycle.emptyTitle'))}</div>
-        <div class="empty-state__description">${esc(t('health.cycle.emptyDesc'))}</div>
-        ${own ? `<button class="btn btn--primary empty-state__cta" data-action="cycle-first">
-          <i data-lucide="plus" class="icon-md" aria-hidden="true"></i>${esc(t('health.cycle.emptyCta'))}</button>` : ''}
-      </div>`);
+      ${emptyStateHTML({
+    icon: 'droplet',
+    title: t('health.cycle.emptyTitle'),
+    description: t('health.cycle.emptyDesc'),
+    // Ohne eigenen Zyklus gibt es hier nichts einzutragen: der CTA entfaellt,
+    // die Aussage bleibt.
+    action: own
+      ? { label: t('health.cycle.emptyCta'), icon: 'plus', attrs: { 'data-action': 'cycle-first' } }
+      : undefined,
+  })}`);
     if (window.lucide) window.lucide.createIcons({ el: cycle.root });
     wireCycle();
     refreshHealthFab();
@@ -3457,21 +4846,192 @@ function renderCycleShell() {
 
   cycle.root.insertAdjacentHTML('beforeend', `
     ${persons}
+    ${own ? cycleBubbleMarkup(prediction, pms) : ''}
     <div class="cycle-hero">
       ${cycleRingMarkup(prediction)}
       <div class="cycle-hero__side">
         ${cycleStatsMarkup(prediction)}
-        ${prediction.trackFertility ? `<p class="health-disclaimer">${esc(t('health.cycle.fertilityDisclaimer'))}</p>` : ''}
+        ${prediction.trackFertility ? `<p class="health-disclaimer">${esc(t(prediction.ovulationConfirmed ? 'health.cycle.fertilityDisclaimerConfirmed' : 'health.cycle.fertilityDisclaimer'))}</p>` : ''}
       </div>
     </div>
+    ${cycleRingLegendMarkup(prediction)}
     ${own ? cycleTodayActionsMarkup() : ''}
-    ${cycleCalendarMarkup(own)}
+    ${cycleCalendarMarkup(own, pms)}
+    ${cycleTrendsMarkup()}
     ${cycleHistoryMarkup(own)}
     ${cycleFooterMarkup(own)}
   `);
   if (window.lucide) window.lucide.createIcons({ el: cycle.root });
   wireCycle();
   refreshHealthFab();
+}
+
+// --------------------------------------------------------
+// "Heute"-Einblendung (C-1): EIN kompaktes Banner statt einer Kartenexplosion -
+// Zyklustag + Phase (immer) plus HOECHSTENS eine zweite Zeile nach fester
+// Prioritaet (ueberfaellige Periode > staerkster Schmerztag laut Muster >
+// heute wahrscheinliche Symptome > PMS-Fenster > kommendes wahrscheinliches
+// Symptom > fruchtbares Fenster > nichts - NIE eine Fuellphrase). Nur in der
+// eigenen Ansicht (isOwnCycleView(), siehe Aufrufstellen in renderCycleShell())
+// - Vorhersagen einer fremden Person zu einer "heute"-Aussage zu verdichten
+// waere anmassend.
+// v2 Nutzer-Feedback: symptomLikelihoodMarkup() (die Symptom-Muster-Chips)
+// lebt inzwischen im Kalenderabschnitt (cycleCalendarMarkup()), nicht mehr in
+// den Trends - der frühere, dort vergrabene Callout war praktisch unsichtbar.
+// --------------------------------------------------------
+
+/** SSW-Zeile einer Schwangerschaft - von cyclePregnancyMarkup() UND der
+ * "Heute"-Einblendung geteilt, damit die Wochen/Tage-Berechnung nur an einer
+ * Stelle steht, nicht dupliziert. */
+function cyclePregnancyWeekText(p) {
+  return t('health.cycle.pregnancy.week', { weeks: p.gestWeeks, days: p.gestDays });
+}
+
+// `icon` parametrisiert, welches Lucide-Zeichen die
+// Bubble zeigt (Default 'sparkles', der bisherige einzige Wert) - der
+// Schwangerschafts-Zweig unten baut sein "baby"-Icon damit ueber DIESELBE
+// Huelle statt einer eigenen, fast identischen Wrapper-Kopie.
+function cycleBubbleShell(line1Text, line2Html, icon = 'sparkles') {
+  return `
+    <div class="cycle-bubble" role="region" aria-label="${esc(t('health.cycle.bubble.ariaLabel'))}">
+      <div class="cycle-bubble__icon" aria-hidden="true"><i data-lucide="${esc(icon)}"></i></div>
+      <div class="cycle-bubble__body">
+        <p class="cycle-bubble__line1">${esc(line1Text)}</p>
+        ${line2Html}
+      </div>
+    </div>`;
+}
+
+// `pms` (Fix 3): vorab in renderCycleShell() EINMAL berechnet (own-gated,
+// siehe dortiger Dokblock) und hier nur noch gelesen - kein zweiter
+// pmsWindow()-Aufruf mehr.
+function cycleBubbleMarkup(prediction, pms) {
+  const today = todayKey();
+
+  // Schwangerschaft: Zeile 1 ist die SSW-Zeile (cyclePregnancyWeekText(), s.o.)
+  // - keine Zeile 2, da waehrend der Schwangerschaft alle Zyklus-Vorhersagen
+  // ohnehin pausiert sind (siehe predictCycle()).
+  if (prediction.isPregnant) {
+    const p = prediction.pregnancy || {};
+    const line1 = p.hasDue ? cyclePregnancyWeekText(p) : t('health.cycle.pregnancy.title');
+    return cycleBubbleShell(line1, '', 'baby');
+  }
+
+  const phaseLabel = t(CYCLE_PHASE_LABEL_KEYS[prediction.phase] || CYCLE_PHASE_LABEL_KEYS[PHASE.FOLLICULAR]);
+  const line1 = t('health.cycle.bubble.line1', { day: prediction.cycleDay, phase: phaseLabel });
+  const settings = cycleSettings();
+
+  // Prioritaet 1: Periode heute/ueberfaellig erwartet - derselbe Handlungsaufruf
+  // wie die "Heute"-Aktionsleiste (cycleStartPeriodToday(), keine zweite
+  // Speicherlogik). Eigener data-action-Name (cycle-bubble-start-period), damit
+  // wireCycle()s einzelner querySelector(...) fuer "cycle-start-period"
+  // weiterhin genau den Knopf der Aktionsleiste trifft - zwei Elemente mit
+  // demselben data-action wuerden sich sonst den einen Listener teilen.
+  if (prediction.daysUntilNext <= 0) {
+    // Eine faellige/ueberfaellige Vorhersage UND ein
+    // vergessener, noch offener Periodeneintrag (cycleOpenPeriod()) duerfen
+    // NICHT gleichzeitig "Periode starten" anbieten - der Server prueft
+    // Ueberschneidungen nicht, ein Tippen wuerde also eine zweite, sich
+    // ueberlappende Periode anlegen. Zeile 2 wird dann zur "laeuft die noch?"-
+    // Frage mit demselben Beenden-Knopf wie die Aktionsleiste darunter
+    // (cycleEndPeriodToday(), KEIN zweiter Speicherpfad) - die "Periode
+    // starten"-CTA erscheint nur, wenn KEINE Periode offen ist.
+    const openPeriod = cycleOpenPeriod();
+    if (openPeriod) {
+      return cycleBubbleShell(line1, `
+        <div class="cycle-bubble__line2 cycle-bubble__line2--row">
+          <span>${esc(t('health.cycle.bubble.periodStillOpen'))}</span>
+          <button type="button" class="btn btn--sm btn--secondary" data-action="cycle-bubble-end-period">${esc(t('health.cycle.today.endPeriod'))}</button>
+        </div>`);
+    }
+    const line2Text = prediction.daysUntilNext === 0
+      ? t('health.cycle.bubble.periodToday')
+      : t('health.cycle.bubble.periodOverdue', { count: Math.abs(prediction.daysUntilNext) });
+    return cycleBubbleShell(line1, `
+      <div class="cycle-bubble__line2 cycle-bubble__line2--row">
+        <span>${esc(line2Text)}</span>
+        <button type="button" class="btn btn--sm btn--primary" data-action="cycle-bubble-start-period">${esc(t('health.cycle.today.startPeriod'))}</button>
+      </div>`);
+  }
+
+  // Prioritaet 2 (v2, Nutzer-Feedback): heute der laut Historie staerkste
+  // Schmerztag - VOR der generischen "heute wahrscheinlich"-Zeile (Prioritaet
+  // 3), weil ein konkreter Schmerz-Spitzentag mehr Handlungswert traegt als
+  // eine blosse Symptom-Liste. peakPainDay() rechnet rein aus der Historie
+  // (siehe dort); der Vergleich gegen den AKTUELLEN Zyklustag passiert hier.
+  // Musterformulierung ("laut deinem Muster"/"oft"), bewusst keine Prognose
+  // ("du wirst") und keine Ratschlagszeile - dieselbe Zurueckhaltung wie die
+  // uebrigen Bubble-Zeilen. Tippen oeffnet, wie Prioritaet 3, das heutige
+  // Tages-Log (derselbe data-action, keine zweite Logging-Route).
+  const peakPain = peakPainDay(cycle.logs, cycle.periods, settings);
+  if (peakPain && peakPain.cycleDay === prediction.cycleDay) {
+    const symptomLabel = t(symptomType(peakPain.symptomKey).labelKey);
+    return cycleBubbleShell(line1, `
+      <button type="button" class="cycle-bubble__line2 cycle-bubble__line2--action" data-action="cycle-bubble-log-today">
+        <span>${esc(t('health.cycle.bubble.peakPainDay', { symptom: symptomLabel }))}</span>
+        <i data-lucide="chevron-right" aria-hidden="true"></i>
+      </button>`);
+  }
+
+  // Die verbleibenden Prioritaeten brauchen dieselbe Symptom-Wahrscheinlichkeit
+  // ueber ALLE SYMPTOM_TYPES (nicht nur das im Trends-Bereich gewaehlte) - EIN
+  // Durchlauf fuer diesen Render, nicht pro Fall neu. predictSymptomLikelihood()
+  // rekonstruiert die Zyklen aus Perioden/Logs bei JEDEM Aufruf (siehe
+  // symptomCyclePattern()/reconstructCycles() in health-cycle.js); 20 Aufrufe
+  // pro Render sind bei den ueblichen Datenmengen (Dutzende Perioden, Hunderte
+  // Tages-Logs) unkritisch, aber unnoetig oefter als einmal wiederholt -
+  // dasselbe Muster wie pmsWindow() dort, das ebenfalls ueber alle Symptome
+  // iteriert.
+  const likelihoods = SYMPTOM_TYPES.map((s) => ({
+    symptom: s,
+    result: predictSymptomLikelihood(cycle.logs, cycle.periods, settings, s.value, today),
+  }));
+
+  // Prioritaet 3: heute wahrscheinliche Symptome (bis zu drei, in SYMPTOM_TYPES-
+  // Reihenfolge - keine weitere Gewichtung noetig).
+  const likelyToday = likelihoods.filter((l) => l.result.isLikelyToday).slice(0, 3);
+  if (likelyToday.length) {
+    const names = likelyToday.map((l) => t(l.symptom.labelKey)).join(', ');
+    return cycleBubbleShell(line1, `
+      <button type="button" class="cycle-bubble__line2 cycle-bubble__line2--action" data-action="cycle-bubble-log-today">
+        <span>${esc(t('health.cycle.bubble.likelySymptomsToday', { symptoms: names }))}</span>
+        <i data-lucide="chevron-right" aria-hidden="true"></i>
+      </button>`);
+  }
+
+  // Prioritaet 4: PMS-Fenster - enthaelt "heute" oder beginnt innerhalb
+  // der naechsten drei Tage. `pms` kommt als Parameter (s.o.), kein
+  // eigener pmsWindow()-Aufruf hier mehr.
+  if (pms) {
+    const startsWithinDays = daysBetween(today, pms.start);
+    const containsToday = today >= pms.start && today <= pms.end;
+    if (containsToday || (startsWithinDays >= 0 && startsWithinDays <= 3)) {
+      const weekday = t(CYCLE_WEEKDAY_LABEL_KEYS[weekdayIndex(pms.start)]);
+      return cycleBubbleShell(line1, `<p class="cycle-bubble__line2">${esc(t('health.cycle.bubble.pmsWindow', { weekday }))}</p>`);
+    }
+  }
+
+  // Prioritaet 5: naechstes wahrscheinliches Symptom - ueber alle Symptome
+  // hinweg das fruehste `nextLikelyDate` innerhalb der naechsten 7 Tage.
+  const upcoming = likelihoods
+    .filter((l) => l.result.nextLikelyDate && daysBetween(today, l.result.nextLikelyDate) >= 0 && daysBetween(today, l.result.nextLikelyDate) <= 7)
+    .sort((a, b) => (a.result.nextLikelyDate < b.result.nextLikelyDate ? -1 : 1))[0];
+  if (upcoming) {
+    const weekday = t(CYCLE_WEEKDAY_LABEL_KEYS[weekdayIndex(upcoming.result.nextLikelyDate)]);
+    const symptom = t(upcoming.symptom.labelKey);
+    return cycleBubbleShell(line1, `<p class="cycle-bubble__line2">${esc(t('health.cycle.bubble.upcomingSymptom', { weekday, symptom }))}</p>`);
+  }
+
+  // Prioritaet 6: fruchtbares Fenster (nur wenn ueberhaupt verfolgt - die
+  // Verhuetungs-Einstellung (contraception) schaltet trackFertility unter
+  // hormoneller Verhuetung bereits ab).
+  if (prediction.trackFertility && prediction.fertileStart && today >= prediction.fertileStart && today <= prediction.fertileEnd) {
+    const key = prediction.ovulationConfirmed ? 'health.cycle.bubble.fertileConfirmed' : 'health.cycle.bubble.fertile';
+    return cycleBubbleShell(line1, `<p class="cycle-bubble__line2">${esc(t(key, { date: formatDate(prediction.fertileEnd) }))}</p>`);
+  }
+
+  // Prioritaet 7: nichts Passendes - NIE eine Fuellphrase, nur Zeile 1.
+  return cycleBubbleShell(line1, '');
 }
 
 // --------------------------------------------------------
@@ -3484,7 +5044,7 @@ function cyclePregnancyMarkup(prediction, own) {
 
   let detail;
   if (p.hasDue) {
-    const weekLine = t('health.cycle.pregnancy.week', { weeks: p.gestWeeks, days: p.gestDays });
+    const weekLine = cyclePregnancyWeekText(p);
     const countdown = p.overdue
       ? t('health.cycle.pregnancy.overdue', { days: Math.abs(p.daysUntilDue) })
       : t('health.cycle.pregnancy.countdown', { days: p.daysUntilDue });
@@ -3540,13 +5100,29 @@ function cycleRingMarkup(prediction) {
   let markers = '';
   if (ring.ovulationFrac != null) {
     const [ox, oy] = cyclePolar(CX, CY, R, ring.ovulationFrac);
+    // Bestätigt (Temperaturanstieg, Phase 3) bekommt einen zusätzlichen
+    // Aussenring - derselbe Punkt, ein sichtbar anderer Zustand, keine zweite
+    // Farbe (die bliebe ohne Legende unerklärt).
+    if (ring.ovulationConfirmed) {
+      markers += `<circle cx="${ox.toFixed(1)}" cy="${oy.toFixed(1)}" r="8" fill="none" stroke="var(--cycle-ovulation)" stroke-width="2" />`;
+    }
     markers += `<circle cx="${ox.toFixed(1)}" cy="${oy.toFixed(1)}" r="5.5" fill="var(--cycle-ovulation)" stroke="var(--color-surface)" stroke-width="2.5" />`;
   }
   const [tx, ty] = cyclePolar(CX, CY, R, ring.currentFrac);
   markers += `<circle class="cycle-ring__now" cx="${tx.toFixed(1)}" cy="${ty.toFixed(1)}" r="7.5" fill="var(--module-health)" stroke="var(--color-surface)" stroke-width="3" />`;
 
+  // "Day N"-Sprechblase (Flo-Vorbild): sitzt am „jetzt"-Marker, aber ausserhalb
+  // des Rings, statt die Tageszahl in der ohnehin engen Ringmitte unterzubringen.
+  // Eine kurze Konnektorlinie verbindet Marker und Sprechblase, exakt am selben
+  // Winkel (cyclePolar mit grösserem Radius) - keine zweite, unabhängige Position.
+  const [lx, ly] = cyclePolar(CX, CY, R + SW / 2 + 3, ring.currentFrac);
+  const [bx, by] = cyclePolar(CX, CY, R + SW / 2 + 19, ring.currentFrac);
+  markers += `<line class="cycle-ring__connector" x1="${lx.toFixed(1)}" y1="${ly.toFixed(1)}" x2="${bx.toFixed(1)}" y2="${by.toFixed(1)}" stroke="var(--color-border)" stroke-width="1.5" />`;
+  const badgeLeftPct = (bx / 220 * 100).toFixed(2);
+  const badgeTopPct = (by / 220 * 100).toFixed(2);
+
   const phaseLabel = t(CYCLE_PHASE_LABEL_KEYS[prediction.phase] || CYCLE_PHASE_LABEL_KEYS[PHASE.FOLLICULAR]);
-  const ringAria = `${phaseLabel} · ${t('health.cycle.ring.cycleDay', { day: prediction.cycleDay })}`;
+  const ringAria = `${phaseLabel} · ${t('health.cycle.ring.cycleDay', { day: prediction.cycleDay })} ${t('health.cycle.ring.of', { total: ring.total })}`;
 
   return `
     <div class="cycle-ring" data-phase="${esc(prediction.phase)}">
@@ -3555,12 +5131,36 @@ function cycleRingMarkup(prediction) {
         ${arcs}
         ${markers}
       </svg>
+      <div class="cycle-ring__daybadge" style="left:${badgeLeftPct}%; top:${badgeTopPct}%" aria-hidden="true">
+        <span class="cycle-ring__daybadge-label">${esc(t('health.cycle.ring.dayBadge', { day: prediction.cycleDay }))}</span>
+      </div>
       <div class="cycle-ring__center">
         <span class="cycle-ring__phase">${esc(phaseLabel)}</span>
-        <span class="cycle-ring__day">${esc(t('health.cycle.ring.cycleDay', { day: prediction.cycleDay }))}</span>
         <span class="cycle-ring__status">${esc(`${t('health.cycle.status.nextPeriod')}: ${cycleCountdownText(prediction)}`)}</span>
       </div>
     </div>`;
+}
+
+/**
+ * Kompakte Legende zum Ring - nur die drei Farben, die der Ring tatsaechlich
+ * zeigt (Periode immer, fruchtbares Fenster/Eisprung nur bei aktivierter
+ * Fruchtbarkeitsverfolgung, siehe cycleRing()). Bewusst NICHT die volle
+ * Kalender-Legende (die auch "vorhergesagt"/"heute" fuehrt, was auf dem Ring
+ * keine eigene Farbe hat) - dieselbe .cycle-legend-Komponente, aber eine
+ * eigene, kleinere Auswahl. Der Ring-Mittelpunkt nennt die AKTUELLE Phase
+ * schon als Text; diese Legende erklaert die uebrigen Bogenfarben, die sonst
+ * nur ueber die Farbe selbst zu unterscheiden waeren.
+ */
+function cycleRingLegendMarkup(prediction) {
+  const items = [{ cls: 'is-menstruation', key: 'health.cycle.legend.period' }];
+  if (prediction.trackFertility) {
+    items.push(
+      { cls: 'is-fertile', key: 'health.cycle.legend.fertile' },
+      { cls: 'is-ovulation', key: 'health.cycle.legend.ovulation' },
+    );
+  }
+  return `<div class="cycle-legend cycle-ring__legend">${items.map((i) => `
+    <span class="cycle-legend__item"><span class="cycle-legend__swatch ${i.cls}"></span>${esc(t(i.key))}</span>`).join('')}</div>`;
 }
 
 function cycleCountdownText(prediction) {
@@ -3589,42 +5189,110 @@ function cycleStatsMarkup(prediction) {
 
   // Nächste Periode: nur das Datum — der Countdown steht bereits im Ring-Zentrum,
   // die Karte würde ihn sonst dublieren (Critique).
+  //
+  // Perimenopause: mit gesetztem Modus UND einer Spanne (nextStartRange,
+  // siehe predictCycle()-Dokblock) zeigt die Kachel die Spanne statt des
+  // einzelnen Mittelwert-Datums, mit dem Mittelwert als Unterzeile - der
+  // Ring-Mittelpunkt (cycleCountdownText()) bleibt bewusst bei EINER Zahl
+  // (nextStart/daysUntilNext), weil ein Countdown auf eine Spanne dort keinen
+  // sinnvollen einzelnen Text ergäbe.
+  const perimenopauseRange = (prediction.perimenopause && prediction.nextStartRange) ? prediction.nextStartRange : null;
   tiles.push(cycleStatCardMarkup({
     icon: 'calendar-heart',
     labelKey: 'health.cycle.status.nextPeriod',
-    value: formatDate(prediction.nextStart),
-    sub: '',
+    value: perimenopauseRange
+      ? `${formatDate(perimenopauseRange.min)} - ${formatDate(perimenopauseRange.max)}`
+      : formatDate(prediction.nextStart),
+    sub: perimenopauseRange
+      ? t('health.cycle.status.nextPeriodRangeSub', { date: formatDate(prediction.nextStart) })
+      : '',
   }));
 
   if (prediction.trackFertility) {
+    // Bestätigt (Phase 3, Temperaturanstieg) vs. vorhergesagt (Kalendermethode) -
+    // derselbe Unterschied, den predictCycle()/cycleRing() schon tragen, hier nur
+    // sichtbar gemacht.
+    const ovulationLabel = prediction.ovulationConfirmed
+      ? t('health.cycle.status.ovulationConfirmed')
+      : t('health.cycle.status.ovulation');
     tiles.push(cycleStatCardMarkup({
       icon: 'sparkles',
       labelKey: 'health.cycle.status.fertileWindow',
       value: `${formatDate(prediction.fertileStart)} – ${formatDate(prediction.fertileEnd)}`,
-      sub: `${t('health.cycle.status.ovulation')}: ${formatDate(prediction.ovulationDate)}`,
+      sub: `${ovulationLabel}: ${formatDate(prediction.ovulationDate)}`,
     }));
-  } else {
-    const reg = stats.regular === null
-      ? t('health.cycle.status.notEnoughData')
-      : t(stats.regular ? 'health.cycle.status.regular' : 'health.cycle.status.irregular');
-    tiles.push(cycleStatCardMarkup({ icon: 'activity', labelKey: 'health.cycle.status.regularity', value: reg, sub: '' }));
+  } else if (prediction.fertilitySuppressed === 'contraception') {
+    // Ohne die fruchtbares-Fenster-Kachel bliebe die Kachel-Luecke
+    // unerklaert (saehe wie ein Fehler statt einer bewussten Abschaltung aus) -
+    // ein ruhiger Hinweis statt stillschweigendem Verschwinden.
+    tiles.push(`
+      <div class="cycle-stat cycle-stat--note">
+        <i data-lucide="info" aria-hidden="true"></i>
+        <span>${esc(t('health.cycle.status.fertilitySuppressedNote'))}</span>
+      </div>`);
   }
+
+  // Regelmäßigkeit (Phase 4d): vorher nur sichtbar, wenn Fruchtbarkeit NICHT
+  // verfolgt wird (prediction.trackFertility ? fertileWindow : regularity) -
+  // mit Fruchtbarkeitsverfolgung an, dem Standard, war diese Kachel bisher
+  // nirgends zu sehen. Jetzt immer da, unabhängig von trackFertility.
+  const variationValue = stats.variation != null
+    // A-4: `count` zusaetzlich zu `value` uebergeben, sonst waehlt t() nie die
+    // `_one`-Variante ("1 Tage" statt "1 Tag") - value ist der fertig
+    // formatierte Anzeigetext, count die rohe Zahl fuer die Pluralwahl.
+    ? t('health.cycle.unit.days', { value: fmtNum(stats.variation), count: stats.variation })
+    : t('health.cycle.status.notEnoughData');
+  const regularitySub = stats.regular === null ? '' : t(stats.regular ? 'health.cycle.status.regular' : 'health.cycle.status.irregular');
+  tiles.push(cycleStatCardMarkup({ icon: 'activity', labelKey: 'health.cycle.status.cycleVariation', value: variationValue, sub: regularitySub }));
 
   // Ø Zyklus + Ø Periode teilen sich EINE volle-Breite-Kachel statt zweier fast
   // identischer Tiles — bricht die „identical card grid"-Wiederholung auf.
+  // Der Typisch/Untypisch-Badge (Phase 4d, allgemein üblicher Bereich statt
+  // des SELBSTBEZÜGLICHEN Regelmäßigkeits-Werts oben) erscheint nur bei einer
+  // echten Basis (Historie oder manuelle Einstellung) - bei einem reinen
+  // Default-Wert (source: 'default'/'insufficient_history') wäre "Typisch"
+  // eine unbelegte Aussage über einen Platzhalter, keine echte Einschätzung.
+  const hasRealCycleBasis = stats.source === 'history' || stats.source === 'settings';
+  const typical = isTypicalCycleLength(stats.avgCycle);
+  const typicalBadge = hasRealCycleBasis
+    ? `<span class="cycle-stat__badge ${typical ? 'cycle-stat__badge--typical' : 'cycle-stat__badge--atypical'}">${esc(t(typical ? 'health.cycle.trends.typical' : 'health.cycle.trends.atypical'))}</span>`
+    : '';
+  const sourceText = cycleStatsSourceText(stats);
   tiles.push(`
     <div class="cycle-stat cycle-stat--dual">
-      <div class="cycle-stat__pair-item">
-        <span class="cycle-stat__head"><i data-lucide="repeat" aria-hidden="true"></i>${esc(t('health.cycle.status.avgCycle'))}</span>
-        <span class="cycle-stat__value">${esc(t('health.cycle.unit.days', { value: fmtNum(stats.avgCycle) }))}</span>
+      <div class="cycle-stat__pair-row">
+        <div class="cycle-stat__pair-item">
+          <span class="cycle-stat__head"><i data-lucide="repeat" aria-hidden="true"></i>${esc(t('health.cycle.status.avgCycle'))}</span>
+          <span class="cycle-stat__value">${esc(t('health.cycle.unit.days', { value: fmtNum(stats.avgCycle), count: stats.avgCycle }))}${typicalBadge}</span>
+        </div>
+        <div class="cycle-stat__pair-item">
+          <span class="cycle-stat__head"><i data-lucide="droplet" aria-hidden="true"></i>${esc(t('health.cycle.status.avgPeriod'))}</span>
+          <span class="cycle-stat__value">${esc(t('health.cycle.unit.days', { value: fmtNum(stats.avgPeriod), count: stats.avgPeriod }))}</span>
+        </div>
       </div>
-      <div class="cycle-stat__pair-item">
-        <span class="cycle-stat__head"><i data-lucide="droplet" aria-hidden="true"></i>${esc(t('health.cycle.status.avgPeriod'))}</span>
-        <span class="cycle-stat__value">${esc(t('health.cycle.unit.days', { value: fmtNum(stats.avgPeriod) }))}</span>
-      </div>
+      ${sourceText ? `<span class="cycle-stat__sub">${esc(sourceText)}</span>` : ''}
     </div>`);
 
   return `<div class="cycle-stats">${tiles.join('')}</div>`;
+}
+
+// Erklärt, worauf Ø Zyklus/Periode gerade beruhen — sonst nicht von der UI
+// unterscheidbar, ob ein Wert aus echter Historie stammt oder (zufällig
+// identisch mit dem Default) nur die Kaltstart-Annahme ist.
+function cycleStatsSourceText(stats) {
+  if (stats.source === 'settings') return '';
+  if (stats.source === 'history') {
+    // A-5: "Basierend auf DEINEN letzten N Perioden" ist in der Fremdansicht
+    // (isOwnCycleView() === false) falsch adressiert - die Person-neutrale
+    // Variante sagt dasselbe ohne die zweite Person anzusprechen.
+    return t(isOwnCycleView() ? 'health.cycle.stats.source.history' : 'health.cycle.stats.source.historyOther', { count: stats.count });
+  }
+  if (stats.source === 'insufficient_history') {
+    const gapsSoFar = Math.max(0, stats.count - 1);
+    const remaining = Math.max(1, MIN_HISTORY_GAPS - gapsSoFar);
+    return t('health.cycle.stats.source.insufficientHistory', { count: remaining });
+  }
+  return t('health.cycle.stats.source.default');
 }
 
 // --------------------------------------------------------
@@ -3633,7 +5301,7 @@ function cycleStatsMarkup(prediction) {
 
 function cycleOpenPeriod() {
   // Jüngste laufende Periode (kein Enddatum), deren Start nicht in der Zukunft liegt.
-  const today = toLocalDateKey(new Date());
+  const today = todayKey();
   return [...cycle.periods]
     .filter((p) => !p.end_date && String(p.start_date).slice(0, 10) <= today)
     .sort((a, b) => (a.start_date < b.start_date ? 1 : -1))[0] || null;
@@ -3659,7 +5327,7 @@ function cycleTodayActionsMarkup(pregnant = false) {
 }
 
 async function cycleStartPeriodToday() {
-  const today = toLocalDateKey(new Date());
+  const today = todayKey();
   try {
     await api.post('/health/cycle/periods', { start_date: today });
     cycle.anchor = today;
@@ -3675,7 +5343,7 @@ async function cycleEndPeriodToday() {
   const open = cycleOpenPeriod();
   if (!open) { window.yuvomi?.showToast(t('health.cycle.today.noOpenPeriod'), 'info'); return; }
   try {
-    await api.patch(`/health/cycle/periods/${open.id}`, { end_date: toLocalDateKey(new Date()) });
+    await api.patch(`/health/cycle/periods/${open.id}`, { end_date: todayKey() });
     window.yuvomi?.showToast(t('health.cycle.today.endedToast'), 'success');
     await reloadCycle();
   } catch (err) {
@@ -3697,13 +5365,59 @@ function cycleMonthLabel(anchorKey) {
   }
 }
 
-function cycleCalendarMarkup(own) {
+function cycleCalendarMarkup(own, pms) {
   const cal = buildCycleCalendar(cycle.anchor, {
     periods: cycle.periods, logs: cycle.logs, settings: cycleSettings(), weekStartsOn: 1,
   });
 
+  // Symptom-Wahrscheinlichkeits-Overlay (Phase 4e): nur Zusatzmarker auf
+  // DEMSELBEN Monatskalender, keine zweite Kalenderflaeche - "getrackt"
+  // (Symptom an diesem Tag tatsaechlich geloggt) vs. "wahrscheinlich"
+  // (Zyklustag-Muster, aber nicht geloggt), derselbe Voll-/Umriss-Kontrast
+  // wie geloggte vs. vorhergesagte Periode.
+  let trackedDates = null;
+  let predictedDates = null;
+  if (cycle.likelihoodSymptom) {
+    const settings = cycleSettings();
+    trackedDates = new Set(
+      (cycle.logs || [])
+        .filter((l) => normalizeSymptomEntries(l.symptoms).some((e) => e.key === cycle.likelihoodSymptom))
+        .map((l) => String(l.log_date).slice(0, 10)),
+    );
+    predictedDates = new Set(predictSymptomLikelihood(cycle.logs, cycle.periods, settings, cycle.likelihoodSymptom).likelyDates);
+  }
+
+  // Intimitäts-Marker NUR in der eigenen Ansicht - das Feld kommt bei
+  // einer fremden Person serverseitig ohnehin nicht mit (siehe docs/SPEC.md,
+  // "Owner-only axis"), das Set bleibt hier aber zusätzlich
+  // durch `own` geschützt, statt sich allein auf das leere Feld zu verlassen.
+  const intimacyDates = own
+    ? new Set((cycle.logs || []).filter((l) => l.intimacy).map((l) => String(l.log_date).slice(0, 10)))
+    : null;
+
+  // PMS-Fenster aus dem Symptom-Muster (Util bereits vorhanden/getestet).
+  // Fensterlogik siehe pmsWindow()-Dokblock (health-cycle.js) - reine
+  // Musterableitung, nie diagnostisch. Shading NUR auf Zellen ohne eigene
+  // Phase (Menstruation/fruchtbar/Eisprung behalten ihre Farbe) - eine
+  // Unterlegung unter einer bereits getönten Phasenfläche würde entweder die
+  // Phasenfarbe verwaschen oder unsichtbar bleiben; ein unphasierter Tag hat
+  // dagegen nichts, das die Musterfarbe verdecken könnte.
+  //
+  // `pms` kommt als Parameter aus renderCycleShell()
+  // (dort own-gated berechnet, EINMAL statt zweimal, siehe dortiger
+  // Dokblock) - in einer fremden Ansicht ist `pms` deshalb immer `null` und
+  // `inPmsWindow` faellt auf `() => false` zurueck. Damit shaded/erklaert
+  // die Fremdansicht kein PMS-Muster, dessen Opt-out (show_pms) und
+  // luteal_length der beobachtenden Person gar nicht zustehen - dieselbe
+  // Konsens-Gate wie beim Intimitäts-Marker oben (own-gated), nur schon eine
+  // Ebene frueher (Berechnung statt nur Anzeige).
+  const inPmsWindow = pms ? (dateKey) => dateKey >= pms.start && dateKey <= pms.end : () => false;
+
   const weekdays = CYCLE_WEEKDAY_LABEL_KEYS
     .map((k) => `<span class="cycle-cal__wd">${esc(t(k))}</span>`).join('');
+
+  let hasConfirmedOvulation = false;
+  let pmsVisibleInMonth = false;
 
   const cells = cal.weeks.flat().map((c) => {
     const cls = ['cycle-cal__day'];
@@ -3711,14 +5425,31 @@ function cycleCalendarMarkup(own) {
     if (c.isToday) cls.push('is-today');
     if (c.phase) cls.push(`is-${c.phase}`);
     if (c.predicted) cls.push('is-predicted');
+    // T2: ein per BBT bestätigtes Fenster (Eisprung + fruchtbare Tage des
+    // AKTUELLEN Zyklus) ist ein MESSWERT, keine Vorhersage mehr - dieselbe
+    // Voll-/Umriss-Unterscheidung, die der Ring dafür schon nutzt (siehe
+    // cycleRingMarkup(): ein zusätzlicher Aussenring am bestätigten Punkt,
+    // keine zweite Farbe). `confirmed` und `predicted` schließen sich laut
+    // buildCycleCalendar() gegenseitig aus.
+    if (c.confirmed) { cls.push('is-confirmed'); hasConfirmedOvulation = true; }
     if (c.hasLog) cls.push('has-log');
+    if (trackedDates?.has(c.dateKey)) cls.push('is-symptom-tracked');
+    else if (predictedDates?.has(c.dateKey)) cls.push('is-symptom-predicted');
+    if (!c.phase && inPmsWindow(c.dateKey)) {
+      cls.push('is-pms');
+      if (c.inMonth) pmsVisibleInMonth = true;
+    }
     const flowAttr = c.flow ? ` data-flow="${esc(c.flow)}"` : '';
     const tag = own ? 'button' : 'div';
     const attrs = own
       ? `type="button" data-cycle-day="${esc(c.dateKey)}" aria-label="${esc(formatDate(c.dateKey))}"`
       : 'aria-hidden="true"';
+    const heart = intimacyDates?.has(c.dateKey)
+      ? '<i data-lucide="heart" class="cycle-cal__intimacy-icon icon-sm" aria-hidden="true"></i>'
+      : '';
     return `<${tag} class="${cls.join(' ')}"${flowAttr} ${attrs}>
       <span class="cycle-cal__num">${esc(c.day)}</span>
+      ${heart}
       ${c.hasLog ? '<span class="cycle-cal__dot" aria-hidden="true"></span>' : ''}
     </${tag}>`;
   }).join('');
@@ -3726,29 +5457,730 @@ function cycleCalendarMarkup(own) {
   return `
     <section class="cycle-cal">
       <div class="cycle-cal__head">
-        <h3 class="cycle-section__title u-toolbar-title">${esc(t('health.cycle.calendar.title'))}</h3>
+        <h3 class="cycle-section__title u-section-title">${esc(t('health.cycle.calendar.title'))}</h3>
         <div class="cycle-cal__nav">
           <button class="btn btn--icon" data-cycle-month="-1" aria-label="${esc(t('health.cycle.calendar.prevMonth'))}"><i data-lucide="chevron-left" aria-hidden="true"></i></button>
           <span class="cycle-cal__month">${esc(cycleMonthLabel(cycle.anchor))}</span>
           <button class="btn btn--icon" data-cycle-month="1" aria-label="${esc(t('health.cycle.calendar.nextMonth'))}"><i data-lucide="chevron-right" aria-hidden="true"></i></button>
         </div>
       </div>
-      <div class="cycle-cal__weekdays" aria-hidden="true">${weekdays}</div>
-      <div class="cycle-cal__grid" role="grid">${cells}</div>
-      ${cycleLegendMarkup()}
+      <!-- .cycle-cal__body ist reines CSS-Layout: ein breiter Container
+           rendert Gitter+Rail zweispaltig (siehe @container cycle-cal in
+           health.css), ein schmaler stapelt in DERSELBEN DOM-Reihenfolge
+           (Gitter, dann Legende, dann Muster-Satz) - Lese-/Tab-Reihenfolge
+           bleibt unveraendert, nur das Aussehen ist responsiv. -->
+      <div class="cycle-cal__body">
+        <div class="cycle-cal__main">
+          <div class="cycle-cal__weekdays" aria-hidden="true">${weekdays}</div>
+          <!-- Bewusst OHNE role=grid: die Rolle verlangt row/gridcell-Struktur und
+               verspricht Pfeiltasten-Navigation, die es hier nicht gibt. Die Tage
+               sind eigenstaendige Buttons mit Datums-Label. -->
+          <div class="cycle-cal__grid">${cells}</div>
+        </div>
+        <div class="cycle-cal__rail">
+          ${cycleLegendMarkup({ hasConfirmedOvulation, showPms: pmsVisibleInMonth, own })}
+          ${symptomLikelihoodMarkup()}
+        </div>
+      </div>
     </section>`;
 }
 
-function cycleLegendMarkup() {
+function cycleLegendMarkup({ hasConfirmedOvulation = false, showPms = false, own = false } = {}) {
   const items = [
+    // A-9/B-1: der einfache Log-Punkt (kein Flow-Wert) bekommt endlich einen
+    // eigenen Legenden-Eintrag - er stand bisher unerklärt im Kalender.
+    { cls: 'cycle-legend__swatch--dot', key: 'health.cycle.legend.logged' },
     { cls: 'is-menstruation', key: 'health.cycle.legend.period' },
     { cls: 'is-menstruation is-predicted', key: 'health.cycle.legend.predicted' },
     { cls: 'is-fertile', key: 'health.cycle.legend.fertile' },
-    { cls: 'is-ovulation', key: 'health.cycle.legend.ovulation' },
+    // T2: die Standard-Eisprung-Zelle zeigt jetzt den Umriss der Kalender-
+    // methode (Vorhersage) - der Vollton ist "bestätigt" vorbehalten (s.u.).
+    { cls: 'is-ovulation is-predicted', key: 'health.cycle.legend.ovulation' },
     { cls: 'is-today', key: 'health.cycle.legend.today' },
   ];
-  return `<div class="cycle-legend">${items.map((i) => `
-    <span class="cycle-legend__item"><span class="cycle-legend__swatch ${i.cls}"></span>${esc(t(i.key))}</span>`).join('')}</div>`;
+  if (hasConfirmedOvulation) {
+    // Nur eingeblendet, wenn der gerade gerenderte Monat tatsächlich eine
+    // bestätigte Zelle zeigt - sonst erklärt die Legende einen Zustand, der
+    // gar nicht zu sehen ist (dieselbe Regel wie beim Symptom-Overlay unten).
+    items.push({ cls: 'is-ovulation is-confirmed', key: 'health.cycle.status.ovulationConfirmed' });
+  }
+  if (cycle.likelihoodSymptom) {
+    items.push(
+      { cls: 'is-symptom-tracked', key: 'health.cycle.trends.symptomTracked' },
+      { cls: 'is-symptom-predicted', key: 'health.cycle.trends.symptomPredicted' },
+    );
+  }
+
+  const rows = items.map((i) => `
+    <span class="cycle-legend__item"><span class="cycle-legend__swatch ${i.cls}"></span>${esc(t(i.key))}</span>`).join('');
+
+  // Eigener Eintrag NUR in der eigenen Ansicht (siehe cycleCalendarMarkup()).
+  const heartRow = own
+    ? `<span class="cycle-legend__item"><i data-lucide="heart" class="cycle-legend__heart-icon icon-sm" aria-hidden="true"></i>${esc(t('health.cycle.intimacy.label'))}</span>`
+    : '';
+
+  // Eigene Zeile statt Legenden-Item, nur wenn ein Muster im
+  // gerenderten Monat tatsächlich sichtbar ist (siehe pmsVisibleInMonth).
+  const pmsRow = showPms
+    ? `<span class="cycle-legend__item"><span class="cycle-legend__swatch is-pms"></span>${esc(t('health.cycle.legend.pms'))}</span>`
+    : '';
+
+  // B-1: eine einzige kompakte Zeile für die 4-stufige Blutungsstärke-Skala,
+  // statt vier weitere Legenden-Items - "Keep the legend from exploding".
+  const flowScale = `
+    <div class="cycle-legend__flow-row">
+      <span class="cycle-legend__flow-label">${esc(t('health.cycle.flow.label'))}</span>
+      ${FLOW_LEVELS.map((f) => `
+        <span class="cycle-legend__flow-step"><span class="cycle-legend__flow-dot" data-flow="${esc(f.value)}"></span>${esc(t(f.labelKey))}</span>`).join('')}
+    </div>`;
+
+  return `<div class="cycle-legend">${rows}${heartRow}${pmsRow}${flowScale}</div>`;
+}
+
+// --------------------------------------------------------
+// Trends (Phase 4) — rein additiv über bereits vorhandenen Daten, deshalb
+// zuletzt gebaut: erst ab genug Historie zeigt ein Trend etwas.
+// --------------------------------------------------------
+
+// Drei Eimer statt der fünf Ring-/Kalender-Phasen (siehe symptomFrequencyByPhase()
+// im Util) - Menstruation und Luteal beantworten die eigentlich gefragten
+// Muster, "other" ist eine bewusste Sammelkategorie, kein eigener Phasenwert.
+// Farben: --cycle-period ist schon etabliert; Luteal bekommt den Modul-Akzent
+// statt eines neuen, unvalidierten Tons; "other" bleibt neutral/gedämpft, wie
+// eine Sammelkategorie es sein sollte.
+const SYMPTOM_PHASE_COLOR = {
+  [PHASE.MENSTRUATION]: 'var(--cycle-period)',
+  [PHASE.LUTEAL]: 'var(--module-health)',
+  other: 'var(--color-text-secondary)',
+};
+// BBT-Werte tragen 2 Nachkommastellen (0,01 °C ist die uebliche Aufloesung
+// eines Basalthermometers); fmtNum()s Standard (1 Stelle) wuerde die Ziffer
+// verschlucken, die detectTemperatureShift() tatsaechlich auswertet.
+const BBT_DECIMALS = { minimumFractionDigits: 2, maximumFractionDigits: 2 };
+
+const SYMPTOM_PHASE_LABEL_KEYS = {
+  [PHASE.MENSTRUATION]: 'health.cycle.phase.menstruation',
+  [PHASE.LUTEAL]: 'health.cycle.phase.luteal',
+  other: 'health.cycle.trends.phaseOther',
+};
+
+// A-7: ab welcher Lücke (Tage) zwischen zwei aufeinanderfolgenden Messungen
+// die datumsskalierte Linie bricht statt durchzuzeichnen - eine 5+ Tage
+// Erfassungspause soll keine Steigung behaupten, die die Daten nicht zeigen.
+const DATE_SCALE_GAP_BREAK_DAYS = 5;
+
+/**
+ * A-7: eigene X-Beschriftung für `dateScaled`-Punkte - chartXLabelsMarkup()
+ * wählt per INDEX (erstes/mittleres/letztes Element), was bei sehr ungleich
+ * verteilten Daten ein Label weit von seiner tatsächlichen x-Position zeigen
+ * würde. Erstes/letztes Datum plus bis zu zwei echte Zwischendaten (keine
+ * erfundene "Mitte"), jedes an seiner TATSÄCHLICHEN x-Position.
+ * @param {Array<{date: string}>} points
+ * @param {(index: number) => number} xFor
+ */
+function dateScaledXLabelsMarkup(points, xFor) {
+  const n = points.length;
+  const y = CHART.H - 7;
+  const picks = n <= 4
+    ? points.map((_, i) => i)
+    : [...new Set([0, Math.floor((n - 1) / 3), Math.floor((2 * (n - 1)) / 3), n - 1])];
+  return picks.map((i) => {
+    const anchor = i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle';
+    return `<text x="${xFor(i).toFixed(1)}" y="${y}" class="chart__axis" text-anchor="${anchor}">${esc(formatDate(points[i].date))}</text>`;
+  }).join('');
+}
+
+/**
+ * Ein einzelnes, unaufgefülltes Liniendiagramm (Zykluslänge, BBT) - dieselbe
+ * Geometrie wie die Vitalwerte-Charts (utils/chart.js), aber ohne deren
+ * Mehrkanal-/Zeitraum-Maschinerie, die hier keine Entsprechung hat: ein Trend
+ * zeigt die GESAMTE Historie, keinen gewählten Ausschnitt.
+ *
+ * A-7: `dateScaled: true` positioniert die Punkte nach ihrem TATSÄCHLICHEN
+ * Datum über die Zeitspanne der Reihe statt nach Index (chartX()) und bricht
+ * die Linie an Lücken > DATE_SCALE_GAP_BREAK_DAYS in mehrere <polyline>-
+ * Segmente - sonst zeichnete eine 30-Tage-Lücke zwischen zwei BBT-Messungen
+ * dieselbe Steigung wie ein Ein-Tage-Abstand (live verifiziert). Die
+ * Zykluslänge-/Schweregrad-Charts bleiben index-basiert (Standard) - dort ist
+ * jeder Punkt ein eigener Zyklus/Eintrag, keine Zeitreihe mit Lücken-Bedeutung.
+ * Die Flächenfüllung entfällt im datumsskalierten Modus (eine Fläche über eine
+ * gebrochene Linie hinweg würde auch die Lücke füllen und wäre irreführend;
+ * eine Basaltemperatur-Kurve ist ohnehin kein "Fläche unter der Linie"-Wert).
+ *
+ * `yDomain: [min, max]` fixiert die Werteachse statt sie aus den Datenwerten
+ * mit 10%-Polsterung abzuleiten (A-8: eine ordinale 1-3-Skala braucht ihre
+ * ECHTEN Grenzen, keine geglättete Spanne, die die Randwerte in die Polsterung
+ * schiebt).
+ */
+function simpleLineChartMarkup({ points, titleText, formatPointTooltip, formatTableValue, tableHeader, formatTick, dateScaled = false, yDomain = null }) {
+  if (points.length < 2) return '';
+  const { W, H } = CHART;
+  const { top, bottom, left, right } = chartScales();
+
+  let min, max;
+  if (yDomain) {
+    [min, max] = yDomain;
+  } else {
+    const values = points.map((p) => p.value);
+    min = Math.min(...values);
+    max = Math.max(...values);
+    if (min === max) { min -= 1; max += 1; }
+    const pad = (max - min) * 0.1;
+    min -= pad; max += pad;
+  }
+
+  const firstDate = points[0].date;
+  const lastDate = points[points.length - 1].date;
+  const span = dateScaled ? Math.max(1, daysBetween(firstDate, lastDate)) : null;
+
+  const x = dateScaled
+    ? (i) => left + (daysBetween(firstDate, points[i].date) / span) * (right - left)
+    : (i) => chartX(i, points.length);
+  const y = (v) => chartY(v, min, max);
+
+  // A-7: Segmente an Lücken > DATE_SCALE_GAP_BREAK_DAYS brechen (nur im
+  // datumsskalierten Modus - im index-Modus ist jeder Abstand "1", nie eine
+  // Lücke).
+  const segments = [];
+  let current = [0];
+  for (let i = 1; i < points.length; i += 1) {
+    const gap = dateScaled ? daysBetween(points[i - 1].date, points[i].date) : 1;
+    if (dateScaled && gap > DATE_SCALE_GAP_BREAK_DAYS) {
+      segments.push(current);
+      current = [i];
+    } else {
+      current.push(i);
+    }
+  }
+  segments.push(current);
+
+  const polylines = segments
+    // Ein einzelner Punkt ohne Nachbarn innerhalb der Lücken-Schwelle bekommt
+    // keine Linie (ein <polyline> mit einem Punkt wäre unsichtbar) - der
+    // Punkt selbst (dots, s.u.) bleibt trotzdem sichtbar.
+    .filter((seg) => seg.length >= 2)
+    .map((seg) => {
+      const spine = seg.map((i) => `${x(i).toFixed(1)},${y(points[i].value).toFixed(1)}`).join(' ');
+      return `<polyline fill="none" stroke="var(--module-health)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="${spine}" />`;
+    }).join('');
+
+  const area = dateScaled ? '' : (() => {
+    const spine = points.map((p, i) => `${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(' ');
+    return `<polygon class="health-chart__area" points="${x(0).toFixed(1)},${bottom.toFixed(1)} ${spine} ${x(points.length - 1).toFixed(1)},${bottom.toFixed(1)}" />`;
+  })();
+
+  const dots = points.map((p, i) =>
+    `<circle cx="${x(i).toFixed(1)}" cy="${y(p.value).toFixed(1)}" r="3.5" fill="var(--module-health)"><title>${esc(formatPointTooltip(p))}</title></circle>`).join('');
+
+  const grid = chartGridMarkup(min, max, (val, wholeTicks) => (formatTick ? formatTick(val, wholeTicks) : String(wholeTicks ? Math.round(val) : val.toFixed(1))));
+  const xLabels = dateScaled ? dateScaledXLabelsMarkup(points, x) : chartXLabelsMarkup(points.map((p) => formatDate(p.date)));
+  const table = chartTableMarkup(titleText, [t('health.cycle.trends.date'), tableHeader],
+    points.map((p) => [formatDate(p.date), formatTableValue(p.value)]));
+
+  return `
+    <div class="health-chart-section">
+      <div class="health-chart-section__head"><div class="health-chart-section__title">${esc(titleText)}</div></div>
+      <svg class="health-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(titleText)}">
+        ${grid}
+        ${area}
+        ${polylines}
+        ${dots}
+        ${xLabels}
+      </svg>
+      ${table}
+    </div>`;
+}
+
+/**
+ * Zykluslänge als Balkendiagramm mit typisch/untypisch-Färbung (Phase 4d,
+ * ersetzt das vorherige Linien-/Flächendiagramm) - ein Balken pro Wert macht
+ * "wie weicht DIESER Zyklus ab" direkter lesbar als eine Linie, deren Sinn
+ * (Anstieg/Abfall) hier ohnehin nicht die eigentliche Aussage ist. Nullbasiert
+ * (min=0), nicht um die Daten herum gepolstert wie simpleLineChartMarkup() -
+ * ein Balkendiagramm mit verkürzter Achse würde Unterschiede verzerren, eine
+ * Linie nicht (siehe dataviz-Anti-Pattern "truncated bar baseline").
+ * Dieselbe geteilte Geometrie (chart.js), nur <rect> statt <polyline>+<circle>.
+ */
+function cycleLengthTrendChartMarkup(trend) {
+  const { W, H } = CHART;
+  const { left, right, bottom } = chartScales();
+  const n = trend.length;
+
+  const min = 0;
+  const max = Math.max(...trend.map((e) => e.days), TYPICAL_CYCLE_RANGE.max) * 1.08;
+  const y = (v) => chartY(v, min, max);
+
+  // Referenzband für den allgemein üblichen Bereich - dieselbe Klasse/Optik
+  // wie das Laborwert-Normband (analyteTrendChartMarkup), keine neue Farbe.
+  const yHigh = y(TYPICAL_CYCLE_RANGE.max);
+  const yLow = y(TYPICAL_CYCLE_RANGE.min);
+  const band = `
+    <rect class="health-chart__band" x="${left}" y="${yHigh.toFixed(1)}" width="${(right - left).toFixed(1)}" height="${(yLow - yHigh).toFixed(1)}" />
+    <line class="health-chart__band-line" x1="${left}" y1="${yHigh.toFixed(1)}" x2="${right}" y2="${yHigh.toFixed(1)}" />
+    <line class="health-chart__band-line" x1="${left}" y1="${yLow.toFixed(1)}" x2="${right}" y2="${yLow.toFixed(1)}" />`;
+
+  // Bandskala statt chartX(): das teilt sich eine Geometrie mit den Linien-
+  // Charts, deren Punkte am Rand (chartX(0,n) === left) genau auf die
+  // Plotgrenze fallen duerfen, weil ein Punkt kein Volumen hat. Ein Balken hat
+  // welches - an derselben Stelle zentriert ragt er zur Haelfte seiner Breite
+  // ueber die Plotgrenze hinaus (Befund: der erste Balken uebermalte die
+  // rechte Haelfte der "10"-Beschriftung, "10" sah wie "1" aus) und beruehrt
+  // ohne Abstand die Achse. Jeder Balken bekommt stattdessen eine eigene,
+  // gleich breite Bahn (bandWidth); der Balken selbst nimmt nur einen Teil
+  // davon ein, der Rest ist Polsterung zu beiden Seiten - auch zu den
+  // Plotgrenzen hin, nicht nur zwischen den Balken.
+  const bandWidth = (right - left) / n;
+  const barW = Math.max(6, Math.min(28, bandWidth * 0.5));
+  const xFor = (i) => left + bandWidth * (i + 0.5);
+  const typicalLabel = (typical) => t(typical ? 'health.cycle.trends.typical' : 'health.cycle.trends.atypical');
+
+  const bars = trend.map((e, i) => {
+    const cx = xFor(i);
+    const by = y(e.days);
+    const typical = isTypicalCycleLength(e.days);
+    const color = typical ? 'var(--module-health)' : 'var(--color-warning)';
+    const label = `${formatDate(e.date)}: ${t('health.cycle.unit.days', { value: fmtNum(e.days), count: e.days })} (${typicalLabel(typical)})`;
+    return `<rect x="${(cx - barW / 2).toFixed(1)}" y="${by.toFixed(1)}" width="${barW.toFixed(1)}" height="${(bottom - by).toFixed(1)}" rx="2" fill="${color}"><title>${esc(label)}</title></rect>`;
+  }).join('');
+
+  const grid = chartGridMarkup(min, max, (val) => String(Math.round(val)));
+  // Eine eigene Beschriftung statt chartXLabelsMarkup() (dessen "erstes/
+  // mittleres/letztes"-Auswahl fuer eine LINIE gedacht ist, deren Punkte
+  // zwischen den drei Marken nur den Verlauf, keine eigene Kategorie tragen):
+  // ein Balken IST eine eigene Kategorie und will grundsaetzlich sein eigenes
+  // Datum darunter. Erst ab mehr Balken, als der 600 Einheiten breite Plot
+  // ueberlappungsfrei beschriften kann, duennt eine feste Schrittweite aus -
+  // Anfang und Ende bleiben dabei immer beschriftet.
+  const MAX_BAR_LABELS = 8;
+  const dense = n > MAX_BAR_LABELS;
+  const labelStride = dense ? Math.ceil(n / MAX_BAR_LABELS) : 1;
+  // Bei wenigen Balken (der Normalfall) darf jedes Label mittig unter seinem
+  // eigenen Balken stehen - die Bandpolsterung schuetzt schon vor einem
+  // Ueberlauf ueber die Plotgrenze. Erst wenn viele Balken die Baender schmal
+  // machen, brauchen die beiden aeussersten Labels wieder den alten
+  // Rand-Anker (start/end), sonst liefe der ausgeduennte erste/letzte Wert
+  // ueber den Rand hinaus.
+  const xLabels = trend.map((e, i) => {
+    if (i !== 0 && i !== n - 1 && i % labelStride !== 0) return '';
+    const anchor = i === 0 ? (dense ? 'start' : 'middle') : i === n - 1 ? (dense ? 'end' : 'middle') : 'middle';
+    return `<text x="${xFor(i).toFixed(1)}" y="${H - 7}" class="chart__axis" text-anchor="${anchor}">${esc(formatDate(e.date))}</text>`;
+  }).join('');
+  const titleText = t('health.cycle.trends.cycleLength');
+  const table = chartTableMarkup(titleText, [t('health.cycle.trends.date'), titleText],
+    trend.map((e) => [formatDate(e.date), `${t('health.cycle.unit.days', { value: fmtNum(e.days), count: e.days })} (${typicalLabel(isTypicalCycleLength(e.days))})`]));
+  // Ohne Legende war die Bar-Farbe die einzige Auskunft "typisch/untypisch" -
+  // sichtbar nur im Hover-Tooltip, auf einem Touch-Geraet also gar nicht.
+  // Dieselbe .cycle-legend-Komponente wie Kalender und Symptom-Haeufigkeit,
+  // keine neue Legenden-Optik erfunden.
+  const legend = `
+    <div class="cycle-legend">
+      <span class="cycle-legend__item"><span class="cycle-legend__swatch" style="background:var(--module-health)"></span>${esc(typicalLabel(true))}</span>
+      <span class="cycle-legend__item"><span class="cycle-legend__swatch" style="background:var(--color-warning)"></span>${esc(typicalLabel(false))}</span>
+    </div>`;
+
+  return `
+    <div class="health-chart-section">
+      <div class="health-chart-section__head"><div class="health-chart-section__title">${esc(titleText)}</div></div>
+      <p class="health-chart-section__caption">${esc(t('health.cycle.trends.typicalRangeLabel', { min: TYPICAL_CYCLE_RANGE.min, max: TYPICAL_CYCLE_RANGE.max }))}</p>
+      <svg class="health-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(titleText)}">
+        ${grid}
+        ${band}
+        ${bars}
+        ${xLabels}
+      </svg>
+      ${legend}
+      ${table}
+    </div>`;
+}
+
+function bbtTrendChartMarkup(series) {
+  return simpleLineChartMarkup({
+    points: series.map((e) => ({ date: e.date, value: e.celsius })),
+    titleText: t('health.cycle.bbt.label'),
+    formatPointTooltip: (p) => `${formatDate(p.date)}: ${fmtNum(p.value, BBT_DECIMALS)} ${t('health.cycle.bbt.celsius')}`,
+    formatTableValue: (v) => `${fmtNum(v, BBT_DECIMALS)} ${t('health.cycle.bbt.celsius')}`,
+    tableHeader: t('health.cycle.bbt.label'),
+    // BBT-Spannen liegen typischerweise unter 1 °C - hier ist die Nachkommastelle
+    // die eigentliche Auskunft, nicht Pseudo-Präzision (siehe chart.js-Kommentar).
+    formatTick: (val) => fmtNum(val, BBT_DECIMALS),
+    // A-7: Messungen liegen selten an jedem Tag vor - datumsproportional statt
+    // indexbasiert, sonst zeigt eine 30-Tage-Erfassungspause dieselbe Steigung
+    // wie ein Ein-Tage-Abstand.
+    dateScaled: true,
+  });
+}
+
+/**
+ * Symptom-Häufigkeit je Phase als gestapelte Anteilsbalken (DESIGN.md: ein
+ * Verhältnis als Anteil am Element via flex-grow, eine Bahn, die Farbe traegt
+ * die Fuellung) - Top 8 nach Gesamthäufigkeit, damit die Liste nicht alle
+ * 20 Presets zeigt, auch wenn sie irgendwann alle mal vorkamen.
+ */
+/**
+ * Schweregrad-Verlauf eines Symptoms (Phase 4b) - dieselbe simpleLineChartMarkup()-
+ * Geometrie wie Zykluslänge/BBT, nur mit 1-3 statt Tagen/Grad als Werteachse.
+ *
+ * A-8: `yDomain: [1, 3]` fixiert die Achse auf die ECHTEN Grenzen der Skala -
+ * ohne das verschluckte simpleLineChartMarkup()s 10%-Polsterung die Randwerte
+ * 1 und 3 (nur "2" landete zufällig auf einer der 5 Gitterlinien). Die
+ * Tick-Beschriftung zeigt die Intensitäts-WÖRTER ("Leicht"/"Mäßig"/"Stark",
+ * dieselben wie symptomIntensityLabelKey() im Tooltip/der Tabelle) statt der
+ * nackten Zahl 1-3 - eine ordinale Skala ohne Einheit ist als Wort auf Anhieb
+ * lesbar, eine Zahl bräuchte eine zusätzliche Legende dafür. PAD_L (56)
+ * trägt die längsten dieser drei Wörter ("Mäßig") ohne Überlauf.
+ */
+function symptomIntensityTrendChartMarkup(trend, symptomLabel) {
+  return simpleLineChartMarkup({
+    points: trend.map((e) => ({ date: e.date, value: e.intensity })),
+    titleText: symptomLabel,
+    formatPointTooltip: (p) => `${formatDate(p.date)}: ${t(symptomIntensityLabelKey(p.value))}`,
+    formatTableValue: (v) => t(symptomIntensityLabelKey(v)),
+    tableHeader: t('health.cycle.trends.severity'),
+    formatTick: (val) => (Number.isInteger(val) && val >= 1 && val <= 3 ? t(symptomIntensityLabelKey(val)) : ''),
+    yDomain: [1, 3],
+  });
+}
+
+/**
+ * Der Satz eines Zyklustag-Musters, OHNE das Raster - eigene Funktion, damit
+ * die Symptom-Chips im Kalenderabschnitt (symptomLikelihoodMarkup()) denselben
+ * Satz wie das Trends-Aufklappelement (symptomCyclePatternMarkup()) zeigen
+ * koennen, statt einer zweiten, parallel gepflegten Formulierung.
+ *
+ * "N Tage vor der Periode" ist konkreter als "in der Lutealphase" und gewinnt
+ * deshalb, wenn typicalDaysBeforePeriod ein echtes Muster gefunden hat (mind.
+ * 2 Zyklen mit demselben Wert - siehe symptomCyclePattern()). Sonst faellt es
+ * auf die grobe Phasen-Aussage zurueck, die immer verfuegbar ist, sobald das
+ * Symptom ueberhaupt einmal vorkam; ganz ohne Vorkommen (totalCount>=2, aber
+ * kein Treffer) bleibt die "kam nicht wieder vor"-Aussage der einzige Fall
+ * ohne echtes Muster.
+ */
+function symptomCyclePatternSentence(pattern, symptomLabel) {
+  if (pattern.totalCount < 2) return '';
+  const phaseLabel = pattern.mostCommonPhase ? t(SYMPTOM_PHASE_LABEL_KEYS[pattern.mostCommonPhase]) : null;
+  return pattern.typicalDaysBeforePeriod != null
+    ? t('health.cycle.trends.cyclePatternDaysBefore', { symptom: symptomLabel, days: pattern.typicalDaysBeforePeriod })
+    : phaseLabel
+      ? t('health.cycle.trends.cyclePatternSentence', { symptom: symptomLabel, phase: phaseLabel, occurred: pattern.occurredCount, total: pattern.totalCount })
+      : t('health.cycle.trends.cyclePatternNone', { symptom: symptomLabel, total: pattern.totalCount });
+}
+
+/**
+ * Zyklustag-Muster eines Symptoms (Phase 4c) - Satz + kompaktes Raster (ein
+ * Balken je Zyklus, Tageszellen phasengefaerbt, Ring um die Zelle markiert
+ * ein tatsaechliches Vorkommen). Kein eigener Farbcode fuer "Treffer" - eine
+ * Umrandung bleibt auch fuer Farbfehlsichtige von der Fuellfarbe unterscheidbar,
+ * ausserdem traegt title="" denselben Zyklustag als Text.
+ */
+function symptomCyclePatternMarkup(pattern, symptomLabel) {
+  if (pattern.totalCount < 2) return '';
+  const sentence = symptomCyclePatternSentence(pattern, symptomLabel);
+
+  const rows = pattern.cycles.map((c) => {
+    const cells = c.phaseByDay.map((phase, i) => {
+      const day = i + 1;
+      const hit = c.occurredOnDays.includes(day);
+      return `<span class="cycle-pattern-grid__cell${hit ? ' cycle-pattern-grid__cell--hit' : ''}" style="background:${SYMPTOM_PHASE_COLOR[phase]}" title="${esc(t('health.cycle.ring.cycleDay', { day }))}"></span>`;
+    }).join('');
+    return `
+      <div class="cycle-pattern-grid__row">
+        <span class="cycle-pattern-grid__label">${esc(formatDate(c.cycleStart))}</span>
+        <div class="cycle-pattern-grid__days">${cells}</div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="cycle-pattern">
+      <p class="cycle-pattern__sentence">${esc(sentence)}</p>
+      <div class="cycle-pattern-grid">${rows}</div>
+    </div>`;
+}
+
+function symptomFrequencyChartMarkup(freq, dayLogs, periods, settings) {
+  const top = freq.slice(0, 8);
+  const legend = Object.keys(SYMPTOM_PHASE_COLOR).map((key) => `
+    <span class="cycle-legend__item"><span class="cycle-legend__swatch" style="background:${SYMPTOM_PHASE_COLOR[key]}"></span>${esc(t(SYMPTOM_PHASE_LABEL_KEYS[key]))}</span>`).join('');
+
+  const rows = top.map((row) => {
+    const label = symptomType(row.key)?.labelKey ? t(symptomType(row.key).labelKey) : row.key;
+    const segs = Object.keys(SYMPTOM_PHASE_COLOR)
+      .map((key) => ({ key, count: row[key] || 0 }))
+      .filter((s) => s.count > 0)
+      .map((s) => `<span class="cycle-symptom-row__seg" style="--seg-share:${s.count};background:${SYMPTOM_PHASE_COLOR[s.key]}" title="${esc(`${t(SYMPTOM_PHASE_LABEL_KEYS[s.key])}: ${fmtNum(s.count)}`)}"></span>`)
+      .join('');
+    // Schweregrad-Punkte (Phase 4b): dieselbe Punkt-Komponente wie im Tages-Log-
+    // Editor, gerundet auf die naechste Stufe - "nicht gradiert" zeigt bewusst
+    // keine Punkte statt einer erfundenen Nullstufe.
+    const dots = row.avgIntensity != null ? symptomIntensityDotsHTML(Math.round(row.avgIntensity)) : '';
+    // EIN Aufklapper statt zwei getrennter ("Schweregrad-Verlauf" +
+    // "Zyklustag-Muster") - acht Symptomzeilen mit je zwei Disclosures waren
+    // eine Wand. Reihenfolge innen: Muster-Satz, Muster-Raster, dann
+    // Schweregrad-Chart (symptomCyclePatternMarkup() liefert Satz+Raster
+    // bereits als EIN Block, siehe dort).
+    const trend = symptomIntensityTrend(dayLogs, row.key);
+    const trendChart = trend.length >= 2 ? symptomIntensityTrendChartMarkup(trend, label) : '';
+    const pattern = symptomCyclePattern(dayLogs, periods, settings, row.key);
+    const patternMarkup = symptomCyclePatternMarkup(pattern, label);
+    const detailsInner = [patternMarkup, trendChart].filter(Boolean).join('');
+    const details = detailsInner
+      ? advancedSection(detailsInner, { label: t('health.cycle.trends.details') })
+      : '';
+    return `
+      <div class="cycle-symptom-row">
+        <div class="cycle-symptom-row__head">
+          <span class="cycle-symptom-row__name">${esc(label)}${dots}</span>
+          <strong>${esc(fmtNum(row.total))}</strong>
+        </div>
+        <div class="cycle-symptom-row__track">${segs}</div>
+        ${details}
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="health-chart-section">
+      <div class="health-chart-section__head"><div class="health-chart-section__title">${esc(t('health.cycle.trends.symptomFrequency'))}</div></div>
+      <div class="cycle-legend">${legend}</div>
+      <div class="cycle-symptom-list">${rows}</div>
+    </div>`;
+}
+
+/**
+ * Gefühls-Häufigkeit je Phase - dieselbe gestapelte-Anteilsbalken-
+ * Darstellung wie symptomFrequencyChartMarkup() (.cycle-symptom-row wird 1:1
+ * wiederverwendet), nur über feelingFrequencyByPhase() und MOOD_TYPES statt
+ * SYMPTOM_TYPES. Top 6 (statt 8 bei Symptomen) - MOOD_TYPES hat ohnehin nur 7
+ * Presets, mehr als 6 wäre kaum eine Kürzung. Kein Aufklapper je Zeile (anders
+ * als bei Symptomen): weder ein Schweregrad-Verlauf (Gefühle sind ungraduiert)
+ * noch ein Zyklustag-Muster ist hier v1-Scope.
+ */
+function feelingFrequencyChartMarkup(freq) {
+  const top = freq.slice(0, 6);
+  const legend = Object.keys(SYMPTOM_PHASE_COLOR).map((key) => `
+    <span class="cycle-legend__item"><span class="cycle-legend__swatch" style="background:${SYMPTOM_PHASE_COLOR[key]}"></span>${esc(t(SYMPTOM_PHASE_LABEL_KEYS[key]))}</span>`).join('');
+
+  const rows = top.map((row) => {
+    const preset = moodType(row.key);
+    const label = preset ? t(preset.labelKey) : row.key;
+    const icon = preset ? `<i data-lucide="${esc(preset.icon)}" class="icon-sm cycle-symptom-row__icon" aria-hidden="true"></i>` : '';
+    const segs = Object.keys(SYMPTOM_PHASE_COLOR)
+      .map((key) => ({ key, count: row[key] || 0 }))
+      .filter((s) => s.count > 0)
+      .map((s) => `<span class="cycle-symptom-row__seg" style="--seg-share:${s.count};background:${SYMPTOM_PHASE_COLOR[s.key]}" title="${esc(`${t(SYMPTOM_PHASE_LABEL_KEYS[s.key])}: ${fmtNum(s.count)}`)}"></span>`)
+      .join('');
+    return `
+      <div class="cycle-symptom-row">
+        <div class="cycle-symptom-row__head">
+          <span class="cycle-symptom-row__name">${icon}${esc(label)}</span>
+          <strong>${esc(fmtNum(row.total))}</strong>
+        </div>
+        <div class="cycle-symptom-row__track">${segs}</div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="health-chart-section">
+      <div class="health-chart-section__head"><div class="health-chart-section__title">${esc(t('health.cycle.trends.feelingFrequency'))}</div></div>
+      <div class="cycle-legend">${legend}</div>
+      <div class="cycle-symptom-list">${rows}</div>
+    </div>`;
+}
+
+/**
+ * B-3: Blutungslast je abgeschlossenem Zyklus als Balkendiagramm - dieselbe
+ * Balken-Geometrie wie cycleLengthTrendChartMarkup() (Nullbasis, eigene
+ * Datums-Beschriftung je Balken, Ausdünnung ab MAX_BAR_LABELS), aber ohne
+ * dessen Typisch/Atypisch-Referenzband: es gibt keinen "allgemein üblichen"
+ * Blutungslast-Bereich wie TYPICAL_CYCLE_RANGE bei der Zykluslänge - eine
+ * erfundene Referenz wäre unbegründet. `trend` kommt aus periodFlowLoad()
+ * (health-cycle.js), nur für Perioden mit mindestens einem Flow-Log.
+ */
+function flowLoadTrendChartMarkup(trend) {
+  const { W, H } = CHART;
+  const { left, right, bottom } = chartScales();
+  const n = trend.length;
+
+  const min = 0;
+  const max = Math.max(...trend.map((e) => e.load)) * 1.08;
+  const y = (v) => chartY(v, min, max);
+
+  const bandWidth = (right - left) / n;
+  const barW = Math.max(6, Math.min(28, bandWidth * 0.5));
+  const xFor = (i) => left + bandWidth * (i + 0.5);
+
+  const bars = trend.map((e, i) => {
+    const cx = xFor(i);
+    const by = y(e.load);
+    // Last-Wert nennt beides, den rohen Wert UND die Basis (Anzahl geloggter
+    // Tage, via die schon bestehende health.cycle.unit.days-Pluralform) - eine
+    // Last aus 2 geloggten Tagen ist etwas anderes als dieselbe Last aus 5,
+    // das darf im Hover/der Tabelle nicht verschwinden.
+    const daysText = t('health.cycle.unit.days', { value: fmtNum(e.loggedDays), count: e.loggedDays });
+    const label = `${formatDate(e.date)}: ${t('health.cycle.trends.flowLoadValue', { load: fmtNum(e.load, { maximumFractionDigits: 0 }), days: daysText })}`;
+    return `<rect x="${(cx - barW / 2).toFixed(1)}" y="${by.toFixed(1)}" width="${barW.toFixed(1)}" height="${(bottom - by).toFixed(1)}" rx="2" fill="var(--module-health)"><title>${esc(label)}</title></rect>`;
+  }).join('');
+
+  const grid = chartGridMarkup(min, max, (val) => String(Math.round(val)));
+  const MAX_BAR_LABELS = 8;
+  const dense = n > MAX_BAR_LABELS;
+  const labelStride = dense ? Math.ceil(n / MAX_BAR_LABELS) : 1;
+  const xLabels = trend.map((e, i) => {
+    if (i !== 0 && i !== n - 1 && i % labelStride !== 0) return '';
+    const anchor = i === 0 ? (dense ? 'start' : 'middle') : i === n - 1 ? (dense ? 'end' : 'middle') : 'middle';
+    return `<text x="${xFor(i).toFixed(1)}" y="${H - 7}" class="chart__axis" text-anchor="${anchor}">${esc(formatDate(e.date))}</text>`;
+  }).join('');
+
+  const titleText = t('health.cycle.trends.flowLoad');
+  const table = chartTableMarkup(titleText, [t('health.cycle.trends.date'), t('health.cycle.trends.flowLoadColumn')],
+    trend.map((e) => {
+      const daysText = t('health.cycle.unit.days', { value: fmtNum(e.loggedDays), count: e.loggedDays });
+      return [formatDate(e.date), t('health.cycle.trends.flowLoadValue', { load: fmtNum(e.load, { maximumFractionDigits: 0 }), days: daysText })];
+    }));
+
+  return `
+    <div class="health-chart-section">
+      <div class="health-chart-section__head"><div class="health-chart-section__title">${esc(titleText)}</div></div>
+      <p class="health-chart-section__caption">${esc(t('health.cycle.trends.flowLoadCaption'))}</p>
+      <svg class="health-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(titleText)}">
+        ${grid}
+        ${bars}
+        ${xLabels}
+      </svg>
+      ${table}
+    </div>`;
+}
+
+/**
+ * B-4: ruhiger, nicht-alarmistischer Hinweis, wenn heavyBleedingSignal()
+ * (health-cycle.js) ein wiederholtes Muster findet - Ton/Optik wie der
+ * bestehende Disclaimer (.health-disclaimer, kein Warnfarbton), Mustersprache
+ * statt Diagnose. Der allgemeine "kein Medizinprodukt"-Disclaimer steht schon
+ * im Footer der Seite (cycleFooterMarkup(), außerhalb dieses Bereichs) - kein
+ * zweiter hier nötig, nur der zusätzliche eine Satz.
+ */
+function heavyBleedingHintMarkup(signal) {
+  if (!signal) return '';
+  const key = signal === 'heavy' ? 'health.cycle.trends.heavyBleedingHintHeavy' : 'health.cycle.trends.heavyBleedingHintLong';
+  return `<p class="health-disclaimer">${esc(t(key))}</p>`;
+}
+
+/**
+ * Kompakte Schmerz-Kachel am ANFANG des Trends-Bereichs (eine Kachel,
+ * kein Chart) - painSummary() (health-cycle.js) liefert die drei Zahlen
+ * bereits fertig gerechnet, hier nur Layout/i18n. `avgPainDaysPerCycle`/
+ * `avgIntensity` können `null` sein (noch keine abgeschlossenen Zyklen bzw.
+ * keine gradierte Auswahl) - dann steht ein "-" statt einer erfundenen Zahl.
+ */
+function painSummaryTileMarkup(summary) {
+  if (!summary) return '';
+  const avgDaysText = summary.avgPainDaysPerCycle != null ? fmtNum(summary.avgPainDaysPerCycle) : '-';
+  const intensityText = summary.avgIntensity != null ? fmtNum(summary.avgIntensity, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) : '-';
+  return `
+    <div class="health-chart-section cycle-pain-tile">
+      <div class="health-chart-section__head"><div class="health-chart-section__title">${esc(t('health.cycle.trends.painTitle'))}</div></div>
+      <div class="cycle-pain-tile__stats">
+        <div class="cycle-pain-tile__stat">
+          <span class="cycle-pain-tile__value">${esc(fmtNum(summary.currentCyclePainDays, { maximumFractionDigits: 0 }))}</span>
+          <span class="cycle-pain-tile__label">${esc(t('health.cycle.trends.painCurrentCycleLabel'))}</span>
+        </div>
+        <div class="cycle-pain-tile__stat">
+          <span class="cycle-pain-tile__value">${esc(avgDaysText)}</span>
+          <span class="cycle-pain-tile__label">${esc(t('health.cycle.trends.painAvgPerCycleLabel'))}</span>
+        </div>
+        <div class="cycle-pain-tile__stat">
+          <span class="cycle-pain-tile__value">${esc(intensityText)}</span>
+          <span class="cycle-pain-tile__label">${esc(t('health.cycle.trends.painAvgIntensityLabel'))}</span>
+        </div>
+      </div>
+    </div>`;
+}
+
+/**
+ * Symptom-Wahrscheinlichkeit (Phase 4e; v2 Nutzer-Feedback: aus den Trends IN
+ * den Kalenderabschnitt umgezogen - direkt unter der Kalender-Legende, statt
+ * ganz unten auf der Seite, wo die einzige sichtbare Wirkung (die Marker) weit
+ * oben passierte und ein Chip-Tap wie ein No-op wirkte). Symptom-Wahl treibt
+ * weiterhin einen "heute wahrscheinlich"-Hinweis und das Overlay auf dem
+ * Monatskalender (siehe cycleCalendarMarkup). Die Auswahl selbst ist EIN
+ * globaler UI-Zustand (cycle.likelihoodSymptom), kein Prop dieser Funktion,
+ * weil sie den Kalender an anderer Stelle auf der Seite mitbestimmt.
+ *
+ * Nur Symptome mit genug betrachtbarer Zyklus-Historie (dieselbe
+ * MIN_HISTORY_GAPS-Schwelle wie Phase 0/4e) UND mindestens einem
+ * tatsaechlichen Vorkommen erscheinen im Wahl-Chips - ein Chip, der immer
+ * "zu wenig Daten" sagt, waere kein nuetzlicher Chip.
+ *
+ * Direkt unter den Chips: derselbe Muster-Satz wie im Trends-Aufklapper
+ * (symptomCyclePatternSentence(), keine zweite Formulierung) - das macht eine
+ * Auswahl endlich sichtbar wirksam, auch ohne erst zum Kalender hochzuscrollen.
+ * candidates garantiert bereits totalCount>=2, der Satz ist also nie leer.
+ */
+function symptomLikelihoodMarkup() {
+  const settings = cycleSettings();
+  const candidates = SYMPTOM_TYPES.filter((s) => {
+    const p = symptomCyclePattern(cycle.logs, cycle.periods, settings, s.value);
+    return p.totalCount >= MIN_HISTORY_GAPS && p.occurredCount > 0;
+  });
+  if (!candidates.length) return '';
+
+  const selected = candidates.some((s) => s.value === cycle.likelihoodSymptom) ? cycle.likelihoodSymptom : null;
+  const chips = candidates.map((s) => `
+    <button type="button" class="health-choice" data-likelihood-symptom="${esc(s.value)}" aria-pressed="${s.value === selected}">${esc(t(s.labelKey))}</button>`).join('');
+
+  const selectedType = selected ? symptomType(selected) : null;
+  const sentence = selectedType
+    ? symptomCyclePatternSentence(symptomCyclePattern(cycle.logs, cycle.periods, settings, selected), t(selectedType.labelKey))
+    : '';
+
+  return `
+    <div class="cycle-likelihood">
+      <p class="cycle-likelihood__caption">${esc(t('health.cycle.calendar.likelihoodCaption'))}</p>
+      <div class="cycle-likelihood__picker" role="group" aria-label="${esc(t('health.cycle.calendar.likelihoodTitle'))}">${chips}</div>
+      ${sentence ? `<p class="cycle-pattern__sentence cycle-likelihood__sentence">${esc(sentence)}</p>` : ''}
+    </div>`;
+}
+
+function cycleTrendsMarkup() {
+  const lengthTrend = cycleLengthTrend(cycle.periods);
+  const settings = cycleSettings();
+  const symptomFreq = symptomFrequencyByPhase(cycle.logs, cycle.periods, settings);
+  const feelingFreq = feelingFrequencyByPhase(cycle.logs, cycle.periods, settings);
+  const bbt = bbtSeries(cycle.logs);
+
+  // B-3: Blutungslast NUR für abgeschlossene Perioden mit mindestens einem
+  // Flow-Log (periodFlowLoad() liefert sonst null) - eine laufende Episode ist
+  // noch nicht fertig geloggt, ein Balken dafür wäre eine Zwischenmeldung, kein
+  // abgeschlossener Wert.
+  const { avgPeriod } = cycleStats(cycle.periods, settings, todayKey());
+  const flowLoadTrend = sortPeriodsAsc(cycle.periods)
+    .filter((p) => p.end_date)
+    .map((p) => {
+      const load = periodFlowLoad(p, cycle.logs, avgPeriod);
+      return load ? { date: p.start_date, ...load } : null;
+    })
+    .filter(Boolean);
+
+  const heavySignal = heavyBleedingSignal(cycle.periods, cycle.logs);
+  const pain = painSummary(cycle.logs, cycle.periods, settings, todayKey());
+
+  const sections = [
+    painSummaryTileMarkup(pain),
+    lengthTrend.length >= 2 ? cycleLengthTrendChartMarkup(lengthTrend) : '',
+    flowLoadTrend.length >= 2 ? flowLoadTrendChartMarkup(flowLoadTrend) : '',
+    heavyBleedingHintMarkup(heavySignal),
+    symptomFreq.length ? symptomFrequencyChartMarkup(symptomFreq, cycle.logs, cycle.periods, settings) : '',
+    feelingFreq.length ? feelingFrequencyChartMarkup(feelingFreq) : '',
+    bbt.length >= 2 ? bbtTrendChartMarkup(bbt) : '',
+  ].filter(Boolean);
+
+  // Kein leerer Abschnitt: ohne genug Historie für auch nur EINEN Trend
+  // gibt es hier nichts zu zeigen - der Haupt-Leerzustand deckt das schon.
+  if (!sections.length) return '';
+
+  return `
+    <section class="cycle-trends">
+      <h3 class="cycle-section__title u-section-title">${esc(t('health.cycle.trends.title'))}</h3>
+      ${sections.join('')}
+    </section>`;
 }
 
 // --------------------------------------------------------
@@ -3763,9 +6195,14 @@ function cycleHistoryMarkup(own) {
 
   if (!rows.length) return '';
 
+  // B-2: dieselbe avgPeriod wie der Kalender/die Vorhersage - eine offene
+  // (laufende) Periode nutzt sie für periodFlowSummary()s Spannenberechnung
+  // (siehe dessen Dokblock/periodDateRange() in health-cycle.js).
+  const { avgPeriod } = cycleStats(cycle.periods, cycleSettings(), todayKey());
+
   return `
     <section class="cycle-history">
-      <h3 class="cycle-section__title u-toolbar-title">${esc(t('health.cycle.history.title'))}</h3>
+      <h3 class="cycle-section__title u-section-title">${esc(t('health.cycle.history.title'))}</h3>
       <ul class="cycle-history__list">${rows.map((p) => {
         const start = String(p.start_date).slice(0, 10);
         const end = p.end_date ? String(p.end_date).slice(0, 10) : null;
@@ -3774,9 +6211,16 @@ function cycleHistoryMarkup(own) {
         const nextStart = nextStartById.get(p.id);
         const cycleLen = nextStart ? Math.round((Date.parse(`${String(nextStart).slice(0, 10)}T00:00Z`) - Date.parse(`${start}T00:00Z`)) / 86400000) : null;
         const meta = [];
-        if (lenDays != null) meta.push(t('health.cycle.unit.days', { value: fmtNum(lenDays) }));
+        if (lenDays != null) meta.push(t('health.cycle.unit.days', { value: fmtNum(lenDays), count: lenDays }));
         else meta.push(t('health.cycle.history.ongoing'));
-        if (cycleLen != null) meta.push(t('health.cycle.history.cycleLength', { value: fmtNum(cycleLen) }));
+        if (cycleLen != null) meta.push(t('health.cycle.history.cycleLength', { value: fmtNum(cycleLen), count: cycleLen }));
+        // B-2: nur ein Chip, wenn im Zeitraum dieser Periode wirklich ein
+        // Flow-Wert geloggt wurde (periodFlowSummary() liefert sonst null).
+        const flowSummary = periodFlowSummary(p, cycle.logs, avgPeriod);
+        if (flowSummary) {
+          const level = flowLevel(flowSummary.heaviest);
+          meta.push(t('health.cycle.history.flowHeaviest', { value: level ? t(level.labelKey) : flowSummary.heaviest }));
+        }
         const editBtn = own
           ? `<button type="button" class="btn btn--icon btn--sm" data-cycle-edit="${esc(p.id)}" aria-label="${esc(t('health.cycle.period.edit'))}"><i data-lucide="pencil" aria-hidden="true"></i></button>`
           : '';
@@ -3800,8 +6244,10 @@ function cycleFooterMarkup(own) {
       <a class="btn btn--ghost btn--sm" href="/api/v1/health/export/cycle${q}" download>
         <i data-lucide="download" aria-hidden="true"></i>${esc(t('health.cycle.export.csv'))}
       </a>
+      ${own ? `<button class="btn btn--ghost btn--sm" data-action="cycle-import"><i data-lucide="upload" aria-hidden="true"></i>${esc(t('health.cycle.import.button'))}</button>` : ''}
       ${own ? `<button class="btn btn--ghost btn--sm" data-action="cycle-settings"><i data-lucide="settings-2" aria-hidden="true"></i>${esc(t('health.cycle.settings.open'))}</button>` : ''}
     </div>
+    ${own ? `<p class="cycle-hint cycle-discovery-hint">${t('health.cycle.discoveryHint')}</p>` : ''}
     ${disclaimerMarkup()}`;
 }
 
@@ -3811,13 +6257,8 @@ function cycleFooterMarkup(own) {
 
 function wireCycle() {
   wireTablistKeys(cycle.root);
-  cycle.root.querySelectorAll('.health-person-chip').forEach((chip) =>
-    chip.addEventListener('click', () => {
-      const id = Number(chip.dataset.personId);
-      if (id === cycle.personId) return;
-      cycle.personId = id;
-      switchCyclePerson();
-    }));
+  installPopoverMenus(cycle.root);
+  wirePersonSwitcher(cycle, switchCyclePerson);
 
   cycle.root.querySelectorAll('[data-cycle-month]').forEach((btn) =>
     btn.addEventListener('click', () => { stepCycleMonth(Number(btn.dataset.cycleMonth)); renderCycleShell(); }));
@@ -3834,8 +6275,29 @@ function wireCycle() {
   cycle.root.querySelector('[data-action="cycle-first"]')?.addEventListener('click', () => openPeriodModal(null));
   cycle.root.querySelector('[data-action="cycle-start-period"]')?.addEventListener('click', () => cycleStartPeriodToday());
   cycle.root.querySelector('[data-action="cycle-end-period"]')?.addEventListener('click', () => cycleEndPeriodToday());
-  cycle.root.querySelector('[data-action="cycle-log-today"]')?.addEventListener('click', () => openDayLogModal(toLocalDateKey(new Date())));
+  cycle.root.querySelector('[data-action="cycle-log-today"]')?.addEventListener('click', () => openDayLogModal(todayKey()));
   cycle.root.querySelector('[data-action="cycle-settings"]')?.addEventListener('click', () => openCycleSettingsModal());
+  cycle.root.querySelector('[data-action="cycle-import"]')?.addEventListener('click', () => openCycleImportModal());
+
+  // C-1: "Heute"-Einblendung - eigene data-action-Namen (siehe cycleBubbleMarkup()),
+  // ruft aber dieselben Funktionen wie die bestehende Aktionsleiste auf, keine
+  // zweite Speicher-/Navigationslogik.
+  cycle.root.querySelector('[data-action="cycle-bubble-start-period"]')?.addEventListener('click', () => cycleStartPeriodToday());
+  // Dieselbe Funktion wie der "Periode beenden"-Knopf
+  // der Aktionsleiste, nur unter einem eigenen data-action-Namen (derselbe
+  // Grund wie bei cycle-bubble-start-period oben - kein geteilter Listener).
+  cycle.root.querySelector('[data-action="cycle-bubble-end-period"]')?.addEventListener('click', () => cycleEndPeriodToday());
+  cycle.root.querySelector('[data-action="cycle-bubble-log-today"]')?.addEventListener('click', () => openDayLogModal(todayKey()));
+
+  // Symptom-Wahrscheinlichkeits-Chip (Phase 4e): erneutes Antippen des schon
+  // gewaehlten Chips waehlt ab (Overlay aus) - dieselbe Toggle-Geste wie ein
+  // aktiver Filter, kein Extra-"Zuruecksetzen"-Knopf noetig.
+  cycle.root.querySelectorAll('[data-likelihood-symptom]').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.likelihoodSymptom;
+      cycle.likelihoodSymptom = cycle.likelihoodSymptom === key ? null : key;
+      renderCycleShell();
+    }));
 }
 
 // Sichtbarkeit für ein Zyklus-Event vorauswählen: bestehender Wert gewinnt,
@@ -3849,9 +6311,25 @@ function cycleVisibilityFor(row) {
 // Perioden-Modal (Anlegen/Bearbeiten inkl. Löschen)
 // --------------------------------------------------------
 
+// A-3: Serverseitig (server/routes/health/cycle.js) werden ueberlappende und
+// zukuenftige Perioden bewusst zugelassen (Speichern bleibt erlaubt) - nur die
+// weiche, nicht blockierende Warnung im Modal ist neu. Ueberlappung: zwei
+// Bereiche [start,end] ueberschneiden sich, wenn jeweils der Beginn des einen
+// nicht nach dem Ende des anderen liegt; eine laufende Periode (kein end_date)
+// zaehlt dabei als bis auf Weiteres offen.
+function periodOverlapsExisting(start, end, periods, excludeId) {
+  const aEnd = end || '9999-12-31';
+  return periods.some((p) => {
+    if (excludeId && p.id === excludeId) return false;
+    const bStart = String(p.start_date).slice(0, 10);
+    const bEnd = p.end_date ? String(p.end_date).slice(0, 10) : '9999-12-31';
+    return start <= bEnd && bStart <= aEnd;
+  });
+}
+
 function openPeriodModal(period) {
   const isEdit = Boolean(period && period.id);
-  const startVal = isEdit ? String(period.start_date).slice(0, 10) : toLocalDateKey(new Date());
+  const startVal = isEdit ? String(period.start_date).slice(0, 10) : todayKey();
   const endVal = isEdit && period.end_date ? String(period.end_date).slice(0, 10) : '';
 
   openModal({
@@ -3869,6 +6347,7 @@ function openPeriodModal(period) {
             <yuvomi-datepicker id="cycle-end" type="date" value="${esc(endVal)}"></yuvomi-datepicker>
           </div>
         </div>
+        <p class="cycle-hint cycle-hint--warning" data-role="period-warning" hidden></p>
         <div class="form-field">
           <label class="label" for="cycle-visibility">${esc(t('health.cycle.field.visibility'))}</label>
           <select class="input" id="cycle-visibility">
@@ -3887,6 +6366,24 @@ function openPeriodModal(period) {
         </div>
       </form>`,
     onSave(panel) {
+      // A-3: nicht blockierende Warnung bei Zukunftsdatum/Ueberschneidung -
+      // aktualisiert bei jeder Datumsaenderung, Speichern bleibt moeglich.
+      const startEl = panel.querySelector('#cycle-start');
+      const endEl = panel.querySelector('#cycle-end');
+      const warnEl = panel.querySelector('[data-role="period-warning"]');
+      const updateWarning = () => {
+        const start = startEl.value;
+        const end = endEl.value;
+        const messages = [];
+        if (start && start > todayKey()) messages.push(t('health.cycle.period.warningFuture'));
+        if (start && periodOverlapsExisting(start, end, cycle.periods, period?.id)) messages.push(t('health.cycle.period.warningOverlap'));
+        warnEl.textContent = messages.join(' ');
+        warnEl.hidden = messages.length === 0;
+      };
+      startEl.addEventListener('input', updateWarning);
+      endEl.addEventListener('input', updateWarning);
+      updateWarning();
+
       panel.querySelector('[data-action="cancel"]')?.addEventListener('click', () => closeModal({ force: true }));
       panel.querySelector('[data-action="cycle-delete-period"]')?.addEventListener('click', () => deletePeriod(period));
       panel.querySelector('#cycle-period-form').addEventListener('submit', async (e) => {
@@ -3909,6 +6406,7 @@ function openPeriodModal(period) {
           closeModal({ force: true });
           window.yuvomi?.showToast(t('health.cycle.saved'), 'success');
           await reloadCycle();
+          refocusAfterRender();
         } catch (err) {
           console.error('[Health] cycle period save error:', err);
           submitBtn.disabled = false;
@@ -3921,11 +6419,15 @@ function openPeriodModal(period) {
 
 async function deletePeriod(period) {
   if (!period?.id) return;
-  if (!(await confirmOverModal(t('health.cycle.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
+  // Eigener Folgentext je Ziel: der Confirm-Titel ist für Periode und Tages-Log
+  // derselbe, die Folgen sind es nicht (Vorhersage vs. Tageswerte).
+  if (!(await confirmOverModal(t('health.cycle.deleteConfirm'),
+    { danger: true, confirmLabel: t('common.delete'), detail: t('health.cycle.periodDeleteConfirmDetail') }))) return;
   try {
     await api.delete(`/health/cycle/periods/${period.id}`);
     window.yuvomi?.showToast(t('health.cycle.deleted'), 'success');
     await reloadCycle();
+    refocusAfterRender();
   } catch (err) {
     console.error('[Health] cycle period delete error:', err);
     window.yuvomi?.showToast(err?.data?.error || t('health.cycle.deleteError'), 'danger');
@@ -3933,51 +6435,271 @@ async function deletePeriod(period) {
 }
 
 // --------------------------------------------------------
-// Tages-Log-Modal (Flow, Symptome, Stimmung)
+// Perioden-Historie-Import (CSV) - server/routes/health/cycle.js
+// (POST /cycle/import) liefert bereits alles: Alles-oder-nichts-Import mit
+// bis zu zehn Zeilen-Fehlern auf 400, sonst { imported, skipped }. Die Datei-
+// Auswahl fuellt nur das Einfuege-Feld - EIN Textinhalt speist den Import,
+// unabhaengig davon, ob er getippt oder aus einer Datei gelesen wurde.
 // --------------------------------------------------------
+
+function openCycleImportModal() {
+  openModal({
+    title: t('health.cycle.import.title'),
+    size: 'sm',
+    content: `
+      <form id="cycle-import-form" class="form-stack">
+        <p class="cycle-hint">${esc(t('health.cycle.import.explainer'))}</p>
+        <div class="form-field">
+          <label class="label" for="cycle-import-file">${esc(t('health.cycle.import.fileLabel'))}</label>
+          <input class="input" id="cycle-import-file" type="file" accept=".csv,text/csv">
+        </div>
+        <div class="form-field">
+          <label class="label" for="cycle-import-paste">${esc(t('health.cycle.import.pasteLabel'))}</label>
+          <textarea class="input" id="cycle-import-paste" rows="6" placeholder="start_date,end_date"></textarea>
+        </div>
+        <div id="cycle-import-errors" class="form-error cycle-import-errors" role="alert" hidden></div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn--ghost" data-action="cancel">${esc(t('common.cancel'))}</button>
+          <button type="submit" class="btn btn--primary">${esc(t('health.cycle.import.submit'))}</button>
+        </div>
+      </form>`,
+    onSave(panel) {
+      panel.querySelector('[data-action="cancel"]')?.addEventListener('click', () => closeModal({ force: true }));
+
+      const fileInput = panel.querySelector('#cycle-import-file');
+      const pasteInput = panel.querySelector('#cycle-import-paste');
+      const errorsBox = panel.querySelector('#cycle-import-errors');
+
+      fileInput.addEventListener('change', async () => {
+        const file = fileInput.files[0];
+        if (!file) return;
+        pasteInput.value = await file.text();
+      });
+
+      panel.querySelector('#cycle-import-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const submitBtn = panel.querySelector('[type="submit"]');
+        const csv = pasteInput.value.trim();
+        errorsBox.hidden = true;
+        errorsBox.replaceChildren();
+
+        if (!csv) {
+          window.yuvomi?.showToast(t('health.cycle.import.emptyError'), 'danger');
+          return;
+        }
+
+        submitBtn.disabled = true;
+        try {
+          const { data } = await api.post('/health/cycle/import', { csv });
+          closeModal({ force: true });
+          window.yuvomi?.showToast(
+            t('health.cycle.import.resultToast', { imported: data.imported, skipped: data.skipped }),
+            'success',
+          );
+          await reloadCycle();
+          refocusAfterRender();
+        } catch (err) {
+          submitBtn.disabled = false;
+          const rowErrors = err?.status === 400 ? err?.data?.errors : null;
+          if (Array.isArray(rowErrors) && rowErrors.length) {
+            // Server-Meldungen sind technische Zeilenfehler (Zeile/Spaltenwert),
+            // keine uebersetzten UI-Strings - dieselbe Konvention wie ueberall
+            // sonst in dieser App (die Titelzeile davor ist es).
+            const title = document.createElement('p');
+            title.textContent = t('health.cycle.import.errorsTitle');
+            const list = document.createElement('ul');
+            for (const line of rowErrors) {
+              const li = document.createElement('li');
+              li.textContent = line;
+              list.appendChild(li);
+            }
+            errorsBox.replaceChildren(title, list);
+            errorsBox.hidden = false;
+          } else {
+            console.error('[Health] cycle import error:', err);
+            window.yuvomi?.showToast(err?.data?.error || t('health.cycle.import.error'), 'danger');
+          }
+        }
+      });
+    },
+  });
+}
+
+// --------------------------------------------------------
+// Tages-Log-Modal (Flow, Symptome, Gefuehle, Basaltemperatur, Zervixschleim,
+// Tests, Intimitaet)
+// --------------------------------------------------------
+
+// Diese Wertelisten kommen aus
+// health-cycle.js (CERVIX_MUCUS_TYPES/TEST_RESULT_VALUES/INTIMACY_TYPES,
+// importiert oben) - EIN Zuhause statt einer dritten Kopie hier (die
+// vorherigen lokalen Listen standen dieser Konsolidierung nur im Weg, siehe
+// dortiger Dokblock). LH- und Schwangerschaftstest teilen sich denselben
+// labelKey-Namensraum (health.cycle.test.<value>), deshalb exportiert
+// health-cycle.js dafuer nur die Werte, kein eigenes _TYPES-Array.
+const TEST_RESULT_CHOICES = TEST_RESULT_VALUES.map((v) => ({ value: v, labelKey: `health.cycle.test.${v}` }));
+
+/**
+ * Mehrfachauswahl-Variante von wireChoiceGroup(): jeder Chip schaltet nur
+ * sich selbst um, ohne die anderen Chips derselben Gruppe abzuwaehlen -
+ * Gefuehle sind (seit Migration 211) eine Mehrfachauswahl, keine
+ * Einfachauswahl wie Blutungsstaerke oder die Testergebnisse.
+ */
+function wireMultiChoiceGroup(root, group) {
+  const host = root.querySelector(`[data-group="${group}"]`);
+  if (!host) return;
+  host.addEventListener('click', (e) => {
+    const btn = e.target.closest('.health-choice');
+    if (!btn || !host.contains(btn)) return;
+    btn.setAttribute('aria-pressed', String(btn.getAttribute('aria-pressed') !== 'true'));
+  });
+}
+
+/**
+ * Eine Einfachauswahl-Chip-Reihe mit fuehrendem "keine Angabe"-Chip - dasselbe
+ * Muster wie die Blutungsstaerke-Reihe, hier fuer Mucus/Tests/Intimitaet
+ * einmal gebaut statt dreimal kopiert.
+ */
+function singleChoiceButtons(types, noneLabelKey, currentValue, dataAttr) {
+  return [{ value: '', labelKey: noneLabelKey }, ...types]
+    .map((o) => `<button type="button" class="health-choice" data-${dataAttr}="${esc(o.value)}" aria-pressed="${o.value === (currentValue || '')}">${esc(t(o.labelKey))}</button>`)
+    .join('');
+}
+
+/** Drei feste Punkte, von links bis `level` gefuellt (0 = keiner). */
+function symptomIntensityDotsHTML(level) {
+  if (!level) return '';
+  const dots = [1, 2, 3].map((n) => `<span class="health-choice__dot${n <= level ? ' health-choice__dot--filled' : ''}"></span>`).join('');
+  const labelKey = symptomIntensityLabelKey(level);
+  return `<span class="health-choice__dots" role="img" aria-label="${esc(labelKey ? t(labelKey) : '')}">${dots}</span>`;
+}
 
 function openDayLogModal(dateKey) {
   const key = String(dateKey).slice(0, 10);
   const existing = cycle.logs.find((l) => String(l.log_date).slice(0, 10) === key) || null;
-  const activeSymptoms = new Set((existing?.symptoms ? String(existing.symptoms).split(',') : []).filter(Boolean));
+  // Intensitaet je Symptom-Wert (0 = nicht ausgewaehlt, sonst 1-3) - die
+  // einzige Quelle, die der Chip fuer seinen Zustand braucht.
+  const activeIntensity = new Map(normalizeSymptomEntries(existing?.symptoms).map((e) => [e.key, e.intensity ?? 1]));
   const currentFlow = existing?.flow || '';
-  const currentMood = existing?.mood || '';
 
   const flowButtons = [{ value: '', labelKey: 'health.cycle.flow.none' }, ...FLOW_LEVELS.map((f) => ({ value: f.value, labelKey: f.labelKey }))]
-    .map((f) => `<button type="button" class="cycle-choice" data-flow="${esc(f.value)}" aria-pressed="${f.value === currentFlow}">${esc(t(f.labelKey))}</button>`).join('');
+    .map((f) => `<button type="button" class="health-choice" data-flow="${esc(f.value)}" aria-pressed="${f.value === currentFlow}">${esc(t(f.labelKey))}</button>`).join('');
 
-  const symptomButtons = SYMPTOM_TYPES.map((s) =>
-    `<button type="button" class="cycle-choice cycle-choice--chip" data-symptom="${esc(s.value)}" aria-pressed="${activeSymptoms.has(s.value)}">
-      <i data-lucide="${esc(s.icon)}" aria-hidden="true"></i>${esc(t(s.labelKey))}</button>`).join('');
+  // Ein Tap zyklisch durch 0 (aus) -> 1 -> 2 -> 3 -> 0: Auswahl UND Abstufung
+  // sind derselbe Antipper, kein zweites Steuerelement je Chip.
+  const symptomButtons = SYMPTOM_TYPES.map((s) => {
+    const level = activeIntensity.get(s.value) || 0;
+    return `<button type="button" class="health-choice health-choice--chip" data-symptom="${esc(s.value)}" data-intensity="${level}" aria-pressed="${level > 0}">
+      <i data-lucide="${esc(s.icon)}" aria-hidden="true"></i>${esc(t(s.labelKey))}${symptomIntensityDotsHTML(level)}</button>`;
+  }).join('');
 
-  const moodOptions = [`<option value="" ${currentMood ? '' : 'selected'}>${esc(t('health.cycle.mood.none'))}</option>`,
-    ...MOOD_TYPES.map((m) => `<option value="${esc(m.value)}" ${m.value === currentMood ? 'selected' : ''}>${esc(t(m.labelKey))}</option>`)].join('');
+  // Gefuehle (Migration 211, Mehrfachauswahl): vorbefuellt aus `feelings`,
+  // ersatzweise aus dem alten Einzelwert `mood` fuer Eintraege von vor der
+  // Migration (Abwaertskompatibilitaet). Dieselben
+  // MOOD_TYPES-Presets wie zuvor das Einzelauswahl-<select> - nur die
+  // Verdrahtung (wireMultiChoiceGroup statt eines <select>) ist neu.
+  //
+  // Der Fallback auf `mood` greift NUR, wenn `feelings`
+  // ueberhaupt kein Array ist (Zeilen von vor Migration 211) - ein bewusst
+  // GELEERTES `feelings: []` ist "keine Gefuehle mehr", nicht "keine Angabe",
+  // und darf das laengst geleerte Gefuehl nicht aus dem eingefrorenen `mood`
+  // wiederbeleben (dieselbe Regel wie normalizeFeelingEntries() in
+  // health-cycle.js).
+  const existingFeelings = new Set(
+    Array.isArray(existing?.feelings)
+      ? existing.feelings
+      : (existing?.mood ? [existing.mood] : []),
+  );
+  const feelingsButtons = MOOD_TYPES.map((m) => `<button type="button" class="health-choice health-choice--chip" data-feeling="${esc(m.value)}" aria-pressed="${existingFeelings.has(m.value)}">
+    <i data-lucide="${esc(m.icon)}" aria-hidden="true"></i>${esc(t(m.labelKey))}</button>`).join('');
+
+  const bbtUnit = existing?.basal_temp_unit === 'f' ? 'f' : 'c';
+  const bbtValue = existing?.basal_temp != null ? String(existing.basal_temp) : '';
+
+  // Zervixschleim und die beiden Testergebnisse - dieselbe
+  // Einfachauswahl-mit-"keine Angabe"-Chip-Reihe wie Blutungsstaerke, ueber
+  // singleChoiceButtons() einmal gebaut statt dreimal kopiert.
+  const mucusButtons = singleChoiceButtons(CERVIX_MUCUS_TYPES, 'health.cycle.mucus.none', existing?.cervix_mucus, 'mucus');
+  const lhButtons = singleChoiceButtons(TEST_RESULT_CHOICES, 'health.cycle.test.unset', existing?.lh_test, 'lh-test');
+  const pregButtons = singleChoiceButtons(TEST_RESULT_CHOICES, 'health.cycle.test.unset', existing?.pregnancy_test, 'pregnancy-test');
+  // Hart privat (siehe server/routes/health/cycle.js): dieses Feld
+  // bleibt beim GET fuer alle ausser dem Eigentuemer selbst unsichtbar,
+  // unabhaengig von `visibility`. openDayLogModal() wird ohnehin nur in der
+  // eigenen Ansicht aufgerufen (siehe FAB-Verdrahtung/isOwnCycleView()), die
+  // Chip-Reihe braucht also keinen eigenen Sichtbarkeits-Check.
+  const intimacyButtons = singleChoiceButtons(INTIMACY_TYPES, 'health.cycle.intimacy.none', existing?.intimacy, 'intimacy');
 
   openModal({
     title: `${t('health.cycle.dayLog.title')} · ${formatDate(key)}`,
     size: 'md',
+    // A-2: kein Autofokus auf das erste Formularfeld (das waere ohne dieses
+    // Flag die Basaltemperatur weiter unten, siehe FIRST_FIELD in modal.js) -
+    // der Browser scrollt sonst beim Fokussieren dorthin, und die
+    // Blutungsstaerke-Gruppe (das meistgenutzte Feld, ganz oben im Formular)
+    // rutscht aus dem sichtbaren Bereich. onSave() setzt den Fokus stattdessen
+    // gezielt auf den ersten Flow-Chip.
+    initialFocus: 'none',
     content: `
       <form id="cycle-log-form" class="form-stack">
         <div class="form-field">
           <span class="label">${esc(t('health.cycle.flow.label'))}</span>
-          <div class="cycle-choices" data-group="flow" role="group" aria-label="${esc(t('health.cycle.flow.label'))}">${flowButtons}</div>
+          <div class="health-choices" data-group="flow" role="group" aria-label="${esc(t('health.cycle.flow.label'))}">${flowButtons}</div>
         </div>
         <div class="form-field">
           <span class="label">${esc(t('health.cycle.symptom.label'))}</span>
-          <div class="cycle-choices cycle-choices--wrap" data-group="symptoms">${symptomButtons}</div>
+          <div class="health-choices health-choices--wrap" data-group="symptoms">${symptomButtons}</div>
+          <div class="cycle-quick-links">
+            <button type="button" class="btn btn--ghost btn--sm" data-action="cycle-log-painkiller">${esc(t('health.cycle.quickLink.painkiller'))}</button>
+            <button type="button" class="btn btn--ghost btn--sm" data-action="cycle-log-weight">${esc(t('health.cycle.quickLink.weight'))}</button>
+          </div>
+        </div>
+        <div class="form-field">
+          <span class="label">${esc(t('health.cycle.feelings.label'))}</span>
+          <div class="health-choices health-choices--wrap" data-group="feelings">${feelingsButtons}</div>
         </div>
         <div class="modal-grid modal-grid--2">
           <div class="form-field">
-            <label class="label" for="cycle-mood">${esc(t('health.cycle.mood.label'))}</label>
-            <select class="input" id="cycle-mood">${moodOptions}</select>
+            <label class="label" for="cycle-bbt">${esc(t('health.cycle.bbt.label'))}</label>
+            <input class="input" id="cycle-bbt" type="number" inputmode="decimal" step="0.01" placeholder="${esc(t('health.cycle.bbt.placeholder'))}" value="${esc(bbtValue)}">
           </div>
           <div class="form-field">
-            <label class="label" for="cycle-log-visibility">${esc(t('health.cycle.field.visibility'))}</label>
-            <select class="input" id="cycle-log-visibility">
-              <option value="private" ${cycleVisibilityFor(existing) === 'family' ? '' : 'selected'}>${esc(t('health.cycle.visibility.private'))}</option>
-              <option value="family" ${cycleVisibilityFor(existing) === 'family' ? 'selected' : ''}>${esc(t('health.cycle.visibility.family'))}</option>
+            <label class="label" for="cycle-bbt-unit">${esc(t('health.cycle.bbt.unitLabel'))}</label>
+            <select class="input" id="cycle-bbt-unit">
+              <option value="c" ${bbtUnit === 'c' ? 'selected' : ''}>${esc(t('health.cycle.bbt.celsius'))}</option>
+              <option value="f" ${bbtUnit === 'f' ? 'selected' : ''}>${esc(t('health.cycle.bbt.fahrenheit'))}</option>
             </select>
           </div>
+        </div>
+        <p class="cycle-hint">${esc(t('health.cycle.bbt.hint'))}</p>
+        <div class="form-field">
+          <span class="label">${esc(t('health.cycle.mucus.label'))}</span>
+          <div class="health-choices" data-group="mucus" role="group" aria-label="${esc(t('health.cycle.mucus.label'))}">${mucusButtons}</div>
+          <p class="cycle-hint">${esc(t('health.cycle.mucus.hint'))}</p>
+        </div>
+        <div class="form-field">
+          <span class="label">${esc(t('health.cycle.test.label'))}</span>
+          <div class="modal-grid modal-grid--2">
+            <div>
+              <span class="label">${esc(t('health.cycle.test.lhLabel'))}</span>
+              <div class="health-choices" data-group="lh-test" role="group" aria-label="${esc(t('health.cycle.test.lhLabel'))}">${lhButtons}</div>
+            </div>
+            <div>
+              <span class="label">${esc(t('health.cycle.test.pregnancyLabel'))}</span>
+              <div class="health-choices" data-group="pregnancy-test" role="group" aria-label="${esc(t('health.cycle.test.pregnancyLabel'))}">${pregButtons}</div>
+            </div>
+          </div>
+        </div>
+        <div class="form-field">
+          <span class="label cycle-intimacy-label"><i data-lucide="lock" class="icon-sm" aria-hidden="true"></i>${esc(t('health.cycle.intimacy.label'))}</span>
+          <div class="health-choices" data-group="intimacy" role="group" aria-label="${esc(t('health.cycle.intimacy.label'))}">${intimacyButtons}</div>
+          <p class="cycle-hint">${esc(t('health.cycle.intimacy.hint'))}</p>
+        </div>
+        <div class="form-field">
+          <label class="label" for="cycle-log-visibility">${esc(t('health.cycle.field.visibility'))}</label>
+          <select class="input" id="cycle-log-visibility">
+            <option value="private" ${cycleVisibilityFor(existing) === 'family' ? '' : 'selected'}>${esc(t('health.cycle.visibility.private'))}</option>
+            <option value="family" ${cycleVisibilityFor(existing) === 'family' ? 'selected' : ''}>${esc(t('health.cycle.visibility.family'))}</option>
+          </select>
         </div>
         <div class="form-field">
           <label class="label" for="cycle-log-note">${esc(t('health.cycle.field.note'))}</label>
@@ -3990,29 +6712,71 @@ function openDayLogModal(dateKey) {
         </div>
       </form>`,
     onSave(panel) {
-      // Flow: Einfachauswahl (Toggle). Symptome: Mehrfachauswahl.
-      panel.querySelectorAll('[data-group="flow"] .cycle-choice').forEach((btn) =>
-        btn.addEventListener('click', () => {
-          const on = btn.getAttribute('aria-pressed') === 'true';
-          panel.querySelectorAll('[data-group="flow"] .cycle-choice').forEach((b) => b.setAttribute('aria-pressed', 'false'));
-          btn.setAttribute('aria-pressed', on ? 'false' : 'true');
-        }));
-      panel.querySelectorAll('[data-symptom]').forEach((btn) =>
-        btn.addEventListener('click', () => btn.setAttribute('aria-pressed', btn.getAttribute('aria-pressed') === 'true' ? 'false' : 'true')));
+      // Flow, Zervixschleim, Tests und Intimitaet: Einfachauswahl (Toggle),
+      // wie schon zuvor die Blutungsstaerke. Symptome behalten ihre eigene
+      // Stufen-Logik weiter unten. Gefuehle sind Mehrfachauswahl
+      // (wireMultiChoiceGroup statt wireChoiceGroup).
+      wireChoiceGroup(panel, 'flow');
+      wireChoiceGroup(panel, 'mucus');
+      wireChoiceGroup(panel, 'lh-test');
+      wireChoiceGroup(panel, 'pregnancy-test');
+      wireChoiceGroup(panel, 'intimacy');
+      wireMultiChoiceGroup(panel, 'feelings');
+      panel.querySelectorAll('[data-symptom]').forEach((btn) => btn.addEventListener('click', () => {
+        const next = (Number(btn.dataset.intensity) + 1) % 4;
+        btn.dataset.intensity = String(next);
+        btn.setAttribute('aria-pressed', String(next > 0));
+        btn.querySelector('.health-choice__dots')?.remove();
+        btn.insertAdjacentHTML('beforeend', symptomIntensityDotsHTML(next));
+      }));
+
+      // A-2: Fokus auf den ersten Flow-Chip statt (per Default via
+      // FIRST_FIELD in modal.js) auf das erste <input> - siehe die
+      // "none"-Option oben, direkt im openModal()-Aufruf. Der Chip ist
+      // bereits im DOM und regulaer fokussierbar, kein Timeout noetig.
+      panel.querySelector('[data-group="flow"] .health-choice')?.focus();
 
       panel.querySelector('[data-action="cancel"]')?.addEventListener('click', () => closeModal({ force: true }));
       panel.querySelector('[data-action="cycle-delete-log"]')?.addEventListener('click', () => deleteDayLog(existing));
 
+      // Schnelleinstieg in Medikamente/Vitalwerte, OHNE den
+      // eingebauten Dirty-Check zu umgehen - ein normaler closeModal()-Aufruf
+      // (kein force) fragt bei ungespeicherten Aenderungen wie gewohnt nach
+      // Verwerfen/Abbrechen, und nur ein tatsaechlich abgeschlossenes
+      // Schliessen (true zurueckgegeben) navigiert weiter. Einfacher und
+      // robuster als ein zweiter, eigener "dirty"-Tracker neben dem des
+      // Modal-Systems.
+      panel.querySelector('[data-action="cycle-log-painkiller"]')?.addEventListener('click', async () => {
+        if (await closeModal()) window.yuvomi?.navigate('/health/medications');
+      });
+      panel.querySelector('[data-action="cycle-log-weight"]')?.addEventListener('click', async () => {
+        if (await closeModal()) window.yuvomi?.navigate('/health/vitals');
+      });
+
       panel.querySelector('#cycle-log-form').addEventListener('submit', async (e) => {
         e.preventDefault();
         const submitBtn = panel.querySelector('[type="submit"]');
-        const flowBtn = panel.querySelector('[data-group="flow"] .cycle-choice[aria-pressed="true"]');
-        const symptoms = [...panel.querySelectorAll('[data-symptom][aria-pressed="true"]')].map((b) => b.dataset.symptom);
+        const flowBtn = panel.querySelector('[data-group="flow"] .health-choice[aria-pressed="true"]');
+        const symptoms = [...panel.querySelectorAll('[data-symptom][aria-pressed="true"]')]
+          .map((b) => ({ key: b.dataset.symptom, intensity: Number(b.dataset.intensity) || null }));
+        const feelings = [...panel.querySelectorAll('[data-group="feelings"] [data-feeling][aria-pressed="true"]')]
+          .map((b) => b.dataset.feeling);
+        const mucusBtn = panel.querySelector('[data-group="mucus"] .health-choice[aria-pressed="true"]');
+        const lhBtn = panel.querySelector('[data-group="lh-test"] .health-choice[aria-pressed="true"]');
+        const pregBtn = panel.querySelector('[data-group="pregnancy-test"] .health-choice[aria-pressed="true"]');
+        const intimacyBtn = panel.querySelector('[data-group="intimacy"] .health-choice[aria-pressed="true"]');
+        const bbtRaw = panel.querySelector('#cycle-bbt').value.trim();
         const body = {
           log_date: key,
           flow: flowBtn?.dataset.flow || '',
           symptoms,
-          mood: panel.querySelector('#cycle-mood').value || null,
+          basal_temp: bbtRaw === '' ? null : Number(bbtRaw),
+          basal_temp_unit: bbtRaw === '' ? null : panel.querySelector('#cycle-bbt-unit').value,
+          cervix_mucus: mucusBtn?.dataset.mucus || '',
+          lh_test: lhBtn?.dataset.lhTest || '',
+          pregnancy_test: pregBtn?.dataset.pregnancyTest || '',
+          feelings,
+          intimacy: intimacyBtn?.dataset.intimacy || '',
           visibility: panel.querySelector('#cycle-log-visibility').value || 'private',
           note: panel.querySelector('#cycle-log-note').value.trim() || null,
         };
@@ -4022,6 +6786,7 @@ function openDayLogModal(dateKey) {
           closeModal({ force: true });
           window.yuvomi?.showToast(t('health.cycle.saved'), 'success');
           await reloadCycle();
+          refocusAfterRender();
         } catch (err) {
           console.error('[Health] cycle log save error:', err);
           submitBtn.disabled = false;
@@ -4034,11 +6799,13 @@ function openDayLogModal(dateKey) {
 
 async function deleteDayLog(log) {
   if (!log?.id) return;
-  if (!(await confirmOverModal(t('health.cycle.deleteConfirm'), { danger: true, confirmLabel: t('common.delete') }))) return;
+  if (!(await confirmOverModal(t('health.cycle.deleteConfirm'),
+    { danger: true, confirmLabel: t('common.delete'), detail: t('health.cycle.logDeleteConfirmDetail') }))) return;
   try {
     await api.delete(`/health/cycle/logs/${log.id}`);
     window.yuvomi?.showToast(t('health.cycle.deleted'), 'success');
     await reloadCycle();
+    refocusAfterRender();
   } catch (err) {
     console.error('[Health] cycle log delete error:', err);
     window.yuvomi?.showToast(err?.data?.error || t('health.cycle.deleteError'), 'danger');
@@ -4049,14 +6816,32 @@ async function deleteDayLog(log) {
 // Einstellungs-Modal (persönliche Vorhersage-Parameter)
 // --------------------------------------------------------
 
+// CONTRACEPTION_TYPES kommt aus health-cycle.js
+// (importiert oben) - dieselbe geschlossene Auswahl, die server/routes/health/
+// cycle.js zur Validierung importiert (CONTRACEPTION_VALUES, davon abgeleitet).
+// 'none' ist ein bewusst gewaehlter Wert ("keine Verhuetung", explizit
+// angegeben) und bleibt von der leeren Option ("nicht angegeben", `null` in
+// der DB) unterschieden.
+
+// Dieselbe 0/1/2/3/5/7-Reihe wie die bestehende Perioden-Erinnerung
+// (cs-remind-days), hier fuer die Partner-Erinnerung - absichtlich OHNE
+// 10/14 (die Partner-Benachrichtigung ist eine kurzfristige Vorwarnung, keine
+// langfristige Planungserinnerung wie die eigene).
+const PARTNER_REMIND_DAYS = Object.freeze([0, 1, 2, 3, 5, 7]);
+
 function openCycleSettingsModal() {
   const s = cycle.settings || {};
+  // Vom Server vorgefiltert (GET /cycle/settings), nicht mehr aus cycle.members
+  // gebaut: derselbe Praedikat wie der Erinnerungs-Sync selbst
+  // (isEligibleCyclePartner(), server/services/cycle-reminders.js) - eine
+  // eigene Filterung hier waere eine zweite, potenziell abweichende Kopie.
+  const eligiblePartners = s.eligible_partners || [];
   const val = (v) => (v == null ? '' : String(v));
   const stats = cycleStats(cycle.periods, s);
   // Plausibilitäts-Fenster für den Entbindungstermin: knapp in der Vergangenheit
   // (gerade entbunden/überfällig) bis ~40 Wochen voraus (frisch schwanger). Hält
   // die SSW-/Countdown-Mathematik sinnvoll, verhindert absurde Eingaben.
-  const dueTodayKey = toLocalDateKey(new Date());
+  const dueTodayKey = todayKey();
   const dueMin = addLocalDays(dueTodayKey, -40);
   const dueMax = addLocalDays(dueTodayKey, 300);
 
@@ -4089,6 +6874,38 @@ function openCycleSettingsModal() {
         </label>
         <p class="cycle-hint" id="cs-auto-hint">${esc(t('health.cycle.settings.autoHint'))}</p>
         <div class="form-field">
+          <label class="label" for="cs-contraception">${esc(t('health.cycle.settings.contraception'))}</label>
+          <select class="input" id="cs-contraception" aria-describedby="cs-contraception-hint">
+            <option value="" ${s.contraception ? '' : 'selected'}>${esc(t('health.cycle.settings.contraceptionUnset'))}</option>
+            ${CONTRACEPTION_TYPES.map((c) => `<option value="${esc(c.value)}" ${s.contraception === c.value ? 'selected' : ''}>${esc(t(c.labelKey))}</option>`).join('')}
+          </select>
+          <p class="cycle-hint" id="cs-contraception-hint">${esc(t('health.cycle.settings.contraceptionHint'))}</p>
+        </div>
+        <label class="cycle-toggle">
+          <input type="checkbox" id="cs-perimenopause" aria-describedby="cs-perimenopause-hint" ${s.perimenopause_mode ? 'checked' : ''}>
+          <span>${esc(t('health.cycle.settings.perimenopauseMode'))}</span>
+        </label>
+        <p class="cycle-hint" id="cs-perimenopause-hint">${esc(t('health.cycle.settings.perimenopauseModeHint'))}</p>
+        <label class="cycle-toggle">
+          <input type="checkbox" id="cs-show-pms" ${s.show_pms === 0 ? '' : 'checked'}>
+          <span>${esc(t('health.cycle.settings.showPms'))}</span>
+        </label>
+        <div class="form-field">
+          <label class="label" for="cs-notify-partner">${esc(t('health.cycle.settings.notifyPartner'))}</label>
+          <select class="input" id="cs-notify-partner" aria-describedby="cs-notify-partner-hint" ${eligiblePartners.length ? '' : 'disabled'}>
+            <option value="" ${s.notify_partner_user_id ? '' : 'selected'}>${esc(t('health.cycle.settings.remindOff'))}</option>
+            ${eligiblePartners.map((m) => `<option value="${m.id}" ${Number(s.notify_partner_user_id) === m.id ? 'selected' : ''}>${esc(m.display_name)}</option>`).join('')}
+          </select>
+          <p class="cycle-hint" id="cs-notify-partner-hint">${esc(eligiblePartners.length ? t('health.cycle.settings.notifyPartnerHint') : t('health.cycle.settings.notifyPartnerNoEligible'))}</p>
+        </div>
+        <div class="form-field" id="cs-notify-partner-days-field" ${s.notify_partner_user_id ? '' : 'hidden'}>
+          <label class="label" for="cs-notify-partner-days">${esc(t('health.cycle.settings.notifyPartnerDaysBefore'))}</label>
+          <select class="input" id="cs-notify-partner-days">
+            ${PARTNER_REMIND_DAYS.map((d) => `<option value="${d}" ${Number(s.notify_partner_days_before) === d ? 'selected' : ''}>${esc(d === 0 ? t('health.cycle.settings.remindSameDay') : t('health.cycle.unit.days', { value: d, count: d }))}</option>`).join('')}
+          </select>
+        </div>
+        <hr class="cycle-settings__sep">
+        <div class="form-field">
           <label class="label" for="cs-default-visibility">${esc(t('health.cycle.settings.defaultVisibility'))}</label>
           <select class="input" id="cs-default-visibility" aria-describedby="cs-default-visibility-hint">
             <option value="private" ${s.default_visibility === 'family' ? '' : 'selected'}>${esc(t('health.cycle.visibility.private'))}</option>
@@ -4096,6 +6913,19 @@ function openCycleSettingsModal() {
           </select>
           <p class="cycle-hint" id="cs-default-visibility-hint">${esc(t('health.cycle.settings.defaultVisibilityHint'))}</p>
         </div>
+        <hr class="cycle-settings__sep">
+        <div class="form-field">
+          <label class="label" for="cs-remind-days">${esc(t('health.cycle.settings.remindPeriodDaysBefore'))}</label>
+          <select class="input" id="cs-remind-days" aria-describedby="cs-remind-days-hint">
+            <option value="" ${s.remind_period_days_before == null ? 'selected' : ''}>${esc(t('health.cycle.settings.remindOff'))}</option>
+            ${[0, 1, 2, 3, 5, 7, 10, 14].map((d) => `<option value="${d}" ${Number(s.remind_period_days_before) === d ? 'selected' : ''}>${esc(d === 0 ? t('health.cycle.settings.remindSameDay') : t('health.cycle.unit.days', { value: d, count: d }))}</option>`).join('')}
+          </select>
+          <p class="cycle-hint" id="cs-remind-days-hint">${esc(t('health.cycle.settings.remindPeriodDaysBeforeHint'))}</p>
+        </div>
+        <label class="cycle-toggle">
+          <input type="checkbox" id="cs-remind-log" ${s.remind_log_daily ? 'checked' : ''}>
+          <span>${esc(t('health.cycle.settings.remindLogDaily'))}</span>
+        </label>
         <div class="form-field cycle-bulk">
           <button type="button" class="btn btn--secondary" data-action="cycle-apply-visibility"
             aria-describedby="cs-bulk-hint">${esc(t('health.cycle.settings.applyToAll'))}</button>
@@ -4129,6 +6959,15 @@ function openCycleSettingsModal() {
       const pregToggle = panel.querySelector('#cs-pregnancy');
       const dueField = panel.querySelector('#cs-due-field');
       pregToggle?.addEventListener('change', () => { dueField.hidden = !pregToggle.checked; });
+
+      // Tage-vor-Auswahl der Partner-Erinnerung nur zeigen, solange tatsaechlich
+      // eine Person gewaehlt ist - dasselbe Zeig-bei-Bedarf-Muster wie das
+      // Entbindungstermin-Feld oben.
+      const notifyPartnerSelect = panel.querySelector('#cs-notify-partner');
+      const notifyPartnerDaysField = panel.querySelector('#cs-notify-partner-days-field');
+      notifyPartnerSelect?.addEventListener('change', () => {
+        notifyPartnerDaysField.hidden = !notifyPartnerSelect.value;
+      });
 
       // Bulk-Sichtbarkeit: setzt alle bestehenden Einträge auf den oben gewählten
       // Wert. Inline-Bestätigung statt confirmModal - das Modal-System stapelt
@@ -4175,12 +7014,23 @@ function openCycleSettingsModal() {
         const numOr = (sel) => { const raw = panel.querySelector(sel).value.trim(); return raw === '' ? null : Number(raw); };
         const pregnant = pregToggle.checked;
         const due = (panel.querySelector('#cs-due').value || '').trim();
+        const partnerId = numOr('#cs-notify-partner');
         const body = {
           cycle_length_avg: numOr('#cs-cycle'),
           period_length_avg: numOr('#cs-period'),
           luteal_length: numOr('#cs-luteal') ?? 14,
           track_fertility: panel.querySelector('#cs-fertility').checked,
+          contraception: panel.querySelector('#cs-contraception').value || null,
+          perimenopause_mode: panel.querySelector('#cs-perimenopause').checked,
+          show_pms: panel.querySelector('#cs-show-pms').checked,
           default_visibility: panel.querySelector('#cs-default-visibility').value || 'private',
+          remind_period_days_before: numOr('#cs-remind-days'),
+          remind_log_daily: panel.querySelector('#cs-remind-log').checked,
+          notify_partner_user_id: partnerId,
+          // Ohne gewaehlte Person ist der Tage-Wert bedeutungslos (kein
+          // Empfaenger) - nicht mitschicken, statt eines von der UI
+          // ausgeblendeten, aber dennoch gesendeten Zahlenwerts.
+          notify_partner_days_before: partnerId ? numOr('#cs-notify-partner-days') : null,
           pregnancy_mode: pregnant,
           // Termin auch beim Ausschalten behalten (nur im aktiven Modus genutzt) —
           // versehentliches Umschalten löscht die Eingabe dann nicht.
@@ -4201,3 +7051,16 @@ function openCycleSettingsModal() {
     },
   });
 }
+
+export const __test = {
+  canEditFor,
+  loadHealthMembers,
+  personSwitcherMarkup,
+  // Testseam fuer #1031: setzt `careFor` fuer die drei Berechtigungsfaelle
+  // (eigene Daten, betreute Person, unbeteiligtes Mitglied), ohne das Array
+  // selbst nach aussen zu geben - Tests koennen die Betreuungsliste nur ganz
+  // ersetzen, nicht das Modul-interne Array direkt mutieren.
+  setCareForForTest(list) {
+    careFor = Array.isArray(list) ? [...list] : [];
+  },
+};

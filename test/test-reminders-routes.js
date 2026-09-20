@@ -2,7 +2,7 @@
  * Modul: Reminders-Routen-Test (Härtung Coverage-Track)
  * Zweck: HTTP-Schicht von server/routes/reminders.js gegen den echten Router,
  *        die vom bestehenden test-multi-reminders.js NICHT berührt wird:
- *        GET /pending (entity_title-Join task/event/subscription + Fälligkeits-/
+ *        GET /pending (entity_title-Join task/event/subscription/inventory_item + Fälligkeits-/
  *        dismissed-/Nutzer-Filter + Birthday-Sync-Seiteneffekt), POST/GET/PUT-
  *        Validierungspfade (400), PATCH /:id/dismiss, DELETE /:id, DELETE /?entity
  *        - jeweils mit created_by-Isolation (kein Fremdzugriff, kein Bypass).
@@ -42,6 +42,13 @@ function buildTestDb() {
 
 const db = buildTestDb();
 _setTestDatabase(db);
+// Die volle Migrationskette schaltet Inventar, Schichtplan und Muell ab
+// (Migrationen 145, 166, 198). Seit #1279 filtert /pending auch nach diesem
+// Haushaltsschalter - die Suite misst aber die ANDEREN beiden Achsen (Token-Scopes
+// und `access_permissions`). Mit abgeschaltetem Muell waere der waste_pickup-Fall
+// unten auch dann gruen, wenn die Rechte-Achse nichts mehr filterte. Der
+// Haushaltsschalter hat seine eigene Suite: test/test-disabled-module-reminders.js.
+db.prepare("INSERT INTO sync_config (key, value) VALUES ('disabled_modules', '[]') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();
 
 // --------------------------------------------------------
 // Fixtures + Helfer
@@ -70,11 +77,37 @@ function makeSubscription(owner, name = 'Netflix') {
      VALUES (?, 9.99, 'EUR', 'monthly', '2026-06-01', ?)`,
   ).run(name, owner).lastInsertRowid;
 }
+function makeInventoryItem(owner, name = 'Kühlschrank') {
+  return db.prepare(
+    `INSERT INTO inventory_items (name, created_by) VALUES (?, ?)`,
+  ).run(name, owner).lastInsertRowid;
+}
 // remind_at direkt einfügen (umgeht die Route, um Fälligkeit/dismissed frei zu setzen)
 function insertReminder(owner, entityType, entityId, remindAt, dismissed = 0) {
   return db.prepare(
     `INSERT INTO reminders (entity_type, entity_id, remind_at, created_by, dismissed) VALUES (?, ?, ?, ?, ?)`,
   ).run(entityType, entityId, remindAt, owner, dismissed).lastInsertRowid;
+}
+
+function readDisabledModulesConfig() {
+  return db.prepare("SELECT value FROM sync_config WHERE key = 'disabled_modules'").get()?.value ?? null;
+}
+
+function writeDisabledModulesConfig(value) {
+  if (value == null) {
+    db.prepare("DELETE FROM sync_config WHERE key = 'disabled_modules'").run();
+    return;
+  }
+  db.prepare(`INSERT INTO sync_config (key, value) VALUES ('disabled_modules', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(value);
+}
+// Anker direkt einfügen (umgeht server/services/cycle-reminders.js) - `kind`
+// entscheidet, ob GET /pending nachher 'period_predicted' oder
+// 'partner_period' ausliefert (Befund 2).
+function insertCycleAnchor(ownerId, kind, anchorDate = '2026-06-29') {
+  return db.prepare(
+    `INSERT INTO cycle_reminder_anchors (user_id, anchor_date, kind) VALUES (?, ?, ?)`,
+  ).run(ownerId, anchorDate, kind).lastInsertRowid;
 }
 
 const PAST = '2000-01-01T00:00:00';   // immer <= jetzt  -> faellig
@@ -83,9 +116,16 @@ const FUTURE = '2099-12-31T23:59:59';  // immer >  jetzt  -> nicht faellig
 let currentUid = freshUser('admin');
 const app = express();
 app.use(express.json());
+// Token-Scopes und Mitgliedsrechte pro Aufruf setzbar: der Router ist eine
+// MISCHSTELLE (sein Pfad loest auf `calendar` auf, seine Zeilen stammen aus
+// sechs Modulen) und muss die Rechte deshalb selbst stellen.
+let currentScopes = null;          // null = ungescopte Session
+let currentModuleAccess = null;    // null = Admin / unbeschraenkt
 app.use((req, _res, next) => {
   req.authUserId = currentUid;
   req.session = { userId: currentUid, role: 'admin' };
+  req.authScopes = currentScopes;
+  req.sessionModuleAccess = currentModuleAccess;
   next();
 });
 app.use('/api/v1/reminders', remindersRouter);
@@ -111,25 +151,38 @@ const at = (h, m) => `2026-05-01T${String(h).padStart(2, '0')}:${String(m).padSt
 // --------------------------------------------------------
 // GET /pending - entity_title-Join, Fälligkeit, Filter, Isolation
 // --------------------------------------------------------
-test('GET /pending liefert fällige Erinnerungen mit entity_title über alle drei Typen', async () => {
+test('GET /pending liefert fällige Erinnerungen mit entity_title über alle vier Typen', async () => {
   const owner = freshUser();
   currentUid = owner;
 
-  const taskId = makeTask(owner, 'Steuererklärung');
-  const eventId = makeEvent(owner, 'Zahnarzttermin');
-  const subId = makeSubscription(owner, 'Spotify');
-  insertReminder(owner, 'task', taskId, PAST);
-  insertReminder(owner, 'event', eventId, PAST);
-  insertReminder(owner, 'subscription', subId, PAST);
+  // Inventory is disabled by default in a fully migrated database. This test
+  // deliberately exercises all four title joins, so enable every module only
+  // for this request and restore the household setting afterwards.
+  const disabledModulesBefore = readDisabledModulesConfig();
+  writeDisabledModulesConfig('[]');
 
-  const res = await call('GET', '/pending');
-  assert.equal(res.status, 200);
-  // Nur die drei fälligen dieses Nutzers (Isolation via created_by).
-  assert.equal(res.body.data.length, 3);
-  const byType = Object.fromEntries(res.body.data.map((r) => [r.entity_type, r.entity_title]));
-  assert.equal(byType.task, 'Steuererklärung');
-  assert.equal(byType.event, 'Zahnarzttermin');
-  assert.equal(byType.subscription, 'Spotify');
+  try {
+    const taskId = makeTask(owner, 'Steuererklärung');
+    const eventId = makeEvent(owner, 'Zahnarzttermin');
+    const subId = makeSubscription(owner, 'Spotify');
+    const itemId = makeInventoryItem(owner, 'Kühlschrank');
+    insertReminder(owner, 'task', taskId, PAST);
+    insertReminder(owner, 'event', eventId, PAST);
+    insertReminder(owner, 'subscription', subId, PAST);
+    insertReminder(owner, 'inventory_item', itemId, PAST);
+
+    const res = await call('GET', '/pending');
+    assert.equal(res.status, 200);
+    // Nur die vier fälligen dieses Nutzers (Isolation via created_by).
+    assert.equal(res.body.data.length, 4);
+    const byType = Object.fromEntries(res.body.data.map((r) => [r.entity_type, r.entity_title]));
+    assert.equal(byType.task, 'Steuererklärung');
+    assert.equal(byType.event, 'Zahnarzttermin');
+    assert.equal(byType.subscription, 'Spotify');
+    assert.equal(byType.inventory_item, 'Kühlschrank');
+  } finally {
+    writeDisabledModulesConfig(disabledModulesBefore);
+  }
 });
 
 test('GET /pending schließt zukünftige und verworfene Erinnerungen aus', async () => {
@@ -170,6 +223,40 @@ test('GET /pending ist je Nutzer isoliert (kein Fremdzugriff)', async () => {
   assert.equal(res.body.data.length, 0, 'Bob sieht Annas fällige Erinnerungen nicht');
 });
 
+test('GET /pending leaves fasting copy to the device locale', async () => {
+  const owner = freshUser();
+  currentUid = owner;
+  const fastId = db.prepare(`INSERT INTO health_fasts (user_id, start_at, end_at, start_tzid, goal_minutes)
+    VALUES (?, '2026-01-01T00:00:00.000Z', NULL, 'UTC', 60)`).run(owner).lastInsertRowid;
+  insertReminder(owner, 'fasting_goal', fastId, PAST);
+  insertReminder(owner, 'fasting_next_start', fastId, PAST);
+  const response = await call('GET', '/pending');
+  const fasting = response.body.data.filter((row) => row.entity_type.startsWith('fasting_'));
+  assert.deepEqual(fasting.map((row) => row.entity_type), ['fasting_goal', 'fasting_next_start']);
+  for (const row of fasting) {
+    assert.equal('notification_title' in row, false);
+    assert.equal('notification_body' in row, false);
+    assert.equal('target_url' in row, false);
+  }
+});
+
+test('GET /pending hides stale fasting rows while Health is disabled household-wide', async () => {
+  const owner = freshUser();
+  currentUid = owner;
+  const fastId = db.prepare(`INSERT INTO health_fasts (user_id, start_at, end_at, start_tzid, goal_minutes)
+    VALUES (?, '2026-01-01T00:00:00.000Z', NULL, 'UTC', 60)`).run(owner).lastInsertRowid;
+  insertReminder(owner, 'fasting_goal', fastId, PAST);
+  const disabledModulesBefore = readDisabledModulesConfig();
+  writeDisabledModulesConfig('["health"]');
+  try {
+    const response = await call('GET', '/pending');
+    assert.equal(response.status, 200);
+    assert.equal(response.body.data.some((row) => row.entity_type === 'fasting_goal'), false);
+  } finally {
+    writeDisabledModulesConfig(disabledModulesBefore);
+  }
+});
+
 test('GET /pending materialisiert Geburtstags-Artefakte (Seiteneffekt)', async () => {
   const owner = freshUser();
   currentUid = owner;
@@ -186,6 +273,69 @@ test('GET /pending materialisiert Geburtstags-Artefakte (Seiteneffekt)', async (
   // syncAllBirthdayReminders hat ein calendar_event materialisiert und verknüpft.
   const linked = db.prepare('SELECT calendar_event_id FROM birthdays WHERE id = ?').get(bId).calendar_event_id;
   assert.ok(linked, 'Geburtstag hat nach GET /pending ein verknüpftes Kalender-Event');
+});
+
+// --------------------------------------------------------------------------
+// GET /pending - cycle_anchor_kind / cycle_owner_name (Partner-Erinnerung)
+//
+// Ohne diese Felder sagt der In-App-Toast der Partnerperson "Nächste Periode -
+// <Datum>", als wäre es die eigene - der Push-Weg (notifications.js) trägt
+// `cycle_anchor_kind` schon lange, GET /pending bislang nicht.
+// --------------------------------------------------------------------------
+test('GET /pending traegt cycle_anchor_kind + cycle_owner_name an einer Partner-Erinnerung', async () => {
+  const owner = freshUser('member');
+  const partner = freshUser('member');
+
+  const anchorId = insertCycleAnchor(owner, 'partner_period', '2026-06-29');
+  insertReminder(partner, 'cycle_period', anchorId, PAST);
+
+  currentUid = partner;
+  const res = await call('GET', '/pending');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.data.length, 1);
+  const row = res.body.data[0];
+  assert.equal(row.cycle_anchor_kind, 'partner_period');
+  const ownerName = db.prepare('SELECT display_name FROM users WHERE id = ?').get(owner).display_name;
+  assert.equal(row.cycle_owner_name, ownerName, 'der Name gehoert dem Anker-Eigentuemer, nicht der Empfaengerin');
+});
+
+test('GET /pending traegt cycle_anchor_kind ohne cycle_owner_name an einer eigenen Perioden-Erinnerung', async () => {
+  const owner = freshUser('member');
+
+  const anchorId = insertCycleAnchor(owner, 'period_predicted', '2026-06-29');
+  insertReminder(owner, 'cycle_period', anchorId, PAST);
+
+  currentUid = owner;
+  const res = await call('GET', '/pending');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.data.length, 1);
+  const row = res.body.data[0];
+  assert.equal(row.cycle_anchor_kind, 'period_predicted');
+  assert.ok(!('cycle_owner_name' in row), 'die eigene Erinnerung nennt keinen Namen - es ist ja die eigene');
+});
+
+// Luecke zwischen der Loeschung des Ankers (z. B. der Eigentuemer wird
+// geloescht oder aendert die Einstellung) und dem naechsten periodischen
+// Sync, der die verwaiste Zeile eigentlich aufraeumt: bis dahin darf
+// GET /pending eine 'cycle_period'/'cycle_log_nudge'-Zeile ohne Anker nicht
+// ausliefern - ohne cycle_anchor_kind faellt der Client auf die eigene
+// "naechste Periode"-Darstellung zurueck, was bei einer Partner-Erinnerung
+// eine Falschzuordnung waere (schlimmer als gar nichts zu zeigen).
+test('GET /pending zeigt eine verwaiste cycle_period-Erinnerung nicht, solange ihr Anker fehlt', async () => {
+  const owner = freshUser('member');
+  const partner = freshUser('member');
+
+  const anchorId = insertCycleAnchor(owner, 'partner_period', '2026-06-29');
+  insertReminder(partner, 'cycle_period', anchorId, PAST);
+
+  // Die Luecke simulieren: Anker direkt geloescht, ohne dass der Sync schon
+  // gelaufen waere und auch die reminders-Zeile mit entfernt haette.
+  db.prepare('DELETE FROM cycle_reminder_anchors WHERE id = ?').run(anchorId);
+
+  currentUid = partner;
+  const res = await call('GET', '/pending');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.data.length, 0, 'eine Erinnerung ohne Anker darf nicht auftauchen, egal welchen Inhalt sie noch traegt');
 });
 
 // --------------------------------------------------------
@@ -218,7 +368,19 @@ test('POST / lehnt ungültigen entity_type ab (400)', async () => {
   currentUid = owner;
   const res = await call('POST', '', { entity_type: 'bogus', entity_id: makeTask(owner), remind_at: at(9, 0) });
   assert.equal(res.status, 400);
-  assert.match(res.body.error, /task, event, or subscription/);
+  // Die Meldung zaehlt VALID_ENTITY_TYPES auf, statt die Liste ein zweites Mal
+  // von Hand zu fuehren: sie stand hier schon einmal veraltet da, waehrend die
+  // Route laengst mehr Typen kannte. Deshalb prueft der Test die Form und die
+  // Enden, nicht den ausgeschriebenen Satz.
+  assert.match(res.body.error, /^entity_type must be one of: task, event, subscription, inventory_item, inventory_tracked_date\.$/m);
+  // `pantry_item`/`document_expiry` stehen bewusst NICHT im Text: derselbe
+  // Endpunkt weist beide im naechsten Zweig ab (der eine, weil ein Lauf ihn
+  // minuetlich wieder herstellt; der andere, weil documents.js#syncDocument-
+  // ExpiryReminder bei jedem Speichern ALLE Zeilen der Entitaet loescht). Die
+  // drei uebrigen abgeleiteten Herkuenfte bleiben setzbar - dort haelt ein
+  // handgesetzter Termin bis zur naechsten Aenderung ihres Objekts.
+  assert.doesNotMatch(res.body.error, /pantry_item/);
+  assert.doesNotMatch(res.body.error, /document_expiry/);
 });
 
 test('POST / lehnt fehlenden entity_type ab (400)', async () => {
@@ -346,4 +508,98 @@ test('DELETE /?entity löscht alle eigenen Erinnerungen der Entität, fremde ble
   ).get('event', eventId, anna).c;
   assert.equal(annaLeft, 0, 'Annas Erinnerungen sind weg');
   assert.ok(db.prepare('SELECT id FROM reminders WHERE id = ?').get(bobRid), 'Bobs Erinnerung bleibt unberührt');
+});
+
+// --------------------------------------------------------------------------
+// DER PFAD SAGT `calendar`, DIE ZEILEN KOMMEN AUS SECHS MODULEN
+//
+// Befund aus der PR-Review zu #811, aelter als das Feature: `moduleForPath()`
+// bildet den ganzen Reminders-Router auf `calendar` ab (scopes.js), der
+// Pfad-Guard in server/index.js fragt also nur danach. Ausgeliefert werden aber
+// Aufgabentitel, Abo-Namen, Inventar-Gegenstaende und Vorratsartikel.
+// --------------------------------------------------------------------------
+test('ein calendar-Token liest ueber /pending keine fremden Modultitel', async () => {
+  const owner = freshUser();
+  currentUid = owner;
+  insertReminder(owner, 'subscription', makeSubscription(owner, 'Spotify'), PAST);
+  insertReminder(owner, 'inventory_item', makeInventoryItem(owner, 'Herd'), PAST);
+  insertReminder(owner, 'event', makeEvent(owner, 'Elternabend'), PAST);
+
+  currentScopes = ['calendar:read'];
+  try {
+    const res = await call('GET', '/pending');
+    assert.equal(res.status, 200);
+    const types = res.body.data.map((r) => r.entity_type);
+    assert.deepEqual([...new Set(types)], ['event'],
+      'ein calendar-Token bekam Abo- und Inventarnamen, ohne je diese Scopes zu besitzen');
+  } finally {
+    currentScopes = null;
+  }
+});
+
+test('ein calendar-Token verwirft keine fremde Modul-Erinnerung', async () => {
+  const owner = freshUser();
+  currentUid = owner;
+  const id = insertReminder(owner, 'subscription', makeSubscription(owner, 'Disney'), PAST);
+
+  currentScopes = ['calendar:write'];
+  try {
+    const res = await call('PATCH', `/${id}/dismiss`);
+    assert.equal(res.status, 403);
+    assert.equal(db.prepare('SELECT dismissed FROM reminders WHERE id = ?').get(id).dismissed, 0);
+  } finally {
+    currentScopes = null;
+  }
+});
+
+test('ein entzogenes Modul verschwindet auch aus /pending', async () => {
+  const owner = freshUser();
+  currentUid = owner;
+  insertReminder(owner, 'pantry_item', 1, PAST);
+  insertReminder(owner, 'waste_pickup', 1, PAST);
+  insertReminder(owner, 'task', makeTask(owner, 'Kehrwoche'), PAST);
+
+  // access_permissions-Achse: dieselbe Frage, andere Herkunft der Antwort.
+  currentModuleAccess = { pantry: 'none', waste: 'none' };
+  try {
+    const res = await call('GET', '/pending');
+    assert.equal(res.status, 200);
+    assert.ok(!res.body.data.some((r) => r.entity_type === 'pantry_item'),
+      'der Pfad-Guard fragt nach `calendar` und laesst pantry durch - die Route muss selbst filtern');
+    assert.ok(!res.body.data.some((r) => r.entity_type === 'waste_pickup'),
+      'dieselbe Filterung gilt fuer waste_pickup (#1063 Phase 8)');
+    assert.ok(res.body.data.some((r) => r.entity_type === 'task'), 'und nichts anderes wegnehmen');
+  } finally {
+    currentModuleAccess = null;
+  }
+});
+
+test('ein Token ohne jeden lesbaren Scope bekommt eine leere Liste, keinen Fehler', async () => {
+  const owner = freshUser();
+  currentUid = owner;
+  insertReminder(owner, 'task', makeTask(owner, 'Allein'), PAST);
+
+  currentScopes = ['weather:read'];
+  try {
+    const res = await call('GET', '/pending');
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.data, [], 'ein leeres IN () waere ein SQL-Fehler statt einer Antwort');
+  } finally {
+    currentScopes = null;
+  }
+});
+
+test('GET /?entity_type= antwortet 403 statt den Titel zu verraten', async () => {
+  const owner = freshUser();
+  currentUid = owner;
+  const sub = makeSubscription(owner, 'Netflix Family');
+  insertReminder(owner, 'subscription', sub, FUTURE);
+
+  currentScopes = ['calendar:read'];
+  try {
+    const res = await call('GET', `/?entity_type=subscription&entity_id=${sub}`);
+    assert.equal(res.status, 403);
+  } finally {
+    currentScopes = null;
+  }
 });

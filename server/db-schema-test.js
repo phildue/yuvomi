@@ -3,9 +3,27 @@
  * Zweck: SQL-Strings aus MIGRATIONS für node:sqlite-Tests exportieren.
  *        Nur für Testzwecke - db.js nutzt die MIGRATIONS direkt intern.
  * Abhängigkeiten: keine
+ *
+ * WAS DIESE DATEI IST, UND WAS NICHT: ein AUSZUG, kein Schema. Eine Testsuite
+ * fährt nicht alle Migrationen, sondern `MIGRATIONS_SQL[1]` und dazu die
+ * einzelnen späteren, die sie braucht. Ein Eintrag lässt deshalb weg, was eine
+ * Testdatenbank nicht braucht, und `1` ist gar nicht die Migration von damals,
+ * sondern das Grundschema mit einigen später ergänzten Spalten (`locked`,
+ * `archived_at`, `visibility`) bereits eingearbeitet - `start_date` (v41) etwa
+ * ist NICHT darin.
+ *
+ * DIE FOLGE, an der man sonst hängenbleibt: erweitert man eine Abfrage in
+ * `server/` um ein Feld, das nach v1 dazukam, scheitert irgendeine fremde Suite
+ * mit `no such column` - an einer Stelle, die mit ihrem Prüfzweck nichts zu tun
+ * hat. Dann gehört die zugehörige Migration in die betroffene Testdatei, nicht
+ * die Spalte in den Eintrag `1`.
+ *
+ * Die Schlüssel sind Migrations-VERSIONEN. Das war sieben Einträge lang nicht
+ * so: 15 bis 21 trugen den Inhalt von 22 bis 28, und weil niemand sie fuhr,
+ * fiel es nie auf. `npm run test:schema-mirror` hält die Zuordnung jetzt fest.
  */
 
-// SQL-String für Migration v1 (gespiegelt aus db.js MIGRATIONS[0].up)
+// Grundschema (Migration v1, plus einzelne später ergänzte Spalten - siehe oben).
 // Änderungen in db.js MIGRATIONS müssen hier synchron gehalten werden.
 const MIGRATIONS_SQL = {
   1: `
@@ -40,6 +58,12 @@ const MIGRATIONS_SQL = {
       recurrence_rule TEXT,
       parent_task_id  INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
       visibility      TEXT    NOT NULL DEFAULT 'all',
+      -- Ablage als eigene Achse (Migration v132, #688): NULL = im Lauf.
+      archived_at     TEXT,
+      -- Gesperrte Definition (Migration v155, #830): 1 = nur Ersteller:in und
+      -- Admins duerfen die Aufgabe aendern oder loeschen, alle anderen duerfen
+      -- sie weiter abhaken.
+      locked          INTEGER NOT NULL DEFAULT 0,
       created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
       updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
     );
@@ -91,7 +115,11 @@ const MIGRATIONS_SQL = {
       end_datetime         TEXT,
       all_day              INTEGER NOT NULL DEFAULT 0,
       location             TEXT,
-      color                TEXT    NOT NULL DEFAULT '#007AFF',
+      -- Nullable wie in Produktion seit Migration 166 (#891): NULL heisst "dieser
+      -- Termin hat keine eigene Farbe" und leiht sich die der zugewiesenen
+      -- Person. Ein Auszug, der die Spalte weiter NOT NULL haelt, laesst jede
+      -- Suite darauf gruen laufen, die genau diesen Zustand pruefen wollte.
+      color                TEXT,
       icon                 TEXT    NOT NULL DEFAULT 'calendar',
       assigned_to          INTEGER REFERENCES users(id) ON DELETE SET NULL,
       created_by           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -151,7 +179,10 @@ const MIGRATIONS_SQL = {
       created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
       updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
       owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL,
-      visibility      TEXT    NOT NULL DEFAULT 'shared' CHECK (visibility IN ('private', 'shared'))
+      -- Dritte Stufe 'shared_amount' (#659, Migration 156): Betrag zaehlt wie
+      -- 'shared', Details bleiben wie bei 'private' beim Owner.
+      visibility      TEXT    NOT NULL DEFAULT 'shared'
+                              CHECK (visibility IN ('private', 'shared', 'shared_amount'))
     );
     CREATE TABLE IF NOT EXISTS budget_categories (
       key        TEXT PRIMARY KEY,
@@ -201,6 +232,7 @@ const MIGRATIONS_SQL = {
       token_hash   TEXT    NOT NULL UNIQUE,
       token_prefix TEXT    NOT NULL,
       created_by   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      subject_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
       expires_at   TEXT,
       revoked_at   TEXT,
       last_used_at TEXT,
@@ -330,7 +362,11 @@ const MIGRATIONS_SQL = {
       end_datetime         TEXT,
       all_day              INTEGER NOT NULL DEFAULT 0,
       location             TEXT,
-      color                TEXT    NOT NULL DEFAULT '#007AFF',
+      -- Nullable wie in Produktion seit Migration 166 (#891): NULL heisst "dieser
+      -- Termin hat keine eigene Farbe" und leiht sich die der zugewiesenen
+      -- Person. Ein Auszug, der die Spalte weiter NOT NULL haelt, laesst jede
+      -- Suite darauf gruen laufen, die genau diesen Zustand pruefen wollte.
+      color                TEXT,
       icon                 TEXT    NOT NULL DEFAULT 'calendar',
       assigned_to          INTEGER REFERENCES users(id) ON DELETE SET NULL,
       created_by           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -340,6 +376,12 @@ const MIGRATIONS_SQL = {
       recurrence_rule      TEXT,
       subscription_id      INTEGER REFERENCES ics_subscriptions(id) ON DELETE CASCADE,
       user_modified        INTEGER NOT NULL DEFAULT 0,
+      -- Wie in Produktion seit Migration 167 (#899): der eigene Zustand der
+      -- Farbe. user_modified sagt "irgendetwas wurde bearbeitet",
+      -- color_modified allein sagt "die Farbe wird lokal gefuehrt" - der Inbound
+      -- aller drei Anbieter gattert darauf. Fehlt die Spalte im Auszug,
+      -- scheitert jede Suite, die einen Sync-Upsert faehrt, an no such column.
+      color_modified       INTEGER NOT NULL DEFAULT 0,
       created_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
       updated_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
     );
@@ -391,10 +433,10 @@ const MIGRATIONS_SQL = {
   14: `
     ALTER TABLE calendar_events ADD COLUMN icon TEXT NOT NULL DEFAULT 'calendar';
   `,
-  15: `
+  22: `
     UPDATE calendar_events SET icon = 'drill' WHERE icon = 'tooth';
   `,
-  16: `
+  23: `
     ALTER TABLE contacts ADD COLUMN family_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_family_user
       ON contacts(family_user_id) WHERE family_user_id IS NOT NULL;
@@ -410,10 +452,10 @@ const MIGRATIONS_SQL = {
       SELECT 1 FROM contacts WHERE contacts.family_user_id = users.id
     );
   `,
-  17: `
+  24: `
     UPDATE calendar_events SET icon = 'tooth' WHERE icon = 'drill';
   `,
-  18: `
+  25: `
     CREATE TABLE tasks_new (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       title           TEXT    NOT NULL,
@@ -444,7 +486,7 @@ const MIGRATIONS_SQL = {
     CREATE INDEX IF NOT EXISTS idx_tasks_assigned       ON tasks(assigned_to);
     CREATE INDEX IF NOT EXISTS idx_tasks_parent         ON tasks(parent_task_id);
   `,
-  19: `
+  26: `
     CREATE TABLE IF NOT EXISTS family_documents (
       id               INTEGER PRIMARY KEY AUTOINCREMENT,
       name             TEXT    NOT NULL,
@@ -483,13 +525,13 @@ const MIGRATIONS_SQL = {
     CREATE INDEX IF NOT EXISTS idx_family_documents_created_by ON family_documents(created_by);
     CREATE INDEX IF NOT EXISTS idx_family_document_access_user ON family_document_access(user_id);
   `,
-  20: `
+  27: `
     ALTER TABLE calendar_events ADD COLUMN attachment_name TEXT;
     ALTER TABLE calendar_events ADD COLUMN attachment_mime TEXT;
     ALTER TABLE calendar_events ADD COLUMN attachment_size INTEGER;
     ALTER TABLE calendar_events ADD COLUMN attachment_data TEXT;
   `,
-  21: `
+  28: `
     CREATE TABLE IF NOT EXISTS budget_loans (
       id                INTEGER PRIMARY KEY AUTOINCREMENT,
       title             TEXT    NOT NULL,
@@ -525,6 +567,12 @@ const MIGRATIONS_SQL = {
     CREATE INDEX IF NOT EXISTS idx_budget_loans_start_month ON budget_loans(start_month);
     CREATE INDEX IF NOT EXISTS idx_budget_loan_payments_loan ON budget_loan_payments(loan_id);
     CREATE INDEX IF NOT EXISTS idx_budget_loan_payments_paid_date ON budget_loan_payments(paid_date);
+  `,
+  // v41: Startdatum fuer Aufgaben (geplante / zukuenftige Aufgaben).
+  // Gespiegelt aus db.js MIGRATIONS - wie alles hier.
+  41: `
+    ALTER TABLE tasks ADD COLUMN start_date TEXT;
+    CREATE INDEX IF NOT EXISTS idx_tasks_start_date ON tasks(start_date);
   `,
   42: `
     ALTER TABLE users ADD COLUMN oidc_sub      TEXT;
@@ -921,6 +969,409 @@ const MIGRATIONS_SQL = {
   // DST-korrekte Recurrence-Expansion (#549).
   97: `
     ALTER TABLE calendar_events ADD COLUMN tzid TEXT;
+  `,
+
+  // SQL-String für Migration v121 (gespiegelt aus db.js MIGRATIONS):
+  // Einladungslinks für neue Nutzer.
+  121: `
+    CREATE TABLE IF NOT EXISTS invites (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_hash       TEXT    NOT NULL,
+      email            TEXT,
+      username         TEXT,
+      display_name     TEXT,
+      role             TEXT    NOT NULL DEFAULT 'member'
+                               CHECK(role IN ('admin', 'member')),
+      family_role      TEXT    NOT NULL DEFAULT 'other',
+      created_by       INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      expires_at       INTEGER NOT NULL,
+      accepted_at      TEXT,
+      accepted_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      revoked_at       TEXT,
+      created_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_invites_hash ON invites(token_hash);
+    CREATE INDEX IF NOT EXISTS idx_invites_open ON invites(expires_at)
+      WHERE accepted_at IS NULL AND revoked_at IS NULL;
+  `,
+
+  // SQL-String für Migration v160 (gespiegelt aus db.js MIGRATIONS):
+  // Schnellzugriffe als Kachelreihe auf der Übersicht (#469).
+  160: `
+    CREATE TABLE IF NOT EXISTS quick_links (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      name        TEXT    NOT NULL,
+      url         TEXT    NOT NULL,
+      icon_data   TEXT,
+      color       TEXT,
+      visibility  TEXT    NOT NULL DEFAULT 'all',
+      created_by  INTEGER REFERENCES users(id),
+      position    INTEGER NOT NULL DEFAULT 0,
+      created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      updated_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_quick_links_position ON quick_links(position);
+  `,
+  // SQL-String für Migration v171 (gespiegelt aus db.js MIGRATIONS):
+  // Startrechte einer Einladung (#869). Steht als EIGENER Eintrag neben 121
+  // und nicht in dessen CREATE TABLE eingearbeitet: der Spiegel bildet
+  // Versionen ab, und eine Suite, die nur `121` fährt, soll die Spalte auch
+  // nicht haben - sonst prüft sie einen Zustand, den keine Installation je
+  // hatte.
+  171: `
+    ALTER TABLE invites ADD COLUMN permissions TEXT;
+  `,
+
+  // SQL-String für Migration v172 (gespiegelt aus db.js MIGRATIONS):
+  // Persoenliche Standard-Sichtbarkeit je Gesundheitsbereich (#958).
+  172: `
+    CREATE TABLE IF NOT EXISTS health_visibility_defaults (
+      user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      scope_key  TEXT    NOT NULL,
+      visibility TEXT    NOT NULL CHECK(visibility IN ('private', 'family')),
+      updated_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      PRIMARY KEY (user_id, scope_key)
+    );
+  `,
+
+  // SQL for migration v174 (mirrored from db.js MIGRATIONS):
+  // Optional name day and its own generated calendar event.
+  174: `
+    ALTER TABLE birthdays ADD COLUMN name_day TEXT;
+    ALTER TABLE birthdays ADD COLUMN name_day_calendar_event_id INTEGER
+      REFERENCES calendar_events(id) ON DELETE SET NULL;
+    CREATE INDEX IF NOT EXISTS idx_birthdays_name_day_calendar_ref
+      ON birthdays(name_day_calendar_event_id);
+  `,
+
+  // SQL-String für Migration v175 (gespiegelt aus db.js MIGRATIONS):
+  // `access_permissions` akzeptiert neben Modulen und Widgets nun auch
+  // feingranulare Capability-Schlüssel. Bestehende Overrides bleiben erhalten.
+  175: `
+    CREATE TABLE access_permissions_new (
+      subject_type  TEXT NOT NULL CHECK(subject_type IN ('role', 'user')),
+      subject_id    TEXT NOT NULL,
+      resource_type TEXT NOT NULL CHECK(resource_type IN ('module', 'widget', 'capability')),
+      resource_key  TEXT NOT NULL,
+      access        TEXT NOT NULL CHECK(access IN ('none', 'read', 'write', 'allow')),
+      updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      PRIMARY KEY (subject_type, subject_id, resource_type, resource_key)
+    );
+    INSERT INTO access_permissions_new
+      (subject_type, subject_id, resource_type, resource_key, access, updated_at)
+    SELECT subject_type, subject_id, resource_type, resource_key, access, updated_at
+    FROM access_permissions;
+    DROP TABLE access_permissions;
+    ALTER TABLE access_permissions_new RENAME TO access_permissions;
+    CREATE INDEX IF NOT EXISTS idx_access_permissions_subject
+      ON access_permissions(subject_type, subject_id);
+  `,
+
+  // SQL-String für Migration v176 (gespiegelt aus db.js MIGRATIONS):
+  // Persoenliche und gemeinsame Kategorien fuer Notizen.
+  176: `
+      CREATE TABLE note_categories (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        name          TEXT    NOT NULL CHECK(length(trim(name)) BETWEEN 1 AND 80),
+        name_key      TEXT    NOT NULL,
+        scope         TEXT    NOT NULL CHECK(scope IN ('personal', 'household')),
+        owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        created_by    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        sort_order    INTEGER NOT NULL DEFAULT 0,
+        created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        CHECK(
+          (scope = 'personal' AND owner_user_id IS NOT NULL)
+          OR (scope = 'household' AND owner_user_id IS NULL)
+        )
+      );
+
+      CREATE TABLE note_category_assignments (
+        note_id     INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+        category_id INTEGER NOT NULL REFERENCES note_categories(id) ON DELETE CASCADE,
+        assigned_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        PRIMARY KEY (note_id, category_id)
+      );
+
+      CREATE UNIQUE INDEX idx_note_categories_household_name
+        ON note_categories(name_key)
+        WHERE scope = 'household';
+      CREATE UNIQUE INDEX idx_note_categories_personal_name
+        ON note_categories(owner_user_id, name_key)
+        WHERE scope = 'personal';
+      CREATE INDEX idx_note_categories_visible
+        ON note_categories(scope, owner_user_id, sort_order, name COLLATE NOCASE);
+      CREATE INDEX idx_note_category_assignments_category
+        ON note_category_assignments(category_id, note_id);
+      CREATE TRIGGER trg_note_categories_updated_at
+        AFTER UPDATE OF name, name_key, sort_order ON note_categories
+      BEGIN
+        UPDATE note_categories
+        SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        WHERE id = NEW.id;
+      END;
+    `,
+
+  // SQL for migration v194 (mirrored from db.js MIGRATIONS):
+  // Linked replacements keep their original recurrence slot identity.
+  194: `
+    ALTER TABLE calendar_events ADD COLUMN recurrence_parent_id INTEGER
+      REFERENCES calendar_events(id) ON DELETE CASCADE;
+    ALTER TABLE calendar_events ADD COLUMN recurrence_id TEXT;
+    ALTER TABLE calendar_events ADD COLUMN overridden_fields TEXT;
+    CREATE UNIQUE INDEX idx_calendar_occurrence_override_slot
+      ON calendar_events(recurrence_parent_id, recurrence_id)
+      WHERE recurrence_parent_id IS NOT NULL;
+    CREATE INDEX idx_calendar_occurrence_override_range
+      ON calendar_events(recurrence_parent_id, start_datetime)
+      WHERE recurrence_parent_id IS NOT NULL;
+    DROP TRIGGER IF EXISTS trg_search_events_ai;
+    DROP TRIGGER IF EXISTS trg_search_events_au;
+    DROP TRIGGER IF EXISTS trg_search_events_ad;
+    CREATE TRIGGER trg_search_events_ai AFTER INSERT ON calendar_events BEGIN
+      INSERT INTO search_index (entity, entity_id, title, body)
+      VALUES ('event', NEW.id,
+        CASE WHEN NEW.recurrence_parent_id IS NULL
+               OR EXISTS (SELECT 1 FROM json_each(
+                 CASE WHEN json_valid(NEW.overridden_fields) THEN
+                   CASE WHEN json_type(NEW.overridden_fields) = 'array' THEN NEW.overridden_fields END
+                 END) WHERE type = 'text' AND value = 'title')
+             THEN COALESCE(NEW.title, '') ELSE '' END,
+        TRIM(CASE WHEN NEW.recurrence_parent_id IS NULL
+                    OR EXISTS (SELECT 1 FROM json_each(
+                      CASE WHEN json_valid(NEW.overridden_fields) THEN
+                        CASE WHEN json_type(NEW.overridden_fields) = 'array' THEN NEW.overridden_fields END
+                      END) WHERE type = 'text' AND value = 'description')
+                  THEN COALESCE(NEW.description, '') ELSE '' END || ' ' ||
+             CASE WHEN NEW.recurrence_parent_id IS NULL
+                    OR EXISTS (SELECT 1 FROM json_each(
+                      CASE WHEN json_valid(NEW.overridden_fields) THEN
+                        CASE WHEN json_type(NEW.overridden_fields) = 'array' THEN NEW.overridden_fields END
+                      END) WHERE type = 'text' AND value = 'location')
+                  THEN COALESCE(NEW.location, '') ELSE '' END));
+    END;
+    CREATE TRIGGER trg_search_events_au AFTER UPDATE ON calendar_events BEGIN
+      DELETE FROM search_index WHERE entity = 'event' AND entity_id = OLD.id;
+      INSERT INTO search_index (entity, entity_id, title, body)
+      VALUES ('event', NEW.id,
+        CASE WHEN NEW.recurrence_parent_id IS NULL
+               OR EXISTS (SELECT 1 FROM json_each(
+                 CASE WHEN json_valid(NEW.overridden_fields) THEN
+                   CASE WHEN json_type(NEW.overridden_fields) = 'array' THEN NEW.overridden_fields END
+                 END) WHERE type = 'text' AND value = 'title')
+             THEN COALESCE(NEW.title, '') ELSE '' END,
+        TRIM(CASE WHEN NEW.recurrence_parent_id IS NULL
+                    OR EXISTS (SELECT 1 FROM json_each(
+                      CASE WHEN json_valid(NEW.overridden_fields) THEN
+                        CASE WHEN json_type(NEW.overridden_fields) = 'array' THEN NEW.overridden_fields END
+                      END) WHERE type = 'text' AND value = 'description')
+                  THEN COALESCE(NEW.description, '') ELSE '' END || ' ' ||
+             CASE WHEN NEW.recurrence_parent_id IS NULL
+                    OR EXISTS (SELECT 1 FROM json_each(
+                      CASE WHEN json_valid(NEW.overridden_fields) THEN
+                        CASE WHEN json_type(NEW.overridden_fields) = 'array' THEN NEW.overridden_fields END
+                      END) WHERE type = 'text' AND value = 'location')
+                  THEN COALESCE(NEW.location, '') ELSE '' END));
+    END;
+    CREATE TRIGGER trg_search_events_ad AFTER DELETE ON calendar_events BEGIN
+      DELETE FROM search_index WHERE entity = 'event' AND entity_id = OLD.id;
+    END;
+    DELETE FROM search_index WHERE entity = 'event';
+    INSERT INTO search_index (entity, entity_id, title, body)
+    SELECT 'event', id,
+      CASE WHEN recurrence_parent_id IS NULL
+             OR EXISTS (SELECT 1 FROM json_each(
+               CASE WHEN json_valid(overridden_fields) THEN
+                 CASE WHEN json_type(overridden_fields) = 'array' THEN overridden_fields END
+               END) WHERE type = 'text' AND value = 'title')
+           THEN COALESCE(title, '') ELSE '' END,
+      TRIM(CASE WHEN recurrence_parent_id IS NULL
+                  OR EXISTS (SELECT 1 FROM json_each(
+                    CASE WHEN json_valid(overridden_fields) THEN
+                      CASE WHEN json_type(overridden_fields) = 'array' THEN overridden_fields END
+                    END) WHERE type = 'text' AND value = 'description')
+                THEN COALESCE(description, '') ELSE '' END || ' ' ||
+           CASE WHEN recurrence_parent_id IS NULL
+                  OR EXISTS (SELECT 1 FROM json_each(
+                    CASE WHEN json_valid(overridden_fields) THEN
+                      CASE WHEN json_type(overridden_fields) = 'array' THEN overridden_fields END
+                    END) WHERE type = 'text' AND value = 'location')
+                THEN COALESCE(location, '') ELSE '' END)
+    FROM calendar_events;
+  `,
+  // Migration v196: Aenderungszaehler je Einkaufsliste fuer die
+  // Live-Aktualisierung. Backfill und Trigger sind der ganze Inhalt - eine
+  // Suite, die sie faehrt, prueft genau, dass jeder Schreibweg an
+  // shopping_lists und shopping_items die Nummer bewegt.
+  196: `
+      CREATE TABLE shopping_list_changes (
+        list_id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO shopping_list_changes (list_id, version) SELECT id, 0 FROM shopping_lists;
+      CREATE TRIGGER trg_shopping_lists_change_ai AFTER INSERT ON shopping_lists BEGIN
+        INSERT OR IGNORE INTO shopping_list_changes (list_id, version) VALUES (NEW.id, 0);
+      END;
+      CREATE TRIGGER trg_shopping_lists_change_au AFTER UPDATE ON shopping_lists BEGIN
+        INSERT INTO shopping_list_changes (list_id, version) VALUES (NEW.id, 1)
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      CREATE TRIGGER trg_shopping_items_change_ai AFTER INSERT ON shopping_items BEGIN
+        INSERT INTO shopping_list_changes (list_id, version) VALUES (NEW.list_id, 1)
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      -- NUR EINE AENDERUNG, DIE DER ZETTEL ZEIGT, ZAEHLT. Ein UPDATE ohne
+      -- WHEN bewegte die Nummer auch fuer die Buchhaltung: fuer outbound_dirty
+      -- (der CalDAV-Push setzt es nach dem eigenen Haken auf 1 und nach dem
+      -- Versand auf 0 - zwei Schritte, die keine Quittung deckt, und der
+      -- eigene Haken kostete auf einer gespiegelten Liste doch ein Nachladen),
+      -- fuer updated_at (trg_shopping_items_updated_at schreibt es in einem
+      -- zweiten UPDATE - jede Aenderung zaehlte doppelt) und fuer den
+      -- Inbound-Sync, der jede gespiegelte Zeile bei jedem Lauf unveraendert
+      -- neu schreibt. IS NOT statt <>, damit NULL gegen NULL gleich ist.
+      -- Die Liste nennt genau die Spalten, die der Zettel zeigt; eine neue
+      -- Spalte, die er zeigen soll, braucht eine Migration mit dem Trigger.
+      CREATE TRIGGER trg_shopping_items_change_au AFTER UPDATE ON shopping_items
+        WHEN NEW.list_id IS NOT OLD.list_id OR NEW.name IS NOT OLD.name
+          OR NEW.quantity IS NOT OLD.quantity OR NEW.category IS NOT OLD.category
+          OR NEW.is_checked IS NOT OLD.is_checked OR NEW.notes IS NOT OLD.notes
+          OR NEW.url IS NOT OLD.url OR NEW.sort_order IS NOT OLD.sort_order
+          OR NEW.price_cents IS NOT OLD.price_cents OR NEW.store_id IS NOT OLD.store_id
+        BEGIN
+        INSERT INTO shopping_list_changes (list_id, version) VALUES (NEW.list_id, 1)
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      CREATE TRIGGER trg_shopping_items_change_au_moved AFTER UPDATE OF list_id ON shopping_items
+        WHEN OLD.list_id <> NEW.list_id BEGIN
+        INSERT INTO shopping_list_changes (list_id, version) VALUES (OLD.list_id, 1)
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      CREATE TRIGGER trg_shopping_items_change_ad AFTER DELETE ON shopping_items BEGIN
+        INSERT INTO shopping_list_changes (list_id, version) VALUES (OLD.list_id, 1)
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      CREATE TRIGGER trg_shopping_item_tags_change_ai AFTER INSERT ON shopping_item_tags BEGIN
+        INSERT INTO shopping_list_changes (list_id, version)
+          SELECT list_id, 1 FROM shopping_items WHERE id = NEW.item_id
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      CREATE TRIGGER trg_shopping_item_tags_change_ad AFTER DELETE ON shopping_item_tags BEGIN
+        INSERT INTO shopping_list_changes (list_id, version)
+          SELECT list_id, 1 FROM shopping_items WHERE id = OLD.item_id
+          ON CONFLICT(list_id) DO UPDATE SET version = version + 1;
+      END;
+      CREATE TRIGGER trg_shopping_lists_change_ad AFTER DELETE ON shopping_lists BEGIN
+        DELETE FROM shopping_list_changes WHERE list_id = OLD.id;
+      END;
+    `,
+  // Migration 197: only the one table test-search.js needs (waste_types) -
+  // the full migration also creates schedules/overrides/one-offs, irrelevant
+  // to search. Same "extract, not exact copy" rule as key 1.
+  197: `
+    CREATE TABLE waste_types (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      name        TEXT    NOT NULL,
+      icon        TEXT    NOT NULL DEFAULT 'trash-2',
+      color       TEXT    NOT NULL,
+      archived    INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+      sort_order  INTEGER NOT NULL DEFAULT 0,
+      created_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      updated_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    );
+  `,
+  // Migration 206: FTS triggers + backfill for waste_types, same shape as key 66.
+  206: `
+    CREATE TRIGGER trg_search_waste_types_ai AFTER INSERT ON waste_types BEGIN
+      INSERT INTO search_index (entity, entity_id, title, body)
+      VALUES ('waste_type', NEW.id, COALESCE(NEW.name, ''), '');
+    END;
+    CREATE TRIGGER trg_search_waste_types_ad AFTER DELETE ON waste_types BEGIN
+      DELETE FROM search_index WHERE entity = 'waste_type' AND entity_id = OLD.id;
+    END;
+    CREATE TRIGGER trg_search_waste_types_au AFTER UPDATE ON waste_types BEGIN
+      DELETE FROM search_index WHERE entity = 'waste_type' AND entity_id = OLD.id;
+      INSERT INTO search_index (entity, entity_id, title, body)
+      VALUES ('waste_type', NEW.id, COALESCE(NEW.name, ''), '');
+    END;
+
+    INSERT INTO search_index (entity, entity_id, title, body)
+      SELECT 'waste_type', id, COALESCE(name, ''), '' FROM waste_types;
+  `,
+  209: `
+    CREATE TABLE health_fasts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      start_at TEXT NOT NULL,
+      end_at TEXT,
+      start_tzid TEXT NOT NULL,
+      goal_minutes INTEGER CHECK(goal_minutes IS NULL OR (goal_minutes BETWEEN 60 AND 20160 AND goal_minutes % 60 = 0)),
+      rating INTEGER CHECK(rating IS NULL OR rating BETWEEN 1 AND 5),
+      note TEXT CHECK(note IS NULL OR length(note) <= 2000),
+      visibility TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('private', 'family')),
+      revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      CHECK(end_at IS NULL OR end_at > start_at)
+    );
+    CREATE UNIQUE INDEX idx_health_fasts_one_active ON health_fasts(user_id) WHERE end_at IS NULL;
+    CREATE INDEX idx_health_fasts_owner_interval ON health_fasts(user_id, start_at, end_at);
+    CREATE TABLE health_fasting_settings (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      default_goal_minutes INTEGER CHECK(default_goal_minutes IS NULL OR (default_goal_minutes BETWEEN 60 AND 20160 AND default_goal_minutes % 60 = 0)),
+      zone_mode TEXT NOT NULL DEFAULT 'timer' CHECK(zone_mode IN ('timer', 'educational')),
+      safety_acknowledged_at TEXT,
+      safety_acknowledged_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    );
+  `,
+  // Nur die Markierungstabelle aus v215, nicht der ganze Eintrag: sie ist die,
+  // an der `resolvePermissions()` haengt (ein Display bekommt seine Modulrechte
+  // aus seiner Scope-Liste, #1208). Kopplungscodes und Geraete braucht keine
+  // Suite, die Rechte aufloest.
+  215: `
+    CREATE TABLE IF NOT EXISTS display_accounts (
+      user_id    INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    );
+  `,
+  220: `
+    DROP TRIGGER IF EXISTS trg_reminders_tasks_ad;
+    DROP TRIGGER IF EXISTS trg_reminders_events_ad;
+    CREATE TABLE reminders_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_type TEXT NOT NULL CHECK(entity_type IN ('task', 'event', 'subscription', 'inventory_item', 'inventory_tracked_date', 'pantry_item', 'cycle_period', 'cycle_log_nudge', 'schedule_entry', 'schedule_extra_entry', 'waste_pickup', 'document_expiry', 'health_prevention_due', 'fasting_goal', 'fasting_next_start')),
+      entity_id INTEGER NOT NULL,
+      remind_at TEXT NOT NULL,
+      dismissed INTEGER NOT NULL DEFAULT 0,
+      created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      pushed_at TEXT,
+      assigned_from INTEGER REFERENCES users(id) ON DELETE SET NULL
+    );
+    INSERT INTO reminders_new (id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from)
+      SELECT id, entity_type, entity_id, remind_at, dismissed, created_by, created_at, pushed_at, assigned_from FROM reminders;
+    DROP TABLE reminders;
+    ALTER TABLE reminders_new RENAME TO reminders;
+    CREATE INDEX idx_reminders_entity ON reminders(entity_type, entity_id);
+    CREATE INDEX idx_reminders_remind ON reminders(remind_at);
+    CREATE INDEX idx_reminders_user ON reminders(created_by);
+    CREATE INDEX idx_reminders_assigned_from ON reminders(assigned_from);
+    CREATE TRIGGER trg_reminders_tasks_ad
+    AFTER DELETE ON tasks BEGIN
+      DELETE FROM reminders WHERE entity_type = 'task' AND entity_id = OLD.id;
+    END;
+    CREATE TRIGGER trg_reminders_events_ad
+    AFTER DELETE ON calendar_events BEGIN
+      DELETE FROM reminders WHERE entity_type = 'event' AND entity_id = OLD.id;
+    END;
+    ALTER TABLE health_fasting_settings ADD COLUMN remind_goal INTEGER NOT NULL DEFAULT 0 CHECK(remind_goal IN (0, 1));
+    ALTER TABLE health_fasting_settings ADD COLUMN remind_next_start INTEGER NOT NULL DEFAULT 0 CHECK(remind_next_start IN (0, 1));
   `,
 };
 

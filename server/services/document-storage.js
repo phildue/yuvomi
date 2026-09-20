@@ -7,18 +7,20 @@ import { randomUUID } from 'node:crypto';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import fs from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import * as db from '../db.js';
 import * as googleDriveStorage from './google-drive-storage.js';
 import { isBlockedAddress, isBlockedHostname, normalizeHostname } from '../utils/ssrf.js';
 import { safeRequest } from '../utils/http.js';
+import { MAX_UPLOAD_BYTES } from '../utils/upload-limit.js';
 
 const CONFIG_PREFIX = 'document_storage_webdav_';
 const SELECTED_BACKEND_KEY = 'document_storage_selected_backend';
 const SELECTABLE_BACKENDS = new Set(['local', 'webdav', 'google_drive']);
 const DEFAULT_BASE_PATH = 'yuvomi-documents';
 const DEFAULT_TIMEOUT_MS = 8_000;
-const MAX_READ_BYTES = 5 * 1024 * 1024;
+const MAX_READ_BYTES = MAX_UPLOAD_BYTES;
 
 const ENV_FIELDS = {
   enabled: 'DOCUMENT_STORAGE_WEBDAV_ENABLED',
@@ -68,6 +70,74 @@ export function getLocalStorageConfig() {
     enabled: parseEnvFlag('DOCUMENT_STORAGE_LOCAL_ENABLED'),
     basePath: basePath || '/documents',
   };
+}
+
+/**
+ * Prüft beim Start, ob der Ordner für lokale Dokumentablage wirklich da ist.
+ *
+ * DER SCHADEN HIER IST DAS GELINGEN, NICHT DAS SCHEITERN. Der Schreibpfad legt
+ * fehlende Ordner mit `mkdir(recursive)` an und meldet echte Fehler laut - aber
+ * zeigt `DOCUMENT_STORAGE_LOCAL_PATH` auf einen Pfad, den niemand gemountet hat,
+ * dann gelingt genau das: der Ordner entsteht in der Container-Overlay-Schicht,
+ * der Upload klappt, und beim nächsten `pull && up -d` sind die Dateien weg,
+ * während die Datenbank sie weiter referenziert. Kein Fehler, keine Meldung,
+ * keine Datei.
+ *
+ * Deshalb wird hier die EXISTENZ geprüft und nicht nur die Schreibbarkeit: ein
+ * fehlender Ordner ist im Container das Kennzeichen des fehlenden Mounts.
+ * `_DIR` (Host) und `_PATH` (Container) sind die zwei Enden einer Verbindung,
+ * und sie laufen in der Praxis auseinander - im Auslöser dieses Checks zeigte
+ * der Mount auf `/cosmos-storage/documents`, während der Pfad auf dem Default
+ * `/documents` stand (#751).
+ *
+ * Bewusst nur eine Warnung, kein Abbruch (anders als beim Backup-Verzeichnis):
+ * die Dokumentablage ist ein Zusatz, und eine sonst gesunde Installation soll
+ * daran nicht sterben. Sie muss nur laut genug sein, um vor dem ersten Upload
+ * gelesen zu werden.
+ *
+ * @param {{ warn: (msg: string) => void }} log
+ * @returns {Promise<'ok'|'missing'|'not-writable'|'disabled'>} für Tests
+ */
+export async function checkLocalStorageMount(log) {
+  const cfg = getLocalStorageConfig();
+  if (!cfg.enabled) return 'disabled';
+
+  const resolved = path.resolve(cfg.basePath);
+  try {
+    const stat = await fs.stat(resolved);
+    if (!stat.isDirectory()) {
+      log.warn(
+        `DOCUMENT_STORAGE_LOCAL_PATH "${resolved}" exists but is not a directory. `
+        + 'Uploaded documents cannot be stored there.'
+      );
+      return 'not-writable';
+    }
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      log.warn(
+        `DOCUMENT_STORAGE_LOCAL_PATH "${resolved}" does not exist. `
+        + 'Uploads would be written into the container layer and lost on the next update, '
+        + 'while the database keeps referencing them. Mount a host folder onto that exact path '
+        + '(DOCUMENT_STORAGE_LOCAL_DIR is the host side, DOCUMENT_STORAGE_LOCAL_PATH the container side - '
+        + 'they are the two ends of one mount and must match).'
+      );
+      return 'missing';
+    }
+    log.warn(`DOCUMENT_STORAGE_LOCAL_PATH "${resolved}" is not readable (${err.code}).`);
+    return 'not-writable';
+  }
+
+  try {
+    await fs.access(resolved, fsConstants.W_OK);
+  } catch (err) {
+    log.warn(
+      `DOCUMENT_STORAGE_LOCAL_PATH "${resolved}" is not writable (${err.code}). `
+      + 'Check the ownership of the mounted host folder; uploads will fail until it is fixed.'
+    );
+    return 'not-writable';
+  }
+
+  return 'ok';
 }
 
 function storedSelectedUploadBackend() {

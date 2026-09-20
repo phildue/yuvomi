@@ -4,14 +4,17 @@
  */
 
 import { api } from '/api.js';
-import { openModal as openSharedModal, closeModal, confirmModal, confirmOverModal } from '/components/modal.js';
+import { openModal as openSharedModal, closeModal, confirmModal, confirmOverModal, reportFieldError, refocusAfterRender } from '/components/modal.js';
 import { renderDocumentAttachField, bindDocumentAttachField } from '/components/document-attach.js';
 import { t, formatDate, getLocale, dateInputPlaceholder, parseDateInput, isDateInputValid } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { stagger } from '/utils/ux.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
-import { formatMoney } from '/utils/money.js';
+import { formatMoney, amountPlaceholder, toDecimalString, amountIsSavable, smallestUnitLabel } from '/utils/money.js';
+import { todayKey } from '/utils/date.js';
 import { wireTablist } from '/utils/tablist.js';
+import { findPageFab } from '/utils/fab.js';
+import { emptyStateHTML } from '/utils/empty-state.js';
 
 let state = {
   meta: null,
@@ -32,6 +35,29 @@ let state = {
   user: null,
 };
 let _container = null;
+// Eingebettet (siehe render) sinkt die ganze Gliederung um eine Stufe: der Tab-Titel
+// ist <h2>, also Gruppenname <h3> und Karten <h4> - Budget > Split-Ausgaben > Gruppe
+// > Abschnitt (Nachtrag aus dem Review von #1148). Die Optik haengt an Klassen
+// (.split-group-name, .split-card-title), nicht am Tag.
+let _embedded = false;
+
+/* UEBERGABE AUS DEM BUDGET (#1057).
+ *
+ * Eine Buchung mit Zustaendigen kann in die geteilten Ausgaben gereicht werden,
+ * mit den Zustaendigen als Beteiligte. Das ist der Uebergang, den das Ticket
+ * ausdruecklich statt einer Verschmelzung der beiden Funktionen wollte: das
+ * Etikett im Budget bleibt eine Zuschreibung, die Forderung entsteht erst hier,
+ * und der Nutzer bestaetigt sie im Dialog.
+ *
+ * DER DIALOG WIRD NICHT UEBERSPRUNGEN. Die Aufteilung, die Waehrung und die
+ * Gruppe sind Entscheidungen, die das Budget nicht treffen kann - vorbefuellt
+ * wird, was es weiss, den Rest sieht und bestaetigt die Person davor.
+ */
+let _pendingPrefill = null;
+
+export function prefillSplitExpense(data) {
+  _pendingPrefill = data ?? null;
+}
 let _statusTablist = null;   // wireTablist-Handle des Statusfilters (sync ohne onChange)
 
 function setHtml(element, html) {
@@ -60,22 +86,42 @@ function groupIcon(type) {
   }[type] || 'users';
 }
 
-export async function render(container, { user } = {}) {
+export async function render(container, { user, embedded = false } = {}) {
   _container = container;
+  _embedded = embedded;
   state.user = user || null;
+  // `split`, nicht `reading`: Kopf und Kennzahlenband stehen ueber einem
+  // zweispaltigen .split-layout (Gruppen links, Detail rechts) - das IST die
+  // Bauart des Modus. Das Raster selbst traegt die Seite noch in eigenem CSS
+  // (Container-Queries statt Viewport-Breite, siehe split-expenses.css);
+  // das Shell-Raster wirkt nur auf .app-page__body, den es hier nicht gibt.
+  //
+  // EINGEBETTET (budget.js ruft immer mit embedded:true - es gibt heute keine
+  // eigenstaendige Route) TRAEGT DIE UEBERSCHRIFT KEIN ZWEITES <h1>: der
+  // Modulkopf sagt bereits "Budget" (Cross-Modul-Review). Die Budget-Seiten-
+  // CSS behandelte den Split-Titel dort eingebettet schon laenger als
+  // Bereichs-Ueberschrift (typography.css) - das Element selbst blieb bis
+  // hierher ein <h1> und widersprach damit seiner eigenen Rolle. Aus demselben
+  // Grund traegt der Knopf hier --secondary statt --primary: die Primaeraktion ist der FAB
+  // (#split-fab, siehe unten), nicht zwei violette Knoepfe fuer dieselbe
+  // Handlung. Unveraendert bleibt die (heute nicht erreichte) eigenstaendige
+  // Zukunft: <h1> plus Primaerknopf, falls Split-Ausgaben je eine eigene
+  // Navigationsebene bekommt (DESIGN.md, Q-3).
+  const TitleTag = embedded ? 'h2' : 'h1';
+  const addExpenseBtnVariant = embedded ? 'btn--secondary' : 'btn--primary';
   setHtml(container, `
-    <div class="split-page">
-      <header class="budget-panel-head split-topbar">
+    <div class="split-page app-page app-page--split" data-composition="split">
+      <header class="panel-head split-topbar">
         <div>
-          <h1 class="split-title">${t('splitExpenses.title')}</h1>
+          <${TitleTag} class="split-title">${t('splitExpenses.title')}</${TitleTag}>
           <p class="split-subtitle">${t('splitExpenses.subtitle')}</p>
         </div>
-        <button class="btn btn--primary" id="split-add-expense">
+        <button class="btn ${addExpenseBtnVariant}" id="split-add-expense">
           <i data-lucide="plus" class="icon-md" aria-hidden="true"></i>
           ${t('splitExpenses.addExpense')}
         </button>
       </header>
-      <section class="budget-summary" id="split-summary"></section>
+      <section class="metric-grid" id="split-summary"></section>
       <div class="split-layout">
         <aside class="split-groups-panel">
           <div class="split-panel-head">
@@ -95,10 +141,10 @@ export async function render(container, { user } = {}) {
                Pillen-Optik, und role="radiogroup" statt role="group": eine
                Einfachauswahl, die ihren Zustand ansagt und über die geteilte
                Verhaltensschicht Pfeiltasten mitbringt (Critique 2026-07-30, P1). -->
-          <div class="budget-segmented split-status-filter" id="split-status-filter" role="radiogroup" aria-label="${t('splitExpenses.statusLabel')}">
+          <div class="segmented split-status-filter" id="split-status-filter" role="radiogroup" aria-label="${t('splitExpenses.statusLabel')}">
             ${[['active', 'splitExpenses.statusActive'], ['archived', 'splitExpenses.statusArchived']].map(([id, key]) => {
               const on = state.groupStatus === id;
-              return `<button type="button" class="budget-segmented__item${on ? ' is-active' : ''}"
+              return `<button type="button" class="segmented__item${on ? ' is-active' : ''}"
                   role="radio" data-tab-id="${id}" aria-checked="${on}"
                   tabindex="${on ? '0' : '-1'}">${t(key)}</button>`;
             }).join('')}
@@ -107,7 +153,7 @@ export async function render(container, { user } = {}) {
         </aside>
         <main class="split-main" id="split-main" aria-busy="true">${renderSkeletonList({ rows: 5, lines: 2 })}</main>
       </div>
-      <button class="page-fab" id="split-fab" aria-label="${t('splitExpenses.addExpense')}">
+      <button class="page-fab" id="split-fab" aria-label="${t('splitExpenses.addExpense')}" data-dock-label="${t('newLabel.splitExpenses')}">
         <i data-lucide="plus" class="icon-xl" aria-hidden="true"></i>
       </button>
     </div>
@@ -116,6 +162,14 @@ export async function render(container, { user } = {}) {
   await loadInitial();
   bindShell();
   renderAll();
+
+  // Erst NACH renderAll(): der Dialog braucht die geladenen Gruppen und
+  // Mitglieder, sonst stuende er ohne Beteiligte da.
+  if (_pendingPrefill) {
+    const prefill = _pendingPrefill;
+    _pendingPrefill = null;
+    openExpenseModal(null, prefill);
+  }
 }
 
 async function loadInitial() {
@@ -180,7 +234,7 @@ async function loadMemberCandidates() {
 function bindShell() {
   _container.querySelector('#split-add-group')?.addEventListener('click', () => openGroupModal());
   _container.querySelector('#split-add-expense')?.addEventListener('click', () => openExpenseModal());
-  _container.querySelector('#split-fab')?.addEventListener('click', () => openExpenseModal());
+  findPageFab('split-fab')?.addEventListener('click', () => openExpenseModal());
   let groupSearchTimer;
   _container.querySelector('#split-group-search')?.addEventListener('input', (e) => {
     const value = e.target.value.trim();
@@ -235,7 +289,7 @@ function renderStatusFilter() {
   _statusTablist?.sync(state.groupStatus);
   const addExpense = _container.querySelector('#split-add-expense');
   if (addExpense) addExpense.hidden = isArchivedView();
-  const fab = _container.querySelector('#split-fab');
+  const fab = findPageFab('split-fab');
   if (fab) fab.hidden = isArchivedView();
 }
 
@@ -249,17 +303,17 @@ function renderSummary() {
   // Rolle `total`: die Richtung steht im Label („Du bekommst" / „Du schuldest"),
   // nicht im Vorzeichen - deshalb der Ton explizit statt aus der Zahl.
   setHtml(summary, `
-    <div class="budget-summary-card budget-summary-card--positive">
-      <div class="budget-summary-card__label">${t('splitExpenses.youAreOwed')}</div>
-      <div class="budget-summary-card__amount">${owed.length ? owed.map((r) => money(r.amount, r.currency)).join(' · ') : money(0, state.meta.default_currency)}</div>
+    <div class="metric-card metric-card--positive">
+      <div class="metric-card__label">${t('splitExpenses.youAreOwed')}</div>
+      <div class="metric-card__value">${owed.length ? owed.map((r) => money(r.amount, r.currency)).join(' · ') : money(0, state.meta.default_currency)}</div>
     </div>
-    <div class="budget-summary-card budget-summary-card--negative">
-      <div class="budget-summary-card__label">${t('splitExpenses.youOwe')}</div>
-      <div class="budget-summary-card__amount">${owing.length ? owing.map((r) => money(r.amount, r.currency)).join(' · ') : money(0, state.meta.default_currency)}</div>
+    <div class="metric-card metric-card--negative">
+      <div class="metric-card__label">${t('splitExpenses.youOwe')}</div>
+      <div class="metric-card__value">${owing.length ? owing.map((r) => money(r.amount, r.currency)).join(' · ') : money(0, state.meta.default_currency)}</div>
     </div>
-    <div class="budget-summary-card">
-      <div class="budget-summary-card__label">${isArchivedView() ? t('splitExpenses.statusArchived') : t('splitExpenses.activeGroups')}</div>
-      <div class="budget-summary-card__amount">${state.groups.length}</div>
+    <div class="metric-card">
+      <div class="metric-card__label">${isArchivedView() ? t('splitExpenses.statusArchived') : t('splitExpenses.activeGroups')}</div>
+      <div class="metric-card__value">${state.groups.length}</div>
     </div>
   `);
 }
@@ -267,18 +321,18 @@ function renderSummary() {
 function renderGroups() {
   const el = _container.querySelector('#split-groups');
   if (!state.groups.length) {
-    setHtml(el, isArchivedView() ? `
-      <div class="empty-state split-empty-inline">
-        <i data-lucide="archive" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${t('splitExpenses.emptyArchivedTitle')}</div>
-      </div>
-    ` : `
-      <div class="empty-state split-empty-inline">
-        <i data-lucide="receipt-text" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${t('splitExpenses.emptyGroupsTitle')}</div>
-        <div class="empty-state__description">${t('splitExpenses.emptyGroupsText')}</div>
-      </div>
-    `);
+    setHtml(el, isArchivedView()
+      ? emptyStateHTML({
+        className: 'split-empty-inline',
+        icon: 'archive',
+        title: t('splitExpenses.emptyArchivedTitle'),
+      })
+      : emptyStateHTML({
+        className: 'split-empty-inline',
+        icon: 'receipt-text',
+        title: t('splitExpenses.emptyGroupsTitle'),
+        description: t('splitExpenses.emptyGroupsText'),
+      }));
     return;
   }
   setHtml(el, state.groups.map((group) => `
@@ -297,28 +351,30 @@ function renderMain() {
   main.removeAttribute('aria-busy');
   const group = state.groups.find((g) => g.id === state.activeGroupId);
   if (!group) {
-    setHtml(main, isArchivedView() ? `
-      <div class="empty-state split-main-empty">
-        <i data-lucide="archive" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${t('splitExpenses.emptyArchivedTitle')}</div>
-      </div>
-    ` : `
-      <div class="empty-state split-main-empty">
-        <i data-lucide="users-round" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${t('splitExpenses.emptyGroupsTitle')}</div>
-        <div class="empty-state__description">${t('splitExpenses.emptyGroupsText')}</div>
-      </div>
-    `);
+    setHtml(main, isArchivedView()
+      ? emptyStateHTML({
+        className: 'split-main-empty',
+        icon: 'archive',
+        title: t('splitExpenses.emptyArchivedTitle'),
+      })
+      : emptyStateHTML({
+        className: 'split-main-empty',
+        icon: 'users-round',
+        title: t('splitExpenses.emptyGroupsTitle'),
+        description: t('splitExpenses.emptyGroupsText'),
+      }));
     return;
   }
   // Archiv-Ansicht: Salden, Ausgaben und Verlauf bleiben lesbar, alle
   // schreibenden Aktionen weichen dem Wiederherstellen (#574).
   const archived = isArchivedView();
+  const GroupTag = _embedded ? 'h3' : 'h2';
+  const SectionTag = _embedded ? 'h4' : 'h3';
   setHtml(main, `
     <section class="split-group-header">
       <div>
-        <div class="split-kicker">${t(`splitExpenses.groupType.${group.type}`)}</div>
-        <h2>${esc(group.name)}</h2>
+        <${GroupTag} class="split-group-name">${esc(group.name)}</${GroupTag}>
+        <p class="split-group-type">${t(`splitExpenses.groupType.${group.type}`)}</p>
         ${archived ? `<p class="split-archived-badge"><i data-lucide="archive" class="icon-md" aria-hidden="true"></i>${t('splitExpenses.statusArchived')}</p>` : ''}
         <p>${esc(group.description || t('splitExpenses.groupDefaultDescription'))}</p>
       </div>
@@ -335,7 +391,12 @@ function renderMain() {
         <button class="btn btn--secondary btn--icon" id="split-archive-group" aria-label="${t('splitExpenses.archiveGroup')}">
           <i data-lucide="archive" aria-hidden="true"></i>
         </button>
-        <button class="btn btn--secondary btn--icon" id="split-delete-group" aria-label="${t('splitExpenses.deleteGroup')}">
+        <!-- Loeschen ist unumkehrbar (die Gruppe faellt mitsamt ihrer Ausgaben),
+             Bearbeiten/Archivieren nicht - dieselbe Kapsel fuer alle drei
+             verwischte den Unterschied. --danger-outline hebt sich ab, ohne die
+             Zeile zu dominieren; confirmModal({danger:true}) haengt schon
+             darunter (deleteGroup()). -->
+        <button class="btn btn--icon btn--danger-outline" id="split-delete-group" aria-label="${t('splitExpenses.deleteGroup')}">
           <i data-lucide="trash-2" aria-hidden="true"></i>
         </button>`}
         <button class="btn btn--secondary" id="split-settle">
@@ -351,20 +412,20 @@ function renderMain() {
     <div class="split-content-grid">
       <section class="split-card split-card--balances">
         <div class="split-card-head">
-          <h3>${t('splitExpenses.balances')}</h3>
+          <${SectionTag} class="split-card-title">${t('splitExpenses.balances')}</${SectionTag}>
           <span>${t('splitExpenses.simplified')}</span>
         </div>
         <div id="split-balances">${renderBalances()}</div>
       </section>
       <section class="split-card">
         <div class="split-card-head">
-          <h3>${t('splitExpenses.recentExpenses')}</h3>
+          <${SectionTag} class="split-card-title">${t('splitExpenses.recentExpenses')}</${SectionTag}>
         </div>
         <div id="split-expense-list">${renderExpenses(archived)}</div>
       </section>
       <section class="split-card">
         <div class="split-card-head">
-          <h3>${t('splitExpenses.activity')}</h3>
+          <${SectionTag} class="split-card-title">${t('splitExpenses.activity')}</${SectionTag}>
         </div>
         <div class="split-activity">${renderActivity()}</div>
       </section>
@@ -468,6 +529,7 @@ async function archiveGroup(groupId) {
   await loadGroups();
   await loadGroupData();
   renderAll();
+  refocusAfterRender();
 }
 
 /**
@@ -494,6 +556,7 @@ async function deleteGroup(groupId) {
   const confirmed = await confirmModal(t('splitExpenses.deleteGroupConfirm'), {
     danger: true,
     confirmLabel: t('splitExpenses.deleteGroup'),
+    detail: t('splitExpenses.deleteGroupConfirmDetail'),
   });
   if (!confirmed) return;
   await api.delete(`/split-expenses/groups/${groupId}`);
@@ -501,6 +564,7 @@ async function deleteGroup(groupId) {
   await loadGroups();
   await loadGroupData();
   renderAll();
+  refocusAfterRender();
 }
 
 function memberOptions(selectedId = '', source = state.groupMembers.length ? state.groupMembers : state.members) {
@@ -612,11 +676,17 @@ function defaultSplitValues(group) {
 
 function updateSplitInputs(panel) {
   const method = panel.querySelector('[name="split_method"]')?.value || 'equal';
+  // Der Betrag und die Teilbeträge stehen in der gewählten Währung; Prozente
+  // und Anteile sind reine Zahlen und behalten ihren festen Platzhalter.
+  const currency = panel.querySelector('[name="currency"]')?.value || state.meta?.default_currency || 'EUR';
+  const zero = amountPlaceholder(currency);
+  const amountInput = panel.querySelector('[name="amount"]');
+  if (amountInput) amountInput.placeholder = zero;
   panel.querySelectorAll('.split-split-value').forEach((input) => {
     input.hidden = method === 'equal';
     input.required = method !== 'equal';
     if (method === 'percentage') input.placeholder = '30';
-    else if (method === 'exact') input.placeholder = '70.00';
+    else if (method === 'exact') input.placeholder = zero;
     else if (method === 'shares') input.placeholder = '1';
     else input.placeholder = '';
   });
@@ -624,8 +694,42 @@ function updateSplitInputs(panel) {
   validateSplitForm(panel);
 }
 
+/**
+ * Ein Geldbetrag aus dem Formular in der Schreibweise, die der Server erwartet.
+ *
+ * parseMoneyToMinor() in server/services/split-expenses.js nimmt ausschliesslich
+ * /^-?\d+(\.\d+)?$/ entgegen, die Eingabe folgt dagegen der Region - bis in die
+ * Ziffern hinein. Ohne diese Umschrift kommt "12,50" oder "۱۲٫۵۰" unverändert
+ * am Server an, und das Anlegen scheitert dort mit einem Fehler, der auf kein
+ * Feld zeigt. Die Umschrift selbst steht in utils/money.js, der einen Quelle
+ * für Geldformate.
+ */
+const decimalString = toDecimalString;
+
+/**
+ * Weist einen Betrag zurück, der mehr Nachkommastellen hat als die Währung
+ * kennt. Die Felder hier sind Textfelder, es gibt also kein `step`, das der
+ * Browser prüfen könnte - und der Platzhalter zeigt bei HUF, IDR oder IRR
+ * bereits ganze Einheiten an.
+ *
+ * Ohne diese Prüfung landet die Ablehnung beim Server (parseMoneyToMinor wirft
+ * bei zu vielen Stellen), und die Meldung erscheint als ortloser Fehler statt
+ * am Feld, das sie meint.
+ *
+ * @returns {boolean} true, wenn abgewiesen wurde (der Aufrufer bricht dann ab)
+ */
+function rejectOffGridSplitAmount(input, value, currency, original = null) {
+  if (input == null || value === '' || value == null) return false;
+  if (amountIsSavable(value, currency, { original })) return false;
+  reportFieldError(input, t('common.amountPrecisionRequired', {
+    currency,
+    step: smallestUnitLabel(currency),
+  }));
+  return true;
+}
+
 function numberValue(value) {
-  const normalized = String(value || '').trim().replace(',', '.');
+  const normalized = decimalString(value);
   if (!normalized) return NaN;
   return Number(normalized);
 }
@@ -738,7 +842,7 @@ function collectGroupDefaults(form, data) {
   const config = [];
   if (method === 'percentage' || method === 'shares') {
     form.querySelectorAll('.split-default-value').forEach((input) => {
-      const raw = String(input.value).trim();
+      const raw = decimalString(input.value);
       if (!raw) return;
       const uid = Number(input.name.replace('default_value_', ''));
       config.push(method === 'shares' ? { user_id: uid, shares: Number(raw) } : { user_id: uid, percentage: raw });
@@ -766,7 +870,7 @@ function collectSplitPayload(form) {
   const participants = [...form.querySelectorAll('input[name="participants"]:checked')].map((input) => Number(input.value));
   if (method === 'equal') return { participants, splits: [] };
   const splits = participants.map((userId) => {
-    const value = form.querySelector(`[name="split_value_${userId}"]`)?.value.trim() || '';
+    const value = decimalString(form.querySelector(`[name="split_value_${userId}"]`)?.value);
     if (method === 'percentage') return { user_id: userId, percentage: value };
     if (method === 'exact') return { user_id: userId, amount: value };
     return { user_id: userId, shares: Number(value) };
@@ -857,21 +961,46 @@ async function openGroupModal(group = null) {
         await loadGroups();
         await loadGroupData();
         renderAll();
+        refocusAfterRender();
       });
     },
   });
 }
 
-function openExpenseModal(expense = null) {
+function openExpenseModal(expense = null, prefill = null) {
   if (!state.activeGroupId) return openGroupModal();
   const group = state.groups.find((g) => g.id === state.activeGroupId);
   const isEdit = Boolean(expense && expense.id);
+  // Eine Vorbelegung aus dem Budget (#1057) verhaelt sich wie eine NEUE Ausgabe,
+  // deren Felder schon ausgefuellt sind - nicht wie eine bearbeitete.
+  if (prefill && !isEdit) {
+    expense = {
+      title: prefill.title ?? '',
+      amount: prefill.amount ?? '',
+      currency: prefill.currency ?? group.default_currency,
+      expense_date: prefill.date ?? null,
+    };
+  }
   // Neue Ausgaben starten mit der Standard-Aufteilung der Gruppe (#517),
   // bestehende mit ihrer eigenen gespeicherten Aufteilung.
   const method = isEdit ? (expense.split_method || 'equal') : (group.default_split_method || 'equal');
-  const selectedIds = isEdit ? (expense.splits || []).map((s) => s.user_id) : null;
+  // `null` heisst "Standard-Aufteilung der Gruppe". Eine Vorbelegung aus dem
+  // Budget nennt dagegen genau die Zustaendigen (#1057) - aber nur die, die
+  // auch in DIESER Gruppe sind: eine Person, die im Haushalt zustaendig ist,
+  // aber nicht zur Gruppe gehoert, kann hier nichts tragen. Bleibt davon
+  // niemand uebrig, faellt es auf die Standard-Aufteilung zurueck statt auf
+  // eine Ausgabe ohne Beteiligte.
+  const prefilledIds = prefill?.participantIds?.length
+    ? prefill.participantIds.filter((id) => state.groupMembers.some((m) => Number(m.id ?? m.user_id) === Number(id)))
+    : [];
+  const selectedIds = isEdit
+    ? (expense.splits || []).map((s) => s.user_id)
+    : (prefilledIds.length ? prefilledIds : null);
   const splitValues = isEdit ? deriveSplitValues(expense) : defaultSplitValues(group);
-  const today = (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; })();
+  // Der vorbelegte Tag ist „heute" und geht deshalb nach der Anzeigezone - aus
+  // der Browser-Uhr gebaut trug eine neue Ausgabe abends in einer anderen Zone
+  // den Nachbartag (#829, Nachlese #851).
+  const today = todayKey();
   const methodOption = (value, label) => `<option value="${value}" ${value === method ? 'selected' : ''}>${label}</option>`;
   openSharedModal({
     title: isEdit ? t('splitExpenses.editExpense') : t('splitExpenses.addExpense'),
@@ -879,12 +1008,12 @@ function openExpenseModal(expense = null) {
       <form id="split-expense-form" class="split-form">
         <label>${t('splitExpenses.titleLabel')}<input class="input" name="title" required maxlength="200" value="${esc(expense?.title || '')}"></label>
         <div class="split-form-row">
-          <label>${t('splitExpenses.amount')}<input class="input" name="amount" inputmode="decimal" placeholder="42.50" required value="${esc(expense?.amount || '')}"></label>
+          <label>${t('splitExpenses.amount')}<input class="input" name="amount" inputmode="decimal" placeholder="${amountPlaceholder(isEdit ? expense.currency : group.default_currency)}" required value="${esc(expense?.amount || '')}"></label>
           <label>${t('splitExpenses.paidBy')}<select class="input" name="payer_id">${memberOptions(isEdit ? expense.payer_id : state.user?.id)}</select></label>
         </div>
         <div class="split-form-row">
-          <label>${t('splitExpenses.currency')}<select class="input" name="currency">${state.meta.currencies.map((c) => `<option value="${c}" ${c === (isEdit ? expense.currency : group.default_currency) ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
-          <label>${t('splitExpenses.date')}<yuvomi-datepicker name="expense_date" type="date" value="${esc(isEdit ? (expense.expense_date || today) : today)}"></yuvomi-datepicker></label>
+          <label>${t('splitExpenses.currency')}<select class="input" name="currency">${state.meta.currencies.map((c) => `<option value="${c}" ${c === (expense?.currency || group.default_currency) ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
+          <label>${t('splitExpenses.date')}<yuvomi-datepicker name="expense_date" type="date" value="${esc(expense?.expense_date || today)}"></yuvomi-datepicker></label>
         </div>
         <label>${t('splitExpenses.splitMethod')}<select class="input" name="split_method">
           ${methodOption('equal', t('splitExpenses.splitEqual'))}
@@ -913,6 +1042,7 @@ function openExpenseModal(expense = null) {
       // Ausgabe - ein Kassenbon soll dort auffindbar bleiben.
       const receipts = bindDocumentAttachField(panel, {
         category: 'finance',
+        folderKey: 'splitExpenses',
         folderName: t('documents.splitExpensesFolder'),
         documentName: (file) => t('splitExpenses.receiptDocumentName', {
           title: panel.querySelector('[name="title"]').value.trim() || file.name,
@@ -921,6 +1051,7 @@ function openExpenseModal(expense = null) {
       });
       panel.querySelector('#split-cancel-expense')?.addEventListener('click', () => closeModal());
       panel.querySelector('[name="split_method"]')?.addEventListener('change', () => updateSplitInputs(panel));
+      panel.querySelector('[name="currency"]')?.addEventListener('change', () => updateSplitInputs(panel));
       panel.querySelector('#split-expense-form')?.addEventListener('input', () => validateSplitForm(panel));
       panel.querySelectorAll('input[name="participants"]').forEach((input) => {
         const row = input.closest('.split-participant-row');
@@ -939,18 +1070,31 @@ function openExpenseModal(expense = null) {
         const confirmed = await confirmOverModal(t('splitExpenses.deleteExpenseConfirm'), {
           danger: true,
           confirmLabel: t('common.delete'),
+          detail: t('splitExpenses.deleteExpenseConfirmDetail'),
         });
         if (!confirmed) return;
         await api.delete(`/split-expenses/expenses/${expense.id}`);
         await refreshDashboard();
         await loadGroupData();
         renderAll();
+        refocusAfterRender();
       });
       panel.querySelector('#split-expense-form')?.addEventListener('submit', async (e) => {
         e.preventDefault();
         if (!validateSplitForm(panel)) return;
         const form = panel.querySelector('#split-expense-form');
         const data = Object.fromEntries(new FormData(form));
+        data.amount = decimalString(data.amount);
+        const expenseCurrency = form.querySelector('[name="currency"]')?.value || group.default_currency;
+        if (rejectOffGridSplitAmount(form.querySelector('[name="amount"]'), numberValue(data.amount),
+          expenseCurrency, isEdit ? expense.amount : null)) return;
+        // Auch die Genau-Beträge: sie sind Geld in derselben Währung.
+        if (form.querySelector('[name="split_method"]')?.value === 'exact') {
+          for (const field of form.querySelectorAll('.split-split-value')) {
+            if (field.hidden || !field.value) continue;
+            if (rejectOffGridSplitAmount(field, numberValue(field.value), expenseCurrency)) return;
+          }
+        }
         const { participants, splits } = collectSplitPayload(form);
         const payload = { ...data, participants, splits };
         // commit() lädt wartende Dateien erst jetzt hoch: ein abgebrochenes
@@ -962,6 +1106,7 @@ function openExpenseModal(expense = null) {
         await refreshDashboard();
         await loadGroupData();
         renderAll();
+        refocusAfterRender();
       });
     },
   });
@@ -983,7 +1128,7 @@ function openSettlementModal() {
         </div>
         <p class="form-hint field-hint--warn" id="split-settlement-same" role="status" hidden><i data-lucide="alert-triangle" aria-hidden="true"></i><span>${t('splitExpenses.settlementSamePerson')}</span></p>
         <div class="split-form-row">
-          <label>${t('splitExpenses.amount')}<input class="input" name="amount" inputmode="decimal" required value="${debt ? esc(String(debt.amount)) : ''}"></label>
+          <label>${t('splitExpenses.amount')}<input class="input" name="amount" inputmode="decimal" placeholder="${amountPlaceholder(debt?.currency || group.default_currency)}" required value="${debt ? esc(String(debt.amount)) : ''}"></label>
           <label>${t('splitExpenses.currency')}<select class="input" name="currency">${state.meta.currencies.map((c) => `<option value="${c}" ${c === (debt?.currency || group.default_currency) ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
         </div>
         <label>${t('splitExpenses.notes')}<textarea class="input" name="notes" rows="3" maxlength="5000"></textarea></label>
@@ -1005,6 +1150,7 @@ function openSettlementModal() {
       // übernommen - mehrere Nachweise für eine Überweisung gibt es nicht.
       const proof = bindDocumentAttachField(panel, {
         category: 'finance',
+        folderKey: 'splitExpenses',
         folderName: t('documents.splitExpensesFolder'),
         documentName: (file) => t('splitExpenses.proofDocumentName', {
           group: group?.name || '',
@@ -1032,11 +1178,21 @@ function openSettlementModal() {
       });
       payeeSel.addEventListener('change', syncSameHint);
       syncSameHint();
+      // Der Platzhalter zeigt die Null im Format der gewählten Währung und muss
+      // beim Wechsel mitgehen - JPY schreibt "0", EUR "0,00".
+      const currencySel = form.querySelector('[name="currency"]');
+      currencySel?.addEventListener('change', () => {
+        form.querySelector('[name="amount"]').placeholder = amountPlaceholder(currencySel.value);
+      });
       panel.querySelector('#split-cancel-settlement')?.addEventListener('click', () => closeModal());
       form?.addEventListener('submit', async (e) => {
         e.preventDefault();
         if (samePerson()) { syncSameHint(); payeeSel.focus(); return; }
         const data = Object.fromEntries(new FormData(form));
+        data.amount = decimalString(data.amount);
+        if (rejectOffGridSplitAmount(form.querySelector('[name="amount"]'), numberValue(data.amount),
+          form.querySelector('[name="currency"]')?.value || group.default_currency,
+          debt?.amount ?? null)) return;
         const proofIds = proof ? await proof.commit() : [];
         if (proofIds.length) data.proof_document_id = proofIds[0];
         await api.post(`/split-expenses/groups/${state.activeGroupId}/settlements`, data);
@@ -1044,6 +1200,7 @@ function openSettlementModal() {
         await refreshDashboard();
         await loadGroupData();
         renderAll();
+        refocusAfterRender();
       });
     },
   });
@@ -1079,6 +1236,7 @@ async function openMemberModal() {
         await loadGroups();
         await loadGroupData();
         renderAll();
+        refocusAfterRender();
       });
     },
   });
@@ -1128,6 +1286,7 @@ function openGuestModal() {
         await loadGroups();
         await loadGroupData();
         renderAll();
+        refocusAfterRender();
       });
     },
   });

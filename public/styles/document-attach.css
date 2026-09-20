@@ -5,8 +5,11 @@
  * ein Modul-CSS trüge das Feld also nicht in ein anderes Modul. Genau daran
  * hing, dass .document-dropzone dreimal nebeneinander existierte.
  *
- * Farbe kommt aus --module-accent: das Feld nimmt den Ton des Moduls an, in
- * dessen Formular es steht.
+ * FARBE: neutral im Ruhezustand, Stimme im Zustand (2026-08-19). Hier stand
+ * „Farbe kommt aus --module-accent: das Feld nimmt den Ton des Moduls an, in
+ * dessen Formular es steht" - das ist die Herkunfts-Regel auf den Kopf
+ * gestellt: ein Beleg-Feld nennt eine Datei, und in welchem Modul es steht,
+ * beantwortet der Modulkopf darueber schon.
  * -------------------------------------------------------- */
 
 .doc-attach__chips {
@@ -19,15 +22,24 @@
   display: none;
 }
 
+/* EIN BELEG NENNT EINE DATEI, KEIN MODUL.
+ *
+ * Der Chip trug den Modulton dreifach: als Kante, als 16-%-Flaeche und - in der
+ * Kindregel darunter - als Glyphfarbe. Genau diese Aufteilung ueber ZWEI
+ * Regelkoerper ist die Luecke, durch die er an beiden Marken-Guards
+ * vorbeigekommen ist: sie lesen einen Rumpf, und dort stand nie beides.
+ *
+ * Die Ablegeflaeche weiter unten hat dieselbe Entscheidung bekommen; sie steht
+ * in denselben drei Modulen und beantwortet dieselbe Frage nicht. */
 .doc-attach__chip {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
   max-width: 100%;
   padding: var(--space-1) var(--space-1) var(--space-1) var(--space-3);
-  border: 1px solid color-mix(in srgb, var(--module-accent) 30%, var(--glass-border-subtle));
+  border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-full);
-  background: color-mix(in srgb, var(--module-accent) 10%, var(--color-surface));
+  background: var(--color-surface);
   color: var(--color-text-primary);
   font-size: var(--text-sm);
 }
@@ -35,7 +47,7 @@
 .doc-attach__chip svg {
   width: 14px;
   height: 14px;
-  color: var(--module-accent);
+  color: var(--color-text-secondary);
   flex-shrink: 0;
 }
 
@@ -43,7 +55,7 @@
  * Dokumente-Modul" und „geht erst beim Speichern raus" sichtbar ist. */
 .doc-attach__chip--pending {
   border-style: dashed;
-  background: color-mix(in srgb, var(--module-accent) 5%, var(--color-surface));
+  background: var(--color-fill-well);
 }
 
 .doc-attach__chip-name {
@@ -58,12 +70,12 @@
 a.doc-attach__chip-name {
   color: inherit;
   text-decoration: underline;
-  text-decoration-color: color-mix(in srgb, var(--module-accent) 55%, transparent);
+  text-decoration-color: var(--color-border-strong);
   text-underline-offset: 2px;
 }
 
 a.doc-attach__chip-name:hover {
-  text-decoration-color: var(--module-accent);
+  text-decoration-color: var(--color-accent);
 }
 
 a.doc-attach__chip-name:focus-visible {
@@ -87,7 +99,7 @@ a.doc-attach__chip-name:focus-visible {
 }
 
 .doc-attach__chip-remove:hover {
-  background: color-mix(in srgb, var(--module-accent) 18%, transparent);
+  background: color-mix(in srgb, var(--color-accent) var(--tint-raised), transparent);
   color: var(--color-text-primary);
 }
 
@@ -124,6 +136,20 @@ a.doc-attach__chip-name:focus-visible {
 .doc-attach__action svg {
   width: 16px;
   height: 16px;
+}
+
+/* Fallenlassen (#733). Das Feld zeigt den Zielbereich erst, wenn eine Datei
+ * über ihm hängt - eine dauerhaft gestrichelte Fläche wäre ein zweiter Rahmen
+ * neben dem Formular, den man 99 % der Zeit umsonst liest. Der Rahmen liegt
+ * innen (`outline` statt `border`), damit sich beim Aufleuchten nichts
+ * verschiebt. */
+.doc-attach--dragging {
+  /* Zustand eines GETEILTEN Bedienelements: Stimme, nicht Modulton - dieselbe
+   * Entscheidung wie an der Ablegeflaeche und ihrem `:focus-within`. */
+  outline: 2px dashed var(--color-accent);
+  outline-offset: var(--space-2);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-accent) var(--tint-surface), transparent);
 }
 
 /* --------------------------------------------------------
@@ -168,6 +194,9 @@ a.doc-attach__chip-name:focus-visible {
 
 .doc-attach-picker__footer {
   justify-content: flex-end;
+  /* Umbruch statt Ueberlauf - Begruendung an `.modal-panel__footer`
+   * (layout.css, #872). */
+  flex-wrap: wrap;
 }
 
 .doc-attach-picker__list {
@@ -192,12 +221,12 @@ a.doc-attach__chip-name:focus-visible {
   gap: var(--space-3);
   min-height: var(--target-md);
   padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-glass-inner);
+  border-radius: var(--radius-md);
   cursor: pointer;
 }
 
 .doc-attach-picker__item:hover {
-  background: color-mix(in srgb, var(--module-accent) 10%, transparent);
+  background: color-mix(in srgb, var(--module-accent) var(--tint-state), transparent);
 }
 
 .doc-attach-picker__item:focus-within {
@@ -222,4 +251,127 @@ a.doc-attach__chip-name:focus-visible {
 .doc-attach-picker__item-meta {
   color: var(--color-text-tertiary);
   font-size: var(--text-xs);
+}
+
+/* --------------------------------------------------------
+ * Ablegefläche für eine Datei (.document-dropzone)
+ *
+ * EINE Definition. Sie stand zweimal - in documents.css und in calendar.css -
+ * und die beiden Fassungen waren auseinandergelaufen: verschiedener Radius,
+ * verschiedene Icon-Kachel, verschiedener Dateiname, und nur eine von beiden
+ * hatte einen Fokusring. Dasselbe Markup, zwei Optiken.
+ *
+ * Maßgeblich ist die Dokumente-Fassung (Radius --radius-lg wie jede große
+ * Fläche, Fokusring) mit EINER Korrektur: ihre Icon-Kachel stand auf
+ * --color-surface-elevated plus Schatten, also als Karte in einer Karte.
+ *
+ * SEIT 2026-08-19 IST DIE GANZE FLÄCHE NEUTRAL. Hier stand „sie trägt jetzt das
+ * Tönungsrezept (16 % Modulfarbe)" - das galt für die Icon-Kachel, die v2.22.0
+ * dann neutralisiert hat, während Fläche, Kante und Dateiname den Modulton
+ * behielten. Ein Platzhalter nennt nichts, also bleibt er neutral; der Zustand
+ * (Hover, Dragover, Fokus) gehört der Stimme, weil die Ablegefläche ein
+ * geteiltes Bedienelement ist. Die dritte Fassung derselben Zone stand übrigens
+ * bis dahin unbemerkt in housekeeping.css.
+ * -------------------------------------------------------- */
+
+.document-dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: 148px;
+  padding: var(--space-5);
+  /* NEUTRAL IM RUHEZUSTAND, STIMME IM ZUSTAND.
+   *
+   * Die Kachel darunter wurde in v2.22.0 mit genau dieser Begründung
+   * neutralisiert - die FLÄCHE um sie herum blieb dabei stehen und sagte
+   * weiter „Dokumente" auf einer Seite, die das schon beantwortet hat.
+   * Dieselbe Regel, drei Zeilen weiter nicht angewendet.
+   *
+   * Und die Ablegefläche ist ein geteiltes Bedienelement: sie steht in
+   * Dokumenten, im Kalender und in der Haushaltshilfe. Nach der
+   * Eine-Stimme-Regel gehört ihr Zustand deshalb der Stimme, nicht dem
+   * Modulton - `:focus-within` weiter unten hat das bereits so entschieden
+   * und begründet, Hover und Dragover ziehen jetzt nach.
+   *
+   * DIE FLÄCHE IST EINE SURFACE, KEIN WELL. Der erste Anlauf setzte
+   * `--color-fill-well` und wurde vom Well-Guard zu Recht rot gemacht: ein Well
+   * ist eine Vertiefung, kein umrandeter Kasten, und die gestrichelte Kante ist
+   * hier die eigentliche Affordanz („hier ablegen"). Fläche und Kante zusammen
+   * ergeben eine leere Karte, die auf etwas wartet - genau das ist gemeint. */
+  border: 1.5px dashed var(--color-border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  text-align: center;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background-color var(--transition-fast), transform var(--transition-fast);
+}
+
+.document-dropzone:hover,
+.document-dropzone--active {
+  border-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) var(--tint-state), var(--color-surface));
+}
+
+/* Der Datei-Input liegt sr-only (1x1px, geclippt) im Label und ist trotzdem
+ * tab-fokussierbar. Ohne diese Regel verschwand der Fokus beim Durchtabben
+ * spurlos - der Ring muss auf der sichtbaren Dropzone erscheinen. */
+.document-dropzone:focus-within {
+  /* Die Kante ist Teil derselben Fokus-Affordanz wie der Ring darunter und
+   * traegt darum dieselbe Farbe - die Stimme, nicht den Modulton. */
+  border-color: var(--color-accent);
+  border-style: solid;
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.document-dropzone--active {
+  transform: translateY(-1px);
+}
+
+/* Getönte Icon-Kachel nach dem einen Tönungsrezept: 16 % Modulfarbe auf der
+ * Fläche. Erst das trägt in BEIDEN Themes sichtbar. */
+.document-dropzone__icon {
+  width: 42px;
+  height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  /* NENNT NICHTS: ein Platzhalter, kein Absenderzeichen. Er trug den Modulton
+   * als Waschung und sagte damit „Dokumente" auf einer Seite, die das schon
+   * beantwortet. Neutral ist hier die Aussage, nicht der Rückzug - siehe die
+   * Vollton-Regel in DESIGN.md (Colors): entweder es nennt etwas, dann im
+   * Vollton, oder es nennt nichts, dann neutral. */
+  color: var(--color-text-secondary);
+  background: var(--color-fill-well);
+}
+
+.document-dropzone__icon svg {
+  width: 22px;
+  height: 22px;
+}
+
+.document-dropzone__title {
+  color: var(--color-text-primary);
+}
+
+.document-dropzone__hint,
+.document-dropzone__file {
+  max-width: 100%;
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+/* Der Dateiname nennt eine DATEI, kein Modul: die Pille trug den Modulton
+ * zweimal blass (16-%-Fläche plus dieselbe Farbe als Schrift) und beantwortete
+ * damit eine Frage, die niemand gestellt hat. Neutral, wie die Icon-Kachel. */
+.document-dropzone__file {
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-primary);
+  background: var(--color-surface);
+  font-weight: var(--font-weight-semibold);
 }

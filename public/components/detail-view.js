@@ -9,7 +9,7 @@
  *
  * API:
  *   openDetailView({ title, accentColor, anchor, sections, actions, edit, size, onClose })
- *   closeDetailView({ force }) → Promise<void>
+ *   closeDetailView({ force, fokus }) → Promise<void>
  *
  * Zwei Präsentationen, eine Aufrufer-API: ab 768px UND mit Anker erscheint die
  * Ansicht als verankertes Popover am Auslöser, sonst als Bottom-Sheet über
@@ -18,9 +18,10 @@
 
 import { t } from '/i18n.js';
 import {
-  openModal, closeModal, mountFooter, refreshDirtySnapshot,
-  focusFirstField, updateHeaderAction,
+  openModal, closeModal, mountFooter, refreshDirtySnapshot, forgetRestore,
+  focusFirstField, updateHeaderAction, rememberFocus, restoreFocusAfterClose,
 } from '/components/modal.js';
+import { pushOverlay, dropOverlay } from '/utils/overlay-history.js';
 
 // Ab dieser Breite ist ein Popover am Auslöser die bessere Präsentation: Der
 // Auslöser bleibt sichtbar, der Weg ist kurz. Darunter deckt ein 320px-Kärtchen
@@ -350,6 +351,12 @@ async function switchToForm(panel, opts, state) {
       body.appendChild(pane);
       state.formPane = pane;
       opts.edit.mount(panel, pane);
+      // mount() fuegt sein Markup erst jetzt ein - lange nach dem createIcons-
+      // Lauf, der beim ersten Oeffnen der Leseansicht (renderIcons(panel) oben)
+      // durchlief. Ohne diesen zweiten Lauf bleiben `data-lucide`-Platzhalter im
+      // Formular leer, z. B. die 13 Knoepfe der Markdown-Formatierungsleiste
+      // (#1141).
+      renderIcons(pane);
       // Die Formular-Fußzeile entstand gerade erst im Body und muss ans Panel,
       // sonst scrollt die Primäraktion weg und ein „Speichern" mit
       // type="submit" löst außerhalb seines Formulars kein submit aus (#543).
@@ -561,8 +568,8 @@ function openAsPopover(opts) {
   const onKeydown = (e) => {
     if (e.key === 'Escape') {
       e.stopPropagation();
+      // Den Fokus gibt closeDetailView() an den Ausloeser zurueck (#1083).
       closeDetailView();
-      opts.anchor?.focus?.();
       return;
     }
     if (e.key !== 'Tab') return;
@@ -582,13 +589,23 @@ function openAsPopover(opts) {
   };
 
   const onOutsideClick = (e) => {
-    if (!popover.isConnected || !popover.contains(e.target)) closeDetailView();
+    // Ohne Fokus-Rueckgabe: wer daneben klickt, wollte woanders hin, und ein
+    // Sprung zurueck zum Ausloeser naehme ihm das Ziel weg.
+    if (!popover.isConnected || !popover.contains(e.target)) closeDetailView({ fokus: false });
   };
 
   activePopover = {
     el: popover,
     anchor: opts.anchor,
+    // Wie `openModal` den Ausloeser merkt - damit das Schliessen ihn auch nach
+    // einem Neuaufbau wiederfindet (#1083).
+    merker: rememberFocus(opts.anchor),
     onClose: opts.onClose,
+    // Die Sheet-Praesentation erbt den Marker der Zurueck-Geste von modal.js;
+    // das Popover ist der zweite Weg dieser API und braucht deshalb seinen
+    // eigenen (#871). Es hat keinen Dirty-Guard - eine Leseansicht kann nichts
+    // zu verwerfen haben -, also geht es immer zu.
+    overlayToken: pushOverlay(() => { closeDetailView(); }),
     teardown() {
       document.removeEventListener('keydown', onKeydown);
       document.removeEventListener('click', onOutsideClick);
@@ -644,7 +661,8 @@ export function openDetailView(opts = {}) {
   // und löschte sonst gerade den, den wir eben ausgegeben haben.
   // Ohne activePopover-Prüfung würde closeDetailView() blind closeModal()
   // rufen und ein fremdes, offenes Modal schließen.
-  if (activePopover) closeDetailView();
+  // Ohne Fokus-Rueckgabe: die neue Ansicht nimmt den Fokus selbst.
+  if (activePopover) closeDetailView({ fokus: false });
 
   const token = ++viewSeq;
   activeViewToken = token;
@@ -692,17 +710,29 @@ export function openDetailView(opts = {}) {
  * und ein nicht abgewartetes Schließen ließ das Löschen bereits laufen, während
  * die Rückfrage noch im Slot hing.
  *
- * @param {{force?: boolean}} [opts]
+ * `fokus: false` gibt den Fokus im Popover NICHT an den Auslöser zurück - für
+ * den Klick daneben und für eine neue Ansicht, die ihn selbst nimmt. Das Sheet
+ * läuft über `closeModal()` und dessen eigenen Restore.
+ *
+ * @param {{force?: boolean, fokus?: boolean}} [opts]
  * @returns {Promise<void>}
  */
-export function closeDetailView({ force = false } = {}) {
+export function closeDetailView({ force = false, fokus = true } = {}) {
   activeViewToken = 0;
   if (activePopover) {
-    const { el, teardown, onClose } = activePopover;
+    const { el, teardown, onClose, overlayToken, merker } = activePopover;
     activePopover = null;
     teardown();
     el.remove();
+    dropOverlay(overlayToken);
     if (typeof onClose === 'function') onClose();
+    // Hier wurde AN modal.js VORBEI geschlossen. Der Fokus geht an den Ausloeser
+    // zurueck, mit einem eigenen Merker, damit ein `refocusAfterRender()` nach
+    // dem Neuaufbau ihn wiederfindet (#1083). Ohne Rueckgabe wird der Merker nur
+    // verworfen - der des vorigen Dialogs setzte den Fokus sonst in einen
+    // fremden Zusammenhang.
+    if (fokus && merker) restoreFocusAfterClose(merker);
+    else forgetRestore();
     return Promise.resolve();
   }
   return closeModal({ force });

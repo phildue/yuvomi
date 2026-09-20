@@ -137,11 +137,97 @@ export function documentsPaths() {
     },
     '/api/v1/documents/folders': {
       get: op({ summary: 'List document folders', tag: 'Documents' }),
-      post: op({ summary: 'Create document folder', tag: 'Documents', stateChanging: true, requestBody: jsonBody(null) }),
+      post: op({
+        summary: 'Create document folder',
+        tag: 'Documents',
+        stateChanging: true,
+        requestBody: jsonBody(null),
+        responses: {
+          201: { description: 'Document folder created' },
+          400: { $ref: '#/components/responses/BadRequest' },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          409: { description: 'Sibling name conflict or the parent folder is in an active deletion batch' },
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
+      }),
     },
     '/api/v1/documents/folders/{id}': {
-      put: op({ summary: 'Rename document folder', tag: 'Documents', params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
-      delete: op({ summary: 'Delete document folder (documents keep their row, folder link is cleared)', tag: 'Documents', params: [idParam()], stateChanging: true }),
+      put: op({
+        summary: 'Rename or move document folder',
+        tag: 'Documents',
+        params: [idParam()],
+        stateChanging: true,
+        requestBody: jsonBody(null),
+        responses: {
+          200: { description: 'Document folder updated' },
+          400: { $ref: '#/components/responses/BadRequest' },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          404: { description: 'Folder not found' },
+          409: { description: 'Sibling name conflict or the folder is in an active deletion batch' },
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
+      }),
+      delete: op({
+        summary: 'Delete a document folder subtree',
+        tag: 'Documents',
+        stateChanging: true,
+        description: 'Deletes the folder and all subfolders. `documents=unfile` keeps every document row and clears its folder link, including documents hidden from the caller, while reporting only the visible unfile count. `documents=delete` requires the opaque HMAC snapshot from the latest delete-impact response; the token binds exact folder, document and collateral-link identities. The route then sequentially deletes visible document content and rows while locking the previewed identities, subtree targets and new document links. Destructive deletion is rejected before the first storage operation if any document is hidden from the caller, if a non-admin does not own every visible document, or if the previewed identities changed. A 207 response distinguishes storage, database-row and concurrent-content failures while retaining the folder subtree.',
+        params: [
+          idParam(),
+          {
+            name: 'documents',
+            in: 'query',
+            required: false,
+            schema: { type: 'string', enum: ['unfile', 'delete'], default: 'unfile' },
+          },
+          {
+            name: 'expected_documents',
+            in: 'query',
+            required: false,
+            description: 'Visible document count from the latest delete-impact response. A mismatch rejects the request before deletion.',
+            schema: { type: 'integer', minimum: 0 },
+          },
+          {
+            name: 'expected_folders',
+            in: 'query',
+            required: false,
+            description: 'Folder count from the latest delete-impact response. A mismatch rejects the request before deletion.',
+            schema: { type: 'integer', minimum: 0 },
+          },
+          {
+            name: 'expected_snapshot',
+            in: 'query',
+            required: false,
+            description: 'Identity-bound snapshot from the latest delete-impact response. Required when documents=delete; a mismatch rejects the request before deletion.',
+            schema: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+          },
+        ],
+        responses: {
+          200: { description: 'Folder subtree deleted' },
+          207: { description: 'Some documents were deleted, but storage failures or a concurrent content change left the folder subtree in place' },
+          400: { $ref: '#/components/responses/BadRequest' },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          403: { $ref: '#/components/responses/Forbidden' },
+          404: { description: 'Folder not found' },
+          409: { description: 'Folder contents changed after the impact preview or the subtree overlaps an active deletion batch' },
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
+      }),
+    },
+    '/api/v1/documents/folders/{id}/delete-impact': {
+      get: op({
+        summary: 'Preview the impact of deleting a document folder subtree',
+        tag: 'Documents',
+        description: 'Returns the visible document count, exact folder count, affected-record counts grouped by module, an opaque HMAC snapshot bound to folder, document and collateral-link identities, and whether the caller may delete every affected document. Hidden-document totals are never returned; their presence only makes destructive deletion unavailable.',
+        params: [idParam()],
+        responses: {
+          200: { description: 'Folder deletion impact' },
+          400: { $ref: '#/components/responses/BadRequest' },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          404: { description: 'Folder not found' },
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
+      }),
     },
     '/api/v1/documents': {
       get: op({
@@ -163,6 +249,13 @@ export function documentsPaths() {
               enum: ['medical', 'school', 'identity', 'insurance', 'finance', 'home', 'vehicle', 'legal', 'travel', 'pets', 'warranty', 'taxes', 'work', 'other'],
             },
           },
+          {
+            name: 'expiring',
+            in: 'query',
+            required: false,
+            description: 'Only documents whose expires_at is within the next N days or already past. An invalid value is silently skipped (no filter applied), same as an invalid status/category.',
+            schema: { type: 'integer', minimum: 0 },
+          },
         ],
         responses: {
           200: {
@@ -177,7 +270,7 @@ export function documentsPaths() {
         summary: 'Upload family document',
         tag: 'Documents',
         stateChanging: true,
-        description: 'Stores a document using the active upload backend (`local`, `webdav`, or `google_drive`) with family, restricted, or private visibility. File content is sent as a base64 data URL in `content_data`. An environment-managed local folder may override the selected destination.',
+        description: 'Stores a document using the active upload backend (`local`, `webdav`, or `google_drive`) with family, restricted, or private visibility. File content is sent as a base64 data URL in `content_data`. An environment-managed local folder may override the selected destination. Filing: `folder_id` targets an existing folder; `folder_key` names the system folder a module files its receipts in (`budget`, `tasks`, `splitExpenses`, `inventory`, `housekeeping`, `calendarItems`) and is what identifies it, while `folder_name` is only the label used if that folder still has to be created. Sending `folder_name` alone still works and matches on the name, which is what two clients in different languages used to file into two separate folders.',
         requestBody: jsonBody(null),
         responses: {
           201: {
@@ -208,6 +301,7 @@ export function documentsPaths() {
           401: { $ref: '#/components/responses/Unauthorized' },
           403: { $ref: '#/components/responses/Forbidden' },
           404: { description: 'Document not found' },
+          409: { description: 'Document is part of an active folder deletion batch' },
           500: { $ref: '#/components/responses/InternalServerError' },
         },
       }),
@@ -222,6 +316,7 @@ export function documentsPaths() {
           401: { $ref: '#/components/responses/Unauthorized' },
           403: { $ref: '#/components/responses/Forbidden' },
           404: { description: 'Document not found' },
+          409: { description: 'Document is part of an active folder deletion batch' },
           502: { description: 'Remote document deletion failed; the database row remains', content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } } },
           500: { $ref: '#/components/responses/InternalServerError' },
         },
@@ -233,6 +328,7 @@ export function documentsPaths() {
         tag: 'Documents',
         params: [idParam()],
         stateChanging: true,
+        documentDeleteConflict: true,
         description: 'Archives the document by default. Send `{ "archived": false }` to restore it to active status.',
         requestBody: jsonBody(null),
       }),
@@ -423,6 +519,12 @@ export function documentsPaths() {
           500: { $ref: '#/components/responses/InternalServerError' },
         },
       }),
+    },
+    '/api/v1/documents/{id}/thumbnail': {
+      get: op({ summary: 'Fetch the thumbnail of a document', tag: 'Documents', params: [idParam()], description: 'Subject to the same visibility rules as the document itself.' }),
+    },
+    '/api/v1/documents/dms/thumbnail': {
+      get: op({ summary: 'Fetch a thumbnail from the connected DMS', tag: 'Documents', description: 'Proxies the image from Paperless/Papra so the browser never needs the DMS credentials.' }),
     },
   };
 }

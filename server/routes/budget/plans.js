@@ -7,7 +7,7 @@ import express from 'express';
 import { createLogger } from '../../logger.js';
 import * as db from '../../db.js';
 import { num, collectErrors, MONTH_RE } from '../../middleware/validate.js';
-import { cents, thisMonthLocalKey, validExpenseCategoryKeys } from './helpers.js';
+import { bookedOnly, cents, thisMonthLocalKey, validExpenseCategoryKeys } from './helpers.js';
 
 const log = createLogger('Budget');
 const router = express.Router();
@@ -23,11 +23,21 @@ export const BUDGET_SAVINGS_KEY = '__savings__';
  * Plan = stetiger Monatsbetrag je Ausgabenkategorie; Ist = tatsächliche Ausgaben
  * des Monats (positiv dargestellt). Das Sparziel vergleicht den geplanten Betrag
  * mit dem Netto-Saldo (Einnahmen − Ausgaben) des Monats.
- * @returns {object} { month, plans: [], savings: {}|null, totalPlanned, totalActual }
+ *
+ * **Kein Urteil über die Vergangenheit (#1005).** `budget_plans` haelt EINEN Betrag je
+ * Kategorie ohne Zeitachse - kein `created_at`, und `updated_at` wird bei jeder Aenderung
+ * ueberschrieben. Die DB weiss also nicht, was der Plan in einem frueheren Monat sagte.
+ * Wer heute seinen Plan senkt, drehte damit das „ueber Budget" auf laengst abgeschlossenen
+ * Monaten um. Fuer jeden Monat ausser dem laufenden bleiben `over`/`met` deshalb `null`:
+ * geplant und ist sind Tatsachen und werden weiter geliefert, das Urteil nicht. Faellt
+ * spaeter eine echte Plan-Historie an (#1001), kann `isCurrentMonth` ersatzlos weg.
+ *
+ * @returns {object} { month, isCurrentMonth, plans: [], savings: {}|null, totalPlanned, totalActual }
  */
 export function computePlanProgress(database, month) {
   const from = `${month}-01`;
   const to   = `${month}-31`;
+  const isCurrentMonth = month === thisMonthLocalKey();
 
   const planRows = database.prepare('SELECT category, amount FROM budget_plans').all();
   const planMap  = new Map(planRows.map((r) => [r.category, cents(r.amount)]));
@@ -35,7 +45,7 @@ export function computePlanProgress(database, month) {
   // Ist-Ausgaben je Kategorie (als positive Beträge) für den Monat.
   const spentRows = database.prepare(`
     SELECT category, SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END) AS spent
-    FROM budget_entries WHERE date BETWEEN ? AND ? GROUP BY category
+    FROM budget_entries WHERE date BETWEEN ? AND ?${bookedOnly()} GROUP BY category
   `).all(from, to);
   const spentMap = new Map(spentRows.map((r) => [r.category, cents(r.spent || 0)]));
 
@@ -49,7 +59,7 @@ export function computePlanProgress(database, month) {
       actual,
       remaining: cents(planned - actual),
       ratio: planned > 0 ? actual / planned : 0,
-      over: actual > planned + 0.005,
+      over: isCurrentMonth ? actual > planned + 0.005 : null,
     });
   }
   // Höchste Auslastung zuerst → die Familie sieht gefährdete Budgets oben.
@@ -61,7 +71,7 @@ export function computePlanProgress(database, month) {
   const totals = database.prepare(`
     SELECT SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) AS income,
            SUM(amount) AS balance
-    FROM budget_entries WHERE date BETWEEN ? AND ?
+    FROM budget_entries WHERE date BETWEEN ? AND ?${bookedOnly()}
   `).get(from, to);
   const income  = cents(totals.income || 0);
   const balance = cents(totals.balance || 0); // Netto-Ersparnis des Monats
@@ -72,11 +82,11 @@ export function computePlanProgress(database, month) {
     actual: balance,
     remaining: cents(savingsPlanned - balance),
     ratio: savingsPlanned > 0 ? balance / savingsPlanned : 0,
-    met: balance >= savingsPlanned - 0.005,
+    met: isCurrentMonth ? balance >= savingsPlanned - 0.005 : null,
     income,
   } : null;
 
-  return { month, plans, savings, totalPlanned, totalActual };
+  return { month, isCurrentMonth, plans, savings, totalPlanned, totalActual };
 }
 
 /**

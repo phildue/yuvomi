@@ -4,13 +4,15 @@
     "continue": "Fortsätt",
     "back": "Tillbaka",
     "generate": "Generera",
-    "generating": "…",
+    "generating": "Genererar…",
     "optional": "Valfritt",
     "stepCounter": "Steg {{n}} av {{total}}",
     "toggleVisibility": "Visa eller dölj värdet",
     "copy": "Kopiera",
     "copied": "Kopierat ✓",
-    "language": "Språk"
+    "language": "Språk",
+    "copyRedirect": "Kopiera omdirigerings-URI",
+    "opt": "(valfritt)"
   },
   "config": {
     "title": "Grundkonfiguration",
@@ -22,7 +24,12 @@
     "tzLabel": "Tidszon",
     "errHost": "Ogiltigt värdnamn. Använd endast bokstäver, siffror, bindestreck och punkter.",
     "errPort": "Ogiltig port. Måste vara ett tal mellan 1 och 65535.",
-    "prereqMissing": "Saknade förutsättningar: {{list}}. Installera dem och ladda om sidan."
+    "prereqMissing": "Saknade förutsättningar: {{list}}. {{link}} visar hur du installerar dem.",
+    "prereqLinkDocker": "Docker-guiden",
+    "prereqLinkCompose": "podman-compose-guiden",
+    "prereqRecheck": "Kontrollera igen",
+    "errSecureOverHttp": "Den publika adressen börjar med http://, men det här valet kräver säkra kakor - då kan ingen logga in. Välj \"Direktåtkomst\" eller använd en https://-adress.",
+    "errTz": "Ogiltig tidszon. En IANA-beteckning som Europe/Berlin förväntas."
   },
   "secrets": {
     "title": "Säkerhetsnycklar",
@@ -32,7 +39,7 @@
     "dbLabel": "Krypteringsnyckel för databasen",
     "dbHint": "Krypterar SQLite-databasen i vila.",
     "errBoth": "Båda nycklarna krävs.",
-    "dangerWarn": "Spara dessa nycklar nu. Om du förlorar dem går dina krypterade data inte att återställa — det finns ingen återställning.",
+    "dangerWarn": "Spara dessa nycklar nu. Om du förlorar dem går dina krypterade data inte att återställa — det finns ingen återställning. I slutet av installationen kan du ladda ner .env-filen med båda nycklarna.",
     "preserved": "Dina befintliga nycklar behålls, så den här installationen låser dig inte ute från den nuvarande databasen. Lämna ett fält tomt för att behålla dess nyckel; ett nytt värde ersätter den.",
     "keepPlaceholder": "Befintlig nyckel behålls"
   },
@@ -48,12 +55,12 @@
     "unitsMetric": "Metriskt (°C)",
     "unitsImperial": "Imperialt (°F)",
     "errCoords": "Latitud och longitud krävs.",
-    "errLat": "Ogiltig latitud (–90 till 90).",
-    "errLon": "Ogiltig longitud (–180 till 180)."
+    "errLat": "Ogiltig latitud (-90 till 90).",
+    "errLon": "Ogiltig longitud (-180 till 180)."
   },
   "calendar": {
     "title": "Kalendersynkronisering",
-    "subtitle": "Anslut Yuvomi till Google Kalender eller Apple iCloud. Båda är valfria — expandera för att konfigurera.",
+    "subtitle": "Anslut Yuvomi till Google Kalender, Apple iCloud eller Outlook. Alla valfria - expandera för att konfigurera.",
     "google": "Google Kalender",
     "googleHint": "Skapa OAuth-uppgifter på {{link}}. Omdirigerings-URI: {{redirect}}",
     "googleLink": "console.cloud.google.com",
@@ -66,8 +73,13 @@
     "appleUserLabel": "Apple-ID (e-post)",
     "applePassLabel": "Appspecifikt lösenord",
     "appleUrlLabel": "CalDAV-URL",
-    "appleUrlOpt": "(valfritt)",
-    "appleUrlHint": "Lämna tomt om inte din leverantör använder en annan CalDAV-slutpunkt."
+    "appleUrlHint": "Lämna tomt om inte din leverantör använder en annan CalDAV-slutpunkt.",
+    "outlook": "Outlook-kalender (Microsoft Graph)",
+    "outlookHint": "Skapa en kostnadsfri Entra ID-appregistrering (\"Endast personliga Microsoft-konton\") på {{link}} - se installationsguiden. Omdirigerings-URI: {{redirect}}",
+    "outlookLink": "entra.microsoft.com",
+    "outlookIdLabel": "Klient-ID",
+    "outlookSecretLabel": "Klienthemlighet",
+    "outlookNote": "Enkelriktad push: Yuvomi förblir källan - ändringar gjorda i Outlook skrivs över. Familjens konton kopplas senare i appens inställningar."
   },
   "review": {
     "title": "Granskning",
@@ -96,24 +108,45 @@
     "webdavBackup": "Externa säkerhetskopior",
     "on": "aktiverad",
     "off": "inaktiverad",
-    "documentGoogleDrive": "Google Drive-dokument"
+    "documentGoogleDrive": "Google Drive-dokument",
+    "sessionSecret": "Sessionsnyckel",
+    "dbKey": "Databasnyckel",
+    "keyGenerated": "Nyskapad",
+    "keyPreserved": "Befintlig nyckel behålls",
+    "dataDir": "Datamapp",
+    "privateNetwork": "Åtkomst till egna nätverket",
+    "privateNetworkIcs": "Kalenderprenumerationer",
+    "privateNetworkRecipes": "Recept",
+    "privateNetworkWaste": "Avfallshämtning",
+    "privateNetworkWebdav": "WebDAV-dokument",
+    "baseUrl": "Publik adress",
+    "outlook": "Outlook-kalender",
+    "notEnabled": "inte aktiverat"
   },
   "docker": {
     "title": "Startar Yuvomi",
     "subtitle": "Hämtar avbildningen och startar Docker-containern.",
-    "starting": "Startar containern …",
     "elapsed": "{{n}} s förflutna",
     "running": "Containern är frisk och körs",
     "failed": "Det gick inte att starta containern",
     "unknownError": "Okänt fel",
     "toAdmin": "Fortsätt till administratörsinställning",
-    "retry": "Försök igen"
+    "retry": "Försök igen",
+    "phasePull": "Hämtar avbild",
+    "phaseBoot": "Containern startar",
+    "phaseHealth": "Hälsokontroll pågår",
+    "firstRunHint": "Första gången kan det ta flera minuter.",
+    "stalled": "Det här tar längre tid än vanligt. Loggen nedan visar varför.",
+    "showLogs": "Visa logg",
+    "hideLogs": "Dölj logg",
+    "timedOut": "Inget svar efter 15 minuter. Kontrollera loggen och försök igen.",
+    "logLabel": "Containerlogg"
   },
   "admin": {
     "title": "Skapa administratörskonto",
     "subtitle": "Konfigurera din första inloggning. Detta konto har full åtkomst till Yuvomi.",
     "userLabel": "Användarnamn",
-    "userHint": "3–64 tecken: bokstäver, siffror, . - _",
+    "userHint": "3-64 tecken: bokstäver, siffror, . - _",
     "nameLabel": "Visningsnamn",
     "passLabel": "Lösenord",
     "passPlaceholder": "Minst 8 tecken",
@@ -121,7 +154,7 @@
     "creating": "Skapar …",
     "create": "Skapa konto",
     "errAll": "Alla fält är obligatoriska.",
-    "errUser": "Ogiltigt format på användarnamn (3–64 tecken, bokstäver/siffror/._-).",
+    "errUser": "Ogiltigt format på användarnamn (3-64 tecken, bokstäver/siffror/._-).",
     "errPass": "Lösenordet måste vara minst 8 tecken.",
     "errMatch": "Lösenorden matchar inte.",
     "errCreate": "Det gick inte att skapa administratörskontot."
@@ -132,16 +165,26 @@
     "open": "Öppna Yuvomi →",
     "backupReminder": "Kom ihåg att säkerhetskopiera din .env-fil nu — den innehåller dina nycklar.",
     "download": "Ladda ner .env-filen",
-    "savedTo": "Sparad i {{path}}"
+    "savedTo": "Sparad i {{path}}",
+    "downloadFailed": "Filen kunde inte hämtas - installationsprogrammet har troligen redan avslutats. Dina nycklar finns i .env-filen på din server.",
+    "serverStops": "Installationsprogrammet avslutas om några minuter. Ladda ner filen innan du stänger den här fliken.",
+    "nextTitle": "Härnäst",
+    "nextInvite": "Bjud in familjen",
+    "nextInviteDesc": "Skapa inbjudningslänkar så att alla väljer sitt eget lösenord.",
+    "nextModules": "Välj dina moduler",
+    "nextModulesDesc": "Slå på det hushållet faktiskt använder och göm resten.",
+    "nextInstall": "Installera på telefonerna",
+    "nextInstallDesc": "Öppna Yuvomi i telefonen och lägg till den på hemskärmen - den fungerar offline.",
+    "subtitleExisting": "Yuvomi körs. Den här installationen har redan ett administratörskonto - logga in med dina befintliga uppgifter."
   },
   "advanced": {
     "tag": "Avancerat · valfritt",
     "title": "Avancerade inställningar",
-    "subtitle": "Omvänd proxy, enkel inloggning och automatiska säkerhetskopior. Allt valfritt — det är säkert att hoppa över.",
+    "subtitle": "Enkel inloggning, åtkomst till ditt hemnätverk och några finjusteringar. Allt är valfritt.",
     "proxyLabel": "Hur exponeras Yuvomi?",
     "proxyBehindHttps": "Bakom en omvänd proxy med HTTPS (Caddy, nginx, Traefik)",
     "proxyDirect": "Direkt åtkomst via localhost / HTTP",
-    "proxyHint": "Direkt åtkomst inaktiverar cookies som endast är säkra så att inloggning fungerar utan HTTPS.",
+    "proxyHint": "Välj \"Direktåtkomst\" om du öppnar Yuvomi via http:// - annars kan du inte logga in. Bakom en omvänd proxy med HTTPS väljer du det första alternativet.",
     "oidc": "Enkel inloggning (OIDC)",
     "oidcHint": "Fyll i alla fyra fält för att aktivera SSO, eller lämna dem tomma.",
     "oidcIssuerLabel": "Issuer-URL",
@@ -166,8 +209,7 @@
     "documentLocalEnable": "Spara nya dokument i en lokal mapp",
     "documentLocalPathLabel": "Mappsökväg",
     "documentLocalPathHint": "Sökväg i containern. Lämna tomt för /documents.",
-    "sectionNetwork": "Nätverk",
-    "sectionIntegrations": "Integrationer och säkerhetskopior",
+    "sectionIntegrations": "Enkel inloggning",
     "errSchedule": "Ogiltigt cron-schema (fem mellanslagsseparerade fält förväntas, t.ex. 0 2 * * *).",
     "errKeep": "Antal säkerhetskopior att behålla måste vara ett positivt tal.",
     "webdavBackup": "Externa säkerhetskopior (WebDAV)",
@@ -190,7 +232,32 @@
     "documentGoogleDriveReuseHint": "Lämna båda fälten tomma för att återanvända OAuth-uppgifterna för Google Kalender. För egna uppgifter skapar du dem i Google Cloud Console (som i Kalender-steget).",
     "documentGoogleDriveRedirectLabel": "Omdirigerings-URI",
     "errDocumentGoogleDrivePair": "Klient-ID och klienthemlighet för Google Drive måste antingen anges båda eller lämnas tomma.",
-    "errDocumentGoogleDriveCredentials": "Google Drive kräver antingen ett eget klient-ID och en egen klienthemlighet eller konfigurerade uppgifter för Google Kalender."
+    "errDocumentGoogleDriveCredentials": "Google Drive kräver antingen ett eget klient-ID och en egen klienthemlighet eller konfigurerade uppgifter för Google Kalender.",
+    "dataDirLabel": "Datamapp på värden",
+    "dataDirHint": "Var databasen och appdata ligger på servern. Lämna tomt för ./data bredvid compose-filen.",
+    "documentLocalDirLabel": "Mapp på värden",
+    "documentLocalDirHint": "Mappen på servern som monteras in i containern. Lämna tomt för ./documents.",
+    "documentWebdavPrivateNetwork": "Tillåt ett WebDAV-mål i ditt hemnätverk",
+    "documentWebdavPrivateNetworkHint": "Krävs för ett Nextcloud i ditt eget nätverk. Upphäver SSRF-skyddet för detta mål.",
+    "icsPrivateNetwork": "Tillåt kalenderprenumerationer från ditt hemnätverk",
+    "icsPrivateNetworkHint": "Krävs för ICS-flöden från enheter i ditt eget nätverk. Upphäver SSRF-skyddet för kalenderprenumerationer.",
+    "recipeProviderPrivateNetwork": "Tillåt receptförmedlare på ditt hemnätverk",
+    "recipeProviderPrivateNetworkHint": "Krävs för en Mealie- eller Tandoor-instans i ditt eget nätverk. Upphäver SSRF-skyddet för receptförmedlare.",
+    "wasteSourcePrivateNetwork": "Tillåt avfallshämtningsflöden på ditt hemnätverk",
+    "wasteSourcePrivateNetworkHint": "Krävs för en kommunal avfallskalender speglad i ditt eget nätverk. Upphäver SSRF-skyddet för avfallshämtningens URL-källor.",
+    "oidcTrustEmail": "Lita på e-post utan verified-claim",
+    "oidcTrustEmailHint": "Aktivera bara om din leverantör inte skickar email_verified och du litar på den.",
+    "oidcAllowSignup": "Låt SSO-inloggningar skapa nya konton",
+    "oidcAllowSignupHint": "Stäng av det om din leverantör betjänar fler personer än det här hushållet. Befintliga konton loggar fortfarande in och länkas fortfarande.",
+    "baseUrlLabel": "Publik adress",
+    "baseUrlHint": "Adressen där din familj öppnar Yuvomi - inte containerns värd och port. Används för länkar till lösenordsåterställning och inbjudningar.",
+    "syncIntervalLabel": "Synkroniseringsintervall för kalender (minuter)",
+    "syncIntervalHint": "Hur ofta Yuvomi synkroniserar kalendrar och kontakter. Höj det om din leverantör begränsar antalet anrop.",
+    "errSyncInterval": "Ange ett positivt heltal antal minuter.",
+    "sectionPrivateNetwork": "Åtkomst till ditt hemnätverk",
+    "privateNetworkHint": "Yuvomi vägrar som standard anslutningar till adresser i ditt eget nätverk, vilket skyddar mot att servern luras att nå interna tjänster. Aktivera det du faktiskt kör hemma.",
+    "authPasswordLogin": "Behåll inloggning med användarnamn och lösenord",
+    "authPasswordLoginHint": "Om du stänger av detta blir SSO enda vägen in: inloggningsformuläret och lösenordsåterställningen försvinner. Om leverantören blir onåbar går vägen tillbaka via .env-filen och en omstart."
   },
   "welcome": {
     "title": "Välkommen till Yuvomi",
@@ -201,7 +268,9 @@
     "simpleTime": "Ungefär 2 minuter",
     "advancedTitle": "Avancerad installation",
     "advancedDesc": "Full kontroll: omvänd proxy, kalendersynk, e-post, enkel inloggning och säkerhetskopior.",
-    "advancedTime": "Varje alternativ, steg för steg"
+    "advancedTime": "Varje alternativ, steg för steg",
+    "existingLocked": "En befintlig installation hittades. Använd den avancerade installationen så att dina nuvarande inställningar behålls.",
+    "containerRunning": "Yuvomi körs just nu. Att spara startar om containern, så den blir kortvarigt otillgänglig."
   },
   "simple": {
     "title": "Klart att köra",
@@ -233,5 +302,11 @@
     "fromHint": "Den \"från\"-adress som mottagarna ser. Många leverantörer kräver att den matchar användarnamnet.",
     "fromNameLabel": "Avsändarnamn",
     "errIncomplete": "SMTP-server och avsändaradress krävs."
+  },
+  "storage": {
+    "title": "Lagring och säkerhetskopior",
+    "subtitle": "Var dina data ligger på servern och vart kopiorna tar vägen. Allt är valfritt - standardvärdena fungerar.",
+    "sectionBackups": "Säkerhetskopior",
+    "sectionDocuments": "Dokumentlagring"
   }
 }

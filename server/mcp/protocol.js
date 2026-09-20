@@ -35,7 +35,8 @@ function fail(id, code, message) {
 /**
  * Verarbeitet eine einzelne JSON-RPC-Nachricht.
  * @param {object} database - DB-Handle (better-sqlite3 oder node:sqlite)
- * @param {{ id: number, role?: string }} actor - authentifizierter Akteur
+ * @param {{ id: number, role?: string, scopes?: string[]|null,
+ *           moduleAccess?: object|null, splitGuest?: boolean }} actor - authentifizierter Akteur
  * @param {any}    body      - geparster Request-Body
  * @param {(err: Error) => void} [onInternalError] - Logging-Hook für interne Fehler
  * @param {{ requestHeaders?: object }} [requestContext] - Request-Kontext für die
@@ -79,8 +80,9 @@ async function handleMcpRequest(database, actor, body, onInternalError, requestC
         return ok(id, {});
 
       case 'tools/list':
-        // Nur Tools zeigen, die die Scopes des Tokens zulassen (actor.scopes === null = voll).
-        return ok(id, { tools: listToolDefinitions(actor ? (actor.scopes ?? null) : null) });
+        // Nur Tools zeigen, die der Akteur auch aufrufen darf: Token-Scopes UND
+        // Modulrechte des Nutzers (#823). Beides steckt im actor.
+        return ok(id, { tools: listToolDefinitions(actor || null) });
 
       case 'tools/call': {
         const name = params && params.name;

@@ -18,13 +18,43 @@
  *
  * commit() lädt erst beim Speichern hoch. Bricht der Nutzer das Formular ab,
  * bleibt keine verwaiste Datei im Dokumente-Modul zurück.
+ *
+ * DAS FELD SCHREIBT IN EIN FREMDES MODUL (#1265). Es hängt an Aufgaben, Budget,
+ * Gemeinsamen Ausgaben und Inventar, das Hochladen ist aber `POST /documents`
+ * und damit eine Frage an das Dokumente-Recht - das Recht der Seite sagt
+ * darüber nichts. Wer `tasks: write` und `documents: read` hatte, sah ein
+ * Hochladen-Feld, dessen Speichern im 403 endete. Die Antwort je Stufe, gemessen
+ * an dem, was der Server annimmt:
+ *
+ *   - `write`: unverändert.
+ *   - `read`:  Hochladen verschwindet - der Knopf, das Dateifeld, der Hinweis
+ *              auf die Größe, und die Ablagefläche wird gar nicht erst
+ *              verdrahtet (bei Ziehen gibt es kein Markup zum Wegnehmen).
+ *              Vorhandene Anhänge bleiben als Zustand stehen und lassen sich
+ *              öffnen. Verknüpfen und Lösen BLEIBEN: die Auswahl liest
+ *              `GET /documents`, und die Verknüpfung speichert die Seite über
+ *              ihren EIGENEN Pfad (`PUT /tasks/:id/documents`,
+ *              `attachment_document_ids`) - der Server urteilt dort über das
+ *              Modul der Seite, nicht über Dokumente.
+ *   - `none`:  kein Feld. Schon das Lesen antwortet mit 403, die Auswahl bliebe
+ *              leer und jeder Anhang-Link ginge ins Leere. bind() findet dann
+ *              kein Feld und gibt `null` zurück; alle vier Aufrufer lassen die
+ *              Verknüpfungen in diesem Fall unberührt (sie senden das Feld
+ *              nicht mit), statt sie mit einer leeren Liste zu löschen.
+ *
+ * Die Entscheidung fällt EINMAL, beim Rendern; bind() verdrahtet nur, was im
+ * Markup steht.
  */
 
 import { api } from '/api.js';
 import { t, formatDate } from '/i18n.js';
 import { esc } from '/utils/html.js';
+import { isPreviewable } from '/utils/document-preview.js';
+import { maxUploadBytes, maxUploadMb } from '/utils/upload-limit.js';
+import { attachOverlay } from '/utils/overlay-history.js';
+import { pathAccess, mayWritePath } from '/utils/module-access.js';
 
-const MAX_FILE_SIZE = 5 * 1024 * 1024;
+
 
 // Spiegelt die Upload-Allowlist des Servers (server/routes/documents.js).
 // Der Server bleibt die Instanz, die ablehnt - das accept-Attribut erspart dem
@@ -49,22 +79,27 @@ const FIELD_CLASS = 'doc-attach';
  * @param {object} options
  * @param {object[]} [options.attachments] - bereits verknüpfte Dokumente
  * @param {string} [options.label] - Feld-Beschriftung
- * @param {string} [options.hint] - Hinweistext unter den Aktionen
+ * @param {string} [options.hint] - Hinweistext unter den Aktionen. Ohne ihn
+ *        steht der allgemeine Hinweis da - der nennt das Hochladen und entfällt
+ *        deshalb, wo es nicht angeboten wird.
  * @param {string} [options.icon] - Lucide-Icon der leeren Fläche
- * @returns {string}
+ * @returns {string} leer, wenn das Dokumente-Modul nicht einmal lesbar ist
  */
 export function renderDocumentAttachField({
   attachments = [],
   label = t('documentAttach.label'),
-  hint = t('documentAttach.hint'),
+  hint,
   icon = 'paperclip',
   maxItems = 0,
 } = {}) {
+  if (pathAccess('/documents') === 'none') return '';
+  const canUpload = mayWritePath('/documents');
+  const hintText = hint ?? (canUpload ? t('documentAttach.hint', { size: maxUploadMb() }) : '');
   // Vorbelegung als data-Attribut: hält render und bind entkoppelt, der
   // Aufrufer muss die Liste nicht ein zweites Mal an bind() reichen.
   const initial = attachments
     .filter((a) => a?.document_id)
-    .map((a) => ({ id: a.document_id, name: a.name || a.original_name || '' }));
+    .map((a) => ({ id: a.document_id, name: a.name || a.original_name || '', mime: a.mime_type || '' }));
 
   return `
     <div class="form-group ${FIELD_CLASS}" data-doc-attach
@@ -78,18 +113,18 @@ export function renderDocumentAttachField({
         <span>${esc(t('documentAttach.emptyState'))}</span>
       </p>
       <div class="doc-attach__actions">
-        <button class="btn btn--secondary doc-attach__action" type="button" data-doc-attach-upload>
+        ${canUpload ? `<button class="btn btn--secondary doc-attach__action" type="button" data-doc-attach-upload>
           <i data-lucide="upload" aria-hidden="true"></i>
           <span>${esc(t('documentAttach.uploadAction'))}</span>
-        </button>
+        </button>` : ''}
         <button class="btn btn--secondary doc-attach__action" type="button" data-doc-attach-pick>
           <i data-lucide="folder-open" aria-hidden="true"></i>
           <span>${esc(t('documentAttach.pickAction'))}</span>
         </button>
       </div>
-      <input class="sr-only" type="file" multiple accept="${ACCEPT}" data-doc-attach-input
-             aria-labelledby="doc-attach-label">
-      <p class="form-hint">${esc(hint)}</p>
+      ${canUpload ? `<input class="sr-only" type="file" multiple accept="${ACCEPT}" data-doc-attach-input
+             aria-labelledby="doc-attach-label">` : ''}
+      ${hintText ? `<p class="form-hint">${esc(hintText)}</p>` : ''}
     </div>`;
 }
 
@@ -102,47 +137,69 @@ export function renderDocumentAttachField({
  *
  * @param {HTMLElement} panel - Container, in dem das Feld steckt
  * @param {object} options
- * @param {string} [options.category] - Dokument-Kategorie für neue Uploads
- * @param {string} [options.folderName] - Zielordner für neue Uploads
- * @param {string} [options.visibility] - Sichtbarkeit neuer Uploads
+ * @param {string|Function} [options.category] - Dokument-Kategorie für neue
+ *        Uploads. Ein fester String (Standard) oder eine Funktion, die bei
+ *        jedem commit() frisch ausgewertet wird - für Aufrufer mit einem
+ *        Kategorie-Auswahlfeld im Formular (z. B. Inventar).
+ * @param {string} [options.folderKey] - Schlüssel des Systemordners, in dem das
+ *        Modul seine Belege ablegt ('budget', 'tasks', ...). Er bestimmt, WELCHER
+ *        Ordner gemeint ist; `folderName` ist nur dessen Beschriftung, falls er
+ *        erst noch entstehen muss. Vor Migration v157 trug der Name selbst die
+ *        Identität, und zwei Sprachen ergaben zwei Ordner.
+ * @param {string} [options.folderName] - Beschriftung für einen neu entstehenden Ordner
+ * @param {string|Function} [options.visibility] - Sichtbarkeit neuer Uploads.
+ *        Fester String oder eine Funktion, die bei jedem commit() frisch
+ *        ausgewertet wird - fuer Formulare, in denen die Sichtbarkeit des
+ *        Datensatzes selbst noch umgestellt werden kann.
+ * @param {Function} [options.allowedMemberIds] - () => number[], nur fuer
+ *        `restricted` ausgewertet: wer das Dokument sehen darf.
  * @param {Function} [options.documentName] - (file) => Anzeigename des Uploads
  * @param {number} [options.maxFileSize]
  * @returns {{ commit: Function, documentIds: Function, isDirty: Function }|null}
  */
 export function bindDocumentAttachField(panel, {
   category = 'other',
+  folderKey = '',
   folderName = '',
   visibility = 'family',
+  allowedMemberIds = null,
   documentName = null,
-  maxFileSize = MAX_FILE_SIZE,
+  maxFileSize = maxUploadBytes(),
 } = {}) {
   const field = panel?.querySelector('[data-doc-attach]');
   if (!field) return null;
 
   const chipsEl = field.querySelector('[data-doc-attach-chips]');
   const emptyEl = field.querySelector('[data-doc-attach-empty]');
+  // Fehlt das Dateifeld, hat render() das Hochladen nicht angeboten (kein
+  // Schreibrecht auf Dokumente) - dann bleibt auch jede Verdrahtung dafuer aus.
   const fileInput = field.querySelector('[data-doc-attach-input]');
   const initialIds = readInitialIds(field);
   // 0 = unbegrenzt. Bei 1 nimmt das Feld genau einen Beleg an (Zahlungsnachweis:
   // das Datenmodell hat dort eine einzelne Spalte, ein zweiter Beleg ginge beim
   // Speichern verloren) - dann ersetzt eine neue Wahl die bisherige.
   const maxItems = Number(field.dataset.docAttachMax) || 0;
-  if (maxItems === 1) fileInput.removeAttribute('multiple');
+  if (maxItems === 1) fileInput?.removeAttribute('multiple');
 
   // Zwei Sorten Einträge in einer Liste, damit die Reihenfolge der Chips der
   // Reihenfolge des Hinzufügens entspricht:
   //   { kind: 'document', id, name }  - existiert bereits serverseitig
   //   { kind: 'file', file, name }    - wird erst bei commit() hochgeladen
-  const items = initialIds.map((entry) => ({ kind: 'document', id: entry.id, name: entry.name }));
+  const items = initialIds.map((entry) => ({ kind: 'document', id: entry.id, name: entry.name, mime: entry.mime || '' }));
 
   const renderChips = () => {
     chipsEl.replaceChildren();
     for (const [index, item] of items.entries()) {
       // Bereits abgelegte Dokumente sind anklickbar - ein Beleg, den man nicht
       // ansehen kann, ist kein Beleg. Wartende Uploads haben noch keine URL.
+      // Vorschaubar -> /preview, sonst /download. Der feste /preview-Link war
+      // fuer eine DOCX oder XLSX ein 415: die Datei war angehaengt, aber nicht
+      // mehr zu oeffnen. Welche Typen der Browser inline zeigt, steht einmal in
+      // utils/document-preview.js.
+      const href = `/api/v1/documents/${item.id}/${isPreviewable(item.mime) ? 'preview' : 'download'}`;
       const nameHtml = item.kind === 'file'
         ? `<span class="doc-attach__chip-name">${esc(item.name)}</span>`
-        : `<a class="doc-attach__chip-name" href="/api/v1/documents/${item.id}/preview"
+        : `<a class="doc-attach__chip-name" href="${href}"
               target="_blank" rel="noopener noreferrer"
               title="${esc(t('documentAttach.openAction', { name: item.name }))}">${esc(item.name)}</a>`;
       chipsEl.insertAdjacentHTML('beforeend', `
@@ -177,18 +234,14 @@ export function bindDocumentAttachField(panel, {
     renderChips();
   });
 
-  field.querySelector('[data-doc-attach-upload]').addEventListener('click', () => fileInput.click());
-
-  fileInput.addEventListener('change', () => {
-    for (const file of fileInput.files || []) {
+  if (fileInput) wireUpload(field, fileInput, (files) => {
+    for (const file of files || []) {
       if (file.size > maxFileSize) {
-        window.yuvomi?.showToast(t('documents.fileTooLarge'), 'danger');
+        window.yuvomi?.showToast(t('documents.fileTooLarge', { size: maxUploadMb() }), 'danger');
         continue;
       }
       if (!addItem({ kind: 'file', file, name: file.name })) break;
     }
-    // Zurücksetzen, sonst löst dieselbe Datei beim zweiten Mal kein change aus.
-    fileInput.value = '';
     renderChips();
   });
 
@@ -196,7 +249,7 @@ export function bindDocumentAttachField(panel, {
     const alreadyLinked = new Set(items.filter((i) => i.kind === 'document').map((i) => i.id));
     const picked = await openDocumentPicker(panel, { excludeIds: alreadyLinked, single: maxItems === 1 });
     for (const doc of picked) {
-      if (!addItem({ kind: 'document', id: doc.id, name: doc.name })) break;
+      if (!addItem({ kind: 'document', id: doc.id, name: doc.name, mime: doc.mime_type || '' })) break;
     }
     if (picked.length) renderChips();
   });
@@ -220,25 +273,75 @@ export function bindDocumentAttachField(panel, {
     async commit() {
       for (const item of items) {
         if (item.kind !== 'file') continue;
+        // Sichtbarkeit erst beim Hochladen aufloesen: in einem Formular, das
+        // sie selbst fuehrt (Aufgaben), kann sie zwischen Dateiwahl und
+        // Speichern noch umgestellt worden sein.
+        const vis = typeof visibility === 'function' ? visibility() : visibility;
         const res = await api.post('/documents', {
           name: documentName ? documentName(item.file) : item.file.name,
           description: '',
-          category,
-          visibility,
+          category: typeof category === 'function' ? category() : category,
+          visibility: vis,
           status: 'active',
-          allowed_member_ids: [],
+          allowed_member_ids: vis === 'restricted' && allowedMemberIds ? allowedMemberIds() : [],
           original_name: item.file.name,
           content_data: await readFileAsDataUrl(item.file),
+          ...(folderKey ? { folder_key: folderKey } : {}),
           ...(folderName ? { folder_name: folderName } : {}),
         });
         item.kind = 'document';
         item.id = res.data?.id;
         item.name = res.data?.name || item.name;
+        item.mime = res.data?.mime_type || item.file?.type || '';
         delete item.file;
       }
       return items.filter((i) => i.id).map((i) => i.id);
     },
   };
+}
+
+/**
+ * Die drei Wege, auf denen eine Datei zum Hochladen ins Feld kommt: Knopf,
+ * Dateidialog und Fallenlassen. Nur verdrahtet, wenn render() das Dateifeld
+ * gezeichnet hat - ohne Schreibrecht auf Dokumente haengt am Feld also auch
+ * kein `drop`, und eine hineingezogene Datei wird gar nicht erst angenommen.
+ *
+ * @param {HTMLElement} field
+ * @param {HTMLInputElement} fileInput
+ * @param {(files: FileList|File[]) => void} acceptFiles
+ */
+function wireUpload(field, fileInput, acceptFiles) {
+  field.querySelector('[data-doc-attach-upload]')?.addEventListener('click', () => fileInput.click());
+
+  fileInput.addEventListener('change', () => {
+    acceptFiles(fileInput.files);
+    // Zurücksetzen, sonst löst dieselbe Datei beim zweiten Mal kein change aus.
+    fileInput.value = '';
+  });
+
+  // Fallenlassen statt suchen (#733). Der Browser öffnet eine hierher gezogene
+  // Datei sonst im Tab und verwirft dabei das ausgefüllte Formular darunter -
+  // deshalb hängt der Abbruch am Feld und nicht am Fenster: Dateien, die
+  // woanders landen, gehen weiterhin ihren eigenen Weg.
+  const setDragging = (on) => field.classList.toggle('doc-attach--dragging', on);
+  field.addEventListener('dragover', (event) => {
+    if (!event.dataTransfer?.types?.includes('Files')) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    setDragging(true);
+  });
+  field.addEventListener('dragleave', (event) => {
+    // Nur, wenn der Zeiger das Feld wirklich verlässt - beim Wechsel zwischen
+    // Kindelementen feuert dragleave sonst und das Feld flackert.
+    if (field.contains(event.relatedTarget)) return;
+    setDragging(false);
+  });
+  field.addEventListener('drop', (event) => {
+    if (!event.dataTransfer?.files?.length) return;
+    event.preventDefault();
+    setDragging(false);
+    acceptFiles(event.dataTransfer.files);
+  });
 }
 
 /** Liest die von renderDocumentAttachField hinterlegte Vorbelegung. */
@@ -306,6 +409,9 @@ function openDocumentPicker(panel, { excludeIds = new Set(), single = false } = 
       if (opener?.isConnected) opener.focus();
       resolve(result);
     };
+    // Das Overlay liegt ueber einem offenen Modal; die Zurueck-Geste meint
+    // deshalb zuerst den Picker (#871). Ohne Auswahl heisst zu: abgebrochen.
+    attachOverlay(overlay, () => close(null));
 
     const renderList = () => {
       const needle = searchEl.value.trim().toLowerCase();

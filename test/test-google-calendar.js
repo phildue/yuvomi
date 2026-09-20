@@ -14,8 +14,9 @@ const db = (await import('../server/db.js')).get();
 const { __test } = await import('../server/services/google-calendar.js');
 const { localEventToGoogle, googleAllDayEndToInclusive, localAllDayEndToExclusive,
         upsertGoogleEvents, upsertExternalCalendar,
-        setReadonly, isReadonly, fetchEventColorMap, serverTimeZone } = __test;
+        setReadonly, isReadonly, fetchEventColorMap, householdTimeZone } = __test;
 const { nearestColorId } = await import('../server/utils/ical-color.js');
+const { expandRecurringEvents } = await import('../server/services/calendar-events.js');
 
 // Reale Google-Event-Palette (colors.get → event), Basis für Nearest-Match.
 const GOOGLE_EVENT_PALETTE = {
@@ -290,13 +291,16 @@ test('localEventToGoogle: all-day-Event bleibt ohne timeZone (reines DATE)', () 
   assertEqual(g.start.date, '2026-06-03');
 });
 
-test('serverTimeZone: TZ-Env hat Vorrang, sonst gültige IANA-Zone', () => {
+// Ohne Verbindung (null) faellt householdTimeZone auf die Umgebung zurueck -
+// genau der Rueckfall, den der Google-Outbound nimmt, wenn der Zielkalender
+// keine Zone meldet. Die Einstellung selbst prueft test-household-timezone.js.
+test('householdTimeZone(null): TZ-Env hat Vorrang, sonst gültige IANA-Zone', () => {
   const prevTz = process.env.TZ;
   try {
     process.env.TZ = 'Pacific/Auckland';
-    assertEqual(serverTimeZone(), 'Pacific/Auckland');
+    assertEqual(householdTimeZone(null), 'Pacific/Auckland');
     delete process.env.TZ;
-    const fallback = serverTimeZone();
+    const fallback = householdTimeZone(null);
     assert(typeof fallback === 'string' && fallback.length > 0, 'Fallback liefert eine Zone');
     // Muss von Intl akzeptiert werden, sonst weist Google das Event zurück.
     new Intl.DateTimeFormat('en-US', { timeZone: fallback });
@@ -344,20 +348,60 @@ test('localEventToGoogle: ohne Palette bleibt colorId ungesetzt', () => {
   assertEqual(g.colorId, undefined);
 });
 
-test('localEventToGoogle: ohne event.color bleibt colorId ungesetzt', () => {
+test('localEventToGoogle: eine GELEERTE Farbe wird ausdruecklich geleert (#891/#899)', () => {
+  // NICHT weggelassen, sondern null - und der Unterschied ist der ganze Punkt.
+  // Der Update-Push ist ein `events.patch`, und ein PATCH fasst nur die Felder
+  // an, die im Body STEHEN. Ein fehlendes colorId hiesse "nicht anfassen":
+  // Google behielte seine alte Farbe, waehrend Yuvomi die der zugewiesenen
+  // Person zeigt, und die beiden blieben dauerhaft verschieden.
+  //
+  // Bis v2.48.0 war das folgenlos, weil `color` NOT NULL war und dieser Zweig
+  // fuer Updates nie erreicht wurde. Der Test stand hier trotzdem - er hat die
+  // damals wahre Beobachtung festgehalten statt der Regel dahinter, und waere
+  // deshalb gruen geblieben, wenn der Fall real wird.
   const g = localEventToGoogle(
-    { title: 'Farblos', all_day: 1, start_datetime: '2026-06-03' },
+    { title: 'Farblos', all_day: 1, start_datetime: '2026-06-03', color_modified: 1 },
     GOOGLE_EVENT_PALETTE
   );
+  assertEqual(g.colorId, null);
+  assertEqual('colorId' in g, true, 'das Feld MUSS im Body stehen, sonst loescht der PATCH nichts');
+});
+
+test('localEventToGoogle: eine NIE gelernte Farbe loescht Googles Farbe NICHT (#899)', () => {
+  // Die Gegenprobe zum Test darueber und der Grund fuer #899: bis dahin ging das
+  // null bei JEDEM farblosen Termin hinaus, auch bei einem, der nie eine Farbe
+  // hatte. Ein Termin kommt ohne colorId herein (lokal NULL), jemand faerbt ihn
+  // spaeter in Google, und die naechste beliebige Bearbeitung in Yuvomi raeumte
+  // dessen Farbe ab - ohne dass sie hier je jemand angefasst haette.
+  const g = localEventToGoogle(
+    { title: 'Nie gefaerbt', all_day: 1, start_datetime: '2026-06-03', color_modified: 0 },
+    GOOGLE_EVENT_PALETTE
+  );
+  assertEqual('colorId' in g, false, 'nie gelernt heisst "nicht anfassen", nicht "loeschen"');
+});
+
+test('localEventToGoogle: eine unabbildbare Farbe loescht Googles Farbe NICHT', () => {
+  // Die Gegenprobe zum Test darueber, und die Grenze der Regel: eine fehlende
+  // PALETTE ist etwas anderes als eine fehlende FARBE. Faellt `colors.get` aus,
+  // traegt der Termin sehr wohl eine Farbe - sie laesst sich nur nicht auf eine
+  // der 11 colorIds abbilden. Ein Nullwert wuerde hier eine in Google gesetzte
+  // Farbe wegwerfen, obwohl niemand das wollte; "nicht anfassen" ist richtig.
+  const g = localEventToGoogle(
+    { title: 'Rot', all_day: 1, start_datetime: '2026-06-03', color: '#FF0000' },
+    {}
+  );
   assertEqual(g.colorId, undefined);
+  assertEqual('colorId' in g, false, 'ohne Palette darf das Feld gar nicht erst im Body stehen');
 });
 
 // --------------------------------------------------------
-// upsertGoogleEvents – Event-Farbsync + user_modified-Gate (Issue #219, #427)
+// upsertGoogleEvents – Event-Farbsync + color_modified-Gate (Issue #219, #427, #899)
 // --------------------------------------------------------
 console.log('\n[Google Calendar Test] upsertGoogleEvents – Farbsync\n');
 
-// Seed-User (created_by = 1 in upsertGoogleEvents)
+// Seed-User: bekommt die ID 1 und war damit genau der Grund, warum diese Suite
+// den Fremdschlüssel-Fehler aus #839 nie sehen konnte. Der Fall mit einer
+// anderen Besitzer-ID steht am Ende der Datei.
 db.prepare(`INSERT INTO users (username, display_name, password_hash, role)
   VALUES ('admin', 'Admin', 'x', 'admin')`).run();
 
@@ -372,13 +416,25 @@ const gEvent = {
   end:   { dateTime: '2026-06-03T11:00:00Z' },
 };
 
-test('Erst-Import ohne colorId setzt die Kalenderfarbe als Default', () => {
+test('Erst-Import ohne colorId schreibt KEINE Eigenfarbe (#891)', () => {
+  // Bis v2.48.0 landete hier die Kalenderfarbe. Das las sich harmlos - die
+  // Anzeige stimmte ja -, machte aber eine GEERBTE Farbe ununterscheidbar von
+  // einer, die jemand fuer diesen Termin gewaehlt hat. Da die Eigenfarbe seit
+  // #815 vorn steht, hat sie damit die Farbe der zugewiesenen Person auf Dauer
+  // verdraengt. Der Termin bleibt farblos; die Kalenderfarbe kommt beim Lesen
+  // als cal_color ueber calendar_ref_id dazu, wo sie als geerbt erkennbar ist.
   const calRefId = upsertExternalCalendar('google', 'primary', 'Mein Kalender', '#FF0000');
   upsertGoogleEvents([gEvent], calRefId, '#FF0000', COLOR_MAP);
   const row = db.prepare(
-    'SELECT color FROM calendar_events WHERE external_calendar_id = ?'
+    'SELECT color, calendar_ref_id FROM calendar_events WHERE external_calendar_id = ?'
   ).get(gEvent.id);
-  assertEqual(row.color, '#FF0000');
+  assertEqual(row.color, null);
+  // Gegenprobe: die Farbe ist nicht verloren, nur woanders. Ohne diese Haelfte
+  // waere der Test auch dann gruen, wenn der Termin gar keinen Kalender mehr
+  // haette und die geerbte Farbe damit wirklich weg waere.
+  assertEqual(row.calendar_ref_id, calRefId, 'der Kalenderbezug traegt die geerbte Farbe');
+  const cal = db.prepare('SELECT color FROM external_calendars WHERE id = ?').get(calRefId);
+  assertEqual(cal.color, '#FF0000', 'und dort steht sie unveraendert');
 });
 
 test('colorId wird zur Event-Eigenfarbe aufgelöst (#427)', () => {
@@ -391,17 +447,19 @@ test('colorId wird zur Event-Eigenfarbe aufgelöst (#427)', () => {
   assertEqual(row.color, '#FFA500', 'colorId 6 muss auf den Paletten-Hex gemappt werden');
 });
 
-test('Unbekannte colorId fällt auf die Kalenderfarbe zurück', () => {
+test('Unbekannte colorId schreibt ebenfalls keine Eigenfarbe (#891)', () => {
+  // Eine colorId, die in der Palette fehlt, ist keine Farbangabe - also derselbe
+  // Fall wie gar keine colorId, nicht ein Anlass, die Kalenderfarbe einzusetzen.
   const colored = { ...gEvent, id: 'evt-colorid-unknown', colorId: '99' };
   const calRefId = upsertExternalCalendar('google', 'primary', 'Mein Kalender', '#FF0000');
   upsertGoogleEvents([colored], calRefId, '#FF0000', COLOR_MAP);
   const row = db.prepare(
     'SELECT color FROM calendar_events WHERE external_calendar_id = ?'
   ).get('evt-colorid-unknown');
-  assertEqual(row.color, '#FF0000');
+  assertEqual(row.color, null);
 });
 
-test('Re-Sync übernimmt geänderte Google-Farbe, solange user_modified = 0', () => {
+test('Re-Sync übernimmt geänderte Google-Farbe, solange color_modified = 0', () => {
   const recolored = { ...gEvent, colorId: '10' };
   const calRefId = upsertExternalCalendar('google', 'primary', 'Mein Kalender', '#FF0000');
   upsertGoogleEvents([recolored], calRefId, '#FF0000', COLOR_MAP);
@@ -411,9 +469,9 @@ test('Re-Sync übernimmt geänderte Google-Farbe, solange user_modified = 0', ()
   assertEqual(row.color, '#00FF00', 'Remote-Farbänderung muss ohne lokalen Override durchkommen');
 });
 
-test('Re-Sync überschreibt Farbe NICHT nach lokalem Umfärben (user_modified = 1)', () => {
-  // Nutzer ändert die Event-Farbe – die App setzt dabei user_modified = 1.
-  db.prepare('UPDATE calendar_events SET color = ?, user_modified = 1 WHERE external_calendar_id = ?')
+test('Re-Sync überschreibt Farbe NICHT nach lokalem Umfärben (color_modified = 1)', () => {
+  // Nutzer ändert die Event-Farbe – die App setzt dabei color_modified = 1.
+  db.prepare('UPDATE calendar_events SET color = ?, color_modified = 1 WHERE external_calendar_id = ?')
     .run('#0000FF', gEvent.id);
   const calRefId = upsertExternalCalendar('google', 'primary', 'Mein Kalender', '#FF0000');
   upsertGoogleEvents([gEvent], calRefId, '#FF0000', COLOR_MAP);
@@ -423,7 +481,26 @@ test('Re-Sync überschreibt Farbe NICHT nach lokalem Umfärben (user_modified = 
   assertEqual(row.color, '#0000FF', 'Benutzerfarbe muss über den Sync hinweg erhalten bleiben');
 });
 
-test('Re-Sync aktualisiert übrige Felder, Farbschutz bei user_modified = 1 bleibt', () => {
+test('Eine Titeländerung friert die Farbe NICHT ein (#899)', () => {
+  // Der Repro aus #899 auf Googles Seite: ein Termin kommt ohne colorId herein,
+  // der Nutzer aendert in Yuvomi nur den TITEL - das setzt user_modified = 1 -,
+  // und danach faerbt ihn jemand in Google. Solange das Farb-Gatter an
+  // user_modified hing, kam diese Farbe nie an.
+  const fresh = { ...gEvent, id: 'evt-title-edit' };
+  const calRefId = upsertExternalCalendar('google', 'primary', 'Mein Kalender', '#FF0000');
+  upsertGoogleEvents([fresh], calRefId, '#FF0000', COLOR_MAP);
+  db.prepare('UPDATE calendar_events SET title = ?, user_modified = 1 WHERE external_calendar_id = ?')
+    .run('Team-Meeting (verschoben)', fresh.id);
+
+  upsertGoogleEvents([{ ...fresh, colorId: '6' }], calRefId, '#FF0000', COLOR_MAP);
+  const row = db.prepare(
+    'SELECT color, user_modified FROM calendar_events WHERE external_calendar_id = ?'
+  ).get(fresh.id);
+  assertEqual(row.color, '#FFA500', 'die Farbe aus Google muss trotz Titelbearbeitung ankommen');
+  assertEqual(row.user_modified, 1, 'die Bearbeitung selbst bleibt vermerkt');
+});
+
+test('Re-Sync aktualisiert übrige Felder, Farbschutz bei color_modified = 1 bleibt', () => {
   const updated = { ...gEvent, summary: 'Team-Meeting (verschoben)' };
   const calRefId = upsertExternalCalendar('google', 'primary', 'Mein Kalender', '#FF0000');
   upsertGoogleEvents([updated], calRefId, '#FF0000', COLOR_MAP);
@@ -538,6 +615,131 @@ test('Re-Sync mit geändertem Titel kommt weiterhin an', () => {
     'SELECT title FROM calendar_events WHERE external_calendar_id = ?'
   ).get('evt-changed');
   assertEqual(row.title, 'Team-Meeting (verschoben)', 'Titeländerung muss ankommen');
+});
+
+// --------------------------------------------------------
+// Zeitzone einer Google-Serie (#829)
+//
+// Google liefert die IANA-Zone neben der Zeit (start.timeZone), Yuvomi hat sie
+// nicht mitgeschrieben. Ohne tzid wiederholt expandRecurringEvents den festen
+// Offset des ersten Vorkommens - ueber die Sommer-/Winterzeit-Grenze steht die
+// Serie dann eine Stunde falsch. Fuer CalDAV/Apple war das als #549 laengst
+// behoben, fuer Google nie nachgezogen.
+// --------------------------------------------------------
+
+const torontoSeries = {
+  id: 'evt-tz-829',
+  status: 'confirmed',
+  summary: 'Wochentermin',
+  start: { dateTime: '2026-08-24T19:00:00-04:00', timeZone: 'America/Toronto' },
+  end:   { dateTime: '2026-08-24T20:00:00-04:00', timeZone: 'America/Toronto' },
+  recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO'],
+};
+const tzidOf = (id) => db.prepare(
+  'SELECT tzid FROM calendar_events WHERE external_calendar_id = ?'
+).get(id)?.tzid ?? null;
+
+test('Der Import uebernimmt die Zeitzone, die Google mitliefert', () => {
+  const calRefId = upsertExternalCalendar('google', 'primary', 'Mein Kalender', '#FF0000');
+  upsertGoogleEvents([torontoSeries], calRefId, '#FF0000', COLOR_MAP);
+  assertEqual(tzidOf('evt-tz-829'), 'America/Toronto');
+});
+
+test('Ohne Zone am Termin greift die Zone des Kalenders', () => {
+  const calRefId = upsertExternalCalendar('google', 'primary', 'Mein Kalender', '#FF0000');
+  const item = { ...torontoSeries, id: 'evt-tz-cal', start: { dateTime: '2026-08-24T19:00:00-04:00' } };
+  upsertGoogleEvents([item], calRefId, '#FF0000', COLOR_MAP, { calTimeZone: 'America/Toronto' });
+  assertEqual(tzidOf('evt-tz-cal'), 'America/Toronto');
+});
+
+test('Ein Ganztags-Termin traegt keine Zone', () => {
+  const calRefId = upsertExternalCalendar('google', 'primary', 'Mein Kalender', '#FF0000');
+  const item = {
+    id: 'evt-tz-allday', status: 'confirmed', summary: 'Urlaub',
+    start: { date: '2026-08-24' }, end: { date: '2026-08-26' },
+  };
+  upsertGoogleEvents([item], calRefId, '#FF0000', COLOR_MAP, { calTimeZone: 'America/Toronto' });
+  assertEqual(tzidOf('evt-tz-allday'), null);
+});
+
+test('Eine Bestandszeile bekommt die Zone beim naechsten Lauf nachgetragen', () => {
+  // Der Wertvergleich im UPDATE muss tzid kennen, sonst bliebe die Spalte bei
+  // allen vor diesem Fix importierten Serien fuer immer leer.
+  const calRefId = upsertExternalCalendar('google', 'primary', 'Mein Kalender', '#FF0000');
+  const item = { ...torontoSeries, id: 'evt-tz-backfill' };
+  upsertGoogleEvents([item], calRefId, '#FF0000', COLOR_MAP);
+  db.prepare('UPDATE calendar_events SET tzid = NULL WHERE external_calendar_id = ?').run('evt-tz-backfill');
+
+  upsertGoogleEvents([item], calRefId, '#FF0000', COLOR_MAP);
+  assertEqual(tzidOf('evt-tz-backfill'), 'America/Toronto');
+});
+
+test('Die Serie behaelt ihre Ortszeit ueber den Zeitumstellungs-Wechsel', () => {
+  const calRefId = upsertExternalCalendar('google', 'primary', 'Mein Kalender', '#FF0000');
+  const item = { ...torontoSeries, id: 'evt-tz-dst' };
+  upsertGoogleEvents([item], calRefId, '#FF0000', COLOR_MAP);
+  const row = db.prepare(
+    'SELECT * FROM calendar_events WHERE external_calendar_id = ?'
+  ).get('evt-tz-dst');
+
+  const wallTime = (iso) => new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(new Date(iso));
+
+  const occurrences = expandRecurringEvents([row], '2026-08-24', '2026-11-30');
+  const times = new Set(occurrences.map((o) => wallTime(o.start_datetime)));
+  assertEqual(
+    [...times].join(','), '19:00',
+    'Jedes Vorkommen steht um 19:00 Ortszeit - vor UND nach der Umstellung am 1. November'
+  );
+});
+
+// --------------------------------------------------------
+// created_by ohne den Installations-Nutzer (Issue #839)
+// --------------------------------------------------------
+// Steht bewusst am Ende: der Abschnitt löscht Nutzer 1, und dessen Termine
+// gehen per ON DELETE CASCADE mit. Jeder Test davor hat seine Zusicherungen
+// zu diesem Zeitpunkt bereits geprüft.
+console.log('\n[Google Calendar Test] created_by ohne Nutzer 1 (#839)\n');
+
+db.prepare(`INSERT INTO users (username, display_name, password_hash, role)
+  VALUES ('zweiter', 'Zweiter', 'x', 'member')`).run();
+const secondUserId = db.prepare(`SELECT id FROM users WHERE username = 'zweiter'`).get().id;
+db.prepare(`DELETE FROM users WHERE username = 'admin'`).run();
+
+test('Import läuft weiter, wenn der Nutzer mit ID 1 gelöscht wurde', () => {
+  const calRefId = upsertExternalCalendar('google', 'primary', 'Mein Kalender', '#FF0000');
+  const item = { ...gEvent, id: 'evt-839-no-user-1' };
+  upsertGoogleEvents([item], calRefId, '#FF0000', COLOR_MAP);
+  const row = db.prepare(
+    'SELECT created_by FROM calendar_events WHERE external_calendar_id = ?'
+  ).get('evt-839-no-user-1');
+  assert(row, 'Das Event muss angelegt werden - vorher scheiterte der Insert am Fremdschlüssel');
+  assertEqual(row.created_by, secondUserId, 'Besitzer ist der erste noch existierende Nutzer');
+});
+
+test('Ohne jeden Nutzer wird übersprungen, statt am Fremdschlüssel zu scheitern', () => {
+  db.prepare('DELETE FROM users').run();
+  const calRefId = upsertExternalCalendar('google', 'primary', 'Mein Kalender', '#FF0000');
+  const item = { ...gEvent, id: 'evt-839-no-user-at-all' };
+
+  // Dass hinterher keine Zeile steht, sichert für sich genommen nichts zu - das
+  // galt auch vorher, nur weil der Insert abstürzte. Zusicherung ist, dass er
+  // gar nicht erst versucht wird, und das steht im Fehlerkanal.
+  const errors = [];
+  const realError = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  try { upsertGoogleEvents([item], calRefId, '#FF0000', COLOR_MAP); }
+  finally { console.error = realError; }
+
+  assert(
+    !errors.some((line) => line.includes('FOREIGN KEY')),
+    `Kein Insert-Versuch ohne Besitzer erwartet, geloggt wurde: ${errors.join(' | ')}`
+  );
+  const row = db.prepare(
+    'SELECT id FROM calendar_events WHERE external_calendar_id = ?'
+  ).get('evt-839-no-user-at-all');
+  assertEqual(row, undefined, 'Kein Nutzer, kein Besitzer - und der Lauf bricht trotzdem nicht ab');
 });
 
 // --------------------------------------------------------

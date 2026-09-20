@@ -12,6 +12,23 @@ function csrfHeaderParam() {
   };
 }
 
+/**
+ * Retry-Sicherheit fuer POST (#822). Steht als EIN Helfer hier und wird in
+ * `buildOpenApiSpec` ueber alle POST-Operationen gelegt, statt an jeder
+ * einzelnen wiederholt zu werden: die Middleware gilt fuer den ganzen
+ * `/api/v1`-Namensraum, und eine handgepflegte Liste davon waere schon beim
+ * naechsten neuen Endpoint unvollstaendig.
+ */
+function idempotencyHeaderParam() {
+  return {
+    name: 'Idempotency-Key',
+    in: 'header',
+    required: false,
+    description: 'Optional client-generated key (printable ASCII, max 255 chars) that makes this POST retry-safe. Repeating the request with the same key and the same body returns the original response with `Idempotent-Replayed: true` instead of creating a second record. Reusing a key for a different body, or retrying while the first attempt is still running, answers 409. Keys are stored for 24 hours and survive a restart.',
+    schema: { type: 'string', maxLength: 255 },
+  };
+}
+
 function jsonBody(schemaRef, description = 'JSON request body') {
   return {
     required: true,
@@ -34,6 +51,7 @@ function op({
   requestBody = null,
   responses = null,
   stateChanging = false,
+  documentDeleteConflict = false,
 }) {
   const operation = {
     tags: [tag],
@@ -50,6 +68,11 @@ function op({
   if (admin) {
     operation.description = `${operation.description ? `${operation.description}\n\n` : ''}Admin-only endpoint.`;
     operation.responses[403] = { $ref: '#/components/responses/Forbidden' };
+  }
+  if (documentDeleteConflict) {
+    operation.responses[409] = {
+      description: 'A requested document is being deleted. Retry after the operation finishes. The response body reason is `DOCUMENT_DELETE_IN_PROGRESS`.',
+    };
   }
   if (params.length || stateChanging) {
     operation.parameters = [...params];
@@ -93,4 +116,4 @@ function langParam() {
   };
 }
 
-export { authSecurity, csrfHeaderParam, jsonBody, op, idParam, stringPathParam, langParam };
+export { authSecurity, csrfHeaderParam, idempotencyHeaderParam, jsonBody, op, idParam, stringPathParam, langParam };

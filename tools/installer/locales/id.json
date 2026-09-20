@@ -4,13 +4,15 @@
     "continue": "Lanjut",
     "back": "Kembali",
     "generate": "Buat",
-    "generating": "…",
+    "generating": "Membuat…",
     "optional": "Opsional",
     "stepCounter": "Langkah {{n}} dari {{total}}",
     "toggleVisibility": "Tampilkan atau sembunyikan nilai",
     "copy": "Salin",
     "copied": "Disalin ✓",
-    "language": "Bahasa"
+    "language": "Bahasa",
+    "copyRedirect": "Salin URI pengalihan",
+    "opt": "(opsional)"
   },
   "config": {
     "title": "Konfigurasi dasar",
@@ -22,7 +24,12 @@
     "tzLabel": "Zona waktu",
     "errHost": "Nama host tidak valid. Gunakan hanya huruf, angka, tanda hubung, dan titik.",
     "errPort": "Port tidak valid. Harus berupa angka antara 1 dan 65535.",
-    "prereqMissing": "Prasyarat yang hilang: {{list}}. Harap instal dan muat ulang halaman."
+    "prereqMissing": "Prasyarat yang kurang: {{list}}. {{link}} menunjukkan cara memasangnya.",
+    "prereqLinkDocker": "Panduan Docker",
+    "prereqLinkCompose": "Panduan podman-compose",
+    "prereqRecheck": "Periksa lagi",
+    "errSecureOverHttp": "Alamat publik dimulai dengan http://, tetapi pilihan ini mewajibkan cookie aman - tidak ada yang bisa masuk. Pilih \"Akses langsung\" atau gunakan alamat https://.",
+    "errTz": "Zona waktu tidak valid. Diharapkan nama IANA seperti Europe/Berlin."
   },
   "secrets": {
     "title": "Kunci keamanan",
@@ -32,7 +39,7 @@
     "dbLabel": "Kunci enkripsi basis data",
     "dbHint": "Mengenkripsi basis data SQLite saat diam.",
     "errBoth": "Kedua kunci diperlukan.",
-    "dangerWarn": "Simpan kunci ini sekarang. Jika hilang, data terenkripsi Anda tidak dapat dipulihkan — tidak ada penyetelan ulang.",
+    "dangerWarn": "Simpan kunci ini sekarang. Jika hilang, data terenkripsi Anda tidak dapat dipulihkan — tidak ada penyetelan ulang. Di akhir penyiapan, Anda dapat mengunduh file .env yang berisi kedua kunci.",
     "preserved": "Kunci yang sudah ada tetap dipertahankan, sehingga penyiapan ini tidak akan mengunci Anda dari basis data saat ini. Biarkan kolom kosong untuk mempertahankan kuncinya; memasukkan nilai baru akan menggantinya.",
     "keepPlaceholder": "Kunci yang ada dipertahankan"
   },
@@ -48,12 +55,12 @@
     "unitsMetric": "Metrik (°C)",
     "unitsImperial": "Imperial (°F)",
     "errCoords": "Lintang dan bujur diperlukan.",
-    "errLat": "Lintang tidak valid (–90 hingga 90).",
-    "errLon": "Bujur tidak valid (–180 hingga 180)."
+    "errLat": "Lintang tidak valid (-90 hingga 90).",
+    "errLon": "Bujur tidak valid (-180 hingga 180)."
   },
   "calendar": {
     "title": "Sinkronisasi kalender",
-    "subtitle": "Sambungkan Yuvomi dengan Google Calendar atau Apple iCloud. Keduanya opsional — bentangkan untuk mengonfigurasi.",
+    "subtitle": "Sambungkan Yuvomi dengan Google Calendar, Apple iCloud, atau Outlook. Semuanya opsional - bentangkan untuk mengonfigurasi.",
     "google": "Google Calendar",
     "googleHint": "Buat kredensial OAuth di {{link}}. Redirect URI: {{redirect}}",
     "googleLink": "console.cloud.google.com",
@@ -66,17 +73,22 @@
     "appleUserLabel": "Apple ID (email)",
     "applePassLabel": "Kata sandi khusus aplikasi",
     "appleUrlLabel": "URL CalDAV",
-    "appleUrlOpt": "(opsional)",
-    "appleUrlHint": "Biarkan kosong kecuali penyedia Anda menggunakan endpoint CalDAV yang berbeda."
+    "appleUrlHint": "Biarkan kosong kecuali penyedia Anda menggunakan endpoint CalDAV yang berbeda.",
+    "outlook": "Kalender Outlook (Microsoft Graph)",
+    "outlookHint": "Buat pendaftaran aplikasi Entra ID gratis (\"Hanya akun Microsoft pribadi\") di {{link}} - lihat panduan instalasi. Redirect URI: {{redirect}}",
+    "outlookLink": "entra.microsoft.com",
+    "outlookIdLabel": "Client ID",
+    "outlookSecretLabel": "Client Secret",
+    "outlookNote": "Push satu arah: Yuvomi tetap menjadi sumber utama - perubahan di Outlook akan ditimpa. Akun keluarga dihubungkan nanti di pengaturan aplikasi."
   },
   "advanced": {
     "tag": "Lanjutan · opsional",
     "title": "Pengaturan lanjutan",
-    "subtitle": "Reverse proxy, single sign-on, dan cadangan otomatis. Semua opsional — melewatinya tidak berisiko.",
+    "subtitle": "Single sign-on, akses ke jaringan rumahmu, dan beberapa penyetelan halus. Semua opsional.",
     "proxyLabel": "Bagaimana Yuvomi disediakan?",
     "proxyBehindHttps": "Di belakang reverse proxy dengan HTTPS (Caddy, nginx, Traefik)",
     "proxyDirect": "Akses langsung melalui localhost / HTTP",
-    "proxyHint": "Akses langsung menonaktifkan cookie Secure murni, sehingga login berfungsi tanpa HTTPS.",
+    "proxyHint": "Pilih \"Akses langsung\" jika kamu membuka Yuvomi lewat http:// - kalau tidak, kamu tidak bisa masuk. Di belakang reverse proxy dengan HTTPS, pilih opsi pertama.",
     "oidc": "Single sign-on (OIDC)",
     "oidcHint": "Isi keempat bidang untuk mengaktifkan SSO, atau biarkan kosong.",
     "oidcIssuerLabel": "URL Issuer",
@@ -101,8 +113,7 @@
     "documentLocalEnable": "Simpan dokumen baru di folder lokal",
     "documentLocalPathLabel": "Jalur folder",
     "documentLocalPathHint": "Jalur di dalam kontainer. Biarkan kosong untuk /documents.",
-    "sectionNetwork": "Jaringan",
-    "sectionIntegrations": "Integrasi dan pencadangan",
+    "sectionIntegrations": "Single sign-on",
     "errSchedule": "Jadwal cron tidak valid (diharapkan lima bidang dipisah spasi, mis. 0 2 * * *).",
     "errKeep": "Jumlah cadangan yang disimpan harus berupa angka positif.",
     "webdavBackup": "Cadangan eksternal (WebDAV)",
@@ -125,7 +136,32 @@
     "documentGoogleDriveReuseHint": "Biarkan kedua kolom kosong untuk menggunakan kembali kredensial OAuth Google Calendar. Untuk kredensial khusus, buat di Google Cloud Console (seperti pada langkah Calendar).",
     "documentGoogleDriveRedirectLabel": "URI pengalihan",
     "errDocumentGoogleDrivePair": "ID klien dan rahasia klien Google Drive harus diisi keduanya atau dikosongkan keduanya.",
-    "errDocumentGoogleDriveCredentials": "Google Drive memerlukan ID dan rahasia klien sendiri atau kredensial Google Calendar yang telah dikonfigurasi."
+    "errDocumentGoogleDriveCredentials": "Google Drive memerlukan ID dan rahasia klien sendiri atau kredensial Google Calendar yang telah dikonfigurasi.",
+    "dataDirLabel": "Folder data di host",
+    "dataDirHint": "Tempat basis data dan data aplikasi berada di server. Biarkan kosong untuk memakai ./data di samping berkas compose.",
+    "documentLocalDirLabel": "Folder di host",
+    "documentLocalDirHint": "Folder di server yang dipasang ke dalam kontainer. Biarkan kosong untuk memakai ./documents.",
+    "documentWebdavPrivateNetwork": "Izinkan tujuan WebDAV di jaringan rumah",
+    "documentWebdavPrivateNetworkHint": "Diperlukan untuk Nextcloud di jaringan sendiri. Melepas perlindungan SSRF untuk tujuan ini.",
+    "icsPrivateNetwork": "Izinkan langganan kalender dari jaringan rumah",
+    "icsPrivateNetworkHint": "Diperlukan untuk umpan ICS dari perangkat di jaringan sendiri. Melepas perlindungan SSRF untuk langganan kalender.",
+    "recipeProviderPrivateNetwork": "Izinkan salinan penyedia resep di jaringan rumah",
+    "recipeProviderPrivateNetworkHint": "Diperlukan untuk contoh Mealie atau Tandoor di jaringan Anda. Melepas perlindungan SSRF untuk salinan penyedia resep.",
+    "wasteSourcePrivateNetwork": "Izinkan feed pengumpulan sampah di jaringan rumah",
+    "wasteSourcePrivateNetworkHint": "Diperlukan untuk kalender pengumpulan sampah kota yang dicerminkan di jaringan Anda sendiri. Melepas perlindungan SSRF untuk sumber URL pengumpulan sampah.",
+    "oidcTrustEmail": "Percayai email tanpa klaim verified",
+    "oidcTrustEmailHint": "Aktifkan hanya jika penyedia Anda tidak mengirim email_verified dan Anda memercayainya.",
+    "oidcAllowSignup": "Izinkan masuk SSO membuat akun baru",
+    "oidcAllowSignupHint": "Matikan jika penyedia Anda melayani lebih banyak orang daripada rumah tangga ini. Akun yang sudah ada tetap bisa masuk dan tetap ditautkan.",
+    "baseUrlLabel": "Alamat publik",
+    "baseUrlHint": "Alamat yang dipakai keluargamu untuk membuka Yuvomi - bukan host dan port kontainer. Dipakai untuk tautan atur ulang kata sandi dan undangan.",
+    "syncIntervalLabel": "Interval sinkronisasi kalender (menit)",
+    "syncIntervalHint": "Seberapa sering Yuvomi menyinkronkan kalender dan kontak. Naikkan jika penyedia membatasi laju.",
+    "errSyncInterval": "Masukkan bilangan bulat positif dalam menit.",
+    "sectionPrivateNetwork": "Akses ke jaringan rumahmu",
+    "privateNetworkHint": "Secara bawaan Yuvomi menolak koneksi ke alamat di jaringanmu sendiri, yang melindungi dari server yang diperdaya untuk menjangkau layanan internal. Aktifkan yang benar-benar kamu jalankan di rumah.",
+    "authPasswordLogin": "Pertahankan masuk dengan nama pengguna dan kata sandi",
+    "authPasswordLoginHint": "Mematikannya menjadikan SSO satu-satunya jalan masuk: formulir masuk dan pengaturan ulang kata sandi menghilang. Jika penyedia tidak dapat dijangkau, jalan kembalinya adalah menyunting berkas .env dan memulai ulang."
   },
   "review": {
     "title": "Tinjauan",
@@ -154,24 +190,45 @@
     "webdavBackup": "Cadangan eksternal",
     "on": "aktif",
     "off": "nonaktif",
-    "documentGoogleDrive": "Dokumen Google Drive"
+    "documentGoogleDrive": "Dokumen Google Drive",
+    "sessionSecret": "Kunci sesi",
+    "dbKey": "Kunci basis data",
+    "keyGenerated": "Baru dibuat",
+    "keyPreserved": "Kunci yang ada dipertahankan",
+    "dataDir": "Folder data",
+    "privateNetwork": "Akses ke jaringan lokal",
+    "privateNetworkIcs": "Langganan kalender",
+    "privateNetworkRecipes": "Resep",
+    "privateNetworkWaste": "Pengumpulan sampah",
+    "privateNetworkWebdav": "Dokumen WebDAV",
+    "baseUrl": "Alamat publik",
+    "outlook": "Kalender Outlook",
+    "notEnabled": "tidak diaktifkan"
   },
   "docker": {
     "title": "Yuvomi sedang dimulai",
     "subtitle": "Image dimuat dan kontainer Docker dimulai.",
-    "starting": "Kontainer sedang dimulai …",
     "elapsed": "{{n}} d berlalu",
     "running": "Kontainer sehat dan berjalan",
     "failed": "Kontainer tidak dapat dimulai",
     "unknownError": "Kesalahan tidak diketahui",
     "toAdmin": "Lanjut ke penyiapan admin",
-    "retry": "Coba lagi"
+    "retry": "Coba lagi",
+    "phasePull": "Mengunduh image",
+    "phaseBoot": "Kontainer sedang dijalankan",
+    "phaseHealth": "Pemeriksaan kesehatan berjalan",
+    "firstRunHint": "Pertama kali bisa memakan waktu beberapa menit.",
+    "stalled": "Ini lebih lama dari biasanya. Log di bawah menunjukkan alasannya.",
+    "showLogs": "Tampilkan log",
+    "hideLogs": "Sembunyikan log",
+    "timedOut": "Tidak ada respons setelah 15 menit. Periksa log dan coba lagi.",
+    "logLabel": "Log kontainer"
   },
   "admin": {
     "title": "Buat akun admin",
     "subtitle": "Siapkan login pertama Anda. Akun ini memiliki akses penuh ke Yuvomi.",
     "userLabel": "Nama pengguna",
-    "userHint": "3–64 karakter: huruf, angka, . - _",
+    "userHint": "3-64 karakter: huruf, angka, . - _",
     "nameLabel": "Nama tampilan",
     "passLabel": "Kata sandi",
     "passPlaceholder": "Minimal 8 karakter",
@@ -179,7 +236,7 @@
     "creating": "Sedang membuat …",
     "create": "Buat akun",
     "errAll": "Semua bidang diperlukan.",
-    "errUser": "Format nama pengguna tidak valid (3–64 karakter, huruf/angka/._-).",
+    "errUser": "Format nama pengguna tidak valid (3-64 karakter, huruf/angka/._-).",
     "errPass": "Kata sandi harus minimal 8 karakter.",
     "errMatch": "Kata sandi tidak cocok.",
     "errCreate": "Akun admin tidak dapat dibuat."
@@ -190,7 +247,17 @@
     "open": "Buka Yuvomi →",
     "backupReminder": "Ingat untuk mencadangkan berkas .env Anda sekarang — berkas itu berisi kunci Anda.",
     "download": "Unduh berkas .env",
-    "savedTo": "Disimpan di {{path}}"
+    "savedTo": "Disimpan di {{path}}",
+    "downloadFailed": "File tidak dapat dimuat - installer kemungkinan sudah berhenti. Kuncimu ada di file .env pada servermu.",
+    "serverStops": "Installer akan berhenti dalam beberapa menit. Unduh file sebelum kamu menutup tab ini.",
+    "nextTitle": "Berikutnya",
+    "nextInvite": "Undang keluargamu",
+    "nextInviteDesc": "Buat tautan undangan agar setiap orang memilih kata sandinya sendiri.",
+    "nextModules": "Pilih modulmu",
+    "nextModulesDesc": "Aktifkan yang benar-benar dipakai rumah tanggamu dan sembunyikan sisanya.",
+    "nextInstall": "Pasang di ponsel",
+    "nextInstallDesc": "Buka Yuvomi di ponsel dan tambahkan ke layar utama - bisa dipakai offline.",
+    "subtitleExisting": "Yuvomi sedang berjalan. Instalasi ini sudah punya akun administrator - masuk dengan kredensialmu yang ada."
   },
   "welcome": {
     "title": "Selamat datang di Yuvomi",
@@ -201,7 +268,9 @@
     "simpleTime": "Sekitar 2 menit",
     "advancedTitle": "Penyiapan lanjutan",
     "advancedDesc": "Kontrol penuh: reverse proxy, sinkronisasi kalender, email, single sign-on, dan pencadangan.",
-    "advancedTime": "Setiap opsi, langkah demi langkah"
+    "advancedTime": "Setiap opsi, langkah demi langkah",
+    "existingLocked": "Instalasi yang sudah ada terdeteksi. Gunakan pengaturan lanjutan agar pengaturanmu saat ini tetap tersimpan.",
+    "containerRunning": "Yuvomi sedang berjalan. Menyimpan akan memulai ulang kontainer, jadi akan sebentar tidak tersedia."
   },
   "simple": {
     "title": "Siap digunakan",
@@ -233,5 +302,11 @@
     "fromHint": "Alamat \"Dari\" yang akan dilihat penerima. Banyak penyedia mensyaratkan agar cocok dengan nama pengguna.",
     "fromNameLabel": "Nama pengirim",
     "errIncomplete": "Server SMTP dan alamat pengirim wajib diisi."
+  },
+  "storage": {
+    "title": "Penyimpanan & cadangan",
+    "subtitle": "Di mana datamu tersimpan di server, dan ke mana salinannya pergi. Semua opsional - nilai bawaan sudah berfungsi.",
+    "sectionBackups": "Cadangan",
+    "sectionDocuments": "Penyimpanan dokumen"
   }
 }

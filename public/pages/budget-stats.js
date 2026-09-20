@@ -6,6 +6,9 @@ import { api } from '/api.js';
 import { t, formatDate, getLocale } from '/i18n.js';
 import { wireTablist } from '/utils/tablist.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
+import { mountEmptyState, mountLoadError } from '/utils/empty-state.js';
+import { CHART, chartX, chartY, chartGridMarkup, chartXLabelsMarkup } from '/utils/chart.js';
+import { formatMoneyAxis } from '/utils/money.js';
 
 // Zeitraum und Anker gehören dem Modul (budget.js) und kommen über ctx herein.
 // Vorher hielt dieser View beides selbst - damit gab es zwei Zeitachsen im selben
@@ -50,7 +53,9 @@ async function loadStats() {
   } catch (err) {
     console.error('[Budget] stats load error:', err);
     view.data = null;
-    view.error = true;
+    // Das Fehlerobjekt selbst, nicht nur `true`: `mountLoadError` liest daraus
+    // den Statuscode - die einzige Angabe, die dem Selbsthoster hier weiterhilft.
+    view.error = err;
   }
   renderBodyContent(body);
 }
@@ -58,16 +63,22 @@ async function loadStats() {
 function renderShell() {
   view.root.replaceChildren();
   view.root.insertAdjacentHTML('beforeend', `
-    <div class="budget-stats">
+    <!-- reading, wie die Budget-Seite, in der dieses Panel steckt: dashboard
+         hier setzte --page-measure fuer den Unterbaum auf --layout-wide, und das
+         Kennzahlenband der Berichte lief auf 1200px, waehrend der Budget-Kopf
+         und jeder andere Reiter bei 720px enden (auf main war es 720). Ein
+         eigener Modus je Reiter hiesse, auch den Kopf je Reiter umzuschalten -
+         das ist Welle C in docs/PAGE-COMPOSITION.md, keine Nebenwirkung. -->
+    <div class="budget-stats app-page app-page--reading page-measure--narrow" data-composition="reading">
       <!-- Nur noch die Auflösung: der Zeitraum selbst wird über den geteilten
            Kopf-Stepper des Moduls gewählt. Optik aus dem geteilten
-           .budget-segmented-Baustein. -->
+           .segmented-Baustein. -->
       <div class="budget-stats__controls">
-        <div class="budget-segmented budget-stats__ranges" role="tablist" aria-label="${t('budget.statsRangeLabel')}">
+        <div class="segmented budget-stats__ranges" role="tablist" aria-label="${t('budget.statsRangeLabel')}">
           ${['week', 'month', 'year'].map((r) => {
             const on = r === view.range;
             return `
-            <button type="button" role="tab" class="budget-segmented__item${on ? ' is-active' : ''}"
+            <button type="button" role="tab" class="segmented__item${on ? ' is-active' : ''}"
               data-tab-id="${r}" aria-selected="${on}" tabindex="${on ? '0' : '-1'}"
               aria-controls="budget-stats-body">${t(RANGE_LABELS[r])}</button>`;
           }).join('')}
@@ -103,44 +114,39 @@ function renderBodyContent(body) {
   // darf der Familie nicht vortäuschen, ihre Finanzhistorie sei leer.
   if (view.error) {
     body.replaceChildren();
-    body.insertAdjacentHTML('beforeend', `
-      <div class="empty-state">
-        <i data-lucide="cloud-off" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${t('budget.statsError')}</div>
-        <div class="empty-state__description">${t('budget.statsErrorDescription')}</div>
-        <button class="btn btn--primary empty-state__cta" id="budget-stats-retry">
-          <i data-lucide="refresh-cw" class="icon-md" aria-hidden="true"></i>
-          ${t('budget.statsRetry')}
-        </button>
-      </div>`);
-    if (window.lucide) lucide.createIcons({ el: body });
-    body.querySelector('#budget-stats-retry')?.addEventListener('click', () => loadStats());
+    mountLoadError(body, {
+      title: t('budget.statsError'),
+      description: t('budget.statsErrorDescription'),
+      error: view.error,
+      retryLabel: t('budget.statsRetry'),
+      onRetry: () => loadStats(),
+    });
     return;
   }
   const d = view.data;
   if (!d || (d.totals.income === 0 && d.totals.expenses === 0 && !d.series.some((s) => s.income || s.expenses))) {
     body.replaceChildren();
-    body.insertAdjacentHTML('beforeend', `
-      <div class="empty-state">
-        <div class="empty-state__title">${t('budget.statsEmptyTitle')}</div>
-        <div class="empty-state__description">${t('budget.statsEmptyDescription')}</div>
-      </div>`);
+    mountEmptyState(body, {
+      icon: 'chart-column',
+      title: t('budget.statsEmptyTitle'),
+      description: t('budget.statsEmptyDescription'),
+    });
     return;
   }
   body.replaceChildren();
   body.insertAdjacentHTML('beforeend', `
-    <div class="budget-summary">
-      <div class="budget-summary-card budget-summary-card--income">
-        <div class="budget-summary-card__label">${t('budget.statsIncome')}</div>
-        <div class="budget-summary-card__amount">${fmtAmount(d.totals.income)}</div>
+    <div class="metric-grid">
+      <div class="metric-card metric-card--income">
+        <div class="metric-card__label">${t('budget.statsIncome')}</div>
+        <div class="metric-card__value">${fmtAmount(d.totals.income)}</div>
       </div>
-      <div class="budget-summary-card budget-summary-card--expenses">
-        <div class="budget-summary-card__label">${t('budget.statsExpenses')}</div>
-        <div class="budget-summary-card__amount">${fmtAmount(Math.abs(d.totals.expenses))}</div>
+      <div class="metric-card metric-card--expenses">
+        <div class="metric-card__label">${t('budget.statsExpenses')}</div>
+        <div class="metric-card__value">${fmtAmount(Math.abs(d.totals.expenses))}</div>
       </div>
-      <div class="budget-summary-card ${d.totals.balance >= 0 ? 'budget-summary-card--balance-positive' : 'budget-summary-card--balance-negative'}">
-        <div class="budget-summary-card__label">${t('budget.statsBalance')}</div>
-        <div class="budget-summary-card__amount">${fmtAmount(d.totals.balance)}</div>
+      <div class="metric-card ${d.totals.balance >= 0 ? 'metric-card--balance-positive' : 'metric-card--balance-negative'}">
+        <div class="metric-card__label">${t('budget.statsBalance')}</div>
+        <div class="metric-card__value">${fmtAmount(d.totals.balance)}</div>
       </div>
     </div>
     <div id="budget-stats-trend"></div>
@@ -175,7 +181,11 @@ function renderCatBars() {
   const plans = view.data.range === 'month' ? (view.data.plans || {}) : {};
   const rows = cats.map((c) => {
     const isExp = c.total < 0;
-    const pct = Math.round((Math.abs(c.total) / maxAbs) * 100);
+    // Der Anteil ist der Anteil, wie im Monats-Chart: gleiche Bauart, gleiche
+    // Regel. Der frühere 6-%-Boden zeichnete vier Kategorien mit dem
+    // 9,4-Fachen Abstand gleich lang; der Mindestbalken steht jetzt als Länge
+    // im CSS (--bar-visible). Begründung ausführlich in budget.js.
+    const scale = Math.abs(c.total) / maxAbs;
     const target = isExp ? plans[c.category] : undefined;
     const targetPos = target != null ? Math.min(1, target / maxAbs) : null;
     const targetMarker = targetPos != null
@@ -183,12 +193,14 @@ function renderCatBars() {
              title="${t('budget.planTarget', { amount: view.ctx.formatAmount(target) })}"></div>`
       : '';
     const catLabel = view.ctx.esc(view.ctx.categoryLabel(c.category));
+    // --mirrored: gemeinsame Mittelachse wie im Monats-Chart (Critique
+    // 2026-08-10, P0); der Budgetplan-Zielmarker rechnet im CSS mit.
     return `
-      <div class="budget-bar-row">
+      <div class="budget-bar-row budget-bar-row--mirrored">
         <div class="budget-bar-row__label" title="${catLabel}">${catLabel}</div>
         <div class="budget-bar-row__track">
           <div class="budget-bar-row__fill ${isExp ? 'budget-bar-row__fill--expenses' : 'budget-bar-row__fill--income'}"
-               style="--bar-scale:${pct / 100}"></div>
+               style="--bar-scale:${scale.toFixed(4)};--bar-visible:${c.total !== 0 ? 1 : 0}"></div>
           ${targetMarker}
         </div>
         <div class="budget-bar-row__amount" style="color:${isExp ? 'var(--color-danger)' : 'var(--color-success)'};">
@@ -278,18 +290,23 @@ function renderTrendChart() {
   const host = view.root.querySelector('#budget-stats-trend');
   if (!host) return;
   const s = view.data.series;
-  const W = 600, H = 180, PAD = 8;
   const incomes  = s.map((p) => p.income);
   const expenses = s.map((p) => Math.abs(p.expenses));
   const max = Math.max(1, ...incomes, ...expenses);
-  const x = (i) => PAD + (s.length <= 1 ? 0 : (i * (W - 2 * PAD)) / (s.length - 1));
-  const y = (v) => H - PAD - (v / max) * (H - 2 * PAD);
-  const points = (arr) => arr.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+  const points = (arr) => arr.map((v, i) => `${chartX(i, s.length).toFixed(1)},${chartY(v, 0, max).toFixed(1)}`).join(' ');
   const sum = (arr) => arr.reduce((a, b) => a + b, 0);
 
-  // Die Kurve trug bisher weder Skala noch Zeitachse: zwei farbige Linien ohne
-  // jeden ablesbaren Wert. Achsenbeschriftung liegt als HTML außerhalb des SVG,
-  // weil preserveAspectRatio="none" jeden Text im SVG verzerren würde.
+  // DIE ACHSE STEHT JETZT IM BILD (utils/chart.js).
+  //
+  // Hier stand: „Achsenbeschriftung liegt als HTML außerhalb des SVG, weil
+  // preserveAspectRatio='none' jeden Text im SVG verzerren würde." Der Satz war
+  // richtig und hat die Kausalität verkehrt herum gelesen - das `none` war die
+  // URSACHE, nicht die Randbedingung. Ohne feste Ränder gibt es keinen Platz für
+  // eine Achse im Bild, also musste sie nach draußen, und dort verschiebt sie
+  // sich gegen ihre eigenen Gitterlinien, sobald das Diagramm skaliert (gemessen:
+  // ein 600x180-viewBox auf 720x216 gestreckt). Die geteilte Geometrie bringt den
+  // linken Gutter mit, damit fällt beides weg.
+  //
   // Zweiter Kanal neben der Farbe (Critique P2): Einnahmen solide, Ausgaben
   // gestrichelt - so trennen sich die Serien auch bei Rot-Grün-Schwäche. Der
   // Screenreader-Zugang liegt in der sr-only-Summary + den Punkt-Buttons; das
@@ -311,7 +328,7 @@ function renderTrendChart() {
       income: fmtAmount(p.income),
       expenses: fmtAmount(Math.abs(p.expenses)),
     });
-    const frac = s.length <= 1 ? 0 : (PAD + (i * (W - 2 * PAD)) / (s.length - 1)) / W;
+    const frac = chartX(i, s.length) / CHART.W;
     return `<button type="button" class="budget-stats__point" data-index="${i}"
               style="--point-x:${frac.toFixed(4)};--point-slots:${s.length}"
               tabindex="${i === s.length - 1 ? '0' : '-1'}"
@@ -324,24 +341,16 @@ function renderTrendChart() {
       <div class="budget-chart-section__title">${t('budget.statsTrendTitle')}</div>
       <p class="sr-only">${view.ctx.esc(summary)}</p>
       <div class="budget-stats__trend-wrap">
-        <span class="budget-stats__axis-max" aria-hidden="true">${fmtAmount(max)}</span>
-        <span class="budget-stats__axis-mid" aria-hidden="true">${fmtAmount(max / 2)}</span>
         <div class="budget-stats__plot">
-          <svg class="budget-stats__trend" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
-            ${[0.25, 0.5, 0.75].map((f) => {
-              const gy = (PAD + f * (H - 2 * PAD)).toFixed(1);
-              return `<line class="budget-stats__grid" x1="0" y1="${gy}" x2="${W}" y2="${gy}" vector-effect="non-scaling-stroke" />`;
-            }).join('')}
+          <svg class="budget-stats__trend" viewBox="0 0 ${CHART.W} ${CHART.H}" aria-hidden="true">
+            ${chartGridMarkup(0, max, (val) => formatMoneyAxis(val, view.ctx.currency))}
+            ${chartXLabelsMarkup(s.map((p) => periodLabel(p.period)))}
             <polyline fill="none" stroke="var(--color-success)" stroke-width="2"
                       vector-effect="non-scaling-stroke" points="${points(incomes)}" />
             <polyline fill="none" stroke="var(--color-danger)" stroke-width="2" stroke-dasharray="6 4"
                       vector-effect="non-scaling-stroke" points="${points(expenses)}" />
           </svg>
           <div class="budget-stats__points" role="group" aria-label="${t('budget.statsPointsLabel')}">${hotspots}</div>
-        </div>
-        <div class="budget-stats__axis-x" aria-hidden="true">
-          <span>${formatDate(view.data.from)}</span>
-          <span>${formatDate(view.data.to)}</span>
         </div>
       </div>
       <div class="budget-stats__readout" id="budget-stats-readout" aria-hidden="true"></div>

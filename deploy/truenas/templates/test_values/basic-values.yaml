@@ -3,7 +3,7 @@ resources:
     cpus: 2.0
     memory: 4096
 
-oikos:
+yuvomi:
   session_secret: "dummy_session_secret_for_ci_testing_only_0123456789"
   db_encryption_key: ""
   additional_envs: []
@@ -19,8 +19,9 @@ run_as:
   group: 568
 
 ix_volumes:
-  data: /opt/tests/mnt/oikos/data
-  backups: /opt/tests/mnt/oikos/backups
+  data: /opt/tests/mnt/yuvomi/data
+  backups: /opt/tests/mnt/yuvomi/backups
+  modules: /opt/tests/mnt/yuvomi/modules
 
 storage:
   data:
@@ -32,5 +33,10 @@ storage:
     type: ix_volume
     ix_volume_config:
       dataset_name: backups
+      create_host_path: true
+  modules:
+    type: ix_volume
+    ix_volume_config:
+      dataset_name: modules
       create_host_path: true
   additional_storage: []

@@ -1,7 +1,7 @@
 /**
  * Modul: Setup-Seite (First-Run)
  * Zweck: Anlegen des ersten Admin-Accounts in der Web-GUI beim erstmaligen Start.
- *        Visuell konsistent mit der Login-Seite (gleiche login.css-Klassen).
+ *        Visuell konsistent mit der Login-Seite (gleiche auth.css-Klassen).
  * Abhängigkeiten: /api.js
  */
 
@@ -21,7 +21,7 @@ function getStoredAppName() {
 function setAppBranding(appName) {
   const name = String(appName || '').trim() || DEFAULT_APP_NAME;
   document.title = name;
-  const titleEl = document.querySelector('.login-hero__title');
+  const titleEl = document.querySelector('.auth-hero__title');
   if (titleEl) titleEl.textContent = name;
 }
 
@@ -33,13 +33,13 @@ export async function render(container) {
   const storedAppName = getStoredAppName();
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
-    <main class="login-page" id="main-content">
-      <div class="login-hero">
-        <h1 class="login-hero__title">${esc(storedAppName)}</h1>
-        <p class="login-hero__tagline">${esc(t('setup.tagline'))}</p>
+    <main class="auth-page" id="main-content">
+      <div class="auth-hero">
+        <h1 class="auth-hero__title">${esc(storedAppName)}</h1>
+        <p class="auth-hero__tagline">${esc(t('setup.tagline'))}</p>
       </div>
-      <div class="login-card card card--padded">
-        <form class="login-form" id="setup-form" novalidate>
+      <div class="auth-card card card--padded">
+        <form class="auth-form" id="setup-form" novalidate>
           <div class="form-group">
             <label class="label" for="username">${esc(t('setup.usernameLabel'))}</label>
             <input class="input" type="text" id="username" name="username"
@@ -64,13 +64,13 @@ export async function render(container) {
               autocomplete="new-password"
               placeholder="${esc(t('setup.confirmPasswordPlaceholder'))}" required />
           </div>
-          <div class="login-error" id="setup-error" role="alert" aria-live="polite" hidden></div>
-          <button type="submit" class="btn btn--primary login-form__submit" id="setup-btn">
-            <span class="login-btn__label">${esc(t('setup.submitButton'))}</span>
+          <div class="form-error" id="setup-error" role="alert" aria-live="polite" hidden></div>
+          <button type="submit" class="btn btn--primary auth-form__submit" id="setup-btn">
+            <span class="auth-btn__label">${esc(t('setup.submitButton'))}</span>
           </button>
         </form>
       </div>
-      <p class="login-version" id="setup-version"></p>
+      <p class="auth-version" id="setup-version"></p>
     </main>
   `);
 
@@ -142,11 +142,11 @@ export async function render(container) {
       return;
     }
 
-    const labelEl = submitBtn.querySelector('.login-btn__label');
+    const labelEl = submitBtn.querySelector('.auth-btn__label');
     submitBtn.disabled = true;
     labelEl.textContent = t('setup.creating');
     const spinner = document.createElement('span');
-    spinner.className = 'login-spinner';
+    spinner.className = 'auth-spinner';
     spinner.setAttribute('aria-hidden', 'true');
     submitBtn.insertBefore(spinner, labelEl);
 

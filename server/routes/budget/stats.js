@@ -6,7 +6,7 @@
 import express from 'express';
 import { createLogger } from '../../logger.js';
 import * as db from '../../db.js';
-import { computeStatsRange, cents, budgetFilter, todayLocalDateKey, STATS_RANGES, DATE_RE } from './helpers.js';
+import { bookedOnly, computeStatsRange, cents, budgetFilter, budgetCategoryExpr, todayLocalDateKey, STATS_RANGES, DATE_RE } from './helpers.js';
 import { BUDGET_SAVINGS_KEY } from './plans.js';
 
 const log = createLogger('Budget');
@@ -16,16 +16,18 @@ const router = express.Router();
  * Aggregiert Budget-Daten für den Statistik-Tab.
  * @param {object} database  better-sqlite3/node:sqlite-Instanz mit .prepare()
  */
-export function computeStats(database, { range, anchor }, filter = { clause: '', params: [] }) {
+export function computeStats(database, { range, anchor }, filter = { clause: '', params: [] },
+                             categoryExpr = { expr: 'category', params: [] }) {
   const r = computeStatsRange(range, anchor);
   const f = filter && filter.clause ? filter : { clause: '', params: [] };
+  const c = categoryExpr && categoryExpr.expr ? categoryExpr : { expr: 'category', params: [] };
 
   const totalsRow = database.prepare(`
     SELECT
       COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS income,
       COALESCE(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END), 0) AS expenses,
       COALESCE(SUM(amount), 0) AS balance
-    FROM budget_entries WHERE date BETWEEN ? AND ?${f.clause}
+    FROM budget_entries WHERE date BETWEEN ? AND ?${f.clause}${bookedOnly()}
   `).get(r.from, r.to, ...f.params);
 
   const prevRow = database.prepare(`
@@ -33,17 +35,22 @@ export function computeStats(database, { range, anchor }, filter = { clause: '',
       COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS income,
       COALESCE(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END), 0) AS expenses,
       COALESCE(SUM(amount), 0) AS balance
-    FROM budget_entries WHERE date BETWEEN ? AND ?${f.clause}
+    FROM budget_entries WHERE date BETWEEN ? AND ?${f.clause}${bookedOnly()}
   `).get(r.prevFrom, r.prevTo, ...f.params);
 
+  // Fremde 'shared_amount'-Eintraege zaehlen in totals und series voll mit,
+  // erscheinen hier aber im Sammel-Bucket (#659): eine Kategorie-Auswertung ist
+  // sonst genau die Stelle, an der der verborgene Zweck wieder herausfaellt.
   const byCategory = database.prepare(`
-    SELECT category,
+    SELECT ${c.expr} AS category,
            COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS income,
            COALESCE(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END), 0) AS expenses,
            COALESCE(SUM(amount), 0) AS total
-    FROM budget_entries WHERE date BETWEEN ? AND ?${f.clause}
-    GROUP BY category ORDER BY ABS(SUM(amount)) DESC
-  `).all(r.from, r.to, ...f.params);
+    FROM budget_entries WHERE date BETWEEN ? AND ?${f.clause}${bookedOnly()}
+    -- GROUP BY 1, nicht GROUP BY category: bei gleichnamigem Output-Alias
+    -- gewinnt in SQLite die ECHTE Spalte, und der Sammel-Bucket bliebe leer.
+    GROUP BY 1 ORDER BY ABS(SUM(amount)) DESC
+  `).all(...c.params, r.from, r.to, ...f.params);
 
   // Bucket-Schlüssel: bei 'day' das volle Datum, bei 'month' die ersten 7 Zeichen.
   const keyExpr = r.granularity === 'month' ? "substr(date, 1, 7)" : "date";
@@ -52,7 +59,7 @@ export function computeStats(database, { range, anchor }, filter = { clause: '',
            COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS income,
            COALESCE(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END), 0) AS expenses,
            COALESCE(SUM(amount), 0) AS balance
-    FROM budget_entries WHERE date BETWEEN ? AND ?${f.clause}
+    FROM budget_entries WHERE date BETWEEN ? AND ?${f.clause}${bookedOnly()}
     GROUP BY period
   `).all(r.from, r.to, ...f.params);
 
@@ -95,7 +102,10 @@ export function statsHandler(req, res) {
     if (!DATE_RE.test(anchor))
       return res.status(400).json({ error: 'anchor muss YYYY-MM-DD sein', code: 400 });
 
-    res.json({ data: computeStats(db.get(), { range, anchor }, budgetFilter(req, 'budget_entries')) });
+    res.json({
+      data: computeStats(db.get(), { range, anchor },
+        budgetFilter(req, 'budget_entries'), budgetCategoryExpr(req, 'budget_entries')),
+    });
   } catch (err) {
     log.error('', err);
     res.status(500).json({ error: 'Internal error', code: 500 });

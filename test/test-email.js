@@ -144,7 +144,7 @@ function makeRouteApp(db, svc, { userEmail = 'admin@test', authRole = 'admin' } 
 async function call(app, method, path, body) {
   const { createServer } = await import('node:http');
   const server = createServer(app);
-  await new Promise((r) => server.listen(0, r));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address();
   const res = await fetch(`http://127.0.0.1:${port}${path}`, {
     method,
@@ -225,4 +225,123 @@ test('POST /test returns 400 when no recipient resolvable', async () => {
   const app = makeRouteApp(db, svc, { userEmail: null });
   const { status } = await call(app, 'POST', '/email/test', {});
   assert.equal(status, 400);
+});
+
+// --- env-Vorrang ist sichtbar, nicht nur wahr ------------------------------
+//
+// `resolve()` liess env schon immer über die Datenbank gewinnen. Die
+// Settings-Seite wusste davon nichts: sie zeigte Eingabefelder, speicherte in
+// die Datenbank, und der Wert wirkte nie - ohne Hinweis. Bei WEBDAV_BACKUP_*
+// und DOCUMENT_STORAGE_WEBDAV_* war dasselbe Verhalten längst sichtbar gelöst.
+
+import { readFileSync } from 'node:fs';
+
+/** Die Felder, für die es überhaupt eine Umgebungsvariable gibt - aus der Quelle gelesen. */
+function envBackedFields() {
+  const src = readFileSync(new URL('../server/services/email.js', import.meta.url), 'utf8');
+  const block = src.match(/const CONFIG_KEYS = \{([\s\S]*?)\n\};/);
+  assert.ok(block, 'CONFIG_KEYS in services/email.js nicht gefunden');
+  return [...block[1].matchAll(/^\s*(\w+):\s*\{/gm)].map(m => m[1]);
+}
+
+test('getPublicConfig meldet env-Kontrolle pro Feld, nicht pro Gruppe', () => {
+  const db = makeDb();
+  setCfg(db, { email_smtp_host: 'db.host', email_smtp_user: 'db-user' });
+  const svc = createEmailService({
+    db, nodemailer: makeNodemailerMock(), env: { EMAIL_SMTP_HOST: 'env.host' },
+  });
+  const pub = svc.getPublicConfig();
+  assert.equal(pub.envControlled.host, true, 'gesetzte Variable muss als kontrolliert gelten');
+  assert.equal(pub.envControlled.user, false, 'ungesetzte Variable darf das Feld nicht sperren');
+  assert.equal(pub.host, 'env.host', 'env gewinnt weiterhin über die Datenbank');
+  assert.equal(pub.user, 'db-user', 'freie Felder kommen weiter aus der Datenbank');
+});
+
+test('eine leere Umgebungsvariable sperrt nichts', () => {
+  const db = makeDb();
+  const svc = createEmailService({
+    db, nodemailer: makeNodemailerMock(), env: { EMAIL_SMTP_HOST: '   ' },
+  });
+  assert.equal(svc.getPublicConfig().envControlled.host, false);
+});
+
+test('jedes env-gestützte Feld wird gemeldet - keine Feldliste, die driften kann', () => {
+  const db = makeDb();
+  const svc = createEmailService({ db, nodemailer: makeNodemailerMock(), env: {} });
+  const reported = Object.keys(svc.getPublicConfig().envControlled).sort();
+  assert.deepEqual(reported, envBackedFields().sort(),
+    'envControlled muss genau die Felder abdecken, für die CONFIG_KEYS eine Variable kennt');
+});
+
+test('PUT /config schreibt ein env-gesteuertes Feld NICHT in die Datenbank', async () => {
+  // Gespeichert wäre der Wert eine Zeitbombe: er würde in dem Moment aktiv, in
+  // dem jemand die Umgebungsvariable entfernt.
+  const db = makeDb();
+  const svc = createEmailService({
+    db, nodemailer: makeNodemailerMock(),
+    env: { EMAIL_SMTP_HOST: 'env.host', EMAIL_SMTP_PASS: 'env-pass' },
+  });
+  const app = makeRouteApp(db, svc);
+  const { status } = await call(app, 'PUT', '/email/config', {
+    host: 'ui.host', user: 'ui-user', pass: 'ui-pass', fromAddress: 'a@test',
+  });
+  assert.equal(status, 200);
+  const row = key => db.prepare('SELECT value FROM sync_config WHERE key = ?').get(key)?.value;
+  assert.equal(row('email_smtp_host'), undefined, 'gesperrtes Feld darf nicht gespeichert werden');
+  assert.equal(row('email_smtp_pass'), undefined, 'gesperrtes Passwort darf nicht gespeichert werden');
+  assert.equal(row('email_smtp_user'), 'ui-user', 'freie Felder werden weiterhin gespeichert');
+});
+
+test('clearPassword löscht nichts, solange EMAIL_SMTP_PASS gesetzt ist', async () => {
+  const db = makeDb();
+  setCfg(db, { email_smtp_pass: 'db-pass' });
+  const svc = createEmailService({
+    db, nodemailer: makeNodemailerMock(), env: { EMAIL_SMTP_PASS: 'env-pass' },
+  });
+  const app = makeRouteApp(db, svc);
+  await call(app, 'PUT', '/email/config', { clearPassword: true });
+  assert.equal(
+    db.prepare('SELECT value FROM sync_config WHERE key = ?').get('email_smtp_pass')?.value,
+    'db-pass',
+    'ein gesperrtes Feld darf auch nicht geleert werden'
+  );
+});
+
+test('die Settings-Seite sperrt jedes env-gestützte Feld sichtbar', () => {
+  // Regel statt Allowlist: kommt in CONFIG_KEYS ein Feld dazu, muss die Seite
+  // nachziehen. Genau diese Prüfrichtung fehlte und liess SMTP als einzige
+  // Gruppe ohne env-Erkennung zurück.
+  const page = readFileSync(new URL('../public/settings/pages/admin-email.js', import.meta.url), 'utf8');
+  for (const field of envBackedFields()) {
+    assert.match(page, new RegExp(`data-env-hint="${field}"`),
+      `admin-email.js fehlt der Hinweis für das env-gesteuerte Feld ${field}`);
+    assert.match(page, new RegExp(`^\\s*${field}: '[a-z-]+',`, 'm'),
+      `admin-email.js fehlt die FIELD_IDS-Zuordnung für ${field}`);
+  }
+  assert.match(page, /input\.disabled = controlled/,
+    'admin-email.js muss die gesteuerten Felder tatsächlich sperren');
+});
+
+test('ein SMTP-Passwort behaelt Leerzeichen am Rand, Host und Co. werden getrimmt', () => {
+  // Dieselbe Falle wie bei den WebDAV-Zugangsdaten: getrimmt wird geprueft,
+  // zurueckgegeben aber nur dort, wo Trimmen unschaedlich ist. Bei Host und
+  // Adressen ist ein versehentliches Leerzeichen der wahrscheinlichere Fall,
+  // beim Passwort ist es Teil des Werts.
+  const db = { prepare: () => ({ get: () => undefined, run: () => {}, all: () => [] }) };
+  const svc = createEmailService({
+    db,
+    env: {
+      EMAIL_SMTP_HOST: ' smtp.example.test ',
+      EMAIL_SMTP_PASS: ' geheim ',
+      EMAIL_FROM_ADDRESS: ' family@example.test ',
+    },
+  });
+  const cfg = svc.getPublicConfig();
+  assert.equal(cfg.host, 'smtp.example.test', 'der Host wird getrimmt');
+  assert.equal(cfg.fromAddress, 'family@example.test', 'die Absenderadresse wird getrimmt');
+  // getPublicConfig gibt das Passwort nie heraus; getRawConfig ist die Stelle,
+  // die der Versand tatsaechlich benutzt. Kein optionaler Aufruf: ein Guard,
+  // der still ueberspringt, wenn die Methode fehlt, bewacht nichts.
+  assert.equal(typeof svc.getRawConfig, 'function', 'getRawConfig muss existieren');
+  assert.equal(svc.getRawConfig().pass, ' geheim ', 'das Passwort muss unveraendert bleiben');
 });

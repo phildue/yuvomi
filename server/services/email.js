@@ -35,8 +35,33 @@ export function createEmailService({ db, nodemailer = nodemailerDefault, env = p
   function resolve(field) {
     const { key, env: envName } = CONFIG_KEYS[field];
     const fromEnv = env[envName];
-    if (fromEnv !== undefined && String(fromEnv).trim() !== '') return String(fromEnv).trim();
+    if (fromEnv !== undefined && String(fromEnv).trim() !== '') {
+      // Getrimmt wird geprüft, zurückgegeben aber nur, wo Trimmen unschädlich
+      // ist. Ein Passwort darf mit einem Leerzeichen anfangen oder enden; wer
+      // es abschneidet, macht aus einer gültigen Zugangsdatei eine ungültige,
+      // und das fällt erst beim ersten Versandversuch auf. Bei Host, Port und
+      // den Adressfeldern ist ein versehentliches Leerzeichen dagegen der
+      // wahrscheinlichere Fall, dort hilft das Trimmen.
+      return field === 'pass' ? String(fromEnv) : String(fromEnv).trim();
+    }
     return cfgGet(key);
+  }
+
+  /**
+   * Steht dieses Feld unter env-Kontrolle? Der Vorrang oben galt schon immer,
+   * aber die Settings-Seite wusste nichts davon: sie zeigte Eingabefelder,
+   * speicherte brav in die Datenbank, und der Wert wirkte nie. Ohne Hinweis.
+   * Bei WEBDAV_BACKUP_* und DOCUMENT_STORAGE_WEBDAV_* war dasselbe
+   * Vorrangverhalten längst sichtbar gelöst, bei SMTP nicht.
+   */
+  function isEnvControlled(field) {
+    const fromEnv = env[CONFIG_KEYS[field].env];
+    return fromEnv !== undefined && String(fromEnv).trim() !== '';
+  }
+
+  /** Pro Feld, nicht pro Gruppe: wer nur EMAIL_SMTP_HOST setzt, darf den Rest weiter in der UI pflegen. */
+  function envControlledFields() {
+    return Object.fromEntries(Object.keys(CONFIG_KEYS).map(f => [f, isEnvControlled(f)]));
   }
 
   function getRawConfig() {
@@ -69,14 +94,31 @@ export function createEmailService({ db, nodemailer = nodemailerDefault, env = p
       fromName: c.fromName,
       passwordSet: Boolean(c.pass),
       configured: isConfigured(),
+      envControlled: envControlledFields(),
     };
   }
+
+  /**
+   * ZEITSCHRANKEN AM TRANSPORT, und sie sind absichtlich knapper als die des
+   * Aufrufers. Ohne sie wartet nodemailer unbegrenzt auf einen SMTP-Server, der
+   * die Verbindung offen laesst. Fuer den Erinnerungslauf (#944) ist das mehr
+   * als eine Verzoegerung: er arbeitet alle faelligen Erinnerungen nacheinander
+   * ab, und sein Abbruch nach 8 s liesse den Versand darunter WEITERLAUFEN -
+   * die Zustellung gaelte als gescheitert, wuerde erneut versucht, und die Mail
+   * kaeme womoeglich zweimal an. Deshalb muss der Transport zuerst aufgeben,
+   * nicht der Aufrufer: dann ist die Verbindung wirklich zu und ein erneuter
+   * Versuch ist redlich.
+   */
+  const TRANSPORT_TIMEOUT_MS = 5_000;
 
   function buildTransport(c) {
     const opts = {
       host: c.host,
       port: c.port || (c.secure === 'ssl' ? 465 : 587),
       secure: c.secure === 'ssl',
+      connectionTimeout: TRANSPORT_TIMEOUT_MS,
+      greetingTimeout: TRANSPORT_TIMEOUT_MS,
+      socketTimeout: TRANSPORT_TIMEOUT_MS,
     };
     if (c.secure === 'starttls') opts.requireTLS = true;
     if (c.user) opts.auth = { user: c.user, pass: c.pass || '' };
@@ -87,12 +129,22 @@ export function createEmailService({ db, nodemailer = nodemailerDefault, env = p
     return c.fromName ? `"${c.fromName}" <${c.fromAddress}>` : c.fromAddress;
   }
 
-  async function sendMail({ to, subject, html, text }) {
+  /**
+   * `logLabel` haelt den Betreff aus dem Log. Solange hier nur Passwort-Reset
+   * und Einladungen liefen, war der Betreff fest formuliert und im Log
+   * nuetzlich. Eine Erinnerungsmail (#944) traegt dagegen den Aufgaben- oder
+   * Terminnamen im Betreff - bei Medikamenten-Erinnerungen einen
+   * Gesundheitsdatensatz. Der landete damit auf stdout des Containers, wo er
+   * dauerhaft liegen bleibt und von jeder Log-Sammlung mitgenommen wird.
+   * Wer eine Mail mit variablem Betreff verschickt, nennt hier stattdessen
+   * ihre Gattung.
+   */
+  async function sendMail({ to, subject, html, text, logLabel = null }) {
     if (!isConfigured()) throw new Error('Email is not configured.');
     const c = getRawConfig();
     const transport = buildTransport(c);
     const info = await transport.sendMail({ from: fromHeader(c), to, subject, html, text });
-    log.info(`Mail sent to ${to} (${subject})`);
+    log.info(`Mail sent to ${to} (${logLabel || subject})`);
     return info;
   }
 
@@ -117,7 +169,7 @@ export function createEmailService({ db, nodemailer = nodemailerDefault, env = p
     }
   }
 
-  return { isConfigured, getPublicConfig, getRawConfig, sendMail, sendTest };
+  return { isConfigured, getPublicConfig, getRawConfig, isEnvControlled, sendMail, sendTest };
 }
 
 export const emailService = createEmailService();

@@ -5,7 +5,12 @@
  * Dependencies: none (vanilla JS, Fetch API, Intl API)
  */
 
-const SUPPORTED_LOCALES = ['de', 'en', 'es', 'fr', 'it', 'sv', 'el', 'ru', 'tr', 'zh', 'ja', 'ar', 'hi', 'pt', 'uk', 'pl', 'nl', 'cs', 'vi', 'hu', 'ko', 'id', 'fa'];
+// Relativ, nicht browser-absolut: mehrere Suiten laden i18n.js ohne den Loader
+// aus test-browser-loader.mjs, und '/utils/...' waere dort das Dateisystem-Root.
+// Im Browser loest './utils/timezone.js' von '/i18n.js' aus auf dasselbe auf.
+import { zonedFields } from './utils/timezone.js';
+
+const SUPPORTED_LOCALES = ['de', 'en', 'es', 'fr', 'it', 'sv', 'el', 'ru', 'tr', 'zh', 'ja', 'ar', 'hi', 'pt', 'uk', 'pl', 'nl', 'cs', 'vi', 'hu', 'ko', 'id', 'fa', 'fil'];
 const RTL_LOCALES = new Set(['ar', 'fa']);
 const DEFAULT_LOCALE = 'de';
 const STORAGE_KEY = 'yuvomi-locale';
@@ -19,6 +24,8 @@ const VALID_TIME_FORMATS = ['24h', '12h'];
 let currentLocale = DEFAULT_LOCALE;
 let translations = {};
 let fallbackTranslations = {};
+/** Third-party bundles: moduleId -> { defaultLocale, trees: { [locale]: nested } } */
+let extensionLocaleStore = Object.create(null);
 let i18nReady = false;
 let resolveI18nReady;
 const i18nReadyPromise = new Promise((resolve) => {
@@ -120,7 +127,10 @@ function pluralCategory(locale, count) {
 function resolvePluralKey(key, count) {
   const category = pluralCategory(currentLocale, count);
   for (const candidate of [`${key}_${category}`, `${key}_other`, key]) {
-    const hit = resolve(translations, candidate) ?? resolve(fallbackTranslations, candidate);
+    const extHit = resolveExtensionTranslation(candidate);
+    if (typeof extHit === 'string') return extHit;
+    const hit = resolve(translations, candidate)
+      ?? resolve(fallbackTranslations, candidate);
     if (hit != null) return hit;
   }
   return key;
@@ -147,16 +157,19 @@ function resolvePluralKey(key, count) {
  * Parameter soll im Ergebnis sichtbar sein und nicht still weggekürzt werden.
  */
 export function t(key, params = {}) {
-  const str = typeof params.count === 'number'
-    ? resolvePluralKey(key, params.count)
-    : resolve(translations, key) ?? resolve(fallbackTranslations, key) ?? key;
+  let str;
+  if (typeof params.count === 'number') {
+    str = resolvePluralKey(key, params.count);
+  } else {
+    const extHit = resolveExtensionTranslation(key);
+    str = extHit
+      ?? resolve(translations, key)
+      ?? resolve(fallbackTranslations, key)
+      ?? key;
+  }
   return str.replace(/\{\{(\w+)\}\}/g, (placeholder, name) => (
     Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : placeholder
   ));
-}
-
-function isDateOnlyString(value) {
-  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
 }
 
 const VALID_DATE_FORMATS = ['mdy', 'dmy', 'ymd', 'mdy_dot', 'dmy_dot', 'dmy_slash', 'ymd_dot', 'ymd_slash'];
@@ -189,12 +202,21 @@ export function timeSuffix() {
   return getTimeFormatPreference() === '12h' ? '' : t('calendar.timeSuffix');
 }
 
-function formatDateParts(date, useUtc = false) {
-  const d = date instanceof Date ? date : new Date(date);
-  if (isNaN(d.getTime())) return '';
-  const year = useUtc ? d.getUTCFullYear() : d.getFullYear();
-  const month = String((useUtc ? d.getUTCMonth() : d.getMonth()) + 1).padStart(2, '0');
-  const day = String(useUtc ? d.getUTCDate() : d.getDate()).padStart(2, '0');
+/**
+ * Datums-Bestandteile in der Schreibweise der Präferenz.
+ *
+ * Die Zone steckt in `zonedFields()` (utils/timezone.js), nicht hier: ein
+ * Zeitpunkt wird in die Haushaltszone umgerechnet, eine zonenlose Wanduhrzeit
+ * und ein reines Datum werden gelesen. Vor #829 Teil 3 stand an dieser Stelle
+ * ein `useUtc`-Schalter, der genau eine dieser drei Formen abdeckte - das reine
+ * Datum, über den Umweg `new Date(`${d}T00:00:00Z`)` plus UTC-Gettern.
+ */
+function formatDateParts(date) {
+  const f = zonedFields(date);
+  if (!f) return '';
+  const year = f.year;
+  const month = String(f.month).padStart(2, '0');
+  const day = String(f.day).padStart(2, '0');
   switch (getDateFormatPreference()) {
     case 'dmy': return `${day}.${month}.${year}`;
     case 'mdy_dot': return `${month}.${day}.${year}`;
@@ -212,6 +234,83 @@ export function getLocale() {
   return currentLocale;
 }
 
+/** Core fallback chain for extension modules (UI locale -> module default -> en -> de). */
+export const EXTENSION_LOCALE_FALLBACKS = ['en', DEFAULT_LOCALE];
+
+export function nestFlatLocaleDict(flatDict) {
+  const DANGEROUS = new Set(['__proto__', 'constructor', 'prototype']);
+  const moduleRoot = Object.create(null);
+  for (const [key, value] of Object.entries(flatDict || {})) {
+    if (typeof value !== 'string') continue;
+    const parts = String(key).trim().split('.');
+    if (parts.some((p) => !p || DANGEROUS.has(p))) continue;
+    let node = moduleRoot;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!Object.prototype.hasOwnProperty.call(node, parts[i]) || typeof node[parts[i]] !== 'object') {
+        node[parts[i]] = Object.create(null);
+      }
+      node = node[parts[i]];
+    }
+    node[parts[parts.length - 1]] = value;
+  }
+  return moduleRoot;
+}
+
+function extensionLocaleChain(moduleDefault, locale = currentLocale) {
+  return [...new Set([locale, moduleDefault, ...EXTENSION_LOCALE_FALLBACKS].filter(Boolean))];
+}
+
+function resolveExtensionTranslation(key, locale = currentLocale) {
+  if (!key.startsWith('extensions.')) return undefined;
+  const rest = key.slice('extensions.'.length);
+  const dot = rest.indexOf('.');
+  if (dot <= 0) return undefined;
+  const moduleId = rest.slice(0, dot);
+  const subKey = rest.slice(dot + 1);
+  const store = extensionLocaleStore[moduleId];
+  if (!store) return undefined;
+  for (const loc of extensionLocaleChain(store.defaultLocale, locale)) {
+    const tree = store.trees[loc];
+    if (!tree) continue;
+    const hit = resolve(tree, subKey);
+    if (typeof hit === 'string') return hit;
+  }
+  return undefined;
+}
+
+/**
+ * Third-party module locale bundles. Pass every shipped locales/{code}.json tree;
+ * lookup walks UI locale -> module defaultLocale -> en -> de.
+ */
+export function setExtensionLocaleBundles(moduleId, { defaultLocale = 'en', trees = {} } = {}) {
+  extensionLocaleStore[moduleId] = {
+    defaultLocale,
+    trees: trees && typeof trees === 'object' ? trees : {},
+  };
+}
+
+export function clearExtensionLocaleBundles(moduleId) {
+  delete extensionLocaleStore[moduleId];
+}
+
+/** @deprecated Use setExtensionLocaleBundles — kept for tests and single-locale shortcuts. */
+export function registerExtensionTranslations(moduleId, flatDict) {
+  setExtensionLocaleBundles(moduleId, {
+    defaultLocale: 'en',
+    trees: { en: nestFlatLocaleDict(flatDict) },
+  });
+}
+
+export function unregisterExtensionTranslations(moduleId) {
+  clearExtensionLocaleBundles(moduleId);
+}
+
+export function clearExtensionTranslations() {
+  extensionLocaleStore = Object.create(null);
+}
+
+export { resolveExtensionTranslation, extensionLocaleChain };
+
 /**
  * Locale für Zahlen-/Währungsformatierung (Intl.NumberFormat).
  * Nutzt die gespeicherte Region (voller BCP-47-Tag, z. B. "de-CH" für Schweizer
@@ -226,7 +325,7 @@ export function getFormatLocale() {
   } catch {
     stored = null;
   }
-  return stored && /^[a-z]{2}-[A-Z]{2}$/.test(stored) ? stored : currentLocale;
+  return stored && /^[a-z]{2,3}-[A-Z]{2}$/.test(stored) ? stored : currentLocale;
 }
 
 // Gecachte Intl.NumberFormat-Instanzen je (Format-Locale × Options). Die
@@ -261,9 +360,6 @@ export function getSupportedLocales() {
 /** Datum locale-aware formatieren */
 export function formatDate(date) {
   if (date == null) return '';
-  if (isDateOnlyString(date)) {
-    return formatDateParts(new Date(`${date}T00:00:00Z`), true);
-  }
   return formatDateParts(date);
 }
 
@@ -274,11 +370,10 @@ export function formatDate(date) {
  */
 export function formatDayMonth(date) {
   if (date == null) return '';
-  const useUtc = isDateOnlyString(date);
-  const d = useUtc ? new Date(`${date}T00:00:00Z`) : (date instanceof Date ? date : new Date(date));
-  if (isNaN(d.getTime())) return '';
-  const month = String((useUtc ? d.getUTCMonth() : d.getMonth()) + 1).padStart(2, '0');
-  const day = String(useUtc ? d.getUTCDate() : d.getDate()).padStart(2, '0');
+  const f = zonedFields(date);
+  if (!f) return '';
+  const month = String(f.month).padStart(2, '0');
+  const day = String(f.day).padStart(2, '0');
   switch (getDateFormatPreference()) {
     case 'dmy': return `${day}.${month}.`;
     case 'mdy_dot': return `${month}.${day}.`;
@@ -363,22 +458,43 @@ function isValidDateParts(year, month, day) {
   return date.getUTCFullYear() === y && date.getUTCMonth() === m - 1 && date.getUTCDate() === d;
 }
 
+// Gecachter 24-Stunden-Formatter je UI-Locale. Wie bei _numberFormatCache ist
+// die Konstruktion teuer, und eine Agenda formatiert Dutzende Zeiten pro Render.
+const _timeFormatCache = new Map();
+
+function hourMinuteFormat() {
+  let fmt = _timeFormatCache.get(currentLocale);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat(currentLocale, {
+      hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC',
+    });
+    _timeFormatCache.set(currentLocale, fmt);
+  }
+  return fmt;
+}
+
 /** Uhrzeit locale-aware formatieren */
 export function formatTime(date) {
   if (date == null) return '';
-  const d = date instanceof Date ? date : new Date(date);
-  if (isNaN(d.getTime())) return '';
+  // Eine reine Uhrzeit ('09:00') ist definitionsgemäß Wanduhrzeit - sie hat kein
+  // Datum, an dem eine Zone greifen könnte. Sie muss VOR zonedFields abgefangen
+  // werden: als `new Date(2000, 0, 1, 9, 0)` verpackt wäre sie ein Zeitpunkt, und
+  // eine gesetzte Haushaltszone verschöbe die Stundenleiste der Wochenansicht um
+  // ihren Offset.
+  const wall = typeof date === 'string' && !/\d{4}-\d{2}-\d{2}/.test(date)
+    ? toTimeParts(date) : null;
+  const f = wall ? { ...wall, second: 0 } : zonedFields(date);
+  if (!f) return '';
   if (getTimeFormatPreference() === '12h') {
-    const hour = d.getHours();
-    const minute = String(d.getMinutes()).padStart(2, '0');
-    const displayHour = hour % 12 || 12;
-    return `${displayHour}:${minute} ${hour >= 12 ? 'PM' : 'AM'}`;
+    const displayHour = f.hour % 12 || 12;
+    return `${displayHour}:${String(f.minute).padStart(2, '0')} ${f.hour >= 12 ? 'PM' : 'AM'}`;
   }
-  return new Intl.DateTimeFormat(currentLocale, {
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).format(d);
+  // Weiter über Intl, aber mit der Wanduhr der Anzeigezone als UTC-Date und
+  // `timeZone: 'UTC'`: so bleibt die Schreibweise der Locale erhalten - `id`
+  // trennt mit einem Punkt, `fa` schreibt persische Ziffern - ohne dass der
+  // Formatter selbst noch einmal in die Browser-Zone umrechnet.
+  // Der Referenztag ist beliebig - der Formatter liest nur Stunde und Minute.
+  return hourMinuteFormat().format(Date.UTC(f.year ?? 2000, (f.month ?? 1) - 1, f.day ?? 1, f.hour, f.minute, f.second));
 }
 
 function toTimeParts(value) {

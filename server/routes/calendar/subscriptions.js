@@ -8,6 +8,7 @@ import * as db from '../../db.js';
 import * as icsSubscription from '../../services/ics-subscription.js';
 import { color } from '../../middleware/validate.js';
 import { ICS_COLOR_RE, getUserId, isAdminUser } from './helpers.js';
+import { newNonMembers, nonMemberMessage } from '../../services/household-members.js';
 
 const log = createLogger('Calendar');
 const router = express.Router();
@@ -20,7 +21,19 @@ const router = express.Router();
 router.get('/subscriptions', (req, res) => {
   try {
     const subs = icsSubscription.getAll(getUserId(req));
-    res.json({ data: subs });
+    // DIE QUELL-URL IST EIN ZUGANGSDATUM, KEIN ANZEIGEFELD. Private
+    // Kalenderfeeds tragen ihr Geheimnis regelmaessig IM Pfad; wer die URL
+    // liest, hat den Kalender dauerhaft - auch nachdem sein eigener Zugang
+    // entzogen wurde. Sie gehoert deshalb dem, der das Abo VERWALTET, und nicht
+    // jedem, der Kalender lesen darf.
+    //
+    // Gemessen an den Scopes, nicht an der Anmeldeart: das trifft das
+    // Wandtablett (#1208) und ebenso ein gescoptes API-Token mit
+    // `calendar:read` - dort lag die Luecke schon vor diesem Ticket. Eine
+    // Sitzung traegt `authScopes === null` und sieht die URL wie bisher, sonst
+    // liesse sich ein Abo nicht mehr bearbeiten.
+    const data = req.authScopes == null ? subs : subs.map(({ url, ...rest }) => rest);
+    res.json({ data });
   } catch (err) {
     log.error('', err);
     res.status(500).json({ error: 'Interner Fehler', code: 500 });
@@ -40,9 +53,27 @@ router.post('/subscriptions', async (req, res) => {
     catch { return res.status(400).json({ error: allowPrivate ? 'url: Nur http://, https:// und webcal:// sind erlaubt.' : 'url: Nur https:// und webcal:// sind erlaubt.', code: 400 }); }
     if (!colorVal || !ICS_COLOR_RE.test(colorVal))
       return res.status(400).json({ error: 'color: Pflichtfeld, muss #RRGGBB sein.', code: 400 });
+    // Die Standard-Zuweisung schon beim Anlegen: create() synchronisiert
+    // unmittelbar, und bisher ließ sie sich erst danach im Bearbeiten-Dialog
+    // setzen - die erste, oft größte Ladung Termine kam also grundsätzlich ohne
+    // Zuweisung herein (#730). Optional, damit bestehende Aufrufer unverändert
+    // durchgehen.
+    const rawAssignee = req.body.default_assignee_user_id;
+    let defaultAssignee = null;
+    if (rawAssignee !== undefined && rawAssignee !== null && rawAssignee !== '') {
+      defaultAssignee = Number(rawAssignee);
+      if (!Number.isInteger(defaultAssignee))
+        return res.status(400).json({ error: 'default_assignee_user_id muss eine Zahl oder null sein.', code: 400 });
+      if (!db.get().prepare('SELECT 1 FROM users WHERE id = ?').get(defaultAssignee))
+        return res.status(400).json({ error: 'Unbekannte Nutzer-ID.', code: 400 });
+      // Zugewiesen werden nur Haushaltsmitglieder (#1207); ein neues Abo hat noch keinen Stand.
+      const strangers = newNonMembers([defaultAssignee]);
+      if (strangers.length) return res.status(400).json({ error: nonMemberMessage(strangers), code: 400 });
+    }
 
     const { sub, syncError } = await icsSubscription.create(getUserId(req), {
       name: name.trim(), url, color: colorVal, shared: shared ? 1 : 0,
+      default_assignee_user_id: defaultAssignee,
     });
     res.status(201).json({ data: sub, syncError: syncError || null });
   } catch (err) {
@@ -73,6 +104,12 @@ router.patch('/subscriptions/:id', (req, res) => {
     if (req.body.default_assignee_user_id !== undefined) {
       const raw = req.body.default_assignee_user_id;
       fields.default_assignee_user_id = (raw === null || raw === '') ? null : Number(raw);
+      // Neu nur Haushaltsmitglieder (#1207); die gespeicherte Zuweisung bleibt gueltig.
+      if (fields.default_assignee_user_id !== null) {
+        const stored = db.get().prepare('SELECT default_assignee_user_id AS a FROM ics_subscriptions WHERE id = ?').get(subId)?.a;
+        const strangers = newNonMembers([fields.default_assignee_user_id], { stored: stored == null ? [] : [stored] });
+        if (strangers.length) return res.status(400).json({ error: nonMemberMessage(strangers), code: 400 });
+      }
     }
 
     const updated = icsSubscription.update(getUserId(req), subId, fields, isAdmin);

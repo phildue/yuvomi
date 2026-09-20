@@ -33,7 +33,7 @@ app.use((req, _res, next) => {
   next();
 });
 app.use('/', catRouter);
-const server = app.listen(0);
+const server = app.listen(0, '127.0.0.1');
 const baseUrl = await new Promise((r) => server.on('listening', () => r(`http://127.0.0.1:${server.address().port}`)));
 
 async function call(method, path, body) {
@@ -66,7 +66,7 @@ test('GET /meta: liefert Kategorie-Buckets', async () => {
   assert.ok(Array.isArray(r.body.data.categories));
   assert.ok(Array.isArray(r.body.data.expenseCategories));
   assert.ok(Array.isArray(r.body.data.incomeCategories));
-  assert.equal(typeof r.body.data.expenseSubcategories, 'object');
+  assert.equal(typeof r.body.data.subcategories, 'object');
 });
 
 test('GET /categories: lokalisierte Liste mit genesteten Subkategorien + lang', async () => {
@@ -202,10 +202,11 @@ test('POST subcategories: unbekannte Kategorie → 404', async () => {
   assert.equal(r.status, 404);
 });
 
-test('POST subcategories: income-Kategorie erlaubt keine Subkategorie → 404', async () => {
+test('POST subcategories: income-Kategorie erlaubt keine Subkategorie', async () => {
   const inc = await newCategory('IncCat', 'income');
   const r = await call('POST', `/categories/${inc.key}/subcategories`, { name: 'S' });
-  assert.equal(r.status, 404);
+  assert.equal(r.status, 201);
+  assert.equal(r.body.data.category_key, inc.key);
 });
 
 test('POST subcategories: leerer Name → 400', async () => {

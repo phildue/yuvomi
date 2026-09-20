@@ -1,282 +1,228 @@
 <div align="center">
-  <sub><a href="README.md">English</a> &nbsp;·&nbsp; <b>Deutsch</b></sub>
-
-  <img src="docs/logo.svg" alt="Yuvomi" width="92" />
+  <img src="docs/logo.svg" alt="" width="92" />
 
   <h1>Yuvomi</h1>
-  <p><strong>Der selbstgehostete Familienplaner. Privat, offline-fähig und schön.</strong></p>
+
+  <p><strong>Ein privates Zuhause für alles, was einen Haushalt am Laufen hält.</strong></p>
 
   <p>
-    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT-Lizenz"></a>
-    <a href="https://github.com/ulsklyc/yuvomi/releases"><img src="https://img.shields.io/github/v/release/ulsklyc/yuvomi?style=flat-square&color=6c3aed&label=release" alt="Neuestes Release"></a>
-    <a href="https://github.com/ulsklyc/yuvomi/pkgs/container/yuvomi"><img src="https://img.shields.io/badge/ghcr.io-yuvomi-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker-Image"></a>
-    <a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%E2%89%A522-339933?style=flat-square&logo=node.js&logoColor=white" alt="Node.js ≥22"></a>
-    <img src="https://img.shields.io/badge/PWA-ready-5A0FC8?style=flat-square&logo=pwa&logoColor=white" alt="PWA">
+    Aufgaben, Kalender, Budget, Einkauf, Mahlzeiten, Gesundheit und mehr - für eine Familie,
+    ein Paar oder nur dich. Zwanzig Module für einen Haushalt, meist zwei bis sechs Personen, auf
+    einem Server, der dir gehört, und ab Werk ist das Einzige, was ihn verlässt, eine Versionsprüfung.
   </p>
 
   <p>
-    <a href="docs/installation.md"><strong>→ Installieren</strong></a> &nbsp;·&nbsp;
-    <a href="https://yuvomi.cloud/"><strong>Website & Screenshots</strong></a> &nbsp;·&nbsp;
-    <a href="docs/SPEC.md"><strong>Doku</strong></a> &nbsp;·&nbsp;
+    <a href="https://github.com/ulsklyc/yuvomi/releases"><img src="https://img.shields.io/github/v/release/ulsklyc/yuvomi?style=flat-square&color=6C3AED&label=release" alt="Neuestes Release"></a>
+    <a href="https://github.com/ulsklyc/yuvomi/stargazers"><img src="https://img.shields.io/github/stars/ulsklyc/yuvomi?style=flat-square&color=6C3AED&label=stars" alt="GitHub-Sterne"></a>
+    <a href="https://github.com/ulsklyc/yuvomi/pkgs/container/yuvomi"><img src="https://img.shields.io/badge/ghcr.io-yuvomi-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker-Image"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT-Lizenz"></a>
+  </p>
+
+  <p>
+    <a href="#installieren"><strong>→ In Minuten installieren</strong></a>&nbsp;&nbsp;·&nbsp;
+    <a href="https://yuvomi.cloud/"><strong>Screenshots &amp; Rundgang</strong></a>&nbsp;&nbsp;·&nbsp;
+    <a href="#dokumentation"><strong>Doku</strong></a>&nbsp;&nbsp;·&nbsp;
     <a href="CHANGELOG.md"><strong>Changelog</strong></a>
   </p>
+
+  <sub>Die englische Fassung (<a href="README.md">README.md</a>) ist die maßgebliche; diese Übersetzung folgt ihr.</sub>
+
+  <br><br>
+
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/de/dashboard-dark-web.webp">
+    <img src="docs/screenshots/de/dashboard-light-web.webp" alt="Das Yuvomi-Dashboard: Aufgaben, Termine, Mahlzeiten und Einkaufsliste des Tages auf einem Bildschirm" width="820">
+  </picture>
+
+  <sub><b>20</b> Module&nbsp;&nbsp;·&nbsp; <b>24</b> Sprachen&nbsp;&nbsp;·&nbsp; <b>0</b> Tracker&nbsp;&nbsp;·&nbsp; optionale&nbsp;<b>AES&#8209;256</b>&#8209;Datenbankverschlüsselung&nbsp;&nbsp;·&nbsp; <b>MIT</b></sub>
 </div>
 
-<br>
-
-<div align="center">
-  <table>
-    <tr>
-      <td align="center"><b>17</b><br><sub>Module</sub></td>
-      <td align="center"><sub>·</sub></td>
-      <td align="center"><b>23</b><br><sub>Sprachen</sub></td>
-      <td align="center"><sub>·</sub></td>
-      <td align="center"><b>0</b><br><sub>Tracker</sub></td>
-      <td align="center"><sub>·</sub></td>
-      <td align="center"><b>AES-256</b><br><sub>optionale DB-Verschlüsselung</sub></td>
-      <td align="center"><sub>·</sub></td>
-      <td align="center"><b>MIT</b><br><sub>Lizenz</sub></td>
-    </tr>
-  </table>
-</div>
-
-<br>
-
-<div align="center">
-  <table>
-    <tr>
-      <td width="72%" align="center">
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark-web.png">
-          <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/dashboard-light-web.png">
-          <img src="docs/screenshots/dashboard-light-web.png" alt="Yuvomi-Dashboard — Aufgaben, Kalendertermine, Mahlzeiten und Einkauf auf einen Blick" width="680">
-        </picture>
-      </td>
-      <td width="28%" align="center" valign="middle">
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark-mobile.png">
-          <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/dashboard-light-mobile.png">
-          <img src="docs/screenshots/dashboard-light-mobile.png" alt="Yuvomi auf dem Smartphone" width="148">
-        </picture>
-        <br>
-        <sub>Mobile PWA</sub>
-      </td>
-    </tr>
-  </table>
-  <sub>Für die dunkle Ansicht GitHub auf Dark Mode umstellen.</sub>
-</div>
-
-<br>
-
-Yuvomi hält deinen Haushalt organisiert — Aufgaben, Einkäufe, Mahlzeiten, Kalender, Budget und mehr — an einem privaten Ort, ohne Cloud-Konten oder Abos. Läuft als Docker- oder Podman-Container auf jedem Home-Server oder NAS, inklusive rootless Podman auf SELinux-aktivierten RHEL-/Fedora-/CentOS-Stream-Systemen. Eine ausgefeilte, mobile-first PWA lässt es sich auf jedem Gerät nativ anfühlen.
-
-Jedes Modul ist eigenständig. Nutze, was passt, lass weg, was nicht passt.
-
-<details>
-<summary><sub>Kommst du von <b>Oikos</b>? Das Projekt wurde umbenannt — an der App ändert sich nichts.</sub></summary>
-
-<br>
-
-Yuvomi wurde von **Oikos** umbenannt, um einen Markenkonflikt mit einem unabhängigen Produkt zu vermeiden. Gleicher Code, gleiche Daten, gleicher Maintainer.
-
-- Alte Links (`github.com/ulsklyc/oikos`) leiten automatisch hierher weiter.
-- Das Docker-Image liegt jetzt unter `ghcr.io/ulsklyc/yuvomi`; das alte `ghcr.io/ulsklyc/oikos` funktioniert weiterhin — bitte bei Gelegenheit umstellen.
-- Bestehende Daten und Einstellungen bleiben beim Upgrade vollständig erhalten.
-
-Neues Zuhause: **https://yuvomi.cloud/** · Fragen? Eröffne eine [Diskussion](https://github.com/ulsklyc/yuvomi/discussions).
-
-</details>
-
-<div align="center">
-  <sub>
-    <a href="#app-screenshots">Screenshots</a> &nbsp;·&nbsp;
-    <a href="#module">Module</a> &nbsp;·&nbsp;
-    <a href="#design--technik">Design</a> &nbsp;·&nbsp;
-    <a href="#überall-installieren">Installieren</a> &nbsp;·&nbsp;
-    <a href="#tech-stack">Tech-Stack</a> &nbsp;·&nbsp;
-    <a href="#dokumentation">Doku</a>
-  </sub>
-</div>
+Die meisten Haushalte kleben ihren Alltag aus einem Dutzend Bezahl-Apps zusammen, jede mit eigenem
+Konto, eigenem Abo und einer eigenen Kopie deiner Daten auf fremden Servern. Yuvomi bringt das alles
+an einen Ort, der dir gehört, als Container auf jedem Home-Server oder NAS. Jedes Modul ist
+eigenständig - nutze, was passt, und schalte ab, was nicht passt.
 
 ---
 
-## App-Screenshots
+## Eine App statt einem Dutzend Abos
 
-<div align="center">
-  <table>
-    <tr>
-      <td align="center" width="50%">
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/tasks-dark-web.png">
-          <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/tasks-light-web.png">
-          <img src="docs/screenshots/tasks-light-web.png" alt="Aufgaben — Kanban-Board mit Prioritäten, Fristen und Zuweisung an mehrere Mitglieder">
-        </picture>
-        <br><sub><b>Aufgaben</b> — Kanban-Board, wiederkehrende Termine, Mehrfachzuweisung</sub>
-      </td>
-      <td align="center" width="50%">
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/calendar-dark-web.png">
-          <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/calendar-light-web.png">
-          <img src="docs/screenshots/calendar-light-web.png" alt="Kalender mit Google-OAuth und CalDAV-Sync">
-        </picture>
-        <br><sub><b>Kalender</b> — Google-OAuth, iCloud, CalDAV, ICS-Abos &amp; -Import</sub>
-      </td>
-    </tr>
-    <tr>
-      <td align="center">
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/budget-dark-web.png">
-          <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/budget-light-web.png">
-          <img src="docs/screenshots/budget-light-web.png" alt="Budget — Einnahmen, Ausgaben und geteilte Kosten mit Schuldenvereinfachung">
-        </picture>
-        <br><sub><b>Budget</b> — Einnahmen, Ausgaben, geteilte Kosten, CSV-Export</sub>
-      </td>
-      <td align="center">
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/meals-dark-web.png">
-          <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/meals-light-web.png">
-          <img src="docs/screenshots/meals-light-web.png" alt="Mahlzeiten — wöchentlicher Drag-and-drop-Planer mit Rezeptimport">
-        </picture>
-        <br><sub><b>Mahlzeiten</b> — Wochenplaner, Rezepte, Ein-Klick-Einkaufsexport</sub>
-      </td>
-    </tr>
-    <tr>
-      <td align="center">
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/shopping-dark-web.png">
-          <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/shopping-light-web.png">
-          <img src="docs/screenshots/shopping-light-web.png" alt="Einkauf — gemeinsame, nach Gang sortierte Listen">
-        </picture>
-        <br><sub><b>Einkauf</b> — geteilte Listen, Gang-Gruppen, Wischgesten</sub>
-      </td>
-      <td align="center">
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/contacts-dark-web.png">
-          <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/contacts-light-web.png">
-          <img src="docs/screenshots/contacts-light-web.png" alt="Kontakte — Familienverzeichnis mit CardDAV-Sync">
-        </picture>
-        <br><sub><b>Kontakte</b> — Familienverzeichnis, CardDAV-Sync</sub>
-      </td>
-    </tr>
-  </table>
-  <a href="https://yuvomi.cloud/">Alle Screenshots ansehen →</a>
-</div>
+| Statt zu jonglieren mit… | gibt dir Yuvomi |
+|---|---|
+| einer To-do- &amp; Aufgaben-App | **Aufgaben** - Kanban, Fristen, Wiederholungen, Mehrfachzuweisung |
+| einem Abo für den geteilten Kalender | **Kalender** - Sync, Abos, Sichtbarkeit je Termin |
+| einer App fürs Kostenteilen | **Gemeinsame Ausgaben** - geteilte Kosten mit Schuldenvereinfachung |
+| einer Budget-App | **Budget** - Einnahmen, Ausgaben, Konten, Sparziele |
+| einer Essensplaner- &amp; Rezept-App | **Mahlzeiten &amp; Rezepte** - Wochenplaner mit Einkaufsexport |
+| einer Einkaufslisten-App | **Einkauf** - geteilte, nach Gang sortierte Listen |
+| einem Vorrats- und Ablauf-Tracker | **Vorrat** - Bestand, Lagerort, Mindesthaltbarkeit |
+| einem Dokumentenmanager | **Dokumente** - getaggte, durchsuchbare Familiendateien |
+| einer Hausinventar-App | **Inventar** - Besitz, Kaufpreis, Garantie, verknüpfte Belege |
+| einer Notiz-App &amp; Kontakte-Sync | **Notizen &amp; Kontakte** - Markdown-Notizen, CardDAV-Sync |
+
+## Die Module reden miteinander
+
+Das ist der Teil, den ein Ordner voller Einzel-Apps nicht kann:
+
+- **Der Wochenplan schreibt die Einkaufsliste.** Donnerstag geplant, und die Zutaten stehen auf der Liste, bevor jemand losgeht.
+- **Das letzte Glas aus dem Vorrat steht schon auf der Liste.** Was nach dem Einkauf abgehakt ist, bucht sich mit Menge und Einheit zurück in den Vorrat.
+- **Eine erledigte Aufgabe zahlt aus.** Punkte auf einer Aufgabe landen auf dem Konto der zugewiesenen Person, und der Belohnungskatalog gibt sie aus.
+- **Ein abgelegter Beleg hängt an der Buchung.** Einmal hochgeladen, gehört er gleichzeitig zur Buchung, zur geteilten Ausgabe und zum Inventargegenstand.
+
+## Die zwanzig Module
+
+Schalte an, was dein Haushalt braucht; der Rest bleibt aus dem Weg.
+
+| Modul | In einer Zeile |
+|---|---|
+| **Aufgaben** | Kanban-Board mit Fristen, Unteraufgaben, Wiederholungen, Kommentaren und einem Verlauf, wer was abgehakt hat. |
+| **Einkauf** | Geteilte Listen nach Gang sortiert, mit Wischgesten und Ein-Tipp-Import aus dem Essensplan. |
+| **Mahlzeiten** | Wochenplaner per Drag-and-drop mit Rezept-Seitenleiste und direktem Export in die Einkaufsliste. |
+| **Rezepte** | Rezepte anlegen und skalieren, Mahlzeiten vorbelegen oder eine Mealie- oder Tandoor-Instanz lesend spiegeln. |
+| **Vorrat** | Menge, Lagerort und Mindesthaltbarkeit, mit einer Erinnerung, bevor etwas abläuft. |
+| **Kalender** | Zwei-Wege-Sync mit Google und CalDAV, Outlook-Push, Kalender-Abos, Feiertage und Sichtbarkeit je Termin. |
+| **Dokumente** | Getaggte, durchsuchbare Familiendateien in Ordnern, lokal, auf WebDAV oder in Google Drive. |
+| **Inventar** | Was dir gehört, mit Kaufpreis, Garantie, verknüpften Belegen und Erinnerungen vor Fristablauf. Standardmäßig aus. |
+| **Budget** | Einnahmen, Ausgaben, Konten, Darlehen, Abos und gemeinsame Ausgaben mit Schuldenvereinfachung. |
+| **Hauswirtschaft** | Haushaltshilfen: Dienstpläne, Ein- und Ausstempeln, Abrechnung, Aufgaben und Materialwünsche. |
+| **Entsorgung** | Abholtermine je Abfallart, auch „der letzte Freitag", oder ein abonnierter kommunaler ICS-Kalender. Standardmäßig aus. |
+| **Belohnungen** | Punkte aus Aufgaben, ein elterlich freigegebener Katalog und ein nachvollziehbares Konto. |
+| **Gesundheit** | Vitalwerte, Medikamente, Laborwerte, Aktivität, Zyklus und ein Fastentagebuch je Mitglied, mit Verlaufsdiagrammen. |
+| **Schichtplan** | Rotierende Schichten und feste Wochenpläne, als Ebene im Kalender eingeblendet. Standardmäßig aus. |
+| **Notizen &amp; Kontakte** | Markdown-Haftnotizen mit antippbaren Checklisten, dazu Kontakte mit CardDAV-Sync und vCard-Import/-Export. |
+| **Geburtstage** | Geburtstage und optionale Namenstage, mit Kalendereinträgen, Alter und Erinnerungen. |
+| **Familie** | Mitgliedsprofile mit Rollen und Einladungslinks, über die neue Mitglieder ihr Passwort selbst wählen. |
+| **Erinnerungen** | An Aufgaben, Termine, Garantien, Mindesthaltbarkeit und Abfuhr - in der App, per Push, Gotify, ntfy, Webhook oder E-Mail. |
+| **API-Token** | Bearer-Token mit OpenAPI-3.0-Spezifikation und eingebautem MCP-Endpunkt für KI-Agenten. |
+| **Backup** | Manuelle und geplante Sicherungen mit Rollback vor dem Wiederherstellen und optionalem Cloud-Upload. |
+
+Zwei Dinge gibt es nur auf dem eigenen Server: der **Wandmodus** macht aus dem Küchen-Tablet eine
+Anzeige, die man quer durch den Raum liest, und ein **Immich-Bildschirmschoner** lässt die eigenen
+Fotos laufen, wenn der Bildschirm still steht. Jedes Modul im Detail steht in der
+[Spezifikation](docs/SPEC.md); wie du ein eigenes Modul einhängst - mit eigenen
+Dashboard-Widgets, Rechten und Übersetzungen -, steht im [Modulhandbuch](MODULES.md).
 
 ---
 
-## Module
+## Bevor du dich festlegst
 
-| | Modul | Was es macht |
-|:---:|---|---|
-| ![tasks](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/tasks.png) | **Aufgaben** | Fristen, Prioritäten, Teilaufgaben, wiederkehrende Termine, Zuweisung an mehrere Mitglieder, Sichtbarkeit je Aufgabe (nur ich / Zugewiesene / alle), anpassbare Kategorien, freie Tags, verknüpfte Dokumente aus dem Dokumente-Modul, ein „Mir zugewiesen"-Filter, Stichwortsuche über Titel, Beschreibung und Tags und ein Kanban-Board. Antippen öffnet eine Leseansicht statt des Formulars, damit die Tastatur unten bleibt, wenn man nur nachsehen wollte; Bearbeiten ist ein eigener Schritt, und der Status lässt sich direkt aus der Leseansicht weiterschalten. Eine Aufgabe liegt in genau einer Kategorie, trägt aber beliebig viele Tags: ein Klick auf ein Tag filtert danach, mehrere engen die Liste ein, ein Tag lässt sich haushaltsweit umbenennen oder mit einem anderen zusammenführen, und für eine ganze Auswahl auf einmal vergeben oder entfernen. Optionaler Zwei-Wege-CalDAV-Sync mit Erinnerungslisten (Apple Erinnerungen, Radicale, Nextcloud): Abhaken, Bearbeiten und Löschen einer gespiegelten Aufgabe kommen auf dem Server an, und die Tags reisen als Kategorien der Liste in beide Richtungen mit. |
-| ![shopping](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/shopping.png) | **Einkauf** | Gemeinsame, nach Gang gruppierte Listen mit Wischgesten, Notizen je Artikel, Ein-Tipp-Import aus dem Mahlzeitenplan und der Übernahme aller abgehakten Artikel in den Vorrat. Artikel aus einer CalDAV-Erinnerungsliste zeigen deren Kategorien als Tags. |
-| ![meals](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/meals.png) | **Mahlzeiten** | Wochenplaner mit mehreren Einträgen pro Slot, wöchentlicher Wiederholung, einer Drag-and-drop-Rezept-Seitenleiste, einem Ein-Klick-Wochen-Zufallsgenerator und direktem Export in die Einkaufsliste. |
-| ![recipes](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/recipes.png) | **Rezepte** | Rezepte erstellen, duplizieren und skalieren; Mahlzeiten-Slots vorbefüllen, die Zutaten direkt auf eine Einkaufsliste schicken oder jede geplante Mahlzeit als Rezept speichern. Spiegelt auf Wunsch eine selbst gehostete Mealie-Instanz, nur lesend. |
-| ![pantry](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/pantry.png) | **Vorrat** | Was tatsächlich im Haus ist, als vierte Seite der Küche: Menge und Einheit, Lagerort, Mindesthaltbarkeitsdatum, optionaler Mindestbestand und Notiz. Ein Mengen-Stepper bucht mit einem Tipp ein und aus, Status-Badges erscheinen nur dort, wo sie etwas bedeuten (abgelaufen, läuft binnen einer Woche ab, fast leer, leer), und Filter zeigen genau diese Artikel. Lagerorte lassen sich umbenennen und sortieren; einen zu löschen erhält den Bestand. Läuft in beide Richtungen mit der Einkaufsliste: leere oder knappe Artikel wandern einzeln oder gesammelt auf die Liste (aufgefüllt bis zum Mindestbestand), und alles nach dem Einkauf Abgehakte lässt sich mit Menge und Einheit in den Vorrat buchen. |
-| ![calendar](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/calendar.png) | **Kalender** | Zweiwege-Sync mit Google (OAuth) und CalDAV (iCloud, Nextcloud, Radicale) - Anlegen, Bearbeiten, Löschen und das Verschieben in einen anderen Kalender kommen auf dem Server an -, ICS-Abos, einmaliger Import aus einer `.ics`-Datei oder einem geteilten Feed als bearbeitbare lokale Termine, wiederkehrende Termine mit Scope je Vorkommen (nur diesen Termin, diesen und folgende oder die ganze Serie bearbeiten oder löschen), Anhänge, Feiertags-Overlays, Stichwortsuche über Titel, Ort und Notizen (akzentunabhängig, findet auch Termine mit unbekanntem Datum), ein „Mir zugewiesen"-Filter, Sichtbarkeit je Termin, eine Standard-Zuweisung je synchronisiertem Kalender, zugewiesene Mitglieder als Avatare auf jedem Termin, einen wählbaren Wochenstart (Montag, Sonntag oder Samstag) und ein schreibgeschützter `webcal://`-Export-Feed, der die zugewiesenen Mitglieder optional im Termintitel zeigen kann. Antippen öffnet zuerst eine Leseansicht, die auch Wiederholung im Klartext, Erinnerungen und Sichtbarkeit nennt; Bearbeiten ist ein eigener Schritt. |
-| ![documents](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/documents.png) | **Dokumente** | Familiendateien hochladen, taggen, vorschauen und organisieren, mit Sichtbarkeit je Dokument. Mehrfach-Upload, Ordner, Sortierung, Kategorie-Facetten mit Trefferzahlen sowie Verschieben/Archivieren/Löschen in Stapeln. Optionaler lokaler Ordner-, WebDAV- oder Google-Drive-Speicher sowie Paperless-ngx- und Papra-(DMS-)Anbindung. |
-| ![budget](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/budget.png) | **Budget** | Einnahmen, Ausgaben, wiederkehrende Buchungen, Trend-Charts, ein Statistik-Tab, CSV-Export, Konten mit Startsaldo und laufendem Kontostand samt Nettovermögen, Kredite (optional als Annuitätendarlehen mit festem, variablem oder fest-dann-variablem Zins, Rate, Laufzeit und Gesamtzins werden live berechnet; jedes Darlehen kann in einer eigenen Währung mit festem Umrechnungskurs in die Budget-Währung laufen), geteilte Ausgaben, Abo-Tracking mit Verlängerungen, Währungen und optionalem Enddatum (an einem Datum oder nach N Zahlungen, danach automatisch abgeschlossen), ein Plan-Tab mit monatlichen Kategorie-Budgets und einem Sparziel (Soll vs. Ist), Belege an Buchungen und geteilten Ausgaben (vorhandenes Dokument verknüpfen oder neue Datei hochladen, mehrere je Buchung) sowie ein optionaler persönlicher Budget-Modus, in dem jeder Eintrag privat oder geteilt sein kann, mit Mein-Budget/Haushalt-Ansicht. |
-| ![housekeeping](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/housekeeping.png) | **Haushaltshilfe** | Personal verwalten — Dienstpläne, Ein-/Auschecken, Tages- oder Stundenabrechnung, Aufgaben und Materialanforderungen. |
-| ![rewards](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/rewards.png) | **Belohnungen** | Punktwerte auf Aufgaben schreiben zugewiesenen Mitgliedern gut; ein einstellbarer Standardwert für neue Aufgaben, ein Belohnungskatalog mit elterlich freigegebenen Einlösungen, Opt-in je Mitglied und ein prüfbares Punktekonto. |
-| ![health](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/health.png) | **Gesundheit** | Vitalwerte je Mitglied, Medikamente mit Nachfüll-Warnungen, Laborwerte, Aktivitätsprotokolle und Zyklus-Tracking (Perioden-Vorhersagen, fruchtbares Fenster, Zyklus-Ring, Schwangerschafts-Modus) — mit Trend-Charts, CSV-Export und Sichtbarkeit je Eintrag. |
-| ![notes](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/notes.png) | **Notizen & Kontakte** | Bunte Markdown-Notizzettel, die gerendert im Lesemodus öffnen (Umschalter zum Bearbeiten), mit Volltextsuche, Filter nach Ersteller und vorangestellten angepinnten Notizen, plus ein Kontaktverzeichnis mit CardDAV-Sync und vCard-Import/-Export mehrerer Kontakte. Kontakte folgen derselben Grammatik: Antippen zeigt den Eintrag, bevor es ihn ändern lässt, mit jeder gespeicherten Nummer, Mail und Adresse als eigener Trefferfläche - die Liste bot immer nur die erste davon - und Bearbeiten als eigenem Schritt. |
-| ![birthdays](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/birthdays.png) | **Geburtstage** | Geburtstags-Tracker mit automatischen Kalenderterminen, Altersanzeige, eigenen Erinnerungen und selektivem Import aus synchronisierten Kontakten. |
-| ![family](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/family.png) | **Familie** | Mitgliederprofile mit Rollen, Fotos und Kontaktdaten — synchronisiert mit Kontakten und Geburtstagen. |
-| ![reminders](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/reminders.png) | **Erinnerungen** | Erinnerungen zu Aufgaben und Terminen per In-App-Badge, Opt-in-Web-Push (HTTPS) und Haushalts-Kanälen über Gotify/ntfy. |
-| ![api-tokens](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/api-tokens.png) | **API-Tokens** | Bearer-/X-API-Key-Tokens mit OpenAPI-3.0-Spec und eingebautem MCP-Endpunkt (`/mcp`), über den KI-Agenten wie Claude Desktop die gesamte API in natürlicher Sprache steuern. Optionale Modul-Scopes (Lesen/Schreiben) halten ein Token — etwa für einen KI-Client — von sensiblen Bereichen fern. |
-| ![backup](https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docs/icons/backup.png) | **Backup** | Manuelles und geplantes Datenbank-Backup/-Restore mit automatischem Rollback vor dem Zurückspielen. Optionales WebDAV-Upload-Ziel (Nextcloud, ownCloud usw.). |
+**Was, wenn dieses Projekt aufhört?** Auf deiner Maschine ändert sich nichts. Yuvomi ist
+MIT-lizenziert und selbstgehostet, und auf dem Weg steht kein Server von uns. Der Container, den du
+schon geholt hast, läuft weiter wie heute, mit uns oder ohne uns.
 
-<sub>Vollständiges Datenmodell und Modul-Details in der <a href="docs/SPEC.md">Spec</a>.</sub>
+**Was, wenn du deine Daten woanders haben willst?** Alles liegt in einer SQLite-Datei auf deiner
+eigenen Platte, und sie zu kopieren ist der ganze Export, solange die Dokumente in der Datenbank
+liegen. Geplante Backups schreiben zusätzlich ein wiederherstellbares Archiv, und die dokumentierte
+API holt alles in der Form heraus, die du brauchst.
 
-> **Gesundheit ist kein Medizinprodukt** — keine diagnostischen Aussagen. Gesundheitsdaten sind sensibel; aktiviere die Datenbankverschlüsselung (`DB_ENCRYPTION_KEY`, SQLCipher).
-
-> **Externer Dokumentenspeicher braucht ein eigenes Backup.** Datenbank-Backups enthalten Metadaten und Verweise, nicht die Binärdateien in einem lokalen Ordner, auf WebDAV oder in Google Drive. Sichere das gewählte Ziel separat. Yuvomis Sichtbarkeitseinstellungen steuern nur den Zugriff über Yuvomi. Alle Personen mit Zugriff auf den verbundenen Google-Drive-Ordner `Yuvomi/Documents` können sämtliche dort gespeicherten Dateien sehen. WebDAV-Ziele aus der Admin-Oberfläche müssen zu öffentlichen Adressen auflösen; für ein vertrauenswürdiges LAN- oder Loopback-Ziel setze `DOCUMENT_STORAGE_WEBDAV_URL` über die Deployment-Umgebung oder `DOCUMENT_STORAGE_WEBDAV_ALLOW_PRIVATE_NETWORK=true`, um private Ziele auch aus der UI zuzulassen.
-
-> **Interne Ziele (LAN / private IP) sind standardmäßig blockiert.** Der SSRF-Schutz weist private, Loopback-, Link-local- und interne-DNS-URLs für ICS-Kalenderabos und WebDAV-Dokumentenspeicher ab. Um eine intern auflösende URL zu nutzen, setze das passende Opt-in in deiner Deployment-Umgebung: `ICS_SUBSCRIPTION_ALLOW_PRIVATE_NETWORK=true` für Kalender-Feeds, `DOCUMENT_STORAGE_WEBDAV_ALLOW_PRIVATE_NETWORK=true` für den Dokumentenspeicher. Siehe die [Installationsanleitung](docs/installation.md#environment-variables).
+**Was kostet es?** Nichts. Yuvomi ist kostenlos und MIT-lizenziert. Du stellst den Server; es gibt
+kein Abo, keinen Upsell und keine Bezahlstufe.
 
 ---
 
-## Design & Technik
+## Installieren
 
-- **Disziplinierte Liquid-Glass-UI** — lesbare Arbeitsflächen, dezent transluzente Navigation, Spring-Animationen und modul-getönte Overlays — in reinem CSS gebaut, ohne Framework
-- **PWA** — auf jedem Gerät installierbar, offline nutzbar (schreibgeschützter Zugriff auf zuletzt gesehene Kalender-, Aufgaben-, Einkaufs-, Kontakt- und Dashboard-Daten) und von Smartphone bis Desktop responsiv, mit persistenter mobiler Leiste, konfigurierbaren Favoriten und optimierten Touch-Zielen
-- **Datenschutz zuerst** — vollständig selbstgehostet, optionale SQLCipher-AES-256-Datenbankverschlüsselung (im empfohlenen Docker-Setup aktiv), keine Telemetrie
-- **SSO / OpenID Connect** — optionales Single Sign-on über jeden OIDC-Provider (Authentik, Keycloak, Google, Microsoft Entra), konfiguriert mit vier Umgebungsvariablen; Authorization-Code- + PKCE-Flow
-- **Self-Service-Passwort-Reset** — optionales SMTP lässt Nutzer ein vergessenes Passwort selbst per zeitlich begrenztem E-Mail-Link zurücksetzen; enumerationssicher by design
-- **Kein Build-Schritt** — reine ES-Module, kein Bundler, kein Transpiler, kein Framework
-- **Mehrsprachig** — 23 Sprachen mit automatischer Locale-Erkennung (de, en, es, fr, it, sv, el, ru, tr, zh, ja, ar, hi, pt, uk, pl, nl, cs, vi, hu, ko, id, fa). Eine eigene Haushalts-Einstellung bestimmt die Sprache selbst erzeugter Einträge, damit ein exportierter Kalender und die API die Sprache des Haushalts sprechen statt Englisch
+Such dir deinen Weg aus: [Docker oder Podman](#docker-oder-podman) für volle Kontrolle, die
+[geführte Einrichtung](#geführte-einrichtung) im Browser oder den
+[App-Store deines NAS](#aus-dem-app-store-deines-nas) ganz ohne Terminal.
 
----
+- **Image** - `ghcr.io/ulsklyc/`<wbr>`yuvomi:latest`, rund 500 MB.
+- **Braucht** - 256 MB RAM und einen Port, standardmäßig 3000.
+- **Schreibt** - vier Volumes, die dir gehören: Daten, Backups, Module, Dokumente.
+- **Nach außen** - ab Werk eine Update-Abfrage an die GitHub-Releases-API. Blockier sie, und nichts geht kaputt, nur der Hinweis auf eine neuere Version bleibt aus. Alles andere geht erst nach außen, wenn du eine Funktion nutzt oder einschaltest, die es braucht: das Öffnen der Kalender-Einstellungen lädt die Liste der Feiertagsländer von openholidaysapi.org, die Logo-Suche für ein Abo ruft die Website des Dienstes auf, und Wetter, Feiertage, Wechselkurse, Kalender- und Kontakte-Sync, Rezept-Spiegel, Immich, Paperless oder Papra, Push- und Benachrichtigungskanäle, Cloud-Speicher und Backup verbinden sich erst, wenn du sie einschaltest.
+- **Dein LAN** - Kalender-Abos, WebDAV-Speicher und Rezept-Spiegel unter privaten oder internen Adressen bleiben blockiert, bis du sie freigibst ([wie](docs/installation.md#environment-variables)).
+- **Schlüssel** - optional, aber ohne Weg zurück: ein verlorener oder geänderter Schlüssel öffnet die Datenbank nie wieder, weder für dich noch für uns. Die geführte Einrichtung und Umbrel erzeugen ihn für dich; mit Compose, TrueNAS oder Unraid setzt du ihn selbst, also schreib ihn auf.
+- **Deine Daten** - eine SQLite-Datei unter `/data/yuvomi.db`, dazu Ordner, WebDAV oder Drive, falls die Dokumente dort liegen.
 
-## Überall installieren
+### Docker oder Podman
 
-### Web-Installer (empfohlen)
+Unter Podman lädst du `podman-compose.yml` statt `docker-compose.yml` und startest mit
+`podman compose -f podman-compose.yml up -d`; darin stecken die SELinux-`:Z`-Labels, die RHEL,
+Fedora und CentOS Stream brauchen.
 
-Ein lokalisierter Setup-Assistent — 23 Sprachen — der im Browser läuft. Erkennt Docker oder Podman automatisch, konfiguriert HTTPS, SSO und geplante Backups, startet dann den Container und legt dein Admin-Konto an.
+```bash
+curl -O https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/ulsklyc/yuvomi/main/.env.example
+cp .env.example .env
+openssl rand -hex 32   # SESSION_SECRET
+openssl rand -hex 32   # DB_ENCRYPTION_KEY
+```
+
+> **Öffne jetzt `.env` und ersetze beide `REPLACE_WITH_…`-Platzhalter** durch die zwei eben
+> erzeugten Werte, in dieser Reihenfolge, und schreib den zweiten auf: er ist der
+> Datenbankschlüssel, und nichts kann ihn wiederherstellen. Ohne Verschlüsselung: die Zeile leeren
+> statt sie zu füllen.
+
+```bash
+docker compose up -d
+```
+
+Öffne `http://localhost:3000`. Der erste Besuch führt dich durch das Anlegen des Admin-Kontos. Lädt
+die Seite nicht, nennt `docker compose logs` (unter Podman `podman compose -f podman-compose.yml logs`)
+meist den Grund, und die
+[Fehlersuche](docs/installation.md#troubleshooting) deckt die häufigen Fälle ab.
+
+### Geführte Einrichtung
+
+Ein Einrichtungsassistent im Browser, in 24 Sprachen. Er erkennt Docker oder Podman, richtet HTTPS,
+Single Sign-on und geplante Backups ein, startet dann den Container und legt dein Admin-Konto an.
 
 ```bash
 git clone https://github.com/ulsklyc/yuvomi.git && cd yuvomi
 node tools/installer/install-server.js
 ```
 
-Öffne **http://localhost:8090**. Benötigt Node.js 18+ auf dem Host für den Installer — der App-Container bringt sein eigenes Node 22 mit.
+Öffne **http://localhost:8090**. Braucht Node.js 22+ auf dem Host; der Container bringt sein eigenes Node 24 mit.
 
-### Docker / Podman
+### Aus dem App-Store deines NAS
 
-**Vorgefertigtes Image:**
+**TrueNAS SCALE**, **Umbrel** und **Unraid** führen Yuvomi alle: im Katalog suchen und installieren,
+ganz ohne Terminal. Neu bei Containern? Die
+**[Installationsanleitung](docs/installation.md)** führt Schritt für Schritt durch Engine, HTTPS,
+Backups und Fehlersuche.
 
-```bash
-curl -O https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docker-compose.yml
-curl -O https://raw.githubusercontent.com/ulsklyc/yuvomi/main/.env.example
-cp .env.example .env          # SESSION_SECRET und DB_ENCRYPTION_KEY setzen
-docker compose up -d
-```
+<details>
+<summary><b>Bevor du live gehst: Gesundheitsdaten, Google-Drive-Freigabe und DSGVO</b></summary>
 
-**Aus dem Quellcode bauen:**
+<br>
 
-```bash
-git clone https://github.com/ulsklyc/yuvomi.git && cd yuvomi
-cp .env.example .env
-docker compose up -d --build
-```
+> **Gesundheit ist kein Medizinprodukt.** Es werden keine diagnostischen Aussagen getroffen. Gesundheitsdaten sind sensibel - aktiviere die Datenbankverschlüsselung (`DB_ENCRYPTION_KEY`, SQLCipher).
 
-Öffne `http://localhost:3000`. Der erste Besuch führt dich durch die Anlage deines Admin-Kontos.
+> **Externer Dokumentenspeicher braucht eine eigene Sicherung.** Datenbank-Backups enthalten Metadaten und Verknüpfungen, nicht die Dateien selbst, wenn sie in einem lokalen Ordner, auf WebDAV oder in Google Drive liegen; sichere das gewählte Ziel separat. Yuvomis Sichtbarkeitseinstellungen regeln nur den Zugriff über Yuvomi. Wer Zugriff auf den verbundenen Google-Drive-Ordner `Yuvomi/Documents` hat, sieht alle dort abgelegten Dateien.
 
-> **Podman (RHEL / Fedora / CentOS Stream):** Beide Installer erkennen Podman automatisch und nutzen `podman-compose.yml` mit SELinux-`:Z`-Labels. Für einen manuellen Start: `podman compose -f podman-compose.yml up -d`. Rootless-systemd-Autostart: `tools/quadlet/oikos.container`.
+> **Selbst hosten im DSGVO-Kontext?** Wenn du Yuvomi in der EU oder im EWR betreibst und fremde Daten verarbeitest, lies vorher [Datenschutz für Selfhoster](docs/PRIVACY-FOR-SELFHOSTERS.md). Dort stehen Drittlandsbewertungen für jeden externen Dienst, Hinweise zur Auftragsverarbeitung, Empfehlungen zur Log-Aufbewahrung und eine Vorlage für das Verarbeitungsverzeichnis.
 
-### NAS & Home-Server
+</details>
 
-<table>
-  <tr>
-    <td><b>TrueNAS SCALE</b></td>
-    <td>Apps → Discover Apps → nach <b>Yuvomi</b> suchen → Install</td>
-    <td>Kein Terminal nötig. Community-Apps-Katalog. Versions-Updates via Renovate.</td>
-  </tr>
-  <tr>
-    <td><b>Umbrel</b></td>
-    <td>App Store → nach <b>Yuvomi</b> suchen → Install</td>
-    <td>Ein-Klick-Installation. Alles bleibt auf deinem Umbrel.</td>
-  </tr>
-  <tr>
-    <td><b>Unraid</b></td>
-    <td>Apps → nach <b>Yuvomi</b> suchen → Apply</td>
-    <td>Community-Applications-Template. <code>SESSION_SECRET</code> bei der Installation setzen.</td>
-  </tr>
-</table>
+<details>
+<summary>Kommst du von <b>Oikos</b> oder siehst <code>oikos</code> in einem App-Store? Dieselbe App, umbenannt.</summary>
 
-> **Katalog-Einträge sind weiterhin unter dem alten Namen `oikos` registriert** (TrueNAS `oikos_community`, Unraid `oikos-…`). Die App zeigt und installiert sich als **Yuvomi** — der technische Slug bleibt erhalten, damit bestehende Installationen (Datenbankpfade und Containernamen) nahtlos aktualisieren statt zu brechen. Suche nach **Yuvomi**; taucht ein Store den Eintrag noch als *oikos* auf, ist es dieselbe App.
+<br>
 
-> **Neu bei Docker oder Podman?** Der **[Installations-Leitfaden](docs/installation.md)** deckt Engine-Setup, HTTPS/Reverse-Proxy, Backups und Troubleshooting Schritt für Schritt ab.
+Yuvomi wurde von **Oikos** umbenannt, um einen Markenkonflikt mit einem unabhängigen Produkt zu vermeiden. Gleicher Code, gleiche Daten, gleicher Maintainer.
+
+- Alte Links (`github.com/ulsklyc/oikos`) leiten automatisch hierher weiter.
+- Das Docker-Image liegt jetzt unter `ghcr.io/ulsklyc/yuvomi`; das alte `ghcr.io/ulsklyc/oikos` funktioniert weiter, du kannst also in Ruhe umstellen.
+- Bestehende Daten und Einstellungen bleiben beim Update vollständig erhalten.
+- Manche Katalog-Slugs behalten den technischen Namen `oikos` (z. B. Unraid `oikos-…`), damit bestehende Installationen nahtlos aktualisieren. Suche nach **Yuvomi**; ein Eintrag, der noch als *oikos* erscheint, ist dieselbe App.
+
+</details>
 
 ---
 
-## Tech-Stack
+## Unter der Haube
 
-<p>
+- **Kein Build-Schritt** - reine ES-Module und einfaches CSS. Kein Bundler, kein Transpiler, kein Framework, kein CDN zur Laufzeit.
+- **Apple HIG in der Liquid-Glass-Sprache** - Systemschrift und Apples Typoskala, Kapsel-Bedienelemente, eingerückte Listengruppen und federnde Bewegung, in Hell und Dunkel gegen WCAG AA geprüft.
+- **Privatsphäre zuerst** - vollständig selbstgehostet, optionale SQLCipher-AES-256-Datenbankverschlüsselung, keine Telemetrie.
+- **Anmeldung für einen ganzen Haushalt** - optionale Zwei-Faktor-Anmeldung (TOTP mit Wiederherstellungscodes, auf Wunsch für alle verpflichtend), Einladungslinks statt weitergereichter Passwörter und optionaler Self-Service-Passwort-Reset per E-Mail. Optionales Single Sign-on klappt mit jedem OIDC-Anbieter. Ein Schalter entscheidet, ob eine unbekannte Identität ein Konto bekommt, damit ein über deinen Haushalt hinaus geteilter Anbieter keine Tür öffnet, und ein zweiter macht SSO zum einzigen Weg hinein.
+- **24 Sprachen** mit automatischer Erkennung. Eine eigene Haushaltseinstellung bestimmt die Sprache der Einträge, die Yuvomi selbst anlegt - so spricht ein exportierter Kalender die Sprache deines Haushalts statt Englisch.
+
+<p align="center">
   <img src="https://img.shields.io/badge/Express-000000?style=flat-square&logo=express&logoColor=white" alt="Express">
   <img src="https://img.shields.io/badge/SQLite%20%2F%20SQLCipher-003B57?style=flat-square&logo=sqlite&logoColor=white" alt="SQLite / SQLCipher">
   <img src="https://img.shields.io/badge/Vanilla_JS_(ES_Modules)-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="Vanilla JS">
   <img src="https://img.shields.io/badge/Plain_CSS-1572B6?style=flat-square&logo=css3&logoColor=white" alt="Plain CSS">
+  <img src="https://img.shields.io/badge/Node.js-%E2%89%A522-339933?style=flat-square&logo=node.js&logoColor=white" alt="Node.js 22 oder neuer">
   <img src="https://img.shields.io/badge/Docker-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/Podman-892CA0?style=flat-square&logo=podman&logoColor=white" alt="Podman">
   <img src="https://img.shields.io/badge/PWA-5A0FC8?style=flat-square&logo=pwa&logoColor=white" alt="PWA">
@@ -286,17 +232,28 @@ docker compose up -d --build
 
 ## Dokumentation
 
-[Installation](docs/installation.md) &nbsp;·&nbsp; [Spec & Datenmodell](docs/SPEC.md) &nbsp;·&nbsp; [Module](MODULES.md) &nbsp;·&nbsp; [Mitwirken](CONTRIBUTING.md) &nbsp;·&nbsp; [Sicherheit](SECURITY.md) &nbsp;·&nbsp; [Datenschutz für Selbsthoster](docs/PRIVACY-FOR-SELFHOSTERS.md) &nbsp;·&nbsp; [Changelog](CHANGELOG.md) &nbsp;·&nbsp; [Backlog](BACKLOG.md)
+- **Betreiben** - [Installation](docs/installation.md)&nbsp;&nbsp;·&nbsp; [Sicherheit](SECURITY.md)&nbsp;&nbsp;·&nbsp; [Datenschutz für Selfhoster](docs/PRIVACY-FOR-SELFHOSTERS.md)&nbsp;&nbsp;·&nbsp; [Benachrichtigungs-Webhooks](docs/notification-webhooks.md)&nbsp;&nbsp;·&nbsp; [Immich-Bildschirmschoner](docs/immich-screensaver.md)
+- **Darauf aufbauen** - [Spezifikation &amp; Datenmodell](docs/SPEC.md)&nbsp;&nbsp;·&nbsp; [Fremdmodule](MODULES.md)&nbsp;&nbsp;·&nbsp; [Mitwirken](CONTRIBUTING.md)
+- **Dem Projekt folgen** - [Changelog](CHANGELOG.md)&nbsp;&nbsp;·&nbsp; [Roadmap](docs/ROADMAP.md)&nbsp;&nbsp;·&nbsp; [Entscheidungen](docs/DECISIONS.md)&nbsp;&nbsp;·&nbsp; [Rahmen](docs/SCOPE.md)&nbsp;&nbsp;·&nbsp; [Backlog](BACKLOG.md)&nbsp;&nbsp;·&nbsp; [Veröffentlichen](docs/RELEASING.md)
 
-Wenn du Yuvomi in einem DSGVO-Kontext selbst hostest (EU/EWR, Verarbeitung fremder Daten), lies [docs/PRIVACY-FOR-SELFHOSTERS.md](docs/PRIVACY-FOR-SELFHOSTERS.md) vor dem Produktivbetrieb: Es behandelt Drittland-Bewertungen für jeden externen Dienst (Wetter, CalDAV/CardDAV, OIDC, WebDAV-Backup und Dokumentenspeicher), Hinweise zu Auftragsverarbeitungsverträgen, Empfehlungen zur Log-Aufbewahrung und eine Vorlage für das Verzeichnis von Verarbeitungstätigkeiten.
+**Nutzerhandbuch (aus der Community):** @Kyrodan schreibt eine [Nutzerdokumentation](https://kyrodan.github.io/yuvomi-docs/)
+in seinem eigenen Repository. Sie gehört nicht zu diesem Projekt und kann hinter einem Release
+zurückliegen; wo sie und die Quellen oben sich widersprechen, gelten die oben.
 
 ---
 
-## Lizenz
-
-MIT — siehe [LICENSE](LICENSE).
-
 <div align="center">
   <br>
-  <sub>Mit Sorgfalt gebaut für Familien, die Privatsphäre und Einfachheit schätzen.</sub>
+  <img src="docs/logo.svg" alt="" width="48" />
+  <p><strong>Ein Zuhause für deinen Haushalt. Und es bleibt deins.</strong></p>
+  <p>
+    Einmal installiert. Kein Konto bei uns, kein Abo,<br>
+    und nichts von uns zwischen deinem Haushalt und seinen Daten.
+  </p>
+  <p>
+    <a href="#installieren"><strong>→ In Minuten installieren</strong></a>&nbsp;&nbsp;·&nbsp;
+    <a href="https://github.com/ulsklyc/yuvomi/discussions"><strong>Frag nach</strong></a>
+  </p>
+  <br>
+  <sub>MIT-lizenziert, siehe <a href="LICENSE">LICENSE</a>.</sub>
 </div>

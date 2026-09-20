@@ -30,16 +30,20 @@ import {
 } from '../public/settings/module-order.js';
 import {
   applyHolidaySubdivisionSelection,
+  countrySchoolHolidaysAvailable,
+  createSchoolAvailabilityUpdater,
   ensureHolidayLayerSelection,
   isHolidayCountryResolved,
+  groupLookupAfterSubdivisions,
+  resolveHolidayGroup,
   resolveHolidayLocation,
   runHolidayDiscovery,
   shouldApplySubdivisionResponse,
 } from '../public/settings/pages/modules-calendar.js';
 import {
   persistCurrencySelection,
-  SUPPORTED_CURRENCIES,
 } from '../public/settings/currency.js';
+import { CURRENCY_CODES } from '../public/utils/currency-codes.js';
 import {
   hasValidWeatherCoords,
   isConnectedWeatherControl,
@@ -49,9 +53,16 @@ import {
 } from '../public/settings/pages/modules-kitchen.js';
 import {
   buildMobileNavigationPayload,
-  buildNavigationPayload,
-  persistModuleToggle,
+  buildOrderPayload,
+  kitchenGroupHidden,
 } from '../public/settings/pages/modules-navigation.js';
+import {
+  buildActiveModulesPayload,
+  persistHouseholdToggle,
+} from '../public/settings/pages/modules-active.js';
+import {
+  parseGraceDaysInput,
+} from '../public/settings/pages/modules-countdowns.js';
 
 const member = { role: 'member' };
 const admin = { role: 'admin' };
@@ -108,9 +119,39 @@ test('die Blätter verteilen sich wie beschlossen auf die vier Domänen', () => 
   // Critique 2026-07-27 fand sie unbalanciert (personal 5 / modules 8 / sync 3 /
   // documents 2 / admin 6) - `documents` ist aufgelöst, `modules` von acht auf
   // vier geschrumpft, und was per-user schreibt, liegt bei `personal`.
+  // Immich (#693) liegt bei `admin` wie das Wetter: eine serverweite
+  // Dienstanbindung, deren Zugangsdaten der Browser nie sieht.
+  // Die Aufgaben-Vorgaben (#695) liegen bei `personal` und NICHT bei
+  // `sync-reminders`: welche Erinnerungslisten der Haushalt abgleicht, ist eine
+  // Admin-Entscheidung, in welche davon meine neuen Aufgaben laufen, ist meine.
+  // Nach demselben Schnitt liegt das Zyklus-Opt-out (#760) bei `personal`: ob der
+  // Haushalt den Zyklus führt, steht im adminOnly-`modules-options`, ob ich ihn
+  // sehen will, entscheide ich.
+  // Und ebenso `personal-feeds`: beide Feed-Tokens hängen an der eigenen
+  // users-Zeile und beide Routen tragen keinen Admin-Check, das Blatt lag
+  // trotzdem im adminOnly-`sync-calendar`.
+  // `personal-calendar-subscriptions` ist die Gegenrichtung und derselbe Fall:
+  // `GET /calendar/subscriptions` liefert `shared = 1 OR created_by = ich`, und
+  // PATCH/DELETE/sync antworten 403 für fremde Abos - `isAdmin` ist dort ein
+  // ZUSATZrecht, keine Voraussetzung. Bei `sync` bleiben nur die Blätter, deren
+  // Routen wirklich `requireAdmin` tragen: CalDAV und Google/Apple hängen an
+  // Zugangsdaten des Haushalts.
+  // `modules-countdowns` (#969) liegt bei `modules`, nicht bei `personal`: die
+  // Nachfrist ist haushaltweit und admin-only, kein persoenlicher Wert wie das
+  // Zyklus-Opt-out oben - deshalb ein eigenes Blatt statt eines Platzes in
+  // `modules-options`, dessen eigener Guard (test:frontend-audit) nur Schalter
+  // aus dem geteilten Toggle-Primitiv zulaesst, kein Zahlenfeld.
+  // `admin-displays` (#1208) liegt bei `admin` und nirgends sonst: ein Wandtablett
+  // anzulegen heisst, einem Geraet dauerhaft Zugang zum Haushalt zu geben, und
+  // jede Route des Blatts traegt `requireAdmin`. Es ist kein Modulschalter (es
+  // schaltet nichts an oder aus) und keine Synchronisation (es haengt an keinen
+  // fremden Zugangsdaten) - damit steigt `admin` von 8 auf 9.
+  // `modules-health` gibt `/settings/modules/health` eigenen Inhalt (das
+  // Vorsorge-Typregister) statt eines Alias auf `modules-options` - damit
+  // steigt `modules` von 6 auf 7.
   const perDomain = {};
   for (const leaf of SETTINGS_LEAVES) perDomain[leaf.domainId] = (perDomain[leaf.domainId] ?? 0) + 1;
-  assert.deepEqual(perDomain, { personal: 7, modules: 4, sync: 5, admin: 7 });
+  assert.deepEqual(perDomain, { personal: 11, modules: 7, sync: 5, admin: 9 });
   // Jedes Blatt hängt an einer existierenden Domäne.
   const domainIds = new Set(SETTINGS_DOMAINS.map((domain) => domain.id));
   for (const leaf of SETTINGS_LEAVES) {
@@ -171,42 +212,64 @@ test('Mitglieder können ihre eigene Navigation erreichen', () => {
   assert.equal(leaf.adminOnly, false);
 });
 
-test('die Order eines Mitglieds reist ohne die haushaltweiten Schalter', async () => {
-  // `disabled_modules` ist serverseitig auf Admins beschränkt (403). Im
-  // gemeinsamen Payload wäre der GANZE Request eines Mitglieds gescheitert und
-  // seine Reihenfolge hätte nie gespeichert.
-  const { buildOrderPayload, buildNavigationPayload } = await import('/settings/pages/modules-navigation.js');
-
-  const memberPayload = buildOrderPayload(['calendar', 'tasks', 'kitchen']);
-  assert.deepEqual(Object.keys(memberPayload), ['module_order']);
-  assert.equal('disabled_modules' in memberPayload, false);
-
-  // Für Admins bleibt die gemeinsame Payload erhalten: Order und Aktivierung
-  // werden weiter zusammen geschrieben, also bleibt der Zustand konsistent.
-  const adminPayload = buildNavigationPayload(['notes'], new Set(['meals']), ['calendar', 'kitchen']);
-  assert.ok(Array.isArray(adminPayload.disabled_modules));
-  assert.ok(Array.isArray(adminPayload.module_order));
-
-  // Beide expandieren die Kitchen-Sammelzeile identisch zurück.
-  assert.deepEqual(
-    buildOrderPayload(['calendar', 'kitchen']).module_order,
-    adminPayload.module_order,
-  );
-});
-
-test('Aktivierungs-Schalter und Kitchen-Kinder sind für Mitglieder nicht gerendert', async () => {
-  const source = await readFile(
+test('das persoenliche Blatt traegt keinen haushaltweiten Schalter mehr', async () => {
+  // Die Regel, nicht der Einzelfall: auf `modules-navigation` darf KEIN
+  // Bedienelement stehen, das den Haushalt aendert - egal ob hinter `isAdmin`
+  // versteckt oder nicht. Vorher war genau das der Fall, und zwei unbeschriftete
+  // Bedienelemente mit zwoelf Pixel Abstand trugen sehr verschiedene Reichweiten
+  // (Critique 2026-08-16, P0).
+  // Kommentare raus, BEVOR gesucht wird: beide Blaetter erklaeren im Fliesstext
+  // genau diese Schluessel, und ein Guard, der Prosa fuer Code haelt, meldet die
+  // Begruendung als Verstoss. Genau daran war die erste Fassung rot.
+  const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const personal = stripComments(await readFile(
     new URL('../public/settings/pages/modules-navigation.js', import.meta.url),
     'utf8',
-  );
-  // Haushaltweite Schalter nur für Admins; Mitglieder bekommen stattdessen die
-  // Erklärung, wer darüber entscheidet.
-  assert.match(source, /\$\{isAdmin \? toggleRowHtml\(\{[\s\S]{0,300}data-built-in-module-toggle/);
-  assert.match(source, /data-kitchen-child-toggle[\s\S]{0,400}settings-module-kitchen__child--readonly/);
-  assert.match(source, /isAdmin \? '' : `<p class="form-hint">\$\{t\('settings\.modulesEnableAdminOnly'\)\}/);
-  // Der Save-Pfad muss die Rolle kennen, sonst sendet ein Mitglied disabled_modules.
-  assert.match(source, /async function saveNavigationState\(list, isAdmin\)/);
-  assert.match(source, /isAdmin\s*\?\s*buildNavigationPayload\(/);
+  ));
+  for (const marker of ['data-built-in-module-toggle', 'data-kitchen-child-toggle',
+    'data-third-party-module-toggle']) {
+    assert.equal(personal.includes(marker), false,
+      `das persoenliche Blatt rendert noch '${marker}' - der Haushalts-Schalter ist zurueck`);
+  }
+  // LESEN bleibt richtig: das Blatt muss wissen, was der Haushalt abgeschaltet
+  // hat, sonst kann es den Ausblenden-Knopf nicht sperren und den Grund nicht
+  // nennen. Verboten ist das SCHREIBEN - der Schluessel als Payload-Feld.
+  // Der Kontext gehoert ins Muster: `preferences.disabled_modules : []` ist ein
+  // Ternaer und kein Objektschluessel - die erste Fassung dieses Guards war
+  // daran rot, obwohl das Blatt nur LAS.
+  assert.equal(/(^|[{,])\s*disabled_modules\s*:/m.test(personal), false,
+    'das persoenliche Blatt schreibt disabled_modules - das ist haushaltweit und admin-only');
+  assert.match(personal, /preferences\.disabled_modules/,
+    'das Blatt liest den Haushaltsstand nicht mehr - dann kann es den gesperrten Knopf nicht begruenden');
+  // Und der Save-Pfad muss die Rolle NICHT mehr kennen: eine Payload, die nicht
+  // weiss, wer sie absendet, kann auch nicht die falsche sein.
+  // Die Regel ist "der Save-Pfad kennt die Rolle nicht", nicht "die Signatur
+  // hat genau ein Argument": sie nahm spaeter die im Blatt nie gerenderten
+  // Order-Ids dazu, und daran war dieser Guard rot, ohne dass sich die
+  // Zusicherung geaendert haette.
+  assert.match(personal, /async function saveNavigationState\(list[,)]/);
+  assert.equal(/saveNavigationState\([^)]*isAdmin/.test(personal), false,
+    'der Save-Pfad kennt wieder die Rolle - dann kann er wieder die falsche Payload schicken');
+
+  // Gegenprobe auf der anderen Seite: das adminOnly-Blatt schreibt keine
+  // per-user-Schluessel.
+  const household = stripComments(await readFile(
+    new URL('../public/settings/pages/modules-active.js', import.meta.url),
+    'utf8',
+  ));
+  for (const marker of ['hidden_modules', 'module_order', 'mobile_nav_order', 'data-module-hide']) {
+    assert.equal(household.includes(marker), false,
+      `das Haushalts-Blatt fasst '${marker}' an - das ist per-user`);
+  }
+});
+
+test('das Blatt der aktiven Module liegt adminOnly in der Modul-Domaene', () => {
+  const leaf = SETTINGS_LEAVES.find((entry) => entry.id === 'modules-active');
+  assert.ok(leaf, 'Blatt modules-active fehlt in der Registry');
+  assert.equal(leaf.domainId, 'modules');
+  assert.equal(leaf.adminOnly, true);
+  assert.equal(findSettingsLeaf('/settings/modules/active', admin)?.id, 'modules-active');
+  assert.equal(findSettingsLeaf('/settings/modules/active', member), null);
 });
 
 test('navigation settings leaf reuses the canonical module-order helpers', async () => {
@@ -279,18 +342,41 @@ test('Mitglieder erreichen ihre eigenen Termin-Vorgaben', () => {
   assert.equal(findSettingsLeaf('/settings/modules/calendar', member), null);
 });
 
-test('drei Ein-Schalter-Blätter teilen sich jetzt eines', () => {
+test('Mitglieder erreichen ihr eigenes Zyklus-Opt-out (#760)', () => {
+  // health_cycle_enabled_user schreibt per cfgUserSet pro Nutzer. Läge der
+  // Schalter im adminOnly-`modules-options`, könnte ihn genau die Mehrheit nicht
+  // bedienen, für die er gedacht ist - derselbe Schnitt wie bei personal-calendar.
+  const leaf = SETTINGS_LEAVES.find((entry) => entry.id === 'personal-health');
+  assert.equal(leaf.domainId, 'personal');
+  assert.equal(leaf.adminOnly, false);
+  assert.equal(findSettingsLeaf('/settings/personal/health', member)?.id, 'personal-health');
+  // Der haushaltweite Schalter bleibt daneben adminOnly.
+  assert.equal(findSettingsLeaf('/settings/modules/options', member), null);
+});
+
+test('zwei Ein-Schalter-Blätter teilen sich jetzt eines', () => {
   // Budget, Gesundheit und Haushaltshilfe trugen zusammen drei Checkboxen und
   // kosteten drei Sidebar-Einträge und drei Requests (Critique 2026-07-27).
+  // Gesundheit ist seither wieder raus (siehe Test direkt darunter): die
+  // Vorsorge-Funktion gab `/settings/modules/health` eigenen Inhalt zurück
+  // (das Vorsorge-Typregister) - der Haushalts-Schalter selbst bleibt
+  // trotzdem in `modules-options`.
   for (const legacyPath of [
     '/settings/modules/budget',
-    '/settings/modules/health',
     '/settings/modules/housekeeping',
   ]) {
     assert.equal(currentSettingsPath(legacyPath), '/settings/modules/options');
     assert.equal(findSettingsLeaf(legacyPath, admin)?.id, 'modules-options');
     assert.equal(findSettingsLeaf(legacyPath, member), null);
   }
+});
+
+test('/settings/modules/health führt zum Vorsorge-Typregister, nicht mehr zu modules-options', () => {
+  assert.equal(currentSettingsPath('/settings/modules/health'), '/settings/modules/health');
+  const leaf = findSettingsLeaf('/settings/modules/health', admin);
+  assert.equal(leaf?.id, 'modules-health');
+  assert.equal(leaf?.module, 'health');
+  assert.equal(findSettingsLeaf('/settings/modules/health', member), null, 'bleibt adminOnly');
 });
 
 test('legacy settings tabs migrate to their new destinations', () => {
@@ -454,16 +540,20 @@ test('every approved settings leaf is registered as an exact SPA route', async (
   // Der Router muss seine Settings-Routen aus der Registry ableiten, nie aus
   // einer Handliste - sonst driften Registry und Routentabelle auseinander.
   assert.match(source, /import\s*\{[^}]*\bSETTINGS_LEAVES\b[^}]*\}\s*from\s*'\/settings\/registry\.js'/);
+  // Die Pflichtfelder, nicht das ganze Objektliteral: der Eintrag hat seit dem
+  // Titel-Umbau (Audit P1-2) ein `titleKey`, und ein Guard, der die exakte
+  // Feldliste festnagelt, bricht bei jedem weiteren Feld ohne einen Verstoss
+  // zu melden. Was hier zaehlt, ist Pfad + Seite + Auth + Modul.
   assert.match(
     source,
-    /SETTINGS_LEAVES\.map\(\(\{\s*path\s*\}\)\s*=>\s*\(\{\s*path,\s*page:\s*'\/pages\/settings\.js',\s*requiresAuth:\s*true,\s*module:\s*'settings'\s*\}\)\)/,
+    /SETTINGS_LEAVES\.map\(\(\{\s*path\s*\}\)\s*=>\s*\(\{\s*path,\s*page:\s*'\/pages\/settings\.js',\s*requiresAuth:\s*true,\s*module:\s*'settings'\s*[,}]/,
   );
   // Und die vom IA-Umbau verschobenen Alt-Pfade ebenso: ohne eigene Route
   // matcht ein alter Bookmark gar nichts und die Umleitung käme nie zum Zug.
   assert.match(source, /import\s*\{[^}]*\bRENAMED_SETTINGS_SOURCE_PATHS\b[^}]*\}\s*from\s*'\/settings\/registry\.js'/);
   assert.match(
     source,
-    /RENAMED_SETTINGS_SOURCE_PATHS\.map\(\(path\)\s*=>\s*\(\{\s*path,\s*page:\s*'\/pages\/settings\.js',\s*requiresAuth:\s*true,\s*module:\s*'settings'\s*\}\)\)/,
+    /RENAMED_SETTINGS_SOURCE_PATHS\.map\(\(path\)\s*=>\s*\(\{\s*path,\s*page:\s*'\/pages\/settings\.js',\s*requiresAuth:\s*true,\s*module:\s*'settings'\s*[,}]/,
   );
   assert.ok(RENAMED_SETTINGS_SOURCE_PATHS.length > 0);
 });
@@ -694,6 +784,7 @@ test('navigation sections match the grouped desktop information architecture', (
   assert.equal(moduleSection('kitchen'), NAV_SECTION.household);
   assert.equal(moduleSection('housekeeping'), NAV_SECTION.household);
   assert.equal(moduleSection('documents'), NAV_SECTION.household);
+  assert.equal(moduleSection('inventory'), NAV_SECTION.household);
   assert.equal(moduleSection('rewards'), NAV_SECTION.household);
   assert.equal(moduleSection('contacts'), NAV_SECTION.people);
   assert.equal(moduleSection('birthdays'), NAV_SECTION.people);
@@ -805,6 +896,86 @@ test('holiday location preserves persisted values until discovery is ready', () 
   });
 });
 
+test('holiday group survives a failed or pending group lookup (PR #1186)', () => {
+  const belgium = {
+    location: { country: 'BE', subdivision: null },
+    persistedCountry: 'BE',
+    persistedSubdivision: null,
+    persistedGroup: 'BE-FR',
+  };
+  // Die Suche nach den Gruppen am Land ist gescheitert oder laeuft noch: der Picker
+  // ist versteckt und leer, die gespeicherte Gemeinschaft darf trotzdem nicht fallen.
+  assert.equal(resolveHolidayGroup({ ...belgium, groupReady: false, pickerShown: false, selectedGroup: '' }), 'BE-FR');
+  // Bestaetigt und sichtbar: die Auswahl zaehlt, auch "Alle anzeigen".
+  assert.equal(resolveHolidayGroup({ ...belgium, groupReady: true, pickerShown: true, selectedGroup: 'BE-NL' }), 'BE-NL');
+  assert.equal(resolveHolidayGroup({ ...belgium, groupReady: true, pickerShown: true, selectedGroup: '' }), null);
+  // Bestaetigt ohne Gruppe (Land ohne Gruppen): nichts zu speichern.
+  assert.equal(resolveHolidayGroup({ ...belgium, groupReady: true, pickerShown: false, selectedGroup: '' }), null);
+});
+
+test('holiday group keeps a persisted group only for the place it was saved for (PR #1186)', () => {
+  const saved = { persistedCountry: 'CH', persistedSubdivision: 'CH-BE', persistedGroup: 'CH-BE-VS' };
+  assert.equal(resolveHolidayGroup({
+    ...saved, groupReady: false, pickerShown: false, selectedGroup: '',
+    location: { country: 'CH', subdivision: 'CH-BE' },
+  }), 'CH-BE-VS');
+  // Anderes Land gewaehlt, dessen Gruppensuche scheitert: die alte Schweizer Gruppe
+  // gehoert nicht zu Belgien.
+  assert.equal(resolveHolidayGroup({
+    ...saved, groupReady: false, pickerShown: false, selectedGroup: '',
+    location: { country: 'BE', subdivision: null },
+  }), null);
+  // Unter einer gewaehlten Subdivision zaehlt die Auswahl auch bei verstecktem Picker.
+  assert.equal(resolveHolidayGroup({
+    ...saved, groupReady: true, pickerShown: false, selectedGroup: 'CH-BE-EO',
+    location: { country: 'CH', subdivision: 'CH-BE' },
+  }), 'CH-BE-EO');
+});
+
+test('holiday settings pass the group lookup state to resolveHolidayGroup and report a failed lookup (PR #1186)', async () => {
+  const source = await readFile(new URL('../public/settings/pages/modules-calendar.js', import.meta.url), 'utf8');
+  const data = source.slice(source.indexOf('function holidayPreferenceData('), source.indexOf('function bindWeekStart('));
+  assert.match(data, /holiday_group: resolveHolidayGroup\(\{\s*groupReady: discoveryState\.groupReady,/,
+    'der Speicherweg muss den Bereit-Merker durchreichen, sonst hilft der Helfer nichts');
+  const loader = source.slice(source.indexOf('async function loadGroups('), source.indexOf('function holidayPreferenceData('));
+  assert.match(loader, /catch \{[^}]*return requestId === requestState\.latestRequestId \? false : null;/,
+    'eine gescheiterte Gruppensuche meldet false, nicht "keine Gruppe"');
+});
+
+test('a country change starts a group lookup only for a current, successful subdivision answer (PR #1186)', () => {
+  const ok = { ok: true, value: { selectedResolved: true } };
+  assert.deepEqual(groupLookupAfterSubdivisions({ discovery: ok, requestedCountry: 'BE', currentCountry: 'BE', subdivisionCount: 0 }), { countryLevel: true });
+  assert.deepEqual(groupLookupAfterSubdivisions({ discovery: ok, requestedCountry: 'CH', currentCountry: 'CH', subdivisionCount: 26 }), { countryLevel: false });
+  // DE -> BE schnell hintereinander: die aeltere Antwort darf die Suche fuer Belgien nicht ueberholen.
+  assert.equal(groupLookupAfterSubdivisions({ discovery: ok, requestedCountry: 'DE', currentCountry: 'BE', subdivisionCount: 16 }), null);
+  assert.equal(groupLookupAfterSubdivisions({ discovery: { ok: true, value: null }, requestedCountry: 'DE', currentCountry: 'DE', subdivisionCount: 16 }), null);
+  // Lokal berechnetes Land ohne Schulferien-Quelle (US): keine Anfrage am Land, "keine Gruppe" ist die Auskunft.
+  assert.deepEqual(groupLookupAfterSubdivisions({ discovery: ok, requestedCountry: 'US', currentCountry: 'US', subdivisionCount: 0, schoolHolidaysAvailable: false }), { countryLevel: false });
+  // Regionssuche gescheitert: nichts bestaetigen, die gespeicherte Gruppe bleibt.
+  assert.equal(groupLookupAfterSubdivisions({ discovery: { ok: false, value: null }, requestedCountry: 'CH', currentCountry: 'CH', subdivisionCount: 0 }), null);
+});
+
+test('a country change invalidates the old group picker before it awaits the subdivisions (PR #1186)', async () => {
+  const source = await readFile(new URL('../public/settings/pages/modules-calendar.js', import.meta.url), 'utf8');
+  const start = source.indexOf("countrySelect.addEventListener('change'");
+  const handler = source.slice(start, source.indexOf("subdivisionSelect.addEventListener('change'", start));
+  const cleared = handler.indexOf('clearGroupPicker(groupSelect, groupGroup, groupRequests);');
+  const notReady = handler.indexOf('discoveryState.groupReady = false;');
+  const awaited = handler.indexOf('await runHolidayDiscovery(');
+  assert.ok(cleared > 0 && notReady > 0 && awaited > 0, 'Handler-Bausteine gefunden');
+  assert.ok(cleared < awaited && notReady < awaited, 'der alte Picker muss vor dem Warten auf die Regionen fallen');
+  assert.match(handler, /const lookup = groupLookupAfterSubdivisions\(\{/);
+  assert.match(handler, /if \(lookup\) \{\s*applyGroupResult\(await loadGroups\(/);
+  assert.match(handler, /schoolHolidaysAvailable: countrySchoolHolidaysAvailable\(countriesData, countryCode\),/,
+    'der Landwechsel fragt ein Land ohne Schulferien-Quelle nicht nach Gruppen');
+  const initial = source.slice(source.indexOf('const countriesResult = await runHolidayDiscovery('));
+  assert.match(initial, /subdivisionSelect\.options\.length <= 1\s*&& countrySchoolHolidaysAvailable\(countriesData, preferences\.holiday_country\)\) \{/,
+    'auch der erste Aufbau fragt ein Land ohne Schulferien-Quelle nicht am Land');
+  assert.match(initial, /const stillSavedCountry = countrySelect\.value === preferences\.holiday_country;\s*if \(stillSavedCountry && preferences\.holiday_subdivision\) \{/,
+    'der erste Aufbau startet keine Gruppensuche fuer das gespeicherte Land, wenn schon ein anderes gewaehlt ist');
+  assert.match(initial, /\} else if \(stillSavedCountry && subdivisionsResult\.ok && subdivisionsResult\.value && subdivisionSelect\.options\.length <= 1/);
+});
+
 test('holiday sync enables public holidays when every layer is disabled', () => {
   assert.deepEqual(ensureHolidayLayerSelection({
     showPublic: false,
@@ -820,6 +991,101 @@ test('holiday sync enables public holidays when every layer is disabled', () => 
     showPublic: false,
     showSchool: true,
   });
+});
+
+test('#965: school holidays are available unless the country entry says otherwise', () => {
+  const countries = [
+    { isoCode: 'DE', name: 'Germany' },
+    { isoCode: 'US', name: 'United States', schoolHolidays: false },
+  ];
+  assert.equal(countrySchoolHolidaysAvailable(countries, ''), true, 'kein gewaehltes Land - kein Grund zu sperren');
+  assert.equal(countrySchoolHolidaysAvailable(countries, 'DE'), true, 'ein gewoehnliches OpenHolidays-Land traegt kein Flag');
+  assert.equal(countrySchoolHolidaysAvailable(countries, 'US'), false, 'das Flag ist eine Ausnahmemarkierung, keine Positivliste');
+  assert.equal(countrySchoolHolidaysAvailable(countries, 'FR'), true, 'ein Land ausserhalb der Liste gilt nicht als gesperrt');
+  assert.equal(countrySchoolHolidaysAvailable([], 'US'), true, 'ohne geladene Laenderliste noch keine Sperre - kein Fehlzustand vortaeuschen');
+});
+
+// #965 Review-Fund: die reine Verfuegbarkeitsfrage oben war getestet, ihr
+// Aufrufer nicht - und der loeschte den Haken beim Sperren, ohne ihn je
+// zurueckzugeben. Ein DE-Haushalt mit Schulferien-Ebene, der im Dropdown kurz
+// zu den USA und wieder zu DE blaettert und speichert, verlor die Ebene still.
+// Diese Tests fahren den echten Aufrufer-Pfad (Land-Wechsel-Handler) ueber
+// dieselben drei Bedienelemente, die das Blatt haelt.
+const HOLIDAY_TEST_COUNTRIES = [
+  { isoCode: 'DE', name: 'Germany' },
+  { isoCode: 'US', name: 'United States', schoolHolidays: false },
+];
+
+function schoolControls({ checked }) {
+  return {
+    showSchool: { checked, disabled: false },
+    schoolColorGroup: { hidden: !checked },
+    schoolUnavailableHint: { hidden: true },
+  };
+}
+
+test('#965 Review: DE -> US -> DE gibt den Schulferien-Haken zurueck', () => {
+  const c = schoolControls({ checked: true });
+  const apply = createSchoolAvailabilityUpdater(c);
+
+  apply(HOLIDAY_TEST_COUNTRIES, 'DE'); // initialer Zustand: verfuegbar, Haken an
+  assert.equal(c.showSchool.checked, true);
+  assert.equal(c.showSchool.disabled, false);
+
+  apply(HOLIDAY_TEST_COUNTRIES, 'US'); // Land ohne Quelle: gesperrt UND Haken raus,
+  // denn der Speichern-Pfad liest checked woertlich - stuende der Haken noch,
+  // wuerde holiday_show_school=1 fuer ein Land ohne Datenquelle gespeichert.
+  assert.equal(c.showSchool.disabled, true);
+  assert.equal(c.showSchool.checked, false);
+  assert.equal(c.schoolColorGroup.hidden, true);
+  assert.equal(c.schoolUnavailableHint.hidden, false);
+
+  apply(HOLIDAY_TEST_COUNTRIES, 'DE'); // zurueck: der gemerkte Haken kommt wieder
+  assert.equal(c.showSchool.disabled, false);
+  assert.equal(c.showSchool.checked, true, 'der Umweg ueber die USA darf die Ebene nicht kosten');
+  assert.equal(c.schoolColorGroup.hidden, false);
+  assert.equal(c.schoolUnavailableHint.hidden, true);
+});
+
+test('#965 Review: ein nie gesetzter Haken kommt nach dem Umweg auch nicht zurueck', () => {
+  const c = schoolControls({ checked: false });
+  const apply = createSchoolAvailabilityUpdater(c);
+
+  apply(HOLIDAY_TEST_COUNTRIES, 'US');
+  assert.equal(c.showSchool.checked, false);
+
+  apply(HOLIDAY_TEST_COUNTRIES, 'DE');
+  assert.equal(c.showSchool.checked, false, 'wiederhergestellt wird nur, was vorher da war');
+  assert.equal(c.schoolColorGroup.hidden, true);
+});
+
+test('#965 Review: US -> DE -> US merkt sich den Stand nur einmal, nicht den gesperrten', () => {
+  // Zwei Sperr-Aufrufe hintereinander (US -> GB) duerfen nicht den bereits
+  // geloeschten Haken als "gemerkten Stand" ueberschreiben.
+  const countries = [...HOLIDAY_TEST_COUNTRIES, { isoCode: 'GB', name: 'United Kingdom', schoolHolidays: false }];
+  const c = schoolControls({ checked: true });
+  const apply = createSchoolAvailabilityUpdater(c);
+
+  apply(countries, 'US');
+  apply(countries, 'GB'); // zweites gesperrtes Land direkt hinterher
+  assert.equal(c.showSchool.checked, false);
+
+  apply(countries, 'DE');
+  assert.equal(c.showSchool.checked, true, 'auch ueber zwei gesperrte Laender hinweg bleibt der Stand erhalten');
+});
+
+test('#965 Review: ein bewusster Klick im entsperrten Zustand ueberlebt den naechsten Umweg', () => {
+  const c = schoolControls({ checked: true });
+  const apply = createSchoolAvailabilityUpdater(c);
+
+  apply(HOLIDAY_TEST_COUNTRIES, 'US');
+  apply(HOLIDAY_TEST_COUNTRIES, 'DE'); // Haken wiederhergestellt
+  c.showSchool.checked = false;        // Nutzer schaltet die Ebene jetzt bewusst ab
+
+  apply(HOLIDAY_TEST_COUNTRIES, 'US');
+  apply(HOLIDAY_TEST_COUNTRIES, 'DE');
+  assert.equal(c.showSchool.checked, false,
+    'gemerkt wird der Stand VOR dem Sperren - nicht ein aelterer, laengst verworfener');
 });
 
 test('holiday country remains unresolved until discovery contains the persisted value', () => {
@@ -919,41 +1185,60 @@ test('Budget persistence restores the previous currency on failure', async () =>
   assert.equal(select.disabled, false);
 });
 
-test('Budget currency options match the existing preferences API contract', async () => {
-  const source = await readFile(
-    new URL('../server/routes/preferences.js', import.meta.url),
-    'utf8',
-  );
-  const declaration = source.match(/const VALID_CURRENCIES = \[([^\]]+)\]/);
-  assert.ok(declaration, 'preferences route must declare VALID_CURRENCIES');
-  const backendCurrencies = [...declaration[1].matchAll(/'([A-Z]{3})'/g)]
-    .map((match) => match[1]);
+// Die Waehrungsliste lebte in vier woertlichen Kopien (Einstellungen, Abos,
+// Preferences-Route, Geteilte Ausgaben); zwei Guards hielten sie per Regex
+// ueber den Quelltext deckungsgleich. Seit #841 gibt es sie einmal, in
+// public/utils/currency-codes.js. Der Guard prueft deshalb nicht mehr die
+// Gleichheit von Kopien, sondern DASS ES KEINE ZWEITE LISTE GIBT - eine Regel
+// ueber alle Dateien statt einer Aufzaehlung der drei, die man damals kannte.
+test('the currency list exists exactly once in the repo', async () => {
+  const ROOT = new URL('../', import.meta.url);
+  const SHARED = 'public/utils/currency-codes.js';
+  const files = [];
+  const walk = async (dir) => {
+    for (const entry of await readdir(new URL(dir, ROOT), { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+      const rel = `${dir}${entry.name}`;
+      if (entry.isDirectory()) await walk(`${rel}/`);
+      else if (/\.(js|mjs)$/.test(entry.name)) files.push(rel);
+    }
+  };
+  await walk('public/');
+  await walk('server/');
 
-  assert.deepEqual(SUPPORTED_CURRENCIES, backendCurrencies);
+  const offenders = [];
+  for (const rel of files) {
+    if (rel === SHARED) continue;
+    const source = await readFile(new URL(rel, ROOT), 'utf8');
+    // Ein Array-Literal, dessen Elemente wie ISO-4217-Codes aussehen. Drei
+    // Treffer im echten Vorrat trennen eine Waehrungsliste von zufaelligen
+    // Grossbuchstaben-Tripeln (Laendercodes, Kuerzel in Testdaten).
+    for (const match of source.matchAll(/\[([^\][]*?)\]/gs)) {
+      const codes = [...match[1].matchAll(/'([A-Z]{3})'/g)].map((m) => m[1]);
+      if (codes.length < 5) continue;
+      const known = codes.filter((code) => CURRENCY_CODES.includes(code));
+      if (known.length >= 3) offenders.push(`${rel}: ${codes.slice(0, 5).join(', ')} …`);
+    }
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `Waehrungslisten gehoeren nach ${SHARED} - eine zweite Kopie driftet:\n${offenders.join('\n')}`,
+  );
 });
 
-// Die Haushaltswährung wird zentral in preferences.js validiert, aber Abos und
-// geteilte Ausgaben führen eigene Listen. Liefen sie auseinander, konnte man
-// eine Währung im Haushalt einstellen, die in diesen beiden Modulen nicht
-// wählbar war bzw. dort abgelehnt wurde (KRW, IDR und IRR waren so gestrandet).
-test('subscription and split-expense currency lists match the preferences contract', async () => {
-  const listFrom = async (path, name) => {
-    const source = await readFile(new URL(path, import.meta.url), 'utf8');
-    const declaration = source.match(new RegExp(`const ${name} = \\[([^\\]]+)\\]`));
-    assert.ok(declaration, `${path} must declare ${name}`);
-    return [...declaration[1].matchAll(/'([A-Z]{3})'/g)].map((match) => match[1]);
-  };
-
-  const backendCurrencies = await listFrom('../server/routes/preferences.js', 'VALID_CURRENCIES');
-
-  assert.deepEqual(
-    await listFrom('../public/pages/subscriptions.js', 'CURRENCIES'),
-    backendCurrencies,
-  );
-  assert.deepEqual(
-    await listFrom('../server/routes/split-expenses.js', 'CURRENCIES'),
-    backendCurrencies,
-  );
+// Der Vorrat ist der, den die Preferences-Route validiert: die Auswahl im
+// Browser und die Pruefung im Server lesen dieselbe Konstante.
+test('the shared currency list is sorted, unique and ISO-4217 shaped', () => {
+  assert.deepEqual([...CURRENCY_CODES].sort(), [...CURRENCY_CODES]);
+  assert.equal(new Set(CURRENCY_CODES).size, CURRENCY_CODES.length);
+  for (const code of CURRENCY_CODES) assert.match(code, /^[A-Z]{3}$/);
+  // Frei gewaehlte Stichprobe aus drei Kontinenten: die Liste ist ein Vorrat,
+  // kein Zufallsprodukt eines Refactorings.
+  for (const code of ['EUR', 'USD', 'ILS', 'JPY', 'ZAR']) {
+    assert.ok(CURRENCY_CODES.includes(code), `${code} fehlt im Vorrat`);
+  }
 });
 
 test('weather geolocation callbacks only update the active leaf', () => {
@@ -983,42 +1268,73 @@ test('hasValidWeatherCoords rejects empty, non-numeric and out-of-range input', 
   assert.equal(hasValidWeatherCoords('52.52', '180.1'), false);
 });
 
-test('buildNavigationPayload expands the visible order back to canonical Kitchen children', () => {
-  // Das kanonische Kinder-Set, nicht eine Teilmenge: dieser Test prüft die
-  // Reihenfolgen-Expansion, nicht welche Kinder aktiviert sind.
-  const payload = buildNavigationPayload(
-    ['notes'],
-    new Set(KITCHEN_CHILD_IDS),
-    ['calendar', 'tasks', 'kitchen', 'notes'],
-  );
+// Review-Fund 2026-09-06 (#1027): `Number('')` ist `0`, also speicherte ein
+// versehentlich geleertes Feld bislang eine Nachfrist von null Tagen - jeder
+// überfällige Countdown wäre sofort verschwunden. Ein leeres/nur-Leerzeichen-
+// Feld ist jetzt ausdrücklich ungültig; ein bewusst getipptes `0` bleibt
+// gültig, denn "keine Nachfrist" muss weiterhin erreichbar sein.
+test('parseGraceDaysInput rejects a blank field but still accepts a deliberate 0, and enforces the existing range', () => {
+  assert.equal(parseGraceDaysInput(''), null, 'an empty field must not silently become 0');
+  assert.equal(parseGraceDaysInput('   '), null, 'whitespace-only is the same as empty');
+  assert.equal(parseGraceDaysInput('0'), 0, 'an explicit 0 stays the deliberate "no grace period" value');
+  assert.equal(parseGraceDaysInput('3'), 3);
+  assert.equal(parseGraceDaysInput('90'), 90, 'the upper bound is still accepted');
+  assert.equal(parseGraceDaysInput('91'), null, 'one above the upper bound is still rejected');
+  assert.equal(parseGraceDaysInput('-1'), null, 'still rejected below zero');
+  assert.equal(parseGraceDaysInput('abc'), null, 'still rejected for non-numeric input');
+});
 
-  assert.deepEqual(payload, {
-    disabled_modules: ['notes'],
-    module_order: ['calendar', 'tasks', 'meals', 'recipes', 'shopping', 'pantry', 'notes'],
+test('die Reihenfolge expandiert die Kuechen-Sammelzeile auf ihre vier Kinder', () => {
+  assert.deepEqual(
+    buildOrderPayload(['calendar', 'tasks', 'kitchen', 'notes']).module_order,
+    ['calendar', 'tasks', 'meals', 'recipes', 'shopping', 'pantry', 'notes'],
+  );
+  assert.deepEqual(buildOrderPayload([]).module_order, []);
+  assert.deepEqual(buildOrderPayload(['kitchen']).module_order, ['meals', 'recipes', 'shopping', 'pantry']);
+});
+
+test('die Reihenfolge behaelt, was das Blatt nie gezeigt hat', () => {
+  // Ein Mitglied bekommt `/modules?admin=1` nicht, also stehen seine
+  // Drittanbieter-Module in keiner Zeile dieses Blatts. Sie deshalb aus seiner
+  // gespeicherten Reihenfolge zu streichen, waere ein stiller Verlust bei einer
+  // Handlung, die damit nichts zu tun hat (Codex-Review zu PR #790).
+  const payload = buildOrderPayload(['calendar', 'kitchen'], ['third-party-akahu', 'third-party-solar']);
+  assert.deepEqual(payload.module_order, [
+    'calendar', 'meals', 'recipes', 'shopping', 'pantry',
+    'third-party-akahu', 'third-party-solar',
+  ]);
+
+  // Was sichtbar war, gewinnt: eine Id, die das Blatt gerendert hat, kommt
+  // nicht doppelt zurueck, auch wenn sie faelschlich mitgegeben wird.
+  assert.deepEqual(
+    buildOrderPayload(['calendar'], ['calendar', 'third-party-akahu']).module_order,
+    ['calendar', 'third-party-akahu'],
+  );
+  assert.deepEqual(buildOrderPayload(['calendar']).module_order, ['calendar']);
+});
+
+test('die zwei Blaetter schreiben zwei disjunkte Schluesselmengen', () => {
+  // Das ist die Zusicherung, die den Umzug traegt (Critique 2026-08-16): das
+  // persoenliche Blatt kennt `disabled_modules` nicht mehr, und das
+  // adminOnly-Blatt kennt weder Reihenfolge noch Ausblendungen. Fielen sie
+  // wieder zusammen, waere die Verwechslungsfalle zurueck - und ein
+  // adminOnly-Blatt, das per-user-Schluessel schreibt, ist genau der Fall, den
+  // test:settings-admin-gate sucht.
+  const personal = buildOrderPayload(['calendar', 'kitchen']);
+  const household = buildActiveModulesPayload(['notes', 'rewards']);
+
+  assert.deepEqual(Object.keys(personal), ['module_order']);
+  assert.deepEqual(Object.keys(household), ['disabled_modules']);
+  assert.equal('disabled_modules' in personal, false);
+  assert.equal('module_order' in household, false);
+  assert.equal('hidden_modules' in household, false);
+});
+
+test('der Haushalts-Schalter entdoppelt seine Slugs', () => {
+  assert.deepEqual(buildActiveModulesPayload(['notes', 'notes', 'meals']), {
+    disabled_modules: ['notes', 'meals'],
   });
-});
-
-test('buildNavigationPayload yields an empty module order for an empty visible order', () => {
-  const payload = buildNavigationPayload([], new Set(KITCHEN_CHILD_IDS), []);
-
-  assert.deepEqual(payload, { disabled_modules: [], module_order: [] });
-});
-
-test('buildNavigationPayload keeps the single Kitchen position when expanding', () => {
-  const payload = buildNavigationPayload([], new Set(KITCHEN_CHILD_IDS), ['kitchen']);
-
-  assert.deepEqual(payload.module_order, ['meals', 'recipes', 'shopping', 'pantry']);
-});
-
-test('buildNavigationPayload disables Kitchen children that are not enabled', () => {
-  const payload = buildNavigationPayload(
-    ['budget'],
-    new Set(['meals']),
-    ['kitchen', 'budget'],
-  );
-
-  assert.deepEqual(payload.disabled_modules, ['budget', 'recipes', 'shopping', 'pantry']);
-  assert.deepEqual(payload.module_order, ['meals', 'recipes', 'shopping', 'pantry', 'budget']);
+  assert.deepEqual(buildActiveModulesPayload([]), { disabled_modules: [] });
 });
 
 test('buildMobileNavigationPayload normalizes aliases, duplicates, and slot count', () => {
@@ -1028,49 +1344,89 @@ test('buildMobileNavigationPayload normalizes aliases, duplicates, and slot coun
   );
 });
 
-test('persistModuleToggle restores the toggle and re-enables it when saving fails', async () => {
+test('die Kueche gilt als ausgeblendet, wenn kein SICHTBARES Kind mehr uebrig ist', () => {
+  const child = (id, over) => ({ id, enabled: true, hidden: false, ...over });
+
+  assert.equal(kitchenGroupHidden([child('meals'), child('recipes')]), false);
+  assert.equal(kitchenGroupHidden([child('meals', { hidden: true }), child('recipes')]), false,
+    'ein einzeln verstecktes Kind versteckt noch nicht die Gruppe');
+  assert.equal(kitchenGroupHidden([child('meals', { hidden: true }), child('recipes', { hidden: true })]), true);
+
+  // Ein haushaltweit abgeschaltetes Kind zaehlt nicht mit: es ist nicht
+  // versteckt, es gibt es nicht. Sonst haette der Gruppenknopf einen Zustand
+  // behauptet, den niemand gesetzt hat.
+  assert.equal(kitchenGroupHidden([child('meals', { hidden: true }), child('recipes', { enabled: false })]), true);
+  assert.equal(kitchenGroupHidden([child('meals'), child('recipes', { enabled: false })]), false);
+
+  // Alle vier abgeschaltet: die Gruppe ist dann nicht "von mir versteckt",
+  // sondern gar nicht da - der Knopf ist ohnehin gesperrt.
+  assert.equal(kitchenGroupHidden([child('meals', { enabled: false }), child('recipes', { enabled: false })]), false);
+  assert.equal(kitchenGroupHidden([]), false);
+});
+
+test('der Sitzungs-Teardown vergisst jeden per-Nutzer-Zustand, den die Navigation liest', async () => {
+  // Zwei Abgaenge, kein geteilter Code: der bewusste Logout und der
+  // Sitzungsablauf raeumten getrennt auf, und was nur in einem stand, vererbte
+  // sich am geteilten Geraet an das naechste Mitglied. Geprueft wird die REGEL:
+  // jeder per-Nutzer-Zustand, den `navItems()` liest, muss in der einen
+  // Aufraeumfunktion vorkommen, und beide Wege muessen sie rufen.
+  const source = await readFile(new URL('../public/router.js', import.meta.url), 'utf8');
+
+  const teardown = source.slice(source.indexOf('function forgetSessionState()'));
+  const body = teardown.slice(0, teardown.indexOf('\n}'));
+  for (const state of ['_preferencesLoaded', '_hiddenModules', '_moduleOrder', '_mobileNavOrder', 'currentUser']) {
+    assert.match(body, new RegExp(`${state}\\s*=`), `forgetSessionState() vergisst ${state} nicht`);
+  }
+  // `_disabledModules` gehoert ausdruecklich NICHT dazu: haushaltweit, fuer
+  // jeden gleich, und der Modul-Guard laeuft vor dem Nachladen.
+  assert.equal(/_disabledModules\s*=/.test(body), false,
+    '_disabledModules ist haushaltweit - es zurueckzusetzen oeffnet die Route, die der Haushalt abgeschaltet hat');
+
+  assert.match(source, /auth:expired[\s\S]{0,200}forgetSessionState\(\)/,
+    'der Sitzungsablauf raeumt nicht auf');
+  assert.match(source, /clearSession: \(\) => \{\s*forgetSessionState\(\)/,
+    'der bewusste Logout raeumt nicht ueber dieselbe Funktion auf');
+});
+
+test('der Haushalts-Schalter nimmt sich zurueck, wenn das Speichern scheitert', async () => {
+  // Die drei Faelle zogen mit dem Schalter von der Navigation auf das neue
+  // Blatt und gingen beim Umzug verloren - der Fehlerpfad des einzigen Blatts,
+  // das ein Modul fuer ALLE abschaltet, stand danach ungeprueft da.
   const input = { checked: true, disabled: true };
   let rerendered = false;
 
   await assert.rejects(
-    persistModuleToggle(input, true, async () => {
-      throw new Error('save failed');
-    }, async () => {
+    persistHouseholdToggle(input, true, async () => { throw new Error('save failed'); }, async () => {
       rerendered = true;
     }),
     /save failed/,
   );
 
-  assert.equal(input.checked, false);
+  assert.equal(input.checked, false, 'der Schalter blieb auf dem nicht gespeicherten Zustand stehen');
   assert.equal(input.disabled, false);
-  assert.equal(rerendered, false);
+  assert.equal(rerendered, false, 'ein gescheitertes Speichern darf nicht neu rendern');
 });
 
-test('persistModuleToggle re-renders only after a successful save', async () => {
+test('der Haushalts-Schalter rendert erst nach erfolgreichem Speichern neu', async () => {
   const input = { checked: false, disabled: true };
   const calls = [];
 
-  await persistModuleToggle(input, false, async () => {
-    calls.push('save');
-  }, async () => {
-    calls.push('render');
-  });
+  await persistHouseholdToggle(input, false, async () => { calls.push('save'); }, async () => { calls.push('render'); });
 
   assert.deepEqual(calls, ['save', 'render']);
   assert.equal(input.checked, false);
 });
 
-test('persistModuleToggle does not restore the input when the re-render fails', async () => {
+test('ein gescheiterter Re-Render nimmt den gespeicherten Schalter NICHT zurueck', async () => {
   const input = { checked: true, disabled: true };
 
   await assert.rejects(
-    persistModuleToggle(input, true, async () => {}, async () => {
-      throw new Error('render failed');
-    }),
+    persistHouseholdToggle(input, true, async () => {}, async () => { throw new Error('render failed'); }),
     /render failed/,
   );
 
-  // Save succeeded, so the toggle must keep its new state and not be reverted.
+  // Gespeichert ist gespeichert: den Schalter hier zurueckzudrehen wuerde einen
+  // Zustand zeigen, den der Server nicht mehr hat.
   assert.equal(input.checked, true);
 });
 

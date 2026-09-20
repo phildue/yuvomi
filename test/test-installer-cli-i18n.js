@@ -90,3 +90,48 @@ test('SUPPORTED_LOCALES in install.sh deckt sich mit i18n-mini.js', () => {
 test('CLI-Locale-Verzeichnis existiert', () => {
   assert.ok(existsSync(new URL(CLI_LOCALES_DIR)), 'tools/installer/locales/cli fehlt');
 });
+
+// ── Regel-Guard: printf-Formate ⇄ Aufrufstellen ─────────────────────────────
+//
+// `t()` reicht den Locale-Wert als FORMAT an printf: `printf "$fmt" "$@"`. Damit
+// ist jede Übersetzung ausführbarer Code, nicht nur Text.
+//
+// Eine Sprache, die `%d` statt `%s` schreibt, bricht bei einem nicht-numerischen
+// Argument; ein `%s` zu viel frisst still das nächste Argument oder gibt leer
+// aus; ein `%` im Fliesstext (etwa "100% offline") wird als Formatangabe
+// gelesen. Der Keyset-Guard sieht davon nichts - der Schlüssel ist ja da.
+//
+// Deshalb gegen die AUFRUFSTELLEN prüfen, nicht gegen die Referenzsprache:
+// dort steht, wie viele Argumente ein Schlüssel tatsächlich bekommt.
+test('jeder CLI-Locale-Wert ist ein printf-Format, das zu seiner Aufrufstelle passt', () => {
+  const sh = readFileSync(INSTALL_SH, 'utf8');
+
+  const expectedArgs = new Map();
+  for (const m of sh.matchAll(/t ([a-z][a-zA-Z0-9_.]*)((?: "[^"]*")*)/g)) {
+    const args = (m[2].match(/"/g) || []).length / 2;
+    const key = `MSG_${m[1].replace(/\./g, '_')}`;
+    expectedArgs.set(key, Math.max(expectedArgs.get(key) ?? 0, args));
+  }
+  assert.ok(expectedArgs.size > 0, 'keine t()-Aufrufe in install.sh gefunden');
+
+  const offenders = [];
+  for (const locale of SUPPORTED_LOCALES) {
+    const src = readFileSync(new URL(`${locale}.sh`, CLI_LOCALES_DIR), 'utf8');
+    for (const [, key, value] of src.matchAll(/^(MSG_[A-Za-z0-9_]+)="(.*)"$/gm)) {
+      const specs = [...value.matchAll(/%./g)].map(s => s[0]);
+      const invalid = specs.filter(s => s !== '%s' && s !== '%%');
+      const placeholders = specs.filter(s => s === '%s').length;
+      const expected = expectedArgs.get(key) ?? 0;
+
+      if (invalid.length) {
+        offenders.push(`${locale}.sh ${key}: unzulässige Formatangabe ${invalid.join(' ')} (nur %s und %% erlaubt)`);
+      }
+      if (placeholders !== expected) {
+        offenders.push(`${locale}.sh ${key}: ${placeholders}× %s, die Aufrufstelle übergibt ${expected} Argument(e)`);
+      }
+    }
+  }
+
+  assert.deepEqual(offenders, [],
+    `printf-Format und Aufrufstelle passen nicht zusammen:\n${offenders.join('\n')}`);
+});

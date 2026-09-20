@@ -298,6 +298,73 @@ test('GET /api/preflight liefert envExists und containerRunning', async () => {
   }
 });
 
+test('der Preflight wartet nicht unbegrenzt auf die Container-Engine', async () => {
+  // Der Wizard wartet vor dem Einfach-Pfad und vor dem Erzeugen der Schluessel
+  // auf den Preflight (Review zu #1217). Der Preflight wartete seinerseits auf
+  // die Engine-Erkennung und `docker/podman inspect`, beides ohne Zeitlimit: eine
+  // haengende Engine liess Einfach-Karte und Speichern stumm stehen, obwohl der
+  // Server envExists laengst kannte.
+  const mod = await import('../tools/installer/install-server.js');
+  assert.equal(typeof mod.probeContainerRunning, 'function',
+    'es gibt keine begrenzte Container-Abfrage fuer den Preflight');
+  const { EventEmitter } = await import('node:events');
+
+  const engine = { engine: 'docker', composeBin: 'docker', compose: ['compose'], missing: [] };
+  let killed = false;
+  const hanging = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.exitCode = null;
+    child.kill = () => { killed = true; return true; };
+    return child; // meldet nie 'close'
+  };
+
+  const started = Date.now();
+  const stalled = await mod.probeContainerRunning({ timeoutMs: 50, resolveEngine: async () => engine, spawnFn: hanging });
+  assert.equal(stalled, false, 'eine haengende Engine muss als "laeuft nicht" gelten');
+  assert.ok(Date.now() - started < 2000, 'die Abfrage haelt ihr Zeitlimit nicht ein');
+  assert.equal(killed, true, 'der haengende inspect-Prozess wird nicht beendet');
+
+  const noEngine = await mod.probeContainerRunning({ timeoutMs: 50, resolveEngine: () => new Promise(() => {}), spawnFn: hanging });
+  assert.equal(noEngine, false, 'eine haengende Engine-Erkennung haelt den Preflight auf');
+
+  // Kommt die Engine erst NACH dem Zeitlimit, darf kein inspect mehr starten:
+  // die Funktion ist dann schon zurueck, und niemand beendet einen haengenden
+  // Prozess mehr - jede weitere Preflight-Abfrage liesse einen liegen (Review zu #1217).
+  let lateSpawns = 0;
+  const late = await mod.probeContainerRunning({
+    timeoutMs: 20,
+    resolveEngine: () => new Promise(done => setTimeout(() => done(engine), 60)),
+    spawnFn: (...args) => { lateSpawns++; return hanging(...args); },
+  });
+  assert.equal(late, false, 'eine zu spaete Engine-Erkennung muss als Zeitueberschreitung gelten');
+  await new Promise(done => setTimeout(done, 120));
+  assert.equal(lateSpawns, 0, 'nach dem Zeitlimit startet trotzdem ein inspect, den niemand mehr beendet');
+
+  // Der Normalfall bleibt: "running" auf stdout, Exit 0.
+  const answering = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.exitCode = null;
+    child.kill = () => true;
+    queueMicrotask(() => {
+      child.stdout.emit('data', Buffer.from('running\n'));
+      child.exitCode = 0;
+      child.emit('close', 0);
+    });
+    return child;
+  };
+  assert.equal(await mod.probeContainerRunning({ timeoutMs: 1000, resolveEngine: async () => engine, spawnFn: answering }), true,
+    'ein laufender Container wird nicht mehr erkannt');
+
+  // Exportiert allein reicht nicht: die Route muss sie benutzen.
+  const src = readFileSync(new URL('../tools/installer/install-server.js', import.meta.url), 'utf8');
+  const at = src.indexOf("url.pathname === '/api/preflight'");
+  const route = src.slice(at, src.indexOf('\n  }\n', at));
+  assert.match(route, /await probeContainerRunning\(/, 'die Preflight-Route nutzt die begrenzte Abfrage nicht');
+  assert.doesNotMatch(route, /spawn\(/, 'die Preflight-Route startet inspect weiter selbst und ohne Zeitlimit');
+});
+
 // ── Static parity checks ─────────────────────────────────────────────────────
 
 test('install.html prüft Preflight und zeigt ein Hinweis-Banner', () => {
@@ -448,10 +515,573 @@ test('PRESERVED_KEYS deckt beide Startschlüssel ab', () => {
 });
 
 test('install.sh sichert bestehende .env vor cat > .env', () => {
-  const src = readFileSync(new URL('../install.sh', import.meta.url), 'utf8');
+  // Die Reihenfolge gilt für den CODE, nicht für den Dateitext: ein Kommentar,
+  // der `cat > .env` bloss erwähnt, hat diesen Test schon einmal rot gefärbt,
+  // während der Ablauf völlig korrekt war. Kommentare fliegen deshalb raus,
+  // bevor gemessen wird.
+  const src = readFileSync(new URL('../install.sh', import.meta.url), 'utf8')
+    .split('\n')
+    .map(line => (/^\s*#/.test(line) ? '' : line))
+    .join('\n');
   const backupIdx = src.indexOf('.env.bak-');
   const catIdx = src.indexOf('cat > .env');
   assert.ok(backupIdx !== -1, 'install.sh legt kein .env.bak-* an');
   assert.ok(catIdx !== -1, 'install.sh hat keinen cat > .env Block');
   assert.ok(backupIdx < catIdx, 'Backup muss vor dem Überschreiben (cat > .env) stehen');
+});
+
+// ── Regel-Guard: MANAGED_KEYS ⇄ der ENVEOF-Block ─────────────────────────────
+//
+// install.sh schrieb die .env mit `cat >` neu und warf dabei alles weg, was der
+// Dialog nicht selbst kennt: SMTP, OIDC, WebDAV-Backups, VAPID - 31 der 55
+// Schema-Schlüssel. Wer sie von Hand ergänzt oder den Web-Installer benutzt
+// hatte, verlor sie beim nächsten Lauf lautlos, und ein Rerun ist der Normalfall
+// (Update, geänderter Port, nachgetragenes SMTP), nicht die Ausnahme.
+//
+// preserve_unmanaged() übernimmt jetzt alles, was NICHT in MANAGED_KEYS steht.
+// Damit hängt die Korrektheit an genau einer Invariante, und sie geht in beide
+// Richtungen schief:
+//
+//   Schlüssel geschrieben, aber nicht in MANAGED_KEYS  → steht danach doppelt
+//   Schlüssel in MANAGED_KEYS, aber nicht geschrieben  → wird beim Rerun gelöscht
+//
+// Der zweite Fall ist der gefährliche: er sieht aus wie Aufräumen und ist
+// Datenverlust. Beide Richtungen werden hier geprüft.
+
+function installShSource() {
+  return readFileSync(new URL('../install.sh', import.meta.url), 'utf8');
+}
+
+function managedKeys() {
+  const block = installShSource().match(/^MANAGED_KEYS=\(([\s\S]*?)^\)$/m);
+  assert.ok(block, 'MANAGED_KEYS-Array in install.sh nicht gefunden');
+  return new Set(
+    block[1]
+      .split('\n')
+      .map(line => line.replace(/#.*$/, ''))
+      .join(' ')
+      .split(/\s+/)
+      .filter(Boolean),
+  );
+}
+
+function envHeredocKeys() {
+  const block = installShSource().match(/cat > \.env << ENVEOF\n([\s\S]*?)\nENVEOF/);
+  assert.ok(block, 'ENVEOF-Block in install.sh nicht gefunden');
+  return new Set([...block[1].matchAll(/^([A-Z][A-Z0-9_]*)=/gm)].map(m => m[1]));
+}
+
+test('jeder von install.sh geschriebene Schlüssel steht in MANAGED_KEYS', () => {
+  const managed = managedKeys();
+  const written = [...envHeredocKeys()].filter(key => !managed.has(key));
+  assert.deepEqual(written, [],
+    `install.sh schreibt diese Schlüssel und übernimmt sie zusätzlich aus der alten .env `
+    + `(doppelte Zeilen): ${written.join(', ')}`);
+});
+
+test('jeder MANAGED_KEY wird von install.sh auch wirklich geschrieben', () => {
+  const written = envHeredocKeys();
+  const dropped = [...managedKeys()].filter(key => !written.has(key));
+  assert.deepEqual(dropped, [],
+    `Diese Schlüssel stehen in MANAGED_KEYS, werden aber nicht geschrieben - `
+    + `preserve_unmanaged() unterdrückt sie und der Rerun LÖSCHT sie: ${dropped.join(', ')}`);
+});
+
+test('preserve_unmanaged rettet fremde Schlüssel und lässt eigene in Ruhe', () => {
+  const src = installShSource();
+  assert.match(src, /preserve_unmanaged\(\)/, 'preserve_unmanaged() fehlt');
+  // Aus dem Backup lesen, nicht aus .env: die ist zu diesem Zeitpunkt schon neu
+  // geschrieben, und die Funktion würde ihre eigene Ausgabe wiederkäuen.
+  assert.match(src, /preserved=\$\(preserve_unmanaged "\$backup"\)/,
+    'preserve_unmanaged muss aus dem Backup lesen, nicht aus der frischen .env');
+  assert.match(src, /printf '%s\\n' "\$preserved" \| grep -c \./,
+    'die Anzahl übernommener Zeilen wird gemeldet');
+});
+
+test('install.sh schreibt BASE_URL und fragt die Origin ab', () => {
+  // Ohne BASE_URL versendet der Server keine Passwort-Reset-Links (der
+  // Request-Host-Header wird bewusst nicht vertraut). Zusammensetzen aus Host
+  // und Port reicht nicht: hinter einem Reverse-Proxy ist die Origin eine
+  // andere als die, auf die der Container hört.
+  const src = installShSource();
+  assert.match(src, /^BASE_URL=\$\{YUVOMI_BASE_URL\}$/m, 'install.sh schreibt BASE_URL nicht');
+  assert.match(src, /t basic\.base_url/, 'install.sh fragt die Basis-URL nicht ab');
+  assert.match(src, /YUVOMI_BASE_URL="\$\{YUVOMI_BASE_URL:-\$default_base\}"/,
+    'die Basis-URL braucht einen abgeleiteten Default');
+});
+
+test('der Wetter-Dialog nutzt Open-Meteo und fragt keinen API-Schlüssel mehr ab', () => {
+  // Open-Meteo ist seit 2026-06-07 der Default: kostenlos, ohne Konto, ohne
+  // Schlüssel. Der CLI-Dialog schickte trotzdem jeden zu einer Registrierung
+  // bei OpenWeatherMap, die er nicht braucht.
+  const src = installShSource();
+  for (const key of ['WEATHER_LAT', 'WEATHER_LON', 'WEATHER_CITY', 'WEATHER_UNITS']) {
+    assert.match(src, new RegExp(`^${key}=`, 'm'), `install.sh schreibt ${key} nicht`);
+  }
+  assert.doesNotMatch(src, /t weather\.apikey/,
+    'der Wetter-Dialog fragt weiterhin nach einem OpenWeather-API-Schlüssel');
+  assert.doesNotMatch(src, /^OPENWEATHER_/m,
+    'OPENWEATHER_* gehört nicht mehr in den geschriebenen Block (Legacy läuft über preserve_unmanaged)');
+  // Die Bereichsprüfung ist der Grund, warum der Dialog überhaupt Koordinaten
+  // annehmen darf: bash kann kein Fliesskomma, also muss awk ran.
+  assert.match(src, /valid_number "\$WEATHER_LAT" -90 90/, 'Breitengrad wird nicht validiert');
+  assert.match(src, /valid_number "\$WEATHER_LON" -180 180/, 'Längengrad wird nicht validiert');
+});
+
+test('install.sh leitet Reverse-Proxy-Betrieb aus dem Schema der Basis-URL ab', () => {
+  // Beide Server-Defaults sind für die jeweils andere Betriebsart falsch:
+  // SESSION_SECURE ist aus (kein HSTS, kein Secure-Cookie hinter HTTPS), und
+  // TRUST_PROXY steht auf 1, vertraut also X-Forwarded-For auch dann, wenn gar
+  // kein Proxy davor sitzt - dann kann sich jeder Client eine beliebige IP
+  // geben und das Anmelde-Rate-Limit umgehen, weil es pro IP zählt.
+  const src = installShSource();
+
+  assert.match(src, /^SESSION_SECURE=\$\{YUVOMI_SESSION_SECURE\}$/m, 'SESSION_SECURE wird nicht geschrieben');
+  assert.match(src, /^TRUST_PROXY=\$\{YUVOMI_TRUST_PROXY\}$/m, 'TRUST_PROXY wird nicht geschrieben');
+
+  const fn = src.match(/configure_proxy\(\) \{([\s\S]*?)\n\}/);
+  assert.ok(fn, 'configure_proxy() fehlt');
+
+  // Ein bestehender Wert gewinnt, sonst wäre ein von Hand gesetztes
+  // TRUST_PROXY=2 (zwei Hops) beim nächsten Lauf auf 1 zurückgesetzt.
+  assert.match(fn[1], /read_existing_env_value SESSION_SECURE/, 'bestehendes SESSION_SECURE wird ignoriert');
+  assert.match(fn[1], /read_existing_env_value TRUST_PROXY/, 'bestehendes TRUST_PROXY wird ignoriert');
+
+  // https → Proxy-Betrieb, alles andere → Direktzugriff.
+  const secure = fn[1].match(/YUVOMI_SESSION_SECURE[\s\S]*?esac/);
+  assert.ok(secure && /https:\/\/\*\)\s*YUVOMI_SESSION_SECURE='true'/.test(secure[0]),
+    'https muss SESSION_SECURE=true ergeben');
+  assert.match(fn[1], /https:\/\/\*\)\s*YUVOMI_TRUST_PROXY='1'/, 'https muss TRUST_PROXY=1 ergeben');
+  assert.match(fn[1], /\*\)\s*YUVOMI_TRUST_PROXY='loopback'/,
+    'ohne https muss TRUST_PROXY=loopback sein, sonst ist X-Forwarded-For fälschbar');
+});
+
+test('POST /api/save-env verliert bei einem Rerun keinen bestehenden Wert', async () => {
+  // PRESERVED_KEYS war eine Allowlist aus zwei Schlüsseln und deckte damit zwei
+  // Schlüssel ab statt der Regel. Die Datei wird komplett neu geschrieben,
+  // sanitizeEnv verwirft leere Werte, und der Wizard startet jedes Feld leer -
+  // er lädt bestehende Werte nie nach. Ein Rerun löschte deshalb alles ausser
+  // den beiden Secrets: gemessen 7 von 10 Schlüsseln, darunter DATA_DIR mit dem
+  // Datenbankpfad. Die Installation lief danach auf dem Standardpfad weiter und
+  // sah aus, als wären die Daten weg.
+  const dir = mkdtempSync(join(tmpdir(), 'oikos-rerun-'));
+  try {
+    const before = {
+      SESSION_SECRET: 'alt-session',
+      DB_ENCRYPTION_KEY: 'alt-db',
+      DATA_DIR: '/mnt/tank/yuvomi',
+      EMAIL_SMTP_HOST: 'smtp.example.test',
+      EMAIL_SMTP_PASS: 'geheim',
+      OIDC_ISSUER: 'https://auth.example.test',
+      WEBDAV_BACKUP_URL: 'https://cloud.example.test/dav',
+      VAPID_SUBJECT: 'mailto:admin@example.test',
+      BASE_URL: 'https://planer.example.test',
+      // Ausserhalb des ENV_SCHEMA: der Installer darf auch die Zeilen nicht
+      // verlieren, die er gar nicht kennt.
+      LOG_LEVEL: 'debug',
+    };
+    writeFileSync(
+      join(dir, '.env'),
+      Object.entries(before).map(([k, v]) => `${k}=${v}`).join('\n') + '\n',
+    );
+
+    await withServer(dir, async base => {
+      // Der Rerun, wie der Wizard ihn schickt: ein bewusst geänderter Wert,
+      // alle übrigen Felder leer, weil sie leer starten.
+      const r = await fetch(`${base}/api/save-env`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          env: {
+            TZ: 'Europe/Vienna',
+            DATA_DIR: '', EMAIL_SMTP_HOST: '', EMAIL_SMTP_PASS: '',
+            OIDC_ISSUER: '', WEBDAV_BACKUP_URL: '', VAPID_SUBJECT: '', BASE_URL: '',
+          },
+        }),
+      });
+      assert.equal(r.status, 200);
+    });
+
+    const after = readEnvFile(join(dir, '.env'));
+    for (const [key, value] of Object.entries(before)) {
+      assert.equal(after[key], value, `${key} hat den Rerun nicht überlebt`);
+    }
+    // Ein tatsächlich gesendeter Wert muss weiterhin gewinnen, sonst wäre der
+    // Installer wirkungslos geworden.
+    assert.equal(after.TZ, 'Europe/Vienna', 'ein gesendeter Wert muss den alten überschreiben');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('install.sh baut OAuth-Callbacks und die Schluss-Adresse aus der Basis-URL', () => {
+  // Der Dialog fragt seit dem BASE_URL-Schritt die oeffentliche Origin ab, die
+  // Callbacks wurden aber weiter aus Host und Port zusammengesetzt. Hinter
+  // einem Proxy bekam Google damit eine Redirect-URI mit falschem Schema und
+  // dem internen Port - der OAuth-Flow konnte gar nicht abschliessen, und
+  // genau fuer diesen Fall ist die Frage da. Dasselbe galt fuer die
+  // "Oeffnen"-Adresse am Ende: sie zeigte auf einen Host, den der Nutzer von
+  // aussen nicht erreicht.
+  const src = installShSource();
+
+  for (const path of [
+    '/api/v1/calendar/google/callback',
+    '/api/v1/documents/storage/google-drive/callback',
+  ]) {
+    const uses = [...src.matchAll(new RegExp(`([^"\\s]*)${path.replaceAll('/', '\\/')}`, 'g'))];
+    assert.ok(uses.length > 0, `keine Verwendung von ${path} gefunden`);
+    for (const [, prefix] of uses) {
+      assert.match(prefix, /\$\{YUVOMI_BASE_URL\}$/,
+        `${path} wird aus "${prefix}" gebaut statt aus YUVOMI_BASE_URL`);
+    }
+  }
+
+  assert.match(src, /local url="\$\{YUVOMI_BASE_URL:-/,
+    'die Schluss-Adresse muss die Basis-URL nutzen');
+  // Der Setup-Aufruf selbst geht weiterhin an den lokalen Port: der Installer
+  // spricht den Container direkt an, nicht ueber den Proxy.
+  assert.match(src, /-X POST "http:\/\/localhost:\$\{YUVOMI_PORT\}\/api\/v1\/auth\/setup"/,
+    'der Setup-Aufruf muss lokal bleiben');
+});
+
+test('der Download liefert die geschriebene .env, nicht eine Nachbildung im Browser', async () => {
+  // Die Abschlussseite baute ihre Kopie aus dem Browser-Zustand. Seit der Server
+  // beim Rerun bewahrt, was der Client nicht schickt, ist das die falsche
+  // Quelle: der Download enthielt weder die übernommenen Schlüssel noch die
+  // beiden Secrets, die der Wizard bewusst nie zu sehen bekommt. Wer die Datei
+  // als Sicherung beiseitelegte und später zurückspielte, warf genau das weg,
+  // was der Rerun gerettet hatte - und die Sicherung der einzigen
+  // Verschlüsselungsschlüssel war gar keine.
+  const dir = mkdtempSync(join(tmpdir(), 'oikos-dl-'));
+  try {
+    const contents = 'SESSION_SECRET=geheim-x\nDB_ENCRYPTION_KEY=geheim-y\nDATA_DIR=/mnt/tank\n';
+    writeFileSync(join(dir, '.env'), contents);
+    await withServer(dir, async base => {
+      const r = await fetch(`${base}/api/env-file`);
+      assert.equal(r.status, 200);
+      assert.match(r.headers.get('content-disposition'), /attachment; filename="\.env"/);
+      assert.equal(await r.text(), contents, 'der Download muss die Datei sein, Byte für Byte');
+
+      // Dieselbe Loopback-Schranke wie jede andere API-Route: die Datei enthält
+      // die Verschlüsselungsschlüssel.
+      const cross = await fetch(`${base}/api/env-file`, { headers: { Origin: 'https://evil.test' } });
+      assert.equal(cross.status, 403, 'Cross-Origin muss abgelehnt werden');
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Der Rumpf des done-download-Handlers. Der Guard prüfte vorher die exakte
+ *  Schreibweise `a.href = '/api/env-file';` - er wurde rot, als der Anker durch
+ *  ein fetch mit echter Fehlerprüfung ersetzt wurde, also durch die BESSERE
+ *  Fassung derselben Absicht. Geprüft wird deshalb die Absicht: hol die Datei
+ *  vom Server, und melde Erfolg erst, wenn der Server sie geliefert hat. */
+function doneDownloadHandler(html) {
+  const start = html.indexOf("$('done-download').addEventListener('click'");
+  assert.notEqual(start, -1, 'der done-download-Handler wurde nicht gefunden');
+  // Bis zum nächsten Listener auf oberster Ebene - der Handler endet dort.
+  const rest = html.slice(start + 1);
+  const end = rest.indexOf("\n$('");
+  return rest.slice(0, end === -1 ? undefined : end);
+}
+
+test('die Abschlussseite baut die .env nicht mehr im Browser nach', () => {
+  const html = readFileSync(new URL('../tools/installer/install.html', import.meta.url), 'utf8');
+  const handler = doneDownloadHandler(html);
+  assert.match(handler, /fetch\(\s*['"]\/api\/env-file['"]\s*\)/,
+    'der Download muss die Datei vom Server holen');
+  // Die Nachbildung konnte prinzipiell nicht stimmen und ist entfallen; kehrt
+  // sie zurück, kehrt der Bug mit ihr zurück.
+  assert.doesNotMatch(html, /function renderEnvClient/,
+    'renderEnvClient ist ersatzlos entfallen - der Browser kennt die bewahrten Werte nicht');
+});
+
+test('der Download meldet Erfolg erst, wenn der Server geliefert hat', () => {
+  // Der Anker-Klick konnte nicht scheitern, also wurde keysDownloaded auch dann
+  // gesetzt, wenn nichts ankam. Der Installer beendet sich fünf Minuten nach der
+  // Kontoerstellung: wer den Tab liegen liess, bekam danach keine Datei, keine
+  // Meldung - und eine Oberfläche, die "Schlüssel gesichert" behauptete. Das ist
+  // die einzige Sicherung des DB_ENCRYPTION_KEY.
+  const html = readFileSync(new URL('../tools/installer/install.html', import.meta.url), 'utf8');
+  const handler = doneDownloadHandler(html);
+
+  const okCheck = handler.search(/\.ok\b/);
+  const flagSet = handler.search(/keysDownloaded\s*=\s*true/);
+  assert.notEqual(okCheck, -1, 'der Handler muss die Server-Antwort prüfen (r.ok)');
+  assert.notEqual(flagSet, -1, 'keysDownloaded muss im Handler gesetzt werden');
+  assert.ok(okCheck < flagSet,
+    'die Erfolgsprüfung muss VOR keysDownloaded stehen, sonst meldet ein Fehlschlag Erfolg');
+
+  // Und der Fehlschlag muss sichtbar werden, nicht nur nicht-erfolgreich sein.
+  assert.match(handler, /catch/, 'ein Fehlschlag muss abgefangen werden');
+  assert.match(html, /id="done-err"/, 'der Fehlschlag braucht eine sichtbare Meldung');
+});
+
+test('ein zweiter Lauf kann den Einfach-Pfad nicht ueber eine bestehende .env legen', () => {
+  // Der Rerun-Schutz des Servers bewahrt, was der Client NICHT schickt. Genau
+  // deshalb greift er beim Einfach-Pfad nicht: applySimpleDefaults() setzt host,
+  // port, SESSION_SECURE und TRUST_PROXY hart, buildEnv() schickt sie mit. Ein
+  // zweiter Einfach-Lauf ueber eine Instanz hinter einem Reverse-Proxy nahm ihr
+  // unbemerkt die sicheren Cookies, das Proxy-Vertrauen und die BASE_URL.
+  const html = readFileSync(new URL('../tools/installer/install.html', import.meta.url), 'utf8');
+
+  // Die Sperre haengt an ihrem Anlass, nicht an sich selbst: setzt der
+  // Einfach-Pfad diese Werte eines Tages nicht mehr hart, darf sie fallen.
+  const simpleDefaults = html.slice(html.indexOf('function applySimpleDefaults'));
+  const hardcodesSecurity = /SESSION_SECURE/.test(simpleDefaults.slice(0, 900))
+    && /TRUST_PROXY/.test(simpleDefaults.slice(0, 900));
+  if (!hardcodesSecurity) return; // Anlass entfallen, Zusicherung nicht mehr faellig
+
+  const start = html.indexOf('if (d.envExists)');
+  assert.notEqual(start, -1, 'der Preflight muss auf eine bestehende .env reagieren');
+  // Bis zur schliessenden Klammer, nicht ueber ein Zeichenfenster: ein festes
+  // Fenster reichte in den Prereq-Block darunter hinein, der mode-simple aus
+  // einem ganz anderen Grund sperrt. Die Gegenprobe gegen den Stand VOR dieser
+  // Sperre war damit gruen aus dem falschen Grund - ein Guard, der die Nachbar-
+  // regel mitliest, sichert nicht die Regel, die er zu sichern vorgibt.
+  const block = (() => {
+    const open = html.indexOf('{', start);
+    let depth = 0;
+    for (let i = open; i < html.length; i++) {
+      if (html[i] === '{') depth++;
+      else if (html[i] === '}' && --depth === 0) return html.slice(start, i + 1);
+    }
+    assert.fail('der envExists-Block ist nicht geschlossen');
+  })();
+  assert.match(block, /mode-simple/,
+    'bei bestehender .env muss der Preflight den Einfach-Pfad anfassen');
+  assert.match(block, /disabled\s*=\s*true/,
+    'bei bestehender .env muss der Einfach-Pfad gesperrt werden - sonst ueberschreibt er still Host, Port und die Cookie-Sicherheit');
+  // Und der Nutzer muss erfahren, warum die Karte tot ist.
+  assert.match(html, /id="welcome-existing"/,
+    'die Sperre braucht eine sichtbare Begruendung auf der Willkommensseite');
+});
+
+test('der Einfach-Pfad liest seine Sperre erst nach dem Preflight - beim Start und beim Speichern', () => {
+  // Die Sperre oben setzt erst die ANTWORT des Preflights. Bis dahin ist die
+  // Karte klickbar, und startFlow() wartete nicht: ein Klick in diesem Fenster
+  // landete trotz bestehender .env im Einfach-Pfad, dessen Speichern Host, Port,
+  // SESSION_SECURE und TRUST_PROXY hart darueberschrieb. Geprueft wird deshalb
+  // die Reihenfolge an beiden Tueren: erst warten, dann die Sperre lesen und
+  // umlenken, dann handeln.
+  const html = readFileSync(new URL('../tools/installer/install.html', import.meta.url), 'utf8');
+
+  const bodyFrom = (marker) => {
+    const at = html.indexOf(marker);
+    assert.notEqual(at, -1, `${marker} nicht gefunden`);
+    const open = html.indexOf('{', at + marker.length - 1);
+    let depth = 0;
+    for (let i = open; i < html.length; i++) {
+      if (html[i] === '{') depth++;
+      else if (html[i] === '}' && --depth === 0) return html.slice(open, i + 1);
+    }
+    return assert.fail(`${marker} ist nicht geschlossen`);
+  };
+
+  const start = bodyFrom('function startFlow(');
+  const waitStart = start.indexOf('await preflightDone');
+  const redirect = start.search(/if \(simpleLockedByEnv\) m = 'advanced'/);
+  const defaults = start.indexOf('applySimpleDefaults');
+  assert.notEqual(waitStart, -1, 'startFlow wartet nicht auf den Preflight');
+  assert.ok(redirect > waitStart,
+    'startFlow lenkt bei bestehender .env nicht nach dem Warten in den Erweitert-Pfad um');
+  assert.ok(defaults > redirect,
+    'startFlow setzt die Einfach-Defaults, bevor die Sperre entschieden hat');
+  // Das Warten oeffnet ein zweites Fenster (Review zu #1217): wer waehrenddessen
+  // "Erweitert" waehlt, ist sofort dort - und die haengende Einfach-Wahl rief
+  // danach trotzdem showStep(1) und warf ihn zurueck. Nur die LETZTE Wahl darf
+  // nach dem Warten weiterlaufen.
+  assert.match(html, /let flowRequest = 0;/, 'es gibt keinen Zaehler fuer die letzte Modus-Wahl');
+  const claim = start.indexOf('const request = ++flowRequest');
+  const stale = start.search(/if \(request !== flowRequest\) return;/);
+  assert.ok(claim !== -1 && claim < waitStart,
+    'startFlow vermerkt die Wahl nicht vor dem Warten');
+  assert.ok(stale > waitStart && stale < redirect,
+    'eine ueberholte Einfach-Wahl laeuft nach dem Warten weiter und springt zurueck');
+
+  const save = bodyFrom("$('simple-next').addEventListener('click', async () =>");
+  const write = save.indexOf("fetch('/api/save-env'");
+  const waitSave = save.indexOf('await preflightDone');
+  const refuse = save.search(/if \(simpleLockedByEnv\) \{ startFlow\('advanced'\); return; \}/);
+  assert.notEqual(write, -1, 'der Einfach-Pfad schreibt nicht mehr ueber /api/save-env - Guard veraltet?');
+  assert.ok(waitSave !== -1 && waitSave < write,
+    'das Speichern im Einfach-Pfad wartet nicht auf den Preflight');
+  assert.ok(refuse > waitSave && refuse < write,
+    'das Speichern im Einfach-Pfad bricht bei bestehender .env nicht vor dem Schreiben ab');
+});
+
+test('ein Rerun schreibt gueltige Compose-Syntax unveraendert zurueck', async () => {
+  // readEnvFile/decodeEnvValue kennen nur doppelte Anfuehrungszeichen. Werden
+  // ALLE Zeilen darueber geparst und neu gerendert, wird aus `PASS='a b'` der
+  // Wert mit Quotes und aus `DIR=./data # x` der Wert mit Kommentar - der Rerun
+  // aendert still das Passwort oder mountet ein anderes Verzeichnis. Zeilen,
+  // die niemand anfasst, gehoeren deshalb Zeichen fuer Zeichen zurueck.
+  const dir = mkdtempSync(join(tmpdir(), 'oikos-verbatim-'));
+  try {
+    const tricky = [
+      'SESSION_SECRET=alt-session',
+      "EMAIL_SMTP_PASS='a b'",
+      'DATA_DIR=./data # storage',
+      'OIDC_ISSUER=https://auth.example.test',
+    ];
+    writeFileSync(join(dir, '.env'), `${tricky.join('\n')}\n`);
+    await withServer(dir, async base => {
+      const r = await fetch(`${base}/api/save-env`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ env: { TZ: 'Europe/Berlin' } }),
+      });
+      assert.equal(r.status, 200);
+    });
+    const after = readFileSync(join(dir, '.env'), 'utf8');
+    for (const line of tricky.slice(1)) {
+      assert.ok(after.includes(line), `Zeile wurde neu interpretiert statt uebernommen: ${line}`);
+    }
+    assert.match(after, /^TZ=Europe\/Berlin$/m, 'ein gesendeter Wert muss weiterhin geschrieben werden');
+    assert.ok(after.includes('SESSION_SECRET=alt-session'), 'das bestehende Secret muss bleiben');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('der Installer bleibt nach dem Setup erreichbar, solange der Download aussteht', () => {
+  // Vorher: harte zwei Sekunden nach /api/create-admin. Solange der Download
+  // eine Blob-Kopie im Browser war, ging das - er brauchte den Server nicht.
+  // Seit er die echte Datei holt, war der Knopf fuer jeden tot, der laenger
+  // brauchte, und die Seite meldete trotzdem "gesichert".
+  const src = readFileSync(new URL('../tools/installer/install-server.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(src, /server\.close\(\(\) => process\.exit\(0\)\);\s*\}, 2000\)/,
+    'der harte Zwei-Sekunden-Shutdown darf nicht zurueckkehren');
+  assert.match(src, /beginPostSetupShutdown\(\);\s*\n\s*resetIdle\(server\);/,
+    'nach dem Setup muss der verlaengerbare Nachlauf greifen');
+  // Jeder Request setzt ihn zurueck - sonst waere die Frist wieder starr.
+  assert.match(src, /idleTimer = setTimeout\([\s\S]*?\}, idleMs\);/,
+    'der Idle-Timer muss die veraenderliche Frist benutzen');
+});
+
+test('jede Redirect-URI kommt aus derselben Quelle wie BASE_URL', () => {
+  // Die angezeigte URI wird zeichengenau in die Google Cloud Console kopiert.
+  // Sie stand fest verdrahtet auf `http://${S.host}:${S.port}/...`, waehrend
+  // adv-next den geschriebenen Wert aus BASE_URL baute - bei jedem Setup hinter
+  // einem Reverse-Proxy trug der Nutzer damit eine andere Adresse ein als die,
+  // die die App spaeter schickt. Der Fehler zeigt sich erst beim ersten
+  // OAuth-Versuch als redirect_uri_mismatch, also lange nach der Installation.
+  const html = readFileSync(new URL('../tools/installer/install.html', import.meta.url), 'utf8');
+
+  const callbackLines = html.split('\n')
+    .map((line, i) => [i + 1, line])
+    .filter(([, line]) => line.includes('/callback`'));
+  assert.ok(callbackLines.length >= 2, 'erwartet mindestens zwei Redirect-URI-Zeilen');
+
+  const offenders = callbackLines
+    .filter(([, line]) => !line.includes('plannedOrigin()') && !line.includes('${origin}'))
+    .map(([n, line]) => `Zeile ${n}: ${line.trim().slice(0, 80)}`);
+  assert.deepEqual(offenders, [],
+    `Redirect-URI aus einer zweiten Quelle statt aus plannedOrigin()/origin: ${offenders.join(' | ')}`);
+
+  // Und origin selbst muss BASE_URL sein, nicht wieder host:port.
+  assert.match(html, /const origin = S\.BASE_URL;/,
+    'origin muss BASE_URL sein - sonst zeigt die Konsole auf host:port, die App auf die Proxy-Adresse');
+});
+
+/* Die oeffentliche Adresse folgt dem eingegebenen Host - geprueft am ERGEBNIS.
+ *
+ * Der vorhandene Redirect-Guard prueft, dass jede URI aus plannedOrigin() kommt.
+ * Er blieb gruen, waehrend plannedOrigin() selbstbezueglich wurde: onEnterStep
+ * belegte das Adressfeld mit ihrem Rueckgabewert vor, und ab da las sie nur noch
+ * dieses Feld. Wer den Host auf `nas.local` setzte, bekam trotzdem
+ * `https://localhost:3000` in die .env (Critique 2026-08-15).
+ *
+ * Ein Guard, der eine FUNKTION nennt, sichert nur, dass jemand die richtige
+ * Funktion aufgerufen hat. Dieser hier rechnet die Kette nach, die der Browser
+ * geht: Feldwert rein, geschriebene Origin raus. Er ist absichtlich eine
+ * Nachbildung und keine Zusicherung ueber den echten DOM - aber er faellt um,
+ * sobald die Ableitung wieder aufhoert, dem Host zu folgen.
+ */
+test('die abgeleitete Adresse folgt dem eingegebenen Host, nicht der Vorbelegung', () => {
+  const html = readFileSync(new URL('../tools/installer/install.html', import.meta.url), 'utf8');
+
+  // plannedOrigin() darf das eigene Feld nur lesen, wenn es ANGEFASST wurde.
+  const fn = html.slice(html.indexOf('function plannedOrigin()'));
+  const body = fn.slice(0, fn.indexOf('\n}'));
+  assert.match(body, /dataset\.touched/,
+    'plannedOrigin() muss das Adressfeld an dataset.touched binden - sonst liest es seine eigene Vorbelegung zurueck');
+
+  // Und Host/Port muessen aus den Feldern kommen, nicht aus S: S.host wird erst
+  // in cfg-next gesetzt, die Vorbelegung laeuft davor.
+  assert.match(body, /\$\('cfg-host'\)/,
+    'plannedOrigin() muss den Host aus dem Feld lesen - S.host ist waehrend der Eingabe noch der alte Wert');
+
+  // Die Vorbelegung haengt an allen drei Eingaben, aus denen sie folgt. KEIN
+  // Zeichenfenster mehr: die erste Fassung nahm slice(0, 1200) ab der Funktion,
+  // und ein eingefuegter Kommentarblock schob cfg-port aus dem Fenster - der
+  // Guard fiel um, ohne dass sich an der Verdrahtung etwas geaendert haette.
+  // Ein Fenster misst Textabstand, nicht Verhalten.
+  const wiring = html.slice(html.indexOf('function refreshPlannedOrigin'));
+  for (const id of ['adv-proxy', 'cfg-host', 'cfg-port']) {
+    assert.match(wiring, new RegExp(`'${id}'`),
+      `${id} muss die Vorbelegung der oeffentlichen Adresse neu anstossen`);
+  }
+
+  // Und die REIHENFOLGE, denn sie ist hier die ganze Logik: Listener laufen in
+  // Registrierungsreihenfolge, auf einem <select> feuert `input` vor `change`.
+  // Stand die touched-Markierung hinter der Ableitung, ueberschrieb
+  // refreshPlannedOrigin die gerade getroffene Wahl mit der Host-Ableitung - der
+  // Select sprang sichtbar zurueck, erst der zweite Versuch hielt (Critique
+  // 2026-08-15). Ein Guard, der nur das Vorkommen prueft, sieht das nie.
+  const touchedAt = wiring.indexOf("adv-proxy').addEventListener('input', e =>");
+  const derivedAt = wiring.indexOf("$(id).addEventListener('input', refreshPlannedOrigin)");
+  assert.notEqual(touchedAt, -1, 'adv-proxy braucht eine touched-Markierung auf input');
+  assert.notEqual(derivedAt, -1, 'die Ableitung muss an input haengen');
+  assert.ok(touchedAt < derivedAt,
+    'die touched-Markierung von adv-proxy muss VOR der Ableitung registriert werden, '
+    + 'sonst verwirft der erste Bedienvorgang die Wahl des Nutzers');
+});
+
+test('kein ENABLED-Schalter schreibt ein hartes false', () => {
+  // Ein geschriebenes 'false' ueberlebt sanitizeEnv und schlaegt damit den
+  // Rerun-Schutz: es sieht aus wie eine Entscheidung, ist aber nur ein
+  // unangehaktes Feld, das der Wizard beim Rerun nie aus der .env befuellt.
+  // Wer WebDAV-Backups ausserhalb des Wizards eingerichtet hatte, fand sie nach
+  // einem zweiten Lauf still abgeschaltet (Critique 2026-08-15).
+  const html = readFileSync(new URL('../tools/installer/install.html', import.meta.url), 'utf8');
+  const offenders = html.split('\n')
+    .map((line, i) => [i + 1, line])
+    .filter(([, line]) => /S\.[A-Z_]+\s*=.*\?\s*'true'\s*:\s*'false'/.test(line))
+    .map(([n, line]) => `Zeile ${n}: ${line.trim().slice(0, 70)}`);
+  assert.deepEqual(offenders, [],
+    `Diese Schalter schreiben ein hartes 'false' und ueberschreiben damit bestehende Werte: ${offenders.join(' | ')}`);
+});
+
+test('jedes Feld des Preflights wird im Wizard auch gelesen', () => {
+  // containerRunning wurde bei JEDEM Preflight per docker-inspect-Spawn ermittelt,
+  // von einem Test als Boolean zugesichert und in tools/installer/README.md als
+  // Funktion angekuendigt - und von keiner Zeile in install.html gelesen
+  // (Critique 2026-08-15). Ein Guard, der einen Wert zusichert, den niemand
+  // konsumiert, faerbt einen toten Pfad gruen.
+  //
+  // Die erste Fassung dieser Pruefung war selbst blind: sie suchte die Feldnamen
+  // zeilenweise, die Antwort ist aber ein EINZEILIGES Objektliteral - die Liste
+  // blieb leer und die Assertion darueber gruen. Deshalb steht die Mindestzahl
+  // hier als eigene Zusicherung: ein Guard, der nichts gefunden hat, darf nicht
+  // urteilen.
+  const server = readFileSync(new URL('../tools/installer/install-server.js', import.meta.url), 'utf8');
+  const html = readFileSync(new URL('../tools/installer/install.html', import.meta.url), 'utf8');
+
+  const seg = server.slice(server.indexOf('/api/preflight'));
+  const answer = seg.match(/json\(res,\s*200,\s*\{([^}]*)\}\)/);
+  assert.ok(answer, 'Die Preflight-Antwort wurde nicht gefunden');
+
+  const fields = answer[1]
+    .split(',')
+    .map(part => part.split(':')[0].trim())
+    .filter(Boolean);
+
+  assert.ok(fields.length >= 3,
+    `Nur ${fields.length} Preflight-Felder erkannt (${fields.join(', ')}) - der Scanner greift nicht mehr, `
+    + 'und eine Zusicherung ueber eine fast leere Liste ist keine');
+
+  const unused = fields.filter(f => !html.includes(f));
+  assert.deepEqual(unused, [],
+    `Der Preflight liefert Felder, die der Wizard nie liest: ${unused.join(', ')}. `
+    + 'Entweder auswerten oder Feld, Spawn, Zusicherung und README-Satz gemeinsam entfernen.');
 });

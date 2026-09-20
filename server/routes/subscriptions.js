@@ -16,7 +16,8 @@ import {
 } from '../services/subscriptions.js';
 import { getRates } from '../services/subscription-rates.js';
 import { findLogoOptions } from '../services/subscription-logo.js';
-import { normalizeBudgetVisibility, budgetVisibilityWhere, canEditEntry, resolveBudgetMode } from '../services/budget-visibility.js';
+import { normalizeObjectVisibility, budgetVisibilityWhere, canEditEntry, resolveBudgetMode } from '../services/budget-visibility.js';
+import { dataUrlContentMatches } from '../utils/file-signature.js';
 
 const log = createLogger('Subscriptions');
 const router = express.Router();
@@ -60,8 +61,9 @@ function syncReminder(subscription) {
 function loadSubscription(id) {
   return db.get().prepare(`
     SELECT s.*, c.name AS category_name, c.color AS category_color,
-           c.budget_subcategory_key,
-           p.name AS payment_method_name, u.display_name AS creator_name
+           c.label_key AS category_label_key, c.budget_subcategory_key,
+           p.name AS payment_method_name, p.label_key AS payment_method_label_key,
+           u.display_name AS creator_name
     FROM budget_subscriptions s
     LEFT JOIN subscription_categories c ON c.id = s.category_id
     LEFT JOIN subscription_payment_methods p ON p.id = s.payment_method_id
@@ -200,8 +202,26 @@ function validatePayload(body, { partial = false } = {}) {
     try { parseDateKey(body.next_payment_date); } catch (err) { errors.push(err.message); }
   }
   if (body.website_url && !URL_RE.test(body.website_url)) errors.push('Website URL must use HTTP or HTTPS.');
+  // Konto/Benutzername, unter dem das Abo laeuft (#1004). KEIN Passwortfeld:
+  // die Spalte ist unverschluesselt und wird durchsucht, weil ein Benutzername
+  // ohne sein Passwort keinen Schutz braucht. Hier liegt sie in einer Zeile,
+  // die owner_id und visibility bereits traegt - sie folgt beiden ohne Zutun.
+  if (body.account_username !== undefined && body.account_username !== null
+      && String(body.account_username).length > 200) {
+    errors.push('Account name must be 200 characters or fewer.');
+  }
   if (body.logo_data && (!String(body.logo_data).startsWith('data:image/') || String(body.logo_data).length > 700000)) {
     errors.push('Logo must be an image data URL smaller than 500 KB.');
+  } else if (body.logo_data && /;base64,/i.test(String(body.logo_data))
+    && !dataUrlContentMatches(body.logo_data)) {
+    // Der Typ steht im Praefix und kommt aus dem Browser des Absenders; hier
+    // wird geprueft, ob der Inhalt ihn traegt (#937). Nicht-base64-Bilder haben
+    // keinen Kopf zum Vergleichen und bleiben bei der bisherigen Pruefung.
+    //
+    // Case-insensitiv, weil ein data-URL-Leser `;BASE64,` genauso dekodiert:
+    // ein exakter Substring-Test haette sich mit einer Grossschreibung umgehen
+    // lassen, und zwar genau von dem, der etwas zu verbergen hat.
+    errors.push('Logo content does not match its image type.');
   }
   for (const key of ['category_id', 'payment_method_id']) {
     if (body[key] !== undefined && body[key] !== null && (!Number.isInteger(Number(body[key])) || Number(body[key]) < 1)) {
@@ -360,7 +380,22 @@ router.put('/categories/:id', (req, res) => {
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
     const database = db.get();
     database.transaction(() => {
-      database.prepare('UPDATE subscription_categories SET name = ?, color = ? WHERE id = ?')
+      // UMBENENNEN macht eine Vorgabe zur eigenen Zeile: `label_key` faellt
+      // weg, damit der eingegebene Name gilt statt weiterhin uebersetzt zu
+      // werden. Dasselbe tun tasks.js, contacts.js und inventory/categories.js.
+      //
+      // NUR UMBENENNEN, UND DAS IST DER PUNKT. Der Verwalten-Dialog schickt
+      // Name und Farbe zusammen, auch wenn nur die Farbe angefasst wurde -
+      // ein `label_key = NULL` bei JEDEM Speichern haette die sechs
+      // Seed-Kategorien beim ersten Farbwechsel stillschweigend auf die
+      // Sprache dieses Klienten festgenagelt. Genau der Verlust, den
+      // Migration 143 beim Inventar behoben hat und den der Kommentar in
+      // routes/contacts.js beschreibt. Der Vergleich ist der Kanon-Name, den
+      // der Klient unveraendert zurueckschickt (data-original-name).
+      const categoryRenamed = name.value !== existing.name;
+      database.prepare(`UPDATE subscription_categories
+                        SET name = ?, color = ?${categoryRenamed ? ', label_key = NULL' : ''}
+                        WHERE id = ?`)
         .run(name.value, categoryColor.value, id);
       // Die verknüpfte Budget-Subkategorie führt denselben Namen (POST-Invariante).
       if (existing.budget_subcategory_key) {
@@ -409,7 +444,13 @@ router.put('/payment-methods/:id', (req, res) => {
     if (!existing) return res.status(404).json({ error: 'Payment method not found.', code: 404 });
     const name = str(req.body.name, 'Name', { max: MAX_SHORT });
     if (name.error) return res.status(400).json({ error: name.error, code: 400 });
-    db.get().prepare('UPDATE subscription_payment_methods SET name = ? WHERE id = ?').run(name.value, id);
+    // Wie bei den Kategorien: ein eigener Name schlaegt den uebersetzten - aber
+    // erst, wenn er WIRKLICH ein anderer ist. Ein unveraendert
+    // zurueckgeschickter Name ist keine Umbenennung.
+    const renamed = name.value !== existing.name;
+    db.get().prepare(`UPDATE subscription_payment_methods
+                      SET name = ?${renamed ? ', label_key = NULL' : ''}
+                      WHERE id = ?`).run(name.value, id);
     res.json({ data: db.get().prepare('SELECT * FROM subscription_payment_methods WHERE id = ?').get(id) });
   } catch (err) {
     if (String(err.message).includes('UNIQUE')) return res.status(409).json({ error: 'Payment method already exists.', code: 409 });
@@ -506,8 +547,9 @@ router.get('/', async (req, res) => {
     }
     const rows = db.get().prepare(`
       SELECT s.*, c.name AS category_name, c.color AS category_color,
-             c.budget_subcategory_key,
-             p.name AS payment_method_name, u.display_name AS creator_name
+             c.label_key AS category_label_key, c.budget_subcategory_key,
+             p.name AS payment_method_name, p.label_key AS payment_method_label_key,
+             u.display_name AS creator_name
       FROM budget_subscriptions s
       LEFT JOIN subscription_categories c ON c.id = s.category_id
       LEFT JOIN subscription_payment_methods p ON p.id = s.payment_method_id
@@ -520,14 +562,25 @@ router.get('/', async (req, res) => {
     const enabledRows = converted.rows.filter((row) => row.enabled);
     const completedCount = converted.rows.filter((row) => row.status === 'completed').length;
     const monthlyTotal = enabledRows.reduce((sum, row) => sum + (row.monthly_base || 0), 0);
+    // GRUPPIERT WIRD NACH DER ZEILE, NICHT NACH IHREM ANZEIGETEXT. Hier stand
+    // `row.category_name || 'Uncategorized'`, und damit erfand die Antwort zwei
+    // englische Woerter, die kein Klient uebersetzen konnte - eine Sammelposition
+    // hiess auch in einer spanischen Oberflaeche "Unspecified" (#950). Sie traegt
+    // jetzt `id: null` und ueberlaesst das Wort dem Leser; eine Vorgabezeile
+    // reicht ihren `label_key` durch, eine eigene ihren Namen.
     const byCategory = new Map();
     const byPaymentMethod = new Map();
+    const bucket = (map, id, name, labelKey, amount) => {
+      const entry = map.get(id) ?? { id, name, label_key: labelKey, amount: 0 };
+      entry.amount += amount;
+      map.set(id, entry);
+    };
     for (const row of enabledRows) {
-      const category = row.category_name || 'Uncategorized';
-      const method = row.payment_method_name || 'Unspecified';
-      byCategory.set(category, (byCategory.get(category) || 0) + (row.monthly_base || 0));
-      byPaymentMethod.set(method, (byPaymentMethod.get(method) || 0) + (row.monthly_base || 0));
+      const amount = row.monthly_base || 0;
+      bucket(byCategory, row.category_id ?? null, row.category_name ?? null, row.category_label_key ?? null, amount);
+      bucket(byPaymentMethod, row.payment_method_id ?? null, row.payment_method_name ?? null, row.payment_method_label_key ?? null, amount);
     }
+    const breakdown = (map) => [...map.values()].map((e) => ({ ...e, amount: Number(e.amount.toFixed(2)) }));
     res.json({
       data: {
         subscriptions: converted.rows,
@@ -539,8 +592,8 @@ router.get('/', async (req, res) => {
           monthly_budget: configured.monthly_budget,
           remaining_budget: Number((configured.monthly_budget - monthlyTotal).toFixed(2)),
           base_currency: configured.base_currency,
-          by_category: [...byCategory].map(([name, amount]) => ({ name, amount: Number(amount.toFixed(2)) })),
-          by_payment_method: [...byPaymentMethod].map(([name, amount]) => ({ name, amount: Number(amount.toFixed(2)) })),
+          by_category: breakdown(byCategory),
+          by_payment_method: breakdown(byPaymentMethod),
         },
         rates: converted.rates,
       },
@@ -564,7 +617,7 @@ router.post('/', async (req, res) => {
     });
     if (endErrors.length) return res.status(400).json({ error: endErrors.join(' '), code: 400 });
     const me = actorId(req);
-    const visibility = normalizeBudgetVisibility(
+    const visibility = normalizeObjectVisibility(
       req.body.visibility,
       budgetMode() === 'personal' ? 'private' : 'shared'
     );
@@ -572,15 +625,16 @@ router.post('/', async (req, res) => {
       INSERT INTO budget_subscriptions
         (name, description, amount, currency, billing_cycle, cycle_interval, next_payment_date,
          category_id, payment_method_id, reminder_days, enabled, website_url, logo_data,
-         brand_color, notes, created_by, owner_id, visibility,
+         brand_color, notes, account_username, created_by, owner_id, visibility,
          end_type, end_date, occurrence_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       req.body.name.trim(), req.body.description?.trim() || null, Number(req.body.amount), validated.currency,
       req.body.billing_cycle, validated.cycleInterval, req.body.next_payment_date,
       req.body.category_id || null, req.body.payment_method_id || null, validated.reminderDays,
       req.body.enabled === false ? 0 : 1, req.body.website_url?.trim() || null, req.body.logo_data || null,
-      req.body.brand_color || null, req.body.notes?.trim() || null, me, me, visibility,
+      req.body.brand_color || null, req.body.notes?.trim() || null,
+      req.body.account_username?.trim() || null, me, me, visibility,
       endType, endDate, occurrenceCount,
     );
     let row = loadSubscription(result.lastInsertRowid);
@@ -604,7 +658,7 @@ router.put('/:id', async (req, res) => {
     const value = (key, fallback) => req.body[key] === undefined ? fallback : req.body[key];
     // Sichtbarkeit umschaltbar; owner_id bleibt fix (#476/#505).
     const nextVisibility = req.body.visibility !== undefined
-      ? normalizeBudgetVisibility(req.body.visibility)
+      ? normalizeObjectVisibility(req.body.visibility)
       : current.visibility;
     // Ende-Bedingung aus zusammengeführten Werten (#594): unbenutzte Felder werden
     // konsequent auf null gesetzt, damit ein Moduswechsel keine Altwerte mitschleppt.
@@ -628,7 +682,7 @@ router.put('/:id', async (req, res) => {
       UPDATE budget_subscriptions SET
         name = ?, description = ?, amount = ?, currency = ?, billing_cycle = ?, cycle_interval = ?,
         next_payment_date = ?, category_id = ?, payment_method_id = ?, reminder_days = ?, enabled = ?,
-        website_url = ?, logo_data = ?, brand_color = ?, notes = ?, visibility = ?,
+        website_url = ?, logo_data = ?, brand_color = ?, notes = ?, account_username = ?, visibility = ?,
         end_type = ?, end_date = ?, occurrence_count = ?, completed_at = ?
       WHERE id = ?
     `).run(
@@ -639,7 +693,8 @@ router.put('/:id', async (req, res) => {
       value('payment_method_id', current.payment_method_id) || null,
       validated.reminderDays ?? current.reminder_days, nextEnabled,
       value('website_url', current.website_url)?.trim() || null, value('logo_data', current.logo_data) || null,
-      value('brand_color', current.brand_color) || null, value('notes', current.notes)?.trim() || null, nextVisibility,
+      value('brand_color', current.brand_color) || null, value('notes', current.notes)?.trim() || null,
+      value('account_username', current.account_username)?.trim() || null, nextVisibility,
       endType, endDate, occurrenceCount, completedAt, id,
     );
     let row = loadSubscription(id);

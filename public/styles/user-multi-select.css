@@ -88,7 +88,7 @@
  * <html>; darum diese Variable zuerst lesen. */
 .user-ms__option:has(.user-ms__checkbox:checked) {
   border-color: var(--active-module-accent, var(--module-accent, var(--color-accent)));
-  background: color-mix(in srgb, var(--active-module-accent, var(--module-accent, var(--color-accent))) 12%, transparent);
+  background: color-mix(in srgb, var(--active-module-accent, var(--module-accent, var(--color-accent))) var(--tint-state), transparent);
 }
 
 .user-ms__option:has(.user-ms__checkbox:focus-visible) {

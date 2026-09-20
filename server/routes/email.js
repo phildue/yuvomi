@@ -6,6 +6,7 @@
 import express from 'express';
 import * as db from '../db.js';
 import { createLogger } from '../logger.js';
+import { isAdminRequest } from '../middleware/require-admin.js';
 import { emailService as defaultEmailService } from '../services/email.js';
 
 const log = createLogger('EmailRoutes');
@@ -35,7 +36,7 @@ export function buildRouter({ database, emailService = defaultEmailService, reso
 
   function requireAdmin(req, res, next) {
     // requireAuth (server/auth.js) populates req.authRole for both session and API-token auth.
-    if (req.authRole !== 'admin') {
+    if (!isAdminRequest(req)) {
       return res.status(403).json({ error: 'Admin access required.', code: 403 });
     }
     next();
@@ -61,12 +62,19 @@ export function buildRouter({ database, emailService = defaultEmailService, reso
       if (body.secure !== undefined && !VALID_SECURE.has(String(body.secure))) {
         return res.status(400).json({ error: 'Invalid secure value.', code: 400 });
       }
+      // Ein env-gesteuertes Feld wird NICHT in die Datenbank geschrieben. Der
+      // Wert wirkte ohnehin nicht (env gewinnt, services/email.js:resolve), und
+      // gespeichert wäre er eine Zeitbombe: er würde in dem Moment aktiv, in dem
+      // jemand die Umgebungsvariable entfernt.
+      const locked = field => emailService.isEnvControlled?.(field) === true;
       for (const [field, key] of Object.entries(FIELD_KEYS)) {
-        if (body[field] === undefined) continue;
+        if (body[field] === undefined || locked(field)) continue;
         cfgSet(key, String(body[field] ?? '').trim());
       }
       // Password is write-only: only change it when explicitly provided.
-      if (typeof body.pass === 'string' && body.pass !== '') {
+      if (locked('pass')) {
+        // nichts tun: EMAIL_SMTP_PASS kommt aus der Umgebung
+      } else if (typeof body.pass === 'string' && body.pass !== '') {
         cfgSet('email_smtp_pass', body.pass);
       } else if (body.clearPassword === true) {
         cfgSet('email_smtp_pass', '');

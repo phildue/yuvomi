@@ -8,7 +8,9 @@
  * Tag daneben - genau die Klasse Fehler, gegen die toLocalDateKey() existiert.
  */
 
-import { addLocalDays, parseLocalDateKey, toLocalDateKey } from '/utils/date.js';
+// `todayKey` heisst hier schon ein Parameter (bzw. eine lokale Bindung), der den
+// Bezugstag traegt - der Import kommt deshalb unter eigenem Namen herein.
+import { addLocalDays, parseLocalDateKey, todayKey as householdToday } from '/utils/date.js';
 
 /** Vorlauf in Tagen, ab dem ein Artikel als "läuft bald ab" gilt. */
 export const EXPIRY_SOON_DAYS = 7;
@@ -21,7 +23,7 @@ export const PANTRY_FILTERS = Object.freeze(['expired', 'soon', 'low']);
  * @param {string} [todayKey] - lokaler Tagesschlüssel (YYYY-MM-DD)
  * @returns {{ out: boolean, low: boolean, expiry: 'expired'|'soon'|null }}
  */
-export function pantryItemStatus(item, todayKey = toLocalDateKey()) {
+export function pantryItemStatus(item, todayKey = householdToday()) {
   const quantity = Number(item?.quantity ?? 0);
   const min = item?.min_quantity == null ? null : Number(item.min_quantity);
 
@@ -42,7 +44,7 @@ export function pantryItemStatus(item, todayKey = toLocalDateKey()) {
 }
 
 /** Ganze Kalendertage von todayKey bis dateKey (negativ = liegt zurück). */
-export function daysUntil(dateKey, todayKey = toLocalDateKey()) {
+export function daysUntil(dateKey, todayKey = householdToday()) {
   const from = parseLocalDateKey(todayKey);
   const to = parseLocalDateKey(dateKey);
   // Über Zeitumstellungen hinweg ist ein Tag nicht exakt 86400s lang; das Runden
@@ -55,7 +57,7 @@ export function daysUntil(dateKey, todayKey = toLocalDateKey()) {
  * "Fast leer" umfasst bewusst auch leere Artikel: wer die Liste nach Nachschub
  * durchsieht, will beides sehen.
  */
-export function matchesPantryFilter(item, filter, todayKey = toLocalDateKey()) {
+export function matchesPantryFilter(item, filter, todayKey = householdToday()) {
   if (!filter || filter === 'all') return true;
   const status = pantryItemStatus(item, todayKey);
   if (filter === 'expired') return status.expiry === 'expired';
@@ -65,7 +67,7 @@ export function matchesPantryFilter(item, filter, todayKey = toLocalDateKey()) {
 }
 
 /** Zählt je Filter, wie viele Artikel ihn treffen. */
-export function pantryFilterCounts(items, todayKey = toLocalDateKey()) {
+export function pantryFilterCounts(items, todayKey = householdToday()) {
   const counts = { expired: 0, soon: 0, low: 0 };
   for (const item of items) {
     const status = pantryItemStatus(item, todayKey);

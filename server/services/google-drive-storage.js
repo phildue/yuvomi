@@ -3,6 +3,7 @@ import { Readable } from 'node:stream';
 import { google } from 'googleapis';
 import * as db from '../db.js';
 import { createLogger } from '../logger.js';
+import { MAX_UPLOAD_BYTES } from '../utils/upload-limit.js';
 
 const log = createLogger('GoogleDriveStorage');
 const CONFIG_PREFIX = 'document_storage_google_drive_';
@@ -12,7 +13,7 @@ const FOLDER_MIME = 'application/vnd.google-apps.folder';
 const APP_FOLDER_NAME = 'Yuvomi';
 const DOCUMENTS_FOLDER_NAME = 'Documents';
 const DISPLAY_FOLDER_NAME = `${APP_FOLDER_NAME}/${DOCUMENTS_FOLDER_NAME}`;
-const MAX_READ_BYTES = 5 * 1024 * 1024;
+const MAX_READ_BYTES = MAX_UPLOAD_BYTES;
 
 const defaultGoogleApiFactory = {
   createOAuth2: (clientId, clientSecret, redirectUri) => (

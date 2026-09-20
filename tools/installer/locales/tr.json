@@ -4,13 +4,15 @@
     "continue": "Devam",
     "back": "Geri",
     "generate": "Oluştur",
-    "generating": "…",
+    "generating": "Oluşturuluyor…",
     "optional": "İsteğe bağlı",
     "stepCounter": "Adım {{n}} / {{total}}",
     "toggleVisibility": "Değeri göster veya gizle",
     "copy": "Kopyala",
     "copied": "Kopyalandı ✓",
-    "language": "Dil"
+    "language": "Dil",
+    "copyRedirect": "Yönlendirme URI'sini kopyala",
+    "opt": "(isteğe bağlı)"
   },
   "config": {
     "title": "Temel Yapılandırma",
@@ -22,7 +24,12 @@
     "tzLabel": "Saat dilimi",
     "errHost": "Geçersiz ana bilgisayar adı. Yalnızca harf, rakam, tire ve nokta kullanın.",
     "errPort": "Geçersiz bağlantı noktası. 1 ile 65535 arasında bir sayı olmalıdır.",
-    "prereqMissing": "Eksik ön koşullar: {{list}}. Lütfen bunları kurun ve sayfayı yeniden yükleyin."
+    "prereqMissing": "Eksik gereksinimler: {{list}}. {{link}} bunları nasıl kuracağını gösterir.",
+    "prereqLinkDocker": "Docker kılavuzu",
+    "prereqLinkCompose": "podman-compose kılavuzu",
+    "prereqRecheck": "Yeniden denetle",
+    "errSecureOverHttp": "Herkese açık adres http:// ile başlıyor, ancak bu seçim güvenli çerezleri zorunlu kılıyor - o zaman kimse oturum açamaz. \"Doğrudan erişim\" seç ya da https:// adresi kullan.",
+    "errTz": "Geçersiz saat dilimi. Europe/Berlin gibi bir IANA adı bekleniyor."
   },
   "secrets": {
     "title": "Güvenlik Anahtarları",
@@ -32,7 +39,7 @@
     "dbLabel": "Veritabanı Şifreleme Anahtarı",
     "dbHint": "SQLite veritabanını beklemede şifreler.",
     "errBoth": "Her iki anahtar da gereklidir.",
-    "dangerWarn": "Bu anahtarları şimdi kaydedin. Kaybederseniz şifrelenmiş verileriniz kurtarılamaz — sıfırlama yoktur.",
+    "dangerWarn": "Bu anahtarları şimdi kaydedin. Kaybederseniz şifrelenmiş verileriniz kurtarılamaz — sıfırlama yoktur. Kurulumun sonunda her iki anahtarı içeren .env dosyasını indirebilirsiniz.",
     "preserved": "Mevcut anahtarların korunur, bu nedenle bu kurulum seni geçerli veritabanının dışında bırakmaz. Anahtarını korumak için bir alanı boş bırak; yeni bir değer girmek onu değiştirir.",
     "keepPlaceholder": "Mevcut anahtar korunuyor"
   },
@@ -48,12 +55,12 @@
     "unitsMetric": "Metrik (°C)",
     "unitsImperial": "İngiliz birimi (°F)",
     "errCoords": "Enlem ve boylam gereklidir.",
-    "errLat": "Geçersiz enlem (–90 ile 90 arası).",
-    "errLon": "Geçersiz boylam (–180 ile 180 arası)."
+    "errLat": "Geçersiz enlem (-90 ile 90 arası).",
+    "errLon": "Geçersiz boylam (-180 ile 180 arası)."
   },
   "calendar": {
     "title": "Takvim Senkronizasyonu",
-    "subtitle": "Yuvomi'u Google Takvim veya Apple iCloud'a bağlayın. İkisi de isteğe bağlı — yapılandırmak için genişletin.",
+    "subtitle": "Yuvomi’u Google Takvim, Apple iCloud veya Outlook’a bağlayın. Hepsi isteğe bağlı - yapılandırmak için genişletin.",
     "google": "Google Takvim",
     "googleHint": "{{link}} adresinde OAuth kimlik bilgileri oluşturun. Yönlendirme URI'si: {{redirect}}",
     "googleLink": "console.cloud.google.com",
@@ -66,8 +73,13 @@
     "appleUserLabel": "Apple kimliği (e-posta)",
     "applePassLabel": "Uygulamaya özel parola",
     "appleUrlLabel": "CalDAV URL'si",
-    "appleUrlOpt": "(isteğe bağlı)",
-    "appleUrlHint": "Sağlayıcınız farklı bir CalDAV uç noktası kullanmıyorsa boş bırakın."
+    "appleUrlHint": "Sağlayıcınız farklı bir CalDAV uç noktası kullanmıyorsa boş bırakın.",
+    "outlook": "Outlook Takvimi (Microsoft Graph)",
+    "outlookHint": "{{link}} adresinde ücretsiz bir Entra ID uygulama kaydı oluşturun (\"Yalnızca kişisel Microsoft hesapları\") - kurulum kılavuzuna bakın. Yönlendirme URI’si: {{redirect}}",
+    "outlookLink": "entra.microsoft.com",
+    "outlookIdLabel": "İstemci kimliği",
+    "outlookSecretLabel": "İstemci gizli anahtarı",
+    "outlookNote": "Tek yönlü gönderim: Yuvomi kaynak olmaya devam eder - Outlook’ta yapılan değişikliklerin üzerine yazılır. Aile hesapları daha sonra uygulama ayarlarından bağlanır."
   },
   "review": {
     "title": "İnceleme",
@@ -96,24 +108,45 @@
     "webdavBackup": "Harici yedeklemeler",
     "on": "etkin",
     "off": "devre dışı",
-    "documentGoogleDrive": "Google Drive belgeleri"
+    "documentGoogleDrive": "Google Drive belgeleri",
+    "sessionSecret": "Oturum anahtarı",
+    "dbKey": "Veritabanı anahtarı",
+    "keyGenerated": "Yeni oluşturuldu",
+    "keyPreserved": "Mevcut anahtar korunur",
+    "dataDir": "Veri klasörü",
+    "privateNetwork": "Yerel ağ erişimi",
+    "privateNetworkIcs": "Takvim abonelikleri",
+    "privateNetworkRecipes": "Tarifler",
+    "privateNetworkWaste": "Atık toplama",
+    "privateNetworkWebdav": "WebDAV belgeleri",
+    "baseUrl": "Herkese açık adres",
+    "outlook": "Outlook Takvimi",
+    "notEnabled": "etkin değil"
   },
   "docker": {
     "title": "Yuvomi başlatılıyor",
     "subtitle": "İmaj indiriliyor ve Docker kapsayıcısı başlatılıyor.",
-    "starting": "Kapsayıcı başlatılıyor …",
     "elapsed": "{{n}} sn geçti",
     "running": "Kapsayıcı sağlıklı ve çalışıyor",
     "failed": "Kapsayıcı başlatılamadı",
     "unknownError": "Bilinmeyen hata",
     "toAdmin": "Yönetici Kurulumuna devam et",
-    "retry": "Yeniden dene"
+    "retry": "Yeniden dene",
+    "phasePull": "Görüntü indiriliyor",
+    "phaseBoot": "Kapsayıcı başlatılıyor",
+    "phaseHealth": "Sağlık denetimi sürüyor",
+    "firstRunHint": "İlk seferde bu birkaç dakika sürebilir.",
+    "stalled": "Bu her zamankinden uzun sürüyor. Aşağıdaki günlük nedenini gösteriyor.",
+    "showLogs": "Günlüğü göster",
+    "hideLogs": "Günlüğü gizle",
+    "timedOut": "15 dakika sonra yanıt alınamadı. Günlüğü kontrol edip yeniden deneyin.",
+    "logLabel": "Konteyner günlüğü"
   },
   "admin": {
     "title": "Yönetici Hesabı Oluştur",
     "subtitle": "İlk girişinizi ayarlayın. Bu hesap Yuvomi'a tam erişime sahiptir.",
     "userLabel": "Kullanıcı adı",
-    "userHint": "3–64 karakter: harfler, rakamlar, . - _",
+    "userHint": "3-64 karakter: harfler, rakamlar, . - _",
     "nameLabel": "Görünen ad",
     "passLabel": "Parola",
     "passPlaceholder": "En az 8 karakter",
@@ -121,7 +154,7 @@
     "creating": "Oluşturuluyor …",
     "create": "Hesap oluştur",
     "errAll": "Tüm alanlar gereklidir.",
-    "errUser": "Geçersiz kullanıcı adı biçimi (3–64 karakter, harf/rakam/._-).",
+    "errUser": "Geçersiz kullanıcı adı biçimi (3-64 karakter, harf/rakam/._-).",
     "errPass": "Parola en az 8 karakter olmalıdır.",
     "errMatch": "Parolalar eşleşmiyor.",
     "errCreate": "Yönetici hesabı oluşturulamadı."
@@ -132,16 +165,26 @@
     "open": "Yuvomi'u aç →",
     "backupReminder": "Şimdi .env dosyanızı yedeklemeyi unutmayın — anahtarlarınızı içerir.",
     "download": ".env dosyasını indir",
-    "savedTo": "Şuraya kaydedildi: {{path}}"
+    "savedTo": "Şuraya kaydedildi: {{path}}",
+    "downloadFailed": "Dosya yüklenemedi - kurulum aracı büyük olasılıkla çoktan kapandı. Anahtarların sunucundaki .env dosyasında.",
+    "serverStops": "Kurulum aracı birkaç dakika içinde kapanacak. Bu sekmeyi kapatmadan önce dosyayı indir.",
+    "nextTitle": "Sırada",
+    "nextInvite": "Aileni davet et",
+    "nextInviteDesc": "Herkesin kendi parolasını seçmesi için davet bağlantıları oluştur.",
+    "nextModules": "Modüllerini seç",
+    "nextModulesDesc": "Evinizin gerçekten kullandığını aç, gerisini gizle.",
+    "nextInstall": "Telefonlara kur",
+    "nextInstallDesc": "Yuvomi'yi telefonda aç ve ana ekrana ekle - çevrimdışı da çalışır.",
+    "subtitleExisting": "Yuvomi çalışıyor. Bu kurulumda zaten bir yönetici hesabı var - mevcut bilgilerinle oturum aç."
   },
   "advanced": {
     "tag": "Gelişmiş · isteğe bağlı",
     "title": "Gelişmiş Ayarlar",
-    "subtitle": "Ters proxy, çoklu oturum açma ve otomatik yedeklemeler. Tümü isteğe bağlı — atlamak güvenlidir.",
+    "subtitle": "Çoklu oturum açma, ev ağına erişim ve birkaç ince ayar. Hepsi isteğe bağlı.",
     "proxyLabel": "Yuvomi nasıl yayınlanıyor?",
     "proxyBehindHttps": "HTTPS'li bir ters proxy arkasında (Caddy, nginx, Traefik)",
     "proxyDirect": "localhost / HTTP üzerinden doğrudan erişim",
-    "proxyHint": "Doğrudan erişim, yalnızca güvenli çerezleri devre dışı bırakır; böylece oturum açma HTTPS olmadan çalışır.",
+    "proxyHint": "Yuvomi'yi http:// üzerinden açıyorsan \"Doğrudan erişim\" seç - aksi halde oturum açamazsın. HTTPS'li ters vekil sunucunun arkasındaysan ilk seçeneği seç.",
     "oidc": "Çoklu Oturum Açma (OIDC)",
     "oidcHint": "SSO'yu etkinleştirmek için dört alanı da doldurun ya da boş bırakın.",
     "oidcIssuerLabel": "Issuer URL'si",
@@ -166,8 +209,7 @@
     "documentLocalEnable": "Yeni belgeleri yerel bir klasörde sakla",
     "documentLocalPathLabel": "Klasör yolu",
     "documentLocalPathHint": "Konteyner içindeki yol. /documents için boş bırakın.",
-    "sectionNetwork": "Ağ",
-    "sectionIntegrations": "Entegrasyonlar ve yedeklemeler",
+    "sectionIntegrations": "Çoklu oturum açma",
     "errSchedule": "Geçersiz cron zamanlaması (boşlukla ayrılmış beş alan beklenir, örn. 0 2 * * *).",
     "errKeep": "Saklanacak yedek sayısı pozitif bir sayı olmalıdır.",
     "webdavBackup": "Harici yedeklemeler (WebDAV)",
@@ -190,7 +232,32 @@
     "documentGoogleDriveReuseHint": "Google Takvim OAuth kimlik bilgilerini yeniden kullanmak için iki alanı da boş bırakın. Kendi kimlik bilgilerinizi kullanmak için bunları Google Cloud Console’da oluşturun (Takvim adımındaki gibi).",
     "documentGoogleDriveRedirectLabel": "Yönlendirme URI'si",
     "errDocumentGoogleDrivePair": "Google Drive istemci kimliği ve gizli anahtarı birlikte ayarlanmalı veya ikisi de boş bırakılmalıdır.",
-    "errDocumentGoogleDriveCredentials": "Google Drive için kendi istemci kimliği ve gizli anahtarı ya da yapılandırılmış Google Takvim kimlik bilgileri gerekir."
+    "errDocumentGoogleDriveCredentials": "Google Drive için kendi istemci kimliği ve gizli anahtarı ya da yapılandırılmış Google Takvim kimlik bilgileri gerekir.",
+    "dataDirLabel": "Ana makinedeki veri klasörü",
+    "dataDirHint": "Veritabanının ve uygulama verilerinin sunucuda bulunduğu yer. Compose dosyasının yanındaki ./data için boş bırakın.",
+    "documentLocalDirLabel": "Ana makinedeki klasör",
+    "documentLocalDirHint": "Sunucuda kapsayıcıya bağlanan klasör. ./documents için boş bırakın.",
+    "documentWebdavPrivateNetwork": "Ev ağındaki bir WebDAV hedefine izin ver",
+    "documentWebdavPrivateNetworkHint": "Kendi ağınızdaki bir Nextcloud için gerekli. Bu hedef için SSRF korumasını kaldırır.",
+    "icsPrivateNetwork": "Ev ağından takvim aboneliklerine izin ver",
+    "icsPrivateNetworkHint": "Kendi ağınızdaki cihazların ICS akışları için gerekli. Takvim abonelikleri için SSRF korumasını kaldırır.",
+    "recipeProviderPrivateNetwork": "Ev ağınızdaki tarif sağlayıcı aynalarına izin ver",
+    "recipeProviderPrivateNetworkHint": "Kendi ağınızdaki bir Mealie veya Tandoor örneği için gerekli. Tarif sağlayıcı aynalamaları için SSRF korumasını kaldırır.",
+    "wasteSourcePrivateNetwork": "Ev ağınızdaki atık toplama beslemelerine izin ver",
+    "wasteSourcePrivateNetworkHint": "Kendi ağınızda yansıtılan bir belediye atık toplama takvimi için gereklidir. Atık toplama URL kaynakları için SSRF korumasını kaldırır.",
+    "oidcTrustEmail": "verified claim olmadan e-postaya güven",
+    "oidcTrustEmailHint": "Yalnızca sağlayıcınız email_verified göndermiyorsa ve ona güveniyorsanız etkinleştirin.",
+    "oidcAllowSignup": "SSO girişlerinin yeni hesap oluşturmasına izin ver",
+    "oidcAllowSignupHint": "Sağlayıcınız bu haneden daha fazla kişiye hizmet veriyorsa bunu kapatın. Mevcut hesaplar giriş yapmaya ve eşleşmeye devam eder.",
+    "baseUrlLabel": "Herkese açık adres",
+    "baseUrlHint": "Ailenin Yuvomi'yi açtığı adres - kapsayıcının konağı ve bağlantı noktası değil. Parola sıfırlama ve davet bağlantıları için kullanılır.",
+    "syncIntervalLabel": "Takvim eşitleme aralığı (dakika)",
+    "syncIntervalHint": "Yuvomi'nin takvimleri ve kişileri ne sıklıkla eşitleyeceği. Sağlayıcın hız sınırı uyguluyorsa artır.",
+    "errSyncInterval": "Dakika olarak pozitif bir tam sayı gir.",
+    "sectionPrivateNetwork": "Ev ağına erişim",
+    "privateNetworkHint": "Yuvomi varsayılan olarak kendi ağındaki adreslere bağlantıları reddeder; bu, sunucunun iç servislere ulaşmaya kandırılmasına karşı korur. Evde gerçekten çalıştırdıklarını etkinleştir.",
+    "authPasswordLogin": "Kullanıcı adı ve şifreyle girişi koru",
+    "authPasswordLoginHint": "Kapatmak SSO'yu tek giriş yolu yapar: giriş formu ve şifre sıfırlama kaybolur. Sağlayıcıya erişilemez hale gelirse dönüş yolu .env dosyasını düzenlemek ve yeniden başlatmaktır."
   },
   "welcome": {
     "title": "Yuvomi’ye hoş geldiniz",
@@ -201,7 +268,9 @@
     "simpleTime": "Yaklaşık 2 dakika",
     "advancedTitle": "Gelişmiş kurulum",
     "advancedDesc": "Tam kontrol: ters proxy, takvim senkronizasyonu, e-posta, tek oturum açma ve yedeklemeler.",
-    "advancedTime": "Her seçenek, adım adım"
+    "advancedTime": "Her seçenek, adım adım",
+    "existingLocked": "Mevcut bir kurulum bulundu. Şu anki ayarlarının korunması için gelişmiş kurulumu kullan.",
+    "containerRunning": "Yuvomi şu anda çalışıyor. Kaydetmek kapsayıcıyı yeniden başlatır, bu yüzden kısa süre erişilemez olur."
   },
   "simple": {
     "title": "Hazır",
@@ -233,5 +302,11 @@
     "fromHint": "Alıcıların göreceği «Kimden» adresi. Birçok sağlayıcı bunun kullanıcı adıyla eşleşmesini gerektirir.",
     "fromNameLabel": "Gönderen adı",
     "errIncomplete": "SMTP sunucusu ve gönderen adresi gereklidir."
+  },
+  "storage": {
+    "title": "Depolama ve yedekler",
+    "subtitle": "Verilerinin sunucuda nerede durduğu ve kopyalarının nereye gittiği. Hepsi isteğe bağlı - varsayılanlar çalışır.",
+    "sectionBackups": "Yedekler",
+    "sectionDocuments": "Belge depolama"
   }
 }

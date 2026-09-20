@@ -12,11 +12,13 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { MIGRATIONS_SQL } from '../server/db-schema-test.js';
 import {
   resolvePermissions,
   buildSessionModuleAccess,
+  moduleAccessVerdict,
   clientPermissions,
   permissionCatalog,
   getSubjectPermissions,
@@ -25,12 +27,16 @@ import {
   isValidFamilyRole,
   PERMISSION_MODULES,
   PERMISSION_WIDGETS,
+  PERMISSION_CAPABILITIES,
 } from '../server/permissions.js';
+import { effectiveCapabilityAccess, isPermissionDeviation } from '../public/utils/permission-group.js';
+import { WIDGET_IDS } from '../public/utils/dashboard-widgets.js';
 
 function freshDb() {
   const db = new DatabaseSync(':memory:');
   db.exec(MIGRATIONS_SQL[1]);   // users
   db.exec(MIGRATIONS_SQL[74]);  // access_permissions
+  db.exec(MIGRATIONS_SQL[175]); // capability resource type
   return db;
 }
 
@@ -39,6 +45,47 @@ function addUser(db, { id, role = 'member', family_role = 'other', name = 'U' })
     .run(id, `user${id}`, name, 'x', role, family_role);
   return db.prepare('SELECT id, role, family_role FROM users WHERE id = ?').get(id);
 }
+
+test('migration 175 preserves overrides and permits capability resources', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(MIGRATIONS_SQL[74]);
+  db.prepare(`
+    INSERT INTO access_permissions
+      (subject_type, subject_id, resource_type, resource_key, access, updated_at)
+    VALUES ('role', 'child', 'module', 'notes', 'read', '2024-01-02T03:04:05Z')
+  `).run();
+
+  db.exec(MIGRATIONS_SQL[175]);
+
+  assert.deepEqual(
+    { ...db.prepare(`
+      SELECT subject_type, subject_id, resource_type, resource_key, access, updated_at
+      FROM access_permissions
+    `).get() },
+    {
+      subject_type: 'role',
+      subject_id: 'child',
+      resource_type: 'module',
+      resource_key: 'notes',
+      access: 'read',
+      updated_at: '2024-01-02T03:04:05Z',
+    },
+  );
+  assert.doesNotThrow(() => db.prepare(`
+    INSERT INTO access_permissions
+      (subject_type, subject_id, resource_type, resource_key, access)
+    VALUES ('user', '42', 'capability', 'example', 'allow')
+  `).run());
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS count FROM access_permissions WHERE resource_type = 'capability'").get().count,
+    1,
+  );
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'idx_access_permissions_subject'").get().count,
+    1,
+  );
+  db.close();
+});
 
 // ── Auflösung ────────────────────────────────────────────────────────────────
 
@@ -59,7 +106,57 @@ test('Standard ohne Konfiguration: Vollzugriff (rückwärtskompatibel)', () => {
   assert.equal(r.admin, false);
   assert.equal(r.modules.budget, 'write');
   assert.equal(r.widgets.cycle, 'allow');
+  assert.equal(r.capabilities.notes_manage_household_categories, 'none');
+  assert.equal(r.capabilities.health_use_fasting, 'allow');
   assert.equal(buildSessionModuleAccess(r), null); // nichts eingeschränkt
+});
+
+test('Fasting is default-on but explicit role and member denials still win', () => {
+  const db = freshDb();
+  const member = addUser(db, { id: 21, role: 'member', family_role: 'child' });
+  assert.equal(resolvePermissions(db, member).capabilities.health_use_fasting, 'allow');
+
+  replaceSubjectPermissions(db, 'role', 'child', {
+    capabilities: { health_use_fasting: 'none' },
+  });
+  assert.equal(resolvePermissions(db, member).capabilities.health_use_fasting, 'none');
+
+  replaceSubjectPermissions(db, 'role', 'child', { capabilities: {} });
+  replaceSubjectPermissions(db, 'user', member.id, {
+    capabilities: { health_use_fasting: 'none' },
+  });
+  assert.equal(resolvePermissions(db, member).capabilities.health_use_fasting, 'none');
+  db.close();
+});
+
+test('permission sheet resolves each capability from its own default', () => {
+  const fasting = { default: 'allow' };
+  assert.equal(effectiveCapabilityAccess(fasting, { mode: 'role' }), 'allow');
+  assert.equal(effectiveCapabilityAccess(fasting, { mode: 'user' }), 'allow');
+  assert.equal(effectiveCapabilityAccess(fasting, { mode: 'user', inherited: 'none' }), 'none');
+  assert.equal(effectiveCapabilityAccess(fasting, { mode: 'user', draft: 'none', inherited: 'allow' }), 'none');
+  assert.equal(effectiveCapabilityAccess({ default: 'none' }, { mode: 'role' }), 'none');
+});
+
+test('Haushaltskategorien: Admin darf immer verwalten', () => {
+  const db = freshDb();
+  const admin = addUser(db, { id: 20, role: 'admin', family_role: 'other' });
+  const r = resolvePermissions(db, admin);
+  assert.equal(r.capabilities.notes_manage_household_categories, 'allow');
+});
+
+test('Haushaltskategorien: Rolle kann erlauben, Mitglied-Override kann verbieten', () => {
+  const db = freshDb();
+  const child = addUser(db, { id: 21, family_role: 'child' });
+  replaceSubjectPermissions(db, 'role', child.family_role, {
+    capabilities: { notes_manage_household_categories: 'allow' },
+  });
+  assert.equal(resolvePermissions(db, child).capabilities.notes_manage_household_categories, 'allow');
+
+  replaceSubjectPermissions(db, 'user', child.id, {
+    capabilities: { notes_manage_household_categories: 'none' },
+  });
+  assert.equal(resolvePermissions(db, child).capabilities.notes_manage_household_categories, 'none');
 });
 
 test('Rollen-Profil greift für alle Mitglieder der Rolle', () => {
@@ -122,6 +219,33 @@ test('buildSessionModuleAccess: nur Abweichungen, write wird ausgelassen', () =>
 
 // ── Speicherung / Validierung ────────────────────────────────────────────────
 
+// ── Durchsetzung (geteilt von /api/v1 und MCP, #823) ─────────────────────────
+
+test('moduleAccessVerdict: null lässt alles durch (Admin/unbeschränkt)', () => {
+  assert.equal(moduleAccessVerdict(null, 'tasks', 'write'), 'allow');
+  assert.equal(moduleAccessVerdict(undefined, 'tasks', 'write'), 'allow');
+});
+
+test('moduleAccessVerdict: Deny-Liste — nicht gelistete Module bleiben offen', () => {
+  const map = { tasks: 'none' };
+  assert.equal(moduleAccessVerdict(map, 'calendar', 'write'), 'allow');
+  // Auch ein Pfad ohne Modulzuordnung darf nicht stillschweigend zufallen,
+  // sonst wäre die App für eingeschränkte Mitglieder unbedienbar.
+  assert.equal(moduleAccessVerdict(map, null, 'read'), 'allow');
+});
+
+test('moduleAccessVerdict: none sperrt beide Zugriffsarten', () => {
+  const map = { tasks: 'none' };
+  assert.equal(moduleAccessVerdict(map, 'tasks', 'read'), 'none');
+  assert.equal(moduleAccessVerdict(map, 'tasks', 'write'), 'none');
+});
+
+test('moduleAccessVerdict: read erlaubt Lesen, weist Schreiben ab', () => {
+  const map = { tasks: 'read' };
+  assert.equal(moduleAccessVerdict(map, 'tasks', 'read'), 'allow');
+  assert.equal(moduleAccessVerdict(map, 'tasks', 'write'), 'read-only');
+});
+
 test('Sparse: Standard-Werte werden nicht gespeichert', () => {
   const db = freshDb();
   addUser(db, { id: 9, role: 'member', family_role: 'parent' });
@@ -143,12 +267,61 @@ test('replaceSubjectPermissions ersetzt atomar (kein Merge)', () => {
   assert.deepEqual(stored.modules, { health: 'read' }); // budget-Sperre ist weg
 });
 
-test('Leere Eingabe = „von Rolle erben" (alle Overrides entfernt)', () => {
+test('replaceSubjectPermissions erhält Capability-Zeilen beim Speichern von Modulen', () => {
+  const db = freshDb();
+  db.exec(MIGRATIONS_SQL[175]);
+  db.prepare(`
+    INSERT INTO access_permissions (subject_type, subject_id, resource_type, resource_key, access)
+    VALUES ('role', 'child', 'capability', 'notes.categories', 'allow')
+  `).run();
+
+  replaceSubjectPermissions(db, 'role', 'child', { modules: { budget: 'none' } });
+
+  assert.deepEqual(
+    db.prepare(`
+      SELECT resource_type, resource_key, access
+      FROM access_permissions
+      WHERE subject_type = 'role' AND subject_id = 'child'
+      ORDER BY resource_type, resource_key
+    `).all().map((row) => ({ ...row })),
+    [
+      { resource_type: 'capability', resource_key: 'notes.categories', access: 'allow' },
+      { resource_type: 'module', resource_key: 'budget', access: 'none' },
+    ],
+  );
+});
+
+test('replaceSubjectPermissions ersetzt Capabilities nur bei ausdrücklichem Feld', () => {
+  const db = freshDb();
+  db.prepare(`
+    INSERT INTO access_permissions (subject_type, subject_id, resource_type, resource_key, access)
+    VALUES ('role', 'child', 'capability', 'notes_manage_household_categories', 'allow')
+  `).run();
+
+  replaceSubjectPermissions(db, 'role', 'child', { modules: {} });
+  assert.deepEqual(getSubjectPermissions(db, 'role', 'child').capabilities, {
+    notes_manage_household_categories: 'allow',
+  });
+
+  replaceSubjectPermissions(db, 'role', 'child', { capabilities: {} });
+  assert.deepEqual(getSubjectPermissions(db, 'role', 'child').capabilities, {});
+});
+
+test('Leere Eingabe leert die alten Achsen und lässt ausgelassene Capabilities bestehen', () => {
   const db = freshDb();
   addUser(db, { id: 11, role: 'member', family_role: 'child' });
-  replaceSubjectPermissions(db, 'user', 11, { modules: { budget: 'none' } });
+  replaceSubjectPermissions(db, 'user', 11, {
+    modules: { budget: 'none' },
+    capabilities: { notes_manage_household_categories: 'allow' },
+  });
   replaceSubjectPermissions(db, 'user', 11, {}); // zurücksetzen
-  assert.deepEqual(getSubjectPermissions(db, 'user', 11), { modules: {}, widgets: {} });
+  assert.deepEqual(getSubjectPermissions(db, 'user', 11), {
+    modules: {},
+    widgets: {},
+    capabilities: { notes_manage_household_categories: 'allow' },
+  });
+  replaceSubjectPermissions(db, 'user', 11, { capabilities: {} });
+  assert.deepEqual(getSubjectPermissions(db, 'user', 11), { modules: {}, widgets: {}, capabilities: {} });
 });
 
 test('normalizePermissionInput: unbekannte/ungültige Werte werfen', () => {
@@ -156,6 +329,27 @@ test('normalizePermissionInput: unbekannte/ungültige Werte werfen', () => {
   assert.throws(() => normalizePermissionInput({ modules: { budget: 'bogus' } }), /Invalid module access/);
   assert.throws(() => normalizePermissionInput({ widgets: { nope: 'allow' } }), /Unknown widget/);
   assert.throws(() => normalizePermissionInput({ widgets: { cycle: 'read' } }), /Invalid widget access/);
+});
+
+test('Capability-Defaults bleiben bei Rollen sparse, Nutzer dürfen geerbtes allow aufheben', () => {
+  const db = freshDb();
+  const child = addUser(db, { id: 15, role: 'member', family_role: 'child' });
+
+  replaceSubjectPermissions(db, 'role', 'child', {
+    capabilities: { notes_manage_household_categories: 'none' },
+  });
+  assert.deepEqual(getSubjectPermissions(db, 'role', child.family_role).capabilities, {});
+
+  replaceSubjectPermissions(db, 'role', child.family_role, {
+    capabilities: { notes_manage_household_categories: 'allow' },
+  });
+  replaceSubjectPermissions(db, 'user', child.id, {
+    capabilities: { notes_manage_household_categories: 'none' },
+  });
+  assert.deepEqual(getSubjectPermissions(db, 'user', child.id).capabilities, {
+    notes_manage_household_categories: 'none',
+  });
+  assert.equal(resolvePermissions(db, child).capabilities.notes_manage_household_categories, 'none');
 });
 
 test('isValidFamilyRole', () => {
@@ -170,6 +364,21 @@ test('permissionCatalog liefert Module, Widgets, Rollen, Levels', () => {
   assert.ok(cat.roles.includes('child'));
   assert.deepEqual(cat.moduleAccessLevels, ['none', 'read', 'write']);
   assert.deepEqual(cat.widgetAccessLevels, ['none', 'allow']);
+  assert.ok(cat.capabilities.some((item) => item.key === 'notes_manage_household_categories'));
+  assert.equal(cat.capabilities.find((item) => item.key === 'notes_manage_household_categories').default, 'none');
+  assert.equal(cat.capabilities.find((item) => item.key === 'health_use_fasting').default, 'allow');
+  assert.deepEqual(cat.capabilityAccessLevels, ['none', 'allow']);
+  assert.deepEqual(PERMISSION_CAPABILITIES.map((item) => item.key), ['notes_manage_household_categories', 'health_use_fasting']);
+});
+
+test('capability summary compares against each capability default', () => {
+  const optIn = { key: 'notes_manage_household_categories', default: 'none' };
+  const optOut = { key: 'health_use_fasting', default: 'allow' };
+
+  assert.equal(isPermissionDeviation(optIn, 'none'), false);
+  assert.equal(isPermissionDeviation(optIn, 'allow'), true);
+  assert.equal(isPermissionDeviation(optOut, 'allow'), false);
+  assert.equal(isPermissionDeviation(optOut, 'none'), true);
 });
 
 test('clientPermissions: kompakte Payload mit admin-Flag', () => {
@@ -180,4 +389,59 @@ test('clientPermissions: kompakte Payload mit admin-Flag', () => {
   assert.equal(p.admin, false);
   assert.equal(p.modules.budget, 'read');
   assert.ok('cycle' in p.widgets);
+});
+
+// --------------------------------------------------------
+// Guard: die drei Widget-Listen dürfen nicht auseinanderlaufen
+// --------------------------------------------------------
+
+/**
+ * Ein Dashboard-Widget steht an drei Stellen: als ID im Raster, als sperrbare
+ * Ressource in den Rechten und als Beschriftung in der Rechte-Oberfläche. Fehlt
+ * es in der zweiten, kann ein Admin es als einziges nicht sperren; fehlt es in
+ * der dritten, steht in seiner Zeile der rohe Slug. Beides fällt beim Bauen
+ * eines neuen Widgets nicht auf - deshalb dieser Abgleich (statt einer Liste
+ * erlaubter Ausnahmen: die deckte nur die Dateien ab, nicht die Regel).
+ */
+function idsFromSource(relativePath, pattern) {
+  const source = readFileSync(new URL(relativePath, import.meta.url), 'utf-8');
+  const match = source.match(pattern);
+  assert.ok(match, `${relativePath}: Widget-Liste nicht gefunden - Guard muss nachgezogen werden`);
+  return match[1];
+}
+
+test('jedes Dashboard-Widget ist sperrbar und in der Rechte-UI benannt', () => {
+  /* AUS DEM MODUL, NICHT AUS SEINEM QUELLTEXT (Etappe 7, 2026-08-13). Diese
+   * Zeile las `WIDGET_IDS` per Regex aus `public/pages/dashboard.js`, und
+   * `af2cac51` hat die Liste nach `utils/dashboard-widgets.js` gezogen: seitdem
+   * fand das Muster nichts und die Suite war rot - auf ganzer Strecke, in einem
+   * `npm test`, das niemand fuhr. Der Commit dort zaehlt sechs gruene Suiten
+   * auf, und diese ist keine davon. Dieselbe Form wie beim Precache-Fund einen
+   * Commit vorher: ein Umzug bricht eine Zusicherung zwei Dateien weiter.
+   *
+   * Der Import kann das nicht wieder passieren lassen - er schlaegt laut fehl,
+   * wo ein Regex still leer zurueckkommt. Das Modul ist dafuer gebaut: es
+   * haengt an nichts und laeuft in node (siehe seinen Kopf). */
+  const dashboardIds = [...WIDGET_IDS];
+
+  const labelKeys = idsFromSource(
+    '../public/settings/pages/admin-permissions.js',
+    /const WIDGET_LABEL_KEYS = \{([^}]+)\}/,
+  )
+    .split('\n')
+    .map((line) => line.trim().match(/^([a-z_]+):/i)?.[1])
+    .filter(Boolean);
+
+  const permissionIds = PERMISSION_WIDGETS.map((w) => w.id);
+
+  assert.deepEqual(
+    [...dashboardIds].sort(),
+    [...permissionIds].sort(),
+    'WIDGET_IDS (utils/dashboard-widgets.js) und PERMISSION_WIDGETS (server/permissions.js) sind auseinandergelaufen',
+  );
+  assert.deepEqual(
+    [...dashboardIds].sort(),
+    [...labelKeys].sort(),
+    'WIDGET_IDS (utils/dashboard-widgets.js) und WIDGET_LABEL_KEYS (admin-permissions.js) sind auseinandergelaufen',
+  );
 });

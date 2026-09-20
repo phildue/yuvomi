@@ -99,6 +99,58 @@ test('Ohne Zuweisung erhält die handelnde Person (Kiosk)', () => {
   assert.equal(getBalance(db, child1), before + 15);
 });
 
+test('Die benannte erledigende Person bekommt die Punkte, nicht die zustaendige (#1205)', () => {
+  // child1 nimmt teil (oben eingeschrieben), child2 nicht.
+  db.prepare('INSERT OR IGNORE INTO reward_participants (user_id, enabled) VALUES (?, 1)').run(child2);
+  const before1 = getBalance(db, child1);
+  const before2 = getBalance(db, child2);
+
+  const taskId = makeTask(20, [child1]);           // zugewiesen an child1 ...
+  awardForCompletion(db, taskId, admin, child2);   // ... erledigt hat es child2
+
+  assert.equal(getBalance(db, child2), before2 + 20, 'wer es getan hat, bekommt sie');
+  assert.equal(getBalance(db, child1), before1, 'die Zuweisung allein bucht nichts mehr');
+});
+
+test('Eine benannte Person, die nicht teilnimmt, bucht nichts - auch nicht auf die Zustaendigen (#1205)', () => {
+  // Der Rueckfall auf die Zuweisung waere hier die falscheste der drei
+  // moeglichen Antworten: die Punkte gingen an jemanden, von dem gerade
+  // festgehalten wurde, dass er es NICHT getan hat.
+  db.prepare('DELETE FROM reward_participants WHERE user_id = ?').run(child2);
+  const before1 = getBalance(db, child1);
+  const before2 = getBalance(db, child2);
+
+  const taskId = makeTask(25, [child1]);
+  awardForCompletion(db, taskId, admin, child2);
+
+  assert.equal(getBalance(db, child1), before1);
+  assert.equal(getBalance(db, child2), before2);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM reward_ledger WHERE task_id = ? AND type='earn'").get(taskId).n, 0);
+});
+
+test('Das Zuruecknehmen holt auch die an die erledigende Person gebuchten Punkte zurueck (#1205)', () => {
+  // reverseTaskEarnings filtert bewusst NICHT nach Person - seit die Punkte an
+  // eine benannte Person gehen koennen, waere jeder Personenfilter genau die
+  // Buchung, die stehen bliebe.
+  db.prepare('INSERT OR IGNORE INTO reward_participants (user_id, enabled) VALUES (?, 1)').run(child2);
+  const before = getBalance(db, child2);
+  const taskId = makeTask(35, [child1]);
+
+  syncTaskRewards(db, taskId, 'open', 'done', admin, child2);
+  assert.equal(getBalance(db, child2), before + 35);
+
+  syncTaskRewards(db, taskId, 'done', 'open', admin);
+  assert.equal(getBalance(db, child2), before, 'Storno kennt die Person nicht und braucht sie nicht');
+  db.prepare('DELETE FROM reward_participants WHERE user_id = ?').run(child2);
+});
+
+test('Ohne Benennung gilt die Zuweisungsregel unveraendert (#1205)', () => {
+  const before = getBalance(db, child1);
+  const taskId = makeTask(10, [child1]);
+  awardForCompletion(db, taskId, admin, null);
+  assert.equal(getBalance(db, child1), before + 10);
+});
+
 test('Aufgabe ohne Punkte bucht nichts', () => {
   const taskId = makeTask(0, [child1]);
   awardForCompletion(db, taskId, admin);
@@ -119,7 +171,7 @@ app.use((req, _res, next) => {
   next();
 });
 app.use('/api/v1/rewards', rewardsRouter);
-const server = app.listen(0);
+const server = app.listen(0, '127.0.0.1');
 await new Promise((resolve) => server.once('listening', resolve));
 const port = server.address().port;
 
@@ -262,6 +314,58 @@ test('Ohne Eltern-Freigabe (rewards_require_approval=0) wird sofort gutgeschrieb
 
   // Default (Freigabe nötig) wiederherstellen.
   db.prepare("UPDATE sync_config SET value = '1' WHERE key = 'rewards_require_approval'").run();
+});
+
+// --------------------------------------------------------
+// Stellvertretung (#655): Eltern erledigen mit jüngeren Kindern, die sich nicht
+// selbst anmelden. Beide Hälften des Wunsches trägt der Bestand schon - dieser
+// Abschnitt hält sie fest, damit sie nicht als Nebeneffekt verlorengehen.
+// --------------------------------------------------------
+
+test('Punkte gehen an die zugewiesene Person, nicht an die abhakende (#655)', () => {
+  // Die übrigen Vergabe-Tests belegen das nur zufällig: dort nimmt die handelnde
+  // Person gar nicht am Punktesystem teil, kann also ohnehin nichts bekommen.
+  // Hier tut sie es - erst dann ist "der Zugewiesene verdient" eine echte Aussage.
+  const parent = db.prepare("INSERT INTO users (username, display_name, password_hash, role) VALUES ('papa', 'Papa', 'x', 'member')").run().lastInsertRowid;
+  db.prepare('INSERT INTO reward_participants (user_id, enabled) VALUES (?, 1)').run(parent);
+
+  const parentBefore = getBalance(db, parent);
+  const childBefore = getBalance(db, child1);
+
+  const taskId = makeTask(25, [child1]);
+  awardForCompletion(db, taskId, parent);
+
+  assert.equal(getBalance(db, child1), childBefore + 25, 'das Kind erhält die Punkte');
+  assert.equal(getBalance(db, parent), parentBefore, 'der abhakende Elternteil erhält nichts');
+
+  // Aufräumen: ein zusätzlicher Teilnehmer würde spätere Salden-/Rang-Tests
+  // verschieben, falls dieser Block je nach vorne wandert.
+  db.prepare('DELETE FROM reward_participants WHERE user_id = ?').run(parent);
+});
+
+test('Admin löst stellvertretend ein; ein Mitglied nur für sich selbst (#655)', async () => {
+  asAdmin();
+  await request('POST', '/api/v1/rewards/bonus', { user_id: child1, delta: 500 });
+  const child1Before = getBalance(db, child1);
+
+  // Elternteil löst für das Kind ein: der Abzug trifft das Kind, nicht den Admin.
+  const proxy = await request('POST', '/api/v1/rewards/redemptions', { catalog_id: rewardId, user_id: child1 });
+  assert.equal(proxy.status, 201);
+  assert.equal(getBalance(db, child1), child1Before - 100, 'die Punkte des Kindes werden reserviert');
+
+  // Gegenprobe: ein Mitglied, das eine fremde user_id mitschickt, löst für sich
+  // selbst ein. Die fremde Angabe wird ignoriert, nicht befolgt - keine
+  // Rechteausweitung, aber auch kein Fehler, den der Aufrufer bemerken würde.
+  asAdmin();
+  await request('POST', '/api/v1/rewards/bonus', { user_id: child2, delta: 500 });
+  const c1 = getBalance(db, child1);
+  const c2 = getBalance(db, child2);
+
+  asChild(child2);
+  const spoofed = await request('POST', '/api/v1/rewards/redemptions', { catalog_id: rewardId, user_id: child1 });
+  assert.equal(spoofed.status, 201);
+  assert.equal(getBalance(db, child1), c1, 'das fremde Konto bleibt unberührt');
+  assert.equal(getBalance(db, child2), c2 - 100, 'abgebucht wird beim Aufrufer selbst');
 });
 
 test.after(() => { server.close(); db.close(); });

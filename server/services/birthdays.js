@@ -1,5 +1,7 @@
 import { formatDateKey, resolveHouseholdFormats, translate } from '../utils/i18n.js';
+import { householdTimeZone, localToUTC, todayKey } from '../utils/timezone.js';
 import { OUTBOUND_SOURCES, markEventOutbound, queueEventDeletion } from './calendar-outbound.js';
+import { householdDisabledModules } from './household-modules.js';
 
 const BIRTHDAY_COLOR = '#E11D48';
 const BIRTHDAY_RRULE = 'FREQ=YEARLY;INTERVAL=1';
@@ -35,30 +37,60 @@ function normalizedMonthDay(birthDate, year) {
   return `${year}-${pad2(month)}-${pad2(day)}`;
 }
 
-function nextBirthdayDate(birthDate, from = new Date()) {
-  const now = from instanceof Date ? from : new Date(from);
-  const thisYear = normalizedMonthDay(birthDate, now.getFullYear());
-  const today = now.toISOString().slice(0, 10);
-  return thisYear >= today
-    ? thisYear
-    : normalizedMonthDay(birthDate, now.getFullYear() + 1);
+function normalizedNameDay(nameDay, year) {
+  const [monthStr, dayStr] = String(nameDay).split('-');
+  const month = parseInt(monthStr, 10);
+  let day = parseInt(dayStr, 10);
+  if (month === 2 && day === 29 && !leapYear(year)) day = 28;
+  return `${year}-${pad2(month)}-${pad2(day)}`;
 }
 
-function nextBirthdayAge(birthDate, from = new Date()) {
-  const next = nextBirthdayDate(birthDate, from);
+/**
+ * Ein Geburtstag ist ein Kalendertag, kein Zeitpunkt - deshalb rechnen diese
+ * Helfer auf Datums-Keys statt auf `Date`. Vorher mischte `nextBirthdayDate`
+ * zwei Uhren in DREI Zeilen: das Jahr kam aus `getFullYear()` (Zone des
+ * Containers), der Vergleichstag aus `toISOString()` (UTC). Am 31.12. um 22:00
+ * in Toronto lieferte das Jahr 2026 und den Tag 2027-01-01 - ein Geburtstag am
+ * 31.12. galt damit als vorbei und rutschte um ein volles Jahr nach vorn.
+ * `todayKey` ist jetzt die einzige Uhr, und sie ist die des Haushalts (#829).
+ */
+function nextBirthdayDate(birthDate, today = todayKey(null)) {
+  const year = parseInt(String(today).slice(0, 4), 10);
+  const thisYear = normalizedMonthDay(birthDate, year);
+  return thisYear >= today ? thisYear : normalizedMonthDay(birthDate, year + 1);
+}
+
+function nextBirthdayAge(birthDate, today = todayKey(null)) {
+  const next = nextBirthdayDate(birthDate, today);
   return parseInt(next.slice(0, 4), 10) - parseInt(String(birthDate).slice(0, 4), 10);
 }
 
-function daysUntilBirthday(birthDate, from = new Date()) {
-  const now = from instanceof Date ? from : new Date(from);
-  const next = nextBirthdayDate(birthDate, now);
-  const todayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-  const nextUtc = Date.UTC(
-    parseInt(next.slice(0, 4), 10),
-    parseInt(next.slice(5, 7), 10) - 1,
-    parseInt(next.slice(8, 10), 10),
+function daysUntilBirthday(birthDate, today = todayKey(null)) {
+  const next = nextBirthdayDate(birthDate, today);
+  const keyUtc = (key) => Date.UTC(
+    parseInt(key.slice(0, 4), 10),
+    parseInt(key.slice(5, 7), 10) - 1,
+    parseInt(key.slice(8, 10), 10),
   );
-  return Math.round((nextUtc - todayUtc) / 86400000);
+  return Math.round((keyUtc(next) - keyUtc(String(today).slice(0, 10))) / 86400000);
+}
+
+function nextNameDayDate(nameDay, today = todayKey(null)) {
+  if (!nameDay) return null;
+  const year = parseInt(String(today).slice(0, 4), 10);
+  const thisYear = normalizedNameDay(nameDay, year);
+  return thisYear >= today ? thisYear : normalizedNameDay(nameDay, year + 1);
+}
+
+function daysUntilNameDay(nameDay, today = todayKey(null)) {
+  const next = nextNameDayDate(nameDay, today);
+  if (!next) return null;
+  const keyUtc = (key) => Date.UTC(
+    parseInt(key.slice(0, 4), 10),
+    parseInt(key.slice(5, 7), 10) - 1,
+    parseInt(key.slice(8, 10), 10),
+  );
+  return Math.round((keyUtc(next) - keyUtc(String(today).slice(0, 10))) / 86400000);
 }
 
 function getOffsetMinutes(birthday) {
@@ -73,9 +105,12 @@ function getOffsetMinutes(birthday) {
   return parseInt(birthday.reminder_offset, 10) || 0;
 }
 
-function birthdayReminderAt(birthDate, offsetMin = 0, from = new Date()) {
-  const next = nextBirthdayDate(birthDate, from);
-  const baseTime = new Date(`${next}T12:00:00Z`).getTime();
+// Erinnert wird mittags - und zwar mittags dort, wo der Haushalt lebt. Vorher
+// stand hier 12:00 UTC, was in Auckland der Abend und in Los Angeles der frühe
+// Morgen ist; "mittags" ist eine Wanduhrzeit und trägt keine eigene Zone (#829).
+function birthdayReminderAt(birthDate, offsetMin = 0, today = todayKey(null), tz = householdTimeZone(null)) {
+  const next = nextBirthdayDate(birthDate, today);
+  const baseTime = new Date(localToUTC(`${next}T12:00:00`, tz)).getTime();
   return new Date(baseTime - (offsetMin || 0) * 60000).toISOString();
 }
 
@@ -102,6 +137,14 @@ function eventDescription(name, birthDate, locale, dateFormat) {
     : translate(locale, 'birthdays.calendarEventDescriptionNoDate', { name });
 }
 
+function nameDayEventTitle(name, locale) {
+  return translate(locale, 'birthdays.nameDayCalendarEventTitle', { name });
+}
+
+function nameDayEventDescription(name, locale) {
+  return translate(locale, 'birthdays.nameDayCalendarEventDescription', { name });
+}
+
 /**
  * Löscht einen Geburtstags-Termin und merkt die beim Provider liegende Kopie zur
  * Löschung vor. Die Vormerkung muss davor passieren: danach fehlt der Weg zum
@@ -119,34 +162,47 @@ function deleteCalendarEvent(database, eventId) {
   database.prepare('DELETE FROM calendar_events WHERE id = ?').run(eventId);
 }
 
-function syncBirthdayCalendarEvent(database, birthday) {
+function syncBirthdayCalendarEvent(database, birthday, kind = 'birthday') {
+  const isNameDay = kind === 'name_day';
+  const eventIdField = isNameDay ? 'name_day_calendar_event_id' : 'calendar_event_id';
+  const linkedEventId = birthday[eventIdField];
+  const sourceDate = isNameDay
+    ? (birthday.name_day ? `2000-${birthday.name_day}` : null)
+    : birthday.birth_date;
+
   // "Keine Benachrichtigung" → Geburtstag soll weder im Dashboard noch im
   // Kalender als Termin erscheinen. Vorhandenes Event löschen und null zurückgeben.
-  if (birthday.reminder_offset === '') {
-    if (birthday.calendar_event_id) {
-      deleteCalendarEvent(database, birthday.calendar_event_id);
-      database.prepare('UPDATE birthdays SET calendar_event_id = NULL WHERE id = ?').run(birthday.id);
+  if (!sourceDate || birthday.reminder_offset === '') {
+    if (linkedEventId) {
+      database.prepare(`
+        DELETE FROM reminders
+        WHERE entity_type = 'event' AND entity_id = ? AND created_by = ?
+      `).run(linkedEventId, birthday.created_by);
+      deleteCalendarEvent(database, linkedEventId);
+      database.prepare(`UPDATE birthdays SET ${eventIdField} = NULL WHERE id = ?`).run(birthday.id);
     }
     return null;
   }
 
   const { locale, dateFormat } = resolveHouseholdFormats(database);
   const payload = {
-    title: eventTitle(birthday.name, locale),
-    description: eventDescription(birthday.name, birthday.birth_date, locale, dateFormat),
-    start_datetime: birthday.birth_date,
+    title: isNameDay ? nameDayEventTitle(birthday.name, locale) : eventTitle(birthday.name, locale),
+    description: isNameDay
+      ? nameDayEventDescription(birthday.name, locale)
+      : eventDescription(birthday.name, birthday.birth_date, locale, dateFormat),
+    start_datetime: sourceDate,
     end_datetime: null,
     all_day: 1,
     location: null,
     color: BIRTHDAY_COLOR,
-    icon: 'cake',
+    icon: isNameDay ? 'balloon' : 'cake',
     assigned_to: null,
     recurrence_rule: BIRTHDAY_RRULE,
     created_by: birthday.created_by,
   };
 
-  if (birthday.calendar_event_id) {
-    const existing = database.prepare('SELECT * FROM calendar_events WHERE id = ?').get(birthday.calendar_event_id);
+  if (linkedEventId) {
+    const existing = database.prepare('SELECT * FROM calendar_events WHERE id = ?').get(linkedEventId);
     if (existing) {
       // `external_source` wird bewusst NICHT auf 'local' zurückgesetzt. Das tat
       // diese Anweisung seit dem ersten Geburtstags-Commit, lange bevor es einen
@@ -192,7 +248,7 @@ function syncBirthdayCalendarEvent(database, birthday) {
           payload.description,
           payload.start_datetime,
           payload.start_datetime,
-          birthday.calendar_event_id,
+          linkedEventId,
         );
 
         // Marker inline statt über markEventOutbound: das schreibt über db.get()
@@ -204,7 +260,7 @@ function syncBirthdayCalendarEvent(database, birthday) {
         if (authoredChanged) {
           database.prepare(
             'UPDATE calendar_events SET outbound_dirty = 1, outbound_attempts = 0 WHERE id = ?'
-          ).run(birthday.calendar_event_id);
+          ).run(linkedEventId);
         }
       } else {
         database.prepare(`
@@ -224,10 +280,10 @@ function syncBirthdayCalendarEvent(database, birthday) {
           payload.assigned_to,
           payload.recurrence_rule,
           payload.created_by,
-          birthday.calendar_event_id,
+          linkedEventId,
         );
       }
-      return birthday.calendar_event_id;
+      return linkedEventId;
     }
   }
 
@@ -250,60 +306,77 @@ function syncBirthdayCalendarEvent(database, birthday) {
     payload.recurrence_rule,
   );
 
-  database.prepare('UPDATE birthdays SET calendar_event_id = ? WHERE id = ?')
+  database.prepare(`UPDATE birthdays SET ${eventIdField} = ? WHERE id = ?`)
     .run(result.lastInsertRowid, birthday.id);
   return result.lastInsertRowid;
 }
 
-function syncBirthdayReminder(database, birthday, from = new Date()) {
-  if (!birthday.calendar_event_id) return null;
+function syncBirthdayReminder(database, birthday, from = new Date(), kind = 'birthday') {
+  const isNameDay = kind === 'name_day';
+  const eventId = isNameDay ? birthday.name_day_calendar_event_id : birthday.calendar_event_id;
+  const sourceDate = isNameDay ? `2000-${birthday.name_day}` : birthday.birth_date;
+  if (!eventId || (isNameDay && !birthday.name_day)) return null;
+  const today = todayKey(database, from);
+  const tz    = householdTimeZone(database);
 
   if (birthday.reminder_offset === '') {
     database.prepare(`
       DELETE FROM reminders
       WHERE entity_type = 'event' AND entity_id = ? AND created_by = ?
-    `).run(birthday.calendar_event_id, birthday.created_by);
+    `).run(eventId, birthday.created_by);
     return null;
   }
 
   const offsetMin = getOffsetMinutes(birthday);
-  const desired = birthdayReminderAt(birthday.birth_date, offsetMin, from);
+  const desired = birthdayReminderAt(sourceDate, offsetMin, today, tz);
   const existing = database.prepare(`
     SELECT * FROM reminders
     WHERE entity_type = 'event' AND entity_id = ? AND created_by = ?
     ORDER BY created_at DESC
-  `).all(birthday.calendar_event_id, birthday.created_by);
+  `).all(eventId, birthday.created_by);
 
-  const active = existing.find((row) => row.dismissed === 0);
-  if (active && active.remind_at === desired) return active.id;
+  // EINE ZEILE JE TERMIN, verworfen oder nicht. Hier stand
+  // `existing.find((row) => row.dismissed === 0)`: nach dem Verwerfen fand die
+  // Suche nichts, loeschte alles und legte dieselbe Erinnerung unverworfen neu
+  // an. `GET /reminders/pending` gleicht bei jedem Poll ab, also stand sie eine
+  // Minute spaeter wieder da, mit leerem `pushed_at` auch fuer den Push-Scheduler.
+  // Ersetzt wird nur, wenn sich der Termin selbst aendert: anderer Vorlauf,
+  // anderes Datum, oder der Geburtstag ist vorbei und das naechste Jahr dran.
+  const current = existing.find((row) => row.remind_at === desired && row.dismissed === 0)
+    ?? existing.find((row) => row.remind_at === desired);
+  if (current) return current.id;
 
   database.prepare(`
     DELETE FROM reminders
     WHERE entity_type = 'event' AND entity_id = ? AND created_by = ?
-  `).run(birthday.calendar_event_id, birthday.created_by);
+  `).run(eventId, birthday.created_by);
 
   const result = database.prepare(`
     INSERT INTO reminders (entity_type, entity_id, remind_at, created_by)
     VALUES ('event', ?, ?, ?)
-  `).run(birthday.calendar_event_id, desired, birthday.created_by);
+  `).run(eventId, desired, birthday.created_by);
 
   return result.lastInsertRowid;
 }
 
 function syncBirthdayArtifacts(database, birthday, from = new Date()) {
   const calendarEventId = syncBirthdayCalendarEvent(database, birthday);
-  const refreshed = { ...birthday, calendar_event_id: calendarEventId };
+  let refreshed = { ...birthday, calendar_event_id: calendarEventId };
   syncBirthdayReminder(database, refreshed, from);
+  const nameDayCalendarEventId = syncBirthdayCalendarEvent(database, refreshed, 'name_day');
+  refreshed = { ...refreshed, name_day_calendar_event_id: nameDayCalendarEventId };
+  syncBirthdayReminder(database, refreshed, from, 'name_day');
   return refreshed;
 }
 
 function deleteBirthdayArtifacts(database, birthday) {
-  if (birthday.calendar_event_id) {
+  for (const eventId of [birthday.calendar_event_id, birthday.name_day_calendar_event_id]) {
+    if (!eventId) continue;
     database.prepare(`
       DELETE FROM reminders
       WHERE entity_type = 'event' AND entity_id = ? AND created_by = ?
-    `).run(birthday.calendar_event_id, birthday.created_by);
-    deleteCalendarEvent(database, birthday.calendar_event_id);
+    `).run(eventId, birthday.created_by);
+    deleteCalendarEvent(database, eventId);
   }
 }
 
@@ -333,10 +406,15 @@ function deleteBirthdayArtifacts(database, birthday) {
 function retitleBirthdayEvents(database) {
   const { locale, dateFormat } = resolveHouseholdFormats(database);
   const rows = database.prepare(`
-    SELECT b.name, b.birth_date,
+    SELECT b.name, b.birth_date, 'birthday' AS event_kind,
            e.id, e.title, e.description, e.external_source, e.external_calendar_id
     FROM birthdays b
     JOIN calendar_events e ON e.id = b.calendar_event_id
+    UNION ALL
+    SELECT b.name, NULL AS birth_date, 'name_day' AS event_kind,
+           e.id, e.title, e.description, e.external_source, e.external_calendar_id
+    FROM birthdays b
+    JOIN calendar_events e ON e.id = b.name_day_calendar_event_id
   `).all();
 
   const update = database.prepare(
@@ -350,8 +428,12 @@ function retitleBirthdayEvents(database) {
 
   let changed = 0;
   for (const row of rows) {
-    const title = eventTitle(row.name, locale);
-    const description = eventDescription(row.name, row.birth_date, locale, dateFormat);
+    const title = row.event_kind === 'name_day'
+      ? nameDayEventTitle(row.name, locale)
+      : eventTitle(row.name, locale);
+    const description = row.event_kind === 'name_day'
+      ? nameDayEventDescription(row.name, locale)
+      : eventDescription(row.name, row.birth_date, locale, dateFormat);
     if (title === row.title && description === (row.description ?? null)) continue;
 
     update.run(title, description, row.id);
@@ -364,17 +446,78 @@ function retitleBirthdayEvents(database) {
   return changed;
 }
 
-function hydrateBirthday(row, from = new Date()) {
-  const next_birthday = nextBirthdayDate(row.birth_date, from);
+/**
+ * `database` ist hier NICHT Beiwerk: `next_birthday` und `days_until` sind
+ * Kalendertage, und welcher Tag heute ist, weiss nur die Haushaltszone - die
+ * steht in sync_config (#829). Ohne Verbindung bliebe es beim Rueckfall auf die
+ * Umgebung, und die Uebersicht zaehlte westlich von UTC abends einen Tag zu wenig.
+ */
+function hydrateBirthday(database, row, from = new Date()) {
+  const today = todayKey(database, from);
+  const next_birthday = nextBirthdayDate(row.birth_date, today);
   return {
     ...row,
     next_birthday,
-    next_age: nextBirthdayAge(row.birth_date, from),
-    days_until: daysUntilBirthday(row.birth_date, from),
+    next_age: nextBirthdayAge(row.birth_date, today),
+    days_until: daysUntilBirthday(row.birth_date, today),
+    next_name_day: row.name_day ? nextNameDayDate(row.name_day, today) : null,
+    name_day_days_until: row.name_day ? daysUntilNameDay(row.name_day, today) : null,
   };
 }
 
+function hydrateBirthdayOccurrences(database, row, from = new Date()) {
+  const birthday = hydrateBirthday(database, row, from);
+  const occurrences = [{
+    ...birthday,
+    kind: 'birthday',
+    next_date: birthday.next_birthday,
+  }];
+  if (birthday.name_day && birthday.next_name_day) {
+    occurrences.push({
+      ...birthday,
+      kind: 'name_day',
+      next_date: birthday.next_name_day,
+      days_until: birthday.name_day_days_until,
+      next_age: null,
+    });
+  }
+  return occurrences;
+}
+
+/**
+ * Die AUSSTEHENDEN Erinnerungen an die Geburtstags-Termine dieses Nutzers
+ * abraeumen (#1279). Nur ausstehende: eine zugestellte oder weggewischte Zeile
+ * bleibt stehen, damit der naechste Lauf nach dem Wiedereinschalten sie als
+ * "schon erledigt" wiederfindet (syncBirthdayReminder sucht nach demselben
+ * remind_at) statt dieselbe Meldung ein zweites Mal anzulegen.
+ */
+function clearPendingBirthdayReminders(database, userId) {
+  database.prepare(`
+    DELETE FROM reminders
+    WHERE entity_type = 'event' AND created_by = ? AND dismissed = 0 AND pushed_at IS NULL
+      AND entity_id IN (
+        SELECT calendar_event_id FROM birthdays
+        WHERE created_by = ? AND calendar_event_id IS NOT NULL
+        UNION
+        SELECT name_day_calendar_event_id FROM birthdays
+        WHERE created_by = ? AND name_day_calendar_event_id IS NOT NULL
+      )
+  `).run(userId, userId, userId);
+}
+
 function syncAllBirthdayReminders(database, userId, from = new Date()) {
+  // HAUSHALTSWEIT ABGESCHALTET HEISST: DIESES MODUL GIBT ES HIER NICHT (#1279).
+  // Gleiche Bauart wie Vorrat, Schichtplan und Muell: der Lauf ueberspringt und
+  // raeumt seine ausstehenden Zeilen ab, der erste Lauf nach dem
+  // Wiedereinschalten legt sie neu an. Geburtstags-Erinnerungen laufen als
+  // `event`, die Karte in reminder-origins.js saehe darin den Kalender - der
+  // Schalter `birthdays` erreicht sie nur hier und in der Ausnahme dort.
+  // Die Kalendertermine selbst bleiben unangetastet: jaehrlich wiederkehrend,
+  // zieht an ihnen nichts nach, solange niemand den Geburtstag bearbeitet.
+  if (householdDisabledModules(database).has('birthdays')) {
+    clearPendingBirthdayReminders(database, userId);
+    return;
+  }
   const birthdays = database.prepare(`
     SELECT * FROM birthdays WHERE created_by = ? ORDER BY birth_date ASC
   `).all(userId);
@@ -471,14 +614,17 @@ export {
   BIRTHDAY_RRULE,
   birthdayReminderAt,
   daysUntilBirthday,
+  daysUntilNameDay,
   deleteBirthdayArtifacts,
   eventDescription,
   eventTitle,
   hydrateBirthday,
+  hydrateBirthdayOccurrences,
   importBirthdaysFromContacts,
   listBirthdayImportCandidates,
   nextBirthdayAge,
   nextBirthdayDate,
+  nextNameDayDate,
   retitleBirthdayEvents,
   syncAllBirthdayReminders,
   syncBirthdayArtifacts,

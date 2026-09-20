@@ -1,4 +1,5 @@
 import { t } from '/i18n.js';
+import { moduleAccentVar } from '/utils/module-accent.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
 import { createRetryState } from './components.js';
 import { clearLeafEdits, confirmLeafExit, watchLeafForms } from './dirty-guard.js';
@@ -20,6 +21,33 @@ function createIcon(name, className) {
   icon.dataset.lucide = name;
   icon.setAttribute('aria-hidden', 'true');
   return icon;
+}
+
+/**
+ * Das Zeichen eines Blattes in seiner Marke.
+ *
+ * WER EIN MODUL NENNT, TRAEGT SEINEN TON - die anderen bleiben neutral. Das ist
+ * die Vollton-Regel (DESIGN.md, Colors) auf einer Flaeche, die vorher gar keine
+ * Farbe hatte: neunundzwanzig Blaetter, neunundzwanzig graue Zeichen, obwohl
+ * elf davon von einem Modul handeln, dessen Ton drei Klicks weiter in der
+ * Seitenleiste als Legende steht. Die Gegenrichtung ist genauso Teil der Regel
+ * und der Grund, warum hier nicht alles bunt wird: „Konto", „Darstellung" oder
+ * „Backup" nennen kein Modul, also nennen sie auch keine Farbe.
+ *
+ * Die Zuordnung steht im `module`-Feld der Registry, nicht hier - sonst waere
+ * es die zwoelfte Liste, die mit der Modulliste driften kann.
+ *
+ * @param {object} entry     Blatt aus SETTINGS_LEAVES
+ * @param {string} className Klasse der Marke in ihrem Umfeld (Geometrie)
+ * @returns {HTMLElement}
+ */
+function createLeafMark(entry, className) {
+  const mark = document.createElement('span');
+  mark.className = entry.module ? `${className} vivid-mark` : className;
+  if (entry.module) mark.style.setProperty('--seal-accent', moduleAccentVar(entry.module));
+  mark.setAttribute('aria-hidden', 'true');
+  mark.appendChild(createIcon(entry.icon, `${className}-glyph`));
+  return mark;
 }
 
 function hydrateIcons(container) {
@@ -113,7 +141,7 @@ function createNavigationLink(entry, activeLeaf) {
   const link = createLink(entry.path, 'settings-shell__navigation-link');
   link.dataset.leafId = entry.id;
   link.append(
-    createIcon(entry.icon, 'settings-shell__navigation-link-icon'),
+    createLeafMark(entry, 'settings-shell__navigation-link-icon'),
     document.createTextNode(t(entry.labelKey)),
   );
   if (entry.id === activeLeaf?.id) {
@@ -193,7 +221,7 @@ function createNavigationSearch(navigation, domains, user, activeLeaf) {
       domainHint.textContent = domainLabel;
       text.append(label, domainHint);
 
-      link.append(createIcon(entry.icon, 'settings-shell__navigation-link-icon'), text);
+      link.append(createLeafMark(entry, 'settings-shell__navigation-link-icon'), text);
       item.appendChild(link);
       return item;
     }));
@@ -313,9 +341,13 @@ function updateNavigationActiveState(navigation, activeLeaf) {
   }
 }
 
-function createOverviewLink({ href, icon, title, description }) {
+function createOverviewLink({ href, icon, title, description, entry }) {
   const link = createLink(href, 'settings-overview-link');
-  link.appendChild(createIcon(icon, 'settings-overview-link__icon'));
+  // Eine Domaenen-Zeile hat kein Blatt und damit kein Modul: sie bekommt ihr
+  // Zeichen ohne Marke, wie bisher.
+  link.appendChild(entry
+    ? createLeafMark(entry, 'settings-overview-link__icon')
+    : createIcon(icon, 'settings-overview-link__icon'));
 
   const copy = document.createElement('span');
   copy.className = 'settings-overview-link__copy';
@@ -360,7 +392,7 @@ function createOverviewHeader(title, description = null) {
 
 function createDesktopLeafLink(entry) {
   const link = createLink(entry.path, 'settings-desktop-overview__leaf');
-  link.appendChild(createIcon(entry.icon, 'settings-desktop-overview__leaf-icon'));
+  link.appendChild(createLeafMark(entry, 'settings-desktop-overview__leaf-icon'));
 
   const copy = document.createElement('span');
   copy.className = 'settings-desktop-overview__leaf-copy';
@@ -454,6 +486,7 @@ function renderDomainOverview(content, domain, user) {
       icon: entry.icon,
       title: t(entry.labelKey),
       description: t(entry.descriptionKey),
+      entry,
     }));
   }
 

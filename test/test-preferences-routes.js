@@ -14,6 +14,14 @@
 
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'test-secret';
 process.env.DB_PATH = ':memory:';
+// Die Zone gehoert festgenagelt wie DB_PATH darueber. Ohne Vorgabe faellt
+// `serverTimeZone()` auf die Zone des Rechners zurueck, und dann prueft jede
+// Maschine etwas anderes: die Probe zu `timezone_effective` weiter unten stand
+// fest auf 'Pacific/Auckland' und war auf einer Maschine in Auckland
+// unerfuellbar ("Expected actual to be strictly unequal to: 'Pacific/Auckland'").
+// Genauso halten es test-household-timezone.js, test-display-timezone.js,
+// test-countdown.js und test-tasks-recurrence.js.
+process.env.TZ = 'UTC';
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -107,6 +115,52 @@ test('PUT visible_meal_types: gültige Teilmenge persistiert + filtert Unbekannt
 });
 
 // --------------------------------------------------------
+// meal_type_names (#1058) - Haushaltsnamen ueber stabilen Slot-Schluesseln
+// --------------------------------------------------------
+test('PUT meal_type_names: Nicht-Objekt -> 400', async () => {
+  assert.equal((await put({ meal_type_names: 'Zmittag' })).status, 400);
+  assert.equal((await put({ meal_type_names: ['Zmittag'] })).status, 400);
+});
+test('PUT meal_type_names: Nicht-String als Wert -> 400', async () => {
+  assert.equal((await put({ meal_type_names: { lunch: 42 } })).status, 400);
+});
+test('PUT meal_type_names: zu langer Name -> 400', async () => {
+  assert.equal((await put({ meal_type_names: { lunch: 'x'.repeat(41) } })).status, 400);
+  assert.equal((await put({ meal_type_names: { lunch: 'x'.repeat(40) } })).status, 200);
+});
+test('PUT meal_type_names: Name wird gespeichert und wieder gelesen', async () => {
+  // Ein Komma im Namen ist der Grund fuer JSON statt der kommaseparierten Form
+  // von visible_meal_types nebenan: ein split(',') machte hier zwei Namen.
+  const { status, body } = await put({ meal_type_names: { lunch: '  Zmittag  ', snack: 'Znueni, spaet' } });
+  assert.equal(status, 200);
+  assert.deepEqual(body.data.meal_type_names, { lunch: 'Zmittag', snack: 'Znueni, spaet' });
+  assert.deepEqual((await get()).body.data.meal_type_names, { lunch: 'Zmittag', snack: 'Znueni, spaet' });
+});
+test('PUT meal_type_names: unbekannter Slot faellt weg, ohne den Request zu kippen', async () => {
+  const { status, body } = await put({ meal_type_names: { lunch: 'Zmittag', brunch: 'Elf Uhr' } });
+  assert.equal(status, 200);
+  assert.deepEqual(body.data.meal_type_names, { lunch: 'Zmittag' });
+});
+test('PUT meal_type_names: leerer Name entfernt ihn - das eingebaute Wort gilt wieder', async () => {
+  await put({ meal_type_names: { lunch: 'Zmittag', snack: 'Znueni' } });
+  const { body } = await put({ meal_type_names: { lunch: '', snack: 'Znueni' } });
+  assert.deepEqual(body.data.meal_type_names, { snack: 'Znueni' });
+  // Und der Weg ganz zurueck: null loescht die Zeile, GET faellt auf {} zurueck.
+  await put({ meal_type_names: null });
+  assert.deepEqual((await get()).body.data.meal_type_names, {});
+});
+test('GET meal_type_names: eine kaputte Zeile liefert {}, keinen 500er', async () => {
+  // Der Lesepfad darf an handgeschriebenem Muell in sync_config nicht sterben -
+  // sonst nimmt eine unlesbare Zeile die ganze Praeferenz-Antwort mit.
+  db.prepare("INSERT INTO sync_config (key, value) VALUES ('meal_type_names', '{kaputt')"
+    + " ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();
+  const { status, body } = await get();
+  assert.equal(status, 200);
+  assert.deepEqual(body.data.meal_type_names, {});
+  await put({ meal_type_names: null });
+});
+
+// --------------------------------------------------------
 // currency / date_format / time_format / region
 // --------------------------------------------------------
 test('PUT currency: ungültig -> 400, gültig -> persist', async () => {
@@ -126,6 +180,60 @@ test('PUT region: ungültig -> 400, gültig -> persist, null -> leer', async () 
   assert.equal((await put({ region: 'x' })).status, 400);
   assert.equal((await put({ region: 'de-DE' })).body.data.region, 'de-DE');
   assert.equal((await put({ region: null })).body.data.region, null);
+});
+test('PUT timezone: Mitglied -> 403, ungültig -> 400, gültig -> persist, null -> Rückfall', async () => {
+  // Admin-Gate wie bei Region und Datensprache: an der Zone haengen der
+  // Kalendertag der Server-Jobs, die Zone im abonnierten ICS-Feed und die
+  // Uhrzeit, mit der Termine zu Google und Outlook gehen (#829).
+  assert.equal((await put({ timezone: 'Asia/Tokyo' }, { role: 'member' })).status, 403);
+  assert.equal((await put({ timezone: 'Mars/Olympus_Mons' })).status, 400);
+  assert.equal((await put({ timezone: 'Asia/Tokyo' })).body.data.timezone, 'Asia/Tokyo');
+  // Alias statt kanonischem Namen: die Route prueft gegen ICU, nicht gegen
+  // `Intl.supportedValuesOf` - das fuehrt nur die kanonischen Namen.
+  assert.equal((await put({ timezone: 'Europe/Kiev' })).body.data.timezone, 'Europe/Kiev');
+  // null loescht die Einstellung; `timezone_effective` bleibt trotzdem gefuellt,
+  // sonst haette die Oberflaeche fuer "Automatisch" nichts zu beschriften.
+  const cleared = (await put({ timezone: null })).body.data;
+  assert.equal(cleared.timezone, null);
+  assert.ok(cleared.timezone_effective, 'timezone_effective ist nie leer');
+});
+
+/* Der geltende Wert wird POSITIV geprueft, nicht per Verneinung.
+ *
+ * Hier stand `assert.notEqual(fallback.timezone_effective, 'Pacific/Auckland')`
+ * - dieselbe Zone, die zwei Zeilen darueber gesetzt wurde. Zwei Schwaechen in
+ * einer Zeile: auf einer Maschine in Auckland ist der Rueckfall genau dieser
+ * Wert, die Behauptung dort also unerfuellbar (das `process.env.TZ` am
+ * Dateikopf raeumt das aus); und eine Verneinung liesse eine beliebige DRITTE
+ * Zone durch.
+ *
+ * Was `timezone_effective` ohne Einstellung sein soll, steht in
+ * `householdTimeZone()`: der Rueckfall auf `serverTimeZone()`, und der ist hier
+ * auf 'UTC' genagelt.
+ *
+ * DER SOLLWERT IST DESHALB EIN LITERAL UND NICHT `serverTimeZone()`. Stuende
+ * dort der Aufruf, bildete dieselbe Funktion beide Seiten der Zusicherung, und
+ * ein falscher Rueckfallwert verschoebe beide gleichzeitig. Nachgemessen mit
+ * `serverTimeZone()` auf einen festen Fremdwert sabotiert:
+ *
+ *   Sollwert = serverTimeZone()  -> gruen unter UTC, Europe/Berlin, Auckland
+ *   Sollwert = 'UTC' (so wie es jetzt dasteht) -> rot unter allen dreien
+ *
+ * (Eine Sabotage, die nur das Lesen von `TZ` ausbaut, taugt hier NICHT als
+ * Gegenprobe: mit gepinntem `TZ` liefern beide Zweige von `serverTimeZone()`
+ * denselben Wert, sie ist also wirkungslos. Auch gemessen.)
+ */
+test('GET timezone: gewählter Wert und geltender Wert sind zwei Felder', async () => {
+  await put({ timezone: 'Pacific/Auckland' });
+  const body = (await get()).body.data;
+  assert.equal(body.timezone, 'Pacific/Auckland');
+  assert.equal(body.timezone_effective, 'Pacific/Auckland');
+
+  await put({ timezone: null });
+  const fallback = (await get()).body.data;
+  assert.equal(fallback.timezone, null);
+  assert.equal(fallback.timezone_effective, 'UTC',
+    'ohne Einstellung nennt timezone_effective den Serverrueckfall (process.env.TZ am Dateikopf)');
 });
 
 // --------------------------------------------------------
@@ -164,6 +272,46 @@ test('PUT dashboard_widgets: ungültige Struktur, doppelte IDs oder zu viele Ein
   }));
   assert.equal((await put({ dashboard_widgets: tooMany })).status, 400);
 });
+// --------------------------------------------------------
+// dashboard_today_glance (#740)
+// --------------------------------------------------------
+test('dashboard_today_glance ist standardmäßig an - der Bestand kennt den Schlüssel nicht', async () => {
+  const res = await get();
+  assert.equal(res.body.data.dashboard_today_glance, true);
+});
+test('PUT dashboard_today_glance: alles ausser Boolean und null -> 400', async () => {
+  // '0'/'1' waeren die DB-Schreibweise, nicht die der API - wer sie schickt,
+  // meint etwas anderes als er bekaeme.
+  assert.equal((await put({ dashboard_today_glance: '0' })).status, 400);
+  assert.equal((await put({ dashboard_today_glance: 0 })).status, 400);
+});
+test('null ist kein ungueltiger Boolean, sondern der Rueckweg zur Vorgabe (#827)', async () => {
+  // Dieselbe Schreibweise wie bei `timezone` und `language` nebenan: null heisst
+  // nicht "aus", sondern "ich habe hier nichts Eigenes". Bis v2.34.0 war es ein
+  // 400 - es gab schlicht keinen Weg zurueck.
+  assert.equal((await put({ dashboard_today_glance: false })).status, 200);
+  assert.equal((await get()).body.data.dashboard_follows_default, false);
+  assert.equal((await put({ dashboard_today_glance: null })).status, 200);
+  const back = await get();
+  assert.equal(back.body.data.dashboard_today_glance, true, 'die Vorgabe greift nicht wieder');
+  assert.equal(back.body.data.dashboard_follows_default, true);
+});
+test('dashboard_today_glance haelt beide Richtungen ueber den GET', async () => {
+  assert.equal((await put({ dashboard_today_glance: false })).status, 200);
+  assert.equal((await get()).body.data.dashboard_today_glance, false);
+  assert.equal((await put({ dashboard_today_glance: true })).status, 200);
+  assert.equal((await get()).body.data.dashboard_today_glance, true);
+});
+test('dashboard_today_glance braucht keine Adminrechte - wie die Widgets daneben', async () => {
+  // Die Uebersicht ist eine gemeinsame Seite; wer ihre Kacheln umstellen darf,
+  // darf auch ihr Kopfband abstellen. Waere das eine Admin-Entscheidung, muesste
+  // es dashboard_widgets auch sein.
+  const res = await put({ dashboard_today_glance: false }, { role: 'member', userId: 2 });
+  assert.equal(res.status, 200);
+  assert.equal((await get({ role: 'member', userId: 2 })).body.data.dashboard_today_glance, false);
+  await put({ dashboard_today_glance: true });
+});
+
 test('PUT dashboard_widgets: Teilmenge bleibt beim GET eine Teilmenge', async () => {
   const requested = [{ id: 'notes', visible: false, order: 0, size: '2x1' }];
   const saved = await put({ dashboard_widgets: requested });
@@ -251,11 +399,111 @@ test('PUT disabled_modules: Mitglied -> 403, Admin validiert + persist', async (
   const ok = await put({ disabled_modules: ['tasks', 'budget', 'tasks', 'nonsense'] }, { role: 'admin' });
   assert.deepEqual(ok.body.data.disabled_modules.sort(), ['budget', 'tasks']);
 });
+test('PUT disabled_modules changes Health and fasting cleanup atomically', async () => {
+  cfgSet('disabled_modules', '[]');
+  const userId = db.prepare(`INSERT INTO users
+    (username, display_name, password_hash, role, family_role)
+    VALUES ('preferences-fasting', 'Preferences fasting', 'x', 'member', 'parent')`).run().lastInsertRowid;
+  db.prepare(`INSERT INTO health_fasting_settings
+    (user_id, default_goal_minutes, remind_goal, remind_next_start)
+    VALUES (?, 960, 1, 0)`).run(userId);
+  const fastId = db.prepare(`INSERT INTO health_fasts
+    (user_id, start_at, end_at, start_tzid, goal_minutes)
+    VALUES (?, '2026-09-18T06:00:00.000Z', NULL, 'UTC', 960)`).run(userId).lastInsertRowid;
+  db.prepare(`INSERT INTO reminders (entity_type, entity_id, remind_at, created_by)
+    VALUES ('fasting_goal', ?, '2026-09-18T22:00:00.000Z', ?)`).run(fastId, userId);
+  db.prepare(`INSERT INTO reminders (entity_type, entity_id, remind_at, created_by)
+    VALUES ('fasting_next_start', ?, '2026-09-19T06:00:00.000Z', ?)`).run(fastId, userId);
+  db.exec(`CREATE TRIGGER test_fail_preferences_fasting_delete
+    BEFORE DELETE ON reminders
+    WHEN OLD.entity_type IN ('fasting_goal', 'fasting_next_start')
+    BEGIN
+      SELECT RAISE(ABORT, 'forced preferences fasting cleanup failure');
+    END`);
+  try {
+    const unrelated = await put({ disabled_modules: ['tasks'] }, { role: 'admin' });
+    assert.equal(unrelated.status, 200);
+    assert.deepEqual(JSON.parse(db.prepare("SELECT value FROM sync_config WHERE key = 'disabled_modules'").get().value), ['tasks']);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM reminders WHERE entity_type IN ('fasting_goal', 'fasting_next_start') AND created_by = ?").get(userId).count, 2);
+
+    const failed = await put({ disabled_modules: ['tasks', 'health'] }, { role: 'admin' });
+    assert.equal(failed.status, 500);
+    assert.deepEqual(JSON.parse(db.prepare("SELECT value FROM sync_config WHERE key = 'disabled_modules'").get().value), ['tasks']);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM reminders WHERE entity_type IN ('fasting_goal', 'fasting_next_start') AND created_by = ?").get(userId).count, 2);
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS test_fail_preferences_fasting_delete');
+  }
+
+  const disabled = await put({ disabled_modules: ['tasks', 'health'] }, { role: 'admin' });
+  assert.equal(disabled.status, 200);
+  assert.equal(db.prepare("SELECT count(*) AS count FROM reminders WHERE entity_type = 'fasting_goal' AND created_by = ?").get(userId).count, 0);
+  db.prepare('DELETE FROM users WHERE id = ?').run(userId);
+  cfgSet('disabled_modules', '[]');
+});
 test('PUT health_cycle_enabled: Mitglied -> 403, Admin non-boolean 400, false persist', async () => {
   assert.equal((await put({ health_cycle_enabled: false }, { role: 'member' })).status, 403);
   assert.equal((await put({ health_cycle_enabled: 'no' }, { role: 'admin' })).status, 400);
   assert.equal((await put({ health_cycle_enabled: false }, { role: 'admin' })).body.data.health_cycle_enabled, false);
 });
+// --------------------------------------------------------
+// Zyklus: haushaltweiter Schalter + persoenliches Opt-out (#760)
+// --------------------------------------------------------
+test('PUT health_cycle_enabled_user: Mitglied darf fuer sich abschalten, kein Admin-Gate (#760)', async () => {
+  // Das Gegenstueck zum Test darueber: derselbe Tab, aber die eigene Sicht -
+  // und die darf ein Mitglied ohne Adminrechte aendern.
+  assert.equal((await put({ health_cycle_enabled_user: 'no' }, { role: 'member' })).status, 400);
+  const res = await put({ health_cycle_enabled_user: false }, { role: 'member', userId: 7 });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.data.health_cycle_enabled_user, false);
+  assert.equal(res.body.data.health_cycle_effective, false);
+  cfgDelete('health_cycle_enabled:user:7');
+});
+
+test('health_cycle_effective verundet Haushalt und Person, das Opt-out weitet nie (#760)', async () => {
+  cfgDelete('health_cycle_enabled');
+  cfgDelete('health_cycle_enabled:user:7');
+
+  // Beide an (Default): der Tab erscheint.
+  let data = (await get({ role: 'member', userId: 7 })).body.data;
+  assert.deepEqual(
+    [data.health_cycle_enabled, data.health_cycle_enabled_user, data.health_cycle_effective],
+    [true, true, true],
+  );
+
+  // Nur persoenlich aus: der Haushalt bleibt an, meine Sicht nicht.
+  await put({ health_cycle_enabled_user: false }, { role: 'member', userId: 7 });
+  data = (await get({ role: 'member', userId: 7 })).body.data;
+  assert.deepEqual(
+    [data.health_cycle_enabled, data.health_cycle_enabled_user, data.health_cycle_effective],
+    [true, false, false],
+  );
+
+  // Haushalt aus, persoenlich WIEDER an: das Opt-out kann den Admin-Schalter
+  // nicht ueberstimmen - sonst holte sich jeder einen abgeschalteten Tab zurueck.
+  cfgSet('health_cycle_enabled', '0');
+  await put({ health_cycle_enabled_user: true }, { role: 'member', userId: 7 });
+  data = (await get({ role: 'member', userId: 7 })).body.data;
+  assert.deepEqual(
+    [data.health_cycle_enabled, data.health_cycle_enabled_user, data.health_cycle_effective],
+    [false, true, false],
+  );
+
+  cfgDelete('health_cycle_enabled');
+  cfgDelete('health_cycle_enabled:user:7');
+});
+
+test('das Zyklus-Opt-out gilt pro Person, nicht fuer den Haushalt (#760)', async () => {
+  cfgDelete('health_cycle_enabled');
+  await put({ health_cycle_enabled_user: false }, { role: 'member', userId: 7 });
+
+  assert.equal((await get({ role: 'member', userId: 7 })).body.data.health_cycle_effective, false);
+  assert.equal((await get({ role: 'member', userId: 8 })).body.data.health_cycle_effective, true);
+  // Und der haushaltweite Schalter bleibt davon unberuehrt.
+  assert.equal((await get({ role: 'admin' })).body.data.health_cycle_enabled, true);
+
+  cfgDelete('health_cycle_enabled:user:7');
+});
+
 test('PUT rewards_require_approval: Mitglied -> 403, Admin non-boolean 400, false persist', async () => {
   assert.equal((await put({ rewards_require_approval: false }, { role: 'member' })).status, 403);
   assert.equal((await put({ rewards_require_approval: 'no' }, { role: 'admin' })).status, 400);
@@ -378,12 +626,23 @@ test('GET /holidays/countries: gestubbte API -> 200 mit sortierter Liste', async
   }));
   const res = await raw('GET', '/holidays/countries');
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body.data.map((c) => c.isoCode), ['AT', 'DE']); // nach name sortiert
+  // Neben AT/DE aus dem gestubbten API-Ergebnis erscheinen die sechs lokal
+  // berechneten Laender aus #965 (Australia, Brazil, Canada, New Zealand,
+  // United Kingdom, United States) - alle nach Name eingesortiert.
+  assert.deepEqual(res.body.data.map((c) => c.isoCode),
+    ['AU', 'AT', 'BR', 'CA', 'DE', 'NZ', 'GB', 'US']);
   holidays.__setFetchImpl(null);
 });
-test('GET /holidays/countries: API-Fehler -> 502', async () => {
+test('GET /holidays/countries: API-Fehler -> 200 mit den lokalen Laendern (#965 Review)', async () => {
+  // Vorher wurde aus dem Fetch-Fehler ein 502 und das Frontend fiel auf eine
+  // leere Liste zurueck - ausgerechnet die sechs Laender, die gar kein Netz
+  // brauchen, waren dann nicht mehr waehlbar. Der Service degradiert jetzt auf
+  // seine lokale Liste statt zu werfen.
   holidays.__setFetchImpl(async () => { throw new Error('network down'); });
-  assert.equal((await raw('GET', '/holidays/countries')).status, 502);
+  const res = await raw('GET', '/holidays/countries');
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.data.map((c) => c.isoCode), ['AU', 'BR', 'CA', 'NZ', 'GB', 'US']);
+  assert.ok(res.body.data.every((c) => c.schoolHolidays === false));
   holidays.__setFetchImpl(null);
 });
 test('GET /holidays/subdivisions/:cc: ungültiger Code -> 400', async () => {
@@ -418,6 +677,52 @@ test('GET /holidays/groups/:cc/:sc: gestubbt -> 200', async () => {
   assert.equal(res.body.data.length, 2);
   holidays.__setFetchImpl(null);
 });
+test('PUT holiday_subdivision=null laesst die Gruppe eines Landes ohne Subdivision stehen (PR #1186)', async () => {
+  await put({ holiday_country: 'BE', holiday_subdivision: null, holiday_group: 'BE-FR' });
+  const partial = await put({ holiday_subdivision: null });
+  assert.equal(partial.status, 200);
+  assert.equal(partial.body.data.holiday_country, 'BE');
+  assert.equal(partial.body.data.holiday_group, 'BE-FR', 'ein Teil-Update ohne Gruppe loescht die Gemeinschaft nicht');
+  // Eine Gruppe, die an einer gespeicherten Region hing, faellt weiter mit ihr.
+  await put({ holiday_country: 'CH', holiday_subdivision: 'CH-BE', holiday_group: 'CH-BE-VS' });
+  const removed = await put({ holiday_subdivision: null });
+  assert.equal(removed.body.data.holiday_subdivision, null);
+  assert.equal(removed.body.data.holiday_group, null);
+});
+test('PUT holiday_country auf ein anderes Land ohne Gruppe raeumt die alte Gruppe ab (PR #1186)', async () => {
+  await put({ holiday_country: 'BE', holiday_subdivision: null, holiday_group: 'BE-FR' });
+  const moved = await put({ holiday_country: 'DE', holiday_subdivision: null });
+  assert.equal(moved.body.data.holiday_country, 'DE');
+  assert.equal(moved.body.data.holiday_group, null, 'BE-FR gehoert nicht zu DE');
+  // Dasselbe Land erneut: die Gruppe bleibt.
+  await put({ holiday_country: 'BE', holiday_group: 'BE-FR' });
+  const same = await put({ holiday_country: 'BE' });
+  assert.equal(same.body.data.holiday_group, 'BE-FR');
+  // Landwechsel MIT neuer Gruppe: die neue gilt.
+  const withGroup = await put({ holiday_country: 'CH', holiday_subdivision: 'CH-BE', holiday_group: 'CH-BE-VS' });
+  assert.equal(withGroup.body.data.holiday_group, 'CH-BE-VS');
+});
+test('GET /holidays/groups/:cc: Land ohne Subdivisionen -> Gruppen am Land (D#1182)', async () => {
+  holidays.__setFetchImpl(async (url) => ({
+    ok: true,
+    json: async () => (new URL(String(url)).pathname === '/Subdivisions'
+      ? []
+      : [{ code: 'BE-FR', shortName: 'FR' }, { code: 'BE-NL', shortName: 'NL' }]),
+  }));
+  const res = await raw('GET', '/holidays/groups/BE');
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.data.map((g) => g.code), ['BE-FR', 'BE-NL']);
+  holidays.__setFetchImpl(null);
+});
+test('GET /holidays/groups/:cc: ungültiger Ländercode -> 400', async () => {
+  assert.equal((await raw('GET', '/holidays/groups/be')).status, 400);
+});
+test('PUT holiday: Gruppe am Land ohne Subdivision bleibt gespeichert (D#1182)', async () => {
+  const { status, body } = await put({ holiday_country: 'BE', holiday_subdivision: null, holiday_group: 'BE-FR' });
+  assert.equal(status, 200);
+  assert.equal(body.data.holiday_subdivision, null);
+  assert.equal(body.data.holiday_group, 'BE-FR');
+});
 test('POST /holidays/sync: Mitglied -> 403', async () => {
   assert.equal((await raw('POST', '/holidays/sync', { role: 'member' })).status, 403);
 });
@@ -432,10 +737,18 @@ test('POST /holidays/sync: Admin ohne konfiguriertes Land -> 200 (netz-freier Ea
 // Defensive Parse-Fallbacks der Lese-Helfer (korrupte sync_config-Werte)
 // --------------------------------------------------------
 test('GET / verkraftet korrupte dashboard_widgets (Fallback auf Default)', async () => {
+  // BEIDE Ablagen, seit die Anordnung persönlich ist (#585): der Haushaltswert
+  // ist nur noch Fallback, und ein persönlicher Wert verdeckt ihn. Wer hier nur
+  // den Haushaltswert korrumpiert, prüft nach dem ersten PUT dieser Datei gar
+  // nichts mehr - die Antwort käme dann aus `dashboard_widgets:user:1`.
+  cfgDelete('dashboard_widgets:user:1');
   cfgSet('dashboard_widgets', '{ kaputt');
-  const widgets = (await get()).body.data.dashboard_widgets;
-  assert.deepEqual(widgets, []); // Client erweitert leer auf seine aktuellen Defaults
+  assert.deepEqual((await get()).body.data.dashboard_widgets, []); // Client erweitert leer auf seine Defaults
   cfgDelete('dashboard_widgets');
+
+  cfgSet('dashboard_widgets:user:1', '{ auch kaputt');
+  assert.deepEqual((await get()).body.data.dashboard_widgets, []);
+  cfgDelete('dashboard_widgets:user:1');
 });
 test('GET / verkraftet korrupte per-user calendar_default_reminders', async () => {
   cfgSet('calendar_default_reminders:user:1', 'nicht-json');

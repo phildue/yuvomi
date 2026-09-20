@@ -1,6 +1,6 @@
 import { api } from '/api.js';
 import { t } from '/i18n.js';
-import { confirmModal } from '/components/modal.js';
+import { confirmModal, refocusAfterRender } from '/components/modal.js';
 import {
   createDisclosure,
   createInlineError,
@@ -113,10 +113,12 @@ function renderAccount(listEl, account, reload) {
   delBtn.className = 'btn btn--danger btn--sm';
   delBtn.textContent = t('settings.dmsRemove');
   delBtn.addEventListener('click', async () => {
-    if (!await confirmModal(t('settings.dmsRemoveConfirm'), { danger: true })) return;
+    if (!await confirmModal(t('settings.dmsRemoveConfirm'),
+      { danger: true, detail: t('settings.dmsRemoveConfirmDetail') })) return;
     try {
       await api.delete(`/documents/dms/accounts/${account.id}`);
       await reload();
+      refocusAfterRender();
     } catch (err) {
       showToast(err.message ?? t('common.errorGeneric'), 'danger');
     }

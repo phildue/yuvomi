@@ -17,6 +17,7 @@ import express from 'express';
 
 const dbmod = await import('../server/db.js');
 const { default: housekeepingRouter } = await import('../server/routes/housekeeping.js');
+const { default: tasksRouter } = await import('../server/routes/tasks.js');
 const { computeHourlyAmount } = await import('../server/services/housekeeping-billing.js');
 const db = dbmod.get();
 
@@ -30,10 +31,16 @@ app.use((req, _res, next) => {
   req.authUserId = actor.id;
   req.authRole = actor.role;
   req.session = { userId: actor.id, role: actor.role };
+  req.sessionModuleAccess = actor.moduleAccess ?? null;
+  req.authMethod = actor.authMethod;
+  req.authScopes = actor.authScopes ?? null;
   next();
 });
+// Die Zahlungsaufgabe ist ein zweiter Weg an den bezahlten Besuch, deshalb
+// haengt der Aufgaben-Router mit im selben Server (GHSA-4p5w-5346-8598).
+app.use('/tasks-api', tasksRouter);
 app.use('/', housekeepingRouter);
-const server = app.listen(0);
+const server = app.listen(0, '127.0.0.1');
 const baseUrl = await new Promise((r) => server.on('listening', () => r(`http://127.0.0.1:${server.address().port}`)));
 
 async function call(method, path, { as, body } = {}) {
@@ -50,6 +57,11 @@ async function call(method, path, { as, body } = {}) {
 
 const ADM = { id: ADMIN, role: 'admin' };
 const MEM = { id: MEMBER, role: 'member' };
+// Mitglied mit Housekeeping nur zum Lesen (#1135): GET kommt durch, Schreiben weist
+// die Modul-Middleware in server/index.js ab - die ist hier nicht montiert.
+const MEM_READ = { id: MEMBER, role: 'member', moduleAccess: { housekeeping: 'read' } };
+// API-Token nur mit housekeeping:read, dessen Nutzer (Admin) sonst schreiben duerfte.
+const TOKEN_READ = { id: ADMIN, role: 'admin', authMethod: 'api_token', authScopes: ['housekeeping:read'] };
 
 // --------------------------------------------------------------------------
 // Worker-Anlage: Admin-Gate + Validierung
@@ -97,7 +109,10 @@ test('check-in: öffnet Session -> 201', async () => {
   assert.ok(SESSION_ID);
 });
 
-test('check-in: zweiter Check-in am selben Tag -> 409', async () => {
+test('check-in: zweiter Check-in bei OFFENER Session -> 409', async () => {
+  // Der Name hiess bis #1138 "am selben Tag" und beschrieb damit die alte,
+  // zu weite Sperre. Gemessen hat er immer diesen Fall hier: die Session aus
+  // dem Test davor ist noch offen. Ueberlappende Sessions bleiben gesperrt.
   const r = await call('POST', '/work-sessions/check-in', { as: ADM, body: { worker_id: WORKER_ID, daily_rate: 50 } });
   assert.equal(r.status, 409);
 });
@@ -122,6 +137,46 @@ test('check-out: keine offene Session mehr -> 404', async () => {
   assert.equal(r.status, 404);
 });
 
+test('check-in: nach dem Auschecken ist am selben Tag eine zweite Session erlaubt (#1138)', async () => {
+  // Geteilte Schicht, Pause mit Wiederaufnahme, zwei getrennte Besuche: die
+  // Sperre las vorher JEDE Session des Tages (`loadTodaySession`) und lehnte
+  // deshalb auch nach einem sauberen Auschecken mit 409 ab.
+  const r = await call('POST', '/work-sessions/check-in', { as: ADM, body: { worker_id: WORKER_ID, daily_rate: 40, extras: 0 } });
+  assert.equal(r.status, 201, 'die zweite Session des Tages wird angelegt');
+  const second = r.body.data.id;
+  assert.notEqual(second, SESSION_ID, 'es ist eine eigene Session, nicht die alte');
+
+  // Beide Sessions liegen am selben lokalen Tag und tragen ihre eigenen Daten.
+  const rows = db.prepare(
+    'SELECT id, check_in, check_out, daily_rate FROM housekeeping_work_sessions WHERE worker_id = ? ORDER BY id',
+  ).all(WORKER_ID);
+  assert.equal(rows.length, 2, 'zwei Sessions am selben Tag');
+  assert.equal(rows[0].check_in.slice(0, 10), rows[1].check_in.slice(0, 10), 'derselbe Tag');
+  assert.ok(rows[0].check_out, 'die erste ist abgeschlossen');
+  assert.equal(rows[1].check_out, null, 'die zweite ist offen');
+  assert.equal(rows[0].daily_rate, 50, 'die erste behaelt ihren eigenen Satz');
+  assert.equal(rows[1].daily_rate, 40, 'die zweite ihren');
+});
+
+test('current_session traegt nur die OFFENE Session, today_session auch die geschlossene (#1133)', async () => {
+  // Solange beide Felder dieselbe Zeile lieferten, blieb ein Arbeiter nach dem
+  // Auschecken "eingecheckt" - und der Auscheck-Knopf im Frontend, der an
+  // current_session haengt, war dauerhaft tot.
+  const open = await call('GET', '/workers', { as: ADM });
+  const w = open.body.data.find((item) => item.id === WORKER_ID);
+  assert.ok(w.current_session, 'die zweite Session ist offen');
+  assert.equal(w.current_session.check_out, null);
+
+  const out = await call('POST', '/work-sessions/check-out', { as: ADM, body: { worker_id: WORKER_ID } });
+  assert.equal(out.status, 200);
+
+  const after = await call('GET', '/workers', { as: ADM });
+  const w2 = after.body.data.find((item) => item.id === WORKER_ID);
+  assert.equal(w2.current_session, null, 'ausgecheckt heisst: keine laufende Session');
+  assert.ok(w2.today_session, 'der Besuch von heute steht weiterhin');
+  assert.ok(w2.today_session.check_out, 'und zwar als abgeschlossener');
+});
+
 // --------------------------------------------------------------------------
 // Besuch bezahlen / löschen
 // --------------------------------------------------------------------------
@@ -129,6 +184,37 @@ test('POST /visits/:id/pay: markiert bezahlt', async () => {
   const r = await call('POST', `/visits/${SESSION_ID}/pay`, { as: ADM });
   assert.equal(r.status, 200);
   assert.ok(r.body.data.paid_at, 'paid_at gesetzt');
+});
+
+// Ein bezahlter Besuch ist abgerechnet (GHSA-4p5w-5346-8598): Aendern, erneut
+// Bezahlen und Loeschen verlangen ab da den Admin - dieselbe Grenze wie beim
+// Anlegen des Arbeitsverhaeltnisses. Vorher bleibt der Zettel Mitgliedssache.
+test('bezahlter Besuch: Mitglied darf nicht mehr aendern, erneut bezahlen oder loeschen -> 403', async () => {
+  const before = db.prepare('SELECT daily_rate, extras, paid_at FROM housekeeping_work_sessions WHERE id = ?').get(SESSION_ID);
+  assert.ok(before.paid_at, 'Fixture: der Besuch ist bezahlt');
+
+  const put = await call('PUT', `/visits/${SESSION_ID}`, { as: MEM, body: { date: '2026-05-10', daily_rate: 99999, extras: 50000 } });
+  assert.equal(put.status, 403, `erwartet 403, bekommen ${put.status}`);
+  const pay = await call('POST', `/visits/${SESSION_ID}/pay`, { as: MEM });
+  assert.equal(pay.status, 403);
+  const del = await call('DELETE', `/visits/${SESSION_ID}`, { as: MEM });
+  assert.equal(del.status, 403);
+
+  const after = db.prepare('SELECT daily_rate, extras, paid_at FROM housekeeping_work_sessions WHERE id = ?').get(SESSION_ID);
+  assert.deepEqual(after, before, 'die abgerechnete Zeile ist unveraendert');
+});
+
+test('unbezahlter Besuch: Mitglied darf weiter pflegen (kein Rueckschritt fuer den Alltag)', async () => {
+  // Direkt eingefuegt: der Check-in kennt nur "heute", und heute ist schon belegt.
+  const openId = db.prepare(`
+    INSERT INTO housekeeping_work_sessions (worker_id, check_in, check_out, daily_rate, extras, created_by, rate_type)
+    VALUES (?, '2026-06-01T09:00:00.000Z', '2026-06-01T12:00:00.000Z', 50, 0, ?, 'daily')
+  `).run(WORKER_ID, MEMBER).lastInsertRowid;
+
+  const put = await call('PUT', `/visits/${openId}`, { as: MEM, body: { date: '2026-06-01', daily_rate: 55, extras: 5 } });
+  assert.equal(put.status, 200, `erwartet 200, bekommen ${put.status} ${JSON.stringify(put.body)}`);
+  const del = await call('DELETE', `/visits/${openId}`, { as: MEM });
+  assert.equal(del.status, 200);
 });
 
 test('DELETE /visits/:id: entfernt Besuch (danach 404)', async () => {
@@ -356,6 +442,148 @@ test('POST /visits/:id/pay: markiert verknüpfte Aufgabe als done', async () => 
   assert.equal(task.status, 'done', 'Bezahl-Aufgabe abgeschlossen');
 });
 
+// --------------------------------------------------------------------------
+// Zahlung zuruecknehmen (#1136): nur ein Admin, spiegelbildlich zu /pay. Beide
+// Rollen im Test - sonst waere ein Total-Admin-Gate ebenso gruen wie ein
+// fehlendes. Fixture: PAY_SESSION_ID ist bezahlt (April 2025), die Aufgabe done.
+// --------------------------------------------------------------------------
+const sessionRow = (id) => db.prepare('SELECT * FROM housekeeping_work_sessions WHERE id = ?').get(id);
+const taskRow = (id) => db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+
+test('can_mark_unpaid: nur fuer den Admin und nur bei bezahltem Besuch (#1136)', async () => {
+  const unpaidId = db.prepare(`
+    INSERT INTO housekeeping_work_sessions (worker_id, check_in, check_out, daily_rate, extras, created_by, rate_type)
+    VALUES (?, '2025-04-11T09:00:00.000Z', '2025-04-11T12:00:00.000Z', 30, 0, ?, 'daily')
+  `).run(WORKER_ID, ADMIN).lastInsertRowid;
+  try {
+    const pick = (res, id) => res.body.data.visits.find((v) => v.id === id);
+
+    const adm = await call('GET', '/visits?month=2025-04', { as: ADM });
+    assert.equal(pick(adm, PAY_SESSION_ID).can_mark_unpaid, true, 'Admin, bezahlter Besuch');
+    assert.equal(pick(adm, unpaidId).can_mark_unpaid, false, 'Admin, unbezahlter Besuch: nichts zurueckzunehmen');
+
+    const mem = await call('GET', '/visits?month=2025-04', { as: MEM });
+    assert.equal(pick(mem, PAY_SESSION_ID).can_mark_unpaid, false, 'Mitglied, bezahlter Besuch');
+    assert.equal(pick(mem, unpaidId).can_mark_unpaid, false, 'Mitglied, unbezahlter Besuch');
+
+    const oneAdm = await call('GET', `/visits/${PAY_SESSION_ID}`, { as: ADM });
+    assert.equal(oneAdm.body.data.can_mark_unpaid, true, 'GET /visits/:id traegt das Feld ebenso');
+    const oneMem = await call('GET', `/visits/${PAY_SESSION_ID}`, { as: MEM });
+    assert.equal(oneMem.body.data.can_mark_unpaid, false);
+  } finally {
+    db.prepare('DELETE FROM housekeeping_work_sessions WHERE id = ?').run(unpaidId);
+  }
+});
+
+// #1135: Bearbeiten und Loeschen bietet die Seite nur an, wo der Server es
+// zugesteht. Die Felder lesen dieselbe Funktion wie die Schreibsperre; der
+// zweite Teil haelt fest, dass Feld und Route sich nicht widersprechen.
+test('can_edit/can_delete: Admin immer, Mitglied nur am unbezahlten Besuch - und die Routen sagen dasselbe (#1135)', async () => {
+  const unpaidId = db.prepare(`
+    INSERT INTO housekeeping_work_sessions (worker_id, check_in, check_out, daily_rate, extras, created_by, rate_type)
+    VALUES (?, '2025-04-12T09:00:00.000Z', '2025-04-12T12:00:00.000Z', 30, 0, ?, 'daily')
+  `).run(WORKER_ID, ADMIN).lastInsertRowid;
+  try {
+    const pick = (res, id) => res.body.data.visits.find((v) => v.id === id);
+    const caps = (v) => ({ can_edit: v.can_edit, can_delete: v.can_delete });
+    const pays = (v) => ({ can_mark_paid: v.can_mark_paid, can_mark_unpaid: v.can_mark_unpaid });
+
+    const adm = await call('GET', '/visits?month=2025-04', { as: ADM });
+    assert.deepEqual(caps(pick(adm, PAY_SESSION_ID)), { can_edit: true, can_delete: true }, 'Admin, bezahlt');
+    assert.deepEqual(caps(pick(adm, unpaidId)), { can_edit: true, can_delete: true }, 'Admin, unbezahlt');
+
+    const mem = await call('GET', '/visits?month=2025-04', { as: MEM });
+    assert.deepEqual(caps(pick(mem, PAY_SESSION_ID)), { can_edit: false, can_delete: false }, 'Mitglied, bezahlt');
+    assert.deepEqual(caps(pick(mem, unpaidId)), { can_edit: true, can_delete: true }, 'Mitglied, unbezahlt');
+
+    const oneMem = await call('GET', `/visits/${PAY_SESSION_ID}`, { as: MEM });
+    assert.deepEqual(caps(oneMem.body.data), { can_edit: false, can_delete: false }, 'GET /visits/:id traegt die Felder ebenso');
+
+    // Nur-Lese-Modulrecht: auch am unbezahlten Besuch nichts, was die Middleware abwiese.
+    const readOnly = await call('GET', '/visits?month=2025-04', { as: MEM_READ });
+    assert.deepEqual(caps(pick(readOnly, unpaidId)), { can_edit: false, can_delete: false }, 'Mitglied nur lesend, unbezahlt');
+    const readOnlyOne = await call('GET', `/visits/${unpaidId}`, { as: MEM_READ });
+    assert.deepEqual(caps(readOnlyOne.body.data), { can_edit: false, can_delete: false });
+    assert.deepEqual(pays(pick(readOnly, unpaidId)), { can_mark_paid: false, can_mark_unpaid: false }, 'nur lesend: auch kein Bezahlen');
+
+    // Bezahlen: nur am unbezahlten Besuch, fuer jeden mit Schreibrecht.
+    assert.deepEqual(pays(pick(mem, unpaidId)), { can_mark_paid: true, can_mark_unpaid: false });
+    assert.deepEqual(pays(pick(mem, PAY_SESSION_ID)), { can_mark_paid: false, can_mark_unpaid: false });
+    assert.deepEqual(pays(pick(adm, PAY_SESSION_ID)), { can_mark_paid: false, can_mark_unpaid: true });
+
+    // Ein housekeeping:read-Token: auch als Admin keine Schreib-Aktion.
+    const token = await call('GET', '/visits?month=2025-04', { as: TOKEN_READ });
+    assert.deepEqual({ ...caps(pick(token, PAY_SESSION_ID)), ...pays(pick(token, PAY_SESSION_ID)) },
+      { can_edit: false, can_delete: false, can_mark_paid: false, can_mark_unpaid: false }, 'Lese-Token, bezahlt');
+    assert.deepEqual({ ...caps(pick(token, unpaidId)), ...pays(pick(token, unpaidId)) },
+      { can_edit: false, can_delete: false, can_mark_paid: false, can_mark_unpaid: false }, 'Lese-Token, unbezahlt');
+    const oneAdm = await call('GET', `/visits/${PAY_SESSION_ID}`, { as: ADM });
+    assert.deepEqual(caps(oneAdm.body.data), { can_edit: true, can_delete: true });
+
+    // Feld false -> Route 403, Feld true -> Route laesst durch.
+    const paidBefore = sessionRow(PAY_SESSION_ID);
+    const putPaid = await call('PUT', `/visits/${PAY_SESSION_ID}`, { as: MEM, body: { date: '2025-04-10', daily_rate: 1, extras: 0 } });
+    assert.equal(putPaid.status, 403);
+    assert.equal((await call('DELETE', `/visits/${PAY_SESSION_ID}`, { as: MEM })).status, 403);
+    assert.deepEqual(sessionRow(PAY_SESSION_ID), paidBefore, 'der bezahlte Besuch ist unveraendert');
+    const putOpen = await call('PUT', `/visits/${unpaidId}`, { as: MEM, body: { date: '2025-04-12', daily_rate: 35, extras: 0 } });
+    assert.equal(putOpen.status, 200, JSON.stringify(putOpen.body));
+  } finally {
+    db.prepare('DELETE FROM housekeeping_work_sessions WHERE id = ?').run(unpaidId);
+  }
+});
+
+test('POST /visits/:id/unpay: Mitglied -> 403, Besuch UND Zahlungsaufgabe unveraendert (#1136)', async () => {
+  const before = sessionRow(PAY_SESSION_ID);
+  const taskBefore = taskRow(PAYMENT_TASK_ID);
+  assert.ok(before.paid_at, 'Fixture: der Besuch ist bezahlt');
+  assert.equal(taskBefore.status, 'done', 'Fixture: die Zahlungsaufgabe ist abgehakt');
+
+  const r = await call('POST', `/visits/${PAY_SESSION_ID}/unpay`, { as: MEM });
+  assert.equal(r.status, 403, `erwartet 403, bekommen ${r.status}`);
+
+  assert.deepEqual(sessionRow(PAY_SESSION_ID), before, 'die abgerechnete Zeile ist unveraendert');
+  assert.deepEqual(taskRow(PAYMENT_TASK_ID), taskBefore, 'die Zahlungsaufgabe bleibt abgehakt');
+});
+
+test('POST /visits/:id/unpay: Admin setzt paid_at zurueck und oeffnet die Zahlungsaufgabe wieder (#1136)', async () => {
+  const r = await call('POST', `/visits/${PAY_SESSION_ID}/unpay`, { as: ADM });
+  assert.equal(r.status, 200, `erwartet 200, bekommen ${r.status} ${JSON.stringify(r.body)}`);
+  assert.equal(r.body.data.paid_at, null, 'Antwort: nicht mehr bezahlt');
+  assert.ok(r.body.summary, 'Antwort traegt die Monatssumme wie /pay');
+
+  assert.equal(sessionRow(PAY_SESSION_ID).paid_at, null, 'paid_at in der Zeile zurueckgesetzt');
+  assert.equal(taskRow(PAYMENT_TASK_ID).status, 'open', 'die Zahlungsaufgabe ist wieder offen');
+
+  // reconcilePaymentTasks() laeuft in GET /visits und bucht jede Zeile mit einer
+  // abgehakten Aufgabe als bezahlt. Bliebe die Aufgabe done, kaeme die Zahlung
+  // hier sofort zurueck.
+  const list = await call('GET', '/visits?month=2025-04', { as: ADM });
+  const visit = list.body.data.visits.find((v) => v.id === PAY_SESSION_ID);
+  assert.equal(visit.paid_at, null, 'der naechste Lesezugriff bucht die Zahlung nicht zurueck');
+  assert.equal(visit.payment_task_status, 'open');
+  assert.equal(visit.can_mark_unpaid, false, 'unbezahlt gibt es nichts mehr zurueckzunehmen');
+});
+
+test('POST /visits/:id/unpay: unbezahlter Besuch -> 200, nichts geaendert (#1136)', async () => {
+  const before = sessionRow(PAY_SESSION_ID);
+  const taskBefore = taskRow(PAYMENT_TASK_ID);
+  assert.equal(before.paid_at, null, 'Fixture: der Besuch ist unbezahlt');
+
+  const r = await call('POST', `/visits/${PAY_SESSION_ID}/unpay`, { as: ADM });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.data.paid_at, null);
+  assert.deepEqual(sessionRow(PAY_SESSION_ID), before, 'Zeile unveraendert');
+  assert.deepEqual(taskRow(PAYMENT_TASK_ID), taskBefore, 'Aufgabe unveraendert');
+});
+
+test('POST /visits/:id/unpay: unbekannte id -> 404, ungueltige id -> 400 (#1136)', async () => {
+  const missing = await call('POST', '/visits/999999/unpay', { as: ADM });
+  assert.equal(missing.status, 404);
+  const invalid = await call('POST', '/visits/abc/unpay', { as: ADM });
+  assert.equal(invalid.status, 400);
+});
+
 test('teardown: Payment-Tasks-Einstellung zurücksetzen', () => {
   db.prepare(`UPDATE sync_config SET value = '0' WHERE key = 'housekeeping_payment_tasks'`).run();
 });
@@ -560,6 +788,89 @@ test('ein rein lokaler Besuch merkt nichts beim Provider vor', async () => {
     before,
     'ohne Provider-Zuordnung gibt es dort nichts zu löschen',
   );
+});
+
+// ---------------------------------------------------------------------------
+// Die Zahlungsaufgabe als zweiter Weg (GHSA-4p5w-5346-8598). Verliess die Aufgabe
+// eines BEZAHLTEN Besuchs 'done', setzte syncHousekeepingPaymentStatus paid_at
+// zurueck, und danach waren Aendern und Loeschen des Besuchs wieder
+// Mitgliedssache. Beide Aufgaben-Wege - Formular (PUT) und Status (PATCH, auch
+// Checkbox, Swipe, Sammelaktion) - halten jetzt dieselbe Grenze wie die
+// Besuchsrouten. Beide Rollen im Test, sonst waere auch ein Total-Gate gruen.
+// ---------------------------------------------------------------------------
+
+async function paidVisitWithTask(name, localDate) {
+  setConfig('housekeeping_payment_tasks', '1');
+  const workerId = await freshWorker(name);
+  const created = await call('POST', '/work-sessions/check-in', {
+    as: ADM,
+    body: { worker_id: workerId, daily_rate: 40, local_date: localDate },
+  });
+  assert.equal(created.status, 201, `Fixture: Check-in ${created.status} ${JSON.stringify(created.body)}`);
+  const visitId = created.body.data.id;
+  const paid = await call('POST', `/visits/${visitId}/pay`, { as: ADM });
+  assert.equal(paid.status, 200);
+  const row = db.prepare('SELECT paid_at, payment_task_id FROM housekeeping_work_sessions WHERE id = ?').get(visitId);
+  assert.ok(row.paid_at, 'Fixture: der Besuch ist bezahlt');
+  assert.ok(row.payment_task_id, 'Fixture: der Besuch hat eine Zahlungsaufgabe');
+  return { visitId, taskId: row.payment_task_id };
+}
+
+const visitRow = (id) => db.prepare('SELECT paid_at, daily_rate, extras FROM housekeeping_work_sessions WHERE id = ?').get(id);
+const taskStatus = (id) => db.prepare('SELECT status FROM tasks WHERE id = ?').get(id).status;
+
+test('bezahlter Besuch: Mitglied oeffnet die Zahlungsaufgabe nicht wieder (PATCH status) -> 403', async () => {
+  const { visitId, taskId } = await paidVisitWithTask('Pia', '2025-07-01');
+  const before = visitRow(visitId);
+
+  const r = await call('PATCH', `/tasks-api/${taskId}/status`, { as: MEM, body: { status: 'open' } });
+  assert.equal(r.status, 403, `erwartet 403, bekommen ${r.status} ${JSON.stringify(r.body)}`);
+  assert.equal(taskStatus(taskId), 'done', 'die Aufgabe bleibt erledigt');
+  assert.deepEqual(visitRow(visitId), before, 'der Besuch bleibt bezahlt und unveraendert');
+
+  // Der eigentliche Schaden: ohne die Grenze gingen danach Aendern und Loeschen durch.
+  const put = await call('PUT', `/visits/${visitId}`, { as: MEM, body: { date: '2025-07-01', daily_rate: 99999, extras: 0 } });
+  assert.equal(put.status, 403);
+  const del = await call('DELETE', `/visits/${visitId}`, { as: MEM });
+  assert.equal(del.status, 403);
+  assert.deepEqual(visitRow(visitId), before);
+});
+
+test('bezahlter Besuch: Mitglied oeffnet die Zahlungsaufgabe nicht ueber das Formular (PUT) -> 403', async () => {
+  const { visitId, taskId } = await paidVisitWithTask('Rosa', '2025-07-02');
+  const before = visitRow(visitId);
+
+  const r = await call('PUT', `/tasks-api/${taskId}`, { as: MEM, body: { status: 'in_progress' } });
+  assert.equal(r.status, 403, `erwartet 403, bekommen ${r.status} ${JSON.stringify(r.body)}`);
+  assert.equal(taskStatus(taskId), 'done');
+  assert.deepEqual(visitRow(visitId), before);
+});
+
+test('bezahlter Besuch: ein Admin darf die Zahlungsaufgabe wieder oeffnen', async () => {
+  const { visitId, taskId } = await paidVisitWithTask('Sara', '2025-07-03');
+
+  const r = await call('PATCH', `/tasks-api/${taskId}/status`, { as: ADM, body: { status: 'open' } });
+  assert.equal(r.status, 200, `erwartet 200, bekommen ${r.status} ${JSON.stringify(r.body)}`);
+  assert.equal(taskStatus(taskId), 'open');
+  assert.equal(visitRow(visitId).paid_at, null, 'der Admin nimmt die Zahlung damit zurueck');
+});
+
+test('unbezahlter Besuch: Mitglied bewegt die Zahlungsaufgabe weiter frei', async () => {
+  setConfig('housekeeping_payment_tasks', '1');
+  const workerId = await freshWorker('Tina');
+  const created = await call('POST', '/work-sessions/check-in', {
+    as: ADM,
+    body: { worker_id: workerId, daily_rate: 40, local_date: '2025-07-04' },
+  });
+  const visitId = created.body.data.id;
+  const { payment_task_id: taskId } = db.prepare('SELECT payment_task_id FROM housekeeping_work_sessions WHERE id = ?').get(visitId);
+  assert.ok(taskId, 'Fixture: der Besuch hat eine Zahlungsaufgabe');
+
+  const progress = await call('PATCH', `/tasks-api/${taskId}/status`, { as: MEM, body: { status: 'in_progress' } });
+  assert.equal(progress.status, 200, `erwartet 200, bekommen ${progress.status} ${JSON.stringify(progress.body)}`);
+  const done = await call('PATCH', `/tasks-api/${taskId}/status`, { as: MEM, body: { status: 'done' } });
+  assert.equal(done.status, 200, 'abhaken bleibt Mitgliedssache - es ist dasselbe wie Bezahlen');
+  assert.ok(visitRow(visitId).paid_at, 'abgehakt heisst bezahlt');
 });
 
 test('teardown: Server schließen', async () => {

@@ -8,13 +8,32 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import * as db from '../db.js';
 import { createLogger } from '../logger.js';
+import { getSupportedLocales } from '../utils/i18n.js';
+import { normalizeCapabilities, buildExtensionCatalog, MODULE_ID_RE as ID_RE } from './module-capabilities.js';
+import { setExtensionScopeModules } from '../scopes.js';
+import { setExtensionPermissionCatalog } from '../permissions.js';
 
 const log = createLogger('Modules');
 
 const MODULES_DIR = path.resolve(process.env.MODULES_DIR || path.join(import.meta.dirname, '..', '..', 'modules'));
 const DISABLED_KEY = 'third_party_disabled_modules';
-const ID_RE = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/;
+// Die hoechste Manifest-Formatversion, die diese Fassung lesen kann. Wer ein
+// Feld aus `capabilities` entfernt oder umbenennt, hebt SIE an - der Guard in
+// test/test-modules.js besteht darauf. Neue OPTIONALE Felder brauchen keine
+// Anhebung: ein aelteres Modul laesst sie weg und verhaelt sich wie zuvor.
+export const SUPPORTED_MANIFEST_VERSION = 1;
+
 const SAFE_RELATIVE_RE = /^[a-zA-Z0-9][a-zA-Z0-9._/-]*$/;
+const MENU_LABEL_KEY_RE = /^[a-z][a-z0-9._-]{0,79}$/;
+const MODULE_LOCALE_FILE_RE = /^([a-z]{2,3})\.json$/;
+const EXTENSION_DEFAULT_LOCALE = 'en';
+
+/** Sync cache for permissions/scopes — refreshed on each listModules(). */
+let _extensionCatalog = {
+  permissionModules: [],
+  permissionWidgets: [],
+  scopeModules: [],
+};
 
 function cfgGet(key) {
   const row = db.get().prepare('SELECT value FROM sync_config WHERE key = ?').get(key);
@@ -55,11 +74,48 @@ function modulePublicUrl(id, relPath) {
   return `/api/v1/modules/assets/${encodeURIComponent(id)}/${relPath.split('/').map(encodeURIComponent).join('/')}`;
 }
 
-function normalizeManifest(raw, folderName) {
+// Exportiert fuer test/test-modules.js: der Formatvertrag wird an DIESER
+// Funktion geprueft, nicht ueber den Umweg des Dateisystems - ein Test, der
+// dafuer Ordner anlegt, veraendert die Liste, die andere Tests zaehlen.
+export function normalizeManifest(raw, folderName) {
   const manifest = raw && typeof raw === 'object' ? raw : {};
   const id = String(manifest.id || folderName || '').trim();
   if (!ID_RE.test(id)) throw new Error('module.json must define a lowercase id using letters, numbers and hyphens.');
   if (id !== folderName) throw new Error('module id must match the folder name.');
+
+  // FORMATVERSION DES MANIFESTS, nicht Version des Moduls (das ist `version`).
+  //
+  // WARUM DAS HIER STEHT UND NICHT SPAETER: seit #919 ist `capabilities` eine
+  // zugesagte Oberflaeche - Widgets, `ext:<id>`-Rechte, ein API-Praefix, eine
+  // Locale-Kette. `modules/` ist gitignored, die Module kommen zur Laufzeit,
+  // und niemand hier sieht, wer die Oberflaeche mit welchen Annahmen benutzt.
+  // Ohne diese Zahl waere jede kuenftige Umbenennung eines Feldes ein stiller
+  // Bruch: das Modul laedt, das Feld fehlt, und der Haushalt merkt es an einem
+  // Widget, das nichts mehr tut.
+  //
+  // FEHLT DIE ANGABE, gilt 1. Das ist keine Nachlaessigkeit, sondern der
+  // einzige Wert, der die Manifeste nicht bricht, die es seit #919 schon geben
+  // kann - sie beschreiben genau dieses Format.
+  //
+  // EINE ZU HOHE ZAHL WIRD ABGEWIESEN, statt teilweise gelesen zu werden. Ein
+  // Manifest fuer ein Format, das diese Yuvomi-Fassung nicht kennt, halb zu
+  // laden hiesse, Felder stillschweigend zu ignorieren, die es fuer wesentlich
+  // haelt - und der Betreiber saehe ein Modul, das laeuft und etwas anderes
+  // tut als beschrieben. Die Fehlermeldung nennt beide Zahlen, damit klar ist,
+  // wer wen ueberholt hat.
+  const rawManifestVersion = manifest.manifestVersion;
+  const manifestVersion = rawManifestVersion === undefined || rawManifestVersion === null
+    ? SUPPORTED_MANIFEST_VERSION
+    : Number(rawManifestVersion);
+  if (!Number.isInteger(manifestVersion) || manifestVersion < 1) {
+    throw new Error('module.json manifestVersion must be a positive integer.');
+  }
+  if (manifestVersion > SUPPORTED_MANIFEST_VERSION) {
+    throw new Error(
+      `module.json declares manifestVersion ${manifestVersion}, but this Yuvomi supports up to `
+      + `${SUPPORTED_MANIFEST_VERSION}. Update Yuvomi, or use a build of the module for this version.`,
+    );
+  }
 
   const entry = String(manifest.entry || '').trim();
   if (!isSafeRelativeFile(entry) || !entry.endsWith('.js')) {
@@ -78,21 +134,58 @@ function normalizeManifest(raw, folderName) {
   const accent = /^#[0-9a-fA-F]{6}$/.test(manifest.accent || '') ? manifest.accent : '#6366F1';
   const menu = manifest.menu && typeof manifest.menu === 'object' ? manifest.menu : {};
   const showInMenu = menu.show !== false;
+  let menuLabelKey = menu.labelKey ? String(menu.labelKey).trim().slice(0, 80) : null;
+  if (menuLabelKey && !MENU_LABEL_KEY_RE.test(menuLabelKey)) {
+    throw new Error('menu.labelKey is invalid.');
+  }
   const label = String(menu.label || name).trim().slice(0, 40);
   const menuIcon = String(menu.icon || icon).trim().slice(0, 40);
   const order = Number.isFinite(Number(menu.order)) ? Number(menu.order) : 1000;
   const pathValue = String(menu.path || `/m/${id}`).trim();
   const routePath = pathValue === `/m/${id}` ? pathValue : `/m/${id}`;
 
+  const COMPOSITION = new Set(['reading', 'data', 'dashboard', 'form', 'split', 'full']);
+  const WIDTHS = new Set(['reading', 'content', 'wide']);
+  const pageRaw = manifest.page && typeof manifest.page === 'object' ? manifest.page : {};
+  const composition = COMPOSITION.has(String(pageRaw.composition || '').trim())
+    ? String(pageRaw.composition).trim()
+    : 'reading';
+  const width = WIDTHS.has(String(pageRaw.width || '').trim())
+    ? String(pageRaw.width).trim()
+    : (composition === 'data' ? 'content' : composition === 'dashboard' ? 'wide' : 'reading');
+  // Dieselbe Regel wie fuer composition und width: ein unbekannter Wert
+  // faellt auf den unterstuetzten zurueck, statt roh weitergereicht zu werden.
+  // MODULES.md verspricht `context.page` als NORMALISIERTE Erklaerung und
+  // nennt fuer beide Felder nur `standard`; ein Tippfehler im Manifest darf
+  // im Client keinen Zustand erzeugen, den es nicht gibt.
+  const NAVIGATION = new Set(['standard']);
+  const RESPONSIVE = new Set(['standard']);
+  const navigation = NAVIGATION.has(String(pageRaw.navigation || '').trim())
+    ? String(pageRaw.navigation).trim()
+    : 'standard';
+  const responsive = RESPONSIVE.has(String(pageRaw.responsive || '').trim())
+    ? String(pageRaw.responsive).trim()
+    : 'standard';
+
   return {
     id,
     name,
     version,
+    // Nach aussen sichtbar, damit ein Betreiber in der Admin-Liste sieht, nach
+    // welchem Format ein Modul gebaut ist - und nicht raten muss, warum eines
+    // sich anders verhaelt als das daneben.
+    manifestVersion,
     description,
     icon,
     accent,
     entry,
     style: style || null,
+    page: {
+      composition,
+      width,
+      navigation,
+      responsive,
+    },
     route: {
       path: routePath,
       entry: modulePublicUrl(id, entry),
@@ -101,9 +194,65 @@ function normalizeManifest(raw, folderName) {
     menu: {
       show: showInMenu,
       label,
+      ...(menuLabelKey ? { labelKey: menuLabelKey } : {}),
       icon: menuIcon,
       order,
     },
+  };
+}
+
+async function scanModuleLocales(basePath) {
+  const dir = path.join(basePath, 'locales');
+  const supported = new Set(getSupportedLocales());
+  try {
+    const entries = await fs.readdir(dir);
+    return entries
+      .map((file) => file.match(MODULE_LOCALE_FILE_RE)?.[1])
+      .filter((loc) => loc && supported.has(loc))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+function normalizeModuleI18n(rawI18n, availableLocales) {
+  const supported = getSupportedLocales();
+  const block = rawI18n && typeof rawI18n === 'object' ? rawI18n : {};
+  let defaultLocale = String(block.defaultLocale || EXTENSION_DEFAULT_LOCALE).trim();
+  if (!supported.includes(defaultLocale)) defaultLocale = EXTENSION_DEFAULT_LOCALE;
+  if (availableLocales.length) {
+    if (!availableLocales.includes(defaultLocale)) {
+      defaultLocale = availableLocales.includes(EXTENSION_DEFAULT_LOCALE)
+        ? EXTENSION_DEFAULT_LOCALE
+        : availableLocales[0];
+    }
+  }
+  return {
+    defaultLocale,
+    availableLocales,
+    coreLocales: supported,
+  };
+}
+
+function clientCapabilities(caps) {
+  if (!caps) return null;
+  return {
+    permissionModuleKey: caps.permissionModuleKey,
+    permissionModule: caps.permissionModule,
+    apiPrefix: caps.apiPrefix,
+    scopeKey: caps.scopeKey,
+    widgets: (caps.widgets || []).map((w) => ({
+      id: w.id,
+      shortId: w.shortId,
+      entry: w.entry,
+      label: w.label,
+      labelKey: w.labelKey || null,
+      icon: w.icon,
+      defaultSize: w.defaultSize,
+      defaultVisible: w.defaultVisible,
+      optionsSchema: w.optionsSchema,
+      moduleKey: w.moduleKey,
+    })),
   };
 }
 
@@ -134,9 +283,21 @@ async function readModule(folderName, disabledSet) {
         throw new Error('style file does not exist.');
       }
     }
+    const capabilities = await normalizeCapabilities(
+      raw,
+      manifest.id,
+      basePath,
+      modulePublicUrl,
+      pathExists,
+      isSafeRelativeFile,
+    );
+    const availableLocales = await scanModuleLocales(basePath);
+    const i18n = normalizeModuleI18n(raw.i18n, availableLocales);
     const enabled = !disabledSet.has(manifest.id);
     return {
       ...manifest,
+      i18n,
+      capabilities: clientCapabilities(capabilities),
       enabled,
       status: enabled ? 'enabled' : 'disabled',
       error: null,
@@ -151,11 +312,30 @@ async function readModule(folderName, disabledSet) {
       accent: '#EF4444',
       route: null,
       menu: { show: false, label: folderName, icon: 'triangle-alert', order: 1000 },
+      capabilities: null,
       enabled: false,
       status: 'error',
       error: err?.message || 'Module could not be loaded.',
     };
   }
+}
+
+function refreshExtensionCatalog(modules) {
+  const enabled = modules.filter((m) => m.enabled && m.status === 'enabled');
+  _extensionCatalog = buildExtensionCatalog(
+    enabled.map((m) => ({
+      ...m,
+      capabilities: m.capabilities ? {
+        permissionModuleKey: m.capabilities.permissionModuleKey,
+        permissionModule: m.capabilities.permissionModule,
+        widgets: m.capabilities.widgets,
+        apiPrefix: m.capabilities.apiPrefix,
+        scopeKey: m.capabilities.scopeKey,
+      } : null,
+    })),
+  );
+  setExtensionScopeModules(_extensionCatalog.scopeModules);
+  setExtensionPermissionCatalog(_extensionCatalog);
 }
 
 async function listModules({ admin = false } = {}) {
@@ -169,6 +349,8 @@ async function listModules({ admin = false } = {}) {
   const modules = (await Promise.all(entries.map((entry) => readModule(entry, disabledSet))))
     .filter(Boolean)
     .sort((a, b) => (a.menu?.order ?? 1000) - (b.menu?.order ?? 1000) || a.name.localeCompare(b.name));
+
+  refreshExtensionCatalog(modules);
 
   return admin ? modules : modules.filter((module) => module.enabled && module.status === 'enabled');
 }
@@ -228,4 +410,16 @@ async function resolveAssetPath(id, relPath) {
   return assetPath;
 }
 
-export { MODULES_DIR, listModules, setModuleEnabled, resolveAssetPath };
+function getExtensionPermissionCatalog() {
+  return _extensionCatalog;
+}
+
+export {
+  MODULES_DIR,
+  listModules,
+  setModuleEnabled,
+  resolveAssetPath,
+  getExtensionPermissionCatalog,
+};
+
+export { extensionPermissionKey } from './module-capabilities.js';

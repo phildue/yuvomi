@@ -25,6 +25,28 @@ function flattenKeys(obj, prefix = '', out = new Set()) {
   return out;
 }
 
+// Dieselbe Zusicherung wie für die App-Locales (test/test-i18n.js), nur mit der
+// Einrückung, die HIER gilt: die Installer-Locales stehen auf ZWEI Leerzeichen.
+//
+// Sie stand dort bis zum 2026-08-20 als Stichprobe über Zeile 2 und übersah damit
+// acht völlig uneingerückte Zeilen in allen 24 App-Locales. Hier gab es die Prüfung
+// bisher gar nicht - die Dateien sind sauber, aber nichts hielt sie dabei. Da beide
+// Verzeichnisse von denselben Skripten und Händen gepflegt werden, gilt die Regel
+// an beiden Enden oder an keinem.
+test('jede Installer-Locale ist Zeile für Zeile 2-Leerzeichen-formatiert', () => {
+  const wrong = [];
+  for (const locale of SUPPORTED_LOCALES) {
+    const raw = readFileSync(new URL(`${locale}.json`, LOCALES_DIR), 'utf8');
+    const canonical = `${JSON.stringify(JSON.parse(raw), null, 2)}\n`;
+    if (raw === canonical) continue;
+    const a = raw.split('\n');
+    const b = canonical.split('\n');
+    const i = a.findIndex((line, n) => line !== b[n]);
+    wrong.push(`${locale}.json Zeile ${i + 1}: ${JSON.stringify(a[i])} statt ${JSON.stringify(b[i])}`);
+  }
+  assert.deepEqual(wrong, [], `nicht kanonisch 2-Leerzeichen-formatiert:\n  ${wrong.join('\n  ')}`);
+});
+
 /** Alle in install.html referenzierten i18n-Schlüssel (Attribute, t(), applyRich). */
 function referencedKeys() {
   const html = readFileSync(HTML_PATH, 'utf8');
@@ -121,4 +143,125 @@ test('GET /locales/* lehnt Path-Traversal und Nicht-JSON mit 404 ab', async () =
       assert.equal(r.status, 404, `${path} hätte 404 liefern müssen`);
     }
   });
+});
+
+// ── Regel-Guard: kein Locale-Wert besteht nur aus Zeichensetzung ─────────────
+//
+// `common.generating` stand in allen 23 Sprachen woertlich auf "…". Der
+// Generieren-Button setzt diesen Wert als textContent, verlor damit fuer die
+// Dauer der Operation seinen zugaenglichen Namen und wurde als
+// "Auslassungspunkte, Schaltflaeche, deaktiviert" vorgelesen.
+//
+// Der Keyset-Guard darueber konnte das nicht sehen: der Schluessel WAR in jeder
+// Sprache vorhanden, nur ohne Inhalt. Ein Wert ohne einen einzigen Buchstaben
+// oder eine Ziffer ist keine Uebersetzung, sondern ein Platzhalter, der es in
+// den Bestand geschafft hat.
+test('kein Locale-Wert besteht ausschliesslich aus Zeichensetzung', () => {
+  // \p{L} deckt jedes Alphabet ab (kyrillisch, arabisch, CJK), \p{N} Ziffern.
+  // Emoji und Haken duerfen begleiten, aber nicht die ganze Aussage tragen.
+  const hasContent = (value) => /[\p{L}\p{N}]/u.test(value);
+  const offenders = [];
+
+  for (const locale of SUPPORTED_LOCALES) {
+    const walk = (obj, prefix = '') => {
+      for (const [k, v] of Object.entries(obj)) {
+        const key = prefix ? `${prefix}.${k}` : k;
+        if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, key);
+        else if (typeof v === 'string' && v.length > 0 && !hasContent(v)) {
+          offenders.push(`${locale}: ${key} = ${JSON.stringify(v)}`);
+        }
+      }
+    };
+    walk(loadLocale(locale));
+  }
+
+  assert.deepEqual(offenders, [],
+    'Diese Werte enthalten keinen einzigen Buchstaben und keine Ziffer. Steht so '
+    + 'einer auf einem Button, hat das Element keinen Namen mehr:\n' + offenders.join('\n'));
+});
+
+test('der Generieren-Button traegt waehrend der Operation einen Namen und haengt nicht', () => {
+  const html = readFileSync(HTML_PATH, 'utf8');
+  // Der Zustand muss angesagt werden, nicht nur bebildert.
+  assert.match(html, /btn\.setAttribute\('aria-busy', 'true'\)/,
+    'der Generieren-Button meldet seinen Betriebszustand nicht');
+  // Ohne finally blieb der Button nach einem Fehlschlag dauerhaft deaktiviert
+  // und im Ersatztext stehen: der Schritt war nur per Reload verlassbar.
+  assert.match(html, /\} finally \{[\s\S]*?btn\.disabled = false;[\s\S]*?btn\.textContent = t\('common\.generate'\);/,
+    'der Generieren-Button wird nicht in jedem Fall zurueckgesetzt');
+});
+
+test('Zahlenbereiche in Fehlermeldungen sind mit ASCII-Minus geschrieben', () => {
+  // "Ungültiger Breitengrad (–90 bis 90)" nannte in 19 Sprachen einen Wert, den
+  // das Feld gar nicht annimmt: <input type="number"> kennt nur ASCII-Minus.
+  // Wer die Zahl aus der Meldung kopierte, bekam dieselbe Meldung erneut.
+  //
+  // Die Regel trifft nur Striche, die unmittelbar an einer Ziffer kleben -
+  // Vorzeichen und Bis-Striche. Der Gedankenstrich als Satzzeichen ist davon
+  // unberührt: er trägt in ru, uk, fr, ja und zh die Satzstruktur und bleibt.
+  const offenders = [];
+  for (const locale of SUPPORTED_LOCALES) {
+    const walk = (obj, prefix = '') => {
+      for (const [k, v] of Object.entries(obj)) {
+        const key = prefix ? `${prefix}.${k}` : k;
+        if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, key);
+        else if (typeof v === 'string' && /[–—](?=[0-9])/u.test(v)) {
+          offenders.push(`${locale}: ${key} = ${JSON.stringify(v)}`);
+        }
+      }
+    };
+    walk(loadLocale(locale));
+  }
+  assert.deepEqual(offenders, [],
+    'En-/Em-Dash direkt vor einer Ziffer ist ein Vorzeichen oder Bis-Strich und '
+    + 'gehört als ASCII "-" geschrieben:\n' + offenders.join('\n'));
+});
+
+/* Ein data-i18n-Attribut auf einem Schluessel MIT Platzhalter ist immer kaputt.
+ *
+ * applyTranslations ruft `t(key)` ohne Parameter und schreibt das Ergebnis in
+ * textContent. Traegt der Wert ein {{...}}, landet der Platzhalter woertlich auf
+ * dem Bildschirm - und zwar erst beim Sprachwechsel, weil der Text bis dahin von
+ * der Laufzeit korrekt gesetzt war. Genau deshalb faellt es beim Bauen nicht auf.
+ *
+ * Dreimal derselbe Fehler an drei Stellen (cfg-prereq, welcome-prereq,
+ * simple-access-desc, Critique 2026-08-15) sind kein Zufall mehr, sondern eine
+ * fehlende Regel: solche Elemente werden ueber applyRich() oder einen eigenen
+ * t()-Aufruf in localize() versorgt und tragen KEIN data-i18n. */
+test('kein data-i18n zeigt auf einen Schluessel mit Platzhalter', () => {
+  const html = readFileSync(HTML_PATH, 'utf8');
+  const reference = loadLocale(REFERENCE);
+  const lookup = (key) => key.split('.').reduce((o, k) => (o == null ? o : o[k]), reference);
+
+  const offenders = [];
+  for (const [, key] of html.matchAll(/\bdata-i18n="([^"]+)"/g)) {
+    const value = lookup(key);
+    if (typeof value === 'string' && /\{\{\w+\}\}/.test(value)) {
+      offenders.push(`${key} -> "${value}"`);
+    }
+  }
+  assert.deepEqual(offenders, [],
+    `data-i18n auf interpolierten Schluesseln (applyTranslations kann sie nicht fuellen): ${offenders.join(' | ')}`);
+});
+
+/* Der Sprachumschalter bietet GENAU die unterstuetzten Sprachen an.
+ *
+ * `fil` fehlte in der Optionsliste, obwohl SUPPORTED_LOCALES es fuehrt und
+ * fil.json ausgeliefert wird (Critique 2026-08-15). Folge: bei einem
+ * philippinischen Browser stand `$('lang-switch').value = getLocale()` auf einem
+ * Wert ohne Option, der Umschalter war LEER - und wer einmal wechselte, kam nie
+ * zurueck. Die vorhandenen Tests pruefen Dateibestand, Keyparitaet, Auslieferung
+ * und Platzhalter; die Optionsliste hat nie jemand gegen die Sprachliste
+ * gehalten, obwohl sie die einzige Stelle ist, an der der Nutzer sie sieht. */
+test('der Sprachumschalter bietet genau die unterstuetzten Sprachen an', () => {
+  const html = readFileSync(HTML_PATH, 'utf8');
+  const select = html.match(/<select id="lang-switch"[\s\S]*?<\/select>/);
+  assert.ok(select, 'lang-switch nicht gefunden');
+
+  const offered = [...select[0].matchAll(/<option value="([^"]+)"/g)].map(m => m[1]).sort();
+  const supported = [...SUPPORTED_LOCALES].sort();
+
+  assert.deepEqual(offered, supported,
+    `Optionsliste weicht von SUPPORTED_LOCALES ab. Nur im Select: ${offered.filter(l => !supported.includes(l))}; `
+    + `nur in SUPPORTED_LOCALES: ${supported.filter(l => !offered.includes(l))}`);
 });

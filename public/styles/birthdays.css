@@ -2,76 +2,101 @@
   --module-accent: var(--module-birthdays);
   /* Kohärenter Modul-Ton für Fokus-Ringe (Router setzt --active-module-accent). */
   --c-accent: var(--active-module-accent, var(--module-birthdays));
+  /* Page geometry (width, gutters, header/body axis) comes from
+   * PAGE-COMPOSITION.md / .app-page--reading — not from this file. */
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
-  /* Full-bleed-Root (Issue #577). Vorher --content-max-width-narrow (720px):
-   * Geburtstage war damit als einziges Personen-Modul halb so breit wie
-   * Kontakte direkt daneben in der Navigation, und die Seite schrumpfte beim
-   * Wechsel sichtbar. Jetzt dieselbe kanonische Content-Spalte wie überall. */
+  /* Full-bleed root; bottom clearance for nav + FAB. */
   padding-bottom: calc(var(--nav-bottom-height) + var(--space-6));
 }
 
-/* --------------------------------------------------------
- * Kopf: Struktur (Flex/Padding/Sticky/3px-Streifen) kommt aus .page-toolbar
- * (Canonical Page Head) in layout.css — hier nur die Suche.
- * -------------------------------------------------------- */
-/* Toolbar search uses the shared .page-search control (page-search.css);
- * .page-toolbar__center handles its placement. No module visual needed. */
-
+/* Hint copy only — measure/gutter live on .page-section.page-measure. */
 .birthdays-hint {
-  margin-inline: var(--page-inline-pad);
+  margin: 0;
   color: var(--color-text-secondary);
   font-size: var(--text-sm);
 }
 
 /* --------------------------------------------------------
- * Liste (nach Nähe sortiert) — eine Elevation-Ebene: nur die Karten.
+ * Liste (nach Nähe sortiert) — EIN Träger, Zeilen per Haarlinie
+ * (Zeilenlisten-Regel, tokens.css). Vorher trug jede Zeile ihre eigene Karte:
+ * sechs Geburtstage waren sechs Objekte statt einer Liste.
  * -------------------------------------------------------- */
+/* SIE TRÄGT `.row-carrier` (Critique 2026-08-13, zweite Runde). Fläche, Radius,
+ * Schatten, `overflow` und `container-type` standen hier Wert für Wert ein
+ * zweites Mal - ein Nachbau, den die erste Runde nicht fand, weil sie nach dem
+ * KLASSENNAMEN gesucht hat und nicht nach der Signatur. Der Preis war sichtbar:
+ * weil die Klasse fehlte, bekam die Liste das neue Lesemaß nicht und stand bei
+ * 1440px auf 1156px, während die Kontaktliste daneben 720px trug. Der 436px-
+ * Sprung beim Modulwechsel, den die erste Runde als behoben gemeldet hat, war
+ * damit nur ein Modul weitergewandert.
+ *
+ * Horizontal inset is owned by .app-page__body (page-inline-pad); width cap by
+ * .page-section.page-measure / --page-measure from composition mode. */
 .birthdays-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding-inline: var(--page-inline-pad);
+  /* ZWEI Container-Namen, und beide sind nötig: `list-rows` kommt aus
+   * `.row-carrier` und ist der geteilte Name, unter dem die Zeilenbausteine
+   * ihre Fragen stellen; `birthdays-list` ist der eigene, unter dem die
+   * Countdown-Chips dieses Moduls ihre stellen. Ohne die ausdrückliche
+   * Nennung beider gewönne der später geladene Wert und der andere wäre
+   * lautlos tot. */
+  container-name: birthdays-list list-rows;
 }
 
-.birthday-item {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-3) var(--space-4);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-sm);
+/* DIE GEBURTSTAGSZEILE IST EINE `.list-row` - hier steht nur die Abweichung.
+ *
+ * Sie stand bei 121,6px im Schnitt und schwankte um 24,6px, und beides kam aus
+ * DREI Textzeilen übereinander: der Name brach unter dem Countdown-Chip um
+ * (`overflow-wrap: anywhere` bei 250px Spalte, „Tante Claire Becker" = zwei
+ * Zeilen), darunter stand die Datumszeile, darunter die Notiz. Der Chip stand
+ * im Namensraum und nahm ihm 90px, obwohl er zur Metazeile gehört - genau die
+ * Rolle, die die Aufgabenzeile ihrem Prioritäts-Chip gibt.
+ *
+ * Name und Chip teilen sich jetzt nicht mehr eine Zeile: der Name bekommt die
+ * volle Spalte, der Chip führt die Metazeile an.
+ *
+ * Anzeige, Ausrichtung, Gap und Polsterung stehen deshalb nicht mehr hier: sie
+ * sind `.list-row` (list-row.css). Was bleibt, steht unten - die getönte
+ * Heute-Fläche, das Medium und die Metazeile mit dem Chip darin. */
+
+/* Trennlinie an den direkten Kindern des Traegers, NICHT an der Zeile selbst -
+ * dasselbe Muster wie `.list-rows > * + *` im Einkauf, und aus demselben
+ * Grund: seit der Wischbedienung (Runde 4, C-2) liegt zwischen Traeger und
+ * Zeile der `.swipe-row`-Wrapper. `.birthday-item + .birthday-item` fand danach
+ * keine Geschwister mehr und alle Haarlinien waren verschwunden. `> * + *`
+ * misst den Traeger und ist gegen solche Zwischenebenen immun. */
+.birthdays-list > * + * {
+  border-top: 1px solid var(--color-border-subtle);
 }
 
-/* „Heute"-Höhepunkt: der einzige emotionale Peak des Moduls. */
+/* Dass der Wischwrapper weder Radius noch Abstand traegt, steht jetzt in seiner
+ * Basisregel (layout.css) - hier war es der Modul-Reset, den die Aufgaben und
+ * der Einkauf nicht hatten. */
+
+/* „Heute"-Höhepunkt: der einzige emotionale Peak des Moduls. Er trägt jetzt die
+ * getönte Zeilenfläche des 16-%-Rezepts statt Kante + Verlauf + Extraschatten -
+ * in einem Träger ist die Fläche das einzige Mittel, das keine Kante braucht. */
 .birthday-item--today {
-  border-color: color-mix(in srgb, var(--module-accent) 45%, var(--color-border));
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--module-accent) 9%, var(--color-surface)), var(--color-surface));
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--module-accent) 24%, transparent), var(--shadow-md);
+  background: color-mix(in srgb, var(--module-accent) var(--tint-surface), var(--color-surface));
 }
 
-.birthday-item__body {
-  min-width: 0;
-  flex: 1;
-}
-
-.birthday-item__row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
-}
-
+/* DER NAME WIRD GEKAPPT, NICHT UMGEBROCHEN - und das ist die Antwort, die das
+ * Personen-Vokabular der App schon gibt: `.contact-item__name` steht seit
+ * jeher auf `nowrap` plus Ellipse. Ein umbrechender Name macht die Zeile
+ * zweizeilig und nimmt der Liste ihren Takt; ein gekappter Personenname bleibt
+ * erkennbar („Tante Claire Beck…"), anders als ein gekappter Artikelname im
+ * Einkauf, wo `.list-row__name` aus genau diesem Grund umbricht.
+ *
+ * `unicode-bidi: plaintext` bleibt: ein arabischer Name in einer sonst
+ * lateinischen Liste muss seine eigene Leserichtung behalten. */
 .birthday-item__name {
   min-width: 0;
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
-  overflow-wrap: anywhere;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   unicode-bidi: plaintext;
 }
 
@@ -82,19 +107,116 @@
   color: var(--module-accent);
 }
 
+/* EINE Metazeile, und sie bricht nicht um: Countdown-Chip, dann Datum und
+ * Alter, dann - wo Platz ist - die Notiz. `--space-1` und nicht `--space-2`:
+ * die Teile sind durch einen Mittelpunkt getrennt, und der bringt seinen
+ * eigenen Abstand mit.
+ *
+ * DIE BEGRÜNDUNG FÜR DEN ENGEN ABSTAND WAR EINE FLÄCHE, DIE ES NICHT MEHR GIBT.
+ * Hier stand „der Chip hat eigene Polsterung und eine eigene Fläche, zwischen
+ * ihm und dem Text liest sich der Abstand optisch als das Doppelte" - richtig,
+ * solange alle drei Countdown-Stufen eine Kapsel trugen. Seit v2.23.0 trägt nur
+ * noch „Heute" eine (Skalen-Regel), und ohne sie stand „in 12 Tagen 30.08.2026
+ * · wird 37 Lindas Schwester" als ein einziger Zug da: die Kapsel war der
+ * Trenner gewesen, ohne dass es jemand aufgeschrieben hatte.
+ *
+ * Getrennt wird deshalb jetzt ausdrücklich, mit dem Mittelpunkt über den
+ * `+`-Kombinator - derselbe Träger, den `ageMeta()` schon INNERHALB von
+ * `__when` benutzt („30.08.2026 · wird 37") und den die Vorratsmeldungen seit
+ * derselben Etappe tragen. Der Trenner gehört dem ZWISCHENRAUM, nicht dem
+ * Teil davor oder danach, deshalb `::before` am zweiten Element.
+ *
+ * Die Notiz gewinnt dabei mit: sie hing schon vorher direkt am Alter („wird 37
+ * Lindas Schwester"), und das war nie beabsichtigt - es ist nur nie
+ * aufgefallen, weil links davon eine Kapsel stand und die Zeile dadurch
+ * gegliedert aussah. */
 .birthday-item__meta {
-  margin-top: var(--space-0h);
-  color: var(--color-text-secondary);
-  font-size: var(--text-sm);
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-wrap: nowrap;
+  min-width: 0;
+  overflow: hidden;
   unicode-bidi: plaintext;
 }
 
+.birthday-item__meta > * + *::before {
+  content: '·';
+  margin-inline-end: var(--space-1);
+  color: var(--color-text-tertiary);
+}
+
+.birthday-item__meta > .birthday-chip {
+  flex-shrink: 0;
+}
+
+.birthday-item__when {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.birthday-item__name-day {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* DIE NOTIZ IST EINE FRAGE DER BREITE, NICHT DES GERÄTS - deshalb der Container
+ * am Träger und nicht der Viewport: massgeblich ist, was die ZEILE hat.
+ *
+ * GEMESSEN bei 390px, de, Demo-Haushalt: der Metazeile bleiben 262px, „in 31
+ * Tagen" belegt 90px und „12.09.2026 · wird 8" 150px - für die Notiz bleiben
+ * 22px, und darunter kappt sie das Datum vor sich mit. Ein angeschnittenes
+ * Datum ist schlimmer als eine Notiz, die erst weiter oben erscheint. Wer die
+ * Notiz sucht, öffnet den Eintrag; wer die Liste überfliegt, sucht das Datum.
+ *
+ * Die Notiz behält `overflow-wrap: anywhere` NICHT: sie steht jetzt in einer
+ * Zeile, die nicht umbricht, und wird dort gekappt statt gebrochen.
+ *
+ * WARUM 560px UND NICHT 400: die Schwelle muss in BEIDEN Gerätewelten halten.
+ * Am Finger sind die zwei Zeilenknöpfe weggeklappt (siehe die `hover: none`-
+ * Regel oben) und die Metazeile hätte schon ab rund 400px Trägerbreite Platz;
+ * am Zeiger stehen sie da und kosten 100px. Ein Container weiss nicht, welche
+ * Welt er bedient - 560px ist der Wert, ab dem die Notiz in beiden steht, ohne
+ * dem Datum vor ihr Platz zu nehmen (gemessen: 128px freie Breite am Zeiger,
+ * 240px am Finger). */
 .birthday-item__notes {
-  margin-top: var(--space-1);
-  color: var(--color-text-secondary);
-  font-size: var(--text-sm);
-  overflow-wrap: anywhere;
+  display: none;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   unicode-bidi: plaintext;
+}
+
+@container birthdays-list (min-width: 560px) {
+  .birthday-item__notes {
+    display: block;
+  }
+}
+
+/* A birthday plus a name day can overflow the metadata row on a narrow card.
+ * Wider layouts keep both dates inline; below 840px the name day gets its own
+ * wrapping row. Notes remain the least important metadata, matching the
+ * original mobile rule, so they yield the space first. */
+@container birthdays-list (max-width: 840px) {
+  .birthday-item__meta--with-name-day {
+    flex-wrap: wrap;
+  }
+
+  .birthday-item__meta--with-name-day > .birthday-item__name-day {
+    flex-basis: 100%;
+    min-width: 0;
+    white-space: normal;
+  }
+
+  .birthday-item__meta--with-name-day > .birthday-item__name-day::before {
+    content: none;
+    margin-inline-end: 0;
+  }
+
+  .birthday-item__meta--with-name-day > .birthday-item__notes {
+    display: none;
+  }
 }
 
 .birthday-item__actions {
@@ -103,42 +225,109 @@
   flex-shrink: 0;
 }
 
+/* Auf Touch tragen die Wischrichtungen die beiden Zeilenaktionen, und die
+ * Knoepfe verschwinden - in einer Grouped-Liste waren sie die lauteste Stelle
+ * des Bildschirms. Auf Zeigergeraeten bleiben sie: dort gibt es keine Geste.
+ * Die Reserve am Zeilenende gehoert dann dem Wisch-Chevron (.swipe-row::after,
+ * layout.css), genau wie im Einkauf.
+ *
+ * STEHT BEWUSST HIER UNTEN, nicht oben beim Traeger: die Basisregel darueber
+ * setzt `display: flex` mit derselben Spezifitaet, und eine Media-Query davor
+ * verliert gegen sie allein durch die Reihenfolge (gemessen: die Knoepfe
+ * blieben sichtbar, obwohl `(hover: none)` griff). */
+@media (hover: none) {
+  /* VERSTECKT, NICHT ENTFERNT: `display: none` nahm die beiden Knoepfe auch aus
+   * dem Fokus- und Screenreader-Baum. Die Gesten haengen ausschliesslich an
+   * `touchstart`/`touchmove`, die Reveal-Panels sind `aria-hidden`, und die
+   * Zeile selbst traegt keine Aktion - wer sein Telefon per Tastatur,
+   * Schaltersteuerung oder VoiceOver bedient, kam damit an keinen Geburtstag
+   * mehr heran. Optisch bleibt es dasselbe: aus dem Fluss genommen gibt die
+   * Zeile den Platz genauso frei. Beim Fokus kommen sie zurueck. */
+  .birthday-item__actions {
+    position: absolute;
+    width: var(--space-px);
+    height: var(--space-px);
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .birthday-item__actions:focus-within {
+    position: static;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip-path: none;
+  }
+
+  .birthday-item {
+    padding-inline-end: calc(var(--space-2) + var(--space-3) + var(--space-2));
+  }
+}
+
 /* --------------------------------------------------------
  * Countdown-Chip — einheitliches Wort-Register, kontrastgeprüft (AA).
  * -------------------------------------------------------- */
+/* Die Kapsel gehoert seit 2026-08-18 nur noch der Vollton-Stufe („Heute"):
+ * eine Polsterung ohne Fuellung ist ein Loch, kein Chip. Was hier bleibt, ist
+ * das gemeinsame Register - Groesse, Gewicht, kein Umbruch -, damit die drei
+ * Stufen dieselbe Zeile fuehren wie der Prioritaets-Chip der Aufgabenzeile. */
 .birthday-chip {
   flex-shrink: 0;
-  padding: 0.25rem 0.6rem;
-  border-radius: var(--radius-full);
   font-size: var(--text-xs);
   font-weight: var(--font-weight-semibold);
   white-space: nowrap;
 }
 
+/* ── DREI STUFEN, DIE AUCH DREI SIND ──
+ *
+ * `countdownChip()` in birthdays.js sagt seit jeher „`mod` steuert die visuelle
+ * Stufe" und kennt drei: heute, in bis zu sieben Tagen, spaeter. Die CSS-Regeln
+ * fuer `--default` und `--soon` waren BITWEISE identisch - eine Skala mit einer
+ * Stufe, die es nicht gab. Sie ist niemandem aufgefallen, weil beide getoent
+ * waren und eine Toenung ohnehin kaum etwas sagt.
+ *
+ * Die Leiter laeuft jetzt ueber die AUFFAELLIGKEIT, nicht ueber den Farbton:
+ * heute traegt den Modulton im Vollton, „bald" tritt in die Primaertinte vor,
+ * alles Weitere bleibt Sekundaertinte. Ein Geburtstag in 40 Tagen ist keine
+ * Farbaussage, und drei Toenungen derselben Rose waeren genau der Fall, den
+ * die Vollton-Regel misst.
+ *
+ * Der Modulton ist hier ausdruecklich richtig: die Zeile beantwortet „wann",
+ * und der eine Tag, an dem die Antwort HEUTE lautet, ist der Anlass des ganzen
+ * Moduls. */
 .birthday-chip--default {
-  background: color-mix(in srgb, var(--module-accent) 10%, transparent);
-  /* Text zur Ink-Seite gezogen → AA auf hellem Tint (statt reinem Akzent 3,9:1). */
-  color: color-mix(in srgb, var(--module-accent) 72%, var(--color-text-primary));
+  color: var(--color-text-secondary);
+  font-weight: var(--font-weight-medium);
 }
 
 .birthday-chip--soon {
-  background: color-mix(in srgb, var(--module-accent) 16%, transparent);
-  color: color-mix(in srgb, var(--module-accent) 74%, var(--color-text-primary));
+  color: var(--color-text-primary);
 }
 
+/* Vollton nach der Hausbauart: Ton als Flaeche, feste Tinte darauf. Vorher
+ * stand hier der zu Schwarz vertiefte Akzent mit --color-text-on-accent, weil
+ * reines Weiss auf dem hellen Dark-Ton nur ~2,7:1 trug. Genau dafuer gibt es
+ * --color-ink-on-vivid (light weiss, dark dunkle Tinte): der ungemischte
+ * Modulton haelt damit 5,08:1 light und 7,35:1 dark - im Dark ueber dem, was
+ * die Vertiefung schaffte (4,87:1), und ohne eine zweite Farbrechnung, die
+ * nur an dieser Stelle vorkam. */
 .birthday-chip--today {
-  /* Akzent zu Schwarz vertieft, damit weißer Text in BEIDEN Themes AA hält:
-   * der helle Dark-Mode-Akzent (#FB7185) trägt reines Weiß sonst nur ~2,7:1. */
-  background: color-mix(in srgb, var(--module-accent) 72%, black);
-  color: var(--color-text-on-accent);
+  background: var(--module-accent);
+  color: var(--color-ink-on-vivid);
+  padding: var(--space-0h) var(--space-2);
+  border-radius: var(--radius-full);
 }
 
 /* --------------------------------------------------------
  * Avatare
  * -------------------------------------------------------- */
+/* 52px WAR EIN ROHWERT UND EIN DRITTES MASS. Kontakte, das Nachbarmodul
+ * derselben Familie, tragen ihr Zeilenbild seit jeher auf `--target-md`
+ * (`.contact-item__icon`) - hier standen 52 hartkodierte Pixel, die die Zeile
+ * allein schon auf 76px hoben, bevor der Text mitzählte. */
 .birthday-avatar {
-  width: 52px;
-  height: 52px;
+  width: var(--target-md);
+  height: var(--target-md);
   border-radius: var(--radius-full);
   object-fit: cover;
   flex-shrink: 0;
@@ -148,9 +337,14 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  /* Theme-aware: Surface statt hartcodiertem white → korrekt in Dark Mode. */
-  background: color-mix(in srgb, var(--module-accent) 18%, var(--color-surface));
-  color: color-mix(in srgb, var(--module-accent) 76%, var(--color-text-primary));
+  /* EIN KONTAKT OHNE HAUSHALTS-VERKNUEPFUNG HAT KEINE IDENTITAETSFARBE, und
+   * genau das soll die Scheibe sagen. v2.19 hat das schon so begruendet
+   * („contacts without a link keep the neutral tint on purpose"), aber der
+   * „neutrale" Ton war der MODULTON - eine Farbaussage, nur eine leise. Wer
+   * verknuepft ist, traegt seine Mitgliedsfarbe; wer es nicht ist, traegt gar
+   * keine. Vollton-Regel, zweiter Zweig (DESIGN.md, Colors). */
+  background: var(--color-fill-well);
+  color: var(--color-text-secondary);
   font-weight: var(--font-weight-bold);
 }
 
@@ -175,7 +369,7 @@
   align-items: center;
   justify-content: center;
   /* Theme-aware statt hartcodiertem white. */
-  background: color-mix(in srgb, var(--module-accent) 16%, var(--color-surface));
+  background: color-mix(in srgb, var(--module-accent) var(--tint-surface), var(--color-surface));
   cursor: pointer;
 }
 
@@ -186,7 +380,7 @@
 }
 
 .birthday-preview__fallback {
-  color: color-mix(in srgb, var(--module-accent) 76%, var(--color-text-primary));
+  color: color-mix(in srgb, var(--module-accent) var(--tint-ink), var(--color-text-primary));
   font-size: var(--text-xl);
   font-weight: var(--font-weight-bold);
 }
@@ -245,6 +439,29 @@
   min-height: var(--target-base);
 }
 
+.birthday-name-day__controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(96px, 0.55fr) auto;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.birthday-name-day__clear {
+  min-height: var(--target-base);
+  white-space: nowrap;
+}
+
+.birthday-name-day__clear svg {
+  width: 16px;
+  height: 16px;
+}
+
+.birthday-name-day__hint {
+  margin-top: var(--space-1);
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+}
+
 .birthday-modal__hint {
   color: var(--color-text-secondary);
   font-size: var(--text-sm);
@@ -266,15 +483,13 @@
 /* --------------------------------------------------------
  * Responsive
  * -------------------------------------------------------- */
-@media (max-width: 640px) {
-  .birthday-item__row {
-    flex-wrap: wrap;
-  }
-
-  .birthday-item__name {
-    flex: 1 1 100%;
-  }
-
+@media (max-width: 639px) {
+  /* Hier stand der Umbruch der Namenszeile (`.birthday-item__row { flex-wrap:
+   * wrap }` plus `flex: 1 1 100%` am Namen). Er war die Antwort darauf, dass
+   * Name und Countdown-Chip sich eine Zeile teilten und auf dem Telefon nicht
+   * nebeneinander passten - und er war der Grund, aus dem die Zeile 121,6px
+   * hoch stand. Der Chip steht jetzt in der Metazeile, damit gibt es keine
+   * Konkurrenz mehr um die erste Zeile und nichts umzubrechen. */
   .birthday-modal__identity {
     flex-direction: column;
     align-items: stretch;
@@ -282,6 +497,15 @@
 
   .birthday-modal__photo-wrap {
     align-self: center;
+  }
+
+  .birthday-name-day__controls {
+    grid-template-columns: minmax(0, 1fr) minmax(88px, 0.7fr);
+  }
+
+  .birthday-name-day__clear {
+    grid-column: 1 / -1;
+    justify-self: start;
   }
 }
 
@@ -355,13 +579,20 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Schon hinzugefuegt: Zuruecknehmen-Muster (tokens.css, #1230) statt
+ * `opacity: 0.7`. Das Badge sagt den Zustand und bleibt voll. */
 .bd-import-row--done {
   cursor: default;
-  opacity: 0.7;
+  background: var(--color-surface-receded);
 }
 
-.bd-import-row--done:hover {
-  background: transparent;
+.bd-import-row--done:hover,
+.bd-import-row--done:focus-within {
+  background: var(--color-surface-receded);
+}
+
+.bd-import-row--done .bd-import-row__date {
+  color: var(--color-text-receded);
 }
 
 .bd-import-row__check {
@@ -371,7 +602,8 @@
   justify-content: center;
   width: 18px;
   height: 18px;
-  color: var(--module-accent);
+  /* Rueckfall wie beim Badge darunter: der Dialog liegt ausserhalb von .birthdays-page. */
+  color: var(--module-accent, var(--module-birthdays));
 }
 
 .bd-import-row__check i {
@@ -379,23 +611,23 @@
   height: 16px;
 }
 
+/* DER IMPORT-DIALOG HAENGT UNTER document.body, NICHT UNTER .birthdays-page
+ * (components/modal.js). --module-accent ist nur an der Seitenwurzel gesetzt,
+ * im Dialog also leer: das Badge hatte keine Flaeche, und seine Tinte stand
+ * gerendert bei 1,04:1 (light) und 1,03:1 (dark) auf dem Dialoggrund (#1230).
+ * Der Rueckfall auf das globale Modul-Token ist dasselbe Muster wie
+ * .vcard-import-row__bday in contacts.css. */
 .bd-import-row__badge {
   flex: none;
   font-size: var(--text-xs);
-  color: var(--color-text-on-accent);
-  background: var(--module-accent);
+  color: var(--color-ink-on-vivid);
+  background: var(--module-accent, var(--module-birthdays));
   padding: var(--space-0h) var(--space-2);
   border-radius: var(--radius-full);
 }
 
-.bd-import__empty {
-  color: var(--color-text-secondary);
-  font-size: var(--text-sm);
-  text-align: center;
-  padding: var(--space-6) var(--space-3);
-  background: var(--color-surface-2);
-  border-radius: var(--radius-lg);
-}
+/* Der Import-Leerzustand ist seit Block 2 die geteilte .empty-state--compact
+ * (layout.css) - ein Leerzustand bekommt keine eigene Fläche. */
 
 .bd-import__without {
   margin-top: var(--space-3);
@@ -430,17 +662,28 @@
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  /* Umbruch statt Quetschen - Begruendung an `.modal-panel__footer`
+   * (layout.css, #872). */
+  flex-wrap: wrap;
   gap: var(--space-3);
   margin-top: var(--space-4);
 }
 
-@media (max-width: 640px) {
-  /* Icon-only: der Button trägt sein Label via aria-label weiter. */
+@media (max-width: 639px) {
+  /* Icon-only: der Button trägt sein Label via aria-label weiter.
+   * DIE LABEL-VERLUST-REGEL (Runde 6, Phase 3b): er wechselt dabei in die
+   * Icon-Form seiner Familie - quadratisch auf `--target-base`, die Kapsel wird
+   * damit zum Kreis. Das bloße Zusammenziehen des Innenabstands ließ ihn als
+   * 50x48-Oval zurück, also in einer Form, die es sonst nirgends gibt. */
   .birthdays-toolbar__import span {
     display: none;
   }
 
   .birthdays-toolbar__import {
-    padding-inline: var(--space-3);
+    width: var(--target-base);
+    height: var(--target-base);
+    padding: 0;
+    flex-shrink: 0;
+    justify-content: center;
   }
 }

@@ -15,7 +15,7 @@ export function contactsPaths() {
       patch: op({ summary: 'Reorder contact categories', tag: 'Contacts', stateChanging: true, requestBody: jsonBody(null) }),
     },
     '/api/v1/contacts/categories/{key}': {
-      put: op({ summary: 'Rename contact category', tag: 'Contacts', params: [stringPathParam('key', 'Category key')], stateChanging: true, requestBody: jsonBody(null) }),
+      put: op({ summary: 'Rename or recolor contact category', tag: 'Contacts', params: [stringPathParam('key', 'Category key')], stateChanging: true, requestBody: jsonBody(null) }),
       delete: op({ summary: 'Delete contact category', tag: 'Contacts', params: [stringPathParam('key', 'Category key')], stateChanging: true }),
     },
     '/api/v1/contacts/cardav/accounts': {

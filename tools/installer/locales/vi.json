@@ -4,13 +4,15 @@
     "continue": "Tiếp tục",
     "back": "Quay lại",
     "generate": "Tạo",
-    "generating": "…",
+    "generating": "Đang tạo…",
     "optional": "Tùy chọn",
     "stepCounter": "Bước {{n}} / {{total}}",
     "toggleVisibility": "Hiện hoặc ẩn giá trị",
     "copy": "Sao chép",
     "copied": "Đã sao chép ✓",
-    "language": "Ngôn ngữ"
+    "language": "Ngôn ngữ",
+    "copyRedirect": "Sao chép URI chuyển hướng",
+    "opt": "(tùy chọn)"
   },
   "config": {
     "title": "Cấu hình cơ bản",
@@ -22,7 +24,12 @@
     "tzLabel": "Múi giờ",
     "errHost": "Tên máy chủ không hợp lệ. Chỉ dùng chữ cái, số, dấu gạch ngang và dấu chấm.",
     "errPort": "Cổng không hợp lệ. Phải là số từ 1 đến 65535.",
-    "prereqMissing": "Thiếu điều kiện tiên quyết: {{list}}. Vui lòng cài đặt chúng và tải lại trang này."
+    "prereqMissing": "Thiếu thành phần bắt buộc: {{list}}. {{link}} hướng dẫn cách cài đặt.",
+    "prereqLinkDocker": "Hướng dẫn Docker",
+    "prereqLinkCompose": "Hướng dẫn podman-compose",
+    "prereqRecheck": "Kiểm tra lại",
+    "errSecureOverHttp": "Địa chỉ công khai bắt đầu bằng http://, nhưng lựa chọn này bắt buộc cookie bảo mật - khi đó không ai đăng nhập được. Hãy chọn \"Truy cập trực tiếp\" hoặc dùng địa chỉ https://.",
+    "errTz": "Múi giờ không hợp lệ. Cần một tên IANA như Europe/Berlin."
   },
   "secrets": {
     "title": "Khóa bảo mật",
@@ -32,7 +39,7 @@
     "dbLabel": "Khóa mã hóa cơ sở dữ liệu",
     "dbHint": "Mã hóa cơ sở dữ liệu SQLite khi lưu trữ.",
     "errBoth": "Cả hai khóa đều bắt buộc.",
-    "dangerWarn": "Hãy lưu các khóa này ngay. Nếu mất, dữ liệu được mã hóa của bạn sẽ không thể khôi phục — không có cách đặt lại.",
+    "dangerWarn": "Hãy lưu các khóa này ngay. Nếu mất, dữ liệu được mã hóa của bạn sẽ không thể khôi phục — không có cách đặt lại. Khi hoàn tất cài đặt, bạn có thể tải xuống tệp .env chứa cả hai khóa.",
     "preserved": "Các khóa hiện có của bạn được giữ nguyên, nên thiết lập này sẽ không khiến bạn mất quyền truy cập cơ sở dữ liệu hiện tại. Để trống một trường để giữ khóa của nó; nhập giá trị mới sẽ thay thế khóa đó.",
     "keepPlaceholder": "Giữ khóa hiện có"
   },
@@ -48,12 +55,12 @@
     "unitsMetric": "Hệ mét (°C)",
     "unitsImperial": "Hệ Anh (°F)",
     "errCoords": "Vĩ độ và kinh độ là bắt buộc.",
-    "errLat": "Vĩ độ không hợp lệ (–90 đến 90).",
-    "errLon": "Kinh độ không hợp lệ (–180 đến 180)."
+    "errLat": "Vĩ độ không hợp lệ (-90 đến 90).",
+    "errLon": "Kinh độ không hợp lệ (-180 đến 180)."
   },
   "calendar": {
     "title": "Đồng bộ lịch",
-    "subtitle": "Kết nối Yuvomi với Google Calendar hoặc Apple iCloud. Cả hai đều tùy chọn — mở rộng để cấu hình.",
+    "subtitle": "Kết nối Yuvomi với Google Calendar, Apple iCloud hoặc Outlook. Tất cả đều tùy chọn - mở rộng để cấu hình.",
     "google": "Google Calendar",
     "googleHint": "Tạo thông tin xác thực OAuth tại {{link}}. URI chuyển hướng: {{redirect}}",
     "googleLink": "console.cloud.google.com",
@@ -66,8 +73,13 @@
     "appleUserLabel": "Apple ID (email)",
     "applePassLabel": "Mật khẩu dành riêng cho ứng dụng",
     "appleUrlLabel": "URL CalDAV",
-    "appleUrlOpt": "(tùy chọn)",
-    "appleUrlHint": "Để trống trừ khi nhà cung cấp của bạn dùng điểm cuối CalDAV khác."
+    "appleUrlHint": "Để trống trừ khi nhà cung cấp của bạn dùng điểm cuối CalDAV khác.",
+    "outlook": "Lịch Outlook (Microsoft Graph)",
+    "outlookHint": "Tạo đăng ký ứng dụng Entra ID miễn phí (\"Chỉ tài khoản Microsoft cá nhân\") tại {{link}} - xem hướng dẫn cài đặt. URI chuyển hướng: {{redirect}}",
+    "outlookLink": "entra.microsoft.com",
+    "outlookIdLabel": "Client ID",
+    "outlookSecretLabel": "Client Secret",
+    "outlookNote": "Đẩy một chiều: Yuvomi vẫn là nguồn chính - các thay đổi trong Outlook sẽ bị ghi đè. Tài khoản của gia đình được kết nối sau trong phần cài đặt ứng dụng."
   },
   "review": {
     "title": "Xem lại",
@@ -96,24 +108,45 @@
     "webdavBackup": "Sao lưu bên ngoài",
     "on": "bật",
     "off": "tắt",
-    "documentGoogleDrive": "Tài liệu Google Drive"
+    "documentGoogleDrive": "Tài liệu Google Drive",
+    "sessionSecret": "Khóa phiên",
+    "dbKey": "Khóa cơ sở dữ liệu",
+    "keyGenerated": "Vừa tạo mới",
+    "keyPreserved": "Giữ nguyên khóa hiện có",
+    "dataDir": "Thư mục dữ liệu",
+    "privateNetwork": "Truy cập mạng nội bộ",
+    "privateNetworkIcs": "Đăng ký lịch",
+    "privateNetworkRecipes": "Công thức",
+    "privateNetworkWaste": "Thu gom rác",
+    "privateNetworkWebdav": "Tài liệu WebDAV",
+    "baseUrl": "Địa chỉ công khai",
+    "outlook": "Lịch Outlook",
+    "notEnabled": "chưa bật"
   },
   "docker": {
     "title": "Đang khởi động Yuvomi",
     "subtitle": "Đang tải image và khởi động container Docker.",
-    "starting": "Đang khởi động container …",
     "elapsed": "Đã qua {{n}}s",
     "running": "Container hoạt động bình thường",
     "failed": "Container không khởi động được",
     "unknownError": "Lỗi không xác định",
     "toAdmin": "Tiếp tục đến Cài đặt Admin",
-    "retry": "Thử lại"
+    "retry": "Thử lại",
+    "phasePull": "Đang tải image",
+    "phaseBoot": "Container đang khởi động",
+    "phaseHealth": "Đang kiểm tra tình trạng",
+    "firstRunHint": "Lần đầu có thể mất vài phút.",
+    "stalled": "Việc này lâu hơn thường lệ. Nhật ký bên dưới cho biết lý do.",
+    "showLogs": "Hiện nhật ký",
+    "hideLogs": "Ẩn nhật ký",
+    "timedOut": "Không có phản hồi sau 15 phút. Hãy kiểm tra nhật ký và thử lại.",
+    "logLabel": "Nhật ký container"
   },
   "admin": {
     "title": "Tạo tài khoản Admin",
     "subtitle": "Thiết lập lần đăng nhập đầu tiên. Tài khoản này có toàn quyền truy cập vào Yuvomi.",
     "userLabel": "Tên người dùng",
-    "userHint": "3–64 ký tự: chữ cái, số, . - _",
+    "userHint": "3-64 ký tự: chữ cái, số, . - _",
     "nameLabel": "Tên hiển thị",
     "passLabel": "Mật khẩu",
     "passPlaceholder": "Ít nhất 8 ký tự",
@@ -121,7 +154,7 @@
     "creating": "Đang tạo …",
     "create": "Tạo tài khoản",
     "errAll": "Tất cả các trường là bắt buộc.",
-    "errUser": "Định dạng tên người dùng không hợp lệ (3–64 ký tự, chữ cái/số/._-).",
+    "errUser": "Định dạng tên người dùng không hợp lệ (3-64 ký tự, chữ cái/số/._-).",
     "errPass": "Mật khẩu phải có ít nhất 8 ký tự.",
     "errMatch": "Mật khẩu không khớp.",
     "errCreate": "Không thể tạo tài khoản admin."
@@ -132,16 +165,26 @@
     "open": "Mở Yuvomi →",
     "backupReminder": "Nhớ sao lưu tệp .env của bạn ngay bây giờ — nó chứa các khóa của bạn.",
     "download": "Tải xuống tệp .env",
-    "savedTo": "Đã lưu vào {{path}}"
+    "savedTo": "Đã lưu vào {{path}}",
+    "downloadFailed": "Không tải được tệp - trình cài đặt nhiều khả năng đã dừng. Các khóa của bạn nằm trong tệp .env trên máy chủ.",
+    "serverStops": "Trình cài đặt sẽ dừng sau vài phút. Hãy tải tệp về trước khi bạn đóng thẻ này.",
+    "nextTitle": "Tiếp theo",
+    "nextInvite": "Mời gia đình bạn",
+    "nextInviteDesc": "Tạo liên kết mời để mỗi người tự chọn mật khẩu riêng.",
+    "nextModules": "Chọn mô-đun",
+    "nextModulesDesc": "Bật những gì gia đình bạn thực sự dùng và ẩn phần còn lại.",
+    "nextInstall": "Cài lên điện thoại",
+    "nextInstallDesc": "Mở Yuvomi trên điện thoại và thêm vào màn hình chính - vẫn dùng được khi ngoại tuyến.",
+    "subtitleExisting": "Yuvomi đang chạy. Bản cài đặt này đã có tài khoản quản trị - hãy đăng nhập bằng thông tin hiện có của bạn."
   },
   "advanced": {
     "tag": "Nâng cao · tùy chọn",
     "title": "Cài đặt nâng cao",
-    "subtitle": "Reverse proxy, đăng nhập một lần và sao lưu tự động. Tất cả đều tùy chọn — bỏ qua là an toàn.",
+    "subtitle": "Đăng nhập một lần, truy cập mạng gia đình, và vài tinh chỉnh. Tất cả đều tùy chọn.",
     "proxyLabel": "Yuvomi được hiển thị như thế nào?",
     "proxyBehindHttps": "Sau reverse proxy với HTTPS (Caddy, nginx, Traefik)",
     "proxyDirect": "Truy cập trực tiếp qua localhost / HTTP",
-    "proxyHint": "Truy cập trực tiếp tắt cookie chỉ dành cho HTTPS để đăng nhập hoạt động mà không cần HTTPS.",
+    "proxyHint": "Chọn \"Truy cập trực tiếp\" nếu bạn mở Yuvomi qua http:// - nếu không bạn sẽ không đăng nhập được. Phía sau reverse proxy có HTTPS, hãy chọn tùy chọn đầu tiên.",
     "oidc": "Đăng nhập một lần (OIDC)",
     "oidcHint": "Điền cả bốn trường để bật SSO, hoặc để trống.",
     "oidcIssuerLabel": "URL Issuer",
@@ -166,8 +209,7 @@
     "documentLocalEnable": "Lưu tài liệu mới vào thư mục cục bộ",
     "documentLocalPathLabel": "Đường dẫn thư mục",
     "documentLocalPathHint": "Đường dẫn trong container. Để trống để dùng /documents.",
-    "sectionNetwork": "Mạng",
-    "sectionIntegrations": "Tích hợp và sao lưu",
+    "sectionIntegrations": "Đăng nhập một lần",
     "errSchedule": "Lịch cron không hợp lệ (cần năm trường phân tách bằng dấu cách, ví dụ 0 2 * * *).",
     "errKeep": "Số bản sao lưu cần giữ phải là một số dương.",
     "webdavBackup": "Sao lưu bên ngoài (WebDAV)",
@@ -190,7 +232,32 @@
     "documentGoogleDriveReuseHint": "Để trống cả hai trường để dùng lại thông tin xác thực OAuth của Google Calendar. Để dùng thông tin riêng, hãy tạo trong Google Cloud Console (như ở bước Calendar).",
     "documentGoogleDriveRedirectLabel": "URI chuyển hướng",
     "errDocumentGoogleDrivePair": "ID ứng dụng khách và mã bí mật Google Drive phải được đặt cùng nhau hoặc đều để trống.",
-    "errDocumentGoogleDriveCredentials": "Google Drive cần ID ứng dụng khách và mã bí mật riêng hoặc thông tin xác thực Google Calendar đã được cấu hình."
+    "errDocumentGoogleDriveCredentials": "Google Drive cần ID ứng dụng khách và mã bí mật riêng hoặc thông tin xác thực Google Calendar đã được cấu hình.",
+    "dataDirLabel": "Thư mục dữ liệu trên máy chủ",
+    "dataDirHint": "Nơi cơ sở dữ liệu và dữ liệu ứng dụng nằm trên máy chủ. Để trống để dùng ./data bên cạnh tệp compose.",
+    "documentLocalDirLabel": "Thư mục trên máy chủ",
+    "documentLocalDirHint": "Thư mục trên máy chủ được gắn vào container. Để trống để dùng ./documents.",
+    "documentWebdavPrivateNetwork": "Cho phép đích WebDAV trong mạng nội bộ",
+    "documentWebdavPrivateNetworkHint": "Cần cho Nextcloud trong mạng của bạn. Gỡ bảo vệ SSRF cho đích này.",
+    "icsPrivateNetwork": "Cho phép đăng ký lịch từ mạng nội bộ",
+    "icsPrivateNetworkHint": "Cần cho nguồn ICS từ thiết bị trong mạng của bạn. Gỡ bảo vệ SSRF cho đăng ký lịch.",
+    "recipeProviderPrivateNetwork": "Cho phép gương nhà cung cấp công thức trong mạng nội bộ",
+    "recipeProviderPrivateNetworkHint": "Cần cho phiên bản Mealie hoặc Tandoor trong mạng của bạn. Gỡ bảo vệ SSRF cho gương nhà cung cấp công thức.",
+    "wasteSourcePrivateNetwork": "Cho phép nguồn cấp thu gom rác trong mạng nội bộ",
+    "wasteSourcePrivateNetworkHint": "Cần cho lịch thu gom rác của thành phố được nhân bản trong mạng của bạn. Gỡ bảo vệ SSRF cho các nguồn URL thu gom rác.",
+    "oidcTrustEmail": "Tin cậy email khi không có claim verified",
+    "oidcTrustEmailHint": "Chỉ bật nếu nhà cung cấp không gửi email_verified và bạn tin tưởng họ.",
+    "oidcAllowSignup": "Cho phép đăng nhập SSO tạo tài khoản mới",
+    "oidcAllowSignupHint": "Tắt tùy chọn này nếu nhà cung cấp của bạn phục vụ nhiều người hơn hộ gia đình này. Các tài khoản hiện có vẫn đăng nhập và vẫn được liên kết.",
+    "baseUrlLabel": "Địa chỉ công khai",
+    "baseUrlHint": "Địa chỉ mà gia đình bạn mở Yuvomi - không phải host và cổng của container. Dùng cho liên kết đặt lại mật khẩu và lời mời.",
+    "syncIntervalLabel": "Khoảng thời gian đồng bộ lịch (phút)",
+    "syncIntervalHint": "Yuvomi đồng bộ lịch và danh bạ bao lâu một lần. Tăng lên nếu nhà cung cấp giới hạn tần suất.",
+    "errSyncInterval": "Hãy nhập một số nguyên dương tính bằng phút.",
+    "sectionPrivateNetwork": "Truy cập mạng gia đình",
+    "privateNetworkHint": "Theo mặc định, Yuvomi từ chối kết nối tới các địa chỉ trong mạng của bạn, giúp tránh việc máy chủ bị lừa truy cập dịch vụ nội bộ. Hãy bật những gì bạn thực sự chạy tại nhà.",
+    "authPasswordLogin": "Giữ đăng nhập bằng tên người dùng và mật khẩu",
+    "authPasswordLoginHint": "Tắt tùy chọn này khiến SSO là lối vào duy nhất: biểu mẫu đăng nhập và đặt lại mật khẩu sẽ biến mất. Nếu nhà cung cấp không truy cập được, đường quay lại là sửa tệp .env và khởi động lại."
   },
   "welcome": {
     "title": "Chào mừng đến với Yuvomi",
@@ -201,7 +268,9 @@
     "simpleTime": "Khoảng 2 phút",
     "advancedTitle": "Thiết lập nâng cao",
     "advancedDesc": "Toàn quyền kiểm soát: reverse proxy, đồng bộ lịch, email, đăng nhập một lần và sao lưu.",
-    "advancedTime": "Mọi tùy chọn, từng bước"
+    "advancedTime": "Mọi tùy chọn, từng bước",
+    "existingLocked": "Đã phát hiện một bản cài đặt hiện có. Hãy dùng thiết lập nâng cao để giữ nguyên các cài đặt hiện tại của bạn.",
+    "containerRunning": "Yuvomi đang chạy. Việc lưu sẽ khởi động lại container, nên nó sẽ tạm thời không khả dụng."
   },
   "simple": {
     "title": "Sẵn sàng",
@@ -233,5 +302,11 @@
     "fromHint": "Địa chỉ \"Từ\" mà người nhận sẽ thấy. Nhiều nhà cung cấp yêu cầu nó khớp với tên người dùng.",
     "fromNameLabel": "Tên người gửi",
     "errIncomplete": "Máy chủ SMTP và địa chỉ người gửi là bắt buộc."
+  },
+  "storage": {
+    "title": "Lưu trữ và sao lưu",
+    "subtitle": "Dữ liệu của bạn nằm ở đâu trên máy chủ, và bản sao của nó đi về đâu. Tất cả đều tùy chọn - giá trị mặc định vẫn chạy tốt.",
+    "sectionBackups": "Sao lưu",
+    "sectionDocuments": "Lưu trữ tài liệu"
   }
 }

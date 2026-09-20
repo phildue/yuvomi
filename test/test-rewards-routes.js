@@ -52,7 +52,7 @@ app.use((req, _res, next) => {
 });
 app.use(express.json());
 app.use('/', rewardsRouter);
-const server = app.listen(0);
+const server = app.listen(0, '127.0.0.1');
 const baseUrl = await new Promise((r) => server.on('listening', () => r(`http://127.0.0.1:${server.address().port}`)));
 test.after(() => server.close());
 
@@ -168,6 +168,32 @@ test('PATCH /catalog/:id — 404/400/Teil-Update/Deaktivieren', async () => {
   assert.equal(upd.body.data.description, 'Lecker');
   assert.equal(upd.body.data.name, 'Eis', 'Name unverändert');
   assert.equal(upd.body.data.cost, 10, 'cost unverändert');
+});
+
+test('PATCH /catalog/:id — gesendetes null leert, fehlendes Feld erhält (#789)', async () => {
+  // Die UI schickt beim Speichern IMMER alle Felder, leere als `null`. Wer eine
+  // Prämie ohne Icon anlegt und danach nur den Preis ändert, schickt also
+  // `icon: null` mit - und bekam den Text "null" als Icon zurück.
+  const id = (await call('POST', '/catalog', { body: { name: 'Ohne Icon', cost: 7 } })).body.data.id;
+  const kept = await call('PATCH', `/catalog/${id}`, { body: { name: 'Ohne Icon', cost: 8, icon: null, description: null } });
+  assert.equal(kept.body.data.icon, null, 'icon bleibt NULL, nicht der Text "null"');
+  assert.equal(kept.body.data.description, null, 'description bleibt NULL, nicht der Text "null"');
+  const stored = db.prepare('SELECT icon, description FROM reward_catalog WHERE id=?').get(id);
+  assert.equal(stored.icon, null, 'auch in der DB steht kein "null"');
+  assert.equal(stored.description, null);
+
+  // Die Gegenrichtung muss erhalten bleiben: gesendetes `null` LEERT weiterhin,
+  // sonst wäre ein gesetztes Icon nicht mehr zu entfernen.
+  await call('PATCH', `/catalog/${id}`, { body: { icon: '🎁', description: 'Da' } });
+  const cleared = await call('PATCH', `/catalog/${id}`, { body: { icon: null, description: null } });
+  assert.equal(cleared.body.data.icon, null, 'null leert ein gesetztes Icon');
+  assert.equal(cleared.body.data.description, null, 'null leert eine gesetzte Beschreibung');
+
+  // Und ein fehlendes Feld lässt den Wert unangetastet.
+  await call('PATCH', `/catalog/${id}`, { body: { icon: '🍬', description: 'Bleibt' } });
+  const untouched = await call('PATCH', `/catalog/${id}`, { body: { cost: 9 } });
+  assert.equal(untouched.body.data.icon, '🍬', 'fehlendes icon-Feld ändert nichts');
+  assert.equal(untouched.body.data.description, 'Bleibt', 'fehlendes description-Feld ändert nichts');
 });
 
 test('GET /catalog — Nicht-Admin nur aktive, Admin all=1 auch inaktive', async () => {
@@ -359,6 +385,34 @@ test('GET /redemptions — Status-Filter + Namens-Joins', async () => {
   assert.ok(mine && mine.user_name, 'user_name-Join vorhanden');
   // ungültiger Status-Query wird ignoriert (kein Filter) -> liefert Liste
   assert.equal((await call('GET', '/redemptions?status=bogus', { actor: ADMIN })).status, 200);
+});
+
+test('GET /redemptions — wer nicht entscheidet, sieht nur seine eigenen', async () => {
+  // DIE POSITIVE HAELFTE DIESER REGEL, und sie ist die wichtigere. Am Display
+  // gemessen kommt immer eine leere Liste heraus - ein Wandtablett kann keine
+  // eigene Anfrage haben -, und die bliebe leer, selbst wenn der Filter das
+  // falsche Subjekt bände. Dann verlöre JEDES Mitglied seine eigene Liste, und
+  // niemand hätte es bemerkt.
+  const { kid: einer, id: seine } = await pendingRedemption(100);
+  const { kid: andere, id: fremde } = await pendingRedemption(100);
+
+  const alsEr = await call('GET', '/redemptions', { actor: einer });
+  assert.equal(alsEr.status, 200);
+  const ids = alsEr.body.data.map((r) => r.id);
+  assert.ok(ids.includes(seine), 'seine eigene Anfrage ist da');
+  assert.ok(!ids.includes(fremde), 'die des anderen nicht');
+  assert.ok(alsEr.body.data.every((r) => r.user_id === einer.id), 'und sonst auch nichts Fremdes');
+
+  // Der Administrator entscheidet und sieht deshalb beide.
+  const alsAdmin = await call('GET', '/redemptions', { actor: ADMIN });
+  const adminIds = alsAdmin.body.data.map((r) => r.id);
+  assert.ok(adminIds.includes(seine) && adminIds.includes(fremde), 'der Admin sieht beide');
+
+  // Der Status-Filter bleibt neben dem Subjektfilter wirksam - zwei Bedingungen
+  // in einer Abfrage sind die Stelle, an der eine still verlorengeht.
+  const nurOffen = await call('GET', '/redemptions?status=pending', { actor: einer });
+  assert.equal(nurOffen.status, 200);
+  assert.ok(nurOffen.body.data.every((r) => r.user_id === einer.id && r.status === 'pending'));
 });
 
 test('GET /overview — Ränge, Katalog und pendingCount nach Aktivität', async () => {

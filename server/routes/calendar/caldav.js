@@ -3,6 +3,7 @@
  */
 
 import { createLogger } from '../../logger.js';
+import { integrationDetailsVisible } from '../../scopes.js';
 import express from 'express';
 import * as caldavSync from '../../services/caldav-sync.js';
 import * as caldavReminders from '../../services/caldav-reminders-sync.js';
@@ -59,7 +60,10 @@ router.put('/caldav/accounts/:id', requireAdmin, async (req, res) => {
 router.delete('/caldav/accounts/:id', requireAdmin, (req, res) => {
   try {
     const accountId = parseInt(req.params.id, 10);
-    const result = caldavSync.deleteAccount(accountId);
+    // Query statt Body: DELETE-Requests tragen in dieser App keinen Body, und
+    // der Client soll die Wahl ausdruecklich mitschicken (#732).
+    const deleteEvents = req.query.deleteEvents === 'true';
+    const result = caldavSync.deleteAccount(accountId, { deleteEvents });
     res.json({ data: result });
   } catch (err) {
     log.error('CalDAV account deletion failed:', err);
@@ -85,13 +89,18 @@ router.get('/caldav/accounts/:id/calendars', requireAdmin, async (req, res) => {
 router.patch('/caldav/accounts/:id/calendars', requireAdmin, (req, res) => {
   try {
     const accountId = parseInt(req.params.id, 10);
-    const { calendarUrl, enabled } = req.body;
+    const { calendarUrl, enabled, deleteEvents } = req.body;
 
     if (!calendarUrl || enabled === undefined) {
       return res.status(400).json({ error: 'Missing calendarUrl or enabled field.', code: 400 });
     }
+    if (deleteEvents !== undefined && typeof deleteEvents !== 'boolean') {
+      return res.status(400).json({ error: 'deleteEvents must be a boolean.', code: 400 });
+    }
 
-    const result = caldavSync.updateCalendarSelection(accountId, calendarUrl, enabled);
+    const result = caldavSync.updateCalendarSelection(accountId, calendarUrl, enabled, {
+      deleteEvents: deleteEvents === true,
+    });
     res.json({ data: result });
   } catch (err) {
     log.error('CalDAV calendar selection update failed:', err);
@@ -114,7 +123,19 @@ router.post('/caldav/sync', requireAdmin, async (req, res) => {
 router.get('/caldav/status', (req, res) => {
   try {
     const status = caldavSync.getStatus();
-    res.json({ data: status });
+    // SERVER-ADRESSE UND BENUTZERNAME SIND VERWALTUNGSDATEN, keine Kalenderdaten.
+    // `calendar:read` reicht bis hierher, weil der Pfad-Guard am ersten Segment
+    // urteilt - ein Wandtablett an der Kuechenwand haette damit ausgelesen,
+    // gegen welchen Server dieser Haushalt mit welchem Namen synchronisiert.
+    // Die Regel steht in scopes.js, gemessen an den Scopes und nicht am
+    // Kontotyp; eine Sitzung sieht unveraendert alles.
+    const data = integrationDetailsVisible(req)
+      ? status
+      : {
+        ...status,
+        accounts: (status.accounts || []).map(({ caldavUrl, username, ...rest }) => rest),
+      };
+    res.json({ data });
   } catch (err) {
     log.error('CalDAV status failed:', err);
     res.status(500).json({ error: 'Failed to get CalDAV status.', code: 500 });

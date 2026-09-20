@@ -7,9 +7,14 @@
  * Scoping/Visibility-Modell:
  *   - Jede Zeile gehört einem Nutzer (`user_id`, "Eigentümer").
  *   - Lesen: erlaubt für den Eigentümer ODER wenn `visibility = 'family'`.
- *   - Schreiben/Ändern/Löschen: ausschließlich der Eigentümer.
+ *   - Schreiben/Ändern/Löschen: der Eigentümer - oder eine Person, der ein Admin
+ *     die Betreuung dieses Eigentümers eingeräumt hat (`health_care_grants`, #584).
+ *     Betreuung schließt das Lesen der betreuten Person mit ein, auch der als
+ *     `private` markierten Zeilen; ohne das wäre der eben eingetragene Fieberwert
+ *     für die eintragende Person sofort unsichtbar.
  *   - Verschachtelte Entitäten (Schedules/Logs, Lab-Results) erben Scoping/Visibility
  *     von ihrem Eltern-Datensatz (Medikament bzw. Befund).
+ *   - Der Zyklus-Tab ist von der Betreuung ausgenommen (siehe `cycle.js`).
  */
 
 import { createLogger } from '../../logger.js';
@@ -21,14 +26,25 @@ export const VISIBILITIES = ['private', 'family'];
 export const LOG_STATUS   = ['taken', 'skipped', 'pending'];
 export const FLOW_LEVELS  = ['spotting', 'light', 'medium', 'heavy'];
 export const MAX_UNIT     = 30;
-export const MAX_SYMPTOMS = 300;
 
 export function viewerId(req) {
   return req.authUserId || req.session.userId;
 }
 
+// Betreute Personen als Subquery statt als aufgelöste ID-Liste: die Zahl der
+// Platzhalter bliebe sonst von den Daten abhängig, und jede aufrufende Route
+// müsste die Liste selbst beschaffen.
+const CARED_FOR_SUBQUERY = 'SELECT subject_id FROM health_care_grants WHERE caregiver_id = ?';
+
 /**
- * Baut eine WHERE-Teilbedingung für Sichtbarkeit/Personen-Filter.
+ * Baut eine WHERE-Teilbedingung für Sichtbarkeit/Personen-Filter: Eigentümer
+ * oder `visibility = 'family'`. Betreuung spielt hier bewusst KEINE Rolle -
+ * dafür gibt es `careAwareClause()`.
+ *
+ * Warum zwei Funktionen statt eines Flags: so steht an jeder Aufrufstelle
+ * lesbar, welches Modell gilt, und wer die Wahl vergisst, landet auf der
+ * engeren Variante statt versehentlich fremde Daten zu öffnen.
+ *
  * @param {string} alias         - Tabellen-Alias mit user_id + visibility
  * @param {number} viewer        - eingeloggter Nutzer
  * @param {number|null} personId  - optionaler Personen-Filter (?user_id=)
@@ -40,6 +56,104 @@ export function visibilityClause(alias, viewer, personId) {
     return { sql: `${alias}.user_id = ? AND ${alias}.visibility = 'family'`, params: [personId] };
   }
   return { sql: `(${alias}.user_id = ? OR ${alias}.visibility = 'family')`, params: [viewer] };
+}
+
+/**
+ * Wie `visibilityClause()`, zusätzlich mit den Daten betreuter Personen - auch
+ * deren privaten (#584). Gilt für Vitalwerte, Medikamente, Laborbefunde und
+ * Aktivitäten.
+ */
+export function careAwareClause(alias, viewer, personId) {
+  if (personId) {
+    if (personId === viewer) return { sql: `${alias}.user_id = ?`, params: [viewer] };
+    // Betreute Person: volle Sicht wie der Eigentümer. Für alle anderen bleibt
+    // es beim Familien-Filter.
+    return {
+      sql: `${alias}.user_id = ? AND (${alias}.visibility = 'family' OR ? IN (${CARED_FOR_SUBQUERY}))`,
+      params: [personId, personId, viewer],
+    };
+  }
+  return {
+    sql: `(${alias}.user_id = ? OR ${alias}.visibility = 'family' OR ${alias}.user_id IN (${CARED_FOR_SUBQUERY}))`,
+    params: [viewer, viewer],
+  };
+}
+
+// --------------------------------------------------------
+// Betreuung (#584)
+// --------------------------------------------------------
+
+/** IDs der Personen, für die `viewer` eintragen darf. Ohne Betreuung: []. */
+export function caredForIds(viewer) {
+  if (!viewer) return [];
+  return db.get().prepare(CARED_FOR_SUBQUERY).all(viewer).map((r) => r.subject_id);
+}
+
+/**
+ * Darf `viewer` Daten schreiben, die `ownerId` gehören? Wahr für die eigenen
+ * Daten und für jede Person, deren Betreuung eingeräumt wurde.
+ */
+export function canWriteFor(viewer, ownerId) {
+  if (!viewer || !ownerId) return false;
+  if (viewer === ownerId) return true;
+  return !!db.get().prepare(
+    'SELECT 1 FROM health_care_grants WHERE subject_id = ? AND caregiver_id = ?'
+  ).get(ownerId, viewer);
+}
+
+/**
+ * WHERE-Fragment für Zeilen, die `viewer` ändern oder löschen darf: die eigenen
+ * plus die jeder betreuten Person. Ersetzt das frühere `user_id = ?`.
+ * @param {string} alias - Tabellen-Alias oder '' für unqualifizierte Spalten
+ */
+export function writableClause(alias, viewer) {
+  const col = `${alias ? `${alias}.` : ''}user_id`;
+  return {
+    sql: `(${col} = ? OR ${col} IN (${CARED_FOR_SUBQUERY}))`,
+    params: [viewer, viewer],
+  };
+}
+
+/**
+ * Lädt einen abhängigen Datensatz, wenn `viewer` dessen Eltern-Zeile ändern
+ * darf; sonst null.
+ *
+ * Zeitpläne und Dosis-Einträge hängen am Medikament, Analyte am Befund: sie
+ * haben keine eigene `user_id`, ihr Scoping ist immer das des Elternteils. Wer
+ * das von Hand als `m.user_id = ?` schreibt, schneidet die Betreuung (#584)
+ * still wieder weg - genau das war #884: anlegen ging, wegräumen nicht. Die
+ * Regel steht deshalb hier und nicht in jeder Route erneut.
+ *
+ * @param {string} sql         - SELECT … JOIN … WHERE <kind>.id = ?  (ohne Scope)
+ * @param {string} parentAlias - Alias der Eltern-Tabelle mit `user_id`
+ * @param {number} id          - ID des abhängigen Datensatzes
+ * @param {number} viewer      - eingeloggter Nutzer
+ */
+export function writableChild(sql, parentAlias, id, viewer) {
+  const w = writableClause(parentAlias, viewer);
+  return db.get().prepare(`${sql} AND ${w.sql}`).get(id, ...w.params) ?? null;
+}
+
+/**
+ * Eigentümer eines zu schreibenden Datensatzes aus dem Request.
+ * Ohne `user_id` im Body bleibt es der eingeloggte Nutzer - die Route verhält
+ * sich für alle Bestandsaufrufe also unverändert.
+ *
+ * @returns {{ ownerId: number }|{ error: string, status: number }}
+ */
+export function resolveOwner(req, viewer) {
+  const raw = req.body?.user_id;
+  if (raw === undefined || raw === null || raw === '') return { ownerId: viewer };
+
+  const ownerId = parseInt(raw, 10);
+  if (!ownerId) return { error: 'Ungültige Person.', status: 400 };
+  if (!canWriteFor(viewer, ownerId)) {
+    // Bewusst 403 und nicht 404: dass es die Person gibt, weiß der Aufrufer aus
+    // der Mitgliederliste ohnehin - verschleiert würde hier nichts, nur die
+    // Ursache unklar gemacht.
+    return { error: 'Keine Berechtigung, für diese Person einzutragen.', status: 403 };
+  }
+  return { ownerId };
 }
 
 /** Koerziert einen Boolean/0/1-Wert zu 0|1 oder undefined (= nicht gesetzt). */

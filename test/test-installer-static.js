@@ -36,23 +36,39 @@ test('GET /tokens.css liefert 200 + text/css aus public/styles', async () => {
   });
 });
 
-test('GET /fonts/plus-jakarta-sans-variable.woff2 liefert 200 + font/woff2', async () => {
+/**
+ * HIER STANDEN ZWEI FONT-TESTS - einer sicherte der /fonts/-Route ihre 200 zu,
+ * der andere haertete sie gegen Path-Traversal und Nicht-woff2.
+ *
+ * Die Route ist entfallen (Begruendung in install-server.js), und mit ihr die
+ * beiden Dateien. Der Haertungstest waere dabei GRUEN GEBLIEBEN, ohne noch
+ * irgendetwas zu haerten: ohne Route liefert jeder /fonts/-Pfad 404, also auch
+ * die drei Angriffspfade. Ein Test, dessen Aussage sich still von „die Route
+ * wehrt ab" zu „es gibt keine Route" verschiebt, ist keine Zusicherung mehr -
+ * deshalb sagt der Nachfolger, was er wirklich prueft.
+ */
+test('der Installer serviert keine Schriften mehr - auch nicht die der App', async () => {
   await withServer(async base => {
-    const r = await fetch(`${base}/fonts/plus-jakarta-sans-variable.woff2`);
-    assert.equal(r.status, 200);
-    assert.equal(r.headers.get('content-type'), 'font/woff2');
-    const body = Buffer.from(await r.arrayBuffer());
-    assert.ok(body.length > 0, 'Font-Body ist leer');
-  });
-});
-
-test('GET /fonts/* lehnt Nicht-woff2 und Path-Traversal mit 404 ab', async () => {
-  await withServer(async base => {
-    for (const path of ['/fonts/nope.woff2', '/fonts/../install.html', '/fonts/evil.css']) {
+    // Die frueher ausgelieferte Datei zuerst: sie ist der Beleg, dass hier die
+    // ROUTE fehlt und nicht nur eine Datei.
+    for (const path of [
+      '/fonts/plus-jakarta-sans-variable.woff2',
+      '/fonts/nope.woff2',
+      '/fonts/../install.html',
+      '/fonts/evil.css',
+    ]) {
       const r = await fetch(`${base}${path}`);
       assert.equal(r.status, 404, `${path} hätte 404 liefern müssen`);
     }
   });
+
+  // Und die Gegenrichtung: die Schrift darf auch nicht ueber ein Stylesheet
+  // zurueckkommen. `public/` fuehrt seit dem Redesign kein @font-face - faellt
+  // diese Zusicherung, steht wieder eine Schrift im Spiel, fuer die es keine
+  // Auslieferung gibt.
+  const tokens = readFileSync(new URL('../public/styles/tokens.css', import.meta.url), 'utf8');
+  assert.doesNotMatch(tokens, /@font-face/, 'tokens.css deklariert wieder eine Schrift');
+  assert.doesNotMatch(tokens, /Plus Jakarta/i, 'tokens.css nennt wieder Plus Jakarta Sans');
 });
 
 // ── Token-Parität: install.html nutzt App-Tokens, keine eigenen Hardcodes ─────

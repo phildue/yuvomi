@@ -80,16 +80,46 @@
  * display:flex dieser Zeile gewinnt. */
 .notes-filters {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: var(--space-2);
   padding-block: var(--space-2);
   padding-inline: var(--page-inline-pad);
   border-bottom: 1px solid var(--color-border-subtle);
   flex-shrink: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--module-accent) transparent;
+  -webkit-overflow-scrolling: touch;
+}
+
+.notes-filters::-webkit-scrollbar { height: 10px; }
+.notes-filters::-webkit-scrollbar-track { background: transparent; }
+.notes-filters::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--module-accent) var(--tint-hint), transparent);
+  border: 3px solid transparent;
+  border-radius: var(--radius-full);
+  background-clip: padding-box;
 }
 
 .notes-filters[hidden] {
   display: none;
+}
+
+.notes-filter-group {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Both groups keep their width; the outer row owns scrolling. An independently
+ * shrinking category scroller becomes zero-width beside a long creator group. */
+
+.notes-filter-group + .notes-filter-group {
+  padding-inline-start: var(--space-2);
+  border-inline-start: var(--space-px) solid var(--color-border-subtle);
 }
 
 .notes-grid {
@@ -108,12 +138,12 @@
 }
 
 /* Abschnittsköpfe („Angepinnt" / „Weitere Notizen") spannen über alle Spalten,
- * wie der Leerzustand. */
+ * wie der Leerzustand. Groesse/Gewicht kamen hier als eigene Kopie derselben
+ * Section-Title-Rolle, die u-section-title zentral fuehrt (Polish-Batch,
+ * PLAN.md #7) - jetzt im Markup, hier bleibt nur Layout/Farbe. */
 .notes-group__title {
   grid-column: 1 / -1;
   margin: 0;
-  font-size: var(--type-section-title);
-  font-weight: var(--font-weight-semibold);
   color: var(--color-text-secondary);
 }
 
@@ -159,16 +189,43 @@
 /* --------------------------------------------------------
  * Notiz-Karte
  * -------------------------------------------------------- */
+/* Die Zettelfarbe ist eine frei gewählte NUTZERFARBE. Sie trug hier bis
+ * Runde 3 die ganze Karte als Vollfläche, mit einer zur Laufzeit gerechneten
+ * Textfarbe (getReadableTextColor) - die einzige Stelle der App, an der eine
+ * ungemessene Nutzerfarbe eine Inhaltsfläche trug, und im Dark-Theme ein Feld
+ * heller Pastellblöcke. Jetzt gilt das gemessene 16-%-Rezept (DESIGN.md,
+ * User-Farben-Regel): 16 % Zettelfarbe auf der Kartenfläche, Text immer
+ * --color-text-primary. Der Zettel bleibt unterscheidbar, die Lesbarkeit hängt
+ * nicht mehr an der gewählten Farbe - auch nicht bei Alt-Daten ausserhalb der
+ * Palette. Randlos wie jede Karte dieser Welt. */
+/* DIE SCHEIBE UNTER DEN KARTEN-AKTIONEN, ALS BENANNTE STUFE.
+ *
+ * Hier stand `--color-overlay-light` - der MODAL-SCRIM der App (tokens.css),
+ * und app-weit das einzige Bedienelement mit gefuellter Ruheflaeche; kein
+ * anderer Icon-Knopf unter 472 Knoepfen auf acht Routen tut das (Critique
+ * 2026-08-13). Er stand auf keiner Sprosse der Toenungsskala und komponierte
+ * mit einer frei gewaehlten Nutzerfarbe, sein Ergebnis war also nicht im
+ * Voraus gemessen - was die User-Farben-Regel ausdruecklich verlangt.
+ *
+ * Die Scheibe hat trotzdem eine Aufgabe: am Finger stehen die drei Knoepfe
+ * dauerhaft ueber dem Notiztext, und ohne Flaeche waere das Icon auf Schrift
+ * gelegt. Sie bleibt also - aber als benannte Stufe aus der TINTE der Karte
+ * statt als Scrim. Das ist zugleich der Richtungsfehler des Scrims behoben:
+ * 35 % Schwarz auf einer dunklen Karte machte die Scheibe DUNKLER als ihren
+ * Grund, `--color-text-primary` kippt mit dem Theme und liegt in beiden
+ * Themes auf der richtigen Seite. */
 .note-card {
+  --note-action-bg: color-mix(in srgb, var(--color-text-primary) var(--tint-state), transparent);
+  --note-action-bg-hover: color-mix(in srgb, var(--color-text-primary) var(--tint-surface), transparent);
   min-width: 0;
   border-radius: var(--radius-md);
   padding: var(--space-3);
   cursor: pointer;
   position: relative;
   transition: transform var(--transition-fast), box-shadow var(--transition-fast);
-  /* Hairline aus der eigenen Textfarbe: gibt auch dem weißen Zettel auf
-   * warm-paper eine definierte Kante, ohne Design-Werte hartzukodieren. */
-  border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+  background: color-mix(in srgb, var(--note-color, transparent) var(--tint-surface), var(--color-surface));
+  color: var(--color-text-primary);
+  border: none;
   box-shadow: var(--shadow-sm);
 }
 
@@ -190,7 +247,7 @@
   width: var(--target-base);
   height: var(--target-base);
   border-radius: var(--radius-full);
-  background: var(--color-overlay-light);
+  background: var(--note-action-bg);
   border: none;
   cursor: pointer;
   display: flex;
@@ -214,7 +271,7 @@
 .note-card--pinned .note-card__pin {
   opacity: 1;
   pointer-events: auto;
-  background: var(--color-overlay-light);
+  background: var(--note-action-bg);
 }
 
 .note-card:hover .note-card__pin {
@@ -226,7 +283,7 @@
 .note-card__pin:focus-visible {
   opacity: 1;
   pointer-events: auto;
-  background: var(--color-overlay);
+  background: var(--note-action-bg-hover);
 }
 
 .note-card__title {
@@ -239,6 +296,35 @@
 .note-card__title,
 .note-card__content {
   unicode-bidi: plaintext;
+}
+
+.note-card__categories {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+}
+
+.note-category-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 100%;
+  padding: var(--space-0h) var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--color-fill-well);
+  color: var(--color-text-secondary);
+}
+
+.note-category-badge__name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.note-category-badge svg {
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+  flex: 0 0 auto;
 }
 
 .note-card__content {
@@ -265,8 +351,149 @@
   justify-content: space-between;
   margin-top: var(--space-2);
   padding-top: var(--space-2);
-  border-top: 1px solid color-mix(in srgb, currentColor 35%, transparent);
-  color: inherit;
+  border-top: var(--space-px) solid var(--color-border-subtle);
+}
+
+.note-category-editor__choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-bottom: var(--space-2);
+}
+
+.note-read__categories {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-bottom: var(--space-3);
+}
+
+.note-category-selection {
+  min-height: var(--target-base);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 100%;
+  padding-block: 0;
+  padding-inline: var(--space-2) var(--space-0h);
+  border: var(--space-px) solid var(--color-border);
+  border-radius: var(--radius-full);
+  border-color: var(--module-notes);
+  background: color-mix(in srgb, var(--module-notes) var(--tint-state), transparent);
+  color: var(--color-text-primary);
+}
+
+.note-category-selection > svg {
+  width: var(--icon-md);
+  height: var(--icon-md);
+  flex-shrink: 0;
+}
+
+.note-category-selection__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note-category-selection__remove {
+  display: grid;
+  place-items: center;
+  width: var(--target-md);
+  height: var(--target-md);
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.note-category-selection__remove:hover { background: var(--color-surface-hover); color: var(--color-text-primary); }
+.note-category-selection__remove:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+.note-category-selection__remove svg { width: var(--icon-md); height: var(--icon-md); }
+
+.note-category-picker { position: relative; }
+.note-category-picker__combobox { position: relative; }
+
+.note-category-picker__list {
+  position: absolute;
+  z-index: var(--z-dropdown);
+  inset: calc(100% + var(--space-1)) 0 auto;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: var(--space-1);
+  border: var(--space-px) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-md);
+}
+
+.note-category-picker__list[hidden] { display: none; }
+
+.note-category-picker__option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: var(--target-base);
+  padding: var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-primary);
+  text-align: start;
+  cursor: pointer;
+}
+
+.note-category-picker__option:hover,
+.note-category-picker__option.is-active { background: var(--color-surface-hover); }
+.note-category-picker__option svg { width: var(--icon-md); height: var(--icon-md); color: var(--color-text-secondary); }
+.note-category-picker__scope { color: var(--color-text-tertiary); font-size: var(--text-xs); }
+
+.note-category-editor__scope {
+  display: flex;
+  align-items: center;
+  flex: 1 1 0;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.note-category-editor__scope .form-input {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+}
+
+.note-category-editor__create {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.note-category-editor__create[hidden] { display: none; }
+
+@media (max-width: 639px) {
+  .notes-manage-categories {
+    width: var(--target-base);
+    height: var(--target-base);
+  }
+  .notes-manage-categories span { display: none; }
+  .notes-filter-group + .notes-filter-group {
+    padding-inline-start: 0;
+    border-inline-start: 0;
+  }
+  .note-category-editor__create { align-items: stretch; }
+  .note-category-editor__scope { flex: 1 1 100%; }
+  .note-category-editor__scope .form-input { flex: 1; }
+  .note-category-editor__create > .btn { width: 100%; }
 }
 
 .note-card__creator {
@@ -274,9 +501,24 @@
   align-items: center;
   gap: var(--space-1);
   font-size: var(--text-xs);
-  color: inherit;
+  color: var(--color-text-secondary);
 }
 
+/* DIE SCHEIBE IST DER PUNKT IN SEINER GRÖSSTEN FORM - ALSO VOLLTON.
+ *
+ * Hier stand das gemessene 16-%-Rezept mit Primärtext darauf, und die
+ * Begründung dafür war eine Kontrastrechnung: der 70-%-Ink-Mix bricht an den
+ * Enden der Helligkeitsachse (weiss/light 1.92:1, schwarz/dark 1.97:1). Die
+ * Rechnung stimmt bis heute - sie beantwortet nur eine Frage, die sich nicht
+ * mehr stellt. Auf dieser 16px-Scheibe steht seit der Initialen-Schwelle-Regel
+ * gar kein Text mehr (notes.js), und die Identitätsfarben-Regel benennt die
+ * Scheibe ausdrücklich als „den Dot in seiner grössten Form, keine Fläche".
+ * Eine Waschung war hier die letzte Nutzerfarbe der App, die ihre Identität
+ * blass nannte.
+ *
+ * Wo Text auf einer Nutzerfarbe nötig IST, löst das inzwischen
+ * `getReadableTextColor` - fünf Bauteile fahren so (user-multi-select,
+ * seal-pair, contacts, rewards, Dashboard). */
 .note-card__avatar {
   width: 16px;
   height: 16px;
@@ -284,9 +526,7 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: var(--text-xs);
-  font-weight: var(--font-weight-bold);
-  color: var(--color-text-on-accent);
+  background: var(--avatar-color, var(--color-accent));
   flex-shrink: 0;
   overflow: hidden;
 }
@@ -308,7 +548,7 @@
   width: var(--target-base);
   height: var(--target-base);
   border-radius: var(--radius-full);
-  background: var(--color-overlay-light);
+  background: var(--note-action-bg);
   border: none;
   cursor: pointer;
   display: flex;
@@ -340,12 +580,12 @@
 }
 
 .note-card__open:hover {
-  background: var(--color-overlay);
+  background: var(--note-action-bg-hover);
 }
 
 .note-card__delete:hover {
   background: var(--color-danger-light);
-  color: var(--color-danger);
+  color: var(--color-danger-ink);
 }
 
 @media (pointer: coarse) {
@@ -379,8 +619,8 @@
 .note-read-view {
   padding: var(--space-4);
   border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--note-color, transparent) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--note-color, transparent) 26%, transparent);
+  background: color-mix(in srgb, var(--note-color, transparent) var(--tint-surface), transparent);
+  border: 1px solid color-mix(in srgb, var(--note-color, transparent) var(--tint-hint), transparent);
 }
 
 .note-read__body {
@@ -436,66 +676,3 @@
 
 .note-color-swatch:hover       { transform: scale(1.15); }
 .note-color-swatch--active     { border-color: var(--color-text-primary); transform: scale(1.1); }
-
-/* --------------------------------------------------------
- * Formatierungs-Toolbar im Notiz-Editor
- * -------------------------------------------------------- */
-.note-format-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-1);
-  padding: var(--space-1) var(--space-2);
-  border: 1.5px solid var(--color-border);
-  border-bottom: none;
-  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-  background-color: var(--color-surface-2);
-}
-
-.note-format-toolbar + .form-input {
-  border-top-left-radius: 0;
-  border-top-right-radius: 0;
-}
-
-.note-format-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  /* Nicht schrumpfen: bei 12 Buttons in einem ~340px-Modal bricht die Leiste
-   * jetzt um (flex-wrap), statt die Buttons unter die Fingergröße zu quetschen. */
-  flex: 0 0 auto;
-  width: 32px;
-  height: 32px;
-  border: none;
-  border-radius: var(--radius-xs);
-  background: transparent;
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  transition: background-color var(--transition-fast), color var(--transition-fast);
-  font-size: var(--text-sm);
-  padding: 0;
-}
-
-/* Touch: volle 44px-Targets (iOS-Minimum, --target-base) */
-@media (pointer: coarse) {
-  .note-format-btn {
-    width: var(--target-base);
-    height: var(--target-base);
-  }
-}
-
-.note-format-btn:hover {
-  background-color: var(--color-accent-light);
-  color: var(--color-accent);
-}
-
-.note-format-btn--sep {
-  width: 1px;
-  background-color: var(--color-border);
-  margin: var(--space-1) var(--space-1);
-  cursor: default;
-}
-
-.note-format-btn--sep:hover {
-  background-color: var(--color-border);
-  color: var(--color-text-secondary);
-}

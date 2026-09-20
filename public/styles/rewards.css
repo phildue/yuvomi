@@ -15,12 +15,14 @@
   flex-direction: column;
 }
 
-/* Toolbar: Titel links, Tab-Reihe füllt den Rest und bleibt rechtsbündig. */
+/* Die Tab-Reihe ist die Bar-Zeile des Kopfs (.page-toolbar__bar, layout.css,
+ * Werkzeugzeilen-Regel 2026-08-27): volle Zeile unter dem Titel auf ALLEN
+ * Viewports, nicht mehr nur in der kompakten Groessenklasse. Das fruehere
+ * `margin-left: auto` (rechtsbuendig neben dem Titel) war Titelzeilen-Logik
+ * und ist mit der eigenen Zeile entfallen. */
 .rewards-tabs {
   display: flex;
-  flex-wrap: wrap;
   gap: var(--space-1);
-  margin-left: auto;
 }
 
 .rewards-content__inner {
@@ -47,13 +49,16 @@
   flex-wrap: wrap;
 }
 
+/* Groesse/Gewicht kommen seit dem Polish-Batch (PLAN.md #7) aus der
+ * geteilten .u-section-title-Rolle (typography.css) statt aus einer eigenen
+ * 18px-Deklaration hier - vier Sektionskoepfe (Setup, Anfragen, Punktestand,
+ * Katalog), die schon vorher eine Bereichs-Ueberschrift waren, nur 2px unter
+ * der kanonischen Section-Title-Stufe. */
 .rw-section__title {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
   margin: 0;
-  font-size: var(--text-lg);
-  font-weight: 600;
   color: var(--color-text-primary);
 }
 .rw-section__title i { width: 18px; height: 18px; color: var(--module-accent); }
@@ -70,34 +75,50 @@
   justify-content: center;
   border-radius: var(--radius-full);
   overflow: hidden;
+  /* Platzhalterfläche, solange ein Avatarbild lädt. */
   background: var(--color-surface-3);
   font-weight: 600;
   font-size: var(--text-sm);
-  color: var(--color-text-on-accent);
+  /* KEINE Textfarbe hier. Sie stand als `--color-text-on-accent` (weiß) über
+     dieser grauen Platzhalterfläche und ergab 1,19:1 - sie kam nur deshalb nie
+     an, weil beide Varianten sie überschreiben: die Bildvariante hat gar keinen
+     Text, die Initialenvariante setzt ihre Farbe inline aus
+     `getReadableTextColor(Nutzerfarbe)` (rewards.js:98, Regel 3: auf einer
+     Nutzerfarbe wählt der Text seinen Ton). Eine zugesagte Farbe, die nie gilt,
+     ist eine Zusage, die beim ersten neuen Markup bricht. */
 }
 .rw-avatar img { width: 100%; height: 100%; object-fit: cover; }
-.rw-avatar--initials { background: var(--rw-avatar-bg, var(--module-accent)); }
+/* Der Fallback ist NEUTRAL, nicht der Modulton. Er greift heute nie - rewards.js
+ * setzt --rw-avatar-bg immer, notfalls auf AVATAR_FALLBACK_COLOR - und genau das
+ * ist der Grund, ihn zu korrigieren: eine tote Zusage bricht beim ersten neuen
+ * Markup, und sie bräche hier in die Identitätsfarben-Regel hinein (wer keine
+ * eigene Farbe hat, bleibt neutral, statt die Modulfarbe zu erben). Dieselbe
+ * Lehre steht acht Zeilen weiter oben über der Textfarbe, die nie ankam. */
+.rw-avatar--initials { background: var(--rw-avatar-bg, var(--color-fill-well)); }
 
 /* --------------------------------------------------------
    Übersicht: Punktestände (gleichwertige Zeilenliste, bewusst flach)
    -------------------------------------------------------- */
+/* EIN Träger, Zeilen per Haarlinie (Zeilenlisten-Regel, tokens.css) - vorher
+ * trug jede Punktestandszeile ihre eigene Karte.
+ *
+ * DER TRÄGER IST `.row-carrier` (Critique 2026-08-13). Fläche, Radius,
+ * Schatten, `overflow` und die Haarlinie über den +-Kombinator standen hier
+ * Wert für Wert ein zweites Mal - ein Nachbau, den man erst sieht, wenn man
+ * beide Dateien nebeneinander legt. Was bleibt, ist das Listen-Reset. */
 .rw-standings {
   list-style: none;
   margin: 0;
   padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
 }
+/* SIE TRÄGT `.list-row`. Was bleibt, ist die eigene Spaltenaufteilung: die
+ * Zeile führt in der Mitte einen Fortschrittsbalken, also drei benannte
+ * Spalten statt Name-über-Meta. Anzeigeart, Polsterung, Mindesthöhe,
+ * Übergang und Hover kommen aus der geteilten Zeile. */
 .rw-standing {
   display: grid;
   grid-template-columns: minmax(180px, 1.2fr) minmax(0, 1.6fr) auto;
-  align-items: center;
   gap: var(--space-4);
-  padding: var(--space-3);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-md);
 }
 
 /* Fokussierbarer Öffner (Tastatur/Screenreader) für das Mitglieds-Detail. */
@@ -119,14 +140,12 @@
   outline: var(--focus-ring-width) solid var(--focus-ring-color);
   outline-offset: var(--focus-ring-offset);
 }
-.rw-standing__rank {
-  flex: 0 0 auto;
-  min-width: 18px;
-  font-size: var(--text-sm);
-  font-weight: 600;
-  color: var(--color-text-secondary);
-  font-variant-numeric: tabular-nums;
-}
+/* `.rw-standing__rank` stand hier: die Platzziffer vor dem Namen, erster Inhalt
+ * der Zeile und der einzige, aus dem keine Handlung folgt. In einem Haushalt
+ * mit zwei Kindern heisst "2" dauerhaft "letzte" - ein Wettbewerbs-Scoreboard
+ * in einer App, deren Positionierung "ein Zuhause" ist. Entschieden am
+ * 2026-08-13: die Ziffer geht, die Naehe zur naechsten Praemie steht ohnehin
+ * schon in derselben Zeile und ist handlungsfaehig. */
 .rw-standing__idtext { min-width: 0; display: flex; flex-direction: column; }
 .rw-standing__name {
   font-weight: 600;
@@ -137,22 +156,31 @@
   transition: color 140ms ease;
 }
 .rw-standing__points { font-size: var(--text-sm); color: var(--color-text-secondary); }
+/* Der Punktestand ist die Hauptaussage seiner Zeile und trägt Label-Farbe: der
+ * Modulton sagte hier „Belohnungen" auf einer Seite, deren Titel und Siegel das
+ * schon beantwortet haben (Herkunfts-Regel). Was die Zahl auszeichnet, ist ihr
+ * Grad und ihr Gewicht, nicht ihre Farbe - dieselbe Entscheidung wie bei den
+ * Large Titles, die immer Label-Farbe tragen. */
 .rw-standing__points strong {
   font-size: var(--text-xl);
   font-weight: 700;
-  color: var(--module-accent);
+  color: var(--color-text-primary);
   font-variant-numeric: tabular-nums;
 }
-.rw-standing__points strong.rw-countup--active { color: color-mix(in srgb, var(--module-accent) 70%, var(--color-text-primary)); }
+/* Der Zählvorgang ist ein ZUSTAND, kein Herkunftszeichen: er darf die Stimme
+ * nehmen, solange er läuft. */
+.rw-standing__points strong.rw-countup--active { color: var(--color-accent); }
 .rw-standing__progress { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
-.rw-standing__actions { display: flex; justify-content: flex-end; }
+/* Umbruch statt Quetschen - Begruendung an `.modal-panel__footer`
+ * (layout.css, #872). */
+.rw-standing__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; }
 
 /* --------------------------------------------------------
    Eltern-Ersteinrichtung
    -------------------------------------------------------- */
 .rw-setup {
   padding: var(--space-4);
-  border: 1px solid var(--color-border-subtle);
+  border: 1px solid transparent;
   border-radius: var(--radius-lg);
   background: var(--color-surface-2);
 }
@@ -172,22 +200,27 @@
   padding: var(--space-2) 0;
 }
 .rw-setup-step__mark { width: 20px; height: 20px; color: var(--color-text-tertiary); flex: 0 0 auto; }
-.rw-setup-step--done .rw-setup-step__mark { color: var(--module-tasks); }
+/* „Erledigt" ist ein Zustand, kein Modul: der Haken trug den Ton des
+ * AUFGABEN-Moduls, weil der Schritt dorthin führt - eine geliehene Herkunft
+ * für eine Aussage, die die App überall gleich macht. */
+.rw-setup-step--done .rw-setup-step__mark { color: var(--color-success); }
 .rw-setup-step__label { flex: 1 1 auto; color: var(--color-text-primary); }
 .rw-setup-step--done .rw-setup-step__label { color: var(--color-text-secondary); text-decoration: line-through; }
 .rw-setup-step__go {
   flex: 0 0 auto;
   min-height: var(--target-sm);
   padding: var(--space-1) var(--space-3);
-  border: 1px solid var(--module-accent);
+  /* Ein Knopf tut in jedem Modul dasselbe und trägt deshalb die Stimme
+   * (Eine-Stimme-Regel), nicht den Ton des Raums, in dem er zufällig steht. */
+  border: 1px solid var(--color-accent);
   border-radius: var(--radius-full);
   background: transparent;
-  color: var(--module-accent);
+  color: var(--color-accent);
   font-size: var(--text-sm);
   font-weight: 600;
   cursor: pointer;
 }
-.rw-setup-step__go:hover { background: color-mix(in srgb, var(--module-accent) 10%, transparent); }
+.rw-setup-step__go:hover { background: color-mix(in srgb, var(--color-accent) var(--tint-state), transparent); }
 
 /* Fortschritt zur nächsten Prämie */
 .rw-progress { display: flex; flex-direction: column; gap: var(--space-2); }
@@ -197,18 +230,27 @@
   background: var(--color-surface-3);
   overflow: hidden;
 }
+/* EIN FÜLLSTAND TUT IN JEDEM MODUL DASSELBE - also trägt er die Stimme.
+ *
+ * Hier stand ein Verlauf aus dem Modulton, und er war der letzte chromatische
+ * Verlauf auf Inhalt in der ganzen App (nachgezählt: alle übrigen
+ * `linear-gradient` sind Schraffur, Modal-Griff oder Skeleton-Shimmer). Zwei
+ * Regeln treffen ihn: chromatische Verläufe gehören nicht auf Inhalt, und ein
+ * Balken beantwortet „wie weit", nicht „wo bin ich".
+ *
+ * v2.23.0 hat genau das für `.metric-card__progress` entschieden. Diese Zeile
+ * ist ihr Geschwister und blieb stehen, weil damals nur dort gesucht wurde, wo
+ * es aufgefallen war. */
 .rw-progress__fill {
   width: 100%;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg,
-    color-mix(in srgb, var(--module-accent) 78%, white),
-    var(--module-accent));
+  background: var(--color-accent);
   /* scaleX statt width animieren — projektweite Konvention (budget/dashboard/tasks-Bars),
    * vom frontend-audit erzwungen; --rw-progress (0–1) wird inline gesetzt. */
   transform-origin: left center;
   transform: scaleX(var(--rw-progress, 0));
-  transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1);
+  transition: transform var(--duration-xl) var(--ease-out);
 }
 .rw-progress__label { margin: 0; font-size: var(--text-xs); color: var(--color-text-secondary); }
 .rw-progress__label--muted { color: var(--color-text-tertiary); }
@@ -216,18 +258,40 @@
 /* --------------------------------------------------------
    Offene Anfragen
    -------------------------------------------------------- */
+/* Randlose Karte wie jede andere: die getönte Fläche MIT getönter Kante war
+ * dasselbe Muster, das Runde 1 in der Haushaltshilfe entfernt hat. Die Tönung
+ * bleibt als Dringlichkeitssignal, die Kante geht - sie sagte nichts, was die
+ * Fläche nicht schon sagt. */
+/* DIE ALTE BEGRUENDUNG MASS GEGEN DIE FALSCHE FLAECHE.
+ * Hier stand "16 %, nicht 8: gemessen 1.25:1 light / 1.29:1 dark" - beide Werte
+ * gegen `--color-surface`, also gegen WEISS. Nachgemessen am Dokument ist die
+ * Nachbarschaft dieser Karte gar keine weisse: ihr Geschwister `.rw-section`
+ * ist transparent, sie sitzt direkt auf dem Seitengrund. Gegen den echten Grund
+ * lag die 16-%-Mischung bei 1,11:1 hell und 1,64:1 dunkel - in zwei Themes zwei
+ * verschiedene Dinge, und damit nach der Absenderband-Regel kein Kanal
+ * (Critique 2026-08-13). Die alte Begruendung berief sich ausserdem auf "das
+ * eine Toenungsrezept dieser Welt", eine Regel, die die Toenungsskala seit
+ * Runde 9 abgeloest hat.
+ *
+ * ZWEI KORREKTUREN. Die Mischung nimmt jetzt den Grund, auf dem die Karte
+ * WIRKLICH liegt (dieselbe Pro-Hintergrund-Regel, die das Siegel ueber
+ * `--seal-base` fuehrt). Und die Stufe ist `--tint-wash`: 16 % ist die Stufe
+ * des Elements, das SELBST das getoente Objekt ist (Chip, Badge, Icon-Well);
+ * was fremden Inhalt untergreift - hier Avatar, Titel, Metazeile und zwei
+ * Knoepfe - ist der Wash-Fall. Die Dringlichkeit traegt seit diesem Commit der
+ * Zaehler im Kopf, die Flaeche ist nur noch der Traeger. */
 .rw-pending-panel {
-  padding: var(--space-4);
-  border: 1px solid color-mix(in srgb, var(--module-accent) 30%, var(--color-border-subtle));
+  padding: var(--space-2) var(--space-4);
   border-radius: var(--radius-lg);
-  background: color-mix(in srgb, var(--module-accent) 6%, var(--color-surface));
+  background: color-mix(in srgb, var(--module-accent) var(--tint-wash), var(--color-bg));
+  box-shadow: var(--shadow-sm);
 }
-.rw-pending-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.rw-pending-list { list-style: none; margin: 0; padding: 0; }
 .rw-pending {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  padding: var(--space-2) 0;
+  padding: var(--space-3) 0;
 }
 .rw-pending + .rw-pending { border-top: 1px solid var(--color-border-subtle); }
 .rw-pending__text { flex: 1 1 auto; min-width: 0; }
@@ -249,11 +313,25 @@
   gap: var(--space-3);
   padding: var(--space-5);
   background: var(--color-surface);
-  border: 1px solid var(--color-border-subtle);
+  border: 1px solid transparent;
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-xs);
 }
-.rw-reward-card--inactive { opacity: 0.62; }
+/* Zurücknehmen-Muster (tokens.css, #1230) statt `opacity: 0.62`. Das
+ * „Inaktiv"-Etikett trägt den Zustand und bleibt voll. */
+.rw-reward-card--inactive {
+  background: var(--color-surface-receded);
+  border-color: var(--color-border-receded);
+  box-shadow: none;
+}
+
+.rw-reward-card--inactive .rw-reward-card__desc {
+  color: var(--color-text-receded);
+}
+/* NENNT NICHTS: das Zeichen der Prämie steht in ihrer eigenen Karte, in ihrem
+ * eigenen Modul. Es trug den Modulton als 16-%-Waschung MIT demselben Ton als
+ * Glyph darauf - dieselbe Farbe zweimal blass, sechsmal nebeneinander auf der
+ * Kachelwand. Neutral wie die Icon-Kachel der Ablegefläche (document-attach.css). */
 .rw-reward-card__icon {
   display: inline-flex;
   align-items: center;
@@ -261,10 +339,10 @@
   width: 48px;
   height: 48px;
   border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--module-accent) 12%, var(--color-surface-2));
+  background: var(--color-fill-well);
   font-size: var(--text-2xl);
 }
-.rw-reward-card__icon i { width: 22px; height: 22px; color: var(--module-accent); }
+.rw-reward-card__icon i { width: 22px; height: 22px; color: var(--color-text-secondary); }
 .rw-reward-card__body { flex: 1 1 auto; }
 .rw-reward-card__name { margin: 0; font-weight: 600; color: var(--color-text-primary); }
 .rw-reward-card__desc { margin: var(--space-1) 0 0; font-size: var(--text-sm); color: var(--color-text-secondary); }
@@ -279,13 +357,15 @@
 .rw-reward-card__actions { display: flex; align-items: center; gap: var(--space-2); }
 .rw-reward-card__short { font-size: var(--text-xs); color: var(--color-text-tertiary); }
 
+/* Der Preis ist die Zahl, auf die es in dieser Karte ankommt - er trägt
+ * Label-Farbe und sein Gewicht, nicht den Modulton (Herkunfts-Regel). */
 .rw-cost {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
   font-weight: 600;
   font-size: var(--text-sm);
-  color: var(--module-accent);
+  color: var(--color-text-primary);
 }
 .rw-cost i { width: 15px; height: 15px; }
 
@@ -315,21 +395,44 @@
   transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
 }
 .rw-chip:hover { border-color: var(--color-border-strong); }
+/* Ein Filter-Chip, kein Segment: er trägt den Ton als getönte Fläche, nicht
+ * deckend gefüllt (Rezept: tokens.css, Abschnitt 6c). Deckend war er die eine
+ * Stelle, an der ein Chip wie ein Segment aussah. */
 .rw-chip--active {
-  background: var(--module-accent);
-  border-color: var(--module-accent);
-  color: var(--color-text-on-accent);
+  background: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-state), transparent);
+  border-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-hint), transparent);
+  color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-ink), var(--color-text-primary));
 }
 
-.rw-ledger { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+/* Verlaufsliste: EIN Träger (Zeilenlisten-Regel, tokens.css). Der Träger endet
+ * mit der Liste, deshalb trennt der +-Kombinator statt border-bottom je Zeile. */
+.rw-ledger {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  background: var(--color-surface);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
 .rw-ledger-row {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  padding: var(--space-3) 0;
-  border-bottom: 1px solid var(--color-border-subtle);
+  padding: var(--space-3) var(--space-4);
 }
-.rw-ledger-row:last-child { border-bottom: 0; }
+.rw-ledger-row + .rw-ledger-row {
+  border-top: 1px solid var(--color-border-subtle);
+}
+/* Der Träger entscheidet (tokens.css): im Modal ist der Grund schon
+ * --color-surface, eine zweite weisse Karte darauf wäre unsichtbar. Die
+ * Kurzfassung der Liste bleibt deshalb trägerlos, nur mit Haarlinien. */
+.rw-ledger--compact {
+  background: none;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: visible;
+}
 .rw-ledger-row--compact { padding: var(--space-2) 0; }
 .rw-ledger-row__icon {
   flex: 0 0 auto;
@@ -343,14 +446,36 @@
   color: var(--color-text-secondary);
 }
 .rw-ledger-row__icon i { width: 17px; height: 17px; }
-.rw-ledger-row__icon--earn  { background: color-mix(in srgb, var(--module-tasks) 16%, transparent); color: var(--module-tasks); }
-.rw-ledger-row__icon--bonus { background: color-mix(in srgb, var(--module-accent) 16%, transparent); color: var(--module-accent); }
-.rw-ledger-row__icon--redeem { background: color-mix(in srgb, var(--module-budget) 16%, transparent); color: var(--module-budget); }
+
+/* DAS ZEICHEN UNTERSCHEIDET, NICHT DER TON.
+ *
+ * Hier standen drei Farbvarianten - `--earn` in --module-tasks, `--bonus` in
+ * --module-accent, `--redeem` in --module-budget - und sie hatten gleich drei
+ * Fehler übereinander:
+ *
+ * 1. Sie liehen sich FREMDE Modultöne. Eine Zeile im Belohnungsmodul sagte
+ *    „Aufgaben" und „Budget", obwohl sie eine Punktebuchung beschreibt.
+ * 2. --module-tasks und --module-accent (rewards) sind BEIDE --_family-work
+ *    und damit bitweise derselbe Wert: gemessen trugen `--earn` und `--bonus`
+ *    identisch color(srgb 0.0824 0.498 0.239 / 0.16) mit identischem Glyph
+ *    darauf. Zwei Stufen einer Reihe, die zufällig gleich aussehen - derselbe
+ *    Fehler wie `--default`/`--soon` der Geburtstags-Chips in v2.23.0.
+ * 3. Sie nannten ihren Ton zweimal blass, Waschung plus gleichfarbiger Glyph.
+ *
+ * Der Kanal, der schon immer trug, ist das Zeichen: check-circle, sparkles,
+ * gift, sliders-horizontal, undo-2 (LEDGER_ICON in rewards.js). Es unterscheidet
+ * ALLE FÜNF Buchungsarten - die Farbe kannte nur drei und ließ die restlichen
+ * zwei stumm neutral. Die Scheibe bleibt deshalb bei der neutralen Basis oben;
+ * ein Vollton-Siegel je Zeile wäre die Gegenrichtung desselben Fehlers und
+ * streute die Modulmarke durch die Liste ihres eigenen Moduls. */
 .rw-ledger-row__text { flex: 1 1 auto; min-width: 0; }
 .rw-ledger-row__reason { margin: 0; font-weight: 500; color: var(--color-text-primary); }
 .rw-ledger-row__meta { margin: var(--space-1) 0 0; font-size: var(--text-xs); color: var(--color-text-secondary); }
 .rw-delta { flex: 0 0 auto; font-weight: 700; font-variant-numeric: tabular-nums; }
-.rw-delta--pos { color: var(--module-tasks); }
+/* Die Richtung der Buchung ist eine WERT-Aussage, keine Modul-Aussage: sie
+ * nimmt den Zuwachs-Ton der App (Geld-Vokabular des Budgets), nicht den Ton des
+ * Aufgabenmoduls, aus dem der Punkt zufällig stammte. */
+.rw-delta--pos { color: var(--color-success); }
 .rw-delta--neg { color: var(--color-text-secondary); }
 
 /* --------------------------------------------------------
@@ -391,24 +516,28 @@
 .rw-redeem-summary__row--neg strong { color: var(--color-danger); }
 
 .rw-participant-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+/* Im Modal, also trägerlos (Träger-Regel) - nur die Haarlinie trennt. */
 .rw-participant {
   display: flex;
   align-items: center;
   gap: var(--space-3);
   padding: var(--space-3) 0;
-  border-bottom: 1px solid var(--color-border-subtle);
 }
-.rw-participant:last-child { border-bottom: 0; }
+.rw-participant + .rw-participant {
+  border-top: 1px solid var(--color-border-subtle);
+}
 .rw-participant__name { flex: 1 1 auto; font-weight: 500; color: var(--color-text-primary); }
 
 .rw-detail-head { display: flex; align-items: center; gap: var(--space-4); margin-bottom: var(--space-4); }
 .rw-detail-points { margin: 0; color: var(--color-text-secondary); }
-.rw-detail-points strong { font-size: var(--text-2xl); color: var(--module-accent); }
+/* Geschwister von `.rw-standing__points strong` - dieselbe Zahl, dieselbe
+ * Entscheidung: Label-Farbe, nicht Modulton. */
+.rw-detail-points strong { font-size: var(--text-2xl); color: var(--color-text-primary); }
 .rw-detail-hint { margin: var(--space-1) 0 0; font-size: var(--text-sm); color: var(--color-text-secondary); }
 
 /* Toggle-Switch */
 .rw-switch { display: inline-flex; align-items: center; gap: var(--space-2); cursor: pointer; }
-.rw-switch input { accent-color: var(--module-accent); width: 18px; height: 18px; }
+.rw-switch input { accent-color: var(--color-accent); width: 18px; height: 18px; }
 .rw-switch--compact { margin-left: auto; }
 
 /* Kleine Button-Variante (global additiv, für dichte Aktionsreihen) */
@@ -427,27 +556,23 @@
   .rw-pending__actions { gap: var(--space-3); }
 }
 
-@media (max-width: 767px) {
-  .rewards-toolbar { flex-direction: column; align-items: stretch; }
-  .rewards-tabs {
-    margin-left: 0;
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-  .rewards-tabs::-webkit-scrollbar { display: none; }
-  .rewards-tabs .sub-tab { flex: 1 1 0; justify-content: center; }
-}
+/* Der Kopf trug hier `flex-direction: column`, die Leiste ihr eigenes
+ * Scroll-Rezept und ihre Tabs ein `flex: 1 1 0`. Alle drei sind mit der
+ * Shell-Regel entfallen (layout.css, „Tab-Leiste im Modulkopf"). Das
+ * Schrumpfenlassen der Tabs war eine MODUL-Lösung für ein SHELL-Problem: sie
+ * hat Belohnungen zufällig vor dem Überlauf bewahrt, der die Haushaltshilfe mit
+ * derselben Bauart traf. */
 
-@media (max-width: 640px) {
+@media (max-width: 639px) {
   .rewards-content__inner { gap: var(--space-6); padding-top: var(--space-4); }
   .rw-reward-grid { grid-template-columns: 1fr; }
   /* Schmaler Viewport ⇒ mit hoher Wahrscheinlichkeit Touch: 44-pt-Ziele. */
   .btn--sm,
   .rw-setup-step__go { min-height: var(--target-base); }
+  /* Nur die Spaltenzahl: der Abstand ist seit dem Umzug auf `.list-row`
+   * derselbe Wert wie dort, und ihn hier zu wiederholen wäre ein Nachbau. */
   .rw-standing {
     grid-template-columns: 1fr;
-    gap: var(--space-3);
   }
   .rw-standing__actions { justify-content: stretch; }
   .rw-standing__actions .btn { flex: 1 1 auto; }

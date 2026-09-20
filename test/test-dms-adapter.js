@@ -61,35 +61,82 @@ test('search: leerer Query listet alle Dokumente (ohne query-Param)', async () =
   assert.equal(results.length, 1);
 });
 
-test('parseAsnQuery: erkennt Präfix, reine Zahl und lehnt Text ab (#511)', () => {
-  assert.equal(parseAsnQuery('asn:123'), 123);
-  assert.equal(parseAsnQuery('ASN 456'), 456);
-  assert.equal(parseAsnQuery('asn#789'), 789);
-  assert.equal(parseAsnQuery('  42 '), 42);
-  assert.equal(parseAsnQuery('Stromrechnung'), null);
-  assert.equal(parseAsnQuery('asn:'), null);
-  assert.equal(parseAsnQuery('2026 Vertrag'), null);
-  assert.equal(parseAsnQuery(''), null);
+test('parseAsnQuery: Präfix ist exklusiv, reine Zahl mehrdeutig, Text keine ASN (#511, #763)', () => {
+  assert.deepEqual(parseAsnQuery('asn:123'), { asn: 123, exclusive: true });
+  assert.deepEqual(parseAsnQuery('ASN 456'), { asn: 456, exclusive: true });
+  assert.deepEqual(parseAsnQuery('asn#789'), { asn: 789, exclusive: true });
+  // Nackte Zahl bleibt eine ASN-Kandidatin, beansprucht die Suche aber nicht allein.
+  assert.deepEqual(parseAsnQuery('  42 '), { asn: 42, exclusive: false });
+  assert.deepEqual(parseAsnQuery('Stromrechnung'), { asn: null, exclusive: false });
+  assert.deepEqual(parseAsnQuery('asn:'), { asn: null, exclusive: false });
+  assert.deepEqual(parseAsnQuery('2026 Vertrag'), { asn: null, exclusive: false });
+  assert.deepEqual(parseAsnQuery(''), { asn: null, exclusive: false });
 });
 
-test('search: reine Zahl filtert per archive_serial_number statt Volltext (#511)', async () => {
-  mockFetch(() => jsonResponse({
-    count: 1,
-    results: [{ id: 7, title: 'Rechnung', original_file_name: 'r.pdf', created: null }],
-  }));
-  const adapter = new PaperlessAdapter(account);
-  const results = await adapter.search('123456', { limit: 20 });
-
-  assert.equal(calls[0].url, 'https://dms.example.com/api/documents/?page_size=20&archive_serial_number=123456');
-  assert.equal(results.length, 1);
-});
-
-test('search: asn:-Präfix filtert per archive_serial_number (#511)', async () => {
+test('search: asn:-Präfix filtert ausschließlich per archive_serial_number (#511)', async () => {
   mockFetch(() => jsonResponse({ count: 0, results: [] }));
   const adapter = new PaperlessAdapter(account);
   await adapter.search('asn:42', { limit: 20 });
 
+  assert.equal(calls.length, 1, 'expliziter ASN-Query darf keine Volltextsuche auslösen');
   assert.equal(calls[0].url, 'https://dms.example.com/api/documents/?page_size=20&archive_serial_number=42');
+});
+
+test('search: reine Zahl sucht ASN UND Volltext, ASN-Treffer zuerst (#763)', async () => {
+  mockFetch((url) => {
+    if (url.includes('archive_serial_number=1728')) {
+      return jsonResponse({ count: 1, results: [{ id: 9, title: 'Gestempeltes Dokument', original_file_name: 'a.pdf', created: null }] });
+    }
+    return jsonResponse({ count: 1, results: [{ id: 5, title: '1728 Pest receipt', original_file_name: 'b.pdf', created: null }] });
+  });
+  const adapter = new PaperlessAdapter(account);
+  const results = await adapter.search('1728', { limit: 20 });
+
+  const urls = calls.map((c) => c.url).sort();
+  assert.deepEqual(urls, [
+    'https://dms.example.com/api/documents/?page_size=20&archive_serial_number=1728',
+    'https://dms.example.com/api/documents/?page_size=20&query=1728',
+  ]);
+  assert.deepEqual(results.map((r) => r.id), ['9', '5'], 'ASN-Treffer steht vor den Volltexttreffern');
+});
+
+test('search: reine Zahl entdoppelt ein Dokument, das beide Wege liefern (#763)', async () => {
+  mockFetch(() => jsonResponse({
+    count: 1,
+    results: [{ id: 7, title: 'Rechnung 1728', original_file_name: 'r.pdf', created: null }],
+  }));
+  const adapter = new PaperlessAdapter(account);
+  const results = await adapter.search('1728', { limit: 20 });
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].id, '7');
+});
+
+test('search: reine Zahl liefert Volltexttreffer, auch wenn die ASN-Abfrage scheitert (#763)', async () => {
+  mockFetch((url) => {
+    if (url.includes('archive_serial_number')) return jsonResponse({}, 400);
+    return jsonResponse({ count: 1, results: [{ id: 5, title: '1728 Pest receipt', original_file_name: 'b.pdf', created: null }] });
+  });
+  const adapter = new PaperlessAdapter(account);
+  const results = await adapter.search('1728', { limit: 20 });
+
+  assert.deepEqual(results.map((r) => r.id), ['5']);
+});
+
+test('search: reine Zahl kürzt die zusammengeführte Liste auf das Limit (#763)', async () => {
+  mockFetch((url) => {
+    if (url.includes('archive_serial_number')) {
+      return jsonResponse({ count: 1, results: [{ id: 99, title: 'ASN-Treffer', original_file_name: 'a.pdf', created: null }] });
+    }
+    return jsonResponse({
+      count: 3,
+      results: [1, 2, 3].map((id) => ({ id, title: `Text ${id}`, original_file_name: `${id}.pdf`, created: null })),
+    });
+  });
+  const adapter = new PaperlessAdapter(account);
+  const results = await adapter.search('1728', { limit: 3 });
+
+  assert.deepEqual(results.map((r) => r.id), ['99', '1', '2']);
 });
 
 test('search: HTTP-Fehler wirft mit Statuscode', async () => {

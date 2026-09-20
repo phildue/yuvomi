@@ -23,36 +23,64 @@
 const SCOPE_MODULES = [
   { key: 'tasks',        prefixes: ['tasks'] },
   { key: 'shopping',     prefixes: ['shopping'] },
-  { key: 'meals',        prefixes: ['meals', 'recipes', 'mealie'] },
+  { key: 'meals',        prefixes: ['meals', 'recipes', 'recipe-providers'] },
   { key: 'pantry',       prefixes: ['pantry'] },
+  { key: 'inventory',    prefixes: ['inventory'] },
   { key: 'calendar',     prefixes: ['calendar', 'reminders', 'birthdays'] },
   { key: 'notes',        prefixes: ['notes'] },
   { key: 'contacts',     prefixes: ['contacts'] },
+  { key: 'schedule',     prefixes: ['schedule'] },
   { key: 'budget',       prefixes: ['budget', 'split-expenses'] },
   { key: 'documents',    prefixes: ['documents'] },
   { key: 'health',       prefixes: ['health'] },
   { key: 'rewards',      prefixes: ['rewards'] },
   { key: 'housekeeping', prefixes: ['housekeeping'] },
+  { key: 'waste',        prefixes: ['waste'] },
   { key: 'weather',      prefixes: ['weather'] },
   { key: 'family',       prefixes: ['family'] },
-  { key: 'dashboard',    prefixes: ['dashboard'] },
+  // `quick-links` teilt sich den Schluessel mit `dashboard`: die Kachelreihe ist
+  // kein eigenes Modul (#469), aber ihre Route braucht eine Zuordnung - ohne
+  // eine waere sie fuer JEDES gescopte Token gesperrt (tokenAllows verweigert
+  // unbekannte Module) und damit auch fuer das, das die Uebersicht lesen darf.
+  { key: 'dashboard',    prefixes: ['dashboard', 'quick-links'] },
   { key: 'search',       prefixes: ['search'] },
 ];
 
 const MODULE_KEYS = SCOPE_MODULES.map((m) => m.key);
-const MODULE_KEY_SET = new Set(MODULE_KEYS);
 
-// Pfadsegment → Modul-Schlüssel (aus SCOPE_MODULES abgeleitet, keine Doppelpflege).
-const PREFIX_TO_MODULE = new Map();
-for (const mod of SCOPE_MODULES) {
-  for (const prefix of mod.prefixes) PREFIX_TO_MODULE.set(prefix, mod.key);
+/** Extension scope modules registered at runtime from third-party manifests. */
+let _extensionScopeModules = [];
+
+export function setExtensionScopeModules(modules) {
+  _extensionScopeModules = Array.isArray(modules)
+    ? modules.filter((m) => m && typeof m.key === 'string' && Array.isArray(m.prefixes))
+    : [];
+  rebuildScopeMaps();
 }
 
-const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+function allScopeModules() {
+  return [...SCOPE_MODULES, ..._extensionScopeModules];
+}
 
-/** Alle gültigen Einzel-Scope-Strings (`modul:read` + `modul:write`). */
-const ALL_SCOPES = MODULE_KEYS.flatMap((key) => [`${key}:read`, `${key}:write`]);
-const ALL_SCOPE_SET = new Set(ALL_SCOPES);
+let MODULE_KEY_SET = new Set(MODULE_KEYS);
+let PREFIX_TO_MODULE = new Map();
+let ALL_SCOPES = MODULE_KEYS.flatMap((key) => [`${key}:read`, `${key}:write`]);
+let ALL_SCOPE_SET = new Set(ALL_SCOPES);
+
+function rebuildScopeMaps() {
+  const keys = allScopeModules().map((m) => m.key);
+  MODULE_KEY_SET = new Set(keys);
+  PREFIX_TO_MODULE = new Map();
+  for (const mod of allScopeModules()) {
+    for (const prefix of mod.prefixes) PREFIX_TO_MODULE.set(prefix, mod.key);
+  }
+  ALL_SCOPES = keys.flatMap((key) => [`${key}:read`, `${key}:write`]);
+  ALL_SCOPE_SET = new Set(ALL_SCOPES);
+}
+
+rebuildScopeMaps();
+
+const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 /**
  * Parst den DB-Wert der `scopes`-Spalte in ein Array oder `null`.
@@ -106,12 +134,61 @@ function requiredAccess(method) {
 
 /**
  * Ermittelt den Modul-Schlüssel für einen /api/v1-Pfad (ohne führendes /api/v1).
+ *
+ * GROSS-/KLEINSCHREIBUNG WIRD HIER GEFALTET, WEIL EXPRESS SIE BEIM ROUTEN
+ * IGNORIERT. Express matcht Mount-Pfade und Routen standardmaessig ohne
+ * Beachtung der Schreibweise: `/Notes` landet im Notiz-Router wie `/notes`.
+ * Ohne das Falten fand diese Funktion fuer `/Notes` keinen Praefix und gab
+ * `null` zurueck - und die Modul-Deny-Liste in server/index.js laesst `null`
+ * durch. Ein Mitglied mit `notes: none` las so jede sichtbare Notiz, eines
+ * mit `tasks: read` schrieb Aufgaben. Alle Praefixe sind klein geschrieben
+ * (Kern-Module hier oben, Erweiterungen per `MODULE_ID_RE`).
  * @param {string} path z. B. "/health/cycle" oder "health/cycle"
  * @returns {string|null} Modul-Schlüssel oder null (unbekannt/nicht scopebar).
  */
 function moduleForPath(path) {
-  const segment = String(path || '').replace(/^\/+/, '').split('/')[0];
-  return PREFIX_TO_MODULE.get(segment) || null;
+  const cleaned = String(path || '').replace(/^\/+/, '').toLowerCase();
+  const parts = cleaned.split('/').filter(Boolean);
+  if (parts[0] === 'extensions' && parts[1]) {
+    const extKey = PREFIX_TO_MODULE.get(`extensions/${parts[1]}`);
+    if (extKey) return extKey;
+  }
+  if (parts.length >= 2) {
+    const compound = `${parts[0]}/${parts[1]}`;
+    const compoundKey = PREFIX_TO_MODULE.get(compound);
+    if (compoundKey) return compoundKey;
+  }
+  return PREFIX_TO_MODULE.get(parts[0]) || null;
+}
+
+/**
+ * Modul-Schlüssel + benötigtes Zugriffsniveau für eine Session-Anfrage
+ * (`moduleAccessVerdict()`'s zweites/drittes Argument). Anders als
+ * `moduleForPath()` + `requiredAccess()` allein senkt dies das Niveau auf
+ * `read` für genau `/schedule/preferences` (S-12, UX-Audit: die eigene
+ * Erinnerungsvorlaufzeit/Wochenstunden hängen an der EIGENEN users-Zeile,
+ * kein Admin-Gate) — ohne den Modul-Schlüssel selbst auf `null` zu setzen,
+ * was `moduleAccessVerdict()` unconditional auf "erlaubt" zwingen würde,
+ * auch für `none`-Zugriff. Exaktes `===`, kein `startsWith`, damit
+ * `/schedule/preferencesX` nicht mitgemeint ist.
+ * @param {string} path z. B. "/schedule/preferences"
+ * @param {string} method HTTP-Methode
+ * @returns {{ moduleKey: string|null, access: 'read'|'write' }}
+ */
+function sessionModuleAccessRequirement(path, method) {
+  const moduleKey = moduleForPath(path);
+  const access = path === '/schedule/preferences' ? 'read' : requiredAccess(method);
+  return { moduleKey, access };
+}
+
+/** All scope module keys including runtime extension modules. */
+function getModuleKeys() {
+  return allScopeModules().map((m) => m.key);
+}
+
+/** All valid scope strings including extension modules. */
+function getAllScopes() {
+  return ALL_SCOPES;
 }
 
 /**
@@ -131,7 +208,27 @@ function tokenAllows(scopes, moduleKey, access) {
   return false;
 }
 
+/**
+ * Darf dieses Credential die VERWALTUNGSDETAILS einer Integration sehen?
+ *
+ * Gemeint sind Server-Adressen, Benutzernamen und Kontomailadressen der
+ * angebundenen Konten - `GET /calendar/caldav/status`, `/calendar/outlook/status`.
+ * Der Pfad-Guard urteilt am ersten Segment, `calendar:read` reicht also bis in
+ * diese Statusrouten hinein. Ein Wandtablett hat genau diesen Scope, haengt
+ * oeffentlich und braucht von alldem nichts (#1241 Runde 3); dasselbe gilt fuer
+ * ein Integrationstoken, das fuer einen fremden Client ausgestellt wurde.
+ *
+ * AN DEN SCOPES GEMESSEN, NICHT AM KONTOTYP - dieselbe Entscheidung wie bei den
+ * Abo-Quell-URLs in Runde 1: die Luecke ist keine Eigenheit des Displays,
+ * sondern die jedes gescopten Credentials. Eine Sitzung (`authScopes === null`)
+ * sieht unveraendert alles; fuer sie aendert sich nichts.
+ */
+function integrationDetailsVisible(req) {
+  return req?.authScopes == null;
+}
+
 export {
+  integrationDetailsVisible,
   SCOPE_MODULES,
   MODULE_KEYS,
   ALL_SCOPES,
@@ -140,5 +237,8 @@ export {
   serializeScopes,
   requiredAccess,
   moduleForPath,
+  sessionModuleAccessRequirement,
   tokenAllows,
+  getModuleKeys,
+  getAllScopes,
 };

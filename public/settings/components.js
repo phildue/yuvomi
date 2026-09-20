@@ -1,5 +1,7 @@
 import { t } from '/i18n.js';
+import { moduleIconHTML } from '/nav-icons.js';
 import { esc } from '/utils/html.js';
+import { getReadableTextColor } from '/utils/color.js';
 
 let settingRowIdCounter = 0;
 
@@ -70,20 +72,44 @@ export function toggleRowHtml({
   checked = false,
   disabled = false,
   className = '',
-  // Icon vor dem Text (Lucide-Name); der Platzhalter braucht wie überall ein
-  // `lucide.createIcons()` nach dem Einfügen.
+  // Icon vor dem Text. Der Name geht durch `moduleIconHTML`: ist es ein
+  // Modulzeichen, kommt es aus Yuvomis Satz, sonst als Lucide-Platzhalter
+  // (der wie überall ein `lucide.createIcons()` nach dem Einfügen braucht).
   icon = null,
   // Zeilen, deren Kontext den Schalter schon benennt (Modul-Listen), tragen ihr
   // Label nur für Screenreader.
   labelVisible = true,
+  // FARBSCHEIBE STATT ICON - für Zeilen, deren Gegenstand eine eigene Farbe
+  // HAT (eine Person, eine Kalenderebene). Sie nimmt eine FARBE entgegen und
+  // baut die Scheibe selbst, statt fertiges Markup durchzureichen: ein
+  // `swatchHtml`-Parameter wäre ein zweiter Escape-Pfad neben `attrs`, und
+  // genau davon hat diese Funktion einen.
+  //
+  // Die Farbe steht als Scheibe NEBEN dem Text, nie als Fläche darunter - das
+  // ist die Vollton-Regel für freie Nutzerfarben (DESIGN.md): auf einer frei
+  // gewählten Helligkeit gibt es keine Tinte, die trägt. `swatchLabel` füllt
+  // sie mit Initialen, wenn sie groß genug dafür ist.
+  swatchColor = null,
+  swatchLabel = '',
   attrs = {},
 }) {
   const rowClass = ['toggle-row', className].filter(Boolean).join(' ');
-  const iconHtml = icon ? `<i data-lucide="${esc(icon)}" aria-hidden="true"></i>` : '';
+  const iconHtml = icon ? moduleIconHTML(icon) : '';
+  // DIE TINTE WIRD GERECHNET, NICHT GESETZT. `--color-ink-on-vivid` gilt fuer
+  // KURATIERTE Toene, deren Helligkeit bekannt ist. Eine frei gewaehlte Farbe
+  // hat keine garantierte Tinte - dieselbe Rechnung macht der Avatar-Stack
+  // (components/user-multi-select.js), und zwei Antworten auf dieselbe Frage
+  // waeren genau die Spaltung, die #891 an drei Stellen aufgeraeumt hat.
+  const swatchHtml = swatchColor
+    ? `<span class="toggle-row__swatch" aria-hidden="true"`
+      + ` style="--swatch-color:${esc(String(swatchColor))};color:${getReadableTextColor(String(swatchColor))}">`
+      + `${esc(String(swatchLabel ?? ''))}</span>`
+    : '';
   const labelClass = labelVisible ? '' : ' class="sr-only"';
   return `<label class="${rowClass}">`
     + `<input type="checkbox"${attrsHtml({ ...attrs, checked, disabled })}>`
     + iconHtml
+    + swatchHtml
     + `<span${labelClass}>${esc(String(label ?? ''))}</span>`
     + '</label>';
 }
@@ -262,4 +288,46 @@ export function createRetryState({ message, onRetry }) {
 
   state.appendChild(button);
   return state;
+}
+
+/**
+ * Aufklappbares Feld einer Modulzeile verdrahten (Kueche).
+ *
+ * Stand kurz in beiden Modul-Blaettern wortgleich (Audit 2026-08-16). Es ist
+ * kein Blatt-Detail, sondern das Verhalten einer geteilten Komponente: derselbe
+ * Ausloeser, dasselbe Panel, dieselbe `aria-expanded`-Kopplung.
+ *
+ * `aria-controls` gehoert dazu und fehlte in beiden Fassungen: der Ausloeser
+ * sagte "ich bin aufgeklappt", nannte aber nicht, WAS. Die Id wird hier
+ * vergeben, damit kein Blatt sie selbst erfinden muss.
+ */
+export function bindDisclosure(container, { triggerSelector, panelSelector, id }) {
+  const trigger = container.querySelector(triggerSelector);
+  const panel = container.querySelector(panelSelector);
+  if (!trigger || !panel) return;
+
+  if (id && !panel.id) {
+    panel.id = id;
+    trigger.setAttribute('aria-controls', id);
+  }
+
+  trigger.addEventListener('click', () => {
+    const expanded = trigger.getAttribute('aria-expanded') === 'true';
+    trigger.setAttribute('aria-expanded', String(!expanded));
+    panel.hidden = expanded;
+  });
+}
+
+/**
+ * Statuswort einer Drittanbieter-Modulzeile.
+ *
+ * Liegt hier und nicht in einem der zwei Modul-Blaetter: beide zeigen dieselbe
+ * Zeile, nur mit verschiedenen Bedienelementen. Ein Blatt, das vom anderen
+ * importiert, zoege beim Oeffnen das falsche Modul mit.
+ */
+export function thirdPartyStatusLabel(module) {
+  if (module.status === 'error') return t('settings.thirdPartyModulesStatusError');
+  return module.enabled
+    ? t('settings.thirdPartyModulesStatusEnabled')
+    : t('settings.thirdPartyModulesStatusDisabled');
 }
