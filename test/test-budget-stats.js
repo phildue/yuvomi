@@ -122,6 +122,25 @@ test('computeStats byCategory: aggregiert + sortiert', () => {
   eq(r.byCategory[1].expenses, -300, 'food summe');
 });
 
+test('computeStats bySubcategory: Jahr, nur Eintraege mit Unterkategorie, ohne Pending', () => {
+  const db = freshDb();
+  const addSub = (date, amount, category, subcategory, pending = 0) =>
+    db.prepare('INSERT INTO budget_entries (title, amount, category, subcategory, date, is_pending) VALUES (?,?,?,?,?,?)')
+      .run('x', amount, category, subcategory, date, pending);
+  addSub('2026-01-05', -1200, 'housing', 'rent_mortgage');
+  addSub('2026-07-05', -1200, 'housing', 'rent_mortgage');
+  addSub('2026-03-05', -90, 'housing', 'utilities');
+  addSub('2026-04-05', -500, 'housing', 'utilities', 1); // pending
+  addSub('2026-02-01', -40, 'food', '');                  // ohne Unterkategorie
+  addSub('2026-02-01', 3000, 'salary', '');
+  const r = computeStats(db, { range: 'year', anchor: '2026-06-15' });
+  eq(r.bySubcategory.length, 2, 'zwei Unterkategorien');
+  eq(r.bySubcategory[0].subcategory, 'rent_mortgage', 'groesste zuerst');
+  eq(r.bySubcategory[0].category, 'housing', 'Kategorie mitgeliefert');
+  eq(r.bySubcategory[0].total, -2400, 'Jahressumme');
+  eq(r.bySubcategory[1].total, -90, 'pending zaehlt nicht');
+});
+
 test('computeStats comparison: Vormonat', () => {
   const db = freshDb();
   add(db, '2026-05-10', -400, 'food'); // Vormonat

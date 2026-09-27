@@ -207,6 +207,10 @@ let state = {
   categoryFilterKey: null,    // aktiver Kategorie-Filter für die Transaktionsliste (Drilldown aus dem Balkendiagramm)
   subcategoryFilterKey: null, // aktiver Subkategorie-Filter (nur gültig innerhalb der aktiven Kategorie; klappt deren Subkategorien-Balken auf)
   typeFilter: null,           // 'income' | 'expenses' | null — Drilldown aus den Einnahmen/Ausgaben-Kacheln (rein clientseitig, kein Server-Roundtrip nötig)
+  // Drilldown-Filter des Statistik-Tabs. Eigenes Objekt statt der Monatsfelder
+  // oben: der Tab schaltet zwischen Woche/Monat/Jahr, ohne dass der Filter
+  // verfaellt, und wird vom Statistik-Modul direkt mutiert (ctx.filter).
+  statsFilter: { category: null, subcategory: null, type: null },
   accountsShowArchived: false,
   activeTab:   'budget',
   loanFilterId: null,
@@ -525,6 +529,7 @@ export async function render(container, { user }) {
   // einer Woche noch den Kontoauszug von damals — beim Darlehens-Statusfilter
   // sogar ohne sichtbaren Hinweis. Der aktive Tab bleibt bewusst erhalten.
   state.accountFilterId = null;
+  state.statsFilter = { category: null, subcategory: null, type: null };
   state.loanFilterId = null;
   state.loanStatusFilter = 'active';
   state.accountsShowArchived = false;
@@ -760,7 +765,9 @@ function renderBody() {
     renderStats(body.querySelector('#budget-reports-panel'), {
       user: _user, currency: state.currency,
       budgetMode: state.budgetMode, scope: state.scope,
-      formatAmount, categoryLabel, esc,
+      formatAmount, categoryLabel, subcategoryLabel, esc,
+      formatFlow: (n) => amountByRole(n, 'flow').text,
+      filter: state.statsFilter,
       // Zeitraum und Auflösung gehören dem Modul, nicht dem Panel: der Stepper
       // sitzt im geteilten Kopf, das Panel wählt nur noch die Auflösung.
       range: state.range,

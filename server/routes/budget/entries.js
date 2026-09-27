@@ -26,6 +26,12 @@ import { nonMemberMessage } from '../../services/household-members.js';
 const log = createLogger('Budget');
 const router = express.Router();
 
+/** 'YYYY-MM' -> der Folgemonat. */
+function nextMonthKey(key) {
+  const [y, m] = key.split('-').map(Number);
+  return m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`;
+}
+
 /**
  * "Alle N" (#636): ganze Zahl in [1, MAX_INTERVAL_COUNT].
  *
@@ -233,13 +239,33 @@ router.get('/', (req, res) => {
     const month = req.query.month || todayKey(db.get()).slice(0, 7);
     const loanId = req.query.loan_id ? parseInt(req.query.loan_id, 10) : null;
 
-    if (!loanId && !MONTH_RE.test(month))
+    // Freier Zeitraum (?from=&to=) fuer den Statistik-Tab: dort ist der Zeitraum
+    // Woche/Monat/Jahr, nicht ein Kalendermonat. Hoechstens ein Jahr, weil fuer
+    // jeden beruehrten Monat die Serien materialisiert werden.
+    const hasRange = !loanId && (req.query.from !== undefined || req.query.to !== undefined);
+    let rangeFrom = null;
+    let rangeTo = null;
+    if (hasRange) {
+      rangeFrom = req.query.from;
+      rangeTo = req.query.to;
+      if (!DATE_RE.test(rangeFrom || '') || !DATE_RE.test(rangeTo || '') || rangeFrom > rangeTo)
+        return res.status(400).json({ error: 'from und to muessen YYYY-MM-DD sein (from <= to)', code: 400 });
+      const spanDays = (Date.parse(`${rangeTo}T00:00:00Z`) - Date.parse(`${rangeFrom}T00:00:00Z`)) / 86_400_000;
+      if (spanDays > 366)
+        return res.status(400).json({ error: 'Zeitraum darf hoechstens ein Jahr umfassen', code: 400 });
+    } else if (!loanId && !MONTH_RE.test(month)) {
       return res.status(400).json({ error: 'month muss YYYY-MM sein', code: 400 });
+    }
 
-    if (!loanId) generateRecurringInstances(db.get(), month);
+    if (hasRange) {
+      const last = rangeTo.slice(0, 7);
+      for (let m = rangeFrom.slice(0, 7); m <= last; m = nextMonthKey(m)) generateRecurringInstances(db.get(), m);
+    } else if (!loanId) {
+      generateRecurringInstances(db.get(), month);
+    }
 
-    const from   = `${month}-01`;
-    const to     = `${month}-31`;
+    const from   = hasRange ? rangeFrom : `${month}-01`;
+    const to     = hasRange ? rangeTo : `${month}-31`;
     let sql      = `
       SELECT b.*, u.display_name AS creator_name,
              ${RESPONSIBLE_USERS_SQL},
@@ -262,6 +288,10 @@ router.get('/', (req, res) => {
       sql += ' WHERE b.date BETWEEN ? AND ?';
       params.push(from, to);
     }
+
+    // Nur gebuchte Eintraege: der Statistik-Tab summiert ebenfalls nur diese
+    // (bookedOnly), die Liste soll zu den Balken darueber passen.
+    if (hasRange && req.query.booked_only === '1') sql += bookedOnly('b');
 
     if (req.query.category && validCategoryKeys().includes(req.query.category)) {
       sql += ' AND b.category = ?';
