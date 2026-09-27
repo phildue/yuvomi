@@ -225,14 +225,14 @@ function renderBodyContent(body) {
     </div>
     <div id="budget-stats-trend"></div>
     <div id="budget-stats-cat"></div>
-    <div id="budget-stats-entries"></div>
     <div id="budget-stats-donut"></div>
+    <div id="budget-stats-entries"></div>
     <div class="budget-stats__export"></div>
   `);
   renderTrendChart();
   renderCatBars();
-  renderEntries();
   renderDonut();
+  renderEntries();
   renderExport();
 }
 
