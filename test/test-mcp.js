@@ -197,7 +197,7 @@ test('Scope-Durchsetzung: budget:read darf list_expenses, aber nicht create_expe
       { requestHeaders: { authorization: 'Bearer test-token' } },
     );
     assert.equal(createRes.result.isError, true);
-    assert.match(createRes.result.content[0].text, /not permitted by this token's scopes/i);
+    assert.match(createRes.result.content[0].text, /not permitted for this account/i);
   } finally {
     global.fetch = realFetch;
   }
@@ -235,7 +235,7 @@ test('Scope-Durchsetzung: budget:read darf keine Meals-Tools nutzen', async () =
     (err) => internalErrors.push(err),
   );
   assert.equal(res.result.isError, true);
-  assert.match(res.result.content[0].text, /not permitted by this token's scopes/i);
+  assert.match(res.result.content[0].text, /not permitted for this account/i);
 });
 
 // ── create_task ──────────────────────────────────────────────────────────────

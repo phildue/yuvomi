@@ -140,6 +140,10 @@ jobs:
     needs: build-and-push
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: self-hosted
+    # Der "Wait for CI"-Schritt deckelt sich selbst auf 5 Minuten; der Rest ist
+    # ein SSH-Deploy. 10 Minuten sind Puffer genug, ohne einen haengenden
+    # Runner sechs Stunden lang zu blockieren (Default-Timeout ohne Deckel).
+    timeout-minutes: 10
 
     steps:
       - name: Wait for CI to pass on this commit

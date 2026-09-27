@@ -515,7 +515,10 @@ test('jeder getaggte Release hat einen CHANGELOG-Eintrag, keine Version doppelt'
  *   rot. Nach dem naechsten Release deckt der Tag die Fassung ab, der Eintrag ist dann
  *   ueberfluessig und darf gehen. */
 const RELEASED_SECTION_EDITS = {
-  // 'x.y.z': '<hash aus der Fehlermeldung>', // #Issue: warum der Abschnitt nachtraeglich geaendert wurde
+  // Fork-only tag (phildue/yuvomi): v1.21.1 fixed a sw.js/package.json version
+  // sync gap pre-dating the upstream merge and never got a CHANGELOG entry.
+  // Added retroactively so the tagged-release guard has something to compare.
+  '1.21.1': '90592366ace8',
 };
 
 const sectionHash = (section) => createHash('sha256').update(section).digest('hex').slice(0, 12);

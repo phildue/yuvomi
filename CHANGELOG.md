@@ -7259,6 +7259,10 @@ App-wide UX/UI audit (all modules, light/dark, desktop/mobile). The findings, th
 ### Fixed
 - Calendar holidays: fixed school-holiday dates for multilingual Swiss cantons being shown too long. Previously the two language-region schedules were merged into their combined span (e.g. Bern ending 14 August instead of 9 August for the German-speaking part); with the new region picker each part now shows its real dates. Public holidays remain visible regardless of the selected region.
 
+## [1.21.1] - 2026-08-02
+
+No user-facing changes. Release-tooling fix only: `public/sw.js` hardcodes `APP_RELEASE` independently of `package.json`'s version field, and the two had drifted out of sync on the v1.21.0 release, breaking the service-worker cache-cleanup check on activate. This release re-syncs both to 1.21.1.
+
 ## [1.21.0] - 2026-07-14
 
 ### Added
