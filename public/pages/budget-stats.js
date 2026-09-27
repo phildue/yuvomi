@@ -427,10 +427,30 @@ function renderEntryRows() {
 // Segmente auf die Palettengröße begrenzen: alles jenseits davon fließt in eine
 // „Sonstige"-Sammelscheibe. Ein Donut mit 15 Kategorien ist ohnehin nicht mehr
 // ablesbar, und ohne Deckel bekämen Segment 1 und 8 dieselbe Farbe.
-function donutSlices(byCategory) {
-  const exp = byCategory
-    .filter((c) => c.expenses < 0)
-    .map((c) => ({ label: view.ctx.categoryLabel(c.category), value: Math.abs(c.expenses) }))
+// Ausgangsdaten des Donuts: normalerweise die Kategorien, aber unter einer
+// aktiven Kategorie (Drilldown) deren Unterkategorien — derselbe Wechsel, den
+// die Balken schon zeigen. Nur Ausgaben haben Unterkategorien; eine gewählte
+// Einnahmenkategorie hat keine Zeilen dafür und fällt auf die Kategorien
+// zurück, statt einen leeren Donut zu zeigen.
+function donutSource() {
+  const cat = view.filter.category;
+  if (cat) {
+    const subs = (view.data.bySubcategory ?? []).filter((s) => s.category === cat && s.expenses < 0);
+    if (subs.length) {
+      return { rows: subs, label: (s) => view.ctx.subcategoryLabel(s.subcategory), value: (s) => Math.abs(s.expenses), drilledCategory: cat };
+    }
+  }
+  return {
+    rows: view.data.byCategory.filter((c) => c.expenses < 0),
+    label: (c) => view.ctx.categoryLabel(c.category),
+    value: (c) => Math.abs(c.expenses),
+    drilledCategory: null,
+  };
+}
+
+function donutSlices(src) {
+  const exp = src.rows
+    .map((r) => ({ label: src.label(r), value: src.value(r) }))
     .sort((a, b) => b.value - a.value);
   if (exp.length <= DONUT_SEGMENTS) return exp;
   const head = exp.slice(0, DONUT_SEGMENTS - 1);
@@ -440,9 +460,14 @@ function donutSlices(byCategory) {
 
 function renderDonut() {
   const host = view.root.querySelector('#budget-stats-donut');
-  const exp = donutSlices(view.data.byCategory);
+  const src = donutSource();
+  const exp = donutSlices(src);
   const total = exp.reduce((s, e) => s + e.value, 0);
   if (!host || total === 0) return;
+  // Unter einer Kategorie zeigt der Donut ihre Unterkategorien — derselbe Titel
+  // waere dann irrefuehrend ("Ausgabenanteile" klingt nach dem ganzen Haushalt),
+  // der Kategoriename dahinter sagt, wovon die Rede ist.
+  const titleSuffix = src.drilledCategory ? ` · ${view.ctx.esc(view.ctx.categoryLabel(src.drilledCategory))}` : '';
 
   const pctOf = (value) => Math.round((value / total) * 100);
   const C = 2 * Math.PI * 60; // r=60
@@ -473,7 +498,7 @@ function renderDonut() {
   host.replaceChildren();
   host.insertAdjacentHTML('beforeend', `
     <div class="budget-chart-section">
-      <div class="budget-chart-section__title">${t('budget.statsDonutTitle')}</div>
+      <div class="budget-chart-section__title">${t('budget.statsDonutTitle')}${titleSuffix}</div>
       <p class="sr-only">${view.ctx.esc(summary)}</p>
       <div class="budget-stats__donut-wrap">
         <svg viewBox="0 0 160 160" class="budget-stats__donut" aria-hidden="true">${segs}</svg>
