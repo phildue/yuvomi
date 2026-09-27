@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The budget statistics tab can now be drilled into, just like a single month.** Click a category
+  bar to see its subcategories and, below them, the individual entries behind it for the whole
+  selected week, month or year; click a subcategory to narrow further, or the income/expenses cards
+  to look at one side only. The filter stays when you switch between week, month and year, so a full
+  year of spending can be compared category by category. Only booked entries are listed, so the list
+  always adds up to the bars above it, and entries whose purpose is hidden in personal mode stay
+  masked.
+
 - **A wall tablet can now tick a task off and ask for a reward, for whoever is standing in front of
   it.** Until now a display only showed things. Tapping a task on a tablet opens the list of people
   and asks who did it, because on a wall "me" is nobody; picking someone ticks the task off and

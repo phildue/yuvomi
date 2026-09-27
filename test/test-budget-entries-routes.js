@@ -174,6 +174,25 @@ test('GET /: category-Filter grenzt die Liste ein', async () => {
   assert.deepEqual(r.body.data.map((e) => e.title), ['trans-a']);
 });
 
+test('GET /: from/to liefert Buchungen ueber mehrere Monate (Statistik-Drilldown)', async () => {
+  insertEntry({ title: 'range-jan', amount: -5, category: 'housing', subcategory: 'utilities', date: '2033-01-10' });
+  insertEntry({ title: 'range-jun', amount: -6, category: 'housing', subcategory: 'rent_mortgage', date: '2033-06-10' });
+  insertEntry({ title: 'range-out', amount: -7, category: 'housing', subcategory: 'utilities', date: '2034-01-01' });
+  insertEntry({ title: 'range-pending', amount: -8, category: 'housing', subcategory: 'utilities', date: '2033-03-03', is_pending: 1 });
+  const all = await call('GET', '/?from=2033-01-01&to=2033-12-31&category=housing');
+  assert.equal(all.status, 200);
+  assert.deepEqual(all.body.data.map((e) => e.title).sort(), ['range-jan', 'range-jun', 'range-pending']);
+  const booked = await call('GET', '/?from=2033-01-01&to=2033-12-31&booked_only=1&category=housing&subcategory=utilities');
+  assert.deepEqual(booked.body.data.map((e) => e.title), ['range-jan']);
+});
+
+test('GET /: from/to validiert Format, Reihenfolge und Spanne', async () => {
+  assert.equal((await call('GET', '/?from=2033-01-01')).status, 400);
+  assert.equal((await call('GET', '/?from=nope&to=2033-01-01')).status, 400);
+  assert.equal((await call('GET', '/?from=2033-02-01&to=2033-01-01')).status, 400);
+  assert.equal((await call('GET', '/?from=2030-01-01&to=2033-01-01')).status, 400);
+});
+
 test('GET /: account_id-Filter grenzt auf ein Konto ein', async () => {
   const acc = db.prepare("INSERT INTO budget_accounts (name, created_by) VALUES ('Giro', ?)").run(A).lastInsertRowid;
   insertEntry({ title: 'with-acc', amount: -7, category: 'food', date: '2032-05-10', account_id: acc });
