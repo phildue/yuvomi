@@ -13,7 +13,14 @@ import { formatMoneyAxis } from '/utils/money.js';
 // Zeitraum und Anker gehören dem Modul (budget.js) und kommen über ctx herein.
 // Vorher hielt dieser View beides selbst - damit gab es zwei Zeitachsen im selben
 // Modul, die nie synchron waren (Critique 2026-07-30, P1).
-const view = { range: 'month', anchor: null, data: null, error: false, ctx: null, root: null };
+const view = {
+  range: 'month', anchor: null, data: null, error: false, ctx: null, root: null,
+  // Drilldown wie auf der Monatsseite: Kategorie -> Unterkategorie -> Buchungen.
+  // Das Objekt gehört budget.js (ctx.filter) und wird hier direkt mutiert, damit
+  // der Filter den Wechsel Woche/Monat/Jahr und den Tabwechsel überlebt.
+  filter: { category: null, subcategory: null, type: null },
+  entries: null, entriesError: false, entriesSeq: 0,
+};
 
 const RANGE_LABELS = {
   week: 'budget.statsRangeWeek',
@@ -26,6 +33,8 @@ export async function renderStats(panel, ctx) {
   view.root = panel;
   view.range = ctx.range;
   view.anchor = ctx.anchor;
+  view.filter = ctx.filter ?? view.filter;
+  view.entries = null;
   renderShell();
   await loadStats();
 }
@@ -103,6 +112,67 @@ function wire() {
     activeClass: 'is-active',
     onChange: (id) => view.ctx.onRangeChange(id),
   });
+
+  // Filter-Klicks per Delegation: der Körper wird bei jeder Filteränderung neu
+  // gezeichnet, direkte Listener gingen dabei verloren.
+  view.root.querySelector('#budget-stats-body').addEventListener('click', (e) => {
+    const typeBtn = e.target.closest('[data-type-filter]');
+    if (typeBtn) {
+      const type = typeBtn.dataset.typeFilter;
+      view.filter.type = view.filter.type === type ? null : type;
+      // Eine Kategorie der anderen Art bliebe sonst als unsichtbarer Filter stehen.
+      if (view.filter.type && !categoryMatchesType(view.filter.category)) clearCategory();
+      return applyFilter(`[data-type-filter="${type}"]`);
+    }
+    const subBtn = e.target.closest('[data-subcategory]');
+    if (subBtn) {
+      const key = subBtn.dataset.subcategory;
+      view.filter.subcategory = view.filter.subcategory === key ? null : key;
+      return applyFilter(`[data-subcategory="${CSS.escape(key)}"]`);
+    }
+    const catBtn = e.target.closest('[data-category]');
+    if (catBtn) {
+      const key = catBtn.dataset.category;
+      view.filter.category = view.filter.category === key ? null : key;
+      // Die Unterkategorie gehört zur vorher aktiven Kategorie.
+      view.filter.subcategory = null;
+      return applyFilter(`[data-category="${CSS.escape(key)}"]`);
+    }
+    if (e.target.closest('#budget-stats-clear-category')) {
+      clearCategory();
+      return applyFilter();
+    }
+    if (e.target.closest('#budget-stats-clear-type')) {
+      view.filter.type = null;
+      return applyFilter();
+    }
+  });
+}
+
+function clearCategory() {
+  view.filter.category = null;
+  view.filter.subcategory = null;
+}
+
+function categoryMatchesType(category) {
+  if (!category || !view.filter.type) return true;
+  const row = view.data?.byCategory.find((c) => c.category === category);
+  if (!row) return false;
+  return view.filter.type === 'income' ? row.income > 0 : row.expenses < 0;
+}
+
+function filterActive() {
+  const f = view.filter;
+  return !!(f.category || f.subcategory || f.type);
+}
+
+// Neu zeichnen aus den schon geladenen Statistikdaten (kein Neuabruf); nur die
+// Buchungsliste holt sich ihre Zeilen vom Server. Der Fokus geht zum
+// angeklickten Element zurück, sonst verliert die Tastatur ihre Stelle.
+function applyFilter(focusSelector) {
+  const body = view.root.querySelector('#budget-stats-body');
+  renderBodyContent(body);
+  if (focusSelector) body.querySelector(focusSelector)?.focus();
 }
 
 function renderBodyContent(body) {
@@ -136,14 +206,18 @@ function renderBodyContent(body) {
   body.replaceChildren();
   body.insertAdjacentHTML('beforeend', `
     <div class="metric-grid">
-      <div class="metric-card metric-card--income">
+      <button type="button" class="metric-card metric-card--income budget-summary-card--clickable${view.filter.type === 'income' ? ' is-active' : ''}"
+              data-type-filter="income" aria-pressed="${view.filter.type === 'income'}"
+              aria-label="${view.ctx.esc(t('budget.filterIncomeLabel'))}">
         <div class="metric-card__label">${t('budget.statsIncome')}</div>
         <div class="metric-card__value">${fmtAmount(d.totals.income)}</div>
-      </div>
-      <div class="metric-card metric-card--expenses">
+      </button>
+      <button type="button" class="metric-card metric-card--expenses budget-summary-card--clickable${view.filter.type === 'expenses' ? ' is-active' : ''}"
+              data-type-filter="expenses" aria-pressed="${view.filter.type === 'expenses'}"
+              aria-label="${view.ctx.esc(t('budget.filterExpensesLabel'))}">
         <div class="metric-card__label">${t('budget.statsExpenses')}</div>
         <div class="metric-card__value">${fmtAmount(Math.abs(d.totals.expenses))}</div>
-      </div>
+      </button>
       <div class="metric-card ${d.totals.balance >= 0 ? 'metric-card--balance-positive' : 'metric-card--balance-negative'}">
         <div class="metric-card__label">${t('budget.statsBalance')}</div>
         <div class="metric-card__value">${fmtAmount(d.totals.balance)}</div>
@@ -151,11 +225,13 @@ function renderBodyContent(body) {
     </div>
     <div id="budget-stats-trend"></div>
     <div id="budget-stats-cat"></div>
+    <div id="budget-stats-entries"></div>
     <div id="budget-stats-donut"></div>
     <div class="budget-stats__export"></div>
   `);
   renderTrendChart();
   renderCatBars();
+  renderEntries();
   renderDonut();
   renderExport();
 }
@@ -173,7 +249,13 @@ const DONUT_SEGMENTS = DONUT_COLORS.length;
 
 function renderCatBars() {
   const host = view.root.querySelector('#budget-stats-cat');
-  const cats = view.data.byCategory.filter((c) => c.total !== 0);
+  const type = view.filter.type;
+  const cats = view.data.byCategory.filter((c) => {
+    if (c.total === 0) return false;
+    if (type === 'income') return c.income > 0;
+    if (type === 'expenses') return c.expenses < 0;
+    return true;
+  });
   if (!host || !cats.length) return;
   const maxAbs = Math.max(...cats.map((c) => Math.abs(c.total)), 1);
   // Budgetplan-Ziele nur im Monatsbereich einblenden — dort deckt sich der
@@ -193,10 +275,18 @@ function renderCatBars() {
              title="${t('budget.planTarget', { amount: view.ctx.formatAmount(target) })}"></div>`
       : '';
     const catLabel = view.ctx.esc(view.ctx.categoryLabel(c.category));
+    const isActive = view.filter.category === c.category;
+    // Unterkategorien klappen nur unter der aktiven Kategorie auf, wie auf der
+    // Monatsseite.
+    const subs = isActive
+      ? (view.data.bySubcategory ?? []).filter((s) => s.category === c.category)
+      : [];
     // --mirrored: gemeinsame Mittelachse wie im Monats-Chart (Critique
     // 2026-08-10, P0); der Budgetplan-Zielmarker rechnet im CSS mit.
     return `
-      <div class="budget-bar-row budget-bar-row--mirrored">
+      <button type="button" class="budget-bar-row budget-bar-row--mirrored budget-bar-row--clickable${isActive ? ' is-active' : ''}"
+              data-category="${view.ctx.esc(c.category)}" aria-pressed="${isActive}"
+              aria-label="${view.ctx.esc(t('budget.viewCategoryTransactions', { name: view.ctx.categoryLabel(c.category) }))}">
         <div class="budget-bar-row__label" title="${catLabel}">${catLabel}</div>
         <div class="budget-bar-row__track">
           <div class="budget-bar-row__fill ${isExp ? 'budget-bar-row__fill--expenses' : 'budget-bar-row__fill--income'}"
@@ -206,7 +296,8 @@ function renderCatBars() {
         <div class="budget-bar-row__amount" style="color:${isExp ? 'var(--color-danger)' : 'var(--color-success)'};">
           ${isExp ? '' : '+'}${view.ctx.formatAmount(c.total)}
         </div>
-      </div>`;
+      </button>
+      ${subs.length ? renderSubBars(subs) : ''}`;
   }).join('');
   host.replaceChildren();
   host.insertAdjacentHTML('beforeend', `
@@ -214,6 +305,123 @@ function renderCatBars() {
       <div class="budget-chart-section__title">${t('budget.statsCategoryTitle')}</div>
       <div class="budget-chart">${rows}</div>
     </div>`);
+}
+
+function renderSubBars(subs) {
+  const maxAbs = Math.max(...subs.map((s) => Math.abs(s.total)), 1);
+  const rows = subs.map((s) => {
+    const isExp = s.total < 0;
+    const label = view.ctx.subcategoryLabel(s.subcategory);
+    const isActive = view.filter.subcategory === s.subcategory;
+    const scale = Math.abs(s.total) / maxAbs;
+    return `
+      <button type="button" class="budget-bar-row budget-bar-row--sub budget-bar-row--clickable${isActive ? ' is-active' : ''}"
+              data-subcategory="${view.ctx.esc(s.subcategory)}" aria-pressed="${isActive}"
+              aria-label="${view.ctx.esc(t('budget.viewSubcategoryTransactions', { name: label }))}">
+        <div class="budget-bar-row__label" title="${view.ctx.esc(label)}">${view.ctx.esc(label)}</div>
+        <div class="budget-bar-row__track">
+          <div class="budget-bar-row__fill ${isExp ? 'budget-bar-row__fill--expenses' : 'budget-bar-row__fill--income'}"
+               style="--bar-scale:${scale.toFixed(4)}"></div>
+        </div>
+        <div class="budget-bar-row__amount" style="color:${isExp ? 'var(--color-danger)' : 'var(--color-success)'};">
+          ${isExp ? '' : '+'}${view.ctx.formatAmount(s.total)}
+        </div>
+      </button>`;
+  }).join('');
+  return `<div class="budget-subchart">${rows}</div>`;
+}
+
+// Die einzelnen Buchungen zum gewählten Filter. Ohne Filter bleibt die Fläche
+// leer: ein Jahr voller Buchungen ist keine Statistik mehr, und die Kategorien
+// darüber sind der Einstieg.
+function renderEntries() {
+  const host = view.root.querySelector('#budget-stats-entries');
+  if (!host) return;
+  host.replaceChildren();
+  if (!filterActive()) { view.entries = null; return; }
+
+  const f = view.filter;
+  const chips = [];
+  if (f.category) {
+    chips.push(`
+      <button class="budget-account-chip" id="budget-stats-clear-category" type="button"
+              aria-label="${view.ctx.esc(t('budget.clearCategoryFilter'))}">
+        <i data-lucide="tag" class="icon-xs" aria-hidden="true"></i>
+        <span>${view.ctx.esc(view.ctx.categoryLabel(f.category))}${f.subcategory ? ` · ${view.ctx.esc(view.ctx.subcategoryLabel(f.subcategory))}` : ''}</span>
+        <i data-lucide="x" class="icon-xs" aria-hidden="true"></i>
+      </button>`);
+  }
+  if (f.type) {
+    chips.push(`
+      <button class="budget-account-chip" id="budget-stats-clear-type" type="button"
+              aria-label="${view.ctx.esc(t('budget.clearTypeFilter'))}">
+        <i data-lucide="filter" class="icon-xs" aria-hidden="true"></i>
+        <span>${view.ctx.esc(t(f.type === 'income' ? 'budget.income' : 'budget.expenses'))}</span>
+        <i data-lucide="x" class="icon-xs" aria-hidden="true"></i>
+      </button>`);
+  }
+  host.insertAdjacentHTML('beforeend', `
+    <div class="budget-chart-section">
+      <div class="budget-chart-section__title">${t('budget.transactions')} ${chips.join(' ')}</div>
+      <div id="budget-stats-entries-list" aria-live="polite"></div>
+    </div>`);
+  if (window.lucide) lucide.createIcons({ el: host });
+  loadEntries();
+}
+
+async function loadEntries() {
+  const seq = ++view.entriesSeq;
+  const list = view.root.querySelector('#budget-stats-entries-list');
+  if (!list) return;
+  list.insertAdjacentHTML('beforeend', renderSkeletonList({ rows: 3, lines: 1 }));
+  const { from, to } = view.data;
+  const f = view.filter;
+  const cat = f.category ? `&category=${encodeURIComponent(f.category)}` : '';
+  const sub = f.subcategory ? `&subcategory=${encodeURIComponent(f.subcategory)}` : '';
+  try {
+    const res = await api.get(`/budget?from=${from}&to=${to}&booked_only=1${cat}${sub}${scopeQuery()}`);
+    // Ein späterer Klick hat die Anfrage überholt: seine Antwort gilt, nicht diese.
+    if (seq !== view.entriesSeq) return;
+    view.entries = res.data;
+    view.entriesError = false;
+  } catch (err) {
+    if (seq !== view.entriesSeq) return;
+    console.error('[Budget] stats entries load error:', err);
+    view.entries = null;
+    view.entriesError = true;
+  }
+  renderEntryRows();
+}
+
+function renderEntryRows() {
+  const list = view.root.querySelector('#budget-stats-entries-list');
+  if (!list) return;
+  list.replaceChildren();
+  if (view.entriesError) {
+    list.insertAdjacentHTML('beforeend', `<p class="budget-stats__note">${view.ctx.esc(t('budget.statsError'))}</p>`);
+    return;
+  }
+  const type = view.filter.type;
+  const rows = (view.entries ?? []).filter((e) => !type || (e.amount > 0) === (type === 'income'));
+  if (!rows.length) {
+    list.insertAdjacentHTML('beforeend', `<p class="budget-stats__note">${view.ctx.esc(t('budget.statsEmptyDescription'))}</p>`);
+    return;
+  }
+  list.insertAdjacentHTML('beforeend', rows.map((e) => {
+    const isIncome = e.amount > 0;
+    const masked = !!e.details_hidden;
+    const title = masked ? t('budget.maskedEntryTitle') : e.title;
+    const sub = !masked && e.subcategory ? ` / ${view.ctx.subcategoryLabel(e.subcategory)}` : '';
+    return `
+      <div class="list-row budget-entry${masked ? ' budget-entry--masked' : ''}">
+        <div class="budget-entry__indicator ${isIncome ? 'budget-entry__indicator--income' : 'budget-entry__indicator--expenses'}"></div>
+        <div class="list-row__main">
+          <div class="list-row__name budget-entry__title">${view.ctx.esc(title)}</div>
+          <div class="list-row__meta budget-entry__meta">${view.ctx.esc(formatDate(e.date))} · ${view.ctx.esc(view.ctx.categoryLabel(e.category))}${view.ctx.esc(sub)}</div>
+        </div>
+        <div class="budget-entry__amount ${isIncome ? 'budget-entry__amount--income' : 'budget-entry__amount--expenses'}">${view.ctx.formatFlow(e.amount)}</div>
+      </div>`;
+  }).join(''));
 }
 
 // Segmente auf die Palettengröße begrenzen: alles jenseits davon fließt in eine

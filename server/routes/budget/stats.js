@@ -6,7 +6,7 @@
 import express from 'express';
 import { createLogger } from '../../logger.js';
 import * as db from '../../db.js';
-import { bookedOnly, computeStatsRange, cents, budgetFilter, budgetCategoryExpr, todayLocalDateKey, STATS_RANGES, DATE_RE } from './helpers.js';
+import { bookedOnly, computeStatsRange, cents, budgetFilter, budgetCategoryExpr, budgetSubcategoryExpr, todayLocalDateKey, STATS_RANGES, DATE_RE } from './helpers.js';
 import { BUDGET_SAVINGS_KEY } from './plans.js';
 
 const log = createLogger('Budget');
@@ -17,10 +17,12 @@ const router = express.Router();
  * @param {object} database  better-sqlite3/node:sqlite-Instanz mit .prepare()
  */
 export function computeStats(database, { range, anchor }, filter = { clause: '', params: [] },
-                             categoryExpr = { expr: 'category', params: [] }) {
+                             categoryExpr = { expr: 'category', params: [] },
+                             subcategoryExpr = { expr: 'subcategory', params: [] }) {
   const r = computeStatsRange(range, anchor);
   const f = filter && filter.clause ? filter : { clause: '', params: [] };
   const c = categoryExpr && categoryExpr.expr ? categoryExpr : { expr: 'category', params: [] };
+  const sc = subcategoryExpr && subcategoryExpr.expr ? subcategoryExpr : { expr: 'subcategory', params: [] };
 
   const totalsRow = database.prepare(`
     SELECT
@@ -51,6 +53,20 @@ export function computeStats(database, { range, anchor }, filter = { clause: '',
     -- gewinnt in SQLite die ECHTE Spalte, und der Sammel-Bucket bliebe leer.
     GROUP BY 1 ORDER BY ABS(SUM(amount)) DESC
   `).all(...c.params, r.from, r.to, ...f.params);
+
+  // Unterkategorien je Kategorie, für den Drilldown im Statistik-Tab. Wie in
+  // /summary: nur Ausgaben haben welche (validateSubcategory erzwingt '' für
+  // Einnahmen), der Filter prüft die echte Spalte, Kategorie UND Unterkategorie
+  // laufen durch dieselbe Maskierung (#659) - der Schlüssel allein verriete die
+  // Kategorie.
+  const bySubcategory = database.prepare(`
+    SELECT ${c.expr} AS category, ${sc.expr} AS subcategory,
+           COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS income,
+           COALESCE(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END), 0) AS expenses,
+           COALESCE(SUM(amount), 0) AS total
+    FROM budget_entries WHERE date BETWEEN ? AND ? AND subcategory != ''${f.clause}${bookedOnly()}
+    GROUP BY 1, 2 ORDER BY ABS(SUM(amount)) DESC
+  `).all(...c.params, ...sc.params, r.from, r.to, ...f.params);
 
   // Bucket-Schlüssel: bei 'day' das volle Datum, bei 'month' die ersten 7 Zeichen.
   const keyExpr = r.granularity === 'month' ? "substr(date, 1, 7)" : "date";
@@ -83,6 +99,7 @@ export function computeStats(database, { range, anchor }, filter = { clause: '',
     totals: { income: totalsRow.income, expenses: totalsRow.expenses, balance: totalsRow.balance },
     series,
     byCategory,
+    bySubcategory,
     comparison: { income: prevRow.income, expenses: prevRow.expenses, balance: prevRow.balance },
     plans,
   };
@@ -104,7 +121,8 @@ export function statsHandler(req, res) {
 
     res.json({
       data: computeStats(db.get(), { range, anchor },
-        budgetFilter(req, 'budget_entries'), budgetCategoryExpr(req, 'budget_entries')),
+        budgetFilter(req, 'budget_entries'), budgetCategoryExpr(req, 'budget_entries'),
+        budgetSubcategoryExpr(req, 'budget_entries')),
     });
   } catch (err) {
     log.error('', err);

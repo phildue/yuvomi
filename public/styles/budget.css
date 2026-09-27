@@ -1735,6 +1735,7 @@ button.budget-entry__title {
 .budget-stats__donut-wrap { display:flex; gap:var(--space-4); align-items:center; flex-wrap:wrap; }
 .budget-stats__donut { width:160px; height:160px; }
 .budget-stats__export { margin-top:var(--space-4); }
+.budget-stats__note { margin: var(--space-2) 0; color: var(--color-text-secondary); font-size: var(--text-sm); }
 
 /* Ziel-Marker im Reports-Tab: kleine Tick-Linie auf dem Kategorie-Balken beim
  * geplanten Monatswert (nur bei range='month'). */
