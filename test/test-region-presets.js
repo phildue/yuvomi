@@ -10,6 +10,11 @@ import {
   resolveRegion,
   numberLocaleFor,
 } from '../public/settings/region-presets.js';
+import { CURRENCY_CODES } from '../public/utils/currency-codes.js';
+
+// Spiegelt die Formprüfung aus getFormatLocale() in public/i18n.js. Zwei- oder
+// dreibuchstabiger Sprachcode, damit fil-PH (Filipino) durchkommt.
+const BCP47_TAG = /^[a-z]{2,3}-[A-Z]{2}$/;
 
 async function backendList(name) {
   const src = await readFile(
@@ -22,7 +27,7 @@ async function backendList(name) {
 }
 
 test('every region preset maps to backend-valid currency, date and time values', async () => {
-  const currencies = await backendList('VALID_CURRENCIES');
+  const currencies = CURRENCY_CODES;
   const dateFormats = await backendList('VALID_DATE_FORMATS');
   const timeFormats = await backendList('VALID_TIME_FORMATS');
 
@@ -117,6 +122,16 @@ test('Malaysia preset formats MYR amounts with the local currency symbol', () =>
   assert.ok(formatted.includes('1,234.56'));
 });
 
+test('New Zealand preset uses NZD and local number formatting', () => {
+  const locale = numberLocaleFor({ region: 'en-NZ', ...REGION_PRESETS['en-NZ'] });
+  const formatted = new Intl.NumberFormat(locale, { style: 'currency', currency: 'NZD' })
+    .format(1234.56);
+
+  assert.equal(locale, 'en-NZ');
+  assert.ok(formatted.includes('$'));
+  assert.ok(formatted.includes('1,234.56'));
+});
+
 test('numberLocaleFor derives the tag even without a stored region, and empties for custom', () => {
   // Region nicht gesetzt, aber Formate entsprechen einem Preset → abgeleiteter Tag.
   assert.equal(numberLocaleFor({ ...REGION_PRESETS['de-CH'] }), 'de-CH');
@@ -127,7 +142,28 @@ test('numberLocaleFor derives the tag even without a stored region, and empties 
   // Jeder gelieferte Tag muss ein gültiger BCP-47-Regionscode sein (getFormatLocale-Regex).
   for (const code of REGION_CODES) {
     const tag = numberLocaleFor({ region: code, ...REGION_PRESETS[code] });
-    assert.match(tag, /^[a-z]{2}-[A-Z]{2}$/, `${code}: numberLocaleFor tag not BCP-47`);
+    assert.match(tag, BCP47_TAG, `${code}: numberLocaleFor tag not BCP-47`);
+  }
+});
+
+// Die Tag-Form wird an fünf Stellen geprüft (getFormatLocale, VALID_REGION,
+// resolveHouseholdLocale, formatMoney, householdRegion). Eine Region mit
+// dreibuchstabigem Sprachcode wie fil-PH fiel durch jede Stelle, die noch auf
+// {2} stand - deshalb liest der Guard die Regexe aus dem Code, statt sie zu
+// doppeln, und schlägt an, sobald eine davon zurückfällt.
+test('jede Tag-Formprüfung akzeptiert zwei- UND dreibuchstabige Sprachcodes', async () => {
+  const sources = [
+    ['public/i18n.js', 'getFormatLocale'],
+    ['server/routes/preferences.js', 'VALID_REGION'],
+    ['server/utils/i18n.js', 'resolveHouseholdLocale/formatMoney/householdRegion'],
+  ];
+  for (const [file, label] of sources) {
+    const src = await readFile(new URL(`../${file}`, import.meta.url), 'utf8');
+    const tagChecks = [...src.matchAll(/\[a-z\]\{([^}]+)\}-\[A-Z\]\{2\}/g)].map((m) => m[1]);
+    assert.ok(tagChecks.length > 0, `${file}: keine BCP-47-Formprüfung gefunden (${label})`);
+    for (const quantifier of tagChecks) {
+      assert.equal(quantifier, '2,3', `${file}: Formprüfung auf {${quantifier}} weist fil-PH ab (${label})`);
+    }
   }
 });
 
@@ -181,4 +217,40 @@ test('preferences route validates the region field shape', async () => {
   assert.ok(!pattern.test('french'));
   assert.ok(!pattern.test('fr_FR'));
   assert.ok(!pattern.test(''));
+});
+
+// --------------------------------------------------------------------------
+// #297: Der Melder fand VND nicht mehr in der Auswahl, obwohl `vi.json`
+// ausgeliefert wird. Der Code war beim Vereinheitlichen der vier
+// Waehrungskopien (#340) verschwunden und zwei Monate lang niemandem
+// aufgefallen - weil ihn nichts geprueft hat.
+//
+// DER GUARD IST EINE REGEL UEBER DEN BESTAND, KEINE LISTE VON DATEIEN. Eine
+// Allowlist deckt genau die Faelle, die schon richtig sind; die drei Locales
+// ohne Region (el, hu, vi) standen in keiner. Er liest `public/locales/` und
+// erfaehrt so von einer neuen Sprache, ohne dass jemand ihn nachtraegt.
+//
+// Die Gegenrichtung - jedes Preset nennt eine waehlbare Waehrung - steht schon
+// im ersten Test dieser Datei. Zusammen schliessen die beiden den Kreis, der
+// bei #297 offen war: eine Sprache ohne Region konnte keine Waehrung fordern,
+// und so fiel niemandem auf, dass ihre fehlte.
+// --------------------------------------------------------------------------
+
+test('jede ausgelieferte Sprache hat mindestens ein Region-Preset (#297)', async () => {
+  const dir = new URL('../public/locales/', import.meta.url);
+  const locales = (await readdir(dir))
+    .filter((name) => name.endsWith('.json'))
+    .map((name) => name.replace(/\.json$/, ''));
+
+  assert.ok(locales.length > 0, 'public/locales/ muss Sprachdateien enthalten');
+
+  const languagesWithRegion = new Set(REGION_CODES.map((code) => code.split('-')[0]));
+  const orphans = locales.filter((locale) => !languagesWithRegion.has(locale));
+
+  assert.deepEqual(
+    orphans,
+    [],
+    'Ohne Region landet diese Sprache zwangslaeufig auf "Benutzerdefiniert" und muss '
+    + `Waehrung, Datum und Zeit einzeln raten: ${orphans.join(', ')}`,
+  );
 });

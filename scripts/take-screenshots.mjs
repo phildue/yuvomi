@@ -1,11 +1,12 @@
 /**
  * Screenshot Script - Yuvomi
- * Fully automated: seeds demo data, creates Linda user, starts server,
- * captures all modules in light + dark mode for two device profiles:
+ * Fully automated: seeds demo data (in the target locale), starts a server and
+ * captures every module and sub-tab in light + dark mode for two device profiles:
  *   - web:    iPad Pro 13"         → 2752 × 2064 px  (viewport 1376×1032, DSF 2.0)
  *   - mobile: iPhone 17 Pro Max    → 1320 × 2868 px  (portrait, DSF ≈ 2.70)
  *
- * Usage:  node scripts/take-screenshots.mjs
+ * Usage:  node scripts/take-screenshots.mjs              (English → docs/screenshots/)
+ *         SHOT_LOCALE=de node scripts/take-screenshots.mjs  (German → docs/screenshots/de/)
  *
  * Side effects: writes a temporary database to /tmp/yuvomi-screenshot.db
  *               and starts a server on port 3099. Both are cleaned up on exit.
@@ -80,18 +81,33 @@ const MODULES = [
   { path: '/',             name: 'dashboard'      },
   { path: '/tasks',        name: 'tasks'          },
   { path: '/calendar',     name: 'calendar'       },
+  // Küchen-Kreislauf in seiner eigenen Reihenfolge: planen → kochen → einkaufen → lagern
   { path: '/meals',        name: 'meals'          },
   { path: '/recipes',      name: 'recipes'        },
   { path: '/shopping',     name: 'shopping'       },
+  { path: '/pantry',       name: 'pantry'         },
   { path: '/birthdays',    name: 'birthdays'      },
   { path: '/notes',        name: 'notes'          },
   { path: '/contacts',     name: 'contacts'       },
   { path: '/budget',       name: 'budget'              },
+  { path: '/budget',       name: 'budget-plan',          tab: '#budget-tab-plan' },
+  { path: '/budget',       name: 'budget-accounts',      tab: '#budget-tab-accounts' },
   { path: '/budget',       name: 'budget-subscriptions', tab: '#budget-tab-subscriptions' },
   { path: '/budget',       name: 'budget-reports',       tab: '#budget-tab-reports' },
   { path: '/budget',       name: 'budget-loans',         tab: '#budget-tab-loans' },
   { path: '/budget',       name: 'split-expenses',       tab: '#budget-tab-split-expenses' },
   { path: '/documents',    name: 'documents'      },
+  // Achtzehntes Modul (#741). Standardmaessig aus, der Demo-Seed schaltet es ein -
+  // ohne diesen Eintrag beworb die Landingpage ein Modul, das sie nirgends zeigt.
+  //
+  // Nur die Einstiegsansicht: sie traegt die drei Kennzahlen (Posten, Gesamtwert,
+  // Handlungsbedarf) und ist damit die, die auf Daumennagelgroesse noch etwas
+  // sagt. Eine zweite Aufnahme der aufgeklappten Kategorie gab es kurzzeitig,
+  // sie wurde von keiner Seite referenziert - und unreferenzierte Aufnahmen sind
+  // genau der Bestand, den diese Runde abgebaut hat. Wieder aufnehmen mit:
+  // { path: '/inventory', name: 'inventory-items',
+  //   tab: '[data-category="electronics"] [data-action="open-category"]' },
+  { path: '/inventory',    name: 'inventory'      },
   { path: '/housekeeping', name: 'housekeeping'          },
   { path: '/housekeeping', name: 'housekeeping-tasks',   tab: '.housekeeping-tabs [data-tab-id="tasks"]' },
   { path: '/housekeeping', name: 'housekeeping-reports', tab: '.housekeeping-tabs [data-tab-id="reports"]' },
@@ -120,13 +136,39 @@ function initFlags(arg) {
     localStorage.setItem('yuvomi-theme', arg.theme);
   } catch {}
   window.addEventListener('beforeinstallprompt', (e) => e.preventDefault());
+
+  // Die Versionsnummer in der Seitenleiste ist das einzige im Bild, das jedes
+  // Patch-Release veraltet - der Screenshot müsste dann neu, obwohl sich sonst
+  // nichts geändert hat. Sie gehört hier ausgeblendet und nicht in der App
+  // abschaltbar gemacht: der Screenshot-Modus ist eine Eigenschaft dieses
+  // Scripts, kein Schalter, den ein Haushalt je sehen soll.
+  //
+  // Als CSS und nicht über das `hidden`-Attribut des Elements: updateBranding()
+  // setzt dieses Attribut bei jeder Navigation neu aus der geladenen Version
+  // (router.js:452), ein einmaliges Verstecken hielte also nur bis zum nächsten
+  // Modul. Der Style wird ins Dokument gehängt, sobald es einen head gibt.
+  const hideVersion = () => {
+    if (document.getElementById('shot-hide-version')) return;
+    const style = document.createElement('style');
+    style.id = 'shot-hide-version';
+    style.textContent = '.nav-sidebar__version { display: none !important; }';
+    document.head.appendChild(style);
+  };
+  if (document.head) hideVersion();
+  else document.addEventListener('DOMContentLoaded', hideVersion, { once: true });
 }
 
 async function dismissOverlays(page) {
   await page.evaluate(() => {
     document.querySelectorAll('.onboarding-overlay, yuvomi-install-prompt').forEach((el) => el.remove());
   });
-  const closeBtn = page.locator('.modal-close').first();
+  // `[data-action="close-modal"]` statt einer Klasse: modal.js verdrahtet das
+  // Schliessen ueber genau dieses Attribut (modal.js:610) und meint damit das
+  // Header-X UND jedes Footer-"Abbrechen". Hier stand `.modal-close`, das es
+  // seit der Namensschulden-Runde nicht mehr gibt - der Aufruf fiel still auf
+  // `count() === 0` zurueck, also war das Sicherheitsnetz weg, ohne dass ein
+  // Lauf je fehlgeschlagen waere.
+  const closeBtn = page.locator('[data-action="close-modal"]').first();
   if (await closeBtn.count() > 0) {
     try { await closeBtn.click({ timeout: 400 }); } catch {}
   }
@@ -287,10 +329,12 @@ async function setupDemoDb() {
   // 3. Seed demo data. seed-demo.js creates every user (incl. Linda, the admin/mom
   //    screenshot persona with her own health & cycle data) and sets the weather
   //    preference (Dortmund) directly in sync_config — no post-seed API calls needed.
+  //    The locale reaches the seed too: an English UI showing German content (or
+  //    the other way round) is the one thing these screenshots must not show.
   console.log('  Running seed-demo.js…');
   const seed = spawnSync(
     'node',
-    [resolve(ROOT, 'scripts/seed-demo.js'), '--db', DEMO_DB],
+    [resolve(ROOT, 'scripts/seed-demo.js'), '--db', DEMO_DB, '--locale', LOCALE],
     { cwd: ROOT, stdio: 'inherit' }
   );
   if (seed.status !== 0) throw new Error('seed-demo.js failed');

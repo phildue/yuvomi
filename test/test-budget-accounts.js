@@ -389,3 +389,76 @@ test('archived: PUT toggelt, include_archived steuert Sichtbarkeit, net_worth ig
     assert.equal(restored.net_worth, 400);
   } finally { await h.close(); }
 });
+
+test('Kreditkarte: Bank und Kreditrahmen werden gespeichert und wieder geliefert (#541)', async () => {
+  cleanup();
+  const h = createHarness();
+  try {
+    const res = await h.call('POST', '/accounts', {
+      name: 'Visa', type: 'credit', starting_balance: 0, credit_bank: 'Musterbank', credit_limit: 2000,
+    });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.data.credit_bank, 'Musterbank');
+    assert.equal(res.body.data.credit_limit, 2000);
+
+    const updated = await h.call('PUT', `/accounts/${res.body.data.id}`, { credit_bank: 'Andere Bank', credit_limit: 3500 });
+    assert.equal(updated.body.data.credit_bank, 'Andere Bank');
+    assert.equal(updated.body.data.credit_limit, 3500);
+
+    // Leerer String löscht, undefined lässt unangetastet: ein Teil-Update darf
+    // Bank und Rahmen nicht nebenbei verwerfen.
+    const cleared = await h.call('PUT', `/accounts/${res.body.data.id}`, { credit_bank: '', credit_limit: '' });
+    assert.equal(cleared.body.data.credit_bank, null);
+    assert.equal(cleared.body.data.credit_limit, null);
+
+    await h.call('PUT', `/accounts/${res.body.data.id}`, { credit_limit: 1000 });
+    const renamed = await h.call('PUT', `/accounts/${res.body.data.id}`, { name: 'Visa Gold' });
+    assert.equal(renamed.body.data.credit_limit, 1000, 'Namensänderung darf den Rahmen nicht löschen');
+  } finally { await h.close(); }
+});
+
+test('available_limit: nur bei Kreditkarte mit Rahmen, Schuld zieht ab, Guthaben vergrößert nicht (#541)', async () => {
+  cleanup();
+  const h = createHarness();
+  try {
+    const card = (await h.call('POST', '/accounts', {
+      name: 'Visa', type: 'credit', starting_balance: 0, credit_limit: 1000,
+    })).body.data;
+    assert.equal(card.available_limit, 1000, 'ohne Buchungen steht der volle Rahmen');
+
+    await h.call('POST', '', { title: 'Einkauf', amount: -250, category: EXPENSE_CAT, date: PAST, account_id: card.id });
+    const charged = (await h.call('GET', '/accounts')).body.data.accounts[0];
+    assert.equal(charged.current_balance, -250);
+    assert.equal(charged.available_limit, 750);
+
+    // Guthaben auf der Karte hebt den Rahmen nicht an.
+    await h.call('POST', '', { title: 'Gutschrift', amount: 400, category: INCOME_CAT, date: PAST, account_id: card.id });
+    const inCredit = (await h.call('GET', '/accounts')).body.data.accounts[0];
+    assert.equal(inCredit.current_balance, 150);
+    assert.equal(inCredit.available_limit, 1000);
+
+    // Ohne Rahmen und bei jedem anderen Kontotyp bleibt das Feld null.
+    cleanup();
+    await h.call('POST', '/accounts', { name: 'Ohne Rahmen', type: 'credit', starting_balance: 0 });
+    await h.call('POST', '/accounts', { name: 'Giro', type: 'checking', starting_balance: 500, credit_limit: 9000 });
+    const rest = (await h.call('GET', '/accounts')).body.data.accounts;
+    assert.equal(rest.find((a) => a.name === 'Ohne Rahmen').available_limit, null);
+    assert.equal(rest.find((a) => a.name === 'Giro').available_limit, null, 'kein Kreditkonto ⇒ kein Rahmen');
+  } finally { await h.close(); }
+});
+
+test('POST/PUT /accounts weisen einen negativen Kreditrahmen ab (#541)', async () => {
+  cleanup();
+  const h = createHarness();
+  try {
+    const bad = await h.call('POST', '/accounts', { name: 'Visa', type: 'credit', credit_limit: -100 });
+    assert.equal(bad.status, 400);
+
+    const ok = (await h.call('POST', '/accounts', { name: 'Visa', type: 'credit', credit_limit: 500 })).body.data;
+    const badUpdate = await h.call('PUT', `/accounts/${ok.id}`, { credit_limit: -1 });
+    assert.equal(badUpdate.status, 400);
+
+    const unchanged = (await h.call('GET', '/accounts')).body.data.accounts[0];
+    assert.equal(unchanged.credit_limit, 500, 'abgewiesenes Update darf nichts verändern');
+  } finally { await h.close(); }
+});

@@ -8,8 +8,13 @@
 import { readFileSync } from 'node:fs';
 import path from 'path';
 import * as db from '../../db.js';
-import { budgetVisibilityWhere, budgetScopeWhere, canEditEntry, resolveBudgetMode } from '../../services/budget-visibility.js';
-import { computeLoanSchedule, remainingPrincipalAfter } from '../../services/loan-amortization.js';
+import {
+  budgetVisibilityWhere, budgetScopeWhere, budgetDetailsHiddenWhere, canEditEntry,
+  resolveBudgetMode, maskBudgetEntry, BUDGET_MASKED_CATEGORY,
+} from '../../services/budget-visibility.js';
+import { computeLoanSchedule, remainingPrincipalFromPayments, remainingInstallmentsForBalance } from '../../services/loan-amortization.js';
+import { todayKey } from '../../utils/timezone.js';
+import { newNonMembers } from '../../services/household-members.js';
 
 // --------------------------------------------------------
 // Persönlich/geteilt (#476/#505): Haushalts-Modus + Sichtbarkeits-Enforcement.
@@ -47,6 +52,58 @@ export function budgetFilter(req, alias, { scoped = true } = {}) {
     if (scope === 'mine') params.push(me); // household-Fragment hat keinen Bind
   }
   return { clause, params };
+}
+
+/**
+ * Kategorie-Ausdruck für Aggregationen (#659). Fremde 'shared_amount'-Einträge
+ * laufen unter einem neutralen Sammel-Bucket statt unter ihrer echten
+ * Kategorie - sonst verriete ausgerechnet die Kategorie-Auswertung den Zweck,
+ * den die Stufe schützt, obwohl der Betrag korrekt mitzählt.
+ *
+ * Der Bind gehört in die SELECT-Liste und damit VOR die WHERE-Binds:
+ *   .all(...categoryExpr.params, from, to, ...filter.params)
+ *
+ * @returns {{ expr: string, params: number[] }}
+ */
+export function budgetCategoryExpr(req, alias) {
+  const mode = getBudgetMode();
+  if (mode !== 'personal') return { expr: `${alias}.category`, params: [] };
+  return {
+    expr: `CASE WHEN ${budgetDetailsHiddenWhere(alias, '?', { mode })}`
+        + ` THEN '${BUDGET_MASKED_CATEGORY}' ELSE ${alias}.category END`,
+    params: [viewerId(req)],
+  };
+}
+
+/**
+ * Subkategorie-Pendant zu budgetCategoryExpr(): maskBudgetEntry() leert
+ * `subcategory` bei fremden 'shared_amount'-Einträgen genau wie `category`
+ * (Subkategorie-Schlüssel sind kategoriegebunden, z.B. verrät "rent_mortgage"
+ * bereits "housing") - eine Subkategorie-Aggregation ohne dieselbe Maskierung
+ * unterliefe #659 über genau den Umweg, den die Kategorie-Maskierung schließt.
+ *
+ * @returns {{ expr: string, params: number[] }}
+ */
+export function budgetSubcategoryExpr(req, alias) {
+  const mode = getBudgetMode();
+  if (mode !== 'personal') return { expr: `${alias}.subcategory`, params: [] };
+  return {
+    expr: `CASE WHEN ${budgetDetailsHiddenWhere(alias, '?', { mode })}`
+        + ` THEN '' ELSE ${alias}.subcategory END`,
+    params: [viewerId(req)],
+  };
+}
+
+/**
+ * Maskiert die Zweck-Felder fremder 'shared_amount'-Einträge in einer bereits
+ * geladenen Liste (#659). Betrag, Datum und Konto bleiben stehen; der Saldo
+ * bleibt dadurch aus der Liste nachvollziehbar.
+ */
+export function maskEntries(req, rows) {
+  const mode = getBudgetMode();
+  if (mode !== 'personal') return rows;
+  const me = viewerId(req);
+  return rows.map((row) => maskBudgetEntry(row, me, mode));
 }
 
 /** Prüft Schreib-Berechtigung im personal-Modus; im shared-Modus immer erlaubt. */
@@ -157,16 +214,113 @@ export function localizedSubcategory(subcategory, lang) {
 // Wiederkehrende Einträge: Intervalle + virtuelles (geglättetes) Budget
 // --------------------------------------------------------
 
-export const RECURRENCE_INTERVAL_KEYS = ['monthly', 'half_year', 'yearly'];
+/**
+ * Das Intervall ist eine EINHEIT plus eine Anzahl (#636), nicht mehr eine feste
+ * Liste von Rhythmen. Die alten Schlüssel monthly/half_year/yearly konnten nur
+ * drei Abstände ausdrücken; eine Zahlung alle zwei Wochen oder alle drei Monate
+ * war nicht abbildbar, obwohl genau solche Verträge der Alltag sind.
+ *
+ * `half_year` ist deshalb kein Schlüssel mehr, sondern monatlich × 6 - Migration
+ * 128 rechnet den Bestand um. Zwei Schreibweisen für denselben Rhythmus wären
+ * sonst dauerhaft nebeneinander gelaufen, und jede Auswertung müsste beide kennen.
+ *
+ * Den Wochentag bzw. den Tag im Monat trägt das Datum des Eintrags selbst: eine
+ * Serie, die am 15. beginnt, kommt am 15. wieder. Ein eigenes Feld dafür (wie es
+ * die Vorlage in #636 kennt) wäre eine zweite Wahrheit neben `date`.
+ */
+export const RECURRENCE_INTERVAL_KEYS = ['weekly', 'monthly', 'yearly'];
 
-/** Anzahl Monate zwischen zwei Vorkommen einer Serie. */
-export function monthsPerInterval(interval) {
-  return interval === 'yearly' ? 12 : interval === 'half_year' ? 6 : 1;
+// Obergrenze wie im RRULE-Formular der Aufgaben/Termine: dieselbe Zahl im
+// Eingabefeld, damit "alle N" überall dasselbe Höchstmaß hat.
+export const MAX_INTERVAL_COUNT = 99;
+
+/** Anzahl auf eine ganze Zahl in [1, MAX_INTERVAL_COUNT] bringen. */
+export function normalizeIntervalCount(value) {
+  const n = Math.trunc(Number(value));
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(n, MAX_INTERVAL_COUNT);
+}
+
+/**
+ * Vorkommen pro Jahr - die gemeinsame Größe hinter Glättung und Auswertung.
+ * Für Wochen ist das bewusst 52 und nicht 365.25/7: der Monatsanteil einer
+ * wöchentlichen Zahlung ist eine Planungsgröße, keine Abrechnung, und 52 ist
+ * die Zahl, mit der Verträge rechnen.
+ */
+export function occurrencesPerYear(interval, count = 1) {
+  const n = normalizeIntervalCount(count);
+  if (interval === 'weekly') return 52 / n;
+  if (interval === 'yearly') return 1 / n;
+  return 12 / n;
 }
 
 /** Effektiver Monatsanteil eines Periodenbetrags (für virtuelles Budget). */
-export function effectiveMonthly(amount, interval) {
-  return cents(Number(amount || 0) / monthsPerInterval(interval));
+export function effectiveMonthly(amount, interval, count = 1) {
+  return cents(Number(amount || 0) * occurrencesPerYear(interval, count) / 12);
+}
+
+/**
+ * Erwartete, noch nicht bestätigte Buchungen zählen in KEINER Summe mit (#637).
+ *
+ * Sie sind sichtbar und planbar, aber sie sind nicht passiert. Zählten sie mit,
+ * bliebe genau die Diskrepanz zum Kontoauszug bestehen, wegen der die
+ * Bestätigung überhaupt gewünscht wurde.
+ *
+ * Ein Fragment statt einer Regel pro Abfrage: die Summen liegen über fünf
+ * Dateien verstreut (Übersicht, Statistik, Plan, Kontostand, Dashboard), und
+ * eine vergessene Stelle fiele niemandem auf - sie zeigte nur eine Zahl, die um
+ * eine erwartete Buchung danebenliegt. `test:budget-structure` prüft deshalb
+ * jede SUM über budget_entries auf dieses Fragment.
+ *
+ * @param {string} [alias] Tabellen-Alias der Abfrage, leer für unaliasierte
+ * @returns {string} beginnt mit ' AND '
+ */
+export function bookedOnly(alias = '') {
+  return ` AND ${alias ? `${alias}.` : ''}is_pending = 0`;
+}
+
+const MS_PER_DAY = 86_400_000;
+
+/**
+ * Alle Fälligkeitstage einer Serie innerhalb eines Monats, aufsteigend.
+ *
+ * Der Starttag selbst zählt nicht mit: er ist der Eintrag, der die Serie trägt.
+ * Wochenserien liefern hier mehrere Tage - genau daran hing bisher, dass es
+ * keine gab: die Materialisierung kannte nur einen Termin je Monat.
+ *
+ * @param {string} startDate  YYYY-MM-DD, Datum des Serien-Originals
+ * @param {string} interval   'weekly' | 'monthly' | 'yearly'
+ * @param {number} count      Anzahl der Einheiten zwischen zwei Vorkommen
+ * @param {string} month      YYYY-MM
+ * @returns {string[]}        YYYY-MM-DD
+ */
+export function occurrenceDatesInMonth(startDate, interval, count, month) {
+  const step = normalizeIntervalCount(count);
+  const [y, m] = month.split('-').map(Number);
+  const [sy, sm, sd] = startDate.split('-').map(Number);
+  if (!y || !m || !sy) return [];
+
+  if (interval === 'weekly') {
+    const start      = Date.UTC(sy, sm - 1, sd);
+    const monthStart = Date.UTC(y, m - 1, 1);
+    const monthEnd   = Date.UTC(y, m, 0);
+    const stepMs     = step * 7 * MS_PER_DAY;
+    // Direkt zum ersten Vorkommen im Monat rechnen statt sich hinzuiterieren:
+    // eine 2019 begonnene Wochenserie hat sonst hunderte Leerläufe je Aufruf.
+    let i = Math.max(1, Math.ceil((monthStart - start) / stepMs));
+    const dates = [];
+    for (let at = start + i * stepMs; at <= monthEnd; at += stepMs) {
+      if (at >= monthStart) dates.push(ymd(new Date(at)));
+    }
+    return dates;
+  }
+
+  const monthsPer = (interval === 'yearly' ? 12 : 1) * step;
+  const monthsDiff = (y - sy) * 12 + (m - sm);
+  if (monthsDiff < 1 || monthsDiff % monthsPer !== 0) return [];
+  // Monatsüberlauf kappen: der 31. wird im April zum 30.
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return [`${month}-${String(Math.min(sd, lastDay)).padStart(2, '0')}`];
 }
 
 /**
@@ -176,14 +330,12 @@ export function effectiveMonthly(amount, interval) {
  * Virtuelle Serien (recurrence_virtual = 1) halten im Original bereits den
  * geglätteten Monatsanteil (amount); es wird in JEDEM Monat eine Instanz erzeugt.
  * Nicht-virtuelle Serien erzeugen den vollen Betrag nur in Fälligkeitsmonaten
- * (alle monthsPerInterval(interval) Monate ab dem Startmonat).
+ * (an den Tagen aus occurrenceDatesInMonth).
  * @param {import('better-sqlite3-multiple-ciphers').Database} database
  * @param {string} month  YYYY-MM
  */
 export function generateRecurringInstances(database, month) {
   const [y, m] = month.split('-').map(Number);
-  const monthStart = `${month}-01`;
-  const monthEnd   = `${month}-31`;
 
   // Alle Serien-Originale, die vor diesem Monat begonnen haben
   const originals = database.prepare(`
@@ -192,43 +344,81 @@ export function generateRecurringInstances(database, month) {
       AND strftime('%Y-%m', date) < ?
   `).all(month);
 
+  const skipStmt = database.prepare(
+    'SELECT 1 FROM budget_recurrence_skipped WHERE parent_id = ? AND date = ?'
+  );
+  const existsStmt = database.prepare(
+    'SELECT id FROM budget_entries WHERE recurrence_parent_id = ? AND date = ?'
+  );
+  const insertStmt = database.prepare(`
+    INSERT INTO budget_entries
+      (title, amount, category, subcategory, date, is_recurring, recurrence_parent_id,
+       created_by, owner_id, visibility, is_pending, account_id)
+    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+  `);
+  // Die Zustaendigen des Originals auf die frische Instanz kopieren (#1057).
+  const copyResponsiblesStmt = database.prepare(`
+    INSERT OR IGNORE INTO budget_entry_responsibles (entry_id, user_id)
+    SELECT ?, user_id FROM budget_entry_responsibles WHERE entry_id = ?
+  `);
+
   for (const orig of originals) {
-    // Übersprungener Monat?
-    const skipped = database.prepare(
-      'SELECT 1 FROM budget_recurrence_skipped WHERE parent_id = ? AND month = ?'
-    ).get(orig.id, month);
-    if (skipped) continue;
-
-    // Instanz schon vorhanden?
-    const existing = database.prepare(`
-      SELECT id FROM budget_entries
-      WHERE recurrence_parent_id = ? AND date BETWEEN ? AND ?
-    `).get(orig.id, monthStart, monthEnd);
-    if (existing) continue;
-
-    // Bei nicht-virtuellen Serien nur in Fälligkeitsmonaten erzeugen.
     const interval = orig.recurrence_interval || 'monthly';
-    if (!orig.recurrence_virtual) {
-      const [oy, om] = orig.date.split('-').map(Number);
-      const monthsDiff = (y - oy) * 12 + (m - om);
-      if (monthsDiff < 1 || monthsDiff % monthsPerInterval(interval) !== 0) continue;
+
+    // Virtuelle Serien tragen im Original bereits den Monatsanteil: sie kommen in
+    // JEDEM Monat einmal vor, unabhängig vom Rhythmus - auch bei Wochenserien,
+    // deren Anteil sonst über den Monat verstreut läge, ohne dass eine der
+    // Buchungen die Zahlung wäre.
+    const dates = orig.recurrence_virtual
+      ? [`${month}-${String(Math.min(
+          parseInt(orig.date.split('-')[2], 10),
+          new Date(Date.UTC(y, m, 0)).getUTCDate(),
+        )).padStart(2, '0')}`]
+      : occurrenceDatesInMonth(orig.date, interval, orig.recurrence_interval_count, month);
+
+    for (const date of dates) {
+      // Übersprungen (eine gelöschte Instanz) oder schon vorhanden? Beides wird am
+      // Fälligkeitstag geprüft, nicht am Monat: eine Wochenserie hat mehrere pro
+      // Monat, und ein gelöschter Dienstag darf die übrigen nicht mitnehmen.
+      if (skipStmt.get(orig.id, date)) continue;
+      if (existsStmt.get(orig.id, date)) continue;
+
+      // Materialisierte Instanz erbt Eigentümer + Sichtbarkeit des Serien-Originals
+      // (#476/#505). Ohne das würde jede Instanz owner_id=NULL + visibility='shared'
+      // (Spalten-Default) bekommen: eine private Serie würde im Haushalt sichtbar und
+      // für die Eigentümer:in in scope=mine unsichtbar.
+      // Verlangt die Serie eine Bestätigung (#637), entsteht die Buchung als
+      // erwartet: sichtbar und planbar, aber in keiner Summe. Der Ursprung
+      // selbst bleibt eine echte Buchung - er wurde von Hand eingetragen.
+      // Das KONTO gehört in dieselbe Liste (#973): eine Dauerlastschrift geht
+      // jeden Monat vom selben Konto ab. Es fehlte hier, seit es die Spalte
+      // gibt, und die Wirkung war unauffällig, weil nur die erste Buchung von
+      // Hand entsteht - ab dem zweiten Monat trug die Instanz kein Konto, und
+      // wer nach Konto filtert, sah die Serie ab dort nicht mehr.
+      //
+      // AUSSER bei einer virtuellen Serie, und das ist keine Feinheit:
+      // deren Instanzen sind Planwerte, keine Zahlungen. 1200 im Jahr stehen
+      // dort als 100 je Monat, während die Bank einmal 1200 abbucht.
+      // `listAccounts()` summiert jeden nicht-erwarteten Eintrag mit Konto in
+      // den Saldo, und die Instanz trägt kein eigenes `recurrence_virtual` -
+      // die Saldo-Abfrage könnte einen Planwert also gar nicht erkennen.
+      // Gemessen: acht Monate einer virtuellen Jahresserie ergaben -800
+      // Kontosaldo für eine Abbuchung, die noch gar nicht stattgefunden hat.
+      // Ohne Konto bleibt der Saldo exakt so, wie er vor #973 war.
+      const inheritsAccount = orig.recurrence_virtual ? null : (orig.account_id ?? null);
+      const created = insertStmt.run(
+        orig.title, orig.amount, orig.category, orig.subcategory || '', date,
+        orig.id, orig.created_by, orig.owner_id, orig.visibility || 'shared',
+        orig.recurrence_confirm ? 1 : 0, inheritsAccount,
+      );
+
+      // ZUSTAENDIGE ERBEN MIT (#1057). Anders als das Konto gilt das auch fuer
+      // virtuelle Serien: das Etikett bewegt kein Geld, es kann also keinen
+      // Saldo verfaelschen - und "wer kuemmert sich darum" ist am Planwert
+      // genauso richtig wie an der Zahlung. Als eigene Anweisung statt im
+      // INSERT, weil die Zustaendigkeit in einer n:m-Tabelle liegt.
+      copyResponsiblesStmt.run(created.lastInsertRowid, orig.id);
     }
-
-    // Datum berechnen: gleicher Tag, am letzten Tag des Monats gekappt
-    const origDay    = parseInt(orig.date.split('-')[2], 10);
-    const lastDay    = new Date(y, m, 0).getDate();
-    const instanceDay = Math.min(origDay, lastDay);
-    const instanceDate = `${month}-${String(instanceDay).padStart(2, '0')}`;
-
-    // Materialisierte Instanz erbt Eigentümer + Sichtbarkeit des Serien-Originals
-    // (#476/#505). Ohne das würde jede Instanz owner_id=NULL + visibility='shared'
-    // (Spalten-Default) bekommen: eine private Serie würde im Haushalt sichtbar und
-    // für die Eigentümer:in in scope=mine unsichtbar.
-    database.prepare(`
-      INSERT INTO budget_entries
-        (title, amount, category, subcategory, date, is_recurring, recurrence_parent_id, created_by, owner_id, visibility)
-      VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
-    `).run(orig.title, orig.amount, orig.category, orig.subcategory || '', instanceDate, orig.id, orig.created_by, orig.owner_id, orig.visibility || 'shared');
   }
 }
 
@@ -347,13 +537,16 @@ export function loadBudgetMeta() {
 
   const expenseCategories = categories.filter((c) => c.type === 'expense');
   const incomeCategories = categories.filter((c) => c.type === 'income');
-  const expenseSubcategories = {};
+  // Nach Kategorie gruppiert, über beide Typen: Subkategorien gehören seit
+  // #691 auch an Einnahmen-Kategorien. Der Schlüssel ist die Kategorie, nicht
+  // ihr Typ - eine Aufteilung nach expense/income hätte hier keinen Leser.
+  const subcategoriesByCategory = {};
   for (const sub of subcategories) {
-    if (!expenseSubcategories[sub.category_key]) expenseSubcategories[sub.category_key] = [];
-    expenseSubcategories[sub.category_key].push(sub);
+    if (!subcategoriesByCategory[sub.category_key]) subcategoriesByCategory[sub.category_key] = [];
+    subcategoriesByCategory[sub.category_key].push(sub);
   }
 
-  return { categories, expenseCategories, incomeCategories, expenseSubcategories };
+  return { categories, expenseCategories, incomeCategories, subcategories: subcategoriesByCategory };
 }
 
 export function validCategoryKeys() {
@@ -383,7 +576,6 @@ export function defaultSubcategory(category) {
 }
 
 export function validateSubcategory(category, subcategory) {
-  if (!validExpenseCategoryKeys().includes(category)) return '';
   if (!subcategory) return defaultSubcategory(category);
   const row = db.get().prepare(`
     SELECT 1 FROM budget_subcategories WHERE category_key = ? AND key = ?
@@ -433,6 +625,34 @@ export function fromBudgetAmount(amount, loan) {
   return cents(Number(amount || 0) / loanRate(loan));
 }
 
+// --------------------------------------------------------
+// Richtung eines Darlehens (#638)
+// --------------------------------------------------------
+
+// Das Modul war ursprünglich nur für verliehenes Geld gedacht - die Rate wurde
+// deshalb immer als Einnahme gebucht. Ein aufgenommener Kredit zahlt aber raus,
+// seine Rate ist eine Ausgabe.
+export const LOAN_DIRECTIONS = ['lent', 'borrowed'];
+
+// Wie eine Rate ins Budget gebucht wird. Vorzeichen UND Kategorie hängen an der
+// Richtung: stats.js liest den Typ am Vorzeichen ab (amount > 0 = Einnahme), die
+// Kategorie muss dazu passen, sonst steht eine Ausgabe unter einer income-Kategorie.
+//
+// Diese Regel steht hier und nicht im Loans-Router, weil sie an DREI Stellen gilt:
+// beim Buchen einer Rate, beim Umbuchen nach einem Richtungswechsel und beim
+// Bearbeiten des gekoppelten Budget-Eintrags. Solange sie nur der Loans-Router
+// kannte, erzwang der Eintrags-Router weiter das alte "Rate = Einnahme" und
+// sperrte damit jede Korrektur an der Rate eines aufgenommenen Kredits (#859).
+export const REPAYMENT_BOOKING = {
+  lent: { sign: 1, category: 'Geschenke & Transfers', subcategory: '' },
+  borrowed: { sign: -1, category: 'financial_other', subcategory: 'loans_interest' },
+};
+
+/** Buchungsregel eines Darlehens; unbekannte/fehlende Richtung fällt auf 'lent' zurück. */
+export function bookingFor(direction) {
+  return REPAYMENT_BOOKING[direction] || REPAYMENT_BOOKING.lent;
+}
+
 export function loanSummaryRow(loan, baseCurrency = budgetCurrency()) {
   const payments = db.get().prepare(`
     SELECT p.*, u.display_name AS creator_name,
@@ -455,14 +675,23 @@ export function loanSummaryRow(loan, baseCurrency = budgetCurrency()) {
   // nicht der Durchschnitt total_amount/installment_count (die letzte Rate ist
   // kleiner). Sonst weicht der gebuchte Ratenbetrag von der angezeigten Monatsrate
   // ab. Die letzte Rate wird im Zahlungs-Default ohnehin über remaining_amount getrued.
-  const interest = loanInterestSummary(loan, paidInstallments);
+  const interest = loanInterestSummary(loan, payments);
   const installmentAmount = interest ? interest.monthly_payment : cents(loan.total_amount / loan.installment_count);
-  // Restschuld: das noch offene Kapital laut Tilgungsplan. remainingAmount oben ist
+  // Restschuld: das noch offene Kapital, seit #954 aus den gebuchten Beträgen
+  // nachgerechnet statt an der Planposition abgelesen. remainingAmount oben ist
   // dagegen die Summe der Restraten und enthält die Zinsen der Restlaufzeit - bei
   // verzinsten Darlehen liegen die beiden Werte deshalb auseinander, und die
   // Restschuld ist die Zahl, die auch die Bank meldet. Zinsfreie Darlehen haben
   // keinen Zinsanteil, dort sind beide identisch.
   const remainingPrincipal = interest ? interest.remaining_principal : remainingAmount;
+
+  // Fertig ist ein Darlehen, wenn kein Kapital mehr offen ist - beim Zins-Darlehen
+  // entscheidet das seit #954 die REALE Restschuld: wer frueh tilgt, schuldet die
+  // kuenftigen Planzinsen nicht nach, also darf danach auch keine Rate mehr buchbar
+  // sein. remaining_installments zaehlt weiter die ungebuchten Plan-Raten (eine
+  // Zaehlung, keine Schuld); zinsfreie Darlehen laufen ueber denselben Ausdruck,
+  // weil remainingPrincipal dort remainingAmount IST.
+  const settled = remainingInstallments <= 0 || remainingPrincipal <= 0.005;
 
   // Währung je Darlehen (#582): Alle Beträge oben bleiben in der Darlehenswährung.
   // currency=NULL heißt "Budget-Währung" und wird erst hier aufgelöst, damit eine
@@ -482,8 +711,13 @@ export function loanSummaryRow(loan, baseCurrency = budgetCurrency()) {
     remaining_amount: remainingAmount,
     remaining_principal: remainingPrincipal,
     remaining_installments: remainingInstallments,
-    next_installment_number: remainingInstallments > 0 ? paidInstallments + 1 : null,
-    next_due_month: remainingInstallments > 0 ? addMonths(loan.start_month, paidInstallments) : null,
+    // Dieselbe Zahl, aber am Kontostand statt am Vertrag gerechnet (#964).
+    // Ohne Zinsteil oder bei nicht amortisierender Rate bleibt sie null, und die
+    // Oberflaeche zeigt dann allein die Planzahl.
+    remaining_installments_forecast: forecastRemainingInstallments(loan, interest, paidInstallments),
+    is_settled: settled,
+    next_installment_number: !settled ? paidInstallments + 1 : null,
+    next_due_month: !settled ? addMonths(loan.start_month, paidInstallments) : null,
     interest,
     payments,
   };
@@ -492,9 +726,10 @@ export function loanSummaryRow(loan, baseCurrency = budgetCurrency()) {
 // Zins-Darlehen (#569): Kennzahlen für die Anzeige aus dem Amortisationsplan
 // (exakte Monatsrate, Gesamtzins, Restschuld nach Zinsbindung). Zinsfreie
 // Darlehen liefern null, sodass die Anzeige unverändert bleibt.
-// paidInstallments steuert nur remaining_principal (Restschuld zum aktuellen
-// Ratenstand); alle anderen Kennzahlen sind vom Zahlungsfortschritt unabhängig.
-export function loanInterestSummary(loan, paidInstallments = 0) {
+// payments steuert nur remaining_principal: die Restschuld folgt seit #954 den
+// gebuchten Beträgen (Sondertilgung senkt sie, Minderzahlung nicht), alle
+// anderen Kennzahlen bleiben planbasiert und vom Zahlungsfortschritt unabhängig.
+export function loanInterestSummary(loan, payments = []) {
   if (!loan.interest_mode || loan.interest_mode === 'none' || loan.principal == null) return null;
   const calc = computeLoanSchedule({
     principal: loan.principal,
@@ -514,10 +749,44 @@ export function loanInterestSummary(loan, paidInstallments = 0) {
     followup_rate: loan.followup_rate,
     monthly_payment: calc.monthlyPayment,
     total_interest: calc.totalInterest,
-    remaining_principal: remainingPrincipalAfter(calc.schedule, loan.principal, paidInstallments),
+    remaining_principal: remainingPrincipalFromPayments({
+      principal: loan.principal,
+      fixedRate: loan.fixed_rate,
+      interestMode: loan.interest_mode,
+      fixedPeriodMonths: loan.fixed_period_months,
+      followupRate: loan.followup_rate,
+    }, payments),
     remaining_after_binding: calc.remainingAfterBinding,
     binding_end_month: loan.fixed_period_months ? addMonths(loan.start_month, loan.fixed_period_months) : null,
   };
+}
+
+/**
+ * Die Restlaufzeit, die dem Geld folgt (#964).
+ *
+ * `remaining_installments` an der Zeile zaehlt weiter die ungebuchten
+ * PLAN-Raten - das beschreibt den Vertrag und bleibt stehen. Diese Zahl daneben
+ * beantwortet die andere Frage: wie viele Raten sind es bei der REALEN
+ * Restschuld noch? Wer sondertilgt, sieht sie sinken, waehrend die Planzahl
+ * unveraendert bleibt; die Oberflaeche zeigt beide, damit der Vertragsblick
+ * nicht still verschwindet.
+ *
+ * `null`, wo die Frage keinen Sinn hat: zinsfreie Darlehen (dort IST die
+ * Planzahl die Antwort), nicht amortisierende Raten, und alles, was
+ * computeLoanSchedule schon nicht rechnen konnte.
+ */
+function forecastRemainingInstallments(loan, interest, paidInstallments) {
+  if (!interest) return null;
+  const zahl = remainingInstallmentsForBalance({
+    balance: interest.remaining_principal,
+    monthlyPayment: interest.monthly_payment,
+    fixedRate: loan.fixed_rate,
+    interestMode: loan.interest_mode,
+    fixedPeriodMonths: loan.fixed_period_months,
+    followupRate: loan.followup_rate,
+    paidInstallments,
+  });
+  return zahl;
 }
 
 export function loadLoan(id, baseCurrency = budgetCurrency()) {
@@ -533,7 +802,10 @@ export function loadLoan(id, baseCurrency = budgetCurrency()) {
 export function refreshLoanStatus(loanId) {
   const loan = loadLoan(loanId);
   if (!loan) return null;
-  const status = loan.remaining_installments === 0 || loan.remaining_amount <= 0.005 ? 'paid' : 'active';
+  // is_settled traegt seit #954 auch die reale Restschuld des Zins-Darlehens -
+  // eine fruehe Volltilgung stellt den Status auf paid, obwohl Plan-Raten
+  // ungebucht bleiben (deren Zinsen schuldet niemand nach).
+  const status = loan.is_settled ? 'paid' : 'active';
   if (status !== loan.status) {
     db.get().prepare('UPDATE budget_loans SET status = ? WHERE id = ?').run(status, loanId);
     return loadLoan(loanId);
@@ -541,9 +813,84 @@ export function refreshLoanStatus(loanId) {
   return loan;
 }
 
+/* DIE ZUSTAENDIGEN EINER BUCHUNG ALS JSON (#1057).
+ *
+ * Als Unterabfrage und nicht als JOIN: ein JOIN auf eine n:m-Tabelle
+ * vervielfacht die Zeile je zustaendiger Person, und jede Summe darueber waere
+ * still falsch. Dieselbe Form, die der Kalender fuer `assigned_users` benutzt.
+ *
+ * Der Baustein erwartet die Buchung als `b` - alle drei Lesepfade dieses Moduls
+ * benennen sie so.
+ */
+export const RESPONSIBLE_USERS_SQL = `(
+  SELECT json_group_array(json_object(
+    'id', ru.id, 'display_name', ru.display_name, 'color', ru.avatar_color
+  ))
+  FROM budget_entry_responsibles ber JOIN users ru ON ru.id = ber.user_id
+  WHERE ber.entry_id = b.id
+) AS responsible_users_json`;
+
+/**
+ * Die Zustaendigen einer Buchung ersetzen (#1057).
+ *
+ * ERSETZEN, NICHT ERGAENZEN: das Formular sendet die vollstaendige Auswahl, und
+ * "niemand" muss ausdrueckbar sein. Ein leeres Array loescht also alle Zeilen.
+ * `undefined` dagegen heisst "nicht mitgeschickt" und laesst alles stehen -
+ * sonst raeumte jeder Teil-Request (etwa das Abhaken einer Buchung) die
+ * Zustaendigkeit ab.
+ *
+ * @param {number} entryId
+ * @param {Array<number>|undefined} rawUserIds
+ */
+export function replaceResponsibles(entryId, rawUserIds) {
+  if (rawUserIds === undefined) return;
+  const ids = Array.isArray(rawUserIds)
+    ? [...new Set(rawUserIds.map(Number).filter((n) => Number.isInteger(n) && n > 0))]
+    : [];
+  db.get().prepare('DELETE FROM budget_entry_responsibles WHERE entry_id = ?').run(entryId);
+  if (!ids.length) return;
+  // Unbekannte IDs fallen still weg statt den Request zu kippen: die Auswahl
+  // kann eine Person nennen, die zwischen Laden und Absenden entfernt wurde.
+  const ins = db.get().prepare(`
+    INSERT OR IGNORE INTO budget_entry_responsibles (entry_id, user_id)
+    SELECT ?, id FROM users WHERE id = ?
+  `);
+  for (const id of ids) ins.run(entryId, id);
+}
+
+/**
+ * Wer unter den mitgeschickten Zustaendigen NEU waere und kein Haushaltsmitglied
+ * ist (#1207) - gegen den gespeicherten Stand des Eintrags `entryId`: wer dort
+ * schon steht, bleibt gueltig. `undefined` heisst "nicht mitgeschickt", wie in
+ * replaceResponsibles(). Vor jedem Schreiben zu fragen: replaceResponsibles()
+ * laeuft erst nach dem eigentlichen Update und verwirft Unbekannte still.
+ *
+ * @param {number|null} entryId
+ * @param {Array<number>|undefined} rawUserIds
+ * @returns {number[]}
+ */
+export function responsibleNonMembers(entryId, rawUserIds) {
+  if (!Array.isArray(rawUserIds)) return [];
+  const ids = rawUserIds.map(Number).filter((n) => Number.isInteger(n) && n > 0);
+  const stored = entryId == null
+    ? []
+    : db.get().prepare('SELECT user_id FROM budget_entry_responsibles WHERE entry_id = ?').all(entryId).map((r) => r.user_id);
+  return newNonMembers(ids, { stored });
+}
+
+/** Das JSON aus RESPONSIBLE_USERS_SQL in ein Array wandeln. */
+export function withResponsibles(row) {
+  if (!row) return row;
+  const { responsible_users_json, ...rest } = row;
+  let parsed = [];
+  try { parsed = responsible_users_json ? JSON.parse(responsible_users_json) : []; } catch { parsed = []; }
+  return { ...rest, responsible_users: parsed };
+}
+
 export function entryWithLoanMeta(id) {
-  return db.get().prepare(`
+  return withResponsibles(db.get().prepare(`
     SELECT b.*, u.display_name AS creator_name,
+           ${RESPONSIBLE_USERS_SQL},
            p.id AS loan_payment_id,
            p.loan_id AS loan_id,
            p.installment_number AS loan_installment_number,
@@ -554,7 +901,7 @@ export function entryWithLoanMeta(id) {
     LEFT JOIN budget_loan_payments p ON p.budget_entry_id = b.id
     LEFT JOIN budget_loans l ON l.id = p.loan_id
     WHERE b.id = ?
-  `).get(id);
+  `).get(id));
 }
 
 // --------------------------------------------------------
@@ -583,7 +930,7 @@ export function validateAccountRef(raw) {
  * @param {boolean} includeArchived
  */
 export function listAccounts(includeArchived = false, filter = { clause: '', params: [] }) {
-  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const today = todayKey(db.get()); // YYYY-MM-DD in der Haushaltszone (#829)
   // Sichtbarkeits-Filter (#476/#505): im personal-Modus dürfen fremde private
   // Einträge weder Saldo noch entry_count beeinflussen, sonst verrät ein geteiltes
   // Konto Betrag/Existenz privater Fremd-Einträge. Im shared-Modus ist f leer.
@@ -592,23 +939,33 @@ export function listAccounts(includeArchived = false, filter = { clause: '', par
     SELECT a.*,
            a.starting_balance + COALESCE((
              SELECT SUM(e.amount) FROM budget_entries e
-             WHERE e.account_id = a.id AND e.date <= ?${f.clause}
+             WHERE e.account_id = a.id AND e.date <= ?${f.clause}${bookedOnly('e')}
            ), 0) AS current_balance,
            a.starting_balance + COALESCE((
              SELECT SUM(e.amount) FROM budget_entries e
-             WHERE e.account_id = a.id${f.clause}
+             WHERE e.account_id = a.id${f.clause}${bookedOnly('e')}
            ), 0) AS projected_balance,
            (SELECT COUNT(*) FROM budget_entries e WHERE e.account_id = a.id${f.clause}) AS entry_count
     FROM budget_accounts a
     WHERE ? = 1 OR a.archived = 0
     ORDER BY a.sort_order ASC, a.name COLLATE NOCASE ASC
   `).all(today, ...f.params, ...f.params, ...f.params, includeArchived ? 1 : 0);
-  return rows.map((a) => ({
-    ...a,
-    starting_balance:  cents(a.starting_balance),
-    current_balance:   cents(a.current_balance),
-    projected_balance: cents(a.projected_balance),
-  }));
+  return rows.map((a) => {
+    const currentBalance = cents(a.current_balance);
+    // Verfügbarer Rahmen nur für Kreditkarten mit gepflegtem Limit. Ein negativer
+    // Saldo ist die offene Schuld; ein positiver (Guthaben auf der Karte) vergrößert
+    // den Rahmen nicht, deshalb der Clamp auf 0.
+    const availableLimit = a.type === 'credit' && a.credit_limit != null
+      ? Math.max(0, cents(a.credit_limit) - Math.max(0, -currentBalance))
+      : null;
+    return {
+      ...a,
+      starting_balance:  cents(a.starting_balance),
+      current_balance:   currentBalance,
+      projected_balance: cents(a.projected_balance),
+      available_limit:   availableLimit,
+    };
+  });
 }
 
 export function nextAccountSortOrder() {

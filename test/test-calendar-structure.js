@@ -2,7 +2,7 @@
  * Calendar structure guard.
  *
  * Sichert die modulare Aufteilung von server/routes/calendar.js: der Orchestrator
- * muss dieselbe {Methode, Pfad}-Routentabelle wie vor dem Split ergeben (46
+ * muss die festgelegte {Methode, Pfad}-Routentabelle ergeben (63
  * Routen), und die Cluster-Router müssen zusammen exakt diese Routen ergeben
  * (keine verlorene/doppelte Route). Zusätzlich wird die extern konsumierte
  * Re-Export-Fläche (__test.googleTarget, genutzt von test:google-multi) gepinnt.
@@ -37,6 +37,7 @@ const { default: feedRouter } = await import('../server/routes/calendar/feed.js'
 const { default: crudRouter } = await import('../server/routes/calendar/crud.js');
 const { default: caldavRouter } = await import('../server/routes/calendar/caldav.js');
 const { default: syncTargetsRouter } = await import('../server/routes/calendar/sync-targets.js');
+const { default: outlookRouter } = await import('../server/routes/calendar/outlook.js');
 
 /** Sammelt geordnet alle {METHOD path}-Paare eines Express-Routers (inkl. gemounteter Sub-Router). */
 function collectRoutes(router) {
@@ -72,7 +73,11 @@ const EXPECTED = [
   'GET /google/calendars',
   'PATCH /google/calendars',
   'PATCH /external-calendars',
+  'GET /external-calendars/default-assignee-backfill',
+  'POST /external-calendars/default-assignee-backfill',
   'DELETE /google/disconnect',
+  'DELETE /google/mirrored-events',
+  'DELETE /apple/mirrored-events',
   'PUT /google/readonly',
   // apple
   'GET /apple/status',
@@ -98,9 +103,13 @@ const EXPECTED = [
   'GET /:id',
   'POST /',
   'PUT /:id',
+  'PUT /:seriesId/occurrences/:recurrenceId',
+  'PUT /:seriesId/occurrences/:recurrenceId/following',
   'POST /:id/reset',
   'POST /:id/exceptions',
   'DELETE /:id',
+  'DELETE /:seriesId/occurrences/:recurrenceId',
+  'DELETE /:seriesId/occurrences/:recurrenceId/following',
   // caldav (events + reminders)
   'POST /caldav/accounts',
   'GET /caldav/accounts',
@@ -114,18 +123,28 @@ const EXPECTED = [
   'PATCH /caldav/accounts/:id/reminder-lists',
   'POST /caldav/reminders/sync',
   'GET /caldav/reminders/status',
+  // outlook (Microsoft Graph, one-way push)
+  'GET /outlook/auth',
+  'GET /outlook/callback',
+  'GET /outlook/accounts',
+  'PUT /outlook/accounts/:id',
+  'DELETE /outlook/accounts/:id',
+  'GET /outlook/accounts/:id/calendars',
+  'PATCH /outlook/accounts/:id/calendars',
+  'POST /outlook/sync',
+  'GET /outlook/status',
 ];
 
-test('Orchestrator ergibt exakt die erwartete Routentabelle (46 Routen)', () => {
+test('Orchestrator ergibt exakt die erwartete Routentabelle (63 Routen)', () => {
   const actual = collectRoutes(calendarRouter).sort();
   assert.deepEqual(actual, [...EXPECTED].sort());
-  assert.equal(actual.length, 46);
+  assert.equal(actual.length, 63);
 });
 
 test('die Cluster-Router zusammen ergeben genau die Orchestrator-Routen (keine verlorene/doppelte Route)', () => {
   const perModule = [
     readRouter, googleRouter, appleRouter, subscriptionsRouter, feedRouter, crudRouter, caldavRouter,
-    syncTargetsRouter,
+    syncTargetsRouter, outlookRouter,
   ].flatMap(collectRoutes);
   // keine Route kommt in mehr als einem Cluster-Router vor
   const seen = new Set();

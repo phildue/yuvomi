@@ -4,9 +4,11 @@
  *
  * Vorher definierten Tasks (.filter-chip), Kontakte (.contact-filter-chip) und
  * Dokumente (.documents-filter-chip) drei nahezu identische Chips nebeneinander.
- * Tasks und Dokumente teilen sich jetzt diese Datei; Kontakte bleiben bewusst
- * eigenständig, weil ihr Aktiv-Zustand eine andere Füllung (--c-accent, deckend)
- * fährt und eine Angleichung deren Erscheinungsbild ändern würde.
+ * Tasks und Dokumente teilen sich jetzt diese Datei. Kontakte behalten ihren
+ * eigenen Selektor (eigene Zeilen-Geometrie), fahren aber seit dem HIG-Rollout
+ * denselben Aktiv-Zustand: --tint-state Fläche / --tint-hint Kante / --tint-ink
+ * Tinte. Ihre frühere deckende Füllung las sich wie ein aktives Segment, und
+ * die gefüllte Kapsel gehört seit Runde 1 den Segmenten.
  *
  * Reihenfolge-Hinweis: global NACH glass.css eingebunden, damit die bestehende
  * Tasks-Darstellung unverändert bleibt.
@@ -41,33 +43,70 @@
  * (dokumentiert in tokens.css, Abschnitt Modul-Akzente), nicht als roher
  * Akzent: der Chip-Grund ist selbst eine Tönung derselben Farbe, dadurch hing
  * der Kontrast allein an der Akzent-Helligkeit (tasks 3.60:1, notes 3.57:1).
- * Füllung und Rahmen bleiben unberührt, der Chip behält seine Modulfarbe. */
+ * Füllung und Rahmen bleiben unberührt, der Chip behält seine Modulfarbe.
+ *
+ * Die Werte standen bis zum HIG-Rollout als rohe Zahlen (18 % Fläche, 50 %
+ * Kante) in einem @supports-Zwilling, der zusätzlich blur-xs und einen
+ * Specular-Inset auflegte - Glas auf einem INHALTS-Element und damit gegen die
+ * Glas-ist-Chrome-Regel. Weil jeder Browser mit backdrop-filter ohnehin diesen
+ * Zweig sah, wurden seine Farbwerte hier der Bestand; nur Blur und Specular
+ * sind weg.
+ *
+ * Seit c788ce01 nennt der Chip statt der Zahlen die BENANNTEN Stufen der
+ * Tönungsskala (tokens.css, Abschnitt 6b), und das war nicht nur eine
+ * Umbenennung: Kante und Tinte trafen ihre Stufe punktgenau (--tint-hint 50 %,
+ * --tint-ink 70 %), die FLÄCHE hat sich dabei bewegt - --tint-state ist 12 %,
+ * nicht die 18 %, die hier bis 2026-09-07 standen. Wer eine Zahl braucht,
+ * liest sie in tokens.css; hier steht sie absichtlich nicht mehr. */
 .filter-chip--active {
-  background-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) 14%, transparent);
-  border-color: var(--module-accent, var(--color-accent));
-  color: color-mix(in srgb, var(--module-accent, var(--color-accent)) 70%, var(--color-text-primary));
-}
-
-@supports (backdrop-filter: blur(1px)) {
-  .filter-chip--active {
-    background: color-mix(in srgb, var(--module-accent, var(--color-accent)) 18%, transparent);
-    backdrop-filter: var(--blur-xs);
-    -webkit-backdrop-filter: var(--blur-xs);
-    border-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) 50%, transparent);
-    box-shadow: var(--glass-inset-base);
-  }
+  background-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-state), transparent);
+  border-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-hint), transparent);
+  color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-ink), var(--color-text-primary));
 }
 
 /* Dichtere Variante für Filterzeilen mit vielen Chips (Dokumente). Das Touch-Maß
  * hängt an (hover: none) statt an der Viewport-Breite: ein Tablet im Hochformat
- * (768–1023px) ist Touch und bekam über eine reine max-width-Regel sonst
- * 32px-Chips — unter dem 44pt-Minimum. */
+ * (768-1023px) ist Touch und bekam über eine reine max-width-Regel sonst
+ * 32px-Chips - unter dem 44pt-Minimum. */
 .filter-chip--sm {
   min-height: var(--target-md);
 }
 
 @media (hover: none) {
   .filter-chip--sm {
+    min-height: var(--target-base);
+  }
+}
+
+/* --------------------------------------------------------
+ * KOMPAKTE HÖHENKLASSE: der Chip fällt auf das Zeiger-Maß.
+ *
+ * Die Basisregel oben setzt --target-lg (48px) UNBEDINGT - das Fingermaß, auch
+ * auf einem Zeigergerät. Auf einem Telefon ist das richtig. Auf einem
+ * 1280x800-Laptop bei 200 % Browserzoom (also 640x400, WCAG 1.4.4) ist es der
+ * teuerste Posten der Seite: gemessen auf /tasks belegen Kopf und Filterreihe
+ * dort zusammen 171,6px von 400px - 43 % des Fensters, bevor die erste Aufgabe
+ * kommt, und die Filterreihe (78px) ist darin GRÖSSER als der Kopf (63px).
+ *
+ * Dieselbe Abwägung, die layout.css für den Modulkopf trifft (§ „kompakte
+ * Höhenklasse"): wo die Höhe fehlt und die Breite reicht, gibt die Höhe nach.
+ *
+ * DER TOUCH-FALL BLEIBT UNBERÜHRT, und das ist die Bedingung, unter der die
+ * Regel überhaupt zulässig ist: `(hover: none)` holt --target-base zurück, und
+ * das ist auf Touch selbst --target-lg (tokens.css § 11). Ein Telefon im
+ * Querformat verliert damit keinen einzigen Pixel Zielgrösse - es sieht diese
+ * Regel, nimmt sie aber in der Zeile darunter zurück. Genau die Arbeitsteilung
+ * trägt schon `.filter-chip--sm`; hier steht sie nur zusätzlich an der
+ * Höhenachse.
+ * -------------------------------------------------------- */
+@media (max-height: 499px) {
+  .filter-chip {
+    min-height: var(--target-md);
+  }
+}
+
+@media (max-height: 499px) and (hover: none) {
+  .filter-chip {
     min-height: var(--target-base);
   }
 }
@@ -87,7 +126,7 @@
  * Scroll-Affordanz für horizontal scrollende Leisten (Audit F-06)
  *
  * Geteilte Konvention: wireScrollFade (utils/ux.js) setzt has-fade-start/-end,
- * solange links/rechts Inhalt verborgen liegt — der weiche Anriss ersetzt den
+ * solange links/rechts Inhalt verborgen liegt - der weiche Anriss ersetzt den
  * bewusst versteckten Scrollbalken (Chip-Zeilen, Tab-Leisten, Personen-Chips).
  * Vertikale Sonderfälle (Sidebar) überschreiben die Maske spezifischer.
  *
@@ -108,16 +147,99 @@
  * ist kein Grund, Lesbarkeit einzutauschen.
  * -------------------------------------------------------- */
 .has-fade-end {
-  mask-image: linear-gradient(to right, #000 calc(100% - var(--space-6)), transparent);
-  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - var(--space-6)), transparent);
+  mask-image: linear-gradient(to right, var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+  -webkit-mask-image: linear-gradient(to right, var(--mask-opaque) calc(100% - var(--space-6)), transparent);
 }
 
 .has-fade-start {
-  mask-image: linear-gradient(to right, transparent, #000 var(--space-6));
-  -webkit-mask-image: linear-gradient(to right, transparent, #000 var(--space-6));
+  mask-image: linear-gradient(to right, transparent, var(--mask-opaque) var(--space-6));
+  -webkit-mask-image: linear-gradient(to right, transparent, var(--mask-opaque) var(--space-6));
 }
 
 .has-fade-start.has-fade-end {
-  mask-image: linear-gradient(to right, transparent, #000 var(--space-6), #000 calc(100% - var(--space-6)), transparent);
-  -webkit-mask-image: linear-gradient(to right, transparent, #000 var(--space-6), #000 calc(100% - var(--space-6)), transparent);
+  mask-image: linear-gradient(to right, transparent, var(--mask-opaque) var(--space-6), var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+  -webkit-mask-image: linear-gradient(to right, transparent, var(--mask-opaque) var(--space-6), var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+}
+
+/* SPIEGELUNG FÜR RTL. `has-fade-start` heisst „am ANFANG geht es weiter" - in
+ * `ar` und `fa` (die App setzt `dir=rtl`) liegt der Anfang rechts. Ein
+ * Verlauf kennt keine logische Richtung: `to right` bleibt physisch, also
+ * fadete die Leiste dort die falsche Kante - sichtbare Chips wurden gedämpft,
+ * verborgene hart abgeschnitten. Die Werte sind dieselben, nur die Achse dreht.
+ * Nur `to left` statt einer eigenen Rezeptur, damit die beiden nicht driften. */
+[dir="rtl"] .has-fade-end {
+  mask-image: linear-gradient(to left, var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+  -webkit-mask-image: linear-gradient(to left, var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+}
+
+[dir="rtl"] .has-fade-start {
+  mask-image: linear-gradient(to left, transparent, var(--mask-opaque) var(--space-6));
+  -webkit-mask-image: linear-gradient(to left, transparent, var(--mask-opaque) var(--space-6));
+}
+
+[dir="rtl"] .has-fade-start.has-fade-end {
+  mask-image: linear-gradient(to left, transparent, var(--mask-opaque) var(--space-6), var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+  -webkit-mask-image: linear-gradient(to left, transparent, var(--mask-opaque) var(--space-6), var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+}
+
+/* --------------------------------------------------------
+ * Die scharfe Fassung fuer TAB-LEISTEN (Werkzeugzeilen-Regel, 2026-08-27).
+ *
+ * Der 24px-Fade oben ist fuer Chip-Reihen gebaut, in denen viele schmale
+ * Elemente stehen - an einer Tab-Leiste verdeckt er genau den mageren
+ * Anschnitt, der „hier geht es weiter" sagen soll (gemessen am Budget:
+ * 9px-Anschnitt komplett im Fade; an der Kuechen-Rail verschwand das
+ * „Vorrat 10"-Badge bei 403>375px). Die Bauart stammt aus budget.css
+ * (Audit P2) und war dort Modul-privat, waehrend dieselbe Leiste in sechs
+ * Moduldateien lebt: schmaler 12px-Fade, der den angeschnittenen Nachbarn
+ * sichtbar laesst. Gilt fuer die Bar-Zeile des Modulkopfs
+ * (.page-toolbar__bar, layout.css) und fuer eigenstaendige Sub-Tab-Rails
+ * (.sub-tabs-bar, heute die Kueche). Sie steht HIER, weil die Masken-Familie
+ * samt RTL-Spiegelung an diesem Ort wohnt - eine zweite Rezeptur in einer
+ * Moduldatei war der Zustand, den diese Runde beendet. */
+.page-toolbar__bar.has-fade-end,
+.page-toolbar__bar .has-fade-end,
+.sub-tabs-bar.has-fade-end {
+  mask-image: linear-gradient(to right, var(--mask-opaque) calc(100% - var(--space-3)), transparent);
+  -webkit-mask-image: linear-gradient(to right, var(--mask-opaque) calc(100% - var(--space-3)), transparent);
+}
+
+.page-toolbar__bar.has-fade-start.has-fade-end,
+.page-toolbar__bar .has-fade-start.has-fade-end,
+.sub-tabs-bar.has-fade-start.has-fade-end {
+  mask-image: linear-gradient(to right, transparent, var(--mask-opaque) var(--space-3), var(--mask-opaque) calc(100% - var(--space-3)), transparent);
+  -webkit-mask-image: linear-gradient(to right, transparent, var(--mask-opaque) var(--space-3), var(--mask-opaque) calc(100% - var(--space-3)), transparent);
+}
+
+/* Achse gespiegelt, Werte gleich - Begruendung an der RTL-Basisregel oben. */
+[dir="rtl"] .page-toolbar__bar.has-fade-end,
+[dir="rtl"] .page-toolbar__bar .has-fade-end,
+[dir="rtl"] .sub-tabs-bar.has-fade-end {
+  mask-image: linear-gradient(to left, var(--mask-opaque) calc(100% - var(--space-3)), transparent);
+  -webkit-mask-image: linear-gradient(to left, var(--mask-opaque) calc(100% - var(--space-3)), transparent);
+}
+
+[dir="rtl"] .page-toolbar__bar.has-fade-start.has-fade-end,
+[dir="rtl"] .page-toolbar__bar .has-fade-start.has-fade-end,
+[dir="rtl"] .sub-tabs-bar.has-fade-start.has-fade-end {
+  mask-image: linear-gradient(to left, transparent, var(--mask-opaque) var(--space-3), var(--mask-opaque) calc(100% - var(--space-3)), transparent);
+  -webkit-mask-image: linear-gradient(to left, transparent, var(--mask-opaque) var(--space-3), var(--mask-opaque) calc(100% - var(--space-3)), transparent);
+}
+
+/* --------------------------------------------------------
+ * Scroll-Polster für jede Leiste mit Rand-Fade (HIG-Rollout Runde 3).
+ *
+ * Die Maske sagt „hier geht es weiter"; sie sagt nicht, wo eine Leiste zum
+ * Stehen kommt. Ohne Polster hält `scrollIntoView({ inline: 'nearest' })` das
+ * angesteuerte Element bündig an der Kante und schneidet den Nachbarn
+ * wortmittig ab - genau das, was die Fade-Maske verdecken sollte (gefunden an
+ * der Personen-Chipreihe der Gesundheit, mobil).
+ *
+ * Der Marker `u-scroll-fade` kommt aus wireScrollFade (utils/ux.js), nicht aus
+ * dem Markup: so gilt diese Regel für JEDE Leiste, die den geteilten Helfer
+ * nutzt, statt für eine Liste von Modulen. Die Lehre der Küchen-
+ * Zusammenführung, wörtlich angewandt.
+ * -------------------------------------------------------- */
+.u-scroll-fade {
+  scroll-padding-inline: var(--space-6);
 }

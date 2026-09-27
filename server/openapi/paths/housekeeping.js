@@ -1,5 +1,10 @@
 import { op, jsonBody, idParam } from '../helpers.js';
 
+const VISIT_CAPABILITY_NOTE = 'Each visit carries `can_edit` and `can_delete`: true when the caller may write to the Housekeeping module and the visit is either unpaid or the caller is an admin '
+  + '(a paid visit is settled), `can_mark_paid`: true when the caller may write and the visit is unpaid, and `can_mark_unpaid`: true when the visit is paid and the caller is an admin. '
+  + 'Write access means both the member module permission and, for API tokens, a `housekeeping:write` scope. '
+  + 'They are hints for the interface; `PUT`/`DELETE /api/v1/housekeeping/visits/{id}` and `POST .../unpay` check the role themselves.';
+
 export function housekeepingPaths() {
   return {
     '/api/v1/housekeeping/dashboard': {
@@ -28,15 +33,25 @@ export function housekeepingPaths() {
       post: op({ summary: 'Check out a housekeeper', tag: 'Housekeeping', stateChanging: true, requestBody: jsonBody(null) }),
     },
     '/api/v1/housekeeping/visits': {
-      get: op({ summary: 'List housekeeping visits for a month', tag: 'Housekeeping' }),
+      get: op({ summary: 'List housekeeping visits for a month', tag: 'Housekeeping', description: VISIT_CAPABILITY_NOTE }),
     },
     '/api/v1/housekeeping/visits/{id}': {
-      get: op({ summary: 'Get housekeeping visit', tag: 'Housekeeping', params: [idParam()] }),
-      put: op({ summary: 'Update housekeeping visit', tag: 'Housekeeping', params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
+      get: op({ summary: 'Get housekeeping visit', tag: 'Housekeeping', params: [idParam()], description: VISIT_CAPABILITY_NOTE }),
+      put: op({ summary: 'Update housekeeping visit', tag: 'Housekeeping', params: [idParam()], stateChanging: true, documentDeleteConflict: true, requestBody: jsonBody(null) }),
       delete: op({ summary: 'Delete housekeeping visit', tag: 'Housekeeping', params: [idParam()], stateChanging: true }),
     },
     '/api/v1/housekeeping/visits/{id}/pay': {
       post: op({ summary: 'Mark housekeeping visit as paid', tag: 'Housekeeping', params: [idParam()], stateChanging: true }),
+    },
+    '/api/v1/housekeeping/visits/{id}/unpay': {
+      post: op({
+        summary: 'Take back the payment of a housekeeping visit',
+        description: 'Clears `paid_at` and reopens a linked payment task that is done. A visit that is not paid is returned unchanged.',
+        tag: 'Housekeeping',
+        admin: true,
+        params: [idParam()],
+        stateChanging: true,
+      }),
     },
     '/api/v1/housekeeping/decay-tasks': {
       get: op({ summary: 'List housekeeping decay tasks', tag: 'Housekeeping' }),

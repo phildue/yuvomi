@@ -7,35 +7,82 @@
   <!-- Fallback-Tokens VOR dem tokens.css-Link: lädt tokens.css (inkl. Dark-Mode-
        Media-Query), gewinnen dessen spätere :root-Regeln per Cascade. Fehlt
        tokens.css (falscher OIKOS_INSTALLER_ROOT, Packaging-/Volume-Fehler), bleibt
-       der Installer trotzdem lesbar statt Serif-auf-Transparent zu rendern —
+       der Installer trotzdem lesbar statt Serif-auf-Transparent zu rendern -
        genau die fehlkonfigurierte Umgebung, in der ein Installer läuft. -->
   <style>
     :root {
-      --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      --font-mono: ui-monospace, 'SF Mono', 'Fira Code', 'Roboto Mono', monospace;
-      --color-bg: #F5F4F1;
+      /* Sagt dem Browser, dass beide Modi bedient werden. Ohne diese Zeile
+         rendert er UA-Bedienelemente (die unchecked Checkbox!) in Hell-Optik,
+         auch wenn die ganze Seite dunkel ist - ein weisses Kaestchen auf
+         dunkler Flaeche. Betrifft nur das, was der Browser selbst zeichnet. */
+      color-scheme: light dark;
+      /* Der System-Font-Stack, nicht Plus Jakarta Sans: die Schrift ist mit dem
+         HIG-Redesign aus der App entfallen, und ein Fallback, der sie lädt,
+         zeigt eine Welt, die es nicht mehr gibt. */
+      --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "Segoe UI", Roboto, Arial, sans-serif;
+      --font-mono: ui-monospace, 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+      --color-bg: #F5F3ED;
       --color-surface: #FFFFFF;
-      --color-surface-2: #FAFAF8;
-      --color-border: #E8E7E2;
-      --color-text-primary: #1C1C1A;
-      --color-text-secondary: #6C6B67;
+      --color-surface-2: #FBFAF7;
+      --color-border: #E4E0D7;
+      --color-text-primary: #1D1B17;
+      --color-text-secondary: #63615B;
+      /* tokens.css leitet dieses Token aus --color-text-tertiary ab; hier steht
+         dessen Wert direkt, weil der Fallback keine zweite Ebene braucht. */
+      --color-text-placeholder: #6B675F;
       --color-accent: #6C3AED;
-      --color-accent-hover: #4A26BB;
-      --color-text-on-accent: #FFFFFF;
-      --color-success: #15803D;
-      --color-warning: #A15C0A;
-      --color-danger: #B91C1C;
-      --radius-sm: 8px;
+      --color-accent-hover: #5B2FD4;
+      /* Traegt die Primaerbutton-Mischung der App. Die Rampe INVERTIERT im Dark
+         Mode (#FBFAF7 statt #0E0D0B) - dadurch wird der Knopf dort heller statt
+         dunkler, und die dunkle Tinte darauf gewinnt Kontrast statt zu verlieren. */
+      --neutral-950: #0E0D0B;
+      /* Tinte auf farbiger Fläche. Muss dem Theme folgen: --color-accent hellt
+         im Dark-Mode auf #A78BFA auf, weißer Text fällt dort durch.
+         tokens.css definiert dasselbe Token; dessen --color-text-on-accent ist
+         dagegen statisch weiß und taugt hier deshalb nicht. */
+      --color-ink-on-vivid: #FFFFFF;
+      --color-success: #1E7B35;
+      --color-warning: #A85D00;
+      --color-danger: #D70015;
+      --radius-xs: 4px;
+      --radius-sm: 10px;
       --radius-md: 12px;
-      --shadow-md: 0 2px 8px rgba(18,14,8,.09), 0 1px 2px rgba(18,14,8,.05);
-      --shadow-lg: 0 8px 24px rgba(18,14,8,.13), 0 2px 6px rgba(18,14,8,.05);
+      --radius-lg: 16px;
+      --radius-full: 9999px;
+      /* Typo-Rampe aus tokens.css. Der Installer rechnete vorher in rohen px und
+         lag mit der Hälfte der Werte zwischen zwei Stufen. Seit dem Redesign ist
+         die Rampe Apples: --text-base ist Callout (17px am Body, hier 16px als
+         iOS-Zoom-Schwelle), --text-2xl ist Title 2 mit 22px statt 24px. */
+      --text-2xs:  0.625rem;
+      --text-xs:   0.75rem;
+      --text-sm:   0.875rem;
+      --text-base: 1rem;
+      --text-lg:   1.125rem;
+      --text-xl:   1.25rem;
+      --text-2xl:  1.375rem;
+      --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04), 0 2px 6px rgba(0, 0, 0, 0.04);
+      --shadow-md: 0 2px 10px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+      --shadow-lg: 0 8px 28px rgba(0, 0, 0, 0.12), 0 2px 6px rgba(0, 0, 0, 0.04);
     }
     @media (prefers-color-scheme: dark) {
       :root {
-        --color-bg: #16151A; --color-surface: #201F26; --color-surface-2: #2A2932;
-        --color-border: #35343E; --color-text-primary: #F4F3F7; --color-text-secondary: #A9A7B4;
-        --color-accent: #A78BFA; --color-accent-hover: #C4B5FD; --color-text-on-accent: #1C1B22;
-        --color-success: #4ADE80; --color-warning: #FBBF24; --color-danger: #F87171;
+        /* --color-surface-2 liegt hier TIEFER als --color-bg (#0F0E0D gegen
+           #191816) - das ist kein Vertipper, sondern die Dunkelseite der App:
+           die gehobene Fläche ist die Karte (--color-surface), der Grund darunter
+           wird dunkler statt heller. --color-border folgt nicht der
+           Neutralen-Rampe, tokens.css setzt es im Dark-Mode eigens. */
+        --color-bg: #191816; --color-surface: #2B2825; --color-surface-2: #0F0E0D;
+        --color-border: #47423B; --color-text-primary: #F5F3ED; --color-text-secondary: #B4AEA5;
+        --color-text-placeholder: #A9A39A;
+        --color-accent: #A78BFA; --color-accent-hover: #BCA6FC; --color-ink-on-vivid: #0A0A0C;
+        --neutral-950: #FBFAF7;
+        --color-success: #30D158; --color-warning: #FF9F0A; --color-danger: #FF6961;
+        /* Inkl. des 1px-Kantenrings aus tokens.css (Dark-Kur 2026-08-17): ein
+           reiner Schwarz-Wurf ist auf der Kohle-Buehne unsichtbar, die Karte
+           hinge allein am Flaechenkontrast. */
+        --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.30), 0 0 0 1px rgba(255, 255, 255, 0.06);
+        --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.40), 0 0 0 1px rgba(255, 255, 255, 0.06);
+        --shadow-lg: 0 8px 28px rgba(0, 0, 0, 0.50), 0 0 0 1px rgba(255, 255, 255, 0.05);
       }
     }
   </style>
@@ -46,9 +93,50 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     [hidden] { display: none !important; }
     body {
-      font-family: var(--font-sans); background: var(--color-bg); color: var(--color-text-primary);
-      min-height: 100vh; display: flex; flex-direction: column;
+      font-family: var(--font-sans); color: var(--color-text-primary);
+      min-height: 100dvh; display: flex; flex-direction: column;
       align-items: center; padding: 48px 16px 80px;
+      /* HIER STAND EIN AKZENT-HAUCH am oberen Rand - ein radialer Verlauf, der
+         bis v2.0.0 wortgleich auf der Login-Seite der App stand. Dort ist er mit
+         dem HIG-Redesign gefallen, und der Grund gilt hier genauso: die Marke
+         trägt das Tile, nicht die Bühne. Der Installer HAT das Tile (.brand__mark
+         weiter unten, 64px auf Akzentfläche) - der Verlauf war die zweite
+         Markenaussage auf derselben Fläche, und die leisere von beiden.
+
+         Der Grund bleibt notiert, damit die Fläche nicht beim nächsten Durchgang
+         als „kahl" wieder gefüllt wird: sie ist absichtlich der Seitengrund. */
+      background: var(--color-bg);
+      position: relative;   /* Bezug fuer .lang-switch */
+      /* Die Karte hing oben und liess rund 40 % der Höhe leer. `safe` verhindert
+         den klassischen Zentrier-Bug: ohne das Schlüsselwort schneidet ein
+         überhoher Schritt (Advanced sind 4 Bildschirme) oben unscrollbar ab.
+         Browser ohne `safe`-Unterstützung verwerfen die Zeile und bleiben beim
+         bisherigen Verhalten. */
+      justify-content: safe center;
+    }
+
+    /* Marken-Anker über der Karte: Zeichen plus Wortmarke, dasselbe Motiv wie
+       .login-hero__mark in der App. Der Wizard trug bisher kein Yuvomi-Zeichen. */
+    .brand { text-align: center; margin-bottom: 22px; }
+    .brand__mark {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 64px; height: 64px; margin-bottom: 12px;
+      border-radius: var(--radius-lg);
+      background-color: var(--color-accent);
+      /* Folgt dem Theme. --color-text-on-accent wäre hier statisches Weiss und
+         im Dark-Mode derselbe Kontrastfehler wie bei den Primäraktionen. */
+      color: var(--color-ink-on-vivid);
+      box-shadow: var(--shadow-md), inset 0 1px 0 color-mix(in srgb, var(--color-ink-on-vivid) 22%, transparent);
+    }
+    .brand__mark svg { width: 55%; height: 55%; }
+    .brand__word {
+      font-size: var(--text-xl); font-weight: 700;
+      /* Label-Farbe, nicht Akzent. auth.css:77-81 haelt fest, dass DESIGN.md
+         einen Titel in Akzentfarbe ausdruecklich verbietet, und hat die
+         Anmeldeseite genau deshalb zurueckgesetzt. Der Installer ist die ERSTE
+         Begegnung mit dem Produkt und trug als einziges Yuvomi-Artefakt noch
+         die abgeloeste Fassung. Die Marke traegt das Tile darueber. */
+      letter-spacing: -.02em; color: var(--color-text-primary);
     }
     .progress-track { position: fixed; top: 0; left: 0; right: 0; height: 3px; background: var(--color-border); z-index: 100; }
     /* scaleX statt width: kein Layout-Reflow, flüssiger Fortschrittsbalken. */
@@ -56,18 +144,32 @@
     html[dir="rtl"] .progress-fill { transform-origin: right center; }
 
     /* Sprachumschaltung: oben rechts, überschreibt die Browser-Erkennung. */
-    .lang-switch { position: fixed; top: 12px; inset-inline-end: 12px; z-index: 120; display: flex; align-items: center; gap: 6px; }
+    /* absolute statt fixed: mitscrollend verdeckte er beim Scrollen Ueberschriften
+       (gemessen die H2 des Abschlusses, mitten im Wort durchschnitten). Er hat
+       oben seinen Platz und muss nicht mitreisen - der Wizard ist ein Formular,
+       keine Leseflaeche, und die Sprache waehlt man am Anfang. */
+    .lang-switch { position: absolute; top: 12px; inset-inline-end: 12px; z-index: 120; display: flex; align-items: center; gap: 6px; }
     .lang-switch svg { width: 15px; height: 15px; stroke: var(--color-text-secondary); fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
     .lang-switch select {
       appearance: none; -webkit-appearance: none;
-      padding: 6px 26px 6px 10px; font-size: 13px; font-weight: 600;
+      padding: 6px 26px 6px 10px; font-size: var(--text-sm); font-weight: 600;
       border: 1.5px solid var(--color-border); border-radius: var(--radius-sm);
       background: var(--color-surface); color: var(--color-text-primary);
       font-family: var(--font-sans); cursor: pointer; min-height: 36px;
-      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236c6b67' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
-      background-repeat: no-repeat; background-position: right 9px center;
     }
-    html[dir="rtl"] .lang-switch select { padding: 6px 10px 6px 26px; background-position: left 9px center; }
+    html[dir="rtl"] .lang-switch select { padding: 6px 10px 6px 26px; }
+    /* Chevron als Maske statt background-image: url() kann keine var() tragen,
+       der Strich stand deshalb hartkodiert auf #6c6b67 - im Dark Mode 2.77:1
+       auf der Feldflaeche und damit unter der 3:1-Schwelle fuer UI-Grafik
+       (WCAG 1.4.11). Die Maske nimmt ihre Farbe aus dem Token und folgt beiden
+       Themes; inset-inline-end deckt RTL ohne zweite Regel. */
+    .lang-switch::after {
+      content: ''; position: absolute; inset-inline-end: 9px; top: 50%;
+      width: 12px; height: 12px; margin-top: -6px; pointer-events: none;
+      background: var(--color-text-secondary);
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") center / 12px 12px no-repeat;
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") center / 12px 12px no-repeat;
+    }
     .lang-switch select:focus-visible { outline: none; border-color: var(--color-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 12%, transparent); }
 
     /* Modus-Wahl: zwei große, klar unterscheidbare Wege. */
@@ -88,46 +190,111 @@
       border-radius: var(--radius-sm); background: color-mix(in srgb, var(--color-accent) 12%, transparent);
     }
     .mode-card__icon svg { width: 21px; height: 21px; stroke: var(--color-accent); fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-    .mode-card__title { font-size: 16px; font-weight: 700; letter-spacing: -.01em; }
-    .mode-card__badge { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--color-accent); }
-    .mode-card__desc { font-size: 13px; line-height: 1.5; color: var(--color-text-secondary); }
-    .mode-card__meta { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; font-weight: 600; color: var(--color-text-secondary); }
+    .mode-card__title { font-size: var(--text-base); font-weight: 700; letter-spacing: -.01em; }
+    .mode-card__badge { font-size: var(--text-xs); font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--color-accent); }
+    .mode-card__desc { font-size: var(--text-sm); line-height: 1.5; color: var(--color-text-secondary); }
+    .mode-card__meta { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: var(--text-xs); font-weight: 600; color: var(--color-text-secondary); }
     .mode-card__meta svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-    .mode-card:disabled { opacity: .45; cursor: not-allowed; pointer-events: none; }
+    /* Gesperrt wird über Fläche und Textfarbe, nicht über Deckkraft: eine Karte,
+       die ihren eigenen Text unlesbar macht, um Unantastbarkeit zu zeigen, reißt
+       AA. Seit die bestehende Installation den Einfach-Pfad sperrt, ist das der
+       Normalfall des Zweitlaufs und nicht mehr die seltene Docker-Ausnahme. */
+    .mode-card:disabled {
+      cursor: not-allowed;
+      pointer-events: none;
+      /* Die Bühnenfarbe, nicht --color-surface-2: sie liegt in BEIDEN Modi hinter
+         der aktiven Karte (hell heller, dunkel dunkler), die gesperrte Karte
+         tritt also in beiden zurück. Alle vier hier benutzten Tokens stehen im
+         Fallback-Block oben - --color-surface-3 und --color-border-subtle nicht,
+         die wären ohne tokens.css eine leere Variable und damit wirkungslos. */
+      background: var(--color-bg);
+      border-color: var(--color-border);
+    }
+    .mode-card:disabled .mode-card__title,
+    .mode-card:disabled .mode-card__desc { color: var(--color-text-secondary); }
+    /* „Empfohlen" an einer gesperrten Karte ist eine Empfehlung, der niemand
+       folgen kann. Das Abzeichen geht, der Vorrang wandert per is-primary. */
+    .mode-card:disabled .mode-card__badge { display: none; }
+    .mode-card:disabled .mode-card__icon { background: var(--color-surface-2); }
+    .mode-card:disabled .mode-card__icon svg,
+    .mode-card:disabled .mode-card__meta svg { stroke: var(--color-text-secondary); }
 
     /* Simple-Bereitschaftsliste: „alles erledigt"-Zusammenfassung. */
     .ready-list { display: flex; flex-direction: column; gap: 12px; margin: 4px 0 20px; }
-    .ready-item { display: flex; align-items: flex-start; gap: 11px; font-size: 14px; line-height: 1.45; }
+    .ready-item { display: flex; align-items: flex-start; gap: 11px; font-size: var(--text-sm); line-height: 1.45; }
     .ready-item svg { width: 20px; height: 20px; flex-shrink: 0; stroke: var(--color-success); fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; margin-top: 1px; }
     .ready-item b { font-weight: 600; }
     .ready-item span { color: var(--color-text-secondary); }
     .link-btn {
       background: none; border: none; padding: 0; font-family: var(--font-sans);
-      font-size: 13px; font-weight: 600; color: var(--color-accent); cursor: pointer; text-decoration: underline;
+      font-size: var(--text-sm); font-weight: 600; color: var(--color-accent); cursor: pointer; text-decoration: underline;
     }
-    .link-btn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; border-radius: 3px; }
+    .link-btn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; border-radius: var(--radius-xs); }
     .card {
-      background: var(--color-surface); border: 1px solid var(--color-border);
-      border-radius: var(--radius-md); box-shadow: var(--shadow-lg);
+      /* Kein 1px-Rahmen PLUS 28px-Schatten: die Karte der App traegt --shadow-sm
+         und keine Kante (layout.css:3260). Die Kombination aus feiner Linie und
+         weitem Schatten ist genau das Muster, das der Detektor als
+         gpt-thin-border-wide-shadow meldet - hier zu Recht. */
+      background: var(--color-surface);
+      border-radius: var(--radius-md); box-shadow: var(--shadow-sm);
       width: 100%; max-width: 560px;
     }
     .step { display: none; animation: up .25s ease; }
     .step.active { display: block; }
     @keyframes up { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
     .card-head { padding: 28px 32px 22px; border-bottom: 1px solid var(--color-border); }
-    .step-tag { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--color-accent); margin-bottom: 8px; }
-    .card-head h2 { font-size: 21px; font-weight: 700; letter-spacing: -.02em; }
+    .step-tag { font-size: var(--text-xs); font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--color-accent); margin-bottom: 8px; }
+    .card-head h2 { font-size: var(--text-xl); font-weight: 700; letter-spacing: -.02em; }
+    /* showStep() fokussiert die Überschrift programmatisch, damit Tastatur- und
+       Screenreader-Nutzer der Navigation folgen (WCAG 2.4.3). Der blaue
+       UA-Default-Ring liess sie dabei bei jedem Schrittwechsel wie ein
+       Eingabefeld aussehen. Sichtbar bleibt der Ring nur für Tastaturnavigation. */
+    h2[tabindex="-1"]:focus { outline: none; }
+    h2[tabindex="-1"]:focus-visible {
+      outline: 2px solid var(--color-accent); outline-offset: 4px; border-radius: var(--radius-xs);
+    }
     /* Visuell versteckt, für Screenreader vorhanden (persistenter Seiten-H1). */
     .vh { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
-    .card-head p  { font-size: 14px; color: var(--color-text-secondary); margin-top: 7px; line-height: 1.55; }
+    .card-head p  { font-size: var(--text-sm); color: var(--color-text-secondary); margin-top: 7px; line-height: 1.55; }
     .card-body { padding: 24px 32px; }
     .card-foot { padding: 16px 32px; border-top: 1px solid var(--color-border); display: flex; justify-content: flex-end; gap: 10px; }
     .field { margin-bottom: 18px; }
-    .field label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
-    .opt { font-weight: 400; color: var(--color-text-secondary); font-size: 12px; }
-    input[type=text], input[type=password], input[type=email], select {
-      width: 100%; padding: 9px 12px; border: 1.5px solid var(--color-border); border-radius: var(--radius-sm);
-      background: var(--color-surface); color: var(--color-text-primary); font-family: var(--font-sans); font-size: 14px;
+    .field label { display: block; font-size: var(--text-sm); font-weight: 600; margin-bottom: 6px; }
+    /* Die Kästchen waren 13x13 neben einem 16px hohen Label und verfehlten damit
+       jede Zielgrösse (WCAG 2.2 SC 2.5.8 verlangt 24x24 CSS-Pixel). Das gilt in
+       jeder Breite, nicht nur mobil - deshalb keine Media-Query. */
+    input[type=checkbox] {
+      inline-size: 24px; block-size: 24px; flex-shrink: 0;
+      margin: 0; accent-color: var(--color-accent); cursor: pointer;
+    }
+    .field label:has(input[type=checkbox]) {
+      display: flex; align-items: center; gap: 10px; margin-bottom: 0; cursor: pointer;
+    }
+    .opt { font-weight: 400; color: var(--color-text-secondary); font-size: var(--text-xs); }
+    /* Der Platzhalter war NIRGENDS gesetzt und fiel damit auf Chromes UA-Default
+       #757575 zurück, der im Dark Mode nicht mitkippt: gemessen 3.36:1 auf dem
+       dunklen Feldgrund, über alle 25 Felder mit placeholder-Attribut. Dieselbe
+       Falle hatte die App an ihren Quick-Add-Feldern (Critique 2026-07-29,
+       layout.css:4225) - dort deckt seither ein Elementselektor jedes künftige
+       Feld mit ab, statt auf die richtige Klasse zu hoffen. Hier genauso.
+       Die Platzhalter tragen echte Beispielwerte (Host, Port, Koordinaten). */
+    input::placeholder,
+    textarea::placeholder {
+      color: var(--color-text-placeholder);
+      opacity: 1; /* Firefox setzt ::placeholder sonst auf opacity < 1 und senkt den Kontrast erneut */
+    }
+    /* 16px ist Pflicht, nicht Geschmack: iOS Safari zoomt bei jedem Fokus auf ein
+       Feld darunter, und der Nutzer landet nach jedem Tipp in einem verschobenen
+       Layout. Die Felder standen seit dem Juni-Critique auf 14px. */
+    /* padding-inline-end wie im Feldkanon der App (layout.css:4202): ohne ihn
+       laeuft der laengste Optionstext in den Chevron - gemessen 288px Inhalt in
+       einem 262px breiten Feld bei 390px, ohne Ellipse. Betrifft ausgerechnet den
+       hervorgehobenen Sicherheits-Select. */
+    select { padding-inline-end: 40px; text-overflow: ellipsis; }
+    input[type=text], input[type=password], input[type=email], input[type=number], select {
+      width: 100%; padding: 10px 12px; border: 1.5px solid var(--color-border); border-radius: var(--radius-sm);
+      background: var(--color-surface); color: var(--color-text-primary); font-family: var(--font-sans);
+      font-size: var(--text-base);
       outline: none; transition: border-color .15s;
     }
     input:focus, select:focus {
@@ -142,77 +309,131 @@
       box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-danger) 18%, transparent);
     }
     .secret-row { display: flex; gap: 7px; flex-wrap: wrap; }
-    .secret-row input { flex: 1; font-family: var(--font-mono); font-size: 12px; }
-    .hint { font-size: 12px; color: var(--color-text-secondary); margin-top: 5px; line-height: 1.4; }
+    /* `flex: 1` hatte Flex-Basis 0: das Feld schrumpfte auf den Rest, den die
+       Buttons übrig liessen, gemessen 102px für einen 64-Zeichen-Schlüssel bei
+       390px Breite - direkt unter „Speichere diese Schlüssel jetzt". Mit
+       Basis 100 % bekommt der Wert immer die volle Zeile, die Buttons rutschen
+       in die zweite. min-width: 0 verhindert, dass der Feldinhalt die Zeile
+       aufspannt und den Umbruch aushebelt. */
+    .secret-row input { flex: 1 1 100%; min-width: 0; font-family: var(--font-mono); font-size: var(--text-sm); }
+    /* 14px wie die Hinweise der App (auth.css:115). Auf 12px war ausgerechnet
+       die erklaerende Prosa fuer Laien kleiner als in der fertigen App. */
+    .hint { font-size: var(--text-sm); color: var(--color-text-secondary); margin-top: 5px; line-height: 1.4; }
     .hint a { color: var(--color-accent); }
+    /* Redirect-URIs sind unzerbrechliche Maschinenwerte in fester Kartenbreite:
+       ohne Umbruch clippte overflow:hidden der Toggle-Card sie mobil kommentarlos
+       (gemessen 472px Inhalt in 343px Karte) - und genau dieser Wert muss
+       zeichengenau in eine fremde Konsole. #done-path traegt dasselbe Muster
+       inline; hier gilt es fuer alle drei Redirect-<code>-Knoten. */
+    .hint code { word-break: break-all; }
+    /* Kapsel statt eigener 8px-Ecke: die App gibt für Buttons durchgängig
+       --radius-glass-button (= --radius-full) vor, der Installer erfand hier
+       eine fremde Grammatik. --radius-full lag ungenutzt im Dokument. */
     .btn {
-      display: inline-flex; align-items: center; gap: 5px; padding: 9px 20px;
-      border-radius: var(--radius-sm); font-family: var(--font-sans); font-size: 14px; font-weight: 600;
+      display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+      min-height: 44px; padding: 10px 20px;
+      border-radius: var(--radius-full); font-family: var(--font-sans); font-size: var(--text-sm); font-weight: 600;
       cursor: pointer; border: none; transition: background .12s, opacity .12s;
     }
-    .btn-primary { background: var(--color-accent); color: var(--color-text-on-accent); }
+    /* Dieselbe Mischung wie .btn--primary der App (layout.css:3957): der reine
+       Akzent war ein messbar anderes Violett als jeder Primaerbutton der App -
+       direkt neben einem Marken-Tile, das die App-Farbe korrekt traegt. */
+    .btn-primary { background: color-mix(in srgb, var(--color-accent) 88%, var(--neutral-950)); color: var(--color-ink-on-vivid); }
     .btn-primary:hover:not(:disabled) { background: var(--color-accent-hover); }
+    /* Scharfgestellte Zwei-Klick-Bestaetigung (Speichern & Starten): der Zustand
+       muss SICHTBAR sein, nicht nur im Buttontext - ein Doppelklicker liest das
+       Label nie, ein Zoegerer haelt den ersten Klick sonst fuer wirkungslos.
+       Bleibt in der einen violetten Stimme: hellere Flaeche plus Akzentring. */
+    .btn-primary.is-armed {
+      background: var(--color-accent-hover);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 28%, transparent);
+    }
     .btn-ghost   { background: var(--color-surface-2); color: var(--color-text-primary); border: 1.5px solid var(--color-border); }
     .btn-ghost:hover:not(:disabled) { background: var(--color-border); }
-    .btn-sm      { padding: 6px 11px; font-size: 12px; }
+    .btn-sm      { min-height: 40px; padding: 6px 12px; font-size: var(--text-xs); }
     .btn:disabled { opacity: .45; cursor: not-allowed; }
     .btn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
     .error-banner {
       display: none; margin-top: 12px; padding: 10px 14px; border-radius: var(--radius-sm);
       background: color-mix(in srgb, var(--color-danger) 8%, transparent);
       border: 1.5px solid color-mix(in srgb, var(--color-danger) 25%, transparent);
-      color: var(--color-danger); font-size: 13px;
+      color: var(--color-danger); font-size: var(--text-sm);
     }
     .info-banner {
       margin-bottom: 18px; padding: 10px 14px; border-radius: var(--radius-sm);
       background: color-mix(in srgb, var(--color-accent) 8%, transparent);
       border: 1.5px solid color-mix(in srgb, var(--color-accent) 25%, transparent);
-      color: var(--color-text-primary); font-size: 13px; line-height: 1.45;
+      color: var(--color-text-primary); font-size: var(--text-sm); line-height: 1.45;
     }
     .toggle-card { border: 1.5px solid var(--color-border); border-radius: var(--radius-sm); overflow: hidden; margin-bottom: 14px; }
     .toggle-head {
       display: flex; align-items: center; justify-content: space-between;
       width: 100%; padding: 13px 16px; cursor: pointer; user-select: none;
-      font-family: var(--font-sans); font-size: 14px; font-weight: 600; text-align: start;
+      font-family: var(--font-sans); font-size: var(--text-sm); font-weight: 600; text-align: start;
       background: var(--color-surface); color: var(--color-text-primary); border: none;
+      /* Aus 13 + 17 + 13 wurden gemessene 43px. Der Knopf trägt keine .btn-Klasse
+         und fiel damit durch beide Netze: weder `.btn { min-height: 44px }` noch
+         die mobile `.btn-sm`-Regel erfassen ihn. Sieben dieser Köpfe stehen im
+         Erweitert-Schritt untereinander. */
+      min-height: 44px;
     }
     .toggle-head:hover { background: var(--color-surface-2); }
     .toggle-head:focus-visible {
       outline: none; box-shadow: inset 0 0 0 2px var(--color-accent);
     }
-    .toggle-badge { font-size: 11px; font-weight: 500; color: var(--color-text-secondary); }
+    .toggle-badge { font-size: var(--text-xs); font-weight: 500; color: var(--color-text-secondary); }
     .toggle-body { display: none; padding: 16px; border-top: 1.5px solid var(--color-border); background: var(--color-surface-2); }
     .toggle-body.open { display: block; }
     .status-box { background: var(--color-surface-2); border: 1.5px solid var(--color-border); border-radius: var(--radius-sm); padding: 16px; }
-    .status-row { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+    .status-row { display: flex; align-items: center; gap: 10px; font-size: var(--text-sm); }
     .spinner { width: 18px; height: 18px; border: 2px solid var(--color-border); border-top-color: var(--color-accent); border-radius: 50%; animation: spin .65s linear infinite; flex-shrink: 0; }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .ok-icon  { color: var(--color-success); font-size: 20px; line-height: 1; }
-    .err-icon { color: var(--color-danger);  font-size: 20px; line-height: 1; }
-    .elapsed  { font-size: 11px; color: var(--color-text-secondary); margin-top: 3px; }
+    .ok-icon  { color: var(--color-success); font-size: var(--text-xl); line-height: 1; }
+    .err-icon { color: var(--color-danger);  font-size: var(--text-xl); line-height: 1; }
+    .elapsed  { font-size: var(--text-xs); color: var(--color-text-secondary); margin-top: 3px; }
     .log-box  {
-      display: none; font-family: var(--font-mono); font-size: 11px; color: var(--color-text-secondary);
+      display: none; font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-secondary);
       white-space: pre-wrap; max-height: 180px; overflow-y: auto;
       margin-top: 12px; padding: 10px; background: var(--color-surface-2);
-      border: 1px solid var(--color-border); border-radius: 5px;
+      border: 1px solid var(--color-border); border-radius: var(--radius-xs);
     }
-    .review-grid { display: grid; grid-template-columns: 160px 1fr; gap: 8px 12px; font-size: 14px; }
+    /* Die Box ist per Tastatur fokussier- und scrollbar (tabindex im Markup):
+       im Fehlerfall ist das Protokoll die einzige Diagnose. */
+    .log-box:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+    /* minmax(0, 1fr) statt 1fr: die Wertspalte darf unter ihre min-content-
+       Breite schrumpfen, und overflow-wrap bricht unzerbrechliche Maschinenwerte
+       (BASE_URL mit DDNS-Host, Nextcloud-WebDAV-URL) um. Ohne beides schob die
+       Pruefseite die GANZE Seite seitlich (gemessen 534px body-scrollWidth bei
+       375px Viewport, WCAG 1.4.10) - ausgerechnet der Kontrollschirm vor dem
+       irreversiblen Klick. Die Schluesselspalte gibt auf schmalen Viewports mit. */
+    .review-grid { display: grid; grid-template-columns: minmax(110px, 160px) minmax(0, 1fr); gap: 8px 12px; font-size: var(--text-sm); }
+    .review-grid > :not(.review-key) { overflow-wrap: anywhere; }
     .review-key  { color: var(--color-text-secondary); }
     .masked      { font-family: var(--font-mono); letter-spacing: 3px; color: var(--color-text-secondary); }
     .done-wrap   { text-align: center; padding: 20px 0 8px; }
-    .done-wrap .icon { font-size: 52px; margin-bottom: 14px; }
-    .done-wrap h2 { font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
-    .done-wrap p  { color: var(--color-text-secondary); margin: 8px 0 28px; font-size: 15px; }
+    /* Der Abschluss trug ein 🎉-Systemsemoji: der einzige Bildinhalt der ganzen
+       Reise, auf jedem Betriebssystem anders gerendert und gegen PRODUCT.md:22
+       („kein Konfetti"). Jetzt trägt ihn das Yuvomi-Zeichen in einem Erfolgsring. */
+    .done-mark {
+      display: inline-grid; place-items: center; width: 72px; height: 72px;
+      margin-bottom: 16px; border-radius: var(--radius-full);
+      color: var(--color-success);
+      background: color-mix(in srgb, var(--color-success) 12%, transparent);
+      box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--color-success) 34%, transparent);
+    }
+    .done-mark svg { width: 40px; height: 40px; }
+    .done-wrap h2 { font-size: var(--text-2xl); font-weight: 700; letter-spacing: -.02em; }
+    .done-wrap p  { color: var(--color-text-secondary); margin: 8px 0 28px; font-size: var(--text-base); }
     .open-link {
       display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 13px 32px;
-      background: var(--color-accent); color: var(--color-text-on-accent); text-decoration: none;
+      background: var(--color-accent); color: var(--color-ink-on-vivid); text-decoration: none;
       border: none; cursor: pointer; font-family: var(--font-sans);
-      border-radius: var(--radius-sm); font-weight: 700; font-size: 15px;
+      border-radius: var(--radius-full); font-weight: 700; font-size: var(--text-base);
       transition: background .12s;
     }
     .open-link:hover { background: var(--color-accent-hover); }
     .open-link:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
-    /* Sekundäre Variante: gleiche Größe/Prominenz, aber ohne Vollfläche —
+    /* Sekundäre Variante: gleiche Größe/Prominenz, aber ohne Vollfläche -
        wird dem sicherheitskritischen Download untergeordnet, nicht winzig. */
     .open-link--muted {
       background: transparent; color: var(--color-accent);
@@ -223,15 +444,38 @@
     .done-actions .open-link, .done-actions .btn { width: 100%; max-width: 300px; }
     .done-check { color: var(--color-success); }
 
-    /* Hochkonsequente Warnung (Schlüsselverlust, Backup-Erinnerung) — stärker als .info-banner. */
+    /* „Als Naechstes" auf dem Abschluss. Zeilen in EINEM Traeger, getrennt durch
+       Haarlinien ueber den +-Kombinator - dieselbe Grammatik wie .ready-list im
+       Einfach-Pfad, damit der Abschluss nicht eine dritte Listenform erfindet. */
+    .next-steps { margin-top: 28px; text-align: start; }
+    .next-step {
+      display: flex; align-items: flex-start; gap: 12px; padding: 14px 0;
+      color: inherit; text-decoration: none; font-size: var(--text-sm); line-height: 1.5;
+    }
+    .next-step + .next-step { border-top: 1px solid var(--color-border); }
+    /* fill/stroke-Angaben ausgeschrieben: die gemeinsame .icon-svg-Regel gilt nur
+       für `.btn .icon-svg, .open-link .icon-svg`. Ohne sie rendert Lucide als
+       gefüllte schwarze Fläche statt als Strichzeichnung - im ersten Screenshot
+       sahen die drei Zeilen aus wie Klötze. */
+    .next-step .icon-svg {
+      width: 20px; height: 20px; margin-top: 2px; flex-shrink: 0;
+      stroke: var(--color-accent); fill: none;
+      stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+    }
+    .next-step b { font-weight: 600; }
+    .next-step span span { color: var(--color-text-secondary); }
+    a.next-step:hover { background: var(--color-surface-2); }
+    a.next-step:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; border-radius: var(--radius-xs); }
+
+    /* Hochkonsequente Warnung (Schlüsselverlust, Backup-Erinnerung) - stärker als .info-banner. */
     .danger-banner {
       display: flex; gap: 10px; align-items: flex-start;
       margin-bottom: 18px; padding: 12px 14px; border-radius: var(--radius-sm);
       background: color-mix(in srgb, var(--color-danger) 9%, transparent);
       border: 1.5px solid color-mix(in srgb, var(--color-danger) 32%, transparent);
-      color: var(--color-text-primary); font-size: 13px; line-height: 1.5;
+      color: var(--color-text-primary); font-size: var(--text-sm); line-height: 1.5;
     }
-    .danger-banner .warn-icon { color: var(--color-danger); font-size: 16px; line-height: 1.4; flex-shrink: 0; }
+    .danger-banner .warn-icon { color: var(--color-danger); font-size: var(--text-base); line-height: 1.4; flex-shrink: 0; }
     .danger-banner strong { color: var(--color-danger); }
 
     /* Weichere Erinnerung (kein Live-Hazard, z. B. Backup-Hinweis auf „Fertig"). */
@@ -240,21 +484,27 @@
       margin-bottom: 18px; padding: 12px 14px; border-radius: var(--radius-sm);
       background: color-mix(in srgb, var(--color-warning) 10%, transparent);
       border: 1.5px solid color-mix(in srgb, var(--color-warning) 30%, transparent);
-      color: var(--color-text-primary); font-size: 13px; line-height: 1.5;
+      color: var(--color-text-primary); font-size: var(--text-sm); line-height: 1.5;
     }
-    .warn-banner .warn-icon { color: var(--color-warning); font-size: 16px; line-height: 1.4; flex-shrink: 0; }
+    /* Das Glyph bleibt warnfarben, gemessen 4.35:1 auf der komponierten
+       Bannerflaeche. Unter der 4.5:1-Textschwelle, aber ueber der 3:1-Schwelle
+       fuer grafische Objekte - und genau das ist es: aria-hidden="true", die
+       Aussage steht im Text daneben. Es auf Label-Farbe zu setzen wuerde einen
+       etablierten Kanal wegnehmen, um eine Schwelle zu erfuellen, die fuer
+       dekorative Icons nicht gilt. */
+    .warn-banner .warn-icon { color: var(--color-warning); font-size: var(--text-base); line-height: 1.4; flex-shrink: 0; }
 
-    /* Sektionsüberschrift im Advanced-Schritt — Haarlinie statt zweitem Eyebrow,
+    /* Sektionsüberschrift im Advanced-Schritt - Haarlinie statt zweitem Eyebrow,
        damit sie sich klar vom akzentfarbenen .step-tag unterscheidet. */
     .group-label {
-      font-size: 12px; font-weight: 700; letter-spacing: .01em;
+      font-size: var(--text-xs); font-weight: 700; letter-spacing: .01em;
       color: var(--color-text-secondary); margin: 22px 0 10px;
       padding-bottom: 6px; border-bottom: 1px solid var(--color-border);
     }
     .group-label:first-child { margin-top: 4px; }
     .group-label + .field, .group-label + .toggle-card { margin-top: 0; }
 
-    /* Der Proxy-Select ist sicherheitsrelevant — visuell hervorheben. */
+    /* Der Proxy-Select ist sicherheitsrelevant - visuell hervorheben. */
     .field-emphasis {
       padding: 14px; border-radius: var(--radius-sm);
       background: color-mix(in srgb, var(--color-accent) 5%, transparent);
@@ -268,12 +518,24 @@
     [data-eye] .icon-off { display: none; }
     [data-eye][aria-pressed="true"] .icon-on  { display: none; }
     [data-eye][aria-pressed="true"] .icon-off { display: inline; }
-    .copied-note { font-size: 11px; color: var(--color-success); }
+    .copied-note { font-size: var(--text-xs); color: var(--color-success); }
 
     /* Touch-Ziele ≥44px und erreichbarer Footer auf Mobilgeräten. */
     @media (max-width: 640px) {
+      /* Der Sprachumschalter sitzt absolut oben rechts und ist auf 44px
+         Zielgroesse gewachsen: er reichte damit bis 56px herunter, waehrend der
+         Inhalt bei 48px begann und das Markenzeichen anschnitt. */
+      body { padding-top: 68px; }
       .btn-sm { min-height: 44px; min-width: 44px; padding: 8px 12px; }
       .secret-row .btn-sm { flex: 0 0 auto; }
+      /* Der Select war das letzte Bedienelement unter der Grenze (Primärbutton
+         38px war es bis zur .btn-Regel oben). */
+      select, input[type=text], input[type=password], input[type=email], input[type=number] { min-height: 44px; }
+      /* Und der Sprachumschalter noch einmal eigens: `.lang-switch select` (0,1,1)
+         schlägt das nackte `select` (0,0,1), und eine Media-Query hebt die
+         Spezifität nicht an - die Zeile darüber hat ihn deshalb nie erreicht, er
+         blieb bei seinen 36px. Gleiche Spezifität, spätere Regel, sie gewinnt. */
+      .lang-switch select { min-height: 44px; }
       .card-foot {
         position: sticky; bottom: 0; z-index: 10;
         background: var(--color-surface);
@@ -286,40 +548,33 @@
       .step { animation: none; }
       .spinner { animation: none; }
       .progress-fill { transition: none; }
+      /* Der Modus-Karten-Hover hob sich um 2px und der Abschluss-CTA blendete
+         die Farbe - beide liefen unter `reduce` weiter. */
+      .mode-card { transition: border-color .15s, box-shadow .15s; }
+      .mode-card:hover { transform: none; }
+      .btn, .open-link, input, select { transition: none; }
     }
   </style>
 </head>
 <body>
-  <div class="progress-track"><div class="progress-fill" id="prog"></div></div>
+  <!-- Rein dekorativ: die Auskunft "wo bin ich" traegt der Schrittzaehler. -->
+  <div class="progress-track" aria-hidden="true"><div class="progress-fill" id="prog"></div></div>
 
   <!-- Sprachumschaltung: überschreibt die Browser-Erkennung, Wahl wird gemerkt. -->
-  <div class="lang-switch">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10Z"/></svg>
-    <select id="lang-switch" aria-label="Language" data-i18n-aria="common.language">
-      <option value="de">Deutsch</option>
-      <option value="en">English</option>
-      <option value="es">Español</option>
-      <option value="fr">Français</option>
-      <option value="it">Italiano</option>
-      <option value="pt">Português</option>
-      <option value="nl">Nederlands</option>
-      <option value="sv">Svenska</option>
-      <option value="pl">Polski</option>
-      <option value="cs">Čeština</option>
-      <option value="hu">Magyar</option>
-      <option value="el">Ελληνικά</option>
-      <option value="ru">Русский</option>
-      <option value="uk">Українська</option>
-      <option value="tr">Türkçe</option>
-      <option value="ar">العربية</option>
-      <option value="fa">فارسی</option>
-      <option value="hi">हिन्दी</option>
-      <option value="vi">Tiếng Việt</option>
-      <option value="id">Bahasa Indonesia</option>
-      <option value="zh">中文</option>
-      <option value="ja">日本語</option>
-      <option value="ko">한국어</option>
-    </select>
+
+  <!-- Absender der Reise. Die Wortmarke ist ein Eigenname und bleibt in jeder
+       Sprache gleich, braucht also keinen Locale-Key. -->
+  <div class="brand">
+    <span class="brand__mark" aria-hidden="true">
+      <svg viewBox="0 0 160 160" fill="currentColor">
+        <g fill-opacity="0.82">
+          <circle cx="64" cy="72" r="27"/>
+          <circle cx="100" cy="78" r="25"/>
+          <circle cx="80" cy="106" r="24"/>
+        </g>
+      </svg>
+    </span>
+    <div class="brand__word">Yuvomi</div>
   </div>
 
   <main class="card">
@@ -332,8 +587,29 @@
         <p data-i18n="welcome.subtitle">Let's get your private family planner running. Choose how you'd like to set it up.</p>
       </div>
       <div class="card-body">
-        <div class="error-banner" id="welcome-prereq" role="alert" data-i18n="config.prereqMissing">
-          Missing prerequisites. Please install them and reload this page.
+        <!-- Kein data-i18n: der Text wird zur Laufzeit mit {{list}} und einem
+             eingebetteten Link zusammengesetzt. Stand hier ein data-i18n, schrieb
+             applyTranslations beim Sprachwechsel die Rohfassung zurück und der
+             Nutzer las wörtlich „Fehlende Voraussetzungen: {{list}}". localize()
+             baut ihn stattdessen neu auf, wie bei gcal-hint und apple-hint. -->
+        <div class="error-banner" id="welcome-prereq" role="alert"></div>
+        <button type="button" class="btn btn-ghost" id="prereq-recheck" style="display:none" data-i18n="config.prereqRecheck">Check again</button>
+        <!-- Bestehende Installation: der Einfach-Pfad ist dann gesperrt, weil er
+             Host, Port, SESSION_SECURE und TRUST_PROXY hart setzt und eine
+             laufende HTTPS-Instanz damit stumm degradieren würde. Kein
+             role="alert" - das ist eine Wegweisung beim Laden der Seite, keine
+             Reaktion auf eine Handlung. -->
+        <div class="info-banner" id="welcome-existing" style="display:none" role="note" data-i18n="welcome.existingLocked">
+          An existing installation was detected. Continue with the advanced setup so your current settings are kept.
+        </div>
+        <!-- Der Preflight ermittelt per docker inspect, ob der Container gerade
+             LAEUFT - das ist ein anderer Fall als eine blosse .env: hier wird
+             gleich eine benutzte Installation neu gestartet, mit kurzer
+             Ausfallzeit fuer den Haushalt. Der Wert wurde bisher berechnet, per
+             Test als Boolean zugesichert und in der README angekuendigt, aber von
+             keiner Zeile gelesen. -->
+        <div class="info-banner" id="welcome-running" style="display:none" role="note" data-i18n="welcome.containerRunning">
+          Yuvomi is currently running. Saving will restart the container, so it will be briefly unavailable.
         </div>
         <div class="mode-grid">
           <button type="button" class="mode-card is-primary" id="mode-simple">
@@ -386,22 +662,31 @@
           </div>
           <div class="ready-item">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 5 5L20 7"/></svg>
-            <div><b data-i18n="simple.itemAccessTitle">Local access</b><br><span id="simple-access-desc" data-i18n="simple.itemAccessDesc">Reachable at http://localhost:3000 on this machine.</span></div>
+            <!-- Kein data-i18n: der Wert trägt {{url}} und wird zur Laufzeit
+                 gesetzt. applyTranslations ruft t() ohne Parameter, hätte den
+                 Text beim Sprachwechsel also durch die Rohfassung ersetzt -
+                 sichtbar als „Erreichbar unter {{url}} auf diesem Gerät". -->
+            <div><b data-i18n="simple.itemAccessTitle">Local access</b><br><span id="simple-access-desc">Reachable at http://localhost:3000 on this machine.</span></div>
           </div>
           <div class="ready-item">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 5 5L20 7"/></svg>
             <div><b data-i18n="simple.itemBackupsTitle">Daily backups on</b><br><span data-i18n="simple.itemBackupsDesc">A local backup is kept every night.</span></div>
           </div>
         </div>
+        <!-- Kein eigener Banner zur bestehenden .env: mit ihr ist dieser Pfad
+             gesperrt und lenkt in den Erweitert-Pfad um (startFlow), wo
+             #cfg-existing warnt. -->
         <div class="warn-banner" role="note">
           <span class="warn-icon" aria-hidden="true">&#x26A0;</span>
-          <span data-i18n="simple.backupReminder">After setup, back up the generated .env file — it holds your only encryption keys.</span>
+          <span data-i18n="simple.backupReminder">After setup, back up the generated .env file - it holds your only encryption keys.</span>
         </div>
         <button type="button" class="link-btn" id="simple-to-advanced" data-i18n="simple.switchAdvanced">Need more options? Switch to advanced setup</button>
         <div class="error-banner" id="simple-err" role="alert"></div>
       </div>
       <div class="card-foot">
         <button class="btn btn-ghost" data-back data-i18n="common.back">Back</button>
+        <!-- Live-Region wie bei rev-next: das Scharfstellen muss angesagt werden. -->
+        <span class="vh" role="status" id="simple-armed-note"></span>
         <button class="btn btn-primary" id="simple-next" data-i18n="simple.start">Set up &amp; start Yuvomi</button>
       </div>
     </div>
@@ -414,12 +699,12 @@
         <p data-i18n="config.subtitle">How will you access Yuvomi?</p>
       </div>
       <div class="card-body">
-        <div class="info-banner" id="cfg-existing" style="display:none" data-i18n="config.existing">
-          Existing configuration detected — your current .env file will be backed up before saving.
+        <div class="warn-banner" id="cfg-existing" role="note" style="display:none">
+          <span class="warn-icon" aria-hidden="true">&#x26A0;</span>
+          <span data-i18n="config.existing">Existing configuration detected - your current .env file will be backed up before saving.</span>
         </div>
-        <div class="error-banner" id="cfg-prereq" role="alert" data-i18n="config.prereqMissing">
-          Missing prerequisites. Please install them and reload this page.
-        </div>
+        <!-- Wie #welcome-prereq: Text zur Laufzeit, kein data-i18n. -->
+        <div class="error-banner" id="cfg-prereq" role="alert"></div>
         <div class="field">
           <label for="cfg-host" data-i18n="config.hostLabel">Domain or IP address</label>
           <input type="text" id="cfg-host" value="localhost" placeholder="localhost or 192.168.1.x">
@@ -433,6 +718,40 @@
           <label for="cfg-tz" data-i18n="config.tzLabel">Timezone</label>
           <input type="text" id="cfg-tz" placeholder="Europe/Berlin">
         </div>
+
+        <!-- Proxy-Wahl und oeffentliche Adresse standen bis 2026-08-15 im
+             Erweitert-Schritt, unter der Ueberschrift "Alles optional,
+             Ueberspringen ist unbedenklich". Sie sind aber die einzige
+             PFLICHT-Entscheidung des Wizards: sie setzt SESSION_SECURE und
+             TRUST_PROXY und entscheidet damit, ob die Anmeldung ueber HTTPS
+             sicher ist. Genau falsch herum etikettiert - und sachlich gehoert
+             beides zu der Frage, die dieser Schritt stellt ("Wie greifst du auf
+             Yuvomi zu?"). Nebenwirkung: plannedOrigin() kennt die endgueltige
+             Adresse jetzt schon im Kalenderschritt, der frueher davor lag.
+             Die Locale-Schluessel behalten ihr advanced.*-Praefix. -->
+        <div class="field field-emphasis">
+          <label for="adv-proxy" data-i18n="advanced.proxyLabel">How is Yuvomi exposed?</label>
+          <select id="adv-proxy">
+            <option value="proxy" data-i18n="advanced.proxyBehindHttps">Behind a reverse proxy with HTTPS (Caddy, nginx, Traefik)</option>
+            <option value="direct" data-i18n="advanced.proxyDirect">Direct access over localhost / HTTP</option>
+          </select>
+          <div class="hint" data-i18n="advanced.proxyHint">Pick "Direct access" if you open Yuvomi over http:// - otherwise you cannot sign in. Behind a reverse proxy with HTTPS, pick the first option.</div>
+        </div>
+        <!-- BASE_URL wurde bisher aus Schema, Host und Port abgeleitet. Hinter
+             einem Reverse-Proxy stimmt das nie: die öffentliche Adresse ist
+             https://yuvomi.example.com, nicht host:port des Containers. Der
+             CLI-Installer fragt sie aus genau diesem Grund ausdrücklich ab
+             (tools/installer/README.md). Ein falscher Wert fällt erst Wochen
+             später auf, weil er nur Reset- und Einladungsmails betrifft - deren
+             Links zeigen dann auf einen Port, den von aussen niemand erreicht.
+             Das Feld ist mit dem abgeleiteten Wert vorbelegt, bleibt es also
+             leer, ändert sich gegenüber vorher nichts. -->
+        <div class="field">
+          <label for="adv-base-url" data-i18n="advanced.baseUrlLabel">Public address</label>
+          <input type="text" id="adv-base-url" placeholder="https://yuvomi.example.com">
+          <div class="hint" data-i18n="advanced.baseUrlHint">The address your family opens Yuvomi at - not the container's host and port. Used for password reset and invitation links.</div>
+        </div>
+
         <div class="error-banner" id="cfg-err" role="alert"></div>
       </div>
       <div class="card-foot">
@@ -446,12 +765,12 @@
       <div class="card-head">
         <div class="step-tag"></div>
         <h2 tabindex="-1" data-i18n="secrets.title">Security Keys</h2>
-        <p data-i18n="secrets.subtitle">These protect your session and encrypt the database. Store your .env file safely — losing these keys means losing access to your data.</p>
+        <p data-i18n="secrets.subtitle">These protect your session and encrypt the database. Store your .env file safely - losing these keys means losing access to your data.</p>
       </div>
       <div class="card-body">
         <div class="danger-banner" role="note">
           <span class="warn-icon" aria-hidden="true">&#x26A0;</span>
-          <span data-i18n="secrets.dangerWarn">Save these keys now. If you lose them, your encrypted data cannot be recovered — there is no reset.</span>
+          <span data-i18n="secrets.dangerWarn">Save these keys now. If you lose them, your encrypted data cannot be recovered - there is no reset.</span>
         </div>
         <div class="info-banner" id="sec-preserved" style="display:none" role="note" data-i18n="secrets.preserved">
           Your existing keys are kept, so this setup will not lock you out of the current database. Leave a field empty to keep its key; entering a new value replaces it.
@@ -542,7 +861,7 @@
       <div class="card-head">
         <div class="step-tag"></div>
         <h2 tabindex="-1" data-i18n="calendar.title">Calendar Sync</h2>
-        <p data-i18n="calendar.subtitle">Connect Yuvomi to Google Calendar or Apple iCloud. Both optional — expand to configure.</p>
+        <p data-i18n="calendar.subtitle">Connect Yuvomi to Google Calendar, Apple iCloud or Outlook. All optional - expand to configure.</p>
       </div>
       <div class="card-body">
         <div class="toggle-card">
@@ -554,6 +873,21 @@
             <p class="hint" id="gcal-hint" style="margin-bottom:12px">
               Create OAuth credentials at <a href="https://console.cloud.google.com" target="_blank" rel="noopener">console.cloud.google.com</a>.
               Redirect URI: <code id="gcal-redirect-hint"></code>
+            </p>
+            <!-- Der Kopieren-Knopf steht NEBEN #gcal-hint, nicht darin: localize()
+                 baut dessen Inhalt per applyRich mit replaceChildren neu auf, und
+                 ein Kind wäre beim ersten Sprachdurchlauf spurlos verschwunden.
+                 Genau das ist beim ersten Anlauf passiert. -->
+            <p class="hint" style="margin-bottom:12px">
+              <!-- Sichtbare Beschriftung statt nur aria-label: fünf gleich
+                   aussehende Icon-Knöpfe waren in der Elementliste eines
+                   Screenreaders nicht unterscheidbar, und ein Erstinstallierer
+                   erkennt an einem Rechteck-Icon nicht, was kopiert wird. -->
+              <button type="button" class="btn btn-ghost btn-sm" data-copy="gcal-redirect-hint">
+                <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                <span data-i18n="common.copyRedirect">Copy redirect URI</span>
+              </button>
+              <span class="copied-note" id="gcal-redirect-hint-copied" role="status" aria-live="polite"></span>
             </p>
             <div class="field">
               <label for="gcal-id" data-i18n="calendar.googleIdLabel">Client ID</label>
@@ -584,10 +918,38 @@
               <input type="password" id="apple-pass">
             </div>
             <div class="field">
-              <label for="apple-url"><span data-i18n="calendar.appleUrlLabel">CalDAV URL</span> <span class="opt" data-i18n="calendar.appleUrlOpt">(optional)</span></label>
+              <label for="apple-url"><span data-i18n="calendar.appleUrlLabel">CalDAV URL</span> <span class="opt" data-i18n="common.opt">(optional)</span></label>
               <input type="text" id="apple-url" placeholder="https://caldav.icloud.com">
               <div class="hint" data-i18n="calendar.appleUrlHint">Leave empty unless your provider uses a different CalDAV endpoint.</div>
             </div>
+          </div>
+        </div>
+        <div class="toggle-card">
+          <button type="button" class="toggle-head" data-toggle="outlook-body" aria-expanded="false" aria-controls="outlook-body">
+            <span data-i18n="calendar.outlook">Outlook Calendar (Microsoft Graph)</span>
+            <span class="toggle-badge" id="outlook-badge" data-i18n="common.optional">Optional</span>
+          </button>
+          <div class="toggle-body" id="outlook-body">
+            <p class="hint" id="outlook-hint" style="margin-bottom:12px">
+              Create a free Entra ID app registration ("Personal Microsoft accounts only") at <a href="https://entra.microsoft.com" target="_blank" rel="noopener">entra.microsoft.com</a> - see the installation guide.
+              Redirect URI: <code id="outlook-redirect-hint"></code>
+            </p>
+            <p class="hint" style="margin-bottom:12px">
+              <button type="button" class="btn btn-ghost btn-sm" data-copy="outlook-redirect-hint">
+                <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                <span data-i18n="common.copyRedirect">Copy redirect URI</span>
+              </button>
+              <span class="copied-note" id="outlook-redirect-hint-copied" role="status" aria-live="polite"></span>
+            </p>
+            <div class="field">
+              <label for="outlook-id" data-i18n="calendar.outlookIdLabel">Application (client) ID</label>
+              <input type="text" id="outlook-id">
+            </div>
+            <div class="field">
+              <label for="outlook-secret" data-i18n="calendar.outlookSecretLabel">Client Secret</label>
+              <input type="password" id="outlook-secret">
+            </div>
+            <p class="hint" data-i18n="calendar.outlookNote">One-way push: Yuvomi stays the source of truth and overwrites changes made in Outlook. Family accounts are connected later in the app under Settings.</p>
           </div>
         </div>
       </div>
@@ -602,7 +964,7 @@
       <div class="card-head">
         <div class="step-tag"></div>
         <h2 tabindex="-1" data-i18n="email.title">Email &amp; Password Reset</h2>
-        <p data-i18n="email.subtitle">Let family members reset a forgotten password by email. Optional — skip if you don't need it.</p>
+        <p data-i18n="email.subtitle">Let family members reset a forgotten password by email. Optional - skip if you don't need it.</p>
       </div>
       <div class="card-body">
         <div class="field">
@@ -646,7 +1008,7 @@
             <div class="hint" data-i18n="email.fromHint">The “from” address recipients will see. Many providers require it to match your username.</div>
           </div>
           <div class="field">
-            <label for="email-from-name"><span data-i18n="email.fromNameLabel">Sender name</span> <span class="opt" data-i18n="calendar.appleUrlOpt">(optional)</span></label>
+            <label for="email-from-name"><span data-i18n="email.fromNameLabel">Sender name</span> <span class="opt" data-i18n="common.opt">(optional)</span></label>
             <input type="text" id="email-from-name" placeholder="Yuvomi">
           </div>
         </div>
@@ -659,50 +1021,32 @@
     </div>
 
     <!-- Step: Advanced (optional) -->
-    <div class="step" id="step-advanced">
+    <!-- Step: Speicher & Sicherungen
+
+         Herausgeloest aus dem Erweitert-Schritt, der 44 Bedienelemente auf einem
+         Bildschirm trug - der zweitgroesste hatte 12. Der Schnitt laeuft entlang
+         einer Frage, nicht entlang einer Zahl: hier steht alles, was entscheidet,
+         WO Daten liegen (Ordner, Sicherungen, Dokumentablage); im Erweitert-Schritt
+         bleibt, was entscheidet, WOMIT sich Yuvomi verbindet.
+
+         Beide Schritte sind jetzt nummeriert. 'advanced' stand in UNNUMBERED mit
+         der Begruendung "optionaler Sammel-Schritt" - und war damit ausgerechnet
+         der einzige Bildschirm ohne Fortschrittsangabe. Der Sammel-Charakter ist
+         mit dieser Teilung weg, die Begruendung also auch. -->
+    <div class="step" id="step-storage">
       <div class="card-head">
-        <div class="step-tag" data-i18n="advanced.tag">Advanced · optional</div>
-        <h2 tabindex="-1" data-i18n="advanced.title">Advanced Settings</h2>
-        <p data-i18n="advanced.subtitle">Reverse proxy, single sign-on and automatic backups. All optional — skipping is safe.</p>
+        <div class="step-tag"></div>
+        <h2 tabindex="-1" data-i18n="storage.title">Storage &amp; backups</h2>
+        <p data-i18n="storage.subtitle">Where your data lives on the server, and where copies of it go. All optional - the defaults work.</p>
       </div>
       <div class="card-body">
-        <div class="group-label" data-i18n="advanced.sectionNetwork">Networking</div>
-        <div class="field field-emphasis">
-          <label for="adv-proxy" data-i18n="advanced.proxyLabel">How is Yuvomi exposed?</label>
-          <select id="adv-proxy">
-            <option value="proxy" data-i18n="advanced.proxyBehindHttps">Behind a reverse proxy with HTTPS (Caddy, nginx, Traefik)</option>
-            <option value="direct" data-i18n="advanced.proxyDirect">Direct access over localhost / HTTP</option>
-          </select>
-          <div class="hint" data-i18n="advanced.proxyHint">Direct access disables secure-only cookies so login works without HTTPS.</div>
+        <div class="field">
+          <label for="adv-data-dir" data-i18n="advanced.dataDirLabel">Host data folder</label>
+          <input type="text" id="adv-data-dir" placeholder="./data">
+          <div class="hint" data-i18n="advanced.dataDirHint">Where the database and app data live on the server. Leave empty to use ./data next to the compose file.</div>
         </div>
 
-        <div class="group-label" data-i18n="advanced.sectionIntegrations">Integrations &amp; backups</div>
-        <div class="toggle-card">
-          <button type="button" class="toggle-head" data-toggle="oidc-body" aria-expanded="false" aria-controls="oidc-body">
-            <span data-i18n="advanced.oidc">Single Sign-On (OIDC)</span>
-            <span class="toggle-badge" data-i18n="common.optional">Optional</span>
-          </button>
-          <div class="toggle-body" id="oidc-body">
-            <p class="hint" style="margin-bottom:12px" data-i18n="advanced.oidcHint">Fill in all four fields to enable SSO, or leave them empty.</p>
-            <div class="field">
-              <label for="oidc-issuer" data-i18n="advanced.oidcIssuerLabel">Issuer URL</label>
-              <input type="text" id="oidc-issuer" placeholder="https://auth.example.com/application/o/oikos/">
-            </div>
-            <div class="field">
-              <label for="oidc-client-id" data-i18n="advanced.oidcClientIdLabel">Client ID</label>
-              <input type="text" id="oidc-client-id">
-            </div>
-            <div class="field">
-              <label for="oidc-client-secret" data-i18n="advanced.oidcClientSecretLabel">Client Secret</label>
-              <input type="password" id="oidc-client-secret">
-            </div>
-            <div class="field">
-              <label for="oidc-redirect" data-i18n="advanced.oidcRedirectLabel">Redirect URI</label>
-              <input type="text" id="oidc-redirect">
-            </div>
-          </div>
-        </div>
-
+        <div class="group-label" data-i18n="storage.sectionBackups">Backups</div>
         <div class="toggle-card">
           <button type="button" class="toggle-head" data-toggle="backup-body" aria-expanded="false" aria-controls="backup-body">
             <span data-i18n="advanced.backup">Automatic Backups</span>
@@ -723,7 +1067,6 @@
             </div>
           </div>
         </div>
-
         <div class="toggle-card">
           <button type="button" class="toggle-head" data-toggle="webdav-backup-body" aria-expanded="false" aria-controls="webdav-backup-body">
             <span data-i18n="advanced.webdavBackup">Off-site Backups (WebDAV)</span>
@@ -756,9 +1099,14 @@
               <label for="adv-webdav-backup-path" data-i18n="advanced.webdavBackupPathLabel">Remote path</label>
               <input type="text" id="adv-webdav-backup-path" placeholder="/yuvomi/backups/">
             </div>
+            <div class="field">
+              <label for="adv-webdav-backup-keep" data-i18n="advanced.backupKeepLabel">Backups to keep</label>
+              <input type="text" id="adv-webdav-backup-keep" placeholder="7">
+            </div>
           </div>
         </div>
 
+        <div class="group-label" data-i18n="storage.sectionDocuments">Document storage</div>
         <div class="toggle-card">
           <button type="button" class="toggle-head" data-toggle="document-local-body" aria-expanded="false" aria-controls="document-local-body">
             <span data-i18n="advanced.documentLocal">Local Document Storage</span>
@@ -769,13 +1117,17 @@
               <label><input type="checkbox" id="adv-document-local-enable"> <span data-i18n="advanced.documentLocalEnable">Store new documents in a local folder</span></label>
             </div>
             <div class="field">
+              <label for="adv-document-local-dir" data-i18n="advanced.documentLocalDirLabel">Host folder</label>
+              <input type="text" id="adv-document-local-dir" placeholder="./documents">
+              <div class="hint" data-i18n="advanced.documentLocalDirHint">The folder on the server that gets mounted into the container. Leave empty to use ./documents.</div>
+            </div>
+            <div class="field">
               <label for="adv-document-local-path" data-i18n="advanced.documentLocalPathLabel">Folder path</label>
               <input type="text" id="adv-document-local-path" placeholder="/documents">
               <div class="hint" data-i18n="advanced.documentLocalPathHint">Path inside the container. Leave empty to use /documents.</div>
             </div>
           </div>
         </div>
-
         <div class="toggle-card">
           <button type="button" class="toggle-head" data-toggle="document-webdav-body" aria-expanded="false" aria-controls="document-webdav-body">
             <span data-i18n="advanced.documentWebdav">WebDAV Document Storage</span>
@@ -809,9 +1161,8 @@
               <input type="text" id="adv-document-webdav-path" placeholder="yuvomi-documents">
               <div class="hint" data-i18n="advanced.documentWebdavPathHint">Remote folder for document files. Leave empty to use yuvomi-documents.</div>
             </div>
-          </div>
+                      </div>
         </div>
-
         <div class="toggle-card">
           <button type="button" class="toggle-head" data-toggle="document-google-drive-body" aria-expanded="false" aria-controls="document-google-drive-body">
             <span data-i18n="advanced.documentGoogleDrive">Google Drive Document Storage</span>
@@ -837,11 +1188,113 @@
               </div>
               <div class="hint" data-i18n="advanced.documentGoogleDriveReuseHint">Leave both overrides empty to reuse Google Calendar OAuth credentials.</div>
             </div>
-            <div class="hint"><span data-i18n="advanced.documentGoogleDriveRedirectLabel">Redirect URI</span>: <code id="document-google-drive-redirect-hint"></code></div>
+            <div class="hint"><span data-i18n="advanced.documentGoogleDriveRedirectLabel">Redirect URI</span>: <code id="document-google-drive-redirect-hint"></code>
+              <button type="button" class="btn btn-ghost btn-sm" data-copy="document-google-drive-redirect-hint">
+                <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                <span data-i18n="common.copyRedirect">Copy redirect URI</span>
+              </button>
+              <span class="copied-note" id="document-google-drive-redirect-hint-copied" role="status" aria-live="polite"></span>
+            </div>
           </div>
         </div>
 
+        <div class="error-banner" id="storage-err" role="alert"></div>
+      </div>
+      <div class="card-foot">
+        <button class="btn btn-ghost" data-back data-i18n="common.back">Back</button>
+        <button class="btn btn-primary" id="storage-next" data-i18n="common.continue">Continue</button>
+      </div>
+    </div>
+
+    <div class="step" id="step-advanced">
+      <div class="card-head">
+        <div class="step-tag" data-i18n="advanced.tag">Advanced · optional</div>
+        <h2 tabindex="-1" data-i18n="advanced.title">Advanced Settings</h2>
+        <p data-i18n="advanced.subtitle">Single sign-on, access to your home network, and a few fine adjustments. All optional.</p>
+      </div>
+      <div class="card-body">
+        <div class="group-label" data-i18n="advanced.sectionIntegrations">Single sign-on</div>
+        <div class="toggle-card">
+          <button type="button" class="toggle-head" data-toggle="oidc-body" aria-expanded="false" aria-controls="oidc-body">
+            <span data-i18n="advanced.oidc">Single Sign-On (OIDC)</span>
+            <span class="toggle-badge" data-i18n="common.optional">Optional</span>
+          </button>
+          <div class="toggle-body" id="oidc-body">
+            <p class="hint" style="margin-bottom:12px" data-i18n="advanced.oidcHint">Fill in all four fields to enable SSO, or leave them empty.</p>
+            <div class="field">
+              <label for="oidc-issuer" data-i18n="advanced.oidcIssuerLabel">Issuer URL</label>
+              <input type="text" id="oidc-issuer" placeholder="https://auth.example.com/application/o/oikos/">
+            </div>
+            <div class="field">
+              <label for="oidc-client-id" data-i18n="advanced.oidcClientIdLabel">Client ID</label>
+              <input type="text" id="oidc-client-id">
+            </div>
+            <div class="field">
+              <label for="oidc-client-secret" data-i18n="advanced.oidcClientSecretLabel">Client Secret</label>
+              <input type="password" id="oidc-client-secret">
+            </div>
+            <div class="field">
+              <label for="oidc-redirect" data-i18n="advanced.oidcRedirectLabel">Redirect URI</label>
+              <input type="text" id="oidc-redirect">
+            </div>
+            <div class="field">
+              <label><input type="checkbox" id="adv-oidc-trust-email"> <span data-i18n="advanced.oidcTrustEmail">Trust email without a verified claim</span></label>
+              <div class="hint" data-i18n="advanced.oidcTrustEmailHint">Only enable this if your provider does not send email_verified and you trust it.</div>
+            </div>
+            <div class="field">
+              <label><input type="checkbox" id="adv-oidc-allow-signup" checked> <span data-i18n="advanced.oidcAllowSignup">Let SSO sign-ins create new accounts</span></label>
+              <div class="hint" data-i18n="advanced.oidcAllowSignupHint">Turn this off when your provider serves more people than this household. Existing accounts still sign in and still get linked.</div>
+            </div>
+            <div class="field">
+              <label><input type="checkbox" id="adv-auth-password-login" checked> <span data-i18n="advanced.authPasswordLogin">Keep the username and password login</span></label>
+              <div class="hint" data-i18n="advanced.authPasswordLoginHint">Turning this off makes SSO the only way in: the login form and password reset disappear. It takes effect once at least one account is linked to your provider, so a fresh install can still create its first admin. If your provider becomes unreachable, the way back is editing the .env file and restarting.</div>
+            </div>
+          </div>
+        </div>
+
+
+
+
+
+
+        <!-- Die drei Freigaben stehen zusammen, weil sie DIESELBE Frage beantworten:
+             darf Yuvomi Ziele im eigenen Netz erreichen? Sie hingen vorher an drei
+             Orten - zwei lose unter "Weitere Optionen", eine im WebDAV-Akkordeon -,
+             weil sie technisch an verschiedenen Feldern haengen. Die Pruefseite fasst
+             sie laengst zu einer Zeile zusammen und begruendet das dort auch; was sie
+             als eine Auskunft zeigt, wird hier als eine Frage gestellt. -->
+        <div class="group-label" data-i18n="advanced.sectionPrivateNetwork">Access to your home network</div>
+        <p class="hint" style="margin-bottom:12px" data-i18n="advanced.privateNetworkHint">Yuvomi refuses connections to addresses on your own network by default, which protects against a server being tricked into reaching internal services. Enable what you actually run at home.</p>
+        <!-- Die drei Einzel-Hints lagen fertig uebersetzt in allen 24 Locales,
+             wurden aber nie gerendert - dabei tragen genau sie die Anker
+             (Mealie, Tandoor, Nextcloud), an denen ein Erstinstallierer erkennt,
+             ob ihn die Freigabe betrifft. -->
+        <div class="field">
+          <label><input type="checkbox" id="adv-ics-private"> <span data-i18n="advanced.icsPrivateNetwork">Allow calendar subscriptions from your home network</span></label>
+          <div class="hint" data-i18n="advanced.icsPrivateNetworkHint">Needed for ICS feeds from devices on your own network. Lifts the SSRF protection for calendar subscriptions.</div>
+        </div>
+        <div class="field">
+          <label><input type="checkbox" id="adv-recipe-provider-private"> <span data-i18n="advanced.recipeProviderPrivateNetwork">Allow recipe provider mirrors on your home network</span></label>
+          <div class="hint" data-i18n="advanced.recipeProviderPrivateNetworkHint">Needed for a Mealie or Tandoor instance on your own network. Lifts the SSRF protection for recipe provider mirrors.</div>
+        </div>
+        <div class="field">
+          <label><input type="checkbox" id="adv-waste-source-private"> <span data-i18n="advanced.wasteSourcePrivateNetwork">Allow waste collection feeds on your home network</span></label>
+          <div class="hint" data-i18n="advanced.wasteSourcePrivateNetworkHint">Needed for a municipal waste calendar mirrored on your own network. Lifts the SSRF protection for waste collection URL sources.</div>
+        </div>
+        <div class="field">
+          <label><input type="checkbox" id="adv-document-webdav-private"> <span data-i18n="advanced.documentWebdavPrivateNetwork">Allow a WebDAV target on your home network</span></label>
+          <div class="hint" data-i18n="advanced.documentWebdavPrivateNetworkHint">Needed for a Nextcloud on your own network. Lifts the SSRF protection for this target.</div>
+        </div>
+
         <div class="group-label" data-i18n="advanced.sectionMore">More options</div>
+        <!-- Stand hart auf 15 im Code und wurde bei jedem weiteren Lauf wieder
+             auf 15 zurückgeschrieben - wer wegen iCloud-Ratenbegrenzung auf 60
+             gestellt hatte, verlor die Einstellung stillschweigend. -->
+        <div class="field">
+          <label for="adv-sync-interval" data-i18n="advanced.syncIntervalLabel">Calendar sync interval (minutes)</label>
+          <input type="number" id="adv-sync-interval" min="5" max="1440" step="5" placeholder="15">
+          <div class="hint" data-i18n="advanced.syncIntervalHint">How often Yuvomi syncs calendars and contacts. Raise it if your provider rate-limits you.</div>
+        </div>
         <div class="field">
           <label for="adv-fixer" data-i18n="advanced.fixerLabel">Fixer API key (live currency rates)</label>
           <input type="password" id="adv-fixer" autocomplete="off">
@@ -875,11 +1328,25 @@
           <div class="review-key" data-i18n="review.port">Port</div>           <div id="rv-port"></div>
           <div class="review-key" data-i18n="review.tz">Timezone</div>       <div id="rv-tz"></div>
           <div class="review-key" data-i18n="review.access">Access</div>       <div id="rv-access"></div>
-          <div class="review-key">SESSION_SECRET</div> <div class="masked">&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;</div>
-          <div class="review-key">DB_ENCRYPT_KEY</div> <div class="masked">&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;</div>
+          <!-- Der einzige Wert, dessen Fehler AUSSCHLIESSLICH still auftritt:
+               falsch gesetzt zeigen Reset- und Einladungslinks ins Leere, und
+               das faellt erst Wochen spaeter auf. Er wurde auf Schritt 1
+               erfragt und danach nirgends mehr gezeigt - waehrend die Seite
+               drei SSRF-Schalter listet, die sofort sichtbar scheitern. -->
+          <div class="review-key" data-i18n="review.baseUrl">Public address</div><div id="rv-base-url"></div>
+          <!-- Hier standen acht Punkte hinter „SESSION_SECRET" und
+               „DB_ENCRYPT_KEY". Beides war unbrauchbar: die Maskierung verbarg
+               genau den Wert, den eine Prüfseite prüfbar machen soll, und
+               DB_ENCRYPT_KEY war nicht einmal der echte Variablenname (er heißt
+               DB_ENCRYPTION_KEY) - wer danach in seiner .env suchte, fand nichts.
+               Die nützliche Auskunft ist nicht der Wert, sondern was mit ihm
+               geschieht: neu erzeugt oder aus der bestehenden .env übernommen. -->
+          <div class="review-key" data-i18n="review.sessionSecret">Session key</div> <div id="rv-session-secret"></div>
+          <div class="review-key" data-i18n="review.dbKey">Database key</div>        <div id="rv-db-key"></div>
           <div class="review-key" data-i18n="review.weather">Weather</div>        <div id="rv-weather"></div>
           <div class="review-key" data-i18n="review.google">Google Calendar</div><div id="rv-google"></div>
           <div class="review-key" data-i18n="review.apple">Apple CalDAV</div>   <div id="rv-apple"></div>
+          <div class="review-key" data-i18n="review.outlook">Outlook Calendar</div><div id="rv-outlook"></div>
           <div class="review-key" data-i18n="review.email">Email</div>          <div id="rv-email"></div>
           <div class="review-key" data-i18n="review.oidc">Single Sign-On</div>  <div id="rv-oidc"></div>
           <div class="review-key" data-i18n="review.backups">Backups</div>       <div id="rv-backups"></div>
@@ -887,12 +1354,24 @@
           <div class="review-key" data-i18n="review.documentLocal">Local documents</div><div id="rv-document-local"></div>
           <div class="review-key" data-i18n="review.documentWebdav">WebDAV documents</div><div id="rv-document-webdav"></div>
           <div class="review-key" data-i18n="review.documentGoogleDrive">Google Drive documents</div><div id="rv-document-google-drive"></div>
+          <!-- Der Host-Ordner ist ein Mount, kein Detail: liegt er falsch, sind
+               die Daten beim nächsten `pull && up -d` weg. -->
+          <div class="review-key" data-i18n="review.dataDir">Data folder</div><div id="rv-data-dir"></div>
+          <!-- Und die beiden SSRF-Aufhebungen: der Wizard fragt sie ab, die
+               Prüfseite zeigte sie nicht. Eine Prüfseite, die ausgerechnet die
+               sicherheitsrelevanten Schalter auslässt, prüft das Falsche. -->
+          <div class="review-key" data-i18n="review.privateNetwork">Private-network access</div><div id="rv-private-network"></div>
         </div>
         <div class="error-banner" id="rev-err" role="alert"></div>
       </div>
       <div class="card-foot">
         <button class="btn btn-ghost" data-back data-i18n="common.back">Back</button>
-        <button class="btn btn-primary" id="rev-next" data-i18n="review.save">Save &amp; Start Docker</button>
+        <!-- Live-Region fuer das Scharfstellen: der Textwechsel am fokussierten
+             Button wird nicht zuverlaessig angesagt - wer ihn nicht sieht, haelt
+             den ersten Klick fuer wirkungslos und klickt "zum ersten Mal". -->
+        <span class="vh" role="status" id="rev-armed-note"></span>
+        <!-- Kein data-i18n: traegt die Zwei-Klick-Bestaetigung im Text. -->
+        <button class="btn btn-primary" id="rev-next">Save &amp; Start Docker</button>
       </div>
     </div>
 
@@ -908,15 +1387,39 @@
           <div class="status-row" role="status" aria-live="polite">
             <div class="spinner" id="dkr-icon" aria-hidden="true"></div>
             <div>
-              <div id="dkr-text" data-i18n="docker.starting">Starting container&#x2026;</div>
-              <div class="elapsed" id="dkr-elapsed"></div>
+              <!-- Kein data-i18n: der Text wird zur Laufzeit gesetzt (Phase, Erfolg,
+                   Fehlschlag) und liegt in der aria-live-Region. Mit data-i18n
+                   ersetzte ein Sprachwechsel „Start fehlgeschlagen" durch
+                   „Image wird geladen" - neben rotem Kreuz und Fehlerprotokoll,
+                   und wurde auch noch angesagt. Siehe dockerTextKey. -->
+              <div id="dkr-text">Downloading image</div>
+              <!-- Die Dauererwartung steht ab Sekunde 0 da, nicht erst wenn es
+                   zu lange dauert: das ist der Unterschied zwischen „es laeuft"
+                   und „es haengt". -->
+              <!-- aria-hidden, obwohl sichtbar: der Zaehler wird JEDE SEKUNDE neu
+                   geschrieben und liegt in einer aria-live-Region. Ein Screenreader
+                   sagte dadurch bis zu 900 Mal die verstrichene Zeit an - und die
+                   Phasenwechsel darueber, die die eigentliche Auskunft tragen,
+                   gingen darin unter. Die Region bleibt fuer #dkr-text zustaendig. -->
+              <div class="elapsed" id="dkr-elapsed" aria-hidden="true"></div>
+              <div class="elapsed" id="dkr-expect" data-i18n="docker.firstRunHint">The first run can take several minutes.</div>
             </div>
           </div>
-          <div class="log-box" id="dkr-log"></div>
+          <div class="warn-banner" id="dkr-stalled" role="status" style="display:none">
+            <span class="warn-icon" aria-hidden="true">&#x26A0;</span>
+            <span data-i18n="docker.stalled">This is taking longer than usual. The log below shows why.</span>
+          </div>
+          <!-- tabindex: die Box scrollt, und im Fehlerfall ist das Protokoll die
+               einzige Diagnose - ohne Fokus war sie per Tastatur unscrollbar
+               (WCAG 2.1.1). -->
+          <div class="log-box" id="dkr-log" tabindex="0" role="region" aria-label="Container log" data-i18n-aria="docker.logLabel"></div>
         </div>
       </div>
       <div class="card-foot" id="dkr-foot" style="display:none">
-        <button class="btn btn-primary" id="dkr-next" data-i18n="docker.toAdmin">Continue to Admin Setup</button>
+        <!-- Kein data-i18n: wechselt zwischen Anzeigen und Verbergen. -->
+        <button class="btn btn-ghost" id="dkr-logs-toggle" style="display:none">Show log</button>
+        <!-- Kein data-i18n: zustandsbehaftet (siehe setDockerPrimary). -->
+        <button class="btn btn-primary" id="dkr-next">Continue to Admin Setup</button>
       </div>
     </div>
 
@@ -930,17 +1433,20 @@
       <div class="card-body">
         <div class="field">
           <label for="adm-user" data-i18n="admin.userLabel">Username</label>
-          <input type="text" id="adm-user" placeholder="jane" autocomplete="username">
-          <div class="hint" data-i18n="admin.userHint">3&#x2013;64 characters: letters, numbers, . - _</div>
+          <!-- required: die Wizard-Konvention ist "alles optional" - gerade darum
+               tragen die faktischen Pflichtfelder dieses Schritts den Zustand
+               programmatisch (WCAG 3.3.2; validiert wird in createAdmin). -->
+          <input type="text" id="adm-user" placeholder="jane" autocomplete="username" required aria-required="true">
+          <div class="hint" data-i18n="admin.userHint">3-64 characters: letters, numbers, . - _</div>
         </div>
         <div class="field">
           <label for="adm-name" data-i18n="admin.nameLabel">Display Name</label>
-          <input type="text" id="adm-name" placeholder="Jane Smith" autocomplete="name">
+          <input type="text" id="adm-name" placeholder="Jane Smith" autocomplete="name" required aria-required="true">
         </div>
         <div class="field">
           <label for="adm-pass" data-i18n="admin.passLabel">Password</label>
           <div class="secret-row">
-            <input type="password" id="adm-pass" placeholder="At least 8 characters" data-i18n-ph="admin.passPlaceholder" autocomplete="new-password">
+            <input type="password" id="adm-pass" placeholder="At least 8 characters" data-i18n-ph="admin.passPlaceholder" autocomplete="new-password" required aria-required="true">
             <button type="button" class="btn btn-ghost btn-sm" data-eye="adm-pass" aria-pressed="false" aria-label="Show or hide value" data-i18n-aria="common.toggleVisibility">
               <svg class="icon-svg icon-on" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>
               <svg class="icon-svg icon-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c6.5 0 10 8 10 8a18.5 18.5 0 0 1-2.16 3.19M6.61 6.61A18.5 18.5 0 0 0 2 12s3.5 7 10 7a9.12 9.12 0 0 0 5.4-1.61"/><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><line x1="2" x2="22" y1="2" y2="22"/></svg>
@@ -949,7 +1455,7 @@
         </div>
         <div class="field">
           <label for="adm-conf" data-i18n="admin.confLabel">Confirm Password</label>
-          <input type="password" id="adm-conf" autocomplete="new-password">
+          <input type="password" id="adm-conf" autocomplete="new-password" required aria-required="true">
         </div>
         <div class="error-banner" id="adm-err" role="alert"></div>
       </div>
@@ -963,26 +1469,111 @@
     <div class="step" id="step-done">
       <div class="card-body">
         <div class="done-wrap">
-          <div class="icon">&#x1F389;</div>
+          <div class="done-mark" aria-hidden="true">
+            <svg viewBox="0 0 160 160" fill="currentColor">
+              <g fill-opacity="0.82">
+                <circle cx="64" cy="72" r="27"/>
+                <circle cx="100" cy="78" r="25"/>
+                <circle cx="80" cy="106" r="24"/>
+              </g>
+            </svg>
+          </div>
           <h2 tabindex="-1" data-i18n="done.title">Yuvomi is ready!</h2>
-          <p data-i18n="done.subtitle">Your family planner is running and your admin account is set up.</p>
+          <!-- Kein data-i18n: der Text haengt seit dem 404-Zweig vom Zustand ab
+               (frisch angelegt gegen schon vorhanden). applyTranslations wuerde
+               beim Sprachwechsel den Grundtext zurueckschreiben und die
+               Rerun-Aussage verschlucken. localize() setzt ihn stattdessen. -->
+          <p id="done-subtitle">Your family planner is running and your admin account is set up.</p>
           <div class="warn-banner" role="note" style="text-align:start">
             <span class="warn-icon" aria-hidden="true">&#x26A0;</span>
-            <span data-i18n="done.backupReminder">Remember to back up your .env file now — it holds your keys.</span>
+            <span data-i18n="done.backupReminder">Remember to back up your .env file now - it holds your keys.</span>
           </div>
           <div class="done-actions">
             <button type="button" class="open-link" id="done-download">
               <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
               <span data-i18n="done.download">Download .env file</span>
             </button>
+            <!-- Text im Markup statt per textContent: er trägt keinen Platzhalter,
+                 also übersetzt applyTranslations ihn beim Sprachwechsel korrekt
+                 mit. Der Speicherpfad steht in #done-path direkt darunter und
+                 wird im Fehlerfall mit eingeblendet - so bleibt die Meldung auch
+                 dann vollständig, wenn savedEnvPath leer ist. -->
+            <div class="error-banner" id="done-err" role="alert" style="text-align:start" data-i18n="done.downloadFailed">
+              The file could not be loaded - the installer has most likely shut down already. Your keys are in the .env file on your server.
+            </div>
             <div class="hint" id="done-path" style="display:none; margin:0; font-family:var(--font-mono); word-break:break-all"></div>
             <a id="done-link" class="open-link" href="#" target="_blank" rel="noopener" data-i18n="done.open">Open Yuvomi &#x2192;</a>
+            <!-- Der Installer beendet sich nach der Kontoerstellung von selbst.
+                 Wer den Tab liegen lässt, findet den Download-Endpunkt tot vor -
+                 das gehört auf den Bildschirm, nicht nur in den Quelltext. -->
+            <p class="hint" style="margin:0" data-i18n="done.serverStops">The installer shuts down a few minutes from now. Download the file before you close this tab.</p>
+          </div>
+
+          <!-- „Als Nächstes". Der Wizard endete bisher mit einem Warndreieck und
+               zwei Knöpfen - die letzte Note der Installation eines FAMILIEN-
+               planers war eine Warnung plus eine Hausaufgabe, und das Ergebnis
+               ein Haushalt mit genau einem Mitglied. Der Installer ist der eine
+               Ort, an dem der Nutzer nachweislich Zeit für Einrichtung
+               mitbringt; hier steht deshalb, was die App aus einem Konto einen
+               Haushalt macht. Die Ziele sind echte App-Routen, per JS an die
+               Instanz-Adresse gehängt (siehe fillNextSteps). -->
+          <div class="next-steps">
+            <div class="group-label" data-i18n="done.nextTitle">Next up</div>
+            <a class="next-step" id="next-invite" href="#" target="_blank" rel="noopener">
+              <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6M22 11h-6"/></svg>
+              <span><b data-i18n="done.nextInvite">Invite your family</b><br><span data-i18n="done.nextInviteDesc">Create invitation links so everyone picks their own password.</span></span>
+            </a>
+            <a class="next-step" id="next-modules" href="#" target="_blank" rel="noopener">
+              <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+              <span><b data-i18n="done.nextModules">Choose your modules</b><br><span data-i18n="done.nextModulesDesc">Turn on what your household actually uses and hide the rest.</span></span>
+            </a>
+            <div class="next-step next-step--static">
+              <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 18h.01"/></svg>
+              <span><b data-i18n="done.nextInstall">Install it on your phones</b><br><span data-i18n="done.nextInstallDesc">Open Yuvomi on a phone and add it to the home screen - it works offline.</span></span>
+            </div>
           </div>
         </div>
       </div>
     </div>
 
   </main>
+
+  <!-- Der Sprachumschalter steht am ENDE des Dokuments, nicht davor.
+       showStep() setzt den Fokus bei jedem Schrittwechsel auf die Ueberschrift
+       des Schritts; alles, was im DOM davor liegt, ist vorwaerts per Tab nie
+       erreichbar (gemessen: nur Shift+Tab fuehrte hin, auf jedem Schritt).
+       Visuell bleibt er oben rechts - die Position kommt aus dem CSS, nicht aus
+       der Dokumentreihenfolge. Als globales Werkzeug gehoert er ans Ende der
+       Tab-Ordnung, nicht vor den Inhalt des aktuellen Schritts. -->
+  <div class="lang-switch">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10Z"/></svg>
+    <select id="lang-switch" aria-label="Language" data-i18n-aria="common.language">
+      <option value="de">Deutsch</option>
+      <option value="en">English</option>
+      <option value="es">Español</option>
+      <option value="fil">Filipino</option>
+      <option value="fr">Français</option>
+      <option value="it">Italiano</option>
+      <option value="pt">Português</option>
+      <option value="nl">Nederlands</option>
+      <option value="sv">Svenska</option>
+      <option value="pl">Polski</option>
+      <option value="cs">Čeština</option>
+      <option value="hu">Magyar</option>
+      <option value="el">Ελληνικά</option>
+      <option value="ru">Русский</option>
+      <option value="uk">Українська</option>
+      <option value="tr">Türkçe</option>
+      <option value="ar">العربية</option>
+      <option value="fa">فارسی</option>
+      <option value="hi">हिन्दी</option>
+      <option value="vi">Tiếng Việt</option>
+      <option value="id">Bahasa Indonesia</option>
+      <option value="zh">中文</option>
+      <option value="ja">日本語</option>
+      <option value="ko">한국어</option>
+    </select>
+  </div>
 
 <script type="module">
 // All step panels live in the static HTML above.
@@ -1000,13 +1591,16 @@ await initInstallerI18n();
 // Defaults, minimale Fragen) und „Erweitert" (voller Funktionsumfang).
 const FLOWS = {
   simple:   ['welcome', 'simple', 'docker', 'admin', 'done'],
-  advanced: ['welcome', 'config', 'secrets', 'weather', 'calendar', 'email', 'advanced', 'review', 'docker', 'admin', 'done'],
+  advanced: ['welcome', 'config', 'secrets', 'weather', 'calendar', 'email', 'storage', 'advanced', 'review', 'docker', 'admin', 'done'],
 };
-const ALL_STEPS = ['welcome','simple','config','secrets','weather','calendar','email','advanced','review','docker','admin','done'];
+const ALL_STEPS = ['welcome','simple','config','secrets','weather','calendar','email','storage','advanced','review','docker','admin','done'];
 // Diese Schritte tragen bewusst keine „Schritt N von M"-Nummer: Einstieg,
-// optionaler Sammel-Schritt, der reine Docker-Wartebildschirm (keine Eingabe)
-// und der Abschluss.
-const UNNUMBERED = new Set(['welcome', 'advanced', 'docker', 'done']);
+// der reine Docker-Wartebildschirm (keine Eingabe) und der Abschluss.
+// 'advanced' stand hier als "optionaler Sammel-Schritt" - er war damit der
+// groesste Bildschirm der Reise UND der einzige ohne Fortschrittsangabe. Seit
+// der Teilung in Speicher und Erweitert ist er weder Sammelbecken noch
+// Ausnahme.
+const UNNUMBERED = new Set(['welcome', 'docker', 'done']);
 
 let flow = FLOWS.advanced;
 let mode = 'advanced';
@@ -1015,8 +1609,53 @@ let currentStep = 0;
 // Persistenter Knoten für die Google-Redirect-URI: applyRich baut die Hint-Kinder
 // bei jedem Sprachwechsel neu, dieser <code>-Knoten behält seinen Text.
 const gcalRedirectNode = document.createElement('code');
+// Dieselbe id wie der statische <code> im Markup, den applyRich hier ersetzt:
+// ohne sie fand [data-copy="gcal-redirect-hint"] nach dem ersten localize()
+// nichts mehr, und der Kopieren-Knopf tat still gar nichts.
+gcalRedirectNode.id = 'gcal-redirect-hint';
+// Dieselbe Bauart für die Outlook-Redirect-URI, aus demselben Grund.
+const outlookRedirectNode = document.createElement('code');
+outlookRedirectNode.id = 'outlook-redirect-hint';
 
 /** Alle statischen + dynamischen Übersetzungen anwenden; bei Sprachwechsel erneut aufrufbar. */
+// Muss VOR localize() stehen: localize() läuft beim Laden (weiter unten) und
+// ruft renderPrereq(), das diesen Zustand liest. Eine let-Deklaration weiter
+// unten im Modul wäre zu diesem Zeitpunkt in der temporal dead zone - der
+// Zugriff hätte nicht undefined geliefert, sondern die Seite mit einem
+// ReferenceError gar nicht erst aufgebaut.
+let lastPrereqMissing = null;
+// localize() laeuft einmal VOR `const S` (zwei Zeilen weiter unten) und danach
+// bei jedem Sprachwechsel. Alles darin, was S liest, braucht dieses Flag: ein
+// Zugriff auf S in der temporal dead zone liefert kein undefined, sondern wirft
+// - und die Seite baut sich dann gar nicht erst auf. Beim ersten Lauf steht der
+// Text ohnehin schon korrekt im Markup, gebraucht wird er erst beim Wechsel.
+let wizardReady = false;
+// Der Einfach-Pfad kann aus ZWEI unabhaengigen Gruenden gesperrt sein: fehlende
+// Container-Engine (Prereq) oder eine bestehende .env (Preflight). Ohne diesen
+// Zustand kannte checkPrereqs() nur „sperren" und nie „freigeben" - wer Docker
+// nachinstallierte und „Erneut pruefen" klickte, sah die Meldung verschwinden
+// und die als „Empfohlen" ausgezeichnete Karte tot zurueckbleiben.
+let simpleLockedByEnv = false;
+// Beschriftungen, die vom Zustand abhaengen und einen Sprachwechsel ueberleben
+// muessen. Alle drei standen vorher als data-i18n im Markup und wurden dabei
+// auf ihren Grundtext zurueckgesetzt - beim Bestaetigungsknopf hiess das: die
+// zweite Klick-Sicherung war weg, der naechste Klick schrieb die .env.
+let dockerPrimaryKey = 'docker.toAdmin';
+let dockerTextKey = 'docker.phasePull';
+let reviewConfirmed = false;
+// Zeitstempel des Scharfstellens: ein woertlicher Doppelklick (~200 ms) traf
+// sonst beide Stufen der Zwei-Klick-Bestaetigung in einer Geste - derselbe
+// Button, dieselbe Position, und dahinter liegt .env-Schreiben plus
+// Container-Neustart. Der zweite Klick zaehlt erst nach einer Schrecksekunde.
+const CONFIRM_COOLDOWN_MS = 600;
+let reviewArmedAt = 0;
+let simpleArmedAt = 0;
+let logsOpen = false;
+// Muss ebenfalls vor localize() stehen: der Abschluss-Untertitel haengt daran,
+// und localize() laeuft schon beim Laden. Beim Rerun gab es das Admin-Konto
+// bereits - der Standardtext behauptete, es sei gerade eingerichtet worden.
+let adminExisted = false;
+
 function localize() {
   applyTranslations(document);
   document.querySelectorAll('[data-i18n-aria]').forEach(el => {
@@ -1030,6 +1669,29 @@ function localize() {
   al.href = 'https://appleid.apple.com'; al.target = '_blank'; al.rel = 'noopener';
   al.textContent = t('calendar.appleLink');
   applyRich($('apple-hint'), 'calendar.appleHint', { link: al });
+  const ol = document.createElement('a');
+  ol.href = 'https://entra.microsoft.com'; ol.target = '_blank'; ol.rel = 'noopener';
+  ol.textContent = t('calendar.outlookLink');
+  applyRich($('outlook-hint'), 'calendar.outlookHint', { link: ol, redirect: outlookRedirectNode });
+  // Die Prereq-Meldung trägt einen Platzhalter und einen Link, überlebt einen
+  // Sprachwechsel also nur, wenn sie neu gebaut wird - wie die zwei Hints oben.
+  renderPrereq();
+  // Zustandsbehaftete Beschriftungen aus dem Zustand neu setzen. Sie tragen
+  // kein data-i18n mehr, weil applyTranslations sie sonst auf ihren Grundtext
+  // zuruecksetzt - beim Bestaetigungsknopf hiesse das, dass ein Sprachwechsel
+  // die zweite Klick-Sicherung entwaffnet.
+  $('rev-next').textContent = t(reviewConfirmed ? 'review.confirm' : 'review.save');
+  $('dkr-next').textContent = t(dockerPrimaryKey);
+  $('dkr-text').textContent = t(dockerTextKey);
+  $('dkr-logs-toggle').textContent = t(logsOpen ? 'docker.hideLogs' : 'docker.showLogs');
+  // Der Abschluss-Untertitel haengt am Zustand, nicht nur an der Sprache.
+  $('done-subtitle').textContent = t(adminExisted ? 'done.subtitleExisting' : 'done.subtitle');
+  // Dasselbe für die Adresszeile des Einfach-Pfads ({{url}}).
+  if (wizardReady) $('simple-access-desc').textContent = t('simple.itemAccessDesc', { url: deriveBaseUrl() });
+  // Und fuer die Werte der Pruefseite: ihre Labels uebersetzt applyTranslations,
+  // die Werte ("Neu erzeugt", "Direkt / HTTP") kommen aus renderReview - ohne
+  // diesen Aufruf blieb der Kontrollschirm nach einem Sprachwechsel zweisprachig.
+  if (wizardReady) renderReview();
   applyStepCounters();
 }
 
@@ -1062,29 +1724,84 @@ const S = {
   GOOGLE_CLIENT_ID: '', GOOGLE_CLIENT_SECRET: '', GOOGLE_REDIRECT_URI: '',
   GOOGLE_DRIVE_CLIENT_ID: '', GOOGLE_DRIVE_CLIENT_SECRET: '', GOOGLE_DRIVE_REDIRECT_URI: '',
   APPLE_USERNAME: '', APPLE_APP_SPECIFIC_PASSWORD: '', APPLE_CALDAV_URL: '',
+  MS_CLIENT_ID: '', MS_CLIENT_SECRET: '', MS_REDIRECT_URI: '',
   EMAIL_SMTP_HOST: '', EMAIL_SMTP_PORT: '', EMAIL_SMTP_SECURE: '',
   EMAIL_SMTP_USER: '', EMAIL_SMTP_PASS: '', EMAIL_FROM_ADDRESS: '', EMAIL_FROM_NAME: '',
   SESSION_SECURE: '', TRUST_PROXY: '',
   OIDC_ISSUER: '', OIDC_CLIENT_ID: '', OIDC_CLIENT_SECRET: '', OIDC_REDIRECT_URI: '',
+  OIDC_TRUST_EMAIL_WITHOUT_VERIFIED_CLAIM: '', OIDC_ALLOW_SIGNUP: '', AUTH_ALLOW_PASSWORD_LOGIN: '',
   BACKUP_ENABLED: '', BACKUP_SCHEDULE: '', BACKUP_KEEP: '',
   WEBDAV_BACKUP_ENABLED: '', WEBDAV_BACKUP_URL: '', WEBDAV_BACKUP_USERNAME: '',
-  WEBDAV_BACKUP_PASSWORD: '', WEBDAV_BACKUP_PATH: '',
+  WEBDAV_BACKUP_PASSWORD: '', WEBDAV_BACKUP_PATH: '', WEBDAV_BACKUP_KEEP: '',
   FIXER_API_KEY: '', VAPID_SUBJECT: '',
+  DATA_DIR: '',
+  SYNC_INTERVAL_MINUTES: '',
+  ICS_SUBSCRIPTION_ALLOW_PRIVATE_NETWORK: '',
+  RECIPE_PROVIDER_ALLOW_PRIVATE_NETWORK: '',
+  WASTE_SOURCE_ALLOW_PRIVATE_NETWORK: '',
+  MAX_UPLOAD_MB: '',
   DOCUMENT_STORAGE_LOCAL_ENABLED: '',
   DOCUMENT_STORAGE_LOCAL_PATH: '',
+  DOCUMENT_STORAGE_LOCAL_DIR: '',
   DOCUMENT_STORAGE_WEBDAV_ENABLED: '',
   DOCUMENT_STORAGE_WEBDAV_URL: '',
   DOCUMENT_STORAGE_WEBDAV_USERNAME: '',
   DOCUMENT_STORAGE_WEBDAV_PASSWORD: '',
   DOCUMENT_STORAGE_WEBDAV_PATH: '',
+  DOCUMENT_STORAGE_WEBDAV_ALLOW_PRIVATE_NETWORK: '',
 };
 
 /** Absolute Origin aus Schema/Host/Port; Standard-Ports (80/443) weglassen. */
-function deriveBaseUrl() {
-  const scheme = S.scheme || (S.SESSION_SECURE === 'true' ? 'https' : 'http');
+function deriveBaseUrl(schemeOverride = null, hostOverride = null, portOverride = null) {
+  const scheme = schemeOverride || S.scheme || (S.SESSION_SECURE === 'true' ? 'https' : 'http');
   const defaultPort = scheme === 'https' ? '443' : '80';
-  const host = S.host || 'localhost';
-  return (S.port && S.port !== defaultPort) ? `${scheme}://${host}:${S.port}` : `${scheme}://${host}`;
+  const host = hostOverride || S.host || 'localhost';
+  const port = portOverride || S.port;
+  return (port && port !== defaultPort) ? `${scheme}://${host}:${port}` : `${scheme}://${host}`;
+}
+
+/**
+ * Die Origin, unter der die App voraussichtlich laufen wird - die EINE Quelle
+ * für jede angezeigte oder geschriebene Redirect-URI.
+ *
+ * Der Kalenderschritt kommt vor dem Erweitert-Schritt, kennt die öffentliche
+ * Adresse also noch nicht sicher. Solange das Feld leer ist, gilt die Ableitung
+ * aus Schema, Host und Port; sobald der Nutzer sie gesetzt hat, gilt seine
+ * Eingabe - auch rückwirkend, wenn er nochmal in den Kalenderschritt blättert.
+ */
+function plannedOrigin() {
+  // NUR das vom Nutzer GETIPPTE Feld gewinnt, nicht sein blosser Inhalt.
+  //
+  // onEnterStep('config') belegt dieses Feld beim Betreten des Schritts vor - mit
+  // dem Rueckgabewert genau dieser Funktion. Ohne die touched-Pruefung war sie ab
+  // diesem Moment selbstbezueglich: sie las den eigenen Vorbelegungswert und
+  // leitete nie wieder ab. Wer danach den Host auf `nas.local` setzte, bekam
+  // trotzdem `https://localhost:3000` in die .env - und damit tote Reset-Links,
+  // drei falsche Redirect-URIs und einen Oeffnen-Knopf auf localhost.
+  const field = $('adv-base-url');
+  const typed = field?.dataset.touched ? field.value.trim().replace(/\/+$/, '') : '';
+  // Ohne http(s)-Schema ist die Eingabe keine Origin: "yuvomi.example.com"
+  // ergaebe schemalose Redirect-URIs, eine kaputte BASE_URL in der .env und
+  // einen Oeffnen-Link, der jedes getippte Schema unbesehen uebernaehme.
+  if (typed.startsWith('http://') || typed.startsWith('https://')) return typed;
+
+  // Host und Port aus den FELDERN, nicht aus S: S.host/S.port werden erst in
+  // cfg-next gesetzt, die Vorbelegung laeuft aber waehrend der Eingabe auf
+  // demselben Schritt. Aus S gelesen haette sie bis zum Verlassen des Schritts
+  // `localhost` gezeigt - also genau in dem Moment, in dem der Nutzer sie
+  // haette pruefen sollen.
+  const host = $('cfg-host')?.value.trim() || S.host || 'localhost';
+  const port = $('cfg-port')?.value.trim() || S.port || '3000';
+  // Das Schema aus der Proxy-Wahl, nicht aus S.scheme: das wird erst in cfg-next
+  // gesetzt, der Nutzer steht beim Tippen aber noch davor.
+  const scheme = $('adv-proxy')?.value === 'direct' ? 'http' : 'https';
+  return deriveBaseUrl(scheme, host, port);
+}
+
+/** Kennt der Browser diese Zeitzone? Intl wirft bei unbekannten IANA-Namen. */
+function isValidTimeZone(tz) {
+  try { new Intl.DateTimeFormat(undefined, { timeZone: tz }); return true; }
+  catch { return false; }
 }
 
 /** Ein 32-Byte-Hex-Secret vom Installer-Server holen. */
@@ -1136,6 +1853,8 @@ function buildEnv() {
     GOOGLE_DRIVE_REDIRECT_URI: S.GOOGLE_DRIVE_REDIRECT_URI,
     APPLE_USERNAME: S.APPLE_USERNAME, APPLE_APP_SPECIFIC_PASSWORD: S.APPLE_APP_SPECIFIC_PASSWORD,
     APPLE_CALDAV_URL: S.APPLE_CALDAV_URL,
+    MS_CLIENT_ID: S.MS_CLIENT_ID, MS_CLIENT_SECRET: S.MS_CLIENT_SECRET,
+    MS_REDIRECT_URI: S.MS_REDIRECT_URI,
     EMAIL_SMTP_HOST: S.EMAIL_SMTP_HOST, EMAIL_SMTP_PORT: S.EMAIL_SMTP_PORT,
     EMAIL_SMTP_SECURE: S.EMAIL_SMTP_SECURE, EMAIL_SMTP_USER: S.EMAIL_SMTP_USER,
     EMAIL_SMTP_PASS: S.EMAIL_SMTP_PASS, EMAIL_FROM_ADDRESS: S.EMAIL_FROM_ADDRESS,
@@ -1143,59 +1862,58 @@ function buildEnv() {
     SESSION_SECURE: S.SESSION_SECURE, TRUST_PROXY: S.TRUST_PROXY,
     OIDC_ISSUER: S.OIDC_ISSUER, OIDC_CLIENT_ID: S.OIDC_CLIENT_ID,
     OIDC_CLIENT_SECRET: S.OIDC_CLIENT_SECRET, OIDC_REDIRECT_URI: S.OIDC_REDIRECT_URI,
+    OIDC_TRUST_EMAIL_WITHOUT_VERIFIED_CLAIM: S.OIDC_TRUST_EMAIL_WITHOUT_VERIFIED_CLAIM,
+    OIDC_ALLOW_SIGNUP: S.OIDC_ALLOW_SIGNUP,
+    AUTH_ALLOW_PASSWORD_LOGIN: S.AUTH_ALLOW_PASSWORD_LOGIN,
     BACKUP_ENABLED: S.BACKUP_ENABLED, BACKUP_SCHEDULE: S.BACKUP_SCHEDULE, BACKUP_KEEP: S.BACKUP_KEEP,
     WEBDAV_BACKUP_ENABLED: S.WEBDAV_BACKUP_ENABLED, WEBDAV_BACKUP_URL: S.WEBDAV_BACKUP_URL,
     WEBDAV_BACKUP_USERNAME: S.WEBDAV_BACKUP_USERNAME, WEBDAV_BACKUP_PASSWORD: S.WEBDAV_BACKUP_PASSWORD,
-    WEBDAV_BACKUP_PATH: S.WEBDAV_BACKUP_PATH,
+    WEBDAV_BACKUP_PATH: S.WEBDAV_BACKUP_PATH, WEBDAV_BACKUP_KEEP: S.WEBDAV_BACKUP_KEEP,
     FIXER_API_KEY: S.FIXER_API_KEY, VAPID_SUBJECT: S.VAPID_SUBJECT,
+    DATA_DIR: S.DATA_DIR,
+    ICS_SUBSCRIPTION_ALLOW_PRIVATE_NETWORK: S.ICS_SUBSCRIPTION_ALLOW_PRIVATE_NETWORK,
+    RECIPE_PROVIDER_ALLOW_PRIVATE_NETWORK: S.RECIPE_PROVIDER_ALLOW_PRIVATE_NETWORK,
+    WASTE_SOURCE_ALLOW_PRIVATE_NETWORK: S.WASTE_SOURCE_ALLOW_PRIVATE_NETWORK,
+    MAX_UPLOAD_MB: S.MAX_UPLOAD_MB,
     DOCUMENT_STORAGE_LOCAL_ENABLED: S.DOCUMENT_STORAGE_LOCAL_ENABLED,
     DOCUMENT_STORAGE_LOCAL_PATH: S.DOCUMENT_STORAGE_LOCAL_PATH,
+    DOCUMENT_STORAGE_LOCAL_DIR: S.DOCUMENT_STORAGE_LOCAL_DIR,
     DOCUMENT_STORAGE_WEBDAV_ENABLED: S.DOCUMENT_STORAGE_WEBDAV_ENABLED,
     DOCUMENT_STORAGE_WEBDAV_URL: S.DOCUMENT_STORAGE_WEBDAV_URL,
     DOCUMENT_STORAGE_WEBDAV_USERNAME: S.DOCUMENT_STORAGE_WEBDAV_USERNAME,
     DOCUMENT_STORAGE_WEBDAV_PASSWORD: S.DOCUMENT_STORAGE_WEBDAV_PASSWORD,
     DOCUMENT_STORAGE_WEBDAV_PATH: S.DOCUMENT_STORAGE_WEBDAV_PATH,
-    SYNC_INTERVAL_MINUTES: '15',
+    DOCUMENT_STORAGE_WEBDAV_ALLOW_PRIVATE_NETWORK: S.DOCUMENT_STORAGE_WEBDAV_ALLOW_PRIVATE_NETWORK,
+    // Kein hartes '15' mehr: der Wert stand nirgends im Wizard und wurde bei
+    // JEDEM Lauf zurückgeschrieben, weil preserveUnmanagedLines nur bewahrt, was
+    // der Client nicht schickt. Wer wegen iCloud-Ratenbegrenzung von Hand auf 60
+    // gestellt hatte, verlor das beim nächsten Durchlauf stillschweigend. Leer
+    // heisst jetzt: nicht anfassen, der Server-Default (15) greift ohnehin.
+    SYNC_INTERVAL_MINUTES: S.SYNC_INTERVAL_MINUTES,
     TZ: S.tz, OIKOS_HTTP_PORT: S.port,
   };
 }
 
-// Spiegelt install-server.js:encodeEnvValue/renderEnvFile, damit die vom Nutzer
-// heruntergeladene Kopie byte-genau der geschriebenen .env entspricht.
-function encodeEnvValueClient(str) {
-  const dollarSafe = String(str).replace(/\$/g, '$$$$');
-  if (/^\s|\s$|[\s#"'`\\]/.test(str)) {
-    return '"' + dollarSafe.replace(/(["\\])/g, '\\$1') + '"';
-  }
-  return dollarSafe;
-}
-function renderEnvClient(env) {
-  const lines = ['# Generated by Yuvomi Installer'];
-  for (const [k, v] of Object.entries(env)) {
-    if (v == null || v === '') {
-      // Bewahrte Schlüssel kennt der Browser nicht — sie stehen nur in der .env
-      // auf der Platte. Ein stilles Weglassen sähe in der heruntergeladenen
-      // Datei aus wie „gibt es nicht"; der Kommentar sagt, wo der Wert steht.
-      if (preservedKeys.has(k)) lines.push(`# ${k} unchanged - kept from your previous .env`);
-      continue;                            // sonst wie sanitizeEnv: Leere überspringen
-    }
-    lines.push(`${k}=${encodeEnvValueClient(v)}`);
-  }
-  return lines.join('\n') + '\n';
-}
+// Die .env wurde hier einmal nachgebaut (encodeEnvValueClient/renderEnvClient),
+// damit der Download der geschriebenen Datei entspricht. Das konnte nicht
+// gelingen: der Browser kennt weder die beim Rerun übernommenen Werte noch die
+// bewahrten Secrets. Der Download holt jetzt die echte Datei über
+// /api/env-file, und die Nachbildung ist damit ersatzlos entfallen.
 
 // Vom Server gemeldeter .env-Pfad (aus /api/save-env), auf „Fertig" angezeigt.
 let savedEnvPath = '';
-// Im Einfach-Modus werden die Schlüssel nie angezeigt — der Download ist der
+// Im Einfach-Modus werden die Schlüssel nie angezeigt - der Download ist der
 // einzige Weg zu ihrem einzigen Backup. Bis er erfolgt ist, führt der Download
 // (nicht „Öffnen") und „Öffnen" wird einmalig abgefangen.
 let keysDownloaded = false;
 let openWarned = false;
 
 S.tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+// Ab hier darf localize() auf S zugreifen (siehe wizardReady oben).
+wizardReady = true;
 $('cfg-tz').value = S.tz;
 
-// Warn up front if a previous setup exists — save-env will back it up — and
+// Warn up front if a previous setup exists - save-env will back it up - and
 // learn which keys must survive this run. Everything that generates or asks for
 // a secret awaits this, so a slow preflight can never race a fresh key into an
 // existing installation.
@@ -1204,31 +1922,102 @@ const preflightDone = (async () => {
     const r = await fetch('/api/preflight');
     if (!r.ok) return;
     const d = await r.json();
-    if (d.envExists) $('cfg-existing').style.display = 'block';
+    // Unabhaengig von envExists: ein laufender Container ist die schaerfere
+    // Auskunft, denn der Speichern-Schritt startet ihn neu.
+    if (d.containerRunning) $('welcome-running').style.display = 'block';
+
+    if (d.envExists) {
+      // flex, nicht block: .warn-banner stellt Icon und Text in eine Zeile.
+      $('cfg-existing').style.display = 'flex';
+      // Und der Einfach-Pfad wird gesperrt. applySimpleDefaults() setzt host,
+      // port, SESSION_SECURE='false' und TRUST_PROXY='loopback' hart, buildEnv()
+      // schickt sie mit - der Rerun-Schutz des Servers bewahrt aber nur, was der
+      // Client NICHT schickt. Ein zweiter Einfach-Lauf über eine Instanz hinter
+      // einem Reverse-Proxy nahm ihr also unbemerkt die sicheren Cookies, das
+      // Proxy-Vertrauen und die BASE_URL (Reset-Links zeigten danach auf
+      // localhost). Im Erweitert-Pfad steht jeder dieser Werte sichtbar im
+      // Formular, deshalb führt eine zweite Einrichtung dort entlang.
+      $('welcome-existing').style.display = 'block';
+      simpleLockedByEnv = true;
+      const simple = $('mode-simple');
+      simple.disabled = true;
+      // Der Vorrang wandert mit: eine gesperrte Karte, die weiterhin „Empfohlen"
+      // trägt, schickt den Nutzer gegen eine Tür, die er nicht öffnen kann.
+      simple.classList.remove('is-primary');
+      $('mode-advanced').classList.add('is-primary');
+    }
     for (const key of d.preservedKeys || []) preservedKeys.add(key);
   } catch { /* preflight is best-effort */ }
 })();
 
 // Verify Docker prerequisites before the wizard can proceed. Missing tools
 // block both entry paths rather than failing silently when the container starts.
-(async () => {
+//
+// Der Zustand war eine Sackgasse: beide Türen zu, dazu „Bitte installiere sie und
+// lade die Seite neu" - ohne Link, ohne Anleitung, und ohne den Fall zu trennen,
+// den detectEngine sehr wohl kennt. Bei fehlendem Docker hilft docker.com, bei
+// vorhandenem Podman ohne Compose hilft `dnf install podman-compose`; das ist
+// nicht dieselbe Auskunft. Und neu laden muss dafür niemand.
+/** Der Link, der zur fehlenden Voraussetzung passt. */
+function prereqLinkNode(missing) {
+  // detectEngine meldet 'docker','podman' nur, wenn gar keine Engine da ist.
+  // Alles andere heisst: Podman läuft, Compose fehlt.
+  const engineMissing = missing.includes('docker');
+  const a = document.createElement('a');
+  a.href = engineMissing
+    ? 'https://docs.docker.com/get-docker/'
+    : 'https://github.com/containers/podman-compose#installation';
+  a.target = '_blank';
+  a.rel = 'noopener';
+  a.textContent = t(engineMissing ? 'config.prereqLinkDocker' : 'config.prereqLinkCompose');
+  return a;
+}
+
+/** Prereq-Meldung (neu) aufbauen - auch nach einem Sprachwechsel. */
+function renderPrereq() {
+  if (!lastPrereqMissing) return;
+  for (const id of ['cfg-prereq', 'welcome-prereq']) {
+    applyRich($(id), 'config.prereqMissing', {
+      list: lastPrereqMissing.join(', '),
+      link: prereqLinkNode(lastPrereqMissing),
+    });
+    $(id).style.display = 'block';
+  }
+}
+
+async function checkPrereqs() {
   try {
     const r = await fetch('/api/prereqs');
     if (!r.ok) return;
     const d = await r.json();
-    if (!d.ok) {
-      const msg = t('config.prereqMissing', { list: d.missing.join(', ') });
-      $('cfg-prereq').textContent = msg;
-      $('cfg-prereq').style.display = 'block';
-      $('cfg-next').disabled = true;
-      const wp = $('welcome-prereq');
-      wp.textContent = msg;
-      wp.style.display = 'block';
-      $('mode-simple').disabled = true;
-      $('mode-advanced').disabled = true;
+    const blocked = !d.ok;
+    lastPrereqMissing = blocked ? d.missing : null;
+
+    $('cfg-next').disabled = blocked;
+    $('mode-advanced').disabled = blocked;
+    // Aus BEIDEN Gruenden zusammen, statt nur zu sperren: so gibt ein bestandener
+    // Recheck den Einfach-Pfad wieder frei, ohne die .env-Sperre aufzuheben.
+    const simple = $('mode-simple');
+    simple.disabled = blocked || simpleLockedByEnv;
+    // Und der Vorrang wandert mit: eine gesperrte Karte, die weiter die
+    // Akzentflaeche der Empfehlung traegt, sieht aus wie die richtige Wahl und
+    // laesst sich nicht anklicken.
+    simple.classList.toggle('is-primary', !simple.disabled);
+    $('mode-advanced').classList.toggle('is-primary', simple.disabled && !blocked);
+    $('prereq-recheck').style.display = blocked ? '' : 'none';
+
+    if (blocked) {
+      renderPrereq();
+    } else {
+      for (const id of ['cfg-prereq', 'welcome-prereq']) {
+        $(id).textContent = '';
+        $(id).style.display = 'none';
+      }
     }
   } catch { /* prereq check is best-effort */ }
-})();
+}
+checkPrereqs();
+$('prereq-recheck').addEventListener('click', checkPrereqs);
 
 function setProgress(n) {
   const ratio = flow.length > 1 ? n / (flow.length - 1) : 0;
@@ -1248,7 +2037,19 @@ function showStep(n) {
   // Fokus auf die Überschrift des neuen Schritts, damit Tastatur-/Screenreader-
   // Nutzer der Navigation folgen (WCAG 2.4.3). preventScroll verhindert Sprünge.
   const heading = $(`step-${active}`)?.querySelector('h1, h2');
-  if (heading) heading.focus({ preventScroll: true });
+  if (heading) {
+    // Der Schrittzaehler steht im DOM VOR der fokussierten H2 und wurde beim
+    // Schrittwechsel nie mit angesagt - der Fortschritt war nur rueckwaerts
+    // erkundbar. describedby haengt ihn an die Fokus-Ansage an.
+    const tag = $(`step-${active}`)?.querySelector('.step-tag');
+    if (tag && tag.textContent) {
+      if (!tag.id) tag.id = `step-tag-${active}`;
+      heading.setAttribute('aria-describedby', tag.id);
+    } else {
+      heading.removeAttribute('aria-describedby');
+    }
+    heading.focus({ preventScroll: true });
+  }
   onEnterStep(active);
 }
 
@@ -1261,14 +2062,47 @@ function onEnterStep(name) {
   } else if (name === 'simple') {
     ensureKeys();
     $('simple-access-desc').textContent = t('simple.itemAccessDesc', { url: deriveBaseUrl() });
+    // Bestätigungszustand zurücksetzen, falls der Nutzer erneut hierher navigiert.
+    simpleConfirmed = false;
+    $('simple-next').textContent = t('simple.start');
+    $('simple-next').classList.remove('is-armed');
+    $('simple-armed-note').textContent = '';
+  } else if (name === 'review') {
+    renderReview();
+    // Bestätigungszustand zurücksetzen, falls der Nutzer erneut hierher
+    // navigiert - dieselbe Entwaffnung wie beim Einfach-Pfad oben.
+    reviewConfirmed = false;
+    $('rev-next').textContent = t('review.save');
+    $('rev-next').classList.remove('is-armed');
+    $('rev-armed-note').textContent = '';
+  } else if (name === 'config') {
+    // Vorbelegen, aber nur solange der Nutzer nichts eingetippt hat: sonst
+    // überschriebe ein Schritt zurück und wieder vor seine Eingabe.
+    refreshPlannedOrigin();
   } else if (name === 'calendar') {
-    // Vorläufige Redirect-URI (http); nach der Proxy-Wahl in adv-next verfeinert.
-    gcalRedirectNode.textContent = `http://${S.host}:${S.port}/api/v1/calendar/google/callback`;
-  } else if (name === 'advanced') {
-    const scheme = $('adv-proxy').value === 'direct' ? 'http' : 'https';
+    // Die ANGEZEIGTE URI muss dieselbe sein, die später in die .env geht - sie
+    // wird zeichengenau in die Google Cloud Console übertragen. Hier stand fest
+    // verdrahtet `http://host:port`, während adv-next den echten Wert aus
+    // BASE_URL baut: wer die angezeigte Adresse kopierte, trug bei jedem
+    // HTTPS-Setup die falsche ein, und der Fehler zeigte sich erst beim ersten
+    // OAuth-Versuch als redirect_uri_mismatch.
+    gcalRedirectNode.textContent = `${plannedOrigin()}/api/v1/calendar/google/callback`;
+    outlookRedirectNode.textContent = `${plannedOrigin()}/api/v1/calendar/outlook/callback`;
+  } else if (name === 'storage') {
     $('document-google-drive-redirect-hint').textContent =
-      `${scheme}://${S.host}:${S.port}/api/v1/documents/storage/google-drive/callback`;
+      `${plannedOrigin()}/api/v1/documents/storage/google-drive/callback`;
   } else if (name === 'done') {
+    // Beim Rerun ist der Untertitel eine Luege („dein Admin-Konto ist
+    // eingerichtet" - es war schon da). Der Titel stimmt in beiden Faellen.
+    $('done-subtitle').textContent = t(adminExisted ? 'done.subtitleExisting' : 'done.subtitle');
+    // Aus BASE_URL, nicht aus host:port: hinter einem Reverse-Proxy ist das die
+    // einzige Adresse, unter der die Familie die App wirklich erreicht - und
+    // seit cfg-next steht sie fest. Hier statt im Admin-Handler, damit die Ziele
+    // an DIESEM Schritt haengen und nicht an dem einen Weg dorthin.
+    const appUrl = S.BASE_URL || deriveBaseUrl();
+    $('done-link').href = appUrl;
+    $('next-invite').href = `${appUrl}/settings/admin/family`;
+    $('next-modules').href = `${appUrl}/settings/modules/options`;
     if (savedEnvPath) {
       const p = $('done-path');
       p.textContent = t('done.savedTo', { path: savedEnvPath });
@@ -1290,19 +2124,48 @@ function setDoneEmphasis() {
 
 // „Fertig": eine Kopie der geschriebenen .env herunterladen, damit Nicht-Techniker
 // ihre einzigen Schlüssel sichern können (die Backup-Erinnerung wird handlungsfähig).
-$('done-download').addEventListener('click', () => {
-  const blob = new Blob([renderEnvClient(buildEnv())], { type: 'text/plain' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = '.env';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-  // Schlüssel gesichert: „Öffnen" darf jetzt führen.
-  keysDownloaded = true;
-  setDoneEmphasis();
+$('done-download').addEventListener('click', async () => {
+  // Die Datei vom Server holen, nicht aus dem Browser-Zustand nachbauen. Seit
+  // der Server beim Rerun bewahrt, was der Client nicht schickt, kennt dieser
+  // Zustand weder die übernommenen Schlüssel noch die beiden Secrets, die der
+  // Wizard bewusst nie zu sehen bekommt - die „Sicherung" hätte beides
+  // verloren, und genau die Schlüssel sind der Grund für den Knopf.
+  //
+  // Und zwar per fetch statt per Anker-Klick: der Anker meldet keinen Fehlschlag
+  // zurück, also wurde keysDownloaded auch dann gesetzt, wenn gar nichts ankam.
+  // Der Installer beendet sich fünf Minuten nach der Kontoerstellung - wer den
+  // Tab liegen ließ, bekam danach keine Datei, keine Meldung und eine Oberfläche,
+  // die „Schlüssel gesichert" behauptete. Das ist die EINZIGE Sicherung des
+  // DB_ENCRYPTION_KEY, für den es ausdrücklich kein Zurücksetzen gibt.
+  const btn = $('done-download');
+  const err = $('done-err');
+  err.style.display = 'none';
+  btn.disabled = true;
+  let url = '';
+  try {
+    const r = await fetch('/api/env-file');
+    if (!r.ok) throw new Error(String(r.status));
+    url = URL.createObjectURL(await r.blob());
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '.env';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Schlüssel gesichert: „Öffnen" darf jetzt führen. Erst hier, nur nach ok.
+    keysDownloaded = true;
+    setDoneEmphasis();
+  } catch {
+    err.style.display = 'block';
+    // Den Speicherpfad mit einblenden, damit die Datei von Hand auffindbar
+    // bleibt. Im Erweitert-Pfad steht er ohnehin schon da, im Einfach-Pfad nicht.
+    if (savedEnvPath) $('done-path').style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    // Erst nach dem Klick freigeben, sonst zieht Safari den Blob unter dem
+    // laufenden Download weg.
+    if (url) setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
 });
 
 // Sicherheitsgate: im Einfach-Modus lenkt der erste „Öffnen"-Klick vor dem
@@ -1347,7 +2210,25 @@ $('mode-simple').addEventListener('click', () => startFlow('simple'));
 $('mode-advanced').addEventListener('click', () => startFlow('advanced'));
 $('simple-to-advanced').addEventListener('click', () => startFlow('advanced'));
 
-function startFlow(m) {
+// Zaehlt die Modus-Wahlen. Nur die letzte darf nach dem Warten weiterlaufen.
+let flowRequest = 0;
+
+async function startFlow(m) {
+  // Die Sperre des Einfach-Pfads setzt erst die ANTWORT des Preflights, und
+  // bis dahin ist die Karte klickbar. Ein Klick in diesem Fenster landete
+  // trotz bestehender .env im Einfach-Pfad, dessen Speichern Host, Port und
+  // die Cookie-Sicherheit hart darueberschrieb. Deshalb erst warten, dann
+  // entscheiden - und bei bestehender .env dorthin, wo jeder dieser Werte
+  // sichtbar im Formular steht.
+  // Das Warten oeffnet selbst ein Fenster: wer waehrenddessen "Erweitert"
+  // waehlt, ist sofort dort. Die haengende Einfach-Wahl ist dann ueberholt und
+  // darf ihn nicht per showStep(1) zurueckwerfen.
+  const request = ++flowRequest;
+  if (m === 'simple') {
+    await preflightDone;
+    if (request !== flowRequest) return;
+    if (simpleLockedByEnv) m = 'advanced';
+  }
   mode = m;
   flow = FLOWS[m];
   applyStepCounters();
@@ -1363,15 +2244,32 @@ function showErr(id, msg) {
 
 /** aria-invalid auf allen Feldern zurücksetzen (bei Schrittwechsel / erneuter Prüfung). */
 function clearInvalid(root = document) {
-  root.querySelectorAll('[aria-invalid="true"]').forEach(el => el.removeAttribute('aria-invalid'));
+  root.querySelectorAll('[aria-invalid="true"]').forEach(el => {
+    el.removeAttribute('aria-invalid');
+    // Nur fail() setzt describedby; mit der Markierung geht auch die Bindung.
+    el.removeAttribute('aria-describedby');
+  });
 }
 
 /** Banner-Fehler zeigen UND das schuldige Feld markieren + fokussieren (WCAG 3.3.1). */
 function fail(bannerId, msg, inputId) {
-  showErr(bannerId, msg);
   const el = inputId && $(inputId);
+  const banner = $(bannerId);
+  // Das Banner unter das schuldige Feld ziehen: es stand am Ende des card-body
+  // und lag bei langen Schritten ausserhalb des Viewports (gemessen: Bannertop
+  // 787px bei 720px Viewport) - Sehende sahen nur den roten Rahmen, den Grund
+  // bekam allein der Screenreader. Verschieben statt erzeugen haelt die
+  // "kein dynamisches DOM"-Regel dieses Moduls.
+  if (el && banner) {
+    const wrap = el.closest('.field') || el;
+    if (wrap.nextElementSibling !== banner) wrap.after(banner);
+  }
+  showErr(bannerId, msg);
   if (el) {
     el.setAttribute('aria-invalid', 'true');
+    // Meldung programmatisch ans Feld binden: wer spaeter zum Feld
+    // zurueckkehrt, hoert den Grund, nicht nur "ungueltig" (WCAG 3.3.1/1.3.1).
+    el.setAttribute('aria-describedby', bannerId);
     el.focus({ preventScroll: true });
     el.scrollIntoView({ block: 'center' });
   }
@@ -1382,20 +2280,38 @@ document.addEventListener('click', async e => {
   if (genId) {
     const btn = e.target.closest('[data-gen]');
     btn.disabled = true;
+    // common.generating stand woertlich auf "…": der Button verlor damit
+    // waehrend der Operation seinen zugaenglichen Namen und wurde vorgelesen
+    // als "Auslassungspunkte, Schaltflaeche, deaktiviert". aria-busy sagt den
+    // Zustand an, statt ihn nur zu bebildern.
+    btn.setAttribute('aria-busy', 'true');
     btn.textContent = t('common.generating');
-    const r = await fetch('/api/generate-secret', { method: 'POST' });
-    const d = await r.json();
-    const inp = $(genId);
-    inp.value = d.secret;
-    btn.disabled = false;
-    btn.textContent = t('common.generate');
-    // Nach dem Generieren den Wert sichtbar machen und Kopieren anbieten —
-    // dies ist der einzige Moment, in dem der Nutzer den Schlüssel notieren kann.
-    inp.type = 'text';
-    const eyeBtn = document.querySelector(`[data-eye="${genId}"]`);
-    if (eyeBtn) eyeBtn.setAttribute('aria-pressed', 'true');
-    const copyBtn = document.querySelector(`[data-copy="${genId}"]`);
-    if (copyBtn) copyBtn.hidden = false;
+    try {
+      const r = await fetch('/api/generate-secret', { method: 'POST' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      const inp = $(genId);
+      inp.value = d.secret;
+      // Nach dem Generieren den Wert sichtbar machen und Kopieren anbieten -
+      // dies ist der einzige Moment, in dem der Nutzer den Schlüssel notieren kann.
+      inp.type = 'text';
+      const eyeBtn = document.querySelector(`[data-eye="${genId}"]`);
+      if (eyeBtn) eyeBtn.setAttribute('aria-pressed', 'true');
+      const copyBtn = document.querySelector(`[data-copy="${genId}"]`);
+      if (copyBtn) copyBtn.hidden = false;
+      showErr('sec-err', '');
+    } catch {
+      // Ohne diesen Zweig blieb der Button nach einem Fehlschlag fuer immer
+      // deaktiviert und ohne Namen stehen - der Schritt war dann nur noch
+      // ueber einen Reload verlassbar. Kein neuer Locale-Schluessel:
+      // docker.unknownError trifft die Aussage woertlich und ist in allen 23
+      // Sprachen vorhanden.
+      showErr('sec-err', t('docker.unknownError'));
+    } finally {
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+      btn.textContent = t('common.generate');
+    }
     return;
   }
 
@@ -1410,9 +2326,15 @@ document.addEventListener('click', async e => {
 
   const copyBtn = e.target.closest('[data-copy]');
   if (copyBtn) {
-    const inp = $(copyBtn.dataset.copy);
-    if (!inp.value) return;
-    try { await navigator.clipboard.writeText(inp.value); } catch { /* Clipboard kann blockiert sein */ }
+    const src = $(copyBtn.dataset.copy);
+    // value ODER textContent: die Redirect-URIs stehen in <code>, nicht in einem
+    // Feld. Sie sind der einzige Wert, den der Nutzer zeichengenau in eine
+    // fremde Oberfläche (Google Cloud Console) übertragen muss - und hatten als
+    // einzige keinen Kopieren-Knopf, obwohl der Mechanismus zwei Felder weiter
+    // schon stand.
+    const text = src.value ?? src.textContent;
+    if (!text) return;
+    try { await navigator.clipboard.writeText(text); } catch { /* Clipboard kann blockiert sein */ }
     const note = $(`${copyBtn.dataset.copy}-copied`);
     if (note) {
       // In die Live-Region schreiben (statt nur einblenden), damit Screenreader
@@ -1451,10 +2373,44 @@ $('cfg-next').addEventListener('click', () => {
     fail('cfg-err', t('config.errPort'), 'cfg-port');
     return;
   }
+  // Die Zeitzone ist derselbe stille Spaetzuender wie BASE_URL: ein Tippfehler
+  // ("Europe/Berln") faellt lautlos auf UTC zurueck, und Backup-Cron plus
+  // Haushaltszonen-Vorbelegung laufen falsch, ohne dass irgendwo etwas rot wird.
+  // Der eigene Port wird streng geprueft - dieses Feld war das einzige ohne Riegel.
+  const rawTz = $('cfg-tz').value.trim();
+  if (rawTz && !isValidTimeZone(rawTz)) {
+    fail('cfg-err', t('config.errTz'), 'cfg-tz');
+    return;
+  }
   showErr('cfg-err', '');
   S.host = rawHost;
   S.port = String(rawPort);
-  S.tz   = $('cfg-tz').value.trim() || 'UTC';
+  S.tz   = rawTz || 'UTC';
+
+  // Reverse proxy vs. direct access drives the secure-cookie / trust-proxy pair.
+  // Steht seit dem Umzug hier statt in adv-next: die Entscheidung gehoert zu
+  // "Wie greifst du auf Yuvomi zu?", und alles Weitere (Schema, BASE_URL, die
+  // Redirect-URIs im Kalenderschritt) haengt daran.
+  if ($('adv-proxy').value === 'direct') {
+    S.SESSION_SECURE = 'false';     // allow login cookies over plain HTTP
+    S.TRUST_PROXY = 'loopback';
+  } else {
+    S.SESSION_SECURE = 'true';      // enforce secure cookies behind the proxy
+    S.TRUST_PROXY = '1';            // trust one proxy hop (Caddy/nginx/Traefik)
+  }
+  S.scheme = S.SESSION_SECURE === 'true' ? 'https' : 'http';
+  S.BASE_URL = plannedOrigin();
+
+  // Der eine Widerspruch, der garantiert die Anmeldung bricht: die oeffentliche
+  // Adresse ist http://, aber Cookies werden auf Secure gezwungen. Der Browser
+  // speichert sie dann nicht, und der Login schlaegt ohne jede Meldung fehl -
+  // erst nach der ganzen Installation, wenn niemand mehr hier sucht.
+  // Geprueft wird die WIRKUNG (das Paar aus Adresse und Cookie-Flag), nicht die
+  // Auswahl im Select: dieselbe Kombination kann auf drei Wegen entstehen.
+  if (S.SESSION_SECURE === 'true' && S.BASE_URL.startsWith('http://')) {
+    fail('cfg-err', t('config.errSecureOverHttp'), 'adv-proxy');
+    return;
+  }
   next();
 });
 
@@ -1463,7 +2419,7 @@ $('sec-next').addEventListener('click', () => {
   const ss = $('sec-session').value.trim();
   const dk = $('sec-db').value.trim();
   // Ein leeres Feld ist nur zulässig, wenn der bestehende Schlüssel übernommen
-  // wird — dann steht der Wert bereits in der .env auf dem Server.
+  // wird - dann steht der Wert bereits in der .env auf dem Server.
   const missing = (!ss && !preservedKeys.has('SESSION_SECRET')) ? 'sec-session'
     : (!dk && !preservedKeys.has('DB_ENCRYPTION_KEY')) ? 'sec-db' : null;
   if (missing) { fail('sec-err', t('secrets.errBoth'), missing); return; }
@@ -1500,15 +2456,26 @@ $('wea-next').addEventListener('click', () => {
 $('cal-next').addEventListener('click', () => {
   S.GOOGLE_CLIENT_ID = $('gcal-id').value.trim();
   S.GOOGLE_CLIENT_SECRET = $('gcal-secret').value.trim();
+  // Vorläufiger Wert; adv-next setzt ihn nach der Proxy-Wahl endgültig aus
+  // derselben Origin. Beide lesen plannedOrigin(), damit sie nicht auseinander
+  // laufen - hier stand `http://host:port` fest verdrahtet.
   S.GOOGLE_REDIRECT_URI = S.GOOGLE_CLIENT_ID
-    ? `http://${S.host}:${S.port}/api/v1/calendar/google/callback` : '';
+    ? `${plannedOrigin()}/api/v1/calendar/google/callback` : '';
   S.APPLE_USERNAME = $('apple-user').value.trim();
   S.APPLE_APP_SPECIFIC_PASSWORD = $('apple-pass').value.trim();
   S.APPLE_CALDAV_URL = $('apple-url').value.trim();
+  S.MS_CLIENT_ID = $('outlook-id').value.trim();
+  S.MS_CLIENT_SECRET = $('outlook-secret').value.trim();
+  // Wie die Google-URI: vorläufig aus plannedOrigin(), adv-next zieht nach.
+  S.MS_REDIRECT_URI = S.MS_CLIENT_ID
+    ? `${plannedOrigin()}/api/v1/calendar/outlook/callback` : '';
 
   // Prefill the OIDC redirect URI from the chosen host/port as a starting point.
+  // Auch hier aus plannedOrigin(): anders als die Google-URI wird diese NICHT in
+  // adv-next nachgezogen (sie ist ein editierbares Feld), stand also als
+  // einzige dauerhaft auf http://host:port - und landete so in der .env.
   if (!$('oidc-redirect').value.trim()) {
-    $('oidc-redirect').value = `http://${S.host}:${S.port}/api/v1/auth/oidc/callback`;
+    $('oidc-redirect').value = `${plannedOrigin()}/api/v1/auth/oidc/callback`;
   }
 
   next();
@@ -1525,8 +2492,16 @@ $('email-next').addEventListener('click', () => {
     const from = $('email-from').value.trim();
     // Host und Absenderadresse sind das Minimum für einen funktionierenden Versand.
     if (!host || !from) { fail('email-err', t('email.errIncomplete'), !host ? 'email-host' : 'email-from'); return; }
+    // Der SMTP-Port zeigt einen Fehler erst Wochen spaeter beim ersten
+    // Passwort-Reset - dieselbe Spaetzuender-Klasse wie BASE_URL. Leer bleibt
+    // erlaubt (Server-Default 587); config.errPort trifft die Aussage woertlich.
+    const smtpPort = $('email-port').value.trim();
+    if (smtpPort && (!/^\d+$/.test(smtpPort) || +smtpPort < 1 || +smtpPort > 65535)) {
+      fail('email-err', t('config.errPort'), 'email-port');
+      return;
+    }
     S.EMAIL_SMTP_HOST   = host;
-    S.EMAIL_SMTP_PORT   = $('email-port').value.trim();
+    S.EMAIL_SMTP_PORT   = smtpPort;
     S.EMAIL_SMTP_SECURE = $('email-secure').value;
     S.EMAIL_SMTP_USER   = $('email-user').value.trim();
     S.EMAIL_SMTP_PASS   = $('email-pass').value;
@@ -1540,33 +2515,100 @@ $('email-next').addEventListener('click', () => {
   next();
 });
 
-$('adv-next').addEventListener('click', () => {
-  clearInvalid();
-  // Reverse proxy vs. direct access drives the secure-cookie / trust-proxy pair.
-  if ($('adv-proxy').value === 'direct') {
-    S.SESSION_SECURE = 'false';     // allow login cookies over plain HTTP
-    S.TRUST_PROXY = 'loopback';
-  } else {
-    S.SESSION_SECURE = 'true';      // enforce secure cookies behind the proxy
-    S.TRUST_PROXY = '1';            // trust one proxy hop (Caddy/nginx/Traefik)
-  }
+// Merken, dass der Nutzer die öffentliche Adresse selbst gesetzt hat - danach
+// belegt onEnterStep sie nicht mehr aus Host und Port vor.
+$('adv-base-url').addEventListener('input', e => {
+  // Leeren nimmt die Markierung zurueck: sonst blieb das Feld fuer immer leer
+  // (die Vorbelegung greift nur ohne touched), waehrend in die .env still die
+  // Ableitung ging - eine Adresse, die auf keinem Bildschirm zu sehen war.
+  if (!e.target.value.trim()) delete e.target.dataset.touched;
+  else e.target.dataset.touched = '1';
+  // Die angezeigte Drive-URI hängt an derselben Origin und steht auf demselben
+  // Bildschirm - sie muss beim Tippen mitgehen, sonst kopiert der Nutzer die
+  // Adresse von vor seiner Änderung.
+  $('document-google-drive-redirect-hint').textContent =
+    `${plannedOrigin()}/api/v1/documents/storage/google-drive/callback`;
+});
+/**
+ * Die Vorbelegung der oeffentlichen Adresse neu rechnen.
+ *
+ * Haengt an ALLEN drei Eingaben, aus denen sie abgeleitet wird: Host, Port und
+ * Proxy-Wahl. Vorher lief sie nur beim Betreten des Schritts und beim
+ * Proxy-Wechsel - und der Proxy-Zweig war wirkungslos, weil plannedOrigin() das
+ * Feld las, das er gerade setzen wollte. Wer den Host tippte, sah die Adresse
+ * darunter unveraendert stehen und hatte keinen Anlass, sie zu korrigieren.
+ */
+/**
+ * Ist diese Adresse nur im eigenen Netz erreichbar?
+ *
+ * Entscheidet die Vorauswahl der Proxy-Frage. `localhost:3000` plus „hinter
+ * Reverse-Proxy" (die erste und damit vorausgewaehlte Option) ergab eine
+ * Installation, die nur Secure-Cookies ausstellt und ueber http:// keine
+ * Anmeldung zulaesst - der Normalfall des ersten Durchlaufs war kaputt.
+ */
+function isLocalAddress(host) {
+  const h = (host || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h) return true;
+  // Ein Name OHNE Punkt ist per Definition nicht oeffentlich aufloesbar - `nas`
+  // oder `homeserver` ist auf jedem LAN mit DNS-Suffix der Normalfall und war
+  // vorher nicht abgedeckt. Die Folge waere die Vorauswahl „Reverse-Proxy" und
+  // damit SESSION_SECURE=true ueber plain HTTP gewesen.
+  if (!h.includes('.') && !h.includes(':')) return true;
+  return h === 'localhost' || h === '::1'
+    || /\.(local|lan|internal|home\.arpa)$/.test(h)
+    || /^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h)
+    || /^169\.254\./.test(h)
+    || /^172\.(1[6-9]|2\d|3[01])\./.test(h)
+    || /^f[cd][0-9a-f]{2}:/.test(h);   // IPv6 ULA fc00::/7
+}
 
-  // Das finale Schema steht erst hier fest (nach der Proxy-Wahl) — davon abgeleitete
-  // Redirect-URIs neu berechnen, damit sie nicht fälschlich http:// bleiben.
-  S.scheme = S.SESSION_SECURE === 'true' ? 'https' : 'http';
-  const origin = `${S.scheme}://${S.host}:${S.port}`;
-  if (S.GOOGLE_CLIENT_ID) S.GOOGLE_REDIRECT_URI = `${origin}/api/v1/calendar/google/callback`;
+function refreshPlannedOrigin() {
+  // Die Proxy-Wahl folgt dem Host, solange der Nutzer sie nicht selbst gesetzt
+  // hat - dieselbe touched-Mechanik wie beim Adressfeld.
+  const proxy = $('adv-proxy');
+  if (!proxy.dataset.touched) {
+    proxy.value = isLocalAddress($('cfg-host').value.trim()) ? 'direct' : 'proxy';
+  }
+  const field = $('adv-base-url');
+  if (!field.dataset.touched) field.value = plannedOrigin();
+  $('document-google-drive-redirect-hint').textContent =
+    `${plannedOrigin()}/api/v1/documents/storage/google-drive/callback`;
+}
+
+// REIHENFOLGE IST HIER DIE GANZE LOGIK: Listener laufen in
+// Registrierungsreihenfolge, und auf einem <select> feuert `input` VOR `change`.
+// Stand die touched-Markierung hinter der Ableitung, lief refreshPlannedOrigin
+// beim ersten Bedienen, bevor es wusste, dass der Nutzer gerade selbst gewaehlt
+// hat - und ueberschrieb seine Wahl mit der Host-Ableitung. Der Select sprang
+// sichtbar zurueck, erst der zweite Versuch hielt. Gefaehrlich ist die Richtung
+// „oeffentlicher Host, bewusst auf Direktzugriff": zurueckgesetzt auf `proxy`
+// heisst SESSION_SECURE=true, und der Widerspruchs-Riegel greift nicht, weil die
+// abgeleitete Adresse dann https:// ist.
+$('adv-proxy').addEventListener('input', e => { e.target.dataset.touched = '1'; });
+$('adv-proxy').addEventListener('change', e => { e.target.dataset.touched = '1'; });
+
+for (const id of ['adv-proxy', 'cfg-host', 'cfg-port']) {
+  $(id).addEventListener('input', refreshPlannedOrigin);
+  $(id).addEventListener('change', refreshPlannedOrigin);
+}
+
+$('storage-next').addEventListener('click', () => {
+  clearInvalid();
+  // Alles, was entscheidet, WO Daten liegen. Herausgeloest aus adv-next, als der
+  // Erweitert-Schritt geteilt wurde; die Reihenfolge der Pruefungen ist
+  // unveraendert, nur der Fehler-Container heisst hier storage-err.
+  const origin = S.BASE_URL;
 
   const driveEnabled = $('adv-document-google-drive-enable').checked;
   const driveClientId = $('adv-document-google-drive-client-id').value.trim();
   const driveClientSecret = $('adv-document-google-drive-client-secret').value;
   if (driveEnabled && Boolean(driveClientId) !== Boolean(driveClientSecret)) {
-    fail('adv-err', t('advanced.errDocumentGoogleDrivePair'),
+    fail('storage-err', t('advanced.errDocumentGoogleDrivePair'),
       driveClientId ? 'adv-document-google-drive-client-secret' : 'adv-document-google-drive-client-id');
     return;
   }
   if (driveEnabled && !(driveClientId && driveClientSecret) && !(S.GOOGLE_CLIENT_ID && S.GOOGLE_CLIENT_SECRET)) {
-    fail('adv-err', t('advanced.errDocumentGoogleDriveCredentials'), 'adv-document-google-drive-client-id');
+    fail('storage-err', t('advanced.errDocumentGoogleDriveCredentials'), 'adv-document-google-drive-client-id');
     return;
   }
   S.GOOGLE_DRIVE_CLIENT_ID = driveEnabled ? driveClientId : '';
@@ -1576,6 +2618,61 @@ $('adv-next').addEventListener('click', () => {
     : '';
   $('document-google-drive-redirect-hint').textContent =
     `${origin}/api/v1/documents/storage/google-drive/callback`;
+  const backupOn = $('adv-backup-enable').checked;
+  const schedule = backupOn ? $('adv-backup-schedule').value.trim() : '';
+  const keep = backupOn ? $('adv-backup-keep').value.trim() : '';
+  if (schedule && schedule.split(/\s+/).length !== 5) { fail('storage-err', t('advanced.errSchedule'), 'adv-backup-schedule'); return; }
+  if (keep && !/^[1-9]\d*$/.test(keep)) { fail('storage-err', t('advanced.errKeep'), 'adv-backup-keep'); return; }
+  // only persist BACKUP_ENABLED=false when explicitly disabled.
+  S.BACKUP_ENABLED = backupOn ? '' : 'false';
+  S.BACKUP_SCHEDULE = schedule;
+  S.BACKUP_KEEP = keep;
+
+  // Leer statt 'false' - bei allen drei ENABLED-Schaltern. Ein geschriebenes
+  // 'false' saehe aus wie eine Entscheidung, ist aber nur der unangehakte
+  // Zustand eines Feldes, das der Wizard beim Rerun NIE aus der bestehenden .env
+  // befuellt. Es ueberlebte sanitizeEnv (nicht leer) und schlug damit den
+  // Rerun-Schutz: wer WebDAV-Backups ausserhalb des Wizards eingerichtet hatte,
+  // fand sie nach einem zweiten Lauf still abgeschaltet, waehrend URL, Benutzer
+  // und Passwort stehen blieben. Dieselbe Form wie BACKUP_ENABLED darunter.
+  S.DOCUMENT_STORAGE_LOCAL_ENABLED = $('adv-document-local-enable').checked ? 'true' : '';
+  S.DOCUMENT_STORAGE_LOCAL_PATH = $('adv-document-local-path').value.trim();
+  // Der Host-Ordner gehört zum Container-Pfad: fehlte er, zeigte das Volume
+  // weiter auf /documents, während die App woanders hinschrieb. Die Uploads
+  // landeten dann im Container-Overlay und waren beim nächsten Update weg.
+  S.DOCUMENT_STORAGE_LOCAL_DIR = $('adv-document-local-dir').value.trim();
+
+  S.DOCUMENT_STORAGE_WEBDAV_ENABLED = $('adv-document-webdav-enable').checked ? 'true' : '';
+  S.DOCUMENT_STORAGE_WEBDAV_URL = $('adv-document-webdav-url').value.trim();
+  S.DOCUMENT_STORAGE_WEBDAV_USERNAME = $('adv-document-webdav-username').value.trim();
+  S.DOCUMENT_STORAGE_WEBDAV_PASSWORD = $('adv-document-webdav-password').value;
+  S.DOCUMENT_STORAGE_WEBDAV_PATH = $('adv-document-webdav-path').value.trim();
+  // Nur setzen, wenn angehakt: ein geschriebenes `false` sähe aus wie eine
+  // Entscheidung, ist aber der Server-Default.
+
+  // Externe WebDAV-Backups (optional, zusätzlich zu den lokalen Backups).
+  S.WEBDAV_BACKUP_ENABLED  = $('adv-webdav-backup-enable').checked ? 'true' : '';
+  S.WEBDAV_BACKUP_URL      = $('adv-webdav-backup-url').value.trim();
+  S.WEBDAV_BACKUP_USERNAME = $('adv-webdav-backup-username').value.trim();
+  S.WEBDAV_BACKUP_PASSWORD = $('adv-webdav-backup-password').value;
+  S.WEBDAV_BACKUP_PATH     = $('adv-webdav-backup-path').value.trim();
+  const webdavKeep = $('adv-webdav-backup-keep').value.trim();
+  if (webdavKeep && !/^[1-9]\d*$/.test(webdavKeep)) { fail('storage-err', t('advanced.errKeep'), 'adv-webdav-backup-keep'); return; }
+  S.WEBDAV_BACKUP_KEEP = webdavKeep;
+
+  S.DATA_DIR = $('adv-data-dir').value.trim();
+
+  next();
+});
+
+$('adv-next').addEventListener('click', () => {
+  clearInvalid();
+  // Alles, was entscheidet, WOMIT sich Yuvomi verbindet. Speicher und
+  // Sicherungen stehen einen Schritt davor.
+  const origin = S.BASE_URL;
+  if (S.GOOGLE_CLIENT_ID) S.GOOGLE_REDIRECT_URI = `${origin}/api/v1/calendar/google/callback`;
+  if (S.MS_CLIENT_ID) S.MS_REDIRECT_URI = `${origin}/api/v1/calendar/outlook/callback`;
+
   const oidcRedirectField = $('oidc-redirect');
   const redirectVal = oidcRedirectField.value.trim();
   if (!redirectVal || /\/api\/v1\/auth\/oidc\/callback$/.test(redirectVal)) {
@@ -1584,7 +2681,7 @@ $('adv-next').addEventListener('click', () => {
 
   // OIDC: der Server braucht alle vier Werte oder keinen. Die Redirect-URI wird
   // aber automatisch vorbefüllt (siehe cal-next), daher darf sie NICHT in die
-  // „alles oder nichts"-Prüfung einfließen — sonst blockiert jeder Nutzer ohne SSO.
+  // „alles oder nichts"-Prüfung einfließen - sonst blockiert jeder Nutzer ohne SSO.
   // Gemessen wird nur an den drei manuell eingegebenen Kernfeldern.
   const oidcCore = {
     OIDC_ISSUER: $('oidc-issuer').value.trim(),
@@ -1601,44 +2698,55 @@ $('adv-next').addEventListener('click', () => {
   if (coreFilled === 3) {
     Object.assign(S, oidcCore);
     S.OIDC_REDIRECT_URI = $('oidc-redirect').value.trim() || `${origin}/api/v1/auth/oidc/callback`;
+    // Nur schreiben, wenn ausdrücklich gesetzt: der Schalter senkt die Sicherheit
+    // und der Server-Default (verlangt email_verified) ist der richtige.
+    S.OIDC_TRUST_EMAIL_WITHOUT_VERIFIED_CLAIM = $('adv-oidc-trust-email').checked ? 'true' : '';
+    // Andersherum als beim Schalter darueber: hier ist der ABGEWAEHLTE Zustand
+    // der, der in die .env muss. Der Server-Default legt Konten an, das Haekchen
+    // ist also nur die Bestaetigung des Defaults und braucht keine Zeile.
+    S.OIDC_ALLOW_SIGNUP = $('adv-oidc-allow-signup').checked ? '' : 'false';
+    // Dasselbe Muster: der Server laesst die Passwort-Anmeldung zu, das Haekchen
+    // bestaetigt nur den Default. Und der abgewaehlte Zustand ist ohne OIDC
+    // wirkungslos - deshalb steht er ausschliesslich in diesem Zweig.
+    S.AUTH_ALLOW_PASSWORD_LOGIN = $('adv-auth-password-login').checked ? '' : 'false';
   } else {
     S.OIDC_ISSUER = ''; S.OIDC_CLIENT_ID = ''; S.OIDC_CLIENT_SECRET = ''; S.OIDC_REDIRECT_URI = '';
+    S.OIDC_TRUST_EMAIL_WITHOUT_VERIFIED_CLAIM = '';
+    S.OIDC_ALLOW_SIGNUP = '';
+    S.AUTH_ALLOW_PASSWORD_LOGIN = '';
   }
   showErr('adv-err', '');
 
-  // Backups: validate optional schedule/retention before persisting.
-  const backupOn = $('adv-backup-enable').checked;
-  const schedule = backupOn ? $('adv-backup-schedule').value.trim() : '';
-  const keep = backupOn ? $('adv-backup-keep').value.trim() : '';
-  if (schedule && schedule.split(/\s+/).length !== 5) { fail('adv-err', t('advanced.errSchedule'), 'adv-backup-schedule'); return; }
-  if (keep && !/^[1-9]\d*$/.test(keep)) { fail('adv-err', t('advanced.errKeep'), 'adv-backup-keep'); return; }
-  // only persist BACKUP_ENABLED=false when explicitly disabled.
-  S.BACKUP_ENABLED = backupOn ? '' : 'false';
-  S.BACKUP_SCHEDULE = schedule;
-  S.BACKUP_KEEP = keep;
-
-  S.DOCUMENT_STORAGE_LOCAL_ENABLED = $('adv-document-local-enable').checked ? 'true' : 'false';
-  S.DOCUMENT_STORAGE_LOCAL_PATH = $('adv-document-local-path').value.trim();
-
-  S.DOCUMENT_STORAGE_WEBDAV_ENABLED = $('adv-document-webdav-enable').checked ? 'true' : 'false';
-  S.DOCUMENT_STORAGE_WEBDAV_URL = $('adv-document-webdav-url').value.trim();
-  S.DOCUMENT_STORAGE_WEBDAV_USERNAME = $('adv-document-webdav-username').value.trim();
-  S.DOCUMENT_STORAGE_WEBDAV_PASSWORD = $('adv-document-webdav-password').value;
-  S.DOCUMENT_STORAGE_WEBDAV_PATH = $('adv-document-webdav-path').value.trim();
-
-  // Externe WebDAV-Backups (optional, zusätzlich zu den lokalen Backups).
-  S.WEBDAV_BACKUP_ENABLED  = $('adv-webdav-backup-enable').checked ? 'true' : 'false';
-  S.WEBDAV_BACKUP_URL      = $('adv-webdav-backup-url').value.trim();
-  S.WEBDAV_BACKUP_USERNAME = $('adv-webdav-backup-username').value.trim();
-  S.WEBDAV_BACKUP_PASSWORD = $('adv-webdav-backup-password').value;
-  S.WEBDAV_BACKUP_PATH     = $('adv-webdav-backup-path').value.trim();
+  // Die drei Heimnetz-Freigaben stehen seit der Zusammenfuehrung beisammen.
+  S.ICS_SUBSCRIPTION_ALLOW_PRIVATE_NETWORK = $('adv-ics-private').checked ? 'true' : '';
+  S.RECIPE_PROVIDER_ALLOW_PRIVATE_NETWORK = $('adv-recipe-provider-private').checked ? 'true' : '';
+  S.WASTE_SOURCE_ALLOW_PRIVATE_NETWORK = $('adv-waste-source-private').checked ? 'true' : '';
+  S.DOCUMENT_STORAGE_WEBDAV_ALLOW_PRIVATE_NETWORK =
+    $('adv-document-webdav-private').checked ? 'true' : '';
 
   S.FIXER_API_KEY  = $('adv-fixer').value.trim();
   S.VAPID_SUBJECT  = $('adv-push-subject').value.trim();
 
-  // BASE_URL steht erst jetzt fest (Schema aus der Proxy-Wahl) — für Reset-Links.
-  S.BASE_URL = deriveBaseUrl();
+  const syncInterval = $('adv-sync-interval').value.trim();
+  if (syncInterval && !/^[1-9]\d*$/.test(syncInterval)) {
+    fail('adv-err', t('advanced.errSyncInterval'), 'adv-sync-interval'); return;
+  }
+  S.SYNC_INTERVAL_MINUTES = syncInterval;
 
+  next();
+});
+
+/**
+ * Die Pruefseite aus dem Zustand rendern.
+ *
+ * Lebte als Block im adv-next-Handler - mit der Folge, dass ein Sprachwechsel
+ * AUF der Pruefseite die Labels uebersetzte, die Werte aber deutsch stehen
+ * liess ("Neu erzeugt", "Direkt / HTTP"): localize() hatte keinen Review-Zweig,
+ * und neu gerendert wurde nur auf dem Weg durch adv-next. Ausgerechnet der
+ * Kontrollschirm vor dem irreversiblen Klick war zweisprachig. Jetzt rufen
+ * onEnterStep('review') und localize() dieselbe Funktion.
+ */
+function renderReview() {
   $('rv-host').textContent    = S.host;
   $('rv-port').textContent    = S.port;
   $('rv-tz').textContent      = S.tz;
@@ -1648,14 +2756,17 @@ $('adv-next').addEventListener('click', () => {
     : '-';
   $('rv-google').textContent  = S.GOOGLE_CLIENT_ID ? t('review.configured') : '-';
   $('rv-apple').textContent   = S.APPLE_USERNAME || '-';
+  $('rv-outlook').textContent = S.MS_CLIENT_ID ? t('review.configured') : '-';
   $('rv-email').textContent   = S.EMAIL_SMTP_HOST ? (S.EMAIL_FROM_ADDRESS || t('review.configured')) : '-';
   $('rv-oidc').textContent    = S.OIDC_ISSUER ? t('review.configured') : '-';
   $('rv-backups').textContent = S.BACKUP_ENABLED === 'false' ? t('review.off') : t('review.on');
   $('rv-webdav-backup').textContent = S.WEBDAV_BACKUP_ENABLED === 'true'
     ? (S.WEBDAV_BACKUP_URL || t('review.configured'))
     : '-';
+  // Beide Enden des Mounts zeigen: der Host-Ordner ist die Hälfte, die
+  // bisher fehlte und ohne die Uploads beim nächsten Update verschwanden.
   $('rv-document-local').textContent = S.DOCUMENT_STORAGE_LOCAL_ENABLED === 'true'
-    ? (S.DOCUMENT_STORAGE_LOCAL_PATH || '/documents')
+    ? `${S.DOCUMENT_STORAGE_LOCAL_DIR || './documents'} → ${S.DOCUMENT_STORAGE_LOCAL_PATH || '/documents'}`
     : '-';
   $('rv-document-webdav').textContent = S.DOCUMENT_STORAGE_WEBDAV_ENABLED === 'true'
     ? (S.DOCUMENT_STORAGE_WEBDAV_URL || t('review.configured'))
@@ -1663,25 +2774,46 @@ $('adv-next').addEventListener('click', () => {
   $('rv-document-google-drive').textContent = S.GOOGLE_DRIVE_REDIRECT_URI
     ? t('review.configured')
     : '-';
+  // Was mit den Schlüsseln geschieht, nicht wie sie aussehen. preservedKeys
+  // kennt die Antwort schon, seit der Preflight sie meldet.
+  for (const [id, key] of [['rv-session-secret', 'SESSION_SECRET'], ['rv-db-key', 'DB_ENCRYPTION_KEY']]) {
+    $(id).textContent = preservedKeys.has(key) ? t('review.keyPreserved') : t('review.keyGenerated');
+  }
+  $('rv-base-url').textContent = S.BASE_URL || '-';
+  $('rv-data-dir').textContent = S.DATA_DIR || './data';
+  // Die drei Schalter zusammen in einer Zeile: sie beantworten dieselbe Frage
+  // („darf Yuvomi Ziele im eigenen Netz erreichen?") und stehen im Wizard nur
+  // deshalb getrennt, weil sie an verschiedenen Feldern hängen.
+  const privateNet = [
+    S.ICS_SUBSCRIPTION_ALLOW_PRIVATE_NETWORK === 'true' && t('review.privateNetworkIcs'),
+    S.RECIPE_PROVIDER_ALLOW_PRIVATE_NETWORK === 'true' && t('review.privateNetworkRecipes'),
+    S.WASTE_SOURCE_ALLOW_PRIVATE_NETWORK === 'true' && t('review.privateNetworkWaste'),
+    S.DOCUMENT_STORAGE_WEBDAV_ALLOW_PRIVATE_NETWORK === 'true' && t('review.privateNetworkWebdav'),
+  ].filter(Boolean);
+  // "nicht freigegeben" statt "deaktiviert": der unberuehrte Default ist keine
+  // getroffene Entscheidung und soll auch nicht wie eine klingen.
+  $('rv-private-network').textContent = privateNet.length ? privateNet.join(', ') : t('review.notEnabled');
+}
 
-  // Bestätigungszustand zurücksetzen, falls der Nutzer erneut hierher navigiert.
-  reviewConfirmed = false;
-  $('rev-next').textContent = t('review.save');
-
-  next();
-});
-
-let reviewConfirmed = false;
 $('rev-next').addEventListener('click', async () => {
   const btn = $('rev-next');
   // Irreversibler Schritt: erster Klick fordert Bestätigung, zweiter führt aus.
   if (!reviewConfirmed) {
     reviewConfirmed = true;
+    reviewArmedAt = Date.now();
     btn.textContent = t('review.confirm');
+    // Sichtbar scharfstellen, nicht nur den Text wechseln (siehe .is-armed).
+    btn.classList.add('is-armed');
+    // Und hoerbar: der Textwechsel am fokussierten Button wird nicht
+    // zuverlaessig angesagt - ohne die Live-Region wirkte der erste Klick fuer
+    // Screenreader wie "nichts passiert".
+    $('rev-armed-note').textContent = t('review.confirm');
     showErr('rev-err', '');
     return;
   }
-  btn.disabled = true; btn.textContent = t('review.saving');
+  if (Date.now() - reviewArmedAt < CONFIRM_COOLDOWN_MS) return;
+  btn.disabled = true; btn.textContent = t('review.saving'); btn.classList.remove('is-armed');
+  $('rev-armed-note').textContent = '';
   const env = buildEnv();
   try {
     const r = await fetch('/api/save-env', {
@@ -1690,20 +2822,45 @@ $('rev-next').addEventListener('click', async () => {
       body: JSON.stringify({ env }),
     });
     const d = await r.json().catch(() => null);
-    if (!r.ok) throw new Error(d?.error || t('review.errSave'));
+    if (!r.ok) throw new Error(d?.error || '');
     if (d?.path) savedEnvPath = d.path;
     next();
     startDocker();
   } catch (e) {
     btn.disabled = false; btn.textContent = t('review.save'); reviewConfirmed = false;
-    showErr('rev-err', e.message);
+    $('rev-armed-note').textContent = '';
+    // Uebersetzte Hauptaussage zuerst, das rohe Server-/Netzwerkdetail nur als
+    // Klammer: sanitizeEnv-Meldungen sind englisch, die Nutzerin liest hier
+    // aber eine von 24 Sprachen.
+    showErr('rev-err', e.message ? `${t('review.errSave')} (${e.message})` : t('review.errSave'));
   }
 });
 
 // Einfach-Modus: Schlüssel sicherstellen, .env schreiben und direkt starten.
+let simpleConfirmed = false;
 $('simple-next').addEventListener('click', async () => {
+  // Zweite Tuer derselben Sperre: kaeme der Einfach-Pfad je an startFlow()
+  // vorbei, schreibt er trotzdem nicht ueber eine bestehende .env.
+  await preflightDone;
+  if (simpleLockedByEnv) { startFlow('advanced'); return; }
   const btn = $('simple-next');
-  btn.disabled = true; btn.textContent = t('review.saving');
+  // Genauso irreversibel wie rev-next, also dieselbe Zwei-Klick-Bestätigung.
+  // Dass der Laien-Pfad sie nicht hatte, drehte die Schutzlogik um: weniger
+  // Netz für die Nutzer, die weniger überblicken.
+  if (!simpleConfirmed) {
+    simpleConfirmed = true;
+    simpleArmedAt = Date.now();
+    btn.textContent = t('review.confirm');
+    // Sichtbar scharfstellen, nicht nur den Text wechseln (siehe .is-armed).
+    btn.classList.add('is-armed');
+    // Hoerbar wie bei rev-next (siehe dort).
+    $('simple-armed-note').textContent = t('review.confirm');
+    showErr('simple-err', '');
+    return;
+  }
+  if (Date.now() - simpleArmedAt < CONFIRM_COOLDOWN_MS) return;
+  btn.disabled = true; btn.textContent = t('review.saving'); btn.classList.remove('is-armed');
+  $('simple-armed-note').textContent = '';
   try {
     await ensureKeys();
     S.BASE_URL = deriveBaseUrl();
@@ -1713,21 +2870,51 @@ $('simple-next').addEventListener('click', async () => {
       body: JSON.stringify({ env: buildEnv() }),
     });
     const d = await r.json().catch(() => null);
-    if (!r.ok) throw new Error(d?.error || t('review.errSave'));
+    if (!r.ok) throw new Error(d?.error || '');
     if (d?.path) savedEnvPath = d.path;
     next();
     startDocker();
   } catch (e) {
-    btn.disabled = false; btn.textContent = t('simple.start');
-    showErr('simple-err', e.message);
+    btn.disabled = false; btn.textContent = t('simple.start'); simpleConfirmed = false;
+    $('simple-armed-note').textContent = '';
+    // Wie bei rev-err: uebersetzte Hauptaussage, rohes Detail in Klammern.
+    showErr('simple-err', e.message ? `${t('review.errSave')} (${e.message})` : t('review.errSave'));
   }
 });
 
 let pollInterval = null;
 let dockerStart = null;
+// Der Wartebildschirm war der längste und angstbesetzteste Moment der Reise und
+// hatte den geringsten Informationsgehalt: Spinner, ein Satz, ein Sekundenzähler.
+// Diese drei Schwellen machen daraus einen Verlauf mit Ausweg.
+const STALL_AFTER_MS = 90_000;    // ab hier: Protokoll und „Erneut versuchen"
+const TIMEOUT_MS = 15 * 60_000;   // ab hier: aufhören zu pollen und das sagen
+// Wie oft /api/status hintereinander scheitern darf, bevor es ein Fehler ist.
+// Vorher verschluckte der catch jeden Fehler dauerhaft: ein toter Server
+// bedeutete einen Spinner, der sich für immer dreht.
+const MAX_POLL_FAILURES = 8;
+
+let pollFailures = 0;
+let dockerDone = false;
+
+const PHASE_KEYS = {
+  pull: 'docker.phasePull',
+  boot: 'docker.phaseBoot',
+  health: 'docker.phaseHealth',
+};
 
 async function startDocker() {
+  // Ein noch laufendes Intervall zuerst abraeumen. Der Retry-Knopf erscheint
+  // schon nach 90 Sekunden Stillstand, also waehrend gepollt wird - ohne das
+  // hier ueberschreibt die Zeile unten pollInterval, die alte ID ist verloren,
+  // und zwei Timer pollen weiter. Beim Erfolg laesst sich nur der neuere
+  // stoppen, der verwaiste triggert den Erfolgsuebergang wieder und wieder.
+  clearInterval(pollInterval);
+  pollInterval = null;
   dockerStart = Date.now();
+  pollFailures = 0;
+  dockerDone = false;
+  setPhase('pull');
   tickElapsed();
   try {
     const r = await fetch('/api/start', { method: 'POST' });
@@ -1740,48 +2927,157 @@ async function startDocker() {
   pollInterval = setInterval(pollDocker, 2000);
 }
 
+/** Benennt, was gerade passiert, statt durchgehend „Container wird gestartet". */
+function setDockerText(key) {
+  dockerTextKey = key;
+  $('dkr-text').textContent = t(key);
+}
+
+function setPhase(phase) {
+  const key = PHASE_KEYS[phase];
+  if (key) setDockerText(key);
+}
+
+/** Protokoll fortlaufend zeigen, sobald es etwas zu zeigen gibt. */
+function showDockerLog(text) {
+  if (!text) return;
+  const el = $('dkr-log');
+  if (el.textContent === text) return;
+  el.textContent = text;
+  // Beim Verfolgen soll das Neueste sichtbar sein.
+  if (el.style.display === 'block') el.scrollTop = el.scrollHeight;
+}
+
 function tickElapsed() {
   const el = $('dkr-elapsed');
-  if (!el || flow[currentStep] !== 'docker') return;
-  el.textContent = t('docker.elapsed', { n: Math.floor((Date.now() - dockerStart) / 1000) });
+  if (!el || flow[currentStep] !== 'docker' || dockerDone) return;
+  const elapsed = Date.now() - dockerStart;
+  el.textContent = t('docker.elapsed', { n: Math.floor(elapsed / 1000) });
+  // Nach 90 s bekommt der Nutzer beides, was ihm bis dahin fehlte: Einblick
+  // (Protokoll) und einen Ausweg (erneut versuchen).
+  if (elapsed >= STALL_AFTER_MS) revealDockerEscape();
+  if (elapsed >= TIMEOUT_MS) { dockerFailed(t('docker.timedOut')); return; }
   setTimeout(tickElapsed, 1000);
+}
+
+// Der Fussbutton wechselt seine Bedeutung (weiter / erneut versuchen). Ein
+// Handler-Slot statt addEventListener pro Zustand: sonst überlebt der alte
+// Handler den Wechsel und ein Klick auf „Weiter" startete Docker neu.
+let dockerPrimaryHandler = null;
+/**
+ * Den Primaerknopf des Docker-Schirms setzen - ueber den SCHLUESSEL, nicht den
+ * fertigen Text.
+ *
+ * Der Knopf trug `data-i18n="docker.toAdmin"` und wechselt zur Laufzeit auf
+ * „Erneut versuchen". Ein Sprachwechsel schrieb dann den Grundtext zurueck,
+ * waehrend der Handler weiter restartDocker war: Beschriftung und Handlung
+ * liefen auseinander, und zwar an einem der beiden irreversiblen Momente.
+ */
+function setDockerPrimary(labelKey, handler) {
+  const btn = $('dkr-next');
+  if (dockerPrimaryHandler) btn.removeEventListener('click', dockerPrimaryHandler);
+  dockerPrimaryHandler = handler;
+  dockerPrimaryKey = labelKey;
+  btn.textContent = t(labelKey);
+  btn.addEventListener('click', handler);
+}
+
+// Der Protokoll-Umschalter wird einmal verdrahtet, nicht bei jedem Einblenden.
+$('dkr-logs-toggle').addEventListener('click', () => {
+  const log = $('dkr-log');
+  const open = log.style.display !== 'block';
+  log.style.display = open ? 'block' : 'none';
+  logsOpen = open;
+  $('dkr-logs-toggle').textContent = t(logsOpen ? 'docker.hideLogs' : 'docker.showLogs');
+  if (open) log.scrollTop = log.scrollHeight;
+});
+
+/** Protokoll-Umschalter und „Erneut versuchen" einblenden (idempotent). */
+function revealDockerEscape() {
+  const foot = $('dkr-foot');
+  if (foot.style.display === 'flex') return;
+  $('dkr-stalled').style.display = 'flex';
+  $('dkr-logs-toggle').style.display = 'inline-flex';
+  setDockerPrimary('docker.retry', restartDocker);
+  foot.style.display = 'flex';
 }
 
 async function pollDocker() {
   try {
     const r = await fetch('/api/status');
+    if (!r.ok) throw new Error(`status ${r.status}`);
     const d = await r.json();
+    pollFailures = 0;
+    showDockerLog(d.logs);
     if (d.status === 'running') {
-      clearInterval(pollInterval);
-      $('dkr-icon').className = 'ok-icon';
-      $('dkr-icon').textContent = '✓';
-      $('dkr-text').textContent = t('docker.running');
-      $('dkr-foot').style.display = 'flex';
-      $('dkr-next').addEventListener('click', () => next());
+      dockerSucceeded();
     } else if (d.status === 'error') {
       clearInterval(pollInterval);
       dockerFailed(d.logs || t('docker.unknownError'));
+    } else {
+      setPhase(d.phase);
     }
-  } catch { /* keep polling during startup */ }
+  } catch {
+    // Ein einzelner Fehlschlag ist normal, solange der Container hochfährt.
+    // Eine ununterbrochene Serie ist es nicht.
+    if (++pollFailures >= MAX_POLL_FAILURES) {
+      clearInterval(pollInterval);
+      dockerFailed(t('docker.unknownError'));
+    }
+  }
+}
+
+function dockerSucceeded() {
+  // Endzustand nur einmal betreten: ein spaeter Tick aus einem Timer, der die
+  // Antwort schon unterwegs hatte, darf den Schritt nicht erneut umschalten.
+  if (dockerDone) return;
+  clearInterval(pollInterval);
+  dockerDone = true;
+  $('dkr-icon').className = 'ok-icon';
+  $('dkr-icon').textContent = '✓';
+  setDockerText('docker.running');
+  $('dkr-stalled').style.display = 'none';
+  $('dkr-expect').style.display = 'none';
+  $('dkr-logs-toggle').style.display = 'none';
+  $('dkr-log').style.display = 'none';
+  setDockerPrimary('docker.toAdmin', () => next());
+  $('dkr-foot').style.display = 'flex';
+}
+
+function restartDocker() {
+  $('dkr-icon').className = 'spinner';
+  $('dkr-icon').textContent = '';
+  $('dkr-stalled').style.display = 'none';
+  $('dkr-expect').style.display = '';
+  $('dkr-log').style.display = 'none';
+  $('dkr-log').textContent = '';
+  $('dkr-logs-toggle').style.display = 'none';
+  logsOpen = false;
+  $('dkr-logs-toggle').textContent = t('docker.showLogs');
+  $('dkr-foot').style.display = 'none';
+  startDocker();
 }
 
 function dockerFailed(logs) {
+  // Symmetrisch zu dockerSucceeded: pollDocker ist async, also kann ein Tick
+  // seine Antwort noch auswerten, nachdem ein anderer den Erfolg gemeldet hat.
+  // Ohne diesen Riegel ueberschriebe ein solcher Nachzuegler den fertigen
+  // Bildschirm mit einer Fehlermeldung.
+  if (dockerDone) return;
+  clearInterval(pollInterval);
+  dockerDone = true;
   $('dkr-icon').className = 'err-icon';
   $('dkr-icon').textContent = '✗';
-  $('dkr-text').textContent = t('docker.failed');
+  setDockerText('docker.failed');
+  $('dkr-stalled').style.display = 'none';
+  $('dkr-expect').style.display = 'none';
   const logEl = $('dkr-log');
   logEl.style.display = 'block';
   logEl.textContent = logs;
+  logEl.scrollTop = logEl.scrollHeight;
+  $('dkr-logs-toggle').style.display = 'none';
+  setDockerPrimary('docker.retry', restartDocker);
   $('dkr-foot').style.display = 'flex';
-  $('dkr-next').textContent = t('docker.retry');
-  $('dkr-next').addEventListener('click', () => {
-    $('dkr-icon').className = 'spinner';
-    $('dkr-icon').textContent = '';
-    $('dkr-text').textContent = t('docker.starting');
-    $('dkr-log').style.display = 'none';
-    $('dkr-foot').style.display = 'none';
-    startDocker();
-  }, { once: true });
 }
 
 $('adm-next').addEventListener('click', createAdmin);
@@ -1806,19 +3102,27 @@ async function createAdmin() {
       body: JSON.stringify({ username: u, display_name: dn, password: p, port: parseInt(S.port, 10) }),
     });
     const d = await r.json();
-    if (r.status === 201 || r.status === 403) {
-      const appUrl = new URL(`${S.scheme || 'http'}://placeholder`);
-      appUrl.hostname = S.host;
-      appUrl.port = S.port;
-      $('done-link').href = appUrl.href;
-      next();
+    // 201 = angelegt. 403/404 = es gibt schon eins, und das ist beim Rerun der
+    // NORMALFALL, kein Fehler: /auth/setup antwortet in production mit 404 und
+    // nur ausserhalb davon mit 403 (server/auth.js). Der 403-Zweig existierte in
+    // keinem realen Deployment - der Rerun-Nutzer bekam nach elf Schirmen den
+    // rohen englischen Serverstring „Not found." zu sehen, in allen 24 Sprachen,
+    // ohne Hinweis und ohne Weiterweg. Seit der Preflight bestehende
+    // Installationen ausdruecklich in DIESEN Pfad lenkt, ist das sein Regelfall.
+    if (r.status === 201) {
+      next();   // die Ziele setzt onEnterStep('done')
+    } else if (r.status === 403 || r.status === 404) {
+      adminExisted = true;
+      next();   // derselbe Abschluss: Download und „Als Naechstes" braucht er genauso
     } else {
       btn.disabled = false; btn.textContent = t('admin.create');
-      showErr('adm-err', d.error || t('admin.errCreate'));
+      // Uebersetzte Hauptaussage zuerst, das rohe Serverdetail nur in Klammern -
+      // hier landen sonst englische Serverstrings in allen 24 Sprachen.
+      showErr('adm-err', d.error ? `${t('admin.errCreate')} (${d.error})` : t('admin.errCreate'));
     }
   } catch (e) {
     btn.disabled = false; btn.textContent = t('admin.create');
-    showErr('adm-err', e.message);
+    showErr('adm-err', e.message ? `${t('admin.errCreate')} (${e.message})` : t('admin.errCreate'));
   }
 }
 
@@ -1829,6 +3133,20 @@ document.addEventListener('keydown', e => {
   if (el.tagName !== 'INPUT' || el.type === 'checkbox') return;
   const primary = $(`step-${flow[currentStep]}`)?.querySelector('.card-foot .btn-primary');
   if (primary && !primary.disabled) { e.preventDefault(); primary.click(); }
+});
+
+// Reload oder Schliessen wirft die gesamte Eingabe weg: der Wizard haelt
+// bewusst keinen Formularzustand vor (die Felder tragen Secrets). Ab dem
+// ersten Schritt fragt der Browser deshalb nach; auf dem Abschluss ist nichts
+// mehr zu verlieren. Gemessen: Reload auf Schritt 8 warf vorher kommentarlos
+// alles weg, inklusive eingefuegter OAuth-Secrets - waehrend ausgerechnet die
+// Sprachwahl den Reload ueberlebte.
+window.addEventListener('beforeunload', e => {
+  if (currentStep > 0 && flow[currentStep] !== 'done') {
+    e.preventDefault();
+    // Chrome verlangt zusaetzlich returnValue, der Text selbst kommt vom Browser.
+    e.returnValue = '';
+  }
 });
 
 showStep(0);

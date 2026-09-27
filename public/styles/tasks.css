@@ -51,18 +51,25 @@
   max-width: 320px;
 }
 
-.tasks-toolbar .btn--icon {
-  width: var(--target-base);
-  height: var(--target-base);
-  min-width: var(--target-base);
-  min-height: var(--target-base);
-}
+/* Hier stand ein Override auf --target-base. Er hat die Shell repariert, nicht
+ * das Modul: .btn--icon schaltete seine Größe nach der Viewport-Breite statt
+ * nach der Zeigerfähigkeit. Seit Phase 3c steht die eine Antwort in
+ * layout.css. */
 
 /* Sichtbarkeit wird per [hidden] geschaltet (Kanban blendet Gruppierung und
  * Mehrfachauswahl aus). Ohne diese Regel gewinnt display:flex/inline-flex der
  * Komponente gegen das Attribut. */
 .tasks-toolbar [hidden],
 .tasks-filters-row [hidden] {
+  display: none;
+}
+
+/* Und die Zeile selbst. Im Verlauf (#791) faellt die ganze Filterleiste weg,
+ * und `display: flex` weiter unten schlaegt das `[hidden] { display: none }`
+ * des Browsers per Spezifitaet - die Zeile stand mit `hidden` im DOM weiter
+ * sichtbar da. Dieselbe Falle, gegen die die Regel darueber schon einmal
+ * geschrieben wurde; sie deckte nur die KINDER ab. */
+.tasks-filters-row[hidden] {
   display: none;
 }
 
@@ -86,14 +93,152 @@
   margin-inline-start: auto;
 }
 
-@media (max-width: 640px) {
+@media (max-width: 639px) {
+  /* Kompakter Kopf (Finish-Review Fundament-Phase): die Toolbar schob die
+   * erste Aufgabe unter die Falz. Eine Stufe weniger Vertikalraum je Naht. */
+  .tasks-body {
+    padding-top: var(--space-3);
+  }
+
+  /* EINE Bedienzeile, auch auf dem Telefon (2026-08-10).
+   *
+   * Hier stand `flex-wrap: wrap` mit `row-gap`, also die Erlaubnis, in zwei
+   * Zeilen zu brechen: Chips (52px) plus Gruppierungswahl (54px), gemessen
+   * 110px. Zusammen mit dem dreizeiligen Kopf standen auf 375x812 damit 341px
+   * Chrome ueber 210px Inhalt - die Chrome-Regel (DESIGN.md) laesst Kopf plus
+   * EINE Bedienzeile, und die Zeile hier war anderthalb.
+   *
+   * `nowrap` genuegt, weil die Reihe darunter schon richtig gebaut ist: die
+   * Chips scrollen INNERHALB von `.tasks-filters` (Regel gleich darunter), die
+   * Gruppierungswahl bleibt als letztes Kind der Reihe stehen. Ein Moduswahl-
+   * schalter, der seitlich aus dem Bild scrollt, waere der falsche Tausch. */
   .tasks-filters-row {
-    flex-wrap: wrap;
-    row-gap: var(--space-2);
+    flex-wrap: nowrap;
+    margin-bottom: var(--space-3);
+  }
+
+  /* DIE GRUPPIERUNGSWAHL VERLIERT IHR LABEL (Label-Verlust-Regel, DESIGN.md).
+   *
+   * Mit Text mass sie 175px von 343 - mehr als die Haelfte der Zeile fuer eine
+   * Zwei-Wege-Wahl, und die Chips daneben wurden dadurch schon beim zweiten
+   * Chip von der Fade-Maske mitten im Wort abgeschnitten. Als Icon-Paar misst
+   * sie 88px und gibt den Rest den Chips zurueck.
+   *
+   * Die Regel verlangt drei Dinge, und alle drei stehen hier: die Icon-Form
+   * DERSELBEN Familie (das Icon stand vorher schon neben dem Label, es bleibt
+   * nur allein zurueck), die Zielgroesse in BEIDEN Achsen, und der Zustand
+   * ueber getoente Flaeche - den traegt `.group-toggle__btn--active`
+   * unveraendert weiter. Der zugaengliche Name haengt nicht an dieser Regel:
+   * `aria-label` steht im Markup, nicht in dieser Media-Query. */
+  .group-toggle__label {
+    display: none;
+  }
+
+  /* Die Zielgroesse steht am TRAEGER unter seinem eigenen Namen, nicht unter
+   * einem Nachkommen-Selektor: der Guard sucht die Signatur des Label-Verlusts
+   * und dann den Traeger im selben At-Block. Ein
+   * `.group-toggle:not(...) .group-toggle__btn` haette dieselbe Wirkung und
+   * waere fuer ihn unsichtbar - und damit fuer jeden, der die Regel spaeter
+   * pruefen will. Der Ansichts-Umschalter im Kopf bekommt sie mit; er ist
+   * dasselbe Bauteil und war mit 30px Hoehe ohnehin unter Mass. Seine engere
+   * Naht behaelt er ueber `.group-toggle--icons` (Regel weiter unten). */
+  .group-toggle__btn {
+    width: var(--target-base);
+    height: var(--target-base);
+    min-height: var(--target-base);
+    padding-inline: 0;
+  }
+
+  /* Chips in EINER seitlich scrollbaren Reihe statt zwei umbrochenen Zeilen -
+   * dieselbe versteckte Scroll-Leiste wie .sub-tabs-bar und .contacts-filters.
+   * Die Tap-Fläche der Chips (--target-lg aus filter-chip.css) bleibt
+   * unangetastet, kein Chip schrumpft in der nowrap-Reihe.
+   *
+   * Scroll-Affordanz (Finish-Verdict Fundament-Phase, Neubefund c): die Reihe
+   * clippte hart mitten im Wort am Rand. Eine Fade-Mask an der Endkante zeigt
+   * „hier geht es weiter"; das gleich große End-Padding sorgt dafür, dass am
+   * Scroll-Ende der letzte Chip VOR der Fade-Zone steht und voll lesbar ist.
+   * Startkante bewusst ohne Fade (iOS-Verhalten, Ruhelage bleibt bündig). */
+  .tasks-filters-row .tasks-filters {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+    padding-inline-end: var(--space-6);
+    -webkit-mask-image: linear-gradient(to right, var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+    mask-image: linear-gradient(to right, var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+  }
+
+  /* Achse gespiegelt, Werte gleich - Begruendung an den Basisregeln in
+     filter-chip.css. Die Endkante liegt in `ar` und `fa` links. */
+  [dir="rtl"] .tasks-filters-row .tasks-filters {
+    -webkit-mask-image: linear-gradient(to left, var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+    mask-image: linear-gradient(to left, var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+  }
+
+  .tasks-filters-row .tasks-filters::-webkit-scrollbar {
+    display: none;
+  }
+
+  .tasks-filters-row .tasks-filters > * {
+    flex-shrink: 0;
   }
 
   .tasks-filters__end {
     margin-inline-start: 0;
+  }
+
+  /* Icon-only-Segmente (Ansichts-Umschalter im Kopf) brauchen weniger
+   * Innenraum als Text-Segmente - schmaleres Padding, damit Titel + Aktionen
+   * bei 375px in EINE Zeile passen (zusammen mit den engeren
+   * .page-toolbar-Nähten aus layout.css; Finish-Verdict Fix 6). Eigene
+   * Variante statt Toolbar-Selektor: der #577-Rail-Guard verbietet
+   * horizontales Padding unter Rail-Aliassen pauschal. */
+  .group-toggle--icons .group-toggle__btn {
+    padding-inline: var(--space-2);
+  }
+}
+
+/* KOMPAKTE HÖHE: die Filterreihe ist EINE Bedienzeile, nicht zwei.
+ *
+ * Die Chrome-Regel (DESIGN.md) lässt über dem Inhalt den Kopf und höchstens
+ * eine Bedienzeile. Der Kopf hält sie shell-weit ein (layout.css); hier steht,
+ * was das für die Zeile darunter heißt. Gemessen auf 640x400: die Reihe
+ * umbrach in Chips (52px) plus Gruppierungswahl (54px), zusammen 110px -
+ * anderthalb Bedienzeilen aus einem `flex-wrap: wrap`, das für 375px gedacht
+ * war, wo der Platz FEHLT. Hier ist die Breite da und die Höhe knapp.
+ *
+ * Die scrollende Chip-Reihe steht schon unter (max-width: 639px) und wird
+ * hier wiederholt statt geteilt: ein 800x400-Fenster ist breit genug für die
+ * erste Regel und trotzdem zu niedrig für zwei Zeilen. Eine gemeinsame
+ * Bedingung hätte auch das Padding und die Nähte mitgenommen, die dort aus
+ * der BREITE folgen und hier falsch wären. */
+@media (max-height: 499px) {
+  .tasks-filters-row {
+    flex-wrap: nowrap;
+  }
+
+  .tasks-filters-row .tasks-filters {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+    padding-inline-end: var(--space-6);
+    -webkit-mask-image: linear-gradient(to right, var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+    mask-image: linear-gradient(to right, var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+  }
+
+  [dir="rtl"] .tasks-filters-row .tasks-filters {
+    -webkit-mask-image: linear-gradient(to left, var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+    mask-image: linear-gradient(to left, var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+  }
+
+  .tasks-filters-row .tasks-filters::-webkit-scrollbar {
+    display: none;
+  }
+
+  .tasks-filters-row .tasks-filters > * {
+    flex-shrink: 0;
   }
 }
 
@@ -101,13 +246,17 @@
 /* Gruppierungs-Toggle */
 .group-toggle {
   display: flex;
-  background-color: var(--color-surface-2);
+  background-color: var(--color-surface-3);
   border-radius: var(--radius-sm);
   padding: var(--space-0h);
   gap: var(--space-0h);
 }
 
 .group-toggle__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
   padding: var(--space-1) var(--space-3);
   border-radius: calc(var(--radius-sm) - 2px);
   font-size: var(--text-sm);
@@ -118,14 +267,117 @@
   cursor: pointer;
 }
 
+/* Die Gruppierungswahl folgt dem Chip neben ihr in dieselbe Höhenklasse.
+ *
+ * Sie steht mit den Filter-Chips in EINER Zeile und ist deren Nachbar, nicht
+ * ihr Gegenstück: bliebe sie bei --target-lg, während der Chip auf das
+ * Zeiger-Mass fällt, setzte allein sie weiter die Höhe der ganzen Reihe - der
+ * Gewinn beim Chip wäre rechnerisch da und optisch keiner. Gemessen bei
+ * 640x400: Reihe 54px, davon 54px von der Wahl und 48px vom Chip.
+ *
+ * Die Rücknahme auf Touch steht wie beim Chip daneben; die Begründung dort
+ * gilt hier wörtlich (filter-chip.css, § kompakte Höhenklasse). */
+/* `height` UND `min-height`, weil die Breitenklasse (max-width: 639px) dem Knopf
+ * ein festes `height: var(--target-base)` gibt - ein reines `min-height` hätte
+ * dagegen lautlos verloren, und bei 640x400 greifen BEIDE Klassen. */
+@media (max-height: 499px) {
+  .group-toggle__btn {
+    height: var(--target-md);
+    min-height: var(--target-md);
+  }
+}
+
+@media (max-height: 499px) and (hover: none) {
+  .group-toggle__btn {
+    height: var(--target-base);
+    min-height: var(--target-base);
+  }
+}
+
+/* ZWEI HÖHEN JE KOPFZEILE (Critique 2026-08-31, P3): der Ansichts-Umschalter
+ * stand am Desktop als 54px-Well neben 40px-Kapseln (--target-md ist die
+ * entschiedene Desktop-Zielhöhe der Kopf-Bedienelemente, siehe tokens.css) -
+ * die wichtigste Aktion war das KLEINSTE Element der Zeile. Am Zeigegerät
+ * fallen die Segmente des Kopf-Umschalters in dieselbe Höhenklasse wie ihre
+ * Nachbarn; Touch behält --target-lg aus der Basisregel. Bewusst nur im Kopf
+ * (.page-toolbar): die Gruppierungswahl der Filterzeile folgt dokumentiert
+ * der Höhenklasse ihres Chip-Nachbarn (Kommentar oben). */
+@media (hover: hover) and (pointer: fine) {
+  .page-toolbar .group-toggle {
+    /* 1px-Naht statt 2px: 40px-Segmente + Naht + Rand = 44px Aussenhoehe,
+     * exakt die Silhouette der Icon-Kapseln daneben. */
+    padding: var(--space-px);
+  }
+
+  .page-toolbar .group-toggle__btn {
+    min-height: var(--target-md);
+  }
+}
+
+/* Ein Segment-Label ist EINZEILIG oder gar nicht da: fuer Enge gibt es die
+ * Label-Verlust-Regel (Weglassen), nicht den Umbruch. Ohne nowrap brach
+ * „Kanban-Ansicht" am Bindestrich auf zwei Zeilen und streckte via
+ * align-items-Stretch ALLE Segmente auf 49px - das 55px-Well der Critique
+ * 2026-08-31 war in Wahrheit dieser eine Umbruch. */
+.group-toggle__label {
+  white-space: nowrap;
+}
+
+/* Das Icon steht neben dem Label, nicht statt seiner - solange Platz ist.
+ * Es ist der Teil, der bleibt, wenn das Label faellt (siehe die 640er-Regel). */
+.group-toggle__icon {
+  width: var(--icon-md);
+  height: var(--icon-md);
+  flex-shrink: 0;
+}
+
 .group-toggle__btn:hover:not(.group-toggle__btn--active) {
   color: var(--color-text-primary);
 }
 
+/* Aktiv = erhabene Surface-Pille im Well, Modulton nur in der Tinte - dieselbe
+ * Segment-Sprache wie .cal-toolbar__view-btn--active und .segmented__item
+ * (Rezept: tokens.css, Abschnitt 6c). */
 .group-toggle__btn--active {
-  background-color: var(--color-surface);
-  color: var(--color-text-primary);
-  box-shadow: var(--shadow-sm);
+  background-color: var(--seg-active-bg);
+  box-shadow: var(--seg-active-shadow);
+  color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-ink), var(--color-text-primary));
+}
+
+/* DER KOPF-UMSCHALTER TRAEGT SEIN LABEL ERST IN DER SIDEBAR-WELT.
+ *
+ * Die Label-Verlust-Regel oben (max-width: 639px) ist die Schwelle des
+ * Umschalters in der FILTERREIHE - der steht dort allein in seiner Zeile und
+ * hat den Platz. Der Umschalter im KOPF teilt sich seine Zeile mit Titel,
+ * Suche und vier weiteren Knoepfen, und fuer ihn ist 640px zu frueh:
+ * gemessen (2026-08-28, gleiche Laufart, nur Label an/aus) waechst er mit
+ * Label von 130 auf 395px und drueckt den Kopf bei 834px - iPad hochkant -
+ * von ZWEI auf DREI Zeilen, also um 52px. Genau die Zeile, die die
+ * Chrome-Regel nicht hergibt.
+ *
+ * 1024px ist deshalb nicht gegriffen, sondern die Grenze, an der der Kopf
+ * ohnehin einzeilig wird (dort uebernimmt die Sidebar, der Large Title faellt
+ * auf den Inline-Schnitt): gemessen 79px bei 1024 und 1440px, mit Label wie
+ * ohne. Was das Label kostet, ist dort 1px.
+ *
+ * NACHGEMESSEN MIT NOWRAP (2026-08-31): die 1px-Aussage oben galt nur, weil
+ * „Kanban-Ansicht" damals ZWEIZEILIG umbrach und der Umschalter dadurch
+ * kuenstlich schmal blieb. Einzeilig (nowrap, Regel oben) misst er 393px,
+ * und ab 1024px endete der Primaerknopf der Kopfzeile bei x=1221 - auf
+ * schmaleren Sidebar-Viewports ausserhalb. Frei ist die Zeile ab ~1240px;
+ * der Breakpoint-Kanon (tokens.css §11c, Guard in test-frontend-audit.js)
+ * erlaubt aber nur 640/768/1024/1440 samt Komplementen - also traegt der
+ * Umschalter sein Label erst in der Wide-Klasse (>= 1440). Zwischen 1024
+ * und 1439 stehen Icons mit aria-label/title, wie unterhalb 1024 zuvor.
+ *
+ * Warum HIER und nicht im 640er-Block oben: die Bauteile stehen ab Zeile 247,
+ * also HINTER jenem Block. Eine Regel gleicher Spezifitaet wuerde dort gegen
+ * die spaetere Definition verlieren - dieselbe Kaskaden-Falle, die im
+ * schmalen Zustand der Kueche schon einmal 358px Hoehe gekostet hat. */
+@media (max-width: 1439px) {
+  .group-toggle--icons .group-toggle__label {
+    display: none;
+  }
 }
 
 /* --------------------------------------------------------
@@ -167,22 +419,34 @@
   color: var(--color-ink-on-vivid);
 }
 
-/* Filter-Toggle-Button */
+/* Filter-Toggle-Button - FORM VOM CHIP, hier nur noch die Abweichung.
+ *
+ * Hier standen vierzehn Deklarationen, die `.filter-chip` (filter-chip.css)
+ * zeichengleich wiederholten: Anzeige, Ausrichtung, Gap, Polsterung, Radius,
+ * Schriftgrad und -schnitt, nowrap, Cursor, 1.5px-Kante, Fläche, Textfarbe,
+ * Übergang und Mindesthöhe. Der Knopf war damit der VIERTE Chip - genau die
+ * Divergenz, gegen die filter-chip.css angelegt wurde („Vorher definierten
+ * Tasks, Kontakte und Dokumente drei nahezu identische Chips nebeneinander").
+ * Er stand nur nicht in der Aufzählung, weil er anders heisst.
+ *
+ * ZWEI FOLGEN, DIE ES OHNE DIE KOPIE NICHT GEGEBEN HÄTTE:
+ *
+ * 1. Er trug weiter `transition: all`, das am Chip am 2026-07-30 als Defekt
+ *    ausgebaut wurde (`all` zieht Layout-Properties mit). Eine Kopie erbt
+ *    keine Korrekturen.
+ * 2. Seine `min-height: var(--target-lg)` war UNBEDINGT und setzte als
+ *    höchstes Kind die Höhe der ganzen Filterreihe - die Chips daneben
+ *    strecken sich (`#filter-bar` ist ein Flex-Container mit dem Default
+ *    `stretch`). Gemessen bei 640x400 mit Zeigergerät: die Chips lasen ihre
+ *    neue Höhenklasse korrekt als 40px und standen trotzdem bei 48px, weil
+ *    dieser Knopf die Zeile aufspannte. Wer nur den Chip misst, sieht den
+ *    Grund nicht.
+ *
+ * Was BLEIBT, ist die echte Abweichung: der Knopf schrumpft in der seitlich
+ * scrollenden Reihe nicht, und sein Aktiv-Zustand ist ein anderer als der des
+ * Chips (Kante und Tinte, KEINE getönte Fläche - „es sind Filter gesetzt" ist
+ * ein anderer Satz als „dieser Filter ist an"). */
 .filter-toggle-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  padding: var(--space-1) var(--space-3);
-  border-radius: var(--radius-full);
-  font-size: var(--text-sm);
-  font-weight: var(--font-weight-medium);
-  white-space: nowrap;
-  cursor: pointer;
-  border: 1.5px solid var(--color-border);
-  background-color: var(--color-surface);
-  color: var(--color-text-secondary);
-  transition: all var(--transition-fast);
-  min-height: var(--target-lg);
   flex-shrink: 0;
 }
 
@@ -192,9 +456,16 @@
   color: var(--color-text-primary);
 }
 
+/* Gesetzte Filter = derselbe Zustand wie ein aktiver Chip daneben, also
+ * dieselbe Behandlung: getönte Fläche, getönte Kante, --tint-ink-Tinte. Hier
+ * stand der ROHE Modulton als Kante UND als Text - die vierte Schreibweise
+ * desselben Tons in derselben Zeile, und die einzige ohne den gemessenen
+ * Ink-Mix. `--open` (Panel offen) bleibt davon unberührt: das ist ein anderer
+ * Zustand und trägt weiter nur eine neutrale Betonung. */
 .filter-toggle-btn--active {
-  border-color: var(--module-accent, var(--color-accent));
-  color: var(--module-accent, var(--color-accent));
+  background-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-state), transparent);
+  border-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-hint), transparent);
+  color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-ink), var(--color-text-primary));
 }
 
 .filter-toggle-btn__count {
@@ -260,106 +531,145 @@
 /* --------------------------------------------------------
  * Gruppen-Überschriften
  * -------------------------------------------------------- */
+/* NUR NOCH DER ABSTAND ZUR NÄCHSTEN GRUPPE steht hier. Form, Lesemaß und die
+ * Stellung von Label und Zählstand kommen aus `.list-group` (list-row.css) -
+ * dieselbe Grammatik wie im Einkauf und im Vorrat.
+ *
+ * Was dabei ENTFALLEN ist und warum:
+ *
+ * - `.task-group__header` mit `justify-content: space-between`: die Zahl stand
+ *   an der rechten TRÄGERKANTE statt am Ende ihrer Überschrift. Auf 1280px
+ *   waren das 640px Abstand zum Gruppennamen. Genau diesen Befund hatte der
+ *   Einkauf am 2026-07-30 („las sich als unverbundener Wert"), und die geteilte
+ *   Regel trägt seine Antwort bereits (`.list-group__count`, margin-inline-start).
+ * - `.task-group__count` als Pille auf --color-surface-2: ein Zählstand ist
+ *   kein Zustand. Die Pille gab ihm das Gewicht eines Badges neben Chips, die
+ *   im selben Bild wirklich Zustände tragen.
+ * - `.task-group__title` in der Sentence-Case-Rolle: die Gruppenbeschriftung
+ *   ist app-weit Versalien (list-row.css, „zwei der drei Tabs hielten es so").
+ *   Aufgaben war der Ausreisser.
+ *
+ * Das Lesemaß liegt jetzt an `.list-group` und gilt für Kopf UND Träger aus
+ * einer Regel - vorher stand derselbe Wert zweimal da. */
 .task-group {
   margin-bottom: var(--space-6);
 }
 
-.task-group__header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: var(--space-2);
-  padding: 0 var(--space-1);
-}
-
-.task-group__title {
-  /* Typografie via .nav-section-label-Schicht (Sentence-Case, Critique P2) */
-  color: var(--color-text-secondary);
-}
-
-.task-group__count {
-  font-size: var(--text-xs);
-  /* AA-lesbar auf --color-surface-2 (disabled/neutral-300 fiel durch — Critique) */
-  color: var(--color-text-secondary);
-  background-color: var(--color-surface-2);
-  padding: 2px var(--space-2);
-  border-radius: var(--radius-full);
-}
-
 /* --------------------------------------------------------
  * Swipe-Wrapper - Task-spezifische Styles
- * Basis-Styles (.swipe-row, .swipe-reveal, .swipe-reveal--done)
+ * Basis-Styles (.swipe-row, .swipe-reveal und alle drei Reveal-Rollen)
  * liegen in layout.css
  * -------------------------------------------------------- */
 
-/* Kein Margin mehr am Task-Card selbst (übernimmt swipe-row) */
+/* KEIN eigener Radius, KEIN eigener Abstand: beides gehört dem Träger
+ * (.list-rows), der die Wischfläche mit seinem overflow: hidden klippt.
+ * Das Touch-Feedback während der Geste trägt die geteilte Bühne
+ * (.swipe-row--swiping > :first-child in layout.css).
+ *
+ * KEIN `will-change: transform` mehr - auch das Compositor-Versprechen ist
+ * geteilt und hängt an der Geste (.swipe-row--armed). Hier stand es dauerhaft:
+ * 11 Aufgabenkarten gleichzeitig, 54 Ebenen und ~15,2 MB Ebenen-Speicher auf
+ * /tasks im Ruhezustand (Audit 2026-08-08, P2-1). */
 .swipe-row .task-card {
-  margin-bottom: 0;
-  border-radius: 0 var(--radius-md) var(--radius-md) 0;
   position: relative;
   z-index: 1;
-  will-change: transform;
 }
 
-/* Rechts hinter der Karte = Bearbeiten (Swipe nach rechts) */
-.swipe-reveal--edit {
-  left: 0;
-  background-color: var(--color-accent);
-  color: var(--color-ink-on-vivid);
-  border-radius: var(--radius-md) 0 0 var(--radius-md);
-}
-
-/* Touch-Feedback: leichte Hervorhebung während Swipe */
-.swipe-row--swiping .task-card {
-  box-shadow: var(--shadow-lg);
-}
-
-/* #11 Swipe-Affordanz: subtiler grüner Streifen am rechten Rand (nur Touch-Geräte) */
-@media (pointer: coarse) {
-  .swipe-row::after {
-    content: '';
-    position: absolute;
-    top: 0;
-    right: 0;
-    width: 4px;
-    height: 100%;
-    background: linear-gradient(to left, color-mix(in srgb, var(--color-success) 60%, transparent), transparent);
-    border-radius: 0 var(--radius-md) var(--radius-md) 0;
-    pointer-events: none;
-    transition: opacity var(--transition-fast);
-  }
-
-  .swipe-row--swiping::after {
-    opacity: 0;
-  }
-}
+/* Swipe-Affordanz: der geteilte Chevron-Hint aus layout.css (.swipe-row::after)
+ * trägt den Hinweis - wie beim Einkauf. Der frühere grüne Streifen (v0.20)
+ * überschrieb auf Touch dasselbe Pseudoelement, ließ aber dessen
+ * translateY(-50%) stehen: der "volle" Streifen hing zur Hälfte über der
+ * Kartenoberkante und stand als grauer Splitter an der rechten Kante
+ * (Finish-Review Fundament-Phase). */
 
 /* --------------------------------------------------------
  * Task-Card
  * -------------------------------------------------------- */
+/* Zeile, keine Karte: KEINE eigene Fläche, KEIN Radius, KEIN Schatten, KEIN
+ * eigener Abstand. Das leistet alles der Träger (.list-rows), die Trennung
+ * seine Haarlinie `.list-rows > * + *`. Vorher war jede Aufgabe eine weiße
+ * Karte auf dem Grouped-Grund - das Karten-Paradigma, das der Einkauf in
+ * Runde 3 abgelegt hat und die Aufgaben behielten, weil der Zeilenlisten-Guard
+ * nur fand, wer die Regel schon befolgt. */
 .task-card {
-  background-color: var(--color-surface);
-  border-radius: 0 var(--radius-md) var(--radius-md) 0;
-  box-shadow: var(--shadow-sm);
-  margin-bottom: var(--space-2);
-  overflow: hidden;
-  transition: box-shadow var(--transition-fast);
+  transition: background-color var(--transition-fast);
 }
 
 .task-card:hover {
-  box-shadow: var(--shadow-md);
+  background-color: var(--color-surface-hover);
 }
 
-.task-card--done {
-  opacity: 0.6;
-  transition: opacity var(--transition-base);
+/* Erledigt und abgelegt (#688) treten über das Zurücknehmen-Muster zurück
+ * (tokens.css, #1230), nicht über die Deckung: `opacity: 0.6` / `0.55` zog
+ * jeden Text der Karte auf 1,7 bis 3,9:1, die Initialen der Avatare
+ * eingeschlossen. Fläche vertieft, Metazeile eine Stufe leiser, Priorität,
+ * Etiketten und Avatare voll. EINE Regel für beide, weil die Fläche gleich
+ * gemeint ist; der Unterschied liegt im Titel: erledigt trägt den Durchstrich,
+ * abgelegt nicht - die Aufgabe ist aus dem Lauf, nicht zwingend fertig. Der
+ * linke Streifen bleibt die Priorität.
+ *
+ * `.tasks-page` IST KEIN SCHMUCK. glass.css setzt die Kartenfläche mit
+ * `.tasks-page .task-card` (0-2-0) und schlug damit das unqualifizierte
+ * `.task-card--done` (0-1-0), obwohl dieses Stylesheet später lädt - die
+ * zurückgenommene Fläche kam auf /tasks nie an (Codex an #1230). Gleich
+ * spezifisch gewinnt jetzt die Ladereihenfolge, dieselbe Abmachung, die der
+ * Kommentar in glass.css nennt („glass.css < page CSS"). Die Fläche bleibt auch
+ * unter dem Zeiger: `.tasks-page .task-card:hover` (glass.css, 0-3-0) tönte die
+ * Karte sonst wie eine offene, deshalb steht die Hover-Fassung in derselben
+ * Regel. Guard: test-frontend-audit.js, „keine spezifischere Regel
+ * ueberschreibt eine zurueckgenommene Zustandsregel". */
+.tasks-page .task-card--done,
+.tasks-page .task-card--archived,
+.tasks-page .task-card--done:hover,
+.tasks-page .task-card--archived:hover {
+  background-color: var(--color-surface-receded);
 }
 
+.task-card--archived .task-card__title {
+  color: var(--color-text-secondary);
+}
+
+.task-card--done .task-card__meta,
+.task-card--done .due-date,
+.task-card--archived .task-card__meta,
+.task-card--archived .due-date {
+  color: var(--color-text-receded);
+}
+
+.task-card__archived {
+  color: var(--color-text-tertiary);
+}
+
+/* Die Polsterung steht als eigene Eigenschaft, weil die Trefferfläche des
+ * Titels sie mitrechnet (.task-card__title::before). Als zwei getrennte
+ * Literale liefen sie schon auseinander: das ::before rechnete mit --space-3,
+ * während die Karte hier --space-4 trug - auf dem Desktop endete die
+ * Trefferfläche damit 4px vor der Kartenkante. Ein Wert, zwei Leser. */
+/* SIE TRAEGT `.list-row` (Critique 2026-08-13, P2). Anzeigeart, Abstand,
+ * Umbruchverbot, Mindesthoehe, Uebergang und Hover kommen von dort - sie
+ * standen hier und in der Regel darueber ein zweites Mal.
+ *
+ * Die groessere Polsterung ist seit dem Folgelauf keine eigene Zahl mehr,
+ * sondern die benannte Stufe `.list-row--roomy` (list-row.css) samt ihrer
+ * Variable `--list-row-pad`; hier steht nur noch, was diese Zeile allein
+ * betrifft: die Verkleinerung unter 640px (weiter unten) und die Ausrichtung
+ * `flex-start`, weil ein zweizeiliger Titel seine Statuskugel sonst auf halbe
+ * Hoehe zoege. */
 .task-card__main {
-  display: flex;
   align-items: flex-start;
-  gap: var(--space-3);
-  padding: var(--space-4);
+}
+
+/* Gasse für den Wisch-Chevron (.swipe-row::after, layout.css): 8px Abstand vom
+ * Rand + 12px Glyph + 8px Luft. Der Einkauf reservierte sie an .shopping-item
+ * schon immer, die Aufgaben nicht - dort lag der Chevron über dem Zeilenende.
+ * Unauffällig unter 640px (Inline-Aktionen sind dort ausgeblendet), sichtbar
+ * auf Touch-Tablets zwischen 641 und 1023px, wo Chevron UND Inline-Aktionen
+ * gleichzeitig da sind. Ab 1024px blendet layout.css den Chevron aus, die
+ * Reserve kostet dort nichts, weil (hover: none) am Zeigergerät nicht greift. */
+@media (hover: none) {
+  .task-card__main {
+    padding-inline-end: calc(var(--space-2) + var(--space-3) + var(--space-2));
+  }
 }
 
 /* Status-Checkbox */
@@ -376,6 +686,34 @@
   align-items: center;
   justify-content: center;
   position: relative;
+}
+
+/* Die Personenauswahl beim Abhaken (#1205) steht NEBEN dem Haken, nicht darin.
+ *
+ * SIE DARF DIE ZEILE NICHT HOEHER MACHEN. Der Haken traegt seine Trefflaeche
+ * ueber ein ::before und haengt sich per negativem `margin-top` in die Zeile,
+ * damit --target-base die Zeilenhoehe nicht mitbestimmt (siehe die Regel
+ * darueber). Dieser Knopf macht es genauso - ohne den Ausgleich waere eine
+ * Aufgabenzeile mit Auswahl hoeher als eine ohne, und im Solo-Haushalt, wo er
+ * gar nicht rendert, saehe dieselbe Liste anders aus.
+ *
+ * ZURUECKGENOMMEN IM TON, VOLL IN DER FLAECHE. Optisch ist er die zweite
+ * Antwort auf eine Frage, die meistens keine braucht, also traegt er die
+ * tertiaere Textfarbe; angefasst wird er mit demselben Finger wie alles andere,
+ * also behaelt er --target-base als Trefflaeche. Das ist die Aufteilung aus
+ * tokens.css (Zielgroesse in mindestens einer Achse, Optik davon unabhaengig). */
+.task-doer-btn {
+  width: var(--target-base);
+  height: var(--target-base);
+  margin-top: calc((var(--target-base) - var(--space-5)) / -2);
+  margin-inline-start: calc(var(--space-2) * -1);
+  color: var(--color-text-tertiary);
+  flex-shrink: 0;
+}
+
+.task-doer-btn:hover,
+.task-doer-btn[aria-expanded='true'] {
+  color: var(--color-text-secondary);
 }
 
 .task-status-btn::before {
@@ -397,13 +735,43 @@
   transition: border-color var(--transition-fast), background-color var(--transition-fast);
 }
 
-.task-status-btn:hover::after {
+/* DAS ZEICHEN IST AUSGENOMMEN, statt seine Farbe zurueckzuschreiben.
+ *
+ * Hier stand die Ausnahme zuerst als Gegenregel (`--static:hover::after` mit
+ * `border-color: var(--color-text-tertiary)`), und die war eine FARBAUSSAGE mit
+ * Spezifitaet (0,2,1): sie schlug `--done::after` und `--in_progress::after`
+ * (beide (0,1,1)) und faerbte beim Ueberfahren den gruenen Ring einer
+ * erledigten Aufgabe grau. Das Zeichen bekam damit genau die Hover-Reaktion,
+ * die es nicht haben soll - nur in einer anderen Farbe (Review zu PR #1252).
+ *
+ * `:not()` sagt stattdessen, was gemeint ist: der KNOPF reagiert, das ZEICHEN
+ * nicht. Keine zweite Farbaussage, also auch nichts, was den Zustandsring
+ * ueberstimmen koennte. */
+.task-status-btn:not(.task-status-btn--static):hover::after {
   border-color: var(--module-accent, var(--color-accent));
+}
+
+/* DAS ZEICHEN STATT DES KNOPFS (#467), dieselbe Bauart wie
+ * `.subtask-item__checkbox--static` aus #1209: der Ring bleibt, weil er die
+ * Auskunft traegt - ob die Aufgabe erledigt ist -, aber nichts an ihm lockt
+ * mehr zum Tippen. Der Zeiger wird neutral, und die vergroesserte Trefflaeche
+ * (`::before`) verschwindet: sie ist fuer eine Beruehrung da, die es hier nicht
+ * mehr gibt. Den Hover-Rahmen nimmt die Regel oben aus, nicht eine Gegenregel
+ * hier - siehe die Begruendung dort.
+ *
+ * `cursor` steht NACH der Basisregel: gleiche Spezifitaet entscheidet die
+ * Quellreihenfolge, und davor stehend waere es wirkungslos gewesen. */
+.task-status-btn--static {
+  cursor: default;
+}
+
+.task-status-btn--static::before {
+  content: none;
 }
 
 /* Auf Mobile trägt die Kategorie-Section-Überschrift die Kategorie bereits —
  * das Inline-Label je Zeile ist dort redundant und kostet Platz. */
-@media (max-width: 640px) {
+@media (max-width: 639px) {
   .task-card .task-card__meta .task-card__category {
     display: none;
   }
@@ -482,6 +850,25 @@
   animation: check-pop var(--duration-md) var(--ease-out);
 }
 
+/* KEIN `check-pop` AM ZUSTANDSZEICHEN (#467). Die Animation quittiert eine
+ * BERUEHRUNG; an einem `span`, den niemand antippen kann, liefe sie bei jedem
+ * Neuzeichnen der Liste los und behauptete ein Abhaken, das gerade nicht
+ * stattfand.
+ *
+ * ZWEI KLASSEN IM SELEKTOR, NICHT EINE. `animation: none` stand zuerst in
+ * `.task-status-btn--static` (Zeile 751) - eine einzelne Klasse wie
+ * `--done` hier, also gleiche Spezifitaet, und weil `--static` WEITER OBEN
+ * steht, gewann `--done` nach Quellreihenfolge. Die Deklaration war damit
+ * wirkungslos, und der Kommentar darueber behauptete das Gegenteil (Review zu
+ * PR #1252). (0,2,0) haengt an keiner Position: wer die Bloecke morgen
+ * umsortiert, kippt die Regel nicht.
+ *
+ * Es steht NICHT in der reduced-motion-Abfrage: das ist keine Frage der
+ * Bewegungsvorliebe, sondern eine falsche Aussage. */
+.task-status-btn--done.task-status-btn--static {
+  animation: none;
+}
+
 /* Skalierungs-Pops unter reduzierter Bewegung abschalten (Audit F-07);
  * der Farbwechsel trägt das Feedback allein. */
 @media (prefers-reduced-motion: reduce) {
@@ -515,6 +902,24 @@
 
 .task-status-btn--done .task-status-btn__check { display: block; }
 
+/* Am Wandtablett IST der Haken die Personenauswahl (#1209).
+ *
+ * DER KNOPF SIEHT AUS WIE JEDER ANDERE HAKEN, und das ist Absicht. Am Display
+ * ist „ich" niemand - ein Tipp kann dort nicht abhaken, er muss fragen, fuer
+ * wen. Das ist ein Unterschied im VERHALTEN, nicht im Aussehen: wer an der
+ * Kuechenwand steht, soll denselben Ring sehen wie auf seinem Telefon und nicht
+ * erst ein neues Bauteil lernen. Der Statusknopf wird dort gar nicht gezeichnet,
+ * dieser hier steht an seiner Stelle, und er traegt dieselbe Basisklasse - also
+ * auch die Trefflaeche im ::before und den Ausgleich, der die Zeilenhoehe
+ * unveraendert laesst.
+ *
+ * DAS ICON DES POPOVER-TRIGGERS FAELLT DESHALB WEG. `popoverMenuHtml()` setzt
+ * immer eines, und ein `icon-md`-Haken mitten im leeren Ring waere ein dritter
+ * Zustand neben offen und erledigt - eine Aufgabe saehe aus, als waere sie
+ * schon abgehakt. Der Ring aus `::after` traegt die Darstellung allein, genau
+ * wie bei einer offenen Aufgabe. */
+.task-status-btn--pick > .icon-md { display: none; }
+
 .task-card__body {
   flex: 1;
   min-width: 0;
@@ -526,12 +931,28 @@
    * Die Reset-Regeln (font/border/background) kommen aus reset.css, hier nur
    * die Block-Geometrie, damit der Button wie der frühere Div fließt. */
   display: block;
+  position: relative;
   width: 100%;
   padding: 0;
   text-align: start;
   color: var(--color-text-primary);
-  margin-bottom: var(--space-1);
+  margin-bottom: var(--space-0h);
   cursor: pointer;
+  /* EINZEILIG MIT ELLIPSE, und das ist die Ausnahme von der Regel nebenan
+   * (list-row.css: „UMBRECHEN, NICHT ABSCHNEITEN"). Die Regel gilt dem
+   * ARTIKELNAMEN im Laden: dort ist der Name der einzige Zweck der Zeile und
+   * nirgends sonst zu haben. Ein Aufgabentitel steht vollstaendig in der
+   * Detailflaeche, die ein Tipp auf genau diesen Knopf oeffnet.
+   *
+   * Gemessen bei 390x844: von zwoelf Zeilen brachen zwei zweizeilig um
+   * („Tropfenden Wasserhahn reparieren", „Geburtstagsgeschenk fuer Mama") und
+   * standen mit 80,6px gegen 61,1px der uebrigen zehn - eine Streuung von
+   * 19,5px in einer Liste, die einen Takt haben soll. Die 228px Titelspalte
+   * fassen rund 28 Zeichen; was darueber liegt, endet jetzt in einer Ellipse
+   * statt in einer zweiten Zeile. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   text-decoration: line-through;
   text-decoration-color: transparent;
   transition:
@@ -539,16 +960,143 @@
     text-decoration-color var(--transition-base);
 }
 
+/* DER TITEL NIMMT DEN PLATZ, DEN SEINE KARTE IHM LÄSST (Zielgrössen-Regel,
+ * DESIGN.md). Die Box misst 22,1px - eine Textzeile im Body-Schnitt - und kam
+ * bisher allein über die Spacing-Ausnahme von WCAG 2.5.8 durch: das nächste
+ * Zielzentrum liegt weit genug weg. Genau das war der Fehlschluss. Die
+ * Ausnahme ist für Ziele gedacht, die dicht stehen MÜSSEN, weil sie nicht
+ * wachsen können, ohne ihren Nachbarn zu verdrängen. Dieser Titel kann: über
+ * ihm liegen 12px Karten-Padding und unter ihm 4px bis zur Metazeile, beide
+ * leer. Er war kurz aus Versehen, nicht aus Platznot.
+ *
+ * ::before statt Padding, weil der Text bleiben soll, wo er ist - dasselbe
+ * Rezept wie bei `.weather-widget__refresh` („kompakt aussehen, voll treffen",
+ * DESIGN.md). Die Fläche endet exakt an der Metazeile: unten steht der Wert des
+ * `margin-bottom` darüber, keinen Pixel mehr, sonst nähme sie den Tag-Filtern
+ * ihre eigenen Treffer weg. Oben steht die Polsterung der Zeile.
+ *
+ * BEIDE SEITEN LESEN IHREN NACHBARN, statt ihn zu wiederholen: `--list-row-pad`
+ * kommt aus `.list-row--roomy` (list-row.css) und wird mobil kleiner,
+ * `--space-0h` ist derselbe Token wie im margin-bottom darüber. Vorher standen
+ * hier zwei Literale, und eines davon (--space-3 gegen --space-4 Polsterung)
+ * stimmte schon nicht. */
+.task-card__title::before {
+  content: '';
+  position: absolute;
+  inset-block: calc(-1 * var(--list-row-pad, var(--space-3))) calc(-1 * var(--space-0h));
+  inset-inline: 0;
+}
+
 .task-card--done .task-card__title {
   color: var(--color-text-secondary);
   text-decoration-color: var(--color-text-secondary);
 }
 
+/* EINE ZEILE, UND SIE BRICHT NICHT UM.
+ *
+ * Hier stand `flex-wrap: wrap` mit 12px Gap. Das war der Höhentreiber der
+ * Aufgabenliste, nicht die Polsterung: acht mögliche Elemente (Priorität, zwei
+ * Daten, Wiederholung, Anhang, Sichtbarkeit, Kategorie, bis zu vier Etiketten)
+ * ergaben je nach Aufgabe zwei bis drei Metazeilen, und benachbarte Zeilen
+ * waren damit verschieden hoch - das Auge findet in einer Liste ohne festen
+ * Takt keinen Rhythmus mehr.
+ *
+ * WAS ÜBERLÄUFT, IST ENTSCHIEDEN, NICHT ZUFÄLLIG: Priorität und Fälligkeit
+ * schrumpfen nicht (`flex-shrink: 0` unten), das Etikett schon - es trägt seine
+ * eigene Ellipse (`.list-row__tag`/`.task-tag`) und den „+N"-Marker daneben.
+ * Deshalb ist die Reihenfolge im Markup die Rangfolge: was hinten steht, gibt
+ * zuerst nach. Ein Abschnitt ohne Ellipse käme in dieser Zeile nicht vor.
+ *
+ * Warum nicht einfach weniger rendern: die Auswahl trifft schon renderTaskCard
+ * (zwei Daten, doppelte Kategorie, ein Etikett statt drei). Diese Regel hält
+ * den Takt auch dann, wenn eine Aufgabe alles gleichzeitig trägt. */
 .task-card__meta {
   display: flex;
   align-items: center;
-  gap: var(--space-3);
-  flex-wrap: wrap;
+  /* 4px, nicht 8: die Elemente der Zeile sind Pillen mit eigener Polsterung und
+   * eigener Fläche - zwischen zwei Chips liest sich der Abstand optisch als das
+   * Doppelte. Gemessen war es die letzten 3px, die eine Zeile mit Priorität,
+   * Fälligkeit UND Wiederholungs-Glyphe (231px auf 228px) noch überlaufen
+   * liessen. */
+  gap: var(--space-1);
+  flex-wrap: nowrap;
+  min-width: 0;
+  overflow: hidden;
+  /* DIE ZEILE TRAEGT IHRE HOEHE, NICHT DER GROESSTE CHIP DARIN.
+   *
+   * Bis 2026-08-18 war das Prioritaets-Etikett mit seiner Fuellung, seiner
+   * Kante und seiner geerbten Zeilenhoehe das hoechste Element hier (23,63px)
+   * und bestimmte damit den Abstand zwischen Titel und Metazeile. Ohne die
+   * Fuellung (Skalen-Regel) blieb die Zeile beim Etikett stehen: 22,8px, und
+   * die Zielzentren von Titel und Tag ruckten von 23,56 auf 23,15px zusammen -
+   * unter die 24px, die WCAG 2.5.8 fuer zwei untermassige Ziele verlangt.
+   * Sonde 4 der Dokument-Guards hat genau das gemeldet.
+   *
+   * Die Hoehe gehoert deshalb der ZEILE. 25px setzt den Abstand auf 24,25px
+   * (gemessen, 1440x900, de) und haelt ihn auch fuer Zeilen ohne Etikett und
+   * ohne Tag, wo die Metazeile bisher noch flacher war - eine Zusicherung, die
+   * es vorher gar nicht gab, weil sie an einem Chip hing, der fehlen darf. */
+  min-height: 25px;
+}
+
+.task-card__meta > .priority-badge,
+.task-card__meta > .due-date {
+  flex-shrink: 0;
+}
+
+/* DAS ETIKETT GIBT NACH, UND ZWAR MIT ELLIPSE.
+ *
+ * Ohne diese Regel klippte der `overflow: hidden` der Metazeile das Chip mitten
+ * im Wort ab: gemessen bei 390px stand „drin" statt „dringend" und bei einer
+ * langen Fälligkeit („Überfällig - 11.08.2026") blieb vom Etikett ein 1px
+ * breiter Splitter stehen. `.list-row__tag` trägt seine Ellipse seit jeher,
+ * `.task-tag` hatte sie nie - sie brauchte sie auch nie, solange die Zeile
+ * umbrach.
+ *
+ * `min-width` statt reinem `flex-shrink`: unter etwa vier Zeichen sagt ein
+ * Etikett nichts mehr, und dann ist der „+N"-Marker daneben die ehrlichere
+ * Auskunft. Der Marker selbst schrumpft nie - er ist zwei bis drei Zeichen breit
+ * und ist genau die Stelle, an der steht, dass etwas fehlt. */
+.task-card__meta > .task-tag {
+  flex: 0 1 auto;
+  /* 24px, WEIL DIE ZEILE PLATZ HAT. Ein Etikett, das anfassbar ist (der
+   * Filter-Tag setzt den Filter), darf die Spacing-Ausnahme von WCAG 2.5.8 nur
+   * nehmen, wenn es sie BRAUCHT - sitzt es in einer Zeile, die ihm die vollen
+   * 24px liesse, ist die Ausnahme eine Ausrede. Sonde 4 der Dokument-Guards
+   * misst genau das („nimmt die Spacing-Ausnahme, obwohl sein Traeger Platz
+   * laesst"). Die 23px kamen aus Schriftgroesse plus Polsterung und waren nie
+   * gesetzt, sondern uebrig geblieben. */
+  min-height: 24px;
+  align-items: center;
+  min-width: 3.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* DAS ETIKETT IST EINE FRAGE DER BREITE, NICHT DES GERÄTS - deshalb der
+   * Container und nicht der Viewport: massgeblich ist, was die ZEILE hat.
+   *
+   * GEMESSEN, NICHT GESCHÄTZT (390px, de, Demo-Haushalt): der Textspalte
+   * bleiben 258px, „• Dringend" belegt 88px und „Heute fällig" mit Glyphe
+   * 110px - mit Abständen 214px. Für ein Etikett bleiben 44px, und darunter
+   * beginnt es zu klippen: gemessen stand „drin…" statt „dringend", und in der
+   * Nachbarzeile schnitt der Überlauf das FÄLLIGKEITSDATUM an („11.08.202|6").
+   * Ein angeschnittenes Datum ist schlimmer als ein fehlendes Etikett.
+   *
+   * Das englische Mockup traf die Grenze nicht: „Urgent" und „Aug 13" sind
+   * zusammen 60px kürzer als ihre deutschen Entsprechungen. Die Zeile hängt
+   * damit an der längsten Locale, nicht an der Referenz-Locale. */
+  display: none;
+}
+
+@container list-rows (min-width: 420px) {
+  .task-card__meta > .task-tag {
+    display: block;
+  }
+}
+
+.task-card__meta > .task-tag--more {
+  flex-shrink: 0;
+  min-width: 0;
 }
 
 .task-card__inline-action {
@@ -564,45 +1112,61 @@
   color: var(--color-text-primary);
 }
 
-@media (max-width: 640px) {
+@media (max-width: 639px) {
   .task-card__main {
     gap: var(--space-2);
-    padding: var(--space-3);
+    /* Der Takt der Liste entsteht aus Polsterung UND Metazeile. Die Metazeile
+     * bricht seit dem Schnitt nicht mehr um (siehe .task-card__meta), damit
+     * trägt die Polsterung die Höhe allein: 12px oben und unten ergaben 71px
+     * je Zeile, 8px ergeben 58px - bei unveränderter Zielgröße, weil die
+     * Trefferfläche des Titels an --list-row-pad hängt und mitwandert. */
+    --list-row-pad: var(--space-2);
   }
 
-  .task-card__inline-action[data-action="archive-task"] {
+  /* HIG-Dichte (Reminders-Muster): auf Touch KEINE Inline-Action-Buttons -
+   * Tippen öffnet die Lese-Ansicht (mit allen Aktionen), Wischen erledigt/
+   * bearbeitet. Drei 44px-Buttons pro Zeile quetschten den Titel auf ~115px
+   * und brachen jede Aufgabe zweizeilig um. */
+  .task-card__inline-action {
     display: none;
   }
 }
 
-/* Prioritäts-Badge */
+/* ── PRIORITAET: EINE RANGMARKE, KEIN GETOENTES FELD ──
+ *
+ * Bis 2026-08-18 nannte dieses Etikett seinen Ton DREIMAL blass: als Fuellung
+ * (12 % light / 18 % dark), als Kante (25 % von currentColor) und als Schrift.
+ * Genau die Bauart, die die Vollton-Regel an den Marken abgeloest hat - hier
+ * auf einer SKALA, wo sie mehr kostet: gemessen (skalen-vollton.mjs, CIEDE2000
+ * gegen die Kartenflaeche) liegen die Fuellungen von „Hoch" und „Dringend"
+ * 3,47 (light) bzw. 4,01 (dark) auseinander. Das ist ueber der Schwelle von
+ * 2,3, aber ein Drittel dessen, was dieses Projekt fuer die Diagramm-Serien
+ * als Abstand akzeptiert hat, und die beiden Felder stehen nie nebeneinander,
+ * sondern jeweils allein in einer Zeile. Im Vollton sind es 12,90 und 23,62.
+ *
+ * Die Skalen-Regel hat deshalb zwei Zweige, und dieser hier ist der erste:
+ * eine RANGMARKE traegt ihren Ton in einem vollen Punkt, die Schrift bleibt
+ * neutral. Der zweite Zweig (eine MELDUNG traegt ihn in der Schrift) steht am
+ * Vorrats-Badge. Beide geben die Flaeche auf - eine Beimischung kann eine
+ * Stufe nicht benennen, sie kann sie nur andeuten.
+ *
+ * Der Nebeneffekt ist der eigentliche Gewinn in dieser Liste: das Etikett
+ * konkurriert nicht mehr mit dem Aufgabentitel um dieselbe Aufmerksamkeit,
+ * und die Tag-Chips daneben sind nicht mehr formgleich mit ihm. */
 .priority-badge {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
+  gap: var(--space-1h);
   font-size: var(--text-xs);
-  font-weight: var(--font-weight-semibold);
-  padding: 2px var(--space-2);
-  border-radius: var(--radius-glass-chip);
-  border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
 }
 
-.priority-badge--low     { color: var(--color-priority-low);    background-color: var(--color-priority-low-bg); }
-.priority-badge--medium  { color: var(--color-priority-medium); background-color: var(--color-priority-medium-bg); }
-.priority-badge--high    { color: var(--color-priority-high);   background-color: var(--color-priority-high-bg); }
-.priority-badge--urgent  { color: var(--color-priority-urgent); background-color: var(--color-priority-urgent-bg); }
-
-.priority-dot {
-  width: var(--space-1);
-  height: var(--space-1);
-  border-radius: var(--radius-full);
-  flex-shrink: 0;
-}
-
-.priority-dot--low    { background-color: var(--color-priority-low); }
-.priority-dot--medium { background-color: var(--color-priority-medium); }
-.priority-dot--high   { background-color: var(--color-priority-high); }
-.priority-dot--urgent { background-color: var(--color-priority-urgent); }
+/* `.priority-dot` STAND HIER und ist nach list-row.css gezogen: dieselbe
+ * Rangmarke steht seit dieser Etappe auch am Aufgaben-Chip des Kalenders, und
+ * ein Page-CSS je Seite heisst, dass tasks.css dort gar nicht geladen ist. Eine
+ * zweite Fassung in calendar.css waere die Bauart gewesen, an der die
+ * Prioritaet ueberhaupt erst zwei Gesichter bekommen hat. */
 
 /* Fälligkeitsdatum */
 .due-date {
@@ -700,6 +1264,18 @@
   position: relative;
 }
 
+/* Dieselbe Modulton-Einladung wie am grossen Statusknopf (oben) und an
+ * .item-check (shopping.css) - die Unteraufgabe war der dritte Abhakmoment
+ * und der einzige ohne sie (Signaturelement-Runde 2026-08-31). */
+/* Wie am Statusknopf daneben: das Zeichen ist AUSGENOMMEN, statt seine Farbe
+ * zurueckzuschreiben. Die alte Gegenregel (`--static:hover` mit
+ * `border-color: var(--color-border)`) trug (0,2,0) und schlug damit
+ * `--done` (0,1,0) - am Wandtablett wurde der gruene Rahmen einer erledigten
+ * Teilaufgabe beim Ueberfahren grau, seit #1209. */
+.subtask-item__checkbox:not(.subtask-item__checkbox--static):hover {
+  border-color: var(--module-accent, var(--color-accent));
+}
+
 .subtask-item__checkbox::before {
   content: '';
   position: absolute;
@@ -710,6 +1286,39 @@
   background-color: var(--color-success);
   border-color: var(--color-success);
   animation: check-pop var(--duration-sm) var(--ease-out);
+}
+
+/* Am Wandtablett ist die Teilaufgabe ein Zustandszeichen, kein Bedienelement
+ * (#1209). Sie traegt dieselbe Grundform, damit die Liste dort nicht anders
+ * aussieht als anderswo - aber nichts, was eine Beruehrung verspricht: kein
+ * Zeigerwechsel, keine Modulton-Einladung beim Ueberfahren, und vor allem
+ * keine 15px-Trefflaeche um ein Element, das nichts tut. Der erste Anlauf war
+ * ein `disabled`-Knopf: die Form eines Bedienelements ohne seine Wirkung.
+ *
+ * DIE STELLE IST TEIL DER REGEL. Diese drei Regeln muessen NACH den
+ * Basisregeln darueber stehen: sie haetten sonst dieselbe Spezifitaet und
+ * verloeren nach Quellreihenfolge - sichtbar waere nichts, die Kaesten saehen
+ * weiter aus wie Knoepfe. Genau so ist es beim ersten Anlauf passiert, als der
+ * Block versehentlich in der `prefers-reduced-motion`-Abfrage weiter oben
+ * landete: dort wirkte er fuer niemanden, und nebenbei verlor
+ * `.task-status-btn--done` sein `animation: none`. */
+.subtask-item__checkbox--static {
+  cursor: default;
+}
+
+/* Dieselbe Stelle, derselbe Grund wie bei `.task-status-btn--done.--static`
+ * daneben - und derselbe Kaskadenfehler: `.subtask-item__checkbox--done`
+ * (Zeile 1258) traegt `check-pop` und steht davor. Am Wandtablett lief die
+ * Animation deshalb seit #1209 an jeder erledigten Teilaufgabe mit, bei jedem
+ * Neuzeichnen; mit dem Nur-lesen-Zeichen (#467) gilt das nun auch auf dem
+ * Telefon eines Mitglieds. Zwei Klassen, damit es nicht wieder an der
+ * Reihenfolge haengt. */
+.subtask-item__checkbox--done.subtask-item__checkbox--static {
+  animation: none;
+}
+
+.subtask-item__checkbox--static::before {
+  content: none;
 }
 
 .subtask-item__checkbox-icon {
@@ -727,6 +1336,31 @@
 .subtask-item--done .subtask-item__title {
   text-decoration: line-through;
   color: var(--color-text-secondary);
+}
+
+/* Umbenennen und Löschen eines Teilschritts (#748). Dieselbe Zielgröße und
+ * derselbe zurückgenommene Ton wie die Inline-Aktionen der Aufgabenzeile
+ * darüber - der Teilschritt ist eine Zeile derselben Liste, keine eigene
+ * Gattung. Bewusst NICHT hover-only: auf dem Touchgerät gibt es kein Hover,
+ * und dort ist das Korrigieren eines Tippfehlers der häufigere Fall. */
+.subtask-item__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-shrink: 0;
+}
+
+.subtask-item__action {
+  width: var(--target-base);
+  height: var(--target-base);
+  min-width: var(--target-base);
+  min-height: var(--target-base);
+  color: var(--color-text-tertiary);
+}
+
+.subtask-item__action:hover,
+.subtask-item__action:focus-visible {
+  color: var(--color-text-primary);
 }
 
 .subtask-item__add {
@@ -760,9 +1394,27 @@
   min-height: 60vh;
 }
 
+/* VIER Spalten, nicht drei. KANBAN_COLS() in pages/tasks.js fuehrt offen,
+ * laufend, erledigt und abgelegt; hier stand `repeat(3, 1fr)`, also fiel die
+ * vierte in eine zweite Rasterzeile unter die erste Spalte. Weil eine
+ * Rasterzeile ihre Hoehe von ihrer hoechsten Zelle nimmt, wanderte "Abgelegt"
+ * mit jeder erledigten Aufgabe weiter nach unten - das Desktop-Symptom aus
+ * #1250. Die Drei-Spalten-Regel stammt aus dem Redesign vom Maerz, die vierte
+ * Spalte kam Ende April dazu: die Spalte wurde ergaenzt, das Layout nicht.
+ *
+ * Zwei Stufen statt einer: vier Spalten waeren ab 640px je rund 160px breit,
+ * und eine Aufgabenkarte traegt dort Titel, Faelligkeit und Personen.
+ * `minmax(0, 1fr)` statt `1fr`, weil ein langer Titel ohne Leerzeichen die
+ * Spalte sonst ueber ihren Anteil hinaus aufzieht. */
 @media (min-width: 640px) {
   .kanban-board {
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1024px) {
+  .kanban-board {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
 
@@ -772,6 +1424,32 @@
   display: flex;
   flex-direction: column;
   min-height: 200px;
+}
+
+/* Eine zugeklappte Spalte ist nur noch ihr Kopf (#1250) - ohne das behielte sie
+ * ihre 200px und waere fast so hoch wie mit ein paar Karten darin, das
+ * Zuklappen also folgenlos. `min-height: auto` statt `0`: der Kopf traegt seine
+ * eigene Hoehe, und die soll er behalten. */
+.kanban-col--collapsed {
+  min-height: auto;
+}
+
+/* Der Kopf traegt die Gruppen-Grammatik aus list-row.css (.list-group__toggle,
+ * .list-group__chevron) - hier steht nur, was das Brett davon abweichend
+ * braucht: der Knopf fuellt die Zeile bis zum Zaehler. */
+.kanban-col__toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: start;
 }
 
 .kanban-col__header {
@@ -803,9 +1481,13 @@
   transition: background-color var(--transition-fast);
 }
 
-.kanban-col__body--over {
-  background-color: var(--color-accent-light);
-  border-radius: 0 0 var(--radius-md) var(--radius-md);
+/* `hidden` ALLEIN REICHT HIER NICHT, und das ist keine Vorsichtsmassnahme: die
+ * Regel darueber setzt `display: flex`, und eine Klassenregel sticht das
+ * `[hidden] { display: none }` des Browsers. Ohne diese Zeile traegt eine
+ * zugeklappte Spalte ihr Attribut und bleibt trotzdem stehen - sichtbar, voll,
+ * und fuer Screenreader zugleich als versteckt ausgewiesen. */
+.kanban-col__body[hidden] {
+  display: none;
 }
 
 .kanban-card {
@@ -823,24 +1505,49 @@
   box-shadow: var(--shadow-md);
 }
 
-.kanban-card--dragging {
-  opacity: 0.4;
+/* Die drei Zustände eines Zugs heißen seit #808 auch hier, wie sie überall im
+ * Haus heißen: SortableJS setzt `sortable-chosen` auf die aufgenommene Karte,
+ * `sortable-ghost` auf den Platzhalter an der Zielstelle und `sortable-drag`
+ * auf das mitgeführte Abbild. Vorher trug das Board eigene Namen für dieselben
+ * drei Dinge, weil es einen eigenen Drag hatte. */
+.kanban-card.sortable-chosen {
   cursor: grabbing;
-  transform: rotate(1.5deg);
 }
 
-.kanban-card--ghost {
-  position: fixed;
-  z-index: var(--z-drag);
-  pointer-events: none;
+/* Der Platzhalter zeigt, WO die Karte landet - er ist die Zielmarke, die vorher
+ * ein eigenes leeres div (`.kanban-drop-placeholder`) und eine eingefärbte
+ * Spalte übernommen haben. Er steht an der genaueren Stelle als beide. */
+.kanban-card.sortable-ghost {
+  opacity: 0.4;
+  border: var(--space-px) dashed var(--module-accent, var(--color-accent));
+  background-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-state), transparent);
+  box-shadow: none;
+}
+
+.kanban-card.sortable-drag {
   opacity: 0.88;
   box-shadow: var(--shadow-xl);
   transform: rotate(2deg) scale(1.03);
   transition: none;
 }
 
-.kanban-card--done {
-  opacity: 0.6;
+/* Dasselbe Zurücknehmen-Muster wie die Listenkarte (#1230). Die Deckung hat hier
+ * nur unter prefers-reduced-motion gegriffen - stagger() liess sonst ein
+ * Inline-`opacity: 1` stehen -, und dort lag jeder Text der Karte bei 1,8 bis
+ * 3,6:1. Die Kante ersetzt den Schatten: eine vertiefte Karte hebt sich nicht -
+ * auch nicht unter dem Zeiger. `.kanban-card:hover` (0-2-0) gab ihr sonst den
+ * Schatten einer aktiven Karte zurück (Codex an #1230); die Hover-Fassung steht
+ * deshalb in derselben Regel und schlägt ihn bei gleicher Spezifität durch die
+ * spätere Stelle. */
+.kanban-card--done,
+.kanban-card--done:hover {
+  background-color: var(--color-surface-receded);
+  box-shadow: 0 0 0 var(--space-px) var(--color-border-receded);
+}
+
+.kanban-card--done .kanban-card__meta,
+.kanban-card--done .due-date {
+  color: var(--color-text-receded);
 }
 
 .kanban-card__title {
@@ -882,7 +1589,7 @@
   height: 24px;
   padding: 0;
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-full);
   background: transparent;
   color: var(--color-text-secondary);
   cursor: pointer;
@@ -901,14 +1608,6 @@
   width: 12px;
   height: 12px;
   pointer-events: none;
-}
-
-.kanban-drop-placeholder {
-  height: 60px;
-  border: 2px dashed var(--color-accent);
-  border-radius: var(--radius-sm);
-  background-color: var(--color-accent-light);
-  opacity: 0.5;
 }
 
 /* Leere Spalte: ruhiger Hinweis, dass hier (noch) nichts liegt - statt einer
@@ -935,19 +1634,24 @@
 }
 
 /* Während ein Karten-Drag läuft: leere Spalten laden aktiv zum Ablegen ein.
+ * Die Frage "wird gerade gezogen?" beantwortet das DOM selbst - `sortable-chosen`
+ * hängt an der aufgenommenen Karte und verschwindet mit ihr. Vorher setzte der
+ * eigene Drag-Code dafür eine Klasse am Board und musste sie in jedem Ausgang
+ * wieder abräumen, auch im folgenlosen; ein vergessener Pfad hätte die Spalten
+ * für immer leuchten lassen.
  * Modul-Akzent (grün auf der Aufgaben-Seite), damit die Affordanz zur restlichen
  * Modulfarbe passt statt zum globalen Akzent. */
-.kanban-board--dragging .kanban-col__empty {
+.kanban-board:has(.sortable-chosen) .kanban-col__empty {
   border-color: var(--module-accent, var(--color-accent));
   color: var(--module-accent, var(--color-accent));
-  background-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) 8%, transparent);
+  background-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-state), transparent);
 }
 
-.kanban-board--dragging .kanban-col__empty-idle {
+.kanban-board:has(.sortable-chosen) .kanban-col__empty-idle {
   display: none;
 }
 
-.kanban-board--dragging .kanban-col__empty-drop {
+.kanban-board:has(.sortable-chosen) .kanban-col__empty-drop {
   display: inline;
 }
 
@@ -1001,7 +1705,7 @@
   min-height: var(--target-base);
 }
 
-@media (max-width: 640px) {
+@media (max-width: 639px) {
   .bulk-actions-bar {
     align-items: stretch;
     flex-direction: column;
@@ -1020,30 +1724,70 @@
   color: var(--color-text-tertiary);
 }
 
-/* Verknüpfte Dokumente im Aufgaben-Modal (#503). */
-.task-documents__list {
+/* Verknüpfte Dokumente in der LESEANSICHT (#503, #733).
+ *
+ * Im Formular steht seit #733 das geteilte Beleg-Feld (document-attach.css) -
+ * die eigene Auswahlliste, die hier einmal stand, ist damit weg und mit ihr
+ * ihre beiden Klassen. Was bleibt, ist der Chip: die Leseansicht nennt die
+ * Dokumente beim Namen, und Bilder zeigt sie als Vorschau. */
+.task-detail__docs {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
+  align-items: flex-start;
   gap: var(--space-2);
-  margin: var(--space-2) 0 var(--space-3);
 }
 
-.task-documents__empty {
-  margin: 0;
-  font-size: var(--text-xs);
-  color: var(--color-text-tertiary);
+/* Auto-fill statt fester Spaltenzahl: ein einzelnes Foto soll nicht auf
+ * Viertelbreite schrumpfen, vier sollen nicht überlaufen. */
+.task-detail__doc-previews {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(7rem, 1fr));
+  gap: var(--space-2);
+  width: 100%;
 }
 
+.task-detail__doc-preview {
+  display: block;
+  overflow: hidden;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-2);
+  line-height: 0;
+}
+
+.task-detail__doc-preview:hover {
+  border-color: var(--color-accent);
+}
+
+.task-detail__doc-preview:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+
+/* Feste Höhe mit `cover`: Hochkant-Fotos und Querformat stehen sonst in einer
+ * Reihe unterschiedlich hoch, und die Kachelreihe franst aus. */
+.task-detail__doc-preview img {
+  display: block;
+  width: 100%;
+  height: 7rem;
+  object-fit: cover;
+}
+
+/* Der Chip ist seit #733 nur noch in der Leseansicht zu Hause und dort selbst
+ * der Link: im Formular steht das geteilte Beleg-Feld, das seine eigenen Chips
+ * samt Entfernen-Knopf mitbringt. Deshalb Polsterung auf beiden Seiten gleich -
+ * die schmalere rechte gehoerte dem Knopf, den es hier nicht mehr gibt. */
 .task-doc-chip {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
   max-width: 100%;
-  padding: var(--space-1) var(--space-1) var(--space-1) var(--space-2);
+  padding: var(--space-1) var(--space-3);
   background: var(--color-surface-2);
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-full);
   font-size: var(--text-xs);
+  text-decoration: none;
 }
 
 .task-doc-chip__icon {
@@ -1057,21 +1801,104 @@
   color: var(--color-text-primary);
   text-overflow: ellipsis;
   white-space: nowrap;
-  text-decoration: none;
 }
 
-.task-doc-chip__name:hover {
+.task-doc-chip:hover .task-doc-chip__name {
   color: var(--color-accent);
   text-decoration: underline;
 }
 
-.task-doc-chip__remove {
+.task-doc-chip:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+
+/* --------------------------------------------------------
+ * Kommentare an einer Aufgabe (#734)
+ *
+ * Bewusst keine Sprechblasen und keine Avatare in der Reihe: die Unterhaltung
+ * steht in einer Detailansicht mit zwölf anderen Zeilen, und ein Chat-Look
+ * würde sie zum lautesten Element darin machen. Was sie braucht, ist die
+ * Zuordnung (wer, wann) und Luft zwischen den Beiträgen.
+ * -------------------------------------------------------- */
+.task-comments {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+}
+
+.task-comments__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.task-comments__status {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
+}
+
+.task-comment {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.task-comment + .task-comment {
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+.task-comment__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.task-comment__author {
+  font-weight: var(--font-weight-semibold, 600);
+  font-size: var(--text-sm);
+  color: var(--color-text-primary);
+}
+
+.task-comment__when {
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+}
+
+/* Die Aktionen treten zurück, bis der Beitrag berührt wird - sie gehören zum
+ * eigenen Kommentar und nicht zur Unterhaltung. Auf Zeigegeräten ohne Hover
+ * (Telefon) bleiben sie sichtbar, sonst wären sie unerreichbar. */
+.task-comment__actions {
+  display: flex;
+  gap: var(--space-1);
+  margin-inline-start: auto;
+  opacity: 0;
+  /* Unsichtbar heißt auch unerreichbar: ein Knopf mit opacity:0, der weiter
+   * Klicks annimmt, löscht einen Kommentar, den niemand angefasst zu haben
+   * glaubt. Tastaturfokus bringt ihn über :focus-within zurück. */
+  pointer-events: none;
+  transition: opacity var(--duration-sm) var(--ease-out);
+}
+
+.task-comment:hover .task-comment__actions,
+.task-comment:focus-within .task-comment__actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (hover: none) {
+  .task-comment__actions { opacity: 1; pointer-events: auto; }
+}
+
+.task-comment__action {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  flex: 0 0 auto;
-  width: 1.375rem;
-  height: 1.375rem;
+  width: 1.75rem;
+  height: 1.75rem;
   padding: 0;
   background: transparent;
   border: none;
@@ -1080,9 +1907,99 @@
   cursor: pointer;
 }
 
-.task-doc-chip__remove:hover {
-  background: var(--color-surface-raised);
+.task-comment__action:hover {
+  background: var(--color-surface-2);
+  color: var(--color-text-primary);
+}
+
+.task-comment__action--danger:hover {
   color: var(--color-danger);
+}
+
+.task-comment__action:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+
+/* Zeilenumbrüche des Verfassers bleiben stehen: ein Kommentar mit drei
+ * Aufzählungspunkten liest sich sonst als ein Absatz. */
+.task-comment__text {
+  font-size: var(--text-sm);
+  color: var(--color-text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.task-comment__mention {
+  color: var(--color-accent);
+  font-weight: var(--font-weight-medium, 500);
+}
+
+/* Die eigene Erwähnung bekommt eine Fläche: „mich hat jemand gemeint" ist der
+ * Grund, aus dem der Beitrag überhaupt gelesen wird. */
+.task-comment__mention--me {
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--color-accent) var(--tint-surface), transparent);
+}
+
+.task-comments__form,
+.task-comment__edit {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: flex-end;
+}
+
+.task-comments__field,
+.task-comment__edit {
+  position: relative;
+  width: 100%;
+}
+
+.task-comment__input {
+  width: 100%;
+  resize: vertical;
+}
+
+.task-comment__edit-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+/* Vorschläge beim Tippen eines @. Sie liegen über dem Feld und nicht darunter:
+ * in der Detailansicht steht das Eingabefeld ganz unten, eine Liste darunter
+ * fiele aus dem sichtbaren Bereich. */
+.task-comment__suggest {
+  position: absolute;
+  bottom: calc(100% + var(--space-1));
+  inset-inline-start: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  min-width: 12rem;
+  max-width: 100%;
+  padding: var(--space-1);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+
+.task-comment__suggest-item {
+  padding: var(--space-1) var(--space-2);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-primary);
+  font-size: var(--text-sm);
+  text-align: start;
+  cursor: pointer;
+}
+
+.task-comment__suggest-item:hover,
+.task-comment__suggest-item.is-active {
+  background: var(--color-surface-2);
 }
 
 /* Büroklammer-Badge auf der Aufgabenkarte (Anzahl verknüpfter Dokumente). */
@@ -1090,4 +2007,175 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-0h);
+}
+
+/* Notiz der Aufgabe in der Leseansicht (#731). Der Inhalt kommt durch denselben
+ * Renderer wie die Notizen, also gelten dort auch dieselben `note-md-*`-Regeln.
+ * Hier bleibt nur der letzte Blockabstand: er säße sonst als Leerzeile unter der
+ * Zeile, und die Notiz ist die letzte im Panel. */
+.task-detail__note > :last-child {
+  margin-bottom: 0;
+}
+
+/* --------------------------------------------------------
+ * Verlauf (#791)
+ *
+ * Die dritte Ansicht liegt auf der geteilten Zeilen-Grammatik (list-row.css):
+ * Gruppe, Trennlinien, Textspalte und Metazeile sind dieselben wie im Einkauf
+ * und im Vorrat. Hier steht nur, was ein Vorgang anders hat als ein Bestand -
+ * er ist ganzflaechig anklickbar, und er traegt rechts eine Uhrzeit.
+ * -------------------------------------------------------- */
+
+/* Die ganze Zeile ist der Weg zur Aufgabe, also ist sie ein Knopf. Ein
+ * anklickbares div waere fuer die Tastatur nicht vorhanden - dieselbe
+ * Entscheidung wie beim Gruppenkopf (#812). */
+.history-row {
+  width: 100%;
+  background: none;
+  border: 0;
+  font: inherit;
+  color: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.history-row:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: calc(var(--focus-ring-offset) * -1);
+  border-radius: var(--radius-xs);
+}
+
+/* Der Avatar sitzt in einem eigenen Traeger, weil er per aria-hidden aus der
+ * Vorlesereihenfolge faellt - der Name steht daneben. */
+.history-row__avatar {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+/* Name und Wiederholungszeichen NEBENEINANDER, also eine Flex-Zeile.
+ * `svg { display: block }` aus dem Reset macht aus einem Icon im Textfluss
+ * sonst einen eigenen Absatz: das Wiederholungszeichen stand unter dem Namen
+ * statt hinter ihm, und die Zeile war dreizeilig. */
+.history-row .list-row__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* Wer abgehakt hat, wenn es jemand anderes war als die erledigende Person
+ * (#1205). Eine Nebenauskunft, also leiser als der Name davor - aber Text und
+ * nicht nur Farbe, denn die Unterscheidung steht in den Woertern ("abgehakt
+ * von"), nicht im Ton. */
+.history-row__by {
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
+}
+
+/* Der Trenner gehoert ins Stylesheet, nicht in 24 Uebersetzungen: „Lea abgehakt
+ * von Mama" liest sich ohne ihn wie ein abgebrochener Satz, und ein Mittelpunkt
+ * am Anfang des Textes waere ein Satzzeichen, das jede Sprache mitschleppen
+ * muesste, obwohl es reine Typografie ist. */
+.history-row__by::before {
+  content: '·';
+  margin-inline-end: var(--space-1);
+}
+
+/* Tabellarisch, damit die Uhrzeiten untereinander fluchten: die Ziffern einer
+ * Spalte sollen eine Spalte ergeben und nicht ausfransen. */
+.history-row__time {
+  flex: 0 0 auto;
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Die Personenauswahl steht ueber der Liste und traegt deren Lesemass - sonst
+ * liefe sie bis an die Traegerkante, waehrend die Zeilen darunter bei 720px
+ * enden. */
+.history-people {
+  max-width: var(--page-measure, var(--content-max-width-narrow));
+  margin-bottom: var(--space-3);
+  overflow-x: auto;
+}
+
+/* WER IN EINER SCROLLENDEN REIHE STEHT, MUSS SICH SELBST GEGEN DAS SCHRUMPFEN
+ * WEHREN - UND ZWAR ALS DIREKTES KIND (#1068).
+ *
+ * `overflow-x: auto` an der Reihe greift erst, wenn die Flex-Items nicht mehr
+ * nachgeben. Solange sie duerfen, schrumpfen sie ZUERST und die Reihe scrollt
+ * gar nicht: gemessen bei 375px mit neun Mitgliedern fiel der schmalste Chip auf
+ * 40px - unter die Zielgroesse, die dieser Chip als Traeger des Label-Verlusts
+ * gerade zusichern soll. Mit der Regel bleiben alle neun bei 48px und die Reihe
+ * scrollt. Dasselbe Muster steht in dieser Datei schon einmal, an der
+ * Filterzeile: `.tasks-filters-row .tasks-filters > * { flex-shrink: 0 }`.
+ *
+ * Das Flex-Item ist der KNOPF. `.history-people__mark` liegt eine Ebene tiefer
+ * und ist fuer die Reihe unsichtbar - eine Regel dort haette diesen Schutz nie
+ * geleistet, so plausibel sie sich auch liest. */
+.history-people .group-toggle__btn {
+  flex-shrink: 0;
+}
+
+/* Die Marke, die bleibt, wenn das Label faellt.
+ *
+ * Ihr eigenes `flex-shrink: 0` gilt IM KNOPF, nicht in der Reihe: der Knopf ist
+ * selbst eine Flexbox, und ein langes Label neben der Scheibe wuerde sie sonst
+ * zusammendruecken. Die Groesse bringt der Avatar inline mit
+ * (`renderAvatarStack`), hier steht nur, dass sie ihm bleibt. */
+.history-people__mark {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+/* „Mehr anzeigen" schliesst die Liste ab, mittig unter ihr. */
+.history-more {
+  display: flex;
+  justify-content: center;
+  max-width: var(--page-measure, var(--content-max-width-narrow));
+  margin-top: var(--space-4);
+}
+
+/* --------------------------------------------------------
+ * „Zuletzt erledigt" in der Detailansicht (#791)
+ * -------------------------------------------------------- */
+
+.detail-history {
+  display: grid;
+  gap: var(--space-1);
+}
+
+/* Zeitpunkt und Person stehen NEBENEINANDER, nicht an den beiden Kanten.
+ * `justify-content: space-between` war hier ohne Wirkung - die Zeile hat die
+ * Breite ihres Inhalts, nicht die des Panels - und waere mit Wirkung falsch
+ * gewesen: dieselbe Beobachtung wie beim Gruppenkopf, wo ein an die rechte
+ * Kante geschobener Wert sich als unverbunden las (Critique 2026-07-30). Wer
+ * es gemacht hat, gehoert zu wann. */
+.detail-history__row {
+  display: flex;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+.detail-history__when {
+  color: var(--color-text-primary);
+}
+
+.detail-history__who {
+  color: var(--color-text-secondary);
+}
+
+/* Wer abgehakt hat, wenn es jemand anderes war (#1205) - dieselbe Rangfolge wie
+ * im Haushaltsverlauf: der Name der erledigenden Person steht vorn, die
+ * Nebenauskunft leiser dahinter. Die Zeile ist eine Flex-Zeile mit gap, der
+ * Trenner also unnoetig; dort steht er, weil der Zusatz IM Textfluss der
+ * Metazeile haengt. */
+.detail-history__by {
+  color: var(--color-text-tertiary);
+}
+
+.detail-history__empty {
+  margin: 0;
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
 }

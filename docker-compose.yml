@@ -10,23 +10,38 @@ services:
     volumes:
       - ${DATA_DIR:-./data}:/data
       - ${BACKUP_DIR:-./backups}:/backups
-      # Drop Yuvomi modules into ./modules, or set MODULES_DIR=/path/to/modules.
+      # Drop Yuvomi modules into ./modules, or set MODULES_DIR=/path/to/modules in
+      # .env. The app reads that name inside the container too, so environment:
+      # below pins it to /app/modules; the .env value only moves the mount source.
       - ${MODULES_DIR:-./modules}:/app/modules
-      # Optional local documents folder: mount a host directory to /documents inside the container
-      - ${DOCUMENT_STORAGE_LOCAL_DIR:-./documents}:/documents
+      # Optional local documents folder. BOTH ends come from the .env: the app
+      # writes to DOCUMENT_STORAGE_LOCAL_PATH, so mounting at a fixed /documents
+      # would send uploads into the container layer as soon as anyone changes
+      # that path - and they would be gone on the next pull && up -d.
+      - ${DOCUMENT_STORAGE_LOCAL_DIR:-./documents}:${DOCUMENT_STORAGE_LOCAL_PATH:-/documents}
+    # Bewusst die Kurzform, nicht `path:`/`required:` (Issue #765): die Langform
+    # gibt es erst ab Compose v2.24, und Synology DSM, QNAP und ältere Distros
+    # liefern älter - dort scheitert schon das Einlesen mit
+    # "services.yuvomi.env_file.0 must be a string", also noch vor dem ersten
+    # Start. Die Langform stand hier für Git-/GitOps-Stacks ohne .env (#698);
+    # dieser Weg geht seitdem über docs/docker-compose.portainer.yml, das jede
+    # Variable einzeln aufführt. Sie hier zu behalten kaufte nichts: ohne .env
+    # fehlt SESSION_SECRET, und der Container beendet sich beim Start - der
+    # Deploy scheitert also so oder so, nur eine Stufe später.
     env_file:
       - .env
     environment:
       - NODE_ENV=production
       - DB_PATH=${DB_PATH:-/data/yuvomi.db}
       - BACKUP_DIR=/backups
+      - MODULES_DIR=/app/modules
       # Local document storage (optional): set to true to store uploaded documents on the mounted /documents folder.
       - DOCUMENT_STORAGE_LOCAL_ENABLED=${DOCUMENT_STORAGE_LOCAL_ENABLED:-false}
       - DOCUMENT_STORAGE_LOCAL_PATH=${DOCUMENT_STORAGE_LOCAL_PATH:-/documents}
       # Secure cookies come from .env (the installer sets them):
       #   - Reverse proxy + HTTPS → SESSION_SECURE=true, TRUST_PROXY=1
       #   - Direct HTTP access     → SESSION_SECURE=false, TRUST_PROXY=loopback
-      # Default when unset (e.g. bare `docker compose up` without .env): false,
+      # Default when unset (e.g. a .env that does not carry the line): false,
       # so direct HTTP login keeps working out of the box.
       - SESSION_SECURE=${SESSION_SECURE:-false}
     healthcheck:

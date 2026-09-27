@@ -41,7 +41,8 @@ export default router;
 // Öffentliche Export-Fläche unverändert (von Tests + index.js konsumiert).
 export {
   computeStatsRange,
-  generateRecurringInstances, monthsPerInterval, effectiveMonthly, RECURRENCE_INTERVAL_KEYS,
+  generateRecurringInstances, occurrencesPerYear, occurrenceDatesInMonth, effectiveMonthly,
+  RECURRENCE_INTERVAL_KEYS, MAX_INTERVAL_COUNT, normalizeIntervalCount,
   categoryInUseCount, subcategoryInUseCount, categoryCountByType, subcategoryCountForCategory,
 } from './budget/helpers.js';
 export { resolveExportRange } from './budget/entries.js';

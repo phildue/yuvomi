@@ -4,13 +4,15 @@
     "continue": "Pokračovat",
     "back": "Zpět",
     "generate": "Generovat",
-    "generating": "…",
+    "generating": "Generuji…",
     "optional": "Volitelné",
     "stepCounter": "Krok {{n}} z {{total}}",
     "toggleVisibility": "Zobrazit nebo skrýt hodnotu",
     "copy": "Kopírovat",
     "copied": "Zkopírováno ✓",
-    "language": "Jazyk"
+    "language": "Jazyk",
+    "copyRedirect": "Kopírovat přesměrovací URI",
+    "opt": "(volitelné)"
   },
   "config": {
     "title": "Základní konfigurace",
@@ -22,7 +24,12 @@
     "tzLabel": "Časové pásmo",
     "errHost": "Neplatný název hostitele. Používej jen písmena, číslice, pomlčky a tečky.",
     "errPort": "Neplatný port. Musí být číslo mezi 1 a 65535.",
-    "prereqMissing": "Chybějící požadavky: {{list}}. Nainstaluj je a znovu načti stránku."
+    "prereqMissing": "Chybějící požadavky: {{list}}. {{link}} ukazuje, jak je nainstalovat.",
+    "prereqLinkDocker": "Návod pro Docker",
+    "prereqLinkCompose": "Návod pro podman-compose",
+    "prereqRecheck": "Zkusit znovu",
+    "errSecureOverHttp": "Veřejná adresa začíná na http://, ale tato volba vynucuje zabezpečené cookies - přihlášení pak není možné. Zvol „Přímý přístup\" nebo použij adresu https://.",
+    "errTz": "Neplatné časové pásmo. Očekává se název IANA, např. Europe/Berlin."
   },
   "secrets": {
     "title": "Bezpečnostní klíče",
@@ -32,7 +39,7 @@
     "dbLabel": "Šifrovací klíč databáze",
     "dbHint": "Šifruje databázi SQLite v klidovém stavu.",
     "errBoth": "Oba klíče jsou povinné.",
-    "dangerWarn": "Uložte tyto klíče hned. Pokud je ztratíte, vaše šifrovaná data budou nenávratně ztracena — neexistuje žádné obnovení.",
+    "dangerWarn": "Uložte tyto klíče hned. Pokud je ztratíte, vaše šifrovaná data budou nenávratně ztracena — neexistuje žádné obnovení. Na konci instalace si můžete stáhnout soubor .env s oběma klíči.",
     "preserved": "Vaše stávající klíče zůstanou zachovány, takže vás tato instalace neodřízne od současné databáze. Nechte pole prázdné, aby se klíč zachoval; zadání nové hodnoty jej nahradí.",
     "keepPlaceholder": "Stávající klíč zachován"
   },
@@ -48,12 +55,12 @@
     "unitsMetric": "Metrické (°C)",
     "unitsImperial": "Imperiální (°F)",
     "errCoords": "Zeměpisná šířka a délka jsou povinné.",
-    "errLat": "Neplatná zeměpisná šířka (–90 až 90).",
-    "errLon": "Neplatná zeměpisná délka (–180 až 180)."
+    "errLat": "Neplatná zeměpisná šířka (-90 až 90).",
+    "errLon": "Neplatná zeměpisná délka (-180 až 180)."
   },
   "calendar": {
     "title": "Synchronizace kalendáře",
-    "subtitle": "Propoj Yuvomi s Kalendářem Google nebo Apple iCloud. Obojí je volitelné – rozbal pro konfiguraci.",
+    "subtitle": "Propoj Yuvomi s Kalendářem Google, Apple iCloud nebo Outlookem. Vše volitelné - rozbal pro konfiguraci.",
     "google": "Kalendář Google",
     "googleHint": "Vytvoř OAuth přihlašovací údaje na {{link}}. Přesměrovací URI: {{redirect}}",
     "googleLink": "console.cloud.google.com",
@@ -66,17 +73,22 @@
     "appleUserLabel": "Apple ID (e-mail)",
     "applePassLabel": "Heslo pro aplikaci",
     "appleUrlLabel": "URL CalDAV",
-    "appleUrlOpt": "(volitelné)",
-    "appleUrlHint": "Nechej prázdné, pokud tvůj poskytovatel nepoužívá jiný koncový bod CalDAV."
+    "appleUrlHint": "Nechej prázdné, pokud tvůj poskytovatel nepoužívá jiný koncový bod CalDAV.",
+    "outlook": "Kalendář Outlook (Microsoft Graph)",
+    "outlookHint": "Vytvoř bezplatnou registraci aplikace Entra ID („pouze osobní účty Microsoft\") na {{link}} - viz instalační příručka. Přesměrovací URI: {{redirect}}",
+    "outlookLink": "entra.microsoft.com",
+    "outlookIdLabel": "ID klienta",
+    "outlookSecretLabel": "Tajný klíč klienta",
+    "outlookNote": "Jednosměrný push: Yuvomi zůstává zdrojem pravdy - změny v Outlooku se přepíší. Rodinné účty se připojí později v nastavení aplikace."
   },
   "advanced": {
     "tag": "Pokročilé · volitelné",
     "title": "Pokročilá nastavení",
-    "subtitle": "Reverzní proxy, jednotné přihlášení a automatické zálohy. Vše volitelné – přeskočení je bezpečné.",
+    "subtitle": "Jednotné přihlášení, přístup do domácí sítě a pár jemných nastavení. Vše volitelné.",
     "proxyLabel": "Jak je Yuvomi zpřístupněn?",
     "proxyBehindHttps": "Za reverzní proxy s HTTPS (Caddy, nginx, Traefik)",
     "proxyDirect": "Přímý přístup přes localhost / HTTP",
-    "proxyHint": "Přímý přístup zakáže cookies pouze pro HTTPS, aby přihlášení fungovalo bez HTTPS.",
+    "proxyHint": "Zvol „Přímý přístup\", pokud Yuvomi otevíráš přes http:// - jinak se nepřihlásíš. Za reverzní proxy s HTTPS zvol první možnost.",
     "oidc": "Jednotné přihlášení (OIDC)",
     "oidcHint": "Vyplň všechna čtyři pole pro povolení SSO, nebo je nechej prázdná.",
     "oidcIssuerLabel": "URL vydavatele",
@@ -101,8 +113,7 @@
     "documentLocalEnable": "Ukládat nové dokumenty do místní složky",
     "documentLocalPathLabel": "Cesta ke složce",
     "documentLocalPathHint": "Cesta uvnitř kontejneru. Ponechte prázdné pro /documents.",
-    "sectionNetwork": "Síť",
-    "sectionIntegrations": "Integrace a zálohy",
+    "sectionIntegrations": "Jednotné přihlášení",
     "errSchedule": "Neplatný cron plán (očekává se pět polí oddělených mezerami, např. 0 2 * * *).",
     "errKeep": "Počet zachovaných záloh musí být kladné číslo.",
     "webdavBackup": "Externí zálohy (WebDAV)",
@@ -125,7 +136,32 @@
     "documentGoogleDriveReuseHint": "Chcete-li znovu použít přihlašovací údaje OAuth Kalendáře Google, ponechte obě pole prázdná. Pro vlastní údaje je vytvořte v Google Cloud Console (jako v kroku Kalendář).",
     "documentGoogleDriveRedirectLabel": "URI přesměrování",
     "errDocumentGoogleDrivePair": "ID klienta a tajný klíč Google Drive musí být buď oba vyplněny, nebo oba prázdné.",
-    "errDocumentGoogleDriveCredentials": "Google Drive vyžaduje vlastní ID klienta a tajný klíč nebo nastavené přihlašovací údaje Kalendáře Google."
+    "errDocumentGoogleDriveCredentials": "Google Drive vyžaduje vlastní ID klienta a tajný klíč nebo nastavené přihlašovací údaje Kalendáře Google.",
+    "dataDirLabel": "Složka dat na hostiteli",
+    "dataDirHint": "Kde na serveru leží databáze a data aplikace. Nechte prázdné pro ./data vedle souboru compose.",
+    "documentLocalDirLabel": "Složka na hostiteli",
+    "documentLocalDirHint": "Složka na serveru, která se připojí do kontejneru. Nechte prázdné pro ./documents.",
+    "documentWebdavPrivateNetwork": "Povolit cíl WebDAV v domácí síti",
+    "documentWebdavPrivateNetworkHint": "Potřeba pro Nextcloud ve vlastní síti. Ruší ochranu SSRF pro tento cíl.",
+    "icsPrivateNetwork": "Povolit odběry kalendáře z domácí sítě",
+    "icsPrivateNetworkHint": "Potřeba pro ICS kanály ze zařízení ve vlastní síti. Ruší ochranu SSRF pro odběry kalendáře.",
+    "recipeProviderPrivateNetwork": "Povolit zrcadla poskytovatelů receptů v domácí síti",
+    "recipeProviderPrivateNetworkHint": "Potřeba pro instanci Mealie nebo Tandoor v síti. Ruší ochranu SSRF pro zrcadla poskytovatelů receptů.",
+    "wasteSourcePrivateNetwork": "Povolit kanály svozu odpadu v domácí síti",
+    "wasteSourcePrivateNetworkHint": "Potřeba pro obecní kalendář svozu odpadu zrcadlený ve vlastní síti. Ruší ochranu SSRF pro URL zdroje svozu odpadu.",
+    "oidcTrustEmail": "Důvěřovat e-mailu bez claimu verified",
+    "oidcTrustEmailHint": "Zapněte jen tehdy, pokud váš poskytovatel neposílá email_verified a důvěřujete mu.",
+    "oidcAllowSignup": "Povolit přihlášením přes SSO zakládat nové účty",
+    "oidcAllowSignupHint": "Vypněte, pokud váš poskytovatel slouží více lidem než této domácnosti. Stávající účty se dál přihlašují a dál se propojují.",
+    "baseUrlLabel": "Veřejná adresa",
+    "baseUrlHint": "Adresa, na které tvoje rodina otevírá Yuvomi - ne hostitel a port kontejneru. Používá se pro odkazy na obnovu hesla a pozvánky.",
+    "syncIntervalLabel": "Interval synchronizace kalendáře (minuty)",
+    "syncIntervalHint": "Jak často Yuvomi synchronizuje kalendáře a kontakty. Zvyš, pokud tě poskytovatel omezuje.",
+    "errSyncInterval": "Zadej celé kladné číslo minut.",
+    "sectionPrivateNetwork": "Přístup do domácí sítě",
+    "privateNetworkHint": "Yuvomi ve výchozím nastavení odmítá spojení na adresy ve tvé síti, což chrání před tím, aby byl server přiměn k oslovení interních služeb. Povol to, co doma opravdu provozuješ.",
+    "authPasswordLogin": "Zachovat přihlášení uživatelským jménem a heslem",
+    "authPasswordLoginHint": "Vypnutím se SSO stane jedinou cestou dovnitř: přihlašovací formulář i obnova hesla zmizí. Pokud je poskytovatel nedostupný, cesta zpět vede přes úpravu souboru .env a restart."
   },
   "review": {
     "title": "Přehled",
@@ -154,24 +190,45 @@
     "webdavBackup": "Externí zálohy",
     "on": "zapnuto",
     "off": "vypnuto",
-    "documentGoogleDrive": "Dokumenty Google Drive"
+    "documentGoogleDrive": "Dokumenty Google Drive",
+    "sessionSecret": "Klíč relace",
+    "dbKey": "Klíč databáze",
+    "keyGenerated": "Nově vytvořen",
+    "keyPreserved": "Stávající zůstane zachován",
+    "dataDir": "Složka dat",
+    "privateNetwork": "Přístup do vlastní sítě",
+    "privateNetworkIcs": "Odběry kalendáře",
+    "privateNetworkRecipes": "Recepty",
+    "privateNetworkWaste": "Svoz odpadu",
+    "privateNetworkWebdav": "Dokumenty WebDAV",
+    "baseUrl": "Veřejná adresa",
+    "outlook": "Kalendář Outlook",
+    "notEnabled": "nepovoleno"
   },
   "docker": {
     "title": "Spouštění Yuvomi",
     "subtitle": "Obraz se načítá a kontejner Docker se spouští.",
-    "starting": "Spouštění kontejneru …",
     "elapsed": "{{n}} s uplynulo",
     "running": "Kontejner je v pořádku a spuštěn",
     "failed": "Kontejner se nepodařilo spustit",
     "unknownError": "Neznámá chyba",
     "toAdmin": "Pokračovat na nastavení správce",
-    "retry": "Zkusit znovu"
+    "retry": "Zkusit znovu",
+    "phasePull": "Stahování obrazu",
+    "phaseBoot": "Kontejner se spouští",
+    "phaseHealth": "Probíhá kontrola stavu",
+    "firstRunHint": "Poprvé to může trvat několik minut.",
+    "stalled": "Trvá to déle než obvykle. Protokol níže ukazuje proč.",
+    "showLogs": "Zobrazit protokol",
+    "hideLogs": "Skrýt protokol",
+    "timedOut": "Po 15 minutách žádná odpověď. Zkontrolujte protokol a zkuste to znovu.",
+    "logLabel": "Protokol kontejneru"
   },
   "admin": {
     "title": "Vytvoření účtu správce",
     "subtitle": "Nastav své první přihlášení. Tento účet má úplný přístup k Yuvomi.",
     "userLabel": "Uživatelské jméno",
-    "userHint": "3–64 znaků: písmena, číslice, . - _",
+    "userHint": "3-64 znaků: písmena, číslice, . - _",
     "nameLabel": "Zobrazované jméno",
     "passLabel": "Heslo",
     "passPlaceholder": "Minimálně 8 znaků",
@@ -179,7 +236,7 @@
     "creating": "Vytváří se …",
     "create": "Vytvořit účet",
     "errAll": "Všechna pole jsou povinná.",
-    "errUser": "Neplatný formát uživatelského jména (3–64 znaků, písmena/číslice/._-).",
+    "errUser": "Neplatný formát uživatelského jména (3-64 znaků, písmena/číslice/._-).",
     "errPass": "Heslo musí mít alespoň 8 znaků.",
     "errMatch": "Hesla se neshodují.",
     "errCreate": "Nepodařilo se vytvořit účet správce."
@@ -190,7 +247,17 @@
     "open": "Otevřít Yuvomi →",
     "backupReminder": "Nezapomeňte nyní zálohovat soubor .env — obsahuje vaše klíče.",
     "download": "Stáhnout soubor .env",
-    "savedTo": "Uloženo do {{path}}"
+    "savedTo": "Uloženo do {{path}}",
+    "downloadFailed": "Soubor se nepodařilo načíst - instalátor se pravděpodobně už ukončil. Tvé klíče najdeš v souboru .env na serveru.",
+    "serverStops": "Instalátor se za pár minut ukončí. Stáhni soubor, než tuto kartu zavřeš.",
+    "nextTitle": "Další kroky",
+    "nextInvite": "Pozvi rodinu",
+    "nextInviteDesc": "Vytvoř pozvánkové odkazy, ať si každý zvolí vlastní heslo.",
+    "nextModules": "Vyber moduly",
+    "nextModulesDesc": "Zapni to, co vaše domácnost opravdu používá, zbytek skryj.",
+    "nextInstall": "Nainstaluj do telefonů",
+    "nextInstallDesc": "Otevři Yuvomi v telefonu a přidej ho na plochu - funguje i offline.",
+    "subtitleExisting": "Yuvomi běží. Tato instalace už má účet správce - přihlas se svými stávajícími údaji."
   },
   "welcome": {
     "title": "Vítejte v Yuvomi",
@@ -201,7 +268,9 @@
     "simpleTime": "Přibližně 2 minuty",
     "advancedTitle": "Pokročilé nastavení",
     "advancedDesc": "Plná kontrola: reverzní proxy, synchronizace kalendáře, e-mail, jednotné přihlášení a zálohy.",
-    "advancedTime": "Každá volba, krok za krokem"
+    "advancedTime": "Každá volba, krok za krokem",
+    "existingLocked": "Byla nalezena existující instalace. Použij pokročilé nastavení, aby se zachovalo tvé současné nastavení.",
+    "containerRunning": "Yuvomi právě běží. Uložení restartuje kontejner, takže bude na chvíli nedostupný."
   },
   "simple": {
     "title": "Připraveno",
@@ -233,5 +302,11 @@
     "fromHint": "Adresa „Od\", kterou uvidí příjemci. Mnoho poskytovatelů vyžaduje, aby odpovídala uživatelskému jménu.",
     "fromNameLabel": "Jméno odesílatele",
     "errIncomplete": "SMTP server a adresa odesílatele jsou povinné."
+  },
+  "storage": {
+    "title": "Úložiště a zálohy",
+    "subtitle": "Kde na serveru leží tvá data a kam se ukládají jejich kopie. Vše je volitelné - výchozí nastavení funguje.",
+    "sectionBackups": "Zálohy",
+    "sectionDocuments": "Úložiště dokumentů"
   }
 }

@@ -5,9 +5,11 @@
  * Abhängigkeiten: server/services/recurrence.js
  */
 
-import { nextOccurrence, matchesRRuleByday } from './recurrence.js';
+import {
+  nextOccurrence, matchesRRuleByday, rruleLine, parseRRule, untilInstantMs,
+} from './recurrence.js';
 import { resolveIcalColor } from '../utils/ical-color.js';
-import { localToUTC, utcToWall } from '../utils/timezone.js';
+import { hasExplicitZone, localToUTC, utcToWall } from '../utils/timezone.js';
 
 function unfoldLines(ics) {
   return ics.replace(/\r?\n[ \t]/g, '');
@@ -86,7 +88,46 @@ function parseCategories(block) {
   return out;
 }
 
-function parseICS(ics) {
+// RELATED-TO (RFC 5545 §3.8.4.5) trägt die Unteraufgaben-Beziehung: Apple
+// Reminders, Nextcloud Tasks und Tasks.org hängen sie ans KIND und schreiben
+// die UID des Elternteils hinein. Der Parameter RELTYPE ist optional und hat
+// laut §3.2.15 den Default PARENT - ein RELATED-TO ohne RELTYPE ist also
+// bereits die Elternangabe und darf nicht übersehen werden.
+//
+// Die Gegenrichtung (RELTYPE=CHILD am Elternteil) kommt seltener vor, kostet
+// hier aber nur eine Zeile; wer sie schreibt, verlöre seine Hierarchie sonst
+// genauso still. SIBLING ist keine Hierarchie und wird verworfen.
+function parseRelations(block) {
+  const re = /^RELATED-TO((?:;[^:;\n]*)*):(.*)$/gim;
+  const childUids = [];
+  let parentUid = null;
+  let m;
+  while ((m = re.exec(block)) !== null) {
+    const relType = (/;RELTYPE=([^;:]+)/i.exec(m[1])?.[1] || 'PARENT').trim().toUpperCase();
+    const value = unescapeICSText(m[2].trim())?.trim();
+    if (!value) continue;
+    if (relType === 'PARENT') { if (!parentUid) parentUid = value; }
+    else if (relType === 'CHILD' && !childUids.includes(value)) childUids.push(value);
+  }
+  return { parentUid, childUids };
+}
+
+/**
+ * @param {string} ics
+ * @param {{onSkip?: (info: {uid: string|null, reason: string, summary: string|null}) => void, allowMissingUid?: boolean}} [opts]
+ *   `onSkip` meldet jeden VEVENT, den der Parser verwirft. Ohne den Haken war ein
+ *   übersprungener Termin von einem nie gelieferten nicht zu unterscheiden: er
+ *   fehlte einfach, und der Sync meldete Erfolg (#883).
+ *   `allowMissingUid` (Default false, strikt für alle bestehenden Aufrufer):
+ *   manche Anbieter-Feeds - insbesondere die kommunaler Entsorgungskalender,
+ *   die Waste importiert (#1063) - liefern VEVENTs ganz ohne UID. Mit dieser
+ *   Option wird ein fehlendes UID allein NICHT mehr verworfen (DTSTART bleibt
+ *   Pflicht); der Aufrufer erhält `uid: null` und ist dafür verantwortlich,
+ *   eine eigene deterministische Ersatz-Identität zu bilden - dieser Parser
+ *   tut das bewusst nicht, weil eine sinnvolle Ersatz-Identität vom Label
+ *   abhängt, das erst der jeweilige Aufrufer kennt.
+ */
+function parseICS(ics, { onSkip, allowMissingUid = false } = {}) {
   const unfolded = unfoldLines(ics);
   const events   = [];
   const vEventRe = /BEGIN:VEVENT([\s\S]*?)END:VEVENT/g;
@@ -102,7 +143,7 @@ function parseICS(ics) {
     const summary     = unescapeICSText(get('SUMMARY') || '(kein Titel)');
     const description = unescapeICSText(get('DESCRIPTION')) || null;
     const location    = unescapeICSText(get('LOCATION'))    || null;
-    const rrule       = get('RRULE')       ? `RRULE:${get('RRULE')}` : null;
+    const rrule       = get('RRULE')       ? rruleLine(get('RRULE')) : null;
     // RFC 7986: COLOR trägt einen CSS3-Namen (oder Hex) für die Event-Eigenfarbe.
     const color       = resolveIcalColor(get('COLOR'));
     const parseDTLine = (prop) => {
@@ -160,11 +201,27 @@ function parseICS(ics) {
       const conv = formatICSDate(recIdLine.value, recIsDate, recIdLine.tzid);
       recurrenceId = conv ? conv.slice(0, 10) : null;
     }
-    if (!uid || !dtstart) continue;
+    if ((!uid && !allowMissingUid) || !dtstart) {
+      onSkip?.({ uid, summary: uid ? summary : null, reason: !uid ? 'missing UID' : 'missing or unparsable DTSTART' });
+      continue;
+    }
     // TZID des Serien-Starts merken (nur zeitgebunden): erlaubt DST-korrekte
     // Expansion, die die lokale Uhrzeit über die Sommer-/Winterzeit hält (#549).
     const tzid = (!allDay && dtStartLine.tzid) ? dtStartLine.tzid : null;
-    events.push({ uid, summary, description, location, dtstart, dtend, rrule, allDay, color, exdates, recurrenceId, tzid });
+    // CATEGORIES (#1063 Waste): dient Waste als primäres Label für die
+    // Import-Zuordnung, wenn der Feed sie führt; sonst fällt der Aufrufer auf
+    // SUMMARY zurück. Bestehende Aufrufer ignorieren dieses Feld einfach.
+    const categories = parseCategories(block);
+    // STATUS:CANCELLED (RFC 5545 §3.8.1.11): ein abgesagtes Vorkommen. Ohne
+    // diese Markierung würde Waste eine Absage wie ein normales Vorkommen
+    // importieren; der Aufrufer entscheidet, ob/wie er sie ausschließt.
+    const status = (/^STATUS(?:;[^:]*)?:(.*)$/im.exec(block)?.[1] || '').trim().toUpperCase() || null;
+    // RDATE (RFC 5545 §3.8.5.2) wird von diesem Parser nicht expandiert - nur
+    // erkannt. Ein Feed, der zusätzliche Einzeltermine über RDATE statt über
+    // eigene VEVENTs einträgt, würde sonst still unvollständig importiert;
+    // der Aufrufer entscheidet, ob das den Import blockiert.
+    const hasRDate = /^RDATE(?:;[^:]*)?:/im.test(block);
+    events.push({ uid, summary, description, location, dtstart, dtend, rrule, allDay, color, exdates, recurrenceId, tzid, categories, status, hasRDate });
   }
   return events;
 }
@@ -254,7 +311,8 @@ function parseVTODO(ics) {
     let priority  = prioRaw !== null ? parseInt(prioRaw, 10) : null;
     if (priority === 0 || Number.isNaN(priority)) priority = null;
     const tags = parseCategories(block);
-    todos.push({ uid, summary, description, completed, status, due, priority, tags });
+    const { parentUid, childUids } = parseRelations(block);
+    todos.push({ uid, summary, description, completed, status, due, priority, tags, parentUid, childUids });
   }
   return todos;
 }
@@ -313,15 +371,45 @@ function expandRRULE(vevent, windowStart, windowEnd) {
   // Tagtermine, deren lokales Datum == UTC-Datum ist (kein Mitternachts-Überlauf).
   const wall = vevent.tzid ? utcToWall(vevent.dtstart, vevent.tzid) : null;
   const tzAware = wall && wall.date === startDate;
+  const zonenUnsicher = !!vevent.tzid && !tzAware;
+  // UNTIL ALS ZEITPUNKT, WO ES EINER IST (#1269) - dieselbe Unterscheidung wie
+  // in services/calendar-events.js und aus demselben Grund: ein Serienende
+  // mitten am Schnitttag darf dessen Vorkommen nicht mehr durchlassen. Der
+  // Abonnement-Pfad liest dieselben fremden Kalender wie der CalDAV-Sync.
+  const untilMs = untilInstantMs(parseRRule(vevent.rrule), { tzid: vevent.tzid, toUTC: localToUTC });
   let current = startDate, iterations = 0;
   const MAX_ITER = 1500;
+  let occurrence = 0;
   while (current <= windowEnd && iterations < MAX_ITER) {
     iterations++;
-    if (maxCount !== null && iterations > maxCount) break;
 
-    if (current >= windowStart && !exdateSet.has(current)
-        && matchesRRuleByday(current, vevent.rrule)) {
-      const occStart = tzAware ? localToUTC(`${current}T${wall.time}`, vevent.tzid) : current + timeSuffix;
+    // BYDAY-FILTER VOR DEM ZAEHLEN, EXDATE DANACH (RFC 5545, #513). Ein Tag
+    // ausserhalb des Musters ist gar kein Vorkommen der Serie und darf nicht
+    // gegen COUNT zaehlen; ein ausgenommenes ist eines und zaehlt mit. Hier
+    // zaehlte bis dahin die SCHLEIFE selbst (`iterations > maxCount`), also
+    // jeder Kandidat - `FREQ=MONTHLY;BYDAY=MO;COUNT=2` lieferte einen Termin
+    // statt zwei. (Dieselbe Aufteilung wie in services/calendar-events.js.)
+    if (!matchesRRuleByday(current, vevent.rrule, { utcDiffersFromLocal: zonenUnsicher })) {
+      const skip = nextOccurrence(current, vevent.rrule, { anchor: startDate, utcDiffersFromLocal: zonenUnsicher });
+      if (!skip || skip <= current) break;
+      current = skip;
+      continue;
+    }
+
+    // Vorkommen hinter UNTIL sind keine und zaehlen auch nicht gegen COUNT -
+    // deshalb vor dem Zaehler. Nur mit eigener Zone ist ein Zeitpunkt zu
+    // vergleichen; ganztaegig oder zonenlos bleibt es beim Tag (#1269).
+    const occStartAt = untilMs === null
+      ? null
+      : (tzAware ? localToUTC(`${current}T${wall.time}`, vevent.tzid) : current + timeSuffix);
+    if (occStartAt !== null && hasExplicitZone(occStartAt) && Date.parse(occStartAt) > untilMs) break;
+
+    if (maxCount !== null && occurrence >= maxCount) break;
+    occurrence++;
+
+    if (current >= windowStart && !exdateSet.has(current)) {
+      const occStart = occStartAt
+        ?? (tzAware ? localToUTC(`${current}T${wall.time}`, vevent.tzid) : current + timeSuffix);
       let occEnd = null;
       if (durationMs !== null) {
         if (vevent.allDay) {
@@ -340,7 +428,9 @@ function expandRRULE(vevent, windowStart, windowEnd) {
         color: vevent.color,
       });
     }
-    const next = nextOccurrence(current, vevent.rrule);
+    // startDate ist DTSTART und damit der Anker: ohne ihn schreibt eine
+    // Klemmung in einem kurzen Monat den Tag der Serie um (#978).
+    const next = nextOccurrence(current, vevent.rrule, { anchor: startDate, utcDiffersFromLocal: zonenUnsicher });
     if (!next || next <= current) break;
     current = next;
   }

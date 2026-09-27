@@ -18,6 +18,13 @@ function test(name, fn) {
 }
 function assert(cond, msg) { if (!cond) throw new Error(msg || 'Assertion fehlgeschlagen'); }
 
+function assertCompactCalendarQueries(statements) {
+  const calendarReads = statements.filter((sql) => /\b(?:FROM|JOIN)\s+calendar_events\b/i.test(sql));
+  assert(calendarReads.length > 0, 'keine Kalenderabfrage aufgezeichnet');
+  assert(calendarReads.every((sql) => !/\be\.\*|\battachment_data\b/i.test(sql)),
+    `Attachment-Body in kompakter Kalenderabfrage: ${calendarReads.join('\n---\n')}`);
+}
+
 const db = new DatabaseSync(':memory:');
 db.exec('PRAGMA foreign_keys = ON;');
 db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -27,10 +34,17 @@ db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
 db.exec(MIGRATIONS_SQL[1]);
 // Migration 44: FTS5 index + sync triggers. Must apply cleanly.
 db.exec(MIGRATIONS_SQL[44]);
+db.exec(MIGRATIONS_SQL[85]); // calendar_event_exceptions
+db.exec(MIGRATIONS_SQL[27]); // legacy calendar attachment body
+db.exec(MIGRATIONS_SQL[194]); // linked occurrence overrides
 // Migration 65: health tables (medications, health_activities) the search reads from.
 db.exec(MIGRATIONS_SQL[65]);
 // Migration 66: FTS triggers + backfill for medications and health activities.
 db.exec(MIGRATIONS_SQL[66]);
+// Migration 197: waste_types (only the table search reads from).
+db.exec(MIGRATIONS_SQL[197]);
+// Migration 206: FTS triggers + backfill for waste_types.
+db.exec(MIGRATIONS_SQL[206]);
 
 console.log('\n[Search-Test] FTS5-Volltextsuche\n');
 
@@ -57,6 +71,30 @@ db.prepare(`INSERT INTO contacts (name, phone, email) VALUES ('Cake Bakery', '55
 db.prepare(`INSERT INTO calendar_events (title, description, start_datetime, created_by)
   VALUES ('Cake tasting', 'pick a flavor', '2030-01-01T10:00:00Z', ?)`).run(uid);
 
+// Sichtbarkeit in der globalen Suche (#474, Luecke aus dem #1055-Review): der
+// Events-Bucket traegt dieselben zwei Klauseln wie die Kalender-Suche. Die
+// Fixture braucht dafuer die Abo-Tabelle (Migration 10) und `subscription_id`;
+// der CHECK auf external_source kennt in Migration 1 kein 'ics', deshalb wird
+// er fuer die zwei Abo-Zeilen ausgesetzt - im echten Schema ist er erweitert.
+db.exec(MIGRATIONS_SQL[10]);
+db.exec('ALTER TABLE calendar_events ADD COLUMN subscription_id INTEGER REFERENCES ics_subscriptions(id) ON DELETE CASCADE;');
+const insVisEvent = db.prepare(`INSERT INTO calendar_events
+  (title, description, start_datetime, created_by, visibility, external_source, subscription_id)
+  VALUES (?, ?, '2030-02-01T10:00:00Z', ?, ?, ?, ?)`);
+insVisEvent.run('Cake secret private', 'hidden', otherUid, 'private', 'local', null);
+const cakeAssignedToMe = insVisEvent.run('Cake assignees with me', 'shared with me', otherUid, 'assignees', 'local', null).lastInsertRowid;
+db.prepare('INSERT INTO event_assignments (event_id, user_id) VALUES (?, ?)').run(cakeAssignedToMe, uid);
+insVisEvent.run('Cake assignees without me', 'not for me', otherUid, 'assignees', 'local', null);
+insVisEvent.run('Cake own private', 'mine', uid, 'private', 'local', null);
+const sharedSub = db.prepare(`INSERT INTO ics_subscriptions (name, url, shared, created_by)
+  VALUES ('Shared feed', 'https://feed.test/shared.ics', 1, ?)`).run(otherUid).lastInsertRowid;
+const privateSub = db.prepare(`INSERT INTO ics_subscriptions (name, url, shared, created_by)
+  VALUES ('Private feed', 'https://feed.test/private.ics', 0, ?)`).run(otherUid).lastInsertRowid;
+db.exec('PRAGMA ignore_check_constraints = ON;');
+insVisEvent.run('Cake from shared feed', 'ics row', otherUid, 'all', 'ics', sharedSub);
+insVisEvent.run('Cake from private feed', 'ics row', otherUid, 'all', 'ics', privateSub);
+db.exec('PRAGMA ignore_check_constraints = OFF;');
+
 // Health medications: own (private), foreign family-visible, foreign private.
 db.prepare(`INSERT INTO medications (user_id, name, dosage_text, visibility)
   VALUES (?, 'Aspirin', '500mg tablet', 'private')`).run(uid);
@@ -73,11 +111,15 @@ db.prepare(`INSERT INTO health_activities (user_id, type, performed_at, note, vi
 db.prepare(`INSERT INTO health_activities (user_id, type, performed_at, note, visibility)
   VALUES (?, 'boxing', '2030-01-03T08:00:00Z', 'private spar', 'private')`).run(otherUid);
 
+// Waste types: household-owned catalog, no owner filter (like contacts); archived excluded at query time.
+db.prepare(`INSERT INTO waste_types (name, color) VALUES ('Cake-day recycling', '#22C55E')`).run();
+db.prepare(`INSERT INTO waste_types (name, color, archived) VALUES ('Cake-day organic (retired)', '#A16207', 1)`).run();
+
 test('Migration 44 legt FTS5-Tabelle und Trigger an, Backfill leer (Seed danach)', () => {
   const tbl = db.prepare(`SELECT name FROM sqlite_master WHERE name = 'search_index'`).get();
   assert(tbl, 'search_index sollte existieren');
   const triggers = db.prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_search_%'`).get();
-  assert(triggers.n === 21, `Erwartet 21 Trigger (15 aus Mig. 44 + 6 aus Mig. 66), erhalten ${triggers.n}`);
+  assert(triggers.n === 24, `Erwartet 24 Trigger (15 aus Mig. 44 + 6 aus Mig. 66 + 3 aus Mig. 199), erhalten ${triggers.n}`);
 });
 
 test('buildMatchQuery erzeugt sichere Präfix-Phrasen, ignoriert Sonderzeichen', () => {
@@ -106,6 +148,100 @@ test('Suche deckt alle Entitäten ab', () => {
   assert(r.notes.some((n) => n.content.includes('cake')), 'Notiz gefunden');
   assert(r.contacts.some((c) => c.title === 'Cake Bakery'), 'Kontakt gefunden');
   assert(r.events.some((e) => e.title === 'Cake tasting'), 'Termin gefunden');
+  assert(r.waste.some((w) => w.title === 'Cake-day recycling'), 'Abfall-Typ gefunden');
+});
+
+test('Suche findet Abfall-Typ über Namen, verbirgt archivierte Typen', () => {
+  const r = runSearch(db, 'recycling', uid);
+  const titles = r.waste.map((w) => w.title);
+  assert(titles.includes('Cake-day recycling'), 'Aktiver Typ gefunden');
+  assert(!titles.includes('Cake-day organic (retired)'), 'Archivierter Typ ausgeschlossen');
+});
+
+test('Abfall-Suchtrigger halten den Index synchron (UPDATE/DELETE)', () => {
+  const t = db.prepare(`INSERT INTO waste_types (name, color) VALUES ('Renamewaste', '#000000')`).run();
+  assert(runSearch(db, 'Renamewaste', uid).waste.length === 1, 'Neu angelegt gefunden');
+  db.prepare(`UPDATE waste_types SET name = 'Renamedwaste' WHERE id = ?`).run(t.lastInsertRowid);
+  assert(runSearch(db, 'Renamewaste', uid).waste.length === 0, 'Alter Name weg');
+  assert(runSearch(db, 'Renamedwaste', uid).waste.length === 1, 'Neuer Name im Index');
+  db.prepare(`DELETE FROM waste_types WHERE id = ?`).run(t.lastInsertRowid);
+  assert(runSearch(db, 'Renamedwaste', uid).waste.length === 0, 'Nach DELETE nicht mehr im Index');
+});
+
+test('globale Suche liefert den aufgelösten verschobenen Termin mit Originalidentität', () => {
+  const masterId = db.prepare(`
+    INSERT INTO calendar_events
+      (title, description, start_datetime, end_datetime, all_day, recurrence_rule, created_by)
+    VALUES ('Global master', 'Current global description', '2030-07-01T09:00:00',
+            '2030-07-01T10:00:00', 0, 'FREQ=DAILY;COUNT=3', ?)
+  `).run(uid).lastInsertRowid;
+  const childId = db.prepare(`
+    INSERT INTO calendar_events
+      (title, description, start_datetime, end_datetime, all_day, recurrence_parent_id,
+       recurrence_id, overridden_fields, created_by)
+    VALUES ('Global override Qzxglobal', 'Stale global description',
+            '2030-07-10T11:00:00', '2030-07-10T12:00:00', 1, ?, '2030-07-01',
+            '["title","start_datetime","end_datetime"]', ?)
+  `).run(masterId, uid).lastInsertRowid;
+  db.prepare(`
+    INSERT INTO calendar_event_exceptions (event_id, exception_date)
+    VALUES (?, '2030-07-01')
+  `).run(masterId);
+
+  const result = runSearch(db, 'Qzxglobal', uid).events;
+  assert(result.length === 1, 'genau ein Treffer erwartet');
+  assert(result[0].id === Number(childId), 'Child-ID fehlt');
+  assert(result[0].all_day === 0, 'nicht überschriebenes all_day muss vom Master kommen');
+  assert(result[0].start_datetime === '2030-07-10T11:00:00', 'verschobener Start fehlt');
+  assert(result[0].series_id === Number(masterId), 'series_id fehlt');
+  assert(result[0].recurrence_id === '2030-07-01', 'originale recurrence_id fehlt');
+  assert(result[0].is_occurrence_override === true, 'Override-Kennzeichen fehlt');
+});
+
+test('globale Suche löst große Anhänge auf, ohne attachment_data zu lesen', () => {
+  const largeAttachment = 'A'.repeat(1024 * 1024);
+  const masterId = db.prepare(`
+    INSERT INTO calendar_events
+      (title, start_datetime, end_datetime, recurrence_rule, created_by, attachment_data)
+    VALUES ('Attachment master', '2030-08-01T09:00:00', '2030-08-01T10:00:00',
+            'FREQ=DAILY;COUNT=2', ?, ?)
+  `).run(uid, largeAttachment).lastInsertRowid;
+  const childId = db.prepare(`
+    INSERT INTO calendar_events
+      (title, start_datetime, end_datetime, recurrence_parent_id, recurrence_id,
+       overridden_fields, created_by, attachment_data)
+    VALUES ('Qzxlargeattachment override', '2030-08-05T11:00:00', '2030-08-05T12:00:00',
+            ?, '2030-08-01', '["title","start_datetime","end_datetime"]', ?, ?)
+  `).run(masterId, uid, largeAttachment).lastInsertRowid;
+
+  const originalPrepare = db.prepare.bind(db);
+  const statements = [];
+  db.prepare = (sql) => {
+    statements.push(String(sql));
+    return originalPrepare(sql);
+  };
+  let result;
+  try {
+    result = runSearch(db, 'Qzxlargeattachment', uid).events;
+  } finally {
+    delete db.prepare;
+  }
+
+  assert(result.some((event) => Number(event.id) === Number(childId)), 'linked Treffer fehlt');
+  assertCompactCalendarQueries(statements);
+});
+
+test('SQL guard erkennt e.* auch hinter einem calendar_events-JOIN', () => {
+  let error;
+  try {
+    assertCompactCalendarQueries([
+      'SELECT e.* FROM search_index si JOIN calendar_events e ON e.id = si.entity_id',
+    ]);
+  } catch (caught) {
+    error = caught;
+  }
+  assert(error?.message.startsWith('Attachment-Body in kompakter Kalenderabfrage:'),
+    `JOIN-Wildcard wurde nicht als Attachment-Body erkannt: ${error?.message || 'kein Fehler'}`);
 });
 
 test('Präfix-Treffer funktionieren (Teilwort)', () => {
@@ -163,6 +299,36 @@ test('Health-Suche verbirgt fremde private Zeilen', () => {
   assert(act.activities.length === 0, 'Fremde private Aktivität ausgeschlossen');
 });
 
+// --------------------------------------------------------
+// Termine: Sichtbarkeit (#474) und Abo-Filter in der globalen Suche.
+// Bis zum Review von #1055 hatte der Events-Bucket keine der beiden Klauseln,
+// die die Kalender-Suche (routes/calendar/read.js) seit #474 traegt - jedes
+// Mitglied fand Titel und Datum fremder PRIVATER Termine ueber ein Stichwort.
+// --------------------------------------------------------
+
+test('Termine: die globale Suche zeigt, was die Kalender-Suche zeigt - eigene, "all", mir zugewiesene, aus geteilten Abos', () => {
+  const titles = runSearch(db, 'cake', uid).events.map((e) => e.title);
+  for (const wanted of ['Cake tasting', 'Cake assignees with me', 'Cake own private', 'Cake from shared feed']) {
+    assert(titles.includes(wanted), `${wanted} muss gefunden werden`);
+  }
+});
+
+test('Termine: fremde private, fremd-zugewiesene und Termine aus fremden privaten Abos bleiben unsichtbar', () => {
+  const titles = runSearch(db, 'cake', uid).events.map((e) => e.title);
+  for (const hidden of ['Cake secret private', 'Cake assignees without me', 'Cake from private feed']) {
+    assert(!titles.includes(hidden),
+      `${hidden} darf NICHT gefunden werden - vorher fand jedes Mitglied Titel und Datum fremder privater Termine`);
+  }
+  // Der Ersteller selbst findet seine privaten Termine und sein eigenes Abo weiter.
+  assert(runSearch(db, 'secret', otherUid).events.some((e) => e.title === 'Cake secret private'),
+    'der Ersteller sieht seinen eigenen privaten Termin');
+  const feeds = runSearch(db, 'feed', otherUid).events.map((e) => e.title);
+  assert(feeds.includes('Cake from private feed') && feeds.includes('Cake from shared feed'),
+    'der Abo-Besitzer sieht beide Abos');
+  assert(!runSearch(db, 'feed', uid).events.some((e) => e.title === 'Cake from private feed'),
+    'ein fremdes, nicht geteiltes Abo bleibt fuer andere unsichtbar');
+});
+
 test('Health-Suchtrigger halten den Index synchron (UPDATE/DELETE)', () => {
   const m = db.prepare(`INSERT INTO medications (user_id, name, dosage_text, visibility)
     VALUES (?, 'Zolpidemtmp', 'x', 'private')`).run(uid);
@@ -178,7 +344,7 @@ test('Leere/kurze Query liefert leere Ergebnisse', () => {
   const r = runSearch(db, '', uid);
   assert(r.tasks.length === 0 && r.events.length === 0 && r.notes.length === 0
     && r.contacts.length === 0 && r.items.length === 0
-    && r.meds.length === 0 && r.activities.length === 0, 'Alles leer');
+    && r.meds.length === 0 && r.activities.length === 0 && r.waste.length === 0, 'Alles leer');
 });
 
 console.log(`\n[Search-Test] Ergebnis: ${passed} bestanden, ${failed} fehlgeschlagen\n`);

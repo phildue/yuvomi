@@ -208,6 +208,46 @@ test('Users für Meta-Endpoint abrufbar', () => {
   assert(users[0].avatar_color, 'avatar_color vorhanden');
 });
 
+// #671: In der Detailansicht waren Teilaufgaben reine Anzeige, während dieselbe
+// Teilaufgabe in der Listenkarte einen Schalter hatte. Wer eine anlegte und die
+// Aufgabe danach öffnete, sah sie - und kam nicht mehr an sie heran. Der
+// Klick-Handler des Seiten-Containers greift dort nicht, weil die Detailansicht
+// in den Top-Layer rendert; die Delegation muss also am Knoten selbst hängen.
+test('Teilaufgaben der Detailansicht sind abhakbar, nicht nur lesbar', () => {
+  // Die Detailansicht wohnt seit #918 in der geteilten Komponente - dieselbe,
+  // die die Übersicht und der Kalender öffnen.
+  const source = readFileSync(new URL('../public/components/task-detail.js', import.meta.url), 'utf8');
+  const fn = source.match(/function subtaskListNode\([\s\S]*?\n\}/);
+  assert(fn, 'subtaskListNode muss existieren');
+  const body = fn[0];
+  // DIE ZEILE, NICHT DER ANLEGEN-KNOPF DARUNTER. Ein blosses
+  // `createElement('button')` stand hier, bis die Zeile bei `tasks: read` zum
+  // Zustandszeichen wurde (#467): der Ausdruck traf danach den zweiten
+  // `createElement('button')` dieser Funktion - den Hinzufuegen-Knopf - und
+  // blieb gruen, ohne noch etwas ueber die Zeile zu sagen. Jetzt steht die
+  // Weiche selbst da, und mit ihr beide Haelften.
+  assert(/createElement\(nurLesen \? 'span' : 'button'\)/.test(body),
+    'mit Schreibrecht muss die Zeile ein <button> sein, damit Tastatur und Screenreader denselben Weg haben');
+  assert(/addEventListener\('click'/.test(body),
+    'ohne eigenen Listener bleibt die Zeile tot: der Container-Handler erreicht den Top-Layer nicht');
+  assert(/toggleSubtaskStatus\(/.test(body),
+    'der Klick muss denselben Statuswechsel auslösen wie in der Listenkarte');
+});
+
+// #671: Jede Filterachse nimmt mehrere Werte. Ein einzelner String im State
+// liefe beim ersten .includes/.forEach in einen TypeError.
+test('Filter-Achsen halten Listen, nicht einzelne Werte', () => {
+  const source = readFileSync(new URL('../public/pages/tasks.js', import.meta.url), 'utf8');
+  assert(/filters:\s*\{ status: \['open'\], priority: \[\], assigned_to: \[\], category: \[\], tags: \[\] \}/.test(source),
+    'der Anfangszustand muss je Achse eine Liste sein');
+  for (const axis of ['status', 'priority', 'assigned_to', 'category']) {
+    assert(new RegExp(`state\\.filters\\.${axis}\\.forEach\\(\\(v\\) => params\\.append\\('${axis}', v\\)\\)`).test(source),
+      `${axis} muss jeden Wert einzeln an die Query hängen`);
+  }
+  assert(/state\.filters = \{ status: \[\], priority: \[\], assigned_to: \[\], category: \[\], tags: \[\] \}/.test(source),
+    '"Alle Filter löschen" muss Listen hinterlassen, keine leeren Strings');
+});
+
 // --------------------------------------------------------
 // Ergebnis
 // --------------------------------------------------------

@@ -6,6 +6,7 @@
 import { createLogger } from '../logger.js';
 import * as db from '../db.js';
 import { buildSplits } from './split-expenses.js';
+import { todayKey } from '../utils/timezone.js';
 
 const log = createLogger('SplitExpenseScheduler');
 
@@ -74,7 +75,11 @@ function generateRecurringExpense(database, recurring) {
   return expenseId;
 }
 
-function processDueRecurringExpenses(today = new Date().toISOString().slice(0, 10)) {
+// `today` in der Haushaltszone (#829): eine wiederkehrende Ausgabe mit
+// next_run_date = heute wurde westlich von UTC schon am Vorabend gebucht, weil
+// der UTC-Tag dort bereits der folgende ist - die Buchung trug dann das
+// Vortagsdatum ihres eigenen Laufs.
+function processDueRecurringExpenses(today = todayKey(db.get())) {
   const database = db.get();
   const due = database.prepare(`
     SELECT *

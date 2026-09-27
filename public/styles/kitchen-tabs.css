@@ -6,18 +6,15 @@
 /* Höhe auf --kitchen-tabs-height überschreiben (56px statt Standard 52px) */
 .kitchen-tabs-bar {
   --sub-tabs-height: var(--kitchen-tabs-height);
-  /* Einziger Modul-Akzent-Träger der Küche: die geteilte Tabs-Leiste trägt den
-   * 3px-Streifen (in --active-module-accent, wechselt je aktivem Tab). Die
-   * vier Tab-Seiten tragen ihn NICHT mehr: sie nutzen seit dem Umbau vom
-   * 2026-07-29 alle den kanonischen Kopf in der Variante
-   * `.page-toolbar--in-group` (layout.css), die genau deshalb existiert - ein
-   * regulärer .page-toolbar hätte hier einen zweiten Streifen in derselben
-   * Farbe gesetzt (Issue #577). box-sizing: border-box aus sub-tabs.css hält
-   * die 56px-Höhe stabil. */
-  border-top: 3px solid var(--active-module-accent, var(--color-accent));
+  /* Der 3px-Akzentstreifen über der Leiste ist mit dem HIG-Rollout entfallen
+   * (DESIGN.md: „Don't Akzentstreifen an Toolbars oder Köpfen"). Die
+   * Modul-Identität trägt jetzt der gefüllte aktive Tab - dieselbe
+   * Segment-Sprache wie überall. Der Sonderfall
+   * `.page-toolbar--in-group` (layout.css) bleibt trotzdem richtig: er hält
+   * den zweiten Kopf unter der Leiste flach (Issue #577). */
 }
 
-@media (max-width: 640px) {
+@media (max-width: 639px) {
   .kitchen-tabs-bar {
     gap: var(--space-0h);
   }
@@ -57,7 +54,14 @@
     flex: 0 0 auto;
     justify-content: center;
     gap: var(--space-0h);
-    padding-inline: var(--space-0h);
+    /* 8px statt 2px seit dem HIG-Rollout: der aktive Tab ist jetzt eine
+     * GEFÜLLTE Kapsel (--target-base = 48px hoch auf Fingergeräten). Mit 2px
+     * Polster schrumpfte sie auf Textbreite und las sich als Blase um das Wort
+     * statt als Segment. Die Rechnung der obigen Notiz bleibt gültig, nur mit
+     * 64px statt 16px Polster: 234 Label + 42 Badge + 64 + 6 Gap = 346px, passt
+     * in 375px. Darunter greift der dort beschriebene Weg - die Leiste scrollt,
+     * statt ein Wort zu kürzen. */
+    padding-inline: var(--space-2);
   }
 
   /* Mobil weicht das Icon, nicht das Label. Vier Tabs teilen sich auf 393px

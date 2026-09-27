@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import test from 'node:test';
 
+import { eachRule } from './css-rules.js';
 import {
   rememberScrollPosition,
   scrollPositionFor,
@@ -62,8 +63,17 @@ test('mobile bottom navigation reserves safe-area space without scroll-time root
   const navRule = cssRuleBody(layoutCss, '.nav-bottom');
   const rootRule = cssRuleBody(layoutCss, ':root');
 
-  assert.match(navRule, /padding-bottom:\s*var\(--safe-area-inset-bottom\)/);
-  assert.match(tokensCss, /--nav-bottom-height:\s*calc\(var\(--nav-height-mobile\)\s*\+\s*var\(--safe-area-inset-bottom\)\)/);
+  // Der Guard hält die ZUSAGE fest (die Bar reserviert die Safe-Area selbst,
+  // niemand mutiert sie beim Scrollen am :root), nicht die Schreibweise. Seit
+  // dem HIG-Rollout ist die Bar eine transparente Zone mit schwebender
+  // Glas-Kapsel: die Reserve steht als dritter Wert im padding-Shorthand und
+  // trägt zusätzlich die Luft unter der Kapsel.
+  assert.match(
+    navRule,
+    /padding(-bottom)?:[^;]*var\(--safe-area-inset-bottom\)/,
+    'die Bar muss die Safe-Area selbst reservieren',
+  );
+  assert.match(tokensCss, /--nav-bottom-height:\s*calc\(var\(--nav-height-mobile\)[^;]*var\(--safe-area-inset-bottom\)\)/);
   assert.equal(rootRule.includes('nav-bottom--hidden'), false);
 });
 
@@ -231,10 +241,65 @@ test('the modules with an inner scroll container are the documented eight', () =
 
 test('closed dashboard speed dial cannot capture first-scroll gestures', () => {
   const dashboardCss = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
-  const containerRule = cssRuleBody(dashboardCss, '.fab-container');
-  const mainRule = cssRuleBody(dashboardCss, '.fab-main');
+  const layoutCss = readFileSync(new URL('../public/styles/layout.css', import.meta.url), 'utf8');
+  const actionsRule = cssRuleBody(dashboardCss, '.fab-actions');
 
-  assert.match(containerRule, /pointer-events:\s*none/);
-  assert.match(mainRule, /pointer-events:\s*auto/);
+  // Der geschlossene Dial darf nur so viel Fläche belegen wie sein Knopf. Das
+  // hing früher an `pointer-events: none` am Kasten - einer Zusicherung, die
+  // jede spätere Regel mit `auto` still aushebeln konnte. Jetzt trägt es die
+  // Geometrie: die Aktionsliste ist absolut positioniert und bläht die Gruppe
+  // gar nicht erst auf, es gibt also keine tote Fläche, die man freistellen müsste.
+  assert.match(actionsRule, /position:\s*absolute/,
+    'die Aktionsliste muss aus dem Fluss der Gruppe heraus - sonst ist der '
+    + 'geschlossene Dial so hoch wie seine ausgeklappte Liste');
+  assert.match(actionsRule, /pointer-events:\s*none/,
+    'die geschlossene Liste ist unsichtbar und darf keine Klicks fangen');
   assert.match(dashboardCss, /\.fab-actions--visible\s*\{[^}]*pointer-events:\s*auto/s);
+  assert.doesNotMatch(cssRuleBody(layoutCss, '.page-fab-group'), /pointer-events/,
+    'die Gruppe braucht keinen Pointer-Freibrief mehr - ihr Kasten ist der FAB');
+});
+
+/* EIN PAN-VERBOT DARF DEN ZWEI-FINGER-WEG NICHT MITNEHMEN (#1276).
+ *
+ * `touch-action: pan-y` erlaubt den senkrechten Bildlauf mit EINEM Finger -
+ * und verbietet stillschweigend `pinch-zoom`. Chromium behandelt jeden
+ * Bildlauf, der mit zwei oder mehr Fingern beginnt, als Zoom-Geste
+ * (`TouchActionFilter::ShouldSuppressScrolling`, crbug.com/632525) und
+ * verwirft ihn ganz, wo pinch-zoom fehlt. Seit #294 stand genau das an
+ * `.app-content`. Gemeldet wurde es von einem Chromebook mit Touchscreen:
+ * Hauptinhalt starr, die Seitenleiste daneben (ohne touch-action) nicht,
+ * Touchpad und Maus auch nicht. Nachgestellt in Chromium mit Touch-Eingabe
+ * bei 1366px: zwei Finger auf dem Hauptinhalt 0px Bildlauf, auf der
+ * Seitenleiste 150px, ein Finger ueberall rund 200px. Am Telefon zoomte
+ * ausserdem das Aufziehen im Hauptinhalt nicht, obwohl der Viewport
+ * `maximum-scale=5` zusagt (WCAG 1.4.4).
+ *
+ * Die Regel gilt fuer jede Fläche, nicht nur fuer den Scrollport: die
+ * Dashboard-Zeilen tragen ihr eigenes `pan-y`, und eine dort begonnene Geste
+ * rechnet mit IHREM Wert. `none` bleibt erlaubt - ein Sortiergriff besitzt
+ * die Geste ganz und braucht keinen Zoom.
+ */
+test('a touch-action that restricts panning keeps pinch-zoom', () => {
+  const styleDir = new URL('../public/styles/', import.meta.url);
+  const offenders = [];
+
+  for (const file of readdirSync(styleDir).filter((f) => f.endsWith('.css'))) {
+    const css = readFileSync(new URL(file, styleDir), 'utf8');
+    for (const rule of eachRule(css)) {
+      for (const [, value] of rule.body.matchAll(/(?:^|[;{\s])touch-action\s*:\s*([^;]+)/g)) {
+        const tokens = value.trim().toLowerCase().split(/\s+/);
+        const restrictsPan = tokens.some((t) => /^pan-(?:x|y|left|right|up|down)$/.test(t));
+        if (restrictsPan && !tokens.includes('pinch-zoom')) {
+          offenders.push(`${file}: ${rule.selector} { touch-action: ${value.trim()} }`);
+        }
+      }
+    }
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    'pan-x/pan-y ohne pinch-zoom verwirft jeden Zwei-Finger-Bildlauf und das '
+    + 'Aufziehen zum Zoomen (#1276) - `pinch-zoom` ergaenzen, z.B. `pan-y pinch-zoom`',
+  );
 });

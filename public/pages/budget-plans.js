@@ -6,9 +6,11 @@
  */
 import { api } from '/api.js';
 import { t } from '/i18n.js';
-import { openModal, closeModal, reportFieldError } from '/components/modal.js';
+import { openModal, closeModal, reportFieldError, refocusAfterRender } from '/components/modal.js';
 import { vibrate } from '/utils/ux.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
+import { emptyStateHTML, mountLoadError } from '/utils/empty-state.js';
+import { amountPlaceholder, amountStep, amountIsSavable, smallestUnitLabel } from '/utils/money.js';
 
 const view = { month: '', data: null, error: false, ctx: null, root: null };
 
@@ -36,7 +38,9 @@ async function load() {
   } catch (err) {
     console.error('[Budget] plans load error:', err);
     view.data = null;
-    view.error = true;
+    // Das Fehlerobjekt selbst, nicht nur `true`: `mountLoadError` liest daraus
+    // den Statuscode - die einzige Angabe, die dem Selbsthoster hier weiterhilft.
+    view.error = err;
   }
   renderBody(body);
 }
@@ -44,7 +48,7 @@ async function load() {
 function renderShell() {
   view.root.replaceChildren();
   view.root.insertAdjacentHTML('beforeend', `
-    <div class="budget-plan">
+    <div class="budget-plan app-page app-page--reading page-measure--narrow" data-composition="reading">
       <div id="budget-plan-body"></div>
     </div>
   `);
@@ -60,24 +64,23 @@ function toneForRatio(ratio, over) {
 function renderBody(body) {
   if (view.error) {
     body.replaceChildren();
-    body.insertAdjacentHTML('beforeend', `
-      <div class="empty-state">
-        <i data-lucide="cloud-off" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${t('budget.statsError')}</div>
-        <div class="empty-state__description">${t('budget.statsErrorDescription')}</div>
-        <button class="btn btn--primary empty-state__cta" id="budget-plan-retry">
-          <i data-lucide="refresh-cw" class="icon-md" aria-hidden="true"></i>
-          ${t('budget.statsRetry')}
-        </button>
-      </div>`);
-    if (window.lucide) lucide.createIcons({ el: body });
-    body.querySelector('#budget-plan-retry')?.addEventListener('click', () => load());
+    mountLoadError(body, {
+      title: t('budget.statsError'),
+      description: t('budget.statsErrorDescription'),
+      error: view.error,
+      retryLabel: t('budget.statsRetry'),
+      onRetry: () => load(),
+    });
     return;
   }
 
   const d = view.data;
   body.replaceChildren();
   body.insertAdjacentHTML('beforeend', `
+    ${d.isCurrentMonth ? '' : `
+      <p class="budget-plan__historic-note">
+        <i data-lucide="info" class="icon-md" aria-hidden="true"></i>${t('budget.planHistoricNote')}
+      </p>`}
     ${renderSavingsCard(d.savings)}
     <div class="budget-plan__section">
       <div class="budget-plan__section-head">
@@ -86,7 +89,7 @@ function renderBody(body) {
           <i data-lucide="plus" class="icon-md" aria-hidden="true"></i>${t('budget.planAddBudget')}
         </button>
       </div>
-      <div id="budget-plan-rows">${renderRows(d.plans)}</div>
+      <div id="budget-plan-rows" class="row-carrier">${renderRows(d.plans)}</div>
     </div>
   `);
   if (window.lucide) lucide.createIcons({ el: body });
@@ -111,15 +114,19 @@ function renderSavingsCard(savings) {
   const ratio = Math.max(0, Math.min(1, savings.ratio));
   const pct = Math.round(savings.ratio * 100);
   // Sparziel: erreichen/übertreffen ist gut (grün), knapp darunter amber, im Minus rot.
-  const tone = savings.met ? 'under' : (savings.actual < 0 ? 'over' : 'near');
+  const tone = savings.met == null
+    ? 'near'
+    : savings.met ? 'under' : (savings.actual < 0 ? 'over' : 'near');
   const R = 52, C = 2 * Math.PI * R;
   const dash = (ratio * C).toFixed(2);
 
-  const status = savings.met
-    ? t('budget.planSavingsMet')
-    : savings.actual < 0
-      ? t('budget.planSavingsNegative')
-      : t('budget.planSavingsShort', { amount: fmt(Math.max(0, savings.remaining)) });
+  const status = savings.met == null
+    ? ''
+    : savings.met
+      ? t('budget.planSavingsMet')
+      : savings.actual < 0
+        ? t('budget.planSavingsNegative')
+        : t('budget.planSavingsShort', { amount: fmt(Math.max(0, savings.remaining)) });
 
   return `
     <button type="button" class="budget-plan-savings budget-plan-savings--tone-${tone}" id="budget-plan-savings">
@@ -138,7 +145,7 @@ function renderSavingsCard(savings) {
           <strong>${fmt(savings.actual)}</strong>
           <span>/ ${fmt(savings.planned)}</span>
         </div>
-        <div class="budget-plan-savings__status budget-plan-savings__status--${tone}">${status}</div>
+        ${status ? `<div class="budget-plan-savings__status budget-plan-savings__status--${tone}">${status}</div>` : ''}
       </div>
       <i data-lucide="pencil" class="budget-plan-savings__edit" aria-hidden="true"></i>
       <span class="sr-only">${t('budget.planEditAction')}</span>
@@ -147,19 +154,23 @@ function renderSavingsCard(savings) {
 
 function renderRows(plans) {
   if (!plans.length) {
-    return `
-      <div class="empty-state budget-plan__empty">
-        <i data-lucide="target" class="empty-state__icon" aria-hidden="true"></i>
-        <div class="empty-state__title">${t('budget.planEmptyTitle')}</div>
-        <div class="empty-state__description">${t('budget.planEmptyDesc')}</div>
-      </div>`;
+    return emptyStateHTML({
+      className: 'budget-plan__empty',
+      icon: 'target',
+      title: t('budget.planEmptyTitle'),
+      description: t('budget.planEmptyDesc'),
+    });
   }
   return plans.map((p) => {
     const tone = toneForRatio(p.ratio, p.over);
     const pct = Math.max(0, Math.min(100, Math.round(p.ratio * 100)));
-    const foot = p.over
-      ? t('budget.planOverBy', { amount: fmt(Math.abs(p.remaining)) })
-      : t('budget.planLeft', { amount: fmt(Math.max(0, p.remaining)) });
+    // over === null: vergangener Monat, kein Urteil (#1005). Ein „noch X uebrig"
+    // waere hier falsch - der Plan von heute galt damals nicht.
+    const foot = p.over === null
+      ? ''
+      : p.over
+        ? t('budget.planOverBy', { amount: fmt(Math.abs(p.remaining)) })
+        : t('budget.planLeft', { amount: fmt(Math.max(0, p.remaining)) });
     return `
       <button type="button" class="budget-plan-row budget-plan-row--tone-${tone}" data-category="${view.ctx.esc(p.category)}">
         <div class="budget-plan-row__top">
@@ -169,7 +180,7 @@ function renderRows(plans) {
         <div class="budget-plan-row__track">
           <div class="budget-plan-row__fill" style="--plan-scale:${pct / 100}"></div>
         </div>
-        <div class="budget-plan-row__foot">${foot}</div>
+        ${foot ? `<div class="budget-plan-row__foot">${foot}</div>` : ''}
         <span class="sr-only">${t('budget.planEditAction')}</span>
       </button>`;
   }).join('');
@@ -244,14 +255,14 @@ function openPlanEditor({ category, savings = false }) {
       const input = panel.querySelector('#plan-amount');
       input?.focus();
       input?.select();
-      panel.querySelector('#plan-save').addEventListener('click', () => savePlan(panel, category));
+      panel.querySelector('#plan-save').addEventListener('click', () => savePlan(panel, category, hasCurrent ? current : null));
       panel.querySelector('#plan-delete')?.addEventListener('click', (e) => {
         const btn = e.currentTarget;
         if (btn.disabled) return;        // Doppel-Klick-Schutz gegen doppeltes DELETE
         btn.disabled = true;
         deletePlan(category).finally(() => { btn.disabled = false; });
       });
-      bindEnter(panel, () => savePlan(panel, category));
+      bindEnter(panel, () => savePlan(panel, category, hasCurrent ? current : null));
     },
   });
 }
@@ -260,8 +271,9 @@ function amountFieldHtml(value) {
   return `
     <div class="form-group">
       <label class="form-label" for="plan-amount">${t('budget.planMonthlyAmount')}</label>
-      <input id="plan-amount" class="form-input" type="number" inputmode="decimal" min="0" step="0.01"
-             value="${value === '' ? '' : String(value)}" placeholder="${t('budget.amountPlaceholder')}" />
+      <input id="plan-amount" class="form-input" type="number" inputmode="decimal" min="0"
+             step="${amountStep(view.ctx.currency, value)}"
+             value="${value === '' ? '' : String(value)}" placeholder="${amountPlaceholder(view.ctx.currency)}" />
     </div>`;
 }
 
@@ -271,12 +283,23 @@ function bindEnter(panel, fn) {
   });
 }
 
-async function savePlan(panel, category) {
+async function savePlan(panel, category, original = null) {
   const raw = panel.querySelector('#plan-amount').value;
   const amount = parseFloat(raw);
   if (isNaN(amount) || amount <= 0) {
     // Fehler am Feld statt als ortloser Toast (geteiltes Muster, Critique P1).
     reportFieldError(panel.querySelector('#plan-amount'), t('budget.validAmountRequired'));
+    return;
+  }
+  // Der Dialog ist kein <form>: gespeichert wird über einen Button-Handler, die
+  // native step-Prüfung läuft also nie. Ohne diese Zeile nähme ein Feld mit
+  // step="1" trotzdem 12,5 JPY entgegen. Ein unangetasteter Bestandswert, der
+  // schon vorher neben dem Raster lag, bleibt speicherbar.
+  if (!amountIsSavable(amount, view.ctx.currency, { original })) {
+    reportFieldError(panel.querySelector('#plan-amount'), t('common.amountPrecisionRequired', {
+      currency: view.ctx.currency,
+      step: smallestUnitLabel(view.ctx.currency),
+    }));
     return;
   }
   const btn = panel.querySelector('#plan-save');
@@ -286,6 +309,7 @@ async function savePlan(panel, category) {
     vibrate(10);
     closeModal({ force: true });
     await load();
+    refocusAfterRender();
     window.yuvomi?.showToast(t('budget.planSavedToast'), 'success');
   } catch (err) {
     console.error('[Budget] plan save error:', err);
@@ -307,11 +331,13 @@ async function deletePlan(category) {
     vibrate(10);
     closeModal({ force: true });
     await load();
+    refocusAfterRender();
     window.yuvomi?.showToast(t('budget.planRemovedToast'), 'default', 5000, async () => {
       if (previous == null) return;
       try {
         await api.put(`/budget/plans/${encodeURIComponent(category)}`, { amount: previous });
         await load();
+        refocusAfterRender();
       } catch (err) {
         console.error('[Budget] plan restore error:', err);
         window.yuvomi?.showToast(t('common.unknownError'), 'danger');

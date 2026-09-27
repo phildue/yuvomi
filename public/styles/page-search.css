@@ -1,9 +1,11 @@
 /* --------------------------------------------------------
  * Shared page-toolbar search field (see public/utils/page-search.js).
  * Canonical persistent, leading-icon, labeled search affordance for
- * list/filter modules. Focus tint follows the active module accent.
+ * list/filter modules.
  * Toolbar positioning (flex/max-width/margin) stays a per-module layout
  * class passed via `className`; only the control visual lives here.
+ * Der Fokus traegt die Stimme, nicht den Modulton: ein Suchfeld tut in jedem
+ * Modul dasselbe (Eine-Stimme-Regel, DESIGN.md).
  * -------------------------------------------------------- */
 
 .page-search {
@@ -33,9 +35,12 @@
   min-height: var(--target-base);
   padding-block: var(--space-2);
   padding-inline: 36px calc(var(--space-2) + 24px);
-  border: 1.5px solid var(--glass-border-subtle);
-  border-radius: var(--radius-glass-button);
-  background: var(--color-surface-2);
+  /* Feldkanon aus DESIGN.md: 1.5px --color-border-control auf Surface-Grund. Die
+   * frühere surface-2-Fläche lag im Dark unter dem Seitengrund und ließ das
+   * Feld mit seiner subtilen Kante fast verschwinden. */
+  border: 1.5px solid var(--color-border-control);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
   color: var(--color-text-primary);
   font-size: var(--text-base);
   /* Strip the native search chrome (WebKit draws its own leading magnifier for
@@ -60,9 +65,9 @@
 
 .page-search__input:focus {
   outline: none;
-  border-color: var(--module-accent, var(--color-accent));
+  border-color: var(--color-accent);
   background: var(--color-surface);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--module-accent, var(--color-accent)) 20%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) var(--tint-shadow), transparent);
 }
 
 .page-search__clear {

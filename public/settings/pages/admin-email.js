@@ -10,7 +10,19 @@ import { createInlineError } from '/settings/components.js';
 
 const DEFAULTS = {
   host: '', port: 587, secure: 'starttls', user: '',
-  fromAddress: '', fromName: 'Yuvomi', passwordSet: false,
+  fromAddress: '', fromName: 'Yuvomi', passwordSet: false, envControlled: {},
+};
+
+// Formularfeld je Konfigurationsfeld. Dieselben Namen wie CONFIG_KEYS in
+// server/services/email.js, damit env_controlled 1:1 zuzuordnen ist.
+const FIELD_IDS = {
+  host: 'email-host',
+  port: 'email-port',
+  secure: 'email-secure',
+  user: 'email-user',
+  pass: 'email-pass',
+  fromAddress: 'email-from',
+  fromName: 'email-fromname',
 };
 
 export async function render(container, { user } = {}) {
@@ -31,11 +43,13 @@ export async function render(container, { user } = {}) {
           <div class="form-group">
             <label class="label" for="email-host">${esc(t('email.host'))}</label>
             <input class="input" id="email-host" name="host" value="${esc(cfg.host)}" autocomplete="off" />
+            <p class="form-hint" data-env-hint="host" hidden>${esc(t('settings.documentStorageEnvHint'))}</p>
           </div>
           <div class="form-group">
             <label class="label" for="email-port">${esc(t('email.port'))}</label>
             <input class="input" id="email-port" name="port" type="number" inputmode="numeric"
               value="${esc(String(cfg.port))}" />
+            <p class="form-hint" data-env-hint="port" hidden>${esc(t('settings.documentStorageEnvHint'))}</p>
           </div>
           <div class="form-group">
             <label class="label" for="email-secure">${esc(t('email.security'))}</label>
@@ -44,24 +58,29 @@ export async function render(container, { user } = {}) {
               <option value="starttls">${esc(t('email.securityStarttls'))}</option>
               <option value="none">${esc(t('email.securityNone'))}</option>
             </select>
+            <p class="form-hint" data-env-hint="secure" hidden>${esc(t('settings.documentStorageEnvHint'))}</p>
           </div>
           <div class="form-group">
             <label class="label" for="email-user">${esc(t('email.user'))}</label>
             <input class="input" id="email-user" name="user" value="${esc(cfg.user)}" autocomplete="off" />
+            <p class="form-hint" data-env-hint="user" hidden>${esc(t('settings.documentStorageEnvHint'))}</p>
           </div>
           <div class="form-group">
             <label class="label" for="email-pass">${esc(t('email.password'))}</label>
             <input class="input" id="email-pass" name="pass" type="password" autocomplete="new-password"
               placeholder="${cfg.passwordSet ? '••••••••' : ''}" />
             <p class="form-hint">${esc(t('email.passwordKeep'))}</p>
+            <p class="form-hint" data-env-hint="pass" hidden>${esc(t('settings.documentStorageEnvHint'))}</p>
           </div>
           <div class="form-group">
             <label class="label" for="email-from">${esc(t('email.fromAddress'))}</label>
             <input class="input" id="email-from" name="fromAddress" type="email" value="${esc(cfg.fromAddress)}" />
+            <p class="form-hint" data-env-hint="fromAddress" hidden>${esc(t('settings.documentStorageEnvHint'))}</p>
           </div>
           <div class="form-group">
             <label class="label" for="email-fromname">${esc(t('email.fromName'))}</label>
             <input class="input" id="email-fromname" name="fromName" value="${esc(cfg.fromName)}" />
+            <p class="form-hint" data-env-hint="fromName" hidden>${esc(t('settings.documentStorageEnvHint'))}</p>
           </div>
           <div id="email-notice"></div>
           <div class="settings-form-actions">
@@ -75,6 +94,23 @@ export async function render(container, { user } = {}) {
 
   const form = container.querySelector('#email-form');
   form.secure.value = cfg.secure;
+
+  // env gewinnt über die Datenbank (server/services/email.js:resolve). Vorher
+  // stand das nur im Code: die Seite zeigte Eingabefelder, speicherte in die
+  // Datenbank, und der Wert wirkte nie - ohne jeden Hinweis. Was die Umgebung
+  // bestimmt, ist jetzt sichtbar gesperrt, Feld für Feld.
+  const envControlled = cfg.envControlled ?? {};
+  for (const [field, id] of Object.entries(FIELD_IDS)) {
+    const controlled = envControlled[field] === true;
+    const input = container.querySelector(`#${id}`);
+    if (input) {
+      input.readOnly = controlled && input.tagName !== 'SELECT';
+      input.disabled = controlled;
+    }
+    const hint = container.querySelector(`[data-env-hint="${field}"]`);
+    if (hint) hint.hidden = !controlled;
+  }
+
   const notice = container.querySelector('#email-notice');
   const saveBtn = container.querySelector('#email-save');
   const testBtn = container.querySelector('#email-test');
@@ -91,16 +127,20 @@ export async function render(container, { user } = {}) {
   };
 
   function collect() {
-    const body = {
-      host: form.host.value.trim(),
-      secure: form.secure.value,
-      user: form.user.value.trim(),
-      fromAddress: form.fromAddress.value.trim(),
-      fromName: form.fromName.value.trim(),
-    };
-    const port = Number.parseInt(form.port.value, 10);
-    if (Number.isFinite(port)) body.port = port;
-    if (form.pass.value) body.pass = form.pass.value;
+    // Gesperrte Felder gar nicht erst mitschicken. Der Server ignoriert sie
+    // ohnehin; sie wegzulassen hält die Absicht des Formulars ehrlich.
+    const free = field => envControlled[field] !== true;
+    const body = {};
+    if (free('host')) body.host = form.host.value.trim();
+    if (free('secure')) body.secure = form.secure.value;
+    if (free('user')) body.user = form.user.value.trim();
+    if (free('fromAddress')) body.fromAddress = form.fromAddress.value.trim();
+    if (free('fromName')) body.fromName = form.fromName.value.trim();
+    if (free('port')) {
+      const port = Number.parseInt(form.port.value, 10);
+      if (Number.isFinite(port)) body.port = port;
+    }
+    if (free('pass') && form.pass.value) body.pass = form.pass.value;
     return body;
   }
 

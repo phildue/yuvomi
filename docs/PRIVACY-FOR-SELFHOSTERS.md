@@ -1,6 +1,6 @@
 # Datenschutz-Hinweise für Selfhoster (Yuvomi)
 
-> **Stand: 14.07.2026** - Diese Hinweise sind eine technisch orientierte
+> **Stand: 06.08.2026** - Diese Hinweise sind eine technisch orientierte
 > Hilfestellung für Betreiber. Prüfe die Aktualität von Angemessenheitsbeschlüssen
 > und DPF-Listungen selbst (siehe Abschnitt „Quellen").
 
@@ -30,6 +30,16 @@
    - 2.7 [Google-Drive-Dokumentspeicher](#27-google-drive-dokumentspeicher)
    - 2.8 [Abonnement-Integrationen](#28-abonnement-integrationen)
    - 2.9 [MCP-Endpoint (KI-/Agent-Zugriff)](#29-mcp-endpoint-ki-agent-zugriff)
+   - 2.10 [Web Push & Benachrichtigungs-Kanäle](#210-web-push--benachrichtigungs-kanäle)
+   - 2.11 [E-Mail-Versand (SMTP)](#211-e-mail-versand-smtp)
+   - 2.12 [Versions-/Changelog-Abruf (GitHub)](#212-versions-changelog-abruf-github)
+   - 2.13 [Rezept-Provider (Mealie / Tandoor)](#213-rezept-provider-mealie--tandoor)
+   - 2.14 [DMS-Anbindung (Paperless-ngx / Papra)](#214-dms-anbindung-paperless-ngx--papra)
+   - 2.15 [ICS-Kalender-Abos](#215-ics-kalender-abos)
+   - 2.16 [Outlook-Push (Microsoft Graph)](#216-outlook-push-microsoft-graph)
+   - 2.17 [Feiertage und Schulferien (OpenHolidays)](#217-feiertage-und-schulferien-openholidays)
+   - 2.18 [Immich-Bildschirmschoner](#218-immich-bildschirmschoner)
+   - 2.19 [Abfall-Modul: ICS-URL-Quellen](#219-abfall-modul-ics-url-quellen)
 3. [Logging und Speicherbegrenzung](#3-logging-und-speicherbegrenzung-art-5-abs-1-lit-e-dsgvo)
 4. [Haushaltsausnahme](#4-haushaltsausnahme-art-2-abs-2-lit-c-dsgvo)
 5. [Verarbeitungsverzeichnis-Vorlage (Art. 30 DSGVO)](#5-verarbeitungsverzeichnis-vorlage-art-30-dsgvo)
@@ -77,12 +87,24 @@ Betreiber daraus resultieren.
 | Open-Meteo | `server/routes/weather.js` | ja (Default) | CH — Angemessenheitsbeschluss | nein (siehe 2.1) |
 | OpenWeatherMap | `server/routes/weather.js` | nur wenn `OPENWEATHER_API_KEY` gesetzt | UK — Angemessenheitsbeschluss | empfohlen (siehe 2.2) |
 | CalDAV/CardDAV-Server | `server/services/caldav-sync.js`, `server/services/cardav-sync.js` | nur wenn Nutzer einen Sync konfiguriert | abhängig vom Provider | ja, bei kommerziellen Anbietern (siehe 2.3) |
+| Google-Kalender-Sync (REST-API) | `server/services/google-calendar.js` | nur nach OAuth-Verbindung | USA/Google; DPF-Status prüfen | ja (siehe 2.3) |
 | OIDC-Provider | `server/auth.js`, `server/services/oidc.js` | nur wenn konfiguriert | abhängig vom Provider | meistens ja (siehe 2.4) |
 | WebDAV-Backup | `server/services/backup-webdav.js` | nur wenn konfiguriert | abhängig vom Provider | ja, bei kommerziellen Anbietern (siehe 2.5) |
 | WebDAV-Dokumentspeicher | `server/services/document-storage.js` | nur wenn konfiguriert | abhängig vom Provider | ja, bei kommerziellen Anbietern (siehe 2.6) |
 | Google-Drive-Dokumentspeicher | `server/services/google-drive-storage.js` | nur nach OAuth-Verbindung und expliziter Auswahl | USA/Google; DPF-Status prüfen | ja (siehe 2.7) |
 | Abonnement-Integrationen | `server/services/subscription-*` | nur wenn konfiguriert/ausgelöst | abhängig von Fixer, Benachrichtigungs- oder KI-Provider | abhängig vom Provider (siehe 2.8) |
-| MCP-Endpoint (KI-/Agent-Zugriff) | `server/index.js:338`, `server/mcp/*` | nur wenn Nutzer ein API-Token erstellt und einen MCP-Client anbindet | **lokaler Client: nein** · Cloud-Client: abhängig vom Anbieter | lokaler Client: nein · Cloud-Client: ggf. gegenüber dem Anbieter (siehe 2.9) |
+| MCP-Endpoint (KI-/Agent-Zugriff) | `server/index.js` (Mount `/mcp`), `server/mcp/*` | nur wenn Nutzer ein API-Token erstellt und einen MCP-Client anbindet | **lokaler Client: nein** · Cloud-Client: abhängig vom Anbieter | lokaler Client: nein · Cloud-Client: ggf. gegenüber dem Anbieter (siehe 2.9) |
+| Web Push | `server/services/push.js` | nur wenn ein Nutzer Push auf einem Gerät aktiviert | Push-Dienst des jeweiligen Browsers (Google/Apple/Mozilla) — USA möglich; Inhalte verschlüsselt | nein (siehe 2.10) |
+| Benachrichtigungs-Kanäle (Gotify/ntfy/E-Mail …) | `server/services/notification-channels.js`, `server/services/notification-providers/` | nur wenn ein Admin einen Kanal konfiguriert | abhängig vom Ziel (meist selbst gehostet) | i. d. R. nein (siehe 2.10) |
+| E-Mail-Versand (SMTP) | `server/services/email.js` | nur wenn SMTP konfiguriert | abhängig vom Provider | ja, bei kommerziellen Anbietern (siehe 2.11) |
+| Versions-/Changelog-Abruf | `server/routes/changelog.js` | ja — beim Öffnen des Änderungsverlaufs bzw. der Versionsprüfung (30-Min-Server-Cache) | USA — GitHub/Microsoft, DPF | nein (siehe 2.12) |
+| Rezept-Provider (Mealie/Tandoor) | `server/services/recipe-providers/` | nur wenn ein Recipe-Provider verbunden ist | i. d. R. selbst gehostet | i. d. R. nein (siehe 2.13) |
+| DMS-Anbindung (Paperless-ngx/Papra) | `server/services/dms/` | nur wenn ein DMS verbunden ist | i. d. R. selbst gehostet | i. d. R. nein (siehe 2.14) |
+| ICS-Kalender-Abos | `server/services/ics-subscription.js` | nur wenn ein Nutzer einen Feed abonniert | abhängig vom Feed-Anbieter | nein (siehe 2.15) |
+| Outlook-Push (Microsoft Graph) | `server/services/outlook-calendar.js` | nur wenn alle `MS_*` gesetzt sind **und** ein Konto per OAuth verbunden wurde | USA/Microsoft; DPF-Status prüfen | für private Microsoft-Konten **nicht abschließbar** (siehe 2.16) |
+| Feiertage/Schulferien (OpenHolidays) | `server/services/holidays.js` | nur wenn ein Admin ein Feiertagsland wählt und eine Feiertags-Ebene aktiv ist | Anbieter-Standort selbst prüfen | nein (siehe 2.17) |
+| Immich-Bildschirmschoner | `server/routes/screensaver.js` | nur wenn `IMMICH_URL` und `IMMICH_API_KEY` gesetzt oder unter Einstellungen → Administration → Immich eingetragen sind | i. d. R. selbst gehostet | i. d. R. nein (siehe 2.18) |
+| Abfall-Modul: ICS-URL-Quellen | `server/services/waste-url-source.js` | nur wenn im Abfall-Modul eine ICS-URL als Quelle abonniert wird | abhängig vom Feed-Anbieter | nein (siehe 2.19) |
 
 ### 2.1 Open-Meteo (Wetter-Standard)
 
@@ -139,8 +161,25 @@ Betreiber daraus resultieren.
   | Mailbox.org / Posteo / mailcow | DE | unkritisch |
   | Apple iCloud | USA (Apple Inc.) | DPF-zertifiziert; AVV via Apple Business |
   | Google Workspace | USA (Google LLC) | DPF-zertifiziert; AVV + DPF-Status prüfen |
+  | Outlook.com / Microsoft 365 | USA (Microsoft Corp.) | **kein CalDAV** — eigener Kanal, siehe Abschnitt 2.16 |
   | Mailbox-Provider Drittland (sonstige) | Einzelfall | individuelle TIA |
 - **AVV:** ja, bei kommerziellen Anbietern.
+- **Google-Kalender-Sync läuft nicht über CalDAV:** Yuvomi synchronisiert Google
+  über die **Google-Calendar-REST-API** mit eigenem OAuth-Flow
+  (`server/services/google-calendar.js`, Endpunkt `www.googleapis.com`).
+  Übertragen werden Termindaten der freigegebenen Kalender in beide Richtungen
+  sowie OAuth-Zugriffs-/Refresh-Token; die Token liegen in der Datenbank und
+  sind nur bei aktiviertem `DB_ENCRYPTION_KEY` verschlüsselt. Drittland- und
+  AVV-Bewertung wie in der Tabelle oben für Google (USA/DPF-Status prüfen,
+  Google-AVV/DPA abschließen) — analog zu Abschnitt 2.7.
+- **Outlook.com spricht kein CalDAV:** Microsoft hat den CalDAV-Zugang für
+  Outlook.com abgeschaltet; ein CalDAV-Konto lässt sich dort gar nicht erst
+  einrichten. Yuvomi schreibt stattdessen über die **Microsoft-Graph-API**
+  (`server/services/outlook-calendar.js`) — und zwar nur in eine Richtung,
+  Yuvomi → Outlook. Weil dabei Freitext-Inhalte an ein privates
+  Microsoft-Konto gehen und ein AVV für solche Konten nicht existiert, hat
+  dieser Kanal einen **eigenen Abschnitt 2.16**; die Bewertung in dieser
+  Tabelle greift für ihn nicht.
 - **Empfehlung:** Trage die konkret eingerichteten Sync-Endpoints in dein
   Verarbeitungsverzeichnis (Abschnitt 5) ein — Yuvomi kennt sie nicht zentral,
   jeder Nutzer kann andere konfigurieren.
@@ -258,14 +297,20 @@ Konfiguration so, dass du auf einen EU-Provider umstellen könntest.
   die Server-IP an den jeweiligen Website-Betreiber. Private, Loopback- und
   Link-Local-Ziele werden blockiert; Skripte der Website werden nicht
   ausgeführt.
-- **Benachrichtigungsdienste:** Je nach Agent werden Name, Betrag, Währung und
-  Fälligkeitsdatum eines Abonnements an SMTP, Discord, Telegram, Pushover,
-  Gotify, Serverchan, Ntfy oder einen Webhook übertragen. Für private/LAN-Ziele
-  ist eine ausdrückliche Deployment-Freigabe erforderlich.
+- **Benachrichtigungsdienste:** Je nach Kanal werden Name, Betrag, Währung und
+  Fälligkeitsdatum eines Abonnements an Gotify, ntfy oder einen Webhook
+  übertragen (`server/services/notification-providers/`); Dienste wie Discord
+  oder Slack erreicht Yuvomi nur über den generischen Webhook, einen eigenen
+  Adapter je Dienst gibt es nicht. Seit #944 kann ein Haushalts-Kanal auch
+  selbst per E-Mail zustellen; er nutzt denselben
+  SMTP-Zugang wie Passwort-Reset und Einladungen (Abschnitt 2.11). Für private/LAN-Ziele
+  ist eine ausdrückliche Deployment-Freigabe erforderlich. Dieselben Kanäle
+  transportieren auch andere Erinnerungen der App — einschließlich
+  Medikamenten-Erinnerungen, siehe Abschnitt 2.10.
 
 ### 2.9 MCP-Endpoint (KI-/Agent-Zugriff)
 
-- **Code-Stellen:** `server/index.js:338` (Mount `/mcp`, nur mit
+- **Code-Stellen:** `server/index.js` (Mount `/mcp`, nur mit
   Authentifizierung), `server/mcp/server.js`, `server/mcp/protocol.js`,
   `server/mcp/tools.js`; Token-Verwaltung `server/scopes.js`.
 - **Was ist das?** Yuvomi stellt einen **MCP-Endpoint** bereit, über den ein
@@ -296,6 +341,282 @@ Konfiguration so, dass du auf einen EU-Provider umstellen könntest.
      Datenkategorien in die Datenschutzerklärung aufnehmen; AVV/DPF-Status prüfen.
   4. **Token widerrufbar halten:** Tokens einzeln widerrufbar; dokumentiere,
      welcher Client welches Token nutzt.
+
+### 2.10 Web Push & Benachrichtigungs-Kanäle
+
+- **Code-Stellen:** `server/services/push.js`, `server/services/push-scheduler.js`,
+  `server/services/medication-scheduler.js`; Haushalts-Kanäle:
+  `server/services/notification-channels.js`, `server/services/notification-providers/`.
+- **Web Push — aktiv nur, wenn:** ein Nutzer Push auf einem Gerät einschaltet
+  (Opt-in je Gerät unter Einstellungen → Persönlich → Benachrichtigungen).
+  Der **Server** sendet die Nachricht dann an den Push-Dienst des jeweiligen
+  Browsers — Google (FCM), Apple oder Mozilla, Verarbeitung in den USA möglich.
+- **Was der Push-Dienst sieht:** Die Nachrichten-**Inhalte** (z. B. der
+  Medikamentenname einer Erinnerung) sind nach dem Web-Push-Standard
+  (RFC 8291) **Ende-zu-Ende zwischen Server und Browser verschlüsselt** — der
+  Push-Dienst kann sie nicht lesen. Er sieht aber **Metadaten**: den
+  Geräte-Endpoint, Zeitpunkt, Häufigkeit und Größe der Nachrichten, die IP
+  deines Yuvomi-Servers und die `VAPID_SUBJECT`-Kontaktangabe.
+- **Besonderheit Gesundheitsdaten:** Erinnerungen des Medikamenten-Moduls
+  tragen den Medikamentennamen im (verschlüsselten) Inhalt. Aus den Metadaten
+  allein ist das nicht erkennbar; wer auch das Metadaten-Muster vermeiden
+  will, lässt Push für Gesundheits-Erinnerungen aus und nutzt die In-App-Anzeige.
+- **Betreuung:** Hat ein Admin unter Einstellungen → Familie eine Person als
+  Betreuer einer anderen eingetragen (`health_care_grants`), erhält der
+  Betreuer dieselbe Medikamenten-Erinnerung auf seinen Geräten und Kanälen,
+  mit dem Namen der betreuten Person davor. Die Erinnerung folgt damit
+  ausschließlich dieser ausdrücklichen Freigabe, nie einer Familienrolle;
+  ohne Eintrag bleibt sie bei der betroffenen Person.
+- **Haushalts-Kanäle (Gotify, ntfy …):** Diese senden Erinnerungs-Inhalte —
+  auch Medikamenten-Erinnerungen — im **Klartext** an den konfigurierten
+  Dienst. Bei einem selbst gehosteten Gotify/ntfy im eigenen Netz bleibt alles
+  bei dir; bei einem fremdbetriebenen Ziel (z. B. ntfy.sh) ist der Betreiber
+  Empfänger von Gesundheitsdaten (Art. 9 DSGVO) — dann nur mit ausdrücklicher
+  Einwilligung aller Betroffenen und AVV, besser: selbst hosten.
+- **Besonderheit E-Mail-Kanal:** Ein Kanal vom Typ *email* stellt dieselben
+  Inhalte per SMTP zu, und der **Betreff trägt sie ebenfalls** („Gesundheit:
+  <Medikament>"). Betreffzeilen sind auf dem Transportweg auch dann sichtbar,
+  wenn der Körper der Nachricht verschlüsselt wäre, und sie stehen dauerhaft im
+  Postfach des Empfängers. Wer einen fremden Mail-Anbieter nutzt, macht ihn
+  damit zum Empfänger von Gesundheitsdaten; für Medikamenten-Erinnerungen
+  gelten dieselben Anforderungen wie oben (Einwilligung + AVV), und der eigene
+  Mailserver ist die datensparsamere Wahl.
+- **AVV:** Für die Browser-Push-Dienste nicht abschließbar (Infrastruktur des
+  Browser-Herstellers); Transparenzhinweis in der Datenschutzerklärung genügt
+  nach h. M., da Inhalte verschlüsselt sind. Für fremdbetriebene
+  Gotify-/ntfy-Ziele: ja.
+
+### 2.11 E-Mail-Versand (SMTP)
+
+- **Code-Stelle:** `server/services/email.js`; genutzt vom
+  Passwort-Reset-Flow, von Einladungs-Mails, vom SMTP-Verbindungstest und von
+  Abonnement-Benachrichtigungen (Abschnitt 2.8).
+- **Aktiv nur, wenn:** SMTP konfiguriert ist (Env oder
+  Einstellungen → Administration → E-Mail).
+- **Was wird übertragen:** Empfänger-Adresse, Betreff/Inhalt der jeweiligen
+  Mail (Reset-Link mit Token, Einladungs-Link, Abo-Erinnerung), Absenderdaten
+  und die IP deines Yuvomi-Servers — an den von dir konfigurierten SMTP-Server.
+- **Drittland/AVV:** abhängig vom Mail-Provider — für EU-Provider
+  (Mailbox.org, Posteo, eigener mailcow) unkritisch; bei US-Providern gelten
+  dieselben DPF-/SCC-Überlegungen wie in Abschnitt 2.4. AVV bei kommerziellen
+  Anbietern abschließen; Mail-Metadaten fallen zusätzlich beim Provider an.
+
+### 2.12 Versions-/Changelog-Abruf (GitHub)
+
+- **Code-Stelle:** `server/routes/changelog.js` — ein authentifizierter Proxy,
+  der `api.github.com/repos/ulsklyc/yuvomi/releases` abruft.
+- **Standard aktiv:** ja. Der Abruf passiert, wenn ein angemeldeter Nutzer den
+  Änderungsverlauf öffnet bzw. die App nach einer neueren Version sieht
+  (Versions-Hinweis an der Navigation); die Antwort wird serverseitig
+  **30 Minuten gecacht**, sodass GitHub nicht bei jedem Klick kontaktiert wird.
+  Nach einem fehlgeschlagenen Abruf pausiert der Kanal **5 Minuten**, statt es
+  bei jeder Anfrage erneut zu versuchen.
+- **Was wird übertragen:** ausschließlich die IP deines Yuvomi-Servers und der
+  User-Agent `Yuvomi/1.0` — keine Nutzerdaten, keine Instanz-Kennung, keine
+  installierte Version. Anfragen gehen vom Backend aus, nie vom Browser.
+- **Drittland:** GitHub Inc./Microsoft, USA — DPF-zertifiziert (Status prüfen).
+- **AVV:** nein (keine Verarbeitung personenbezogener Nutzerdaten im Auftrag);
+  Transparenzhinweis in der Datenschutzerklärung genügt. Wer den Kanal ganz
+  vermeiden will, blockiert ausgehende Verbindungen zu `api.github.com`. Die App
+  funktioniert dann vollständig weiter, und der **Änderungsverlauf ebenfalls**:
+  Antwortet GitHub nicht, zeigt die Ansicht die mit dem Image ausgelieferte
+  `CHANGELOG.md` und sagt das auch. Nur der Hinweis auf eine neuere Version
+  bleibt aus — den kann eine Instanz ohne Netz nach draußen nicht kennen.
+
+### 2.13 Rezept-Provider (Mealie / Tandoor)
+
+- **Code-Stellen:** `server/services/recipe-providers/` (`mealie.js`,
+  `tandoor.js`), `server/services/recipe-provider-sync.js`,
+  `server/routes/recipe-providers.js`.
+- **Aktiv nur, wenn:** eine Mealie- oder Tandoor-Instanz als Recipe-Provider
+  verbunden ist (Einstellungen → Module → Küche).
+- **Was wird übertragen:** API-Token (Bearer) und die Server-IP an die
+  konfigurierte Instanz. Die Adapter sind **reine Lese-Clients**: Rezepte
+  (Titel, Zutaten, Vorschaubilder) werden abgerufen und gespiegelt, nichts wird
+  zurückgeschrieben. Ziele im privaten Netz sind nur mit
+  `RECIPE_PROVIDER_ALLOW_PRIVATE_NETWORK` erreichbar.
+- **Drittland/AVV:** Mealie und Tandoor sind typischerweise selbst gehostet im
+  eigenen Netz - dann kein Drittland, kein AVV. Bei einer fremd betriebenen
+  Instanz gelten die üblichen Prüfungen (Standort, AVV).
+
+### 2.14 DMS-Anbindung (Paperless-ngx / Papra)
+
+- **Code-Stellen:** `server/services/dms/` (`paperless.js`, `papra.js`),
+  `server/routes/dms.js`.
+- **Aktiv nur, wenn:** ein Admin ein Dokumenten-Management-System verbindet.
+- **Was wird übertragen:** API-Token, Dokument-Metadaten und -Inhalte im
+  Rahmen der Anbindung sowie die Server-IP — an das konfigurierte DMS.
+  Dokumente können besonders schützenswerte Inhalte tragen.
+- **Drittland/AVV:** Paperless-ngx/Papra sind typischerweise selbst gehostet —
+  dann kein Drittland, kein AVV. Bei gehosteten Angeboten: Standort und AVV
+  prüfen; für sensible Dokumente EU-/Selbsthosting bevorzugen.
+
+### 2.15 ICS-Kalender-Abos
+
+- **Code-Stelle:** `server/services/ics-subscription.js`.
+- **Aktiv nur, wenn:** ein Nutzer einen ICS-Feed abonniert.
+- **Was wird übertragen:** Der Server **ruft** die konfigurierte Feed-URL
+  regelmäßig **ab** (Intervall `SYNC_INTERVAL_MINUTES`). Zum Feed-Betreiber
+  fließen dabei nur die IP deines Yuvomi-Servers und die Feed-URL selbst —
+  die allerdings bei vielen Anbietern ein **privates Zugriffs-Token im Pfad**
+  trägt. Kalenderdaten fließen ausschließlich herein, nie hinaus.
+- **Drittland/AVV:** abhängig vom Feed-Anbieter; für reine Abrufe ohne
+  Personenbezug genügt der Transparenzhinweis. Feed-URLs mit eingebettetem
+  Token wie Zugangsdaten behandeln (sie erlauben jedem den Kalenderabruf).
+
+### 2.16 Outlook-Push (Microsoft Graph)
+
+- **Code-Stellen:** `server/services/outlook-calendar.js`,
+  `server/routes/calendar/outlook.js`.
+- **Was ist das?** Ein **einseitiger Push Yuvomi → Outlook.com** für private
+  Microsoft-Konten (outlook.com, hotmail.com, M365 Family). Outlook.com bietet
+  kein CalDAV mehr (siehe Abschnitt 2.3), deshalb läuft dieser Weg über die
+  Microsoft-Graph-API. Yuvomi bleibt die führende Quelle: Änderungen in Outlook
+  werden beim nächsten Lauf auf den Yuvomi-Stand zurückgesetzt.
+- **Aktiv nur, wenn:** alle drei Variablen `MS_CLIENT_ID`, `MS_CLIENT_SECRET`
+  und `MS_REDIRECT_URI` gesetzt sind **und** ein Admin ein Microsoft-Konto per
+  OAuth verbunden hat. Fehlt eine der Variablen, ist der Kanal vollständig
+  inert — es gibt keinen Weg, ein Konto ohne den OAuth-Flow anzulegen.
+- **Endpunkte:** `login.microsoftonline.com/consumers/oauth2/v2.0`
+  (Authorize/Token) und `graph.microsoft.com/v1.0`. Der `/consumers`-Pfad
+  bedeutet: ausschließlich private Microsoft-Konten, keine Arbeits- oder
+  Schulkonten.
+- **Scopes:** `offline_access Calendars.ReadWrite User.Read` — kein Zugriff auf
+  Mail, Kontakte oder Dateien.
+
+**Was je Termin an Microsoft übertragen wird:**
+
+| Feld | Übertragen? |
+|---|---|
+| Titel — **einschließlich der Anzeigenamen zugewiesener Mitglieder** (`Abendessen (Anna, Ben)`) | ja |
+| Beschreibung/Notizen, als Klartext-Body | ja |
+| Ort | ja, wenn gesetzt |
+| Start/Ende, Ganztags-Kennzeichen, Zeitzone `Europe/Berlin` | ja |
+| Wiederholungsregel | ja, wenn gesetzt |
+| Teilnehmer, Erinnerungen, Anhänge, Farbe, Termin-Icon, Yuvomi-ID | **nein** |
+
+- **Hinweis zu Gesundheitsdaten (Art. 9 DSGVO):** Titel, Beschreibung und Ort
+  sind **Freitext**, und im Familienkalender steht dort typischerweise genau
+  das — Arzttermine, Therapiestunden, Medikamente. Das medizinische Termin-Icon
+  bleibt lokal, der Text nicht. Push-fähig sind auch automatisch erzeugte
+  Termine, denn sie sind gewöhnliche lokale Termine: Geburtstage
+  (`server/services/birthdays.js`) und Haushaltshilfe-Einsätze **samt Namen der
+  Beschäftigten** (`server/routes/housekeeping.js`). Wer das nicht möchte, hält
+  den Freitext knapp oder stellt den Termin auf `private` — er erreicht dann nur
+  noch das Konto der erstellenden Person und nicht das eines anderen
+  Familienmitglieds (siehe Sichtbarkeit).
+- **Offenlegung gegenüber dem Kontoinhaber:** Der Auto-Sync schiebt Termine in
+  das Postfach **einer** Person. Ist ein Termin anderen Familienmitgliedern
+  zugewiesen, stehen deren Klarnamen im Titel in einem fremden
+  Microsoft-Konto — eine Übermittlung an Microsoft **und** an den Kontoinhaber.
+- **Was hereinkommt und gespeichert wird:** einmalig beim Verbinden das
+  Graph-Profil (`id`, Anzeigename, `mail`/`userPrincipalName`), die Kalenderliste
+  (Id, Name, Farbe, Schreibrecht) und je Zielkalender eine Liste aus Event-Id
+  und `changeKey` zur Drift-Erkennung. **Inhalte fremder Outlook-Termine werden
+  nie abgerufen**, und es gibt keinen Inbound-Sync: nichts aus Outlook wird zu
+  Yuvomi-Termindaten.
+- **Sichtbarkeit:** Der **Auto-Sync** respektiert die In-App-Sichtbarkeit —
+  private Termine anderer Personen landen nicht im Postfach des Kontoinhabers.
+  Ein **ausdrücklich am einzelnen Termin gesetztes** Outlook-Ziel wird dagegen
+  nicht gefiltert; das entspricht dem Google-/CalDAV-Outbound und dem
+  ICS-Export-Feed, denn die Sichtbarkeit ist eine In-App-Kontrolle und keine
+  Ausleitungssperre.
+- **Tokens:** Zugriffs- und Refresh-Token liegen pro Konto-Zeile in der Tabelle
+  `outlook_accounts` — **im Klartext**, geschützt nur durch die optionale
+  Datenbank-Verschlüsselung `DB_ENCRYPTION_KEY` (dieselbe Lage wie bei den
+  Google-Tokens, Abschnitt 2.3). Über die API werden sie nie zurückgegeben. Bei
+  privaten Microsoft-Konten verfallen Refresh-Token nach rund 90 Tagen ohne
+  Nutzung; das Konto verlangt dann einen Reconnect.
+- **Drittland:** Microsoft Corp., USA — DPF-zertifiziert, Status selbst prüfen
+  (Abschnitt 6).
+- **AVV: für private Microsoft-Konten nicht abschließbar.** Für ein
+  outlook.com-Konto gilt der Microsoft-Servicevertrag: Microsoft tritt dort
+  gegenüber dem **Kontoinhaber** auf, nicht als dein Auftragsverarbeiter — ein
+  Vertrag nach Art. 28 DSGVO existiert für diese Konstellation schlicht nicht.
+  **Konsequenz:** Außerhalb der Haushaltsausnahme (Abschnitt 4) ist dieser Kanal
+  kaum rechtssicher zu betreiben. Im reinen Familienbetrieb greift Abschnitt 4
+  und die Frage stellt sich nicht; sobald du Daten Dritter verarbeitest, ist die
+  datenschutzkonforme Alternative ein CalDAV-Ziel (Abschnitt 2.3) statt Outlook.
+  Ein AVV-fähiger Microsoft-Weg wäre Microsoft 365 Business gegen ein
+  Arbeitskonto — den unterstützt Yuvomi wegen des `/consumers`-Endpunkts nicht.
+- **Löschung und Aufbewahrung:**
+  1. Ein in Yuvomi gelöschter Termin wird erst im **nächsten Sync-Lauf** in
+     Outlook gelöscht (bis zu `SYNC_INTERVAL_MINUTES` Verzug, Default 15 Minuten).
+     Dasselbe gilt, wenn ein Termin die Sichtbarkeit für den Kontoinhaber
+     verliert oder sein Ziel verliert.
+  2. **Beim Trennen eines Kontos bleiben bereits gepushte Termine in Outlook
+     stehen.** Wer sie loswerden will, löscht sie **vor** dem Trennen in Yuvomi
+     (oder anschließend von Hand in Outlook).
+  3. Die lokalen Tokens werden beim Trennen gelöscht, **ein Widerruf bei
+     Microsoft erfolgt aber nicht**. Entziehe die Freigabe zusätzlich unter
+     <https://account.live.com/consent/Manage>, sonst bleibt die erteilte
+     Berechtigung dort bestehen.
+- **Intervall:** der gemeinsame Sync-Lauf (`SYNC_INTERVAL_MINUTES`, Default
+  15 Minuten), zusätzlich einmal beim Serverstart, direkt nach dem
+  OAuth-Callback und über einen manuellen Admin-Trigger.
+- **Empfehlungen:** einen **dedizierten Kalender** in Outlook als Ziel wählen
+  (nicht den Hauptkalender), `DB_ENCRYPTION_KEY` setzen, damit die Tokens nicht
+  im Klartext auf der Platte liegen, und bei Gesundheitsbezug den Freitext knapp
+  halten. Das Client-Secret der Entra-App gehört wie ein Passwort behandelt und
+  läuft nach spätestens 24 Monaten ab.
+
+### 2.17 Feiertage und Schulferien (OpenHolidays)
+
+- **Code-Stellen:** `server/services/holidays.js`, Einstellungs-Routen in
+  `server/routes/preferences.js` (`/holidays/...`).
+- **Aktiv nur, wenn:** ein Admin ein Feiertagsland wählt **und** mindestens eine
+  der beiden Ebenen (Feiertage, Schulferien) eingeschaltet ist. Ohne Land wird
+  nichts abgerufen. Kein API-Key.
+- **Endpunkt:** `openholidaysapi.org`, abgefragt vom Backend im gemeinsamen
+  Sync-Lauf und auf manuellen Anstoß eines Admins; die Antworten liegen in der
+  Tabelle `holiday_cache`. Beim Einrichten ruft der Server außerdem die Länder-,
+  Regionen- und Gruppenlisten ab. Für einige Länder, die OpenHolidays nicht
+  führt, berechnet Yuvomi die gesetzlichen Feiertage lokal ohne Abruf.
+- **Was wird übertragen:** Ländercode, ggf. Regionscode, der abgefragte
+  Zeitraum sowie die IP deines Yuvomi-Servers. Keine Nutzer- oder
+  Haushaltsdaten.
+- **Drittland/AVV:** kein AVV (keine Verarbeitung personenbezogener Nutzerdaten
+  im Auftrag); Betreiber und Standort des Dienstes vor der Aktivierung selbst
+  prüfen und in der Datenschutzerklärung transparent nennen.
+
+### 2.18 Immich-Bildschirmschoner
+
+- **Code-Stellen:** `server/routes/screensaver.js`, Einstellungsseite
+  Einstellungen → Administration → Immich.
+- **Aktiv nur, wenn:** eine Immich-URL und ein API-Schlüssel gesetzt sind -
+  per `IMMICH_URL`/`IMMICH_API_KEY` (optional `IMMICH_SCREENSAVER_ALBUM_ID`;
+  Env-Werte haben Vorrang) oder in der Einstellungsseite.
+- **Was wird übertragen:** Der **Server** fragt bei der konfigurierten
+  Immich-Instanz zufällige Fotos ab (`/api/search/random`, optional auf ein
+  Album beschränkt) und holt deren Vorschaubilder
+  (`/api/assets/<id>/thumbnail`). Dabei gehen API-Schlüssel, ggf. Album-ID und
+  die Server-IP an Immich. Der Schlüssel verlässt den Server nie; der Browser
+  erhält die Bilder über Yuvomi, dazu Aufnahmezeitpunkt sowie Stadt und Land aus
+  den EXIF-Daten.
+- **Besonderheit:** Fotos sind oft personenbezogen, und der Bildschirmschoner
+  zeigt sie auf einem gemeinsam genutzten Gerät (Wand-Tablet). Ein eigenes Album
+  statt der gesamten Bibliothek begrenzt, was dort erscheinen kann.
+- **Drittland/AVV:** Immich ist typischerweise selbst gehostet - dann kein
+  Drittland, kein AVV. Bei einer fremd betriebenen Instanz: Standort und AVV
+  prüfen.
+
+### 2.19 Abfall-Modul: ICS-URL-Quellen
+
+- **Code-Stellen:** `server/services/waste-url-source.js`,
+  `server/routes/waste/sources.js`.
+- **Aktiv nur, wenn:** im Abfall-Modul eine ICS-URL (etwa der Abfuhrkalender
+  der Gemeinde) als Quelle abonniert wird. Ein einmaliger Datei-Import
+  kontaktiert niemanden.
+- **Was wird übertragen:** Der Server ruft die URL im eingestellten Intervall
+  ab (zwischen einer Stunde und 30 Tagen, Voreinstellung täglich; zusätzlich
+  „jetzt prüfen" von Hand). Zum Feed-Betreiber fließen die IP deines
+  Yuvomi-Servers und die URL selbst; Abfuhrtermine fließen ausschließlich
+  herein. Ohne Freigabe nur `https://`-Ziele im öffentlichen Netz; `http://`
+  und private Netze nur mit `WASTE_SOURCE_ALLOW_PRIVATE_NETWORK`.
+- **Drittland/AVV:** wie bei den ICS-Kalender-Abos (Abschnitt 2.15): abhängig
+  vom Feed-Anbieter, für reine Abrufe ohne Personenbezug genügt der
+  Transparenzhinweis. Eine URL mit eingebettetem Token wie Zugangsdaten
+  behandeln.
 
 ---
 
@@ -409,13 +730,14 @@ konkrete Konfiguration ein und ergänze um eigene Verarbeitungen.
 | # | Bezeichnung | Zweck | Rechtsgrundlage | Kategorien Betroffener | Kategorien Daten | Empfänger | Drittland | Löschfrist | TOMs |
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | Nutzerkonten / Authentifizierung | Login, Identifizierung | Art. 6 Abs. 1 lit. b | Nutzer der Instanz | E-Mail, Username, Passwort-Hash | <<OIDC-Provider falls aktiv>> | <<EU/Drittland>> | bis Account-Löschung | bcrypt-Hash (Cost 12), HTTPS |
-| 2 | Kalender / Termine | Haushaltskoordination | Art. 6 Abs. 1 lit. b | Nutzer, ggf. Eingeladene | Termintitel, Teilnehmer, Ort | CalDAV-Server (falls Sync) | <<je nach Anbieter>> | bis Löschung durch Nutzer | TLS, AVV |
+| 2 | Kalender / Termine | Haushaltskoordination | Art. 6 Abs. 1 lit. b; bei Gesundheitsangaben im Freitext zusätzlich Art. 9 Abs. 2 lit. a | Nutzer, ggf. Eingeladene | Termintitel, Teilnehmer, Ort, Freitext-Notizen (ggf. Gesundheitsangaben) | CalDAV-Server, Google Calendar und/oder Outlook/Microsoft Graph (falls Sync) | <<je nach Anbieter; Google/Microsoft ggf. USA>> | bis Löschung durch Nutzer; Outlook-Push löscht erst im nächsten Sync-Lauf, beim Trennen gar nicht | TLS, AVV (für private Microsoft-Konten nicht abschließbar, siehe 2.16) |
 | 3 | Kontakte / CardDAV | Adressbuch | Art. 6 Abs. 1 lit. b/f | Nutzer, Kontakte | Name, Adresse, Telefon, E-Mail | CardDAV-Server (falls Sync) | <<je nach Anbieter>> | bis Löschung | TLS, AVV |
 | 4 | Wetter | Anzeige Vorhersage | Art. 6 Abs. 1 lit. b | Nutzer | Koordinaten/Ortsname | Open-Meteo (CH); ggf. OpenWeather (UK) | CH/UK Angemessenheit | sofort nach Anfrage | TLS |
-| 5 | Backups | Datensicherung | Art. 6 Abs. 1 lit. f | Nutzer und alle Datensubjekte der App | Vollbackup der DB | <<WebDAV-Provider>> | <<Aufbewahrungs-Konzept, z. B. 30 Tage rollierend>> | Verschlüsselung vor Upload, AVV |
+| 5 | Backups | Datensicherung | Art. 6 Abs. 1 lit. f | Nutzer und alle Datensubjekte der App | Vollbackup der DB | <<WebDAV-Provider>> | <<je nach Anbieter>> | <<Aufbewahrungs-Konzept, z. B. 30 Tage rollierend>> | Verschlüsselung vor Upload, AVV |
 | 6 | Dokumentablage | Gemeinsame Ablage und Kalenderanhänge | Art. 6 Abs. 1 lit. b/f | Nutzer und in Dokumenten genannte Personen | Dokumentdateien, Anhänge, Metadaten | <<lokaler Hoster, WebDAV-Provider oder Google Drive, falls aktiv>> | <<je nach Anbieter; Google ggf. USA>> | bis Löschung durch Nutzer, Provider-Papierkorb prüfen | TLS, eigener Pfad, AVV, Drive-ACL-Grenze, separates Backup |
 | 7 | Sicherheits-/Betriebs-Logs | Missbrauchserkennung, Fehlersuche | Art. 6 Abs. 1 lit. f | Nutzer / Login-Versuchende | IP bei fehlgeschlagenen Logins, Fehler-Stacktraces | nur lokal | nein | **max. 30 Tage** | Rotation, Zugangsbeschränkung |
 | 8 | MCP-/KI-Anbindung (falls genutzt) | Zugriff eines angebundenen KI-/Agent-Clients auf Instanzdaten | Art. 6 Abs. 1 lit. a/f; bei Art.-9-Daten zusätzlich Art. 9 Abs. 2 lit. a | Nutzer und in den Daten genannte Personen | je nach Token-Scope: Aufgaben, Termine, Einkauf, ggf. health/housekeeping | lokaler Client: keiner · Cloud: <<Anbieter>> | lokaler Client: nein · Cloud: <<je nach Anbieter>> | bis Token-Widerruf | Token-Scoping (Least Privilege), TLS; bei Cloud: AVV, DPF/SCCs+TIA |
+| 9 | Benachrichtigungen (Web Push / Kanäle / SMTP, falls genutzt) | Zustellung von Erinnerungen und Hinweisen | Art. 6 Abs. 1 lit. a/b; bei Medikamenten-Erinnerungen Art. 9 Abs. 2 lit. a | Nutzer der Instanz | Erinnerungsinhalte (ggf. Medikamentenname), Geräte-Endpoints, E-Mail-Adressen | Push-Dienst des Browsers (Inhalte verschlüsselt) · <<Gotify/ntfy-Ziel>> · <<SMTP-Provider>> | Push: USA möglich · sonst <<je nach Ziel>> | bis Abbestellung/Geräte-Abmeldung | RFC-8291-Verschlüsselung (Push), TLS, Selbsthosting der Kanäle |
 
 ### 5.3 Auftragsverarbeiter (Art. 28)
 
@@ -426,6 +748,7 @@ konkrete Konfiguration ein und ergänze um eigene Verarbeitungen.
 | <<OIDC-Provider>> | Authentifizierung | <<Datum>> | <<EU/USA>> | <<AVV; ggf. DPF + SCCs>> |
 | <<WebDAV-Provider>> | Backup- und/oder Dokument-Storage | <<Datum>> | <<je nach Anbieter>> | <<AVV; Verschlüsselung für Backups; Zugriffsbeschränkung>> |
 | <<Google Ireland/Google LLC>> | Google-Drive-Dokumentspeicher (falls aktiv) | <<Datum>> | EU/USA | <<Google-DPA; DPF-Status; ggf. SCCs/TIA; drive.file>> |
+| <<Microsoft Corp.>> | Outlook-Kalender-Push (falls aktiv) | **entfällt — kein AVV für private Konten** | USA | <<DPF-Status; Microsoft-Servicevertrag statt AVV; außerhalb der Haushaltsausnahme CalDAV-Ziel bevorzugen — siehe 2.16>> |
 
 ---
 

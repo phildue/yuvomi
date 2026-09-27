@@ -1,19 +1,34 @@
 /**
- * Generates docs/social-preview.png (1280×640) and docs/og-image.png (1200×630).
+ * Generates docs/social-preview.png (1280×640), docs/og-image.png (1200×630)
+ * and docs/twitter-image.png (1200×675) from one shared design, so the three
+ * assets can never drift apart again.
  *
- * Design "Editorial Violet" — a modern, professional split layout:
+ * PALETTE: the app's, since v2.0.0 — Apple Indigo on the near-black neutral
+ * ground, not the retired violet. The BILDMARKE keeps its violet gradient; it is
+ * the mark, bound in PRODUCT.md, and the one thing on this canvas that must not
+ * follow the interface.
+ *
+ * The typeface does NOT follow. Plus Jakarta Sans stays embedded as base64
+ * because this file produces a COMMITTED artifact: an embedded font renders the
+ * same on every machine, while the app's system stack would resolve to whatever
+ * the generating host happens to have — and this generator has already shipped
+ * tofu glyphs once (see the twitter-image fix). A poster may wear a display face
+ * the product does not; a poster that renders differently per machine may not.
+ *
+ * Design "Editorial Indigo" — a modern, professional split layout:
  *   left  → brand lockup, kicker, headline, feature chips (real Lucide icons), meta
  *   right → dashboard screenshot inside a macOS-style window frame with an
  *           ambient violet glow and premium shadow, bleeding off the right edge.
  *
- * Rendered via headless Chromium for pixel-perfect text/gradients/shadows, with
- * the brand font (Plus Jakarta Sans) embedded as base64, then resized with sharp.
+ * Rendered via headless Chromium (puppeteer, devDependency) for pixel-perfect
+ * text/gradients/shadows, with the brand font (Plus Jakarta Sans) embedded as
+ * base64, then resized with sharp.
  *
  * Usage:  node scripts/generate-social-preview.mjs
  */
 
-import { chromium } from '/opt/homebrew/lib/node_modules/playwright/index.mjs';
-import sharp from '../node_modules/sharp/lib/index.js';
+import puppeteer from 'puppeteer';
+import sharp from 'sharp';
 import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +40,7 @@ const SCREENSHOT_SRC = resolve(ROOT, 'docs/screenshots/dashboard-dark-web.png');
 const FONT_SRC       = resolve(ROOT, 'docs/fonts/plus-jakarta-sans-variable.woff2');
 const OUT_SOCIAL     = resolve(ROOT, 'docs/social-preview.png');
 const OUT_OG         = resolve(ROOT, 'docs/og-image.png');
+const OUT_TWITTER    = resolve(ROOT, 'docs/twitter-image.png');
 
 const screenshotB64 = 'data:image/png;base64,'
   + readFileSync(SCREENSHOT_SRC).toString('base64');
@@ -65,10 +81,10 @@ html, body {
 }
 body {
   position: relative;
-  background-color: #0B0711;
+  background-color: #0A0A0C;
   background-image:
-    radial-gradient(ellipse 78% 95% at 74% 52%, rgba(108,58,237,.42) 0%, transparent 58%),
-    radial-gradient(ellipse 50% 50% at 6% 8%,   rgba(139,92,246,.14) 0%, transparent 55%),
+    radial-gradient(ellipse 78% 95% at 74% 52%, rgba(79,77,201,.45) 0%, transparent 58%),
+    radial-gradient(ellipse 50% 50% at 6% 8%,   rgba(138,135,255,.14) 0%, transparent 55%),
     radial-gradient(ellipse 40% 40% at 96% 96%, rgba(45,212,191,.06) 0%, transparent 50%);
 }
 /* fine tech grid overlay, faded toward edges */
@@ -87,7 +103,7 @@ body::before {
 body::after {
   content: '';
   position: absolute; top: 0; left: 0; right: 0; height: 3px;
-  background: linear-gradient(90deg, transparent 0%, #8b5cf6 30%, #6c3aed 55%, transparent 100%);
+  background: linear-gradient(90deg, transparent 0%, #8A87FF 30%, #4F4DC9 55%, transparent 100%);
   opacity: .85;
 }
 
@@ -122,15 +138,15 @@ body::after {
 .kicker {
   display: inline-flex; align-items: center; align-self: flex-start; gap: 8px;
   padding: 7px 14px; margin-bottom: 22px;
-  border: 1px solid rgba(167,139,250,.35);
+  border: 1px solid rgba(138,135,255,.35);
   border-radius: 999px;
-  background: rgba(139,92,246,.10);
+  background: rgba(138,135,255,.10);
   font-size: 11.5px; font-weight: 700; letter-spacing: .14em;
-  text-transform: uppercase; color: #c4b5fd; line-height: 1;
+  text-transform: uppercase; color: #8A87FF; line-height: 1;
 }
 .kicker .dot {
-  width: 6px; height: 6px; border-radius: 50%; background: #34d399;
-  box-shadow: 0 0 8px rgba(52,211,153,.9);
+  width: 6px; height: 6px; border-radius: 50%; background: #30D158;
+  box-shadow: 0 0 8px rgba(48,209,88,.9);
 }
 
 .headline {
@@ -138,13 +154,13 @@ body::after {
   color: #fff; margin-bottom: 20px;
 }
 .headline .grad {
-  background: linear-gradient(100deg, #c4b5fd 0%, #8b5cf6 55%, #a78bfa 100%);
+  background: linear-gradient(100deg, #A9A7FD 0%, #8A87FF 55%, #9B98FF 100%);
   -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
 }
 
 .sub {
   font-size: 16.5px; font-weight: 400; line-height: 1.55; letter-spacing: -.005em;
-  color: #9b93ad; max-width: 430px; margin-bottom: 30px;
+  color: #AEAEB2; max-width: 430px; margin-bottom: 30px;
 }
 
 .chips { display: flex; flex-wrap: wrap; gap: 9px; margin-bottom: 30px; }
@@ -154,15 +170,15 @@ body::after {
   border: 1px solid rgba(255,255,255,.09);
   border-radius: 11px;
   background: rgba(255,255,255,.035);
-  color: #d6d2e0; font-size: 13.5px; font-weight: 600; letter-spacing: -.01em;
+  color: #E5E5EA; font-size: 13.5px; font-weight: 600; letter-spacing: -.01em;
 }
-.chip svg { width: 16px; height: 16px; color: #a78bfa; flex-shrink: 0; }
+.chip svg { width: 16px; height: 16px; color: #8A87FF; flex-shrink: 0; }
 
 .meta {
   display: flex; align-items: center; gap: 11px;
-  font-size: 12.5px; font-weight: 500; color: #6c6580; letter-spacing: .01em;
+  font-size: 12.5px; font-weight: 500; color: #8E8E93; letter-spacing: .01em;
 }
-.meta .sep { width: 3px; height: 3px; border-radius: 50%; background: #4a4460; }
+.meta .sep { width: 3px; height: 3px; border-radius: 50%; background: #48484A; }
 
 /* ── Right product window ── */
 .stage {
@@ -174,7 +190,7 @@ body::after {
 }
 .glow {
   position: absolute; inset: -60px -40px -60px -40px;
-  background: radial-gradient(ellipse at center, rgba(108,58,237,.55) 0%, transparent 65%);
+  background: radial-gradient(ellipse at center, rgba(79,77,201,.55) 0%, transparent 65%);
   filter: blur(20px);
   z-index: 0;
 }
@@ -182,18 +198,18 @@ body::after {
   position: relative; z-index: 1;
   border-radius: 14px;
   overflow: hidden;
-  background: #15101f;
-  border: 1px solid rgba(167,139,250,.20);
+  background: #1C1C1E;
+  border: 1px solid rgba(138,135,255,.20);
   box-shadow:
     0 40px 90px rgba(0,0,0,.65),
-    0 8px 30px rgba(91,33,182,.30),
+    0 8px 30px rgba(67,64,184,.30),
     inset 0 1px 0 rgba(255,255,255,.06);
 }
 .titlebar {
   height: 40px;
   display: flex; align-items: center; gap: 9px;
   padding: 0 16px;
-  background: linear-gradient(180deg, #211a33 0%, #1a1428 100%);
+  background: linear-gradient(180deg, #2C2C2E 0%, #1C1C1E 100%);
   border-bottom: 1px solid rgba(255,255,255,.05);
 }
 .tl { width: 12px; height: 12px; border-radius: 50%; }
@@ -205,14 +221,14 @@ body::after {
   padding: 0 12px;
   border-radius: 7px;
   background: rgba(0,0,0,.28);
-  color: #7e7691; font-size: 11.5px; font-weight: 500; letter-spacing: .01em;
+  color: #8E8E93; font-size: 11.5px; font-weight: 500; letter-spacing: .01em;
 }
-.titlebar .addr svg { width: 11px; height: 11px; margin-right: 7px; color: #34d399; }
+.titlebar .addr svg { width: 11px; height: 11px; margin-right: 7px; color: #30D158; }
 .window img { width: 100%; display: block; vertical-align: top; }
 /* top shimmer edge */
 .window::after {
   content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(196,181,253,.6) 40%, rgba(196,181,253,.6) 60%, transparent);
+  background: linear-gradient(90deg, transparent, rgba(169,167,253,.6) 40%, rgba(169,167,253,.6) 60%, transparent);
 }
 </style>
 </head>
@@ -271,21 +287,23 @@ body::after {
 // ── Render & export ─────────────────────────────────────────────────────────
 
 async function render(outPath, finalW, finalH) {
-  const browser = await chromium.launch({ headless: true });
-  const DSF = 2;
-  const context = await browser.newContext({
-    viewport:          { width: 1280, height: 640 },
-    deviceScaleFactor: DSF,
-    colorScheme:       'dark',
+  const browser = await puppeteer.launch();
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 640, deviceScaleFactor: 2 });
+  await page.setContent(html(screenshotB64), { waitUntil: 'load', timeout: 120_000 });
+  await page.evaluate(async () => {
+    await document.fonts.ready;
+    const img = document.querySelector('.window img');
+    if (img && !img.complete) await new Promise((r) => { img.onload = r; img.onerror = r; });
+    await img?.decode?.().catch(() => {});
   });
-  const page = await context.newPage();
-  await page.setContent(html(screenshotB64), { waitUntil: 'networkidle' });
-  await page.waitForTimeout(400);
   const raw = await page.screenshot({ type: 'png' });
   await browser.close();
 
+  // 'cover' statt 'fill': das Twitter-Format (16:9) weicht vom 2:1-Canvas ab -
+  // ein leichter Seitenbeschnitt ist unsichtbar, eine Stauchung nicht.
   await sharp(raw)
-    .resize(finalW, finalH, { fit: 'fill' })
+    .resize(finalW, finalH, { fit: 'cover', position: 'centre' })
     .png({ compressionLevel: 9 })
     .toFile(outPath);
 
@@ -293,6 +311,7 @@ async function render(outPath, finalW, finalH) {
 }
 
 console.log('Generating social previews…');
-await render(OUT_SOCIAL, 1280, 640);
-await render(OUT_OG,     1200, 630);
+await render(OUT_SOCIAL,  1280, 640);
+await render(OUT_OG,      1200, 630);
+await render(OUT_TWITTER, 1200, 675);
 console.log('Done.');

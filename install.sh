@@ -23,7 +23,7 @@ ask()     { printf "%s%s%s " "$BOLD" "$*" "$RESET"; }
 # der Umgebung (OIKOS_INSTALLER_LANG > LC_ALL > LC_MESSAGES > LANG), analog der App.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLI_LOCALES_DIR="$SCRIPT_DIR/tools/installer/locales/cli"
-SUPPORTED_LOCALES=(de en es fr it sv el ru tr zh ja ar hi pt uk pl nl cs vi hu ko id fa)
+SUPPORTED_LOCALES=(de en es fr it sv el ru tr zh ja ar hi pt uk pl nl cs vi hu ko id fa fil)
 FALLBACK_LOCALE=en
 ACTIVE_LOCALE=$FALLBACK_LOCALE
 
@@ -80,7 +80,7 @@ generate_secret() {
 # harmloser: ein neuer Wert wirft alle angemeldeten Nutzer aus der App.
 #
 # Der Web-Installer schreibt Werte compose-sicher (Quotes, `\` maskiert, `$` als
-# `$$`) — das wird hier zurückgedreht, damit ein CLI-Rerun nach einer
+# `$$`) - das wird hier zurückgedreht, damit ein CLI-Rerun nach einer
 # Web-Installation denselben Schlüssel liest.
 read_existing_env_value() {
   [ -f .env ] || return 1
@@ -96,6 +96,26 @@ read_existing_env_value() {
   raw="${raw//\$\$/\$}"
   [ -n "$raw" ] || return 1
   printf '%s' "$raw"
+}
+
+# Gegenstück beim Schreiben - spiegelt encodeEnvValue() aus
+# tools/installer/install-server.js: `$` wird zu `$$` (Compose-Literal),
+# riskante Werte (Whitespace, #, Quotes, Backtick, `\`) werden doppelt
+# gequotet, darin `\` und `"` maskiert. Ohne das würde ein Rerun einen vom
+# Web-Installer quotiert geschriebenen Wert entschärft lesen und roh
+# zurückschreiben - Compose interpoliert oder kappt ihn dann.
+escape_env_value() {
+  local raw="$1" out
+  out="${raw//\$/\$\$}"
+  case "$raw" in
+    *[[:space:]\#\"\'\`\\]*)
+      out=$(printf '%s' "$out" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+      printf '"%s"' "$out"
+      ;;
+    *)
+      printf '%s' "$out"
+      ;;
+  esac
 }
 
 on_interrupt() { printf "\n%s%s%s\n" "$YELLOW" "$(t common.interrupted)" "$RESET"; exit 1; }
@@ -158,6 +178,68 @@ configure_basic() {
 
   ask "$(t basic.tz "$sys_tz")"
   read -r YUVOMI_TZ; YUVOMI_TZ="${YUVOMI_TZ:-$sys_tz}"
+
+  # BASE_URL wird nicht aus Host und Port zusammengesetzt und gut: hinter einem
+  # Reverse-Proxy lautet die Origin https://planer.example.com, während der
+  # Container weiter auf localhost:3000 hört. Aus dem Request-Header darf der
+  # Server sie nicht nehmen (Reset-Poisoning), also ist Fragen der einzige Weg.
+  local default_base="http://${YUVOMI_HOST}:${YUVOMI_PORT}"
+  ask "$(t basic.base_url "$default_base")"
+  read -r YUVOMI_BASE_URL; YUVOMI_BASE_URL="${YUVOMI_BASE_URL:-$default_base}"
+
+  # Der Web-Installer setzt das Schema selbst zusammen und kann es nicht
+  # verlieren; hier tippt der Nutzer frei. Ohne Schema ist der Reset-Link
+  # kaputt, und die VAPID-Subject-Kette verwirft den Wert stumm als
+  # "nicht routbar". Ein Schrägstrich am Ende ergäbe `https://host//reset`.
+  case "$YUVOMI_BASE_URL" in
+    http://*|https://*) ;;
+    *) YUVOMI_BASE_URL="http://${YUVOMI_BASE_URL}" ;;
+  esac
+  while [ "${YUVOMI_BASE_URL%/}" != "$YUVOMI_BASE_URL" ]; do
+    YUVOMI_BASE_URL="${YUVOMI_BASE_URL%/}"
+  done
+
+  configure_proxy
+}
+
+# Reverse-Proxy-Betrieb aus dem Schema der Basis-URL ableiten.
+#
+# Der CLI-Installer hat diese beiden Variablen nie geschrieben, und beide
+# Server-Defaults sind für die jeweils andere Betriebsart falsch:
+#
+#   SESSION_SECURE ist per Default aus (`=== 'true'`). Hinter einem HTTPS-Proxy
+#   fehlen damit HSTS und das Secure-Flag am Sitzungscookie.
+#
+#   TRUST_PROXY ist per Default 1, also "vertraue einem Proxy-Hop". Beim
+#   Direktzugriff OHNE Proxy nimmt Express damit den X-Forwarded-For-Header
+#   ungeprüft an - jeder Client kann sich eine beliebige Absender-IP geben und
+#   das Anmelde-Rate-Limit umgehen, weil es pro IP zählt.
+#
+# Das Schema der Basis-URL trägt genau diese Information, und der Web-Installer
+# leitet dieselbe Entscheidung aus derselben Quelle ab (`S.scheme`).
+#
+# Ein bereits vorhandener Wert gewinnt ohne Rückfrage - wie bei den Secrets. Wer
+# TRUST_PROXY von Hand auf `2` oder ein Subnetz gesetzt hat, weiss besser als
+# eine Heuristik, wie seine Kette aussieht.
+configure_proxy() {
+  local existing
+  if existing=$(read_existing_env_value SESSION_SECURE); then
+    YUVOMI_SESSION_SECURE="$existing"
+  else
+    case "$YUVOMI_BASE_URL" in
+      https://*) YUVOMI_SESSION_SECURE='true' ;;
+      *)         YUVOMI_SESSION_SECURE='false' ;;
+    esac
+  fi
+
+  if existing=$(read_existing_env_value TRUST_PROXY); then
+    YUVOMI_TRUST_PROXY="$existing"
+  else
+    case "$YUVOMI_BASE_URL" in
+      https://*) YUVOMI_TRUST_PROXY='1' ;;
+      *)         YUVOMI_TRUST_PROXY='loopback' ;;
+    esac
+  fi
 }
 
 # ── Step 2: Secrets ────────────────────────────────────────────────────────────
@@ -171,7 +253,7 @@ configure_secrets() {
     printf "\n  %s%s:%s\n" "$BOLD" "$varname" "$RESET"
 
     # Bestehender Wert gewinnt ohne Rückfrage. Wer bewusst neu anfangen will,
-    # entfernt die Zeile aus der .env — das ist die explizite Geste dafür.
+    # entfernt die Zeile aus der .env - das ist die explizite Geste dafür.
     local existing
     if existing=$(read_existing_env_value "$varname"); then
       printf -v "$varname" '%s' "$existing"
@@ -195,18 +277,49 @@ configure_secrets() {
 }
 
 # ── Step 3: Weather ────────────────────────────────────────────────────────────
+# Open-Meteo ist seit 2026-06-07 der Standard: kostenlos, ohne Konto, ohne
+# Schlüssel, dafür mit Koordinaten statt Ortsname. Der Dialog fragte trotzdem
+# weiter nach einem OpenWeather-API-Schlüssel und schickte damit jeden, der das
+# Wetter-Widget wollte, zu einer Registrierung, die er nicht braucht.
+# OPENWEATHER_* bleibt als Legacy erhalten, wird aber nicht mehr erfragt: wer
+# es schon nutzt, behält es über den Preserve-Zweig in write_env_and_start.
+
+# Zahl im Bereich [min,max]? Bash kann kein Fliesskomma, awk schon.
+valid_number() {
+  [[ "$1" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || return 1
+  awk -v v="$1" -v lo="$2" -v hi="$3" 'BEGIN { exit !(v >= lo && v <= hi) }'
+}
+
 configure_weather() {
   step "$(t weather.step)"
-  OPENWEATHER_API_KEY=''; OPENWEATHER_CITY='Berlin'
-  OPENWEATHER_UNITS='metric'; OPENWEATHER_LANG='de'
+  WEATHER_LAT=''; WEATHER_LON=''; WEATHER_CITY=''; WEATHER_UNITS='metric'
 
   ask "$(t weather.enable)"
   read -r want_weather
   if [ "${want_weather,,}" = "y" ]; then
-    info "$(t weather.apikey_hint)"
-    ask "$(t weather.apikey)"; read -r OPENWEATHER_API_KEY
-    ask "$(t weather.city)"; read -r city; OPENWEATHER_CITY="${city:-Berlin}"
-    ask "$(t weather.units)"; read -r units; OPENWEATHER_UNITS="${units:-metric}"
+    info "$(t weather.coords_hint)"
+
+    # Leere Eingabe bricht ab statt erneut zu fragen. Ohne diesen Ausstieg ist
+    # die Schleife für jeden, der sich bei der Ja/Nein-Frage vertippt hat, nur
+    # noch mit Ctrl+C verlassbar - und der trap beendet den ganzen Installer,
+    # er müsste also von vorn anfangen. Enter heisst im übrigen Dialog überall
+    # "weiter"; das darf hier nicht die einzige Stelle sein, wo es das nicht tut.
+    while true; do
+      ask "$(t weather.lat)"; read -r WEATHER_LAT
+      [ -z "$WEATHER_LAT" ] && { WEATHER_LAT=''; WEATHER_LON=''; WEATHER_CITY=''; return 0; }
+      valid_number "$WEATHER_LAT" -90 90 && break
+      warn "$(t weather.err_lat)"
+    done
+
+    while true; do
+      ask "$(t weather.lon)"; read -r WEATHER_LON
+      [ -z "$WEATHER_LON" ] && { WEATHER_LAT=''; WEATHER_LON=''; WEATHER_CITY=''; return 0; }
+      valid_number "$WEATHER_LON" -180 180 && break
+      warn "$(t weather.err_lon)"
+    done
+
+    ask "$(t weather.city)"; read -r WEATHER_CITY
+    ask "$(t weather.units)"; read -r units; WEATHER_UNITS="${units:-metric}"
   fi
 }
 
@@ -215,15 +328,16 @@ configure_calendar() {
   step "$(t calendar.step)"
   GOOGLE_CLIENT_ID=''; GOOGLE_CLIENT_SECRET=''; GOOGLE_REDIRECT_URI=''
   APPLE_USERNAME=''; APPLE_APP_SPECIFIC_PASSWORD=''
+  MS_CLIENT_ID=''; MS_CLIENT_SECRET=''; MS_REDIRECT_URI=''
 
   ask "$(t calendar.google_enable)"
   read -r want_google
   if [ "${want_google,,}" = "y" ]; then
     info "$(t calendar.google_hint)"
-    info "$(t calendar.redirect_hint "http://${YUVOMI_HOST}:${YUVOMI_PORT}/api/v1/calendar/google/callback")"
+    info "$(t calendar.redirect_hint "${YUVOMI_BASE_URL}/api/v1/calendar/google/callback")"
     ask "$(t calendar.client_id)"; read -r GOOGLE_CLIENT_ID
     ask "$(t calendar.client_secret)"; read -rs GOOGLE_CLIENT_SECRET; printf "\n"
-    GOOGLE_REDIRECT_URI="http://${YUVOMI_HOST}:${YUVOMI_PORT}/api/v1/calendar/google/callback"
+    GOOGLE_REDIRECT_URI="${YUVOMI_BASE_URL}/api/v1/calendar/google/callback"
   fi
 
   ask "$(t calendar.apple_enable)"
@@ -232,6 +346,16 @@ configure_calendar() {
     info "$(t calendar.apple_hint)"
     ask "$(t calendar.apple_id)"; read -r APPLE_USERNAME
     ask "$(t calendar.apple_pass)"; read -rs APPLE_APP_SPECIFIC_PASSWORD; printf "\n"
+  fi
+
+  ask "$(t calendar.outlook_enable)"
+  read -r want_outlook
+  if [ "${want_outlook,,}" = "y" ]; then
+    info "$(t calendar.outlook_hint)"
+    info "$(t calendar.redirect_hint "${YUVOMI_BASE_URL}/api/v1/calendar/outlook/callback")"
+    ask "$(t calendar.client_id)"; read -r MS_CLIENT_ID
+    ask "$(t calendar.client_secret)"; read -rs MS_CLIENT_SECRET; printf "\n"
+    MS_REDIRECT_URI="${YUVOMI_BASE_URL}/api/v1/calendar/outlook/callback"
   fi
 }
 
@@ -276,7 +400,7 @@ configure_document_storage() {
   ask "$(t document_google_drive.enable)"
   read -r want_document_google_drive
   if [ "${want_document_google_drive,,}" = "y" ]; then
-    info "$(t document_google_drive.redirect_hint "http://${YUVOMI_HOST}:${YUVOMI_PORT}/api/v1/documents/storage/google-drive/callback")"
+    info "$(t document_google_drive.redirect_hint "${YUVOMI_BASE_URL}/api/v1/documents/storage/google-drive/callback")"
     ask "$(t document_google_drive.client_id)"; read -r GOOGLE_DRIVE_CLIENT_ID
     ask "$(t document_google_drive.client_secret)"; read -rs GOOGLE_DRIVE_CLIENT_SECRET; printf "\n"
     if { [ -n "$GOOGLE_DRIVE_CLIENT_ID" ] && [ -z "$GOOGLE_DRIVE_CLIENT_SECRET" ]; } || { [ -z "$GOOGLE_DRIVE_CLIENT_ID" ] && [ -n "$GOOGLE_DRIVE_CLIENT_SECRET" ]; }; then
@@ -285,7 +409,7 @@ configure_document_storage() {
     if [ -z "$GOOGLE_DRIVE_CLIENT_ID" ] && { [ -z "$GOOGLE_CLIENT_ID" ] || [ -z "$GOOGLE_CLIENT_SECRET" ]; }; then
       err "$(t document_google_drive.err_credentials)"
     fi
-    GOOGLE_DRIVE_REDIRECT_URI="http://${YUVOMI_HOST}:${YUVOMI_PORT}/api/v1/documents/storage/google-drive/callback"
+    GOOGLE_DRIVE_REDIRECT_URI="${YUVOMI_BASE_URL}/api/v1/documents/storage/google-drive/callback"
   fi
 }
 
@@ -296,11 +420,18 @@ review_and_confirm() {
   printf "  %-16s %s%s%s\n"  "$(t review.host)"     "$CYAN"   "$YUVOMI_HOST" "$RESET"
   printf "  %-16s %s%s%s\n"  "$(t review.port)"     "$CYAN"   "$YUVOMI_PORT" "$RESET"
   printf "  %-16s %s%s%s\n"  "$(t review.timezone)" "$CYAN"   "$YUVOMI_TZ"   "$RESET"
+  printf "  %-16s %s%s%s\n"  "$(t review.base_url)" "$CYAN"   "$YUVOMI_BASE_URL" "$RESET"
   printf "  %-16s %s***%s%s\n" "SESSION_SECRET" "$YELLOW" "$RESET" "${SESSION_SECRET_REUSED:+ $(t review.secret_reused)}"
   printf "  %-16s %s***%s%s\n" "DB_ENCRYPT_KEY" "$YELLOW" "$RESET" "${DB_ENCRYPTION_KEY_REUSED:+ $(t review.secret_reused)}"
-  [ -n "$OPENWEATHER_API_KEY" ] && printf "  %-16s %s%s%s\n" "$(t review.weather)" "$GREEN" "$(t review.weather_value "$OPENWEATHER_CITY")" "$RESET"
+  # Variablennamen statt übersetzter Labels: dieselbe Geste wie bei den beiden
+  # Zeilen darüber. Sichtbar müssen sie sein, weil hier eine Sicherheitsfrage
+  # entschieden wird, ohne dass jemand danach gefragt wurde.
+  printf "  %-16s %s%s%s\n" "SESSION_SECURE" "$CYAN" "$YUVOMI_SESSION_SECURE" "$RESET"
+  printf "  %-16s %s%s%s\n" "TRUST_PROXY"    "$CYAN" "$YUVOMI_TRUST_PROXY"    "$RESET"
+  [ -n "$WEATHER_LAT" ] && printf "  %-16s %s%s%s\n" "$(t review.weather)" "$GREEN" "$(t review.weather_value "${WEATHER_CITY:-$WEATHER_LAT, $WEATHER_LON}")" "$RESET"
   [ -n "$GOOGLE_CLIENT_ID" ]    && printf "  %-16s %s%s%s\n" "$(t review.google)"  "$GREEN" "$(t review.google_value)" "$RESET"
   [ -n "$APPLE_USERNAME" ]      && printf "  %-16s %s%s%s\n" "$(t review.apple)"   "$GREEN" "$APPLE_USERNAME" "$RESET"
+  [ -n "$MS_CLIENT_ID" ]        && printf "  %-16s %s%s%s\n" "$(t review.outlook)" "$GREEN" "$(t review.outlook_value)" "$RESET"
   [ "$DOCUMENT_STORAGE_LOCAL_ENABLED" = "true" ] && printf "  %-16s %s%s%s\n" "$(t review.document_local)" "$GREEN" "${DOCUMENT_STORAGE_LOCAL_PATH:-/documents}" "$RESET"
   [ "$DOCUMENT_STORAGE_WEBDAV_ENABLED" = "true" ] && printf "  %-16s %s%s%s\n" "$(t review.document_webdav)" "$GREEN" "$DOCUMENT_STORAGE_WEBDAV_URL" "$RESET"
   [ -n "$GOOGLE_DRIVE_REDIRECT_URI" ] && printf "  %-16s %s%s%s\n" "$(t review.document_google_drive)" "$GREEN" "$(t review.google_value)" "$RESET"
@@ -310,10 +441,53 @@ review_and_confirm() {
   [ "${confirm,,}" = "n" ] && { info "$(t review.aborted)"; exit 0; }
 }
 
+# Die Schlüssel, die dieser Dialog selbst belegt. Alles andere in einer
+# bestehenden .env stammt von Hand oder aus dem Web-Installer und wird
+# übernommen - siehe preserve_unmanaged().
+MANAGED_KEYS=(
+  SESSION_SECRET DB_ENCRYPTION_KEY
+  WEATHER_LAT WEATHER_LON WEATHER_CITY WEATHER_UNITS
+  GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET GOOGLE_REDIRECT_URI
+  GOOGLE_DRIVE_CLIENT_ID GOOGLE_DRIVE_CLIENT_SECRET GOOGLE_DRIVE_REDIRECT_URI
+  APPLE_USERNAME APPLE_APP_SPECIFIC_PASSWORD
+  MS_CLIENT_ID MS_CLIENT_SECRET MS_REDIRECT_URI
+  DOCUMENT_STORAGE_LOCAL_ENABLED DOCUMENT_STORAGE_LOCAL_PATH
+  DOCUMENT_STORAGE_WEBDAV_ENABLED DOCUMENT_STORAGE_WEBDAV_URL
+  DOCUMENT_STORAGE_WEBDAV_USERNAME DOCUMENT_STORAGE_WEBDAV_PASSWORD
+  DOCUMENT_STORAGE_WEBDAV_PATH
+  SYNC_INTERVAL_MINUTES TZ OIKOS_HTTP_PORT BASE_URL
+  SESSION_SECURE TRUST_PROXY
+)
+
+# Jede Zuweisung aus der alten .env, die dieser Dialog NICHT selbst setzt.
+#
+# Der Grund: `cat > .env` schrieb 24 Schlüssel und warf alles andere weg. Wer
+# SMTP, OIDC oder WebDAV-Backups von Hand ergänzt hatte - oder den Wizard
+# benutzte, der 55 Schlüssel kennt - verlor sie beim nächsten Lauf lautlos.
+# Ein Rerun ist der Normalfall (Update, geänderter Port, nachgetragenes SMTP),
+# nicht die Ausnahme. Das Backup daneben half nicht: die laufende Installation
+# war trotzdem kaputt, und zwar erst beim nächsten Anmeldeversuch sichtbar.
+#
+# Kommentare fallen bewusst weg: sie beziehen sich auf den alten Aufbau der
+# Datei und stünden im neuen an falscher Stelle.
+preserve_unmanaged() {
+  local source_file="$1" line key
+  [ -f "$source_file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    key="${line%%=*}"
+    [ "$key" = "$line" ] && continue
+    case "$key" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+    in_array "$key" "${MANAGED_KEYS[@]}" && continue
+    printf '%s\n' "$line"
+  done < "$source_file"
+}
+
 # ── Step 6: Container ───────────────────────────────────────────────────────────
 write_env_and_start() {
   step "$(t container.step "$ENGINE_NAME")"
 
+  backup=''
   if [ -f .env ]; then
     backup=".env.bak-$(date +%Y-%m-%dT%H-%M-%S)"
     if ! cp .env "$backup"; then
@@ -323,33 +497,60 @@ write_env_and_start() {
     success "$(t container.backup_ok "$backup")"
   fi
 
+  # Rerun-Erhalt: das Sync-Intervall fragt der Dialog nie ab - ein von Hand
+  # oder vom Wizard gesetzter Wert darf hier nicht auf 15 zurückfallen.
+  local sync_interval
+  sync_interval=$(read_existing_env_value SYNC_INTERVAL_MINUTES) || sync_interval=15
+
   cat > .env << ENVEOF
 # Generated by Yuvomi installer
-SESSION_SECRET=${SESSION_SECRET}
-DB_ENCRYPTION_KEY=${DB_ENCRYPTION_KEY}
-OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
-OPENWEATHER_CITY=${OPENWEATHER_CITY}
-OPENWEATHER_UNITS=${OPENWEATHER_UNITS}
-OPENWEATHER_LANG=${OPENWEATHER_LANG}
-GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
-GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
-GOOGLE_REDIRECT_URI=${GOOGLE_REDIRECT_URI}
-GOOGLE_DRIVE_CLIENT_ID=${GOOGLE_DRIVE_CLIENT_ID}
-GOOGLE_DRIVE_CLIENT_SECRET=${GOOGLE_DRIVE_CLIENT_SECRET}
-GOOGLE_DRIVE_REDIRECT_URI=${GOOGLE_DRIVE_REDIRECT_URI}
-APPLE_USERNAME=${APPLE_USERNAME}
-APPLE_APP_SPECIFIC_PASSWORD=${APPLE_APP_SPECIFIC_PASSWORD}
+SESSION_SECRET=$(escape_env_value "${SESSION_SECRET}")
+DB_ENCRYPTION_KEY=$(escape_env_value "${DB_ENCRYPTION_KEY}")
+WEATHER_LAT=${WEATHER_LAT}
+WEATHER_LON=${WEATHER_LON}
+WEATHER_CITY=$(escape_env_value "${WEATHER_CITY}")
+WEATHER_UNITS=${WEATHER_UNITS}
+GOOGLE_CLIENT_ID=$(escape_env_value "${GOOGLE_CLIENT_ID}")
+GOOGLE_CLIENT_SECRET=$(escape_env_value "${GOOGLE_CLIENT_SECRET}")
+GOOGLE_REDIRECT_URI=$(escape_env_value "${GOOGLE_REDIRECT_URI}")
+GOOGLE_DRIVE_CLIENT_ID=$(escape_env_value "${GOOGLE_DRIVE_CLIENT_ID}")
+GOOGLE_DRIVE_CLIENT_SECRET=$(escape_env_value "${GOOGLE_DRIVE_CLIENT_SECRET}")
+GOOGLE_DRIVE_REDIRECT_URI=$(escape_env_value "${GOOGLE_DRIVE_REDIRECT_URI}")
+APPLE_USERNAME=$(escape_env_value "${APPLE_USERNAME}")
+APPLE_APP_SPECIFIC_PASSWORD=$(escape_env_value "${APPLE_APP_SPECIFIC_PASSWORD}")
+MS_CLIENT_ID=$(escape_env_value "${MS_CLIENT_ID}")
+MS_CLIENT_SECRET=$(escape_env_value "${MS_CLIENT_SECRET}")
+MS_REDIRECT_URI=$(escape_env_value "${MS_REDIRECT_URI}")
 DOCUMENT_STORAGE_LOCAL_ENABLED=${DOCUMENT_STORAGE_LOCAL_ENABLED}
-DOCUMENT_STORAGE_LOCAL_PATH=${DOCUMENT_STORAGE_LOCAL_PATH}
+DOCUMENT_STORAGE_LOCAL_PATH=$(escape_env_value "${DOCUMENT_STORAGE_LOCAL_PATH}")
 DOCUMENT_STORAGE_WEBDAV_ENABLED=${DOCUMENT_STORAGE_WEBDAV_ENABLED}
-DOCUMENT_STORAGE_WEBDAV_URL=${DOCUMENT_STORAGE_WEBDAV_URL}
-DOCUMENT_STORAGE_WEBDAV_USERNAME=${DOCUMENT_STORAGE_WEBDAV_USERNAME}
-DOCUMENT_STORAGE_WEBDAV_PASSWORD=${DOCUMENT_STORAGE_WEBDAV_PASSWORD}
-DOCUMENT_STORAGE_WEBDAV_PATH=${DOCUMENT_STORAGE_WEBDAV_PATH}
-SYNC_INTERVAL_MINUTES=15
+DOCUMENT_STORAGE_WEBDAV_URL=$(escape_env_value "${DOCUMENT_STORAGE_WEBDAV_URL}")
+DOCUMENT_STORAGE_WEBDAV_USERNAME=$(escape_env_value "${DOCUMENT_STORAGE_WEBDAV_USERNAME}")
+DOCUMENT_STORAGE_WEBDAV_PASSWORD=$(escape_env_value "${DOCUMENT_STORAGE_WEBDAV_PASSWORD}")
+DOCUMENT_STORAGE_WEBDAV_PATH=$(escape_env_value "${DOCUMENT_STORAGE_WEBDAV_PATH}")
+SYNC_INTERVAL_MINUTES=${sync_interval}
 TZ=${YUVOMI_TZ}
 OIKOS_HTTP_PORT=${YUVOMI_PORT}
+# Absolute origin for password-reset links and push. The request Host header is
+# deliberately not trusted (reset poisoning), so without this value the server
+# sends no reset mails at all.
+BASE_URL=${YUVOMI_BASE_URL}
+# Derived from the base URL's scheme. SESSION_SECURE=true enables HSTS and the
+# Secure flag on the session cookie; TRUST_PROXY=loopback stops Express from
+# believing an X-Forwarded-For header when there is no proxy in front (that
+# header is what the login rate limit counts per client).
+SESSION_SECURE=${YUVOMI_SESSION_SECURE}
+TRUST_PROXY=${YUVOMI_TRUST_PROXY}
 ENVEOF
+
+  if [ -n "$backup" ]; then
+    local preserved
+    preserved=$(preserve_unmanaged "$backup")
+    if [ -n "$preserved" ]; then
+      printf '\n# Carried over from the previous .env\n%s\n' "$preserved" >> .env
+      success "$(t container.preserved "$(printf '%s\n' "$preserved" | grep -c .)")"
+    fi
+  fi
 
   success "$(t container.env_written)"
 
@@ -408,7 +609,10 @@ create_admin() {
   http_code=$(printf '%s' "$response" | tail -n1)
   body=$(printf '%s' "$response" | head -n-1)
 
-  local url="http://${YUVOMI_HOST}:${YUVOMI_PORT}"
+  # Die Adresse, unter der der Haushalt die App tatsächlich öffnet, nicht die,
+  # auf die der Container hört. Hinter einem Proxy sind das zwei verschiedene,
+  # und ein Link auf http://host:port führt dort ins Leere.
+  local url="${YUVOMI_BASE_URL:-http://${YUVOMI_HOST}:${YUVOMI_PORT}}"
   if [ "$http_code" = "201" ]; then
     success "$(t admin.created)"
     printf "\n%s%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n"   "$BOLD" "$GREEN" "$RESET"
@@ -437,7 +641,10 @@ run_noninteractive() {
   detect_engine || err "$(t noninteractive.no_engine)"
   info "$(t noninteractive.engine "$ENGINE_NAME" "${COMPOSE[*]}")"
 
-  YUVOMI_PORT=$(grep -E '^PORT=' .env 2>/dev/null | cut -d= -f2- | head -n1)
+  # Host-Port ist OIKOS_HTTP_PORT (Compose mappt ${OIKOS_HTTP_PORT:-3000}:3000).
+  # PORT wäre der Container-Innenport - der Health-Poll und die curl-Anleitung
+  # liefen damit gegen den falschen Anschluss.
+  YUVOMI_PORT=$(grep -E '^OIKOS_HTTP_PORT=' .env 2>/dev/null | cut -d= -f2- | head -n1)
   YUVOMI_PORT="${YUVOMI_PORT:-3000}"
   YUVOMI_HOST="localhost"
 
@@ -473,7 +680,7 @@ main() {
   set -- ${positional[@]+"${positional[@]}"}
 
   printf "\n%s%s  ╔══════════════════════════════╗\n" "$BOLD" "$BLUE"
-  printf "  ║      Yuvomi  Installer        ║\n"
+  printf "  ║       Yuvomi Installer       ║\n"
   printf "  ╚══════════════════════════════╝%s\n\n" "$RESET"
 
   if [ "${1:-}" = "--env-file" ]; then

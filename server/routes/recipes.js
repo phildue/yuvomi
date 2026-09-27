@@ -9,7 +9,9 @@ import express from 'express';
 import * as db from '../db.js';
 import { str, num, collectErrors, MAX_TITLE, MAX_TEXT, MAX_SHORT } from '../middleware/validate.js';
 import { normalizeRecipeMealTypes } from '../../public/utils/recipe-meal-types.js';
-import { getAdapter } from '../services/mealie-sync.js';
+import { getAdapter } from '../services/recipe-providers/index.js';
+import { dataUrlContentMatches } from '../utils/file-signature.js';
+import { mayWriteModule } from '../permissions.js';
 
 const log = createLogger('Recipes');
 const router = express.Router();
@@ -20,20 +22,32 @@ const router = express.Router();
 const THUMBNAIL_MIME = new Set(['image/webp', 'image/jpeg', 'image/png']);
 function normalizeMime(value) { return String(value || '').split(';')[0].trim().toLowerCase(); }
 
-// Mirror-Rezepte (source: 'mealie') tragen mealie_account_id; native Rezepte
-// haben diese Spalte NULL. Das ist der einzige Unterschied, den Frontend und
-// Zugriffsschutz brauchen, um ein Rezept korrekt zu behandeln.
+// Mirror-Rezepte tragen provider_account_id; native Rezepte haben diese Spalte
+// NULL. `source` liest den tatsaechlichen Provider-Namen (mealie/tandoor/...)
+// vom verknuepften Account statt ihn hart zu verdrahten - das ist der einzige
+// Unterschied, den Frontend und Zugriffsschutz brauchen, um ein Rezept korrekt
+// zu behandeln, und er erweitert sich automatisch um jeden neuen Provider.
 function withSource(recipe) {
-  return { ...recipe, source: recipe.mealie_account_id ? 'mealie' : 'native' };
+  // DAS BILD SELBST GEHT NIE MIT (#1059, Schritt 2). `SELECT r.*` zieht die
+  // Spalte mit, und eine Data-URL von bis zu 5 MB je Zeile machte aus der
+  // Rezeptliste ein Vielfaches ihrer selbst - fuer eine Vorschau von 32 Pixeln,
+  // die ohnehin ueber `GET /recipes/:id/image` kommt. Uebrig bleibt das Flag,
+  // das die Oberflaeche wirklich braucht: gibt es eins?
+  const { image_data, ...rest } = recipe;
+  return {
+    ...rest,
+    has_own_image: !!image_data,
+    source: recipe.provider_account_id ? recipe.provider_type : 'native',
+  };
 }
 
 function loadRecipeWithIngredients(id) {
   const recipe = db.get().prepare(`
     SELECT r.*, u.display_name AS creator_name, u.avatar_color AS creator_color,
-           m.name AS mealie_account_name
+           p.name AS provider_account_name, p.provider AS provider_type
     FROM recipes r
     LEFT JOIN users u ON u.id = r.created_by
-    LEFT JOIN mealie_accounts m ON m.id = r.mealie_account_id
+    LEFT JOIN recipe_provider_accounts p ON p.id = r.provider_account_id
     WHERE r.id = ?
   `).get(id);
 
@@ -52,10 +66,10 @@ router.get('/', (_req, res) => {
   try {
     const recipes = db.get().prepare(`
       SELECT r.*, u.display_name AS creator_name, u.avatar_color AS creator_color,
-             m.name AS mealie_account_name
+             p.name AS provider_account_name, p.provider AS provider_type
       FROM recipes r
       LEFT JOIN users u ON u.id = r.created_by
-      LEFT JOIN mealie_accounts m ON m.id = r.mealie_account_id
+      LEFT JOIN recipe_provider_accounts p ON p.id = r.provider_account_id
       ORDER BY r.title COLLATE NOCASE ASC, r.id DESC
     `).all();
 
@@ -87,6 +101,31 @@ router.get('/', (_req, res) => {
   }
 });
 
+/* EIN EIGENES BILD JE REZEPT (#1059, Schritt 2).
+ *
+ * Dieselbe Regel wie beim Gegenstandsfoto (routes/inventory/items.js) und beim
+ * Geburtstagsbild: eine Bild-Data-URL, dieselbe Groessengrenze, und der Inhalt
+ * muss zu seinem deklarierten Typ passen (#937) - der Praefix kommt aus dem
+ * Browser des Absenders und ist fuer sich genommen keine Auskunft.
+ *
+ * `undefined` heisst "nicht mitgeschickt" und laesst das gespeicherte Bild
+ * stehen; `null` oder der leere String loeschen es. Ohne diese Unterscheidung
+ * raeumte jedes Teil-Update das Bild ab - derselbe Fehler, den `meal_types`
+ * weiter unten schon einmal hatte.
+ */
+const MAX_RECIPE_IMAGE_LENGTH = 6_990_507; // ~5 MB Rohbild in base64, wie inventory/birthdays
+const RECIPE_IMAGE_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
+
+function validateRecipeImage(val) {
+  if (val === undefined) return { value: undefined, error: null };
+  if (val === null || val === '') return { value: null, error: null };
+  const s = String(val).trim();
+  if (s.length > MAX_RECIPE_IMAGE_LENGTH) return { value: null, error: 'Image is too large.' };
+  if (!RECIPE_IMAGE_RE.test(s)) return { value: null, error: 'Image must be a valid image data URL.' };
+  if (!dataUrlContentMatches(s)) return { value: null, error: 'Image content does not match its image type.' };
+  return { value: s, error: null };
+}
+
 router.post('/', (req, res) => {
   try {
     const { ingredients = [] } = req.body;
@@ -96,14 +135,16 @@ router.post('/', (req, res) => {
     const vRecipeUrl = str(req.body.recipe_url, 'Rezept-URL', { max: MAX_TEXT, required: false });
     const mealTypes = normalizeRecipeMealTypes(req.body.meal_types);
 
-    const errors = collectErrors([vTitle, vNotes, vRecipeUrl]);
+    const vImage = validateRecipeImage(req.body.image_data);
+    const errors = collectErrors([vTitle, vNotes, vRecipeUrl, vImage]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
 
     const recipeId = db.transaction(() => {
       const result = db.get().prepare(`
-        INSERT INTO recipes (title, notes, recipe_url, meal_types, created_by)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(vTitle.value, vNotes.value, vRecipeUrl.value, mealTypes.join(','), req.authUserId || req.session.userId);
+        INSERT INTO recipes (title, notes, recipe_url, meal_types, image_data, created_by)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(vTitle.value, vNotes.value, vRecipeUrl.value, mealTypes.join(','),
+        vImage.value ?? null, req.authUserId || req.session.userId);
 
       const rid = Number(result.lastInsertRowid);
       const insertIng = db.get().prepare(`
@@ -134,13 +175,13 @@ router.put('/:id', (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'Ungueltige Rezept-ID', code: 400 });
 
-    const existing = db.get().prepare('SELECT id, created_by, mealie_account_id FROM recipes WHERE id = ?').get(id);
+    const existing = db.get().prepare('SELECT id, created_by, provider_account_id, meal_types FROM recipes WHERE id = ?').get(id);
     if (!existing) return res.status(404).json({ error: 'Recipe not found', code: 404 });
-    // Mirror-Rezepte sind read-only: Mealie bleibt Quelle der Wahrheit für ihren
-    // Inhalt. Der Check steht vor der created_by-Prüfung, weil sonst genau der
-    // Nutzer, der den Mealie-Account angelegt hat (und damit als created_by
-    // dieser Rezepte gilt), sie über die API editieren könnte.
-    if (existing.mealie_account_id) return res.status(403).json({ error: 'Mirrored recipes are managed in Mealie and cannot be edited here.', code: 403 });
+    // Mirror-Rezepte sind read-only: der Quell-Provider bleibt Quelle der
+    // Wahrheit für ihren Inhalt. Der Check steht vor der created_by-Prüfung,
+    // weil sonst genau der Nutzer, der den Provider-Account angelegt hat (und
+    // damit als created_by dieser Rezepte gilt), sie über die API editieren könnte.
+    if (existing.provider_account_id) return res.status(403).json({ error: 'Mirrored recipes are managed by their source provider and cannot be edited here.', code: 403 });
     if (existing.created_by !== (req.authUserId || req.session.userId)) return res.status(403).json({ error: 'Not authorized.', code: 403 });
 
     const { ingredients = [] } = req.body;
@@ -148,16 +189,29 @@ router.put('/:id', (req, res) => {
     const vTitle = str(req.body.title, 'Titel', { max: MAX_TITLE });
     const vNotes = str(req.body.notes, 'Notizen', { max: MAX_TEXT, required: false });
     const vRecipeUrl = str(req.body.recipe_url, 'Rezept-URL', { max: MAX_TEXT, required: false });
-    const mealTypes = normalizeRecipeMealTypes(req.body.meal_types);
-    const errors = collectErrors([vTitle, vNotes, vRecipeUrl]);
+    // Fehlt das Feld, bleibt die gespeicherte Auswahl stehen - ein Teil-Update
+    // darf sie nicht mitnehmen. Ohne den Rückgriff schriebe jeder Aufruf ohne
+    // meal_types wieder alle vier Mahlzeiten hin und machte eine bewusst leere
+    // Auswahl (#750) beim nächsten Speichern zunichte.
+    const mealTypes = normalizeRecipeMealTypes(
+      req.body.meal_types === undefined ? existing.meal_types : req.body.meal_types
+    );
+    const vImage = validateRecipeImage(req.body.image_data);
+    const errors = collectErrors([vTitle, vNotes, vRecipeUrl, vImage]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
 
     db.transaction(() => {
+      // COALESCE fuer das Bild: ein nicht mitgeschicktes Feld (undefined -> NULL
+      // als Bindung) laesst das gespeicherte stehen. Geloescht wird nur mit
+      // ausdruecklichem null/'' - dann traegt vImage.value ebenfalls null, und
+      // die Fallunterscheidung unten setzt es.
       db.get().prepare(`
         UPDATE recipes
-        SET title = ?, notes = ?, recipe_url = ?, meal_types = ?
+        SET title = ?, notes = ?, recipe_url = ?, meal_types = ?,
+            image_data = CASE WHEN ? = 1 THEN ? ELSE image_data END
         WHERE id = ?
-      `).run(vTitle.value, vNotes.value, vRecipeUrl.value, mealTypes.join(','), id);
+      `).run(vTitle.value, vNotes.value, vRecipeUrl.value, mealTypes.join(','),
+        vImage.value === undefined ? 0 : 1, vImage.value ?? null, id);
 
       db.get().prepare('DELETE FROM recipe_ingredients WHERE recipe_id = ?').run(id);
 
@@ -182,16 +236,55 @@ router.put('/:id', (req, res) => {
   }
 });
 
+/**
+ * GET /api/v1/recipes/:id/image
+ * Liefert das selbst hochgeladene Rezeptbild als Datei (#1059, Schritt 2).
+ *
+ * ALS ROUTE UND NICHT IN DER LISTE. Die Spalte traegt eine Data-URL von bis zu
+ * 5 MB; sie an jeder Mahlzeit einer Wochenansicht mitzuschicken waere ein
+ * Vielfaches der ganzen uebrigen Antwort, fuer eine Vorschau von 32 Pixeln.
+ * Die Listen tragen deshalb nur ein Flag, und das Bild holt sich der Browser
+ * hier - genau wie beim Provider-Thumbnail nebenan, das aus demselben Grund
+ * ein Proxy ist.
+ */
+router.get('/:id/image', (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: 'Invalid recipe ID.', code: 400 });
+
+    const row = db.get().prepare('SELECT image_data FROM recipes WHERE id = ?').get(id);
+    if (!row?.image_data) return res.status(404).json({ error: 'No image available.', code: 404 });
+
+    const match = /^data:(image\/[a-z+]+);base64,(.+)$/i.exec(row.image_data);
+    if (!match) return res.status(415).json({ error: 'Stored image is not readable.', code: 415 });
+
+    const buffer = Buffer.from(match[2], 'base64');
+    res.setHeader('Content-Type', match[1]);
+    res.setHeader('Content-Length', String(buffer.length));
+    // Dieselben Kopfzeilen wie der Provider-Proxy: der Browser soll den Typ
+    // nicht raten, und ein Bild aus der eigenen Datenbank gehoert niemandem
+    // sonst in den Cache.
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'");
+    res.end(buffer);
+  } catch (err) {
+    log.error('GET /:id/image error:', err);
+    res.status(500).json({ error: 'Internal error', code: 500 });
+  }
+});
+
 router.delete('/:id', (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'Invalid recipe ID.', code: 400 });
 
-    const existing = db.get().prepare('SELECT id, created_by, mealie_account_id FROM recipes WHERE id = ?').get(id);
+    const existing = db.get().prepare('SELECT id, created_by, provider_account_id FROM recipes WHERE id = ?').get(id);
     if (!existing) return res.status(404).json({ error: 'Recipe not found.', code: 404 });
-    // Siehe PUT /:id: Mirror-Rezepte lassen sich nur durch Löschen des Mealie-
-    // Accounts entfernen (POST /mealie/accounts/:id), nicht einzeln hier.
-    if (existing.mealie_account_id) return res.status(403).json({ error: 'Mirrored recipes are managed in Mealie and cannot be deleted here.', code: 403 });
+    // Siehe PUT /:id: Mirror-Rezepte lassen sich nur durch Löschen des
+    // Provider-Accounts entfernen (DELETE /recipe-providers/accounts/:id), nicht
+    // einzeln hier.
+    if (existing.provider_account_id) return res.status(403).json({ error: 'Mirrored recipes are managed by their source provider and cannot be deleted here.', code: 403 });
     if (existing.created_by !== (req.authUserId || req.session.userId)) return res.status(403).json({ error: 'Not authorized.', code: 403 });
 
     const result = db.get().prepare('DELETE FROM recipes WHERE id = ?').run(id);
@@ -205,29 +298,30 @@ router.delete('/:id', (req, res) => {
 });
 
 /**
- * GET /api/v1/recipes/:id/mealie-thumbnail
- * Proxied Mealies Rezeptbild (min-original.webp). Kein direkter <img src> auf
- * Mealie möglich: die Medien-Route dort verlangt denselben Bearer-Token wie
- * jeder andere Endpunkt, und der darf den Client nie erreichen (siehe
- * publicAccount() in routes/mealie.js) - also holt der Server die Bytes und
- * reicht sie durch, wie der DMS-Vorschau-Proxy es für Paperless/Papra tut.
+ * GET /api/v1/recipes/:id/provider-thumbnail
+ * Proxied das Rezeptbild eines Recipe-Providers (Mealie, Tandoor, ...). Kein
+ * direkter <img src> auf den Provider möglich: dessen Medien-Route verlangt
+ * denselben Bearer-Token wie jeder andere Endpunkt, und der darf den Client nie
+ * erreichen (siehe publicAccount() in routes/recipe-providers.js) - also holt
+ * der Server die Bytes und reicht sie durch, wie der DMS-Vorschau-Proxy es für
+ * Paperless/Papra tut.
  */
-router.get('/:id/mealie-thumbnail', async (req, res) => {
+router.get('/:id/provider-thumbnail', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'Invalid recipe ID.', code: 400 });
 
     const recipe = db.get().prepare(
-      'SELECT mealie_account_id, mealie_recipe_id, mealie_has_image FROM recipes WHERE id = ?'
+      'SELECT provider_account_id, provider_recipe_id, provider_slug, provider_has_image FROM recipes WHERE id = ?'
     ).get(id);
-    if (!recipe?.mealie_account_id || !recipe.mealie_has_image) {
+    if (!recipe?.provider_account_id || !recipe.provider_has_image) {
       return res.status(404).json({ error: 'No thumbnail available.', code: 404 });
     }
 
-    const account = db.get().prepare('SELECT * FROM mealie_accounts WHERE id = ?').get(recipe.mealie_account_id);
+    const account = db.get().prepare('SELECT * FROM recipe_provider_accounts WHERE id = ?').get(recipe.provider_account_id);
     if (!account) return res.status(404).json({ error: 'No thumbnail available.', code: 404 });
 
-    const thumb = await getAdapter(account).fetchThumbnail(recipe.mealie_recipe_id);
+    const thumb = await getAdapter(account).fetchThumbnail({ id: recipe.provider_recipe_id, slug: recipe.provider_slug });
     const mime = normalizeMime(thumb?.mime);
     if (!thumb?.buffer?.length || !THUMBNAIL_MIME.has(mime)) {
       return res.status(415).json({ error: 'Thumbnail not available.', code: 415 });
@@ -240,8 +334,8 @@ router.get('/:id/mealie-thumbnail', async (req, res) => {
     res.end(thumb.buffer);
   } catch (err) {
     if (err.status === 404) return res.status(404).json({ error: 'No thumbnail available.', code: 404 });
-    log.error('GET /:id/mealie-thumbnail error:', err);
-    res.status(502).json({ error: 'Mealie thumbnail proxy failed.', code: 502 });
+    log.error('GET /:id/provider-thumbnail error:', err);
+    res.status(502).json({ error: 'Recipe provider thumbnail proxy failed.', code: 502 });
   }
 });
 
@@ -270,6 +364,15 @@ router.get('/:id/mealie-thumbnail', async (req, res) => {
  */
 router.post('/:id/to-shopping-list', (req, res) => {
   try {
+    // Dieselbe Regel wie im Essensplan (#1290, ausfuehrlich in
+    // routes/meals.js): `/recipes` gehoert dem Scope-Modul `meals`, angelegt
+    // werden `shopping_items`. Wer in den Einkauf schreibt, braucht dessen
+    // Schreibrecht - als Mitglied wie als Token. Vor den 404ern, damit die
+    // Antwort keine Rezept- und Listen-IDs bestaetigt.
+    if (!mayWriteModule(req, 'shopping')) {
+      return res.status(403).json({ error: 'Write access to the shopping list is required.', code: 403 });
+    }
+
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'Invalid recipe ID.', code: 400 });
 

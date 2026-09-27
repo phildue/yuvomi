@@ -9,6 +9,8 @@ import express from 'express';
 import * as db from '../db.js';
 import { str, oneOf, date, num, collectErrors, MAX_TITLE, MAX_TEXT, MAX_SHORT, DATE_RE } from '../middleware/validate.js';
 import { addDays, mealWeekday, datesForTemplateInRange } from '../services/meal-recurrence.js';
+import { todayKey } from '../utils/timezone.js';
+import { mayWriteModule } from '../permissions.js';
 
 const log = createLogger('Meals');
 
@@ -201,7 +203,7 @@ router.get('/', (req, res) => {
   try {
     const refDate = req.query.week && DATE_RE.test(req.query.week)
       ? req.query.week
-      : new Date().toISOString().slice(0, 10);
+      : todayKey(db.get());
 
     const from = weekStart(refDate);
     const to   = weekEnd(refDate);
@@ -213,10 +215,19 @@ router.get('/', (req, res) => {
     // nachfragen. NULL heißt unbegrenzt.
     const meals = db.get().prepare(`
       SELECT m.*, u.display_name AS creator_name, u.avatar_color AS creator_color,
-             mrt.end_date AS recurrence_end_date
+             mrt.end_date AS recurrence_end_date,
+             -- Hat das verknuepfte Rezept ein Bild (#1059)? Der Planer stellt
+             -- damit den Platzhalter ODER das Vorschaubild, ohne je Karte
+             -- nachzufragen - und ohne einen Request, der fuer ein bildloses
+             -- Rezept ohnehin nur ein 404 waere. Zwei Quellen, zwei Flags: das
+             -- eigene Bild (Schritt 2) und das des Providers (Schritt 1). Die
+             -- Bilddaten selbst gehen NIE mit, die holt der Browser je Route.
+             r.provider_has_image AS recipe_has_image,
+             (r.image_data IS NOT NULL) AS recipe_has_own_image
       FROM meals m
       LEFT JOIN users u ON u.id = m.created_by
       LEFT JOIN meal_recurrence_templates mrt ON mrt.id = m.recurrence_template_id
+      LEFT JOIN recipes r ON r.id = m.recipe_id
       WHERE m.date BETWEEN ? AND ?
       ORDER BY m.date ASC,
         CASE m.meal_type
@@ -732,6 +743,24 @@ router.delete('/ingredients/:ingId', (req, res) => {
  */
 router.post('/:id/to-shopping-list', (req, res) => {
   try {
+    // WER IN DEN EINKAUF SCHREIBT, BRAUCHT DAS EINKAUFS-RECHT (#1290).
+    //
+    // Die beiden Riegel in server/index.js urteilen am ERSTEN PFADSEGMENT
+    // (`moduleForPath`): dieser Aufruf laeuft unter `/meals` und wird deshalb
+    // als `meals` gemessen - angelegt werden aber `shopping_items`. Ein
+    // Mitglied mit `meals: write` und `shopping: none` fuellte so eine Liste,
+    // die es nicht einmal oeffnen darf, und ein Token mit `meals:write` ohne
+    // jeden Einkaufs-Scope genauso. Die Zuordnung am Pfad ist dafuer die
+    // falsche Frage: was ein Aufruf SCHREIBT, weiss nur die Route selbst.
+    // `mayWriteModule()` prueft beide Achsen (Mitgliedsrecht und Token-Scope)
+    // in einem Aufruf.
+    //
+    // VOR DEN 404ern, nicht danach: sonst verriete die Antwort einem
+    // Gesperrten noch, welche Mahlzeit und welche Liste es gibt.
+    if (!mayWriteModule(req, 'shopping')) {
+      return res.status(403).json({ error: 'Write access to the shopping list is required.', code: 403 });
+    }
+
     const mealId = parseInt(req.params.id, 10);
     const meal   = db.get().prepare('SELECT id, recipe_id FROM meals WHERE id = ?').get(mealId);
     if (!meal) return res.status(404).json({ error: 'Mahlzeit nicht gefunden', code: 404 });
@@ -813,6 +842,12 @@ router.post('/:id/to-shopping-list', (req, res) => {
  */
 router.post('/week-to-shopping-list', (req, res) => {
   try {
+    // Derselbe Grund wie beim Einzel-Transfer darueber (#1290): der Pfad sagt
+    // `meals`, geschrieben wird in den Einkauf.
+    if (!mayWriteModule(req, 'shopping')) {
+      return res.status(403).json({ error: 'Write access to the shopping list is required.', code: 403 });
+    }
+
     const { listId, week } = req.body;
 
     if (!listId)

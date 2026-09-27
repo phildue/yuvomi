@@ -100,6 +100,29 @@ export function computeDueDoses(schedules, range = {}) {
 }
 
 /**
+ * Nur die Dosen, die zu einem Zeitpunkt geplant WAREN.
+ *
+ * Die Basis jeder Adhaerenz-Rechnung: `planned` zaehlt Eintraege aus den
+ * Einnahmeplaenen, und eine Bedarfsdosis gehoert zu keinem. Sichtbar wurde das
+ * erst mit #700 - vorher fielen Bedarfsdosen schon am Zeitraumfilter der Route
+ * heraus, seit dem Fix kommen sie mit. Drei von sieben geplanten Dosen plus acht
+ * Kopfschmerztabletten haetten sonst „100 %, 11 von 11" ergeben.
+ *
+ * Unterschieden wird an `scheduled_at` und NICHT an `schedule_id`: die
+ * Plan-Referenz traegt `ON DELETE SET NULL` (Migration 65). Wer einen alten
+ * Einnahmeplan loescht, setzt sie damit auf allen historischen Zeilen zurueck -
+ * ueber `schedule_id` gerechnet wuerde die Vergangenheit dadurch zu lauter
+ * Bedarfsdosen, und Adhaerenz wie Serie fielen rueckwirkend in sich zusammen,
+ * ohne dass jemand eine Dosis anders genommen haette. Der Zeitpunkt bleibt.
+ *
+ * @param {Array<Object>} logs
+ * @returns {Array<Object>}
+ */
+export function scheduledLogs(logs) {
+  return (Array.isArray(logs) ? logs : []).filter((l) => l && l.scheduled_at);
+}
+
+/**
  * Adherence-Quote: genommene Dosen / geplante Dosen im Zeitraum.
  *
  * @param {Array<Object>} logs - Dosis-Log-Zeilen mit `status`
@@ -121,6 +144,116 @@ export function computeAdherence(logs, planned) {
   const rate = denom > 0 ? taken / denom : null;
 
   return { taken, skipped, pending, planned: plannedCount, rate };
+}
+
+// ---- Bedarfsmedikation (#700) ----
+
+/**
+ * Ein gespeicherter Zeitpunkt als echter Moment.
+ *
+ * In `medication_logs` liegen zwei Schreibweisen nebeneinander: `scheduled_at`
+ * ist Wanduhrzeit ohne Zone ('2026-08-16T18:40'), `created_at` und aeltere
+ * `taken_at` enden auf 'Z'. Wer beides mit `new Date()` liest, verschiebt die
+ * Wanduhrzeit um den eigenen UTC-Abstand - oestlich von Greenwich in die
+ * Zukunft, westlich in die Vergangenheit. Beim Countdown waere das kein
+ * Schoenheitsfehler, sondern eine falsche Auskunft darueber, wann die naechste
+ * Dosis erlaubt ist.
+ *
+ * @param {string|Date|null} value
+ * @returns {Date|null} null bei leerem oder unlesbarem Wert.
+ */
+export function parseLogInstant(value) {
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  const raw = String(value ?? '').trim();
+  if (!raw) return null;
+
+  const local = raw.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (local) {
+    const [, y, mo, d, h, mi, s] = local;
+    return new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s || 0));
+  }
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+/**
+ * Ein Zeitpunkt als 'YYYY-MM-DDTHH:MM' in Wanduhrzeit.
+ *
+ * Das Gegenstueck zu parseLogInstant fuer den Schreibweg: `toISOString()` waere
+ * hier falsch, weil die Route den Wert auf Minuten kuerzt und die Zone dabei
+ * verliert - die Einnahme stuende dann mit der UTC-Zahl im Protokoll.
+ *
+ * Damit ist auch gesagt, was der Countdown NICHT kann: Wanduhrzeit gilt in der
+ * Zone des Haushalts (`TZ`, siehe server/utils/timezone.js), so wie
+ * `scheduled_at`, `due_time` und der ganze Kalender es halten. Wer eine Dosis in
+ * Berlin bucht und sie in New York abliest, liest 12:00 als 12:00. Das ist die
+ * Konvention des Hauses und keine Nachlaessigkeit dieser Funktion: ein echter
+ * Instant nur fuer `taken_at` haette zwei Formate in einer Spalte und einen
+ * Countdown, der zwei Zeitrechnungen vergleicht - teurer als der Fall, den er
+ * loest, solange ein Haushalt an einem Ort wohnt.
+ *
+ * @param {Date} [value]
+ * @returns {string}
+ */
+export function toLocalStamp(value = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`
+    + `T${pad(value.getHours())}:${pad(value.getMinutes())}`;
+}
+
+/**
+ * Der Bedarfs-Stand eines Medikaments: wann zuletzt genommen, ab wann wieder
+ * erlaubt, wie lange es noch dauert.
+ *
+ * Bewusst aus dem gespeicherten Zeitstempel abgeleitet und nicht aus einer
+ * mitlaufenden Uhr: der Wert muss einen Reload und ein zweites Geraet
+ * ueberleben. `nextAllowedAt` ist der absolute Zeitpunkt - die Zahl, die man
+ * auch Stunden spaeter noch lesen kann; `remainingMs` ist nur die Lesehilfe
+ * dazu.
+ *
+ * @param {Object} med   - Medikament mit min_interval_hours
+ * @param {Array<Object>} logs - Dosis-Log-Zeilen dieses Medikaments
+ * @param {Date} [now]
+ * @returns {{ lastTakenAt: Date|null, nextAllowedAt: Date|null,
+ *             remainingMs: number, allowed: boolean, intervalHours: number|null }}
+ */
+export function prnDoseState(med, logs, now = new Date()) {
+  const hours = med && med.min_interval_hours != null && Number.isFinite(Number(med.min_interval_hours))
+    ? Number(med.min_interval_hours)
+    : null;
+  const intervalHours = hours !== null && hours > 0 ? hours : null;
+
+  // Nur genommene Dosen zaehlen. Eine uebersprungene oder noch ausstehende sagt
+  // nichts darueber, wann der Koerper zuletzt etwas bekommen hat.
+  let lastTakenAt = null;
+  for (const entry of (Array.isArray(logs) ? logs : [])) {
+    if (!entry || entry.status !== 'taken') continue;
+    const at = parseLogInstant(entry.taken_at || entry.scheduled_at || entry.created_at);
+    if (!at) continue;
+    if (!lastTakenAt || at > lastTakenAt) lastTakenAt = at;
+  }
+
+  if (!lastTakenAt || intervalHours === null) {
+    return { lastTakenAt, nextAllowedAt: null, remainingMs: 0, allowed: true, intervalHours };
+  }
+
+  const nextAllowedAt = new Date(lastTakenAt.getTime() + intervalHours * 3600 * 1000);
+  const remainingMs = Math.max(0, nextAllowedAt.getTime() - now.getTime());
+  return { lastTakenAt, nextAllowedAt, remainingMs, allowed: remainingMs === 0, intervalHours };
+}
+
+/**
+ * Eine Restdauer in Stunden und Minuten, aufgerundet auf die volle Minute.
+ *
+ * Aufgerundet, weil abgerundet die letzten 59 Sekunden als "0 Min." dastuenden
+ * und die Anzeige damit eine Dosis freigaebe, die es noch nicht ist.
+ *
+ * @param {number} ms
+ * @returns {{ hours:number, minutes:number }}
+ */
+export function splitRemaining(ms) {
+  const totalMinutes = Math.max(0, Math.ceil(ms / 60000));
+  return { hours: Math.floor(totalMinutes / 60), minutes: totalMinutes % 60 };
 }
 
 /**

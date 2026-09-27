@@ -2,8 +2,12 @@
  * Module: Papra DMS Adapter
  * Purpose: Wrap the Papra REST API behind the DMS adapter interface
  *          (search, fetchContent, upload, testConnection). Bearer-authenticated.
- * Dependencies: global fetch (Node >=22)
+ *          base_url is operator-supplied and checked against ./guard.js
+ *          before every request. testConnection() builds its own request and
+ *          therefore repeats the check - it must not be the one hole.
+ * Dependencies: global fetch (Node >=22), ./guard.js
  */
+import { assertDmsTargetAllowed } from './guard.js';
 
 const REQUEST_TIMEOUT_MS = 8000;
 
@@ -20,6 +24,7 @@ export class PapraAdapter {
   }
 
   async #request(path, opts = {}) {
+    await assertDmsTargetAllowed(this.base);
     const res = await fetch(`${this.base}${path}`, {
       ...opts,
       headers: this.headers(opts.headers),
@@ -98,6 +103,7 @@ export class PapraAdapter {
 
   async testConnection() {
     try {
+      await assertDmsTargetAllowed(this.base);
       const res = await fetch(`${this.base}/api/api-keys/current`, {
         headers: this.headers(),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),

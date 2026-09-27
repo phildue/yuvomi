@@ -5,9 +5,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, globSync, readFileSync } from 'node:fs';
+import { eachRule } from './css-rules.js';
 
 // Minimales Window/Navigator-Mock für Node
-const { stagger, vibrate, withBusy, scheduleUndoableDelete } = await (async () => {
+const { stagger, vibrate, withBusy, scheduleUndoableDelete, wireSwipeToDismiss } = await (async () => {
   global.window = {
     matchMedia: () => ({ matches: false }),
     addEventListener: () => {},
@@ -64,6 +65,38 @@ test('task + recurrence date fields use the shared yuvomi-datepicker', () => {
   assert.match(tasksSource, /<yuvomi-datepicker type="time"[\s\S]*?name="due_time"/);
   assert.match(rruleSource, /<yuvomi-datepicker type="date"[\s\S]*?id="\$\{prefix\}-rrule-until"/);
   assert.doesNotMatch(tasksSource, /js-date-input|js-time-input/);
+});
+
+/*
+ * DAS EINBLENDEN ENDET AUF DEM STYLESHEET, NICHT AUF EINEM INLINE-WERT.
+ *
+ * `stagger()` liess `opacity: 1`, `transform: translateY(0)` und die eigene
+ * `transition` inline stehen. Das Inline-`opacity: 1` schlug jede Zustandsregel
+ * der Zeile selbst: `.shopping-item--checked { opacity: 0.45 }` und
+ * `.kanban-card--done { opacity: 0.6 }` griffen nur unter
+ * prefers-reduced-motion (dort kehrt stagger frueh zurueck), sonst nie - zwei
+ * Aussehen fuer denselben Zustand (Kontrastmessung nach dem HIG-Redesign,
+ * #1230). Dasselbe Inline-Opacity hielt die Drag-Geister
+ * (`.sortable-ghost { opacity: 0.4 }`) deckend.
+ */
+test('stagger: hinterlaesst nach dem Einblenden kein Inline-opacity, -transform oder -transition', async () => {
+  const els = [{ style: {} }, { style: {} }, { style: {} }];
+  stagger(els, { delay: 0, duration: 0 });
+  await new Promise((r) => setTimeout(r, 40));
+  els.forEach((el, i) => {
+    assert.equal(el.style.opacity || '', '', `Element ${i}: Inline-opacity "${el.style.opacity}" ueberdeckt die Zustandsregeln der Zeile`);
+    assert.equal(el.style.transform || '', '', `Element ${i}: Inline-transform "${el.style.transform}" bleibt stehen`);
+    assert.equal(el.style.transition || '', '', `Element ${i}: Inline-transition "${el.style.transition}" ueberdeckt die Transitions des Stylesheets`);
+  });
+});
+
+test('stagger: raeumt nur die eigenen Werte ab, nicht was inzwischen jemand anderes gesetzt hat', async () => {
+  const el = { style: {} };
+  stagger([el], { delay: 5, duration: 0 });
+  // Eine Wischgeste setzt waehrend des Einblendens ihr eigenes transform.
+  el.style.transform = 'translateX(-40px)';
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(el.style.transform, 'translateX(-40px)', 'stagger hat ein fremdes Inline-transform ueberschrieben');
 });
 
 test('stagger: tut nichts bei prefers-reduced-motion', () => {
@@ -228,6 +261,103 @@ test('scheduleUndoableDelete: ohne Undo läuft der Delete nach dem Fenster', asy
   assert.equal(keepaliveFlag, false, 'der reguläre Commit läuft ohne keepalive');
 });
 
+test('scheduleUndoableDelete: pagehide-Fehler kann den optimistischen Zustand einmalig zurücksetzen', { timeout: 5000 }, async () => {
+  const previousWindow = global.window;
+  const listeners = new Map();
+  let capturedUndo = null;
+  global.window = {
+    matchMedia: () => ({ matches: false }),
+    addEventListener: (type, handler) => { listeners.set(type, handler); },
+    yuvomi: {
+      showToast: (_message, _type, _duration, undo) => { capturedUndo = undo; },
+    },
+  };
+
+  try {
+    const moduleUrl = new URL('../public/utils/ux.js', import.meta.url);
+    moduleUrl.searchParams.set('pagehide-folder-test', String(Date.now()));
+    const { scheduleUndoableDelete: freshSchedule } = await import(moduleUrl);
+    const failure = new Error('keepalive failed');
+    let restoreCount = 0;
+    let restoredError = null;
+    let resolveRestored;
+    const restored = new Promise((resolve) => { resolveRestored = resolve; });
+
+    freshSchedule({
+      message: 'Gelöscht',
+      duration: 10_000,
+      restoreOnKeepaliveError: true,
+      commit: async ({ keepalive }) => {
+        assert.equal(keepalive, true);
+        throw failure;
+      },
+      restore: (err) => {
+        restoreCount += 1;
+        restoredError = err;
+        resolveRestored();
+      },
+    });
+
+    assert.ok(listeners.get('pagehide'), 'der pagehide-Flush muss registriert sein');
+    listeners.get('pagehide')();
+    await restored;
+    capturedUndo?.();
+
+    assert.equal(restoreCount, 1, 'pagehide und ein späterer Undo-Klick dürfen nicht doppelt restoren');
+    assert.equal(restoredError, failure);
+  } finally {
+    global.window = previousWindow;
+  }
+});
+
+test('scheduleUndoableDelete: regulärer Commit-Fehler wird einmalig zurückgesetzt und gemeldet', { timeout: 5000 }, async () => {
+  const previousWindow = global.window;
+  const listeners = new Map();
+  let capturedUndo = null;
+  global.window = {
+    matchMedia: () => ({ matches: false }),
+    addEventListener: (type, handler) => { listeners.set(type, handler); },
+    yuvomi: {
+      showToast: (_message, _type, _duration, undo) => { capturedUndo = undo; },
+    },
+  };
+
+  try {
+    const moduleUrl = new URL('../public/utils/ux.js', import.meta.url);
+    moduleUrl.searchParams.set('timeout-failure-test', String(Date.now()));
+    const { scheduleUndoableDelete: freshSchedule } = await import(moduleUrl);
+    const failure = new Error('regular commit failed');
+    let restoreCount = 0;
+    let restoredError = null;
+    let resolveRestored;
+    const restored = new Promise((resolve) => { resolveRestored = resolve; });
+
+    freshSchedule({
+      message: 'Gelöscht',
+      duration: 5,
+      commit: async ({ keepalive }) => {
+        assert.equal(keepalive, false);
+        throw failure;
+      },
+      restore: (err) => {
+        restoreCount += 1;
+        restoredError = err;
+        resolveRestored();
+      },
+    });
+
+    await restored;
+    capturedUndo?.();
+    listeners.get('pagehide')?.();
+    await Promise.resolve();
+
+    assert.equal(restoreCount, 1, 'Timeout, Undo und pagehide dürfen nicht doppelt restoren');
+    assert.equal(restoredError, failure, 'der Aufrufer braucht denselben Fehler für den globalen Toast');
+  } finally {
+    global.window = previousWindow;
+  }
+});
+
 test('scheduleUndoableDelete ist das einzige Undo-Löschmuster', () => {
   const ux = readFileSync(new URL('../public/utils/ux.js', import.meta.url), 'utf8');
   assert.ok(
@@ -287,4 +417,146 @@ test('parseDateInput: 8 raw digits — invalid date returns empty string', () =>
   localStorage.setItem('yuvomi-date-format', 'dmy');
   assert.equal(parseDateInput('99992026'), '');
   assert.equal(parseDateInput('00000000'), '');
+});
+
+// --------------------------------------------------------
+// Wischen zum Verwerfen (#821)
+// --------------------------------------------------------
+
+/* WARUM DIESE GESTE EINEN TEST BRAUCHT UND NICHT NUR EINEN BLICK:
+ * Sie war app-weit kaputt, sah dabei aber heil aus. Der Toast trug seinen
+ * „Rückgängig"-Knopf, der Knopf trug seinen Handler - nur erreichte ihn kein
+ * Mausklick mehr, weil der Zeiger schon beim `pointerdown` eingefangen wurde
+ * und der `click` damit ans einfangende Element ging. Per Tastatur und per
+ * Touch löste derselbe Knopf weiterhin aus, also blieb der Bruch unter jeder
+ * flüchtigen Prüfung. Gemessen an echtem Chrome, hier festgehalten. */
+
+function swipeStub() {
+  const handlers = {};
+  const el = {
+    style: {},
+    captured: [],
+    addEventListener: (name, fn) => { (handlers[name] ??= []).push(fn); },
+    setPointerCapture: (id) => { el.captured.push(id); },
+  };
+  const fire = (name, props = {}) => {
+    for (const fn of handlers[name] ?? []) fn({ button: 0, pointerId: 1, clientX: 0, ...props });
+  };
+  return { el, fire };
+}
+
+test('wireSwipeToDismiss: blosses Drüberfahren verschiebt nichts', () => {
+  const { el, fire } = swipeStub();
+  wireSwipeToDismiss(el, { onDismiss: () => {} });
+
+  // Maus fährt über den Toast, ohne gedrückt zu sein: die Falle war, dass der
+  // Startpunkt noch auf 0 stand und der Toast damit um die halbe Fensterbreite
+  // wegrutschte - unsichtbar (opacity 0), bevor der Zeiger seinen Knopf erreichte.
+  fire('pointermove', { clientX: 787 });
+
+  assert.equal(el.style.transform, undefined, 'ohne gedrückte Taste darf sich nichts verschieben');
+  assert.equal(el.style.opacity, undefined, 'ohne gedrückte Taste darf nichts ausgeblendet werden');
+});
+
+test('wireSwipeToDismiss: ein Klick fängt den Zeiger nicht ein', () => {
+  const { el, fire } = swipeStub();
+  let dismissed = false;
+  wireSwipeToDismiss(el, { onDismiss: () => { dismissed = true; } });
+
+  fire('pointerdown', { clientX: 100 });
+  fire('pointermove', { clientX: 104 }); // innerhalb der Klick-Toleranz
+  fire('pointerup', { clientX: 104 });
+
+  assert.deepEqual(el.captured, [], 'unterhalb der Wisch-Schwelle darf kein Pointer-Capture gesetzt werden');
+  assert.equal(dismissed, false, 'ein Klick verwirft nicht');
+});
+
+test('wireSwipeToDismiss: aus dem Druck wird eine Wischgeste', () => {
+  const { el, fire } = swipeStub();
+  let dismissed = false;
+  wireSwipeToDismiss(el, { onDismiss: () => { dismissed = true; } });
+
+  fire('pointerdown', { clientX: 100 });
+  fire('pointermove', { clientX: 130 });
+  assert.deepEqual(el.captured, [1], 'jenseits der Toleranz wird der Zeiger genau einmal eingefangen');
+  assert.equal(el.style.transform, 'translateX(30px)');
+
+  fire('pointermove', { clientX: 160 });
+  assert.deepEqual(el.captured, [1], 'ein zweites Capture wäre überflüssig');
+
+  fire('pointerup', { clientX: 160 });
+  assert.equal(dismissed, true, 'jenseits der Schwelle wird verworfen');
+  assert.equal(el.style.transform, '', 'der Versatz wird zurückgenommen');
+  assert.equal(el.style.opacity, '');
+});
+
+test('wireSwipeToDismiss: ein zu kurzer Wisch federt zurück', () => {
+  const { el, fire } = swipeStub();
+  let dismissed = false;
+  wireSwipeToDismiss(el, { onDismiss: () => { dismissed = true; } });
+
+  fire('pointerdown', { clientX: 100 });
+  fire('pointermove', { clientX: 125 }); // über die Toleranz, unter der Schwelle
+  fire('pointerup', { clientX: 125 });
+
+  assert.equal(dismissed, false, 'unter der Schwelle bleibt der Toast stehen');
+  assert.equal(el.style.transform, '', 'der Versatz wird zurückgenommen');
+});
+
+test('wireSwipeToDismiss: ein abgebrochener Zeiger lässt nichts verschoben zurück', () => {
+  const { el, fire } = swipeStub();
+  wireSwipeToDismiss(el, { onDismiss: () => {} });
+
+  // Übernimmt der Browser die Geste als Bildlauf, kommt `pointercancel` statt
+  // `pointerup` - ohne diesen Pfad bliebe der Toast halbtransparent hängen.
+  fire('pointerdown', { clientX: 100 });
+  fire('pointermove', { clientX: 140 });
+  fire('pointercancel');
+
+  assert.equal(el.style.transform, '', 'nach dem Abbruch steht der Toast wieder gerade');
+  assert.equal(el.style.opacity, '');
+
+  fire('pointermove', { clientX: 400 });
+  assert.equal(el.style.transform, '', 'der abgebrochene Druck zählt nicht weiter');
+});
+
+test('wireSwipeToDismiss: die Sekundärtaste startet keine Geste', () => {
+  const { el, fire } = swipeStub();
+  wireSwipeToDismiss(el, { onDismiss: () => {} });
+
+  fire('pointerdown', { clientX: 100, button: 2 });
+  fire('pointermove', { clientX: 200 });
+
+  assert.equal(el.style.transform, undefined, 'ein Rechtsklick ist keine Wischgeste');
+});
+
+test('der Toast überlässt die waagerechte Geste dem Script', () => {
+  // Gegenstück zum Handler: ohne `touch-action` hält der Browser sich die
+  // Deutung offen, übernimmt den waagerechten Wisch als Bildlauf und beendet
+  // den Zeiger mit `pointercancel` - auf dem Telefon war der Wisch damit nie
+  // auslösbar (gemessen in Chrome mit Touch-Emulation).
+  const css = readFileSync(new URL('../public/styles/layout.css', import.meta.url), 'utf8');
+  const toastRule = [...eachRule(css)].find(
+    (r) => r.selector === '.toast' && r.at.length === 0,
+  );
+  assert.ok(toastRule, '.toast muss eine Basisregel in layout.css haben');
+  assert.match(
+    toastRule.body,
+    /touch-action:\s*pan-y/,
+    '.toast braucht touch-action: pan-y, sonst frisst der Bildlauf die Wischgeste',
+  );
+});
+
+test('showToast verdrahtet die Geste über den geteilten Helfer', () => {
+  // Der Inline-Zwilling im Router war die Fassung mit den zwei Fallen. Bleibt
+  // er weg, kann er sie nicht ein zweites Mal einsammeln.
+  const router = readFileSync(new URL('../public/router.js', import.meta.url), 'utf8');
+  assert.ok(
+    router.includes('wireSwipeToDismiss(toast'),
+    'der Toast muss die Geste aus utils/ux.js beziehen',
+  );
+  assert.ok(
+    !router.includes('setPointerCapture'),
+    'die Shell darf keinen eigenen Wisch-Zwilling mit Pointer-Capture halten',
+  );
 });

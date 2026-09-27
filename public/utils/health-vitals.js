@@ -14,15 +14,38 @@ import {
   parseLocalDateKey,
   addLocalDays,
   startOfLocalWeekKey,
+  todayKey,
 } from '/utils/date.js';
 
 // --------------------------------------------------------
 // Metrik-Definitionen
 // --------------------------------------------------------
+// Die fünf Stufen der Stimmungs-Skala (#609). Der gespeicherte Wert ist die
+// Zahl; die Stufe liefert Label und Gesicht dazu. Steht vor VITAL_METRICS, weil
+// die Metrik ihre Achsengrenzen von hier bezieht.
+export const MOOD_SCALE = Object.freeze([
+  { value: 1, icon: 'frown', labelKey: 'health.vitals.mood.veryBad' },
+  { value: 2, icon: 'annoyed', labelKey: 'health.vitals.mood.bad' },
+  { value: 3, icon: 'meh', labelKey: 'health.vitals.mood.okay' },
+  { value: 4, icon: 'smile', labelKey: 'health.vitals.mood.good' },
+  { value: 5, icon: 'laugh', labelKey: 'health.vitals.mood.veryGood' },
+]);
+
+export const MOOD_MIN = MOOD_SCALE[0].value;
+export const MOOD_MAX = MOOD_SCALE[MOOD_SCALE.length - 1].value;
+
 // `channels` beschreibt die genutzten numerischen Kanäle (value_num,
 // value_num2, value_num3). Blutdruck belegt drei (Systole/Diastole/Puls),
 // alle übrigen Metriken genau einen. `units` listet die im Erfassungs-Dialog
 // wählbaren Einheiten; die erste ist der Default.
+//
+// `format` sagt, wie ein Wert gelesen wird, und steuert damit zugleich das
+// Eingabefeld: 'pair' zeigt zwei Kanäle als 120/80, 'duration' rechnet die in
+// `value_num` gespeicherten Dezimalstunden in Stunden und Minuten zurück,
+// 'scale' zeigt eine Stufe der Skala statt einer nackten Zahl. Fehlt das Feld,
+// ist der Wert eine schlichte Zahl mit Einheit. Vor #609 stand diese
+// Fallunterscheidung als `type === 'bp'` an fünf Stellen im Seitenmodul; jede
+// weitere Metrik hätte sie ein weiteres Mal vervielfacht.
 export const VITAL_METRICS = Object.freeze([
   {
     type: 'bp',
@@ -35,6 +58,7 @@ export const VITAL_METRICS = Object.freeze([
       'health.vitals.channel.pulse',
     ],
     units: ['mmHg'],
+    format: 'pair',
   },
   {
     type: 'glucose',
@@ -52,6 +76,27 @@ export const VITAL_METRICS = Object.freeze([
     channelLabelKeys: ['health.vitals.metric.weight'],
     units: ['kg', 'lb'],
   },
+  // Körpermaße (#683). Stehen bewusst neben dem Gewicht: bei einem Säugling
+  // werden die drei gemeinsam erhoben, und wer eines eintragen will, sucht die
+  // anderen daneben. Beide bleiben rohe Messwerte ohne Bewertung - eine
+  // Perzentile braucht Referenzdaten nach Geschlecht und Alter und wäre ein
+  // eigenes Vorhaben, keine Eigenschaft der Metrik.
+  {
+    type: 'height',
+    icon: 'ruler',
+    labelKey: 'health.vitals.metric.height',
+    channels: ['value_num'],
+    channelLabelKeys: ['health.vitals.metric.height'],
+    units: ['cm', 'in'],
+  },
+  {
+    type: 'head_circumference',
+    icon: 'circle-dot',
+    labelKey: 'health.vitals.metric.headCircumference',
+    channels: ['value_num'],
+    channelLabelKeys: ['health.vitals.metric.headCircumference'],
+    units: ['cm', 'in'],
+  },
   {
     type: 'spo2',
     icon: 'activity',
@@ -68,7 +113,75 @@ export const VITAL_METRICS = Object.freeze([
     channelLabelKeys: ['health.vitals.metric.temp'],
     units: ['°C', '°F'],
   },
+  // Schlafdauer einer Nacht (#609). Gespeichert werden Dezimalstunden, damit
+  // Trend, Mittelwert und Delta dieselbe Rechnung wie bei jeder anderen Metrik
+  // benutzen; gelesen und eingegeben wird in Stunden und Minuten, weil niemand
+  // „7,5" für siebeneinhalb Stunden tippt. `measured_at` ist das Ende des
+  // Schlafs (der Morgen), nicht das Zubettgehen - sonst läge eine Nacht je nach
+  // Einschlafzeit mal vor, mal nach Mitternacht und damit im falschen Tag.
+  {
+    type: 'sleep',
+    icon: 'moon',
+    labelKey: 'health.vitals.metric.sleep',
+    channels: ['value_num'],
+    channelLabelKeys: ['health.vitals.metric.sleep'],
+    units: ['h'],
+    format: 'duration',
+  },
+  // Stimmung als 1-5-Skala (#609). Bewusst ohne Einheit: die Zahl ist eine
+  // Stufe, kein Messwert. Nicht zu verwechseln mit der Stimmung im
+  // Zyklus-Tagebuch - die benennt eine ART (gereizt, ängstlich, sensibel) und
+  // gehört zu einem Zyklustag, diese hier misst, wie gut es einem geht, und
+  // steht jeder Person offen, auch ohne Zyklus-Tab.
+  // `domain` klemmt die Chart-Achse auf die volle Skala. Ohne sie zoomt der
+  // Chart auf die vorkommenden Werte: eine Woche zwischen 4 und 5 sähe dann aus
+  // wie ein Absturz, und die gerundeten Achsen-Ticks wiederholten sich
+  // („5, 5, 5, 4, 4"). Eine Stufenskala ist nur vor ihrer eigenen Spannweite zu
+  // lesen - bei Messwerten mit offener Spanne wäre dieselbe Klemmung falsch.
+  {
+    type: 'mood',
+    icon: 'smile',
+    labelKey: 'health.vitals.metric.mood',
+    channels: ['value_num'],
+    channelLabelKeys: ['health.vitals.metric.mood'],
+    units: [],
+    format: 'scale',
+    domain: { min: MOOD_MIN, max: MOOD_MAX },
+  },
 ]);
+
+/**
+ * Stufe zu einem gespeicherten Stimmungswert. Gerundet, weil die Serie über
+ * mehrere Einträge eines Tages mittelt (3,5 zeigt das Gesicht der 4).
+ */
+export function moodStep(value) {
+  // Number(null) und Number('') sind 0 und würden auf die unterste Stufe
+  // geklemmt - „kein Wert" wäre dann „sehr schlecht".
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const rounded = Math.min(MOOD_MAX, Math.max(MOOD_MIN, Math.round(n)));
+  return MOOD_SCALE.find((s) => s.value === rounded) || null;
+}
+
+/** Dezimalstunden in ganze Stunden + Minuten. 7.5 -> { hours: 7, minutes: 30 }. */
+export function splitDuration(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  // Auf die Minute runden, bevor gesplittet wird: 7.999 darf nicht als
+  // „7 h 60 min" herauskommen.
+  const totalMinutes = Math.round(n * 60);
+  return { hours: Math.floor(totalMinutes / 60), minutes: totalMinutes % 60 };
+}
+
+/** Stunden + Minuten in Dezimalstunden. Umkehrung von splitDuration(). */
+export function durationToHours(hours, minutes) {
+  const h = Number(hours) || 0;
+  const m = Number(minutes) || 0;
+  if (!Number.isFinite(h) || !Number.isFinite(m) || h < 0 || m < 0) return null;
+  return Math.round((h * 60 + m)) / 60;
+}
 
 export const VITAL_TYPES = Object.freeze(VITAL_METRICS.map((m) => m.type));
 
@@ -96,7 +209,7 @@ function toFiniteOrNull(value) {
  * @returns {{ buckets: Array<{key,date,gran}>, from: string, to: string, gran: string }}
  */
 export function buildVitalBuckets(range, anchorKey, weekStartsOn = 1) {
-  const anchor = anchorKey || toLocalDateKey(new Date());
+  const anchor = anchorKey || todayKey();
 
   if (range === 'year') {
     const year = parseLocalDateKey(anchor).getFullYear();

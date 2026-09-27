@@ -2,7 +2,7 @@ manifestVersion: 1
 id: yuvomi
 category: files
 name: Yuvomi
-version: "0.66.0"
+version: "1.77.0"
 tagline: Self-hosted family planner — calendar, tasks, shopping, meals & budget
 description: >-
   Yuvomi is a self-hosted, privacy-focused family planner that bundles everything
@@ -50,16 +50,42 @@ description: >-
 
   Open Yuvomi from your Umbrel dashboard and create the first account — that
   account becomes the family admin and can invite the rest of the household.
-releaseNotes: ""
+releaseNotes: >-
+  Loans can now track whether your household borrowed or lent money, optionally
+  assign installments to an account, and book borrowed-money repayments as
+  expenses so mortgage-style payments no longer inflate the monthly balance.
+
+  CalDAV reminder sync now handles task-only collections correctly: reminder
+  lists are discovered on their own, task collections are no longer offered as
+  event calendars, and existing accounts clean up those task lists on the next
+  sync.
+
+  New Zealand dollar support is available in household, subscription, and
+  split-expense settings, and housekeeping task/report actions now show their
+  icons immediately after list updates.
+
+  The installer now keeps the full start log visible before offering retry when
+  setup fails.
+
+  Full release notes are available at
+  https://github.com/ulsklyc/yuvomi/compare/v1.75.6...v1.77.0
+
+backupIgnore:
+  - data/app/yuvomi.db.plaintext-backup*
+  - data/backups/*.db
+
 developer: Ulas Kalayci
 website: https://github.com/ulsklyc/yuvomi
 dependencies: []
 repo: https://github.com/ulsklyc/yuvomi
 support: https://github.com/ulsklyc/yuvomi/issues
-port: 8181
-# Must stay empty for submission — the Umbrel team populates icon/gallery from
-# the assets in umbrel-apps-gallery (see deploy/umbrel/icon.svg + gallery/).
-gallery: []
+port: 8180
+gallery:
+  - 1.webp
+  - 2.webp
+  - 3.webp
+  - 4.webp
+  - 5.webp
 path: ""
 defaultUsername: ""
 defaultPassword: ""

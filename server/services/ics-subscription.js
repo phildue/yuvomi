@@ -49,8 +49,14 @@ function normalizeUrl(raw) {
   return url.href;
 }
 
-async function checkSSRF(urlStr) {
-  if (isPrivateNetworkAllowed()) return;
+/**
+ * `allowPrivateNetwork` defaults to this module's own opt-in
+ * (ICS_SUBSCRIPTION_ALLOW_PRIVATE_NETWORK) but can be swapped for another
+ * module's - waste-url-source.js passes its own WASTE_SOURCE_ALLOW_PRIVATE_NETWORK
+ * check here instead of keeping a second copy of this whole function.
+ */
+async function checkSSRF(urlStr, allowPrivateNetwork = isPrivateNetworkAllowed) {
+  if (allowPrivateNetwork()) return;
   const hostname = new URL(urlStr).hostname;
   // URL.hostname liefert IPv6 in Klammern ([::1]) – für isIP/Filter entfernen.
   const host = hostname.replace(/^\[|\]$/g, '');
@@ -219,8 +225,11 @@ async function syncOne(sub) {
     db.get().transaction(() => {
       for (const ev of flatEvents) {
         try {
-          // Event-Eigenfarbe (RFC 7986) hat Vorrang, sonst die Abo-Farbe.
-          const color    = ev.color || sub.color;
+          // NUR die Eigenfarbe des Termins (RFC 7986 COLOR); die Abo-Farbe ist
+          // geerbt und gehoert nicht in die Eigenfarb-Spalte (#891), sonst
+          // verdraengt sie dauerhaft die Farbe der zugewiesenen Person. Der
+          // Lesepfad liefert sie als cal_color aus ics_subscriptions nach.
+          const color    = ev.color ?? null;
           const existing = findExisting.get(sub.id, ev.uid);
           if (existing) {
             // Dieselben Werte binden die SET-Liste und den Vergleich.
@@ -306,6 +315,12 @@ function toLocalRRule(raw) {
       .filter((d) => /^(MO|TU|WE|TH|FR|SA|SU)$/.test(d));
     if (days.length) rule += `;BYDAY=${days.join(',')}`;
   }
+  // Genau `-1` bei MONTHLY, in der Reihenfolge, die der Validator erwartet
+  // (#960). Der Reduzierer laesst alles weg, was die Engine nicht bedient - und
+  // seit "am letzten Tag des Monats" darstellbar ist, gehoert es dazu. Ohne
+  // diese Zeile kaeme eine importierte Monatsletzten-Serie als blosses
+  // `FREQ=MONTHLY` an und liefe danach auf dem Tag ihres Startdatums.
+  if (freq === 'MONTHLY' && String(parts.BYMONTHDAY ?? '').trim() === '-1') rule += ';BYMONTHDAY=-1';
   const count = parts.COUNT ? parseInt(parts.COUNT, 10) : null;
   if (Number.isInteger(count) && count > 0) {
     rule += `;COUNT=${count}`;
@@ -341,6 +356,11 @@ async function importToLocal(userId, { ics, url, color } = {}) {
   // Einzel-Vorkommen werden eigenständige Termine statt die Serie zu killen (#549).
   rawEvents = normalizeRecurrenceOverrides(rawEvents);
 
+  // HIER bleibt der Fallback bewusst stehen, anders als im Abo-Sync oben (#891).
+  // Ein einmaliger Import macht aus den Terminen LOKALE Termine ohne Quelle -
+  // sie haben danach keinen Kalender mehr, von dem sie eine Farbe erben koennten,
+  // und `color` ist der Wert, den der Nutzer fuer genau diesen Import angegeben
+  // hat. Das ist eine Wahl und gehoert deshalb in die Eigenfarb-Spalte.
   const fallbackColor = color || '#007AFF';
   const insert = db.get().prepare(`
     INSERT INTO calendar_events
@@ -392,12 +412,15 @@ async function importToLocal(userId, { ics, url, color } = {}) {
   return { imported, skipped, total };
 }
 
-async function create(userId, { name, url, color, shared }) {
+async function create(userId, { name, url, color, shared, default_assignee_user_id = null }) {
   const normalizedUrl = normalizeUrl(url);
   await checkSSRF(normalizedUrl);
+  // Die Zuweisung steht VOR dem ersten syncOne() in der Zeile - danach gesetzt
+  // hätte sie die eben eingelesenen Termine nicht mehr erreicht (#730).
   const subId = db.get().prepare(
-    `INSERT INTO ics_subscriptions (name,url,color,shared,created_by) VALUES (?,?,?,?,?)`
-  ).run(name, normalizedUrl, color, shared ? 1 : 0, userId).lastInsertRowid;
+    `INSERT INTO ics_subscriptions (name,url,color,shared,created_by,default_assignee_user_id)
+     VALUES (?,?,?,?,?,?)`
+  ).run(name, normalizedUrl, color, shared ? 1 : 0, userId, default_assignee_user_id).lastInsertRowid;
   const newSub = db.get().prepare('SELECT * FROM ics_subscriptions WHERE id = ?').get(subId);
   let syncError = null;
   try { await syncOne(newSub); } catch (err) { syncError = err.message; }

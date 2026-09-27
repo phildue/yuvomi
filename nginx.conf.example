@@ -12,7 +12,11 @@ server {
     listen 443 ssl http2;
     server_name deine-domain.de;
 
-    # SSL (von Nginx Proxy Manager automatisch verwaltet, oder manuell):
+    # SSL: Bei Nginx Proxy Manager verwaltet NPM die Zertifikate selbst - die
+    # beiden Zeilen bleiben dann auskommentiert. Bei eigenem Nginx MUESSEN sie
+    # einkommentiert werden, NACHDEM das Zertifikat existiert (siehe
+    # docs/installation.md) - ein aktiver 443-ssl-Block ohne ssl_certificate
+    # laesst `nginx -t` fehlschlagen.
     # ssl_certificate /etc/letsencrypt/live/deine-domain.de/fullchain.pem;
     # ssl_certificate_key /etc/letsencrypt/live/deine-domain.de/privkey.pem;
 

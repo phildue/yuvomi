@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- Security headers via meta (GitHub Pages allows no custom HTTP headers).
+       Note: X-Frame-Options / CSP frame-ancestors only take effect as HTTP headers, not via meta. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>Privacy Policy - Yuvomi</title>
+  <meta name="description" content="Privacy policy for yuvomi.cloud under Art. 13 GDPR. Convenience translation; the German version is authoritative.">
+  <meta name="robots" content="index, follow">
+  <meta name="theme-color" content="#FBFAF7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#191816" media="(prefers-color-scheme: dark)">
+  <link rel="canonical" href="https://yuvomi.cloud/privacy.html">
+  <link rel="alternate" hreflang="de" href="https://yuvomi.cloud/datenschutz.html">
+  <link rel="alternate" hreflang="en" href="https://yuvomi.cloud/privacy.html">
+  <meta name="color-scheme" content="light dark">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Yuvomi">
+  <meta property="og:locale" content="en_GB">
+  <meta property="og:title" content="Privacy Policy - Yuvomi">
+  <meta property="og:description" content="Privacy policy for the yuvomi.cloud website. Does not cover your self-hosted instance.">
+  <meta property="og:url" content="https://yuvomi.cloud/privacy.html">
+  <meta property="og:image" content="https://yuvomi.cloud/og-image.png">
+  <meta property="og:image:alt" content="Yuvomi - der selbstgehostete Familienplaner">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Privacy Policy - Yuvomi">
+  <meta name="twitter:description" content="Privacy policy for the yuvomi.cloud website. Does not cover your self-hosted instance.">
+  <meta name="twitter:image" content="https://yuvomi.cloud/twitter-image.png">
+  <link rel="icon" type="image/svg+xml" href="logo.svg">
+
+  <!-- Geteiltes Token-System der vier Seiten. Frueher stand es hier viermal,
+       und dieser Rechtstext hielt eine abgespeckte Teilmenge, die von der
+       Startseite, auf die er verlinkt, unbemerkt abweichen konnte. -->
+  <link rel="stylesheet" href="assets/site.css">
+  <style>
+    /* Seiteneigenes Mass: ein Rechtstext ist eine Spalte, keine Landing-Page. */
+    :root { --maxw: 820px; }
+
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: var(--ff);
+      font-size: 16px;
+      line-height: 1.65;
+      color: var(--text-1);
+      background: var(--bg);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; width: 100%; }
+
+    /* Bis zur Re-Kritik hatten die beiden Rechtsseiten als einzige keinen
+       Theme-Umschalter - vier Laeufe lang gemeldet. Sie uebernahmen zwar die
+       Wahl von den Hauptseiten, aber wer aus einer Suche direkt hier landet,
+       hatte keine. Und genau diese Seite ist der einzige Beleg fuer die
+       "0 Tracker" der Startseite, wird also durchaus direkt aufgerufen. */
+    /* Sprachwechsel zwischen den beiden Fassungen. Die Rechtsseiten hatten vier
+       Laeufe lang keinen Sprachumschalter, weil es kein Ziel gab. */
+    .lang-link { display: inline-flex; align-items: center; min-height: 44px; padding: 8px 12px;
+      border-radius: var(--r-md); border: 1px solid var(--border); background: var(--bg);
+      color: var(--text-2); font-size: 14px; font-weight: 600; text-decoration: none;
+      transition: border-color .15s, color .15s; }
+    .lang-link:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+    .top-actions { display: flex; align-items: center; gap: 14px; }
+    .theme-btn {
+      display: grid; place-items: center; width: 44px; height: 44px; flex-shrink: 0;
+      border-radius: var(--r-sm); border: 1px solid var(--border); background: var(--bg);
+      color: var(--text-2); cursor: pointer; transition: border-color .15s, color .15s;
+    }
+    .theme-btn:hover { border-color: var(--border-strong); color: var(--text-1); }
+    .theme-btn svg { width: 17px; height: 17px; }
+    header.top {
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      padding: 18px 0;
+    }
+    header.top .wrap {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .nav-logo {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 18px;
+      color: var(--text-1);
+      text-decoration: none;
+    }
+    .nav-logo svg { width: 28px; height: 28px; }
+    .back-link {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+      color: var(--text-2);
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 500;
+      padding: 8px 14px;
+      border-radius: var(--r-md);
+      border: 1px solid var(--border);
+      transition: all .18s ease;
+    }
+    .back-link:hover {
+      color: var(--accent);
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    main { flex: 1; padding: 48px 0 64px; }
+
+    h1 {
+      font-size: clamp(28px, 4vw, 40px);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      margin-bottom: 8px;
+      color: var(--text-1);
+    }
+    .subtitle {
+      color: var(--text-3);
+      font-size: 15px;
+      margin-bottom: 40px;
+    }
+
+    h2 {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      margin: 36px 0 12px;
+      color: var(--text-1);
+    }
+    h2:first-of-type { margin-top: 0; }
+    h3 {
+      font-size: 16px;
+      font-weight: 700;
+      margin: 20px 0 8px;
+      color: var(--text-2);
+    }
+
+    p { margin-bottom: 12px; color: var(--text-1); }
+    ul { margin: 0 0 12px 22px; }
+    li { margin-bottom: 4px; }
+    address { font-style: normal; }
+    code { font-family: var(--ff-mono); font-size: 13px; background: var(--bg-alt); padding: 1px 5px; border-radius: 4px; }
+
+    a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; word-break: break-word; }
+    a:hover { color: var(--accent-hover); }
+
+    .legal-disclaimer {
+      background: var(--bg-alt);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--r-md);
+      padding: 16px 20px;
+      margin-bottom: 20px;
+      font-size: 14px;
+      color: var(--text-2);
+    }
+    .legal-disclaimer strong { color: var(--text-1); }
+    .en-summary {
+      font-size: 13px;
+      line-height: 1.6;
+      color: var(--text-3);
+      margin-bottom: 40px;
+    }
+    .en-summary strong { color: var(--text-2); }
+
+    .info-block {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r-lg);
+      padding: 4px 24px;
+      margin: 12px 0 16px;
+      box-shadow: var(--shadow-sm);
+    }
+    .info-block p:first-child { margin-top: 14px; }
+    .info-block p:last-child { margin-bottom: 14px; }
+
+    table { border-collapse: collapse; width: 100%; margin: 8px 0 16px; font-size: 14px; }
+    th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+    th { background: var(--bg-alt); font-weight: 600; color: var(--text-2); }
+    /* Wide tables scroll inside their own box on phones instead of forcing page
+       overflow. The box does the scrolling, not the table: `display: block` on a
+       <table> strips its table role in the accessibility tree, so the phone
+       layout used to hand screen-reader users four unrelated cell runs. */
+    .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    @media (max-width: 600px) {
+      .table-scroll table { white-space: nowrap; }
+    }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+    .small { font-size: 13px; color: var(--text-3); }
+
+    footer.bot {
+      border-top: 1px solid var(--border);
+      background: var(--bg-alt);
+      padding: 24px 0;
+      margin-top: auto;
+    }
+    footer.bot .wrap {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      color: var(--text-3);
+    }
+    footer.bot a { color: var(--text-2); text-decoration: none; }
+    footer.bot a:hover { color: var(--accent); }
+    footer.bot nav { display: flex; gap: 14px; flex-wrap: wrap; }
+    footer.bot nav a { padding: 6px 2px; min-height: 44px; display: inline-flex; align-items: center; }
+
+    /* In-page table of contents (navigation aid; legal text unchanged) */
+    main h2 { scroll-margin-top: 24px; }
+    .toc { margin: 28px 0 10px; padding: 20px 22px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); }
+    .toc-title { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); margin: 0 0 12px; }
+    .toc-list { margin: 0; padding-left: 1.5em; display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 0 24px; }
+    .toc-list li { margin: 0; }
+    /* 44px targets. These are a list of links, not links inside a sentence, so
+       the inline exception to SC 2.5.8 does not cover them - they measured 18px.
+       The row gap goes to 0 because the padding now does that work. */
+    .toc-list a { color: var(--text-2); font-size: 0.9rem; line-height: 1.5; text-decoration: none;
+      display: inline-flex; align-items: center; min-height: 44px; padding: 2px 0; }
+    .toc-list a:hover { color: var(--accent); text-decoration: underline; }
+    @media (max-width: 560px) { .toc-list { grid-template-columns: 1fr; } }
+  
+    /* These two pages relied on the UA default focus ring; match the other pages. */
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+
+    /* Skip link: index and install put 26 focusable nodes between the top of the
+       page and the content, so keyboard users need a way past the nav. */
+    .skip-link { position: absolute; left: -9999px; top: 0; z-index: 200; }
+    .skip-link:focus { left: 8px; top: 8px; padding: 12px 18px; display: inline-flex; align-items: center; min-height: 44px;
+      background: var(--surface); color: var(--text-1);
+      border: 1px solid var(--border); border-radius: var(--r-md); box-shadow: var(--shadow-md); font-weight: 600; }
+  
+    /* 14 dense legal sections with a table of contents at the very top and no way
+       back to it on a phone. Appears only once you are past the first screen. */
+    .to-top { position: fixed; right: 16px; bottom: 16px; z-index: 90;
+      display: inline-flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 16px;
+      background: var(--surface); color: var(--text-1); border: 1px solid var(--border);
+      border-radius: var(--r-full); box-shadow: var(--shadow-md); font-size: 0.85rem; font-weight: 600;
+      opacity: 0; visibility: hidden; transform: translateY(8px); transition: opacity .2s, transform .2s, visibility .2s; }
+    .to-top.show { opacity: 1; visibility: visible; transform: none; }
+    .to-top:hover { text-decoration: none; border-color: var(--border-strong); }
+    .to-top svg { width: 15px; height: 15px; }
+  
+    /* These two pages had no reduced-motion guard at all. */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+      .to-top { transition: none; }
+    }
+
+    /* Print. A privacy notice is the page on this site most likely to end up on
+       paper or in a PDF, and it printed with the floating "Nach oben" pill over
+       the text and every external reference as bare underlined words. */
+    @media print {
+      html { scroll-behavior: auto; }
+      body { background: #fff; color: #000; }
+      .skip-link, .to-top, .back-link { display: none !important; }
+      header.top, .info-block, .toc { background: transparent; }
+      .info-block, .toc, table, tr { break-inside: avoid; }
+      h2 { break-after: avoid; }
+      a[href^="http"]::after { content: " (" attr(href) ")"; font-size: 0.85em; word-break: break-all; }
+    }
+  </style>
+  <script>
+    /* Honor the theme the visitor picked on the main pages (no toggle here). */
+    (function(){
+      try {
+        var t = localStorage.getItem('yuvomi-theme') || localStorage.getItem('oikos-theme');
+        if (t === 'dark' || t === 'light') document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {}
+    })();
+  </script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to content</a>
+
+<header class="top">
+  <div class="wrap">
+    <a href="index.html" class="nav-logo">
+      <svg viewBox="0 0 160 160" fill="none" aria-hidden="true">
+        <defs>
+          <linearGradient id="gf" x1="0" y1="0" x2="160" y2="160" gradientUnits="userSpaceOnUse">
+            <stop offset="0%" stop-color="#8b5cf6"/>
+            <stop offset="100%" stop-color="#6c3aed"/>
+          </linearGradient>
+        </defs>
+        <rect width="160" height="160" rx="36" fill="url(#gf)"/>
+        <g fill="white" fill-opacity="0.82"><circle cx="64" cy="72" r="27"/><circle cx="100" cy="78" r="25"/><circle cx="80" cy="106" r="24"/></g>
+        
+      </svg>
+      Yuvomi
+    </a>
+    <div class="top-actions">
+      <button class="theme-btn" id="themeBtn" type="button" aria-pressed="false" aria-label="Toggle colour scheme">
+        <svg aria-hidden="true" id="sunIco" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        <svg aria-hidden="true" id="moonIco" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+      <a href="datenschutz.html" class="lang-link" hreflang="de" lang="de">Deutsch</a>
+      <a href="index.html" class="back-link">&larr; Back to start</a>
+    </div>
+  </div>
+</header>
+
+<main id="main-content" tabindex="-1">
+  <div class="wrap">
+
+    <h1>Privacy Policy</h1>
+    <p class="subtitle">Information under Art. 13 GDPR · Last updated: 16 August 2026</p>
+
+    <div class="legal-disclaimer">
+      <strong>Note:</strong> This privacy policy applies to the website at
+      <strong>yuvomi.cloud</strong>. It does <strong>not</strong> cover the self-hosted
+      Yuvomi application running on your own server - the operator of that instance is the
+      controller for it (see the self-hoster notes in the project repository).
+    </div>
+
+    <p lang="de" class="en-summary">
+      <strong>Auf Deutsch:</strong> Dies ist eine Übersetzung zur Erleichterung des Verständnisses.
+      Rechtlich verbindlich ist ausschließlich die
+      <a href="datenschutz.html">deutschsprachige Fassung</a>. Bei Abweichungen gilt der deutsche Text.
+    </p>
+
+    <nav class="toc" aria-label="Table of contents">
+      <p class="toc-title">Contents</p>
+      <ol class="toc-list">
+        <li><a href="#s1">Controller within the meaning of the GDPR</a></li>
+        <li><a href="#s2">Data protection officer</a></li>
+        <li><a href="#s3">General information on data processing</a></li>
+        <li><a href="#s4">Hosting via GitHub Pages (third-country transfer, USA)</a></li>
+        <li><a href="#s5">Storage in local browser storage (localStorage)</a></li>
+        <li><a href="#s6">No cookies, no tracking, no analytics, no external requests</a></li>
+        <li><a href="#s7">Contacting us by email</a></li>
+        <li><a href="#s8">Recipients of personal data</a></li>
+        <li><a href="#s9">Storage period</a></li>
+        <li><a href="#s10">Your rights as a data subject</a></li>
+        <li><a href="#s11">Right to lodge a complaint with a supervisory authority</a></li>
+        <li><a href="#s12">Obligation to provide data</a></li>
+        <li><a href="#s13">Automated decision-making and profiling</a></li>
+        <li><a href="#s14">Currency and amendment of this privacy policy</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. Controller within the meaning of the GDPR</h2>
+    <p>The controller for data processing on this website is:</p>
+    <div class="info-block">
+      <address>
+        Ulas Kalayci<br>
+        c/o MDC#885<br>
+        Welserstraße 3<br>
+        87463 Dietmannsried<br>
+        Germany<br><br>
+        Email: <a href="mailto:info@yuvomi.cloud">info@yuvomi.cloud</a><br>
+        Phone: <a href="tel:+4915229278918">+49 1522 927 89 18</a>
+      </address>
+    </div>
+    <p>Further details are available in the <a href="impressum.html">imprint</a>.</p>
+
+    <h2 id="s2">2. Data protection officer</h2>
+    <p>
+      A data protection officer is not required by law (§ 38 BDSG: fewer than 20 people are
+      permanently engaged in the automated processing of personal data; no special categories
+      of personal data within the meaning of Art. 9 GDPR). For any data protection question,
+      please contact the controller named above directly.
+    </p>
+
+    <h2 id="s3">3. General information on data processing</h2>
+    <p>
+      As a matter of principle, we process our visitors' personal data only to the extent
+      necessary to provide a functioning website and our content. The legal bases are in
+      particular Art. 6(1)(f) GDPR (legitimate interests) and § 25 TDDDG (protection of privacy
+      in terminal equipment).
+    </p>
+
+    <h2 id="s4">4. Hosting via GitHub Pages (third-country transfer, USA)</h2>
+    <p>
+      This website is delivered via the GitHub Pages service. The provider is
+      <strong>GitHub, Inc.</strong>, 88 Colin P Kelly Jr Street, San Francisco, CA 94107, USA -
+      a subsidiary of Microsoft Corporation.
+    </p>
+    <p>
+      Each time a page is requested, your browser automatically transmits data to GitHub's
+      servers, where it is stored in what are known as server log files. This typically includes:
+    </p>
+    <ul>
+      <li>the IP address of your device</li>
+      <li>the date and time of access</li>
+      <li>the URL requested and the referrer</li>
+      <li>the browser type and version used</li>
+      <li>the operating system used</li>
+    </ul>
+    <p>
+      <strong>Purpose:</strong> technical provision of the website, maintaining stability and
+      security, protection against misuse and attacks.
+    </p>
+    <p>
+      <strong>Legal basis:</strong> Art. 6(1)(f) GDPR. Our legitimate interest lies in the
+      reliable, secure and low-cost delivery of this open-source project page.
+    </p>
+    <p>
+      <strong>Third-country transfer:</strong> GitHub also processes data in the USA. The USA is
+      a third country within the meaning of the GDPR. The transfer takes place on the basis of the
+      European Commission's adequacy decision of 10 July 2023 (EU-US Data Privacy Framework,
+      Decision 2023/1795); Microsoft Corporation, GitHub's parent company, is certified under the
+      Data Privacy Framework. In addition or in the alternative, standard contractual clauses
+      under Art. 46(2)(c) GDPR (Implementing Decision 2021/914/EU) apply. Despite these
+      safeguards, it cannot be entirely ruled out that US security authorities may access data on
+      the basis of US law (in particular FISA 702, CLOUD Act).
+    </p>
+    <p>
+      <strong>Storage period:</strong> the retention period for the server logs is determined by
+      GitHub. We ourselves have no direct access to this log data. Further information is
+      available in GitHub's privacy statement:
+      <a href="https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement" target="_blank" rel="noopener">docs.github.com/site-policy/privacy-policies/github-general-privacy-statement</a>.
+    </p>
+
+    <h2 id="s5">5. Storage in local browser storage (localStorage)</h2>
+    <p>
+      So that your display preferences persist across page views, the website stores the
+      following values in your browser's localStorage:
+    </p>
+    <div class="table-scroll" role="region" tabindex="0" aria-labelledby="en-5-caption">
+      <table>
+        <caption id="en-5-caption" class="sr-only">Values stored in local browser storage, with content, purpose and retention period</caption>
+        <thead>
+          <tr><th scope="col">Key</th><th scope="col">Content</th><th scope="col">Purpose</th><th scope="col">Retention</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>yuvomi-theme</code></td>
+            <td>e.g. <code>light</code> / <code>dark</code></td>
+            <td>retaining the chosen colour scheme</td>
+            <td>until you delete it</td>
+          </tr>
+          <tr>
+            <td><code>yuvomi-lang</code></td>
+            <td>e.g. <code>de</code> / <code>en</code></td>
+            <td>retaining the chosen language</td>
+            <td>until you delete it</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <strong>Legal basis:</strong> § 25(2) no. 2 TDDDG. Storing these preferences is strictly
+      necessary in order to provide the telemedia service you have expressly requested - namely
+      displaying the website in the language and colour scheme you selected. Consent is therefore
+      not required. These values are not transmitted to third parties or to any server.
+    </p>
+    <p>
+      <strong>How to delete these values:</strong> via your browser settings under "Delete site
+      data" / "Cookies and other site data", or via the developer tools
+      (Application → Local Storage → yuvomi.cloud).
+    </p>
+    <p class="small">
+      <strong>Note:</strong> earlier versions of this website used the keys <code>oikos-theme</code>
+      and <code>oikos-lang</code>. These are still read until you switch language or colour scheme
+      again.
+    </p>
+
+    <h2 id="s6">6. No cookies, no tracking, no analytics, no external requests</h2>
+    <p>
+      This website does not use cookies in the legal sense. In particular, it uses
+      <strong>no</strong> analytics or tracking services (e.g. Google Analytics, Matomo,
+      Plausible), <strong>no</strong> marketing pixels (e.g. Meta, TikTok, LinkedIn pixels),
+      <strong>no</strong> social media embeds and <strong>no</strong> reCAPTCHA.
+    </p>
+    <p>
+      <strong>No fonts are loaded at all</strong>: the pages use only the system fonts already
+      present on your device. Google Fonts is <strong>not</strong> included. No external service
+      is contacted when a page is opened - any figures shown (for example the number of GitHub
+      "stars") are embedded statically into the page before publication, so your browser does not
+      need to establish a connection to any third party for them.
+    </p>
+
+    <h2 id="s7">7. Contacting us by email</h2>
+    <p>
+      If you contact us by email, we process the personal data contained in the email (sender
+      address, content) for the purpose of handling your enquiry. The legal basis is
+      Art. 6(1)(b) GDPR (pre-contractual measures / performance of a contract) or
+      Art. 6(1)(f) GDPR (legitimate interest in responding to enquiries). We delete the data as
+      soon as it is no longer required to achieve that purpose and no statutory retention periods
+      (e.g. § 257 HGB, § 147 AO) prevent deletion.
+    </p>
+
+    <h2 id="s8">8. Recipients of personal data</h2>
+    <p>The recipient of your personal data is:</p>
+    <ul>
+      <li><strong>GitHub, Inc.</strong>, 88 Colin P Kelly Jr Street, San Francisco, CA 94107, USA - as hosting provider (server logs).</li>
+    </ul>
+    <p>
+      No transfer to further third parties takes place unless we expressly state otherwise
+      elsewhere in this policy.
+    </p>
+
+    <h2 id="s9">9. Storage period</h2>
+    <p>
+      We store personal data only for as long as is necessary to achieve the purposes described,
+      or for as long as statutory retention obligations require. Values in localStorage remain on
+      your device until you delete them yourself.
+    </p>
+
+    <h2 id="s10">10. Your rights as a data subject</h2>
+    <p>You have the following rights in respect of the personal data concerning you:</p>
+    <ul>
+      <li><strong>Right of access</strong> (Art. 15 GDPR)</li>
+      <li><strong>Right to rectification</strong> (Art. 16 GDPR)</li>
+      <li><strong>Right to erasure</strong> (Art. 17 GDPR)</li>
+      <li><strong>Right to restriction of processing</strong> (Art. 18 GDPR)</li>
+      <li><strong>Right to data portability</strong> (Art. 20 GDPR)</li>
+      <li><strong>Right to object</strong> to processing based on Art. 6(1)(f) GDPR (Art. 21 GDPR)</li>
+      <li><strong>Right to withdraw consent</strong> at any time with effect for the future (Art. 7(3) GDPR)</li>
+    </ul>
+    <p>To exercise these rights, an informal message to the contact address above is sufficient.</p>
+
+    <h3>Right to object under Art. 21 GDPR</h3>
+    <p>
+      You have the right to object at any time, on grounds relating to your particular situation,
+      to the processing of personal data concerning you which is carried out on the basis of
+      Art. 6(1)(f) GDPR. We will then no longer process the personal data unless we can demonstrate
+      compelling legitimate grounds for the processing which override your interests, rights and
+      freedoms, or the processing serves to assert, exercise or defend legal claims.
+    </p>
+
+    <h2 id="s11">11. Right to lodge a complaint with a supervisory authority</h2>
+    <p>
+      Without prejudice to any other administrative or judicial remedy, you have the right to
+      lodge a complaint with a supervisory authority (Art. 77 GDPR). The authority responsible for
+      us is:
+    </p>
+    <div class="info-block">
+      <address>
+        Bayerisches Landesamt für Datenschutzaufsicht (BayLDA)<br>
+        Promenade 27<br>
+        91522 Ansbach<br>
+        Germany<br><br>
+        <a href="https://www.lda.bayern.de" target="_blank" rel="noopener">www.lda.bayern.de</a>
+      </address>
+    </div>
+
+    <h2 id="s12">12. Obligation to provide data</h2>
+    <p>
+      You are under no contractual or statutory obligation to provide personal data. However,
+      without the transmission of the technically required data (see section 4) this website
+      cannot be delivered to you.
+    </p>
+
+    <h2 id="s13">13. Automated decision-making and profiling</h2>
+    <p>
+      Automated decision-making, including profiling, within the meaning of Art. 22 GDPR does
+      <strong>not</strong> take place.
+    </p>
+
+    <h2 id="s14">14. Currency and amendment of this privacy policy</h2>
+    <p>
+      This privacy policy is currently valid and was last updated on 16 August 2026. Changes to
+      the website or to legal requirements may make it necessary to amend this policy. The current
+      version is always available at
+      <a href="https://yuvomi.cloud/privacy.html">https://yuvomi.cloud/privacy.html</a>.
+    </p>
+
+  </div>
+</main>
+
+
+<footer class="bot">
+  <div class="wrap">
+    <span>&copy; <span id="year">2026</span> Ulas Kalayci · Yuvomi</span>
+    <nav aria-label="Footer">
+      <a href="index.html">Home</a>
+      <a href="impressum.html">Imprint</a>
+      <a href="privacy.html">Privacy</a>
+      <a href="https://github.com/ulsklyc/yuvomi" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+  document.getElementById('year').textContent = new Date().getFullYear();
+</script>
+
+<a class="to-top" href="#main-content" id="toTop"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>Back to top</a>
+<script>
+(function(){
+  var b = document.getElementById('toTop'); if (!b) return;
+  function sync(){ b.classList.toggle('show', scrollY > 600); }
+  addEventListener('scroll', sync, { passive: true }); sync();
+})();
+</script>
+<script>
+/* Der Umschalter schreibt denselben localStorage-Schluessel wie die Hauptseiten,
+   die Wahl gilt also ueber alle vier Seiten. `aria-pressed` meldet den aktuellen
+   Zustand, das Label nennt das Ziel - das Icon allein sagt keines von beidem. */
+(function(){
+  var btn = document.getElementById('themeBtn'); if (!btn) return;
+  var sun = document.getElementById('sunIco'), moon = document.getElementById('moonIco');
+  function stored(){ try { return localStorage.getItem('yuvomi-theme') || localStorage.getItem('oikos-theme'); } catch (e) { return null; } }
+  function isDark(){ var t = stored(); if (t === 'dark') return true; if (t === 'light') return false; return matchMedia('(prefers-color-scheme:dark)').matches; }
+  function apply(){
+    var d = isDark();
+    var t = stored();
+    if (t === 'dark' || t === 'light') document.documentElement.setAttribute('data-theme', t);
+    else document.documentElement.removeAttribute('data-theme');
+    sun.style.display = d ? 'none' : 'block';
+    moon.style.display = d ? 'block' : 'none';
+    btn.setAttribute('aria-pressed', String(d));
+    btn.setAttribute('aria-label', d ? 'Switch to light theme' : 'Switch to dark theme');
+  }
+  btn.addEventListener('click', function(){
+    try { localStorage.setItem('yuvomi-theme', isDark() ? 'light' : 'dark'); } catch (e) {}
+    apply();
+  });
+  apply();
+})();
+</script>
+</body>
+</html>

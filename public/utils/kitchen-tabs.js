@@ -1,17 +1,21 @@
 import { t } from '/i18n.js';
 import { api } from '/api.js';
 import { renderSubTabs, setSubTabBadge, scrollActiveSubTabIntoView } from '/utils/sub-tabs.js';
-import { toLocalDateKey } from '/utils/date.js';
+import { MODULE_ICON, moduleIconEl } from '/nav-icons.js';
+import { todayKey } from '/utils/date.js';
+import { KITCHEN_MODULES as KITCHEN_MODULES_SOURCE } from '/utils/module-accent.js';
 
 // Reihenfolge = Küchen-Kreislauf: planen → kochen → einkaufen → lagern.
-export const KITCHEN_ROUTES = Object.freeze(['/meals', '/recipes', '/shopping', '/pantry']);
+//
+// DIE ABLEITUNG LÄUFT SEIT 2026-08-18 ANDERSHERUM: die Modul-Ids stehen in
+// `/utils/module-accent.js`, die Routen entstehen hier daraus. Vorher war es
+// umgekehrt, und das ging so lange gut, wie niemand ausserhalb dieser Datei die
+// Gruppe brauchte - der geteilte Ton-Auflöser tut es, und diese Datei wird vom
+// Test-Loader gestubt. Die Begründung steht dort; die Aussage ist dieselbe wie
+// vorher: EINE Quelle für die Frage „gehört dieses Modul zur Küche?".
+export { KITCHEN_MODULES } from '/utils/module-accent.js';
+export const KITCHEN_ROUTES = Object.freeze(KITCHEN_MODULES_SOURCE.map((mod) => `/${mod}`));
 export const KITCHEN_STORAGE_KEY = 'yuvomi-kitchen-tab';
-
-// Modul-Namen der Gruppe, aus den Routen abgeleitet (`route.slice(1)`) - dieselbe
-// Konvention, die `isModuleDisabled` unten schon nutzt. Einzige Quelle für die
-// Frage „gehört dieses Modul zur Küche?", damit der geteilte Akzent nicht über
-// eine zweite, driftende Liste läuft.
-export const KITCHEN_MODULES = Object.freeze(KITCHEN_ROUTES.map((route) => route.slice(1)));
 
 const TABS = () => [
   { route: '/meals',    labelKey: 'nav.meals',    icon: 'utensils'      },
@@ -112,7 +116,7 @@ async function loadBadges() {
   try {
     // `today` kommt vom Client: „abgelaufen" hängt am lokalen Kalendertag, und der
     // Server rechnet in UTC (siehe server/routes/kitchen.js).
-    const res = await api.get(`/kitchen/summary?today=${encodeURIComponent(toLocalDateKey())}`);
+    const res = await api.get(`/kitchen/summary?today=${encodeURIComponent(todayKey())}`);
     const data = res.data ?? {};
     if (!_bar?.isConnected) return;
     for (const { route, pick, label, tone } of BADGES) {
@@ -147,12 +151,24 @@ export function renderKitchenTabsBar(container, activeRoute) {
   _activeRoute = activeRoute;
 
   _bar = renderSubTabs(container, {
+    // Zielorte, keine Sichten: die vier Küchen-Routen sind vier eigenständige
+    // Module (eigener `module:`-Wert in router.js, eigene Seitendatei, einzeln
+    // abschaltbar). Die Leiste wird damit zur Navigation aus echten Links -
+    // cmd-Klick öffnet den Vorrat im neuen Tab, wie überall sonst in der Shell.
+    semantics: 'nav',
     tabs: TABS().map(({ route, labelKey, icon }) => ({ id: route, label: t(labelKey), icon })),
     activeId: activeRoute,
     storageKey: KITCHEN_STORAGE_KEY,
     extraClass: 'kitchen-tabs-bar',
     ariaLabel: t('nav.kitchen'),
     title: t('nav.kitchen'),
+    // DER ABSENDER DER KÜCHE STEHT EINMAL, UND ZWAR HIER. Die vier Küchen-Köpfe
+    // bekommen keinen: sie teilen EINEN Tint, weil sie EIN Raum sind - vier
+    // Siegel wiederholten denselben Absender bei jedem Tabwechsel, und zwei der
+    // vier Köpfe (Rezepte, Vorrat) tragen gar keinen Seitentitel, hätten also
+    // einen Absender ohne Brief. Das Besteck ist dasselbe Zeichen, das die
+    // Bottom-Nav für „Küche" führt (kitchenNavButtonEl in router.js).
+    sealIcon: () => moduleIconEl(MODULE_ICON.kitchen),
     insertPosition: 'afterbegin',
     onChange: (route) => window.yuvomi?.navigate(route),
   });

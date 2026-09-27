@@ -11,10 +11,12 @@
   /* Full-bleed-Rail wie .page-toolbar (Issue #577): Hintergrund, Akzentstreifen
    * und Trennlinie laufen bis zur Shell-Kante, der Tab-Inhalt sitzt in der
    * zentrierten Content-Spalte und fluchtet mit dem Seiten-Body darunter.
-   * Konsumenten sind ausschließlich kitchen-tabs.js und health-tabs.js; beide
-   * hängen die Leiste als GESCHWISTER des Modul-Roots in den Router-Wrapper,
-   * womit das `100%` die volle Shell-Breite trifft. (Settings nutzt eine andere
-   * Tab-Mechanik, utils/tablist.js, und rendert keine .sub-tabs-bar.) */
+   * Das gilt für die Leiste ALS EIGENE RAIL: kitchen-tabs.js hängt sie als
+   * GESCHWISTER des Modul-Roots in den Router-Wrapper, womit das `100%` die
+   * volle Shell-Breite trifft. Liegt sie dagegen IM Modulkopf (health-tabs.js),
+   * gibt sie das Rail-Verhalten ab - siehe die Trägerregel unten. (Settings
+   * nutzt eine andere Tab-Mechanik, utils/tablist.js, und rendert keine
+   * .sub-tabs-bar.) */
   padding-inline: var(--page-inline-pad);
   height: var(--sub-tabs-height);
   box-sizing: border-box;
@@ -33,14 +35,61 @@
   display: none;
 }
 
+/* TRÄGERREGEL: eine Sub-Tab-Leiste IM Modulkopf ist keine eigene Rail mehr,
+ * sondern dessen Bar-Zeile.
+ *
+ * Derselbe Satz wie beim Well (Session 5): der Träger entscheidet, nicht das
+ * Bauteil. Sticky-Position, Seitengrund, Trennlinie, Höhe und die Fluchtlinie
+ * gehören dem Kopf; trüge die Leiste sie ein zweites Mal, stünden zwei
+ * Trennlinien untereinander, das Padding läge doppelt und die Leiste klebte
+ * gegen den Kopf, in dem sie liegt.
+ *
+ * Was BLEIBT, ist die Bauart der Leiste: `overflow-x: auto` samt
+ * Scroll-Affordanz. Genau darauf setzt die Shell-Regel „Tab-Leiste im
+ * Modulkopf" (layout.css) auf, die jeder `[role="tablist"]` im Kopf eine eigene
+ * Zeile gibt.
+ *
+ * Nutzer: health-tabs.js. Die Küchen-Leiste bleibt eine eigene Rail - sie
+ * wechselt das MODUL und steht deshalb über dem Kopf, nicht in ihm. */
+.page-toolbar > .sub-tabs-bar {
+  position: static;
+  z-index: auto;
+  height: auto;
+  padding: 0;
+  background-color: transparent;
+  border-bottom: none;
+}
+
+/* Das Absender-Siegel einer Leiste, die selbst die Kopf-Navigation ist
+ * (Leisten-Regel; heute die Küche). Form, Größe und Tönungsgrund kommen von
+ * .module-seal--head in layout.css - hier steht nur, WESSEN Ton es trägt.
+ *
+ * --active-module-accent, nicht --module-accent: die Leiste hängt als
+ * GESCHWISTER des Modul-Roots im Router-Wrapper (kitchen-tabs.js), also gilt
+ * dort keine der Modul-Root-Variablen. Der aktive Akzent auf <html> ist
+ * dieselbe Quelle, aus der schon der aktive Tab seine Füllung nimmt - womit
+ * Siegel und Tab per Konstruktion denselben Ton tragen. */
+.sub-tabs-bar > .module-seal--head {
+  --seal-accent: var(--active-module-accent, var(--color-accent));
+  /* Mit dem `gap` der Leiste ergibt das die 8px, die auch im Modulkopf
+   * zwischen Siegel und Titel stehen. */
+  margin-inline-end: var(--space-1);
+}
+
 /* Optionaler Modul-Titel links der Tabs (Canonical Page Head).
- * Größe/Weight aus der u-toolbar-title-Rolle (typography.css). */
+ * Größe/Weight aus der Kopf-Titelrolle: der Selektor steht in typography.css
+ * in der Shell-Liste der Rolle - eine freie Utility dafür gibt es nicht. */
 .sub-tabs-bar__title {
   flex-shrink: 0;
   margin-right: var(--space-2);
   color: var(--color-text-primary);
 }
 
+/* Ein Selektor für zwei Elementtypen: die Küchen-Leiste rendert `<a href>`
+ * (Zielorte), die Gesundheits-Leiste `<button role="tab">` (Sichten) - siehe
+ * den Kopf von utils/sub-tabs.js. Die Pille sieht in beiden Fällen gleich aus;
+ * `text-decoration` und `font` sind die einzigen Stellen, an denen die
+ * Browser-Defaults auseinanderlaufen. */
 .sub-tab {
   display: inline-flex;
   align-items: center;
@@ -54,6 +103,7 @@
   font-family: inherit;
   font-size: var(--text-sm);
   font-weight: var(--font-weight-medium);
+  text-decoration: none;
   cursor: pointer;
   white-space: nowrap;
   flex-shrink: 0;
@@ -66,11 +116,25 @@
   transition-duration: 0.06s;
 }
 
-/* Aktiv: Akzent-Tint trägt die Modul-Identität, das Label bleibt Ink + semibold
- * (Modul-Akzent-Text auf Hell erreicht nur ~3.5:1 — unter AA 4.5). */
+/* Aktiv = erhabene Surface-Pille, Modulton nur in der Tinte - die eine
+ * Segment-Sprache der Shell (Rezept: tokens.css, Abschnitt 6c; Muster
+ * .group-toggle__btn--active in tasks.css, .cal-toolbar__view-btn--active im
+ * Kalender, .segmented__item.is-active in panel.css).
+ *
+ * Hier stand bis 2026-08-12 die GEFÜLLTE Fassung samt ihrer Begründung
+ * („Modul-Akzent als TEXT erreicht auf Hell nur ~3.5:1"). Die Messung ist mit
+ * den Familientönen (v2.1.0) abgelaufen: der rohe Ton hält 5.04:1 hell /
+ * 4.82:1 dunkel, die --tint-ink-Mischung 7.37:1 / 6.61:1 über alle neun
+ * Familien. Die vier Schwester-Fundstellen haben den Wechsel damals im
+ * Kommentar nachgezogen, diese nicht.
+ *
+ * Diese Leiste liest `--active-module-accent` statt `--module-accent`: sie
+ * sitzt in der Shell, nicht auf dem Page-Root, und kennt den Modulton nur
+ * über das, was der Router aufs Dokument setzt. */
 .sub-tab--active {
-  background-color: color-mix(in srgb, var(--active-module-accent, var(--color-accent)) 14%, transparent);
-  color: var(--color-text-primary);
+  background-color: var(--seg-active-bg);
+  box-shadow: var(--seg-active-shadow);
+  color: color-mix(in srgb, var(--active-module-accent, var(--color-accent)) var(--tint-ink), var(--color-text-primary));
   font-weight: var(--font-weight-semibold);
 }
 
@@ -100,8 +164,8 @@
  *
  * DIESELBE GRAMMATIK WIE `.list-tab__count` in der Einkaufsliste: getönte
  * currentColor-Pille, tabellarische Ziffern. Der Zähler erbt damit die Farbe seines
- * Tabs und braucht keine eigene Kontrastrechnung - auf dem aktiven Tab wird er von
- * selbst dunkler, weil `.sub-tab--active` auf Ink schaltet. */
+ * Tabs und braucht keine eigene Kontrastrechnung. Auf dem AKTIVEN Tab kehrt er
+ * sich um (Regel weiter unten): dort ist der Grund der Vollton-Akzent. */
 .sub-tab__badge {
   display: inline-flex;
   align-items: center;
@@ -133,6 +197,33 @@
  * layout.css greift hier nicht, weil sie nur App-Shell-Komponenten führt. */
 .sub-tab__badge[hidden] {
   display: none;
+}
+
+/* NEUTRAL, NICHT ZWEIMAL IM MODULTON.
+ *
+ * Diese Regel hat zwei Fassungen hinter sich (Akzent als Ziffer auf Tint-Fläche,
+ * dann getönte Marke auf der Surface-Pille) und beide nannten den Modulton
+ * zweimal blass: `--tint-state` als Fläche UND `--tint-ink` als Ziffer darauf.
+ * Die Skalen-Regel (v2.23.0) entscheidet den Fall über die Frage, was das
+ * Etikett SAGT - und ein Zähler sagt „wie viele", keine Identität. Der dritte
+ * Zweig der Regel greift zusätzlich: die Identität, die der Modulton nennen
+ * würde, ist die des Raums, in dem der Zähler steht. Also neutral.
+ *
+ * Der Warnzähler drei Regeln weiter unten ist die Gegenprobe im selben File:
+ * er SAGT etwas („hier fehlt was") und trägt seinen Ton deshalb voll.
+ *
+ * Der Ruhezustand oben bleibt unberührt: dort ist `currentColor` die neutrale
+ * Tab-Tinte, seine 15-%-Tönung also ohnehin farblos. Nur auf dem aktiven Tab
+ * wäre currentColor der Modulton - genau das fängt diese Regel ab. */
+.sub-tab--active .sub-tab__badge {
+  background-color: var(--color-fill-well);
+  color: var(--color-text-primary);
+}
+
+/* Der Vorrats-Warnzähler bleibt sein eigenes Signal - auch auf dem aktiven Tab. */
+.sub-tab--active .sub-tab__badge--warning {
+  background-color: var(--color-warning);
+  color: var(--color-ink-on-vivid);
 }
 
 /* Der einzige Ton-Ausschlag: der Vorrat ist das einzige Küchen-Signal mit einer

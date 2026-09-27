@@ -5,8 +5,17 @@
  * Abhängigkeiten: keine externen.
  */
 
-import { randomBytes } from 'node:crypto';
-import { utcToWall } from '../utils/timezone.js';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import {
+  householdTimeZone, isValidTimeZone, localToUTC, shiftDateKey, utcToWall,
+} from '../utils/timezone.js';
+import { formatWall, vtimezoneFor } from '../utils/vtimezone.js';
+import { outboundDateRange } from './outbound-dtstart.js';
+import { rruleLine } from './recurrence.js';
+import {
+  BODY_FREE_EVENT_COLUMNS, eventProjectionSql, resolveProjectedEventRows,
+} from './calendar-event-reader.js';
+import { baseOccurrenceFor, isLinkedOccurrence } from './calendar-occurrence-overrides.js';
 
 function escapeICSText(s) {
   if (s == null) return '';
@@ -14,7 +23,12 @@ function escapeICSText(s) {
     .replace(/\\/g, '\\\\')
     .replace(/;/g, '\\;')
     .replace(/,/g, '\\,')
-    .replace(/\r?\n/g, '\\n');
+    // Jeder Zeilenumbruch wird zu '\n' - nicht nur '\r\n'/'\n'. Ein einzelnes
+    // '\r' (kein Editor tippt das, aber ein praeparierter Titel kann es tragen)
+    // ging vorher unveraendert durch: eine rohe CR-Steuerzeichenfolge in einer
+    // gefalteten ICS-Zeile ist eine Zeilenumbruch-Injektion in den generierten
+    // Feed (ein Abonnent koennte sie als Beginn einer neuen Property lesen).
+    .replace(/\r\n|\r|\n/g, '\\n');
 }
 
 function foldLine(line) {
@@ -87,108 +101,9 @@ function addDaysDateKey(dateKey, days) {
 // --------------------------------------------------------
 // TZID-Export für wiederkehrende Serien (#549)
 // --------------------------------------------------------
-// Synchronisierte Serien speichern start_datetime als UTC-Instant + tzid. Würde
-// der Feed sie UTC-verankert (mit RRULE, ohne TZID) exportieren, expandierte die
-// App des Abonnenten jede Instanz mit fixer UTC-Zeit → dieselbe Sommer-/Winterzeit-
-// Drift wie beim Import. Deshalb: DTSTART;TZID=<zone> mit lokaler Wanduhrzeit + ein
-// generiertes VTIMEZONE, damit der Abonnent pro Vorkommen korrekt lokal → UTC rechnet.
-
-// UTC-Instant (…Z) → ICS-Basic-Format der lokalen Wanduhrzeit ('YYYYMMDDTHHMMSS').
-function formatWall(iso, tzid) {
-  const w = utcToWall(iso, tzid);
-  if (!w) return null;
-  return w.date.replace(/-/g, '') + 'T' + w.time.replace(/:/g, '');
-}
-
-// Offset (Minuten) einer Zone zum gegebenen UTC-Zeitpunkt.
-function tzOffsetMinutes(utcMs, tzid) {
-  const w = utcToWall(new Date(utcMs).toISOString(), tzid);
-  if (!w) return 0;
-  const [Y, Mo, D] = w.date.split('-').map(Number);
-  const [H, Mi, S] = w.time.split(':').map(Number);
-  return Math.round((Date.UTC(Y, Mo - 1, D, H, Mi, S) - utcMs) / 60000);
-}
-
-function fmtOffset(min) {
-  const a = Math.abs(min);
-  return (min < 0 ? '-' : '+') + pad(Math.floor(a / 60)) + pad(a % 60);
-}
-
-function tzNameAt(utcMs, tzid) {
-  try {
-    const parts = new Intl.DateTimeFormat('en-US', { timeZone: tzid, timeZoneName: 'short', hour12: false })
-      .formatToParts(new Date(utcMs));
-    const p = parts.find((x) => x.type === 'timeZoneName');
-    // Reine Offset-Namen (z.B. 'GMT+2') sind als TZNAME wenig hilfreich → weglassen.
-    return p && !/^GMT|^UTC/.test(p.value) ? p.value : null;
-  } catch { return null; }
-}
-
-// Alle DST-Übergänge eines Jahres (minutengenau per Binärsuche über den Offset-Sprung).
-function findTransitions(year, tzid) {
-  const DAY = 86400000;
-  const end = Date.UTC(year + 1, 0, 1);
-  const out = [];
-  let prevMs = Date.UTC(year, 0, 1);
-  let prevOff = tzOffsetMinutes(prevMs, tzid);
-  for (let t = prevMs + DAY; t <= end; t += DAY) {
-    const off = tzOffsetMinutes(t, tzid);
-    if (off !== prevOff) {
-      let lo = prevMs, hi = t;
-      while (hi - lo > 60000) {
-        const mid = lo + Math.floor((hi - lo) / 120000) * 60000; // minutengenaue Mitte
-        if (tzOffsetMinutes(mid, tzid) === prevOff) lo = mid; else hi = mid;
-      }
-      out.push({ instant: hi, offsetBefore: prevOff, offsetAfter: off });
-    }
-    prevMs = t; prevOff = off;
-  }
-  return out;
-}
-
-// n-ter Wochentag im Monat als BYDAY-Wert (letzter → -1SU), aus einem lokalen Datum.
-function bydayOf(d) {
-  const dow = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'][d.getUTCDay()];
-  const dom = d.getUTCDate();
-  const daysInMonth = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
-  const nth = dom + 7 > daysInMonth ? -1 : Math.ceil(dom / 7);
-  return `${nth}${dow}`;
-}
-
-// VTIMEZONE-Block für eine IANA-Zone, RRULE-basiert (extrapoliert für offene Serien).
-function buildVTimezone(tzid, year) {
-  const transitions = findTransitions(year, tzid);
-  const lines = ['BEGIN:VTIMEZONE', `TZID:${tzid}`];
-  if (transitions.length === 0) {
-    // Keine Sommerzeit: einzelne STANDARD-Komponente mit festem Offset.
-    const off = tzOffsetMinutes(Date.UTC(year, 0, 1), tzid);
-    const name = tzNameAt(Date.UTC(year, 0, 1), tzid);
-    lines.push('BEGIN:STANDARD', `TZOFFSETFROM:${fmtOffset(off)}`, `TZOFFSETTO:${fmtOffset(off)}`);
-    if (name) lines.push(`TZNAME:${name}`);
-    lines.push('DTSTART:19700101T000000', 'END:STANDARD');
-  } else {
-    for (const tr of transitions) {
-      const isDst = tr.offsetAfter > tr.offsetBefore; // Sprung nach vorne → Sommerzeit beginnt
-      // DTSTART der Sub-Komponente ist die lokale Wanduhrzeit im FROM-Offset.
-      const onset = new Date(tr.instant + tr.offsetBefore * 60000);
-      const name = tzNameAt(tr.instant, tzid);
-      lines.push(
-        isDst ? 'BEGIN:DAYLIGHT' : 'BEGIN:STANDARD',
-        `TZOFFSETFROM:${fmtOffset(tr.offsetBefore)}`,
-        `TZOFFSETTO:${fmtOffset(tr.offsetAfter)}`,
-      );
-      if (name) lines.push(`TZNAME:${name}`);
-      lines.push(
-        `DTSTART:${onset.getUTCFullYear()}${pad(onset.getUTCMonth() + 1)}${pad(onset.getUTCDate())}` +
-          `T${pad(onset.getUTCHours())}${pad(onset.getUTCMinutes())}${pad(onset.getUTCSeconds())}`,
-        `RRULE:FREQ=YEARLY;BYMONTH=${onset.getUTCMonth() + 1};BYDAY=${bydayOf(onset)}`,
-        isDst ? 'END:DAYLIGHT' : 'END:STANDARD',
-      );
-    }
-  }
-  lines.push('END:VTIMEZONE');
-  return lines;
-}
+// Die Rechnung selbst - Wanduhrzeit und der VTIMEZONE-Block mit den
+// DST-Übergängen - steht seit #938 in utils/vtimezone.js: der ausgehende
+// CalDAV-Pfad braucht dieselbe und darf sie nicht ein zweites Mal führen.
 
 // Nutzt dieses Event den TZID-Export-Pfad? Nur zeitgebundene Serien mit bekannter
 // Zone - Einzeltermine sind als UTC-Instant bereits eindeutig (kein DST-Problem).
@@ -196,30 +111,126 @@ function usesTzid(ev) {
   return !!(ev.tzid && !ev.all_day && ev.recurrence_rule);
 }
 
-function buildVEvent(ev, dtstamp, showAssignees = false) {
+// --------------------------------------------------------
+// Verankerung naiver Zeiten an der Haushaltszone (#818)
+// --------------------------------------------------------
+// Lokal angelegte Termine speichern reine Wanduhrzeit ohne Offset. Als floating
+// local time exportiert (RFC 5545: gültig, gemeint ist "die Uhr des Betrachters")
+// legen Google, Apple, Thunderbird, Outlook und Home Assistant sie in der Praxis
+// auf UTC - ein 16:00-Termin in Madrid erscheint um 18:00. Weil diese Ziffern die
+// Uhr des Haushalts meinen, tragen sie im Feed jetzt deren Zone: DTSTART;TZID=…
+// plus VTIMEZONE, dazu X-WR-TIMEZONE als Kalenderzone für die Clients, die den
+// Header auswerten.
+
+// Die Zone, an der naive Werte verankert werden. null, wenn sie UTC-gleich oder
+// nicht auflösbar ist: dann sind die Ziffern bereits UTC und ein 'Z' ist eindeutiger
+// als ein VTIMEZONE über eine Zone, die viele Clients nicht als solche führen.
+function resolveFeedZone(tz) {
+  const zone = (tz || '').trim();
+  if (!zone || /^(UTC|GMT|Z|Etc\/(UTC|GMT|GMT0|GMT\+0|GMT-0|Zulu|Universal|Greenwich))$/i.test(zone)) return null;
+  return isValidTimeZone(zone) ? zone : null;
+}
+
+// Eine Datums-/Zeit-Property. Werte mit eigenem Offset sind als UTC-Instant
+// eindeutig; naive Werte bekommen die Feed-Zone (bzw. 'Z', wenn diese UTC ist).
+function stampProp(prop, iso, feedZone) {
+  if (hasExplicitOffset(iso)) return `${prop}:${formatUTC(iso)}`;
+  return feedZone
+    ? `${prop};TZID=${feedZone}:${formatLocal(iso)}`
+    : `${prop}:${formatLocal(iso)}Z`;
+}
+
+// Braucht dieses Event ein VTIMEZONE der Feed-Zone? Nur der naive Pfad; Ganztags-
+// Werte sind VALUE=DATE, Serien mit eigener tzid bringen ihre Zone selbst mit.
+function usesFeedZone(ev) {
+  if (ev.all_day || usesTzid(ev)) return false;
+  return !hasExplicitOffset(ev.start_datetime) ||
+    !!(ev.end_datetime && !hasExplicitOffset(ev.end_datetime));
+}
+
+// EXDATE and RECURRENCE-ID identify the same original recurrence slot. Keeping
+// their notation in one formatter prevents a moved replacement from using a
+// date-only, floating or TZID form different from the master's RRULE set.
+function recurrenceSlotProp(prop, master, dateKey, feedZone) {
+  if (master.all_day) return `${prop};VALUE=DATE:${formatDate(dateKey)}`;
+  if (usesTzid(master)) {
+    const baseOccurrence = baseOccurrenceFor(master, dateKey);
+    return `${prop};TZID=${master.tzid}:${formatWall(baseOccurrence.start_datetime, master.tzid)}`;
+  }
+  const timeSuffix = master.start_datetime.slice(10);
+  return stampProp(prop, dateKey + timeSuffix, feedZone);
+}
+
+// EXDATEs may outlive a changed/imported rule and therefore cannot require a
+// successful occurrence expansion. Reconstruct the instant in constant time,
+// retaining the wall clock across DST as the expander does after #985. When
+// local and stored days differ, the identity is still a UTC day: find its
+// local date among the three adjacent candidates, not by reusing a UTC suffix.
+// This does not scan the rule, so retained/unreachable EXDATEs remain harmless.
+function exceptionSlotProp(master, dateKey, feedZone) {
+  if (master.all_day) return `EXDATE;VALUE=DATE:${formatDate(dateKey)}`;
+  if (usesTzid(master)) {
+    const wall = utcToWall(master.start_datetime, master.tzid);
+    let instant = dateKey + master.start_datetime.slice(10);
+    if (wall?.date === master.start_datetime.slice(0, 10)) {
+      instant = localToUTC(`${dateKey}T${wall.time}`, master.tzid);
+    } else if (wall) {
+      for (const offset of [0, -1, 1]) {
+        const candidate = localToUTC(`${shiftDateKey(dateKey, offset)}T${wall.time}`, master.tzid);
+        if (candidate.slice(0, 10) === dateKey) {
+          instant = candidate;
+          break;
+        }
+      }
+      // If a historical timezone jump leaves no candidate, preserve a harmless
+      // legacy EXDATE rather than making the whole feed unavailable.
+    }
+    return `EXDATE;TZID=${master.tzid}:${formatWall(instant, master.tzid)}`;
+  }
+  return recurrenceSlotProp('EXDATE', master, dateKey, feedZone);
+}
+
+function buildVEvent(
+  ev,
+  dtstamp,
+  showAssignees = false,
+  feedZone = null,
+  recurrenceMaster = null,
+) {
   const lines = ['BEGIN:VEVENT'];
-  lines.push(`UID:event-${ev.id}@yuvomi`);
+  lines.push(`UID:event-${recurrenceMaster?.id ?? ev.id}@yuvomi`);
   lines.push(`DTSTAMP:${dtstamp}`);
+  // DTSTART mit der eigenen Regel in Einklang (#986) - nur fuer selbst angelegte
+  // Serien; ein importiertes DTSTART geht Wort fuer Wort zurueck (#756).
+  // Begruendung in services/outbound-dtstart.js. DAS ENDE WANDERT MIT: es ist
+  // ein absoluter Zeitstempel, kein Abstand - bliebe es stehen, endete der
+  // Termin vor seinem Beginn.
+  // A replacement inherits the master's rule for effective reads, but its own
+  // DTSTART/DTEND are concrete moves and must never be snapped to that rule.
+  const outboundEvent = recurrenceMaster ? { ...ev, recurrence_rule: null } : ev;
+  const { start_datetime: dtstart, end_datetime: dtende } = outboundDateRange(outboundEvent);
+
+  if (recurrenceMaster) {
+    lines.push(recurrenceSlotProp(
+      'RECURRENCE-ID', recurrenceMaster, ev.recurrence_id, feedZone
+    ));
+  }
   if (ev.all_day) {
-    lines.push(`DTSTART;VALUE=DATE:${formatDate(ev.start_datetime)}`);
+    lines.push(`DTSTART;VALUE=DATE:${formatDate(dtstart)}`);
     // DTEND ist exklusiv: Yuvomi speichert das letzte sichtbare Datum → +1 Tag.
-    const endKey = ev.end_datetime || ev.start_datetime;
+    const endKey = dtende || dtstart;
     lines.push(`DTEND;VALUE=DATE:${addDaysDateKey(endKey, 1)}`);
   } else if (usesTzid(ev)) {
     // Wiederkehrende Serie mit Zone: lokale Wanduhrzeit + TZID, damit der Abonnent
     // pro Vorkommen DST-korrekt expandiert (statt fixem UTC-Suffix → Winter-Drift, #549).
-    lines.push(`DTSTART;TZID=${ev.tzid}:${formatWall(ev.start_datetime, ev.tzid)}`);
-    if (ev.end_datetime) lines.push(`DTEND;TZID=${ev.tzid}:${formatWall(ev.end_datetime, ev.tzid)}`);
+    lines.push(`DTSTART;TZID=${ev.tzid}:${formatWall(dtstart, ev.tzid)}`);
+    if (dtende) lines.push(`DTEND;TZID=${ev.tzid}:${formatWall(dtende, ev.tzid)}`);
   } else {
     // Extern synchronisierte Events tragen ein explizites Z/Offset → echte UTC-Konvertierung.
-    // Lokal angelegte Events sind naiv (keine Z/Offset) → floating local time, unverändert
-    // übernommen, damit sie beim Abonnenten exakt wie in der App selbst angezeigt werden.
-    const startFmt = hasExplicitOffset(ev.start_datetime) ? formatUTC(ev.start_datetime) : formatLocal(ev.start_datetime);
-    lines.push(`DTSTART:${startFmt}`);
-    if (ev.end_datetime) {
-      const endFmt = hasExplicitOffset(ev.end_datetime) ? formatUTC(ev.end_datetime) : formatLocal(ev.end_datetime);
-      lines.push(`DTEND:${endFmt}`);
-    }
+    // Lokal angelegte Events sind naiv (keine Z/Offset) → Wanduhrzeit des Haushalts,
+    // an dessen Zone verankert statt floating (#818).
+    lines.push(stampProp('DTSTART', dtstart, feedZone));
+    if (dtende) lines.push(stampProp('DTEND', dtende, feedZone));
   }
   // Opt-in (#482): zugewiesene Personen als Titel-Suffix "(Name, Name)".
   // Escaping erfolgt über den zusammengesetzten String, damit Kommata/Semikola
@@ -232,33 +243,26 @@ function buildVEvent(ev, dtstamp, showAssignees = false) {
   lines.push(`SUMMARY:${escapeICSText(summary)}`);
   if (ev.description) lines.push(`DESCRIPTION:${escapeICSText(ev.description)}`);
   if (ev.location) lines.push(`LOCATION:${escapeICSText(ev.location)}`);
-  if (ev.recurrence_rule) lines.push(`RRULE:${ev.recurrence_rule}`);
+  // rruleLine statt Handarbeit: eine eingelesene Serie bringt ihr `RRULE:` schon
+  // mit, ein blindes Praefix erzeugte `RRULE:RRULE:FREQ=...` und liess strikte
+  // Abonnenten das ganze Event verwerfen (#761).
+  if (ev.recurrence_rule && !recurrenceMaster) lines.push(rruleLine(ev.recurrence_rule));
   // Einzeln ausgenommene Vorkommen (EXDATE, #489). Zeit-Teil = Master-Startzeit,
   // damit die EXDATE-Instanz exakt auf ein RRULE-Vorkommen trifft.
-  if (ev.recurrence_rule && Array.isArray(ev.exception_dates) && ev.exception_dates.length) {
-    // Bei TZID-Serien die lokale Wanduhrzeit des Masters als Zeit-Teil nutzen, damit
-    // die EXDATE-Instanz zonengleich auf ein RRULE-Vorkommen trifft (#549).
-    const wallSuffix = usesTzid(ev) ? formatWall(ev.start_datetime, ev.tzid).slice(8) : null; // 'T072500'
-    const timeSuffix = ev.all_day ? '' : ev.start_datetime.slice(10); // 'T18:00' / 'T18:00:00Z' / ''
+  if (!recurrenceMaster && ev.recurrence_rule
+      && Array.isArray(ev.exception_dates) && ev.exception_dates.length) {
     for (const exDate of ev.exception_dates) {
-      if (ev.all_day) {
-        lines.push(`EXDATE;VALUE=DATE:${formatDate(exDate)}`);
-      } else if (usesTzid(ev)) {
-        lines.push(`EXDATE;TZID=${ev.tzid}:${formatDate(exDate)}${wallSuffix}`);
-      } else {
-        const occIso = exDate + timeSuffix;
-        const fmt = hasExplicitOffset(occIso) ? formatUTC(occIso) : formatLocal(occIso);
-        lines.push(`EXDATE:${fmt}`);
-      }
+      lines.push(exceptionSlotProp(ev, exDate, feedZone));
     }
   }
   lines.push('END:VEVENT');
   return lines.map(foldLine);
 }
 
-function buildFeed(conn, userId, now = new Date()) {
+function buildFeed(conn, userId, now = new Date(), tz = householdTimeZone(conn)) {
   const windowStart = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000)
     .toISOString().slice(0, 10);
+  const feedZone = resolveFeedZone(tz);
 
   // Identische Sichtbarkeitslogik wie GET /api/v1/calendar:
   // alle Events außer fremden, nicht-geteilten ICS-Abos.
@@ -276,9 +280,8 @@ function buildFeed(conn, userId, now = new Date()) {
               ORDER BY u.display_name
            )) AS assignee_names_json` : '';
 
-  const rows = conn.prepare(`
-    SELECT id, title, description, start_datetime, end_datetime, all_day,
-           location, recurrence_rule, tzid${assigneeSelect}
+  const queriedRows = conn.prepare(`
+    SELECT ${eventProjectionSql(conn, 'e', BODY_FREE_EVENT_COLUMNS)}${assigneeSelect}
     FROM calendar_events e
     WHERE (
       e.external_source <> 'ics'
@@ -291,22 +294,73 @@ function buildFeed(conn, userId, now = new Date()) {
       OR DATE(e.start_datetime) >= ?
     )
     ORDER BY e.start_datetime ASC
-  `).all(userId, windowStart)
-    .filter(ev => !isRecurrenceExpired(ev.recurrence_rule, windowStart));
+  `).all(userId, windowStart);
+  const referencedMasterIds = new Set(queriedRows
+    .filter(isLinkedOccurrence)
+    .map((event) => Number(event.recurrence_parent_id)));
+  const rows = queriedRows
+    .filter((event) => !isRecurrenceExpired(event.recurrence_rule, windowStart)
+      || referencedMasterIds.has(Number(event.id)));
 
   // Instanz-Ausnahmen (EXDATE, #489) für die wiederkehrenden Events des Feeds laden.
   const recurringIds = rows.filter(ev => ev.recurrence_rule).map(ev => ev.id);
+  const exceptionsByEvent = new Map();
   if (recurringIds.length) {
     const placeholders = recurringIds.map(() => '?').join(',');
     const exRows = conn.prepare(
       `SELECT event_id, exception_date FROM calendar_event_exceptions WHERE event_id IN (${placeholders})`
     ).all(...recurringIds);
-    const byEvent = new Map();
     for (const r of exRows) {
-      if (!byEvent.has(r.event_id)) byEvent.set(r.event_id, []);
-      byEvent.get(r.event_id).push(r.exception_date);
+      if (!exceptionsByEvent.has(r.event_id)) exceptionsByEvent.set(r.event_id, []);
+      exceptionsByEvent.get(r.event_id).push(r.exception_date);
     }
-    for (const ev of rows) ev.exception_dates = byEvent.get(ev.id) || [];
+  }
+
+  const resolvedRows = resolveProjectedEventRows(conn, rows, { lightweight: true });
+  // RFC 5545 represents a reachable replacement with RECURRENCE-ID, so its
+  // master must not also emit EXDATE. A child that degraded to standalone is
+  // deliberately absent here: its original master slot remains excluded.
+  const linkedSlotsByMaster = new Map();
+  for (const event of resolvedRows.filter((row) => row.is_occurrence_override)) {
+    const parentId = Number(event.series_id);
+    if (!linkedSlotsByMaster.has(parentId)) linkedSlotsByMaster.set(parentId, new Set());
+    linkedSlotsByMaster.get(parentId).add(event.recurrence_id);
+  }
+  for (const event of resolvedRows) {
+    const linkedSlots = linkedSlotsByMaster.get(Number(event.id));
+    event.exception_dates = (exceptionsByEvent.get(event.id) || [])
+      .filter((dateKey) => !linkedSlots?.has(dateKey));
+  }
+  // Keep recurrence context even when an old master itself falls outside the
+  // rolling feed window but one of its moved replacements is displayed now.
+  const mastersById = new Map(queriedRows
+    .filter((event) => event.recurrence_rule)
+    .map((event) => [Number(event.id), event]));
+
+  // Resolution owns assignment inheritance; the title suffix is an export-only
+  // projection, so hydrate it once from the resolved assignment owner IDs.
+  if (showAssignees && resolvedRows.length) {
+    const ownerIds = [...new Set(resolvedRows
+      .map((event) => Number(event.assignment_owner_id ?? event.id))
+      .filter((id) => Number.isInteger(id) && id > 0))];
+    if (ownerIds.length) {
+      const nameRows = conn.prepare(`
+        SELECT ea.event_id, u.display_name
+        FROM event_assignments ea
+        JOIN users u ON u.id = ea.user_id
+        WHERE ea.event_id IN (${ownerIds.map(() => '?').join(',')})
+        ORDER BY ea.event_id, u.display_name
+      `).all(...ownerIds);
+      const namesByOwner = new Map();
+      for (const row of nameRows) {
+        if (!namesByOwner.has(row.event_id)) namesByOwner.set(row.event_id, []);
+        namesByOwner.get(row.event_id).push(row.display_name);
+      }
+      for (const event of resolvedRows) {
+        const ownerId = Number(event.assignment_owner_id ?? event.id);
+        event.assignee_names_json = JSON.stringify(namesByOwner.get(ownerId) ?? []);
+      }
+    }
   }
 
   const dtstamp = formatUTC(now.toISOString());
@@ -318,12 +372,23 @@ function buildFeed(conn, userId, now = new Date()) {
     'METHOD:PUBLISH',
     'X-WR-CALNAME:Yuvomi',
   ];
+  // Kalenderzone für die Clients, die den Header auswerten (Google, Thunderbird).
+  // Sie ersetzt die TZID-Parameter nicht, sondern deckt den Rest: Termine ohne
+  // eigene Zone und die Zone, in der der Abonnent den Kalender angelegt sieht (#818).
+  if (feedZone) out.push(`X-WR-TIMEZONE:${feedZone}`);
   // Je referenzierter Zone genau ein VTIMEZONE (RFC 5545: vor den VEVENTs), damit
-  // Abonnenten die TZID-Serien auflösen können (#549).
-  const usedZones = [...new Set(rows.filter(usesTzid).map((ev) => ev.tzid))];
+  // Abonnenten die TZID-Serien auflösen können (#549) und die an der Haushaltszone
+  // verankerten Termine (#818).
+  const usedZones = new Set(resolvedRows.filter(usesTzid).map((ev) => ev.tzid));
+  if (feedZone && resolvedRows.some(usesFeedZone)) usedZones.add(feedZone);
   const tzYear = now.getUTCFullYear();
-  for (const tzid of usedZones) out.push(...buildVTimezone(tzid, tzYear).map(foldLine));
-  for (const ev of rows) out.push(...buildVEvent(ev, dtstamp, showAssignees));
+  for (const tzid of usedZones) out.push(...vtimezoneFor(tzid, tzYear).map(foldLine));
+  for (const ev of resolvedRows) {
+    const recurrenceMaster = ev.is_occurrence_override
+      ? mastersById.get(Number(ev.series_id))
+      : null;
+    out.push(...buildVEvent(ev, dtstamp, showAssignees, feedZone, recurrenceMaster));
+  }
   out.push('END:VCALENDAR');
   return out.join('\r\n') + '\r\n';
 }
@@ -343,10 +408,24 @@ function clearFeedToken(conn, userId) {
   conn.prepare(`UPDATE users SET calendar_feed_token = NULL WHERE id = ?`).run(userId);
 }
 
+/**
+ * Findet den Besitzer eines Feed-Tokens ueber timingSafeEqual statt eine
+ * SQL-Gleichheit `WHERE token = ?` (die als String-Vergleich je Zeile frueh
+ * abbrechen kann, sobald das erste Byte abweicht - dieselbe Klasse Fehler,
+ * gegen die CSRF/TOTP timingSafeEqual schon einsetzen). Ein Token ist immer
+ * fest lang (randomBytes(32).toString('base64url')), ein `?token=`-Query-Wert
+ * vom Client dagegen beliebig lang - die Laengenpruefung selbst verraet
+ * nichts Geheimes, sie steht nur davor, weil timingSafeEqual bei
+ * ungleicher Laenge wirft.
+ */
 function findUserIdByFeedToken(conn, token) {
   if (!token) return null;
-  const row = conn.prepare(`SELECT id FROM users WHERE calendar_feed_token = ?`).get(token);
-  return row?.id ?? null;
+  const candidate = Buffer.from(token, 'utf8');
+  for (const row of conn.prepare(`SELECT id, calendar_feed_token AS t FROM users WHERE calendar_feed_token IS NOT NULL`).all()) {
+    const stored = Buffer.from(row.t, 'utf8');
+    if (stored.length === candidate.length && timingSafeEqual(stored, candidate)) return row.id;
+  }
+  return null;
 }
 
 function getFeedShowAssignees(conn, userId) {
@@ -366,4 +445,5 @@ export {
   escapeICSText, foldLine, buildFeed,
   getFeedToken, regenerateFeedToken, clearFeedToken, findUserIdByFeedToken,
   getFeedShowAssignees, setFeedShowAssignees,
+  resolveFeedZone, stampProp,
 };

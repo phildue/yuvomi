@@ -1,18 +1,52 @@
 /**
  * Shared sticky sub-tab bar (pill-style).
- * Used by kitchen modules and settings; extend to any future sub-module nav.
+ *
+ * ZWEI SEMANTIKEN, EINE OPTIK. Die Leiste sieht in beiden Fällen gleich aus und
+ * ist es nicht:
+ *
+ *   `semantics: 'nav'`   Die Einträge sind ZIELORTE. Ein Klick wechselt das
+ *                        Modul (Küche: /meals, /recipes, /shopping, /pantry -
+ *                        vier eigene `module:`-Werte in router.js, einzeln
+ *                        abschaltbar). Gebaut als `<nav>` mit echten `<a href>`
+ *                        und `aria-current="page"`. Damit funktionieren
+ *                        cmd-Klick, Mittelklick und „Link kopieren" - dasselbe
+ *                        Hausmuster wie die Shell-Navigation (router.js,
+ *                        navItemEl).
+ *
+ *   `semantics: 'tabs'`  Die Einträge sind SICHTEN im selben Dokument
+ *                        (Gesundheit: alle sechs Routen tragen
+ *                        `module: 'health'`, alle sechs Panels stehen
+ *                        gleichzeitig im DOM). Gebaut als WAI-ARIA-Tablist.
+ *
+ * WARUM DER AUFRUFER DAS SAGT UND NICHT DER HELFER: ein geteilter Helfer kann
+ * nicht wissen, ob unter ihm ein Panel liegt oder eine Route. Vorher schrieb er
+ * unbesehen `role="tab"` und ein `aria-controls` auf eine Panel-ID, die nur
+ * `syncTabPanels` vergeben hätte - und die suchte `[data-panel]`, ein Attribut,
+ * das der eigene Frontend-Guard verbietet. Ergebnis waren zehn Tabs, die auf
+ * nichts zeigten (Audit 2026-08-08, P1-1). Deshalb ist `semantics` PFLICHT und
+ * hat keinen Default: ein Default ist genau der Weg, auf dem sich die falsche
+ * Variante still verbreitet.
  *
  * @param {HTMLElement} anchorEl  - element relative to which the bar is inserted
  * @param {object}      opts
+ * @param {'nav'|'tabs'} opts.semantics        - PFLICHT, siehe oben
  * @param {Array<{id: string, label: string, icon?: string, separatorBefore?: boolean}>} opts.tabs
  * @param {string}      opts.activeId          - initially active tab id
  * @param {Function}    opts.onChange          - called with new id on tab switch
+ * @param {Function}    [opts.panelFor]        - nur bei 'tabs': (id) => Element|null.
+ *                                               Liefert das Panel zu einem Tab. Ohne
+ *                                               Treffer bleibt `aria-controls` WEG statt
+ *                                               ins Leere zu zeigen.
+ * @param {Function}    [opts.hrefFor]         - nur bei 'nav': (id) => string; Default ist
+ *                                               die id selbst (beide Nutzer führen Routen als id)
  * @param {string}      [opts.storageKey]      - sessionStorage key for persistence
  * @param {string}      [opts.extraClass]      - additional CSS class on bar element
  * @param {string}      [opts.ariaLabel]
  * @param {string}      [opts.title]           - optional visible module title (left of the tabs).
- *                                               Decorative (aria-hidden): the tablist's ariaLabel
+ *                                               Decorative (aria-hidden): the bar's ariaLabel
  *                                               already names the cluster for assistive tech.
+ * @param {Function}    [opts.sealIcon]        - nur bei 'nav': Icon-Fabrik (moduleIconEl) für das
+ *                                               Absender-Siegel links des Titels. Siehe unten.
  * @param {InsertPosition} [opts.insertPosition='afterbegin']
  * @returns {HTMLElement} the rendered bar element
  */
@@ -21,33 +55,70 @@ import { wireScrollFade } from '/utils/ux.js';
 let subTabsCounter = 0;
 
 export function renderSubTabs(anchorEl, {
+  semantics,
   tabs,
   activeId,
   onChange,
+  panelFor,
+  hrefFor = (id) => id,
   storageKey,
   extraClass,
   ariaLabel,
   title,
+  sealIcon,
   insertPosition = 'afterbegin',
 }) {
+  if (semantics !== 'nav' && semantics !== 'tabs') {
+    throw new Error(`renderSubTabs: semantics muss 'nav' oder 'tabs' sein (bekam: ${semantics}).`);
+  }
+  // DAS ABSENDER-SIEGEL GEHÖRT DER LEISTE, DIE DAS MODUL WECHSELT.
+  //
+  // Das ist die Leisten-Regel, in der Sprache dieses Helfers: wechselt die
+  // Leiste den `module:`-Wert - genau das heisst `semantics: 'nav'` -, dann ist
+  // SIE die Kopf-Navigation, führt den Modulnamen und damit auch den Absender.
+  // Wechselt sie ihn nicht ('tabs', Gesundheit), liegt sie im kanonischen Kopf,
+  // und der trägt sein Siegel bereits. Ein zweites wäre die Siegel-Inflation,
+  // gegen die die Herkunfts-Regel geschrieben ist - deshalb ein Fehler und kein
+  // stilles Ignorieren: still übergangen käme es beim nächsten Nutzer wieder.
+  if (sealIcon && semantics !== 'nav') {
+    throw new Error("renderSubTabs: sealIcon gehört nur einer Leiste, die das Modul wechselt (semantics 'nav') - im Modulkopf trägt der Kopf das Siegel.");
+  }
+  // Eine Tablist ohne Panels ist genau der Zustand, den dieser Umbau beseitigt:
+  // `role="tab"` verspricht ein Panel, und wer keins anmelden kann, meint 'nav'.
+  if (semantics === 'tabs' && typeof panelFor !== 'function') {
+    throw new Error("renderSubTabs: semantics 'tabs' braucht panelFor(id) - ohne Panels ist es eine Navigation.");
+  }
+  const isNav = semantics === 'nav';
   let current = activeId;
 
   if (storageKey) {
     try { sessionStorage.setItem(storageKey, current); } catch { /* ignore */ }
   }
 
-  const bar = document.createElement('div');
+  const bar = document.createElement(isNav ? 'nav' : 'div');
   const barId = `sub-tabs-${++subTabsCounter}`;
   bar.className = 'sub-tabs-bar' + (extraClass ? ' ' + extraClass : '');
-  bar.setAttribute('role', 'tablist');
+  if (!isNav) bar.setAttribute('role', 'tablist');
   if (ariaLabel) bar.setAttribute('aria-label', ariaLabel);
 
+  // Das Absender-Siegel steht VOR dem Titel und bleibt auch dort stehen, wo der
+  // Titel weicht: mobil blendet die Küchen-Leiste ihr Wort aus, weil die
+  // Bottom-Nav es bereits führt (kitchen-tabs.css). Das MARK ersetzt es dort
+  // nicht - es weist den Raum aus, während das Wort eine Leiste tiefer steht.
+  if (sealIcon) {
+    const sealEl = document.createElement('span');
+    sealEl.className = 'module-seal module-seal--head';
+    sealEl.setAttribute('aria-hidden', 'true');
+    sealEl.appendChild(sealIcon());
+    bar.appendChild(sealEl);
+  }
+
   // Optionaler Modul-Titel links der Tabs (Canonical Page Head). Dekorativ:
-  // aria-hidden, da die Tablist via aria-label denselben Namen bereits trägt;
-  // role="tablist" exponiert dadurch weiterhin nur die Tabs.
+  // aria-hidden, da die Leiste via aria-label denselben Namen bereits trägt;
+  // eine Tablist exponiert dadurch weiterhin nur die Tabs.
   if (title) {
     const titleEl = document.createElement('span');
-    titleEl.className = 'sub-tabs-bar__title u-toolbar-title';
+    titleEl.className = 'sub-tabs-bar__title';
     titleEl.setAttribute('aria-hidden', 'true');
     titleEl.textContent = title;
     bar.appendChild(titleEl);
@@ -61,19 +132,28 @@ export function renderSubTabs(anchorEl, {
       bar.appendChild(sep);
     }
 
-    const btn = document.createElement('button');
+    const btn = document.createElement(isNav ? 'a' : 'button');
     const safeId = safeDomId(id);
-    const tabId = `${barId}-tab-${safeId}`;
-    const panelId = `${barId}-panel-${safeId}`;
-    btn.type = 'button';
-    btn.id = tabId;
+    btn.id = `${barId}-tab-${safeId}`;
     btn.className = 'sub-tab' + (id === current ? ' sub-tab--active' : '');
     btn.dataset.tabId = id;
-    btn.dataset.panelId = panelId;
-    btn.setAttribute('role', 'tab');
-    btn.setAttribute('aria-selected', id === current ? 'true' : 'false');
-    btn.setAttribute('aria-controls', panelId);
-    btn.tabIndex = id === current ? 0 : -1;
+
+    if (isNav) {
+      btn.href = hrefFor(id);
+      // `aria-current="page"` ist die Ansage für „hier stehst du" in einer
+      // Navigation - das Gegenstück zu `aria-selected` in einer Tablist. Alle
+      // Links bleiben per Tab erreichbar (Roving-Tabindex gehört zur Tablist,
+      // nicht zur Navigation).
+      if (id === current) btn.setAttribute('aria-current', 'page');
+    } else {
+      btn.type = 'button';
+      // Vorschlag einer Panel-ID - vergeben wird sie nur, wenn das Panel noch
+      // keine hat (syncTabPanels). Ein Panel, das schon eine ID trug, behält sie.
+      btn.dataset.panelId = `${barId}-panel-${safeId}`;
+      btn.setAttribute('role', 'tab');
+      btn.setAttribute('aria-selected', id === current ? 'true' : 'false');
+      btn.tabIndex = id === current ? 0 : -1;
+    }
 
     if (icon) {
       const i = document.createElement('i');
@@ -118,12 +198,17 @@ export function renderSubTabs(anchorEl, {
     bar.querySelectorAll('[data-tab-id]').forEach((b) => {
       const active = b.dataset.tabId === current;
       b.classList.toggle('sub-tab--active', active);
-      b.setAttribute('aria-selected', String(active));
-      b.tabIndex = active ? 0 : -1;
+      if (isNav) {
+        if (active) b.setAttribute('aria-current', 'page');
+        else b.removeAttribute('aria-current');
+      } else {
+        b.setAttribute('aria-selected', String(active));
+        b.tabIndex = active ? 0 : -1;
+      }
       if (active && focus) b.focus();
     });
     scrollActiveIntoView();
-    syncTabPanels(anchorEl, bar, current);
+    syncTabPanels(bar, current, panelFor);
 
     onChange(current);
   };
@@ -131,6 +216,16 @@ export function renderSubTabs(anchorEl, {
   bar.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-tab-id]');
     if (!btn) return;
+
+    // In der Navigations-Variante sind die Einträge echte Links. Ein Klick mit
+    // Modifier (oder der mittleren Maustaste) gehört dem Browser: neuer Tab,
+    // neues Fenster, Download. Nur der schlichte Linksklick wird zur
+    // SPA-Navigation abgefangen - dasselbe Verhalten wie in der Shell-Nav.
+    if (isNav) {
+      if (e.defaultPrevented) return;
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+      e.preventDefault();
+    }
 
     activateTab(btn.dataset.tabId);
   });
@@ -151,11 +246,17 @@ export function renderSubTabs(anchorEl, {
     if (e.key === 'End') nextIndex = buttons.length - 1;
 
     e.preventDefault();
-    activateTab(buttons[nextIndex]?.dataset.tabId, { focus: true });
+
+    // Tablist: Pfeiltaste WÄHLT (APG „automatic activation") - der Wechsel ist
+    // ein Panel-Tausch im selben Dokument und damit folgenlos.
+    // Navigation: Pfeiltaste bewegt nur den FOKUS. Aktivieren würde bei jedem
+    // Tastendruck ein Modul laden; ausgelöst wird mit Enter bzw. Klick.
+    if (isNav) buttons[nextIndex]?.focus();
+    else activateTab(buttons[nextIndex]?.dataset.tabId, { focus: true });
   });
 
   anchorEl.insertAdjacentElement(insertPosition, bar);
-  syncTabPanels(anchorEl, bar, current);
+  syncTabPanels(bar, current, panelFor);
   // Scroll-Affordanz (geteilte has-fade-Masken, filter-chip.css) + der via
   // storageKey restaurierte Tab kann jenseits des sichtbaren Bereichs liegen.
   wireScrollFade(bar);
@@ -230,19 +331,38 @@ function safeDomId(value) {
     .replace(/^-+|-+$/g, '') || 'tab';
 }
 
-function syncTabPanels(anchorEl, bar, current) {
-  const root = anchorEl.closest('.page') ?? anchorEl.parentElement;
-  if (!root) return;
+/**
+ * Verknüpft Tabs und Panels in beide Richtungen - Tab → `aria-controls`,
+ * Panel → `aria-labelledby`.
+ *
+ * DER AUFRUFER REICHT DIE PANELS HEREIN, DER HELFER SUCHT SIE NICHT. Die
+ * Vorgängerfassung sammelte `[data-panel]` aus dem Seitenbaum; dieses Attribut
+ * ist im Repo per Frontend-Guard verboten, die Suche traf also nie etwas, und
+ * jeder Tab trug trotzdem ein `aria-controls` auf eine ID, die niemand vergab
+ * (Audit 2026-08-08, P1-1). Ohne Panel bleibt das Attribut jetzt WEG: ein
+ * Screenreader kündigt lieber keinen Zielort an als einen, den es nicht gibt.
+ *
+ * Die Sichtbarkeit gehört ebenfalls hierher, damit sie nicht zweimal geregelt
+ * wird - wer Panels anmeldet, gibt das Verstecken mit ab.
+ */
+function syncTabPanels(bar, current, panelFor) {
+  if (typeof panelFor !== 'function') return;
 
   bar.querySelectorAll('[data-tab-id]').forEach((btn) => {
-    const panel = Array.from(root.querySelectorAll('[data-panel]'))
-      .find((candidate) => candidate.dataset.panel === btn.dataset.tabId);
-    if (!panel) return;
+    const panel = panelFor(btn.dataset.tabId);
+    if (!panel) {
+      btn.removeAttribute('aria-controls');
+      return;
+    }
 
-    const active = btn.dataset.tabId === current;
-    panel.id = btn.dataset.panelId;
+    if (!panel.id) panel.id = btn.dataset.panelId;
+    btn.setAttribute('aria-controls', panel.id);
     panel.setAttribute('role', 'tabpanel');
     panel.setAttribute('aria-labelledby', btn.id);
-    panel.hidden = !active;
+    // `aria-labelledby` gewinnt gegen `aria-label`; beide stehen zu lassen hieße,
+    // eine tote Zweitbeschriftung im Markup zu führen. Bis die Leiste steht, ist
+    // das `aria-label` aus dem Panel-Markup der Name - danach der Tab.
+    panel.removeAttribute('aria-label');
+    panel.hidden = btn.dataset.tabId !== current;
   });
 }

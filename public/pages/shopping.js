@@ -6,24 +6,27 @@
 
 import { api } from '/api.js';
 import { stagger, vibrate, scheduleUndoableDelete } from '/utils/ux.js';
+import { wireSwipeRows, maybeShowSwipeHint } from '/utils/swipe-row.js';
 import { t } from '/i18n.js';
 import { esc } from '/utils/html.js';
-import { promptModal, openModal, closeModal, confirmModal, reportFieldError } from '/components/modal.js';
+import { promptModal, openModal, closeModal, confirmModal, reportFieldError, refocusAfterRender } from '/components/modal.js';
 import { DEFAULT_CATEGORY_NAME, categoryLabel } from '/utils/shopping-categories.js';
-import { addLocalDays, toLocalDateKey } from '/utils/date.js';
+import { addLocalDays, todayKey } from '/utils/date.js';
 import { renderKitchenTabsBar, refreshKitchenBadges } from '/utils/kitchen-tabs.js';
 import { mountEmptyState, mountLoadError } from '/utils/empty-state.js';
 import { popoverMenuHtml, installPopoverMenus } from '/utils/popover-menu.js';
 import '/components/category-manager.js';
+import { findPageFab } from '/utils/fab.js';
+import { setBulkPill, clearBulkPill, bulkPillLayer } from '/utils/bulk-pill.js';
+import { makeSortable } from '/utils/sortable.js';
+import { amountPlaceholder, centsToAmountInput, amountInputToCents, toDecimalString, breaksOffAtSeparator } from '/utils/money.js';
+import { startLiveFeed } from '/utils/live-feed.js';
+import { createPageController } from '/utils/page-lifecycle.js';
+
 
 // --------------------------------------------------------
 // Konstanten
 // --------------------------------------------------------
-
-// Swipe-Gesten Konstanten (identisch zu tasks.js)
-const SWIPE_THRESHOLD = 80;   // px - Mindestweg für Aktion
-const SWIPE_MAX_VERT  = 12;   // px - vertikaler Toleranzbereich
-const SWIPE_LOCK_VERT = 30;   // px - ab diesem Weg gilt es als Scroll
 
 /** Icon für eine Kategorie (aus state.categories, Fallback 'tag'). */
 function catIcon(name) {
@@ -45,12 +48,24 @@ const state = {
   items:         [],
   activeList:    null,
   categories:    [],   // { id, name, icon, sort_order }[]
+  stores:        [],   // verwaltete Laeden fuer den Preis am Artikel (#1003)
+  currency:      'EUR',// Haushaltswaehrung, nur fuer die Preisdarstellung
   /** Zwei getrennte Ladewege, zwei getrennte Fehler - sie haben verschiedene
    *  Wiederholungen: die Listen holt die ganze Seite neu, die Artikel nur die
    *  aktive Liste. Ein gemeinsames Feld hätte den einen Fehler mit der
    *  Wiederholung des anderen bedient. */
   listsError:    null,
   itemsError:    null,
+  /** Wer gerade angemeldet ist - der Einklapp-Zustand der Kategorien ist pro
+   *  Haushaltsmitglied gespeichert (#1039), nicht geteilt wie sonst nichts in
+   *  diesem Modul: zwei Personen am selben Geraet sollen sich nicht gegenseitig
+   *  die Gruppen zu- oder aufklappen. */
+  currentUserId: null,
+  /** Eingeklappte Kategorien der AKTIVEN Liste, als Menge stabiler Schluessel
+   *  (siehe categoryStorageKey). Nur das Eingeklappte wird gespeichert - eine
+   *  neu angelegte Kategorie ist damit ohne Zutun aufgeklappt (dieselbe Regel
+   *  wie bei den Aufgaben-Gruppen, #812). */
+  collapsedCategories: new Set(),
 };
 
 // --------------------------------------------------------
@@ -70,37 +85,595 @@ function groupItemsByCategory(items) {
   return [...known, ...unknown];
 }
 
+// --------------------------------------------------------
+// Kategorie-Einklappen (#1039)
+//
+// GESPEICHERT WIRD PRO HAUSHALTSMITGLIED UND PRO LISTE, NICHT GETEILT: anders
+// als die Aufgaben-Gruppen (eine einzige, ungescopte localStorage-Zeile, #812)
+// hat der Einkauf mehrere Listen UND mehrere Nutzer desselben Geraets - eine
+// geteilte Zeile haette „Moabit" und „Neukoelln" dieselbe Klapp-Ansicht
+// aufgezwungen und einem zweiten Haushaltsmitglied die Gruppen des ersten
+// zugeklappt vorgesetzt.
+//
+// GESPEICHERT WIRD NUR DIE STABILE ID, NICHT DER NAME: eine Kategorie-
+// Umbenennung darf den Klapp-Zustand nicht verlieren. Nur Kategorien ohne ID
+// (geloescht, oder Altbestand vor der Kategorie-Verwaltung) fallen auf den
+// normalisierten Namen zurueck - das einzige, was sie stabil identifiziert.
+// --------------------------------------------------------
+
+const COLLAPSED_CATEGORIES_VERSION = 1;
+
+function collapsedCategoriesStorageKey(userId, listId) {
+  return `yuvomi:shopping:collapsedCategories:v${COLLAPSED_CATEGORIES_VERSION}:${userId ?? 'anon'}:${listId}`;
+}
+
+/** Stabiler Speicherschluessel einer Kategorie: ID wenn bekannt, sonst normalisierter Name. */
+function categoryStorageKey(name) {
+  const known = state.categories.find((c) => c.name === name);
+  return known ? `id:${known.id}` : `name:${String(name ?? '').trim().toLowerCase()}`;
+}
+
+function loadCollapsedCategories(userId, listId) {
+  try {
+    const raw = JSON.parse(localStorage.getItem(collapsedCategoriesStorageKey(userId, listId)) ?? 'null');
+    if (!raw || raw.version !== COLLAPSED_CATEGORIES_VERSION || !Array.isArray(raw.collapsed)) {
+      return new Set();
+    }
+    return new Set(raw.collapsed.filter((key) => typeof key === 'string'));
+  } catch {
+    // Privatmodus/kaputtes JSON/Quota: die Gruppen starten dann offen, statt
+    // die Seite an einem defekten Speicherwert scheitern zu lassen.
+    return new Set();
+  }
+}
+
+function saveCollapsedCategories(userId, listId, collapsedSet) {
+  try {
+    localStorage.setItem(
+      collapsedCategoriesStorageKey(userId, listId),
+      JSON.stringify({ version: COLLAPSED_CATEGORIES_VERSION, collapsed: [...collapsedSet] }),
+    );
+  } catch { /* Privatmodus/Quota: der Zustand gilt dann nur fuer diese Sitzung */ }
+}
+
+/**
+ * Entfernt Schluessel, die zu keiner der GERADE gerenderten Gruppen mehr
+ * gehoeren (geloeschte Kategorie, oder die letzte Zeile einer unbekannten
+ * Kategorie ist weg). Laeuft erst, NACHDEM Listen- und Kategorie-Metadaten
+ * vollstaendig geladen sind - vorher liesse sich „gehoert nicht mehr dazu"
+ * nicht von „ist nur noch nicht geladen" unterscheiden.
+ */
+function pruneCollapsedCategories(groups) {
+  const validKeys = new Set(groups.map(([cat]) => categoryStorageKey(cat)));
+  let changed = false;
+  for (const key of [...state.collapsedCategories]) {
+    if (!validKeys.has(key)) {
+      state.collapsedCategories.delete(key);
+      changed = true;
+    }
+  }
+  if (changed) saveCollapsedCategories(state.currentUserId, state.activeListId, state.collapsedCategories);
+}
+
+/** Klappt eine Kategorie in-place um (kein Listen-Rerender, siehe renderItems). */
+function toggleCategoryCollapse(button) {
+  const key = button.dataset.categoryToggle;
+  const rowsEl = button.closest('.list-group')?.querySelector('.list-rows');
+  const chevron = button.querySelector('.list-group__chevron');
+  const nowCollapsed = !state.collapsedCategories.has(key);
+
+  if (nowCollapsed) state.collapsedCategories.add(key);
+  else state.collapsedCategories.delete(key);
+
+  button.setAttribute('aria-expanded', String(!nowCollapsed));
+  chevron?.classList.toggle('list-group__chevron--collapsed', nowCollapsed);
+  if (rowsEl) rowsEl.hidden = nowCollapsed;
+
+  saveCollapsedCategories(state.currentUserId, state.activeListId, state.collapsedCategories);
+}
+
 function shouldIgnoreShoppingRowToggle(target) {
   return Boolean(target?.closest?.('button, a, input, select, textarea, [data-no-row-toggle]'));
 }
 
+// --------------------------------------------------------
+// Sammelaktions-Pille: Zustandsautomat (#1039)
+//
+// VORHER rief updateCheckedActions() bei JEDEM Aufruf setBulkPill() auf,
+// solange irgendein Artikel abgehakt war - die Pille blieb dadurch dauerhaft
+// stehen, sobald beim Laden schon etwas abgehakt war, und nahm der Liste einen
+// Streifen Flaeche fuer eine Rueckmeldung, die zur einzelnen Abhak-Handlung
+// gehoert, nicht zum Ladezustand.
+//
+// JETZT vier Zustaende:
+//   idle       - nichts abgehakt (der naechste Treffer eroeffnet einen Batch)
+//   visible    - Pille steht, Fuenf-Sekunden-Frist laeuft
+//   deferred   - Frist abgelaufen, aber Zeiger/Tastatur stehen noch auf der
+//                Pille; sie verschwindet erst, wenn die Interaktion endet
+//   suppressed - Frist (oder deferred-Interaktion) ist zu Ende, der Batch
+//                bleibt aber > 0: dieselbe Teilmenge zeigt die Pille nicht
+//                erneut, bis sie auf 0 faellt
+//
+// GENERATION UND `container.isConnected` STATT EINES ROUTER-HOOKS: die Seite
+// hat keinen Teardown-Callback - switchList()/render() ersetzen den Inhalt
+// einfach. Ein gestellter Timer wuerde ohne Gegenmassnahme nach einem
+// Listenwechsel oder einer Navigation noch feuern und setBulkPill()/
+// clearBulkPill() auf der SHELL-Schicht ausloesen, die ueber die Seite hinaus
+// lebt - sichtbar als eine fremde Pille (Pantry/Kontakte teilen dieselbe
+// Schicht), die ploetzlich verschwindet. Jeder Timer traegt die Generation,
+// unter der er entstand, und prueft sie plus die Verbindung seiner Wurzel zum
+// Dokument, bevor er etwas anfasst.
+// --------------------------------------------------------
+
+let BULK_PILL_HOLD_MS_OVERRIDE = null; // nur fuer Tests, siehe __test unten
+const BULK_PILL_HOLD_MS = 5000;
+
+let pillTimer = null;
+let pillPhase = 'idle'; // 'idle' | 'visible' | 'deferred' | 'suppressed'
+let pillInteracting = false;
+/** Die Seiten-Wurzel, der der aktuell sichtbare Batch gehoert - siehe unten. */
+let pillOwnerContainer = null;
+
+function clearPillTimer() {
+  if (pillTimer) { clearTimeout(pillTimer); pillTimer = null; }
+}
+
+function schedulePillHide(container) {
+  clearPillTimer();
+  pillTimer = setTimeout(() => {
+    pillTimer = null;
+    // Verlassene Seite: die Wurzel haengt nicht mehr im Dokument (der Router
+    // hat sie beim Navigieren ersetzt). `resetPillMachine()` raeumt jeden
+    // Listenwechsel/Seitenaufbau selbst per `clearPillTimer()` auf, deshalb
+    // genuegt hier die Verbindung zum Dokument als einzige Pruefung.
+    if (!container.isConnected) return;
+    if (pillInteracting) { pillPhase = 'deferred'; return; }
+    pillPhase = 'suppressed';
+    clearBulkPill();
+  }, BULK_PILL_HOLD_MS_OVERRIDE ?? BULK_PILL_HOLD_MS);
+}
+
+/**
+ * Haengt Hover/Fokus-Beobachtung einmalig an die geteilte Pillen-Schicht - sie
+ * lebt app-weit, der Aufruf ist deshalb idempotent (dataset-Flag) statt an
+ * einen bestimmten Seitenbesuch gebunden.
+ */
+function wirePillInteractionGuards() {
+  const layer = bulkPillLayer();
+  if (!layer || layer.dataset.shoppingPillWired) return;
+  layer.dataset.shoppingPillWired = '1';
+
+  layer.addEventListener('mouseenter', () => { pillInteracting = true; });
+  layer.addEventListener('focusin', () => { pillInteracting = true; });
+
+  const endInteraction = () => {
+    pillInteracting = false;
+    if (pillPhase !== 'deferred') return;
+    pillPhase = 'suppressed';
+    // Diese Schicht ist GETEILT (Pantry/Kontakte zeigen hier ihre eigene
+    // Pille) und der Listener bleibt app-weit bestehen, auch nachdem der
+    // Einkauf laengst verlassen wurde - ohne die Eigentuems-Pruefung wuerde
+    // ein Maus-Verlassen auf einer FREMDEN, gerade sichtbaren Pille sie
+    // versehentlich loeschen, nur weil `pillPhase` hier zufaellig noch
+    // 'deferred' vom letzten Einkaufsbesuch war.
+    if (pillOwnerContainer?.isConnected) clearBulkPill();
+  };
+  layer.addEventListener('mouseleave', endInteraction);
+  layer.addEventListener('focusout', (e) => {
+    if (layer.contains(e.relatedTarget)) return; // Fokus bleibt innerhalb der Pille
+    endInteraction();
+  });
+}
+
+/** Setzt den Automaten zurueck - bei Listenwechsel und bei jedem Rendern der Seite. */
+function resetPillMachine() {
+  clearPillTimer();
+  pillPhase = 'idle';
+  pillInteracting = false;
+  pillOwnerContainer = null;
+}
+
+/**
+ * DIE ABSICHT, NICHT DER STAND.
+ *
+ * `state.items` traegt ausschliesslich, was der Server zuletzt gesagt hat. Was
+ * der Nutzer WILL, steht hier: id -> { value, seq, listId, delta }. Die Zeile
+ * zeigt die Ueberlagerung von beidem (`checkedOf`).
+ *
+ * Der Vorlaeufer vermischte die zwei in einem Feld. Dann braucht ein
+ * Fehlschlag eine Ruecksprung-Grundlage, die Grundlage braucht eine
+ * Bestaetigungsnummer, die Bestaetigung eine Ladenummer - sechs Felder, die
+ * sich gegenseitig ueberschreiben, und sieben Review-Runden lang fand jede
+ * neue Wache eine neue Reihenfolge zwischen ihnen. Getrennt gehalten gibt es
+ * keinen Wert mehr, der veralten kann: ein Ruecksprung ist das ENTFERNEN der
+ * Absicht, und was dann steht, ist der Serverstand.
+ *
+ * Vier Regeln, mehr nicht:
+ *   - Antippen setzt die Absicht.
+ *   - Scheitert der Schreibvorgang, faellt sie. Sie war nie wahr.
+ *   - Traegt eine Ladeantwort den gewollten Wert, faellt sie. Sie ist erfuellt.
+ *   - Gelingt der Schreibvorgang und sagt eine SPAETER begonnene Antwort etwas
+ *     anderes, faellt sie auch: der Server hat sie gesehen und seither
+ *     geaendert - jemand anderes im Haushalt. Ohne diese Regel lebte die
+ *     Absicht ewig weiter und niemand koennte die Zeile je zurueckholen.
+ *
+ * Der Schreib-ERFOLG allein raeumt bewusst nichts: die ueberholende Antwort
+ * kommt gerade danach, und wer hier raeumte, liesse sie den Stand
+ * zurueckdrehen. Er vermerkt nur `settledAt`, damit die vierte Regel weiss, ab
+ * wann eine Antwort etwas ueber diese Absicht aussagen KANN.
+ *
+ * Was der Umbau wegnimmt, sind `rollback` und `confirmedAt` - genau die zwei
+ * Felder, die vier Review-Runden lang Befunde erzeugt haben, weil sie einen
+ * WERT festhielten, der veralten konnte. `settledAt` haelt keinen Wert fest,
+ * sondern eine Reihenfolge, und hat nie einen Befund erzeugt. `delta` ist die
+ * Buchungsquittung des Zaehlers: was beim Setzen gebucht wurde, damit das
+ * Zuruecknehmen exakt dasselbe abzieht.
+ */
+const intents = new Map();
+/** Monotone Folgenummer, damit ein zweites Antippen das erste ueberstimmt. */
+let _checkSeq = 0;
+/**
+ * Artikel, die lokal schon weg sind, deren Loeschung der Server aber noch nicht
+ * in jeder Antwort widerspiegelt: Id -> { listId, checked, removedAt } fuer das
+ * Undo-Fenster (`deleteItemUndoable`, `clearCheckedUndoable`) und den Moment
+ * danach.
+ *
+ * Dasselbe Muster wie `intents`, nur fuer das Loeschen: `state.items` traegt
+ * den Serverstand, und der Server hat den Artikel im Undo-Fenster noch. Landet
+ * in diesen fuenf Sekunden eine Live-Auffrischung (jemand anderes hat die
+ * Liste bewegt), ersetzt `loadItems` den Bestand mit der Serverantwort - und
+ * die Zeile stuende wieder da, unter dem Toast, der sie als geloescht meldet.
+ * Schlimmer: die Quittung des DELETE traegt danach als `before` genau die
+ * Marke, die die Auffrischung gesetzt hat, der Feed rueckt vor, und die
+ * naechste Abfrage laedt NICHT nach. Die Zeile bliebe stehen, bis sich die
+ * Liste das naechste Mal bewegt. Und ein Zuruecknehmen im Fenster legte den
+ * Schnappschuss neben die schon wieder vorhandene Zeile: zweimal Milch.
+ *
+ * Deshalb filtert `loadItems` diese Ids aus jeder Antwort: der Bestand nach
+ * der Auffrischung ist der Serverstand OHNE die schwebenden Loeschungen, und
+ * genau das ist der Stand, den die Quittung des DELETE dann meint. `loadLists`
+ * zieht die Eintraege vom Zaehler im Reiter ab, aus demselben Grund: der Server
+ * zaehlt den Artikel noch mit, die Anzeige nicht mehr.
+ *
+ * DER ERFOLG DES DELETE RAEUMT NICHT SOFORT - dieselbe Regel wie `settledAt`
+ * beim Abhaken. Eine Antwort, die VOR dem DELETE losgeschickt wurde und danach
+ * eintrifft, traegt den Artikel noch: sie hat den Server gelesen, als er ihn
+ * hatte. Waere die Schwebe da schon geraeumt, kaeme die Zeile zurueck - und
+ * bliebe, weil die Quittung die Marke des Feeds schon vorgerueckt hat und keine
+ * Abfrage mehr nachlaedt. Genau dieses Fenster oeffnet die Live-Auffrischung
+ * selbst: eine Abfrage stoesst `loadItems` an, und das Undo-Fenster schliesst,
+ * waehrend der GET noch unterwegs ist. Deshalb bekommt der Eintrag beim Erfolg
+ * die Ladenummer `removedAt = _loadSeq`: jede Antwort, die bis dahin begonnen
+ * hat (`startedAt <= removedAt`), wird weiter gefiltert; eine spaeter begonnene
+ * ist die Wahrheit des Servers. Der Eintrag faellt, sobald kein Ladevorgang
+ * mehr unterwegs ist, der ihn noch tragen koennte (`pruneSettledRemovals`) -
+ * bei ruhiger Seite also sofort. Ein Zuruecknehmen und ein FEHLGESCHLAGENER
+ * DELETE raeumen dagegen sofort: der Server hat den Artikel, `restore` bringt
+ * ihn zurueck, und jede Antwort darf ihn wieder tragen.
+ */
+const pendingRemovals = new Map();
+/**
+ * Wann der Server einen Artikel zuletzt BESTAETIGT hat: id -> Ladenummer.
+ *
+ * Sie haengt am Artikel, nicht an der Absicht - denn sie ueberlebt diese. Wer
+ * zweimal antippt, ersetzt die Absicht; die Bestaetigung des ersten Antippens
+ * gilt trotzdem weiter, und eine Ladeantwort, die VOR ihr begann, darf den
+ * Wert dieses Artikels nicht zurueckdrehen. Die uebrigen Artikel und die
+ * Kategorien derselben Antwort landen ganz normal - deshalb je Artikel und
+ * nicht als Wache ueber die ganze Antwort.
+ */
+const settledAt = new Map();
+
+/**
+ * Die Ladeordnung: eine Nummer je BEGONNENEM Ladevorgang, und je Liste die
+ * Nummer des zuletzt ANGEWANDTEN.
+ *
+ * Die einzige verbliebene Zeitrechnung, und sie gehoert zum LADEN, nicht zur
+ * Absicht: zwei Auffrischungen koennen sich ueberholen, und eine aeltere
+ * Antwort darf den Stand nicht ueberschreiben, den eine juengere schon gesetzt
+ * hat. Je Liste, weil ein Laden von Liste B ueber Liste A nichts aussagt.
+ *
+ * `_loadSeq` zaehlt Artikel- UND Listen-Ladevorgaenge: die Schwebe der
+ * Loeschungen fragt bei beiden, ob eine Antwort vor oder nach dem DELETE
+ * begonnen hat, und dafuer muss EINE Ordnung gelten. `_loadsInFlight` haelt
+ * die Nummern der noch offenen Ladevorgaenge, damit die Schwebe weiss, ob noch
+ * eine Antwort unterwegs ist, die einen geloeschten Artikel tragen koennte.
+ */
+let _loadSeq = 0;
+const _appliedLoad = new Map();
+const _loadsInFlight = new Set();
+
+/** Einen Ladevorgang beginnen: Nummer ziehen und als offen vermerken. */
+function beginLoad() {
+  const startedAt = ++_loadSeq;
+  _loadsInFlight.add(startedAt);
+  return startedAt;
+}
+
+/** Einen Ladevorgang abschliessen - angewandt, verworfen oder gescheitert. */
+function endLoad(startedAt) {
+  _loadsInFlight.delete(startedAt);
+  pruneSettledRemovals();
+}
+
+/**
+ * Ob eine Antwort, die bei `startedAt` begann, den schwebend geloeschten
+ * Artikel noch tragen darf: im Undo-Fenster immer (der Server hat ihn), nach
+ * dem DELETE nur, wenn sie vor der Bestaetigung losgeschickt wurde.
+ */
+function removalHides(entry, startedAt) {
+  return entry.removedAt == null || entry.removedAt >= startedAt;
+}
+
+/**
+ * Den Erfolg eines DELETE vermerken: ab jetzt filtert die Schwebe nur noch
+ * Antworten, die vor diesem Moment begonnen haben.
+ */
+function confirmRemovals(ids) {
+  for (const id of ids) {
+    const entry = pendingRemovals.get(id);
+    if (entry) entry.removedAt = _loadSeq;
+  }
+  pruneSettledRemovals();
+}
+
+/**
+ * Bestaetigte Loeschungen fallen lassen, sobald keine Antwort mehr unterwegs
+ * ist, die vor ihrer Bestaetigung begonnen hat. Ist nichts unterwegs, sofort.
+ */
+function pruneSettledRemovals() {
+  let oldest = Infinity;
+  for (const seq of _loadsInFlight) if (seq < oldest) oldest = seq;
+  for (const [id, entry] of pendingRemovals) {
+    if (entry.removedAt != null && entry.removedAt < oldest) pendingRemovals.delete(id);
+  }
+}
+/**
+ * Zu welcher Liste `state.items` gerade gehoert.
+ *
+ * `_appliedLoad` merkt sich je Liste, ob schon etwas Netzfrisches ankam -
+ * `state.items` haelt aber immer nur EINE Liste. Ohne diese Unterscheidung
+ * lehnte die Cache-Wache unten die gecachte Antwort fuer A ab, weil A irgendwann
+ * einmal geladen war, und `switchList` zeichnete danach die noch liegenden
+ * Artikel von B unter dem Reiter von A - ohne Fehlermeldung, und jede weitere
+ * Aktion traf die falsche Liste.
+ */
+let _itemsListId = null;
+
+/**
+ * Den Bestand verwerfen - und mit ihm die Zugehoerigkeit.
+ *
+ * Die beiden gehoeren zusammen, und getrennt gesetzt laufen sie auseinander:
+ * nach `state.items = []` im Fehlerzweig behauptete `_itemsListId` weiter, der
+ * (leere) Bestand gehoere zu dieser Liste, und die Wache in `loadItems` lehnte
+ * die einzige brauchbare Antwort - die gecachte - als Rueckschritt ab. Der
+ * Aufrufer loeschte den Fehler, und die Liste stand als echt leer da.
+ */
+function clearItems() {
+  state.items = [];
+  _itemsListId = null;
+}
+
+/** Was die Zeile ZEIGT: die Absicht, sonst der Serverstand. */
+function checkedOf(item) {
+  const intent = intents.get(item?.id);
+  return intent ? intent.value : (item?.is_checked ?? 0);
+}
+
+/**
+ * Erfuellte Absichten fallen lassen: die Antwort traegt, was gewollt war.
+ *
+ * Der Vergleich ist der ganze Trick. Er braucht keine Uhr und keine
+ * Ladenummer - eine Antwort, die den gewollten Wert traegt, BEWEIST, dass der
+ * Server ihn hat, ganz gleich wann sie losgeschickt wurde. Und eine, die ihn
+ * nicht traegt, beweist nichts: sie kann aelter sein als die Bearbeitung, aus
+ * dem Offline-Cache kommen oder von einer fremden Aenderung erzaehlen. In
+ * allen drei Faellen ist Warten richtig.
+ */
+function settleIntents(items, listId, { fromCache = false, startedAt = 0 } = {}) {
+  // Eine Antwort aus dem Offline-Cache beweist nichts: sie kann beliebig alt
+  // sein, und traegt sie den gewollten Wert zufaellig doch (zweimal antippen
+  // fuehrt zum Ausgangswert zurueck), waere die Absicht faelschlich erfuellt.
+  if (fromCache) return;
+  for (const item of items) {
+    const intent = intents.get(item.id);
+    if (!intent || intent.listId !== listId) continue;
+    // Erfuellt: die Antwort traegt, was gewollt war.
+    const erfuellt = item.is_checked === intent.value;
+    // Ueberholt: der Server hat diesen Artikel bestaetigt, und DIESE Antwort
+    // begann danach - was sie sagt, ist juenger als die eigene Bearbeitung.
+    const bestaetigt = settledAt.get(item.id);
+    const ueberholt = bestaetigt != null && bestaetigt < startedAt;
+    if (erfuellt || ueberholt) intents.delete(item.id);
+  }
+}
+
 async function toggleShoppingItem(id, checked, container) {
   const newVal = checked ? 0 : 1;
+  const listId = state.activeListId;
+  const item   = state.items.find((i) => i.id === id);
 
-  const item = state.items.find((i) => i.id === id);
+  // EINE ABSICHT, DIE HIER ERSETZT WIRD, MUSS ZWEI DINGE HINTERLASSEN.
+  //
+  // Ihre Zaehlerbuchung: die wird zurueckgenommen, denn die neue bucht gleich
+  // ihre eigene. Sonst blieb die des ersten Antippens stehen, wenn dessen
+  // Schreibvorgang spaeter schweigend scheitert (er ist ja ueberstimmt).
+  //
+  // Und ihren bestaetigten Wert: hat der Server sie schon angenommen, ist das
+  // ab jetzt der SERVERSTAND. Ohne diese Zeile ging die Bestaetigung mit der
+  // Absicht verloren, und ein Fehlschlag der neuen sprang an ihr vorbei auf
+  // einen Stand zurueck, den der Server nicht mehr hatte.
+  const vorher = intents.get(id);
+  if (vorher) updateListCounter(vorher.listId, 0, -vorher.delta);
+
+  // Das Delta zaehlt gegen den SERVERSTAND, nicht gegen das Gezeigte: so ist
+  // jede Absicht fuer sich verrechenbar, und ihr Zuruecknehmen trifft genau
+  // ihre eigene Buchung.
+  const delta = (newVal ? 1 : 0) - (item?.is_checked ? 1 : 0);
+
+  const seq = ++_checkSeq;
+  intents.set(id, { value: newVal, seq, listId, delta });
   if (item) {
-    item.is_checked = newVal;
     // Nur die betroffene Zeile aktualisieren — kein Komplett-Re-Render,
     // damit die Scroll-Position der Liste erhalten bleibt (Issue #276).
     updateItemRow(container, item);
-    updateCheckedActions(container);
-    updateListCounter(state.activeListId, 0, newVal ? 1 : -1);
+    // userChecked NUR beim Abhaken selbst (#1039): das Zurueckholen eines
+    // Artikels eroeffnet keinen neuen Feedback-Batch.
+    updateCheckedActions(container, { userChecked: newVal === 1 });
+    updateListCounter(listId, 0, delta);
     renderTabs(container);
   }
 
   try {
-    await api.patch(`/shopping/items/${id}`, { is_checked: newVal });
+    acknowledgeOwnChange(await api.patch(`/shopping/items/${id}`, { is_checked: newVal }));
+    // BEWUSST OHNE AUFRAEUMEN. Die Absicht faellt erst, wenn eine Ladeantwort
+    // den Wert traegt (`settleIntents`) - der Erfolg allein beweist der Zeile
+    // nichts gegen eine Antwort, die gleich danach mit dem alten Stand kommt.
+    //
+    // Eine Ausnahme: ist diese Absicht schon ueberstimmt, wird ihr Ausgang
+    // sonst gar nicht verbucht. Der Server steht jetzt auf `newVal`, also
+    // gehoert das in den SERVERSTAND - nicht in die Absicht, die einem
+    // spaeteren Antippen gehoert.
+    // Der Server traegt jetzt `newVal` - das ist ab hier der SERVERSTAND, ganz
+    // gleich ob diese Absicht noch die aktuelle ist. Der Zeitstempel daneben
+    // schuetzt ihn vor einer Antwort, die vorher losgeschickt wurde.
+    const current = state.items.find((i) => i.id === id);
+    if (current) {
+      // Verschiebt die Bestaetigung den Serverstand unter einer noch offenen
+      // Absicht weg, war deren Buchung gegen die ALTE Basis gerechnet. Die
+      // Anzeige aendert sich nicht (die Absicht ueberlagert weiter), also darf
+      // der Zaehler jetzt nicht wandern - aber das Delta muss mitziehen,
+      // damit sein Zuruecknehmen spaeter auf dem richtigen Wert landet.
+      const offen = intents.get(id);
+      if (offen) offen.delta -= (newVal ? 1 : 0) - (current.is_checked ? 1 : 0);
+      current.is_checked = newVal;
+    }
+    settledAt.set(id, _loadSeq);
     vibrate(10);
   } catch (err) {
-    if (item) {
-      item.is_checked = checked;
-      updateItemRow(container, item);
-      updateCheckedActions(container);
-      updateListCounter(state.activeListId, 0, newVal ? -1 : 1);
+    // ZWEI GRUENDE, WARUM DIE EIGENE ABSICHT NICHT MEHR DA IST, und sie fuehren
+    // auseinander. Ueberstimmt: ein neueres Antippen steht an, dessen Ausgang
+    // entscheidet ueber Zeile, Zaehler UND Meldung - hier ist nichts zu tun.
+    // Erfuellt: eine Antwort trug den Wert schon, weil jemand anderes im
+    // Haushalt dasselbe getan hat. Dann steht die Zeile richtig, aber der
+    // EIGENE Schreibvorgang ist trotzdem gescheitert und gehoert gemeldet.
+    const intent = intents.get(id);
+    if (intent && intent.seq !== seq) return;
+    if (intent) {
+      // DIE ABSICHT FAELLT, mehr passiert nicht. Was die Zeile danach zeigt,
+      // ist der Serverstand - der aktuellste, den wir haben, auch wenn eine
+      // Auffrischung ihn zwischendurch ausgetauscht hat. Es gibt keinen
+      // gemerkten Wert mehr, der dabei veralten koennte.
+      intents.delete(id);
+      // Der Zaehler nimmt GENAU die Buchung zurueck, die das Setzen gemacht
+      // hat - deshalb liegt sie in der Absicht und wird nicht neu berechnet.
+      updateListCounter(intent.listId, 0, -intent.delta);
+      const current = state.items.find((i) => i.id === id);
+      if (current) {
+        updateItemRow(container, current);
+        updateCheckedActions(container);
+      }
       renderTabs(container);
     }
     window.yuvomi.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
   }
+}
+
+/**
+ * Löschen eines Artikels, fünf Sekunden lang widerrufbar: die Zeile geht sofort,
+ * der Server-Delete erst nach Ablauf des Fensters (`scheduleUndoableDelete`).
+ *
+ * Benannt und geteilt, weil das Löschen in dieser Liste über ZWEI Wege geht -
+ * den Knopf in der Zeile und die Wischgeste. Als Kopie nebeneinander lief das
+ * auseinander: der Knopf hatte den Rückweg, der Wisch rief `api.delete` direkt
+ * und löschte sofort und endgültig. Das war die einzige Stelle der App, an der
+ * eine Geste unwiderruflich Daten entfernt - wer sie in Aufgaben und
+ * Geburtstagen als harmlos gelernt hat, verlor hier ohne Rückweg.
+ */
+function deleteItemUndoable(id, container) {
+  const item     = state.items.find((i) => i.id === id);
+  const snapshot = item ? { ...item } : null;
+  // Was die Zeile ZEIGT - danach richtet sich, was der Zaehler abzieht. Der
+  // Schnappschuss daneben traegt den Serverstand, weil `state.items` nur den
+  // fuehrt; eine noch laufende Absicht bleibt in ihrer Karte liegen und
+  // ueberlagert den Artikel wieder, wenn das Loeschen zurueckgenommen wird.
+  //
+  // FRUEHER STAND HIER EIN SONDERFALL: der Merker musste beim Loeschen
+  // aufgeraeumt und der Schnappschuss von einem optimistischen Wert
+  // zurueckgezogen werden, sonst buchte ein spaeterer Fehlschlag ein zweites
+  // Mal (gemessen: `item_total: 0, item_checked: -1`). Mit getrennter Absicht
+  // gibt es nichts zurueckzuziehen und nichts doppelt zu buchen.
+  const gebucht = Boolean(item && checkedOf(item));
+  // DIE BUCHUNG DER OFFENEN ABSICHT IST MIT DIESEM LOESCHEN ABGEGOLTEN: der
+  // Zaehler zieht gleich die ANZEIGE ab, und die enthaelt sie. Bliebe die
+  // Quittung stehen, buchte ein spaeterer Fehlschlag ein zweites Mal ab -
+  // gemessen `item_checked: -1` an einer einelementigen Liste.
+  const offen = intents.get(id);
+  if (offen) offen.delta = 0;
+  // DIE LISTE GEHOERT ZUR AKTION, NICHT ZUM ZEITPUNKT DER RUECKNAHME. Das
+  // Undo-Fenster ist fuenf Sekunden lang, und ein Listenwechsel darin tauscht
+  // `state.items` samt `state.activeListId` aus. Wer danach zurueckholte, legte
+  // den Artikel in die FALSCHE Liste und zaehlte deren Zaehler hoch. Steht so
+  // schon seit dem Knopf; mit dem Wisch daneben ist es nur viel leichter zu
+  // treffen.
+  const listId = state.activeListId;
+
+  // Optimistisch entfernen - und als schwebend vermerken, damit eine
+  // Live-Auffrischung im Undo-Fenster die Zeile nicht zurueckbringt.
+  pendingRemovals.set(id, { listId, checked: gebucht, removedAt: null });
+  state.items = state.items.filter((i) => i.id !== id);
+  updateItemsList(container);
+  updateListCounter(listId, -1, gebucht ? -1 : 0);
+  renderTabs(container);
+
+  scheduleUndoableDelete({
+    message: t('shopping.itemDeletedToast', { name: snapshot?.name ?? '' }),
+    commit: async ({ keepalive }) => {
+      let response;
+      try {
+        response = await api.delete(`/shopping/items/${id}`, { keepalive });
+      } catch (err) {
+        // Schlaegt das DELETE fehl, bringt `restore` die Zeile zurueck, und
+        // jede Antwort darf sie wieder tragen - sofort, nicht erst spaeter.
+        pendingRemovals.delete(id);
+        throw err;
+      }
+      acknowledgeOwnChange(response);
+      // Bestaetigt, aber noch nicht geraeumt: eine Antwort, die vor dem DELETE
+      // losging, traegt den Artikel noch (siehe `pendingRemovals`).
+      confirmRemovals([id]);
+      // Endgueltig weg: die Absicht kann von keiner Antwort mehr erfuellt oder
+      // ueberholt werden und laege sonst tot in der Karte. Bis hierher bleibt
+      // sie liegen - ein Zuruecknehmen im Undo-Fenster braucht sie, damit die
+      // wiederhergestellte Zeile zeigt, was der Server inzwischen hat.
+      intents.delete(id);
+    },
+    restore: (err) => {
+      pendingRemovals.delete(id);
+      if (snapshot) {
+        // Der sichtbare Zustand nur, wenn die Liste noch die gezeigte ist -
+        // sonst gehoert `state.items` bereits einer anderen. Der Server hat
+        // nichts geloescht, also bringt `switchList` den Artikel beim
+        // Zurueckwechseln ohnehin mit. Und nur, wenn die Zeile nicht schon
+        // wieder da ist - sonst stuende sie zweimal.
+        if (state.activeListId === listId && !state.items.some((i) => i.id === id)) {
+          state.items.push(snapshot);
+          state.items.sort((a, b) => a.id - b.id);
+          updateItemsList(container);
+        }
+        // Zurueckgeholt wird die ANZEIGE, also samt der noch offenen Absicht -
+        // und damit ist deren Quittung wieder gueltig. Sie wird berechnet,
+        // nicht aufbewahrt: der Abstand zwischen dem, was sie will, und dem
+        // Serverstand des Schnappschusses.
+        if (offen && intents.get(id) === offen) {
+          offen.delta = (offen.value ? 1 : 0) - (snapshot.is_checked ? 1 : 0);
+        }
+        updateListCounter(listId, 1, checkedOf(snapshot) ? 1 : 0);
+        renderTabs(container);
+      }
+      if (err) window.yuvomi.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+    },
+  });
 }
 
 // --------------------------------------------------------
@@ -113,30 +686,250 @@ function renderTabs(container) {
 
   const tabsHtml = state.lists.map((list) => {
     const unchecked = list.item_total - list.item_checked;
+    // Der Zähler ist aria-hidden, sonst klebt er am Buttonnamen („Einkauf23");
+    // die Ansage steht als aria-label auf dem Tab selbst - dasselbe Muster wie
+    // setSubTabBadge. „0 offene Artikel" deckt auch den ✓-Zustand ehrlich ab.
     return `
       <button class="list-tab ${list.id === state.activeListId ? 'list-tab--active' : ''}"
-              data-action="switch-list" data-id="${list.id}">
+              data-action="switch-list" data-id="${list.id}"
+              ${list.item_total > 0 ? `aria-label="${esc(list.name)}, ${esc(t('nav.shoppingOpen', { count: unchecked }))}"` : ''}>
         ${esc(list.name)}
-        ${list.item_total > 0 ? `<span class="list-tab__count">${unchecked > 0 ? unchecked : '✓'}</span>` : ''}
+        ${list.item_total > 0 ? `<span class="list-tab__count" aria-hidden="true">${unchecked > 0 ? unchecked : '✓'}</span>` : ''}
       </button>`;
   }).join('');
 
   bar.replaceChildren();
   // Führender Listen-Marker: signalisiert „das hier sind Listen" und grenzt die
   // Leiste sichtbar von den Küchen-Modul-Tabs darüber ab (dekorativ, aria-hidden).
+  //
+  // Am hinteren Ende die Aktionen der GEWÄHLTEN Liste. Sie standen bis 2026-08-11
+  // in einem eigenen Kopf darunter, der den Namen der aktiven Liste ein zweites
+  // Mal zeigte - der aktive Chip trägt ihn schon (Keine-sichtbare-
+  // Titelwiederholung-Regel, DESIGN.md). Der Chip IST der Titel; was der Kopf
+  // sonst noch trug, ist genau dieses Menü.
+  //
+  // Der Trigger klebt am rechten Rand (sticky), während die Chips darunter
+  // durchscrollen - das Gegenstück zum Marker links. Sein Panel läuft über die
+  // native Popover-API im Top-Layer und wird deshalb vom `overflow-x: auto`
+  // dieser Leiste nicht geclippt; ein absolut positioniertes Eigenbau-Menü wäre
+  // hier abgeschnitten worden.
+  const actionsHtml = state.activeList ? `
+    <div class="list-tabs-bar__actions">
+      ${popoverMenuHtml({
+        id: 'list-actions-menu',
+        // Der Name muss die Liste nennen: der Trigger steht nicht mehr neben
+        // einer Überschrift, die den Bezug herstellt. „Mehr" allein ließe offen,
+        // worauf sich „Löschen" bezieht - und das löscht die Liste des Haushalts.
+        label: t('shopping.listActionsLabel', { name: state.activeList.name }),
+        items: [
+          { action: 'rename-list', label: t('shopping.renameListLabel'), icon: 'pencil', id: state.activeList.id },
+          { action: 'duplicate-list', label: t('shopping.duplicateListLabel'), icon: 'copy' },
+          { action: 'import-meals', label: t('shopping.importMeals'), icon: 'utensils' },
+          { action: 'send-list', label: t('shopping.sendList'), icon: 'mail' },
+          { action: 'manage-categories', label: t('shopping.manageCategories'), icon: 'tags' },
+          { action: 'manage-stores', label: t('shopping.manageStores'), icon: 'store' },
+          { action: 'delete-list', label: t('shopping.deleteListLabel'), icon: 'trash', id: state.activeList.id, danger: true },
+        ],
+      })}
+    </div>` : '';
+
   bar.insertAdjacentHTML('beforeend', `
     <i data-lucide="list" class="list-tabs-bar__marker" aria-hidden="true"></i>
     ${tabsHtml}
     <button class="list-tab__new" data-action="new-list" aria-label="${t('shopping.newListButton')}">
       <i data-lucide="plus" class="icon-md" aria-hidden="true"></i>
     </button>
+    ${actionsHtml}
   `);
   if (window.lucide) window.lucide.createIcons({ el: bar });
 }
 
+/**
+ * Die offene Liste an ein Haushaltsmitglied mailen (#944).
+ *
+ * ABSCHRIFT, KEIN ZUGANG. Der Dialog sagt beides: wie viele Artikel mitgehen
+ * und dass es eine Momentaufnahme ist. Wer im Laden steht, haekelt nicht mit -
+ * die Mail kann von spaeteren Aenderungen nichts wissen, und der Absender soll
+ * das vorher lesen, nicht hinterher merken.
+ *
+ * Die Auswahl kennt nur Mitglieder MIT hinterlegter Adresse. Ein Name, den man
+ * anklicken kann und der dann scheitert, ist eine Zusage, die nicht haelt; die
+ * Route lehnt denselben Fall ohnehin ab, aber sie ist die zweite Verteidigung,
+ * nicht die erste.
+ */
+async function openSendListDialog(container) {
+  const listId = state.activeListId;
+  const openCount = state.items.filter((item) => !checkedOf(item)).length;
+  if (!openCount) {
+    window.yuvomi.showToast(t('shopping.sendListEmpty'), 'warning');
+    return;
+  }
+
+  let members = [];
+  try {
+    // Nicht `/family/members`: der zeigt dieselben Haushaltsmitglieder, prueft
+    // aber nicht, ob jemand genau EINE gueltige Adresse hat. Dieser Endpunkt
+    // fragt dieselbe Funktion wie die Versandroute, damit die Auswahl niemanden
+    // anbietet, den der Server ablehnt - und umgekehrt.
+    //
+    // Sich selbst einzuschliessen ist Absicht: "schick mir die Liste aufs
+    // Handy" ist derselbe Wunsch wie "schick sie meiner Mutter", und wer sie
+    // sich selbst schickt, bekommt den Absendersatz nicht vorgesetzt (die
+    // Route laesst ihn dann weg).
+    const res = await api.get('/shopping/send-recipients');
+    members = res.data || [];
+  } catch {
+    window.yuvomi.showToast(t('common.errorGeneric'), 'danger');
+    return;
+  }
+
+  // WAEHREND DES LADENS KANN DIE LISTE GEWECHSELT HABEN. Der Dialog haelt
+  // `listId` und die Artikelzahl von vorhin fest, sagt aber nirgends, welche
+  // Liste er meint - er wuerde also die alte verschicken, waehrend auf dem
+  // Bildschirm die neue steht. Bei etwas, das sich nicht zuruecknehmen laesst,
+  // ist das der teuerste Fehler dieser Funktion.
+  if (state.activeListId !== listId) return;
+
+  if (!members.length) {
+    window.yuvomi.showToast(t('shopping.sendListNoRecipients'), 'warning');
+    return;
+  }
+
+  openModal({
+    title: t('shopping.sendListTitle'),
+    content: `
+      <p class="form-hint">${esc(t('shopping.sendListDescription', { count: openCount }))}</p>
+      <div class="form-group">
+        <label class="form-label" for="send-list-recipient">${esc(t('shopping.sendListRecipient'))}</label>
+        <select id="send-list-recipient" class="form-input">
+          ${members.map((m) => `<option value="${m.id}">${esc(m.display_name)}</option>`).join('')}
+        </select>
+      </div>
+      <p class="form-hint">${esc(t('shopping.sendListSnapshotHint'))}</p>
+      <div class="modal-panel__footer modal-panel__footer--plain">
+        <button type="button" class="btn btn--secondary" data-action="close-modal">${esc(t('common.cancel'))}</button>
+        <button type="button" class="btn btn--primary" id="send-list-confirm">${esc(t('shopping.sendListSubmit'))}</button>
+      </div>`,
+    onSave(panel) {
+      panel.querySelector('#send-list-confirm').addEventListener('click', async (event) => {
+        const btn = event.currentTarget;
+        const select = panel.querySelector('#send-list-recipient');
+        const userId = Number(select.value);
+        const name = members.find((m) => m.id === userId)?.display_name ?? '';
+        btn.disabled = true;
+        try {
+          await api.post(`/shopping/${listId}/send`, { userId });
+          closeModal({ force: true });
+          // BEWUSST KEIN success-Toast. Die Erfolgsmeldungen der App sind nach
+          // 50 Bestaetigungen dauerhaft stummgeschaltet (`TOAST_SUCCESS_MAX` in
+          // router.js) - richtig fuer Handlungen, deren Ergebnis auf dem
+          // Bildschirm steht und die man taeglich wiederholt. Ein Mailversand
+          // ist das Gegenteil: er passiert selten, laesst sich nicht
+          // zuruecknehmen, und sein Ergebnis liegt in einem fremden Postfach.
+          // Wer hier nichts sieht, weiss nicht, ob die Liste unterwegs ist.
+          window.yuvomi.showToast(t('shopping.sendListSent', { name }), 'info');
+        } catch (err) {
+          // Der Server nennt seinen Grund maschinenlesbar mit, damit die drei
+          // Absagen hier in der Sprache der Oberflaeche stehen koennen. Sein
+          // Meldungstext bleibt der Rueckfall fuer alles Unerwartete - er ist
+          // englisch wie jede Server-Meldung, aber besser als "ging nicht".
+          const byReason = {
+            recipient_no_email: 'shopping.sendListRecipientNoEmail',
+            smtp_unconfigured: 'shopping.sendListSmtpMissing',
+            nothing_open: 'shopping.sendListEmpty',
+          }[err.data?.reason];
+          window.yuvomi.showToast(
+            byReason ? t(byReason) : (err.data?.error ?? t('shopping.sendListError')),
+            'danger',
+          );
+          btn.disabled = false;
+        }
+      });
+    },
+  });
+}
+
+/**
+ * Liste duplizieren (#1103) - "der Einkauf letzte Woche war gut, das meiste
+ * davon wieder", ohne die alte Liste anzutasten. Kategorie und Handsortierung
+ * werden serverseitig immer übernommen; nur Häkchen/Menge/Notiz sind Flags.
+ *
+ * Artikelzahlen für die neue Liste kommen aus den schon geladenen Artikeln der
+ * QUELL-Liste statt aus einem zweiten `GET /shopping` - genau die Zahlen, die
+ * gleich kopiert werden, sind bereits im Client, ein Neuladen der ganzen
+ * Listen-Übersicht dafür wäre eine Anfrage für eine Antwort, die schon da ist.
+ */
+async function openDuplicateListDialog(container) {
+  const source = state.activeList;
+  if (!source) return;
+
+  openModal({
+    title: t('shopping.duplicateListTitle', { name: source.name }),
+    content: `
+      <div class="form-group">
+        <label class="form-label" for="duplicate-list-name">${esc(t('shopping.duplicateListNameLabel'))}</label>
+        <input class="form-input" type="text" id="duplicate-list-name"
+               value="${esc(t('shopping.duplicateDefaultName', { name: source.name }))}" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="toggle">
+          <input type="checkbox" id="duplicate-reset-checked" checked>
+          <span class="toggle__track"></span>
+          <span>${esc(t('shopping.duplicateResetChecked'))}</span>
+        </label>
+      </div>
+      <div class="form-group">
+        <label class="toggle">
+          <input type="checkbox" id="duplicate-keep-quantities" checked>
+          <span class="toggle__track"></span>
+          <span>${esc(t('shopping.duplicateKeepQuantities'))}</span>
+        </label>
+      </div>
+      <div class="form-group">
+        <label class="toggle">
+          <input type="checkbox" id="duplicate-keep-notes" checked>
+          <span class="toggle__track"></span>
+          <span>${esc(t('shopping.duplicateKeepNotes'))}</span>
+        </label>
+      </div>
+      <div class="modal-panel__footer modal-panel__footer--plain">
+        <button type="button" class="btn btn--secondary" data-action="close-modal">${esc(t('common.cancel'))}</button>
+        <button type="button" class="btn btn--primary" id="duplicate-list-confirm">${esc(t('shopping.duplicateSubmit'))}</button>
+      </div>`,
+    onSave(panel) {
+      panel.querySelector('#duplicate-list-confirm').addEventListener('click', async (event) => {
+        const btn = event.currentTarget;
+        const name = panel.querySelector('#duplicate-list-name').value.trim();
+        if (!name) {
+          reportFieldError(panel.querySelector('#duplicate-list-name'), t('common.nameRequired'));
+          return;
+        }
+        const resetChecked   = panel.querySelector('#duplicate-reset-checked').checked;
+        const keepQuantities = panel.querySelector('#duplicate-keep-quantities').checked;
+        const keepNotes      = panel.querySelector('#duplicate-keep-notes').checked;
+
+        btn.disabled = true;
+        try {
+          const data = await api.post(`/shopping/${source.id}/duplicate`, {
+            name, resetChecked, keepQuantities, keepNotes,
+          });
+          const itemTotal   = state.items.length;
+          const itemChecked = resetChecked ? 0 : state.items.filter(checkedOf).length;
+          state.lists.push({ ...data.data, item_total: itemTotal, item_checked: itemChecked });
+          closeModal({ force: true });
+          await switchList(data.data.id, container);
+          refocusAfterRender();
+        } catch (err) {
+          window.yuvomi.showToast(err.data?.error ?? t('shopping.duplicateError'), 'danger');
+          btn.disabled = false;
+        }
+      });
+    },
+  });
+}
+
 function renderListContent(container) {
   const content = container.querySelector('#list-content');
-  const head = container.querySelector('#list-head');
   if (!content) return;
   content.removeAttribute('aria-busy');
 
@@ -146,27 +939,21 @@ function renderListContent(container) {
   // „Neue Liste erstellen" ausgerechnet eine schreibende Handlung als einzigen
   // Ausweg angeboten (Critique P0, 2026-07-30).
   if (state.listsError) {
-    if (head) {
-      head.replaceChildren();
-      head.hidden = true;
-    }
     mountLoadError(content, {
       title: t('shopping.listsLoadError'),
       description: t('common.loadErrorDescription'),
       error: state.listsError,
       retryLabel: t('common.retry'),
-      onRetry: () => render(container, {}),
+      // Das Router-Signal reist mit: ein Aufbau aus dem Retry-Knopf gehoert
+      // zur selben Route und muss mit ihr fallen (#976).
+      onRetry: () => render(container, { user: { id: state.currentUserId }, signal: _routeSignal }),
     });
     return;
   }
 
   if (!state.activeList) {
-    // Ohne aktive Liste gibt es nichts zu benennen: der Kopf entfällt ganz,
-    // statt einen leeren Titel-Slot und drei toten Aktionen zu zeigen.
-    if (head) {
-      head.replaceChildren();
-      head.hidden = true;
-    }
+    // Ohne aktive Liste gibt es nichts zu benennen: renderTabs lässt die
+    // Aktionszone der Leiste dann weg, statt vier tote Menü-Einträge zu zeigen.
     // Geteilter Renderer (utils/empty-state.js), damit dieser Zustand dieselbe
     // Reihenfolge und Rolle trägt wie die drei Geschwister-Tabs.
     mountEmptyState(content, {
@@ -184,68 +971,6 @@ function renderListContent(container) {
       },
     });
     return;
-  }
-
-  if (head) {
-    head.hidden = false;
-    head.replaceChildren();
-    // Slot-Ordnung wie in den drei Geschwister-Tabs: Titel links, Aktionen
-    // rechts. Der Titel trägt .page-toolbar__title und damit dessen
-    // nowrap + ellipsis - vorher hatte .list-header__name `overflow: hidden`
-    // ohne `white-space`, wodurch „Weekly Shop" schon bei 1440px zweizeilig
-    // brach (Critique 2026-07-29).
-    head.insertAdjacentHTML('beforeend', `
-      <span class="page-toolbar__title list-header__name" data-action="rename-list"
-            data-id="${state.activeList.id}"
-            role="button" tabindex="0" aria-label="${t('shopping.renameListLabel')}">
-        ${esc(state.activeList.name)}
-        <i data-lucide="pencil" class="list-header__edit-icon" aria-hidden="true"></i>
-      </span>
-      <div class="page-toolbar__actions">
-        <!-- Der Kopf trägt NUR NOCH die drei dauerhaften Aktionen.
-             „In den Vorrat" und „Abgehakt löschen" standen hier und kosteten mobil
-             zwei zusätzliche Kopfzeilen: der Titel füllte die erste Zeile allein
-             (er wächst, und die Aktionsgruppe brach wegen ihrer
-             max-content-Breite um), darunter brachen die beiden Labels
-             (140px + 197px gegen 361px) noch einmal. Kopfhöhe 173px bei 393px,
-             229px bei 320px. Sie sitzen jetzt in der geteilten
-             .kitchen-bulkbar über der Liste - derselben Leiste, in der der Vorrat
-             seine Sammelaktion trägt (Critique 2026-07-30, P1). -->
-        <!-- Die drei dauerhaften Aktionen zweimal im DOM: einmal als Leiste (ab
-             768px), einmal als Menü-Einträge (darunter). CSS entscheidet, welche
-             Fassung Platz hat; display:none nimmt die andere auch aus der
-             Tabfolge. Das ist im Repo das etablierte Muster für responsives
-             Chrome, und beide Fassungen tragen dieselben data-action-Werte -
-             der delegierte Handler unterscheidet sie gar nicht. -->
-        <div class="list-header__inline-actions">
-          <button class="btn btn--ghost list-header__import-btn" data-action="import-meals"
-                  aria-label="${t('shopping.importMeals')}" title="${t('shopping.importMeals')}">
-            <i data-lucide="utensils" class="icon-md" aria-hidden="true"></i>
-            <span>${t('shopping.importMeals')}</span>
-          </button>
-          <button class="btn btn--ghost btn--icon" data-action="manage-categories"
-                  aria-label="${t('shopping.manageCategories')}" title="${t('shopping.manageCategories')}">
-            <i data-lucide="tags" class="icon-md" aria-hidden="true"></i>
-          </button>
-          <button class="btn btn--ghost btn--icon" data-action="delete-list"
-                  data-id="${state.activeList.id}" aria-label="${t('shopping.deleteListLabel')}"
-                  title="${t('shopping.deleteListLabel')}">
-            <i data-lucide="trash" class="icon-md" aria-hidden="true"></i>
-          </button>
-        </div>
-        <div class="list-header__more">
-          ${popoverMenuHtml({
-            id: 'list-head-menu',
-            label: t('common.moreActions'),
-            items: [
-              { action: 'import-meals', label: t('shopping.importMeals'), icon: 'utensils' },
-              { action: 'manage-categories', label: t('shopping.manageCategories'), icon: 'tags' },
-              { action: 'delete-list', label: t('shopping.deleteListLabel'), icon: 'trash', id: state.activeList.id, danger: true },
-            ],
-          })}
-        </div>
-      </div>`);
-    if (window.lucide) window.lucide.createIcons({ el: head });
   }
 
   content.replaceChildren();
@@ -269,29 +994,43 @@ function renderListContent(container) {
       </form>
     </div>
 
-    <!-- Sammelaktions-Leiste, ÜBER dem Scroller und als GESCHWISTER der Liste.
-         Nicht darin: updateCheckedActions() läuft beim Abhaken einzelner Artikel,
-         ohne die Liste neu zu bauen (Issue #276, Scroll-Position), und mountItems()
-         leert #items-list komplett. Als Kind der Liste würde eines das andere
-         überschreiben. -->
-    <div class="kitchen-bulkbar" id="list-header-checked" hidden></div>
+    <!-- Die Sammelaktions-Leiste stand hier als statischer Block über der
+         Liste. Seit Etappe 5 ist sie eine Pille in der unteren Shell-Zone
+         (utils/bulk-pill.js) - der Grund steht dort und an .list-bulkbar in
+         layout.css: 103px Listenfläche für einen einzigen abgehakten Artikel.
+         Die alte Begründung („Geschwister der Liste, nicht Kind: mountItems()
+         leert #items-list") ist damit erledigt statt umgezogen - was gar nicht
+         mehr in dieser Seite hängt, kann von ihrem Rendern nicht getroffen
+         werden. -->
 
     <!-- Artikel-Liste; Inhalt via mountItems(), damit der Leerzustand über den
          geteilten Renderer läuft statt als HTML-String hier drin. -->
-    <div class="kitchen-list items-list" id="items-list"></div>
+    <div class="list-scroller page-scrollport items-list" id="items-list"></div>
+
+    <!-- Ansage für Umsortierungen (#678), wie im Kategorie-Manager: das
+         aria-label des Griffs allein ist zu leise - ob ein Screenreader die
+         Label-Änderung am fokussierten Element vorliest, ist von Programm zu
+         Programm verschieden. Eine Live-Region ist die verlässliche Zusage. -->
+    <div class="sr-only" role="status" aria-live="polite" id="items-reorder-announce"></div>
   `);
 
-  mountItems(content.querySelector('#items-list'), container);
+  // Der Listenteil kommt aus updateItemsList - mountItems, Stagger,
+  // Wischgesten, Sortierung und die Sammelaktions-Leiste, die erst dann
+  // feststeht, wenn die abgehakten Artikel im DOM stehen.
+  //
+  // NICHT ein zweites Mal aufgezählt: die Aufzählung stand hier neben der in
+  // updateItemsList und hatte genau einen Schritt verloren. `wireSwipeGestures`
+  // lief nur im Nachlade-Pfad, also erst, wenn die Liste ein ZWEITES Mal gebaut
+  // wurde - beim ersten Öffnen der Seite antwortete keine Zeile auf die Geste.
+  // Der Aufruf stand seit dem Tag falsch, an dem die Geste eingeführt wurde.
+  updateItemsList(container);
 
+  // Für den ganzen Inhalt, nicht nur die Liste: Quick-Add und Kopfzeile tragen
+  // eigene Icons. Der Lauf in updateItemsList hat die Zeilen schon ersetzt.
   if (window.lucide) window.lucide.createIcons({ el: content });
-  stagger(content.querySelectorAll('.shopping-item'));
   wireAutocomplete(container);
   wireQuickAdd(container);
   syncQuickAddDisclosure(container, false);
-  maybeShowSwipeHint(container);
-  // Der Kopf rendert den Container leer; erst hier stehen die abgehakten
-  // Artikel fest, aus denen die Aktionen entstehen.
-  updateCheckedActions(container);
 }
 
 /**
@@ -342,21 +1081,38 @@ function mountItems(listEl, container) {
 
 function renderItems() {
   const groups = groupItemsByCategory(state.items);
-  // Geteilte Gruppen-Grammatik (styles/kitchen-row.css): .kitchen-group ordnet,
-  // .kitchen-rows trägt die weiße Fläche und die Trennlinien. Die Zeilen selbst
+  pruneCollapsedCategories(groups);
+  // Geteilte Gruppen-Grammatik (styles/list-row.css): .list-group ordnet,
+  // .list-rows trägt die weiße Fläche und die Trennlinien. Die Zeilen selbst
   // sind flächenlos - vorher war Einkaufen eine Trennlinien-Liste und der Vorrat
   // eine Kartenliste, dieselbe Sache in zwei Paradigmen (Critique 2026-07-30).
-  return groups.map(([cat, items]) => `
-    <div class="kitchen-group item-category">
-      <div class="kitchen-group__title">
-        <i data-lucide="${catIcon(cat)}" class="icon-sm" aria-hidden="true"></i>
-        ${esc(categoryLabel(cat))}
-        <span class="kitchen-group__count">${items.length}</span>
-      </div>
-      <div class="kitchen-rows">
+  //
+  // Gruppenkopf als echter Knopf im h2 (#1039, Muster aus tasks.js/#812): nur
+  // ein <button> kennt die Tastatur und traegt aria-expanded ueberhaupt. Die
+  // Zeilen (.list-rows) bleiben bei [hidden] im DOM - ein Rerender wuerde
+  // Sortable-Instanzen und Swipe-Closures verwerfen, nur um eine Gruppe
+  // zuzuklappen.
+  return groups.map(([cat, items], idx) => {
+    const key = categoryStorageKey(cat);
+    const collapsed = state.collapsedCategories.has(key);
+    const rowsId = `shopping-category-rows-${idx}`;
+    return `
+    <div class="list-group item-category" data-category="${esc(cat)}">
+      <h2 class="list-group__title">
+        <button type="button" class="list-group__toggle" data-category-toggle="${esc(key)}"
+                aria-expanded="${collapsed ? 'false' : 'true'}" aria-controls="${rowsId}">
+          <i data-lucide="chevron-down" aria-hidden="true"
+             class="list-group__chevron${collapsed ? ' list-group__chevron--collapsed' : ''}"></i>
+          <i data-lucide="${catIcon(cat)}" class="icon-sm" aria-hidden="true"></i>
+          <span>${esc(categoryLabel(cat))}</span>
+        </button>
+        <span class="list-group__count">${items.length}</span>
+      </h2>
+      <div class="list-rows" id="${rowsId}" ${collapsed ? 'hidden' : ''}>
         ${items.map(renderItem).join('')}
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 /**
@@ -372,8 +1128,10 @@ function renderItemMeta(item) {
 }
 
 // Wie viele Tags eine Zeile zeigt, bevor sie zusammenfasst - wie auf den
-// Aufgabenkarten.
-const ITEM_TAGS_VISIBLE = 3;
+// Aufgabenkarten, die am 12.08.2026 aus demselben Grund von drei auf EINEN
+// gegangen sind: die Etiketten standen dort in einer Metazeile, die umbrach,
+// hier auf einer dritten Zeile. Beides macht aus einer 64px-Zeile eine mit 91.
+const ITEM_TAGS_VISIBLE = 1;
 
 /**
  * Gespiegelte VTODO-CATEGORIES eines Einkaufspostens (#586).
@@ -386,50 +1144,72 @@ function renderItemTags(tags) {
   if (!tags?.length) return '';
   const shown = tags.slice(0, ITEM_TAGS_VISIBLE);
   const rest  = tags.length - shown.length;
-  const chips = shown.map((tag) => `<span class="item-tag">${esc(tag)}</span>`);
+  const chips = shown.map((tag) => `<span class="list-row__tag">${esc(tag)}</span>`);
   if (rest > 0) {
-    chips.push(`<span class="item-tag item-tag--more"
+    chips.push(`<span class="list-row__tag list-row__tag--more"
                       title="${esc(tags.slice(ITEM_TAGS_VISIBLE).join(', '))}">+${rest}</span>`);
   }
-  return `<div class="kitchen-row__tags">${chips.join('')}</div>`;
+  // KEIN eigener Block mehr: die Etiketten stehen in der Metazeile neben der
+  // Menge, nicht als dritte Zeile darunter. Als Block kosteten sie 27px in
+  // jeder Zeile, die welche hat - gemessen 90,9px gegen 64px, und das war die
+  // ganze Streuung des Einkaufs.
+  return chips.join('');
 }
 
 function renderItem(item) {
-  const isDone = Boolean(item.is_checked);
+  const isDone = Boolean(checkedOf(item));
   return `
-    <div class="swipe-row" data-swipe-id="${item.id}" data-swipe-checked="${item.is_checked}">
-      <div class="swipe-reveal swipe-reveal--done" aria-hidden="true">
+    <div class="swipe-row" data-swipe-id="${item.id}" data-swipe-checked="${checkedOf(item)}">
+      <div class="swipe-reveal swipe-reveal--done swipe-reveal--leading" aria-hidden="true">
         <i data-lucide="${isDone ? 'rotate-ccw' : 'check'}" class="icon-xl" aria-hidden="true"></i>
         <span>${isDone ? t('shopping.swipeBack') : t('shopping.swipeCheck')}</span>
       </div>
-      <div class="swipe-reveal swipe-reveal--delete" aria-hidden="true">
+      <div class="swipe-reveal swipe-reveal--delete swipe-reveal--trailing" aria-hidden="true">
         <i data-lucide="trash-2" class="icon-xl" aria-hidden="true"></i>
         <span>${t('shopping.swipeDelete')}</span>
       </div>
-      <div class="kitchen-row shopping-item ${isDone ? 'shopping-item--checked' : ''}"
+      <div class="list-row shopping-item ${isDone ? 'shopping-item--checked' : ''}"
            data-item-id="${item.id}">
         <button class="item-check ${isDone ? 'item-check--checked' : ''}"
-                data-action="toggle-item" data-id="${item.id}" data-checked="${item.is_checked}"
+                data-action="toggle-item" data-id="${item.id}" data-checked="${checkedOf(item)}"
                 aria-label="${isDone ? t('shopping.markUndoneLabel', { name: esc(item.name) }) : t('shopping.markDoneLabel', { name: esc(item.name) })}">
           <i data-lucide="check" class="item-check__icon" aria-hidden="true"></i>
         </button>
-        <div class="kitchen-row__main">
-          <div class="kitchen-row__name">${esc(item.name)}${renderItemMeta(item)}</div>
-          ${item.quantity ? `<div class="kitchen-row__meta">${esc(item.quantity)}</div>` : ''}
-          ${renderItemTags(item.tags)}
+        <div class="list-row__main">
+          <div class="list-row__name">${esc(item.name)}${renderItemMeta(item)}</div>
+          ${item.quantity || item.tags?.length ? `<div class="list-row__meta">
+            ${item.quantity ? `<span class="shopping-item__quantity">${esc(item.quantity)}</span>` : ''}
+            ${renderItemTags(item.tags)}
+          </div>` : ''}
         </div>
         <!-- Geteilte .row-action-Grammatik aus layout.css (app-weit von sieben
-             Modulen genutzt), gruppiert in der geteilten .kitchen-row__actions -
+             Modulen genutzt), gruppiert in der geteilten .list-row__actions -
              vorher hingen die zwei Buttons als direkte Flex-Kinder in der Zeile,
              wodurch die Bedienzone in jedem Tab anders zusammengesetzt war. -->
-        <div class="kitchen-row__actions">
+        <div class="list-row__actions">
+          <!-- Griff für die Handsortierung (#678). Ein BUTTON, kein role="img"
+               wie im Kategorie-Manager: dort steht daneben ein Auf/Ab-Paar als
+               Tastaturpfad, hier trägt der Griff ihn selbst (Pfeiltasten bei
+               Fokus). Die Einkaufszeile hat schon Abhaken, Details, Löschen und
+               zwei Wischgesten - zwei weitere Knöpfe hätten die Bedienzone auf
+               dem Handy zugestellt. -->
+          <button class="row-action list-row__drag" data-action="reorder-handle" data-id="${item.id}"
+                  aria-label="${t('shopping.reorderHandle', { name: esc(item.name) })}"
+                  title="${t('shopping.reorderHandleHint')}">
+            <i data-lucide="grip-vertical" class="icon-md" aria-hidden="true"></i>
+          </button>
           <button class="row-action" data-action="item-details" data-id="${item.id}"
                   aria-label="${t('shopping.detailsLabel', { name: esc(item.name) })}">
             <i data-lucide="pencil" class="icon-md" aria-hidden="true"></i>
           </button>
           <button class="row-action row-action--danger" data-action="delete-item" data-id="${item.id}"
                   aria-label="${t('shopping.deleteItemLabel', { name: esc(item.name) })}">
-            <i data-lucide="x" class="icon-md" aria-hidden="true"></i>
+            ${/* trash-2 statt x: das Kreuz heisst app-weit „Schliessen"
+                 (Modals, Chips), Loeschen traegt ueberall den Papierkorb
+                 (Aufgaben, Geburtstage, Mahlzeiten). Der Einkauf war die eine
+                 Zeile, die fuer dieselbe Tat ein anderes Zeichen sprach
+                 (Critique 2026-08-27, P3). */ ''}
+            <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>
           </button>
         </div>
       </div>
@@ -441,6 +1221,29 @@ function renderItem(item) {
 // --------------------------------------------------------
 
 let autocompleteTimeout = null;
+
+/**
+ * Übernimmt eine gewählte Vorschlagszeile ins Formular (#1103): Name immer,
+ * Kategorie/Menge nur, wenn die Zeile sie kennt. Eine Kategorie, die es im
+ * Haushalt nicht mehr gibt (umbenannt/gelöscht seit dem letzten Einkauf),
+ * bleibt beim aktuellen Stand des Feldes stehen, statt eine ungültige Option
+ * zu erzwingen - `<select>` würde sie ohnehin nur stillschweigend ignorieren.
+ */
+function applyAutocompleteSuggestion(container, el) {
+  const nameInput = container.querySelector('#item-name-input');
+  const qtyInput  = container.querySelector('#item-qty-input');
+  const catSelect = container.querySelector('#item-cat-select');
+  if (!nameInput) return;
+
+  nameInput.value = el.dataset.name ?? '';
+  if (catSelect && el.dataset.category
+    && [...catSelect.options].some((o) => o.value === el.dataset.category)) {
+    catSelect.value = el.dataset.category;
+  }
+  if (qtyInput && el.dataset.quantity) {
+    qtyInput.value = el.dataset.quantity;
+  }
+}
 
 function wireAutocomplete(container) {
   const input    = container.querySelector('#item-name-input');
@@ -461,8 +1264,11 @@ function wireAutocomplete(container) {
         if (!suggestions.length) { dropdown.hidden = true; return; }
 
         dropdown.replaceChildren();
+        // Angezeigt wird nur der Name - Kategorie/Menge reisen unsichtbar als
+        // data-Attribute mit und füllen beim Wählen die übrigen Felder (#1103).
         dropdown.insertAdjacentHTML('beforeend', suggestions.map((s, i) =>
-          `<div class="autocomplete-item" data-idx="${i}" data-value="${esc(s)}">${esc(s)}</div>`
+          `<div class="autocomplete-item" data-idx="${i}" data-name="${esc(s.name)}"
+                data-category="${esc(s.category ?? '')}" data-quantity="${esc(s.quantity ?? '')}">${esc(s.name)}</div>`
         ).join(''));
         dropdown.hidden = false;
         activeIdx = -1;
@@ -470,7 +1276,7 @@ function wireAutocomplete(container) {
         dropdown.querySelectorAll('.autocomplete-item').forEach((el) => {
           el.addEventListener('mousedown', (e) => {
             e.preventDefault();
-            input.value = el.dataset.value;
+            applyAutocompleteSuggestion(container, el);
             dropdown.hidden = true;
           });
         });
@@ -495,7 +1301,7 @@ function wireAutocomplete(container) {
       items.forEach((el, i) => el.classList.toggle('autocomplete-item--active', i === activeIdx));
     } else if (e.key === 'Enter' && activeIdx >= 0) {
       e.preventDefault();
-      input.value = items[activeIdx].dataset.value;
+      applyAutocompleteSuggestion(container, items[activeIdx]);
       dropdown.hidden = true;
     } else if (e.key === 'Escape') {
       dropdown.hidden = true;
@@ -571,7 +1377,7 @@ function _flashAddBtn(btn) {
  */
 function syncQuickAddDisclosure(container, open) {
   const page = container.querySelector('.shopping-page');
-  const fab = container.querySelector('#fab-new-item');
+  const fab = findPageFab('fab-new-item');
   if (!page || !fab) return;
 
   const collapsible = window.matchMedia('(hover: none)').matches && Boolean(state.activeList);
@@ -589,6 +1395,30 @@ function syncQuickAddDisclosure(container, open) {
   }
 }
 
+/**
+ * Setzt die Kategorie-Auswahl des Quick-Add auf den Standard zurueck.
+ *
+ * Die Kategorie faellt nach dem Anlegen auf den Standard zurueck (#548:
+ * neu = Sonstiges), statt fuer den NAECHSTEN, unverwandten Artikel stehen zu
+ * bleiben. Ohne diesen Rueckfall blieb sie an der zuletzt gewaehlten
+ * Kategorie haengen - ob von Hand gewaehlt oder von einem Vorschlag
+ * uebernommen (applyAutocompleteSuggestion) - und ein danach eingetippter
+ * Artikel landete dort, nicht in Sonstiges (gemeldet 2026-09-11: "Toast"
+ * landete in "Milchprodukte", weil zuvor ein Milch-Vorschlag gewaehlt wurde).
+ *
+ * Eigene Funktion statt Inline-Zweig im Submit-Handler, damit das Verhalten
+ * testbar ist (Review #1165: die reine Textprobe blieb auch bei totem Code
+ * gruen). Fehlt "Sonstiges" (umbenannt/geloescht), bleibt die Auswahl stehen -
+ * ein ungueltiger Wert im <select> waere schlimmer als eine stehende Kategorie.
+ *
+ * @param {HTMLSelectElement} catSelect
+ */
+function resetQuickAddCategory(catSelect) {
+  if ([...catSelect.options].some((o) => o.value === DEFAULT_CATEGORY_NAME)) {
+    catSelect.value = DEFAULT_CATEGORY_NAME;
+  }
+}
+
 function wireQuickAdd(container) {
   const form = container.querySelector('#quick-add-form');
   if (!form) return;
@@ -601,7 +1431,7 @@ function wireQuickAdd(container) {
     if (!page?.classList.contains('shopping-page--adding')) return;
     e.stopPropagation();
     syncQuickAddDisclosure(container, false);
-    container.querySelector('#fab-new-item')?.focus();
+    findPageFab('fab-new-item')?.focus();
   });
 
   form.addEventListener('submit', async (e) => {
@@ -618,6 +1448,7 @@ function wireQuickAdd(container) {
 
     try {
       const data = await api.post(`/shopping/${state.activeListId}/items`, { name, quantity, category });
+      acknowledgeOwnChange(data);
       state.items.push(data.data);
       // Einfügen in DOM ohne komplettes Re-Render
       updateItemsList(container);
@@ -625,6 +1456,7 @@ function wireQuickAdd(container) {
       renderTabs(container);
       nameInput.value = '';
       qtyInput.value  = '';
+      resetQuickAddCategory(catSelect);
       // Erfolgs-Feedback auf dem +-Button (DOM-API, kein innerHTML)
       _flashAddBtn(form.querySelector('.quick-add__btn'));
       nameInput.focus();
@@ -641,23 +1473,221 @@ function wireQuickAdd(container) {
 // Zeigt den Nudge-Hinweis maximal 3x (gespeichert in localStorage).
 // --------------------------------------------------------
 
-const SWIPE_HINT_KEY  = 'yuvomi:swipeHintSeen';
-const SWIPE_HINT_MAX  = 3;
+// --------------------------------------------------------
+// Handsortierung innerhalb einer Kategorie (#678)
+// --------------------------------------------------------
 
-function maybeShowSwipeHint(container) {
-  if (window.innerWidth >= 1024) return; // Desktop: Swipe nicht relevant
-  const count = parseInt(localStorage.getItem(SWIPE_HINT_KEY) ?? '0', 10);
-  if (count >= SWIPE_HINT_MAX) return;
+/** Laufende Sortable-Instanzen, damit ein Neuaufbau der Liste sie abräumt. */
+let itemSortables = [];
 
-  const firstRow = container.querySelector('.swipe-row');
-  if (!firstRow) return;
+function destroyItemSortables() {
+  itemSortables.forEach((inst) => { try { inst.destroy(); } catch { /* schon abgeräumt */ } });
+  itemSortables = [];
+}
 
-  firstRow.classList.add('swipe-row--hint');
-  firstRow.addEventListener('animationend', () => {
-    firstRow.classList.remove('swipe-row--hint');
-  }, { once: true });
+/** Ziehbare (= nicht abgehakte) Zeilen einer Gruppe in DOM-Reihenfolge. */
+function movableRows(rowsEl) {
+  return Array.from(rowsEl.querySelectorAll(':scope > .swipe-row:not([data-swipe-checked="1"])'));
+}
 
-  localStorage.setItem(SWIPE_HINT_KEY, String(count + 1));
+/**
+ * Schreibt Position und Gesamtzahl in die Griff-Beschriftungen einer Gruppe.
+ *
+ * Nach jedem Zug erneut: der Griff ist bei der Tastaturbedienung das fokussierte
+ * Element, und seine Beschriftung ist die einzige Rückmeldung darüber, wo der
+ * Artikel jetzt steht. Ein statisches „Reihenfolge ändern" ließe Screenreader-
+ * Nutzer nach dem Tastendruck ohne Bestätigung zurück.
+ */
+function refreshHandleLabels(rowsEl) {
+  if (!rowsEl) return;
+  const rows = movableRows(rowsEl);
+  rows.forEach((row, idx) => {
+    const handle = row.querySelector('.list-row__drag');
+    const name   = row.querySelector('.list-row__name')?.textContent?.trim() ?? '';
+    if (!handle) return;
+    handle.removeAttribute('disabled');
+    handle.setAttribute('aria-label', `${t('shopping.reorderHandle', { name })}, ${
+      t('shopping.reorderPosition', { index: idx + 1, total: rows.length })}`);
+  });
+  // Abgehakte Artikel sortieren sich nicht: sie stehen ohnehin am Ende ihrer
+  // Kategorie (ORDER BY is_checked vor sort_order), ein Zug an ihnen wäre
+  // folgenlos. Der Griff bleibt sichtbar, damit die Zeile ihre Form behält.
+  //
+  // Beide Richtungen in EINER Funktion: das Zurückholen eines Artikels ist so
+  // alltäglich wie das Abhaken, und ein nur gesetztes `disabled` hätte den Griff
+  // bis zum nächsten Voll-Render tot gelassen.
+  rowsEl.querySelectorAll(':scope > [data-swipe-checked="1"] .list-row__drag')
+    .forEach((handle) => handle.setAttribute('disabled', ''));
+}
+
+/**
+ * Sagt die neue Position einer bewegten Zeile über die Live-Region an.
+ * Nutzt bewusst `category.reorderAnnounce` mit: der Satz ist wortgleich, und
+ * eine zweite Fassung derselben Aussage wäre 24 Übersetzungen, die
+ * auseinanderlaufen können.
+ */
+function announceItemMove(container, row) {
+  const el = container?.querySelector('#items-reorder-announce');
+  if (!el || !row) return;
+  const rows = movableRows(row.parentElement);
+  const idx  = rows.indexOf(row);
+  if (idx === -1) return;
+  el.textContent = t('category.reorderAnnounce', {
+    name:     row.querySelector('.list-row__name')?.textContent?.trim() ?? '',
+    position: idx + 1,
+    total:    rows.length,
+  });
+}
+
+/** Kategorien mit laufender Sicherung: Name -> { again: boolean }. */
+const orderRuns = new Map();
+
+/**
+ * Einen Sicherungslauf ausführen: liest die Reihenfolge JETZT aus dem DOM.
+ *
+ * `listId` kommt vom Einreihen und nicht aus `state.activeListId`: wechselt der
+ * Nutzer die Liste, während eine Nachfolge aussteht, hält `groupEl` noch die
+ * abgehängten Zeilen der alten Liste. Deren IDs gegen die inzwischen aktive
+ * Liste zu schicken, quittiert die Route zu Recht mit 400 - gemeint war der Zug
+ * in der alten Liste, und dorthin gehört er auch gesichert.
+ */
+async function sendItemOrder(groupEl, container, listId) {
+  const rowsEl   = groupEl.querySelector('.list-rows');
+  const category = groupEl.dataset.category;
+  if (!rowsEl) return true;
+
+  // Alle Artikel der Kategorie, auch die abgehakten: die Route verlangt die
+  // vollständige Gruppe, sonst kollidieren die neuen Ränge mit den alten.
+  const order = Array.from(rowsEl.querySelectorAll(':scope > .swipe-row'))
+    .map((row) => Number(row.dataset.swipeId));
+  if (!order.length) return true;
+
+  try {
+    const data = await api.patch(`/shopping/${listId}/items/reorder`, { category, order });
+    acknowledgeOwnChange(data);
+    // Nur den State nachziehen, nicht neu zeichnen: das DOM steht bereits
+    // richtig, und ein Re-Render würde den Fokus vom Griff nehmen - mitten in
+    // einer Tastaturbedienung wäre das das Ende der Bedienkette.
+    //
+    // Und nur, solange dieselbe Liste offen ist: die Antwort trägt die Artikel
+    // VON `listId`, ein zwischenzeitlicher Listenwechsel bekäme sonst den
+    // Bestand der alten Liste in seinen State geschrieben.
+    if (listId === state.activeListId) state.items = data.data ?? state.items;
+    return true;
+  } catch (err) {
+    // Fehler einer Liste, die gar nicht mehr offen ist, nicht dem Nutzer
+    // vorlegen und erst recht nicht die sichtbare Liste dafür neu bauen.
+    if (listId !== state.activeListId) return false;
+    window.yuvomi.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+    updateItemsList(container);
+    return false;
+  }
+}
+
+/**
+ * Neue Reihenfolge einer Gruppe sichern. Geteilter Persistenz-Pfad von Drag und
+ * Pfeiltasten - beide haben das DOM vorher schon umgestellt, deshalb baut der
+ * Fehlerfall die Liste aus dem unveränderten State neu auf.
+ *
+ * JE KATEGORIE IMMER NUR EINE LAUFENDE ANFRAGE. Zwei schnell nacheinander
+ * gedrückte Pfeiltasten schickten sonst zwei PATCHes parallel los, und es
+ * entschied die Ankunftsreihenfolge beim Server statt die Bedienreihenfolge:
+ * traf der erste zuletzt ein, schrieb er den Zwischenstand fest, das DOM zeigte
+ * aber den zweiten Zug. Der Nutzer sah seine Reihenfolge und bekam beim
+ * nächsten Laden eine andere. Bewusst als Warteschlange und nicht als Entprellung:
+ * die Sicherung bleibt sofort, nur eben der Reihe nach.
+ *
+ * Weitere Züge während eines Laufs werden zu EINER Nachfolge zusammengefasst -
+ * die liest die dann aktuelle Reihenfolge, also genügt sie für beliebig viele.
+ *
+ * @param {HTMLElement} [movedRow] - die bewegte Zeile, für die Ansage
+ */
+function persistItemOrder(groupEl, container, movedRow) {
+  const category = groupEl?.dataset.category;
+  if (!groupEl || !category) return;
+
+  refreshHandleLabels(groupEl.querySelector('.list-rows'));
+  announceItemMove(container, movedRow);
+
+  const running = orderRuns.get(category);
+  if (running) { running.again = true; return; }
+
+  const run    = { again: false };
+  const listId = state.activeListId;
+  orderRuns.set(category, run);
+  (async () => {
+    try {
+      let ok = true;
+      do {
+        run.again = false;
+        ok = await sendItemOrder(groupEl, container, listId);
+      } while (run.again && ok);   // nach einem Fehler hat updateItemsList das DOM zurückgesetzt
+    } finally {
+      orderRuns.delete(category);
+    }
+  })();
+}
+
+/**
+ * Verschiebt eine Zeile um einen Platz und hält den Fokus auf ihrem Griff.
+ * @param {HTMLElement} row
+ * @param {-1|1} delta
+ */
+function moveItemRow(row, delta, container) {
+  const rowsEl = row.parentElement;
+  const rows   = movableRows(rowsEl);
+  const idx    = rows.indexOf(row);
+  const target = idx + delta;
+  if (idx === -1 || target < 0 || target >= rows.length) return;
+
+  if (delta < 0) rowsEl.insertBefore(row, rows[target]);
+  else           rowsEl.insertBefore(row, rows[target].nextSibling);
+
+  vibrate(15);
+  row.querySelector('.list-row__drag')?.focus();
+  persistItemOrder(rowsEl.closest('.list-group'), container, row);
+}
+
+/**
+ * Verdrahtet je Kategorie-Gruppe das Ziehen und die Pfeiltasten am Griff.
+ *
+ * Je Gruppe eine eigene Instanz und kein `group`-Verbund: ein Zug von „Obst"
+ * nach „Backwaren" wäre ein Kategoriewechsel, keine Umsortierung - dafür gibt es
+ * den Detail-Dialog, und die Ränge gelten ohnehin je Kategorie.
+ */
+function wireItemReorder(container) {
+  const listEl = container.querySelector('#items-list');
+  if (!listEl) return;
+  destroyItemSortables();
+
+  listEl.querySelectorAll('.list-group').forEach((groupEl) => {
+    const rowsEl = groupEl.querySelector('.list-rows');
+    if (!rowsEl) return;
+    refreshHandleLabels(rowsEl);
+
+    makeSortable(rowsEl, {
+      handle: '.list-row__drag',
+      draggable: '.swipe-row',
+      // Abgehaktes bleibt liegen: es steht am Ende der Kategorie, und ein Zug
+      // daran würde beim nächsten Laden zurückspringen.
+      filter: '[data-swipe-checked="1"]',
+      onEnd: (evt) => persistItemOrder(groupEl, container, evt?.item),
+    }).then((inst) => { if (inst) itemSortables.push(inst); })
+      .catch(() => { /* ohne SortableJS bleibt der Tastaturpfad */ });
+  });
+
+  // Tastaturpfad, delegiert: derselbe Persistenz-Handler wie das Drag-Ende.
+  // Einmal pro #items-list-Element - mountItems() tauscht nur dessen Inhalt aus,
+  // ein Listener pro Aufruf hätte sich mit jedem Nachladen gestapelt.
+  if (listEl.dataset.reorderWired) return;
+  listEl.dataset.reorderWired = '1';
+  listEl.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+    const handle = e.target.closest?.('.list-row__drag');
+    if (!handle || handle.disabled) return;
+    e.preventDefault();
+    moveItemRow(handle.closest('.swipe-row'), e.key === 'ArrowUp' ? -1 : 1, container);
+  });
 }
 
 // --------------------------------------------------------
@@ -668,139 +1698,36 @@ function wireSwipeGestures(container) {
   const listEl = container.querySelector('#items-list');
   if (!listEl) return;
 
-  listEl.querySelectorAll('.swipe-row').forEach((row) => {
-    let startX = 0, startY = 0;
-    let dx = 0;
-    let locked = false; // false | 'swipe' | 'scroll'
-    let thresholdHit = false;
-    const card = row.querySelector('.shopping-item');
-    if (!card) return;
-
-    function resetCard(animate = true) {
-      card.style.transition = animate ? 'transform 0.25s ease' : '';
-      card.style.transform  = '';
-      row.classList.remove('swipe-row--swiping');
-      row.querySelector('.swipe-reveal--done').style.opacity    = '0';
-      row.querySelector('.swipe-reveal--delete').style.opacity  = '0';
-    }
-
-    row.addEventListener('touchstart', (e) => {
-      if (document.getElementById('shared-modal-overlay')) return;
-      startX = e.touches[0].clientX;
-      startY = e.touches[0].clientY;
-      dx     = 0;
-      locked = false;
-      thresholdHit = false;
-      card.style.transition = '';
-    }, { passive: true });
-
-    row.addEventListener('touchmove', (e) => {
-      if (locked === 'scroll') return;
-
-      const currentX = e.touches[0].clientX;
-      const currentY = e.touches[0].clientY;
-      dx = currentX - startX;
-      const dy = Math.abs(currentY - startY);
-
-      if (locked === false) {
-        if (dy > SWIPE_MAX_VERT && Math.abs(dx) < dy) {
-          locked = 'scroll';
-          resetCard(false);
-          return;
-        }
-        if (Math.abs(dx) > SWIPE_MAX_VERT) {
-          locked = 'swipe';
-        }
-      }
-
-      if (locked !== 'swipe') return;
-
-      if (dy < SWIPE_LOCK_VERT) e.preventDefault();
-
-      const dampened = dx > 0
-        ? Math.min(dx,  SWIPE_THRESHOLD + (dx  - SWIPE_THRESHOLD) * 0.2)
-        : Math.max(dx, -(SWIPE_THRESHOLD + (-dx - SWIPE_THRESHOLD) * 0.2));
-
-      card.style.transform = `translateX(${dampened}px)`;
-      row.classList.add('swipe-row--swiping');
-
-      const progress = Math.min(Math.abs(dx) / SWIPE_THRESHOLD, 1);
-      if (dx < 0) {
-        row.querySelector('.swipe-reveal--done').style.opacity   = String(progress);
-        row.querySelector('.swipe-reveal--delete').style.opacity = '0';
-      } else {
-        row.querySelector('.swipe-reveal--delete').style.opacity = String(progress);
-        row.querySelector('.swipe-reveal--done').style.opacity   = '0';
-      }
-
-      // Haptic-Feedback beim Erreichen des Schwellwerts
-      if (!thresholdHit && Math.abs(dx) >= SWIPE_THRESHOLD) {
-        thresholdHit = true;
-        vibrate(15);
-      }
-    }, { passive: false });
-
-    row.addEventListener('touchend', async () => {
-      if (locked !== 'swipe') { resetCard(false); return; }
-
-      const itemId  = Number(row.dataset.swipeId);
-      const checked = Number(row.dataset.swipeChecked);
-
-      if (dx < -SWIPE_THRESHOLD) {
-        // Swipe links → abhaken / zurück
-        card.style.transition = 'transform 0.2s ease';
-        card.style.transform  = 'translateX(-110%)';
-        vibrate(40);
-        setTimeout(async () => {
-          resetCard(false);
-          const newVal = checked ? 0 : 1;
-          const item   = state.items.find((i) => i.id === itemId);
-          if (item) {
-            item.is_checked = newVal;
-            // Nur die Zeile aktualisieren — Scroll-Position bewahren (Issue #276).
-            updateItemRow(container, item);
-            updateCheckedActions(container);
-            updateListCounter(state.activeListId, 0, newVal ? 1 : -1);
-            renderTabs(container);
-          }
-          try {
-            await api.patch(`/shopping/items/${itemId}`, { is_checked: newVal });
-            vibrate(10);
-          } catch (err) {
-            if (item) {
-              item.is_checked = checked;
-              updateItemRow(container, item);
-              updateCheckedActions(container);
-              updateListCounter(state.activeListId, 0, newVal ? -1 : 1);
-              renderTabs(container);
-            }
-            window.yuvomi.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
-          }
-        }, 200);
-
-      } else if (dx > SWIPE_THRESHOLD) {
-        // Swipe rechts → löschen
-        card.style.transition = 'transform 0.2s ease';
-        card.style.transform  = 'translateX(110%)';
-        vibrate(40);
-        setTimeout(async () => {
-          const item = state.items.find((i) => i.id === itemId);
-          try {
-            await api.delete(`/shopping/items/${itemId}`);
-            state.items = state.items.filter((i) => i.id !== itemId);
-            updateItemsList(container);
-            updateListCounter(state.activeListId, -1, item?.is_checked ? -1 : 0);
-            renderTabs(container);
-          } catch (err) {
-            resetCard(true);
-            window.yuvomi.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
-          }
-        }, 200);
-
-      } else {
-        resetCard(true);
-      }
-    });
+  wireSwipeRows(listEl, {
+    card: '.shopping-item',
+    ignore: '.list-row__drag',
+    // Vor 2.0.0 löschte der Wisch zum Zeilenende hier sofort: eine der zwei
+    // Listen, in denen die Seiten wirklich getauscht haben.
+    sidesSwapped: true,
+    // Beide Seiten führen dieselbe Aktion aus wie der Knopf in der Zeile -
+    // über dieselbe Funktion, nicht über eine zweite Schreibweise daneben.
+    //
+    // Zeilenanfang: abhaken / zurueck - die primäre positive Aktion der Liste
+    // (§2). Die Karte fliegt hinaus, die Zeile bleibt - nur ihr Zustand
+    // wechselt (Issue #276: kein Re-Render der Liste).
+    leading: {
+      reveal: '.swipe-reveal--done',
+      flyOut: true,
+      run: (row) => toggleShoppingItem(
+        Number(row.dataset.swipeId),
+        Number(row.dataset.swipeChecked),
+        container,
+      ),
+    },
+    // Zeilenende: loeschen, widerrufbar - dieselbe Kante wie bei den
+    // Geburtstagen. Die Karte federt zurück statt hinauszufliegen, aus
+    // demselben Grund wie dort: eine hinausgeflogene Karte behauptet, die
+    // Sache sei erledigt, während der Rückgängig-Weg noch fünf Sekunden
+    // offen steht.
+    trailing: {
+      reveal: '.swipe-reveal--delete',
+      run: (row) => deleteItemUndoable(Number(row.dataset.swipeId), container),
+    },
   });
 }
 
@@ -816,20 +1743,24 @@ function wireSwipeGestures(container) {
 function updateItemRow(container, item) {
   const row = container.querySelector(`.swipe-row[data-swipe-id="${item.id}"]`);
   if (!row) return;
-  const isDone = Boolean(item.is_checked);
+  const isDone = Boolean(checkedOf(item));
 
-  row.dataset.swipeChecked = String(item.is_checked);
+  row.dataset.swipeChecked = String(checkedOf(item));
 
   row.querySelector('.shopping-item')?.classList.toggle('shopping-item--checked', isDone);
 
   const checkBtn = row.querySelector('.item-check');
   if (checkBtn) {
     checkBtn.classList.toggle('item-check--checked', isDone);
-    checkBtn.dataset.checked = String(item.is_checked);
+    checkBtn.dataset.checked = String(checkedOf(item));
     checkBtn.setAttribute('aria-label', isDone
       ? t('shopping.markUndoneLabel', { name: item.name })
       : t('shopping.markDoneLabel', { name: item.name }));
   }
+
+  // Der Sortiergriff hängt am Erledigt-Zustand (#678): abgehaktes sortiert sich
+  // nicht, und die Positionsangaben der Gruppe verschieben sich mit.
+  refreshHandleLabels(row.closest('.list-rows'));
 
   // Swipe-Affordance (links) spiegelt den neuen Status
   const reveal = row.querySelector('.swipe-reveal--done');
@@ -854,7 +1785,7 @@ function updateItemRow(container, item) {
  */
 function refreshItemName(container, item) {
   const card = container.querySelector(`.shopping-item[data-item-id="${item.id}"]`);
-  const nameEl = card?.querySelector('.kitchen-row__name');
+  const nameEl = card?.querySelector('.list-row__name');
   if (!nameEl) return;
 
   nameEl.replaceChildren(document.createTextNode(item.name));
@@ -864,16 +1795,31 @@ function refreshItemName(container, item) {
     if (window.lucide) window.lucide.createIcons({ el: nameEl });
   }
 
-  const main = card.querySelector('.kitchen-row__main');
-  const qtyEl = main?.querySelector('.kitchen-row__meta');
-  if (item.quantity) {
-    if (qtyEl) {
-      qtyEl.textContent = item.quantity;
+  /* Die Metazeile trägt seit dem Zeilenschnitt ZWEI Dinge, Menge und Etiketten.
+   * `metaEl.textContent = …` hätte die Etiketten dabei mitgelöscht - deshalb
+   * greift die Menge ihren eigenen Knoten. Die Zeile selbst verschwindet nur,
+   * wenn beides fehlt. */
+  const main = card.querySelector('.list-row__main');
+  const metaEl = main?.querySelector('.list-row__meta');
+  const hasTags = !!item.tags?.length;
+  if (item.quantity || hasTags) {
+    if (!metaEl) {
+      main?.insertAdjacentHTML('beforeend', `<div class="list-row__meta">
+        ${item.quantity ? `<span class="shopping-item__quantity">${esc(item.quantity)}</span>` : ''}
+        ${renderItemTags(item.tags)}
+      </div>`);
     } else {
-      main?.insertAdjacentHTML('beforeend', `<div class="kitchen-row__meta">${esc(item.quantity)}</div>`);
+      const qtyEl = metaEl.querySelector('.shopping-item__quantity');
+      if (item.quantity && qtyEl) {
+        qtyEl.textContent = item.quantity;
+      } else if (item.quantity) {
+        metaEl.insertAdjacentHTML('afterbegin', `<span class="shopping-item__quantity">${esc(item.quantity)}</span>`);
+      } else {
+        qtyEl?.remove();
+      }
     }
   } else {
-    qtyEl?.remove();
+    metaEl?.remove();
   }
 }
 
@@ -934,6 +1880,45 @@ function openItemDetails(itemId, container) {
             </select>
           </div>
         </div>
+        ${/* PREIS UND LADEN (#1003).
+            *
+            * NICHT ALS ZWANGSDIALOG BEIM ABHAKEN. Das Ticket sagt "erfasst,
+            * wenn man abhakt - da ist die Zahl bekannt", und das stimmt; ein
+            * Dialog, der sich bei JEDEM Haken oeffnet, waere im Laden aber
+            * unertraeglich: das Abhaken ist die schnellste Geste der App und
+            * bleibt es. Die Felder stehen deshalb hier, wo der Artikel ohnehin
+            * geoeffnet wird - nachtragen statt unterbrechen.
+            *
+            * Betont bei einem abgehakten Artikel: dann ist die Frage aktuell. */ ''}
+        <div class="pantry-form-row">
+          <div class="form-group">
+            <label class="form-label" for="item-details-price">${t('shopping.priceLabel')}</label>
+            <input class="form-input" type="text" id="item-details-price" inputmode="decimal"
+                   placeholder="${esc(amountPlaceholder(state.currency))}"
+                   value="${item.price_cents != null ? esc(centsToAmountInput(item.price_cents, state.currency)) : ''}">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="item-details-store">${t('shopping.storeLabel')}</label>
+            ${/* COMBOBOX, KEIN SELECT (#1003).
+                *
+                * Eine reine Auswahlliste ist bei einem frischen Haushalt leer und
+                * bleibt es: der erste Laden muesste anderswo entstehen. Ein Knopf
+                * daneben hilft hier nicht - das geteilte Modal kennt bewusst kein
+                * Stacking (siehe modal.js), ein Manager darueber raeumte dieses
+                * Formular samt getippter Eingaben weg.
+                *
+                * Also tippen oder waehlen: die Liste kommt als datalist dazu, und
+                * ein unbekannter Name legt beim Speichern den Laden an. Umbenennen
+                * und Loeschen liegen im Listenmenue, wo der Manager ein Dialog
+                * erster Ebene sein darf. */ ''}
+            <input class="form-input" type="text" id="item-details-store" list="item-details-store-options"
+                   autocomplete="off" placeholder="${esc(t('shopping.storePlaceholder'))}"
+                   value="${esc(state.stores.find((st) => st.id === item.store_id)?.name ?? '')}">
+            <datalist id="item-details-store-options">
+              ${state.stores.map((st) => `<option value="${esc(st.name)}"></option>`).join('')}
+            </datalist>
+          </div>
+        </div>
         <div class="form-group">
           <label class="form-label" for="item-details-url">${t('shopping.urlLabel')}</label>
           <input class="form-input" type="url" id="item-details-url" inputmode="url"
@@ -977,17 +1962,63 @@ function openItemDetails(itemId, container) {
           reportFieldError(nameEl, t('common.nameRequired'));
           return;
         }
-        const payload = {
-          name,
-          quantity: qtyEl.value.trim() || null,
-          category: catEl.value,
-          notes: notesEl.value.trim() || null,
-          url: urlEl.value.trim() || null,
-        };
+        const priceEl = panel.querySelector('#item-details-price');
+        const storeEl = panel.querySelector('#item-details-store');
+        // Der Preis kommt als Text herein und geht als ganze Cent hinaus: Geld
+        // als Gleitkomma summiert sich sichtbar falsch, und die Historie, die
+        // spaeter darauf aufbaut, addiert genau solche Zahlen. Ein leeres Feld
+        // heisst "kein Preis", nicht "null Cent".
+        const priceRoh = priceEl?.value.trim() ?? '';
+        const priceCents = priceRoh === '' ? null : amountInputToCents(priceRoh, state.currency);
+        if (priceRoh !== '' && priceCents === null) {
+          reportFieldError(priceEl, t('budget.validAmountRequired'));
+          return;
+        }
         try {
+          // Der Laden kommt als Name herein, die Zeile speichert eine ID. Ein
+          // Name, den es noch nicht gibt, entsteht hier - der Server gibt bei
+          // einem schon vorhandenen Namen dieselbe Zeile zurueck (COLLATE
+          // NOCASE), zwei Schreibweisen werden also nicht zu zwei Laeden.
+          const storeName = storeEl?.value.trim() ?? '';
+          let storeId = null;
+          if (storeName) {
+            const bekannt = state.stores.find((st) => st.name.toLowerCase() === storeName.toLowerCase());
+            if (bekannt) {
+              storeId = bekannt.id;
+            } else {
+              const angelegt = await api.post('/shopping/stores', { name: storeName });
+              state.stores.push(angelegt.data);
+              storeId = angelegt.data.id;
+            }
+          }
+          const payload = {
+            name,
+            quantity: qtyEl.value.trim() || null,
+            category: catEl.value,
+            notes: notesEl.value.trim() || null,
+            url: urlEl.value.trim() || null,
+            price_cents: priceCents,
+            store_id: storeId,
+          };
           const data = await api.patch(`/shopping/items/${item.id}`, payload);
-          const categoryChanged = data.data.category !== item.category;
-          Object.assign(item, data.data);
+          acknowledgeOwnChange(data);
+          // DER ARTIKEL WIRD BEIM SPEICHERN NACHGESCHLAGEN, nicht beim Oeffnen
+          // festgehalten: waehrend der Dialog offen war, kann eine
+          // Live-Auffrischung `state.items` ersetzt haben - dann ist `item` ein
+          // Objekt, das nirgends mehr haengt, und die Bearbeitung landete dort
+          // statt in der Liste. Die Zeile zeigte weiter den alten Namen, und
+          // weil die Quittung die Marke vorrueckt, holte auch keine Abfrage
+          // das nach. Fehlt der Artikel ganz (jemand hat ihn inzwischen
+          // geloescht, oder er ist noch nicht wieder geladen), bleibt der
+          // Neuaufbau aus dem Bestand.
+          const aktuell = state.items.find((i) => i.id === item.id);
+          if (!aktuell) {
+            closeModal({ force: true });
+            updateItemsList(container);
+            return;
+          }
+          const categoryChanged = data.data.category !== aktuell.category;
+          Object.assign(aktuell, data.data);
           // force: der Dirty-Guard vergleicht gegen den Snapshot vom Öffnen und
           // sähe die gerade gespeicherten Felder als ungespeicherte Änderungen.
           // Ohne das fragte Speichern „Änderungen verwerfen?" (Issue #625).
@@ -999,8 +2030,8 @@ function openItemDetails(itemId, container) {
           if (categoryChanged) {
             updateItemsList(container);
           } else {
-            updateItemRow(container, item);
-            refreshItemName(container, item);
+            updateItemRow(container, aktuell);
+            refreshItemName(container, aktuell);
           }
         } catch (err) {
           window.yuvomi.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
@@ -1019,6 +2050,7 @@ function updateItemsList(container) {
     if (window.lucide) window.lucide.createIcons({ el: listEl });
     stagger(listEl.querySelectorAll('.shopping-item'));
     wireSwipeGestures(container);
+    wireItemReorder(container);
     maybeShowSwipeHint(container);
   }
   updateCheckedActions(container);
@@ -1038,12 +2070,46 @@ function parseShoppingQuantity(raw) {
   const text = String(raw ?? '').trim();
   if (!text) return fallback;
 
+  // Dieselbe Umschrift wie die Betragsfelder (utils/money.js): sie leitet Ziffern
+  // und Dezimaltrenner aus der eingestellten Region ab. Ein eigenes
+  // `replace(',', '.')` stand hier und war in beide Richtungen falsch - unter
+  // en-US gruppiert das Komma Tausender, aus „1,000 g" wurde die Menge 1, und
+  // unter ar oder fa kam eine Eingabe in östlichen Ziffern gar nicht erst an
+  // (`\d` ist ASCII). Beides ohne Fehlermeldung: die Zeile im Übernahme-Dialog
+  // stand einfach auf 1.
+  //
+  // `freeText`, weil hier nur der ANFANG gelesen wird: eine Gruppierung weiter
+  // hinten geht diese Zerlegung nichts an. Ohne das fiel „6 × 1.000 ml" auf die
+  // Menge 1 zurueck, obwohl die 6 eindeutig ist.
+  //
+  // Eine gruppierte Zahl weist die Umschrift ab und liefert einen leeren String.
+  // Dann bleibt es beim Standard, statt zwischen 1 und 1000 zu raten - dieselbe
+  // Entscheidung wie beim Preis, hier aber mit dem sanfteren Ausgang: der Dialog
+  // zeigt die Menge in einem Feld, das sich korrigieren lässt.
+  const decimal = toDecimalString(text, { freeText: true });
+  if (!decimal) return fallback;
+
   // Die Einheit braucht eine Wortgrenze davor, sonst schluckt `\b` sie bei
   // Schreibweisen wie „3x" nicht und die Menge fiele auf 1 zurück.
-  const match = text.match(/^(\d+(?:[.,]\d+)?)\s*(?:(kg|g|ml|l)\b)?/i);
+  // Der Trenner ist hier immer der Punkt - die Umschrift oben hat den der Region
+  // bereits übersetzt.
+  const match = decimal.match(/^(\d+(?:\.\d+)?)\s*(?:(kg|g|ml|l)\b)?/i);
   if (!match) return fallback;
 
-  const quantity = Number(match[1].replace(',', '.'));
+  // Bricht die Zahl mitten in einem Trennzeichen ab, ist sie nicht gelesen,
+  // sondern abgeschnitten. Die Umschrift weist zwar eine erkannte Gruppierung
+  // ab, aber nicht jede: „٢٬٥٠" hat nur zwei Stellen hinter dem Trenner, ist
+  // also kein Gruppierungsmuster - und ein Trenner, den die Region nicht kennt,
+  // steht ohnehin einfach da (unter fa trennt das ASCII-Komma nichts). Diese
+  // Regex liest nur den ANFANG und nähme daraus wortlos die 2.
+  //
+  // Über die geteilte Prüfung aus utils/money.js, die genau die Trennzeichen der
+  // wählbaren Regionen kennt: „irgendein Zeichen zwischen zwei Ziffern" war zu
+  // breit und traf „2x500 g" mit, also die Multiplikator-Schreibweise, die zwei
+  // Zeilen weiter oben ausdrücklich lesbar bleiben soll.
+  if (breaksOffAtSeparator(decimal.slice(match[1].length))) return fallback;
+
+  const quantity = Number(match[1]);
   if (!Number.isFinite(quantity) || quantity <= 0) return fallback;
 
   return { quantity, unit: match[2] ? match[2].toLowerCase() : 'pcs' };
@@ -1057,7 +2123,7 @@ function parseShoppingQuantity(raw) {
  * Vorrat einen Tap entfernt.
  */
 async function openPantryTransfer(container) {
-  const checked = state.items.filter((i) => i.is_checked);
+  const checked = state.items.filter((i) => checkedOf(i));
   if (!checked.length) return;
 
   let locations = [];
@@ -1145,7 +2211,7 @@ async function openPantryTransfer(container) {
             // Daten löschen kann (siehe routes/pantry.js).
             await api.delete(`/shopping/${listId}/items/checked`);
             const removed = checked.length;
-            state.items = state.items.filter((i) => !i.is_checked);
+            state.items = state.items.filter((i) => !checkedOf(i));
             updateItemsList(container);
             updateListCounter(listId, -removed, -removed);
             renderTabs(container);
@@ -1190,39 +2256,155 @@ async function openPantryTransfer(container) {
  *
  * `hidden` statt eines leeren Containers: die Leiste hat eine Fläche, einen Rahmen
  * und Polsterung - leer wäre sie ein sichtbarer 42px-Streifen über der Liste. Die
- * [hidden]-Durchsetzung für `.kitchen-bulkbar` steht in layout.css, weil
+ * [hidden]-Durchsetzung für `.list-bulkbar` steht in layout.css, weil
  * `display: flex` das UA-`[hidden]` sonst schlägt.
+ *
+ * ZEIGT SICH NUR NOCH ALS FUENF-SEKUNDEN-FENSTER EINES NEUEN BATCHES (#1039),
+ * ueber `pillPhase` gesteuert: `userChecked` markiert den EINEN Aufruf, der
+ * einen frischen Batch eroeffnen darf (den echten Nutzer-Abhak-Klick aus
+ * `toggleShoppingItem`); jeder andere Aufruf (Laden, Listenwechsel,
+ * Rueckgaengig) aktualisiert eine bereits sichtbare Pille hoechstens, zeigt
+ * aber nie von sich aus eine neue.
  */
-function updateCheckedActions(container) {
-  const wrap = container.querySelector('#list-header-checked');
-  if (!wrap) return;
+function updateCheckedActions(container, { userChecked = false } = {}) {
+  const checkedCount = state.items.filter((i) => checkedOf(i)).length;
+  if (!checkedCount) {
+    clearPillTimer();
+    pillPhase = 'idle';
+    pillInteracting = false;
+    pillOwnerContainer = null;
+    clearBulkPill();
+    return;
+  }
 
-  const checkedCount = state.items.filter((i) => i.is_checked).length;
-  wrap.replaceChildren();
-  wrap.hidden = !checkedCount;
-  if (!checkedCount) return;
+  // Weder ein frischer Nutzer-Treffer aus dem Ruhezustand noch eine schon
+  // sichtbare Pille: verborgen bleiben (Ladezustand, Listenwechsel, oder ein
+  // Batch, der schon einmal ausgeblendet wurde und noch nicht auf 0 fiel).
+  if (!((userChecked && pillPhase === 'idle') || pillPhase === 'visible' || pillPhase === 'deferred')) {
+    return;
+  }
 
-  const pantryEnabled = !window.yuvomi?.isModuleDisabled?.('pantry');
-  wrap.insertAdjacentHTML('beforeend', `
-    <span class="kitchen-bulkbar__label">${esc(t('shopping.checkedHint', { count: checkedCount }))}</span>
-    ${pantryEnabled ? `
-      <button class="btn btn--secondary kitchen-bulkbar__action" data-action="to-pantry">
-        <i data-lucide="archive" class="icon-sm" aria-hidden="true"></i>
-        <span>${esc(t('shopping.toPantry'))}</span>
-      </button>` : ''}
-    <!-- Nur das Verb, nicht „Abgehakt löschen": die Zeile darüber nennt den Bezug
-         („3 Artikel abgehakt."), und bei 320px sind 262px Innenbreite gemessen -
-         mit 134px für „In den Vorrat" und 169px für das lange Label brach die
-         Leiste in eine dritte Zeile (159px hoch). Mit dem Verb allein sind es
-         253px und die Leiste bleibt auf allen Breiten zweizeilig. Die Aktion ist
-         zudem rückholbar (scheduleUndoableDelete), das Löschen der ganzen Liste
-         sitzt woanders (Überlaufmenü) und hat einen Bestätigungsdialog. -->
-    <button class="btn btn--ghost kitchen-bulkbar__action" data-action="clear-checked"
-            aria-label="${esc(t('shopping.clearChecked', { count: checkedCount }))}">
-      <i data-lucide="trash-2" class="icon-sm" aria-hidden="true"></i>
-      <span>${esc(t('common.delete'))}</span>
-    </button>`);
-  if (window.lucide) window.lucide.createIcons({ el: wrap });
+  const actions = [];
+  if (!window.yuvomi?.isModuleDisabled?.('pantry')) {
+    actions.push({
+      label: t('shopping.toPantry'),
+      onClick: () => openPantryTransfer(container),
+    });
+  }
+  // Nur das Verb, nicht „Abgehakt löschen": das Label links nennt den Bezug,
+  // und der ganze Satz steht im aria-label. Das Löschen der GANZEN Liste sitzt
+  // woanders (Überlaufmenü) und hat einen eigenen Bestätigungsdialog.
+  actions.push({
+    label: t('common.delete'),
+    ariaLabel: t('shopping.clearChecked', { count: checkedCount }),
+    // Die Zahl als Marke - sie wird sichtbar, wo das Subjekt links wegfällt
+    // (unter 21rem Pillenbreite). Von den beiden Kapseln trägt sie diese, weil
+    // ein „Löschen" ohne genanntes Objekt über einer Liste mit 23 Artikeln
+    // gelesen werden kann wie „die Liste löschen".
+    count: checkedCount,
+    // DIE RÜCKFRAGE, UND ZWAR TROTZ DES UNDO (Critique 2026-08-13, P0). Die
+    // Rücknahme war hier als Begründung geführt, sie zu lassen - sie hält
+    // fünf Sekunden, sieht aus wie die Kapsel, die gerade danebenlag, und
+    // steht 8px darunter. Das ist der Rettungsweg für einen Irrtum, den man
+    // BEMERKT; die Frage ist der für den, den man nicht bemerkt.
+    danger: true,
+    confirm: { question: t('shopping.clearCheckedConfirm', { count: checkedCount }) },
+    onClick: () => clearCheckedUndoable(container),
+  });
+
+  // KEINE Icons mehr. Sie kosteten je 12px Breite plus Abstand auf einer
+  // Fläche, die einzeilig bleiben muss, und benannten nichts, was das Wort
+  // daneben nicht schon sagt - „In den Vorrat" mit Archiv-Kiste, „Löschen" mit
+  // Papierkorb. Auf dem Shell-Material trägt die Kapsel den Rang, nicht das
+  // Zeichen darin (dieselbe Form wie .toast__undo).
+  setBulkPill({
+    label: t('shopping.checkedHint', { count: checkedCount }),
+    actions,
+  });
+
+  if (pillPhase === 'idle') {
+    // Nur hier moeglich, wenn userChecked die Bedingung oben erfuellt hat: ein
+    // frischer Batch beginnt jetzt, mit genau EINER Fuenf-Sekunden-Frist.
+    pillPhase = 'visible';
+    pillOwnerContainer = container;
+    wirePillInteractionGuards();
+    schedulePillHide(container);
+  }
+  // 'visible'/'deferred': Zahl und Aktionen sind frisch, die laufende Frist
+  // bzw. die Interaktions-Verlaengerung bleibt unangetastet (Anforderung: kein
+  // Aufschub durch weitere Treffer).
+}
+
+/**
+ * Abgehakte löschen, mit Undo-Fenster. Stand bis Etappe 5 als Zweig im
+ * delegierten Klick-Handler von `container`; die Pille lebt seitdem in der
+ * Shell und ist von dort aus nicht mehr erreichbar - sie ruft direkt.
+ */
+function clearCheckedUndoable(container) {
+  const checked = state.items.filter((i) => checkedOf(i));
+  const count   = checked.length;
+  if (!count) return;
+
+  const snapshot = checked.map((i) => ({ ...i }));
+  // DIESELBE REGEL WIE BEIM EINZELNEN ARTIKEL, hier mit schwererem Preis:
+  // `commit` schlug die Liste bisher ERST beim Ausfuehren nach. Ein
+  // Listenwechsel im Undo-Fenster schickte das DELETE damit an die gerade
+  // geoeffnete Liste und raeumte deren abgehakte Artikel ab - waehrend der
+  // Snapshot zur alten gehoerte und sie also nicht zurueckholen konnte.
+  const listId = state.activeListId;
+
+  // Optimistisch entfernen - und als schwebend vermerken, damit eine
+  // Live-Auffrischung im Undo-Fenster die Zeilen nicht zurueckbringt.
+  for (const item of checked) pendingRemovals.set(item.id, { listId, checked: true, removedAt: null });
+  state.items = state.items.filter((i) => !checkedOf(i));
+  updateItemsList(container);
+  updateListCounter(listId, -count, -count);
+  renderTabs(container);
+
+  scheduleUndoableDelete({
+    message: t('shopping.itemsRemovedToast', { count }),
+    commit: async ({ keepalive }) => {
+      let response;
+      try {
+        // GENAU DIE ARTIKEL, DIE DIE SEITE ENTFERNT HAT - nicht, was beim
+        // Eintreffen abgehakt ist. Hat jemand anderes im Undo-Fenster einen
+        // weiteren Artikel abgehakt (und eine Auffrischung ihn hergebracht),
+        // naehme die Route ohne Liste ihn mit, und das Zuruecknehmen braechte
+        // nur den eigenen Schnappschuss zurueck.
+        response = await api.delete(`/shopping/${listId}/items/checked`, {
+          keepalive,
+          body: JSON.stringify({ ids: checked.map((item) => item.id) }),
+        });
+      } catch (err) {
+        // Sofort raeumen: `restore` bringt die Zeilen zurueck, und jede Antwort
+        // darf sie wieder tragen.
+        for (const item of checked) pendingRemovals.delete(item.id);
+        throw err;
+      }
+      // Weniger als erbeten heisst: jemand hat einen der unseren im Fenster
+      // zurueckgeholt, und der Server hat ihn behalten. Dann meint die Quittung
+      // WENIGER als die eigene Anzeige, und rueckte sie die Marke vor, lade
+      // keine Abfrage nach - die Zeile fehlte, bis die Liste sich das naechste
+      // Mal bewegt. Also gilt sie nur, wenn der Server genau so viele entfernt
+      // hat, wie die Seite entfernt hat - sonst sieht die naechste Abfrage die
+      // Bewegung und holt die Zeile her.
+      if (response?.deleted === count) acknowledgeOwnChange(response);
+      confirmRemovals(checked.map((item) => item.id));
+    },
+    restore: (err) => {
+      for (const item of checked) pendingRemovals.delete(item.id);
+      if (state.activeListId === listId) {
+        // Nur, was nicht schon wieder da ist - sonst stuende es zweimal.
+        const vorhanden = new Set(state.items.map((i) => i.id));
+        snapshot.forEach((item) => { if (!vorhanden.has(item.id)) state.items.push(item); });
+        state.items.sort((a, b) => a.id - b.id);
+        updateItemsList(container);
+      }
+      updateListCounter(listId, count, count);
+      renderTabs(container);
+      if (err) window.yuvomi.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+    },
+  });
 }
 
 function updateListCounter(listId, totalDelta, checkedDelta) {
@@ -1235,7 +2417,7 @@ function updateListCounter(listId, totalDelta, checkedDelta) {
 
 function openMealPlanImport(container) {
   if (!state.activeListId) return;
-  const today = toLocalDateKey(new Date());
+  const today = todayKey();
   const defaultTo = addLocalDays(today, 6);
 
   openModal({
@@ -1333,9 +2515,20 @@ function openMealPlanImport(container) {
 // --------------------------------------------------------
 
 async function loadLists() {
+  // In der Ladeordnung, weil die Schwebe der Loeschungen wissen muss, ob diese
+  // Antwort vor oder nach einem DELETE begonnen hat (siehe `pendingRemovals`).
+  const startedAt = beginLoad();
   try {
     const data   = await api.get('/shopping');
     state.lists  = data.data ?? [];
+    // Der Zaehler im Reiter zeigt, was die Zeilen zeigen: ein Artikel im
+    // Undo-Fenster ist fuer den Server noch da, fuer die Anzeige nicht mehr
+    // (`pendingRemovals`) - sonst zaehlte die Auffrischung ihn wieder mit, und
+    // das Zuruecknehmen buchte ihn ein zweites Mal dazu. Dasselbe fuer eine
+    // Antwort, die vor dem DELETE losging: der Server zaehlte ihn da noch.
+    for (const entry of pendingRemovals.values()) {
+      if (removalHides(entry, startedAt)) updateListCounter(entry.listId, -1, entry.checked ? -1 : 0);
+    }
     state.listsError = null;
   } catch (err) {
     console.error('[Shopping] loadLists Fehler:', err);
@@ -1344,6 +2537,8 @@ async function loadLists() {
     // [Neue Liste erstellen]" stehen blieb - bei 31 vorhandenen Artikeln
     // (Critique P0, 2026-07-30).
     state.listsError = err;
+  } finally {
+    endLoad(startedAt);
   }
 }
 
@@ -1356,16 +2551,110 @@ async function loadCategories() {
   }
 }
 
+/* Laeden und Waehrung fuer das Preisfeld (#1003).
+ *
+ * Beide Ausfaelle sind still und harmlos: ohne Laeden bleibt die Auswahl leer
+ * (der Preis laesst sich trotzdem eintragen), ohne Waehrung gilt EUR. Ein
+ * Einkaufszettel, der wegen eines Nebenfeldes gar nicht aufgeht, waere der
+ * schlechtere Tausch. */
+async function loadStores() {
+  try {
+    const data   = await api.get('/shopping/stores');
+    state.stores = data.data ?? [];
+  } catch {
+    state.stores = [];
+  }
+  try {
+    const prefs    = await api.get('/preferences');
+    state.currency = prefs.data?.currency ?? 'EUR';
+  } catch { /* EUR bleibt */ }
+}
+
 async function loadItems(listId) {
-  const data       = await api.get(`/shopping/${listId}/items`);
-  state.items      = data.data ?? [];
-  state.activeList = data.list ?? null;
-  // Kategorien aus API-Antwort übernehmen wenn vorhanden (immer aktuell)
-  if (data.categories?.length) state.categories = data.categories;
+  const startedAt = beginLoad();
+  // try/finally um den ganzen Rundlauf: die Ladeordnung schliesst ihn ab, ob
+  // er angewandt, verworfen oder gescheitert ist (siehe `endLoad`).
+  try {
+    // `getWithSource`, weil dieser Pfad in der Offline-Whitelist des Service
+    // Workers steht (`API_CACHE_WHITELIST` in sw.js): faellt das Netz aus, kommt
+    // die zuletzt gecachte Antwort mit Status 200 zurueck, und die ist von einer
+    // frischen sonst nicht zu unterscheiden.
+    const { data, fromCache } = await api.getWithSource(`/shopping/${listId}/items`);
+    // Ein Rundlauf kann von einem Listenwechsel ueberholt werden. Alle sechs
+    // Aufrufer laden die GERADE aktive Liste - `switchList` setzt
+    // `state.activeListId` sogar vor dem Warten -, die Antworten kommen aber in
+    // beliebiger Reihenfolge zurueck. Wer nicht mehr die aktive Liste ist, darf
+    // den globalen Stand nicht mehr anfassen: sonst stuenden die Artikel der
+    // alten Liste unter dem neuen Reiter, und die naechste Bearbeitung traefe
+    // die falschen. Das Fenster ist seit #1066 breiter geworden, weil die
+    // Auffrischung des Kategorie-Managers laeuft, waehrend die Seite wieder
+    // bedienbar ist.
+    if (state.activeListId !== listId) return;
+    // Wer aelter ist als das, was schon steht, fasst den Stand nicht mehr an.
+    // Die Wache darueber deckt das nicht ab: dieselbe Liste, zwei Rundlaeufe.
+    // Nur eine netzfrische Antwort setzt die Marke - bei wackligem Netz scheitert
+    // die spaeter begonnene Anfrage oft zuerst und wird aus dem Cache bedient.
+    if (startedAt < (_appliedLoad.get(listId) ?? 0)) return;
+    // EINE GECACHTE ANTWORT ERSETZT KEINEN FRISCHEREN STAND. Sie ist beliebig
+    // alt; steht fuer diese Liste schon etwas Netzfrisches, waere sie ein
+    // Rueckschritt - offline gehoert der zuletzt bekannte Stand auf den Schirm,
+    // nicht ein aelterer. Nur wenn noch gar nichts geladen wurde, ist sie das
+    // Beste, was es gibt.
+    // ... aber nur, wenn `state.items` diese Liste ueberhaupt zeigt. Gehoert der
+    // Bestand einer anderen, ist die gecachte Antwort das Beste, was es gibt -
+    // und allemal besser als die Artikel der falschen Liste.
+    if (fromCache && _appliedLoad.has(listId) && _itemsListId === listId) return;
+    if (!fromCache) _appliedLoad.set(listId, startedAt);
+
+    // `state.items` traegt NUR den Serverstand - die Absichten liegen daneben und
+    // ueberlagern beim Zeichnen. Deshalb wird hier nichts aufgetragen; es faellt
+    // nur, was die Antwort erfuellt hat.
+    // EIN BESTAETIGTER ARTIKEL WIRD VON EINER AELTEREN ANTWORT NICHT
+    // ZURUECKGEDREHT. Die Antwort selbst bleibt gueltig - ihre uebrigen Artikel,
+    // die Liste und die Kategorien werden gebraucht -, nur der eine Wert, von
+    // dem wir sicher wissen, dass er juenger ist, bleibt stehen.
+    const vorherige = new Map(state.items.map((i) => [i.id, i]));
+    // EIN LOKAL GELOESCHTER ARTIKEL KOMMT NICHT ZURUECK, solange sein Undo-Fenster
+    // laeuft: der Server hat ihn noch, die Anzeige nicht mehr (`pendingRemovals`).
+    // Nur so ist der Bestand nach einer Auffrischung "Serverstand ohne die
+    // schwebenden Loeschungen" - und die Quittung des spaeteren DELETE stimmt.
+    // Und auch nicht aus einer Antwort, die VOR dem DELETE losging und erst
+    // danach eintrifft: sie hat den Server gelesen, als er den Artikel noch hatte.
+    const frisch = (data.data ?? []).filter((i) => {
+      const entry = pendingRemovals.get(i.id);
+      return !entry || !removalHides(entry, startedAt);
+    });
+    for (const item of frisch) {
+      const bestaetigt = settledAt.get(item.id);
+      if (bestaetigt != null && bestaetigt >= startedAt) {
+        const alt = vorherige.get(item.id);
+        if (alt) item.is_checked = alt.is_checked;
+      }
+    }
+    state.items = frisch;
+    _itemsListId = listId;
+    settleIntents(state.items, listId, { fromCache, startedAt });
+    state.activeList = data.list ?? null;
+    // Dem Feed sagen, welchen Stand die Seite jetzt haelt: die Antwort traegt
+    // die Laufnummer, zu der ihre Artikel gehoeren. Auch eine gecachte - sie
+    // IST der Stand, den die Seite zeigt, und liegt er unter der Laufnummer,
+    // ist das Nachladen bei der naechsten Abfrage genau richtig.
+    _liveFeed?.hold(listId, data.version);
+    // Kategorien aus API-Antwort übernehmen wenn vorhanden (immer aktuell)
+    if (data.categories?.length) state.categories = data.categories;
+  } finally {
+    endLoad(startedAt);
+  }
 }
 
 async function switchList(listId, container) {
+  // Die Pille gehoert zur Teilmenge EINER Liste (dieselbe Regel wie beim
+  // Seitenwechsel in router.js) - eine laufende Frist der alten Liste darf die
+  // neue nicht treffen (#1039).
+  resetPillMachine();
+  clearBulkPill();
   state.activeListId = listId;
+  state.collapsedCategories = loadCollapsedCategories(state.currentUserId, listId);
   renderTabs(container);
   // Lade-Feedback beim Listenwechsel: dimmt den alten Inhalt (CSS), meldet
   // Screenreadern „busy" — bis renderListContent den neuen Inhalt setzt.
@@ -1375,12 +2664,218 @@ async function switchList(listId, container) {
     state.itemsError = null;
   } catch (err) {
     console.error('[Shopping] loadItems Fehler:', err);
-    state.items = [];
+    clearItems();
     state.activeList = state.lists.find((l) => l.id === listId) ?? null;
     state.itemsError = err;
   }
   renderListContent(container);
   wireListContentEvents(container);
+}
+
+// --------------------------------------------------------
+// Live-Aktualisierung
+// --------------------------------------------------------
+
+/**
+ * Takt der Laufnummern-Abfrage (GET /shopping/versions), solange der Tab
+ * sichtbar ist. Zehn Sekunden sind der Tausch zwischen "es hat sich
+ * aktualisiert" neben jemandem im Laden und einem Server, der von jedem
+ * offenen Zettel eine kleine Anfrage je Takt bekommt - und einem Haushalt
+ * hinter EINER Adresse, der sich den Limiter (300/min) teilt.
+ */
+const LIVE_POLL_MS = 10_000;
+
+/** Controller der laufenden Live-Verdrahtung: faellt mit dem Router-Signal und beim naechsten render(). */
+let _liveController = null;
+/** Der laufende Feed - fuer die Quittung eigener Schreibvorgaenge. */
+let _liveFeed = null;
+/** Das Router-Signal des letzten Aufbaus - der Retry-Knopf reicht es an sein render() weiter. */
+let _routeSignal = null;
+
+/**
+ * Die Quittung eines eigenen Schreibvorgangs an den Feed reichen.
+ *
+ * Die Artikel-Routen antworten mit `list_change: { list_id, before, after }`.
+ * Ist `before` der Stand, den der Feed zuletzt gesehen hat, ist alles bis
+ * `after` das eigene Werk, und die naechste Abfrage laedt die Liste nicht
+ * umsonst nach - das waeren sonst zwei Anfragen je Tab und Haken, auch fuer
+ * den Tab, der den Haken gesetzt hat.
+ */
+function acknowledgeOwnChange(response) {
+  _liveFeed?.acknowledge(response?.list_change);
+}
+
+/**
+ * Was ein frischer Stand an der Zeilen-Ansicht aendert.
+ *
+ * Zwei Faelle, und sie sind mit Absicht verschieden gross. Hat sich nur der
+ * Abgehakt-Zustand bewegt - der haeufige Fall, zwei Leute im selben Laden -,
+ * wird die Zeile an Ort und Stelle umgefaerbt, wie beim eigenen Antippen: kein
+ * Neuaufbau, keine Einblend-Animation, die Scroll-Position bleibt (#276), und
+ * die Reihenfolge auch - Abgehaktes sortiert sich beim naechsten Aufbau ans
+ * Ende, nicht unter dem Finger weg. Ist ein Artikel dazugekommen, verschwunden,
+ * umbenannt oder umsortiert, wird die Liste neu gebaut; das ist der Fall, den
+ * die Animation meint. Umsortiert heisst: sein `sort_order` hat sich bewegt -
+ * die Reihenfolge der ANTWORT allein nicht, denn die aendert sich schon mit
+ * einem Haken (Abgehaktes sortiert der Server ans Ende), und ein Haken darf
+ * keinen Neuaufbau kosten. Das Ziehen eines anderen bewegt `sort_order`; das
+ * Abhaken laesst es stehen.
+ *
+ * Verglichen wird der SERVERSTAND vor und nach dem Laden, nicht das DOM: die
+ * Seite haelt beides ohnehin deckungsgleich, und `updateItemRow` zeichnet die
+ * Ueberlagerung mit der eigenen Absicht selbst (`checkedOf`).
+ */
+function liveRefreshPlan(previous, fresh) {
+  const shape = (i) => JSON.stringify([
+    i.id, i.category, i.name, i.quantity ?? '', i.notes ? 1 : 0, i.url ? 1 : 0,
+    i.price_cents ?? '', i.store_id ?? '', i.tags ?? [], i.sort_order ?? '',
+  ]);
+  const before = previous.map(shape).sort();
+  const after  = fresh.map(shape).sort();
+  if (before.length !== after.length || before.some((s, idx) => s !== after[idx])) {
+    return { rebuild: true, changed: [] };
+  }
+  const checkedBefore = new Map(previous.map((i) => [i.id, i.is_checked]));
+  return {
+    rebuild: false,
+    changed: fresh.filter((i) => checkedBefore.get(i.id) !== i.is_checked),
+  };
+}
+
+/**
+ * Eine Liste nachladen, weil der Feed sie gemeldet hat.
+ *
+ * Still bei Fehlern, wie der stille Refresh des Dashboards: der Zettel zeigt
+ * weiter den letzten bekannten Stand, und die naechste Meldung versucht es
+ * wieder. Nur die AKTIVE Liste laedt ihre Artikel; fuer jede andere reicht die
+ * Listenzeile mit ihrem Zaehler, und `switchList` laedt ohnehin frisch.
+ *
+ * Die eigene Bearbeitung ueberlebt das Nachladen: `loadItems` traegt nur den
+ * Serverstand ein, die Absicht liegt daneben und faellt erst, wenn die Antwort
+ * sie traegt (`settleIntents`). Deshalb darf der Feed auch die eigene
+ * Aenderung melden - die Antwort darauf ist genau die, die die Absicht erfuellt.
+ */
+async function refreshFromFeed(container, listId, signal) {
+  if (state.listsError) return;
+  const active        = listId === state.activeListId;
+  const previous      = state.items;
+  const previousLists = state.lists;
+  // BEIDE Antworten abwarten, nicht nur bis zur ersten Ablehnung. `loadLists`
+  // faengt selbst und vermerkt in `state.listsError`; brach `Promise.all` mit
+  // dem Scheitern von `loadItems` ab, waehrend `loadLists` noch unterwegs war,
+  // stand der Merker beim Lesen unten noch auf null und wurde DANACH gesetzt -
+  // und blieb: die Wache oben wies ab da jede Meldung ab, ohne Fehlerbild,
+  // mit leeren Reitern, bis zum naechsten Seitenaufbau.
+  const [, items] = await Promise.allSettled([loadLists(), active ? loadItems(listId) : null]);
+  const itemsFailed = items.status === 'rejected';
+  if (itemsFailed) console.warn('[Shopping] Live-Aktualisierung fehlgeschlagen:', items.reason);
+  // loadLists() faengt selbst und vermerkt den Fehler fuer den Seitenaufbau,
+  // wo er ein Fehlerbild mit Wiederholung ergibt. Fuer eine STILLE
+  // Auffrischung ist derselbe Vermerk das Gegenteil von still: leere Reiter
+  // und ein Merker, der jede weitere Meldung abwiese. Also zurueck auf den
+  // letzten Stand, und die naechste Meldung versucht es wieder.
+  const listsFailed = Boolean(state.listsError);
+  if (listsFailed) {
+    state.listsError = null;
+    state.lists = previousLists;
+  }
+  if (signal.aborted) return;
+  // Was `loadItems` in `state.items` eingetragen hat, kommt auf den Schirm -
+  // auch wenn die Listenzeile daneben gescheitert ist. Kehrte die Auffrischung
+  // hier um, hielte die Seite einen Stand, den sie nie gezeichnet hat; die
+  // naechste Meldung vergleicht Serverstand mit Serverstand (`liveRefreshPlan`),
+  // faende nichts Neues, und die Zeile erschiene nie.
+  //
+  // Die aktive Liste ist weg - jemand anderes hat sie geloescht. Der Zettel
+  // wechselt auf die erste verbliebene oder zeigt den Leerzustand, statt eine
+  // Liste zu zeigen, die es nicht mehr gibt. Das kann nur eine frische
+  // Listenantwort sagen, nicht der zurueckgeholte Stand.
+  if (!listsFailed && state.activeListId != null && !state.lists.some((l) => l.id === state.activeListId)) {
+    if (state.lists.length) {
+      await switchList(state.lists[0].id, container);
+      return;
+    }
+    state.activeListId = null;
+    state.activeList = null;
+    clearItems();
+    renderTabs(container);
+    renderListContent(container);
+    return;
+  }
+  renderTabs(container);
+  // Inzwischen umgeschaltet: switchList zeichnet die neue Liste selbst.
+  if (!active || state.activeListId !== listId) return;
+  // Gescheitert heisst: `state.items` ist unangetastet, es gibt nichts zu zeichnen.
+  if (itemsFailed) return;
+  if (state.itemsError) {
+    // Der Fehlerzustand von vorhin ist ueberholt - die Antwort ist da.
+    state.itemsError = null;
+    updateItemsList(container);
+    return;
+  }
+  const plan = liveRefreshPlan(previous, state.items);
+  if (plan.rebuild) {
+    updateItemsList(container);
+    return;
+  }
+  for (const item of plan.changed) updateItemRow(container, item);
+  if (plan.changed.length) updateCheckedActions(container);
+}
+
+/**
+ * Die Live-Aktualisierung eines Seitenaufbaus verdrahten. Alles haengt am
+ * Signal DIESES Aufbaus (#976-Muster): der naechste Aufbau bricht den vorigen
+ * ab, und das Router-Signal reisst beide beim Verlassen der Seite mit.
+ *
+ * Der Feed fragt die Laufnummern im Takt ab, solange der Tab sichtbar ist,
+ * und sofort, wenn er sichtbar wird oder den Fokus bekommt - das ist der
+ * Moment, in dem jemand aufs Telefon schaut und den aktuellen Stand erwartet.
+ *
+ * Meldungen laufen durch EINE Warteschlange: zwei Listen in einer Antwort
+ * ergeben ein Nachladen nach dem anderen, nicht zwei, die sich ueberholen.
+ */
+function wireLiveUpdates(container, routeSignal) {
+  _liveController?.abort();
+  const controller = createPageController(routeSignal);
+  _liveController = controller;
+  const { signal } = controller;
+  if (signal.aborted) return;
+
+  const queue = new Set();
+  let draining = false;
+  const drain = async () => {
+    if (draining) return;
+    draining = true;
+    try {
+      while (queue.size && !signal.aborted) {
+        const [listId] = queue;
+        queue.delete(listId);
+        await refreshFromFeed(container, listId, signal);
+      }
+    } finally {
+      draining = false;
+    }
+  };
+  const request = (listId) => {
+    if (signal.aborted || listId == null) return;
+    queue.add(listId);
+    drain();
+  };
+
+  const feed = startLiveFeed({
+    fetchVersions: async () => (await api.get('/shopping/versions')).data ?? [],
+    onChange: request,
+    signal,
+    intervalMs: LIVE_POLL_MS,
+  });
+  _liveFeed = feed;
+  signal.addEventListener('abort', () => { if (_liveFeed === feed) _liveFeed = null; });
+
+  // Die erste Abfrage setzt die Marken; sie laeuft neben dem Laden der Seite.
+  feed.poll();
+  const wake = () => { if (!document.hidden) feed.poll(); };
+  document.addEventListener('visibilitychange', wake, { signal });
+  window.addEventListener('focus', wake, { signal });
 }
 
 // --------------------------------------------------------
@@ -1403,6 +2898,7 @@ function wireTabBar(container) {
         const data = await api.post('/shopping', { name });
         state.lists.push({ ...data.data, item_total: 0, item_checked: 0 });
         await switchList(data.data.id, container);
+        refocusAfterRender();
       } catch (err) {
         window.yuvomi.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
       }
@@ -1411,12 +2907,12 @@ function wireTabBar(container) {
 }
 
 function wireListContentEvents(container) {
-  // Delegations-Wurzel ist der Modul-Root, nicht mehr #list-content: der Kopf
-  // (#list-head) ist seit dem Umstieg auf .page-toolbar ein Geschwister von
-  // #list-content, seine Aktionen (rename-list, import-meals,
-  // manage-categories, delete-list) liegen also außerhalb. .shopping-page ist
-  // der nächste gemeinsame Vorfahre und wird - genau wie #list-content vorher -
-  // pro render() genau einmal erzeugt, womit die Einmal-Bindung unten weiter gilt.
+  // Delegations-Wurzel ist der Modul-Root, nicht #list-content: die Aktionen der
+  // Liste (rename-list, import-meals, manage-categories, delete-list) stehen im
+  // Überlaufmenü der Chip-Leiste und liegen damit außerhalb des Inhalts.
+  // .shopping-page ist der nächste gemeinsame Vorfahre und wird - genau wie
+  // #list-content vorher - pro render() genau einmal erzeugt, womit die
+  // Einmal-Bindung unten weiter gilt.
   const root = container.querySelector('.shopping-page');
   if (!root) return;
 
@@ -1424,17 +2920,24 @@ function wireListContentEvents(container) {
   // die Kinder (replaceChildren), nicht das Element selbst - würde der Listener
   // bei jedem switchList/rename erneut gebunden, feuerte ein Toggle-Klick
   // mehrfach und höbe sich auf (Issue #398).
-  // Positionierung und Schließen des Kopf-Überlaufmenüs. Idempotent, hängt an
+  // Positionierung und Schließen der Überlaufmenüs. Idempotent, hängt an
   // derselben stabilen Wurzel wie die Klick-Delegation.
   installPopoverMenus(root);
 
-  if (root.dataset.eventsWired) {
-    wireRenameKeydown(root);
-    return;
-  }
+  if (root.dataset.eventsWired) return;
   root.dataset.eventsWired = 'true';
 
   root.addEventListener('click', async (e) => {
+    // ---- Kategorie auf-/zuklappen (#1039) ----
+    // Eigener, frueher Zweig statt eines weiteren [data-action]-Falls: die
+    // uebrigen Aktionen loesen serverseitige Aenderungen aus, dieser hier
+    // toggelt nur lokal sichtbares DOM - kein `await`, kein try/catch noetig.
+    const catToggle = e.target.closest('[data-category-toggle]');
+    if (catToggle) {
+      toggleCategoryCollapse(catToggle);
+      return;
+    }
+
     const target = e.target.closest('[data-action]');
     if (!target) {
       if (shouldIgnoreShoppingRowToggle(e.target)) return;
@@ -1461,58 +2964,7 @@ function wireListContentEvents(container) {
 
     // ---- Artikel löschen (mit Undo, 5s Fenster) ----
     if (action === 'delete-item') {
-      const id        = Number(target.dataset.id);
-      const item      = state.items.find((i) => i.id === id);
-      const snapshot  = item ? { ...item } : null;
-
-      // Optimistisch entfernen
-      state.items = state.items.filter((i) => i.id !== id);
-      updateItemsList(container);
-      updateListCounter(state.activeListId, -1, snapshot?.is_checked ? -1 : 0);
-      renderTabs(container);
-
-      scheduleUndoableDelete({
-        message: t('shopping.itemDeletedToast', { name: snapshot?.name ?? '' }),
-        commit: ({ keepalive }) => api.delete(`/shopping/items/${id}`, { keepalive }),
-        restore: (err) => {
-          if (snapshot) {
-            state.items.push(snapshot);
-            state.items.sort((a, b) => a.id - b.id);
-            updateItemsList(container);
-            updateListCounter(state.activeListId, 1, snapshot.is_checked ? 1 : 0);
-            renderTabs(container);
-          }
-          if (err) window.yuvomi.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
-        },
-      });
-    }
-
-    // ---- Abgehakte löschen (mit Undo, 5s Fenster) ----
-    if (action === 'clear-checked') {
-      const checked = state.items.filter((i) => i.is_checked);
-      const count   = checked.length;
-      if (!count) return;
-
-      const snapshot = checked.map((i) => ({ ...i }));
-
-      // Optimistisch entfernen
-      state.items = state.items.filter((i) => !i.is_checked);
-      updateItemsList(container);
-      updateListCounter(state.activeListId, -count, -count);
-      renderTabs(container);
-
-      scheduleUndoableDelete({
-        message: t('shopping.itemsRemovedToast', { count }),
-        commit: ({ keepalive }) => api.delete(`/shopping/${state.activeListId}/items/checked`, { keepalive }),
-        restore: (err) => {
-          snapshot.forEach((item) => state.items.push(item));
-          state.items.sort((a, b) => a.id - b.id);
-          updateItemsList(container);
-          updateListCounter(state.activeListId, count, count);
-          renderTabs(container);
-          if (err) window.yuvomi.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
-        },
-      });
+      deleteItemUndoable(Number(target.dataset.id), container);
     }
 
     // ---- Kategorien verwalten ----
@@ -1520,12 +2972,22 @@ function wireListContentEvents(container) {
       openCategoryManager(container);
     }
 
+    // ---- Laeden verwalten (#1003) ----
+    if (action === 'manage-stores') {
+      openStoreManager(container);
+    }
+
     if (action === 'import-meals') {
       openMealPlanImport(container);
     }
 
-    if (action === 'to-pantry') {
-      await openPantryTransfer(container);
+    if (action === 'send-list') {
+      await openSendListDialog(container);
+    }
+
+    // ---- Liste duplizieren (#1103) ----
+    if (action === 'duplicate-list') {
+      await openDuplicateListDialog(container);
     }
 
     // ---- Liste umbenennen ----
@@ -1540,6 +3002,7 @@ function wireListContentEvents(container) {
         renderTabs(container);
         renderListContent(container);
         wireListContentEvents(container);
+        refocusAfterRender();
       } catch (err) {
         window.yuvomi.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
       }
@@ -1572,7 +3035,7 @@ function wireListContentEvents(container) {
         state.items.length
           ? t('shopping.deleteListConfirm', { name: state.activeList?.name ?? '', count: state.items.length })
           : t('shopping.deleteListConfirmEmpty', { name: state.activeList?.name ?? '' }),
-        { danger: true, confirmLabel: t('common.delete') },
+        { danger: true, confirmLabel: t('common.delete'), detail: t('shopping.deleteListConfirmDetail') },
       );
       if (!confirmed) return;
 
@@ -1581,8 +3044,9 @@ function wireListContentEvents(container) {
       state.activeListId = state.lists[0]?.id ?? null;
       if (state.activeListId) {
         await switchList(state.activeListId, container);
+        refocusAfterRender();
       } else {
-        state.items = [];
+        clearItems();
         state.activeList = null;
         renderTabs(container);
         renderListContent(container);
@@ -1591,7 +3055,14 @@ function wireListContentEvents(container) {
 
       scheduleUndoableDelete({
         message: t('shopping.deletedListToast'),
-        commit: ({ keepalive }) => api.delete(`/shopping/${deletedListId}`, { keepalive }),
+        commit: async ({ keepalive }) => {
+          await api.delete(`/shopping/${deletedListId}`, { keepalive });
+          // Erst wenn das Loeschen wirklich feststeht (Undo-Fenster verstrichen):
+          // ein rueckgaengig gemachtes Loeschen soll den Klapp-Zustand behalten.
+          try {
+            localStorage.removeItem(collapsedCategoriesStorageKey(state.currentUserId, deletedListId));
+          } catch { /* Privatmodus/Quota - unschaedlich, die Zeile war ohnehin verwaist */ }
+        },
         restore: async (err) => {
           // Der Server hat nichts gelöscht (der Commit war aufgeschoben) - die Liste
           // muss also nur zurück in den State und an ihren alten Platz in der Leiste.
@@ -1609,20 +3080,13 @@ function wireListContentEvents(container) {
       });
     }
   });
-
-  wireRenameKeydown(root);
 }
 
-/**
- * Verdrahtet „Rename per Enter" auf dem Listen-Titel. Das Element wird bei jedem
- * renderListContent neu erzeugt, daher muss diese Bindung pro Render erfolgen —
- * im Gegensatz zur delegierten Klick-Bindung an der stabilen Wurzel (Issue #398).
- */
-function wireRenameKeydown(root) {
-  root.querySelector('[data-action="rename-list"]')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') e.currentTarget.click();
-  });
-}
+// Hier stand `wireRenameKeydown`: eine Bindung, die „Enter" auf dem Listen-Titel
+// in einen Klick übersetzte. Sie war nötig, weil der Titel ein `<span
+// role="button" tabindex="0">` war - ein nachgebauter Knopf, dem der Browser
+// keine Tastaturbedienung schenkt. Umbenennen ist jetzt ein echter `<button>` im
+// Überlaufmenü und braucht dafür keine Zeile JS.
 
 // --------------------------------------------------------
 // Kategorie-Verwaltung (kanonischer Ort, früher in Settings)
@@ -1636,23 +3100,129 @@ function wireRenameKeydown(root) {
  * @param {object}  [opts]
  * @param {boolean} [opts.fromDeepLink] true, wenn via ?manage=categories geöffnet
  */
+/**
+ * Laeden verwalten (#1003) - derselbe Manager wie fuer die Kategorien.
+ *
+ * Eine eigene Komponente waere die zweite Bauart fuer dieselbe Sache: eine
+ * kurze, benannte Liste anlegen, umbenennen, loeschen. Der Manager kann das
+ * bereits und braucht nur einen anderen `basePath`; deshalb hat der Server oben
+ * ein PUT bekommen, das die Form spricht, die diese Komponente erwartet.
+ *
+ * Er haengt im Listenmenue und nicht im Artikel-Dialog: das geteilte Modal
+ * kennt kein Stacking, ein Manager ueber dem Formular raeumte es weg. Angelegt
+ * wird ein Laden deshalb beim Speichern des Artikels (siehe Combobox oben),
+ * umbenannt und geloescht hier.
+ * @param {Element} container Seiten-Container
+ */
+function openStoreManager(container) {
+  // Die Arbeit haengt am Ereignis, nicht am Schliessen: `confirmOverModal`
+  // raeumt beim Loeschen das Modal darunter gleich mit ab, das
+  // `category-manager-changed` kommt also erst DANACH. Ein in onClose
+  // ausgewerteter Merker stuende hier auf false, und `state.stores` boete
+  // weiter einen Laden an, den es nicht mehr gibt - die naechste Speicherung
+  // liefe in die 400-Antwort des Servers (gemessen 08.09.).
+  const onChanged = async () => {
+    await Promise.all([loadStores(), loadItems(state.activeListId)]);
+    updateItemsList(container);
+  };
+
+  openModal({
+    title: t('shopping.manageStores'),
+    content: '<yuvomi-category-manager></yuvomi-category-manager>',
+    onSave: (panel) => {
+      const manager = panel.querySelector('yuvomi-category-manager');
+      if (!manager) return;
+      manager.addEventListener('category-manager-changed', onChanged);
+      manager.configure({
+        basePath: '/shopping/stores',
+        titleKey: 'shopping.manageStores',
+        hintKey: 'shopping.storesHint',
+        // Der Standard liest "Neue Kategorie" - in einem Dialog mit dem Titel
+        // "Laeden verwalten" waere das derselbe Bruch wie beim Vorrat.
+        addPlaceholderKey: 'shopping.addStore',
+        // Frage UND Folgentext: der Standard fragte "Kategorie ... loeschen?"
+        // in einem Dialog, der "Laeden verwalten" heisst. Der Fremdschluessel
+        // steht ausserdem auf SET NULL, nicht auf einer Ersatzzuordnung wie bei
+        // den Kategorien dieses Moduls.
+        deleteConfirmKey: 'shopping.storeDeleteConfirm',
+        deleteDetailKey: 'shopping.storeDeleteConfirmDetail',
+      });
+    },
+    // Bewusst KEIN onClose, das den Listener abmeldet: gemessen kommt das
+    // Ereignis des Loeschens erst, wenn das Element schon aus dem Dokument ist
+    // (confirmOverModal raeumt das Modal darunter mit ab, api.delete laeuft
+    // danach weiter). Wer beim Schliessen abmeldet, verpasst genau die
+    // Aenderung, die state.stores veralten laesst - und der Artikel-Dialog boete
+    // danach einen Laden an, den der Server nicht mehr kennt (400 beim
+    // Speichern). Das Element entsteht je Oeffnen neu und wird mit dem Overlay
+    // verworfen; der Listener geht mit ihm.
+  });
+}
+
 async function openCategoryManager(container, { fromDeepLink = false } = {}) {
   const { openModal } = await import('/components/modal.js');
 
-  let changed = false;
   // Die geteilte Komponente (Audit F-15) dispatcht ohne Detail — der lokale
   // State wird nach jeder Mutation frisch vom Server geladen.
+  //
+  // Und wie beim Laden-Manager oben haengt die Auffrischung am Ereignis, nicht
+  // am Schliessen: beim Loeschen raeumt `confirmOverModal` das Modal darunter
+  // ab, bevor `api.delete` laeuft. Ein in onClose ausgewerteter `changed`-Merker
+  // stuende genau dann auf false, und die sichtbare Liste behielte ihre
+  // Gruppierung nach einer Kategorie, die es nicht mehr gibt.
+  //
+  // Und es reichen NICHT die Kategorien allein. Anders als Aufgaben, Kontakte
+  // und Budget, die ueber einen stabilen `key` zeigen, steht die Kategorie im
+  // Einkauf als NAME in `shopping_items.category` - der Server schreibt also in
+  // die Artikelzeilen: Umbenennen per `UPDATE shopping_items SET category = ?`,
+  // Loeschen weist sie der naechsten Kategorie zu. `loadCategories()` fasst
+  // `state.items` nicht an, und `groupItemsByCategory` liest den Namen von dort;
+  // die Zeilen landeten sonst unter der alten Ueberschrift am Listenende.
   const onCategoriesChanged = async () => {
-    changed = true;
+    // Die Seite kann unter diesem Handler weggezogen sein. Kommt der Manager
+    // aus dem Deep-Link `?manage=categories`, navigiert onClose sofort auf
+    // /shopping - und weil diese Seite kein `update()` anbietet, baut der Router
+    // sie ganz neu auf (`content.replaceChildren(...)` plus frisches
+    // `render()`). Beim Loeschen laeuft dieser Handler erst DANACH: `container`
+    // waere ein abgehaengter Knoten, und der neue Aufbau hat ohnehin schon
+    // frisch geladen. Dieselbe Regel wie bei der Sammelaktions-Pille (#1039).
+    if (!container.isConnected) return;
     await loadCategories();
+    const listId = state.activeListId;
+    if (listId) {
+      try {
+        await loadItems(listId);
+        // Hat der Nutzer waehrenddessen die Liste gewechselt, gehoert das
+        // Rendern `switchList` - `loadItems` hat den Stand oben schon
+        // unangetastet gelassen.
+        if (state.activeListId !== listId) return;
+        state.itemsError = null;
+      } catch (err) {
+        // Ohne dieses catch bliebe eine unbeobachtete Rejection zurueck:
+        // `_notifyChanged()` dispatcht synchron und sieht die Promise dieses
+        // Listeners nie. Der Server hat die Artikel dann schon umgeschrieben,
+        // und die Liste zeigte stillschweigend den alten Stand weiter - hier
+        // stattdessen die Fehlerkarte mit Wiederholung, wie bei `switchList`.
+        console.error('[Shopping] loadItems Fehler:', err);
+        // Auch der Fehlerfall gehoert der Liste, fuer die geladen wurde: sonst
+        // leerte ein Fehler der alten Liste die Artikel der neuen.
+        if (state.activeListId !== listId) return;
+        state.items      = [];
+        state.itemsError = err;
+      }
+    }
+    if (state.activeList) {
+      renderListContent(container);
+      wireListContentEvents(container);
+    }
+    refocusAfterRender();
   };
 
-  let manager = null;
   openModal({
     title: t('shopping.manageCategories'),
     content: '<yuvomi-category-manager></yuvomi-category-manager>',
     onSave: (panel) => {
-      manager = panel.querySelector('yuvomi-category-manager');
+      const manager = panel.querySelector('yuvomi-category-manager');
       if (!manager) return;
       manager.addEventListener('category-manager-changed', onCategoriesChanged);
       manager.configure({
@@ -1660,17 +3230,15 @@ async function openCategoryManager(container, { fromDeepLink = false } = {}) {
         labelResolver: (item) => categoryLabel(item.name),
         titleKey: 'shopping.manageCategories',
         hintKey: 'settings.shoppingCategoriesHint',
+        // Anders als Budget/Tasks/Kontakte loescht der Einkauf auch belegte
+        // Kategorien und schiebt die Artikel auf die naechste Kategorie.
+        deleteDetailKey: 'shopping.categoryDeleteConfirmDetail',
       });
     },
+    // onClose traegt nur noch, was wirklich am Schliessen haengt. Kein
+    // Listener-Abmelden: das liefe vor dem Loeschen, und das Element entsteht
+    // je Oeffnen neu und geht mit dem Overlay.
     onClose: () => {
-      // Listener-Cleanup, damit beim Modal-Reuse kein Leak entsteht.
-      manager?.removeEventListener('category-manager-changed', onCategoriesChanged);
-      manager = null;
-      // Bei Mutationen die sichtbare Liste neu aufbauen (Gruppierung/Quick-Add-Select).
-      if (changed && state.activeList) {
-        renderListContent(container);
-        wireListContentEvents(container);
-      }
       // Deep-Link-Query entfernen, wenn der Manager über die URL geöffnet wurde.
       if (fromDeepLink && new URLSearchParams(window.location.search).has('manage')) {
         window.yuvomi?.navigate?.('/shopping');
@@ -1683,10 +3251,24 @@ async function openCategoryManager(container, { fromDeepLink = false } = {}) {
 // Haupt-Render
 // --------------------------------------------------------
 
-export async function render(container, { user }) {
+export async function render(container, { user, signal: routeSignal = null } = {}) {
+  state.currentUserId = user?.id ?? null;
+  _routeSignal = routeSignal;
+  // Ein Seitenaufbau ist immer ein neuer Batch fuer die Sammelaktions-Pille -
+  // eine Frist der vorherigen Seite darf diese hier nicht treffen (#1039).
+  resetPillMachine();
+  // VOR dem Laden: die erste Laufnummern-Abfrage laeuft neben dem Laden der
+  // Seite. Die Reihenfolge der beiden Antworten ist damit NICHT entschieden -
+  // und muss es nicht sein: die Artikel-Antwort traegt ihre Laufnummer, und
+  // `loadItems` gibt sie dem Feed als den Stand, den die Seite haelt
+  // (`hold`). Eine Aenderung zwischen den beiden Antworten faellt so nicht
+  // durch, egal welche zuerst kam. Eine Meldung, die noch in den Aufbau
+  // faellt, laedt hoechstens einmal umsonst; die Ladeordnung (`_loadSeq`)
+  // haelt die Antworten auseinander.
+  wireLiveUpdates(container, routeSignal);
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
-    <div class="shopping-page">
+    <div class="shopping-page page-measure--narrow">
       <div class="list-tabs-bar" id="list-tabs-bar">
         <div class="skeleton skeleton-line skeleton-line--medium" style="height:36px;width:120px;border-radius:var(--radius-full)"></div>
         <div class="skeleton skeleton-line skeleton-line--short"  style="height:36px;width:80px; border-radius:var(--radius-full)"></div>
@@ -1705,16 +3287,17 @@ export async function render(container, { user }) {
     // loadCategories() und loadLists() fangen selbst; der äußere catch ist das
     // Netz für alles Unerwartete und bildet es auf denselben Fehlerzustand ab,
     // statt die Ausnahme in den globalen Fehlerbildschirm laufen zu lassen.
-    await Promise.all([loadCategories(), loadLists()]);
+    await Promise.all([loadCategories(), loadStores(), loadLists()]);
     if (!state.listsError && state.lists.length) {
       const listParam = parseInt(new URLSearchParams(window.location.search).get('list'), 10) || null;
       const target = listParam && state.lists.find((l) => l.id === listParam);
       state.activeListId = target ? target.id : state.lists[0].id;
+      state.collapsedCategories = loadCollapsedCategories(state.currentUserId, state.activeListId);
       try {
         await loadItems(state.activeListId);
       } catch (err) {
         console.error('[Shopping] loadItems Fehler:', err);
-        state.items = [];
+        clearItems();
         state.activeList = state.lists.find((l) => l.id === state.activeListId) ?? null;
         state.itemsError = err;
       }
@@ -1726,20 +3309,21 @@ export async function render(container, { user }) {
 
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
-    <div class="shopping-page">
+    <div class="shopping-page page-measure--narrow">
       <h1 class="sr-only">${t('nav.shopping')}</h1>
+      <!-- Die Listenwahl ist zugleich der Titel der Seite: der aktive Chip nennt
+           die Liste, sein Nachbar am hinteren Ende traegt ihre Aktionen. Hier
+           stand bis 2026-08-11 zusaetzlich ein page-toolbar-Kopf, der denselben
+           Namen ein zweites Mal zeigte (Keine-sichtbare-Titelwiederholung-Regel,
+           DESIGN.md) und mobil rund 64px kostete: /shopping lag bei 53 %
+           Contentflaeche, waehrend /tasks und /budget nach ihrer Kopf-Diaet bei
+           62-63 % standen.
+           KEINE BACKTICKS IN DIESEM KOMMENTAR: er steht INNERHALB des
+           Template-Literals, ein Backtick-Paar schliesst es und macht aus dem
+           Rest ein Tagged Template ("TypeError: toolbar is not a function"). -->
       <div class="list-tabs-bar" id="list-tabs-bar"></div>
-      <!-- Kanonischer Kopf als DIREKTES Kind des Modul-Roots. Er lag früher in
-           #list-content, das selbst --page-inline-pad trägt: als .page-toolbar
-           hätte er dessen Padding ein zweites Mal addiert - genau die
-           „genau einmal pro Ahnenkette"-Bedingung aus tokens.css, an der auch
-           der 16px-Versatz im Budget-Modul hing. Draußen fluchtet er mit der
-           Listen-Chip-Leiste darüber und trägt sein Chrome full-bleed. -->
-      <!-- --narrow: der Kopf endet beim Lesemaß des Körpers (.kitchen-list),
-           nicht an der Content-Spalte. Siehe layout.css. -->
-      <div class="page-toolbar page-toolbar--in-group page-toolbar--narrow" id="list-head" hidden></div>
       <div id="list-content" style="flex:1;display:flex;flex-direction:column;overflow:hidden"></div>
-      <button class="page-fab" id="fab-new-item" aria-label="${t('shopping.addItemLabel')}">
+      <button class="page-fab" id="fab-new-item" aria-label="${t('shopping.addItemLabel')}" data-dock-label="${t('newLabel.shopping')}">
         <i data-lucide="plus" class="icon-xl" aria-hidden="true"></i>
       </button>
     </div>
@@ -1751,7 +3335,7 @@ export async function render(container, { user }) {
   renderListContent(container);
   wireListContentEvents(container);
 
-  container.querySelector('#fab-new-item')?.addEventListener('click', (e) => {
+  findPageFab('fab-new-item')?.addEventListener('click', (e) => {
     const input = container.querySelector('#item-name-input');
     if (!input) {
       // Keine Liste aktiv → neue Liste erstellen
@@ -1779,7 +3363,17 @@ export async function render(container, { user }) {
   const highlightId = parseInt(new URLSearchParams(window.location.search).get('highlight'), 10) || null;
   if (highlightId) {
     const el = container.querySelector(`[data-action="toggle-item"][data-id="${highlightId}"]`);
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (el) {
+      // Steht der Treffer in einer eingeklappten Kategorie, bleibt er bei
+      // [hidden] unsichtbar, obwohl der Selektor ihn findet - ein globaler
+      // Suchtreffer darf nie hinter persistiertem Zustand verschwinden.
+      const rowsEl = el.closest('.list-rows');
+      if (rowsEl?.hidden) {
+        const toggleBtn = rowsEl.closest('.list-group')?.querySelector('[data-category-toggle]');
+        if (toggleBtn) toggleCategoryCollapse(toggleBtn);
+      }
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
   }
 
   // Deep-Link: ?manage=categories öffnet den Kategorie-Manager sofort.
@@ -1788,4 +3382,69 @@ export async function render(container, { user }) {
   }
 }
 
-export const __test = { shouldIgnoreShoppingRowToggle };
+export const __test = {
+  shouldIgnoreShoppingRowToggle,
+  // Mengen-Zerlegung fuer den Vorrats-Uebertrag: haengt an der Format-Locale,
+  // ist also nur verhaltensgetrieben pruefbar (siehe test-shopping-ux.js).
+  parseShoppingQuantity,
+  // Kategorie-Einklappen (#1039): reine Schluessel-/Speicherfunktionen, ohne
+  // DOM. `state` bleibt bewusst ERREICHBAR, nicht ERSETZBAR - Tests lesen und
+  // schreiben ihre Felder direkt, wie beim Muster in test-health-meds.js.
+  state,
+  categoryStorageKey,
+  collapsedCategoriesStorageKey,
+  loadCollapsedCategories,
+  saveCollapsedCategories,
+  pruneCollapsedCategories,
+  toggleCategoryCollapse,
+  // Sammelaktions-Automat (#1039): eine echte, aber knapp bemessene Frist statt
+  // eines Uhr-Objekts - dasselbe Muster wie beim Undo-Fenster in
+  // test-ux-utils.js (dort ein `duration`-Parameter), hier als Setter, weil
+  // die Frist an keiner Aufrufstelle durchgereicht wird.
+  updateCheckedActions,
+  resetPillMachine,
+  getPillPhaseForTest: () => pillPhase,
+  setPillInteractingForTest: (value) => { pillInteracting = value; },
+  setBulkPillHoldMsForTest: (ms) => { BULK_PILL_HOLD_MS_OVERRIDE = ms; },
+  // Abhaken gegen ueberholende Auffrischung: nur als Verhaltenstest pruefbar,
+  // weil der Fehler in der REIHENFOLGE zweier Rundlaeufe steckt und nicht im
+  // Vorhandensein einer Wache. Beide Wege gehoeren dazu - der Merker wird beim
+  // Abhaken gesetzt und beim Laden gelesen.
+  toggleShoppingItem,
+  loadItems,
+  deleteItemUndoable,
+  clearCheckedUndoable,
+  // Der Dialog rendert ueber den Modal-Stub des Loaders; die Tests greifen
+  // sein onSave ab und loesen das Speichern nach einer Auffrischung aus.
+  openItemDetails,
+  // Die schwebenden Loeschungen: geprueft wird, dass eine Auffrischung im
+  // Undo-Fenster sie nicht zurueckbringt und das Fenster sie wieder raeumt.
+  pendingRemovals,
+  // GET /shopping/suggestions liefert seit #1103 Objekte ({name, category,
+  // quantity}), keine blossen Namen - ein Nutzer meldete "[object Object]" im
+  // Namensfeld, weil diese Uebernahme nie eine eigene Pruefung hatte (nur die
+  // Server-Seite der Route war getestet).
+  applyAutocompleteSuggestion,
+  // Quick-Add-Kategorie-Rueckfall (#548, Review #1165): als eigene Funktion
+  // exportiert, damit der Test das VERHALTEN treibt statt den Quelltext zu
+  // durchsuchen - die Textprobe blieb auch gruen, wenn der Zweig tot war.
+  resetQuickAddCategory,
+  // Die Absichten-Karte und ihre Lesefunktion: die Tests pruefen an ihnen die
+  // Trennung selbst - dass `state.items` den Serverstand behaelt und die Zeile
+  // die Ueberlagerung zeigt.
+  intents,
+  checkedOf,
+  // Die Ladeordnung ueberlebt sonst von Test zu Test: `_loadSeq` waechst
+  // global, und eine Wasserstandsmarke aus einem frueheren Fall verwirft die
+  // Auffrischung des naechsten. Aufraeumen gehoert an den ANFANG jedes Falls.
+  clearItems,
+  resetLoadOrderForTest: () => { _appliedLoad.clear(); settledAt.clear(); _loadsInFlight.clear(); _itemsListId = null; },
+  // Live-Aktualisierung: der Plan ist reine Logik (Serverstand vorher/nachher),
+  // das Nachladen und die Verdrahtung laufen ueber den api-Stub.
+  liveRefreshPlan,
+  refreshFromFeed,
+  wireLiveUpdates,
+  acknowledgeOwnChange,
+  getLiveFeedForTest: () => _liveFeed,
+  abortLiveUpdatesForTest: () => { _liveController?.abort(); _liveController = null; _liveFeed = null; },
+};

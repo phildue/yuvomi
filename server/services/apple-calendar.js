@@ -10,6 +10,8 @@
  *
  * sync_config-Schlüssel:
  *   apple_last_sync - ISO-8601-Timestamp des letzten Syncs
+ *   apple_last_error    - Fehlermeldung des letzten Laufs, fehlt nach einem sauberen (#820)
+ *   apple_last_error_at - ISO-8601-Timestamp dieses Fehlers
  */
 
 import { createLogger } from '../logger.js';
@@ -17,13 +19,34 @@ const log = createLogger('Apple');
 
 import * as db from '../db.js';
 import { assignDefaultToEvent } from './sync-assignment.js';
-import { pruneDeletedEvents } from './calendar-prune.js';
+import { pruneDeletedEvents, countSourceEvents, deleteSourceEvents } from './calendar-prune.js';
+import { readSyncOutcome, withSyncOutcome } from './sync-outcome.js';
+import { runSerialized } from '../utils/sync-lock.js';
 import { unfoldLines, parseICS, formatICSDate, tzLocalToUTC, applyDuration, normalizeRecurrenceOverrides } from './ics-parser.js';
 import { decodeHtmlEntities } from '../utils/html-entities.js';
 import * as outbound from './calendar-outbound.js';
 import { processPendingDeletions, processPendingUpdates, flushAccount } from './caldav-outbound.js';
+import { rruleLine } from './recurrence.js';
+import { eventDateTimeFields } from '../utils/ics-datetime.js';
+import { vtimezoneFor } from '../utils/vtimezone.js';
+import { householdTimeZone } from '../utils/timezone.js';
+import { createCalDAVClient } from '../utils/caldav-client.js';
+import { nearestIcalColorName } from '../utils/ical-color.js';
+import { outboundEvent } from './outbound-dtstart.js';
 
 const APPLE_COLOR = '#FC3C44';
+
+function collectLocalOutboundEvents(database) {
+  return database.prepare(`
+    SELECT e.* FROM calendar_events e
+    WHERE e.external_source = 'local' AND e.external_calendar_id IS NULL
+      AND e.recurrence_parent_id IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM calendar_events child
+        WHERE child.recurrence_parent_id = e.id
+      )
+  `).all();
+}
 
 // --------------------------------------------------------
 // Externe Kalender-Metadaten upserten
@@ -94,9 +117,31 @@ function saveCredentials(url, username, password) {
   cfgSet('apple_app_password', password);
 }
 
-function clearCredentials() {
-  ['apple_caldav_url', 'apple_username', 'apple_app_password', 'apple_last_sync'].forEach(cfgDel);
-  log.info('Disconnected.');
+/**
+ * @param {object} [opts]
+ * @param {boolean} [opts.deleteEvents] Gespiegelte Termine mitnehmen (#820).
+ * @returns {{ removed: number }}
+ */
+function clearCredentials({ deleteEvents = false } = {}) {
+  // In einer Transaktion, damit nicht die Termine fallen und die Verbindung
+  // stehen bleibt (oder umgekehrt).
+  return db.get().transaction(() => {
+    const removed = deleteEvents ? clearMirroredEvents() : 0;
+    ['apple_caldav_url', 'apple_username', 'apple_app_password', 'apple_last_sync',
+     // Der Fehlerstand gehoert zur Verbindung (#820).
+     'apple_last_error', 'apple_last_error_at'].forEach(cfgDel);
+    log.info('Disconnected.' + (removed ? ` ${removed} mirrored event(s) removed.` : ''));
+    return { removed };
+  })();
+}
+
+/**
+ * Entfernt die lokal gespiegelten Apple-Termine (#820). Ohne Wirkung nach außen:
+ * der iCloud-Kalender bleibt unberührt, geräumt wird nur die Kopie.
+ * @returns {number} Anzahl gelöschter Termine
+ */
+function clearMirroredEvents() {
+  return deleteSourceEvents(db.get(), 'apple');
 }
 
 // --------------------------------------------------------
@@ -108,7 +153,13 @@ function getStatus() {
   const configured = !!creds;
   const connected  = !!(cfgGet('apple_caldav_url')); // via UI gespeichert
   const lastSync   = cfgGet('apple_last_sync');
-  return { configured, connected, lastSync };
+  // Reist mit dem Status, damit die Rückfrage vor dem Löschen die Zahl sofort
+  // nennen kann - und damit die Einstellungen den Rückstand auch dann noch
+  // zeigen, wenn längst getrennt wurde (#820).
+  const mirroredEvents = countSourceEvents(db.get(), 'apple');
+  // Ein still gescheiterter Lauf sah bisher aus wie ein Kalender, der einfach
+  // aufhoert zu aktualisieren - der Fehler stand nur im Serverlog (#820).
+  return { configured, connected, lastSync, mirroredEvents, ...readSyncOutcome(db.get(), 'apple') };
 }
 
 /**
@@ -119,13 +170,7 @@ async function testConnection() {
   const creds = getCredentials();
   if (!creds) throw new Error('[Apple] No credentials configured.');
 
-  const { createDAVClient } = await import('tsdav');
-  const client = await createDAVClient({
-    serverUrl:          creds.url,
-    credentials:        { username: creds.username, password: creds.password },
-    authMethod:         'Basic',
-    defaultAccountType: 'caldav',
-  });
+  const client = await createClient(creds);
 
   const calendars = await client.fetchCalendars();
   if (!calendars.length) throw new Error('[Apple] Connected, but no calendars found.');
@@ -141,42 +186,49 @@ async function testConnection() {
  * @param {{ id, title, description, start_datetime, end_datetime, all_day, location, recurrence_rule }} event
  * @returns {string}
  */
-function buildICS(event) {
+function buildICS(event, householdZone = null) {
   // UID-Format bewusst auf `oikos-…@oikos.local` belassen (kein Rebrand):
   // bereits synchronisierte Events tragen diese UID auf dem entfernten CalDAV-Server
   // und in external_calendar_id. Eine Änderung würde beim nächsten Sync Duplikate
   // bzw. verwaiste Remote-Objekte erzeugen.
   const uid   = `oikos-${event.id}@oikos.local`;
   const now   = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+  // Zeiten samt Zone zentral (#938). Vorher schnitt dieser Pfad die Trennzeichen
+  // aus dem gespeicherten Wert und schickte die Ziffern ohne Zonenangabe los -
+  // 10 Uhr auf wessen Uhr auch immer.
+  // Start/Ende mit der eigenen Wiederholungsregel in Einklang (#986); ein
+  // importiertes DTSTART bleibt unberuehrt (#756).
+  const when = eventDateTimeFields(outboundEvent(event), householdZone);
   const lines = [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
     'PRODID:-//Yuvomi//Familienplaner//DE',
+  ];
+  // Ein TZID ohne sein VTIMEZONE ist laut RFC 5545 ungueltig.
+  if (when.tzid) lines.push(...vtimezoneFor(when.tzid, Number(String(event.start_datetime).slice(0, 4))));
+  lines.push(
     'BEGIN:VEVENT',
     `UID:${uid}`,
     `DTSTAMP:${now}`,
     `SUMMARY:${escapeICS(event.title)}`,
-  ];
-
-  if (event.all_day) {
-    const startDate = event.start_datetime.slice(0, 10).replace(/-/g, '');
-    // RFC 5545: DTEND for VALUE=DATE is exclusive - add one day
-    const endSrc = (event.end_datetime || event.start_datetime).slice(0, 10);
-    const endD   = new Date(endSrc + 'T00:00:00');
-    endD.setDate(endD.getDate() + 1);
-    const endDate = `${endD.getFullYear()}${String(endD.getMonth() + 1).padStart(2, '0')}${String(endD.getDate()).padStart(2, '0')}`;
-    lines.push(`DTSTART;VALUE=DATE:${startDate}`);
-    lines.push(`DTEND;VALUE=DATE:${endDate}`);
-  } else {
-    const startDt = event.start_datetime.replace(/[-:]/g, '').replace(/\.\d{3}/, '');
-    const endDt   = (event.end_datetime || event.start_datetime).replace(/[-:]/g, '').replace(/\.\d{3}/, '');
-    lines.push(`DTSTART:${startDt}`);
-    lines.push(`DTEND:${endDt}`);
-  }
+    `DTSTART${when.dtstart.params}:${when.dtstart.value}`,
+    `DTEND${when.dtend.params}:${when.dtend.value}`,
+  );
 
   if (event.description) lines.push(`DESCRIPTION:${escapeICS(event.description)}`);
   if (event.location)    lines.push(`LOCATION:${escapeICS(event.location)}`);
-  if (event.recurrence_rule) lines.push(event.recurrence_rule); // z.B. RRULE:FREQ=WEEKLY;BYDAY=MO
+  // Eigenfarbe als CSS3-Name (RFC 7986, #897). Ein Termin ohne eigene Farbe
+  // bekommt keine Zeile und erbt beim Anbieter die des Kalenders.
+  const colorName = nearestIcalColorName(event.color);
+  if (colorName) lines.push(`COLOR:${colorName}`);
+
+  // Beide Schreibweisen kommen vor: eingelesene Serien tragen die volle
+  // ICS-Zeile, lokal angelegte nur den Regelkörper (#756). Roh übernommen ergab
+  // letzteres eine Zeile ohne Property-Namen - ein VEVENT, das kein Server als
+  // Serie liest. patchICSEvent normalisiert an seiner Stelle genauso.
+  if (event.recurrence_rule) {
+    lines.push(rruleLine(event.recurrence_rule));
+  }
 
   lines.push('END:VEVENT', 'END:VCALENDAR');
   return lines.join('\r\n');
@@ -204,15 +256,14 @@ function unescapeICS(str) {
  * Inbound:  iCloud → lokale DB (Upsert via external_calendar_id = UID)
  * Outbound: lokale Termine (external_source='local', external_calendar_id IS NULL) → iCloud
  */
-/** tsdav ist eine optionale Abhängigkeit - dynamischer Import für graceful degradation. */
+/**
+ * tsdav ist eine optionale Abhängigkeit - `createCalDAVClient` importiert sie
+ * dynamisch (graceful degradation) und legt zugleich den `urlFilter` für
+ * Kalenderobjekte an, ohne den tsdav Objekte ohne `.ics`-Namen still
+ * verschluckt (#883).
+ */
 async function createClient(creds) {
-  const { createDAVClient } = await import('tsdav');
-  return createDAVClient({
-    serverUrl:          creds.url,
-    credentials:        { username: creds.username, password: creds.password },
-    authMethod:         'Basic',
-    defaultAccountType: 'caldav',
-  });
+  return createCalDAVClient({ caldav_url: creds.url, username: creds.username, password: creds.password });
 }
 
 /**
@@ -222,7 +273,11 @@ async function createClient(creds) {
  * bleibt vorgemerkt und läuft im nächsten Sync mit.
  * @returns {Promise<{deleted:number,updated:number}>}
  */
-async function flushOutbound({ makeClient } = {}) {
+async function flushOutbound(opts = {}) {
+  return runSerialized('apple', 'flush', () => runFlushOutbound(opts));
+}
+
+async function runFlushOutbound({ makeClient } = {}) {
   const idle = { deleted: 0, updated: 0 };
   const deletions = outbound.pendingDeletions('apple').filter((r) => r.object_url);
   const updates   = outbound.pendingUpdates('apple').filter((e) => e.external_object_url);
@@ -250,7 +305,15 @@ async function flushOutbound({ makeClient } = {}) {
   }
 }
 
+/**
+ * Ein Lauf, dessen Ausgang den Lauf überlebt (#820). Um runSync() statt in ihm,
+ * damit auch der frühe Ausstieg bei fehlenden Zugangsdaten erfasst wird.
+ */
 async function sync() {
+  return runSerialized('apple', 'sync', () => withSyncOutcome(db.get(), 'apple', runSync));
+}
+
+async function runSync() {
   const creds = getCredentials();
   if (!creds) {
     throw new Error('[Apple] No credentials configured (neither in DB nor in .env).');
@@ -320,8 +383,12 @@ async function sync() {
 
     for (const obj of calObjects) {
       // RECURRENCE-ID-Overrides zusammenführen, sonst überschreibt ein geändertes
-      // Einzel-Vorkommen die Serie derselben UID (#549).
-      const parsed = normalizeRecurrenceOverrides(parseICS(obj.data || ''));
+      // Einzel-Vorkommen die Serie derselben UID (#549). Was der Parser verwirft,
+      // wird benannt statt still übergangen (#883).
+      const parsed = normalizeRecurrenceOverrides(parseICS(obj.data || '', {
+        onSkip: ({ uid, reason }) =>
+          log.warn(`Skipped VEVENT (${reason}) uid=${uid ?? '(none)'} at ${obj.url ?? '(unknown URL)'}`),
+      }));
       for (const ev of parsed) {
         try {
           calendarUids.add(ev.uid);
@@ -333,8 +400,11 @@ async function sync() {
               url: obj.url, etag: obj.etag, data: obj.data, calendarUrl: cal.url,
             });
           }
-          // Event-Eigenfarbe (RFC 7986) hat Vorrang, sonst Kalenderfarbe.
-          const evColor = ev.color || calColor;
+          // NUR die Eigenfarbe des Termins (RFC 7986 COLOR); die Kalenderfarbe
+          // ist geerbt und gehoert nicht in die Eigenfarb-Spalte (#891), sonst
+          // verdraengt sie dauerhaft die Farbe der zugewiesenen Person. Der
+          // Lesepfad holt sie als cal_color ueber calendar_ref_id.
+          const evColor = ev.color ?? null;
 
           // Vom Nutzer gelöscht und noch nicht auf dem Server: nicht wieder
           // anlegen, sonst kehrt der Termin bei jedem Sync zurück (#593).
@@ -351,12 +421,16 @@ async function sync() {
           let eventId;
           if (existing) {
             // color nur überschreiben, solange der Nutzer nicht lokal umgefärbt
-            // hat (user_modified = 0); Titel/Zeit bleiben remote-geführt.
+            // hat (color_modified = 0); Titel/Zeit bleiben remote-geführt.
+            //
+            // Nicht `user_modified` (#899): das wird bei jeder Bearbeitung
+            // gesetzt, eine Titeländerung hätte die Farbspalte also dauerhaft
+            // eingefroren und eine Umfärbung auf dem Server nie mehr erreicht.
             db.get().prepare(`
               UPDATE calendar_events
               SET title = ?, description = ?, start_datetime = ?, end_datetime = ?,
                   all_day = ?, location = ?, recurrence_rule = ?, tzid = ?,
-                  color = CASE WHEN user_modified = 0 THEN ? ELSE color END,
+                  color = CASE WHEN color_modified = 0 THEN ? ELSE color END,
                   calendar_ref_id = ?,
                   external_object_url = COALESCE(?, external_object_url)
               WHERE id = ?
@@ -436,14 +510,14 @@ async function sync() {
   // Outbound: lokal → iCloud (erster verfügbarer Kalender)
   // --------------------------------------------------------
   const defaultCal = syncCalendars[0];
-  const localEvents = db.get().prepare(`
-    SELECT * FROM calendar_events
-    WHERE external_source = 'local' AND external_calendar_id IS NULL
-  `).all();
+  const localEvents = collectLocalOutboundEvents(db.get());
+
+  // Einmal je Lauf: die Zone, an der naive Zeiten haengen (#938).
+  const householdZone = householdTimeZone(db.get());
 
   for (const event of localEvents) {
     try {
-      const icsData  = buildICS(event);
+      const icsData  = buildICS(event, householdZone);
       const uid      = `oikos-${event.id}@oikos.local`;
       const filename = `${uid}.ics`;
 
@@ -461,10 +535,15 @@ async function sync() {
         'apple', defaultCal.url, defaultCal.displayName || 'Apple Calendar',
         normalizeCalColor(defaultCal.calendarColor) || APPLE_COLOR
       );
+      // `color_modified` mit hoch: die gerade hinausgegangene Farbe ist unsere.
+      // Der CSS3-Name ist eine verlustbehaftete Abbildung des Hex-Werts - ohne
+      // das Flag holte der nächste Inbound-Lauf ihn zurück und ersetzte den
+      // exakten Wert durch den gerundeten (#899).
       db.get().prepare(`
         UPDATE calendar_events
         SET external_calendar_id = ?, external_source = 'apple',
-            external_object_url = ?, calendar_ref_id = ?
+            external_object_url = ?, calendar_ref_id = ?,
+            color_modified = CASE WHEN color IS NOT NULL THEN 1 ELSE color_modified END
         WHERE id = ?
       `).run(uid, objectUrl, calRefId, event.id);
     } catch (err) {
@@ -479,4 +558,10 @@ async function sync() {
   );
 }
 
-export { sync, flushOutbound, getStatus, saveCredentials, clearCredentials, testConnection };
+export { sync, flushOutbound, getStatus, saveCredentials, clearCredentials,
+         clearMirroredEvents, testConnection };
+
+// Nur fuer Tests: der ICS-Builder ist der einzige Weg, auf dem ein rein lokaler
+// Termin zum Anbieter kommt, und der Sync-Pfad drumherum ist zu gross, um ihn
+// dafuer nachzustellen.
+export const __test = { buildICS, collectLocalOutboundEvents };

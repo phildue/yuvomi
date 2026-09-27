@@ -1,43 +1,22 @@
----
-name: Addition
-about: Add new software to the list.
-title: Add Yuvomi
-labels: addition, reviewers wanted
-assignees: ''
----
+# awesome-selfhosted submission
 
-Thanks for taking the time to suggest an addition to awesome-selfhosted!
+Status (2026-09-14):
 
-Please fill out information below (all fields are mandatory unless noted otherwise):
+- **Issue [#2285](https://github.com/awesome-selfhosted/awesome-selfhosted-data/issues/2285)** - filed 2026-04-02, still open, now labelled `addition` only (the `needs to mature` label is gone). It is the queue position; that repo's CONTRIBUTING states plainly that they do not close issues, only tag them, so it must not be closed or re-filed. Title and body were corrected from the old "Oikos" wording.
+- **Pull request [#2847](https://github.com/awesome-selfhosted/awesome-selfhosted-data/pull/2847)** - adds `software/yuvomi.yml`, still open. A maintainer review on 2026-09-02 requested changes with a single suggestion, `Groupware` as the only tag; it was adopted on 2026-09-10 (commit `c9b7ba83` in the fork branch), `syntax-checks` is green on that commit, and the PR waits for a re-review. This is the path their CONTRIBUTING prefers; the issue is only the fallback for people who would rather not send a PR.
+- Maturity: first tagged release v0.1.0 on 2026-03-30, so the four-month threshold was met on 2026-07-30 - the review date a maintainer had set on the issue.
 
-```yaml
-# software name
-name: "Yuvomi"
-# URL of the software project's homepage
-website_url: "https://yuvomi.cloud/"
-# URL where the full source code of the program can be downloaded
-source_code_url: "https://github.com/ulsklyc/yuvomi"
-# description of what the software does, shorter than 250 characters, sentence case
-description: "Family planner with shared tasks and a rewards/points system, shopping lists, meal planning, pantry stock with expiry tracking, calendar & contact sync (Google, CalDAV/CardDAV), budgeting, split expenses, notes, housekeeping, and per-member health tracking. PWA with offline support."
-# list of license identifiers, see https://github.com/awesome-selfhosted/awesome-selfhosted-data/blob/master/licenses.yml for the full list of licenses
-licenses:
-  - MIT
-# list of languages/platforms, see https://github.com/awesome-selfhosted/awesome-selfhosted-data/tree/master/platforms for the full list of platforms
-platforms:
-  - Nodejs
-  - Docker
-# list of tags (categories), see https://github.com/awesome-selfhosted/awesome-selfhosted-data/tree/master/tags for the full list of tags
-tags:
-  - Groupware
-  - Task Management & To-do Lists
-  - Money, Budgeting & Management
-  - Recipe Management
+`yuvomi.yml` next to this file is the byte-exact content of the submitted entry. Their linter enforces the rules that matter, so keep both in step:
+
+- `description` at most 250 characters, sentence case, ending in a period; no "self-hosted", "open-source" or "free" (the list implies it), and an alternative named as `(alternative to X)`. The previous draft here was 283 characters and would have failed.
+- Every entry in `tags`, `platforms` and `licenses` must exist verbatim in their `tags/`, `platforms/` and `licenses.yml`. The platform is spelled `Nodejs`, not `Node.js`.
+- Only the **first** tag decides where the entry appears in single-page mode. The entry carries `Groupware` alone, as the 2026-09-02 review asked; the three tags it was first submitted with were unusual there (of 1341 entries, 1271 carry exactly one).
+- No metadata fields (`stargazers_count`, `updated_at`, `commit_history`) - their bot writes those.
+
+Validate a change before pushing it:
+
+```bash
+git clone --depth 1 https://github.com/awesome-selfhosted/awesome-selfhosted-data
+cp docs/awesome-selfhosted/yuvomi.yml awesome-selfhosted-data/software/
+cd awesome-selfhosted-data && make install && make awesome_lint
 ```
-
-To ensure your issue is dealt with swiftly, please check the following (check the boxes `[x]`):
-- [x] Submit one item per issue. This eases reviewing and speeds up inclusion.
-- [x] You have searched the repository for any relevant [issues](https://github.com/awesome-selfhosted/awesome-selfhosted-data/issues) or [PRs](https://github.com/awesome-selfhosted/awesome-selfhosted-data/pulls), including closed ones.
-- [x] Any software you are adding is not already listed at any of [awesome-sysadmin](https://github.com/awesome-foss/awesome-sysadmin), [staticgen.com](https://www.staticgen.com/), [staticsitegenerators.bevry.me](https://staticsitegenerators.bevry.me/), [dbdb.io](https://dbdb.io/browse).
-- [x] Any software project you are adding to the list is actively maintained.
-- [ ] Any software project you are adding was first released more than 4 months ago.
-- [x] Any software project you are adding has working installation instructions.

@@ -2,6 +2,8 @@ import express from 'express';
 import { createLogger } from '../logger.js';
 import * as db from '../db.js';
 import { collectErrors, date as validateDate, str, MAX_SHORT, MAX_TEXT, MAX_TITLE } from '../middleware/validate.js';
+import { dataUrlContentMatches } from '../utils/file-signature.js';
+import { hiddenModulesFor } from '../permissions.js';
 import {
   deleteBirthdayArtifacts,
   hydrateBirthday,
@@ -22,17 +24,55 @@ function validatePhotoData(val) {
   const s = String(val).trim();
   if (s.length > MAX_PHOTO_LENGTH) return { value: null, error: 'Profile picture is too large.' };
   if (!PHOTO_RE.test(s)) return { value: null, error: 'Profile picture must be a valid image data URL.' };
+  // Der Regex prueft die Deklaration, diese Zeile den Inhalt (#937).
+  if (!dataUrlContentMatches(s)) return { value: null, error: 'Profile picture content does not match its image type.' };
   return { value: s, error: null };
 }
 
+function validateNameDay(val) {
+  if (val === undefined) return { value: undefined, error: null };
+  if (val === null || val === '') return { value: null, error: null };
+  const value = String(val).trim();
+  const match = /^(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return { value: null, error: 'Name day must use MM-DD.' };
+  const month = Number(match[1]);
+  const day = Number(match[2]);
+  const candidate = new Date(Date.UTC(2000, month - 1, day));
+  if (candidate.getUTCMonth() !== month - 1 || candidate.getUTCDate() !== day) {
+    return { value: null, error: 'Name day must be a valid month and day.' };
+  }
+  return { value, error: null };
+}
+
+/**
+ * EIN GEBURTSTAG BRINGT DIE IDENTITAET SEINES MITGLIEDS MIT.
+ *
+ * `SELECT *` liefert `family_user_id`, aber nicht die Farbe dahinter - und
+ * damit stand jedes Haushaltsmitglied in der Geburtstagsliste auf derselben
+ * neutralen Scheibe, waehrend dieselbe Person auf der Uebersicht, im Kalender,
+ * in den Aufgaben und (seit v2.22.0) in den Kontakten ihre eigene Farbe traegt.
+ * Die Uebersichtskachel hatte den Join laengst (dashboard.js), die Modulseite
+ * nie - dieselbe Reichweiten-Luecke wie bei der Vollton-Kante im Kalender.
+ *
+ * EIN Select fuer alle drei Lesewege (Liste, Naechste, Einzelabruf), damit die
+ * Luecke nicht an einem davon zurueckkommt.
+ */
+const BIRTHDAY_SELECT = `
+  SELECT birthdays.*,
+         u.display_name AS family_display_name,
+         u.avatar_color AS family_avatar_color,
+         u.avatar_data  AS family_avatar_data
+    FROM birthdays
+    LEFT JOIN users u ON u.id = birthdays.family_user_id`;
+
 function loadBirthday(id) {
-  return db.get().prepare('SELECT * FROM birthdays WHERE id = ?').get(id);
+  return db.get().prepare(`${BIRTHDAY_SELECT} WHERE birthdays.id = ?`).get(id);
 }
 
 
 function sortHydrated(rows) {
   return rows
-    .map((row) => hydrateBirthday(row))
+    .map((row) => hydrateBirthday(db.get(), row))
     .sort((a, b) => a.days_until - b.days_until || a.name.localeCompare(b.name));
 }
 
@@ -41,15 +81,16 @@ router.get('/', (req, res) => {
     const userId = req.authUserId || req.session.userId;
     syncAllBirthdayReminders(db.get(), userId);
 
-    let sql = 'SELECT * FROM birthdays WHERE 1=1';
+    // Spalten qualifiziert: seit dem Join auf `users` waere `name` mehrdeutig.
+    let sql = `${BIRTHDAY_SELECT} WHERE 1=1`;
     const params = [];
 
     if (req.query.q) {
-      sql += ' AND name LIKE ?';
+      sql += ' AND birthdays.name LIKE ?';
       params.push(`%${String(req.query.q).trim()}%`);
     }
 
-    sql += ' ORDER BY name COLLATE NOCASE ASC';
+    sql += ' ORDER BY birthdays.name COLLATE NOCASE ASC';
 
     const rows = db.get().prepare(sql).all(...params);
     res.json({ data: sortHydrated(rows) });
@@ -64,7 +105,7 @@ router.get('/upcoming', (req, res) => {
     const userId = req.authUserId || req.session.userId;
     syncAllBirthdayReminders(db.get(), userId);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 5, 1), 50);
-    const rows = db.get().prepare('SELECT * FROM birthdays ORDER BY name COLLATE NOCASE ASC').all();
+    const rows = db.get().prepare(`${BIRTHDAY_SELECT} ORDER BY birthdays.name COLLATE NOCASE ASC`).all();
     res.json({ data: sortHydrated(rows).slice(0, limit) });
   } catch (err) {
     log.error('GET /upcoming error:', err);
@@ -78,15 +119,17 @@ router.post('/', (req, res) => {
     const vBirthDate = validateDate(req.body.birth_date, 'Birth date', true);
     const vNotes = str(req.body.notes, 'Notes', { max: MAX_TEXT, required: false });
     const vPhoto = validatePhotoData(req.body.photo_data);
-    const errors = collectErrors([vName, vBirthDate, vNotes, vPhoto]);
+    const vNameDay = validateNameDay(req.body.name_day);
+    const errors = collectErrors([vName, vBirthDate, vNotes, vPhoto, vNameDay]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
 
     const result = db.get().prepare(`
-      INSERT INTO birthdays (name, birth_date, notes, photo_data, created_by, reminder_offset, reminder_custom_amount, reminder_custom_unit)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO birthdays (name, birth_date, name_day, notes, photo_data, created_by, reminder_offset, reminder_custom_amount, reminder_custom_unit)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       vName.value,
       vBirthDate.value,
+      vNameDay.value ?? null,
       vNotes.value,
       vPhoto.value ?? null,
       req.authUserId || req.session.userId,
@@ -97,15 +140,41 @@ router.post('/', (req, res) => {
 
     const birthday = loadBirthday(result.lastInsertRowid);
     const synced = db.transaction(() => syncBirthdayArtifacts(db.get(), birthday));
-    res.status(201).json({ data: hydrateBirthday(loadBirthday(synced.id)) });
+    res.status(201).json({ data: hydrateBirthday(db.get(), loadBirthday(synced.id)) });
   } catch (err) {
     log.error('POST / error:', err);
     res.status(500).json({ error: 'Internal error.', code: 500 });
   }
 });
 
+
+/**
+ * Die beiden Import-Routen lesen aus KONTAKTEN, nicht aus Geburtstagen.
+ *
+ * DER PFAD SAGT `birthdays`, DER INHALT KOMMT AUS `contacts` - und der
+ * Scope-Guard in server/index.js urteilt nur nach dem ersten Pfadsegment:
+ * `moduleForPath('/birthdays')` ergibt `calendar`. Jedes Credential mit
+ * `calendar:read` kam damit an die Kandidatenliste, und die zaehlt JEDEN
+ * Kontakt des Haushalts mit Namen und Geburtsdatum auf, ohne
+ * Sichtbarkeitsfilter. Gemeldet fuer das Wandtablett aus #1208 (Scopes:
+ * dashboard, calendar, tasks, rewards, wetter - `contacts` ist NICHT dabei,
+ * seine aufgeloesten Rechte melden `contacts: none`), aber die Luecke ist
+ * aelter und trifft jedes gescopte API-Token genauso.
+ *
+ * `hiddenModulesFor()` prueft beide Achsen in einem Aufruf - Token-Scopes UND
+ * die Modulrechte der Rolle. Dieselbe Klasse Befund wie die Abo-URLs in
+ * #1241 Runde 1 und wie #823: eine Mischstelle braucht ihre eigene Pruefung,
+ * weil die Middleware am Pfad haengt.
+ */
+function contactsHidden(req) {
+  return hiddenModulesFor(req, ['contacts']).has('contacts');
+}
+
 router.get('/import/candidates', (req, res) => {
   try {
+    if (contactsHidden(req)) {
+      return res.status(403).json({ error: 'Contact access is required to import birthdays.', code: 403 });
+    }
     const data = listBirthdayImportCandidates(db.get());
     res.json({ data });
   } catch (err) {
@@ -116,6 +185,12 @@ router.get('/import/candidates', (req, res) => {
 
 router.post('/import', (req, res) => {
   try {
+    // Schreibt Geburtstage, LIEST aber Kontakte: ohne diesen Riegel waere der
+    // Umweg offen, sich die abgewiesene Liste ueber die angelegten
+    // Geburtstagseintraege doch noch zusammenzusetzen.
+    if (contactsHidden(req)) {
+      return res.status(403).json({ error: 'Contact access is required to import birthdays.', code: 403 });
+    }
     const userId = req.authUserId || req.session.userId;
     const ids = Array.isArray(req.body.contact_ids) ? req.body.contact_ids : null;
     if (!ids || ids.length === 0) {
@@ -145,15 +220,18 @@ router.put('/:id', (req, res) => {
     if (req.body.birth_date !== undefined) checks.push(validateDate(req.body.birth_date, 'Birth date'));
     if (req.body.notes !== undefined) checks.push(str(req.body.notes, 'Notes', { max: MAX_TEXT, required: false }));
     if (req.body.photo_data !== undefined) checks.push(validatePhotoData(req.body.photo_data));
+    if (req.body.name_day !== undefined) checks.push(validateNameDay(req.body.name_day));
     const errors = collectErrors(checks);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
 
     const vPhoto = req.body.photo_data !== undefined ? validatePhotoData(req.body.photo_data) : { value: undefined };
+    const vNameDay = req.body.name_day !== undefined ? validateNameDay(req.body.name_day) : { value: undefined };
 
     db.get().prepare(`
       UPDATE birthdays
       SET name = COALESCE(?, name),
           birth_date = COALESCE(?, birth_date),
+          name_day = ?,
           notes = ?,
           photo_data = ?,
           reminder_offset = ?,
@@ -164,6 +242,7 @@ router.put('/:id', (req, res) => {
     `).run(
       req.body.name?.trim() ?? null,
       req.body.birth_date ?? null,
+      req.body.name_day !== undefined ? vNameDay.value : existing.name_day,
       req.body.notes !== undefined ? (req.body.notes?.trim() || null) : existing.notes,
       req.body.photo_data !== undefined ? (vPhoto.value ?? null) : existing.photo_data,
       req.body.reminder_offset !== undefined ? req.body.reminder_offset : existing.reminder_offset,
@@ -174,7 +253,7 @@ router.put('/:id', (req, res) => {
 
     const updated = loadBirthday(id);
     db.transaction(() => syncBirthdayArtifacts(db.get(), updated));
-    res.json({ data: hydrateBirthday(loadBirthday(id)) });
+    res.json({ data: hydrateBirthday(db.get(), loadBirthday(id)) });
   } catch (err) {
     log.error('PUT /:id error:', err);
     res.status(500).json({ error: 'Internal error.', code: 500 });

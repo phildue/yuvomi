@@ -51,34 +51,60 @@
   display: none;
 }
 
+/* KOMPAKTE HÖHE: Modulkopf und Filterzeile teilen sich eine Zeile.
+ *
+ * Der Vorrat trug drei Leisten übereinander - Küchen-Raum, Modulkopf, Filter -
+ * und lag damit auf 640x400 bei 173px von 323px Sichtfläche. Nach der
+ * Chrome-Regel (DESIGN.md) ist die Küchen-Leiste der Kopf und die Filterzeile
+ * die eine erlaubte Bedienzeile; der Modulkopf ist die Zeile zu viel.
+ *
+ * Er kann sie aber abgeben, ohne etwas zu verlieren, und das ist ein direkter
+ * Gewinn aus der Kopf-Regel weiter oben: seine Suche steht in der kompakten
+ * Höhe als 48px-Icon da statt als 291px-Feld (layout.css). Was er dann noch
+ * belegt, sind zwei Icon-Knöpfe - Platz, den die Filterzeile daneben hat. */
+@media (max-height: 499px) {
+  .pantry-page {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-content: start;
+  }
+
+  .pantry-page > * {
+    grid-column: 1 / -1;
+  }
+
+  .pantry-page > .page-toolbar {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .pantry-page > .pantry-filters {
+    grid-column: 2;
+    grid-row: 1;
+    /* Die Chips tragen ihre eigene Höhe; ohne diese Zeile zöge das Grid sie
+     * auf die volle Zeilenhöhe und die Zeile würde höher als der Kopf. */
+    align-self: center;
+    padding-top: 0;
+  }
+}
+
 .pantry-filters[hidden] {
   display: none;
 }
 
 /* Die Sammelaktions-Leiste („Alles auf die Einkaufsliste", sobald der
- * Fast-leer-Filter aktiv ist) ist jetzt der geteilte .kitchen-bulkbar-Baustein
- * (styles/kitchen-row.css). Der Einkauf trug dieselbe Sache als zwei Buttons im
- * Kopf und zahlte dafür zwei Kopfzeilen - eine Leiste, zwei Tabs.
- *
- * Hier bleibt nur der Träger der Content-Spalte: die Leiste hängt nicht mehr IM
- * Scroller (#pantry-list), sondern darüber, und braucht damit dieselbe Kante wie
- * die Filter-Chips und die Liste. */
-.pantry-bulkbar-slot {
-  padding-inline: var(--page-inline-pad);
-  padding-top: var(--space-3);
-  flex-shrink: 0;
-}
+ * Fast-leer-Filter aktiv ist) braucht in dieser Seite keinen Träger mehr: sie
+ * ist seit Etappe 5 die Pille der unteren Shell-Zone (.list-bulkbar in
+ * layout.css, gesetzt über utils/bulk-pill.js). Hier stand zuletzt ein
+ * `.pantry-bulkbar-slot`, der ihr die Content-Spalte gab - der letzte Rest
+ * eines Wohnorts im Inhalt. */
 
-.pantry-bulkbar-slot:empty {
-  display: none;
-}
-
-/* Scroller, Lesemaß, FAB-Auslauf, Gruppen-Abstand: .kitchen-list
- * (styles/kitchen-row.css), im Markup neben .pantry-list.
+/* Scroller, Lesemaß, FAB-Auslauf, Gruppen-Abstand: .list-scroller
+ * (styles/list-row.css), im Markup neben .pantry-list.
  *
  * Hier bleibt nur der Träger der Content-Spalte: im Vorrat ist die Liste selbst
  * der Träger (im Einkauf ist es #list-content darüber). Genau deshalb setzt
- * .kitchen-list KEIN padding-inline - es würde sich in einem der beiden Tabs
+ * .list-scroller KEIN padding-inline - es würde sich in einem der beiden Tabs
  * addieren. */
 .pantry-list {
   padding-inline: var(--page-inline-pad);
@@ -91,11 +117,8 @@
  * stattdessen `--fab-safe-zone` (Marge an .app-content, layout.css): kein Platz
  * in der Zeile, sondern ein kürzerer Scrollport. */
 
-.pantry-empty-hint {
-  padding: var(--space-6) var(--space-4);
-  text-align: center;
-  color: var(--color-text-tertiary);
-}
+/* `.pantry-empty-hint` ist entfallen (Block 2): ohne Fundstelle im Markup -
+ * der Vorrat rendert seine Leerzustände über mountEmptyState. */
 
 /* Kopf-Inhalt auf dasselbe Lesemaß wie der Körper: `.page-toolbar--narrow`
  * (layout.css), gesetzt im Markup neben `--in-group`. Hier stand dieselbe
@@ -111,8 +134,8 @@
  * -------------------------------------------------------- */
 
 /* Gruppe, Gruppenkopf, Gruppenfläche und Zähler kommen aus der geteilten
- * Grammatik (styles/kitchen-row.css): .kitchen-group, .kitchen-group__title,
- * .kitchen-group__count, .kitchen-rows. Der Vorrat war hier der Ausreißer -
+ * Grammatik (styles/list-row.css): .list-group, .list-group__title,
+ * .list-group__count, .list-rows. Der Vorrat war hier der Ausreißer -
  * 14px/text-transform:none gegen 12px/uppercase in den beiden Geschwistertabs. */
 
 /* --------------------------------------------------------
@@ -120,7 +143,7 @@
  * -------------------------------------------------------- */
 
 /* Geometrie, Fläche, Trennlinie, Hover und Umbruchverhalten der Zeile kommen aus
- * .kitchen-row (styles/kitchen-row.css). Hier bleibt nur, was den Vorrat
+ * .list-row (styles/list-row.css). Hier bleibt nur, was den Vorrat
  * unterscheidet: der Leer-Zustand, die Kopfzeile mit Badges, der Stepper und die
  * Farbe der Abschluss-Aktion.
  *
@@ -135,11 +158,11 @@
  * Der Name verträgt die Opazität (5,30:1), die Meta-Zeile nicht: sie startet
  * bei --color-text-secondary und fiel mit 0.65 auf 2,65:1 (Critique P1, WCAG
  * 1.4.3). Sie bekommt deshalb das Tertiär-Token statt einer Ausblendung. */
-.pantry-row--out .kitchen-row__name {
+.pantry-row--out .list-row__name {
   opacity: 0.65;
 }
 
-.pantry-row--out .kitchen-row__meta {
+.pantry-row--out .list-row__meta {
   color: var(--color-text-tertiary);
 }
 
@@ -154,8 +177,8 @@
  * stand der Stepper davor und schob die Kante je nach Wertbreite um bis zu
  * 95px hin und her - „Butter" begann bei x=485, „Naturjoghurt" bei x=390. */
 /* Textspalte, Button-Reset, Zielgröße, Fokusring und die vertikale Zentrierung
- * per align-content kommen aus .kitchen-row__main und
- * .kitchen-row__main--interactive (styles/kitchen-row.css) - inklusive des
+ * per align-content kommen aus .list-row__main und
+ * .list-row__main--interactive (styles/list-row.css) - inklusive des
  * Kommentars, warum es align-content und nicht justify-content sein muss. */
 
 .pantry-row__headline {
@@ -166,21 +189,49 @@
   min-width: 0;
 }
 
-/* Name und Metazeile kommen aus .kitchen-row__name / .kitchen-row__meta. Die
+/* Die Statusmarken wandern gemeinsam. Ohne diesen Träger entschied die
+ * Restbreite, wie viele von ihnen umbrechen - gemessen bei 390x844 stand
+ * „Vollmilch" mit „Läuft heute ab" in Zeile zwei und „Fast leer" in Zeile
+ * drei, also 109,5px gegen 86,3px derselben Liste mit zwei Marken nebeneinander.
+ *
+ * `flex-shrink: 0` ist die Bedingung dafür: schrumpfte das Paar, bliebe es in
+ * der Namenszeile stehen und presste sich dort zusammen, statt geschlossen
+ * darunter zu rutschen. Ein eigener Umbruch steht ihm nicht zu - genau den
+ * nimmt der Träger ihm ab. */
+.pantry-row__badges {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  flex-shrink: 0;
+}
+
+/* Name und Metazeile kommen aus .list-row__name / .list-row__meta. Die
  * Regel „umbrechen statt abschneiden" ist dort verallgemeinert: sie galt zuerst
  * für das MHD im Vorrat, gilt jetzt genauso für den Artikelnamen im Einkauf, der
  * bei 320px auf vier lesbare Zeichen gekürzt war. */
 
-/* Badge nach der Hauskonvention "Akzent-Text auf akzent-getöntem Grund":
- * der rohe semantische Ton scheitert dort am Kontrast, weil der Grund selbst
- * eine Tönung derselben Farbe ist (siehe tokens.css, Abschnitt Modul-Akzente). */
+/* ── DIE MELDUNG TRAEGT IHREN TON IN DER SCHRIFT, NICHT UNTER IHR ──
+ *
+ * Hier stand die Hauskonvention „Akzent-Text auf akzent-getoentem Grund", und
+ * sie war fuer MODUL-Toene gedacht: der rohe Modulton scheitert als Schrift am
+ * Kontrast. Die semantischen Toene tun das nicht - gemessen auf der
+ * Kartenflaeche traegt Danger 5,38:1 (light) / 5,20:1 (dark) und Warning
+ * 4,96:1 / 7,13:1, beides AA fuer Kleintext. Die Toenung war hier also nie
+ * noetig, und sie kostete: „Noch 2 Tage" (Warning) und „Fast leer" (Warning)
+ * sahen aus wie derselbe Zustand, und „Vor 6 Tagen abgelaufen" (Danger) hob
+ * sich davon kaum ab - zwei Achsen und drei Stufen in zwei fast gleichen
+ * Feldern.
+ *
+ * Zweiter Zweig der Skalen-Regel: die Rangmarke der Aufgaben-Prioritaet traegt
+ * ihren Ton im Punkt und laesst die Schrift neutral, weil sie GESCANNT wird.
+ * Eine Meldung wird GELESEN - ihr Ton gehoert auf die Zeichen, die man liest.
+ * Ohne Fuellung faellt ausserdem die Polsterung weg, und die schmalste
+ * Namensspalte (128px bei 393px Fenster) bekommt sie zurueck. */
 .pantry-badge {
   display: inline-flex;
   align-items: center;
-  padding: 0 var(--space-2);
-  border-radius: var(--radius-full);
   font-size: var(--text-xs);
-  font-weight: var(--font-weight-medium);
+  font-weight: var(--font-weight-semibold);
   line-height: 1.6;
   /* KEIN white-space: nowrap.
    *
@@ -194,17 +245,22 @@
   max-width: 100%;
 }
 
-.pantry-badge--danger {
-  background-color: color-mix(in srgb, var(--color-danger) 14%, transparent);
-  color: color-mix(in srgb, var(--color-danger) 70%, var(--color-text-primary));
+.pantry-badge--danger  { color: var(--color-danger); }
+.pantry-badge--warning { color: var(--color-warning); }
+
+/* ZWEI MELDUNGEN SIND ZWEI, AUCH WENN SIE DENSELBEN TON HABEN. Ohne Fuellung
+ * fehlt den Kapseln die Kante, an der man sie trennt - und „Vor 2 Tagen
+ * abgelaufen" plus „Leer" tragen beide Danger, standen also als ein Satz da.
+ * Der Mittelpunkt ist dieselbe Trennung, die die Metazeile der Zeile darunter
+ * seit jeher fuehrt, und er kommt ueber den `+`-Kombinator: er gehoert zum
+ * ZWISCHENRAUM, nicht zum Badge (Zeilenlisten-Regel). */
+.pantry-badge + .pantry-badge::before {
+  content: '·';
+  margin-inline-end: var(--space-2);
+  color: var(--color-text-tertiary);
 }
 
-.pantry-badge--warning {
-  background-color: color-mix(in srgb, var(--color-warning) 16%, transparent);
-  color: color-mix(in srgb, var(--color-warning) 70%, var(--color-text-primary));
-}
-
-/* Die Bedien-Gruppe kommt aus .kitchen-row__actions.
+/* Die Bedien-Gruppe kommt aus .list-row__actions.
  *
  * Der Warenkorb sitzt in einem festen Slot an ihrem ANFANG. Vorher stand er
  * absolut an der rechten Zeilenkante - also genau in der Ecke, die der fixierte
@@ -222,6 +278,26 @@
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* DER LEERE SLOT HAT NIE GEHALTEN, WAS ER VERSPRACH.
+ *
+ * Er wurde immer gerendert, „sonst wäre die Bedienzone in jeder Zeile anders
+ * breit und die Minus-Buttons stünden pro Zeile woanders". Das war richtig,
+ * SOLANGE die Bedienung vor dem Namen im DOM stand. Am 2026-07-29 ist sie
+ * dahinter gewandert (`li.append(main, actions)`, pantry.js) - seitdem ist
+ * `.list-row__main` das wachsende Element und die Bedienzone klebt an der
+ * Zeilenkante. Der Stepper ist ihr letztes Kind und steht damit von selbst
+ * bündig, ob ein Warenkorb davor liegt oder nicht.
+ *
+ * NACHGEMESSEN AM GERENDERTEN DOKUMENT (390x844, 12 Zeilen, 5 davon mit
+ * Warenkorb): die linke Kante des Minus-Knopfs liegt bei x=261 - mit leerem
+ * Slot und ohne ihn, in JEDER Zeile. Was der Slot wirklich kostete, war die
+ * Textspalte: 168px statt 220px, und das war der Umbruch der Metazeile.
+ *
+ * Die Begründung ist damit abgelaufen, nicht falsch gewesen. */
+.pantry-row__cart-slot:empty {
+  display: none;
 }
 
 .pantry-row__cart {
@@ -258,7 +334,7 @@
 }
 
 .pantry-stepper__btn:hover:not(:disabled) {
-  background-color: color-mix(in srgb, var(--module-accent) 12%, transparent);
+  background-color: color-mix(in srgb, var(--module-accent) var(--tint-state), transparent);
   border-color: var(--module-accent);
   color: var(--color-text-primary);
 }
@@ -273,18 +349,56 @@
   cursor: not-allowed;
 }
 
-.pantry-stepper__value {
-  /* 7ch fängt die üblichen Werte ("0,5 l", "6 Glas", "4 Stück") ab, damit die
-   * Minus-Buttons eine Spalte bilden statt zu fransen. Längeres ("1 Packung")
-   * darf schieben - abschneiden wäre schlimmer als eine leichte Kante. */
-  min-width: 7ch;
-  text-align: center;
-  font-size: var(--text-sm);
+/* Die Menge führt die Metazeile. Sie stand bis zum 12.08.2026 als
+ * `.pantry-stepper__value` ZWISCHEN den Knöpfen; warum sie umgezogen ist, steht
+ * an ihrer Aufbaustelle in pantry.js.
+ *
+ * Sie hebt sich in der grauen Metazeile auf die Primärfarbe ab: sie ist die
+ * Angabe, die eine Vorratsliste beantwortet, und das MHD dahinter ist die
+ * Einordnung. Tabellenziffern bleiben - ohne sie wandert das MHDn bei jedem
+ * Stepper-Schritt um mehr als eine Ziffernbreite. */
+.pantry-row__quantity {
   font-weight: var(--font-weight-medium);
-  /* Tabellenziffern: ohne sie springt die Zeile bei jedem Schritt seitlich. */
   font-variant-numeric: tabular-nums;
   color: var(--color-text-primary);
   white-space: nowrap;
+}
+
+/* EINE Metazeile, und sie bricht nicht um.
+ *
+ * `.list-row__meta` darf umbrechen (`overflow-wrap: break-word`), weil dort im
+ * Einkauf eine Menge steht, die vollständig lesbar sein muss. Hier stehen zwei
+ * bis drei Angaben, und ein Umbruch macht aus einer 64px-Zeile eine mit 84 oder
+ * 106px - gemessen genau das, unmittelbar nachdem die Menge eingezogen war. */
+.pantry-row .list-row__meta {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* WEGLASSEN STATT ABSCHNEIDEN - dritte Anwendung derselben Hausregel (das
+ * Etikett der Aufgabenzeile, das Konto der Buchungszeile, die Notiz der
+ * Geburtstagszeile machen es genauso).
+ *
+ * Der Anlass ist hier genau messbar: eine Zeile MIT Warenkorb hat 168px
+ * Textspalte statt 220px, und „1 Flasche · MHD 23.12.2027" braucht 182px. Mit
+ * Ellipse stand da „MHD 23.12…." - ein halbes Datum ist keine Angabe, sondern
+ * sieht aus wie ein Fehler, und es ist dieselbe Trunkierung, gegen die das MHD
+ * hier schon einmal nach vorn gewichen ist.
+ *
+ * `:has()` fragt nach dem Warenkorb, nicht nach einer Zeilenklasse: es sind
+ * genau die leeren und fast leeren Artikel, die ihn tragen, und genau bei denen
+ * steht die dringendere Aussage schon als Badge in der Kopfzeile. Wer das MHD
+ * dieser Zeile braucht, öffnet sie - oder filtert auf „Läuft bald ab", wo kein
+ * Warenkorb steht.
+ *
+ * 26rem: die Trägerbreiten sind gemessen 358px (390er-Telefon) und 720px (ab
+ * 768px). Der Schnitt liegt dazwischen, und auf dem breiten Träger stehen
+ * beide Angaben in jeder Zeile. */
+@container list-rows (max-width: 26rem) {
+  .pantry-row:has(.pantry-row__cart) .pantry-row__expiry {
+    display: none;
+  }
 }
 
 /* Touch: das iOS-Minimum von 44pt gilt für Finger, nicht für Mauszeiger. */
@@ -294,51 +408,31 @@
   }
 }
 
-/* Schmale Zeile: der Wert rückt ÜBER die Knöpfe.
+/* HIER STAND DER UMBRUCH DES STEPPERS, und er war die teuerste Zeile des
+ * Moduls. Unter 30rem Trägerbreite rückte das Mengenfeld ÜBER die beiden
+ * Knöpfe; die Bedienzone wurde damit 72,6px hoch und setzte die Zeilenhöhe auf
+ * 89,4px (gemessen 390x844) - nach dem Budget die höchste Zeile der App.
  *
- * WAS GEMESSEN WURDE (320px, 14 Artikel, Critique-Nachlauf 2026-07-30): der
- * Stepper belegte 167px der 262px Zeilenbreite, davon 71px allein das Mengenfeld
- * (`min-width: 7ch`), der Warenkorb-Slot weitere 48px. Für den Namen blieben
- * **31px** - „Olivenöl extra vergine" stand auf 8 Zeilen, die Zeilenhöhen liefen
- * von 89 bis 369px. Bei 393px waren es 90px Namensbreite und durchweg
- * zweizeilige Namen.
+ * DIE ENTSCHEIDUNG WAR RICHTIG GEMESSEN UND HAT SICH ÜBERLEBT. Ihr Anlass
+ * (Critique-Nachlauf 2026-07-30): einzeilig belegte der Stepper 167px der 262px
+ * Zeilenbreite, davon 71px allein das Mengenfeld, und dem Namen blieben 31px -
+ * „Olivenöl extra vergine" stand auf acht Zeilen. Der Umbruch gab dem Namen das
+ * 3,4-fache und kostete rund 20px Höhe. Damals wurde ausdrücklich verworfen,
+ * den Wert in die Metazeile zu setzen („er bleibt bei den Knöpfen, die ihn
+ * ändern").
  *
- * WARUM NICHT DAS MENGENFELD SCHRUMPFEN: „500 g" braucht rund 5ch, „1 Packung"
- * mehr. Auf 3ch gekürzt wäre der Wert die nächste abgeschnittene Aussage - genau
- * der Fehler, den der Artikelname im Einkauf gerade hinter sich hat.
+ * ZWEI DINGE, DIE DAMALS NICHT AUF DEM TISCH LAGEN. Erstens: der EINKAUF, der
+ * Nachbartab derselben Küchenleiste, trägt seine Menge seit jeher in
+ * `.list-row__meta`. Zwei Tabs schrieben dieselbe Angabe an zwei Orte - und
+ * genau solche Doppelschreibungen abzubauen ist der Zweck von `.list-row`.
+ * Zweitens, und das entkräftet den Preis: der umgebrochene Stepper war bereits
+ * exakt so breit wie seine Knopfzeile (100px, `width: calc(...)` unten). Ohne
+ * den Wert ist er genauso breit. Der Umzug kostet den Namen KEINEN Pixel - er
+ * behält seine 168px - und nimmt der Zeile nur ihre zweite Zeile.
  *
- * WARUM NICHT DEN WARENKORB-SLOT OPFERN: er ist konditional, und ihn nur manchmal
- * zu reservieren hätte die Stepper pro Zeile verschoben. Genau dafür wurde der
- * Slot eingeführt.
- *
- * WARUM NICHT DIE GANZE ZEILE UMBRECHEN: mit `flex-wrap` rutschte die Metazeile
- * unter die Bedienung und war von ihrem Namen getrennt (gemessen y=463 gegen 427).
- *
- * WAS ES BRINGT: 92px statt 167px Stepper, also 106px statt 31px für den Namen -
- * das 3,4-fache. WAS ES KOSTET: rund 20px Höhe pro Zeile. Der Wert bleibt bei den
- * Knöpfen, die ihn ändern; er wandert nicht in die Metazeile zum MHD.
- *
- * 30rem: bei 480px Gruppenbreite gibt die einzeilige Form noch 223px an den Namen
- * ab, darunter kippt sie schnell. Gemessene Gruppenbreiten: 288 (320px-Viewport),
- * 361 (393px), 720 (ab 768px) - der Schnitt liegt sauber zwischen 361 und 720. */
-@container kitchen-rows (max-width: 30rem) {
-  .pantry-stepper {
-    flex-wrap: wrap;
-    justify-content: center;
-    /* Ohne feste Breite wickelt der Flex-Container nie um: seine max-content-
-     * Breite ist die Summe aller drei Kinder, und .kitchen-row__actions darf
-     * nicht schrumpfen. Die Breite ist genau die der Knopfzeile. */
-    width: calc(var(--pantry-step-btn) * 2 + var(--space-1));
-  }
-
-  .pantry-stepper__value {
-    /* `order`, nicht DOM-Umbau: die Vorlesereihenfolge Minus → Wert → Plus ist
-     * die richtige und bleibt. */
-    order: -1;
-    flex: 1 0 100%;
-    min-width: 0;
-  }
-}
+ * Was vom alten Block bleibt, ist damit nichts: kein Umbruch, keine feste
+ * Breite, keine `order`-Umkehr. Der Stepper ist wieder das, wonach er aussieht,
+ * zwei Knöpfe nebeneinander. */
 
 /* --------------------------------------------------------
  * Formular
@@ -361,7 +455,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  /* .kitchen-row bringt seine eigene reduced-motion-Rücknahme mit. */
+  /* .list-row bringt seine eigene reduced-motion-Rücknahme mit. */
   .pantry-stepper__btn {
     transition: none;
   }

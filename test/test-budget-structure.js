@@ -14,10 +14,12 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import budgetRouter, {
   computeStatsRange,
-  generateRecurringInstances, monthsPerInterval, effectiveMonthly, RECURRENCE_INTERVAL_KEYS,
+  generateRecurringInstances, occurrencesPerYear, occurrenceDatesInMonth, effectiveMonthly,
+  normalizeIntervalCount, RECURRENCE_INTERVAL_KEYS, MAX_INTERVAL_COUNT,
   categoryInUseCount, subcategoryInUseCount, categoryCountByType, subcategoryCountForCategory,
   resolveExportRange,
   BUDGET_SAVINGS_KEY, computePlanProgress,
@@ -69,6 +71,7 @@ const EXPECTED = [
   'POST /categories',
   'PUT /categories/:key',
   'DELETE /categories/:key',
+  'PATCH /:id/confirm',
   'PATCH /categories/reorder',
   'POST /categories/:categoryKey/subcategories',
   'PUT /categories/:key/subcategories/:subKey',
@@ -95,10 +98,10 @@ const EXPECTED = [
   'GET /stats',
 ];
 
-test('Orchestrator ergibt exakt die erwartete Routentabelle (34 Routen)', () => {
+test('Orchestrator ergibt exakt die erwartete Routentabelle (35 Routen)', () => {
   const actual = collectRoutes(budgetRouter).sort();
   assert.deepEqual(actual, [...EXPECTED].sort());
-  assert.equal(actual.length, 34);
+  assert.equal(actual.length, 35);
 });
 
 test('die Cluster-Router zusammen ergeben genau die Orchestrator-Routen (keine verlorene/doppelte Route)', () => {
@@ -117,7 +120,8 @@ test('die Cluster-Router zusammen ergeben genau die Orchestrator-Routen (keine v
 test('öffentliche Export-Fläche vollständig re-exportiert', () => {
   assert.equal(typeof budgetRouter, 'function', 'default export ist kein Router');
   const fns = {
-    computeStatsRange, generateRecurringInstances, monthsPerInterval, effectiveMonthly,
+    computeStatsRange, generateRecurringInstances, occurrencesPerYear, occurrenceDatesInMonth,
+    normalizeIntervalCount, effectiveMonthly,
     categoryInUseCount, subcategoryInUseCount, categoryCountByType, subcategoryCountForCategory,
     resolveExportRange, computePlanProgress, computeStats, statsHandler,
   };
@@ -125,6 +129,56 @@ test('öffentliche Export-Fläche vollständig re-exportiert', () => {
     assert.equal(typeof fn, 'function', `${name} fehlt oder ist keine Funktion`);
   }
   assert.ok(Array.isArray(RECURRENCE_INTERVAL_KEYS), 'RECURRENCE_INTERVAL_KEYS fehlt');
-  assert.deepEqual(RECURRENCE_INTERVAL_KEYS, ['monthly', 'half_year', 'yearly']);
+  // Einheit + Anzahl statt fester Rhythmen (#636): 'half_year' ist monatlich x 6.
+  assert.deepEqual(RECURRENCE_INTERVAL_KEYS, ['weekly', 'monthly', 'yearly']);
+  assert.equal(MAX_INTERVAL_COUNT, 99, 'dieselbe Obergrenze wie im RRULE-Formular');
   assert.equal(BUDGET_SAVINGS_KEY, '__savings__');
+});
+
+// --------------------------------------------------------
+// Erwartete Buchungen zählen in keiner Summe mit (#637)
+// --------------------------------------------------------
+
+/**
+ * Als Regel über alle Dateien formuliert, nicht als Liste geprüfter Stellen:
+ * eine neue Aggregation entsteht irgendwann, und eine Allowlist deckt genau die
+ * nicht ab. Eine vergessene Stelle fällt sonst niemandem auf - sie zeigt nur
+ * eine Zahl, die um eine erwartete Buchung danebenliegt.
+ */
+const SUM_SOURCES = [
+  'server/routes/budget/entries.js',
+  'server/routes/budget/stats.js',
+  'server/routes/budget/plans.js',
+  'server/routes/budget/helpers.js',
+  'server/routes/dashboard.js',
+];
+
+/** Zerlegt eine Datei in ihre SQL-Template-Literale. */
+function sqlStatements(source) {
+  return [...source.matchAll(/`([^`]*)`/g)].map((m) => m[1]).filter((sql) => /\bFROM\s+budget_entries\b/i.test(sql));
+}
+
+test('jede Summe über budget_entries schließt erwartete Buchungen aus', () => {
+  const offenders = [];
+  for (const file of SUM_SOURCES) {
+    const source = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8');
+    for (const sql of sqlStatements(source)) {
+      if (!/\bSUM\s*\(/i.test(sql)) continue;
+      // Die Kennzahl der ausstehenden Buchungen selbst ist die Ausnahme: sie
+      // zählt genau das Gegenteil und sagt es im Ausdruck auch so.
+      if (/is_pending\s*=\s*1/.test(sql)) continue;
+      const guarded = /bookedOnly\(/.test(sql) || /is_pending\s*=\s*0/.test(sql);
+      if (!guarded) offenders.push(`${file}: ${sql.trim().slice(0, 90).replace(/\s+/g, ' ')}`);
+    }
+  }
+  assert.deepEqual(offenders, [], `Summe ohne is_pending-Filter:\n${offenders.join('\n')}`);
+});
+
+test('der Ausschluss kommt aus einer Quelle, nicht aus verstreuten Literalen', () => {
+  const helpers = readFileSync(new URL('../server/routes/budget/helpers.js', import.meta.url), 'utf8');
+  assert.match(helpers, /export function bookedOnly\(/, 'bookedOnly fehlt als geteilter Helfer');
+  for (const file of ['server/routes/budget/entries.js', 'server/routes/budget/stats.js', 'server/routes/budget/plans.js']) {
+    const source = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8');
+    assert.ok(source.includes('bookedOnly'), `${file} nutzt den geteilten Helfer nicht`);
+  }
 });

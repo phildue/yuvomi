@@ -105,8 +105,18 @@ test('Trigger trägt ein aria-label', () => {
 });
 
 // ── CSS: nur Tokens, kein Hardcoding von Farben ─────────────────────────
-test('CSS nutzt Tokens (--active-module-accent Fallback)', () => {
-  assert(/var\(--active-module-accent,\s*var\(--color-accent\)\)/.test(css), 'Modul-Akzent mit Fallback nötig');
+test('CSS nutzt die Stimme der App, nicht den Modulton', () => {
+  // Hier stand `var(--active-module-accent, var(--color-accent))`: der
+  // ausgewaehlte Tag trug damit in jedem Modul eine andere Farbe. Der
+  // Datepicker ist ein GETEILTES Bedienelement und tut ueberall dasselbe -
+  // Eine-Stimme-Regel (DESIGN.md, 2026-08-10).
+  // Kommentare raus, bevor gesucht wird: sie duerfen die Historie nennen, und
+  // ein `includes()` ueber rohes CSS liest sie als Regeln (dieselbe Falle wie
+  // im Regelscanner, test/css-rules.js).
+  const live = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  assert(/var\(--color-accent\)/.test(live), 'Akzent-Token nötig');
+  assert(!/--active-module-accent|--module-accent/.test(live),
+    'der Datepicker darf keinen Modulton mehr lesen (Eine-Stimme-Regel)');
 });
 test('CSS respektiert prefers-reduced-motion', () => {
   assert(/@media \(prefers-reduced-motion: reduce\)/.test(css), 'Reduced-Motion-Alternative nötig');
@@ -121,8 +131,16 @@ const localesDir = new URL('../public/locales/', import.meta.url);
 const localeFiles = readdirSync(localesDir).filter((f) => f.endsWith('.json'));
 const REQUIRED_KEYS = ['openCalendar', 'openTimePicker', 'previousMonth', 'nextMonth', 'today', 'clear'];
 
+// Erwartete Anzahl aus SUPPORTED_LOCALES lesen statt sie hier zu doppeln: eine
+// fest verdrahtete Zahl bricht bei jeder neuen Sprache, obwohl am Datepicker
+// nichts falsch ist.
+const supportedCount = readFileSync(new URL('../public/i18n.js', import.meta.url), 'utf8')
+  .match(/const SUPPORTED_LOCALES = \[([^\]]+)\]/)[1]
+  .match(/'[^']+'/g).length;
+
 test(`Alle ${localeFiles.length} Locales haben den datepicker-Namespace`, () => {
-  assert(localeFiles.length === 23, `Erwartet 23 Locale-Dateien, gefunden ${localeFiles.length}`);
+  assert(localeFiles.length === supportedCount,
+    `Erwartet ${supportedCount} Locale-Dateien (SUPPORTED_LOCALES), gefunden ${localeFiles.length}`);
   for (const file of localeFiles) {
     const json = JSON.parse(readFileSync(new URL(file, localesDir), 'utf8'));
     assert(json.datepicker, `${file}: datepicker-Namespace fehlt`);

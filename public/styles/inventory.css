@@ -1,0 +1,525 @@
+/**
+ * Modul: Inventar (Inventory)
+ * Zweck: Seiten-Layout, Statusbadges und Detailansicht. Die Liste selbst
+ *        traegt KEINE eigene Zeilen-Geometrie mehr: .list-group/.list-rows/
+ *        .list-row/.list-row__main--interactive/.list-row__name/
+ *        .list-row__meta (styles/list-row.css) sind dasselbe geteilte
+ *        Vokabular, das Vorrat und Einkauf schon nutzen - Inventar soll
+ *        optisch identisch aussehen (Groesse, Abstand, Trennlinie), nicht nur
+ *        aehnlich. Hier bleibt nur, was Inventar von Vorrat unterscheidet:
+ *        Statusbadge und Kaufpreis, so wie pantry.css nur Badges und Stepper
+ *        beitraegt.
+ */
+
+.inventory-page {
+  --module-accent: var(--module-inventory);
+}
+
+/* display:grid (nicht flex-column) aus demselben Grund wie .list-scroller
+ * (list-row.css, dessen Rolle diese Klasse fuer Inventar uebernimmt): jedes
+ * `.list-rows`-Kind (list-row.css) traegt `align-self: start`, das NUR in
+ * einem Grid-Elternteil ausschliesslich die Block-Achse (Hoehe) betrifft. In
+ * einer Flex-Spalte waere `align-self` stattdessen die Quer-Achse (Breite)
+ * und schrumpfte die Zeilenliste auf ihre Inhaltsbreite zusammen - genau das
+ * geschah hier, als renderCategoryList() (Kategorie-Browser-Startseite) als
+ * erstes `.list-rows` in diesem Modul OHNE umschliessende `.list-group`
+ * direkt hier eingehaengt wurde: gemessene Breite 2px, jede Zeile unsichtbar
+ * (per Playwright-Verifikation gefunden, Screenshot zeigte eine leere Seite
+ * unter den Kennzahlkarten). `align-content: start` ersetzt das vormalige
+ * `flex-direction: column` 1:1 fuers Stapeln von Bloecken (Kennzahlkarten,
+ * dann Kategorie-Zeilen ODER Gruppen, oder ein einzelner Leerzustand). */
+.inventory-list {
+  display: grid;
+  align-content: start;
+  gap: var(--space-3);
+  min-width: 0;
+  padding-bottom: var(--space-8);
+  /* Dieselbe Content-Spalte wie der Kopf darueber (.page-toolbar traegt sie
+   * schon in sich): ohne dieses Padding begann die Liste an der rohen
+   * Traeger-Kante, 32px links vom sichtbaren Kopf-Inhalt (Critique
+   * 2026-08-11, gemessen per Playwright auf 1440px). */
+  padding-inline: var(--page-inline-pad);
+}
+
+/* .metric-grid (panel.css) traegt bewusst KEIN max-width - Budget (dessen
+ * Herkunft) hat direkt darunter keine schmal gekappte Liste und darf die
+ * volle Spalte fuellen. Hier steht darunter aber .list-group/.list-rows mit
+ * ihrem eigenen 720px-Lesemass (list-row.css) - ohne dieselbe Kappung lief
+ * die Kennzahlreihe 500px weiter nach rechts als die Gruppe darunter
+ * (gemessen 1440 vs. 940px bei 1440px Viewport). Scoped statt am geteilten
+ * Selektor, damit Budgets eigene volle Breite unangetastet bleibt. */
+.inventory-list .metric-grid {
+  max-width: var(--page-measure, var(--layout-reading));
+}
+
+/* --------------------------------------------------------
+ * Filter-Chips (All / Braucht Aufmerksamkeit) - gleiche einzeilige
+ * Scroll-Zeile wie .pantry-filters (pantry.css), .filter-chip selbst kommt
+ * aus dem geteilten filter-chip.css.
+ * -------------------------------------------------------- */
+
+.inventory-filters {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+  padding-inline: var(--page-inline-pad);
+  padding-block: var(--space-3) 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.inventory-filters::-webkit-scrollbar {
+  display: none;
+}
+
+/* [hidden] hat gegenüber display:flex zu geringe Spezifität - explizit
+ * übersteuern (gleiches Muster wie .pantry-filters[hidden] in list-row.css). */
+.inventory-filters[hidden] {
+  display: none;
+}
+
+/* --------------------------------------------------------
+ * Zurueck-Link + Titel der Kategorie-Detailansicht - abgeleitet von
+ * .settings-leaf-back-link (settings.css), aber als Button statt Link (kein
+ * echter Routenwechsel, siehe Global Constraints) und ohne dessen
+ * responsive Ausblendung: Inventar hat keine parallele Desktop-Sidebar, die
+ * den Zurueck-Weg sonst schon anbietet.
+ * -------------------------------------------------------- */
+
+.inventory-back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: fit-content;
+  min-height: var(--target-base);
+  margin-bottom: var(--space-2);
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--color-text-secondary);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.inventory-back-link:hover {
+  color: var(--color-accent);
+}
+
+.inventory-back-link__icon {
+  width: var(--space-4);
+  height: var(--space-4);
+  flex: 0 0 auto;
+}
+
+/* Der Kommentar hier behauptete "Groesse/Rolle kommt vom semantischen <h2>
+ * selbst" - falsch: reset.css setzt fuer h1-h6 nur font-weight/line-height
+ * zurueck, nie font-size, also rendierte dieser Kopf am UA-Default (~24px),
+ * keiner Design-Stufe (Polish-Audit, PLAN.md #7). Traegt jetzt u-section-title
+ * im Markup, hier bleibt nur Abstand/Farbe. */
+.inventory-category-title {
+  margin: 0 0 var(--space-3);
+  color: var(--color-text-primary);
+}
+
+/* --------------------------------------------------------
+ * Gegenstands-Foto (Formular-Editor + Detailansicht) - abgeleitet von
+ * .birthday-avatar-editor (birthdays.css), gleicher Kreis: ein
+ * rechteckiger Editor kollidierte mit der App-weiten Buttonform-Regel
+ * (test-frontend-audit.js "ein quadratischer Icon-Knopf ist ein Kreis",
+ * vier Ausnahme-Kategorien in tokens.css Abschnitt 9, keine davon deckt
+ * einen Foto-Behaelter). Gleiche Masse/Interaktion wie birthdays.css,
+ * nur der Platzhalter (Icon statt Initialen) unterscheidet sich.
+ * -------------------------------------------------------- */
+
+.inventory-photo-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.inventory-photo-editor {
+  width: 84px;
+  height: 84px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--module-accent) var(--tint-surface), var(--color-surface));
+  cursor: pointer;
+}
+
+.inventory-photo-preview__image {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.inventory-photo-preview__fallback {
+  display: inline-flex;
+  color: color-mix(in srgb, var(--module-accent) var(--tint-ink), var(--color-text-primary));
+}
+
+.inventory-photo-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.inventory-photo-action {
+  width: var(--target-base);
+  height: var(--target-base);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.inventory-photo-action:hover {
+  background: var(--color-surface-hover);
+}
+
+.inventory-photo-action--danger {
+  color: var(--color-danger);
+}
+
+.inventory-detail-photo {
+  display: block;
+  width: 100%;
+  max-width: 240px;
+  /* Ohne aspect-ratio waere die Box so hoch wie das Originalbild - bei einem
+   * nicht-quadratischen Foto machte --radius-full daraus ein Oval statt
+   * eines Kreises. */
+  aspect-ratio: 1 / 1;
+  border-radius: var(--radius-full);
+  object-fit: cover;
+}
+
+/* Kopfzeile im Klickbereich: Name, Indikator-Icons, Statusbadge - exakt wie
+ * .pantry-row__headline (gleiche Klasse waere hier falsch benannt, aber
+ * identische Werte). */
+.inventory-row__headline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+}
+
+/* Kaufpreis, trailing außerhalb des Klickbereichs (wie der Stepper im Vorrat) -
+ * reine Anzeige, kein eigenes Bedienelement, deshalb kein .list-row__actions. */
+.inventory-row__value {
+  flex-shrink: 0;
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------------
+ * Listen-Zeilen in der Detailansicht (Anhaenge, Buchungen, Fristen) -
+ * gleiche Grammatik wie .contact-detail__values in contacts.css.
+ * -------------------------------------------------------- */
+
+.inventory-detail-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.inventory-detail-list__item {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.inventory-detail-list__link {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target-base);
+  color: var(--module-inventory, var(--color-accent));
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.inventory-detail-list__link:hover,
+.inventory-detail-list__link:focus-visible {
+  text-decoration: underline;
+}
+
+.inventory-detail-list__sub {
+  font-size: var(--type-caption);
+  color: var(--color-text-tertiary);
+}
+
+/* Zwei-Spalten-Formularzeile fuer das Item-Formular (Anlegen/Bearbeiten).
+ * Repliziert .pantry-form-row (pantry.css) 1:1, weil inventory.css und
+ * pantry.css sich beim Routenwechsel gegenseitig ausschliessen - nur das
+ * hier aktive Stylesheet wird geladen, .pantry-form-row waere auf
+ * /inventory also nie wirksam. */
+.inventory-form-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: var(--space-3);
+}
+
+/* Vier Zustaende eines Gegenstands, und sie tragen ihren Ton in der SCHRIFT
+ * (Skalen-Regel, zweiter Zweig - wie die Vorratsmeldung). Vorher lag unter
+ * jeder Schrift dieselbe Farbe noch einmal als Waschung; das ist die Bauart,
+ * die die Vollton-Regel an den Marken abgeloest hat, und auf einer Reihe von
+ * Zustaenden kostet sie doppelt: „Verkauft" auf 15 % Grau und „Entsorgt" auf
+ * einer Danger-Toenung unterscheiden sich fast nur noch durch ihr Wort.
+ *
+ * `--disposed` und `--lost` teilen ihre Regel AUSDRUECKLICH: beide heissen
+ * „nicht mehr da", und welcher der beiden Faelle vorliegt, steht im Wort. Das
+ * ist der Unterschied zu zwei Regeln, die zufaellig gleich aussehen. */
+.inventory-status-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.inventory-status-badge--active   { color: var(--color-success); }
+.inventory-status-badge--sold     { color: var(--color-text-secondary); }
+.inventory-status-badge--disposed,
+.inventory-status-badge--lost     { color: var(--color-danger); }
+
+/* --------------------------------------------------------
+ * Verknuepfte Buchungen (Formular, Bearbeiten-Modus)
+ * -------------------------------------------------------- */
+
+.inventory-linked-entries {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.inventory-linked-entry-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto auto;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+}
+
+.inventory-linked-entry-row__title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.inventory-linked-entry-row__role,
+.inventory-linked-entry-row__date {
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.inventory-linked-entry-row__amount {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.inventory-linked-entry-total {
+  display: flex;
+  justify-content: space-between;
+  padding: var(--space-2) var(--space-3);
+  font-weight: 600;
+  border-top: 1px solid var(--color-border);
+}
+
+.inventory-picked-booking-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding: var(--space-1) var(--space-1) var(--space-1) var(--space-3);
+  border: 1px dashed color-mix(in srgb, var(--module-accent) var(--tint-hint), var(--glass-border-subtle));
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--module-accent) var(--tint-wash), var(--color-surface));
+  font-size: var(--text-sm);
+}
+
+/* --------------------------------------------------------
+ * Buchungs-Auswahl-Overlay (im Modal-Panel, spiegelt die Masse von
+ * .doc-attach-picker in document-attach.css)
+ * -------------------------------------------------------- */
+
+.inventory-booking-picker {
+  position: fixed;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  background: var(--color-overlay-glass);
+}
+
+.inventory-booking-picker__panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: min(100%, 460px);
+  max-height: min(80vh, 560px);
+  padding: var(--space-4);
+  border: 1px solid var(--glass-border-subtle);
+  border-radius: var(--radius-glass-card);
+  background-color: var(--glass-bg-card);
+  box-shadow: var(--glass-shadow-lg);
+}
+
+.inventory-booking-picker__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.inventory-booking-picker__nav {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+}
+
+.inventory-booking-picker__list {
+  flex: 1;
+  min-height: 120px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* [hidden] hat gegenüber display:flex zu geringe Spezifität - explizit übersteuern. */
+.inventory-booking-picker__list[hidden],
+.inventory-booking-picker__nav[hidden] {
+  display: none;
+}
+
+.inventory-booking-picker__status {
+  margin: auto;
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+
+.inventory-booking-picker__item {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: var(--target-md);
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: var(--radius-glass-inner);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font-size: var(--text-sm);
+}
+
+.inventory-booking-picker__item:hover {
+  background: color-mix(in srgb, var(--module-accent) var(--tint-state), transparent);
+}
+
+.inventory-booking-picker__item:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.inventory-booking-picker__item-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.inventory-booking-picker__item-meta {
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+}
+
+.inventory-booking-picker__item-amount {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.inventory-booking-picker__role-footer {
+  display: flex;
+  justify-content: flex-end;
+  /* Umbruch statt Quetschen - Begruendung an `.modal-panel__footer`
+   * (layout.css, #872). */
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* --------------------------------------------------------
+ * Garantiestatus-Zeile (Stufe 4) - eigene Klasse statt .form-hint, das nur in
+ * der page-scoped settings.css gestylt ist und hier fehlt.
+ * -------------------------------------------------------- */
+
+.inventory-warranty-status {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-sm);
+}
+
+.inventory-warranty-status--valid {
+  color: var(--color-text-secondary);
+}
+
+.inventory-warranty-status--expiring {
+  color: var(--color-warning);
+}
+
+.inventory-warranty-status--expired {
+  color: var(--color-danger);
+}
+
+/* --------------------------------------------------------
+ * Getrackte Fristen (frei definierbare Termine je Gegenstand)
+ * -------------------------------------------------------- */
+
+.inventory-tracked-dates-hint {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+
+.inventory-tracked-dates-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.inventory-tracked-date-row {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr auto auto auto;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.inventory-tracked-date-row__countdown {
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}

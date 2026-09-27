@@ -5,33 +5,24 @@ services:
     environment:
       APP_HOST: yuvomi_web_1
       APP_PORT: 3000
-      # Yuvomi ships its own session-based login, so Umbrel's proxy auth is
-      # disabled to avoid a double sign-in (same pattern as Immich).
-      # Caveat: with proxy auth off, the first-run bootstrap endpoint
-      # (POST /api/v1/auth/setup) is reachable by any LAN/Tor client until the
-      # owner creates the first admin. Complete setup immediately after install.
-      PROXY_AUTH_ADD: "false"
 
   web:
-    image: ghcr.io/ulsklyc/yuvomi:0.66.0@sha256:0de09531d39d16e13281100b8a55dd3307f1db9a2a07ef5fbfd928894e639cbf
+    image: ghcr.io/ulsklyc/yuvomi:1.77.0@sha256:726ae06111ac05503162e0c4ffb48402c8039062ee99e0ba5dec6112ac87b15e
     restart: on-failure
     stop_grace_period: 1m
     # No `user:` override: the image entrypoint starts as root only to chown the
-    # data/backup volumes, then drops to the unprivileged `node` user via gosu.
+    # app data and backup volumes, then drops to the unprivileged `node` user via gosu.
     volumes:
-      - ${APP_DATA_DIR}/data:/data
-      - ${APP_DATA_DIR}/backups:/backups
+      - ${APP_DATA_DIR}/data/app:/data
+      - ${APP_DATA_DIR}/data/backups:/backups
     environment:
       - NODE_ENV=production
       - PORT=3000
-      # Bewusst /data/oikos.db: der oben gepinnte Image-Digest (0.66.0) enthält die
-      # oikos.db→yuvomi.db-Boot-Migration noch NICHT. Würde hier yuvomi.db stehen,
-      # bootete das alte Image gegen eine leere DB und ignorierte vorhandene Daten.
-      # Beim nächsten Image-Bump (auf eine migrations-fähige Version) migriert der
-      # Resolver oikos.db automatisch — dieser Pfad darf dann unverändert bleiben.
-      - DB_PATH=/data/oikos.db
+      - DB_PATH=/data/yuvomi.db
       - BACKUP_DIR=/backups
       # SESSION_SECRET is required; Umbrel injects a deterministic per-app secret.
       - SESSION_SECRET=${APP_SEED}
+      # DB_ENCRYPTION_KEY enables Yuvomi's SQLite encryption and must stay stable.
+      - DB_ENCRYPTION_KEY=${APP_SEED}
       # Umbrel serves apps over plain HTTP on the LAN, so secure cookies stay off.
       - SESSION_SECURE=false

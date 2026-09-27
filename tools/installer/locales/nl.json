@@ -4,13 +4,15 @@
     "continue": "Doorgaan",
     "back": "Terug",
     "generate": "Genereren",
-    "generating": "…",
+    "generating": "Bezig met genereren…",
     "optional": "Optioneel",
     "stepCounter": "Stap {{n}} van {{total}}",
     "toggleVisibility": "Waarde tonen of verbergen",
     "copy": "Kopiëren",
     "copied": "Gekopieerd ✓",
-    "language": "Taal"
+    "language": "Taal",
+    "copyRedirect": "Redirect-URI kopiëren",
+    "opt": "(optioneel)"
   },
   "config": {
     "title": "Basisconfiguratie",
@@ -22,7 +24,12 @@
     "tzLabel": "Tijdzone",
     "errHost": "Ongeldige hostnaam. Gebruik alleen letters, cijfers, koppeltekens en punten.",
     "errPort": "Ongeldige poort. Moet een getal tussen 1 en 65535 zijn.",
-    "prereqMissing": "Ontbrekende vereisten: {{list}}. Installeer ze en laad de pagina opnieuw."
+    "prereqMissing": "Ontbrekende vereisten: {{list}}. {{link}} laat zien hoe je ze installeert.",
+    "prereqLinkDocker": "De Docker-handleiding",
+    "prereqLinkCompose": "De podman-compose-handleiding",
+    "prereqRecheck": "Opnieuw controleren",
+    "errSecureOverHttp": "Het openbare adres begint met http://, maar deze keuze vereist beveiligde cookies - dan kan niemand inloggen. Kies \"Directe toegang\" of gebruik een https://-adres.",
+    "errTz": "Ongeldige tijdzone. Verwacht wordt een IANA-naam zoals Europe/Berlin."
   },
   "secrets": {
     "title": "Beveiligingssleutels",
@@ -32,7 +39,7 @@
     "dbLabel": "Databaseversleutelingssleutel",
     "dbHint": "Versleutelt de SQLite-database in rust.",
     "errBoth": "Beide sleutels zijn vereist.",
-    "dangerWarn": "Bewaar deze sleutels nu. Als je ze kwijtraakt, zijn je versleutelde gegevens onherstelbaar — er is geen herstel.",
+    "dangerWarn": "Bewaar deze sleutels nu. Als je ze kwijtraakt, zijn je versleutelde gegevens onherstelbaar — er is geen herstel. Aan het einde van de installatie kun je het .env-bestand met beide sleutels downloaden.",
     "preserved": "Je bestaande sleutels blijven behouden, zodat deze installatie je niet buitensluit van de huidige database. Laat een veld leeg om de sleutel te behouden; een nieuwe waarde vervangt hem.",
     "keepPlaceholder": "Bestaande sleutel behouden"
   },
@@ -48,12 +55,12 @@
     "unitsMetric": "Metrisch (°C)",
     "unitsImperial": "Imperiaal (°F)",
     "errCoords": "Breedtegraad en lengtegraad zijn vereist.",
-    "errLat": "Ongeldige breedtegraad (–90 tot 90).",
-    "errLon": "Ongeldige lengtegraad (–180 tot 180)."
+    "errLat": "Ongeldige breedtegraad (-90 tot 90).",
+    "errLon": "Ongeldige lengtegraad (-180 tot 180)."
   },
   "calendar": {
     "title": "Kalendersynchronisatie",
-    "subtitle": "Verbind Yuvomi met Google Agenda of Apple iCloud. Beide optioneel — uitklappen om te configureren.",
+    "subtitle": "Verbind Yuvomi met Google Agenda, Apple iCloud of Outlook. Alles optioneel - uitklappen om te configureren.",
     "google": "Google Agenda",
     "googleHint": "Maak OAuth-inloggegevens aan op {{link}}. Redirect-URI: {{redirect}}",
     "googleLink": "console.cloud.google.com",
@@ -66,17 +73,22 @@
     "appleUserLabel": "Apple ID (e-mail)",
     "applePassLabel": "App-specifiek wachtwoord",
     "appleUrlLabel": "CalDAV-URL",
-    "appleUrlOpt": "(optioneel)",
-    "appleUrlHint": "Leeg laten tenzij je provider een ander CalDAV-eindpunt gebruikt."
+    "appleUrlHint": "Leeg laten tenzij je provider een ander CalDAV-eindpunt gebruikt.",
+    "outlook": "Outlook-agenda (Microsoft Graph)",
+    "outlookHint": "Maak een gratis Entra ID-appregistratie aan (\"Alleen persoonlijke Microsoft-accounts\") op {{link}} - zie de installatiehandleiding. Redirect-URI: {{redirect}}",
+    "outlookLink": "entra.microsoft.com",
+    "outlookIdLabel": "Client-ID",
+    "outlookSecretLabel": "Client-secret",
+    "outlookNote": "Eenrichtingspush: Yuvomi blijft leidend - wijzigingen in Outlook worden overschreven. Gezinsaccounts worden later in de app-instellingen gekoppeld."
   },
   "advanced": {
     "tag": "Geavanceerd · optioneel",
     "title": "Geavanceerde instellingen",
-    "subtitle": "Reverse proxy, single sign-on en automatische back-ups. Alles optioneel — overslaan is veilig.",
+    "subtitle": "Eenmalige aanmelding, toegang tot je thuisnetwerk en een paar fijnafstellingen. Alles optioneel.",
     "proxyLabel": "Hoe wordt Yuvomi aangeboden?",
     "proxyBehindHttps": "Achter een reverse proxy met HTTPS (Caddy, nginx, Traefik)",
     "proxyDirect": "Directe toegang via localhost / HTTP",
-    "proxyHint": "Directe toegang schakelt Secure-only cookies uit zodat inloggen zonder HTTPS werkt.",
+    "proxyHint": "Kies \"Directe toegang\" als je Yuvomi via http:// opent - anders kun je niet inloggen. Achter een reverse proxy met HTTPS kies je de eerste optie.",
     "oidc": "Single sign-on (OIDC)",
     "oidcHint": "Vul alle vier velden in om SSO in te schakelen, of laat ze leeg.",
     "oidcIssuerLabel": "Issuer-URL",
@@ -101,8 +113,7 @@
     "documentLocalEnable": "Nieuwe documenten in een lokale map opslaan",
     "documentLocalPathLabel": "Mappad",
     "documentLocalPathHint": "Pad in de container. Laat leeg voor /documents.",
-    "sectionNetwork": "Netwerk",
-    "sectionIntegrations": "Integraties en back-ups",
+    "sectionIntegrations": "Eenmalige aanmelding",
     "errSchedule": "Ongeldige cron-planning (vijf door spaties gescheiden velden verwacht, bijv. 0 2 * * *).",
     "errKeep": "Te bewaren back-ups moet een positief getal zijn.",
     "webdavBackup": "Externe back-ups (WebDAV)",
@@ -125,7 +136,32 @@
     "documentGoogleDriveReuseHint": "Laat beide velden leeg om de OAuth-inloggegevens van Google Agenda te hergebruiken. Voor eigen gegevens maak je ze aan in de Google Cloud Console (zoals bij de stap Agenda).",
     "documentGoogleDriveRedirectLabel": "Redirect-URI",
     "errDocumentGoogleDrivePair": "De client-ID en het client-secret van Google Drive moeten beide zijn ingesteld of beide leeg zijn.",
-    "errDocumentGoogleDriveCredentials": "Google Drive heeft een eigen client-ID en client-secret of geconfigureerde Google Agenda-inloggegevens nodig."
+    "errDocumentGoogleDriveCredentials": "Google Drive heeft een eigen client-ID en client-secret of geconfigureerde Google Agenda-inloggegevens nodig.",
+    "dataDirLabel": "Datamap op de host",
+    "dataDirHint": "Waar de database en app-gegevens op de server staan. Laat leeg voor ./data naast het compose-bestand.",
+    "documentLocalDirLabel": "Map op de host",
+    "documentLocalDirHint": "De map op de server die in de container wordt gekoppeld. Laat leeg voor ./documents.",
+    "documentWebdavPrivateNetwork": "WebDAV-doel in je thuisnetwerk toestaan",
+    "documentWebdavPrivateNetworkHint": "Nodig voor een Nextcloud in je eigen netwerk. Heft de SSRF-bescherming voor dit doel op.",
+    "icsPrivateNetwork": "Agenda-abonnementen uit je thuisnetwerk toestaan",
+    "icsPrivateNetworkHint": "Nodig voor ICS-feeds van apparaten in je eigen netwerk. Heft de SSRF-bescherming voor agenda-abonnementen op.",
+    "recipeProviderPrivateNetwork": "Recipe provider-spiegels in je thuisnetwerk toestaan",
+    "recipeProviderPrivateNetworkHint": "Nodig voor een Mealie- of Tandoor-exemplaar in je eigen netwerk. Heft de SSRF-bescherming voor recipe provider-spiegels op.",
+    "wasteSourcePrivateNetwork": "Afvalophaal-feeds in je thuisnetwerk toestaan",
+    "wasteSourcePrivateNetworkHint": "Nodig voor een gemeentelijke afvalkalender die in je eigen netwerk wordt gespiegeld. Heft de SSRF-bescherming voor afvalophaal-URL-bronnen op.",
+    "oidcTrustEmail": "E-mail zonder verified-claim vertrouwen",
+    "oidcTrustEmailHint": "Schakel dit alleen in als je provider geen email_verified stuurt en je die vertrouwt.",
+    "oidcAllowSignup": "SSO-aanmeldingen mogen nieuwe accounts aanmaken",
+    "oidcAllowSignupHint": "Zet dit uit als je provider meer mensen bedient dan dit huishouden. Bestaande accounts melden zich nog steeds aan en worden nog steeds gekoppeld.",
+    "baseUrlLabel": "Openbaar adres",
+    "baseUrlHint": "Het adres waarop je gezin Yuvomi opent - niet de host en poort van de container. Wordt gebruikt voor links om wachtwoorden te herstellen en voor uitnodigingen.",
+    "syncIntervalLabel": "Synchronisatie-interval agenda (minuten)",
+    "syncIntervalHint": "Hoe vaak Yuvomi agenda's en contacten synchroniseert. Verhoog dit als je provider je afremt.",
+    "errSyncInterval": "Voer een positief geheel aantal minuten in.",
+    "sectionPrivateNetwork": "Toegang tot je thuisnetwerk",
+    "privateNetworkHint": "Yuvomi weigert standaard verbindingen naar adressen in je eigen netwerk, wat beschermt tegen een server die verleid wordt interne diensten te benaderen. Sta toe wat je thuis echt draait.",
+    "authPasswordLogin": "Aanmelden met gebruikersnaam en wachtwoord behouden",
+    "authPasswordLoginHint": "Uitschakelen maakt SSO de enige manier om binnen te komen: het aanmeldformulier en het herstellen van het wachtwoord verdwijnen. Is de provider onbereikbaar, dan loopt de weg terug via het .env-bestand en een herstart."
   },
   "review": {
     "title": "Controleren",
@@ -154,24 +190,45 @@
     "webdavBackup": "Externe back-ups",
     "on": "ingeschakeld",
     "off": "uitgeschakeld",
-    "documentGoogleDrive": "Google Drive-documenten"
+    "documentGoogleDrive": "Google Drive-documenten",
+    "sessionSecret": "Sessiesleutel",
+    "dbKey": "Databasesleutel",
+    "keyGenerated": "Nieuw aangemaakt",
+    "keyPreserved": "Bestaande sleutel blijft behouden",
+    "dataDir": "Datamap",
+    "privateNetwork": "Toegang tot eigen netwerk",
+    "privateNetworkIcs": "Agenda-abonnementen",
+    "privateNetworkRecipes": "Recepten",
+    "privateNetworkWaste": "Afvalophaal",
+    "privateNetworkWebdav": "WebDAV-documenten",
+    "baseUrl": "Openbaar adres",
+    "outlook": "Outlook-agenda",
+    "notEnabled": "niet vrijgegeven"
   },
   "docker": {
     "title": "Yuvomi wordt gestart",
     "subtitle": "Het image wordt geladen en de Docker-container wordt gestart.",
-    "starting": "Container wordt gestart …",
     "elapsed": "{{n}} s verstreken",
     "running": "Container is gezond en actief",
     "failed": "Container kon niet worden gestart",
     "unknownError": "Onbekende fout",
     "toAdmin": "Doorgaan naar beheerdersinstelling",
-    "retry": "Opnieuw proberen"
+    "retry": "Opnieuw proberen",
+    "phasePull": "Image wordt gedownload",
+    "phaseBoot": "Container start op",
+    "phaseHealth": "Health check loopt",
+    "firstRunHint": "De eerste keer kan dit enkele minuten duren.",
+    "stalled": "Dit duurt langer dan gebruikelijk. Het logboek hieronder laat zien waarom.",
+    "showLogs": "Logboek tonen",
+    "hideLogs": "Logboek verbergen",
+    "timedOut": "Geen reactie na 15 minuten. Bekijk het logboek en probeer het opnieuw.",
+    "logLabel": "Containerlogboek"
   },
   "admin": {
     "title": "Beheerdersaccount aanmaken",
     "subtitle": "Stel je eerste login in. Dit account heeft volledige toegang tot Yuvomi.",
     "userLabel": "Gebruikersnaam",
-    "userHint": "3–64 tekens: letters, cijfers, . - _",
+    "userHint": "3-64 tekens: letters, cijfers, . - _",
     "nameLabel": "Weergavenaam",
     "passLabel": "Wachtwoord",
     "passPlaceholder": "Minimaal 8 tekens",
@@ -179,7 +236,7 @@
     "creating": "Wordt aangemaakt …",
     "create": "Account aanmaken",
     "errAll": "Alle velden zijn vereist.",
-    "errUser": "Ongeldig gebruikersnaamformaat (3–64 tekens, letters/cijfers/._-).",
+    "errUser": "Ongeldig gebruikersnaamformaat (3-64 tekens, letters/cijfers/._-).",
     "errPass": "Het wachtwoord moet minimaal 8 tekens lang zijn.",
     "errMatch": "Wachtwoorden komen niet overeen.",
     "errCreate": "Beheerdersaccount kon niet worden aangemaakt."
@@ -190,7 +247,17 @@
     "open": "Yuvomi openen →",
     "backupReminder": "Vergeet niet je .env-bestand nu te back-uppen — het bevat je sleutels.",
     "download": ".env-bestand downloaden",
-    "savedTo": "Opgeslagen in {{path}}"
+    "savedTo": "Opgeslagen in {{path}}",
+    "downloadFailed": "Het bestand kon niet worden geladen - de installer is waarschijnlijk al gestopt. Je sleutels staan in het .env-bestand op je server.",
+    "serverStops": "De installer stopt over een paar minuten. Download het bestand voordat je dit tabblad sluit.",
+    "nextTitle": "Hierna",
+    "nextInvite": "Nodig je gezin uit",
+    "nextInviteDesc": "Maak uitnodigingslinks zodat iedereen een eigen wachtwoord kiest.",
+    "nextModules": "Kies je modules",
+    "nextModulesDesc": "Zet aan wat je huishouden echt gebruikt en verberg de rest.",
+    "nextInstall": "Installeer het op de telefoons",
+    "nextInstallDesc": "Open Yuvomi op een telefoon en zet het op het startscherm - het werkt offline.",
+    "subtitleExisting": "Yuvomi draait. Deze installatie heeft al een beheerdersaccount - log in met je bestaande gegevens."
   },
   "welcome": {
     "title": "Welkom bij Yuvomi",
@@ -201,7 +268,9 @@
     "simpleTime": "Ongeveer 2 minuten",
     "advancedTitle": "Geavanceerde installatie",
     "advancedDesc": "Volledige controle: reverse proxy, agenda-synchronisatie, e-mail, single sign-on en back-ups.",
-    "advancedTime": "Elke optie, stap voor stap"
+    "advancedTime": "Elke optie, stap voor stap",
+    "existingLocked": "Er is een bestaande installatie gevonden. Gebruik de geavanceerde installatie zodat je huidige instellingen behouden blijven.",
+    "containerRunning": "Yuvomi draait op dit moment. Bij opslaan wordt de container herstart en is hij even niet bereikbaar."
   },
   "simple": {
     "title": "Klaar voor gebruik",
@@ -233,5 +302,11 @@
     "fromHint": "Het \"van\"-adres dat ontvangers zien. Veel providers vereisen dat het overeenkomt met je gebruikersnaam.",
     "fromNameLabel": "Afzendernaam",
     "errIncomplete": "SMTP-server en afzenderadres zijn verplicht."
+  },
+  "storage": {
+    "title": "Opslag en back-ups",
+    "subtitle": "Waar je gegevens op de server staan en waar kopieën ervan heen gaan. Alles optioneel - de standaarden werken.",
+    "sectionBackups": "Back-ups",
+    "sectionDocuments": "Documentopslag"
   }
 }

@@ -1,11 +1,29 @@
 import { api } from '/api.js';
 import { openModal as openSharedModal, closeModal, advancedSection } from '/components/modal.js';
 import { stagger, scheduleUndoableDelete } from '/utils/ux.js';
-import { t, formatDate, parseDateInput, isDateInputValid } from '/i18n.js';
+import { wireSwipeRows, maybeShowSwipeHint } from '/utils/swipe-row.js';
+import { t, formatDate, parseDateInput, isDateInputValid, getLocale } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
-import { toLocalDateKey } from '/utils/date.js';
+import { todayKey } from '/utils/date.js';
+import { setNavBadge, BIRTHDAY_BADGE_DAYS } from '/utils/nav-badges.js';
 import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
+import { moduleAccess } from '/permissions.js';
+import { findPageFab } from '/utils/fab.js';
+// Alias: dieses Modul fuehrt selbst eine `emptyStateHtml()`, die den Renderer
+// mit den Geburtstags-Texten fuellt. Zwei Namen, die sich nur in der
+// Gross-Schreibung unterscheiden, waeren im Modul nicht auseinanderzuhalten.
+import { emptyStateHTML as sharedEmptyStateHTML, emptyHintHTML } from '/utils/empty-state.js';
+import { getReadableTextColor, AVATAR_FALLBACK_COLOR } from '/utils/color.js';
+import {
+  renderAppPage,
+  renderPageHeader,
+  renderPageTitle,
+  renderPageBody,
+  renderPageActions,
+  renderPageSection,
+  renderListSection,
+} from '/utils/page-layout.js';
 
 let state = {
   birthdays: [],
@@ -67,6 +85,66 @@ function renderBirthdayReminderSection(birthday = null) {
     </div>`;
 }
 
+export function daysInNameDayMonth(month) {
+  const numeric = Number(month);
+  if (!Number.isInteger(numeric) || numeric < 1 || numeric > 12) return 0;
+  return new Date(Date.UTC(2000, numeric, 0)).getUTCDate();
+}
+
+export function normalizeNameDaySelection(month, day) {
+  const rawMonth = String(month ?? '').trim();
+  const rawDay = String(day ?? '').trim();
+  if (!rawMonth && !rawDay) return { value: null, complete: true };
+  if (!rawMonth || !rawDay) return { value: null, complete: false };
+  const monthNumber = Number(rawMonth);
+  const dayNumber = Number(rawDay);
+  if (!Number.isInteger(monthNumber) || !Number.isInteger(dayNumber)
+      || dayNumber < 1 || dayNumber > daysInNameDayMonth(monthNumber)) {
+    return { value: null, complete: false };
+  }
+  return {
+    value: `${String(monthNumber).padStart(2, '0')}-${String(dayNumber).padStart(2, '0')}`,
+    complete: true,
+  };
+}
+
+function nameDayDayOptions(month, selectedDay = '') {
+  const count = daysInNameDayMonth(month);
+  const options = [`<option value="">${esc(t('birthdays.nameDayDayPlaceholder'))}</option>`];
+  for (let day = 1; day <= count; day++) {
+    const value = String(day).padStart(2, '0');
+    options.push(`<option value="${value}"${value === selectedDay ? ' selected' : ''}>${day}</option>`);
+  }
+  return options.join('');
+}
+
+export function renderNameDayField(birthday = null) {
+  const [selectedMonth = '', selectedDay = ''] = String(birthday?.name_day || '').split('-');
+  const monthFormatter = new Intl.DateTimeFormat(getLocale(), { month: 'long', timeZone: 'UTC' });
+  const months = Array.from({ length: 12 }, (_, index) => {
+    const value = String(index + 1).padStart(2, '0');
+    const label = monthFormatter.format(new Date(Date.UTC(2000, index, 1)));
+    return `<option value="${value}"${value === selectedMonth ? ' selected' : ''}>${esc(label)}</option>`;
+  }).join('');
+  return `
+    <div class="form-group birthday-name-day">
+      <span class="form-label" id="bd-name-day-label">${t('birthdays.nameDayLabel')}</span>
+      <div class="birthday-name-day__controls" role="group" aria-labelledby="bd-name-day-label">
+        <select class="form-input birthday-modal__select" id="bd-name-day-month" aria-label="${t('birthdays.nameDayMonthLabel')}">
+          <option value="">${t('birthdays.nameDayMonthPlaceholder')}</option>
+          ${months}
+        </select>
+        <select class="form-input birthday-modal__select" id="bd-name-day-day" aria-label="${t('birthdays.nameDayDayLabel')}"${selectedMonth ? '' : ' disabled'}>
+          ${nameDayDayOptions(selectedMonth, selectedDay)}
+        </select>
+        <button class="btn btn--secondary birthday-name-day__clear" type="button" id="bd-name-day-clear" aria-label="${t('birthdays.nameDayClear')}" title="${t('birthdays.nameDayClear')}">
+          <i data-lucide="x" aria-hidden="true"></i><span>${t('birthdays.nameDayClear')}</span>
+        </button>
+      </div>
+      <div class="birthday-name-day__hint">${t('birthdays.nameDayHint')}</div>
+    </div>`;
+}
+
 // Datum + Alter in einer Zeile: „12.08.2026 · wird 30". Der Countdown lebt
 // getrennt im Chip, damit keine Zahl doppelt erscheint.
 function ageMeta(birthday) {
@@ -83,9 +161,37 @@ function countdownChip(birthday) {
   return { label: t('birthdays.inDays', { days: birthday.days_until }), mod };
 }
 
+/**
+ * DIE PERSON SCHLAEGT DIE LISTE, IN DER SIE STEHT.
+ *
+ * `.birthday-avatar--fallback` verspricht seit 2026-08-18 „wer verknuepft ist,
+ * traegt seine Mitgliedsfarbe" - eingeloest war das nur auf der Uebersichts-
+ * kachel. Auf der Modulseite sass jedes Haushaltsmitglied auf derselben
+ * neutralen Scheibe wie eine Tante ohne Zugang (Identitaetsfarben-Regel,
+ * DESIGN.md).
+ *
+ * Reihenfolge: ein Bild, das FUER DIESEN EINTRAG hinterlegt wurde, ist die
+ * genaueste Auskunft und gewinnt; danach kommt das Profilbild des Mitglieds,
+ * danach seine Farbe mit den Initialen. Wer zu niemandem im Haushalt gehoert,
+ * bleibt neutral - er hat keine Identitaetsfarbe, und genau das soll die
+ * Scheibe sagen.
+ *
+ * Die Tinte kommt aus `getReadableTextColor`: eine Avatarfarbe ist frei
+ * gewaehlt, ihre Helligkeit damit unbestimmt - dieselbe Rechnung wie in den
+ * Kontakten.
+ */
 function photoAvatar(birthday, extraClass = '') {
   if (birthday.photo_data) {
     return `<img class="birthday-avatar ${extraClass}" src="${birthday.photo_data}" alt="${esc(birthday.name)}">`;
+  }
+  if (birthday.family_user_id && birthday.family_avatar_data) {
+    return `<img class="birthday-avatar ${extraClass}" src="${esc(birthday.family_avatar_data)}" alt="${esc(birthday.name)}">`;
+  }
+  if (birthday.family_user_id) {
+    const color = birthday.family_avatar_color || AVATAR_FALLBACK_COLOR;
+    const name = birthday.family_display_name || birthday.name;
+    return `<span class="birthday-avatar birthday-avatar--fallback ${extraClass}"
+      style="background-color:${esc(color)};color:${getReadableTextColor(color)}">${esc(initials(name))}</span>`;
   }
   return `<span class="birthday-avatar birthday-avatar--fallback ${extraClass}">${esc(initials(birthday.name))}</span>`;
 }
@@ -110,42 +216,59 @@ async function loadData() {
   updateBirthdayBadge();
 }
 
-function updateBirthdayBadge() {
-  const soon = state.birthdays.filter((b) => (b.days_until ?? 9999) <= 3).length;
-  document.querySelectorAll('[data-route="/birthdays"] .nav-badge').forEach((el) => el.remove());
-  if (!soon) return;
-  document.querySelectorAll('[data-route="/birthdays"]').forEach((navItem) => {
-    let anchor = navItem.querySelector('.nav-item__icon-wrap');
-    if (!anchor) {
-      const icon = navItem.querySelector('.nav-item__icon');
-      anchor = document.createElement('span');
-      anchor.className = 'nav-item__icon-wrap';
-      if (icon) { icon.replaceWith(anchor); anchor.appendChild(icon); }
-      else navItem.prepend(anchor);
-    }
-    const badge = document.createElement('span');
-    badge.className = 'nav-badge';
-    badge.setAttribute('aria-hidden', 'true');
-    badge.textContent = String(soon);
-    anchor.appendChild(badge);
-  });
+/**
+ * How many birthday or name-day occurrences are imminent?
+ * The server computes both distances (`hydrateBirthday`); this function only
+ * applies the cutoff, so `/dashboard` uses the same rule for its initial count.
+ * One person may count twice because the badge describes occurrences, not people.
+ */
+export function countBirthdaysSoon(birthdays) {
+  return birthdays.reduce((count, birthday) => count
+    + ((birthday.days_until ?? 9999) <= BIRTHDAY_BADGE_DAYS ? 1 : 0)
+    + ((birthday.name_day_days_until ?? 9999) <= BIRTHDAY_BADGE_DAYS ? 1 : 0), 0);
 }
 
-function birthdayItemHtml(birthday) {
+function updateBirthdayBadge() {
+  // Nachricht, kein Alarm (Valenz siehe nav-badges.js).
+  setNavBadge('/birthdays', countBirthdaysSoon(state.birthdays), undefined, 'accent');
+}
+
+export function birthdayItemHtml(birthday) {
   const chip = countdownChip(birthday);
   const isToday = chip.mod === 'today';
+  const hasNameDay = birthday.next_name_day && Number.isInteger(birthday.name_day_days_until);
+  const nameDayMeta = hasNameDay
+    ? `<span class="birthday-item__name-day">`
+      + `${esc(t('birthdays.inDays', { days: birthday.name_day_days_until }))} · `
+      + `${esc(formatDate(birthday.next_name_day))} · ${esc(t('birthdays.celebratesNameDay'))}`
+      + '</span>'
+    : '';
+  // Wischbedienung (Redesign Runde 4, C-2): auf Touch tragen die beiden
+  // Richtungen, was bis dahin zwei Icon-Knoepfe in jeder Zeile trugen - in
+  // einer Grouped-Liste die lauteste Stelle des Bildschirms. Auf
+  // Zeigergeraeten bleiben die Knoepfe, dort gibt es keine Geste.
   return `
-    <article class="birthday-item ${isToday ? 'birthday-item--today' : ''}" data-id="${birthday.id}">
+    <div class="swipe-row" data-swipe-id="${birthday.id}">
+      <div class="swipe-reveal swipe-reveal--edit swipe-reveal--leading" aria-hidden="true">
+        <i data-lucide="pencil" class="icon-md"></i>
+        <span>${t('common.edit')}</span>
+      </div>
+      <div class="swipe-reveal swipe-reveal--delete swipe-reveal--trailing" aria-hidden="true">
+        <i data-lucide="trash-2" class="icon-md"></i>
+        <span>${t('common.delete')}</span>
+      </div>
+    <article class="list-row birthday-item ${isToday ? 'birthday-item--today' : ''}" data-id="${birthday.id}">
       <div class="birthday-item__media">${photoAvatar(birthday)}</div>
-      <div class="birthday-item__body">
-        <div class="birthday-item__row">
-          <strong class="birthday-item__name">
-            ${esc(birthday.name)}${isToday ? CAKE_SVG : ''}
-          </strong>
+      <div class="list-row__main">
+        <strong class="list-row__name birthday-item__name">
+          ${esc(birthday.name)}${isToday ? CAKE_SVG : ''}
+        </strong>
+        <div class="list-row__meta birthday-item__meta${hasNameDay ? ' birthday-item__meta--with-name-day' : ''}">
           <span class="birthday-chip birthday-chip--${chip.mod}">${esc(chip.label)}</span>
+          <span class="birthday-item__when">${esc(ageMeta(birthday))}</span>
+          ${nameDayMeta}
+          ${birthday.notes ? `<span class="birthday-item__notes">${esc(birthday.notes)}</span>` : ''}
         </div>
-        <div class="birthday-item__meta">${esc(ageMeta(birthday))}</div>
-        ${birthday.notes ? `<div class="birthday-item__notes">${esc(birthday.notes)}</div>` : ''}
       </div>
       <div class="row-actions birthday-item__actions">
         <button class="row-action" type="button" data-action="edit" data-id="${birthday.id}" aria-label="${t('common.edit')}">
@@ -155,25 +278,28 @@ function birthdayItemHtml(birthday) {
           <i data-lucide="trash-2" aria-hidden="true"></i>
         </button>
       </div>
-    </article>`;
+    </article>
+    </div>`;
 }
 
 function emptyStateHtml() {
+  // `cake` ist dasselbe Zeichen wie CAKE_SVG - das Inline-SVG oben ist die
+  // Lucide-Torte, von Hand kopiert, damit sie neben einem Namen stehen kann.
+  // Im Leerzustand nimmt der Renderer den Lucide-Namen direkt.
   if (state.query.trim()) {
-    return `<div class="empty-state empty-state--compact">
-      ${CAKE_SVG.replace('birthday-cake', 'empty-state__icon')}
-      <div class="empty-state__title">${t('search.noResults')}</div>
-    </div>`;
+    return sharedEmptyStateHTML({
+      variant: 'no-results',
+      icon: 'cake',
+      title: t('search.noResults'),
+    });
   }
-  return `<div class="empty-state">
-    ${CAKE_SVG.replace('birthday-cake', 'empty-state__icon')}
-    <div class="empty-state__title">${t('birthdays.emptyTitle')}</div>
-    <div class="empty-state__description">${t('birthdays.emptyDescription')}</div>
-    <p class="empty-state__hint">${t('emptyHint.birthdays')}</p>
-    <button class="btn btn--primary empty-state__cta" type="button" id="birthdays-empty-cta">
-      ${t('birthdays.addButton')}
-    </button>
-  </div>`;
+  return sharedEmptyStateHTML({
+    icon: 'cake',
+    title: t('birthdays.emptyTitle'),
+    description: t('birthdays.emptyDescription'),
+    hint: t('emptyHint.birthdays'),
+    action: { label: t('birthdays.addButton'), attrs: { id: 'birthdays-empty-cta' } },
+  });
 }
 
 function renderList() {
@@ -200,36 +326,93 @@ function renderList() {
 
   if (window.lucide) window.lucide.createIcons({ el: host });
   stagger(host.querySelectorAll('.birthday-item'));
+  wireBirthdaySwipe(host);
+  maybeShowSwipeHint(host);
+}
+
+/**
+ * Wischbedienung der Liste (Redesign Runde 4, C-2). Dieselben zwei Aktionen,
+ * die auf Zeigergeräten als Knöpfe in der Zeile stehen - zum Zeilenanfang hin
+ * wischen bearbeitet, zum Zeilenende hin löscht.
+ *
+ * Beide federn zurück, statt hinauszufliegen: das Bearbeiten öffnet nur einen
+ * Dialog und die Zeile bleibt, und das Löschen ist über den geteilten
+ * Rückgängig-Weg (`scheduleUndoableDelete`) fünf Sekunden lang widerrufbar -
+ * eine hinausgeflogene Karte hätte behauptet, die Sache sei erledigt.
+ */
+function wireBirthdaySwipe(host) {
+  wireSwipeRows(host, {
+    card: '.birthday-item',
+    trailing: {
+      reveal: '.swipe-reveal--delete',
+      run: (row) => deleteBirthday(Number(row.dataset.swipeId)),
+    },
+    leading: {
+      reveal: '.swipe-reveal--edit',
+      run: (row) => {
+        const birthday = state.birthdays.find((item) => item.id === Number(row.dataset.swipeId));
+        if (birthday) openBirthdayModal({ mode: 'edit', birthday });
+      },
+    },
+  });
 }
 
 function renderPage() {
+  // Reference page for PAGE-COMPOSITION.md: geometry only via page-layout helpers.
+  // Header and body sections share --layout-reading (PAGE-002).
   _container.replaceChildren();
-  _container.insertAdjacentHTML('beforeend', `
-    <div class="birthdays-page">
-      <div class="page-toolbar page-toolbar--wrap birthdays-toolbar">
-        <h1 class="page-toolbar__title">${t('birthdays.title')}</h1>
-        ${renderPageSearch({ id: 'birthdays-search', label: t('birthdays.searchPlaceholder'), placeholder: t('birthdays.searchPlaceholder'), value: state.query, clearLabel: t('common.searchClear'), className: 'birthdays-toolbar__search page-toolbar__center' })}
-        <button class="btn btn--secondary birthdays-toolbar__import" id="birthdays-import-btn" type="button" aria-label="${t('birthdays.importButton')}">
-          <i data-lucide="download" aria-hidden="true"></i><span>${t('birthdays.importButton')}</span>
-        </button>
-      </div>
-
-      <p class="birthdays-hint">${t('birthdays.calendarHint')}</p>
-
-      <div class="birthdays-list" id="birthdays-list"></div>
-
-      <button class="page-fab" id="fab-new-birthday" aria-label="${t('birthdays.addButton')}">
+  _container.insertAdjacentHTML('beforeend', renderAppPage({
+    mode: 'reading',
+    className: 'birthdays-page',
+    legacyAlias: false,
+    header: renderPageHeader({
+      wrap: true,
+      narrow: true,
+      className: 'birthdays-toolbar',
+      title: renderPageTitle(t('birthdays.title')),
+      center: renderPageSearch({
+        id: 'birthdays-search',
+        label: t('birthdays.searchPlaceholder'),
+        placeholder: t('birthdays.searchPlaceholder'),
+        value: state.query,
+        clearLabel: t('common.searchClear'),
+        className: 'birthdays-toolbar__search page-toolbar__center',
+      }),
+      // Actions slot: Import + desktop-docked primary (dockFabIntoToolbar).
+      // DER KNOPF LIEST AUS KONTAKTEN, NICHT AUS GEBURTSTAGEN. Wer `contacts`
+      // nicht sehen darf, bekommt seit #1241 vom Server ein 403 - ohne diese
+      // Zeile bliebe ein Knopf stehen, der nur noch eine Fehlermeldung
+      // aufmacht. Die Durchsetzung bleibt serverseitig, das hier ist die
+      // Anzeige dazu.
+      actions: renderPageActions(moduleAccess('contacts') === 'none' ? '' : `
+          <button class="btn btn--secondary birthdays-toolbar__import" id="birthdays-import-btn" type="button" aria-label="${t('birthdays.importButton')}">
+            <i data-lucide="download" aria-hidden="true"></i><span>${t('birthdays.importButton')}</span>
+          </button>`),
+    }),
+    body: renderPageBody({
+      content: [
+        renderPageSection({
+          className: 'birthdays-hint-section',
+          content: `<p class="birthdays-hint">${t('birthdays.calendarHint')}</p>`,
+        }),
+        renderListSection({
+          className: 'birthdays-list-section',
+          content: `<div class="row-carrier birthdays-list" id="birthdays-list"></div>`,
+        }),
+      ].join('\n'),
+    }),
+    trailing: `
+      <button class="page-fab" id="fab-new-birthday" aria-label="${t('birthdays.addButton')}" data-dock-label="${t('newLabel.birthdays')}">
         <i data-lucide="plus" class="icon-xl" aria-hidden="true"></i>
-      </button>
-    </div>
-  `);
+      </button>`,
+  }));
 
   renderList();
   if (window.lucide) window.lucide.createIcons({ el: _container });
 }
 
 function bindEvents() {
-  _container.querySelector('#fab-new-birthday').addEventListener('click', () => openBirthdayModal({ mode: 'create' }));
+  findPageFab('fab-new-birthday').addEventListener('click', () => openBirthdayModal({ mode: 'create' }));
   _container.querySelector('#birthdays-import-btn')?.addEventListener('click', () => openImportModal());
 
   // Deep-Link aus dem Kontakt-Import („Zu Geburtstagen"): Kandidaten-Modal direkt
@@ -237,7 +420,9 @@ function bindEvents() {
   try {
     if (sessionStorage.getItem('yuvomi:birthdays:autoImport')) {
       sessionStorage.removeItem('yuvomi:birthdays:autoImport');
-      openImportModal();
+      // Dieselbe Bedingung wie am Knopf: ein stehen gebliebenes Flag oeffnete
+      // sonst ein Modal, das nur noch einen 403-Toast zeigen kann.
+      if (moduleAccess('contacts') !== 'none') openImportModal();
     }
   } catch { /* sessionStorage evtl. nicht verfügbar */ }
 
@@ -266,15 +451,6 @@ function bindEvents() {
   });
 }
 
-function readFileAsDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ''));
-    reader.onerror = () => reject(new Error('Failed to read image.'));
-    reader.readAsDataURL(file);
-  });
-}
-
 function birthdayPreviewHtml(name, photoData) {
   if (photoData) return `<img class="birthday-preview__image" src="${photoData}" alt="${esc(name || '')}">`;
   return `<span class="birthday-preview__fallback">${esc(initials(name))}</span>`;
@@ -283,7 +459,7 @@ function birthdayPreviewHtml(name, photoData) {
 function openBirthdayModal({ mode, birthday = null }) {
   const isEdit = mode === 'edit';
   let photoData = birthday?.photo_data || null;
-  const today = toLocalDateKey(new Date());
+  const today = todayKey();
 
   openSharedModal({
     title: isEdit ? t('birthdays.editTitle') : t('birthdays.newTitle'),
@@ -294,7 +470,7 @@ function openBirthdayModal({ mode, birthday = null }) {
             <button type="button" class="birthday-avatar-editor" id="birthday-preview" aria-label="${t('birthdays.photoLabel')}">
               ${birthdayPreviewHtml(birthday?.name || '', photoData)}
             </button>
-            <input class="sr-only" id="bd-photo" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
+            <input class="sr-only" id="bd-photo" type="file" accept="image/png,image/jpeg,image/webp">
             <div class="birthday-modal__photo-actions">
               <button type="button" class="birthday-modal__photo-action" id="bd-photo-edit" aria-label="${t('birthdays.photoLabel')}" title="${t('birthdays.photoLabel')}">
                 <i data-lucide="pencil" aria-hidden="true"></i>
@@ -316,12 +492,13 @@ function openBirthdayModal({ mode, birthday = null }) {
           </div>
         </div>
         ${advancedSection(`
+          ${renderNameDayField(birthday)}
           <div class="form-group">
             <label class="form-label" for="bd-notes">${t('birthdays.notesLabel')}</label>
             <textarea class="form-input" id="bd-notes" rows="3" placeholder="${t('birthdays.notesPlaceholder')}">${esc(birthday?.notes || '')}</textarea>
           </div>
           ${renderBirthdayReminderSection(birthday)}`,
-          { open: isEdit && (!!birthday?.notes || (!!birthday?.reminder_offset && birthday.reminder_offset !== '1440')) })}
+          { open: isEdit && (!!birthday?.name_day || !!birthday?.notes || (!!birthday?.reminder_offset && birthday.reminder_offset !== '1440')) })}
         <div class="birthday-modal__hint">${t('birthdays.calendarHint')}</div>
         <div class="birthday-modal__footer">
           ${isEdit ? `<button class="btn btn--danger" id="bd-delete">${t('common.delete')}</button>` : '<div></div>'}
@@ -348,8 +525,17 @@ function openBirthdayModal({ mode, birthday = null }) {
       fileInput?.addEventListener('change', async (e) => {
         const file = e.target.files?.[0];
         if (!file) return;
+        // Das Feld ist ein Transportmittel, kein Zustand - sofort leeren, wie
+        // beim Kachelbild (`quick-links-manager.js`). Bleibt der Dateiname
+        // stehen, feuert `change` beim nächsten Griff zu DERSELBEN Datei nicht
+        // mehr, und „nochmal anders zuschneiden" täte gar nichts.
+        e.target.value = '';
         try {
-          photoData = await readFileAsDataUrl(file);
+          const { pickCroppedImage } = await import('/utils/avatar-crop.js');
+          const cropped = await pickCroppedImage(file);
+          // Abgebrochener Zuschnitt: das bisherige Bild bleibt stehen.
+          if (cropped === undefined) return;
+          photoData = cropped;
           renderPreview();
         } catch (err) {
           window.yuvomi?.showToast(err.message, 'danger');
@@ -367,6 +553,33 @@ function openBirthdayModal({ mode, birthday = null }) {
         if (reminderCustom) reminderCustom.hidden = reminderOffset.value !== 'custom';
       });
 
+      const nameDayMonth = panel.querySelector('#bd-name-day-month');
+      const nameDayDay = panel.querySelector('#bd-name-day-day');
+      const refreshNameDayDays = (preferredDay = '') => {
+        if (!nameDayDay) return;
+        const option = (value, label) => {
+          const node = document.createElement('option');
+          node.value = value;
+          node.textContent = label;
+          node.selected = value === preferredDay;
+          return node;
+        };
+        const options = [option('', t('birthdays.nameDayDayPlaceholder'))];
+        const dayCount = daysInNameDayMonth(nameDayMonth?.value);
+        for (let day = 1; day <= dayCount; day++) {
+          const value = String(day).padStart(2, '0');
+          options.push(option(value, String(day)));
+        }
+        nameDayDay.replaceChildren(...options);
+        nameDayDay.disabled = !nameDayMonth?.value;
+      };
+      nameDayMonth?.addEventListener('change', () => refreshNameDayDays(nameDayDay?.value));
+      panel.querySelector('#bd-name-day-clear')?.addEventListener('click', () => {
+        if (nameDayMonth) nameDayMonth.value = '';
+        refreshNameDayDays();
+        nameDayMonth?.focus();
+      });
+
       panel.querySelector('#bd-cancel').addEventListener('click', closeModal);
       // Löschen verwirft die Eingaben ohnehin mit dem Datensatz: der Dirty-Guard
       // hätte hier erst nach dem Verwerfen von Feldern gefragt, die gleich mit
@@ -381,9 +594,15 @@ function openBirthdayModal({ mode, birthday = null }) {
         const saveBtn = panel.querySelector('#bd-save');
         const birthDateRaw = panel.querySelector('#bd-birth-date').value;
         const birthDate = parseDateInput(birthDateRaw);
+        const nameDay = normalizeNameDaySelection(nameDayMonth?.value, nameDayDay?.value);
+        if (!nameDay.complete) {
+          window.yuvomi?.showToast(t('birthdays.nameDayIncomplete'), 'warning');
+          return;
+        }
         const body = {
           name: panel.querySelector('#bd-name').value.trim(),
           birth_date: birthDate,
+          name_day: nameDay.value,
           notes: panel.querySelector('#bd-notes').value.trim(),
           photo_data: photoData,
           reminder_offset: panel.querySelector('#bd-reminder-offset').value,
@@ -451,7 +670,7 @@ async function openImportModal() {
 
   const listHtml = hasCandidates
     ? `<div class="bd-import__list">${withBirthday.map(importCandidateRowHtml).join('')}</div>`
-    : `<div class="bd-import__empty">${t('birthdays.importEmpty')}</div>`;
+    : emptyHintHTML(t('birthdays.importEmpty'));
 
   const withoutHtml = withoutBirthday.length
     ? `<details class="bd-import__without">

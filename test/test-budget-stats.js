@@ -69,7 +69,8 @@ function freshDb() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       title TEXT NOT NULL, amount REAL NOT NULL,
       category TEXT NOT NULL DEFAULT 'Sonstiges', subcategory TEXT NOT NULL DEFAULT '',
-      date TEXT NOT NULL, is_recurring INTEGER NOT NULL DEFAULT 0, created_by INTEGER NOT NULL DEFAULT 1
+      date TEXT NOT NULL, is_recurring INTEGER NOT NULL DEFAULT 0, created_by INTEGER NOT NULL DEFAULT 1,
+      is_pending INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE budget_plans (
       category TEXT NOT NULL PRIMARY KEY, amount REAL NOT NULL,
@@ -78,9 +79,9 @@ function freshDb() {
   `);
   return db;
 }
-function add(db, date, amount, category = 'food') {
-  db.prepare('INSERT INTO budget_entries (title, amount, category, date) VALUES (?,?,?,?)')
-    .run('x', amount, category, date);
+function add(db, date, amount, category = 'food', isPending = 0) {
+  db.prepare('INSERT INTO budget_entries (title, amount, category, date, is_pending) VALUES (?,?,?,?,?)')
+    .run('x', amount, category, date, isPending);
 }
 
 test('computeStats month: totals + series-länge + zero-fill', () => {
@@ -96,6 +97,17 @@ test('computeStats month: totals + series-länge + zero-fill', () => {
   eq(r.series[1].period, '2026-06-02', 'bucket 2 period');
   eq(r.series[1].balance, 800, 'bucket 2 balance (1000-200)');
   eq(r.series[0].income, 0, 'leerer bucket zero-filled');
+});
+
+test('computeStats: unbestätigte Serien-Instanzen (is_pending) zählen nirgends mit', () => {
+  const db = freshDb();
+  add(db, '2026-06-02', 1000, 'salary');
+  add(db, '2026-06-03', -300, 'food', 1);   // pending: darf keine SUM beeinflussen
+  const r = computeStats(db, { range: 'month', anchor: '2026-06-15' });
+  eq(r.totals.expenses, 0, 'pending nicht in expenses');
+  eq(r.totals.balance, 1000, 'pending nicht in balance');
+  eq(r.byCategory.some((c) => c.category === 'food'), false, 'pending nicht in byCategory');
+  eq(r.series[2].expenses, 0, 'pending nicht in series');
 });
 
 test('computeStats byCategory: aggregiert + sortiert', () => {

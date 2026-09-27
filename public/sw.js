@@ -3,10 +3,12 @@
  * Zweck: Offline-Fähigkeit, differenzierte Caching-Strategien, Update-Notification
  * Abhängigkeiten: keine
  *
- * Caching-Strategien:
- *   APP_SHELL (HTML + kritische JS/CSS): Cache-First (frisch vorgeladen via install)
- *   PAGE_MODULES (Seiten-JS): Cache-First (frisch vorgeladen via install)
- *   ASSETS (Bilder, Icons): Cache-First, lazily gecacht, bei SW-Update geleert
+ * Caching-Strategien (der Dispatcher unten ist die Wahrheit; dieser Kopf
+ * behauptete bis 2026-08-31 "Cache-First" für Shell und Seitenmodule):
+ *   Navigation + APP_SHELL + PAGE_MODULES + Locales: Network-First mit dem
+ *        Precache (install) als Offline-Fallback - frisch, solange Netz da ist.
+ *   ASSETS (Bilder, Icons) und der Rest-Fallback: Cache-First, lazily gecacht,
+ *        bei SW-Update geleert
  *   API: Network-First für eine Read-only-GET-Whitelist (Kalender, Tasks, …)
  *        → offline letzter Stand sichtbar; Mutationen/Auth immer direkt ans Netz.
  *        Cache wird bei Logout/Session-Ende geleert (CLEAR_API_CACHE-Message).
@@ -15,20 +17,24 @@
  *   → bypassCacheUntil (in-memory + Cache API für SW-Restart-Robustheit)
  */
 
-const APP_RELEASE   = '1.74.0';
-const SHELL_CACHE   = `yuvomi-shell-${APP_RELEASE}`;
-const PAGES_CACHE   = `yuvomi-pages-${APP_RELEASE}`;
-const LOCALES_CACHE = `yuvomi-locales-${APP_RELEASE}`;
-const ASSETS_CACHE  = `yuvomi-assets-${APP_RELEASE}`;
+const APP_RELEASE        = '2.67.0';
+const APP_BUILD_REVISION = '__YUVOMI_BUILD_REVISION__';
+const CACHE_RELEASE      = `${APP_RELEASE}-${APP_BUILD_REVISION}`;
+const SHELL_CACHE        = `yuvomi-shell-${CACHE_RELEASE}`;
+const PAGES_CACHE        = `yuvomi-pages-${CACHE_RELEASE}`;
+const LOCALES_CACHE      = `yuvomi-locales-${CACHE_RELEASE}`;
+const ASSETS_CACHE       = `yuvomi-assets-${CACHE_RELEASE}`;
 // API-Cache bewusst NICHT in ALL_CACHES: er wird bei jedem SW-Update neu benannt
 // (Version im Namen) und bei Logout/Session-Ende gezielt geleert.
-const API_CACHE     = `yuvomi-api-${APP_RELEASE}`;
+const API_CACHE     = `yuvomi-api-${CACHE_RELEASE}`;
 const BYPASS_CACHE  = 'yuvomi-bypass-flag';
 const ALL_CACHES    = [SHELL_CACHE, PAGES_CACHE, LOCALES_CACHE, ASSETS_CACHE];
 
 // GET-API-Pfade (nach /api/v1), die für Read-only-Offline gecacht werden dürfen.
 // NUR Lese-Endpunkte — niemals /auth/* oder Mutationen. Prefix-Match.
 const API_CACHE_WHITELIST = ['/calendar', '/tasks', '/shopping', '/contacts', '/dashboard'];
+// Pfade UNTER einem Whitelist-Prefix, die trotzdem nie gecacht werden.
+const API_CACHE_EXCLUDE = ['/shopping/versions'];
 
 // App-Shell: sofort benötigt für ersten Render
 const APP_SHELL = [
@@ -43,18 +49,36 @@ const APP_SHELL = [
   '/push.js',
   '/sw-register.js',
   '/lucide.min.js',
+  '/lucide-scope.js',
+  // Alles, was `index.html` als `<link rel="stylesheet">` eager lädt, gehört
+  // hierher - sonst rendert der allererste Offline-Start ungestylt. Die Regel
+  // hält `test:sw-precache`; sie ist keine Liste, die man von Hand nachträgt.
   '/styles/tokens.css',
   '/styles/reset.css',
   '/styles/pwa.css',
   '/styles/layout.css',
   '/styles/glass.css',
-  '/styles/login.css',
+  '/styles/typography.css',
+  '/styles/filter-chip.css',
+  '/styles/sub-tabs.css',
+  '/styles/page-search.css',
+  '/styles/kitchen-tabs.css',
+  '/styles/list-row.css',
+  '/styles/panel.css',
+  '/styles/user-multi-select.css',
+  '/styles/datepicker.css',
+  '/styles/category-manager.css',
+  '/styles/icon-picker.css',
+  '/styles/document-attach.css',
+  '/styles/auth.css',
   '/styles/reminders.css',
   '/styles/dashboard.css',
   '/styles/tasks.css',
   '/styles/shopping.css',
   '/styles/meals.css',
   '/styles/calendar.css',
+  '/styles/schedule.css',
+  '/styles/markdown-toolbar.css',
   '/styles/notes.css',
   '/styles/contacts.css',
   '/styles/birthdays.css',
@@ -63,7 +87,9 @@ const APP_SHELL = [
   '/styles/settings.css',
   '/styles/recipes.css',
   '/styles/pantry.css',
+  '/styles/inventory.css',
   '/styles/detail-view.css',
+  '/styles/screensaver.css',
   '/components/yuvomi-install-prompt.js',
   // Geteilte Module. Sie werden von Shell UND Seitenmodulen importiert und
   // müssen deshalb zusammen mit der Shell erneuert werden: der Browser bindet
@@ -72,51 +98,121 @@ const APP_SHELL = [
   // Dateisystem; Fetch-Routing für diese Pfade → SHELL_CACHE (isMutableAppResource).
   '/nav-icons.js',
   '/permissions.js',
+  // Der Router laedt ihn als Seiteneffekt (`import '/components/datepicker.js'`),
+  // also gehoert er in die Shell, nicht zu den Seitenmodulen. Der
+  // Precache-Guard sah diese Import-Form bis #944 nicht.
+  '/components/datepicker.js',
   '/components/detail-view.js',
   '/components/document-attach.js',
+  '/components/health-fasting-insights.js',
   '/components/modal.js',
+  '/components/photo-screensaver.js',
+  '/components/quick-links-manager.js',
+  '/components/task-detail.js',
   '/components/user-multi-select.js',
+  '/components/wall-timer.js',
   '/utils/birthday-event.js',
+  '/utils/bulk-pill.js',
   '/utils/category-labels.js',
+  '/utils/chart.js',
   '/utils/color.js',
   '/utils/contact-name.js',
   '/utils/contrast.js',
+  '/utils/countdown.js',
+  '/utils/dashboard-layout-hint.js',
+  '/utils/dashboard-widgets.js',
+  '/utils/date-status.js',
   '/utils/date.js',
+  '/utils/digits.js',
+  '/utils/day-label.js',
+  '/utils/currency-codes.js',
+  '/utils/calendar-delete.js',
+  '/utils/document-folder-delete.js',
   '/utils/document-preview.js',
+  '/utils/event-color.js',
   '/utils/empty-state.js',
+  '/utils/extension-i18n.js',
+  '/utils/extension-widgets.js',
   '/utils/fab.js',
+  '/utils/folder-upload.js',
+  '/utils/folder-tree.js',
   '/utils/health-activity.js',
   '/utils/health-cycle.js',
+  '/utils/health-fasting.js',
+  '/components/fasting-controls.js',
+  '/components/fasting-dial.js',
+  '/components/fasting-help.js',
+  '/styles/fasting-controls.css',
   '/utils/health-labs.js',
   '/utils/health-meds.js',
   '/utils/health-overview.js',
+  '/utils/health-prevention.js',
   '/utils/health-tabs.js',
   '/utils/health-vitals.js',
   '/utils/help.js',
+  '/utils/household.js',
+  '/utils/html-escape.js',
   '/utils/html.js',
   '/utils/ingredient-row.js',
+  '/utils/inventory-warranty.js',
   '/utils/kitchen-tabs.js',
   '/utils/kitchen-transfer.js',
+  '/utils/live-feed.js',
+  '/utils/markdown-checklist.js',
+  '/utils/markdown-toolbar.js',
+  '/utils/meal-types.js',
+  '/utils/mentions.js',
+  '/utils/module-accent.js',
+  '/utils/module-access.js',
+  '/utils/metric-card.js',
   '/utils/money.js',
+  '/utils/nav-badges.js',
+  '/utils/note-category-filter.js',
+  '/utils/note-category-name.js',
+  '/utils/note-category-overflow.js',
+  '/utils/note-category-picker.js',
+  '/utils/overlay-history.js',
+  '/utils/page-layout.js',
+  '/utils/page-lifecycle.js',
   '/utils/page-search.js',
   '/utils/pantry-locations.js',
   '/utils/pantry-status.js',
   '/utils/pantry-units.js',
+  '/utils/people-picker.js',
+  '/utils/permission-group.js',
   '/utils/phone.js',
   '/utils/popover-menu.js',
+  '/utils/quick-link-url.js',
   '/utils/pwa-install.js',
   '/utils/recipe-meal-types.js',
+  '/utils/recipe-thumb.js',
   '/utils/recipe-to-meal.js',
   '/utils/recurrence-scope.js',
   '/utils/reminder-offset.js',
+  '/utils/schedule-tabs.js',
   '/utils/scroll-restore.js',
+  '/utils/seal-pair.js',
   '/utils/shopping-categories.js',
   '/utils/skeleton.js',
   '/utils/sub-tabs.js',
+  '/utils/swipe-row.js',
+  '/utils/sync-target.js',
   '/utils/tablist.js',
+  '/utils/task-fields.js',
+  '/utils/timezone.js',
+  '/utils/toast-surface.js',
   '/utils/ux.js',
   '/utils/vcard.js',
+  '/utils/version.js',
+  '/utils/upload-limit.js',
+  '/utils/wall-mode.js',
+  '/utils/web-share.js',
   '/offline.html',
+  // offline.html laedt theme-init.js, damit die Huelle dieselbe Farbwelt
+  // trifft wie die App (gespeicherter Wunsch schlaegt Systemeinstellung).
+  // Ohne Precache waere die Wahl genau dann wirkungslos, wenn die Seite
+  // gebraucht wird - offline.
+  '/theme-init.js',
   '/manifest.json',
   '/favicon.ico',
   '/icons/favicon-32.png',
@@ -135,6 +231,7 @@ const APP_LOCALES = [
   '/locales/en.json',
   '/locales/es.json',
   '/locales/fa.json',
+  '/locales/fil.json',
   '/locales/fr.json',
   '/locales/hi.json',
   '/locales/hu.json',
@@ -153,7 +250,13 @@ const APP_LOCALES = [
   '/locales/zh.json',
 ];
 
-// Seiten-Module: lazy geladen, aber vorab gecacht für Offline
+// Seiten-Module: lazy geladen, aber vorab gecacht für Offline.
+// waste.js fehlt hier BEWUSST (Round-3-Review, #1063): wie housekeeping.js
+// und schedule.js ist es ein Opt-in-Modul, das die meisten Installationen
+// nie laden - vorab gecacht würde es jede Installation Bytes kosten, und
+// die Seite selbst ist ohne Netz ohnehin nur eingeschränkt nützlich (die
+// Termine kommen aus /occurrences). Wer die drei offline will, hebt sie
+// zusammen hierher, nicht einzeln.
 const PAGE_MODULES = [
   '/pages/dashboard.js',
   '/pages/tasks.js',
@@ -167,16 +270,21 @@ const PAGE_MODULES = [
   '/pages/documents.js',
   '/pages/rewards.js',
   '/pages/health.js',
+  '/pages/health-fasting.js',
   '/pages/settings.js',
   '/pages/login.js',
+  '/pages/pair-display.js',
   '/pages/recipes.js',
   '/pages/pantry.js',
+  '/pages/inventory.js',
   '/pages/budget-plans.js',
   '/pages/budget-stats.js',
   '/pages/split-expenses.js',
   '/pages/subscriptions.js',
   '/components/category-manager.js',
+  '/components/icon-picker.js',
   '/components/tag-manager.js',
+  '/utils/lucide-icons.js',
   '/utils/sortable.js',
   '/vendor/sortablejs/sortable.esm.min.js',
   // libphonenumber-js: lazy im Kontaktmodul, aber vorab gecacht → Telefon-
@@ -185,6 +293,10 @@ const PAGE_MODULES = [
   '/vendor/libphonenumber/metadata.min.json',
   '/settings/registry.js',
   '/settings/shell.js',
+  // Die Shell importiert ihn beim Laden. Fehlte er hier, brach die
+  // Einstellungsseite offline komplett - der Precache-Guard sah relative
+  // Specifier bis dahin nicht und blieb dabei gruen.
+  '/settings/dirty-guard.js',
   '/settings/components.js',
   '/settings/module-order.js',
   '/settings/cron-label.js',
@@ -192,15 +304,26 @@ const PAGE_MODULES = [
   '/settings/preferences-cache.js',
   '/settings/region-presets.js',
   '/settings/weather-location.js',
+  '/settings/family-users.js',
   '/settings/pages/personal-account.js',
+  '/settings/pages/admin-email.js',
+  '/settings/pages/admin-permissions.js',
+  '/settings/pages/personal-calendar-subscriptions.js',
+  '/settings/pages/personal-feeds.js',
+  '/settings/pages/personal-health.js',
+  '/settings/pages/personal-weather.js',
   '/settings/pages/personal-appearance.js',
   '/settings/pages/personal-device.js',
   '/settings/pages/personal-calendar.js',
+  '/settings/pages/personal-tasks.js',
+  '/settings/pages/modules-active.js',
   '/settings/pages/modules-navigation.js',
   '/settings/pages/modules-kitchen.js',
   '/settings/pages/modules-calendar.js',
   '/settings/pages/modules-options.js',
   '/settings/pages/modules-rewards.js',
+  '/settings/pages/modules-health.js',
+  '/settings/pages/modules-countdowns.js',
   '/settings/pages/sync-calendar.js',
   '/settings/pages/sync-contacts.js',
   '/settings/pages/sync-reminders.js',
@@ -209,8 +332,10 @@ const PAGE_MODULES = [
   '/settings/pages/documents-dms.js',
   '/settings/pages/admin-family.js',
   '/settings/pages/admin-api.js',
+  '/settings/pages/admin-displays.js',
   '/settings/pages/admin-backup.js',
   '/settings/pages/admin-weather.js',
+  '/settings/pages/admin-immich.js',
   '/settings/pages/admin-system.js',
 ];
 
@@ -494,6 +619,11 @@ function isMutableAppResource(pathname) {
 function isCacheableApiGet(pathname) {
   if (!pathname.startsWith('/api/v1')) return false;
   const rest = pathname.slice('/api/v1'.length);
+  // Die Laufnummern-Abfrage der Einkaufslisten faellt unter das Prefix
+  // /shopping, gehoert aber nicht in den Cache: sie kommt alle 10 s je offenem
+  // Tab, und offline hat ein alter Stand der Nummern keinen Wert - die Seite
+  // bekaeme ihn als normale 200 zurueck und hielte ihn fuer frisch.
+  if (API_CACHE_EXCLUDE.includes(rest)) return false;
   return API_CACHE_WHITELIST.some((p) => rest === p || rest.startsWith(`${p}/`));
 }
 
@@ -502,7 +632,17 @@ function isCacheableApiGet(pathname) {
 // --------------------------------------------------------
 self.addEventListener('message', (event) => {
   if (event.data && event.data.type === 'CLEAR_API_CACHE') {
-    event.waitUntil(caches.delete(API_CACHE));
+    // QUITTIEREN, WENN DER ABSENDER EINEN PORT MITSCHICKT. Ohne Rueckmeldung
+    // weiss die Seite nie, wann der Cache wirklich weg ist, und ein sofortiges
+    // Neuladen kann noch aus ihm bedient werden - beim Koppeln waeren das die
+    // privaten Antworten der vorherigen Person. Ein Absender ohne Port (die
+    // aelteren Aufrufer) bekommt wie bisher nichts zurueck.
+    const port = event.ports && event.ports[0];
+    event.waitUntil(
+      caches.delete(API_CACHE)
+        .catch(() => false)
+        .then(() => { if (port) port.postMessage({ ok: true }); }),
+    );
   }
 });
 
@@ -522,14 +662,19 @@ self.addEventListener('push', (event) => {
     icon: '/icons/icon-192.png',
     badge: '/icons/icon-192.png',
     tag: payload.tag || 'yuvomi-push',
-    data: { url: payload.url || '/reminders' },
+    // `/` UND NICHT `/reminders`: diese Route hat es nie gegeben (Critique
+    // 2026-08-10). Der Router kannte sie nicht und fiel still auf die
+    // Uebersicht zurueck - ein Fallback, der wie ein Ziel aussah. Die Uebersicht
+    // ist jetzt der ausgesprochene Fallback; das echte Ziel kommt aus
+    // `payload.url`, das der Server je Herkunft setzt (services/notifications.js).
+    data: { url: payload.url || '/' },
   };
   event.waitUntil(self.registration.showNotification(title, options));
 });
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const targetUrl = (event.notification.data && event.notification.data.url) || '/reminders';
+  const targetUrl = (event.notification.data && event.notification.data.url) || '/';
   event.waitUntil((async () => {
     const all = await clients.matchAll({ type: 'window', includeUncontrolled: true });
     for (const client of all) {

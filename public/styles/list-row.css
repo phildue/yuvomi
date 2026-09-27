@@ -1,0 +1,736 @@
+/**
+ * Geteilte Zeilen-Grammatik
+ * Zweck: EIN Zeilen-Vokabular für jede Liste gleichartiger Zeilen
+ *
+ * APP-WEITES VOKABULAR, KEIN MODUL-BAUSTEIN. Die Grammatik entstand in der
+ * Küche (fünfter geteilter Baustein nach Akzent, Kopf, Tab-Leiste und
+ * Leerzustand) und heißt seitdem nach ihrem Geburtsort. Sie ist es nicht
+ * geblieben: die Zeilenlisten-Regel gilt app-weit, und ein geteiltes Bauteil
+ * mit Modulnamen ist eine Einladung, beim nächsten Modul dasselbe zu tun.
+ * Deshalb `.list-row` statt `.kitchen-row`. Was WIRKLICH der Küche gehört
+ * (die Tab-Leiste über den vier Küchenmodulen, `.kitchen-tabs-bar`), heißt
+ * weiter so.
+ *
+ * WARUM: Nach dem v1.58.0-Umbau teilten die vier Tabs Rahmen, Akzent und
+ * Leerzustand - und darin vier verschiedene Zeilen. Gemessen bei 1440px
+ * (Critique 2026-07-30):
+ *
+ *   Radius        8px (.meal-slot) / 20px (.recipe-card) / 12px (.shopping-item)
+ *                 / 14px (.pantry-row)
+ *   Hintergrund   3x weiß, 1x transparent
+ *   Polsterung    0/0/0/0, 16/16/16/16, 8/4/8/4, 8/52/8/12
+ *   Aktionen      0, 3, 2, 1 Instanzen von .row-action, daneben 8 Eigenbauten
+ *   Sichtbarkeit  2x an `hover` gebunden, 2x dauerhaft
+ *
+ * Jede verbleibende Divergenz des Moduls saß in dieser einen Schicht.
+ *
+ * ZWEI PARADIGMEN, EINE ENTSCHEIDUNG: Einkauf war eine Trennlinien-Liste
+ * (transparente Zeilen, Hairline dazwischen), Vorrat und Rezepte waren Karten
+ * (weiß, eigener Rahmen, eigener Radius, Gap dazwischen). Gewonnen hat die
+ * Trennlinie, und die Fläche wandert auf die GRUPPE: 26 Einkaufsartikel als
+ * Einzelkarten kosten bei 320px je 2px Rahmen plus 8px Gap, also rund 260px
+ * zusätzlichen Scroll für null zusätzliche Information. Die Gruppen
+ * (Kategorie im Einkauf, Lagerort im Vorrat) existierten in beiden Tabs
+ * bereits und tragen die Fläche damit kostenlos.
+ *
+ * Der Grund, aus dem der Vorrat überhaupt Karten brauchte, war das Umbrechen
+ * der Zeile: mit `flex-wrap: wrap` rutschte die MHD-Zeile unter den Stepper
+ * (gemessen y=463 gegen y=427) und ohne eigenen Rahmen war nicht mehr zu sehen,
+ * was zu welchem Artikel gehört. Diese Zeile bricht nicht um; der Text bekommt
+ * eine eigene Spalte mit `min-width: 0`, die Bedienung eine unschrumpfbare.
+ */
+
+/* --------------------------------------------------------
+ * Container
+ * -------------------------------------------------------- */
+
+/* Lesespalte einer Zeilenliste. Bewusst OHNE `padding-inline`:
+ *
+ * Die Content-Spalte kommt aus --page-inline-pad und darf pro Ahnenkette
+ * GENAU EINMAL gesetzt werden (DESIGN.md, Canonical Page Head). Wo der Träger
+ * sitzt, ist pro Tab verschieden - im Vorrat ist es die Liste selbst, im
+ * Einkauf der umgebende #list-content. Trüge dieser Baustein das Padding mit,
+ * addierte es sich in einem der beiden Tabs auf die Kante des anderen.
+ *
+ * Genau das war der Defekt: #items-list hatte var(--space-4) ÜBER dem
+ * --page-inline-pad von #list-content und begann deshalb bei x=268, während
+ * Kopf und Vorrat bei x=252 beginnen (gemessen auf allen fünf Viewports,
+ * Critique 2026-07-30).
+ */
+.list-scroller {
+  flex: 1;
+  /* Ohne min-height: 0 schrumpft ein Flex-Item nicht unter seine Inhaltshöhe -
+   * die Liste blieb so hoch wie ihre Zeilen (1500px im Vorrat), statt auf den
+   * verfügbaren Platz zu fallen. Sichtbar war das nicht, weil .pantry-page
+   * `overflow: hidden` trägt; die Höhe propagierte aber nach oben und machte
+   * .app-content zu einem zweiten Scroller neben der Liste. */
+  min-height: 0;
+  overflow-y: auto;
+  /* Gruppen stapeln über gap, nicht über margin-bottom am Gruppen-Element: der
+   * Einkauf trug die Marge an .item-category, der Vorrat das gap an der Liste -
+   * zwei Wege zum selben Abstand, mit zwei verschiedenen Werten. */
+  display: grid;
+  gap: var(--space-5);
+  align-content: start;
+  /* KEIN max-width hier (mehr). Der Scroller selbst muss die volle verfügbare
+   * Breite einnehmen, sonst reicht sein eigener Trefferbereich für
+   * Mausrad-Scrollen nur bis zur Lesespalten-Kante - rechts davon (auf einem
+   * breiten Desktop-Fenster spürbar viel Fläche) griff das Rad ins Leere.
+   * Die Kappung aufs Lesemaß trägt jetzt .list-rows selbst (und bei
+   * gruppierten Tabs zusätzlich .list-group, siehe dort): das Kind bleibt
+   * schmal und linksbündig, der Scroller drumherum reicht bis zum Fensterrand. */
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Duenner, getoenter Scrollbalken (#1039) - dieselbe Rezeptur wie
+ * `.budget-list` (budget.css), hierher als zweite, angepasste Kopie
+ * uebernommen (budget.css blieb unveraendert - keine gemeinsame Basis):
+ * dieser Scroller ist der geteilte Container von Einkauf, Vorrat und
+ * Rezepten. Ohne das zeigte jede Plattform mit klassischem (nicht
+ * Overlay-)Scrollbalken einen vollen System-Balken neben der Liste, unter
+ * Windows/Firefox/Chromium dauerhaft sichtbar statt nur beim Scrollen - der
+ * Balken gehoerte damit sichtbar dem Betriebssystem, nicht der App.
+ *
+ * `--module-accent` faerbt je Modul verschieden, `--tint-hint` ist die fuer
+ * Scrollbar-Daumen dokumentierte Toenungsstufe (tokens.css, Abschnitt 6b). */
+.list-scroller {
+  scrollbar-width: thin;
+  scrollbar-color: var(--module-accent) transparent;
+}
+
+.list-scroller::-webkit-scrollbar {
+  width: 10px;
+}
+
+.list-scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.list-scroller::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--module-accent) var(--tint-hint), transparent);
+  border: 3px solid transparent;
+  border-radius: var(--radius-full);
+  background-clip: padding-box;
+}
+
+/* Sichtbare Hover-Andeutung, die das Budget-Vorbild nicht kannte: eine reine
+ * Kante (--tint-hint) traegt laut eigener Dokumentation nie allein - ein
+ * Zustand auf ihr braucht denselben Bezug. `calc()` auf zwei bestehenden
+ * Stufen statt einer neuen Zahl, wie tokens.css es fuer Abweichungen verlangt. */
+.list-scroller::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--module-accent) calc(var(--tint-hint) + var(--tint-state)), transparent);
+}
+
+/* --------------------------------------------------------
+ * Sammelaktions-Leiste - UMGEZOGEN, NICHT ENTFALLEN
+ *
+ * „Diese Liste hat eine Teilmenge, und für die gibt es eine Aktion." Der
+ * Baustein heißt weiter `.list-bulkbar`, wohnt seit Etappe 5 aber in der
+ * unteren Shell-Zone: Regel in layout.css bei `.toast`, Material in glass.css,
+ * gesetzt über utils/bulk-pill.js. Dieselbe Bewegung, die der FAB mit #634
+ * gemacht hat - der Knoten gehört inhaltlich zur Seite, aber nicht in ihren
+ * Fluss.
+ *
+ * WAS HIER STAND UND WARUM ES NICHT MEHR REICHT: die Leiste war eine getönte
+ * Fläche mit Rahmen ÜBER dem Scroller, und beide Anläufe davor hatten je einen
+ * eigenen Defekt geheilt (im Vorrat scrollte sie weg, im Einkauf ersetzte sie
+ * zwei Kopfzeilen). Ihr eigener Preis stand nie in der Rechnung: gemessen
+ * 358x103px bei y=113 auf /shopping, also 103 von 552px Listenfläche, ausgelöst
+ * von einem einzigen abgehakten Artikel. Was eine Teilmenge betrifft, darf
+ * nicht die ganze Liste verkürzen.
+ * -------------------------------------------------------- */
+
+/* --------------------------------------------------------
+ * Gruppe: sie trägt die Fläche, nicht die Zeile
+ * -------------------------------------------------------- */
+
+.list-group {
+  display: grid;
+  gap: var(--space-2);
+  /* Trägt jetzt selbst das Lesemaß (.list-scroller ist absichtlich unbegrenzt,
+   * siehe dort) - linksbündig, nicht zentriert: der Listentitel im Kopf
+   * darüber steht an derselben Kante. */
+  max-width: var(--page-measure, var(--content-max-width-narrow));
+}
+
+/* Label-Rolle, keine Titel-Rolle: die Überschrift ordnet, sie konkurriert nicht
+ * mit den Statusfarben der Zeilen darunter. 12px/uppercase, weil zwei der drei
+ * Tabs es so hielten und der dritte (Vorrat, 14px/none) der Ausreißer war. */
+.list-group__title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--text-xs);
+  font-weight: var(--font-weight-semibold);
+  text-transform: uppercase;
+  /* Der EINE Tracking-Wert für Uppercase-Mikro-Labels; ein Guard verbietet
+   * hartkodierte letter-spacing-Werte. */
+  letter-spacing: var(--tracking-label);
+  color: var(--color-text-secondary);
+}
+
+/* Auf- und zuklappbarer Gruppenkopf (#812).
+ *
+ * Ein KNOPF im h2, nicht ein anklickbares h2: sonst kennt ihn die Tastatur
+ * nicht und aria-expanded haette nichts, woran es haengt. Er erbt die
+ * Schrift der Ueberschrift vollstaendig - Groesse, Versalien und Tracking
+ * stehen dort einmal und duerfen hier nicht zum zweiten Mal auftauchen,
+ * sonst laufen Kopf und Knopf beim naechsten Token-Wechsel auseinander. */
+.list-group__toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+
+.list-group__chevron {
+  transition: transform var(--transition-fast);
+}
+
+/* Zugeklappt zeigt der Winkel zur Seite - die Richtung, in die sich die Gruppe
+ * oeffnen wuerde. Gedreht wird der Pfeil, nicht getauscht: ein zweites Icon
+ * waere ein zweiter Ladepfad fuer dieselbe Aussage. */
+.list-group__chevron--collapsed {
+  transform: rotate(-90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .list-group__chevron { transition: none; }
+}
+
+.list-group__title i {
+  color: var(--module-accent);
+  flex-shrink: 0;
+}
+
+/* Am Ende der Überschrift, nicht am Ende der Gruppenbreite: bei 720px stand die
+ * Zahl sonst 640px rechts vom Gruppennamen und las sich als unverbundener Wert
+ * (Critique 2026-07-30). */
+.list-group__count {
+  margin-inline-start: var(--space-1);
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--font-weight-regular);
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--color-text-tertiary);
+}
+
+/* Die Arbeitsfläche. Opak, nie Glas: DESIGN.md reserviert backdrop-filter für
+ * Chrome und Overlays, Bestand muss auf einen Blick lesbar sein. */
+.list-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  background-color: var(--color-surface-work);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  /* Trägt das Lesemaß direkt, für den Fall, dass keine .list-group darüber
+   * liegt (Rezepte: .list-rows ist dort direktes Kind von .list-scroller).
+   * Bei gruppierten Tabs kappt schon .list-group - dieselbe Zahl hier ist
+   * dann redundant, aber unschädlich (verengt nichts weiter). */
+  max-width: var(--page-measure, var(--content-max-width-narrow));
+  /* Ein Grid-Item von .list-scroller dehnt sich per Default (align-items:
+   * stretch) auf die Höhe der verfügbaren Spur, statt auf seine Inhaltshöhe zu
+   * wachsen - unschädlich, solange mehrere kurze Gruppen dieselbe Spur teilen
+   * (Einkauf/Vorrat im Normalfall). Sobald aber EINE Gruppe allein in ihrer
+   * Spur steht und mehr Zeilen hat, als in den sichtbaren Bereich passen (jede
+   * Rezepteliste: keine Gruppen, ein einziges .list-rows; Vorrat unter einem
+   * Filter, der auf eine flache Liste ohne Lagerort-Gruppierung reduziert),
+   * dehnt sich die Gruppe auf die verfügbare Höhe UND schneidet den Rest über
+   * dieses `overflow: hidden` (für Eckenradien gedacht) still ab - der
+   * eigentliche Scroller (.list-scroller) bekommt den Überlauf nie zu sehen,
+   * weil sein Kind schon vorher gekappt wurde. Gemessen an Rezepten mit 50
+   * gespiegelten Einträgen: scrollHeight 3249px, aber clientHeight 657px, kein
+   * Scrollbalken, keine Möglichkeit an die übrigen Zeilen zu kommen.
+   * `align-self: start` lässt jede Gruppe auf ihre Inhaltshöhe wachsen, sodass
+   * .list-scroller (flex:1, overflow-y:auto) den echten Überlauf sieht und
+   * scrollt - unabhängig davon, ob sie allein oder neben anderen Gruppen steht. */
+  align-self: start;
+  /* Abfragbarer Container für die Zeilen darin.
+   *
+   * WARUM HIER UND NICHT AN DER ZEILE: ein Container kann sich selbst nicht
+   * abfragen. Die Gruppe ist bis auf ihren 1px-Rahmen so breit wie ihre Zeilen,
+   * also die richtige Messgröße.
+   *
+   * WARUM CONTAINER UND NICHT VIEWPORT: die maßgebliche Breite ist die der Zeile,
+   * nicht die des Fensters. Dieselbe Vorratszeile steht bei 720px Lesespalte auf
+   * dem Desktop und bei 288px auf einem 320px-Telefon - und in beiden Fällen soll
+   * sie sich nach dem entscheiden, was sie selbst hat. Ein Viewport-Breakpoint
+   * hätte zusätzlich die Sonderfälle mitzuraten, in denen die Spalte schmaler ist
+   * als das Fenster (Modal, künftige Zweispalten-Ansicht).
+   *
+   * `inline-size` und nicht `size`: die Höhe muss frei bleiben, die Zeilen
+   * bestimmen sie. Die Containment-Nebenwirkung (Gruppe wird Containing Block für
+   * absolut positionierte Nachfahren) ist unschädlich - die Swipe-Reveal-Panels
+   * im Einkauf hängen an `.swipe-row`, das selbst `position: relative` trägt. */
+  container-type: inline-size;
+  container-name: list-rows;
+}
+
+/* Trennlinie an den direkten Kindern der Gruppe, NICHT an der Zeile selbst.
+ *
+ * Grund: im Einkauf liegt zwischen Gruppe und Zeile der .swipe-row-Wrapper
+ * (Swipe-to-Delete). Mit `border-bottom` + `:last-child` auf .list-row wäre
+ * jede Zeile das letzte Kind ihres eigenen Wrappers und hätte damit ihre Linie
+ * verloren - alle Trennlinien wären verschwunden. `> * + *` misst die Gruppe und
+ * ist gegen solche Zwischenebenen immun.
+ *
+ * Nebeneffekt, der zum Guard passt: die Zeile trägt jetzt gar keinen Rahmen. */
+.list-rows > * + * {
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+/* --------------------------------------------------------
+ * Zeile
+ * -------------------------------------------------------- */
+
+/* KEIN eigener Radius, KEIN eigener Hintergrund, KEIN eigener Rahmen außer der
+ * Trennlinie: das leistet die Gruppe. Ein Guard in test/test-frontend-audit.js
+ * verbietet, dass ein Modul hier wieder eigene Werte einführt. */
+.list-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  /* Nicht --target-base (44px): die Zielgröße gehört auf die Bedienelemente,
+   * nicht auf die Zeile. Die Zeile ist so hoch wie ihr Inhalt. */
+  min-height: var(--target-lg);
+  transition: background-color var(--transition-fast);
+  /* NICHT umbrechen: mit flex-wrap rutschte die Metazeile unter die Bedienung
+   * und war von ihrem Namen getrennt. Der Text schrumpft stattdessen in seiner
+   * eigenen Spalte (siehe .list-row__main). */
+  flex-wrap: nowrap;
+}
+
+.list-row:hover {
+  background-color: var(--color-surface-hover);
+}
+
+/* --------------------------------------------------------
+ * Zwei bekannte Stufen statt N lokaler Entscheidungen
+ *
+ * Beide Abweichungen unten sind echt und waren einzeln begründet - sie standen
+ * nur als private Werte in zwei Modul-Stylesheets, und zusammen las sich die
+ * geteilte Zeile damit als Vorschlag statt als Regel (Critique 2026-08-13:
+ * „drei Polsterungen, jede mit eigener Begründung im eigenen Modul"). Als
+ * benannte Modifier sind es zwei Stufen, die man kennt und zählt; die nächste
+ * Abweichung muss sich dann an ihnen messen, statt eine dritte Zahl zu setzen.
+ * -------------------------------------------------------- */
+
+/* Die Polsterung als eigene GRÖSSE, nicht als Wert: die Trefferfläche des
+ * Titels rechnet mit ihr (`.task-card__title::before` liest dieselbe Variable),
+ * und sie wird unter 640px kleiner. Zwei Leser, ein Wert. */
+.list-row--roomy {
+  --list-row-pad: var(--space-4);
+  padding: var(--list-row-pad);
+}
+
+/* Führt die Zeile links ein BILD statt eines Bedienelements (Kontakt-Avatar),
+ * steht der Name näher daran: die 12px der Grundzeile sind der Abstand zu einer
+ * Checkbox oder einem Griff, und neben einem Avatar schoben sie den Namen
+ * sichtbar weg. */
+.list-row--tight {
+  gap: var(--space-2);
+}
+
+/* Textspalte: Name über Meta. `min-width: 0` ist die Bedingung dafür, dass
+ * `text-overflow` in den Kindern überhaupt greifen kann - ohne sie wächst die
+ * Spalte über die Zeile hinaus, statt zu schrumpfen. */
+.list-row__main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  gap: var(--space-0h);
+  align-content: center;
+  /* align-content, NICHT justify-content: der Container ist ein Grid, und
+   * justify-content verteilt dort die Tracks entlang der INLINE-Achse. Genau
+   * dieser Tippfehler zentrierte im Vorrat vierzehn Artikelnamen horizontal,
+   * gemessen 89.3px Spanne zwischen den linken Kanten (Critique 2026-07-30). */
+}
+
+/* Wenn die Textspalte selbst die primäre Zeilenaktion ist (Vorrat: die Fläche
+ * öffnet das Formular), braucht sie die reguläre Zielgröße und einen
+ * Button-Reset. */
+.list-row__main--interactive {
+  background: none;
+  border: 0;
+  padding: 0;
+  text-align: start;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  min-height: var(--target-md);
+}
+
+@media (hover: none) {
+  .list-row__main--interactive {
+    min-height: var(--target-lg);
+  }
+}
+
+.list-row__main--interactive:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+  border-radius: var(--radius-xs);
+}
+
+/* UMBRECHEN, NICHT ABSCHNEIDEN. Ein abgeschnittener Artikelname ist der Verlust
+ * des einzigen Zwecks der Zeile: bei 320px war .item-name im Einkauf 56px breit
+ * gegen 176px Bedarf, lesbar blieben vier Zeichen („Broc…", „Cherr…") - und das
+ * genau in der Situation, für die die Liste gebaut ist, im Laden (Critique
+ * 2026-07-30, P0). Eine zweite Zeile kostet Höhe, eine Ellipse kostet die
+ * Aussage. Gilt für Name und Meta gleich: ein gekürztes MHD ist wertlos. */
+/* MIT TRENNSTRICH, NICHT MITTEN IM WORT (Etappe 7, 2026-08-13). Die Begründung
+ * oben stimmt weiter - geprüft hat nie jemand, WIE sie umbricht.
+ * `overflow-wrap: anywhere` bricht per Definition innerhalb eines Wortes, und
+ * bei `hyphens: manual` (dem Voreingestellten) ohne jedes Zeichen: gemessen bei
+ * 320x568 im Einkauf standen 11 von 26 Zeilen als „Kirschtoma / ten",
+ * „Räucher / lachs", „Vollkorn / brot" - jedes gewöhnliche deutsche Kompositum.
+ * Bei 360px ist es genau eine Zeile („Griechischer Joghurt", und die bricht an
+ * ihrer Leerstelle, also richtig), bei 390px keine.
+ *
+ * `hyphens: auto` macht aus dem Bruch eine Trennung, und es ist sprachrichtig,
+ * weil `document.documentElement.lang` dem Locale folgt (i18n.js).
+ *
+ * ES KOSTET EINE ZEILE, EINMAL, UND DAS IST DER PREIS. A/B in derselben Seite
+ * gemessen (320/360/390px, acht Routen): bei 360 und 390 ändert sich nichts,
+ * bei 320 ändert sich GENAU EINE Zeile im ganzen Einkauf - „Griechischer
+ * Joghurt" 85,6 -> 109,1px, bei unveränderter Namensspalte von 88px. Ohne
+ * Trennung stand dort „Griechische / r Joghurt", mit Trennung „Griechi- /
+ * scher / Joghurt": eine Zeile mehr für einen Namen, der sich lesen lässt. In
+ * Vorrat, Rezepten, Budget, Geburtstagen und Haushaltshilfe ist die Differenz
+ * null. Die anderen zehn Einkaufszeilen bekommen ihren Trennstrich zum
+ * Nulltarif - sie waren schon zweizeilig.
+ *
+ * NUR HIER, NICHT AN DER METAZEILE: die trägt `overflow-wrap: break-word`, und
+ * das bricht ein Wort nur, wenn es allein auf einer Zeile nicht unterkommt.
+ * `hyphens: auto` würde dort auch dann trennen, wenn ein Umbruch an einer
+ * Leerstelle möglich ist - eine Änderung an vielen Zeilen ohne einen Befund
+ * dahinter. Die Asymmetrie ist Absicht, nicht ein vergessener Ort. */
+.list-row__name {
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+  min-width: 0;
+  overflow-wrap: anywhere;
+  hyphens: auto;
+  /* `flex: 1 1 auto` für den Fall, dass der Name in einem FLEX-Elternteil steht.
+   *
+   * In .list-row__main (Grid) ist die Zeile wirkungslos. In den Rezepten ist der
+   * Elternteil aber .recipe-row__toggle, und dort war sie der Unterschied zwischen
+   * lesbar und unbenutzbar: als Flex-Item mit `flex-basis: auto` löst die Breite auf
+   * MIN-CONTENT auf, und `overflow-wrap: anywhere` macht min-content zur Breite des
+   * breitesten EINZELZEICHENS. Gemessen bei 320px: 8px Namensspalte, „Chicken Tikka
+   * Masala" ein Zeichen pro Zeile, Zeilenhöhe 448px (Critique 2026-07-30, P0).
+   *
+   * Die Regel, die den Artikelnamen im Einkauf gerettet hat, hat den Rezeptnamen
+   * zerlegt - weil sie eine Elternteil-Annahme mitbringt, die nur drei von vier
+   * Aufrufstellen erfüllen. Ein Guard prüft das jetzt. */
+  flex: 1 1 auto;
+}
+
+.list-row__meta {
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+/* --------------------------------------------------------
+   Gespiegelte VTODO-CATEGORIES einer Zeile (#586)
+   Anzeige, keine Bedienung: die Etiketten gehören der CalDAV-Quellliste.
+   Optisch leiser als der Name, damit sie die Zeile ordnen und nicht führen.
+   -------------------------------------------------------- */
+
+.list-row__tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+}
+
+.list-row__tag {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-0h) var(--space-2);
+  border: var(--space-px) solid var(--color-border-subtle);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-2);
+  color: var(--color-text-secondary);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+  /* Ein sehr langer Fremd-Tag darf die Zeile nicht sprengen. */
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Abgehakte Posten treten insgesamt zurück - die Etiketten mit.
+ *
+ * ÜBER DIE FARBE, NICHT ÜBER DIE DECKUNG. Hier stand `opacity: 0.6`, und das
+ * multiplizierte den Kontrast mit herunter: gerendert 2,58:1 (light) und
+ * 3,71:1 (dark) auf der eigenen Pille. Abgehakt ist ein Zustand, kein
+ * deaktiviertes Bedienelement - die Zeile lässt sich wieder aufmachen, also
+ * gilt 4.5:1. Dieselbe Antwort wie `.shopping-item--checked .item-meta`
+ * (shopping.css): tertiary trägt 5,39 (light) und 7,71 (dark) auf
+ * --color-surface-2 und bleibt sichtbar leiser als der Name. */
+.shopping-item--checked .list-row__tag {
+  color: var(--color-text-tertiary);
+}
+
+/* --------------------------------------------------------
+ * Bedienzone
+ * -------------------------------------------------------- */
+
+/* EINE Sichtbarkeitsregel: immer sichtbar.
+ *
+ * Nicht hover-enthüllt. Die Enthüllung per `opacity: 0` hat in diesem Repo
+ * zweimal hintereinander dieselbe Defektklasse produziert (18 unsichtbare, aber
+ * klickbare Bänder im Wochenboard; danach derselbe Fehler in notes.css und
+ * documents.css), und die Zielgruppe umfasst Tablet- und Trackpad-Geräte, für
+ * die `hover` kein verlässliches Signal ist.
+ *
+ * Ruhig bleibt die Zone durch KONTRAST, nicht durch Unsichtbarkeit: .row-action
+ * steht im Ruhezustand auf --color-text-tertiary und hellt auf Hover und Fokus
+ * auf. `opacity: 0` kommt in dieser Zone nicht vor - der Guard prüft das.
+ */
+.list-row__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-shrink: 0;
+}
+
+/* KEINE an der Zeilenkante verankerte Abschluss-Aktion mehr.
+ *
+ * Hier standen `.list-row--reserve-end` und `.list-row__end-action`: eine
+ * reservierte Endspalte für einen absolut positionierten Knopf. Sie sind
+ * entfallen, weil die rechte Zeilenkante die Ecke ist, die der fixierte FAB
+ * besetzt - der Vorrats-Warenkorb war dort im Ruhezustand zu 87% verdeckt
+ * (Critique 2026-07-30). Solche Aktionen sitzen jetzt in einem festen Slot am
+ * ANFANG der Bedienzone (siehe .pantry-row__cart-slot).
+ *
+ * Zwei Lehren, die bleiben, falls jemand die Verankerung wieder braucht:
+ *
+ * 1. DIE RESERVE MUSS MIT --target-lg RECHNEN. `.row-action` ist über
+ *    `min-width` 48px breit, nicht --target-md (40px). Die alte Formel
+ *    `--target-md + --space-3` = 52px reservierte für einen Knopf, der bei 8px
+ *    Kantenabstand bis 56px reicht: die fehlenden 4px waren messbar als
+ *    überlappende Hitboxen, und weil der Knopf später im DOM stand, gewann er
+ *    den Treffer - ein Tap auf die rechte Kante von „+" schickte den Artikel auf
+ *    die Einkaufsliste statt die Menge zu erhöhen.
+ * 2. EIN FESTER SLOT SCHLÄGT EINE BEDINGTE BREITE. Der Knopf erscheint nur bei
+ *    knappen Artikeln; läge er ohne Platzhalter in der Bedienzone, wäre diese je
+ *    Zeile anders breit und die Stepper stünden pro Zeile woanders.
+ */
+
+/* --------------------------------------------------------
+   Sortiergriff (#678)
+
+   Erbt .row-action und bleibt damit im Maß der Bedienzone. Anders als der Griff
+   im Kategorie-Manager ist er ein echter Button: die Pfeiltasten am fokussierten
+   Griff SIND hier der Tastaturpfad, es gibt kein Auf/Ab-Paar daneben.
+   -------------------------------------------------------- */
+
+.list-row__drag {
+  cursor: grab;
+  /* Ohne das übernimmt der Browser die vertikale Geste als Seiten-Scroll und der
+     Zug am Griff endet, bevor er beginnt. */
+  touch-action: none;
+
+  /* SCHMAL, ABER HOCH - wie im Kategorie-Manager (category-manager.css).
+     Als 48er-Quadrat der .row-action-Grammatik kostete der Griff auf einem
+     375px-Gerät 52px Namensbreite: „Vollkorn-Dinkelbrot mit
+     Sonnenblumenkernen" wuchs damit von zwei auf vier Zeilen (64px → 112px
+     Zeilenhöhe, gemessen 2026-08-06). Die Zieh-Achse ist vertikal, also braucht
+     der Griff seine Fläche in der Höhe, nicht in der Breite: align-self:stretch
+     nimmt die volle Zeilenhöhe als Greifzone, min-height sichert das Touch-Ziel
+     auch in der kürzesten Zeile. */
+  width: auto;
+  min-width: 0;
+  align-self: stretch;
+  min-height: var(--target-md);
+  padding-inline: var(--space-2);
+}
+
+.swipe-row.sortable-chosen .list-row__drag {
+  cursor: grabbing;
+}
+
+/* Eine einzelne Zeile in einer Kategorie hat keine Reihenfolge. Der Griff
+   verschwindet dann, statt eine folgenlose Handlung anzubieten - über
+   :only-child, damit die Regel ohne Zutun des Renderers gilt (auch nach dem
+   Löschen der vorletzten Zeile, das die Liste nicht neu aufbaut). */
+.list-rows > .swipe-row:only-child .list-row__drag {
+  display: none;
+}
+
+/* Abgehaktes sortiert sich nicht: es steht am Ende seiner Kategorie, ein Zug
+   daran wäre folgenlos. Sichtbar bleibt der Griff trotzdem, sonst wechselte die
+   Bedienzone beim Abhaken ihre Breite. */
+.list-row__drag[disabled] {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.list-row__drag[disabled]:hover {
+  background: transparent;
+  color: var(--color-text-tertiary);
+}
+
+.swipe-row.sortable-ghost {
+  opacity: 0.4;
+}
+
+.swipe-row.sortable-chosen .list-row {
+  background: color-mix(in srgb, var(--active-module-accent, var(--color-accent)) var(--tint-state), var(--color-surface));
+}
+
+.swipe-row.sortable-drag .list-row {
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-md);
+  border-radius: var(--radius-glass-inner);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .list-row {
+    transition: none;
+  }
+}
+
+/* --------------------------------------------------------
+ * Der Träger einer Zeilenfolge, ohne Lesemaß
+ * -------------------------------------------------------- */
+
+/* Dieselbe Grammatik wie `.list-rows`, EINSCHLIESSLICH dessen Lesemaß.
+ *
+ * HIER STAND, das Lesemaß gehöre „zur Küchenliste, nicht zur Trägergrammatik",
+ * belegt mit den gemessenen Breiten der Listen außerhalb der Küche (Abos 955px,
+ * Haushaltshilfe 981px, Dokumente 725px auf 1280px). Das war eine Beschreibung
+ * des Bestands, kein Kriterium - und der Preis dafür stand nie daneben:
+ * gemessen auf 1440px trug `.list-rows` 720px und `.row-carrier` 1156px, also
+ * sprang die Inhaltsspalte beim Wechsel von den Aufgaben zu den Kontakten um
+ * 436px, bei gleichem Kopf und gleicher Zeile (Critique 2026-08-13).
+ *
+ * Das Lesemaß ist app-weit EIN Wert (§2, Session 15). Genau deshalb steht es
+ * jetzt hier: eine Zeilenliste ist eine Zeilenliste, und welche der beiden
+ * Klassen sie trägt, ist eine Frage ihrer Verschachtelung, nicht ihrer Breite.
+ *
+ * WARUM ÜBERHAUPT GETEILT: die Regel „eine Folge gleichartiger Zeilen liegt in
+ * genau einem Träger" hat vier weitere Nutzer bekommen. Vier Kopien derselben
+ * fünf Deklarationen wären vier Orte, an denen der Leerzustand vergessen wird -
+ * und genau das ist beim Bau einmal passiert. */
+/* ZWEI Klassen, weil „wer trägt" und „wer trennt" nicht dieselbe Frage sind.
+ * Meist ist es dieselbe Box - dann steht `.row-carrier` allein. Liegt die Liste
+ * aber schon IN einer Karte (die Abo-Liste steckt in `.subscriptions-list-section`,
+ * gemessen: weiß, 16px Radius, Schatten), dann ist DIE der Träger, und eine
+ * zweite Fläche darin wäre genau der Kasten-in-Kasten, den §2 verbietet. Dort
+ * trägt die Liste nur `.row-divided`.
+ *
+ * Dieselbe Grammatik wie beim Well und beim Lesemaß: der Träger entscheidet. */
+/* Der Träger nimmt seinen Zeilen die Kante, statt dass jedes Modul sie sich
+ * selbst abgewöhnt. Das ist nicht Bequemlichkeit, sondern die einzige Fassung,
+ * die trägt: die Trennlinie unten steht mit GLEICHER Spezifität, und jedes
+ * Modul-Stylesheet lädt später - ein `border: none` in der Zeile hätte sie
+ * gelöscht, und zwar lautlos. Gemessen im Dokument: `border-top-width: 0px`
+ * über alle sieben Zeilen des Budget-Plans, während im Stylesheet beide Regeln
+ * richtig dastanden. (`border-style: none` tut dasselbe: bei style `none`
+ * rechnet CSS die Breite auf 0.) Ein `<button>` als Zeile bringt außerdem seine
+ * UA-Kante mit - auch die ist hier erledigt. */
+.row-divided > *,
+.row-carrier > * {
+  border: none;
+}
+
+.row-divided > * + *,
+.row-carrier > * + * {
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+.row-carrier {
+  background-color: var(--color-surface);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+  /* Dasselbe Lesemaß wie `.list-rows`, aus dem Grund, der oben ausgeschrieben
+   * steht. Linksbündig, nicht zentriert: der Kopf über dem Träger steht an
+   * derselben Kante, und die angedockte Primäraktion der Toolbar fluchtet mit
+   * ihr (vorher stand „+ Aufgabe" 325px rechts neben seiner eigenen Liste). */
+  max-width: var(--page-measure, var(--content-max-width-narrow));
+  /* Kommt MIT dem Lesemaß, nicht davor: der Träger clippt (`overflow: hidden`,
+   * für die Eckenradien) und ist Grid-Item, sobald er in einem `.list-scroller`
+   * liegt. Ohne `align-self: start` dehnt ihn die Spur auf ihre volle Höhe und
+   * er schneidet den Überlauf still ab, bevor der Scroller ihn sieht - derselbe
+   * Fall, den `.list-rows` weiter oben ausgeschrieben hat (Rezepte mit 50
+   * Einträgen: scrollHeight 3249px, clientHeight 657px, kein Scrollbalken).
+   * Gefangen vom Guard „die Küchen-Listen teilen eine Zeilen-Grammatik", der
+   * genau diese Kopplung prüft. */
+  align-self: start;
+  /* Und `width: 100%` MUSS dazu, denn `align-self` bedeutet nicht überall
+   * dasselbe. In einem Grid liegt es auf der BLOCK-Achse und heißt „wachse auf
+   * deine Inhaltshöhe" - genau das, was die Zeile darüber will. In einer
+   * Flex-SPALTE liegt dieselbe Eigenschaft auf der INLINE-Achse und heißt
+   * „schrumpfe auf deine Inhaltsbreite"; zusammen mit dem `container-type`
+   * darunter (das den Inhalt für die Größenbestimmung ausblendet) wird daraus
+   * exakt null. Gemessen in der Dokumente-Listenansicht bei 390px: Träger 0px,
+   * Zeilen 24px breit und 474px hoch, 610px Seitenüberlauf - unsichtbar, weil
+   * `.app-content` ihn wegschneidet. Die Breite explizit zu setzen ist in
+   * beiden Kontexten richtig und in keinem eine Annahme. */
+  width: 100%;
+  /* Abfragbarer Container, aus demselben Grund und mit demselben Namen wie bei
+   * `.list-rows` (dort ausgeschrieben). Er fehlte hier: die Zeilen in Kontakten,
+   * Budget, Geburtstagen und der Hauswirtschaft konnten sich als einzige nicht
+   * nach ihrer eigenen Breite entscheiden - eine `@container list-rows`-Regel
+   * hätte dort stillschweigend nie gegriffen, weil kein Vorfahr den Container
+   * aufmacht. Kein Verhaltenswechsel heute (keine dieser Zeilen stellt bislang
+   * eine Frage), sondern das Schliessen der Lücke, bevor die erste es tut. */
+  container-type: inline-size;
+  container-name: list-rows;
+}
+
+/* Ein LEERZUSTAND bekommt gar keine Fläche (§2, Session 5). Trägt die Liste nur
+ * ihn, gibt der Träger seine Karte ab - sonst stünde ein leerer weißer Kasten
+ * da, wo gerade nichts ist. Steht hier einmal statt in jedem Modul: die
+ * Ausnahme gehört zur Regel, nicht zu ihren Nutzern. */
+.row-carrier:has(> .empty-state) {
+  background-color: transparent;
+  box-shadow: none;
+}
+
+/* --------------------------------------------------------
+ * Rangmarke: der Prioritätspunkt
+ * -------------------------------------------------------- */
+/* EINE Fassung für alle Listen, die einen Rang zeigen.
+ *
+ * Sie stand in tasks.css und war damit nur dort verfügbar, wo dieses Page-CSS
+ * geladen ist - die Aufgaben-Chips im Kalender bauten sich ihre eigene Fassung
+ * als getöntes Feld mit getönter Schrift, und dieselbe Aufgabe sprach je nach
+ * Modul zwei Sprachen. Genau das ist die Bauart, die v2.22.0 für die
+ * Terminfarbe abgeschafft hat.
+ *
+ * Der Punkt trägt die Farbe, also trägt er auch die Größe, die das Bestandsmaß
+ * für einen Farbpunkt ist: 8px, wie die Kalender-Ebenenpunkte und die
+ * Feiertagsmarke der Agenda. Bei 4px wäre der Ton nur Beiwerk neben der
+ * Schrift. Die Schrift daneben bleibt neutral - die Skalen-Regel gibt einer
+ * Rangmarke genau einen Kanal. */
+.priority-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+}
+
+.priority-dot--low    { background-color: var(--color-priority-low); }
+.priority-dot--medium { background-color: var(--color-priority-medium); }
+.priority-dot--high   { background-color: var(--color-priority-high); }
+.priority-dot--urgent { background-color: var(--color-priority-urgent); }

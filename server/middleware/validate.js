@@ -18,7 +18,24 @@ const DATETIME_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(?:\.\d+)?)?(?:Z|[+-]
 const COLOR_RE    = /^#[0-9A-Fa-f]{6}$/;
 const MONTH_RE    = /^\d{4}-\d{2}$/;
 // UNTIL und COUNT schließen sich laut RFC 5545 gegenseitig aus (#513).
-const RRULE_RE    = /^(FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)(;INTERVAL=\d{1,2})?(;BYDAY=[A-Z,]{2,}(,[A-Z]{2})*)?(;(UNTIL=\d{8}(T\d{6}Z)?|COUNT=\d{1,4}))?)?$/;
+// Erlaubt ist AUSSCHLIESSLICH `BYMONTHDAY=-1` ("letzter Tag des Monats", #960),
+// und AUSSCHLIESSLICH unter `FREQ=MONTHLY`. Beide Einschraenkungen mussten
+// nachgezogen werden, und die zweite ist die subtilere: als blosse optionale
+// Gruppe NEBEN der Frequenz-Alternation nahm der Ausdruck auch
+// `FREQ=WEEKLY;BYMONTHDAY=-1` an - eine Regel, die `parseRRule` danach
+// ignoriert, weil es die Angabe nur bei MONTHLY liest. Genau das
+// "angenommen, aber nie beachtet", gegen das die Verengung ueberhaupt
+// gebaut wurde, nur eine Ebene hoeher.
+//
+// Deshalb zwei Zweige statt einer gemeinsamen Gruppe: der Monatszweig darf sie
+// tragen, die anderen Frequenzen nicht. Der gemeinsame Schwanz (Endebedingung)
+// steht hinter beiden.
+const RRULE_TAIL  = '(;(UNTIL=\\d{8}(T\\d{6}Z)?|COUNT=\\d{1,4}))?';
+const RRULE_HEAD  = '(;INTERVAL=\\d{1,2})?(;BYDAY=[A-Z,]{2,}(,[A-Z]{2})*)?';
+const RRULE_RE    = new RegExp(
+  `^(FREQ=MONTHLY${RRULE_HEAD}(;BYMONTHDAY=-1)?${RRULE_TAIL}`
+  + `|FREQ=(DAILY|WEEKLY|YEARLY)${RRULE_HEAD}${RRULE_TAIL})?$`
+);
 
 /**
  * Bereinigt und validiert einen Pflicht-String.
@@ -55,7 +72,14 @@ function oneOf(val, allowed, field) {
 }
 
 /**
- * Validiert ein Datumsformat YYYY-MM-DD.
+ * Validiert ein Datumsformat YYYY-MM-DD - Form UND Kalendergueltigkeit.
+ *
+ * Die reine Regex liesse 2026-02-30 oder 2026-13-01 durch. Solche Werte landeten
+ * frueher unbemerkt in der Datenbank und sprengten erst spaeter die Dienste, die
+ * das Datum wirklich parsen (server/services/inventory-deadlines.js#parseDateKey,
+ * server/services/subscriptions.js#parseDateKey) - also nach dem Schreibvorgang,
+ * mit halb geschriebenem Zustand und dauerhaft kaputtem ICS-Feed. Der
+ * UTC-Round-Trip hier spiegelt genau die Pruefung dieser beiden parseDateKey.
  * @param {any}    val
  * @param {string} field
  * @param {boolean} required
@@ -65,9 +89,20 @@ function date(val, field, required = false) {
     if (required) return { value: null, error: `${field} is required.` };
     return { value: null, error: null };
   }
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(val)))
+  const raw = String(val);
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match)
     return { value: null, error: `${field} must be in YYYY-MM-DD format.` };
-  return { value: String(val), error: null };
+  const [, y, m, d] = match;
+  const parsed = new Date(Date.UTC(Number(y), Number(m) - 1, Number(d)));
+  const roundTrip = [
+    parsed.getUTCFullYear(),
+    String(parsed.getUTCMonth() + 1).padStart(2, '0'),
+    String(parsed.getUTCDate()).padStart(2, '0'),
+  ].join('-');
+  if (roundTrip !== raw)
+    return { value: null, error: `${field} must be a valid calendar date.` };
+  return { value: raw, error: null };
 }
 
 /**
@@ -75,9 +110,10 @@ function date(val, field, required = false) {
  */
 function time(val, field) {
   if (!val) return { value: null, error: null };
-  if (!/^\d{2}:\d{2}$/.test(String(val)))
-    return { value: null, error: `${field} must be in HH:MM format.` };
-  return { value: String(val), error: null };
+  const raw = String(val);
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(raw))
+    return { value: null, error: `${field} must be a valid HH:MM time.` };
+  return { value: raw, error: null };
 }
 
 /**
@@ -218,5 +254,5 @@ function bool(val, field) {
 export {
   str, oneOf, date, time, datetime, month, num, color, url, rrule, id, bool, collectErrors,
   MAX_TITLE, MAX_TEXT, MAX_SHORT, MAX_RRULE, MAX_URL,
-  DATE_RE, TIME_RE, DATETIME_RE, COLOR_RE, MONTH_RE,
+  DATE_RE, TIME_RE, DATETIME_RE, COLOR_RE, MONTH_RE, RRULE_RE,
 };

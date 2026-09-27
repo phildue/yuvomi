@@ -74,6 +74,25 @@ test('auth.login: 401 wirft ApiError mit status 401', async () => {
   assert.equal(thrownErr.status, 401);
 });
 
+test('api.post: 429 übernimmt Retry-After in den ApiError', async () => {
+  setup();
+  _mockFetch = () => mockResponse(
+    429,
+    { error: 'Too many requests.', code: 429 },
+    { 'Retry-After': '7' },
+  );
+
+  await assert.rejects(
+    () => api.post('/documents', {}),
+    (err) => {
+      assert.ok(err instanceof ApiError);
+      assert.equal(err.status, 429);
+      assert.equal(err.retryAfter, '7');
+      return true;
+    },
+  );
+});
+
 // ─── 401 auf anderen Endpunkten ─────────────────────────────────────────────
 
 test('api.get: 401 auf geschütztem Endpunkt feuert auth:expired', async () => {
@@ -229,6 +248,19 @@ test('OpenAPI dokumentiert Kalender-Dokumentlinks und Legacy-Anhangsdaten', () =
   assert.equal(list.properties.data.items.$ref, '#/components/schemas/CalendarEvent');
 });
 
+test('OpenAPI dokumentiert die Ausschluss-Semantik der Serienoperationen', () => {
+  const occurrence = openApi.paths['/api/v1/calendar/{seriesId}/occurrences/{recurrenceId}'];
+  const following = openApi.paths[
+    '/api/v1/calendar/{seriesId}/occurrences/{recurrenceId}/following'
+  ];
+
+  assert.match(occurrence.put.description, /linked replacement existed/i);
+  assert.match(occurrence.put.description, /remains excluded/i);
+  assert.match(following.put.description, /every later exclusion except the selected slot/i);
+  assert.match(following.delete.description, /preserves later exclusions/i);
+  assert.doesNotMatch(following.delete.description, /removes .*deletion exceptions/i);
+});
+
 test('OpenAPI dokumentiert stabile Storage-Fehlercodes', () => {
   const codes = openApi.components.schemas.DocumentStorageErrorCode.enum;
   for (const suffix of [
@@ -253,6 +285,24 @@ test('OpenAPI dokumentiert stabile Storage-Fehlercodes', () => {
   );
 });
 
+test('OpenAPI dokumentiert Konflikte bei Verknüpfungen zu laufend gelöschten Dokumenten', () => {
+  const operations = [
+    openApi.paths['/api/v1/documents/{id}/archive'].patch,
+    openApi.paths['/api/v1/tasks/{id}/documents'].put,
+    openApi.paths['/api/v1/housekeeping/visits/{id}'].put,
+    openApi.paths['/api/v1/budget'].post,
+    openApi.paths['/api/v1/budget/{id}'].put,
+    openApi.paths['/api/v1/inventory/items'].post,
+    openApi.paths['/api/v1/inventory/items/{id}'].put,
+    openApi.paths['/api/v1/split-expenses/groups/{id}/expenses'].post,
+    openApi.paths['/api/v1/split-expenses/groups/{id}/settlements'].post,
+    openApi.paths['/api/v1/split-expenses/expenses/{id}'].put,
+  ];
+  for (const operation of operations) {
+    assert.match(operation.responses[409].description, /DOCUMENT_DELETE_IN_PROGRESS/);
+  }
+});
+
 test('OpenAPI erlaubt DMS-Push für local, webdav und google_drive, aber nicht dms', () => {
   const push = openApi.paths['/api/v1/documents/dms/push'].post;
   assert.match(push.description, /local.*webdav.*google_drive/i);
@@ -261,4 +311,22 @@ test('OpenAPI erlaubt DMS-Push für local, webdav und google_drive, aber nicht d
   const linked = openApi.components.schemas.DmsLinkResponse.properties.data;
   assert.deepEqual(linked.properties.storage_backend.enum, ['dms']);
   assert.ok(linked.required.includes('storage_backend'));
+});
+
+// ─── Mitleser eines Moduls nach einer Kontoaenderung neu holen (#1228) ──────
+
+test('auth.updateUser holt danach /auth/me, damit othersCanRead in derselben Sitzung stimmt', async () => {
+  setup();
+  const calls = [];
+  _mockFetch = (url, opts = {}) => {
+    calls.push(`${opts.method || 'GET'} ${url}`);
+    return mockResponse(200, { data: {}, householdSize: 1, othersCanRead: ['tasks'] });
+  };
+
+  await auth.updateUser(7, { role: 'member' });
+
+  const patch = calls.findIndex((c) => /^PATCH .*\/auth\/users\/7$/.test(c));
+  const me = calls.findIndex((c) => /^GET .*\/auth\/me$/.test(c));
+  assert.ok(patch >= 0, `PATCH fehlt: ${calls.join(', ')}`);
+  assert.ok(me > patch, `nach dem PATCH fehlt GET /auth/me: ${calls.join(', ')}`);
 });

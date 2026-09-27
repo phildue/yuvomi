@@ -4,13 +4,15 @@
     "continue": "계속",
     "back": "뒤로",
     "generate": "생성",
-    "generating": "…",
+    "generating": "생성 중…",
     "optional": "선택 사항",
     "stepCounter": "{{total}}단계 중 {{n}}단계",
     "toggleVisibility": "값 표시 또는 숨기기",
     "copy": "복사",
     "copied": "복사됨 ✓",
-    "language": "언어"
+    "language": "언어",
+    "copyRedirect": "리디렉션 URI 복사",
+    "opt": "(선택 사항)"
   },
   "config": {
     "title": "기본 구성",
@@ -22,7 +24,12 @@
     "tzLabel": "시간대",
     "errHost": "잘못된 호스트 이름입니다. 문자, 숫자, 하이픈, 마침표만 사용하세요.",
     "errPort": "잘못된 포트입니다. 1에서 65535 사이의 숫자여야 합니다.",
-    "prereqMissing": "누락된 사전 요구 사항: {{list}}. 설치한 후 페이지를 새로고침하세요."
+    "prereqMissing": "누락된 필수 구성 요소: {{list}}. {{link}}에서 설치 방법을 확인하세요.",
+    "prereqLinkDocker": "Docker 안내서",
+    "prereqLinkCompose": "podman-compose 안내서",
+    "prereqRecheck": "다시 확인",
+    "errSecureOverHttp": "공개 주소가 http://로 시작하는데 이 선택은 보안 쿠키를 강제합니다. 그러면 아무도 로그인할 수 없습니다. \"직접 접근\"을 선택하거나 https:// 주소를 사용하세요.",
+    "errTz": "시간대가 잘못되었습니다. Europe/Berlin 같은 IANA 이름이 필요합니다."
   },
   "secrets": {
     "title": "보안 키",
@@ -32,7 +39,7 @@
     "dbLabel": "데이터베이스 암호화 키",
     "dbHint": "유휴 상태의 SQLite 데이터베이스를 암호화합니다.",
     "errBoth": "두 키 모두 필요합니다.",
-    "dangerWarn": "이 키를 지금 저장하세요. 분실하면 암호화된 데이터를 복구할 수 없습니다 — 재설정은 없습니다.",
+    "dangerWarn": "이 키를 지금 저장하세요. 분실하면 암호화된 데이터를 복구할 수 없습니다 — 재설정은 없습니다. 설정이 끝나면 두 키가 포함된 .env 파일을 다운로드할 수 있습니다.",
     "preserved": "기존 키가 유지되므로 이 설치로 현재 데이터베이스에 접근하지 못하게 되는 일은 없습니다. 키를 유지하려면 필드를 비워 두세요. 새 값을 입력하면 교체됩니다.",
     "keepPlaceholder": "기존 키 유지"
   },
@@ -53,7 +60,7 @@
   },
   "calendar": {
     "title": "캘린더 동기화",
-    "subtitle": "Yuvomi를 Google 캘린더 또는 Apple iCloud에 연결하세요. 둘 다 선택 사항 — 구성하려면 펼치세요.",
+    "subtitle": "Yuvomi를 Google 캘린더, Apple iCloud 또는 Outlook에 연결하세요. 모두 선택 사항 - 구성하려면 펼치세요.",
     "google": "Google 캘린더",
     "googleHint": "{{link}}에서 OAuth 자격 증명을 만드세요. 리디렉션 URI: {{redirect}}",
     "googleLink": "console.cloud.google.com",
@@ -66,20 +73,25 @@
     "appleUserLabel": "Apple ID (이메일)",
     "applePassLabel": "앱 전용 비밀번호",
     "appleUrlLabel": "CalDAV URL",
-    "appleUrlOpt": "(선택 사항)",
-    "appleUrlHint": "제공자가 다른 CalDAV 엔드포인트를 사용하지 않는 한 비워 두세요."
+    "appleUrlHint": "제공자가 다른 CalDAV 엔드포인트를 사용하지 않는 한 비워 두세요.",
+    "outlook": "Outlook 캘린더 (Microsoft Graph)",
+    "outlookHint": "{{link}}에서 무료 Entra ID 앱 등록(\"개인 Microsoft 계정만\")을 만드세요 - 설치 가이드를 참고하세요. 리디렉션 URI: {{redirect}}",
+    "outlookLink": "entra.microsoft.com",
+    "outlookIdLabel": "클라이언트 ID",
+    "outlookSecretLabel": "클라이언트 시크릿",
+    "outlookNote": "단방향 푸시: Yuvomi가 기준이며 Outlook에서의 변경 사항은 덮어쓰기됩니다. 가족 계정은 나중에 앱 설정에서 연결합니다."
   },
   "advanced": {
     "tag": "고급 · 선택 사항",
     "title": "고급 설정",
-    "subtitle": "리버스 프록시, 싱글 사인온, 자동 백업. 모두 선택 사항 — 건너뛰어도 문제없습니다.",
+    "subtitle": "통합 인증, 홈 네트워크 접근, 그리고 몇 가지 세부 조정. 모두 선택 사항입니다.",
     "proxyLabel": "Yuvomi가 어떻게 제공됩니까?",
     "proxyBehindHttps": "HTTPS를 사용하는 리버스 프록시 뒤 (Caddy, nginx, Traefik)",
     "proxyDirect": "localhost / HTTP를 통한 직접 접속",
-    "proxyHint": "직접 접속은 순수 Secure 쿠키를 비활성화하여 HTTPS 없이도 로그인이 작동하게 합니다.",
+    "proxyHint": "http://로 Yuvomi를 연다면 \"직접 접근\"을 선택하세요. 그렇지 않으면 로그인할 수 없습니다. HTTPS 리버스 프록시 뒤에서는 첫 번째 옵션을 선택하세요.",
     "oidc": "싱글 사인온 (OIDC)",
     "oidcHint": "SSO를 활성화하려면 네 필드를 모두 채우거나 비워 두세요.",
-    "oidcIssuerLabel": "Issuer URL",
+    "oidcIssuerLabel": "발급자 URL",
     "oidcClientIdLabel": "클라이언트 ID",
     "oidcClientSecretLabel": "클라이언트 시크릿",
     "oidcRedirectLabel": "리디렉션 URI",
@@ -101,8 +113,7 @@
     "documentLocalEnable": "새 문서를 로컬 폴더에 저장",
     "documentLocalPathLabel": "폴더 경로",
     "documentLocalPathHint": "컨테이너 내부 경로. 비워 두면 /documents를 사용합니다.",
-    "sectionNetwork": "네트워크",
-    "sectionIntegrations": "통합 및 백업",
+    "sectionIntegrations": "통합 인증",
     "errSchedule": "잘못된 cron 일정입니다(공백으로 구분된 다섯 개 필드 필요, 예: 0 2 * * *).",
     "errKeep": "보관할 백업 수는 양수여야 합니다.",
     "webdavBackup": "외부 백업(WebDAV)",
@@ -125,7 +136,32 @@
     "documentGoogleDriveReuseHint": "두 항목을 모두 비워 두면 Google 캘린더 OAuth 자격 증명을 재사용합니다. 전용 자격 증명을 사용하려면 Google Cloud Console에서 만드세요(캘린더 단계와 동일).",
     "documentGoogleDriveRedirectLabel": "리디렉션 URI",
     "errDocumentGoogleDrivePair": "Google Drive 클라이언트 ID와 시크릿은 둘 다 설정하거나 둘 다 비워 두어야 합니다.",
-    "errDocumentGoogleDriveCredentials": "Google Drive에는 자체 클라이언트 ID와 시크릿 또는 구성된 Google 캘린더 자격 증명이 필요합니다."
+    "errDocumentGoogleDriveCredentials": "Google Drive에는 자체 클라이언트 ID와 시크릿 또는 구성된 Google 캘린더 자격 증명이 필요합니다.",
+    "dataDirLabel": "호스트 데이터 폴더",
+    "dataDirHint": "서버에서 데이터베이스와 앱 데이터가 있는 위치입니다. 비워 두면 compose 파일 옆의 ./data를 사용합니다.",
+    "documentLocalDirLabel": "호스트 폴더",
+    "documentLocalDirHint": "컨테이너에 마운트되는 서버의 폴더입니다. 비워 두면 ./documents를 사용합니다.",
+    "documentWebdavPrivateNetwork": "가정 네트워크의 WebDAV 대상 허용",
+    "documentWebdavPrivateNetworkHint": "자체 네트워크의 Nextcloud에 필요합니다. 이 대상에 대한 SSRF 보호를 해제합니다.",
+    "icsPrivateNetwork": "가정 네트워크의 캘린더 구독 허용",
+    "icsPrivateNetworkHint": "자체 네트워크 기기의 ICS 피드에 필요합니다. 캘린더 구독에 대한 SSRF 보호를 해제합니다.",
+    "recipeProviderPrivateNetwork": "가정 네트워크의 레시피 공급자 미러 허용",
+    "recipeProviderPrivateNetworkHint": "자체 네트워크의 Mealie 또는 Tandoor 인스턴스에 필요합니다. 레시피 공급자 미러에 대한 SSRF 보호를 해제합니다.",
+    "wasteSourcePrivateNetwork": "가정 네트워크의 폐기물 수거 피드 허용",
+    "wasteSourcePrivateNetworkHint": "자체 네트워크에 미러링된 지방자치단체 폐기물 수거 캘린더에 필요합니다. 폐기물 수거 URL 소스에 대한 SSRF 보호를 해제합니다.",
+    "oidcTrustEmail": "verified 클레임 없이 이메일 신뢰",
+    "oidcTrustEmailHint": "제공자가 email_verified를 보내지 않고 이를 신뢰하는 경우에만 사용하세요.",
+    "oidcAllowSignup": "SSO 로그인으로 새 계정 생성 허용",
+    "oidcAllowSignupHint": "제공자가 이 가정보다 많은 사람을 담당한다면 끄세요. 기존 계정은 계속 로그인되고 계속 연결됩니다.",
+    "baseUrlLabel": "공개 주소",
+    "baseUrlHint": "가족이 Yuvomi를 여는 주소입니다. 컨테이너의 호스트와 포트가 아닙니다. 비밀번호 재설정 및 초대 링크에 사용됩니다.",
+    "syncIntervalLabel": "캘린더 동기화 간격(분)",
+    "syncIntervalHint": "Yuvomi가 캘린더와 연락처를 동기화하는 주기입니다. 공급자가 요청을 제한하면 값을 늘리세요.",
+    "errSyncInterval": "분 단위 양의 정수를 입력하세요.",
+    "sectionPrivateNetwork": "홈 네트워크 접근",
+    "privateNetworkHint": "Yuvomi는 기본적으로 자체 네트워크의 주소로의 연결을 거부합니다. 이는 서버가 내부 서비스에 접근하도록 유도되는 것을 막습니다. 집에서 실제로 운영하는 것만 허용하세요.",
+    "authPasswordLogin": "사용자 이름과 비밀번호 로그인 유지",
+    "authPasswordLoginHint": "끄면 SSO가 유일한 접속 방법이 됩니다. 로그인 양식과 비밀번호 재설정이 사라집니다. 공급자에 연결할 수 없게 되면 되돌아가는 길은 .env 파일 편집과 재시작입니다."
   },
   "review": {
     "title": "검토",
@@ -154,18 +190,39 @@
     "webdavBackup": "외부 백업",
     "on": "켜짐",
     "off": "꺼짐",
-    "documentGoogleDrive": "Google Drive 문서"
+    "documentGoogleDrive": "Google Drive 문서",
+    "sessionSecret": "세션 키",
+    "dbKey": "데이터베이스 키",
+    "keyGenerated": "새로 생성됨",
+    "keyPreserved": "기존 키 유지",
+    "dataDir": "데이터 폴더",
+    "privateNetwork": "사설 네트워크 접근",
+    "privateNetworkIcs": "캘린더 구독",
+    "privateNetworkRecipes": "레시피",
+    "privateNetworkWaste": "폐기물 수거",
+    "privateNetworkWebdav": "WebDAV 문서",
+    "baseUrl": "공개 주소",
+    "outlook": "Outlook 캘린더",
+    "notEnabled": "허용 안 함"
   },
   "docker": {
     "title": "Yuvomi 시작 중",
     "subtitle": "이미지를 불러오고 Docker 컨테이너를 시작합니다.",
-    "starting": "컨테이너 시작 중 …",
     "elapsed": "{{n}}초 경과",
     "running": "컨테이너가 정상이며 실행 중입니다",
     "failed": "컨테이너를 시작하지 못했습니다",
     "unknownError": "알 수 없는 오류",
     "toAdmin": "관리자 설정으로 계속",
-    "retry": "다시 시도"
+    "retry": "다시 시도",
+    "phasePull": "이미지 내려받는 중",
+    "phaseBoot": "컨테이너 시작 중",
+    "phaseHealth": "상태 검사 진행 중",
+    "firstRunHint": "처음에는 몇 분이 걸릴 수 있습니다.",
+    "stalled": "평소보다 오래 걸리고 있습니다. 아래 로그에서 이유를 확인하세요.",
+    "showLogs": "로그 표시",
+    "hideLogs": "로그 숨기기",
+    "timedOut": "15분이 지나도 응답이 없습니다. 로그를 확인한 뒤 다시 시도하세요.",
+    "logLabel": "컨테이너 로그"
   },
   "admin": {
     "title": "관리자 계정 만들기",
@@ -190,7 +247,17 @@
     "open": "Yuvomi 열기 →",
     "backupReminder": "지금 .env 파일을 백업하는 것을 잊지 마세요 — 키가 들어 있습니다.",
     "download": ".env 파일 다운로드",
-    "savedTo": "{{path}}에 저장됨"
+    "savedTo": "{{path}}에 저장됨",
+    "downloadFailed": "파일을 불러오지 못했습니다 - 설치 프로그램이 이미 종료되었을 수 있습니다. 키는 서버의 .env 파일에 있습니다.",
+    "serverStops": "설치 프로그램은 몇 분 후에 종료됩니다. 이 탭을 닫기 전에 파일을 내려받으세요.",
+    "nextTitle": "다음 단계",
+    "nextInvite": "가족 초대하기",
+    "nextInviteDesc": "초대 링크를 만들어 각자 비밀번호를 직접 정하게 하세요.",
+    "nextModules": "모듈 고르기",
+    "nextModulesDesc": "실제로 쓰는 것만 켜고 나머지는 숨기세요.",
+    "nextInstall": "휴대폰에 설치하기",
+    "nextInstallDesc": "휴대폰에서 Yuvomi를 열고 홈 화면에 추가하세요. 오프라인에서도 작동합니다.",
+    "subtitleExisting": "Yuvomi가 실행 중입니다. 이 설치에는 이미 관리자 계정이 있습니다. 기존 자격 증명으로 로그인하세요."
   },
   "welcome": {
     "title": "Yuvomi에 오신 것을 환영합니다",
@@ -201,7 +268,9 @@
     "simpleTime": "약 2분",
     "advancedTitle": "고급 설정",
     "advancedDesc": "완전한 제어: 리버스 프록시, 캘린더 동기화, 이메일, 싱글 사인온, 백업.",
-    "advancedTime": "모든 옵션을 단계별로"
+    "advancedTime": "모든 옵션을 단계별로",
+    "existingLocked": "기존 설치가 감지되었습니다. 현재 설정을 유지하려면 고급 설정을 사용하세요.",
+    "containerRunning": "Yuvomi가 실행 중입니다. 저장하면 컨테이너가 다시 시작되어 잠시 사용할 수 없습니다."
   },
   "simple": {
     "title": "준비 완료",
@@ -233,5 +302,11 @@
     "fromHint": "받는 사람에게 표시되는 “보낸 사람” 주소입니다. 많은 제공업체가 사용자 이름과 일치할 것을 요구합니다.",
     "fromNameLabel": "보낸 사람 이름",
     "errIncomplete": "SMTP 서버와 보낸 사람 주소는 필수입니다."
+  },
+  "storage": {
+    "title": "저장소 및 백업",
+    "subtitle": "서버에서 데이터가 어디에 있고 사본이 어디로 가는지. 모두 선택 사항이며 기본값으로도 동작합니다.",
+    "sectionBackups": "백업",
+    "sectionDocuments": "문서 저장소"
   }
 }

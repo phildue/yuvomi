@@ -8,6 +8,7 @@ export const apiTags = [
       { name: 'Meals' },
       { name: 'Recipes' },
       { name: 'Pantry' },
+      { name: 'Inventory' },
       // Der Kreislauf-Zustand der vier Küchen-Tabs zusammen, nicht ein fünftes
       // Modul: die Leiste braucht die Zahlen der Nachbarn in einer Abfrage.
       { name: 'Kitchen' },
@@ -19,6 +20,7 @@ export const apiTags = [
       { name: 'SplitExpenses' },
       { name: 'Documents' },
       { name: 'Housekeeping' },
+      { name: 'Waste' },
       { name: 'Modules' },
       { name: 'Backup' },
       { name: 'Weather' },
@@ -31,4 +33,9 @@ export const apiTags = [
       { name: 'Notifications' },
       { name: 'Health' },
       { name: 'Rewards' },
+      { name: 'Schedule' },
+      { name: 'Quick links' },
+      { name: 'Screensaver' },
+      { name: 'Recipe providers' },
+      { name: 'Permissions' },
 ];

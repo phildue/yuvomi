@@ -5,6 +5,7 @@
  * Ausführen: node --loader ./test/test-browser-loader.mjs --test test/test-health-meds.js
  */
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 const {
@@ -16,7 +17,14 @@ const {
   computeDueDoses,
   computeAdherence,
   refillState,
+  parseLogInstant,
+  toLocalStamp,
+  prnDoseState,
+  splitRemaining,
+  scheduledLogs,
 } = await import('../public/utils/health-meds.js');
+
+const { __test: healthHelpers } = await import('../public/pages/health.js');
 
 // --------------------------------------------------------
 // Wochentags-Masken
@@ -168,4 +176,193 @@ test('refillState: über Schwelle oder ohne Schwelle → ok', () => {
   assert.equal(refillState({ stock_qty: 10, refill_threshold: 5 }).level, 'ok');
   assert.equal(refillState({ stock_qty: 10, refill_threshold: null }).level, 'ok');
   assert.equal(refillState({ stock_qty: 10, refill_threshold: null }).below, false);
+});
+
+// --------------------------------------------------------
+// Bedarfsmedikation (#700)
+// --------------------------------------------------------
+
+test('parseLogInstant: Wanduhrzeit bleibt Wanduhrzeit, Z bleibt Instant', () => {
+  const wall = parseLogInstant('2026-08-16T18:40');
+  assert.equal(wall.getHours(), 18);
+  assert.equal(wall.getMinutes(), 40);
+  assert.equal(wall.getFullYear(), 2026);
+
+  // Mit Sekunden, weiterhin ohne Zone.
+  assert.equal(parseLogInstant('2026-08-16T18:40:30').getHours(), 18);
+
+  // Mit Zone: derselbe Moment wie Date.parse, also NICHT als Wanduhrzeit gelesen.
+  assert.equal(parseLogInstant('2026-08-16T18:40:00Z').getTime(),
+    Date.parse('2026-08-16T18:40:00Z'));
+
+  assert.equal(parseLogInstant(''), null);
+  assert.equal(parseLogInstant(null), null);
+  assert.equal(parseLogInstant('kein Datum'), null);
+});
+
+test('toLocalStamp: Minutenstempel ohne Zone, Gegenstueck zu parseLogInstant', () => {
+  const at = new Date(2026, 7, 16, 9, 5);
+  assert.equal(toLocalStamp(at), '2026-08-16T09:05');
+  // Hin und zurueck ergibt denselben Moment - das ist der Punkt der beiden.
+  assert.equal(parseLogInstant(toLocalStamp(at)).getTime(), at.getTime());
+});
+
+test('prnDoseState: ohne Mindestabstand gibt es keinen Countdown', () => {
+  const med = { id: 1, min_interval_hours: null };
+  const logs = [{ status: 'taken', taken_at: '2026-08-16T12:40' }];
+  const s = prnDoseState(med, logs, new Date(2026, 7, 16, 13, 0));
+  assert.equal(s.allowed, true);
+  assert.equal(s.nextAllowedAt, null);
+  assert.equal(s.remainingMs, 0);
+  assert.equal(s.lastTakenAt.getHours(), 12);
+});
+
+test('prnDoseState: naechste Dosis faellt aus letzter Einnahme plus Abstand', () => {
+  const med = { id: 1, min_interval_hours: 6 };
+  const logs = [{ status: 'taken', taken_at: '2026-08-16T12:40' }];
+  const s = prnDoseState(med, logs, new Date(2026, 7, 16, 13, 20));
+
+  assert.equal(s.allowed, false);
+  assert.equal(s.nextAllowedAt.getHours(), 18);
+  assert.equal(s.nextAllowedAt.getMinutes(), 40);
+  assert.equal(s.remainingMs, 5 * 3600_000 + 20 * 60_000);
+});
+
+test('prnDoseState: der Countdown haengt an der Uhr, nicht am Seitenaufbau', () => {
+  const med = { id: 1, min_interval_hours: 6 };
+  const logs = [{ status: 'taken', taken_at: '2026-08-16T12:40' }];
+  // Derselbe Eintrag, zwei Zeitpunkte: nur die Restdauer wandert, der erlaubte
+  // Zeitpunkt bleibt stehen. Genau das muss einen Reload ueberleben.
+  const early = prnDoseState(med, logs, new Date(2026, 7, 16, 13, 40));
+  const later = prnDoseState(med, logs, new Date(2026, 7, 16, 17, 40));
+  assert.equal(early.nextAllowedAt.getTime(), later.nextAllowedAt.getTime());
+  assert.equal(early.remainingMs, 5 * 3600_000);
+  assert.equal(later.remainingMs, 1 * 3600_000);
+
+  const after = prnDoseState(med, logs, new Date(2026, 7, 16, 18, 41));
+  assert.equal(after.allowed, true);
+  assert.equal(after.remainingMs, 0);
+});
+
+test('prnDoseState: nur genommene Dosen zaehlen', () => {
+  const med = { id: 1, min_interval_hours: 6 };
+  const logs = [
+    { status: 'taken',   taken_at: '2026-08-16T08:00' },
+    { status: 'skipped', taken_at: null, scheduled_at: '2026-08-16T14:00' },
+    { status: 'pending', taken_at: null, scheduled_at: '2026-08-16T16:00' },
+  ];
+  const s = prnDoseState(med, logs, new Date(2026, 7, 16, 15, 0));
+  // Uebersprungen und ausstehend sagen nichts darueber, wann der Koerper
+  // zuletzt etwas bekommen hat - sonst schoebe eine ignorierte Zeile den
+  // Countdown nach hinten.
+  assert.equal(s.lastTakenAt.getHours(), 8);
+  assert.equal(s.nextAllowedAt.getHours(), 14);
+  assert.equal(s.allowed, true);
+});
+
+test('prnDoseState: die spaeteste genommene Dosis gewinnt, egal wie sortiert', () => {
+  const med = { id: 1, min_interval_hours: 4 };
+  const logs = [
+    { status: 'taken', taken_at: '2026-08-16T09:00' },
+    { status: 'taken', taken_at: '2026-08-16T15:00' },
+    { status: 'taken', taken_at: '2026-08-16T12:00' },
+  ];
+  const s = prnDoseState(med, logs, new Date(2026, 7, 16, 16, 0));
+  assert.equal(s.lastTakenAt.getHours(), 15);
+  assert.equal(s.nextAllowedAt.getHours(), 19);
+});
+
+test('prnDoseState: eine alte Z-Zeile wird nicht um den UTC-Abstand verschoben', () => {
+  const med = { id: 1, min_interval_hours: 6 };
+  const instant = Date.parse('2026-08-16T10:40:00Z');
+  const logs = [{ status: 'taken', taken_at: '2026-08-16T10:40:00Z' }];
+  const s = prnDoseState(med, logs, new Date(instant));
+  assert.equal(s.lastTakenAt.getTime(), instant);
+  assert.equal(s.nextAllowedAt.getTime(), instant + 6 * 3600_000);
+});
+
+test('prnDoseState: ohne Einnahme steht die Dosis offen', () => {
+  const s = prnDoseState({ id: 1, min_interval_hours: 6 }, [], new Date());
+  assert.equal(s.lastTakenAt, null);
+  assert.equal(s.nextAllowedAt, null);
+  assert.equal(s.allowed, true);
+});
+
+test('prnDoseState: ein Abstand von 0 oder darunter ist keiner', () => {
+  const logs = [{ status: 'taken', taken_at: '2026-08-16T12:00' }];
+  const now = new Date(2026, 7, 16, 12, 1);
+  assert.equal(prnDoseState({ min_interval_hours: 0 }, logs, now).nextAllowedAt, null);
+  assert.equal(prnDoseState({ min_interval_hours: -3 }, logs, now).nextAllowedAt, null);
+});
+
+test('splitRemaining: auf die volle Minute AUFgerundet', () => {
+  assert.deepEqual(splitRemaining(5 * 3600_000 + 20 * 60_000), { hours: 5, minutes: 20 });
+  assert.deepEqual(splitRemaining(90 * 60_000), { hours: 1, minutes: 30 });
+  // Die letzten Sekunden duerfen nicht als „0 Min." dastehen - das gaebe eine
+  // Dosis frei, die noch nicht erlaubt ist.
+  assert.deepEqual(splitRemaining(30_000), { hours: 0, minutes: 1 });
+  assert.deepEqual(splitRemaining(0), { hours: 0, minutes: 0 });
+  assert.deepEqual(splitRemaining(-5000), { hours: 0, minutes: 0 });
+});
+
+test('scheduledLogs: eine Bedarfsdosis zaehlt nicht als eingehaltener Plan', () => {
+  const logs = [
+    { id: 1, status: 'taken', schedule_id: 7, scheduled_at: '2026-08-16T08:00' },
+    { id: 2, status: 'taken', schedule_id: null, taken_at: '2026-08-16T12:40' }, // bei Bedarf
+    { id: 3, status: 'skipped', schedule_id: 7, scheduled_at: '2026-08-16T20:00' },
+    // Der Plan dahinter wurde geloescht: `schedule_id` ist per ON DELETE SET NULL
+    // weg, der geplante Zeitpunkt steht noch. Die Dosis WAR geplant und muss in
+    // der Rechnung bleiben - sonst faellt die Adhaerenz vergangener Wochen in
+    // sich zusammen, weil jemand einen alten Einnahmeplan aufgeraeumt hat.
+    { id: 4, status: 'taken', schedule_id: null, scheduled_at: '2026-08-15T08:00' },
+  ];
+  assert.deepEqual(scheduledLogs(logs).map((l) => l.id), [1, 3, 4]);
+
+  // Der Fall aus dem Review: drei von sieben geplanten genommen, dazu acht
+  // Bedarfsdosen. Ungefiltert stünde da „100 %, 11 von 11".
+  const viele = [
+    ...Array.from({ length: 3 }, (_, i) => ({ status: 'taken', schedule_id: i + 1, scheduled_at: `2026-08-1${i}T08:00` })),
+    ...Array.from({ length: 8 }, () => ({ status: 'taken', schedule_id: null, scheduled_at: null })),
+  ];
+  assert.equal(computeAdherence(viele, 7).rate, 1);
+  assert.equal(computeAdherence(scheduledLogs(viele), 7).rate, 3 / 7);
+
+  assert.deepEqual(scheduledLogs(null), []);
+});
+
+// --------------------------------------------------------
+// Betreuungsrechte im Einnahmeprotokoll (#999)
+// --------------------------------------------------------
+
+test('Einnahmeprotokoll: Korrektur folgt dem gemeinsamen Betreuungsrecht', () => {
+  const source = readFileSync(new URL('../public/pages/health.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function medLogHistoryMarkup()');
+  const end = source.indexOf('/** Ein Log-Eintrag', start);
+  assert.ok(start >= 0 && end > start, 'medLogHistoryMarkup muss auffindbar sein');
+
+  const historyMarkup = source.slice(start, end);
+  assert.match(historyMarkup, /const own = canEditFor\(meds\.personId, meds\.meId\)/,
+    'auch eine ausdruecklich betreute Person braucht den Korrekturknopf');
+  assert.doesNotMatch(historyMarkup, /meds\.personId === meds\.meId/,
+    'eine reine Eigentuemerpruefung schneidet Betreuende vom erlaubten API-Weg ab');
+});
+
+test('canEditFor: eigene Daten, betreute Person und unbeteiligtes Mitglied (#1031, Option 2)', () => {
+  // Der Test oben beweist nur, dass die Aufrufstelle canEditFor() benutzt statt
+  // einer reinen Eigentuemerpruefung - er beweist nicht, dass canEditFor() selbst
+  // die drei Berechtigungsfaelle richtig unterscheidet. Das prueft dieser Test.
+  const selfId = 1;
+  const caredForId = 2;
+  const unrelatedId = 3;
+  try {
+    healthHelpers.setCareForForTest([caredForId]);
+    assert.equal(healthHelpers.canEditFor(selfId, selfId), true,
+      'eigene Daten muessen bearbeitbar bleiben');
+    assert.equal(healthHelpers.canEditFor(caredForId, selfId), true,
+      'eine betreute Person muss bearbeitbar sein');
+    assert.equal(healthHelpers.canEditFor(unrelatedId, selfId), false,
+      'ein unbeteiligtes Mitglied darf nicht bearbeitbar sein');
+  } finally {
+    healthHelpers.setCareForForTest([]);
+  }
 });

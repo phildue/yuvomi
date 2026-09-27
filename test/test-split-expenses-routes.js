@@ -40,11 +40,13 @@ app.use(express.json());
 app.use((req, _res, next) => {
   req.authUserId = actor.id;
   req.authRole = actor.role;
-  req.session = { userId: actor.id, role: actor.role };
+  // cookieSession: eine Sitzung, die neben einem API-Token mitkommt - requireAuth
+  // setzt authUserId/authRole dann aus dem Token, req.session bleibt die Sitzung.
+  req.session = actor.cookieSession ?? { userId: actor.id, role: actor.role };
   next();
 });
 app.use('/', splitRouter);
-const server = app.listen(0);
+const server = app.listen(0, '127.0.0.1');
 const baseUrl = await new Promise((r) => server.on('listening', () => r(`http://127.0.0.1:${server.address().port}`)));
 
 async function call(method, path, { actor: a, body } = {}) {
@@ -103,6 +105,15 @@ test('requireGroupAccess: Mitglied hat Lesezugriff', async () => {
 test('requireGroupAccess: System-Admin ohne Mitgliedschaft hat Zugriff (bewusster Bypass)', async () => {
   const r = await call('GET', `/groups/${GROUP}/members`, { actor: { id: ADMIN, role: 'admin' } });
   assert.equal(r.status, 200);
+});
+
+test('requireGroupAccess: Token eines Aussenstehenden neben einer Admin-Sitzung bekommt 404, die Admin-Sitzung allein 200', async () => {
+  const withToken = await call('GET', `/groups/${GROUP}/members`, {
+    actor: { id: OUTSIDER, role: 'member', cookieSession: { userId: ADMIN, role: 'admin' } },
+  });
+  assert.equal(withToken.status, 404, 'der Bypass urteilt nach der Rolle des Token-Subjekts');
+  const adminOnly = await call('GET', `/groups/${GROUP}/members`, { actor: { id: ADMIN, role: 'admin' } });
+  assert.equal(adminOnly.status, 200);
 });
 
 // --------------------------------------------------------------------------
@@ -166,6 +177,26 @@ test('Ausgabe-Autorisierung: fremdes Mitglied (nicht Ersteller/Manager) darf nic
 test('loadExpense-Sichtbarkeit: Aussenstehender sieht Ausgabe nicht -> 404', async () => {
   const r = await call('PUT', `/expenses/${EXPENSE}`, { actor: { id: OUTSIDER, role: 'member' }, body: { title: 'Y', amount: '1.00', currency: 'EUR' } });
   assert.equal(r.status, 404);
+});
+
+// Der PUT prueft die Mitgliedschaft von Zahler und Beteiligten wie der POST
+// (GHSA-4p5w-5346-8598): vorher liess sich einer Person, die nie in der Gruppe
+// war, eine Schuld zuschreiben, die sie nirgends sieht.
+test('PUT /expenses/:id — Nicht-Mitglied als Zahler oder Beteiligter -> 400, Salden unveraendert', async () => {
+  const before = await netByUser(GROUP);
+  const payer = await call('PUT', `/expenses/${EXPENSE}`, {
+    actor: { id: OWNER, role: 'member' },
+    body: { title: 'Einkauf', amount: '30.00', currency: 'EUR', split_method: 'equal', payer_id: OUTSIDER, participants: [OWNER, MGR], expense_date: '2026-05-10' },
+  });
+  assert.equal(payer.status, 400, `erwartet 400, bekommen ${payer.status}`);
+  const participant = await call('PUT', `/expenses/${EXPENSE}`, {
+    actor: { id: OWNER, role: 'member' },
+    body: { title: 'Einkauf', amount: '30.00', currency: 'EUR', split_method: 'equal', payer_id: OWNER, participants: [OWNER, OUTSIDER], expense_date: '2026-05-10' },
+  });
+  assert.equal(participant.status, 400, `erwartet 400, bekommen ${participant.status}`);
+  const after = await netByUser(GROUP);
+  assert.deepEqual([...after.entries()], [...before.entries()], 'kein Saldo fuer den Aussenstehenden, keine Verschiebung');
+  assert.equal(after.has(OUTSIDER), false);
 });
 
 // --------------------------------------------------------------------------
@@ -299,6 +330,20 @@ test('Gast-Anlage mit bereits vergebenem Username -> 409', async () => {
     body: { display_name: 'Kollision', password: 'supersecret', username: 'greta.custom' },
   });
   assert.equal(r.status, 409);
+});
+
+test('Gast-Anlage: gespiegelter Kontakt traegt den Kategorie-Key misc (#1140)', async () => {
+  const r = await call('POST', `/groups/${GUEST_GROUP}/guests`, {
+    actor: { id: OWNER, role: 'member' },
+    body: { display_name: 'Gast Milo', password: 'supersecret' },
+  });
+  assert.equal(r.status, 201);
+  // syncGuestArtifacts schrieb frueher das deutsche Literal 'Sonstiges' - kein
+  // Key in contact_categories, die UI zeigte es unuebersetzt an (#1140). Der
+  // Spiegel-Kontakt muss den stabilen Key 'misc' tragen.
+  const contact = db.prepare('SELECT category FROM contacts WHERE family_user_id = ?').get(r.body.data.id);
+  assert.ok(contact, 'Kontakt-Artefakt angelegt');
+  assert.equal(contact.category, 'misc', 'gespiegelter Gast-Kontakt nutzt den stabilen Key misc');
 });
 
 // --------------------------------------------------------------------------
@@ -640,6 +685,129 @@ test('split-defaults: PATCH ohne Default-Felder lässt bestehende Aufteilung una
 
 test('split-defaults: Guest darf Defaults nicht ändern -> 403', async () => {
   const r = await call('PATCH', `/groups/${DGROUP}`, { actor: { id: MEM, role: 'member' }, body: { default_split_method: 'equal' } });
+  assert.equal(r.status, 403);
+});
+
+// --------------------------------------------------------------------------
+// Verwaister Gast: die Gruppe verschwindet, das Confinement nicht
+//
+// split_expense_guest_users trägt zwei Aussagen: DASS ein Konto beschränkt ist
+// (Existenz der Zeile - genau das fragt der Guard in server/index.js ab) und
+// WORAUF (group_id). Das CASCADE aus Migration v40 nahm beim Löschen der
+// Gruppe die ganze Zeile mit, der users-Eintrag blieb: aus dem Gast wurde ein
+// haushaltsweit berechtigtes Konto. Migration 124 stellt das auf SET NULL um,
+// die Routen lesen group_id IS NULL als "keine Gruppe", nicht als "frei".
+// --------------------------------------------------------------------------
+let ORPHAN_GROUP, ORPHAN_ID, SIDE_GROUP, SIDE_EXPENSE;
+test('setup verwaister Gast: Gast in leerer Gruppe, zusätzlich Mitglied einer zweiten Gruppe', async () => {
+  const g = await call('POST', '/groups', { actor: { id: OWNER, role: 'member' }, body: { name: 'Wochenendtrip', type: 'travel' } });
+  ORPHAN_GROUP = g.body.data.id;
+  const guest = await call('POST', `/groups/${ORPHAN_GROUP}/guests`, {
+    actor: { id: OWNER, role: 'member' },
+    body: { display_name: 'Gast Orphan', password: 'supersecret', family_role: 'other' },
+  });
+  assert.equal(guest.status, 201);
+  ORPHAN_ID = guest.body.data.id;
+
+  // Zweite Gruppe mit Finanzhistorie, in der der Gast Mitglied wird. Erst so
+  // wird sichtbar, ob das Confinement nach dem Löschen noch greift - ohne
+  // Mitgliedschaft würde schon die Mitglieder-Prüfung alles abfangen.
+  const side = await call('POST', '/groups', { actor: { id: OWNER, role: 'member' }, body: { name: 'Nebenkasse', type: 'general', default_currency: 'EUR' } });
+  SIDE_GROUP = side.body.data.id;
+  await call('POST', `/groups/${SIDE_GROUP}/members`, { actor: { id: OWNER, role: 'member' }, body: { user_id: ORPHAN_ID, role: 'guest' } });
+  const e = await call('POST', `/groups/${SIDE_GROUP}/expenses`, {
+    actor: { id: OWNER, role: 'member' },
+    body: { title: 'Nebenkassen-Beleg', amount: '20.00', currency: 'EUR', split_method: 'equal', category: 'general', payer_id: OWNER, participants: [OWNER, ORPHAN_ID], expense_date: '2026-05-20' },
+  });
+  assert.equal(e.status, 201);
+  SIDE_EXPENSE = e.body.data.id;
+});
+
+test('Gast mit Gruppe erreicht die fremde Ausgabe nicht per ID', async () => {
+  // /expenses/:id hängt nicht an requireGroupAccess, sondern an der
+  // Mitgliedschaft - lesend, kommentierend und schreibend.
+  const guest = { id: ORPHAN_ID, role: 'member' };
+  const comment = await call('POST', `/expenses/${SIDE_EXPENSE}/comments`, { actor: guest, body: { comment: 'mitgelesen' } });
+  assert.equal(comment.status, 404);
+  const put = await call('PUT', `/expenses/${SIDE_EXPENSE}`, { actor: guest, body: { title: 'umbenannt', amount: '1.00', currency: 'EUR' } });
+  assert.equal(put.status, 404);
+  const del = await call('DELETE', `/expenses/${SIDE_EXPENSE}`, { actor: guest });
+  assert.equal(del.status, 404);
+  // Gegenprobe: Der Owner kommt weiterhin heran.
+  const owner = await call('POST', `/expenses/${SIDE_EXPENSE}/comments`, { actor: { id: OWNER, role: 'member' }, body: { comment: 'ok' } });
+  assert.equal(owner.status, 201);
+});
+
+test('Gast mit Gruppe sieht die fremde Gruppe auch im Dashboard nicht', async () => {
+  // Noch vor dem Löschen: Die Mitgliedschaft allein öffnet Salden und Ausgaben
+  // der Nebenkasse, das Confinement muss auch hier greifen.
+  const r = await call('GET', '/dashboard', { actor: { id: ORPHAN_ID, role: 'member' } });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.data.groups.map((g) => g.id), [ORPHAN_GROUP], 'nur die eigene Gruppe');
+  // Die einzige Ausgabe und der einzige Ledger-Eintrag des Gasts liegen in der
+  // Nebenkasse - beides darf über die Mitgliedschaft nicht durchschlagen.
+  assert.deepEqual(r.body.data.recent_expenses, [], 'keine fremden Ausgaben');
+  assert.deepEqual(r.body.data.total_owing, [], 'kein Saldo aus der Nebenkasse');
+  assert.deepEqual(r.body.data.total_owed, []);
+});
+
+test('leere Gast-Gruppe wird gelöscht -> 200', async () => {
+  const r = await call('DELETE', `/groups/${ORPHAN_GROUP}`, { actor: { id: OWNER, role: 'member' } });
+  assert.equal(r.status, 200);
+  assert.equal(db.prepare('SELECT 1 FROM expense_groups WHERE id = ?').get(ORPHAN_GROUP), undefined);
+});
+
+test('Gruppenlöschung behält die Confinement-Zeile und leert nur die Zuordnung', () => {
+  // Genau diese Abfrage fährt der Guard in server/index.js. Fehlt die Zeile,
+  // ist das Gast-Login ein normales Haushaltskonto (Rechteausweitung).
+  const row = db.prepare('SELECT * FROM split_expense_guest_users WHERE user_id = ?').get(ORPHAN_ID);
+  assert.ok(row, 'Gast bleibt als Gast eingetragen');
+  assert.equal(row.group_id, null, 'nur die Gruppenzuordnung fällt weg');
+});
+
+test('access_scope des verwaisten Gasts bleibt split_guest', () => {
+  // Spiegelt USER_PUBLIC_COLUMNS aus server/auth.js (auch von routes/permissions.js genutzt).
+  const scope = db.prepare(`
+    SELECT CASE WHEN EXISTS (
+      SELECT 1 FROM split_expense_guest_users sg WHERE sg.user_id = users.id
+    ) THEN 'split_guest' ELSE 'family' END AS access_scope
+    FROM users WHERE id = ?
+  `).get(ORPHAN_ID);
+  assert.equal(scope.access_scope, 'split_guest');
+});
+
+test('verwaister Gast erreicht die zweite Gruppe nicht, obwohl er Mitglied ist -> 404', async () => {
+  const r = await call('GET', `/groups/${SIDE_GROUP}/members`, { actor: { id: ORPHAN_ID, role: 'member' } });
+  assert.equal(r.status, 404);
+});
+
+test('verwaister Gast sieht keine Gruppen und kein Dashboard', async () => {
+  const groups = await call('GET', '/groups', { actor: { id: ORPHAN_ID, role: 'member' } });
+  assert.equal(groups.status, 200);
+  assert.deepEqual(groups.body.data, []);
+  const dash = await call('GET', '/dashboard', { actor: { id: ORPHAN_ID, role: 'member' } });
+  assert.equal(dash.status, 200);
+  assert.deepEqual(dash.body.data.groups, []);
+  // Salden und jüngste Ausgaben hängen an der Mitgliedschaft, nicht an der
+  // Gruppenliste - ohne eigenen Filter blieben sie sichtbar.
+  assert.deepEqual(dash.body.data.recent_expenses, [], 'keine Ausgaben');
+  assert.deepEqual(dash.body.data.total_owing, [], 'keine offenen Schulden');
+  assert.deepEqual(dash.body.data.total_owed, [], 'keine offenen Forderungen');
+});
+
+test('verwaister Gast: Suche liefert nichts (kein Fallback auf "unbeschränkt")', async () => {
+  const r = await call('GET', '/search?q=', { actor: { id: ORPHAN_ID, role: 'member' } });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.data.groups, [], 'keine Gruppen');
+  assert.deepEqual(r.body.data.expenses, [], 'keine Ausgaben');
+  assert.deepEqual(r.body.data.people, [], 'keine Personen');
+  // Gegenprobe: Für den Owner findet dieselbe Suche die Nebenkasse sehr wohl.
+  const owner = await call('GET', '/search?q=Nebenkassen', { actor: { id: OWNER, role: 'member' } });
+  assert.ok(owner.body.data.expenses.some((e) => e.title === 'Nebenkassen-Beleg'), 'Owner sieht den Beleg');
+});
+
+test('verwaister Gast darf weiterhin keine Gruppe anlegen -> 403', async () => {
+  const r = await call('POST', '/groups', { actor: { id: ORPHAN_ID, role: 'member' }, body: { name: 'Freigeschaltet?' } });
   assert.equal(r.status, 403);
 });
 

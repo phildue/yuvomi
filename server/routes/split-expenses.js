@@ -9,9 +9,14 @@ import * as db from '../db.js';
 import { hashPassword, normalizePassword } from '../utils/password.js';
 import { createLogger } from '../logger.js';
 import { collectErrors, date as validateDate, id as validateId, str, MAX_TEXT, MAX_TITLE } from '../middleware/validate.js';
+import { isAdminRequest } from '../middleware/require-admin.js';
 import { documentLinksFor, loadDocumentLinks, replaceDocumentLinks, visibleDocumentRef } from '../services/document-links.js';
+import { sendDocumentDeletionConflict } from '../services/document-deletion-lock.js';
 import { buildSplits, decorateMoney, minorToDecimal, parseMoneyToMinor, simplifyDebts } from '../services/split-expenses.js';
+import { CURRENCY_CODES } from '../../public/utils/currency-codes.js';
 import { syncBirthdayArtifacts } from '../services/birthdays.js';
+import { householdMemberSql, newNonMembers, staffMessage } from '../services/household-members.js';
+import { todayKey } from '../utils/timezone.js';
 
 const log = createLogger('SplitExpenses');
 const router = express.Router();
@@ -19,13 +24,12 @@ const router = express.Router();
 const avatarColors = ['#007AFF', '#34C759', '#FF9500', '#FF3B30', '#AF52DE', '#FF2D55'];
 const randomAvatarColor = () => avatarColors[Math.floor(Math.random() * avatarColors.length)];
 
+// Derselbe Waehrungsvorrat wie in den Einstellungen und in den Abos - eine
+// Liste fuer Server und Browser (#841, public/utils/currency-codes.js).
 const GROUP_TYPES = ['household', 'couple', 'travel', 'event', 'shopping', 'general'];
 const GROUP_ROLES = ['owner', 'admin', 'guest'];
 const SPLIT_METHODS = ['equal', 'exact', 'percentage', 'shares'];
 const CATEGORIES = ['groceries', 'rent', 'utilities', 'baby', 'pets', 'school', 'travel', 'shopping', 'subscriptions', 'health', 'home', 'general'];
-// Muss mit VALID_CURRENCIES in server/routes/preferences.js übereinstimmen,
-// sonst lehnt diese Route die Haushaltswährung ab (per Test abgesichert).
-const CURRENCIES = ['AED', 'AUD', 'BRL', 'CAD', 'CHF', 'CLP', 'CNY', 'CZK', 'DKK', 'EUR', 'GBP', 'HUF', 'IDR', 'INR', 'IRR', 'JPY', 'KRW', 'KZT', 'MYR', 'NOK', 'PLN', 'RUB', 'SAR', 'SEK', 'TRY', 'UAH', 'USD', 'ZAR'];
 const FREQUENCIES = ['weekly', 'monthly', 'yearly'];
 const FAMILY_ROLES = ['dad', 'mom', 'parent', 'child', 'grandparent', 'relative', 'other'];
 
@@ -33,16 +37,25 @@ function userId(req) {
   return req.authUserId || req.session.userId;
 }
 
+/**
+ * Gast-Confinement in einer Abfrage. Ergebnis:
+ *   null                 - unbeschränktes Konto
+ *   { groupId: 7 }       - Gast, sieht ausschließlich Gruppe 7
+ *   { groupId: null }    - Gast, dessen Gruppe gelöscht wurde: sieht nichts
+ *
+ * Die beiden Aussagen "ist beschränkt" (Existenz der Zeile) und "worauf"
+ * (group_id) müssen getrennt bleiben. Wer nur die group_id abfragt und ihr
+ * Fehlen als "unbeschränkt" liest, hebt das Confinement auf, sobald eine
+ * Gruppe gelöscht wird - das war die Rechteausweitung, die Migration 124
+ * schließt.
+ */
+function splitGuestScope(req) {
+  const row = db.get().prepare('SELECT group_id FROM split_expense_guest_users WHERE user_id = ?').get(userId(req));
+  return row ? { groupId: row.group_id ?? null } : null;
+}
+
 function isSplitGuest(req) {
-  return Boolean(db.get().prepare('SELECT 1 FROM split_expense_guest_users WHERE user_id = ?').get(userId(req)));
-}
-
-function splitGuestGroupId(req) {
-  return db.get().prepare('SELECT group_id FROM split_expense_guest_users WHERE user_id = ?').get(userId(req))?.group_id || null;
-}
-
-function isSystemAdmin(req) {
-  return req.authRole === 'admin' || req.session?.role === 'admin';
+  return Boolean(splitGuestScope(req));
 }
 
 function defaultCurrency() {
@@ -56,19 +69,20 @@ function memberRole(groupId, uid) {
 function canManageGroup(groupId, req) {
   if (isSplitGuest(req)) return false;
   const role = memberRole(groupId, userId(req));
-  return isSystemAdmin(req) || role === 'owner' || role === 'admin';
+  return isAdminRequest(req) || role === 'owner' || role === 'admin';
 }
 
 function requireGroupAccess(groupId, req) {
-  const restrictedGroupId = splitGuestGroupId(req);
-  if (restrictedGroupId && Number(restrictedGroupId) !== Number(groupId)) return null;
+  const guest = splitGuestScope(req);
+  // Gast ohne Gruppe (gelöschte Gruppe) erreicht keine Gruppe mehr - nicht jede.
+  if (guest && (guest.groupId == null || Number(guest.groupId) !== Number(groupId))) return null;
   const group = db.get().prepare(`
     SELECT g.*, m.role AS member_role
     FROM expense_groups g
     LEFT JOIN expense_group_members m ON m.group_id = g.id AND m.user_id = ?
     WHERE g.id = ?
   `).get(userId(req), groupId);
-  if (!group || (!group.member_role && !isSystemAdmin(req))) return null;
+  if (!group || (!group.member_role && !isAdminRequest(req))) return null;
   return group;
 }
 
@@ -150,7 +164,7 @@ function syncGuestArtifacts(database, userId, { displayName, phone, email, birth
   const contact = database.prepare('SELECT id, name FROM contacts WHERE family_user_id = ?').get(userId);
   if (contact) {
     database.prepare(`
-      UPDATE contacts SET name = ?, category = COALESCE(category, 'Sonstiges'), phone = ?, email = ?
+      UPDATE contacts SET name = ?, category = COALESCE(category, 'misc'), phone = ?, email = ?
       WHERE id = ?
     `).run(displayName, phone || null, email || null, contact.id);
 
@@ -167,7 +181,7 @@ function syncGuestArtifacts(database, userId, { displayName, phone, email, birth
   } else {
     database.prepare(`
       INSERT INTO contacts (name, category, phone, email, family_user_id)
-      VALUES (?, 'Sonstiges', ?, ?, ?)
+      VALUES (?, 'misc', ?, ?, ?)
     `).run(displayName, phone || null, email || null, userId);
   }
 
@@ -192,6 +206,10 @@ function syncGuestArtifacts(database, userId, { displayName, phone, email, birth
 }
 
 function loadExpense(expenseId, req) {
+  // Die Mitgliedschaft allein reicht als Zugang nicht: ein Gast kann zusätzlich
+  // in fremden Gruppen stehen. Ohne diesen Filter erreicht er deren Ausgaben
+  // per ID - lesend, kommentierend und als deren Ersteller auch schreibend.
+  const guest = splitGuestScope(req);
   const expense = db.get().prepare(`
     SELECT e.*, u.display_name AS payer_name, g.name AS group_name
     FROM expenses e
@@ -199,9 +217,17 @@ function loadExpense(expenseId, req) {
     JOIN expense_group_members gm ON gm.group_id = e.group_id AND gm.user_id = @userId
     LEFT JOIN users u ON u.id = e.payer_id
     WHERE e.id = @expenseId AND e.status = 'active'
-  `).get({ expenseId, userId: userId(req) });
-  if (!expense && !isSystemAdmin(req)) return null;
-  if (!expense && isSystemAdmin(req)) {
+      AND (@isGuest = 0 OR e.group_id = @restrictedGroupId)
+  `).get({
+    expenseId,
+    userId: userId(req),
+    restrictedGroupId: guest?.groupId ?? null,
+    isGuest: guest ? 1 : 0,
+  });
+  // Der Admin-Bypass gilt nicht für Gastkonten - sonst hinge das Confinement an
+  // der Annahme, dass ein Gast nie die Admin-Rolle trägt.
+  if (!expense && (!isAdminRequest(req) || guest)) return null;
+  if (!expense) {
     return db.get().prepare(`
       SELECT e.*, u.display_name AS payer_name, g.name AS group_name
       FROM expenses e
@@ -289,8 +315,8 @@ function replaceExpenseSplits(database, expense, splits, actorId) {
 }
 
 function parseExpenseBody(body, fallbackCurrency) {
-  const currency = CURRENCIES.includes(body.currency) ? body.currency : fallbackCurrency;
-  const convertedCurrency = CURRENCIES.includes(body.converted_currency) ? body.converted_currency : currency;
+  const currency = CURRENCY_CODES.includes(body.currency) ? body.currency : fallbackCurrency;
+  const convertedCurrency = CURRENCY_CODES.includes(body.converted_currency) ? body.converted_currency : currency;
   const amountMinor = parseMoneyToMinor(body.amount, currency);
   const convertedAmountMinor = body.converted_amount
     ? parseMoneyToMinor(body.converted_amount, convertedCurrency, 'converted_amount')
@@ -311,7 +337,7 @@ function parseExpenseBody(body, fallbackCurrency) {
     convertedCurrency,
     method,
     category,
-    expenseDate: vDate.value || new Date().toISOString().slice(0, 10),
+    expenseDate: vDate.value || todayKey(db.get()),
   };
 }
 
@@ -349,7 +375,7 @@ function normalizeSplitDefaults(body, groupId, fallbackMethod = 'equal') {
 
 router.get('/meta', (_req, res) => {
   try {
-    res.json({ data: { group_types: GROUP_TYPES, group_roles: GROUP_ROLES, split_methods: SPLIT_METHODS, categories: CATEGORIES, currencies: CURRENCIES, frequencies: FREQUENCIES, default_currency: defaultCurrency() } });
+    res.json({ data: { group_types: GROUP_TYPES, group_roles: GROUP_ROLES, split_methods: SPLIT_METHODS, categories: CATEGORIES, currencies: CURRENCY_CODES, frequencies: FREQUENCIES, default_currency: defaultCurrency() } });
   } catch (err) {
     log.error('GET /meta error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -359,22 +385,31 @@ router.get('/meta', (_req, res) => {
 router.get('/dashboard', (req, res) => {
   try {
     const uid = userId(req);
+    // Alle drei Abfragen tragen dasselbe Confinement: die Mitgliedschaft allein
+    // reicht nicht, ein Gast kann zusätzlich in fremden Gruppen stehen. Der
+    // Filter hängt am Gast-Status, nicht an der group_id - ein Gast ohne Gruppe
+    // sieht nichts, nicht alles.
+    const guest = splitGuestScope(req);
+    const restrictedGroupId = guest?.groupId ?? null;
+    const isGuest = guest ? 1 : 0;
     const balances = db.get().prepare(`
       SELECT l.currency, l.user_id, u.display_name, SUM(l.amount_minor) AS net_minor
       FROM expense_ledger_entries l
       JOIN expense_group_members gm ON gm.group_id = l.group_id AND gm.user_id = @uid
       JOIN expense_groups g ON g.id = l.group_id AND g.status = 'active'
       LEFT JOIN users u ON u.id = l.user_id
+      WHERE (@isGuest = 0 OR l.group_id = @restrictedGroupId)
       GROUP BY l.currency, l.user_id
-    `).all({ uid });
+    `).all({ uid, restrictedGroupId, isGuest });
     const mine = balances.filter((row) => row.user_id === uid);
     const totalOwed = mine.filter((row) => row.net_minor > 0).map((row) => normalizeLedgerRow({ ...row, amount_minor: row.net_minor }));
     const totalOwing = mine.filter((row) => row.net_minor < 0).map((row) => normalizeLedgerRow({ ...row, amount_minor: -row.net_minor }));
-    const groupWhere = isSplitGuest(req)
+    const groupWhere = guest
       ? "visible.user_id = @userId AND g.status = 'active' AND g.id = @restrictedGroupId"
       : "visible.user_id = @userId AND g.status = 'active'";
+    // groupId === null (gelöschte Gruppe) trifft über `g.id = NULL` keine Zeile.
     const groups = db.get().prepare(`${groupSelectWhere(groupWhere)} ORDER BY g.updated_at DESC LIMIT 6`)
-      .all({ userId: uid, restrictedGroupId: splitGuestGroupId(req) });
+      .all({ userId: uid, restrictedGroupId });
     const recent = db.get().prepare(`
       SELECT e.*, g.name AS group_name, u.display_name AS payer_name
       FROM expenses e
@@ -382,9 +417,10 @@ router.get('/dashboard', (req, res) => {
       JOIN expense_group_members gm ON gm.group_id = g.id AND gm.user_id = @uid
       LEFT JOIN users u ON u.id = e.payer_id
       WHERE e.status = 'active'
+        AND (@isGuest = 0 OR e.group_id = @restrictedGroupId)
       ORDER BY e.expense_date DESC, e.created_at DESC
       LIMIT 8
-    `).all({ uid });
+    `).all({ uid, restrictedGroupId, isGuest });
     const recentSerialized = serializeExpenseList(recent, userId(req));
     res.json({ data: { total_owed: totalOwed, total_owing: totalOwing, groups, recent_expenses: recentSerialized } });
   } catch (err) {
@@ -397,11 +433,11 @@ router.get('/groups', (req, res) => {
   try {
     const status = req.query.status === 'archived' ? 'archived' : 'active';
     const query = String(req.query.q || '').trim();
-    const guest = isSplitGuest(req);
+    const guest = splitGuestScope(req);
     const rows = db.get().prepare(`
       ${groupSelectWhere(`visible.user_id = @userId AND g.status = @status AND (@query = '' OR g.name LIKE '%' || @query || '%')${guest ? ' AND g.id = @restrictedGroupId' : ''}`)}
       ORDER BY g.updated_at DESC
-    `).all({ userId: userId(req), status, query, restrictedGroupId: splitGuestGroupId(req) });
+    `).all({ userId: userId(req), status, query, restrictedGroupId: guest?.groupId ?? null });
     res.json({ data: rows });
   } catch (err) {
     log.error('GET /groups error:', err);
@@ -417,11 +453,16 @@ router.post('/groups', (req, res) => {
     const errors = collectErrors([vName, vDescription]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
     const type = GROUP_TYPES.includes(req.body.type) ? req.body.type : 'general';
-    const currency = CURRENCIES.includes(req.body.default_currency) ? req.body.default_currency : defaultCurrency();
+    const currency = CURRENCY_CODES.includes(req.body.default_currency) ? req.body.default_currency : defaultCurrency();
     // Beim Anlegen existiert nur der Owner als Mitglied - eine pro-Mitglied-Config
     // ist hier noch nicht sinnvoll (das Frontend bietet den Editor erst im
     // Bearbeiten-Dialog). Nur die Methode wird direkt übernommen.
     const defaultMethod = SPLIT_METHODS.includes(req.body.default_split_method) ? req.body.default_split_method : 'equal';
+    // Wer anlegt, wird Owner der Gruppe - dieselbe Regel wie beim Hinzufuegen
+    // (#1207): ein angemeldetes Konto, das weder Haushaltsmitglied noch Gast
+    // ist, bekommt keine neue Mitgliedschaft.
+    const staff = newNonMembers([userId(req)], { guestsAllowed: true });
+    if (staff.length) return res.status(400).json({ error: staffMessage(staff), code: 400 });
     const result = db.transaction(() => {
       const created = db.get().prepare(`
         INSERT INTO expense_groups (name, description, type, default_currency, default_split_method, created_by)
@@ -451,7 +492,7 @@ router.patch('/groups/:id', (req, res) => {
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
     const current = db.get().prepare('SELECT * FROM expense_groups WHERE id = ?').get(id);
     const type = GROUP_TYPES.includes(req.body.type) ? req.body.type : current.type;
-    const currency = CURRENCIES.includes(req.body.default_currency) ? req.body.default_currency : current.default_currency;
+    const currency = CURRENCY_CODES.includes(req.body.default_currency) ? req.body.default_currency : current.default_currency;
     // Standard-Aufteilung nur anfassen, wenn der Client sie mitschickt (#517).
     let defaultMethod = current.default_split_method;
     let defaultConfig = current.default_split_config;
@@ -547,6 +588,10 @@ router.get('/groups/:id/member-candidates', (req, res) => {
     const groupId = Number(req.params.id);
     if (!requireGroupAccess(groupId, req)) return res.status(404).json({ error: 'Group not found.', code: 404 });
     if (isSplitGuest(req)) return res.status(403).json({ error: 'Not authorized.', code: 403 });
+    // Haushaltsmitglieder, dazu die Gaeste DIESER Gruppe (#1207). Ein Gast
+    // existiert fuer geteilte Ausgaben: er gehoert zu der Gruppe, fuer die er
+    // angelegt wurde, und zu jeder, in der er schon Mitglied ist. Gaeste
+    // anderer Gruppen bietet die Auswahl nicht an.
     const people = db.get().prepare(`
       SELECT 'user' AS source, u.id AS user_id, NULL AS contact_id, u.display_name, u.username,
              u.avatar_color, u.family_role, c.phone, c.email, b.birth_date,
@@ -555,10 +600,37 @@ router.get('/groups/:id/member-candidates', (req, res) => {
       FROM users u
       LEFT JOIN contacts c ON c.family_user_id = u.id
       LEFT JOIN birthdays b ON b.family_user_id = u.id
-      LEFT JOIN expense_group_members gm ON gm.group_id = ? AND gm.user_id = u.id
-      WHERE NOT EXISTS (SELECT 1 FROM housekeeping_workers hw WHERE hw.user_id = u.id)
-      ORDER BY u.display_name COLLATE NOCASE ASC
-    `).all(groupId);
+      LEFT JOIN expense_group_members gm ON gm.group_id = @groupId AND gm.user_id = u.id
+      WHERE ${householdMemberSql('u')}
+      UNION ALL
+      SELECT 'user' AS source, u.id AS user_id, NULL AS contact_id, u.display_name, u.username,
+             u.avatar_color, u.family_role, c.phone, c.email, b.birth_date,
+             CASE WHEN gm.user_id IS NULL THEN 0 ELSE 1 END AS in_group,
+             gm.role AS group_role
+      FROM split_expense_guest_users g
+      JOIN users u ON u.id = g.user_id
+      LEFT JOIN contacts c ON c.family_user_id = u.id
+      LEFT JOIN birthdays b ON b.family_user_id = u.id
+      LEFT JOIN expense_group_members gm ON gm.group_id = @groupId AND gm.user_id = u.id
+      WHERE g.group_id = @groupId OR gm.user_id IS NOT NULL
+      UNION ALL
+      -- Wer schon Mitglied dieser Gruppe ist, ohne Haushaltsmitglied oder Gast
+      -- zu sein (Hauspersonal aus der Zeit vor #1207): neu hinzufuegen laesst
+      -- sich so jemand nicht mehr, aber der Editor muss die Mitgliedschaft
+      -- zeigen, damit sie sich beenden laesst.
+      SELECT 'user' AS source, u.id AS user_id, NULL AS contact_id, u.display_name, u.username,
+             u.avatar_color, u.family_role, c.phone, c.email, b.birth_date,
+             1 AS in_group,
+             gm.role AS group_role
+      FROM expense_group_members gm
+      JOIN users u ON u.id = gm.user_id
+      LEFT JOIN contacts c ON c.family_user_id = u.id
+      LEFT JOIN birthdays b ON b.family_user_id = u.id
+      WHERE gm.group_id = @groupId
+        AND NOT (${householdMemberSql('u')})
+        AND NOT EXISTS (SELECT 1 FROM split_expense_guest_users sg WHERE sg.user_id = u.id)
+      ORDER BY display_name COLLATE NOCASE ASC
+    `).all({ groupId });
     const contacts = db.get().prepare(`
       SELECT 'contact' AS source, NULL AS user_id, c.id AS contact_id, c.name AS display_name,
              NULL AS username, '#2563EB' AS avatar_color, 'other' AS family_role,
@@ -587,6 +659,11 @@ router.post('/groups/:id/members', async (req, res) => {
     if (!memberUserId) return res.status(400).json({ error: 'user_id or contact_id is required.', code: 400 });
     const exists = db.get().prepare('SELECT 1 FROM users WHERE id = ?').get(memberUserId);
     if (!exists) return res.status(404).json({ error: 'User not found.', code: 404 });
+    // Mitglieder und Gaeste, aber kein Hauspersonal (#1207). Eine bestehende
+    // Mitgliedschaft bleibt gueltig und laesst sich weiter aendern.
+    const already = db.get().prepare('SELECT 1 FROM expense_group_members WHERE group_id = ? AND user_id = ?').get(groupId, memberUserId);
+    const staff = newNonMembers([memberUserId], { stored: already ? [memberUserId] : [], guestsAllowed: true });
+    if (staff.length) return res.status(400).json({ error: staffMessage(staff), code: 400 });
     db.get().prepare(`
       INSERT INTO expense_group_members (group_id, user_id, role, invited_by)
       VALUES (?, ?, ?, ?)
@@ -744,6 +821,7 @@ router.post('/groups/:id/expenses', (req, res) => {
     });
     res.status(201).json({ data: serializeExpense(loadExpense(createdId, req), null, userId(req)) });
   } catch (err) {
+    if (sendDocumentDeletionConflict(res, err)) return;
     const message = err.message || 'Invalid expense.';
     log.error('POST /groups/:id/expenses error:', err);
     res.status(message.includes('Internal') ? 500 : 400).json({ error: message, code: message.includes('Internal') ? 500 : 400 });
@@ -758,6 +836,15 @@ router.put('/expenses/:id', (req, res) => {
     const parsed = parseExpenseBody(req.body, existing.converted_currency);
     const payerId = Number(req.body.payer_id || existing.payer_id);
     const participants = Array.isArray(req.body.participants) ? req.body.participants : db.get().prepare('SELECT user_id FROM expense_splits WHERE expense_id = ?').all(existing.id).map((r) => r.user_id);
+    // Dieselbe Regel wie beim Anlegen (GHSA-4p5w-5346-8598): Zahler und
+    // Beteiligte muessen Mitglieder DIESER Gruppe sein. Der PUT nahm die IDs
+    // bisher ungeprueft - ein Mitglied konnte einer Person, die nie in der
+    // Gruppe war, eine Schuld zuschreiben, die diese nirgends sieht und nicht
+    // bestreiten kann.
+    if (!memberRole(existing.group_id, payerId)) return res.status(400).json({ error: 'Payer must be a group member.', code: 400 });
+    for (const participantId of participants) {
+      if (!memberRole(existing.group_id, Number(participantId))) return res.status(400).json({ error: 'All participants must be group members.', code: 400 });
+    }
     const splits = buildSplits({ method: parsed.method, amountMinor: parsed.convertedAmountMinor, currency: parsed.convertedCurrency, participants, splits: req.body.splits });
     db.transaction(() => {
       db.get().prepare(`
@@ -783,6 +870,7 @@ router.put('/expenses/:id', (req, res) => {
     });
     res.json({ data: serializeExpense(loadExpense(existing.id, req), null, userId(req)) });
   } catch (err) {
+    if (sendDocumentDeletionConflict(res, err)) return;
     log.error('PUT /expenses/:id error:', err);
     res.status(400).json({ error: err.message || 'Invalid expense.', code: 400 });
   }
@@ -854,7 +942,7 @@ router.post('/groups/:id/settlements', (req, res) => {
     const payeeId = Number(req.body.payee_id);
     if (!memberRole(groupId, payerId) || !memberRole(groupId, payeeId)) return res.status(400).json({ error: 'Settlement users must be group members.', code: 400 });
     if (payerId === payeeId) return res.status(400).json({ error: 'Settlement needs two different users.', code: 400 });
-    const currency = CURRENCIES.includes(req.body.currency) ? req.body.currency : group.default_currency;
+    const currency = CURRENCY_CODES.includes(req.body.currency) ? req.body.currency : group.default_currency;
     const amountMinor = parseMoneyToMinor(req.body.amount, currency);
     const vNotes = str(req.body.notes, 'Notes', { max: MAX_TEXT, required: false });
     if (vNotes.error) return res.status(400).json({ error: vNotes.error, code: 400 });
@@ -881,6 +969,7 @@ router.post('/groups/:id/settlements', (req, res) => {
     const row = db.get().prepare('SELECT * FROM settlements WHERE id = ?').get(settlementId);
     res.status(201).json({ data: decorateMoney(row) });
   } catch (err) {
+    if (sendDocumentDeletionConflict(res, err)) return;
     log.error('POST /groups/:id/settlements error:', err);
     res.status(400).json({ error: err.message || 'Invalid settlement.', code: 400 });
   }
@@ -964,9 +1053,13 @@ router.get('/search', (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
     const uid = userId(req);
-    const restrictedGroupId = splitGuestGroupId(req);
+    const guest = splitGuestScope(req);
+    const restrictedGroupId = guest?.groupId ?? null;
+    // Der Filter hängt am Gast-Status, nicht an der group_id: ein Gast ohne
+    // Gruppe darf keine Treffer bekommen, nicht alle.
+    const isGuest = guest ? 1 : 0;
     const groups = db.get().prepare(`
-      ${groupSelectWhere(`visible.user_id = @userId AND g.status = 'active' AND (@q = '' OR g.name LIKE '%' || @q || '%')${restrictedGroupId ? ' AND g.id = @restrictedGroupId' : ''}`)}
+      ${groupSelectWhere(`visible.user_id = @userId AND g.status = 'active' AND (@q = '' OR g.name LIKE '%' || @q || '%')${guest ? ' AND g.id = @restrictedGroupId' : ''}`)}
       ORDER BY g.updated_at DESC LIMIT 10
     `).all({ userId: uid, q, restrictedGroupId });
     const expenses = db.get().prepare(`
@@ -976,9 +1069,9 @@ router.get('/search', (req, res) => {
       JOIN expense_group_members gm ON gm.group_id = g.id AND gm.user_id = @uid
       LEFT JOIN users u ON u.id = e.payer_id
       WHERE e.status = 'active' AND (@q = '' OR e.title LIKE '%' || @q || '%' OR e.description LIKE '%' || @q || '%')
-        AND (@restrictedGroupId IS NULL OR g.id = @restrictedGroupId)
+        AND (@isGuest = 0 OR g.id = @restrictedGroupId)
       ORDER BY e.expense_date DESC LIMIT 10
-    `).all({ uid, q, restrictedGroupId });
+    `).all({ uid, q, restrictedGroupId, isGuest });
     const expensesSerialized = serializeExpenseList(expenses, userId(req));
     const people = db.get().prepare(`
       SELECT DISTINCT u.id, u.display_name, u.username, u.avatar_color
@@ -986,9 +1079,9 @@ router.get('/search', (req, res) => {
       JOIN expense_group_members gm ON gm.user_id = u.id
       JOIN expense_group_members mine ON mine.group_id = gm.group_id AND mine.user_id = @uid
       WHERE (@q = '' OR u.display_name LIKE '%' || @q || '%' OR u.username LIKE '%' || @q || '%')
-        AND (@restrictedGroupId IS NULL OR gm.group_id = @restrictedGroupId)
+        AND (@isGuest = 0 OR gm.group_id = @restrictedGroupId)
       ORDER BY u.display_name COLLATE NOCASE ASC LIMIT 10
-    `).all({ uid, q, restrictedGroupId });
+    `).all({ uid, q, restrictedGroupId, isGuest });
     res.json({ data: { groups, expenses: expensesSerialized, people } });
   } catch (err) {
     log.error('GET /search error:', err);

@@ -30,9 +30,16 @@ describe('CardDAV Contacts Schema (Migration 30)', () => {
     // Create minimal schema to satisfy Migration 30 dependencies
     // Migration 30 expects: users table and contacts table to exist
     db.exec(`
+      -- display_name/avatar_* stehen hier, seit der Contacts-Router die
+      -- Identitaetsfarbe eines verknuepften Mitglieds mitliefert (Vollton-Regel,
+      -- DESIGN.md). Diese Fixtures bauen ihr Schema von Hand statt ueber
+      -- buildSchema; eine fehlende Spalte faellt deshalb erst als 500 auf.
       CREATE TABLE users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL
+        username TEXT NOT NULL,
+        display_name TEXT,
+        avatar_color TEXT,
+        avatar_data  TEXT
       );
 
       CREATE TABLE contacts (
@@ -481,9 +488,16 @@ describe('CardDAV Sync Service', () => {
 
     // Create minimal schema
     testDb.exec(`
+      -- display_name/avatar_* stehen hier, seit der Contacts-Router die
+      -- Identitaetsfarbe eines verknuepften Mitglieds mitliefert (Vollton-Regel,
+      -- DESIGN.md). Diese Fixtures bauen ihr Schema von Hand statt ueber
+      -- buildSchema; eine fehlende Spalte faellt deshalb erst als 500 auf.
       CREATE TABLE users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL
+        username TEXT NOT NULL,
+        display_name TEXT,
+        avatar_color TEXT,
+        avatar_data  TEXT
       );
 
       CREATE TABLE contacts (
@@ -1693,9 +1707,16 @@ describe('CardDAV API Routes', () => {
 
     // Create minimal schema
     apiTestDb.exec(`
+      -- display_name/avatar_* stehen hier, seit der Contacts-Router die
+      -- Identitaetsfarbe eines verknuepften Mitglieds mitliefert (Vollton-Regel,
+      -- DESIGN.md). Diese Fixtures bauen ihr Schema von Hand statt ueber
+      -- buildSchema; eine fehlende Spalte faellt deshalb erst als 500 auf.
       CREATE TABLE users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL
+        username TEXT NOT NULL,
+        display_name TEXT,
+        avatar_color TEXT,
+        avatar_data  TEXT
       );
 
       CREATE TABLE contacts (
@@ -2324,9 +2345,16 @@ describe('Contacts API - Multi-Value Fields', () => {
 
     // Create minimal schema
     contactsApiDb.exec(`
+      -- display_name/avatar_* stehen hier, seit der Contacts-Router die
+      -- Identitaetsfarbe eines verknuepften Mitglieds mitliefert (Vollton-Regel,
+      -- DESIGN.md). Diese Fixtures bauen ihr Schema von Hand statt ueber
+      -- buildSchema; eine fehlende Spalte faellt deshalb erst als 500 auf.
       CREATE TABLE users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL
+        username TEXT NOT NULL,
+        display_name TEXT,
+        avatar_color TEXT,
+        avatar_data  TEXT
       );
 
       CREATE TABLE contacts (
@@ -2348,7 +2376,13 @@ describe('Contacts API - Multi-Value Fields', () => {
       -- 'Arzt'/'Sonstiges'; beide werden hier als gültige Keys mitgeführt.
       CREATE TABLE contact_categories (
         key TEXT PRIMARY KEY, name TEXT, label_key TEXT,
-        icon TEXT NOT NULL DEFAULT 'tag', sort_order INTEGER NOT NULL DEFAULT 0
+        icon TEXT NOT NULL DEFAULT 'tag', sort_order INTEGER NOT NULL DEFAULT 0,
+        -- color seit Migration 152: der Router liest sie in
+        -- loadContactCategories(), und die laeuft auch auf dem
+        -- Validierungspfad jedes POST/PUT. Fehlt die Spalte hier, wird aus
+        -- jedem Schreibvorgang eine 500 - dieses Fixture baut sein Schema von
+        -- Hand statt ueber buildSchema.
+        color TEXT
       );
       INSERT INTO contact_categories (key, sort_order) VALUES
         ('doctor',0),('school',1),('authority',2),('insurance',3),

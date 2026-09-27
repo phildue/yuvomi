@@ -6,8 +6,10 @@
  *        auf Touch das native OS-Sheet.
  * Abhängigkeiten: tokens.css (alle Werte via Token), layout.css (.form-input)
  *
- * Akzent: --active-module-accent (vom Router pro Modul gesetzt) mit Fallback
- *         auf --color-accent — trägt die Modul-Identität ins Popover.
+ * Akzent: --color-accent, die Stimme der App. Der Datepicker ist ein
+ *         geteiltes Bedienelement und tut in jedem Modul dasselbe; bis
+ *         2026-08-10 trug er --active-module-accent und faerbte damit den
+ *         ausgewaehlten Tag in jedem Modul anders (Eine-Stimme-Regel).
  */
 
 yuvomi-datepicker {
@@ -50,6 +52,12 @@ yuvomi-datepicker {
   pointer-events: none;
 }
 
+/* Freistehendes Ziel: sein einziger Nachbar ist das Feld, in dem er sitzt - kein
+ * gleichartiges Ziel engt ihn ein, also gilt die volle Zielgröße (tokens.css,
+ * „Die Zielgrößen-Regel"). --target-md waren 40px auf JEDEM Gerät, am Finger
+ * also 8px unter dem Minimum. .ydp-navbtn unten bleibt bei --target-md: die
+ * beiden Monatspfeile stehen als Paar 4px nebeneinander und sind damit ein
+ * Reihen-Ziel. */
 .ydp__trigger {
   position: absolute;
   top: 50%;
@@ -58,8 +66,8 @@ yuvomi-datepicker {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: var(--target-md);
-  height: var(--target-md);
+  width: var(--target-base);
+  height: var(--target-base);
   padding: 0;
   border: 0;
   background: transparent;
@@ -70,14 +78,15 @@ yuvomi-datepicker {
 }
 
 .ydp__trigger:hover {
-  color: var(--active-module-accent, var(--color-accent));
+  color: var(--color-accent);
   background: var(--color-surface-hover);
 }
 
+/* Kein eigener Fokus-Stil: der globale Ring aus reset.css übernimmt. Der
+ * frühere accent-light-Glow maß ~1.05:1 gegen Weiß und trug nichts
+ * (Audit 2026-08-31); nur der Farbwechsel bleibt als Zusatzsignal. */
 .ydp__trigger:focus-visible {
-  outline: none;
-  color: var(--active-module-accent, var(--color-accent));
-  box-shadow: 0 0 0 3px var(--color-accent-light);
+  color: var(--color-accent);
 }
 
 .ydp__trigger svg,
@@ -125,9 +134,14 @@ yuvomi-datepicker[disabled] .ydp__trigger {
     display var(--transition-fast) allow-discrete;
 }
 
-@supports (backdrop-filter: blur(1px)) {
+/* Zweizweigig, wie im Kopf von glass.css vorgeschrieben: Safari < 18 kennt nur
+ * den -webkit-Zweig, und iOS ist das Hauptgerät dieser PWA. Bis 2026-08-09 fragte
+ * dieser Block nur nach der Standardschreibweise und setzte auch nur sie - das
+ * Popover stand dort ohne Glas. */
+@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
   .ydp-popover {
     backdrop-filter: var(--blur-lg) saturate(var(--lg-glass-saturate));
+    -webkit-backdrop-filter: var(--blur-lg) saturate(var(--lg-glass-saturate));
   }
 }
 
@@ -183,7 +197,7 @@ yuvomi-datepicker[disabled] .ydp__trigger {
   border: 0;
   background: transparent;
   color: var(--color-text-secondary);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-full);
   cursor: pointer;
   transition: color var(--transition-fast), background-color var(--transition-fast);
 }
@@ -191,11 +205,6 @@ yuvomi-datepicker[disabled] .ydp__trigger {
 .ydp-navbtn:hover {
   color: var(--color-text-primary);
   background: var(--color-surface-hover);
-}
-
-.ydp-navbtn:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--color-accent-light);
 }
 
 .ydp-navbtn svg,
@@ -245,13 +254,16 @@ yuvomi-datepicker[disabled] .ydp__trigger {
 }
 
 .ydp-cal__day.is-today {
-  box-shadow: inset 0 0 0 1.5px var(--active-module-accent, var(--color-accent));
+  box-shadow: inset 0 0 0 1.5px var(--color-accent);
   font-weight: var(--font-weight-semibold);
 }
 
 .ydp-cal__day[aria-selected="true"] {
-  background: var(--active-module-accent, var(--color-accent));
-  color: var(--color-text-on-accent);
+  background: var(--color-accent);
+  /* Die Modul-Akzente hellen im Dark-Modus durchgehend auf; auf den hellsten
+   * (Notizen, Vorrat) trug weisser Text nur 1,44:1. --color-ink-on-vivid kippt
+   * mit dem Modus und hält in beiden Themes mindestens 4,99:1. */
+  color: var(--color-ink-on-vivid);
   font-weight: var(--font-weight-semibold);
 }
 
@@ -262,11 +274,6 @@ yuvomi-datepicker[disabled] .ydp__trigger {
 
 .ydp-cal__day:disabled:hover {
   background: transparent;
-}
-
-.ydp-cal__day:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--color-accent-light);
 }
 
 .ydp-cal__foot {
@@ -285,13 +292,13 @@ yuvomi-datepicker[disabled] .ydp__trigger {
   background: transparent;
   font-size: var(--text-sm);
   font-weight: var(--font-weight-medium);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-full);
   cursor: pointer;
   transition: background-color var(--transition-fast);
 }
 
 .ydp-textbtn--today {
-  color: var(--active-module-accent, var(--color-accent));
+  color: var(--color-accent);
 }
 
 .ydp-textbtn--clear {
@@ -300,11 +307,6 @@ yuvomi-datepicker[disabled] .ydp__trigger {
 
 .ydp-textbtn:hover {
   background: var(--color-surface-hover);
-}
-
-.ydp-textbtn:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--color-accent-light);
 }
 
 /* --------------------------------------------------------
@@ -341,12 +343,12 @@ yuvomi-datepicker[disabled] .ydp__trigger {
 }
 
 .ydp-time__opt[aria-selected="true"] {
-  background: var(--active-module-accent, var(--color-accent));
-  color: var(--color-text-on-accent);
+  background: var(--color-accent);
+  color: var(--color-ink-on-vivid);
   font-weight: var(--font-weight-semibold);
 }
 
 .ydp-time__opt:focus-visible {
   outline: none;
-  box-shadow: inset 0 0 0 2px var(--active-module-accent, var(--color-accent));
+  box-shadow: inset 0 0 0 2px var(--color-accent);
 }

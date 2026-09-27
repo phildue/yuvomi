@@ -3,35 +3,125 @@
  * Zweck: VAPID-Auflösung, Subscribe/Unsubscribe-Routen, Versand, Scheduler.
  * Ausführen: node --experimental-sqlite test/test-push.js
  */
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import express from 'express';
 import { buildRouter } from '../server/routes/push.js';
 import { processDuePushes } from '../server/services/push-scheduler.js';
 import { MIGRATIONS } from '../server/db.js';
+import { fetchRetry } from './fetch-retry.js';
 
 // --- Minimal-Schema -------------------------------------------------------
 function makeDb() {
   const db = new DatabaseSync(':memory:');
   db.exec('PRAGMA foreign_keys = ON;');
   db.exec(`
-    CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL);
+    CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
+      role TEXT NOT NULL DEFAULT 'member', family_role TEXT, schedule_reminder_offset_minutes INTEGER,
+      -- D6: der Subjekt-Name auf der geerbten Vorsorge-Erinnerung
+      -- kommt aus users.display_name.
+      display_name TEXT NOT NULL DEFAULT '');
     CREATE TABLE sync_config (key TEXT PRIMARY KEY, value TEXT);
+    -- Zweite Rechte-Achse des Vorrats-Voll-Syncs (#467).
+    CREATE TABLE access_permissions (
+      subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, resource_type TEXT NOT NULL,
+      resource_key TEXT NOT NULL, access TEXT NOT NULL,
+      PRIMARY KEY (subject_type, subject_id, resource_type, resource_key));
     CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
       created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE);
     CREATE TABLE calendar_events (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL);
     CREATE TABLE budget_subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
       amount REAL, currency TEXT, next_payment_date TEXT);
+    CREATE TABLE inventory_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+      purchase_date TEXT, warranty_months INTEGER);
+    CREATE TABLE inventory_item_dates (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL,
+      label TEXT NOT NULL, date TEXT NOT NULL);
+    CREATE TABLE pantry_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+      quantity REAL NOT NULL DEFAULT 1, expires_on TEXT, created_by INTEGER REFERENCES users(id) ON DELETE SET NULL);
+    -- Minimal, nur genug fuer den 'document_expiry'-Zweig in processDueNotifications().
+    CREATE TABLE family_documents (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+      expires_at TEXT);
+    -- Minimal, nur genug fuer den 'health_prevention_due'-Zweig in
+    -- processDueNotifications() UND fuer syncAllPreventionReminders() -
+    -- ohne diese zwei Tabellen scheitert schon die Sync-Abfrage mit "no such
+    -- table", bevor die due-Abfrage ueberhaupt drankommt.
+    CREATE TABLE health_prevention_types (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
+    CREATE TABLE health_prevention_records (id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type_id INTEGER REFERENCES health_prevention_types(id) ON DELETE SET NULL,
+      name TEXT);
+    -- Periodic notification delivery reconciles fasting reminders before it
+    -- selects due rows. Keep this minimal scheduler fixture on the same
+    -- service boundary even though these tests do not seed a fast.
+    CREATE TABLE health_fasting_settings (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      default_goal_minutes INTEGER,
+      remind_goal INTEGER NOT NULL DEFAULT 0,
+      remind_next_start INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE health_fasts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      start_at TEXT NOT NULL,
+      end_at TEXT,
+      goal_minutes INTEGER
+    );
+    -- Minimal, wie inventory_items/pantry_items daneben - nur genug fuer die
+    -- CASE-Zweige in processDueNotifications() und den Schichtplan-Sync.
+    CREATE TABLE schedule_shift_types (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+      start_time TEXT, end_time TEXT);
+    CREATE TABLE schedule_reminder_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      date_key TEXT NOT NULL,
+      shift_type_id INTEGER NOT NULL REFERENCES schedule_shift_types(id) ON DELETE CASCADE,
+      pattern_day_id INTEGER
+    );
+    CREATE UNIQUE INDEX idx_schedule_reminder_entries_slot_test
+      ON schedule_reminder_entries(user_id, date_key, COALESCE(pattern_day_id, 0));
+    CREATE TABLE schedule_extra_shifts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      date_key TEXT NOT NULL,
+      shift_type_id INTEGER NOT NULL REFERENCES schedule_shift_types(id) ON DELETE CASCADE,
+      note TEXT,
+      reminder_offset_minutes INTEGER,
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+    );
     CREATE TABLE reminders (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      entity_type TEXT NOT NULL CHECK(entity_type IN ('task','event','subscription')),
+      entity_type TEXT NOT NULL CHECK(entity_type IN ('task','event','subscription','inventory_item','inventory_tracked_date','pantry_item','cycle_period','cycle_log_nudge','schedule_entry','schedule_extra_entry','waste_pickup','document_expiry','fasting_goal','fasting_next_start')),
       entity_id INTEGER NOT NULL,
       remind_at TEXT NOT NULL,
       dismissed INTEGER NOT NULL DEFAULT 0,
       pushed_at TEXT,
       created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+      -- D6-Betreuungs-Fan-out: processDueNotifications() selektiert
+      -- r.assigned_from ungeachtet des entity_type, also muss die Spalte hier stehen.
+      assigned_from INTEGER REFERENCES users(id) ON DELETE SET NULL
+    );
+    -- Gleiche Bauart wie schedule_reminder_entries darueber: die
+    -- CASE-Zweige fuer 'waste_pickup' in processDueNotifications() lesen beide
+    -- Tabellen, also muessen beide hier stehen. Fehlten sie, brach der ganze
+    -- Push-Test mit "no such table: waste_reminder_entries" ab - und weil
+    -- "npm test" eine &&-Kette ist, kam danach KEINE Suite mehr dran (#1063).
+    CREATE TABLE waste_types (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+      icon TEXT NOT NULL DEFAULT 'trash-2', color TEXT NOT NULL DEFAULT '#22C55E',
+      archived INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE waste_reminder_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type_id INTEGER NOT NULL REFERENCES waste_types(id) ON DELETE CASCADE,
+      date_key TEXT NOT NULL,
+      UNIQUE (user_id, type_id, date_key)
+    );
+    CREATE TABLE cycle_reminder_anchors (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      anchor_date TEXT NOT NULL,
+      kind TEXT NOT NULL
     );
     CREATE TABLE push_subscriptions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -201,6 +291,19 @@ test('sendPushToUser keeps sub on transient (500) error', async () => {
   assert.equal(db.prepare('SELECT COUNT(*) c FROM push_subscriptions').get().c, 1);
 });
 
+/**
+ * Startet die Push-Routen hinter einem echten Listener und meldet die Basis-URL.
+ *
+ * Der Abbau haengt NICHT am Testende (gemessen am 09.09.2026): frueher schloss
+ * jeder Test den Server in seiner letzten Zeile. Warf eine Assertion davor, war
+ * diese Zeile unerreichbar, der Socket blieb offen - und der Prozess endete
+ * nicht mehr. Im Log stand der `✖`, das Suiten-Ende fehlte, und `npm test` hing
+ * unbegrenzt statt rot zu werden. Betroffen war jeder Test dieser Datei.
+ *
+ * Deshalb raeumt `after()` auf, wie in `test/server-ready.js` (PR #1088).
+ * Innerhalb eines `test()`-Callbacks bindet der Hook an genau diesen Test und
+ * laeuft direkt danach - auch nach einer geworfenen Assertion.
+ */
 async function startApp(db, webpush, userId = 1) {
   const app = express();
   app.use(express.json());
@@ -208,50 +311,54 @@ async function startApp(db, webpush, userId = 1) {
   const { createPushService } = await import('../server/services/push.js');
   const pushService = createPushService({ db, webpush });
   app.use('/', buildRouter({ pushService, database: db }));
-  const server = await new Promise((r) => { const s = app.listen(0, () => r(s)); });
-  return { baseUrl: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => server.close(r)) };
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+
+  after(async () => {
+    // Erst die Keep-Alive-Verbindungen von `fetch`: `close()` wartet sonst auf
+    // einen Socket, den niemand mehr schliesst.
+    server.closeAllConnections?.();
+    await new Promise((r) => server.close(r));
+  });
+
+  return { baseUrl: `http://127.0.0.1:${server.address().port}` };
 }
 
 test('GET /vapid-public-key returns the key', async () => {
   const db = makeDb();
   const app = await startApp(db, makeWebpushMock());
-  const res = await fetch(`${app.baseUrl}/vapid-public-key`);
+  const res = await fetchRetry(`${app.baseUrl}/vapid-public-key`);
   const json = await res.json();
   assert.equal(res.status, 200);
   assert.equal(json.data.key, 'PUB_GEN');
-  await app.close();
 });
 
 test('POST /subscribe inserts then upserts the subscription', async () => {
   const db = makeDb();
   const app = await startApp(db, makeWebpushMock());
   const body = { endpoint: 'https://push/x', keys: { p256dh: 'PP', auth: 'AA' } };
-  let res = await fetch(`${app.baseUrl}/subscribe`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  let res = await fetchRetry(`${app.baseUrl}/subscribe`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   assert.equal(res.status, 201);
-  res = await fetch(`${app.baseUrl}/subscribe`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, keys: { p256dh: 'PP2', auth: 'AA2' } }) });
+  res = await fetchRetry(`${app.baseUrl}/subscribe`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, keys: { p256dh: 'PP2', auth: 'AA2' } }) });
   assert.equal(res.status, 201);
   const rows = db.prepare('SELECT p256dh FROM push_subscriptions WHERE endpoint = ?').all('https://push/x');
   assert.equal(rows.length, 1);
   assert.equal(rows[0].p256dh, 'PP2');
-  await app.close();
 });
 
 test('POST /subscribe rejects missing keys', async () => {
   const db = makeDb();
   const app = await startApp(db, makeWebpushMock());
-  const res = await fetch(`${app.baseUrl}/subscribe`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ endpoint: 'https://push/x' }) });
+  const res = await fetchRetry(`${app.baseUrl}/subscribe`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ endpoint: 'https://push/x' }) });
   assert.equal(res.status, 400);
-  await app.close();
 });
 
 test('POST /unsubscribe removes the subscription', async () => {
   const db = makeDb();
   db.prepare("INSERT INTO push_subscriptions (user_id,endpoint,p256dh,auth) VALUES (1,'https://push/x','p','a')").run();
   const app = await startApp(db, makeWebpushMock());
-  const res = await fetch(`${app.baseUrl}/unsubscribe`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ endpoint: 'https://push/x' }) });
+  const res = await fetchRetry(`${app.baseUrl}/unsubscribe`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ endpoint: 'https://push/x' }) });
   assert.equal(res.status, 204);
   assert.equal(db.prepare('SELECT COUNT(*) c FROM push_subscriptions').get().c, 0);
-  await app.close();
 });
 
 test('POST /test forwards client-provided localized text', async () => {
@@ -259,48 +366,44 @@ test('POST /test forwards client-provided localized text', async () => {
   const webpush = makeWebpushMock();
   db.prepare("INSERT INTO push_subscriptions (user_id,endpoint,p256dh,auth) VALUES (1,'https://push/x','p','a')").run();
   const app = await startApp(db, webpush);
-  const res = await fetch(`${app.baseUrl}/test`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Titel', body: 'Inhalt' }) });
+  const res = await fetchRetry(`${app.baseUrl}/test`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Titel', body: 'Inhalt' }) });
   const json = await res.json();
   assert.equal(res.status, 200);
   assert.equal(json.data.sent, 1);
   assert.equal(json.data.devices, 1);
   assert.match(webpush.calls[0].payload, /Titel/);
-  await app.close();
 });
 
 test('POST /test reports sent 0 / devices 0 when nothing is registered', async () => {
   const db = makeDb();
   const app = await startApp(db, makeWebpushMock());
-  const res = await fetch(`${app.baseUrl}/test`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) });
+  const res = await fetchRetry(`${app.baseUrl}/test`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) });
   const json = await res.json();
   assert.equal(res.status, 200);
   assert.equal(json.data.sent, 0);
   assert.equal(json.data.devices, 0);
-  await app.close();
 });
 
 test('POST /test reports sent 0 but devices 1 when the subscription is gone', async () => {
   const db = makeDb();
   db.prepare("INSERT INTO push_subscriptions (user_id,endpoint,p256dh,auth) VALUES (1,'https://push/gone','p','a')").run();
   const app = await startApp(db, makeWebpushMock());
-  const res = await fetch(`${app.baseUrl}/test`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) });
+  const res = await fetchRetry(`${app.baseUrl}/test`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) });
   const json = await res.json();
   assert.equal(res.status, 200);
   assert.equal(json.data.sent, 0);
   // Vor dem Senden gezaehlt: der Client kann "abgelaufen" von "nie registriert" trennen.
   assert.equal(json.data.devices, 1);
   assert.equal(db.prepare('SELECT COUNT(*) c FROM push_subscriptions').get().c, 0);
-  await app.close();
 });
 
 test('POST /test only counts the current user devices', async () => {
   const db = makeDb();
   db.prepare("INSERT INTO push_subscriptions (user_id,endpoint,p256dh,auth) VALUES (2,'https://push/bob','p','a')").run();
   const app = await startApp(db, makeWebpushMock(), 1);
-  const res = await fetch(`${app.baseUrl}/test`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) });
+  const res = await fetchRetry(`${app.baseUrl}/test`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) });
   const json = await res.json();
   assert.equal(json.data.devices, 0);
-  await app.close();
 });
 
 function pastIso() { return new Date(Date.now() - 60_000).toISOString(); }

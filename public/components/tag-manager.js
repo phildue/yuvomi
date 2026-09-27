@@ -22,6 +22,17 @@ import { api } from '/api.js';
 import { t } from '/i18n.js';
 import { esc } from '/utils/html.js';
 
+/**
+ * Haengt an die Erfolgsmeldung an, was liegen blieb (#830).
+ *
+ * Der Server benennt an gesperrten Aufgaben nichts um, statt den ganzen Aufruf
+ * abzuweisen. Ohne diesen Zusatz meldete die Oberflaeche „umbenannt" und der
+ * alte Name staende weiter da, ohne dass irgendwo stuende warum.
+ */
+function withSkipped(message, skipped) {
+  return skipped ? `${message} ${t('tasks.tagsSkippedLocked', { count: skipped })}` : message;
+}
+
 class TagManagerElement extends HTMLElement {
   constructor() {
     super();
@@ -190,8 +201,9 @@ class TagManagerElement extends HTMLElement {
       const res = await api.put(`/tasks/tags/${encodeURIComponent(from)}`, { name: to });
       this._tags = res.data?.tags ?? this._tags;
       this._open = null;
-      this._announce(t('tasks.tagsUpdated', { count: res.data?.updated ?? 0 }));
-      window.yuvomi?.showToast?.(t('tasks.tagsUpdated', { count: res.data?.updated ?? 0 }), 'success');
+      const renamedMsg = withSkipped(t('tasks.tagsUpdated', { count: res.data?.updated ?? 0 }), res.data?.skipped);
+      this._announce(renamedMsg);
+      window.yuvomi?.showToast?.(renamedMsg, 'success');
       this._renderList();
       this.dispatchEvent(new CustomEvent('tag-manager-changed', { detail: { tags: this._tags } }));
     } catch (err) {
@@ -204,8 +216,9 @@ class TagManagerElement extends HTMLElement {
       const res = await api.delete(`/tasks/tags/${encodeURIComponent(tag)}`);
       this._tags = res.data?.tags ?? this._tags;
       this._open = null;
-      this._announce(t('tasks.tagDeleted', { count: res.data?.updated ?? 0 }));
-      window.yuvomi?.showToast?.(t('tasks.tagDeleted', { count: res.data?.updated ?? 0 }), 'success');
+      const deletedMsg = withSkipped(t('tasks.tagDeleted', { count: res.data?.updated ?? 0 }), res.data?.skipped);
+      this._announce(deletedMsg);
+      window.yuvomi?.showToast?.(deletedMsg, 'success');
       this._renderList();
       this.dispatchEvent(new CustomEvent('tag-manager-changed', { detail: { tags: this._tags } }));
     } catch (err) {

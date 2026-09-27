@@ -1,7 +1,8 @@
 /**
  * Modul: Gesundheit (Health) - CSV-Export (Übersicht)
  * Zweck: Je Bereich ein GET-Endpunkt, der text/csv als Download liefert. Scoping
- *        und Visibility greifen identisch zu den List-Routen (visibilityClause);
+ *        und Visibility greifen identisch zu den List-Routen (careAwareClause,
+ *        also einschliesslich betreuter Personen - #584);
  *        der optionale ?from=&to=-Zeitraum filtert auf das jeweilige Datumsfeld.
  *        Die CSV-Serialisierung liegt im testbaren Helfer
  *        server/services/health-export.js. Der Zyklus-Export liegt bewusst bei
@@ -12,7 +13,7 @@ import express from 'express';
 import * as db from '../../db.js';
 import { vitalsToCsv, activitiesToCsv, labsToCsv, medLogsToCsv } from '../../services/health-export.js';
 import {
-  log, viewerId, visibilityClause, attachResults,
+  log, viewerId, careAwareClause, attachResults,
   exportFilename, sendCsv, exportRange,
 } from './helpers.js';
 
@@ -23,7 +24,7 @@ router.get('/export/vitals', (req, res) => {
   try {
     const viewer   = viewerId(req);
     const personId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
-    const clause   = visibilityClause('v', viewer, personId);
+    const clause   = careAwareClause('v', viewer, personId);
     const { from, to } = exportRange(req);
     const params = [...clause.params];
     let sql = `SELECT v.* FROM health_vitals v WHERE ${clause.sql}`;
@@ -44,7 +45,7 @@ router.get('/export/activities', (req, res) => {
   try {
     const viewer   = viewerId(req);
     const personId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
-    const clause   = visibilityClause('a', viewer, personId);
+    const clause   = careAwareClause('a', viewer, personId);
     const { from, to } = exportRange(req);
     const params = [...clause.params];
     let sql = `SELECT a.* FROM health_activities a WHERE ${clause.sql}`;
@@ -65,7 +66,7 @@ router.get('/export/labs', (req, res) => {
   try {
     const viewer   = viewerId(req);
     const personId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
-    const clause   = visibilityClause('r', viewer, personId);
+    const clause   = careAwareClause('r', viewer, personId);
     const { from, to } = exportRange(req);
     const params = [...clause.params];
     let sql = `SELECT r.* FROM health_lab_reports r WHERE ${clause.sql}`;
@@ -86,16 +87,22 @@ router.get('/export/meds-logs', (req, res) => {
   try {
     const viewer   = viewerId(req);
     const personId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
-    const clause   = visibilityClause('m', viewer, personId);
+    const clause   = careAwareClause('m', viewer, personId);
     const { from, to } = exportRange(req);
     const params = [...clause.params];
     let sql = `
       SELECT l.*, m.name AS medication_name FROM medication_logs l
       JOIN medications m ON m.id = l.medication_id
       WHERE ${clause.sql}`;
-    if (from) { sql += ' AND l.scheduled_at >= ?'; params.push(`${from}T00:00`); }
-    if (to)   { sql += ' AND l.scheduled_at <= ?'; params.push(`${to}T23:59`); }
-    sql += ' ORDER BY COALESCE(l.scheduled_at, l.created_at) ASC, l.id ASC';
+    // Gefiltert wird nach demselben Ausdruck, nach dem sortiert wird - und auf
+    // Minuten zugeschnitten, weil `scheduled_at` Wanduhrzeit fuehrt und
+    // `created_at` auf 'Z' endet. Eine Bedarfsdosis hat keinen Zeitplan; ueber
+    // `l.scheduled_at` allein fiel sie aus jedem Zeitraum und stand damit in
+    // keinem Auszug, den jemand seiner Aerztin hinlegt (#700).
+    const WHEN = 'COALESCE(l.scheduled_at, l.taken_at, l.created_at)';
+    if (from) { sql += ` AND substr(${WHEN}, 1, 16) >= ?`; params.push(`${from}T00:00`); }
+    if (to)   { sql += ` AND substr(${WHEN}, 1, 16) <= ?`; params.push(`${to}T23:59`); }
+    sql += ` ORDER BY ${WHEN} ASC, l.id ASC`;
 
     const rows = db.get().prepare(sql).all(...params);
     sendCsv(res, exportFilename('meds-logs', from, to), medLogsToCsv(rows));

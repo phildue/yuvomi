@@ -10,6 +10,8 @@
  *   google_sync_token     - Inkrementeller Sync-Token von Google (events.list)
  *   google_last_sync      - ISO-8601-Timestamp des letzten erfolgreichen Syncs
  *   google_calendar_id    - ID des zu synchronisierenden Kalenders (Default: 'primary')
+ *   google_last_error     - Fehlermeldung des letzten Laufs, fehlt nach einem sauberen (#820)
+ *   google_last_error_at  - ISO-8601-Timestamp dieses Fehlers
  */
 
 import { createLogger } from '../logger.js';
@@ -22,8 +24,13 @@ import * as outbound from './calendar-outbound.js';
 import { decodeHtmlEntities } from '../utils/html-entities.js';
 import { nearestColorId } from '../utils/ical-color.js';
 // Fallback-Zone für den Outbound-Sync, wenn Google für den Zielkalender keine liefert.
-import { serverTimeZone } from '../utils/timezone.js';
+import { householdTimeZone } from '../utils/timezone.js';
+import { outboundEvent } from './outbound-dtstart.js';
 import { assignDefaultToEvent } from './sync-assignment.js';
+import { countSourceEvents, deleteSourceEvents } from './calendar-prune.js';
+import { readSyncOutcome, withSyncOutcome } from './sync-outcome.js';
+import { rruleValue } from './recurrence.js';
+import { runSerialized } from '../utils/sync-lock.js';
 
 const GOOGLE_COLOR = '#4285F4';
 
@@ -112,7 +119,7 @@ function isConnected() {
  * Inbound braucht Name/Farbe, Outbound Rolle/Zeitzone - beides steckt in
  * derselben calendarList.get-Antwort.
  * @returns {Promise<{role:string|null,timeZone:string|null,name:string,color:string,refId:number}|null>}
- *          null, wenn der Kalender nicht (mehr) zugänglich ist.
+ *          null, wenn der Abruf gescheitert ist - warum, sagt metaFailure().
  */
 async function loadCalendarMeta(calendar, calendarId, cache) {
   if (cache.has(calendarId)) return cache.get(calendarId);
@@ -130,9 +137,22 @@ async function loadCalendarMeta(calendar, calendarId, cache) {
     };
   } catch (err) {
     log.warn(`Calendar metadata is not accessible (${calendarId}):`, err.message);
+    let failures = metaFailures.get(cache);
+    if (!failures) metaFailures.set(cache, failures = new Map());
+    failures.set(calendarId, err);
   }
   cache.set(calendarId, info);
   return info;
+}
+
+// Ein null im Cache sagt nicht, ob der Kalender weg ist oder nur das Netz. Der Grund
+// hängt deshalb am Cache selbst: er lebt so lange wie der Lauf, der ihn gecacht hat,
+// und jeder spätere Treffer im selben Lauf findet ihn.
+const metaFailures = new WeakMap();
+
+/** Der Fehler, an dem der Metadaten-Abruf für calendarId in diesem Lauf scheiterte. */
+function metaFailure(cache, calendarId) {
+  return metaFailures.get(cache)?.get(calendarId) ?? null;
 }
 
 /**
@@ -210,15 +230,35 @@ async function processPendingUpdates(calendar, colorMap = {}, metaCache = new Ma
   const clearMove = outbound.clearOutboundMove;
   // Nach dem Umzug zeigt die Zeile auf den Zielkalender. Ohne das ginge ein
   // späteres Löschen an den alten Kalender und liefe dort ins Leere, während der
-  // Termin in Google stehen bliebe.
+  // Termin in Google stehen bliebe. Die Vormerkung dieses Umzugs fällt gleich mit,
+  // eine während des Aufrufs neu vorgemerkte bleibt stehen (über sie entscheidet
+  // settleOutbound). Bliebe die erledigte bis nach dem Patch liegen, räumte sie
+  // bei einem scheiternden Patch erst der nächste Lauf per clearOutboundMove ab -
+  // und der setzt dabei den Fehlversuchszähler des Patches zurück.
   const applyMove = db.get().prepare(`
     UPDATE calendar_events
-    SET calendar_ref_id = ?, external_calendar_id = ?, outbound_move_to = NULL
+    SET calendar_ref_id = ?, external_calendar_id = ?,
+        outbound_move_to = CASE WHEN outbound_move_to = ? THEN NULL ELSE outbound_move_to END
     WHERE id = ?
   `);
 
   const handleError = (err, event, what, giveUp) =>
     outbound.handleUpdateError(err, event, what, 'Google', giveUp);
+
+  // Ein gescheiterter Metadaten-Abruf ist kein Kalender ohne Schreibrecht:
+  // calendarList.get scheitert auch an Netz, Token-Refresh oder Ratenlimit. Eine
+  // deshalb verworfene Vormerkung erreichte Google nie, und kein Inbound brächte den
+  // Unterschied zurück. Es gilt dieselbe Regel wie für einen gescheiterten Aufruf:
+  // verworfen wird nur bei 404/410 (nicht mehr zugänglich), 400 oder verbrauchten
+  // Versuchen. `now` ist der nachgeladene Stand, dessen Zähler gilt.
+  // @returns {boolean} true, wenn der Termin auf den nächsten Lauf wartet
+  const waitsForMeta = (now, calendarId) => {
+    const err = metaFailure(metaCache, calendarId);
+    if (!err || outbound.outboundFailureAction(err, now.outbound_attempts) !== 'retry') return false;
+    outbound.failOutbound(now.id);
+    log.warn(`Calendar metadata for ${calendarId} is unavailable, outbound work for event ${now.id} stays queued (attempt ${now.outbound_attempts + 1}):`, err.message);
+    return true;
+  };
 
   let done = 0;
   for (const event of events) {
@@ -232,22 +272,35 @@ async function processPendingUpdates(calendar, colorMap = {}, metaCache = new Ma
 
     const meta = await loadCalendarMeta(calendar, calendarId, metaCache);
     if (!isWritableRole(meta?.role ?? null)) {
+      const now = outbound.reloadEvent(event.id);
+      if (!now) continue; // parallel gelöscht - der Tombstone-Pfad übernimmt
+      if (!meta && waitsForMeta(now, calendarId)) continue;
       log.warn(`Calendar ${calendarId} has no writable role (role=${meta?.role ?? null}), skipping outbound work for event ${event.id}.`);
       clear(event.id);
       continue;
     }
     // Zeigt nach einem Umzug auf den Zielkalender - dessen Zone gilt für den Patch.
     let activeMeta = meta;
+    // Der Umzug, den dieser Lauf bei Google ausgeführt hat.
+    let movedTo = null;
 
     // ── Umzug in einen anderen Kalender (events.move) ────────────────────────
     const moveTo = event.outbound_move_to;
     if (moveTo && moveTo !== calendarId) {
       const destMeta = await loadCalendarMeta(calendar, moveTo, metaCache);
       if (!isWritableRole(destMeta?.role ?? null)) {
-        // Der Zielkalender bleibt unangetastet: nur die Vormerkung fällt weg,
-        // der Termin bleibt in Google, wo er ist.
-        log.warn(`Destination calendar ${moveTo} has no writable role (role=${destMeta?.role ?? null}), keeping event ${event.id} in ${calendarId}.`);
-        clearMove(event.id);
+        const now = outbound.reloadEvent(event.id);
+        if (!now) continue; // parallel gelöscht - der Tombstone-Pfad übernimmt
+        // Während des Abrufs anders gewählt: das Urteil über dieses Ziel betrifft
+        // den neuen Umzug nicht, über ihn entscheidet der nächste Lauf.
+        if (now.outbound_move_to === moveTo) {
+          // Wie ein gescheiterter Umzug: nicht im alten Kalender patchen.
+          if (!destMeta && waitsForMeta(now, moveTo)) continue;
+          // Der Zielkalender bleibt unangetastet: nur die Vormerkung fällt weg,
+          // der Termin bleibt in Google, wo er ist.
+          log.warn(`Destination calendar ${moveTo} has no writable role (role=${destMeta?.role ?? null}), keeping event ${event.id} in ${calendarId}.`);
+          clearMove(event.id);
+        }
       } else {
         try {
           const moved = await calendar.events.move({
@@ -258,14 +311,18 @@ async function processPendingUpdates(calendar, colorMap = {}, metaCache = new Ma
           eventId    = moved?.data?.id || event.external_calendar_id;
           calendarId = moveTo;
           activeMeta = destMeta;
-          applyMove.run(destMeta.refId, eventId, event.id);
-          if (!event.outbound_dirty) done++;
+          applyMove.run(destMeta.refId, eventId, moveTo, event.id);
+          movedTo = moveTo;
         } catch (err) {
           // Der Umzug ist die Voraussetzung für den Patch im Zielkalender -
           // hier abbrechen, statt im alten Kalender zu patchen. Wird der Umzug
           // aufgegeben, bleibt eine vorgemerkte Feldänderung für den nächsten
           // Lauf bestehen.
-          handleError(err, event, 'move', clearMove);
+          // Geurteilt wird am nachgeladenen Stand: eine Bearbeitung während des
+          // Aufrufs hat den Zähler zurückgesetzt, und ein inzwischen anders
+          // gewähltes Ziel ist ein neuer Umzug, der mit diesem nicht fallen darf.
+          const now = outbound.reloadEvent(event.id);
+          if (now?.outbound_move_to === moveTo) handleError(err, now, 'move', clearMove);
           continue;
         }
       }
@@ -274,23 +331,35 @@ async function processPendingUpdates(calendar, colorMap = {}, metaCache = new Ma
       clearMove(event.id);
     }
 
-    if (!event.outbound_dirty) continue;
-
     // ── Geänderte Felder pushen (events.patch) ───────────────────────────────
     // Frisch nachladen: zwischen der Auswahl oben und hier liegt mindestens ein
     // await, in dem eine weitere Bearbeitung eingetroffen sein kann. Sonst ginge
-    // der ältere Stand raus und das anschließende clear würde die neue
-    // Vormerkung mitlöschen - Google bliebe dauerhaft hinterher.
+    // der ältere Stand raus. Auch ob überhaupt gepatcht wird, entscheidet dieser
+    // Stand: eine Bearbeitung während des Umzugs geht so noch im Zielkalender
+    // hinaus, statt auf den nächsten Lauf zu warten.
     const fresh = outbound.reloadEvent(event.id);
     if (!fresh) continue; // parallel gelöscht - der Tombstone-Pfad übernimmt
 
+    // Das Ziel, auf dem der Umzug beruhte, steht in der Auswahl: `fresh` kommt erst
+    // nach events.move und kennt einen Zielwechsel währenddessen schon.
+    if (!fresh.outbound_dirty) {
+      if (movedTo) {
+        outbound.settleOutbound(fresh, movedTo, event);
+        done++;
+      }
+      continue;
+    }
+
     try {
-      const gEvent = localEventToGoogle(fresh, colorMap, activeMeta?.timeZone || serverTimeZone());
+      const gEvent = localEventToGoogle(fresh, colorMap, activeMeta?.timeZone || householdTimeZone(db.get()));
       await calendar.events.patch({ calendarId, eventId, requestBody: gEvent });
-      clear(event.id);
+      // Während des Patches Eingetroffenes bleibt vorgemerkt.
+      outbound.settleOutbound(fresh, movedTo, event);
       done++;
     } catch (err) {
-      handleError(err, event, 'update', clear);
+      // Mit dem Zähler des nachgeladenen Stands: eine Bearbeitung seit der Auswahl
+      // hat ihn zurückgesetzt und bekommt ihre eigenen Versuche.
+      handleError(err, fresh, 'update', clear);
     }
   }
   return done;
@@ -302,7 +371,11 @@ async function processPendingUpdates(calendar, colorMap = {}, metaCache = new Ma
  * Fehler sind unkritisch - die Vormerkung bleibt stehen und der Sync holt nach.
  * @returns {Promise<{deleted:number,updated:number}>}
  */
-async function flushOutbound() {
+async function flushOutbound({ createCalendar = authorizedCalendar } = {}) {
+  return runSerialized('google', 'flush', () => runFlushOutbound(createCalendar));
+}
+
+async function runFlushOutbound(createCalendar) {
   const idle = { deleted: 0, updated: 0 };
   if (!isConnected() || isReadonly()) return idle;
 
@@ -310,7 +383,7 @@ async function flushOutbound() {
   const hasUpdates   = pendingUpdateCount() > 0;
   if (!hasDeletions && !hasUpdates) return idle;
 
-  const calendar = google.calendar({ version: 'v3', auth: loadAuthorizedClient() });
+  const calendar = createCalendar();
   const deleted = hasDeletions ? await processPendingDeletions(calendar) : 0;
   const updated = hasUpdates
     ? await processPendingUpdates(calendar, await fetchEventColorMap(calendar), new Map())
@@ -455,6 +528,16 @@ function loadAuthorizedClient() {
   return client;
 }
 
+/**
+ * Der Kalender-Client mit den gespeicherten Tokens. Sync-Lauf und Sofortversuch
+ * bauen ihn per Vorgabe selbst; eine Suite reicht stattdessen eine Attrappe
+ * herein, damit sie die Sperre an genau diesen beiden Einstiegen treiben kann
+ * (#593) statt nur an server/utils/sync-lock.js für sich.
+ */
+function authorizedCalendar() {
+  return google.calendar({ version: 'v3', auth: loadAuthorizedClient() });
+}
+
 // --------------------------------------------------------
 // Öffentliche API
 // --------------------------------------------------------
@@ -514,20 +597,49 @@ function getStatus() {
     lastSync,
     selectedCount: enabledCalendarIds().length,
     readonly: isReadonly(),
+    // Reist mit dem Status, damit die Rückfrage vor dem Löschen die Zahl sofort
+    // nennen kann - und damit die Einstellungen den Rückstand auch dann noch
+    // zeigen, wenn längst getrennt wurde (#820).
+    mirroredEvents: countSourceEvents(db.get(), 'google'),
+    // Ein still gescheiterter Lauf sah bisher aus wie ein Kalender, der einfach
+    // aufhoert zu aktualisieren - der Fehler stand nur im Serverlog (#820).
+    ...readSyncOutcome(db.get(), 'google'),
   };
 }
 
 /**
- * Tokens und Sync-State löschen (Verbindung trennen).
+ * Entfernt die lokal gespiegelten Google-Termine (#820). Ohne Wirkung nach außen:
+ * der Google-Kalender bleibt unberührt, geräumt wird nur die Kopie.
+ * @returns {number} Anzahl gelöschter Termine
  */
-function disconnect() {
-  ['google_access_token', 'google_refresh_token', 'google_token_expiry',
-   'google_last_sync', 'google_readonly'].forEach(cfgDel);
-  db.get().prepare('DELETE FROM google_calendar_selection').run();
-  // Offene Löschungen verfallen mit der Verbindung: ohne Token gibt es niemanden
-  // mehr, bei dem gelöscht werden könnte (#593).
-  db.get().prepare(`DELETE FROM calendar_pending_deletions WHERE source = 'google'`).run();
-  log.info('Disconnected.');
+function clearMirroredEvents() {
+  return deleteSourceEvents(db.get(), 'google');
+}
+
+/**
+ * Tokens und Sync-State löschen (Verbindung trennen).
+ * @param {object} [opts]
+ * @param {boolean} [opts.deleteEvents] Gespiegelte Termine mitnehmen (#820).
+ * @returns {{ removed: number }}
+ */
+function disconnect({ deleteEvents = false } = {}) {
+  // Vor dem Trennen: danach ist die Kalenderauswahl fort, und ein Aufräumen nach
+  // Kalender wäre nicht mehr möglich. Beides in einer Transaktion, damit nicht die
+  // Termine fallen und die Verbindung stehen bleibt (oder umgekehrt).
+  return db.get().transaction(() => {
+    const removed = deleteEvents ? clearMirroredEvents() : 0;
+    ['google_access_token', 'google_refresh_token', 'google_token_expiry',
+     'google_last_sync', 'google_readonly',
+     // Der Fehlerstand gehoert zur Verbindung: bliebe er stehen, meldete die
+     // Karte nach dem Trennen einen Ausfall, den es nicht mehr gibt (#820).
+     'google_last_error', 'google_last_error_at'].forEach(cfgDel);
+    db.get().prepare('DELETE FROM google_calendar_selection').run();
+    // Offene Löschungen verfallen mit der Verbindung: ohne Token gibt es niemanden
+    // mehr, bei dem gelöscht werden könnte (#593).
+    db.get().prepare(`DELETE FROM calendar_pending_deletions WHERE source = 'google'`).run();
+    log.info('Disconnected.' + (removed ? ` ${removed} mirrored event(s) removed.` : ''));
+    return { removed };
+  })();
 }
 
 /**
@@ -535,9 +647,18 @@ function disconnect() {
  * Inbound:  Google → lokale DB (Upsert via external_calendar_id)
  * Outbound: lokale Termine (external_source='local', external_calendar_id IS NULL) → Google
  */
-async function sync() {
-  const client   = loadAuthorizedClient();
-  const calendar = google.calendar({ version: 'v3', auth: client });
+/**
+ * Ein Lauf, dessen Ausgang den Lauf überlebt (#820). Der Wrapper liegt um
+ * runSync() statt in ihm, damit JEDER Ausstieg erfasst wird - auch das frühe
+ * Werfen bei fehlendem Token, das ohne Verbindung der wahrscheinlichste Fall ist.
+ */
+async function sync({ createCalendar = authorizedCalendar } = {}) {
+  return runSerialized('google', 'sync',
+    () => withSyncOutcome(db.get(), 'google', () => runSync(createCalendar)));
+}
+
+async function runSync(createCalendar) {
+  const calendar = createCalendar();
 
   // Event-Farbpalette (colorId → Hex) einmalig für den ganzen Sync laden.
   const eventColorMap = await fetchEventColorMap(calendar);
@@ -601,7 +722,8 @@ async function sync() {
         throw err;
       }
 
-      upsertGoogleEvents(response.data.items || [], calRefId, calColor, eventColorMap, { fullResync: !syncToken });
+      upsertGoogleEvents(response.data.items || [], calRefId, calColor, eventColorMap,
+        { fullResync: !syncToken, calTimeZone: meta?.timeZone ?? null });
       pageToken    = response.data.nextPageToken;
       newSyncToken = response.data.nextSyncToken || newSyncToken;
     } while (pageToken);
@@ -635,14 +757,19 @@ async function sync() {
         continue;
       }
       try {
-        const gEvent  = localEventToGoogle(event, eventColorMap, meta?.timeZone || serverTimeZone());
+        const gEvent  = localEventToGoogle(event, eventColorMap, meta?.timeZone || householdTimeZone(db.get()));
         const created = await calendar.events.insert({ calendarId: targetId, requestBody: gEvent });
         // refId aus den Metadaten: trägt Name und Farbe des Kalenders statt der
         // rohen ID als Notnamen.
         const calRefId = meta.refId;
+        // `color_modified` mit hoch: die gerade hinausgegangene Farbe ist unsere.
+        // Die elf `colorId`s sind eine verlustbehaftete Abbildung des Hex-Werts -
+        // ohne das Flag holte der nächste Inbound-Lauf die gemappte Farbe zurück
+        // und ersetzte damit die gewählte (#899).
         db.get().prepare(`
           UPDATE calendar_events
-          SET external_calendar_id = ?, external_source = 'google', calendar_ref_id = ?
+          SET external_calendar_id = ?, external_source = 'google', calendar_ref_id = ?,
+              color_modified = CASE WHEN color IS NOT NULL THEN 1 ELSE color_modified END
           WHERE id = ?
         `).run(created.data.id, calRefId, event.id);
       } catch (err) {
@@ -753,7 +880,7 @@ function originalStartDate(item) {
   return raw ? String(raw).slice(0, 10) : null;
 }
 
-function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, colorMap = {}, { fullResync = false } = {}) {
+function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, colorMap = {}, { fullResync = false, calTimeZone = null } = {}) {
   // Auf den meldenden Kalender eingegrenzt: wird ein Event in Google von Kalender
   // A nach B verschoben, meldet A es als 'cancelled', während B es als aktiv
   // liefert - bei beiden dieselbe Event-ID. Ein ID-only-DELETE löscht dann je
@@ -791,6 +918,16 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
     `SELECT id, start_datetime FROM calendar_events WHERE external_calendar_id = ? AND external_source = 'google'`
   );
 
+  // created_by ist ein Fremdschlüssel auf users, und hier stand die 1 fest. Wer
+  // den bei der Installation angelegten Nutzer löscht, bekommt seither jeden
+  // Insert mit "FOREIGN KEY constraint failed" zurück (#839): der Sync läuft
+  // durch, importiert aber nichts. CalDAV und Apple hatten denselben Fehler,
+  // Google wurde damals nicht nachgezogen. Einmal auflösen statt je Event - die
+  // Zeile ist über den ganzen Lauf konstant.
+  const ownerRow  = db.get().prepare('SELECT id FROM users ORDER BY id ASC LIMIT 1').get();
+  const createdBy = ownerRow ? ownerRow.id : null;
+  if (createdBy === null) log.warn('No user in database - new events are not imported.');
+
   const insertOrUpdate = db.get().transaction((item) => {
     // Löschung aus diesem Kalender - eine Zeile, die inzwischen zu einem anderen
     // Kalender gehört, ist davon nicht gemeint.
@@ -826,6 +963,12 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
     const endDt       = allDay
       ? googleAllDayEndToInclusive(item.end?.date)
       : (item.end?.dateTime || item.end?.date || null);
+    // Zeitzone der Serie (#829). Google liefert die IANA-Zone neben der Zeit;
+    // ohne sie wiederholt die Expansion den festen Offset des ersten Vorkommens
+    // und die Serie driftet über die Sommer-/Winterzeit-Grenze um eine Stunde -
+    // derselbe Fehler, der für CalDAV/Apple schon als #549 behoben wurde, nur
+    // hier nie nachgezogen. Ganztags-Termine tragen keine Zone.
+    const tzid        = allDay ? null : (item.start?.timeZone || calTimeZone || null);
     const title       = item.summary || '(kein Titel)';
     const description = item.description || null;
     const location    = item.location    || null;
@@ -834,9 +977,17 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
     // steht ein EXDATE vorn, landete es sonst als Wiederholungsregel in der DB.
     const rrule       = recurrenceRuleOf(item);
 
-    // Event-Eigenfarbe aus colorId auflösen (Google liefert nur die Paletten-ID),
-    // sonst Kalenderfarbe als Default.
-    const evColor = (item.colorId && colorMap[item.colorId]) || calColor;
+    // NUR die Eigenfarbe des Termins, aufgelöst aus Googles colorId (die API
+    // liefert die Paletten-ID, nicht den Hex-Wert). Die Kalenderfarbe gehört
+    // NICHT hierher: sie ist geerbt und sagt über diesen einen Termin nichts.
+    // Sie hier einzusetzen hat sie ununterscheidbar von einer ausdrücklichen
+    // Angabe gemacht und damit die Farbe der zugewiesenen Person verdrängt
+    // (#891). Der Lesepfad holt sie weiterhin als cal_color über calendar_ref_id.
+    //
+    // Google selbst denkt genauso: ein Event ohne colorId erbt dort die
+    // Kalenderfarbe, und `localEventToGoogle` schickt für einen Termin ohne
+    // eigene Farbe folgerichtig keine colorId zurück.
+    const evColor = (item.colorId && colorMap[item.colorId]) || null;
 
     const existing = db.get().prepare(
       'SELECT id, outbound_dirty FROM calendar_events WHERE external_calendar_id = ? AND external_source = ?'
@@ -850,24 +1001,28 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
 
     if (existing) {
       // color nur überschreiben, solange der Nutzer nicht lokal umgefärbt hat
-      // (user_modified = 0). Dadurch bleiben benutzerdefinierte Event-Farben über
+      // (color_modified = 0). Dadurch bleiben benutzerdefinierte Event-Farben über
       // Syncs hinweg erhalten (Issue #219), während echte Google-Farbänderungen
       // weiterhin durchkommen. Titel/Zeit bleiben unverändert remote-geführt.
+      //
+      // Das Gatter hing bis #899 an `user_modified`, das JEDE Bearbeitung setzt:
+      // wer den Titel änderte, fror die Farbspalte für immer ein und erfuhr von
+      // einer Umfärbung in Google nie mehr etwas.
       // Der Vergleich in der WHERE-Klausel hält Schreibvorgänge ab, die nichts
       // ändern: ein Full-Resync (abgelaufener syncToken) liefert den kompletten
       // Kalender erneut, und ohne den Vergleich würde jede Zeile davon neu
       // geschrieben. `IS NOT` statt `<>`, weil der Vergleich NULL-sicher sein
       // muss; die Farbspalte wiederholt ihren SET-Ausdruck, damit eine lokale
-      // Umfärbung (user_modified) nicht als Unterschied zählt. Die Bindings der
+      // Umfärbung (color_modified) nicht als Unterschied zählt. Die Bindings der
       // SET-Liste kommen dafür ein zweites Mal.
       const values = [
-        title, description, startDt, endDt, allDay ? 1 : 0, location, rrule, evColor, calRefId,
+        title, description, startDt, endDt, allDay ? 1 : 0, location, rrule, tzid, evColor, calRefId,
       ];
       db.get().prepare(`
         UPDATE calendar_events
         SET title = ?, description = ?, start_datetime = ?, end_datetime = ?,
-            all_day = ?, location = ?, recurrence_rule = ?,
-            color = CASE WHEN user_modified = 0 THEN ? ELSE color END,
+            all_day = ?, location = ?, recurrence_rule = ?, tzid = ?,
+            color = CASE WHEN color_modified = 0 THEN ? ELSE color END,
             calendar_ref_id = ?
         WHERE id = ?
           AND (   title           IS NOT ?
@@ -877,17 +1032,22 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
                OR all_day         IS NOT ?
                OR location        IS NOT ?
                OR recurrence_rule IS NOT ?
-               OR color           IS NOT CASE WHEN user_modified = 0 THEN ? ELSE color END
+               OR tzid            IS NOT ?
+               OR color           IS NOT CASE WHEN color_modified = 0 THEN ? ELSE color END
                OR calendar_ref_id IS NOT ?
               )
       `).run(...values, existing.id, ...values);
     } else {
+      // Ohne Nutzer gibt es niemanden, dem der Termin gehören könnte. Die Zweige
+      // darüber - Aktualisierung und Löschung - kommen ohne ihn aus und laufen
+      // weiter; gewarnt wurde einmal beim Auflösen, nicht je Event.
+      if (createdBy === null) return;
       const inserted = db.get().prepare(`
         INSERT INTO calendar_events
           (title, description, start_datetime, end_datetime, all_day,
-           location, color, external_calendar_id, external_source, recurrence_rule, calendar_ref_id, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'google', ?, ?, 1)
-      `).run(title, description, startDt, endDt, allDay ? 1 : 0, location, evColor, item.id, rrule, calRefId);
+           location, color, external_calendar_id, external_source, recurrence_rule, tzid, calendar_ref_id, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'google', ?, ?, ?, ?)
+      `).run(title, description, startDt, endDt, allDay ? 1 : 0, location, evColor, item.id, rrule, tzid, calRefId, createdBy);
       assignDefaultToEvent(db.get(), inserted.lastInsertRowid, defaultAssignee);
     }
 
@@ -1022,7 +1182,11 @@ function normalizeRecurrenceUntil(rule, allDay) {
  * @param {string} [timeZone]  IANA-Zone, in der Google die Wanduhrzeit interpretiert.
  *                             Normalerweise die Zone des Zielkalenders (siehe sync()).
  */
-function localEventToGoogle(event, colorMap = {}, timeZone = serverTimeZone()) {
+function localEventToGoogle(rawEvent, colorMap = {}, timeZone = householdTimeZone(null)) {
+  // Start und Ende mit der eigenen Wiederholungsregel in Einklang (#986), bevor
+  // irgendein Feld daraus abgeleitet wird - ein importiertes DTSTART bleibt
+  // unberuehrt (#756). Begruendung in services/outbound-dtstart.js.
+  const event = outboundEvent(rawEvent);
   const allDay = !!event.all_day;
   const gEvent = {
     summary:     event.title,
@@ -1033,9 +1197,31 @@ function localEventToGoogle(event, colorMap = {}, timeZone = serverTimeZone()) {
   // Event-Farbe verlustbehaftet auf die nächste der 11 Google-colorIds mappen.
   // Ohne verfügbare Palette (colors.get fehlgeschlagen) bleibt colorId ungesetzt,
   // dann erbt das Event in Google die Kalenderfarbe.
+  //
+  // NULL STATT WEGLASSEN, wenn der Nutzer die Farbe GELEERT hat (#891/#899).
+  // Der Unterschied zählt nur beim Update, und dort entscheidet er alles: der
+  // Push ist ein `events.patch`, und ein PATCH fasst genau die Felder an, die im
+  // Body STEHEN. Ein fehlendes `colorId` heißt also "nicht anfassen", nicht
+  // "löschen" - Google behielte seine alte Farbe, während Yuvomi die der
+  // zugewiesenen Person zeigt, und die beiden blieben dauerhaft verschieden.
+  //
+  // ABER NUR BEI EINEM ECHTEN LEEREN, und das ist der Unterschied zu #891: dort
+  // ging das null bei jedem Termin ohne Farbe hinaus, auch bei einem, der nie
+  // eine hatte. Ein Termin kommt ohne `colorId` herein (lokal NULL), jemand
+  // färbt ihn später in Google, und die nächste beliebige Bearbeitung in Yuvomi
+  // hätte dessen Farbe abgeräumt, ohne dass sie hier je jemand angefasst hätte.
+  // `color_modified` trennt die beiden Zustände: nur wer die Farbe wirklich
+  // geleert hat, leert sie auch drüben.
+  //
+  // Eine fehlende Palette ist wieder etwas anderes als eine fehlende Farbe: dann
+  // trägt der Termin sehr wohl eine, wir können sie nur nicht auf eine colorId
+  // abbilden. Dort ist "nicht anfassen" richtig, und ein Nullwert würde eine in
+  // Google gesetzte Farbe löschen, obwohl niemand das wollte.
   if (event.color) {
     const colorId = nearestColorId(event.color, colorMap);
     if (colorId) gEvent.colorId = colorId;
+  } else if (event.color_modified) {
+    gEvent.colorId = null;
   }
 
   if (allDay) {
@@ -1057,22 +1243,19 @@ function localEventToGoogle(event, colorMap = {}, timeZone = serverTimeZone()) {
   }
 
   if (event.recurrence_rule) {
-    const body = event.recurrence_rule.startsWith('RRULE:')
-      ? event.recurrence_rule.slice('RRULE:'.length)
-      : event.recurrence_rule;
-    gEvent.recurrence = [`RRULE:${normalizeRecurrenceUntil(body, allDay)}`];
+    gEvent.recurrence = [`RRULE:${normalizeRecurrenceUntil(rruleValue(event.recurrence_rule), allDay)}`];
   }
 
   return gEvent;
 }
 
-export { getAuthUrl, handleCallback, getStatus, disconnect, sync, listCalendars,
-         listSelection, setCalendarEnabled, setReadonly, flushOutbound };
+export { getAuthUrl, handleCallback, getStatus, disconnect, clearMirroredEvents, sync,
+         listCalendars, listSelection, setCalendarEnabled, setReadonly, flushOutbound };
 export const __test = {
   localEventToGoogle, googleAllDayEndToInclusive, localAllDayEndToExclusive,
   upsertGoogleEvents, upsertExternalCalendar, setReadonly, isReadonly, isWritableRole,
   listSelection, setCalendarEnabled, recordSyncToken, getSyncToken, enabledCalendarIds,
-  fetchEventColorMap, serverTimeZone,
+  fetchEventColorMap, householdTimeZone,
   processPendingDeletions, pendingDeletionCount,
   processPendingUpdates, pendingUpdateCount,
   googleCalendarIdForEvent, currentGoogleCalendarId, loadCalendarMeta,

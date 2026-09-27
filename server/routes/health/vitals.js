@@ -6,9 +6,11 @@
 import express from 'express';
 import * as db from '../../db.js';
 import * as v from '../../middleware/validate.js';
+import { defaultVisibilityFor, vitalScopeKey } from './visibility-defaults.js';
 import {
   log, VISIBILITIES, MAX_UNIT,
-  viewerId, visibilityClause, applyUpdate, badRequest,
+  viewerId, careAwareClause, applyUpdate, badRequest,
+  resolveOwner, writableClause,
 } from './helpers.js';
 
 const router = express.Router();
@@ -18,7 +20,7 @@ router.get('/vitals', (req, res) => {
   try {
     const viewer   = viewerId(req);
     const personId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
-    const clause   = visibilityClause('v', viewer, personId);
+    const clause   = careAwareClause('v', viewer, personId);
     const params   = [...clause.params];
     let sql = `SELECT v.* FROM health_vitals v WHERE ${clause.sql}`;
 
@@ -51,11 +53,18 @@ router.post('/vitals', (req, res) => {
     const errors = v.collectErrors([type, valueNum, valueNum2, valueNum3, unit, measuredAt, note, visibility]);
     if (errors.length) return badRequest(res, errors);
 
+    // Optionales user_id: eine betreuende Person trägt für die betreute ein (#584).
+    const owner = resolveOwner(req, viewer);
+    if (owner.error) return res.status(owner.status).json({ error: owner.error, code: owner.status });
+
     const result = db.get().prepare(`
       INSERT INTO health_vitals (user_id, type, value_num, value_num2, value_num3, unit, measured_at, note, visibility)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(viewer, type.value, valueNum.value, valueNum2.value, valueNum3.value,
-           unit.value, measuredAt.value, note.value, visibility.value || 'private');
+    `).run(owner.ownerId, type.value, valueNum.value, valueNum2.value, valueNum3.value,
+           unit.value, measuredAt.value, note.value,
+           // Fehlt das Feld, gilt die Wahl des EIGENTUEMERS fuer diese Metrik
+           // (#958) - nicht die der erfassenden Person: die Zeile gehoert ihm.
+           visibility.value || defaultVisibilityFor(db.get(), owner.ownerId, vitalScopeKey(type.value)));
 
     const row = db.get().prepare('SELECT * FROM health_vitals WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json({ data: row });
@@ -72,7 +81,8 @@ router.patch('/vitals/:id', (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'Ungültige ID.', code: 400 });
 
-    const existing = db.get().prepare('SELECT * FROM health_vitals WHERE id = ? AND user_id = ?').get(id, viewer);
+    const w = writableClause('', viewer);
+    const existing = db.get().prepare(`SELECT * FROM health_vitals WHERE id = ? AND ${w.sql}`).get(id, ...w.params);
     if (!existing) return res.status(404).json({ error: 'Vitalwert nicht gefunden.', code: 404 });
 
     const b = req.body || {};
@@ -106,7 +116,8 @@ router.delete('/vitals/:id', (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'Ungültige ID.', code: 400 });
 
-    const existing = db.get().prepare('SELECT id FROM health_vitals WHERE id = ? AND user_id = ?').get(id, viewer);
+    const w = writableClause('', viewer);
+    const existing = db.get().prepare(`SELECT id FROM health_vitals WHERE id = ? AND ${w.sql}`).get(id, ...w.params);
     if (!existing) return res.status(404).json({ error: 'Vitalwert nicht gefunden.', code: 404 });
 
     db.get().prepare('DELETE FROM health_vitals WHERE id = ?').run(id);

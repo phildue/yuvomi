@@ -27,8 +27,10 @@ function parseWeekday(field) {
 }
 
 function timeLabel(hour, minute) {
-  const date = new Date(2000, 0, 1, hour, minute, 0, 0);
-  return formatTime(date);
+  // Als reine Uhrzeit, nicht als Date: ein Zeitplan ist Wanduhrzeit, und ein
+  // Date waere ein Zeitpunkt, den eine gesetzte Haushaltszone verschoebe.
+  const p2 = (n) => String(n).padStart(2, '0');
+  return formatTime(`${p2(hour)}:${p2(minute)}`);
 }
 
 function weekdayLabel(dow) {

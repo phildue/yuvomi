@@ -1322,10 +1322,10 @@ function updateContactMultiValues(contactId, vcard) {
   // der vCard, legte der anschließende Insert ihn ein zweites Mal als
   // nicht-primäre Kopie an - bei jedem Sync aufs Neue. Deshalb fällt er hier
   // aus der Einfügeliste heraus.
-  const keyOf        = (r) => `${r.label ?? ''} ${r.value ?? ''}`;
+  const keyOf        = (r) => `${r.label ?? ''}\x00${r.value ?? ''}`;
   const addressKeyOf = (r) => [
     r.label, r.street, r.city, r.state, r.postal_code ?? r.postalCode, r.country,
-  ].map((v) => v ?? '').join(' ');
+  ].map((v) => v ?? '').join('\x00');
 
   const primaryKeys = (rows, key) => new Set(rows.filter((r) => r.is_primary).map(key));
   const without     = (list, taken, key) => (list ?? []).filter((e) => !taken.has(key(e)));

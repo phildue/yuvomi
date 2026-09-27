@@ -17,7 +17,10 @@
   padding: 0 var(--space-1);
   border-radius: var(--radius-full, 9999px);
   background: var(--color-priority-urgent);
-  color: var(--color-text-on-accent);
+  /* Dieselbe Falle wie beim Akzent: --color-priority-urgent ist im Light ein
+   * tiefes Rot, im Dark ein helles Rosé. Weiss trug dort 1,90:1 auf der Zahl
+   * im Badge. */
+  color: var(--color-ink-on-vivid);
   font-size: var(--text-xs);
   font-weight: var(--font-weight-bold);
   line-height: 18px;
@@ -29,16 +32,23 @@
 /* Reminder-Toast: Bell-Icon + Textblock */
 .toast--reminder {
   gap: var(--space-2, 8px);
-  cursor: pointer;
   padding-right: var(--space-2, 8px);
 }
 
-.toast__reminder-icon {
-  display: flex;
-  align-items: center;
-  flex-shrink: 0;
-  color: var(--module-reminders);
-}
+/* HIER STAND `.toast__reminder-icon`, und es steht mit Absicht nichts mehr an
+ * seiner Stelle: das Herkunfts-Siegel der Meldung braucht keine eigene Regel.
+ * Form, Groesse, Material und Tinte kommen vollstaendig vom geteilten
+ * .module-seal-Baustein (layout.css); den Ton pro Meldung setzt reminders.js
+ * inline aus der Herkunft der Zeile. Hier stand „samt seiner --vivid-Variante":
+ * die brauchte der Toast als einzige umgekehrte Flaeche der App, seit dem
+ * 2026-08-17 steht ihr Vollton aber in der Basisregel und die Variante ist
+ * gestrichen.
+ *
+ * DIE VORIGE FASSUNG WAR EINE GLOCKE IN --module-reminders, in jeder Meldung
+ * dieselbe: sie sagte, DASS etwas faellig ist, nie WORAUS. Und sie war
+ * unlesbar - der Erinnerungs-Violett lag auf dem Toast-Grund bei 1,84:1 und
+ * damit unter der 3:1 der Grafikschwelle, in beiden Themes, weil der Toast in
+ * beiden die Umkehrung der Seite ist. */
 
 .toast__reminder-text {
   display: flex;
@@ -46,6 +56,22 @@
   flex: 1;
   gap: var(--space-0h);
   min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+}
+
+button.toast__reminder-text {
+  cursor: pointer;
+}
+
+button.toast__reminder-text:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+  border-radius: var(--radius-xs);
 }
 
 .toast__reminder-text strong {
@@ -79,6 +105,39 @@
 
 .reminder-section__title {
   color: var(--color-text-primary);
+}
+
+/* Die Hinweiszeile im gesperrten Abschnitt gehoert zum SCHALTER UEBER IHR.
+   Groesse und Farbe bringt `.task-field-hint` (tasks.css) mit - dieselbe Rolle
+   soll nicht zweimal verschieden aussehen -, aber der Abstand nach unten
+   gehoert diesem Abschnitt: ohne ihn steht das Label "Erinnern" direkt am Satz
+   und liest sich als dessen Beschriftung (im Browser gemessen). Nur der EINE
+   abweichende Wert steht hier, nicht der ganze Satz noch einmal. */
+.reminder-section .task-field-hint {
+  margin-bottom: var(--space-3);
+}
+
+/* EIN GESPERRTES FELD MUSS AUCH GESPERRT AUSSEHEN. `.input:disabled` ist
+   nirgends gestaltet - im Browser gemessen: der gesperrte Vorlauf sah
+   haargenau aus wie die Wiederholungs-Auswahl drueber, die sich bedienen
+   laesst. `.toggle input:disabled + .toggle__track` (layout.css) traegt den
+   Schalter schon, die Felder darunter trug nichts.
+
+   `0.6` ist NICHT frei gewaehlt, sondern der Hauswert fuer genau diese Rolle:
+   `.settings-page .form-input:disabled` (settings.css) dimmt so. Eine eigene
+   Zahl waere eine dritte fuer eine Bedeutung (`.btn:disabled` nutzt 0.4, und
+   das darf abweichen - ein Knopf traegt keinen Wert, den man noch lesen
+   muss). 0.55 stand hier zuerst und drueckte den Text auf 3.84:1 in Hell;
+   0.6 haelt 4.54:1, und Lesbarkeit ist bei einem gesperrten Feld der ganze
+   Zweck der Sperre anstelle des Entfernens.
+
+   Absichtlich NUR auf diesen Abschnitt begrenzt: ein `.input:disabled` fuer
+   die ganze App aendert das Bild jedes gesperrten Feldes (Dienstplan-
+   Fieldsets, Budget, Einstellungen) und ist eine eigene Entscheidung, keine
+   Nebenwirkung dieser. */
+.reminder-section .input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .reminder-fields {

@@ -1,6 +1,6 @@
-import { mealie } from '/api.js';
+import { recipeProviders } from '/api.js';
 import { formatDate, formatTime, t } from '/i18n.js';
-import { closeModal, confirmModal, openModal } from '/components/modal.js';
+import { closeModal, confirmModal, openModal, refocusAfterRender } from '/components/modal.js';
 import {
   createInlineError,
   createRetryState,
@@ -11,6 +11,23 @@ import { getPreferences, savePreferences } from '/settings/preferences-cache.js'
 import { esc } from '/utils/html.js';
 
 const MEAL_TYPES = ['breakfast', 'lunch', 'dinner', 'snack'];
+// Muss zur Serverpruefung in routes/preferences.js passen; der Server kappt
+// ohnehin, das `maxlength` erspart dem Nutzer nur die Fehlermeldung.
+const MAX_MEAL_TYPE_NAME = 40;
+
+/* Hier steht bewusst das EINGEBAUTE Wort, nicht mealTypeLabel(): dieser Schirm
+ * ist der Ort, an dem der Haushaltsname vergeben wird, und er steht direkt
+ * daneben im Feld. Beides auf denselben Namen zu setzen zeigte ihn zweimal und
+ * verbaerge, was das Feld eigentlich ueberschreibt. */
+function builtInMealTypeLabel(mealType) {
+  return t(`meals.type${mealType[0].toUpperCase()}${mealType.slice(1)}`);
+}
+
+// Anzeigename je Provider - Eigenname, keine i18n-Übersetzung (wie
+// recipes.sourceMealie/sourceTandoor in jeder Locale unübersetzt bleiben).
+function providerLabel(provider) {
+  return provider === 'tandoor' ? 'Tandoor' : 'Mealie';
+}
 
 function showToast(message, tone = 'default') {
   window.yuvomi?.showToast(message, tone);
@@ -58,6 +75,9 @@ function renderPage(container, preferences) {
   const visibleMealTypes = Array.isArray(preferences.visible_meal_types)
     ? preferences.visible_meal_types
     : MEAL_TYPES;
+  const mealTypeNames = (preferences.meal_type_names && typeof preferences.meal_type_names === 'object')
+    ? preferences.meal_type_names
+    : {};
 
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
@@ -68,23 +88,36 @@ function renderPage(container, preferences) {
         <p class="form-hint">${t('settings.mealTypesHint')}</p>
         <div class="meal-type-toggles" id="meal-type-toggles">
           ${MEAL_TYPES.map((mealType) => toggleRowHtml({
-            label: t(`meals.type${mealType[0].toUpperCase()}${mealType.slice(1)}`),
+            label: builtInMealTypeLabel(mealType),
             checked: visibleMealTypes.includes(mealType),
             attrs: { value: mealType },
           })).join('')}
+        </div>
+        <h3 class="settings-card__title">${t('settings.mealTypeNamesLabel')}</h3>
+        <p class="form-hint">${t('settings.mealTypeNamesHint')}</p>
+        <div class="meal-type-names" id="meal-type-names">
+          ${MEAL_TYPES.map((mealType) => `
+            <div class="form-field">
+              <label class="form-label" for="meal-name-${mealType}">${builtInMealTypeLabel(mealType)}</label>
+              <input class="form-input" type="text" id="meal-name-${mealType}"
+                     data-meal-name="${mealType}" maxlength="${MAX_MEAL_TYPE_NAME}"
+                     value="${esc(mealTypeNames[mealType] ?? '')}"
+                     placeholder="${esc(builtInMealTypeLabel(mealType))}">
+            </div>
+          `).join('')}
         </div>
         <p class="form-hint">${t('settings.kitchenExternalHint')}</p>
       </div>
     </section>
 
     <section class="settings-section">
-      <h2 class="settings-section__title">${t('settings.mealieTitle')}</h2>
+      <h2 class="settings-section__title">${t('settings.recipeProvidersTitle')}</h2>
       <div class="settings-card">
-        <p class="settings-card-description">${t('settings.mealieDescription')}</p>
-        <div id="mealie-accounts" class="settings-sync-accounts"></div>
+        <p class="settings-card-description">${t('settings.recipeProvidersDescription')}</p>
+        <div id="recipe-provider-accounts" class="settings-sync-accounts"></div>
         <div class="settings-form-actions">
-          <button type="button" class="btn btn--primary" id="mealie-add-account-btn">
-            ${t('settings.mealieAddAccount')}
+          <button type="button" class="btn btn--primary" id="recipe-provider-add-account-btn">
+            ${t('settings.recipeProviderAddAccount')}
           </button>
         </div>
       </div>
@@ -92,12 +125,12 @@ function renderPage(container, preferences) {
   `);
 }
 
-function renderMealieAccount(container, account, refresh) {
+function renderProviderAccount(container, account, refresh) {
   const card = document.createElement('article');
   card.className = 'caldav-account-item';
 
-  const details = [lastSyncDetail(account.lastSync), account.baseUrl];
-  if (account.lastError) details.push(t('settings.mealieLastError', { message: account.lastError }));
+  const details = [providerLabel(account.provider), lastSyncDetail(account.lastSync), account.baseUrl];
+  if (account.lastError) details.push(t('settings.recipeProviderLastError', { message: account.lastError }));
 
   const syncBtn = document.createElement('button');
   syncBtn.type = 'button';
@@ -106,18 +139,18 @@ function renderMealieAccount(container, account, refresh) {
   syncBtn.addEventListener('click', async () => {
     syncBtn.disabled = true;
     try {
-      // syncAccount() wirft nie bei einem fehlgeschlagenen Mealie-Abruf (Netzwerk/
+      // syncAccount() wirft nie bei einem fehlgeschlagenen Provider-Abruf (Netzwerk/
       // Auth) - der Fehler steckt dann in result.data.failed/error, HTTP bleibt 200.
       // Nur ein echter Request-Fehler (Server down, 500) landet im catch.
-      const res = await mealie.syncAccount(account.id);
+      const res = await recipeProviders.syncAccount(account.id);
       if (res.data?.failed) {
-        showToast(res.data.error || t('settings.mealieSyncFailed'), 'danger');
+        showToast(res.data.error || t('settings.recipeProviderSyncFailed'), 'danger');
       } else {
-        showToast(t('settings.mealieSyncSuccess'), 'success');
+        showToast(t('settings.recipeProviderSyncSuccess'), 'success');
       }
       await refresh();
     } catch (err) {
-      showToast(err.message || t('settings.mealieSyncFailed'), 'danger');
+      showToast(err.message || t('settings.recipeProviderSyncFailed'), 'danger');
       syncBtn.disabled = false;
     }
   });
@@ -138,18 +171,18 @@ function renderMealieAccount(container, account, refresh) {
   const editLinkBtn = document.createElement('button');
   editLinkBtn.type = 'button';
   editLinkBtn.className = 'btn btn--ghost btn--sm';
-  editLinkBtn.textContent = t('settings.mealieEditLink');
-  editLinkBtn.addEventListener('click', () => openMealieLinkModal(account, refresh));
+  editLinkBtn.textContent = t('settings.recipeProviderEditLink');
+  editLinkBtn.addEventListener('click', () => openProviderLinkModal(account, refresh));
   actions.appendChild(editLinkBtn);
 
   const enableBtn = document.createElement('button');
   enableBtn.type = 'button';
   enableBtn.className = 'btn btn--ghost btn--sm';
-  enableBtn.textContent = account.enabled ? t('settings.mealieDisable') : t('settings.mealieEnable');
+  enableBtn.textContent = account.enabled ? t('settings.recipeProviderDisable') : t('settings.recipeProviderEnable');
   enableBtn.addEventListener('click', async () => {
     enableBtn.disabled = true;
     try {
-      await mealie.updateAccount(account.id, { enabled: !account.enabled });
+      await recipeProviders.updateAccount(account.id, { enabled: !account.enabled });
       await refresh();
     } catch (err) {
       showToast(err.message || t('common.errorGeneric'), 'danger');
@@ -164,21 +197,22 @@ function renderMealieAccount(container, account, refresh) {
   deleteBtn.textContent = t('common.delete');
   deleteBtn.addEventListener('click', async () => {
     // Löschen des Accounts löscht per FK-Kaskade auch alle von ihm gespiegelten
-    // Rezepte (server/db.js Migration v111) - der Hinweis nennt das explizit,
-    // sonst verschwinden Rezepte scheinbar grundlos aus dem Essensplan.
+    // Rezepte - der Hinweis nennt das explizit, sonst verschwinden Rezepte
+    // scheinbar grundlos aus dem Essensplan.
     const confirmed = await confirmModal(
       t('settings.disconnectAccountConfirmTitle', { name: account.name }),
       {
-        detail: t('settings.mealieDeleteAccountConfirm', { count: account.recipeCount ?? 0 }),
+        detail: t('settings.recipeProviderDeleteAccountConfirm', { count: account.recipeCount ?? 0 }),
         confirmLabel: t('common.delete'),
         danger: true,
       },
     );
     if (!confirmed) return;
     try {
-      await mealie.deleteAccount(account.id);
-      showToast(t('settings.mealieAccountDeleted'), 'success');
+      await recipeProviders.deleteAccount(account.id);
+      showToast(t('settings.recipeProviderAccountDeleted'), 'success');
       await refresh();
+      refocusAfterRender();
     } catch (err) {
       showToast(err.message || t('common.errorGeneric'), 'danger');
     }
@@ -189,38 +223,39 @@ function renderMealieAccount(container, account, refresh) {
   container.appendChild(card);
 }
 
-function openMealieLinkModal(account, refresh) {
+function openProviderLinkModal(account, refresh) {
   openModal({
-    title: t('settings.mealieEditLink'),
+    title: t('settings.recipeProviderEditLink'),
     size: 'sm',
     content: `
-      <form id="mealie-link-form" novalidate autocomplete="off">
-        <p class="form-hint">${t('settings.mealieExternalUrlHint')}</p>
+      <form id="recipe-provider-link-form" novalidate autocomplete="off">
+        <p class="form-hint">${t('settings.recipeProviderExternalUrlHint', { provider: providerLabel(account.provider) })}</p>
         <div class="form-group">
-          <label class="form-label" for="mealie-link-external-url">${t('settings.mealieExternalUrlLabel')}</label>
-          <input class="form-input" type="url" id="mealie-link-external-url" placeholder="https://cook.example.com" value="${esc(account.externalUrl ?? '')}" />
+          <label class="form-label" for="recipe-provider-link-external-url">${t('settings.recipeProviderExternalUrlLabel')}</label>
+          <input class="form-input" type="url" id="recipe-provider-link-external-url" placeholder="https://cook.example.com" value="${esc(account.externalUrl ?? '')}" />
         </div>
-        <div id="mealie-link-error" class="form-error" role="alert" hidden></div>
+        <div id="recipe-provider-link-error" class="form-error" role="alert" hidden></div>
         <div class="modal-actions">
-          <button type="button" class="btn btn--ghost" id="mealie-link-cancel">${t('common.cancel')}</button>
+          <button type="button" class="btn btn--ghost" id="recipe-provider-link-cancel">${t('common.cancel')}</button>
           <button type="submit" class="btn btn--primary">${t('common.save')}</button>
         </div>
       </form>
     `,
     onSave: (panel) => {
-      const form = panel.querySelector('#mealie-link-form');
-      const errorEl = panel.querySelector('#mealie-link-error');
-      panel.querySelector('#mealie-link-cancel')?.addEventListener('click', () => closeModal({ force: true }));
+      const form = panel.querySelector('#recipe-provider-link-form');
+      const errorEl = panel.querySelector('#recipe-provider-link-error');
+      panel.querySelector('#recipe-provider-link-cancel')?.addEventListener('click', () => closeModal({ force: true }));
 
       form.addEventListener('submit', async (e) => {
         e.preventDefault();
         errorEl.hidden = true;
-        const external_url = panel.querySelector('#mealie-link-external-url').value.trim();
+        const external_url = panel.querySelector('#recipe-provider-link-external-url').value.trim();
         try {
-          await mealie.updateAccount(account.id, { external_url });
+          await recipeProviders.updateAccount(account.id, { external_url });
           closeModal({ force: true });
-          showToast(t('settings.mealieAccountUpdated'), 'success');
+          showToast(t('settings.recipeProviderAccountUpdated'), 'success');
           await refresh();
+          refocusAfterRender();
         } catch (err) {
           errorEl.textContent = err.message || t('common.errorGeneric');
           errorEl.hidden = false;
@@ -230,20 +265,20 @@ function openMealieLinkModal(account, refresh) {
   });
 }
 
-async function loadMealieAccounts(container) {
-  const listEl = container.querySelector('#mealie-accounts');
+async function loadProviderAccounts(container) {
+  const listEl = container.querySelector('#recipe-provider-accounts');
   if (!listEl) return;
   listEl.replaceChildren();
 
-  const reload = () => loadMealieAccounts(container);
+  const reload = () => loadProviderAccounts(container);
 
   let accounts;
   try {
     // getStatus() statt listAccounts(): liefert dieselben Felder bereits im
-    // camelCase-Format, das renderMealieAccount() erwartet, plus recipeCount -
+    // camelCase-Format, das renderProviderAccount() erwartet, plus recipeCount -
     // listAccounts() (GET /accounts) gibt dagegen die rohen snake_case-DB-Spalten
     // zurück (base_url/last_sync/last_error) und kennt recipeCount gar nicht.
-    const res = await mealie.getStatus();
+    const res = await recipeProviders.getStatus();
     accounts = res.data || [];
   } catch (err) {
     listEl.appendChild(createRetryState({
@@ -256,62 +291,84 @@ async function loadMealieAccounts(container) {
   if (accounts.length === 0) {
     const empty = document.createElement('p');
     empty.className = 'form-hint';
-    empty.textContent = t('settings.mealieEmptyState');
+    empty.textContent = t('settings.recipeProvidersEmptyState');
     listEl.appendChild(empty);
     return;
   }
 
-  for (const account of accounts) renderMealieAccount(listEl, account, reload);
+  for (const account of accounts) renderProviderAccount(listEl, account, reload);
 }
 
-function bindMealieAddButton(container) {
-  const addBtn = container.querySelector('#mealie-add-account-btn');
+function bindProviderAddButton(container) {
+  const addBtn = container.querySelector('#recipe-provider-add-account-btn');
   if (!addBtn) return;
   addBtn.addEventListener('click', () => {
     openModal({
-      title: t('settings.mealieAddAccount'),
+      title: t('settings.recipeProviderAddAccount'),
       size: 'sm',
       content: `
-        <form id="mealie-add-form" novalidate autocomplete="off">
+        <form id="recipe-provider-add-form" novalidate autocomplete="off">
           <div class="form-group">
-            <label class="form-label" for="mealie-name">${t('settings.mealieNameLabel')}<span class="required-marker" aria-hidden="true"> *</span></label>
-            <input class="form-input" type="text" id="mealie-name" required maxlength="100" />
+            <label class="form-label" for="recipe-provider-select">${t('settings.recipeProviderTypeLabel')}</label>
+            <select class="form-input" id="recipe-provider-select">
+              <option value="mealie">Mealie</option>
+              <option value="tandoor">Tandoor</option>
+            </select>
           </div>
           <div class="form-group">
-            <label class="form-label" for="mealie-url">${t('settings.mealieUrlLabel')}<span class="required-marker" aria-hidden="true"> *</span></label>
-            <input class="form-input" type="url" id="mealie-url" required placeholder="https://mealie.example.com" />
-            <small class="form-hint">${t('settings.mealieUrlHint')}</small>
+            <label class="form-label" for="recipe-provider-name">${t('settings.recipeProviderNameLabel')}<span class="required-marker" aria-hidden="true"> *</span></label>
+            <input class="form-input" type="text" id="recipe-provider-name" required maxlength="100" />
           </div>
           <div class="form-group">
-            <label class="form-label" for="mealie-external-url">${t('settings.mealieExternalUrlLabel')}</label>
-            <input class="form-input" type="url" id="mealie-external-url" placeholder="https://cook.example.com" />
-            <small class="form-hint">${t('settings.mealieExternalUrlHint')}</small>
+            <label class="form-label" for="recipe-provider-url">${t('settings.recipeProviderUrlLabel')}<span class="required-marker" aria-hidden="true"> *</span></label>
+            <input class="form-input" type="url" id="recipe-provider-url" required placeholder="https://cook.example.com" />
+            <small class="form-hint">${t('settings.recipeProviderUrlHint')}</small>
           </div>
           <div class="form-group">
-            <label class="form-label" for="mealie-token">${t('settings.mealieTokenLabel')}<span class="required-marker" aria-hidden="true"> *</span></label>
-            <input class="form-input" type="password" id="mealie-token" required autocomplete="off" />
-            <small class="form-hint">${t('settings.mealieTokenHint')}</small>
+            <label class="form-label" for="recipe-provider-external-url">${t('settings.recipeProviderExternalUrlLabel')}</label>
+            <input class="form-input" type="url" id="recipe-provider-external-url" placeholder="https://cook.example.com" />
+            <small class="form-hint">${t('settings.recipeProviderExternalUrlHint', { provider: 'Mealie' })}</small>
           </div>
-          <div id="mealie-add-error" class="form-error" role="alert" hidden></div>
+          <div class="form-group">
+            <label class="form-label" for="recipe-provider-token">${t('settings.recipeProviderTokenLabel')}<span class="required-marker" aria-hidden="true"> *</span></label>
+            <input class="form-input" type="password" id="recipe-provider-token" required autocomplete="off" />
+            <small class="form-hint" id="recipe-provider-token-hint">${t('settings.recipeProviderTokenHintMealie')}</small>
+          </div>
+          <div id="recipe-provider-add-error" class="form-error" role="alert" hidden></div>
           <div class="modal-actions">
-            <button type="button" class="btn btn--ghost" id="mealie-add-cancel">${t('common.cancel')}</button>
+            <button type="button" class="btn btn--ghost" id="recipe-provider-add-cancel">${t('common.cancel')}</button>
             <button type="submit" class="btn btn--primary">${t('common.save')}</button>
           </div>
         </form>
       `,
       onSave: (panel) => {
-        const form = panel.querySelector('#mealie-add-form');
-        const errorEl = panel.querySelector('#mealie-add-error');
-        panel.querySelector('#mealie-add-cancel')?.addEventListener('click', () => closeModal({ force: true }));
+        const form = panel.querySelector('#recipe-provider-add-form');
+        const errorEl = panel.querySelector('#recipe-provider-add-error');
+        const providerSelect = panel.querySelector('#recipe-provider-select');
+        const externalUrlHint = panel.querySelector('#recipe-provider-external-url').nextElementSibling;
+        const tokenHint = panel.querySelector('#recipe-provider-token-hint');
+        panel.querySelector('#recipe-provider-add-cancel')?.addEventListener('click', () => closeModal({ force: true }));
+
+        // Name/URL/externe URL/Token haben dieselbe Form für jeden Provider -
+        // nur der Token-Hinweis und der "Öffnen in ..."-Text unterscheiden sich,
+        // je nachdem, wo der Nutzer den API-Token erzeugt.
+        providerSelect.addEventListener('change', () => {
+          const label = providerLabel(providerSelect.value);
+          tokenHint.textContent = providerSelect.value === 'tandoor'
+            ? t('settings.recipeProviderTokenHintTandoor')
+            : t('settings.recipeProviderTokenHintMealie');
+          externalUrlHint.textContent = t('settings.recipeProviderExternalUrlHint', { provider: label });
+        });
 
         form.addEventListener('submit', async (e) => {
           e.preventDefault();
           errorEl.hidden = true;
 
-          const name = panel.querySelector('#mealie-name').value.trim();
-          const base_url = panel.querySelector('#mealie-url').value.trim();
-          const external_url = panel.querySelector('#mealie-external-url').value.trim();
-          const api_token = panel.querySelector('#mealie-token').value;
+          const provider = providerSelect.value;
+          const name = panel.querySelector('#recipe-provider-name').value.trim();
+          const base_url = panel.querySelector('#recipe-provider-url').value.trim();
+          const external_url = panel.querySelector('#recipe-provider-external-url').value.trim();
+          const api_token = panel.querySelector('#recipe-provider-token').value;
 
           if (!name || !base_url || !api_token) {
             errorEl.textContent = t('common.requiredFields');
@@ -320,10 +377,11 @@ function bindMealieAddButton(container) {
           }
 
           try {
-            await mealie.createAccount({ name, base_url, external_url, api_token });
+            await recipeProviders.createAccount({ provider, name, base_url, external_url, api_token });
             closeModal({ force: true });
-            showToast(t('settings.mealieAccountAdded'), 'success');
-            await loadMealieAccounts(container);
+            showToast(t('settings.recipeProviderAccountAdded'), 'success');
+            await loadProviderAccounts(container);
+            refocusAfterRender();
           } catch (err) {
             errorEl.textContent = err.message || t('common.errorGeneric');
             errorEl.hidden = false;
@@ -368,6 +426,39 @@ function bindEvents(container) {
       window.yuvomi?.showToast(error.message || t('common.errorGeneric'), 'danger');
     }
   });
+
+  /* Namen der Slots (#1058).
+   *
+   * AUF `change`, NICHT AUF `input`: sonst schriebe jeder Tastendruck eine
+   * Praeferenz. Der Browser feuert `change` beim Verlassen des Feldes und bei
+   * Enter - genau dann, wenn der Name fertig ist.
+   *
+   * ALLE VIER WERDEN GESENDET, nicht nur das geaenderte: der Server speichert
+   * das Objekt als Ganzes, ein Teil-Objekt loeschte die uebrigen Namen. */
+  const nameFields = container.querySelector('#meal-type-names');
+  const nameInputs = [...(nameFields?.querySelectorAll('[data-meal-name]') ?? [])];
+  let persistedNames = Object.fromEntries(nameInputs.map((i) => [i.dataset.mealName, i.value]));
+
+  nameFields?.addEventListener('change', async (event) => {
+    const field = event.target.closest('[data-meal-name]');
+    if (!field) return;
+
+    const names = Object.fromEntries(nameInputs.map((i) => [i.dataset.mealName, i.value.trim()]));
+    nameInputs.forEach((i) => { i.disabled = true; });
+    try {
+      await savePreferences({ meal_type_names: names });
+      // Der Server trimmt und wirft leere Namen weg - das Feld zeigt danach,
+      // was wirklich gespeichert ist, statt der eingetippten Leerzeichen.
+      nameInputs.forEach((i) => { i.value = names[i.dataset.mealName] ?? ''; });
+      persistedNames = names;
+      window.yuvomi?.showToast(t('settings.mealTypeNamesSaved'), 'success');
+    } catch (error) {
+      nameInputs.forEach((i) => { i.value = persistedNames[i.dataset.mealName] ?? ''; });
+      window.yuvomi?.showToast(error.message || t('common.errorGeneric'), 'danger');
+    } finally {
+      nameInputs.forEach((i) => { i.disabled = false; });
+    }
+  });
 }
 
 export async function render(container, { user }) {
@@ -375,6 +466,6 @@ export async function render(container, { user }) {
   const preferences = await getPreferences();
   renderPage(container, preferences);
   bindEvents(container);
-  bindMealieAddButton(container);
-  await loadMealieAccounts(container);
+  bindProviderAddButton(container);
+  await loadProviderAccounts(container);
 }

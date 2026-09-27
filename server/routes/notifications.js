@@ -1,11 +1,12 @@
 /**
  * Modul: Notification-Routen (Admin)
- * Zweck: Gotify/ntfy Channels verwalten und Testbenachrichtigungen senden.
+ * Zweck: Notification-Channels verwalten und Testbenachrichtigungen senden.
  * Abhaengigkeiten: express, notification-channels.js, notifications.js
  */
 import express from 'express';
 import * as db from '../db.js';
 import { createLogger } from '../logger.js';
+import { isAdminRequest } from '../middleware/require-admin.js';
 import { createNotificationChannelStore, NOTIFICATION_PROVIDERS } from '../services/notification-channels.js';
 import { notificationService as defaultNotificationService } from '../services/notifications.js';
 
@@ -26,7 +27,7 @@ export function buildRouter({
   const router = express.Router();
 
   function requireAdmin(req, res, next) {
-    if (req.authRole !== 'admin') {
+    if (!isAdminRequest(req)) {
       return res.status(403).json({ error: 'Admin access required.', code: 403 });
     }
     next();
@@ -37,7 +38,23 @@ export function buildRouter({
   router.get('/providers', (req, res) => {
     try {
       void req;
-      const available = NOTIFICATION_PROVIDERS.filter((provider) => notificationService.providers?.[provider.id]);
+      // `available` heisst „der Server kennt diesen Adapter", nicht „er kann
+      // senden". Ein Provider, der eine Voraussetzung ausserhalb seines Kanals
+      // hat - Mail braucht den app-weiten SMTP-Zugang -, sagt das ueber
+      // `isAvailable()`. Wer keine hat, gilt unveraendert als bereit.
+      const available = NOTIFICATION_PROVIDERS
+        .filter((provider) => notificationService.providers?.[provider.id])
+        .map((provider) => {
+          const adapter = notificationService.providers[provider.id];
+          if (typeof adapter.isAvailable !== 'function') return provider;
+          let ready = false;
+          try {
+            ready = adapter.isAvailable() === true;
+          } catch (err) {
+            log.warn(`Provider ${provider.id} availability check failed:`, err.message);
+          }
+          return { ...provider, ready };
+        });
       res.json({ data: available });
     } catch (err) {
       log.error('Error reading notification providers:', err.message);

@@ -41,9 +41,14 @@ import { esc } from '/utils/html.js';
  * @param {string}   opts.label          Zugänglicher Name des Triggers.
  * @param {Array<{action: string, label: string, icon: string, id?: string|number, danger?: boolean}>} opts.items
  * @param {string}   [opts.triggerClass] Zusätzliche Klassen für den Trigger.
+ * @param {string}   [opts.icon]         Lucide-Name für den Trigger. Standard
+ *        `ellipsis` - das Überlaufmenü, für das diese Datei gebaut wurde. Ein
+ *        anderer Name ist für ein Menü gedacht, das nicht „mehr davon" heißt,
+ *        sondern eine bestimmte Frage stellt (die Personenauswahl beim Abhaken,
+ *        #1205); dort wäre das Auslassungszeichen eine Falschauskunft.
  * @returns {string}
  */
-export function popoverMenuHtml({ id, label, items = [], triggerClass = 'btn btn--ghost btn--icon' }) {
+export function popoverMenuHtml({ id, label, items = [], triggerClass = 'btn btn--ghost btn--icon', icon = 'ellipsis' }) {
   const entries = items.map((item) => `
     <button type="button" role="menuitem"
             class="popover-menu__item${item.danger ? ' popover-menu__item--danger' : ''}"
@@ -54,8 +59,9 @@ export function popoverMenuHtml({ id, label, items = [], triggerClass = 'btn btn
 
   return `
     <button type="button" class="${triggerClass} popover-menu__trigger"
-            popovertarget="${esc(id)}" aria-label="${esc(label)}" title="${esc(label)}">
-      <i data-lucide="ellipsis" class="icon-md" aria-hidden="true"></i>
+            popovertarget="${esc(id)}" aria-haspopup="menu" aria-expanded="false"
+            aria-label="${esc(label)}" title="${esc(label)}">
+      <i data-lucide="${esc(icon)}" class="icon-md" aria-hidden="true"></i>
     </button>
     <div class="popover-menu" id="${esc(id)}" popover role="menu">${entries}</div>`;
 }
@@ -70,9 +76,15 @@ function onBeforeToggle(event) {
 function onToggle(event) {
   const panel = event.target;
   if (!(panel instanceof HTMLElement) || !panel.matches('.popover-menu')) return;
+
+  // `aria-expanded` gehoert dem Trigger, und die Popover-API pflegt es nicht:
+  // sie kennt nur `popovertarget`, kein ARIA. Ohne diese Zeile meldet der
+  // Screenreader ein Menue, das nie aufgeht.
+  const trigger = document.querySelector(`[popovertarget="${panel.id}"]`);
+  trigger?.setAttribute('aria-expanded', String(event.newState === 'open'));
+
   if (event.newState !== 'open') { panel.style.opacity = ''; return; }
 
-  const trigger = document.querySelector(`[popovertarget="${panel.id}"]`);
   if (trigger) {
     const rect = trigger.getBoundingClientRect();
     const width = panel.offsetWidth || 200;
@@ -88,6 +100,63 @@ function onToggle(event) {
     panel.style.top = `${Math.round(Math.max(8, top))}px`;
   }
   panel.style.opacity = '1';
+
+  // DER FOKUS ZIEHT MIT INS MENUE. `role="menu"` sagt der assistiven Technik
+  // eine Menue-Bedienung zu, und die Popover-API haelt davon nichts: sie
+  // oeffnet das Panel im Top-Layer und laesst den Fokus am Trigger stehen. Wer
+  // per Tastatur oeffnet, stuende sonst vor einer Liste, die er nur mit Tab
+  // erreicht - und in einem Menue fuehrt Tab hinaus, nicht hindurch.
+  const items = itemsOf(panel);
+  if (!items.length) return;
+  const checked = items.findIndex((item) => item.getAttribute('aria-checked') === 'true');
+  focusItem(items, checked === -1 ? 0 : checked);
+}
+
+/** Die bedienbaren Eintraege eines Panels in DOM-Reihenfolge. */
+function itemsOf(panel) {
+  return [...panel.querySelectorAll('.popover-menu__item:not([disabled])')];
+}
+
+/**
+ * Roving Tabindex: im Menue fuehren die Pfeiltasten, Tab fuehrt hinaus.
+ *
+ * Ohne das traegt jeder Eintrag seinen Button-Standard `tabindex=0`, und ein
+ * Sechs-Personen-Menue kostet sechs Tabs zum Verlassen - das Gegenteil dessen,
+ * was `role="menu"` ankuendigt.
+ */
+function focusItem(items, index) {
+  const target = items[(index + items.length) % items.length];
+  for (const item of items) item.tabIndex = item === target ? 0 : -1;
+  target.focus();
+}
+
+/**
+ * Pfeiltasten, Home und End - die Menue-Bedienung aus der ARIA-Praxis.
+ *
+ * WARUM HIER UND NICHT JE SEITE: Der Personen-Umschalter der Gesundheit war
+ * bis 2026-08-31 ein `role="tablist"` und bekam seine Pfeiltasten von
+ * `wireTablistKeys`. Als Menue erbte er die Rollen - aber keine Bedienung, und
+ * das fiel erst im Review auf. Rezepte-Quellenfilter und Einkaufs-Ueberlaufmenue
+ * hatten dieselbe Luecke laenger. Ein geteiltes Vokabular, das nur das Aussehen
+ * teilt, verteilt den Fehler, statt ihn zu loesen.
+ */
+function onKeydown(event) {
+  const panel = event.target?.closest?.('.popover-menu');
+  if (!panel) return;
+  const items = itemsOf(panel);
+  if (!items.length) return;
+
+  const current = items.indexOf(event.target.closest('.popover-menu__item'));
+  const next = {
+    ArrowDown: current + 1,
+    ArrowUp: current === -1 ? items.length - 1 : current - 1,
+    Home: 0,
+    End: items.length - 1,
+  }[event.key];
+  if (next === undefined) return;
+
+  event.preventDefault();
+  focusItem(items, next);
 }
 
 /**
@@ -121,4 +190,5 @@ export function installPopoverMenus(root) {
   root.addEventListener('beforetoggle', onBeforeToggle, { capture: true });
   root.addEventListener('toggle', onToggle, { capture: true });
   root.addEventListener('click', onItemClick, { capture: true });
+  root.addEventListener('keydown', onKeydown);
 }

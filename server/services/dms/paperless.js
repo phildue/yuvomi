@@ -2,8 +2,13 @@
  * Module: Paperless-ngx DMS Adapter
  * Purpose: Wrap the Paperless-ngx REST API behind the DMS adapter interface
  *          (search, fetchContent, upload, testConnection). Token-authenticated.
- * Dependencies: global fetch (Node >=22)
+ *          base_url is operator-supplied, so every request funnels through
+ *          #fetch() and #fetch() alone checks the target (./guard.js). A method
+ *          that calls global fetch() directly would bypass the guard - that is
+ *          why testConnection() goes through #fetch() too.
+ * Dependencies: global fetch (Node >=22), ./guard.js
  */
+import { assertDmsTargetAllowed } from './guard.js';
 
 const REQUEST_TIMEOUT_MS = 8000;
 // Paperless-ngx handelt seine REST-API über einen versionierten Accept-Header aus.
@@ -13,17 +18,22 @@ const REQUEST_TIMEOUT_MS = 8000;
 // ältere Instanzen ohne diese Version weiterhin funktionieren.
 const API_VERSION = 9;
 
-// Erkennt ASN-Suchen (Discussion #511): die Archiv-Seriennummer ist in Paperless
-// der eindeutige, oft aufs Papier gestempelte Ordnungsschlüssel. Ein expliziter
-// Präfix (`asn:123`, `asn 123`, `asn#123`) ODER eine reine Zahl wird als ASN
-// interpretiert und exakt gefiltert, statt per Volltext zu raten. Gibt die
-// numerische ASN zurück oder null, wenn es keine ASN-Suche ist.
+// Erkennt ASN-Suchen (Discussion #511, Issue #763): die Archiv-Seriennummer ist in
+// Paperless der eindeutige, oft aufs Papier gestempelte Ordnungsschlüssel.
+//
+// Ein expliziter Präfix (`asn:123`, `asn 123`, `asn#123`) meint ausschließlich die
+// ASN und filtert exakt. Eine nackte Zahl ist dagegen mehrdeutig: sie kann die
+// gestempelte ASN sein, ebenso gut aber eine Hausnummer, ein Jahr oder eine
+// Rechnungsnummer im Titel (#763). Sie wird deshalb als nicht-exklusiv gemeldet,
+// damit der Aufrufer beide Deutungen bedient statt eine zu erzwingen.
+//
+// → { asn: number|null, exclusive: boolean }
 export function parseAsnQuery(query) {
   const q = String(query || '').trim();
   const prefixed = /^asn[:#\s]\s*(\d+)$/i.exec(q);
-  if (prefixed) return Number(prefixed[1]);
-  if (/^\d+$/.test(q)) return Number(q);
-  return null;
+  if (prefixed) return { asn: Number(prefixed[1]), exclusive: true };
+  if (/^\d+$/.test(q)) return { asn: Number(q), exclusive: false };
+  return { asn: null, exclusive: false };
 }
 
 export class PaperlessAdapter {
@@ -39,6 +49,9 @@ export class PaperlessAdapter {
   }
 
   async #fetch(path, opts = {}) {
+    // Vor JEDEM Request, nicht einmalig im Konstruktor: die Prüfung ist async,
+    // und ein Konto kann seine base_url zwischen zwei Aufrufen geändert haben.
+    await assertDmsTargetAllowed(this.base);
     const url = `${this.base}${path}`;
     const res = await fetch(url, {
       ...opts,
@@ -71,19 +84,12 @@ export class PaperlessAdapter {
     return `${this.base}/documents/${id}`;
   }
 
-  async search(query, { limit = 20 } = {}) {
-    const q = String(query || '').trim();
-    // Leerer Query listet alle Dokumente (Paperless: /api/documents/ ohne query
-    // liefert die volle Liste) — ermöglicht Durchblättern statt exaktes Raten.
+  // Eine Ergebnisseite holen. `extra` setzt entweder den Volltext- oder den
+  // ASN-Filter; ohne beides listet Paperless alle Dokumente (/api/documents/ ohne
+  // query liefert die volle Liste) - ermöglicht Durchblättern statt exaktes Raten.
+  async #searchPage(extra, limit) {
     const params = new URLSearchParams({ page_size: String(limit) });
-    const asn = parseAsnQuery(q);
-    if (asn !== null) {
-      // Exakter ASN-Filter statt Volltext: trifft genau das eine Dokument mit
-      // dieser Archiv-Seriennummer (Discussion #511).
-      params.set('archive_serial_number', String(asn));
-    } else if (q) {
-      params.set('query', q);
-    }
+    for (const [k, v] of Object.entries(extra)) params.set(k, String(v));
     const res = await this.#request(`/api/documents/?${params.toString()}`);
     const body = await res.json();
     return (body.results || []).map((r) => ({
@@ -93,6 +99,39 @@ export class PaperlessAdapter {
       filename: r.archived_file_name || r.original_file_name || `${r.id}.pdf`,
       url: this.docUrl(r.id),
     }));
+  }
+
+  async search(query, { limit = 20 } = {}) {
+    const q = String(query || '').trim();
+    const { asn, exclusive } = parseAsnQuery(q);
+
+    // Exakter ASN-Filter statt Volltext: trifft genau das eine Dokument mit dieser
+    // Archiv-Seriennummer (Discussion #511).
+    if (asn !== null && exclusive) {
+      return this.#searchPage({ archive_serial_number: asn }, limit);
+    }
+
+    // Nackte Zahl (#763): beide Deutungen bedienen. Das ASN-Dokument steht oben,
+    // darunter folgen die Volltexttreffer, damit `1728` sowohl die gestempelte
+    // Seriennummer als auch "1728 Pest receipt" findet. Die ASN-Abfrage darf die
+    // Suche nicht mitreißen, wenn die Instanz sie ablehnt (z. B. Zahl außerhalb des
+    // Integer-Bereichs) - der Volltextpfad ist hier der wichtigere von beiden.
+    if (asn !== null) {
+      const [byAsn, byText] = await Promise.all([
+        this.#searchPage({ archive_serial_number: asn }, limit).catch(() => []),
+        this.#searchPage({ query: q }, limit),
+      ]);
+      const merged = [];
+      const seen = new Set();
+      for (const doc of [...byAsn, ...byText]) {
+        if (seen.has(doc.id)) continue;
+        seen.add(doc.id);
+        merged.push(doc);
+      }
+      return merged.slice(0, limit);
+    }
+
+    return this.#searchPage(q ? { query: q } : {}, limit);
   }
 
   async getDocument(id) {

@@ -10,6 +10,9 @@ import express from 'express';
 import * as db from '../db.js';
 import { createLogger } from '../logger.js';
 import { getBalance, isEnrolled, postLedger } from '../services/rewards.js';
+import { householdMemberSql, newNonMembers, nonMemberMessage } from '../services/household-members.js';
+import { isAdminRequest } from '../middleware/require-admin.js';
+import { displayActingPerson, isDisplayRequest } from '../services/display-acting.js';
 
 const log = createLogger('Rewards');
 const router = express.Router();
@@ -18,7 +21,7 @@ const MAX_COST = 1_000_000;
 const MAX_BONUS = 1_000_000;
 
 function requireAdmin(req, res, next) {
-  if (req.authRole !== 'admin') {
+  if (!isAdminRequest(req)) {
     return res.status(403).json({ error: 'Admin access required.', code: 403 });
   }
   next();
@@ -28,8 +31,10 @@ function actingUser(req) {
   return req.authUserId || req.session?.userId || null;
 }
 
-// Nur echte Familienmitglieder (keine Haushaltshilfe-Konten).
-const MEMBER_FILTER = 'NOT EXISTS (SELECT 1 FROM housekeeping_workers hw WHERE hw.user_id = u.id)';
+// Nur Haushaltsmitglieder - kein Hauspersonal, keine Gaeste (#1207). Eine
+// alte Einschreibung von Personal oder Gast bleibt in reward_participants
+// stehen, erscheint aber in keiner dieser Listen und zaehlt nicht mit.
+const MEMBER_FILTER = householdMemberSql('u');
 
 function toInt(val) {
   const n = Math.trunc(Number(val));
@@ -88,12 +93,12 @@ router.get('/overview', (req, res) => {
     const pending = d.prepare("SELECT COUNT(*) AS n FROM reward_redemptions WHERE status = 'pending'").get().n;
     // Zähler für den Eltern-Ersteinrichtungs-Hinweis (aktivierte Mitglieder,
     // angelegte Prämien, Aufgaben mit Punktewert).
-    const participantCount = d.prepare('SELECT COUNT(*) AS n FROM reward_participants WHERE enabled = 1').get().n;
+    const participantCount = d.prepare(`SELECT COUNT(*) AS n FROM reward_participants p JOIN users u ON u.id = p.user_id WHERE p.enabled = 1 AND ${MEMBER_FILTER}`).get().n;
     const catalogCount = d.prepare('SELECT COUNT(*) AS n FROM reward_catalog WHERE is_active = 1').get().n;
     const pointedTaskCount = d.prepare('SELECT COUNT(*) AS n FROM tasks WHERE points > 0').get().n;
     res.json({ data: {
       balances, catalog, pendingCount: pending,
-      isAdmin: req.authRole === 'admin', me: actingUser(req),
+      isAdmin: isAdminRequest(req), me: actingUser(req),
       setup: { participantCount, catalogCount, pointedTaskCount },
     } });
   } catch (err) {
@@ -132,6 +137,14 @@ router.put('/participants/:userId', requireAdmin, (req, res) => {
     const enabled = req.body?.enabled === true || req.body?.enabled === 1 ? 1 : 0;
     const user = db.get().prepare('SELECT id FROM users WHERE id = ?').get(userId);
     if (!user) return res.status(404).json({ error: 'User not found.', code: 404 });
+    // Einschreiben nur Haushaltsmitglieder (#1207). Eine eingeschaltete
+    // Einschreibung von frueher bleibt gueltig und laesst sich abschalten;
+    // abgeschaltet ist sie keine mehr, und neu anlegen geht nicht.
+    if (enabled === 1) {
+      const current = db.get().prepare('SELECT enabled FROM reward_participants WHERE user_id = ?').get(userId);
+      const strangers = newNonMembers([userId], { stored: current?.enabled === 1 ? [userId] : [] });
+      if (strangers.length) return res.status(400).json({ error: nonMemberMessage(strangers), code: 400 });
+    }
 
     db.get().prepare(`
       INSERT INTO reward_participants (user_id, enabled) VALUES (?, ?)
@@ -151,7 +164,7 @@ router.put('/participants/:userId', requireAdmin, (req, res) => {
 // --------------------------------------------------------
 router.get('/catalog', (req, res) => {
   try {
-    const all = req.authRole === 'admin' && req.query.all === '1';
+    const all = isAdminRequest(req) && req.query.all === '1';
     const rows = db.get().prepare(`
       SELECT id, name, cost, icon, description, is_active, sort_order
       FROM reward_catalog
@@ -214,9 +227,15 @@ router.patch('/catalog/:id', requireAdmin, (req, res) => {
       if (!Number.isFinite(cost) || cost < 1 || cost > MAX_COST)
         return res.status(400).json({ error: 'cost must be a positive number.', code: 400 });
     }
-    const icon = req.body?.icon !== undefined ? (String(req.body.icon).trim().slice(0, 8) || null) : existing.icon;
-    const description = req.body?.description !== undefined
-      ? (String(req.body.description).trim() || null) : existing.description;
+    // `undefined` (Feld fehlt) heisst "unveraendert lassen", `null` (Feld leer
+    // abgeschickt) heisst "leeren". Beides ueber `!= null` zusammenzufassen
+    // machte das Leeren unmoeglich, beides ueber `!== undefined` schickte das
+    // gesendete `null` durch `String()` - und speicherte den Text "null" als
+    // Icon. Deshalb bleiben die drei Faelle hier ausdruecklich getrennt.
+    const icon = req.body?.icon === undefined ? existing.icon
+      : (req.body.icon === null ? null : String(req.body.icon).trim().slice(0, 8) || null);
+    const description = req.body?.description === undefined ? existing.description
+      : (req.body.description === null ? null : String(req.body.description).trim() || null);
     const sort_order = req.body?.sort_order !== undefined && Number.isFinite(toInt(req.body.sort_order))
       ? toInt(req.body.sort_order) : existing.sort_order;
     const is_active = req.body?.is_active !== undefined
@@ -282,6 +301,18 @@ router.get('/redemptions', (req, res) => {
   try {
     const status = ['pending', 'fulfilled', 'rejected', 'cancelled'].includes(req.query.status)
       ? req.query.status : null;
+    // WER NICHT ENTSCHEIDET, SIEHT NUR SEINE EIGENEN ANFRAGEN.
+    //
+    // Das Bestaetigen und Ablehnen ist Administratorensache, und nur dafuer
+    // braucht jemand die Anfragen der anderen. Die Oberflaeche wusste das
+    // laengst - sie filtert die Antwort seit jeher auf die eigene Person
+    // (public/pages/rewards.js) -, aber sie filterte sie NACH dem Herunterladen.
+    // Bis zu 300 Zeilen samt freiem Wunschtext und Bild jedes Mitglieds gingen
+    // also an jeden hinaus, der das Modul lesen darf. Aufgefallen ist es an
+    // einem Wandtablett mit `rewards:read`, das gar keine eigenen Zeilen haben
+    // kann - der Fehler ist aelter und traf jedes Mitglied ohne Adminrecht.
+    const admin = isAdminRequest(req);
+    const me = actingUser(req);
     const rows = db.get().prepare(`
       SELECT r.id, r.user_id, r.catalog_id, r.reward_name, r.reward_icon, r.cost, r.status,
              r.note, r.decided_at, r.created_at,
@@ -290,10 +321,12 @@ router.get('/redemptions', (req, res) => {
       FROM reward_redemptions r
       JOIN users u ON u.id = r.user_id
       LEFT JOIN users dec ON dec.id = r.decided_by
-      ${status ? 'WHERE r.status = @status' : ''}
+      WHERE 1 = 1
+        ${status ? 'AND r.status = @status' : ''}
+        ${admin ? '' : 'AND r.user_id = @me'}
       ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END, r.created_at DESC, r.id DESC
       LIMIT 300
-    `).all({ status });
+    `).all({ status, me });
     res.json({ data: rows });
   } catch (err) {
     log.error('GET /redemptions error:', err);
@@ -310,7 +343,31 @@ router.post('/redemptions', (req, res) => {
   try {
     const d = db.get();
     const me = actingUser(req);
-    const targetId = req.body?.user_id != null && req.authRole === 'admin' ? toInt(req.body.user_id) : me;
+
+    // EIN WANDTABLETT BEANTRAGT FUER EINE AM GERAET GEWAEHLTE PERSON (#1209).
+    //
+    // Es ist kein Admin, also greift die stellvertretende Einloesung darunter
+    // fuer es nicht - und der Rueckfall auf `me` waere hier besonders
+    // schaedlich: das Display-Konto nimmt an Belohnungen gar nicht teil, der
+    // Aufruf endete also an `isEnrolled` mit einer 400, die von einem Tippfehler
+    // spraeche statt von einer fehlenden Angabe. Die Person MUSS benannt sein,
+    // und `displayActingPerson` prueft dabei dasselbe, was auch das Abhaken
+    // prueft: Haushaltsmitglied, und das Modul selbst schreiben duerfen.
+    //
+    // WAS DAS DISPLAY DABEI NICHT WIRD: `requested_by` und - falls der Haushalt
+    // ohne Freigabe arbeitet - `decided_by` bleiben das Geraet. Das ist die
+    // ehrliche Buchung: beantragt hat es das Tablett, bekommen hat es die
+    // Person. Ob ueberhaupt jemand freigeben muss, bleibt unveraendert die
+    // Einstellung des Haushalts (`rewards_require_approval`) - ein Display
+    // verschiebt diese Grenze nicht, in keine Richtung.
+    let targetId;
+    if (isDisplayRequest(req)) {
+      const actor = displayActingPerson(req, req.body?.user_id, 'rewards', { db: d });
+      if (!actor.ok) return res.status(actor.status).json({ error: actor.error, code: actor.status });
+      targetId = actor.userId;
+    } else {
+      targetId = req.body?.user_id != null && isAdminRequest(req) ? toInt(req.body.user_id) : me;
+    }
     if (!targetId) return res.status(400).json({ error: 'user_id is required.', code: 400 });
 
     const item = d.prepare('SELECT * FROM reward_catalog WHERE id = ? AND is_active = 1').get(toInt(req.body?.catalog_id));
@@ -368,7 +425,7 @@ router.patch('/redemptions/:id', (req, res) => {
     if (row.status !== 'pending')
       return res.status(409).json({ error: 'Redemption already decided.', code: 409 });
 
-    const isAdmin = req.authRole === 'admin';
+    const isAdmin = isAdminRequest(req);
     if ((action === 'fulfill' || action === 'reject') && !isAdmin)
       return res.status(403).json({ error: 'Admin access required.', code: 403 });
     if (action === 'cancel' && !isAdmin && row.user_id !== me)

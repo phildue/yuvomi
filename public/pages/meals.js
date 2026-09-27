@@ -5,7 +5,7 @@
  */
 
 import { api } from '/api.js';
-import { openModal as openSharedModal, closeModal as closeSharedModal, selectModal, confirmModal, advancedSection, wireBlurValidation, reportFieldError } from '/components/modal.js';
+import { openModal as openSharedModal, closeModal as closeSharedModal, selectModal, confirmModal, advancedSection, wireBlurValidation, reportFieldError, refocusAfterRender } from '/components/modal.js';
 import { stagger, scheduleUndoableDelete, wireScrollFade } from '/utils/ux.js';
 import { t, formatDate, formatDayMonth, formatDateInput, parseDateInput, isDateInputValid } from '/i18n.js';
 import { esc } from '/utils/html.js';
@@ -14,21 +14,24 @@ import { DEFAULT_CATEGORY_NAME } from '/utils/shopping-categories.js';
 import { renderKitchenTabsBar } from '/utils/kitchen-tabs.js';
 import { resolveShoppingTarget, announceTransfer, mountMissingShoppingList } from '/utils/kitchen-transfer.js';
 import { ingredientRowHTML } from '/utils/ingredient-row.js';
-import { addLocalDays, startOfLocalWeekKey, toLocalDateKey } from '/utils/date.js';
-import { normalizeRecipeMealTypes, recipeSupportsMealType } from '/utils/recipe-meal-types.js';
+import { addLocalDays, startOfLocalWeekKey, todayKey } from '/utils/date.js';
+import { normalizeRecipeMealTypes, recipeSupportsMealType, recipeAllowsMealType } from '/utils/recipe-meal-types.js';
 import { mountEmptyState, mountLoadError, emptyStateEl } from '/utils/empty-state.js';
 import { mealPayloadFromRecipe } from '/utils/recipe-to-meal.js';
+import { findPageFab } from '/utils/fab.js';
+import { zonedWeekday } from '/utils/timezone.js';
+import { mealTypeList, primeMealTypeNames } from '/utils/meal-types.js';
+import { recipeThumbHtml, wireRecipeThumbs } from '/utils/recipe-thumb.js';
+import { toDecimalString, breaksOffAtSeparator, toStoredNumber } from '/utils/money.js';
 
 // --------------------------------------------------------
 // Konstanten
 // --------------------------------------------------------
 
-const MEAL_TYPES = () => [
-  { key: 'breakfast', label: t('meals.typeBreakfast'), icon: 'sunrise' },
-  { key: 'lunch',     label: t('meals.typeLunch'),     icon: 'sun'     },
-  { key: 'dinner',    label: t('meals.typeDinner'),    icon: 'moon'    },
-  { key: 'snack',     label: t('meals.typeSnack'),     icon: 'cookie'  },
-];
+// Slots, Symbole und Namen kommen aus utils/meal-types.js - der Haushalt darf
+// sie umbenennen (#1058), und ein zweiter Ort haette dabei den alten Namen
+// behalten.
+const MEAL_TYPES = () => mealTypeList();
 
 const DAY_NAMES = () => [
   t('meals.dayMo'), t('meals.dayDi'), t('meals.dayMi'), t('meals.dayDo'),
@@ -71,13 +74,75 @@ function addDays(dateStr, n) {
   return addLocalDays(dateStr, n);
 }
 
+/**
+ * Schmale Telefone (PR #1200 Review, Blocking 2): das volle Datum an beiden
+ * Enden - "14.09.2026 - 20.09.2026" - lief in de/fr/uk bei 320/375px 21-112px
+ * ueber die Zeile. Seit #1164 lebt `#week-today` in derselben Zeile wie das
+ * Label und macht sie um seine Breite enger; auf main war der schlechteste
+ * Fall 9px bei 320px, hier gemessen bis 112px. Seit Runde 5 (unten,
+ * `syncTodayButton()`) ist `#week-today` unter 640px nur noch ein Icon ohne
+ * Text - der reservierte Platz bleibt dadurch in jeder Sprache gleich schmal
+ * (~44-48px wie ein Pfeil), statt mit dem uebersetzten Wort zu wachsen.
+ *
+ * Unter 640px faellt das Jahr an BEIDEN Enden weg (`formatDayMonth` statt
+ * `formatDate`) - verwandt mit dem Muster, das der Kalender fuer sein eigenes
+ * schmales Wochen-Label nutzt (`updateLabel()`, calendar.js:
+ * `calendar.dayRangeLabel`), dort behaelt nur der Endtag sein Jahr. Hier
+ * fällt es an BEIDEN Tagen weg: eine Kalenderwoche liegt so gut wie nie über
+ * einen Jahreswechsel, und die zusätzliche Breite (nicht nur ein Datum,
+ * sondern zwei) war noetig, um die von Reviewern gemessenen 112px in fr
+ * sicher aufzufangen.
+ */
+const NARROW_WEEK_LABEL_QUERY = '(max-width: 639px)';
+
 function formatWeekLabel(monday) {
   const sunday = addDays(monday, 6);
-  return `${formatDate(monday)} – ${formatDate(sunday)}`;
+  const narrow = window.matchMedia?.(NARROW_WEEK_LABEL_QUERY).matches;
+  // Unter 640px faellt das Jahr an BEIDEN Enden weg (`formatDayMonth`): die
+  // Kalenderwoche liegt so gut wie nie ueber einen Jahreswechsel, und die
+  // gesparte Breite ist hier der knappere Preis - eine Woche wie
+  // "28.12. - 03.01." bleibt trotzdem eindeutig genug fuer den Kopf einer
+  // Seite, die ohnehin "diese Woche" zeigt.
+  const from = narrow ? formatDayMonth(monday) : formatDate(monday);
+  const to = narrow ? formatDayMonth(sunday) : formatDate(sunday);
+  return `${from} – ${to}`;
 }
 
+/**
+ * PR #1200 Review Runde 3, Nice-to-have 4: `formatWeekLabel()` liest
+ * `matchMedia` nur beim Rendern - ein Fenster, das ueber die 640px-Schwelle
+ * gezogen wird, behielt bis zum naechsten Wochenwechsel das alte Format.
+ *
+ * EINE gehaltene `MediaQueryList` statt eines
+ * `window.matchMedia(...).addEventListener(...)` in einem Rutsch: ohne
+ * gehaltene Referenz darf die Engine die Liste einsammeln, und der Listener
+ * verstummt irgendwann still - dasselbe Muster wie router.js' `darkSchemeQuery`.
+ * Modul-Top-Level statt in `render()`: `render()` laeuft bei jeder Navigation
+ * zur Seite neu, ein dort gebundener Listener wuerde sich mit jedem Besuch
+ * verdoppeln.
+ *
+ * `_container?.isConnected` (wie beim Fokus-Rueckstoss weiter unten) haelt den
+ * Listener nach einer Navigation weg von /meals stumm - ohne die Prüfung
+ * rendert er in einen Container, den niemand mehr sieht.
+ *
+ * PR #1200 Review Runde 4, Should-fix 2: hier stand `renderWeekGrid()` statt
+ * `updateWeekLabel()` - eine Bildschirmdrehung ueber die 640px-Schwelle riss
+ * damit das GANZE Wochengitter neu auf (jede Karte, den Stagger, den Scroll
+ * zur heutigen Spalte), obwohl nur das Label ein anderes Format braucht.
+ * Stand der Fokus auf einer Mahlzeit-Karte, landete er nach dem Neuaufbau auf
+ * `<body>` - eine Kartenreferenz, die `renderWeekGrid()` wegwirft, ueberlebt
+ * den Wechsel nicht. `updateWeekLabel()` ruehrt nur `#week-label` und den
+ * Reset-Knopf an, beide unabhaengig vom Karten-DOM - der Fokus bleibt daher
+ * unberuehrt, wo immer er gerade steht.
+ */
+function onNarrowWeekLabelQueryChange() {
+  if (_container?.isConnected) updateWeekLabel();
+}
+const _narrowWeekLabelQuery = typeof window !== 'undefined' ? window.matchMedia?.(NARROW_WEEK_LABEL_QUERY) ?? null : null;
+_narrowWeekLabelQuery?.addEventListener('change', onNarrowWeekLabelQueryChange);
+
 function isToday(dateStr) {
-  return dateStr === toLocalDateKey(new Date());
+  return dateStr === todayKey();
 }
 
 function formatDayDate(dateStr) {
@@ -91,12 +156,7 @@ function mealCategories() {
 }
 
 function recipeMealTypeOptions() {
-  return [
-    { key: 'breakfast', label: t('meals.typeBreakfast') },
-    { key: 'lunch', label: t('meals.typeLunch') },
-    { key: 'dinner', label: t('meals.typeDinner') },
-    { key: 'snack', label: t('meals.typeSnack') },
-  ];
+  return mealTypeList().map(({ key, label }) => ({ key, label }));
 }
 
 function buildRandomMealAssignments({ weekStart, visibleMealTypes, meals, recipes, replaceExisting = false, pick = Math.random }) {
@@ -197,6 +257,7 @@ async function loadPreferences() {
   try {
     const res = await api.get('/preferences');
     state.visibleMealTypes = res.data.visible_meal_types ?? state.visibleMealTypes;
+    primeMealTypeNames(res.data);
   } catch {
     // Default beibehalten
   }
@@ -205,6 +266,91 @@ async function loadPreferences() {
 // --------------------------------------------------------
 // Render
 // --------------------------------------------------------
+
+/**
+ * Der Zeitraum-Kopf: zurueck, Wert, vor - und DAHINTER der Reset. „Heute" ist
+ * ein Reset, kein Navigationsschritt: hinter dem Stepper statt zwischen den
+ * Inhalts-Aktionen. Das ist die Regel, die budget.js an „Aktuell" festhaelt,
+ * und seit #1164 gilt sie fuer alle drei Zeitraum-Koepfe (Kalender,
+ * Wochenplan, Budget). Vorher stand „Heute" im Actions-Slot neben
+ * „Zufallsplan" und „+ Gericht" - Inhalts-Aktionen einer ganz anderen
+ * Gewichtung - und landete unter ~768px auf einer zweiten Zeile, getrennt vom
+ * Stepper, den es zuruecksetzt. Als eigener Baustein, damit der
+ * Verhaltenstest die GERENDERTE Reihenfolge prueft (test-meals.js), statt
+ * Quelltext zu lesen.
+ */
+function weekNavHtml() {
+  return `
+          <button class="btn btn--icon" id="week-prev" aria-label="${t('meals.prevWeek')}">
+            <i data-lucide="chevron-left" aria-hidden="true"></i>
+          </button>
+          <span class="week-nav__label" id="week-label"></span>
+          <button class="btn btn--icon" id="week-next" aria-label="${t('meals.nextWeek')}">
+            <i data-lucide="chevron-right" aria-hidden="true"></i>
+          </button>
+          <button class="btn btn--secondary week-nav__today" id="week-today">${t('meals.today')}</button>
+  `;
+}
+
+/**
+ * „Heute" erscheint nur, wenn die aktuelle Woche nicht zu sehen ist -
+ * dieselbe Sichtbarkeitsregel wie syncTodayButton() im Kalender (#1164).
+ *
+ * `.is-current` statt `hidden` (PR #1200 Review): `hidden` entfernte die Box
+ * aus dem Fluss, und `.week-nav__label` daneben (`flex: 1`) wuchs in den frei
+ * gewordenen Platz - "›" ruckte dadurch um die Knopfbreite, sobald der Reset
+ * erschien oder verschwand. `.is-current` (layout.css, `.btn.is-current`)
+ * blendet nur per `visibility` aus; die Box bleibt im Fluss, der Slot bleibt
+ * gleich breit. `inert` nimmt dem Knopf zusaetzlich Zeiger, Fokus und
+ * A11y-Baum.
+ *
+ * War der Knopf fokussiert (Enter auf „Heute" fuehrt genau in den Zustand, der
+ * ihn gleich verbirgt), holt sich der Fokus vorher einen Stepper daneben -
+ * sonst faellt er auf `<body>`, denn ein `inert`es Element blurred wie
+ * `display: none` es taete.
+ *
+ * PR #1200 Review Runde 5, Should-fix: unter 640px wird der Knopf hier
+ * zusaetzlich auf ein reines Icon umgeschaltet (kein sichtbarer Text mehr) -
+ * dieselbe `NARROW_WEEK_LABEL_QUERY`-Schwelle wie `formatWeekLabel()`, damit
+ * beide zusammen kippen. Der uebersetzte Text von `meals.today` bleibt
+ * erhalten, wandert aber auf `aria-label`/`title` statt auf den sichtbaren
+ * Inhalt - Icons skalieren nicht mit der Wortlaenge der Uebersetzung, anders
+ * als der vorherige Text-Knopf (Runde 3/4). `dataset.iconOnly` haelt fest,
+ * welche Darstellung gerade steht, damit ein Aufruf ohne Wechsel (z. B. bei
+ * jedem Wochenwechsel) das Icon nicht unnoetig neu erzeugt.
+ */
+function syncTodayButton(root = _container) {
+  const btn = root?.querySelector('#week-today');
+  if (!btn) return;
+  const isCurrent = state.currentWeek === getMondayOf(todayKey());
+  // `typeof document` statt eines nackten Bezeichners: Testumgebungen ohne DOM
+  // stubben `document` nicht immer, und ein nackter Bezeichner wirft dort
+  // schon beim Werteauswerten.
+  const active = typeof document !== 'undefined' ? document.activeElement : null;
+  if (isCurrent && active === btn) {
+    (root.querySelector('#week-prev') || root.querySelector('#week-next'))?.focus();
+  }
+  btn.classList.toggle('is-current', isCurrent);
+  btn.inert = isCurrent;
+
+  const label = t('meals.today');
+  btn.setAttribute('aria-label', label);
+  btn.title = label;
+  const narrow = typeof window !== 'undefined'
+    ? Boolean(window.matchMedia?.(NARROW_WEEK_LABEL_QUERY).matches)
+    : false;
+  if (narrow) {
+    if (btn.dataset.iconOnly !== 'true') {
+      btn.textContent = '';
+      btn.insertAdjacentHTML('beforeend', '<i data-lucide="calendar-check" aria-hidden="true"></i>');
+      btn.dataset.iconOnly = 'true';
+      if (window.lucide) lucide.createIcons({ el: btn });
+    }
+  } else if (btn.dataset.iconOnly === 'true') {
+    btn.textContent = label;
+    btn.dataset.iconOnly = 'false';
+  }
+}
 
 export async function render(container, { user }) {
   _container = container;
@@ -222,17 +368,8 @@ export async function render(container, { user }) {
            Aktionsblock dazwischen - mobil gemessen 80px und 705px, einhändig
            also nie beide erreichbar. -->
       <div class="page-toolbar page-toolbar--in-group page-toolbar--wrap">
-        <div class="page-toolbar__center week-nav">
-          <button class="btn btn--icon" id="week-prev" aria-label="${t('meals.prevWeek')}">
-            <i data-lucide="chevron-left" aria-hidden="true"></i>
-          </button>
-          <span class="week-nav__label" id="week-label"></span>
-          <button class="btn btn--icon" id="week-next" aria-label="${t('meals.nextWeek')}">
-            <i data-lucide="chevron-right" aria-hidden="true"></i>
-          </button>
-        </div>
+        <div class="page-toolbar__center week-nav">${weekNavHtml()}</div>
         <div class="page-toolbar__actions">
-          <button class="week-nav__today" id="week-today">${t('meals.today')}</button>
           <!-- Nur Desktop: klappt die Rezept-Spalte weg, damit alle sieben
                Tagesspalten in voller Breite ins Board passen. -->
           <button class="btn btn--icon week-nav__rail-toggle" id="rail-toggle"
@@ -248,12 +385,12 @@ export async function render(container, { user }) {
         </div>
       </div>
       <div class="meals-layout">
-        <div class="week-grid" id="week-grid">
+        <div class="week-grid page-scrollport" id="week-grid">
           <div style="grid-column:1/-1">${renderSkeletonList({ rows: 5, lines: 2 })}</div>
         </div>
         <aside class="recipe-sidebar" id="recipe-sidebar"></aside>
       </div>
-      <button class="page-fab" id="fab-new-meal" aria-label="${t('meals.addMealTitle')}">
+      <button class="page-fab" id="fab-new-meal" aria-label="${t('meals.addMealTitle')}" data-dock-label="${t('newLabel.meals')}">
         <i data-lucide="plus" class="icon-xl" aria-hidden="true"></i>
       </button>
     </div>
@@ -262,8 +399,17 @@ export async function render(container, { user }) {
   if (window.lucide) lucide.createIcons({ el: container });
   renderKitchenTabsBar(container, '/meals');
 
-  const today  = toLocalDateKey(new Date());
+  const today  = todayKey();
   const monday = getMondayOf(today);
+
+  // Vor dem ersten Laden synchronisieren, nicht erst danach: `state.currentWeek`
+  // steht schon (die Seite oeffnet immer auf der aktuellen Woche), also kann
+  // „Heute" seinen Zielzustand VOR dem ersten Bildaufbau bekommen. Sonst
+  // rendert weekNavHtml() ihn sichtbar, der Ladevorgang laeuft, und erst danach
+  // versteckt syncTodayButton() ihn wieder - ein sichtbares Aufblitzen bei
+  // jedem frischen Laden von /meals (PR #1200 Review, Befund 5).
+  state.currentWeek = monday;
+  syncTodayButton();
 
   await Promise.all([loadWeek(monday), loadLists(), loadPreferences(), loadCategories(), loadRecipes()]);
   renderWeekGrid();
@@ -272,7 +418,7 @@ export async function render(container, { user }) {
   wireRecipeSidebar();
   wireRailToggle();
 
-  container.querySelector('#fab-new-meal').addEventListener('click', () => {
+  findPageFab('fab-new-meal').addEventListener('click', () => {
     const firstType = state.visibleMealTypes[0] ?? 'lunch';
     openMealModal({ mode: 'create', date: today, mealType: firstType });
   });
@@ -329,7 +475,7 @@ function wireRailToggle() {
     hidden = gespeichert === 'hidden';
   } else {
     const grid = _container.querySelector('#week-grid');
-    const desktop = !window.matchMedia?.('(max-width: 640px)').matches;
+    const desktop = !window.matchMedia?.('(max-width: 639px)').matches;
     hidden = Boolean(desktop && grid && grid.scrollWidth > grid.clientWidth + 1);
   }
   apply(hidden);
@@ -345,12 +491,24 @@ function wireRailToggle() {
 // Wochengitter
 // --------------------------------------------------------
 
+/**
+ * Aktualisiert NUR Label und Reset-Knopf der Wochen-Navigation - ohne das
+ * Wochengitter anzufassen. Eigene Funktion statt zweier Zeilen inline in
+ * `renderWeekGrid()` (PR #1200 Review Runde 4, Should-fix 2): der
+ * Breakpoint-Handler unten braucht GENAU diese zwei Zeilen, keine der
+ * Karten-Neuaufbauten, die im Rest von `renderWeekGrid()` folgen.
+ */
+function updateWeekLabel() {
+  const label = _container?.querySelector('#week-label');
+  if (label) label.textContent = formatWeekLabel(state.currentWeek);
+  syncTodayButton();
+}
+
 function renderWeekGrid() {
   const grid = _container.querySelector('#week-grid');
   if (!grid) return;
 
-  _container.querySelector('#week-label').textContent =
-    formatWeekLabel(state.currentWeek);
+  updateWeekLabel();
 
   // Fehlgeschlagene Woche: Fehlerzustand statt Leerzustand. Muss VOR der
   // Leer-Prüfung stehen - `state.meals` ist nach einem Fehler ebenfalls leer,
@@ -425,7 +583,9 @@ function renderWeekGrid() {
   grid.insertAdjacentHTML('beforeend', gutterHTML + weekDays.map((date, dayIndex) => {
     const mealsForDay = state.meals.filter((m) => m.date === date);
     const todayClass  = isToday(date) ? 'day-header--today' : '';
-    const dayNameIndex = (new Date(`${date}T00:00:00`).getDay() + 6) % 7;
+    // zonedWeekday statt `new Date(key + 'T00:00:00').getDay()`: derselbe Wert,
+    // aber ohne den Umweg ueber ein Date der Browser-Zone (#829 Teil 3).
+    const dayNameIndex = (zonedWeekday(date) + 6) % 7;
     // Spalte 1 ist die Gutter-Spalte, Zeile 1 die Kopfzeile — Inhalte ab 2.
     const dayCol = dayIndex + 2;
 
@@ -448,6 +608,9 @@ function renderWeekGrid() {
 
   grid.removeAttribute('aria-busy');
   if (window.lucide) lucide.createIcons({ el: grid });
+  // Vorschaubilder brauchen ihren Platzhalter-Ruecksturz per Listener (#1059) -
+  // ein `onerror` im Markup waere ein Inline-Handler und CSP-verboten.
+  wireRecipeThumbs(grid);
   stagger(grid.querySelectorAll('.meal-card'));
   wireGrid(grid);
 
@@ -461,7 +624,7 @@ function renderWeekGrid() {
   }
 
   // Auf schmalen Viewports (gestapelte Tage) den heutigen Tag in den Blick scrollen.
-  if (window.matchMedia?.('(max-width: 640px)').matches) {
+  if (window.matchMedia?.('(max-width: 639px)').matches) {
     grid.querySelector('.day-header--today')?.closest('.day-column')
       ?.scrollIntoView({ block: 'start' });
   } else if (grid.scrollWidth > grid.clientWidth + 1) {
@@ -537,17 +700,19 @@ function renderRecipeSidebar() {
     titleEl.textContent = recipe.title;
     card.appendChild(titleEl);
 
-    if (recipe.source === 'mealie') {
-      const sourceBadge = document.createElement('span');
-      sourceBadge.className = 'source-badge source-badge--mealie';
-      sourceBadge.textContent = t('recipes.sourceMealie');
-      if (recipe.mealie_account_name) sourceBadge.title = recipe.mealie_account_name;
-      card.appendChild(sourceBadge);
+    if (recipe.source !== 'native') {
+      const sourceBadgeEl = document.createElement('span');
+      sourceBadgeEl.className = `source-badge source-badge--${recipe.source}`;
+      sourceBadgeEl.textContent = t(`recipes.source${recipe.source[0].toUpperCase()}${recipe.source.slice(1)}`);
+      if (recipe.provider_account_name) sourceBadgeEl.title = recipe.provider_account_name;
+      card.appendChild(sourceBadgeEl);
     }
 
-    // Mahlzeiten-Chips nur bei echter Teilmenge: ein Rezept, das zu allen (oder
-    // keinem) Typ passt, trägt mit "überall"-Chips null Information und ist dann
-    // das lauteste Element der Karte (Audit P2, Muster wie recipes.js showBadges).
+    // Mahlzeiten-Chips nur bei echter Teilmenge: ein Rezept, das zu allen Typen
+    // passt, trägt mit "überall"-Chips null Information und ist dann das
+    // lauteste Element der Karte (Audit P2, Muster wie recipes.js showBadges).
+    // Der leere Fall ist seit #750 die Gegenprobe und keine Teilmenge mehr: Er
+    // sagt „nur von Hand", denn der Zufallsvorschlag übergeht dieses Rezept.
     const recipeTypes = normalizeRecipeMealTypes(recipe.meal_types);
     const allTypeOptions = recipeMealTypeOptions();
     if (recipeTypes.length && recipeTypes.length < allTypeOptions.length) {
@@ -562,12 +727,32 @@ function renderRecipeSidebar() {
           types.appendChild(badge);
         });
       card.appendChild(types);
+    } else if (!recipeTypes.length) {
+      const types = document.createElement('div');
+      types.className = 'recipe-sidebar__card-types';
+      const badge = document.createElement('span');
+      badge.className = 'meal-type-badge meal-type-badge--none';
+      badge.textContent = t('recipes.mealTypeNone');
+      types.appendChild(badge);
+      card.appendChild(types);
     }
 
     list.appendChild(card);
   });
 
   sidebar.appendChild(list);
+}
+
+/**
+ * Ist das Rezeptmodul fuer diesen Haushalt ueberhaupt erreichbar?
+ *
+ * Ein Admin kann Rezepte abschalten und Mahlzeiten anlassen; bestehende Essen
+ * behalten ihre `recipe_id`, aber `/recipes` leitet dann auf die Startseite um.
+ * Ein Knopf, der dorthin zeigt, waere ein Versprechen ins Leere - und weil er
+ * dem externen Link vorgeht, naehme er auch den noch mit (#936).
+ */
+function recipesReachable() {
+  return !window.yuvomi?.isModuleDisabled?.('recipes');
 }
 
 function renderSlot(date, type, mealsForDay, dayCol, typeRow) {
@@ -593,6 +778,11 @@ function renderSlot(date, type, mealsForDay, dayCol, typeRow) {
     `;
   }
 
+  // Die Aktions-Labels NENNEN ihre Mahlzeit („Fluffige Pancakes loeschen"):
+  // vorher trugen alle Karten dieselben drei Saetze, und ein Screenreader, der
+  // die Woche durchgeht, hoerte 25x „Mahlzeit loeschen" ohne Bezug (Critique
+  // 2026-08-27, Persona Sam). Dasselbe Muster wie im Einkauf („Brokkoli
+  // abhaken", shopping.markDoneLabel).
   const cardsHTML = meals.map((meal) => {
     const ownCount    = meal.ingredients?.length ?? 0;
     const ingDone     = meal.ingredients?.filter((i) => i.on_shopping_list).length ?? 0;
@@ -610,32 +800,48 @@ function renderSlot(date, type, mealsForDay, dayCol, typeRow) {
       ? `<span class="meal-card__recurrence" aria-label="${t('meals.recurrenceBadge')}"><i data-lucide="repeat-2" class="icon-sm" aria-hidden="true"></i></span>`
       : '';
 
+    // Die Karte ist bewusst KEIN Button: sie trägt Buttons und einen Link, und
+    // interaktiver Inhalt in einem Button ist invalides HTML - Screenreader
+    // verlieren dann die inneren Aktionen (Critique 2026-08-17). Das Öffnen
+    // gehört der Titelfläche; die Aktionen stehen daneben, nicht darin.
     return `
-      <div class="meal-card"
+      <div class="meal-card" data-meal-id="${meal.id}">
+        <button type="button" class="meal-card__open${(meal.recipe_has_own_image || meal.recipe_has_image) ? ' meal-card__open--with-thumb' : ''}"
            data-action="edit-meal"
-           data-meal-id="${meal.id}"
-           role="button" tabindex="0">
-        <div class="meal-card__title"><span class="meal-card__title-text">${esc(meal.title)}</span>${recurrenceBadge}</div>
-        ${ingLabel ? `<div class="meal-card__meta">
-          <span class="meal-card__ingredients-count">${ingLabel}${esc(ingDoneLabel)}</span>
-        </div>` : ''}
+           data-meal-id="${meal.id}">
+          ${(meal.recipe_has_own_image || meal.recipe_has_image) ? recipeThumbHtml({
+            recipeId: meal.recipe_id,
+            hasImage: meal.recipe_has_image,
+            hasOwnImage: meal.recipe_has_own_image,
+            className: 'meal-card__thumb',
+          }) : ''}
+          <span class="meal-card__title"><span class="meal-card__title-text">${esc(meal.title)}</span>${recurrenceBadge}</span>
+          ${ingLabel ? `<span class="meal-card__meta">
+            <span class="meal-card__ingredients-count">${ingLabel}${esc(ingDoneLabel)}</span>
+          </span>` : ''}
+        </button>
         <div class="meal-card__actions">
-          ${meal.recipe_url ? `<a class="meal-card__action-btn meal-card__action-btn--recipe"
+          ${meal.recipe_id && recipesReachable() ? `<a class="meal-card__action-btn meal-card__action-btn--recipe"
+            data-action="open-linked-recipe"
+            href="/recipes?open=${encodeURIComponent(meal.recipe_id)}"
+            aria-label="${esc(t('meals.viewRecipeNamed', { title: meal.title }))}"
+          ><i data-lucide="chef-hat" class="icon-sm" aria-hidden="true"></i></a>`
+          : meal.recipe_url ? `<a class="meal-card__action-btn meal-card__action-btn--recipe"
             data-action="open-recipe"
             href="${esc(meal.recipe_url)}"
             target="_blank"
             rel="noopener noreferrer"
-            aria-label="${t('meals.openRecipe')}"
+            aria-label="${esc(t('meals.openRecipeNamed', { title: meal.title }))}"
           ><i data-lucide="link" class="icon-sm" aria-hidden="true"></i></a>` : ''}
           ${canTransfer ? `<button class="meal-card__action-btn meal-card__action-btn--shopping"
             data-action="transfer-meal"
             data-meal-id="${meal.id}"
-            aria-label="${t('common.toShoppingList')}"
+            aria-label="${esc(t('common.toShoppingListNamed', { title: meal.title }))}"
           ><i data-lucide="shopping-cart" class="icon-sm" aria-hidden="true"></i></button>` : ''}
           <button class="meal-card__action-btn"
             data-action="delete-meal"
             data-meal-id="${meal.id}"
-            aria-label="${t('meals.deleteMeal')}"
+            aria-label="${esc(t('meals.deleteMealNamed', { title: meal.title }))}"
           ><i data-lucide="trash-2" class="icon-sm" aria-hidden="true"></i></button>
         </div>
       </div>
@@ -681,7 +887,7 @@ function wireNav() {
   });
 
   _container.querySelector('#week-today')?.addEventListener('click', async () => {
-    const monday = getMondayOf(toLocalDateKey(new Date()));
+    const monday = getMondayOf(todayKey());
     if (monday === state.currentWeek) return;
     setWeekBusy();
     await loadWeek(monday);
@@ -716,6 +922,20 @@ function wireGrid(grid) {
       return;
     }
 
+    // Sprung ins eigene Rezept (#936). Ein `<a href>` und kein Knopf, aus dem
+    // Grund, den der Dashboard-Kopf schon nennt: ein Knopf, der navigiert,
+    // nimmt dem Nutzer Cmd-Klick, Mittelklick und "Link kopieren". Deshalb
+    // faengt der Handler den Klick nur ab, wenn der Browser ihn nicht selbst
+    // besser bedient - sonst waere der href ein Versprechen, das der Handler
+    // bricht.
+    if (action === 'open-linked-recipe') {
+      e.stopPropagation();
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+      e.preventDefault();
+      window.yuvomi?.navigate(btn.getAttribute('href'));
+      return;
+    }
+
     if (action === 'edit-meal') {
       const mealId = parseInt(btn.dataset.mealId, 10);
       const meal   = state.meals.find((m) => m.id === mealId);
@@ -733,19 +953,14 @@ function wireGrid(grid) {
     }
   });
 
-  grid.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      const card = e.target.closest('[data-action="edit-meal"]');
-      if (card) { e.preventDefault(); card.click(); }
-    }
-  });
-
   grid.addEventListener('dragover', (e) => {
     if (!_dragRecipeId) return;
     const slot = e.target.closest('.meal-slot');
     if (!slot) return;
     const recipe = state.recipes.find((entry) => entry.id === _dragRecipeId);
-    if (!recipe || !recipeSupportsMealType(recipe, slot.dataset.type)) return;
+    // Ziehen ist eine Entscheidung des Nutzers, nicht der Automatik: ein Rezept
+    // ohne erklärte Mahlzeit bleibt hier ablegbar (#750, recipeAllowsMealType).
+    if (!recipe || !recipeAllowsMealType(recipe, slot.dataset.type)) return;
     e.preventDefault();
     clearRecipeDropTargets();
     slot.classList.add('meal-slot--drop-target');
@@ -759,7 +974,7 @@ function wireGrid(grid) {
     clearRecipeDropTargets();
     if (!slot) return;
     const recipe = state.recipes.find((entry) => entry.id === recipeId);
-    if (!recipe || !recipeSupportsMealType(recipe, slot.dataset.type)) return;
+    if (!recipe || !recipeAllowsMealType(recipe, slot.dataset.type)) return;
     e.preventDefault();
     const slotMeals = state.meals.filter((meal) => meal.date === slot.dataset.date && meal.meal_type === slot.dataset.type);
     if (slotMeals.length) {
@@ -767,6 +982,9 @@ function wireGrid(grid) {
       if (!confirmed) return;
     }
     await addRecipeToSlot(recipe, slot.dataset.date, slot.dataset.type, { replaceMeals: slotMeals });
+    // Nur nach der Rueckfrage: in einen leeren Platz gezogen schliesst kein
+    // Dialog, und das Nachfassen griffe auf den Merker eines frueheren zurueck (#1083).
+    if (slotMeals.length) refocusAfterRender();
   });
 
   wireDragDrop(grid);
@@ -919,7 +1137,12 @@ function wireDragDrop(grid) {
   grid.addEventListener('pointerdown', (e) => {
     const card = e.target.closest('.meal-card');
     if (!card) return;
-    if (e.target.closest('[data-action="delete-meal"], [data-action="transfer-meal"], [data-action="open-recipe"]')) return;
+    // Die Aktionsleiste ist kein Drag-Griff. Hier standen drei Aktionen
+    // namentlich, und die vierte (`open-linked-recipe`, #936) fehlte prompt:
+    // ihr `pointerdown` startete ein Ziehen, das Loslassen verschob das Essen
+    // in einen anderen Slot und verschluckte den Klick. Eine Liste vergisst den
+    // naechsten Knopf genauso - der Container ist die Regel.
+    if (e.target.closest('.meal-card__actions')) return;
 
     const slot = card.closest('.meal-slot');
     if (!slot) return;
@@ -1027,6 +1250,122 @@ async function moveMeal(mealId, targetDate, targetType) {
 // Modal
 // --------------------------------------------------------
 
+/**
+ * Eine skalierte Zutatenmenge, in der Schreibweise der eingestellten Region.
+ *
+ * Die Menge ist Freitext („250 g", „1 1/2 Tassen", „eine Prise"), also wird nur
+ * die fuehrende Zahl angefasst und der Rest der Zeile unveraendert angehaengt.
+ * Erkannt werden gemischte Brueche, einfache Brueche und Dezimalzahlen; alles
+ * andere bleibt, wie es dasteht.
+ *
+ * LESEN UND SCHREIBEN haengen beide an der Region, und das ist der Kern. Vorher
+ * las die Funktion mit einem eigenen `replace(',', '.')` und schrieb mit einem
+ * `useComma`, das sie sich aus der Eingabe abgeschaut hatte. Beides war still
+ * falsch: unter en-US gruppiert das Komma Tausender, „1,000 g" wurde also zur
+ * Basis 1 und danach mit dem Faktor multipliziert - eine Zutat, die um den
+ * Faktor tausend zu klein im Rezept stand. Unter fa oder ar-EG traf die Regex
+ * gar nicht erst (`\d` ist ASCII), die Zeile blieb ungeskaliert zwischen
+ * skalierten Geschwistern stehen. Und das abgeschaute `useComma` konnte den
+ * Trenner nur wiederholen, den die gespeicherte Zutat zufaellig trug - eine aus
+ * Mealie gespiegelte „1.5" blieb in einer deutschen Oberflaeche „1.5".
+ *
+ * Die Umschrift ist dieselbe wie bei Preis und Einkaufsmenge
+ * (`toDecimalString`), die Ausgabe geht durch `toStoredNumber`. Damit
+ * liest die Funktion ihre eigene Ausgabe wieder ein, was sie muss: der
+ * gerenderte Wert landet in einer Zutatenzeile, wird gespeichert und beim
+ * naechsten Anwenden des Rezepts erneut skaliert. Deshalb auch ohne
+ * Gruppierung - ein gruppierter Wert kaeme nicht wieder herein.
+ *
+ * Eine gruppierte Eingabe wird abgewiesen und die Zeile bleibt UNVERAENDERT
+ * stehen. Das ist bewusst ein anderer Ausgang als beim Einkauf, wo ein nicht
+ * verstandener Wert auf „1 Stueck" faellt: dort ist die Menge ein Vorschlag in
+ * einem korrigierbaren Feld, hier ist sie der Text der Zutat selbst, und der
+ * Originaltext ist die einzige Antwort, die nichts erfindet.
+ */
+function scaleQuantityText(quantity, factor) {
+  if (!quantity || factor === 1) return quantity;
+
+  // Erst umschreiben, dann lesen: sonst sieht die ASCII-Regex unter fa/ar-EG
+  // ueberhaupt keine Ziffer, und zwar auch nicht in einem Bruch wie „1 1/2".
+  // `freeText`, weil nur die fuehrende Zahl gerechnet wird: eine Gruppierung im
+  // Rest („2 Dosen à 1.000 ml") darf die Zeile nicht ungeskaliert stehen lassen.
+  const original = String(quantity).trim();
+  const text = toDecimalString(original, { freeText: true });
+  if (!text) return quantity;
+
+  // Der Rest der Zeile kommt aus dem ORIGINAL, nicht aus der umgeschriebenen
+  // Fassung: umgeschrieben wird nur, was auch gerechnet wird. Sonst verloere ein
+  // zweiter Zahlenteil im Text seine Ziffern - unter fa wurde „۲ x ۵۰۰ g" zu
+  // „۴ x 500 g", also zu einer Zeile in zwei Schriften. Der Offset stimmt, weil
+  // toDecimalString positionstreu ist (ein Zeichen hinein, ein Zeichen hinaus);
+  // die Zusicherung steht dort im Kopf und haengt an einem Guard.
+  // In CODEPOINTS, nicht in UTF-16-Einheiten: die Ziffern von 40 der 77 Systeme
+  // liegen ausserhalb der BMP und belegen zwei Einheiten, ihr ASCII-Ergebnis nur
+  // eine. Mit `.length` verrutschte der Schnitt genau dort und schnitt mitten in
+  // ein Zeichen - gemessen ergab „𞥒 x 500 g" ein „4\uDD52 x 500 g" mit einer
+  // halben Ersatzzeichen-Paarung, und dieser kaputte Text wurde in die
+  // Zutatenzeile geschrieben.
+  const zeichen = [...original];
+  const restOf = (match, tailGroup) => zeichen.slice([...match[0]].length - [...match[tailGroup]].length).join('');
+
+  // Der Abbruch-im-Trenner gilt fuer ALLE drei Formen, nicht nur fuer die
+  // Dezimalzahl unten. Bricht ein Nenner in einem Trenner ab, ist der Bruch nicht
+  // gelesen, sondern abgeschnitten: aus „1/2,5 cup" wurde 1/2, mal Faktor, und der
+  // Rest „,5 cup" dahinter - also „1,5 cup", eine plausible und falsche Menge.
+  // Dann lieber gar nichts anfassen, wie bei „eine Prise".
+  const mixed = text.match(/^(\d+)\s+(\d+)\/(\d+)(.*)$/);
+  if (mixed) {
+    if (breaksOffAtSeparator(mixed[4])) return quantity;
+    const whole = Number(mixed[1]);
+    const num = Number(mixed[2]);
+    const den = Number(mixed[3]);
+    if (den > 0) return `${formatScaledQuantity((whole + (num / den)) * factor)}${restOf(mixed, 4)}`;
+  }
+
+  const frac = text.match(/^(\d+)\/(\d+)(.*)$/);
+  if (frac) {
+    if (breaksOffAtSeparator(frac[3])) return quantity;
+    const num = Number(frac[1]);
+    const den = Number(frac[2]);
+    if (den > 0) return `${formatScaledQuantity((num / den) * factor)}${restOf(frac, 3)}`;
+  }
+
+  const dec = text.match(/^(\d+(?:\.\d+)?)(.*)$/);
+  if (dec) {
+    // Bricht die Zahl mitten in einem Trennzeichen ab, ist sie nicht gelesen,
+    // sondern abgeschnitten. Unter fa ist das ASCII-Komma kein Dezimaltrenner:
+    // aus „1,5 kg" waere sonst die Basis 1 geworden und die Ausgabe „۲,5 kg",
+    // also eine halbierte Zutat in einer Schreibweise, die es nicht gibt.
+    // Ueber dieselbe geteilte Pruefung wie im Einkauf: sie kennt die Trennzeichen
+    // der waehlbaren Regionen. „Irgendein Zeichen zwischen zwei Ziffern" war zu
+    // breit und liess „2x500 g" ungeskaliert stehen - ein `x` trennt nichts.
+    const abgeschnitten = breaksOffAtSeparator(dec[2]);
+    const base = Number(dec[1]);
+    if (!abgeschnitten && Number.isFinite(base)) {
+      return `${formatScaledQuantity(base * factor)}${restOf(dec, 2)}`;
+    }
+  }
+
+  // „eine Prise", „nach Geschmack": nichts zu rechnen, also nichts anfassen.
+  return quantity;
+}
+
+/**
+ * Die skalierte Zahl als Text: hoechstens zwei Nachkommastellen, Ziffern in
+ * ASCII, Trenner aus der Region soweit serverlesbar, ohne Gruppierung.
+ *
+ * Warum die Ziffern NICHT der Region folgen, obwohl der Trenner es tut: dieser
+ * Text wird in die Zutatenzeile geschrieben und gespeichert, und beim Uebertrag
+ * in die Einkaufsliste liest ihn `parseQuantity` in
+ * server/services/shopping-import.js mit einer ASCII-Regex wieder ein. Eine in
+ * nativen Ziffern geschriebene Menge („۲۰۰۰ g") kaeme dort nicht an - die Zutat
+ * liesse sich nicht mehr mit anderen zusammenzaehlen. Begruendung und der Weg zu
+ * einem saubereren Endzustand stehen bei `toStoredNumber` in utils/money.js.
+ */
+function formatScaledQuantity(value) {
+  return toStoredNumber(value);
+}
+
 function openMealModal(opts) {
   state.modal = opts;
   const { mode, date, mealType, meal } = opts;
@@ -1084,49 +1423,6 @@ function openMealModal(opts) {
       const recipeScaleInput = panel.querySelector('#modal-recipe-scale');
       const saveAsRecipeBtn = panel.querySelector('#modal-save-as-recipe');
       let currentAppliedRecipe = null;
-
-      const scaleQuantityText = (quantity, factor) => {
-        if (!quantity || factor === 1) return quantity;
-
-        const formatNumber = (num, useComma = false) => {
-          const rounded = Math.round(num * 100) / 100;
-          if (Number.isInteger(rounded)) return String(rounded);
-          const text = String(rounded);
-          return useComma ? text.replace('.', ',') : text;
-        };
-
-        const mixed = quantity.match(/^(\d+)\s+(\d+)\/(\d+)(.*)$/);
-        if (mixed) {
-          const whole = Number(mixed[1]);
-          const num = Number(mixed[2]);
-          const den = Number(mixed[3]);
-          if (den > 0) {
-            const value = (whole + (num / den)) * factor;
-            return `${formatNumber(value)}${mixed[4]}`;
-          }
-        }
-
-        const frac = quantity.match(/^(\d+)\/(\d+)(.*)$/);
-        if (frac) {
-          const num = Number(frac[1]);
-          const den = Number(frac[2]);
-          if (den > 0) {
-            const value = (num / den) * factor;
-            return `${formatNumber(value)}${frac[3]}`;
-          }
-        }
-
-        const dec = quantity.match(/^(\d+(?:[.,]\d+)?)(.*)$/);
-        if (dec) {
-          const useComma = dec[1].includes(',');
-          const base = Number(dec[1].replace(',', '.'));
-          if (Number.isFinite(base)) {
-            return `${formatNumber(base * factor, useComma)}${dec[2]}`;
-          }
-        }
-
-        return quantity;
-      };
 
       const applyRecipe = (recipeId) => {
         const id = Number(recipeId);
@@ -1219,7 +1515,6 @@ function openMealModal(opts) {
         }
       });
 
-
       addIngBtn.addEventListener('click', () => {
         const tmp  = document.createElement('div');
         tmp.insertAdjacentHTML('beforeend', ingredientRowHTML({ categories: mealCategories() }));
@@ -1265,6 +1560,7 @@ function openMealModal(opts) {
               onUndone: async () => {
                 await loadWeek(state.currentWeek);
                 renderWeekGrid();
+                refocusAfterRender();
               },
             });
           } else {
@@ -1321,14 +1617,15 @@ function buildModalContent({ mode, date, mealType, meal }) {
   const hasIngOpen = isEdit && meal.ingredients?.some((i) => !i.on_shopping_list);
 
   const recipeOptionHtml = (r) => `<option value="${r.id}" ${isEdit && meal.recipe_id === r.id ? 'selected' : ''}>${esc(r.title)}</option>`;
-  // Optgroups nur, sobald Mealie-Rezepte wirklich vorkommen: ohne Mirror-
+  // Optgroups nur, sobald gespiegelte Rezepte wirklich vorkommen: ohne Mirror-
   // Account bleibt die flache Liste von vorher unverändert (kein UI-Rauschen).
-  const hasMirroredRecipes = state.recipes.some((r) => r.source === 'mealie');
+  const hasMirroredRecipes = state.recipes.some((r) => r.source !== 'native');
+  const mirroredSources = [...new Set(state.recipes.map((r) => r.source).filter((s) => s !== 'native'))].sort();
   const recipeOptions = hasMirroredRecipes
     ? [
       `<option value="">${t('meals.savedRecipePlaceholder')}</option>`,
-      `<optgroup label="${esc(t('recipes.sourceNative'))}">${state.recipes.filter((r) => r.source !== 'mealie').map(recipeOptionHtml).join('')}</optgroup>`,
-      `<optgroup label="${esc(t('recipes.sourceMealie'))}">${state.recipes.filter((r) => r.source === 'mealie').map(recipeOptionHtml).join('')}</optgroup>`,
+      `<optgroup label="${esc(t('recipes.sourceNative'))}">${state.recipes.filter((r) => r.source === 'native').map(recipeOptionHtml).join('')}</optgroup>`,
+      ...mirroredSources.map((s) => `<optgroup label="${esc(t(`recipes.source${s[0].toUpperCase()}${s.slice(1)}`))}">${state.recipes.filter((r) => r.source === s).map(recipeOptionHtml).join('')}</optgroup>`),
     ].join('')
     : [
       `<option value="">${t('meals.savedRecipePlaceholder')}</option>`,
@@ -1586,6 +1883,7 @@ async function deleteMeal(mealId) {
         await api.delete(`/meals/${mealId}?scope=${choice}`);
         await loadWeek(state.currentWeek);
         renderWeekGrid();
+        refocusAfterRender();
         window.yuvomi?.showToast(
           choice === 'future' ? t('meals.seriesEndedToast') : t('meals.seriesDeletedToast'),
           'success',
@@ -1660,7 +1958,34 @@ async function transferMeal(mealId, btn) {
   }
 }
 
-export const __test = { buildRandomMealAssignments, mealPayloadFromRecipe };
+export const __test = {
+  buildRandomMealAssignments,
+  mealPayloadFromRecipe,
+  // Skalierte Zutatenmenge: haengt an der Format-Locale und ist deshalb nur
+  // verhaltensgetrieben pruefbar (siehe test-meals.js).
+  scaleQuantityText,
+  // Zeitraum-Kopf (#1164): Reihenfolge und Sichtbarkeitsregel des
+  // „Heute"-Resets sind verhaltensgetrieben gepinnt (test-meals.js).
+  weekNavHtml,
+  syncTodayButton,
+  getMondayOf,
+  formatWeekLabel,
+  state,
+  // PR #1200 Review Runde 3, Nice-to-have 1: der bisherige Verdrahtungstest
+  // las `renderWeekGrid()` als QUELLTEXT (Regex auf den Funktionskoerper) -
+  // ein auskommentiertes `// syncTodayButton();` im echten Render-Pfad blieb
+  // gruen, solange der String noch irgendwo im Funktionskoerper stand. Dieser
+  // Wrapper laesst den TATSAECHLICHEN Render-Pfad laufen (mit einem
+  // uebergebenen Test-Container statt des Modul-internen `_container`), damit
+  // der Test die echte Verdrahtung prueft, nicht ihre Textform.
+  renderWeekGridForTest(container) {
+    _container = container;
+    renderWeekGrid();
+  },
+  // PR #1200 Review Runde 3, Nice-to-have 4: pinnt, dass ein Wechsel ueber die
+  // 640px-Schwelle das Wochen-Label wirklich neu zeichnet (test-meals.js).
+  onNarrowWeekLabelQueryChange,
+};
 
 // --------------------------------------------------------
 // Hilfsfunktion

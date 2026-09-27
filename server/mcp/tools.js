@@ -10,7 +10,8 @@
  *      geht per authentifiziertem Loopback (`fetch` → eigener HTTP-Server) und
  *      erbt exakt die Rechte des aufrufenden API-Tokens; Rollen- und
  *      CSRF-Prüfung greifen serverseitig auf `/api/v1/*` wie bei jedem Client.
- * Abhängigkeiten: server/middleware/validate.js, server/openapi.js
+ * Abhängigkeiten: server/middleware/validate.js, server/openapi.js,
+ *                  server/scopes.js + server/permissions.js (Rechte-Durchsetzung)
  *
  * Architektur: Jedes Tool ist EIN Eintrag in der Registry (Definition + Handler
  *   zusammen) — daraus werden `tools/list` und der Dispatch abgeleitet, damit
@@ -24,8 +25,13 @@ import * as v from '../middleware/validate.js';
 import { readFileSync } from 'node:fs';
 import { buildOpenApiSpec } from '../openapi.js';
 import { tokenAllows } from '../scopes.js';
+import { moduleAccessVerdict, MODULE_ACCESS_ALLOW } from '../permissions.js';
+import { toLocalDateKey } from '../../public/utils/date.js';
+import { taskScopeNeedsToday, taskScopeWhere } from '../services/task-scope.js';
 import { visibilityWhere } from '../services/visibility.js';
+import { getUpcomingEvents } from '../services/calendar-event-reader.js';
 import { loadTagsFor, normalizeTags, setTags, tagKey } from '../utils/task-tags.js';
+import { readBindAddress, selfCallHost } from '../utils/bind-address.js';
 
 const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
 
@@ -46,21 +52,33 @@ function listTasks(db, actorId, args) {
   let sql = `
     SELECT t.id, t.title, t.status, t.priority, t.category, t.due_date, t.due_time
     FROM tasks t
-    WHERE t.parent_task_id IS NULL
+    WHERE ${taskScopeWhere('t', { includeFuture: !!args.include_future, bind: '@today' })}
       -- Sichtbarkeit (#474): kein Zugriff auf private/eingeschränkte Aufgaben
       -- anderer. Stand hier bisher nicht, obwohl die Termin-Abfrage sie führt -
       -- ein MCP-Token sah damit jede private Aufgabe des Haushalts, und mit den
       -- Tags (#586) käme deren Freitext gleich mit.
       AND ${visibilityWhere('t', 'task_assignments', 'task_id', '@me')}
   `;
+  // Dieselbe Auswahl wie `GET /api/v1/tasks` und die Uebersicht (#825): eine
+  // Automatisierung, die andere Aufgaben sieht als das UI, ist der Grund, aus
+  // dem hier schon einmal die Sichtbarkeit nachgezogen werden musste.
   const params = { me: actorId };
+  if (taskScopeNeedsToday({ includeFuture: !!args.include_future })) params.today = toLocalDateKey();
+  // Das Archiv ist seit #688 eine eigene Achse (tasks.archived_at), kein
+  // Statuswert mehr. `status: 'archived'` bleibt als Eingabe erlaubt und meint
+  // unverändert „zeig mir die Ablage" - nur wird jetzt die Ablage gefragt und
+  // nicht das Statusfeld, das es dort nie sauber ausdrücken konnte.
   if (args.status) {
     const s = v.oneOf(args.status, ['open', 'in_progress', 'done', 'archived'], 'status');
     if (s.error) throw new ToolError(s.error);
-    sql += ' AND t.status = @status';
-    params.status = args.status;
+    if (args.status === 'archived') {
+      sql += ' AND t.archived_at IS NOT NULL';
+    } else {
+      sql += ' AND t.status = @status AND t.archived_at IS NULL';
+      params.status = args.status;
+    }
   } else {
-    sql += " AND t.status != 'archived'";
+    sql += ' AND t.archived_at IS NULL';
   }
   // Tag-Filter, gleiche Semantik wie GET /api/v1/tasks: mehrere Tags engen
   // UND-verknüpft ein, die Schreibweise zählt nicht.
@@ -176,15 +194,32 @@ function listUpcomingEvents(db, actorId, args) {
   let limit = parseInt(args.limit, 10);
   if (!Number.isFinite(limit)) limit = 20;
   limit = Math.min(Math.max(limit, 1), 100);
-  // Sichtbarkeit (#474): kein Zugriff auf private/eingeschränkte Termine anderer.
-  return db.prepare(`
-    SELECT e.id, e.title, e.start_datetime, e.end_datetime, e.all_day, e.location
-    FROM calendar_events e
-    WHERE date(e.start_datetime) >= date('now')
-      AND ${visibilityWhere('e', 'event_assignments', 'event_id')}
-    ORDER BY e.start_datetime ASC
-    LIMIT ?
-  `).all(actorId, actorId, limit);
+  // Reuse the calendar/dashboard service so recurrence expansion, EXDATEs,
+  // displayed moved children and visibility stay one contract across REST and
+  // MCP. fromToday preserves this tool's existing calendar-day boundary.
+  return getUpcomingEvents(db, {
+    userId: actorId,
+    limit,
+    // The shared reader bounds eligible occurrences per series by limit.
+    windowDays: null,
+    fromToday: true,
+  }).map((event) => ({
+    id: event.id,
+    title: event.title,
+    start_datetime: event.start_datetime,
+    end_datetime: event.end_datetime,
+    all_day: event.all_day,
+    location: event.location,
+    ...(event.is_occurrence_override ? {
+      series_id: event.series_id,
+      recurrence_id: event.recurrence_id,
+      is_occurrence_override: true,
+      assignment_owner_id: event.assignment_owner_id,
+      attachment_owner_id: event.attachment_owner_id,
+      reminder_owner_id: event.reminder_owner_id,
+      reminder_anchor_start: event.reminder_anchor_start,
+    } : {}),
+  }));
 }
 
 function createEvent(db, actorId, args) {
@@ -372,7 +407,9 @@ function internalBaseUrl() {
   return (
     process.env.MCP_INTERNAL_BASE_URL
     || process.env.BASE_URL
-    || `http://127.0.0.1:${process.env.PORT || 3000}`
+    // Dieselbe Adresse, auf der server/index.js lauscht: bindet der Server nur
+    // an eine LAN-Adresse, ginge ein Aufruf an 127.0.0.1 ins Leere.
+    || `http://${selfCallHost(readBindAddress(process.env.BIND_ADDRESS))}:${process.env.PORT || 3000}`
   ).replace(/\/+$/, '');
 }
 
@@ -497,7 +534,8 @@ const CORE_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        status: { type: 'string', enum: ['open', 'in_progress', 'done', 'archived'], description: 'Filter by task status.' },
+        status: { type: 'string', enum: ['open', 'in_progress', 'done', 'archived'], description: 'Filter by task status. "archived" is not a status but the separate archive: it lists the filed-away tasks with whatever status they carry.' },
+        include_future: { type: 'boolean', description: 'Include tasks that only start at a later date. Left out by default, matching the app: a task with a start date next week is not up yet.' },
         tag: {
           type: 'array',
           items: { type: 'string' },
@@ -897,44 +935,89 @@ const TOOL_DEFINITIONS = ALL_TOOLS.map(({ name, description, inputSchema }) => (
 const TOOL_MAP = new Map(ALL_TOOLS.map((t) => [t.name, t]));
 
 /**
- * Darf der Token dieses Tool nutzen? Tools ohne `scope` (Meta-/Brücken-Tools) sind
- * immer erlaubt — die OpenAPI-Brücke setzt Scopes ohnehin serverseitig am
- * Loopback-REST-Layer durch. `scopes === null` = kein Scoping (voller Zugriff).
- * @param {string[]|null} scopes
+ * Darf dieser Akteur das Tool nutzen? Zwei voneinander unabhängige Grenzen, und
+ * BEIDE müssen zustimmen:
+ *
+ *   1. Token-Scopes — Least Privilege des Integrationstokens selbst.
+ *      `scopes === null` = kein Scoping (Legacy-Token, voller Zugriff).
+ *   2. Modulrechte des Nutzers (#467) — was das Mitglied hinter dem Token
+ *      überhaupt darf. `moduleAccess === null` = Admin oder unbeschränkt.
+ *
+ * Punkt 2 fehlte hier (#823): die Kern-Tools laufen in-process gegen SQLite und
+ * sehen die /api/v1-Middleware nie, ein Mitglied mit `tasks: none` bekam über
+ * `list_tasks` trotzdem die Aufgaben. Ein Scope kann Rechte nur einschränken,
+ * niemals erweitern — deshalb ist die Reihenfolge egal, aber die Konjunktion
+ * nicht.
+ *
+ * Tools ohne `scope` (Meta-/Brücken-Tools) bleiben erlaubt: die OpenAPI-Brücke
+ * ruft per Loopback über /api/v1 auf und erbt dort Scopes, Modulrechte und
+ * Guest-Guard vom echten Middleware-Stapel. Ausnahme sind Split-Guests, die
+ * gar keinen Haushaltszugriff haben — für sie sind alle Kern-Tools zu.
+ *
+ * @param {{ scopes?: string[]|null, moduleAccess?: object|null, splitGuest?: boolean, display?: boolean }|null} actor
  * @param {{ scope?: { module: string, access: 'read'|'write' } }} tool
  * @returns {boolean}
  */
-function toolAllowed(scopes, tool) {
+function toolAllowed(actor, tool) {
+  // EIN WANDTABLETT ERREICHT GAR KEIN WERKZEUG, auch keines ohne `scope`
+  // (#1208). `/mcp` liegt bewusst ausserhalb der /api/v1-Gates, und der
+  // Display-Zweig in `requireAuth` setzt Scopes unabhaengig vom Pfad - ohne
+  // diese Zeile laege hier eine Tuer offen, die die REST-Seite verschlossen
+  // hat. Dieselbe Klasse wie GHSA-4jcg-7jvj-p4v9: eine Regel, die je Pfad statt
+  // zentral steht.
+  //
+  // WARUM VOR der Abkuerzung darunter, der Gast-Riegel aber dahinter bleibt:
+  // ohne `scope` sind `list_api_operations`, `get_api_operation` und
+  // `call_api_operation`. Der letzte laeuft ueber `internalApiRequest` in die
+  // REST-Schicht zurueck und traegt damit deren Gates - fuer einen
+  // Ausgaben-Gast IST das sein Weg zu /split-expenses ueber MCP, und ihn
+  // zuzumachen naehme echten Zugang weg (test-mcp.js haelt genau diese drei
+  // Namen fuer ihn fest). Ein Display hat dort nichts zu holen: seine vier
+  // Lesemodule erreicht es ueber REST, und einen Integrationskanal braucht ein
+  // Geraet an der Wand nicht.
+  //
+  // OFFEN UND NICHT HIER ENTSCHIEDEN: dass ein Gast ueber die beiden anderen
+  // den vollstaendigen OpenAPI-Katalog liest, obwohl `/openapi.json` ueber REST
+  // administratorgesperrt ist. Das ist ein eigener Befund, aelter als #1208.
+  if (actor && actor.display) return false;
   if (!tool.scope) return true;
-  return tokenAllows(scopes, tool.scope.module, tool.scope.access);
+  // Gast-Konten für geteilte Ausgaben erreichen unter /api/v1 nur
+  // /split-expenses; kein Kern-Tool liegt dort, also alle gesperrt.
+  if (actor && actor.splitGuest) return false;
+  const scopes = actor ? (actor.scopes ?? null) : null;
+  if (!tokenAllows(scopes, tool.scope.module, tool.scope.access)) return false;
+  const moduleAccess = actor ? (actor.moduleAccess ?? null) : null;
+  return moduleAccessVerdict(moduleAccess, tool.scope.module, tool.scope.access) === MODULE_ACCESS_ALLOW;
 }
 
 /**
- * Tool-Definitionen für `tools/list`, gefiltert auf die Scopes des Tokens —
- * ein LLM sieht nur Tools, die es auch aufrufen darf.
- * @param {string[]|null} scopes
+ * Tool-Definitionen für `tools/list`, gefiltert auf das, was der Akteur wirklich
+ * aufrufen darf — ein LLM sieht kein Tool, das ihm der nächste Aufruf verweigert.
+ * @param {{ scopes?: string[]|null, moduleAccess?: object|null, splitGuest?: boolean, display?: boolean }|null} actor
  * @returns {Array<{ name: string, description: string, inputSchema: object }>}
  */
-function listToolDefinitions(scopes = null) {
+function listToolDefinitions(actor = null) {
   return ALL_TOOLS
-    .filter((tool) => toolAllowed(scopes, tool))
+    .filter((tool) => toolAllowed(actor, tool))
     .map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
 }
 
 /**
  * Führt ein Tool aus.
- * @param {{ db: object, actor: { id: number, role?: string, scopes?: string[]|null }, requestHeaders?: object }} ctx
+ * @param {{ db: object, actor: { id: number, role?: string, scopes?: string[]|null, moduleAccess?: object|null, splitGuest?: boolean }, requestHeaders?: object }} ctx
  * @param {string} name  - Tool-Name
  * @param {object} args  - Tool-Argumente
  * @returns {Promise<any>} rohes Ergebnis (wird vom Protokoll-Layer serialisiert)
- * @throws {ToolError} bei unbekanntem Tool, fehlender Scope-Berechtigung oder Validierungsfehler
+ * @throws {ToolError} bei unbekanntem Tool, fehlender Berechtigung oder Validierungsfehler
  */
 async function callTool(ctx, name, args = {}) {
   const tool = TOOL_MAP.get(name);
   if (!tool) throw new ToolError(`Unknown tool: ${name}`);
-  const scopes = ctx.actor ? (ctx.actor.scopes ?? null) : null;
-  if (!toolAllowed(scopes, tool)) {
-    throw new ToolError(`Tool "${name}" is not permitted by this token's scopes.`);
+  const actor = ctx.actor || null;
+  if (!toolAllowed(actor, tool)) {
+    // Eine Meldung für beide Gründe: welche der zwei Grenzen zugeschlagen hat,
+    // geht den Aufrufer nichts an (und verriete, dass es das Modul gibt).
+    throw new ToolError(`Tool "${name}" is not permitted for this account.`);
   }
   return tool.handler(ctx, args || {});
 }

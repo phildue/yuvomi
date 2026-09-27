@@ -57,40 +57,37 @@
 
 .contacts-filters::-webkit-scrollbar { display: none; }
 
-.contact-filter-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  /* Mehr Seitenraum: der gefüllte Aktiv-Zustand (--c-accent) ließ kurze Labels
-     wie „Alle" bei space-3 fast kreisrund und randeng wirken (#569). */
-  padding: var(--space-1) var(--space-4);
-  border-radius: var(--radius-full);
-  font-size: var(--text-sm);
-  font-weight: var(--font-weight-medium);
-  white-space: nowrap;
-  cursor: pointer;
-  border: 1.5px solid var(--color-border);
-  background: transparent;
-  color: var(--color-text-secondary);
-  transition: all var(--transition-fast);
-  min-height: 30px;
-}
-
-.contact-filter-chip:hover:not(.contact-filter-chip--active) {
-  border-color: var(--color-text-secondary);
-  color: var(--color-text-primary);
-}
-
-.contact-filter-chip--active {
-  background-color: var(--c-accent);
-  border-color: var(--c-accent);
-  color: var(--color-ink-on-vivid);
-}
-
-@media (max-width: 767px) {
-  .contact-filter-chip {
-    min-height: var(--target-lg);
+/* Dieselbe Rechnung wie bei `.list-tabs-bar` im Einkauf (#758): Die Leiste
+ * polstert sich mit `--page-inline-pad`, und bei `box-sizing: border-box` zieht
+ * dieses Polster von einer Kappung ab, statt sie zu verlaengern. Mit dem
+ * generischen Lesemass blieben bei 1907px von 720px genau 313px fuer die
+ * Kategorie-Chips uebrig - gemessen abgeschnitten, nur nie gemeldet. Die
+ * Kappung steht deshalb hier, wo auch das Polster steht, und rechnet es ein;
+ * das rechte Polster faellt weg, damit die Flaeche an der Lesekante endet.
+ * Unterhalb 1024px greift sie nicht: dort polstert die Basisregel symmetrisch
+ * und der Chip-Streifen braucht seinen Auslauf zum Scrollen. */
+@media (min-width: 1024px) {
+  .page-measure--narrow .contacts-filters {
+    max-width: calc(var(--page-measure) + var(--page-inline-pad));
+    padding-inline-end: 0;
   }
+}
+
+/* ER TRÄGT `.filter-chip` (Critique 2026-08-13). Hier stand ein Nachbau, der
+ * zehn seiner vierzehn Deklarationen zeichengleich mit der geteilten Regel
+ * teilte - und in den übrigen vier war er nicht anders, sondern schlechter:
+ * `transition: all` hatte die geteilte Regel ausdrücklich abgeschafft (sie
+ * zieht implizit Layout-Eigenschaften mit), und `min-height: 30px` war ein
+ * hartkodierter Wert weit unter `--target-lg` - gemessen fiel der Chip am
+ * Desktop auf 31px, während jeder andere Filterchip der App 48px hoch ist.
+ * Der Aktivzustand war ohnehin Zeichen für Zeichen dieselbe Regel, nur mit
+ * `--c-accent` statt `--module-accent` - und `--c-accent` löst laut Kopf
+ * dieser Datei genau darauf auf.
+ *
+ * Was BLEIBT, ist der Seitenraum: der Aktivzustand ließ kurze Labels wie
+ * „Alle" bei `--space-3` fast kreisrund wirken (#569). */
+.contact-filter-chip {
+  padding-inline: var(--space-4);
 }
 
 /* --------------------------------------------------------
@@ -103,29 +100,38 @@
   padding-inline: var(--page-inline-pad);
 }
 
+/* Ein Träger pro Kategorie (Zeilenlisten-Regel, tokens.css): die Zeilen lagen
+ * vorher direkt auf dem Grouped-Grund und hatten damit keinen Rand, an dem das
+ * Auge die Gruppe als EIN Objekt fasst. Der Versal-Sektionskopf bleibt bewusst
+ * ausserhalb - er sitzt sticky auf dem Grund, wie in Apples Kontakten. */
 .contact-group {
-  margin-bottom: 0;
+  margin-bottom: var(--space-4);
 }
 
-/* Pro Kategorie ein abgeleiteter Farbton (--cat). KEIN neuer Modul-Akzent
- * (DESIGN §2), sondern dezente, aus bestehenden AA-verifizierten Tokens
- * abgeleitete Flächen. --cat kaskadiert von der Gruppe auf Icon + Header. */
-.contact-group--doctor    { --cat: var(--color-success); }         /* Arzt → Grün (Fürsorge) */
-.contact-group--school    { --cat: var(--color-warning); }         /* Schule/Kita → Amber (Lernen) */
-.contact-group--authority { --cat: var(--color-accent); }          /* Behörde → Violett (amtlich, distinct vom Modul-Blau) */
-.contact-group--insurance { --cat: var(--module-budget); }         /* Versicherung → Teal (Absicherung) */
-.contact-group--craftsman { --cat: var(--module-meals); }          /* Handwerker → Orange (Werkstatt) */
-.contact-group--emergency { --cat: var(--color-danger); }          /* Notfall → Rot (semantisch) */
-.contact-group--misc      { --cat: var(--color-text-secondary); }  /* Sonstiges → neutral */
+/* Der Traeger ist `.row-carrier` (list-row.css) - hier standen seine vier
+ * Deklarationen ein zweites Mal. Die Klasse steht am Element, diese Regel
+ * bleibt als Ankerpunkt fuer die Kategorie-Toene darunter. */
+
+/* DER TON EINER KATEGORIE KOMMT AUS DEN DATEN, nicht mehr aus sieben Regeln
+ * `.contact-group--<key>` (Migration 152). Die Gruppe setzt `--cat` und
+ * `--cat-ink` inline; ohne kuratierten Ton bleibt beides ungesetzt und die
+ * Marke neutral - das ist die Aussage, nicht ihr Fehlen.
+ *
+ * WARUM DIE LISTE WEG MUSSTE: ein Selektor auf den Kategorie-Schluessel trifft
+ * per Konstruktion nur die SEED-Kategorien. Seit #357 legt der Haushalt eigene
+ * an, und die fielen alle auf den Modulton zurueck - im Demo-Haushalt sahen
+ * „Familie" und „Dienstleistungen" deshalb gleich aus. Eine Farbe, die zwei
+ * Dinge meint, ist keine (Vollton-Regel, DESIGN.md Colors). Dieselbe Bauart,
+ * die dieselbe Regel schon zweimal eingeholt hat: was ueber einen NAMEN laeuft,
+ * deckt N Namen ab, nicht die Regel. */
 
 .contact-group__header {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   color: var(--color-text-secondary);
-  padding: var(--space-2) var(--space-4) var(--space-1);
+  padding: var(--space-4) var(--space-1) var(--space-2);
   background-color: var(--color-bg);
-  border-bottom: 1px solid var(--color-border);
   position: sticky;
   top: 0;
   z-index: var(--z-sticky);
@@ -140,14 +146,27 @@
   flex-shrink: 0;
 }
 
-.contact-item {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding-right: var(--space-4);
-  border-bottom: 1px solid var(--color-border-subtle);
-  transition: background-color var(--transition-fast);
-}
+/* DIE POLSTERUNG GEHÖRT DER ZEILE, NICHT DEM KNOPF DARIN. Sie stand bis
+ * Etappe 5 in `.contact-item__open` (16px, mobil 12px) und die Zeile selbst
+ * hatte oben und unten gar keine - dadurch bekam die Textspalte 24px
+ * Innenabstand und die 48px-Bedienzone daneben null. Gemessen bei 390x844:
+ * 43,7px Text plus 24 = 67,7px, während jede geschnittene Liste der App auf
+ * 48 + 2x8 = 64 steht. Das ist kein Zufallsunterschied, sondern die Rechnung
+ * von `.list-row`: die Polsterung muss BEIDE Spalten umschließen, sonst
+ * bestimmt die höhere allein. Mit ihr an der Zeile: 64px, wie Einkauf,
+ * Vorrat, Rezepte, Budget und die Hauswirtschaft. */
+/* SIE TRAEGT `.list-row` (Critique 2026-08-13, P2). Fuenf der sechs
+ * Deklarationen standen zeichengleich in list-row.css, und die sechste - die
+ * Haarlinie ueber den +-Kombinator - stand dort ebenfalls, nur am TRAEGER
+ * (`.row-carrier > * + *`). Der Traeger heisst hier `.contact-group__list` und
+ * war seinerseits ein Nachbau von `.row-carrier`, Wert fuer Wert: Flaeche,
+ * Radius, Schatten, overflow. Beide tragen die geteilten Klassen jetzt mit.
+ *
+ * Was BLEIBT: der kleinere Abstand - seit dem Folgelauf aber nicht mehr als
+ * eigener Wert hier, sondern als benannte Stufe `.list-row--tight`
+ * (list-row.css). Links steht ein Avatar, kein Bedienelement, und die 12px der
+ * geteilten Zeile schoben den Namen sichtbar von ihm weg; das ist eine Rolle,
+ * die auch die naechste Bildliste haben wird, keine Eigenheit der Kontakte. */
 
 .contact-item:hover {
   background-color: var(--color-surface-2);
@@ -155,35 +174,15 @@
 
 /* --------------------------------------------------------
  * Auswahl-Modus (opt-in Bulk)
+ *
+ * DIE LEISTE IST ENTFALLEN (Critique 2026-08-13). Hier standen `.contacts-
+ * selectbar` und ihre zwei Kinder: eine umbrechende Leiste im Fluss der Seite,
+ * die im Auswahlmodus rund 120px Chrome über die Liste schob. Die Sammelaktion
+ * ist jetzt die geteilte Pille in der unteren Shell-Zone (utils/bulk-pill.js) -
+ * derselbe Baustein, dieselbe Sprache und dieselbe Rückfrage wie in Einkauf und
+ * Vorrat. Was von der Auswahl hier bleibt, ist die ZEILE: ihre Checkbox, ihre
+ * Tönung und der Griff, der im Auswahlmodus weicht.
  * -------------------------------------------------------- */
-.contacts-selectbar {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2) var(--space-3);
-  flex-wrap: wrap;
-  padding-block: var(--space-2);
-  padding-inline: var(--page-inline-pad);
-  border-bottom: 1px solid var(--color-border);
-  background-color: var(--color-surface-2);
-  flex-shrink: 0;
-}
-
-/* Ohne diesen Guard schlägt display:flex das hidden-Attribut (reset.css erzwingt
- * [hidden] nicht) → die Leiste bliebe dauerhaft sichtbar. */
-.contacts-selectbar[hidden] {
-  display: none;
-}
-
-.contacts-selectbar__count {
-  font-weight: var(--font-weight-medium);
-  color: var(--color-text-primary);
-}
-
-.contacts-selectbar__actions {
-  display: flex;
-  gap: var(--space-2);
-  margin-left: auto;
-}
 
 .contact-item__select {
   cursor: pointer;
@@ -203,29 +202,41 @@
 }
 
 .contact-item--selected {
-  background-color: color-mix(in srgb, var(--c-accent) 12%, transparent);
+  background-color: color-mix(in srgb, var(--c-accent) var(--tint-state), transparent);
 }
 
-.contacts-page.is-selecting .page-fab {
+/* Auswahlmodus verdeckt die Anlege-Affordance. Gefragt wird über :has() am
+ * Dokument, weil der FAB seit #634 nicht mehr unter `.contacts-page` hängt,
+ * sondern in der Shell-Layer neben dem Scrollport. */
+html:has(.contacts-page.is-selecting) .page-fab {
   display: none;
 }
 
+/* Und mit der Affordance geht ihr Nachlauf (Etappe 6, 2026-08-13). Dieselbe
+   Paarung wie in layout.css: die Nachlauf-Regel fragt `:not([hidden])` und
+   sieht ein `display: none` nicht. */
+html:has(.contacts-page.is-selecting) {
+  --fab-safe-zone: 0px;
+}
+
 /* Öffnen/Bearbeiten: echte, fokussierbare Schaltfläche (Tastatur/Screenreader).
- * Padding wandert hierher, damit die gesamte linke Zeilenfläche klickbar ist. */
+ *
+ * DER KNOPF-RESET UND DIE ZIELGRÖSSE STEHEN NICHT MEHR HIER, sondern kommen
+ * aus `.list-row__main--interactive` (list-row.css) - der Baustein für genau
+ * diesen Fall: „die Textspalte IST die primäre Zeilenaktion". Der Vorrat trägt
+ * ihn seit der Küchen-Zusammenführung, die Kontakte hatten dieselben sieben
+ * Deklarationen zeichengleich daneben stehen.
+ *
+ * WAS DER UMZUG DER POLSTERUNG KOSTET, und es ist derselbe Preis, den der
+ * Vorrat schon zahlt: die 8px oben und unten gehören jetzt der Zeile und sind
+ * nicht mehr Teil der Klickfläche. Der Knopf hält seine Zielgröße stattdessen
+ * über `min-height` - 40px am Zeiger, 48px am Finger. */
 .contact-item__open {
   flex: 1;
   min-width: 0;
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  padding: var(--space-4);
-  padding-right: var(--space-2);
-  background: none;
-  border: none;
-  font: inherit;
-  color: inherit;
-  text-align: left;
-  cursor: pointer;
 }
 
 .contact-item__open:focus-visible {
@@ -234,36 +245,24 @@
   border-radius: var(--radius-md);
 }
 
-/* Chevron: dezente „Zeile öffnet Detail"-Affordanz. Sichtbar (leise) für Touch,
- * verstärkt bei Hover/Fokus der Zeile. */
-.contact-item__chevron {
-  width: 18px;
-  height: 18px;
-  flex-shrink: 0;
-  color: var(--color-text-disabled);
-  opacity: 0.6;
-  transition: opacity var(--transition-fast), color var(--transition-fast), transform var(--transition-fast);
-}
-
-.contact-item:hover .contact-item__chevron,
-.contact-item__open:focus-visible .contact-item__chevron {
-  opacity: 1;
-  color: var(--c-accent);
-  transform: translateX(2px);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .contact-item__chevron { transition: opacity var(--transition-fast), color var(--transition-fast); }
-  .contact-item:hover .contact-item__chevron,
-  .contact-item__open:focus-visible .contact-item__chevron { transform: none; }
-}
+/* Der Chevron ist entfallen (Redesign Runde 6, Phase 1). Er stand als letztes
+ * Kind des Öffnen-Knopfes, während die Zeilenaktionen als Geschwister daneben
+ * liegen - optisch landete er damit in der Zeilenmitte und versprach
+ * Navigation, wo die Knöpfe daneben etwas anderes liefern.
+ *
+ * REGEL, nicht Einzelfall: ein Chevron entfällt, WO eine Zeile eigene Aktionen
+ * trägt. Eine Zeile ohne Aktionen darf ihn behalten - dort ist Öffnen das
+ * Einzige, was sie tut. Gehalten von `eine Zeile mit eigenen Aktionen
+ * verspricht keine Navigation` (test:frontend-audit). */
 
 .contact-item__icon {
   width: var(--target-md);
   height: var(--target-md);
   border-radius: var(--radius-full);
-  background-color: color-mix(in srgb, var(--cat, var(--c-accent)) 15%, transparent);
-  color: var(--cat, var(--c-accent));
+  /* Haut aus .vivid-mark (layout.css), aber nur mit kuratiertem Ton - sonst
+   * neutral. Begruendung an den Kategorie-Toenen oben. */
+  --seal-accent: var(--cat, var(--color-fill-well));
+  color: var(--cat-ink, var(--color-text-secondary));
   display: flex;
   align-items: center;
   justify-content: center;
@@ -271,12 +270,25 @@
   font-size: var(--text-lg);
 }
 
-/* Personen/Familien-Kontakte: Initialen statt Kategorie-Icon, im Modul-Ton.
- * Überschreibt den Kategorie-Ton der Gruppe bewusst mit --c-accent. */
-.contact-item__icon--initials {
-  --cat: var(--c-accent);
+/* Verknüpfte Haushaltsmitglieder: das Bild oder die Initialen des Menschen, in
+ * SEINER Farbe. Fläche und Tinte kommen inline aus den Daten (die Begründung
+ * steht an `contactAvatar` in contacts.js), deshalb trägt diese Variante
+ * bewusst KEIN `.vivid-mark`: dessen Tinte ist die gemessene für kuratierte
+ * Töne, und eine frei gewählte Avatarfarbe braucht die gerechnete.
+ *
+ * Hier stand bis 2026-08-18 `--cat: var(--c-accent)`, also der Modul-Ton -
+ * dieselbe Scheibe für jedes Mitglied, während dieselben Menschen zwei Klicks
+ * weiter ihre eigene trugen. */
+.contact-item__icon--member {
+  overflow: hidden;
   font-size: var(--text-sm);
   font-weight: var(--font-weight-semibold);
+}
+
+.contact-item__icon--member img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .contact-item__body {
@@ -327,6 +339,19 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* In der schmalen Zeile faellt die E-Mail GANZ, samt Trenner: „+49 231
+ * 4452210 · pr…" trug null Information mehr als die Nummer allein, kostete
+ * aber die Zeile ihren Atem (Critique 2026-08-27, P3). Die Telefonnummer ist
+ * die handlungsleitende Angabe (der Anrufen-Knopf steht daneben); die Mail
+ * steht vollstaendig im Detail. Steht hinter den Basisregeln - bei gleicher
+ * Spezifitaet gewinnt sonst die Basis (DESIGN.md, Media-Block-Don't). */
+@container list-rows (max-width: 26rem) {
+  .contact-item__meta-sep,
+  .contact-item__meta-email {
+    display: none;
+  }
 }
 
 .contact-item__actions {
@@ -422,9 +447,18 @@
   color: var(--color-danger);
 }
 
+/* Auf der Tönung trägt --color-danger nur 4,45:1 - deshalb hier der Ink-Ton
+ * (5,69:1), wie auf jeder anderen -light-Fläche der App. Das Symbol wandert
+ * mit, sonst steht die Zeile im Hover zweifarbig da. */
 .contact-menu-item--danger:hover,
 .contact-menu-item--danger:focus-visible {
   background-color: var(--color-danger-light);
+  color: var(--color-danger-ink);
+}
+
+.contact-menu-item--danger:hover .contact-menu-item__icon,
+.contact-menu-item--danger:focus-visible .contact-menu-item__icon {
+  color: var(--color-danger-ink);
 }
 
 /* --------------------------------------------------------
@@ -444,8 +478,8 @@
   height: var(--target-md);
   flex-shrink: 0;
   border-radius: var(--radius-full);
-  background-color: color-mix(in srgb, var(--c-accent) 15%, transparent);
-  color: var(--c-accent);
+  --seal-accent: var(--cat, var(--color-fill-well));
+  color: var(--cat-ink, var(--color-text-secondary));
 }
 
 .contacts-cat-select .form-input {
@@ -496,8 +530,12 @@
   margin-top: var(--space-4);
 }
 
+/* Eine Aktionsgruppe IN der Fusszeile ist selbst eine Knopfzeile und braucht
+ * dieselbe Erlaubnis (#872): fuer die Fusszeile ist sie EIN Flex-Item, also
+ * unteilbar - ohne eigenen Umbruch laeuft sie als Ganzes ueber. */
 .contact-modal__footer-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-3);
 }
 
@@ -507,18 +545,16 @@
 @media (max-width: 767px) {
   .contact-item__open {
     gap: var(--space-2);
-    padding: var(--space-3);
-    padding-right: var(--space-2);
   }
 
-  .contact-item {
-    padding-right: var(--space-3);
-  }
-
-  .contact-item__icon {
-    width: 36px;
-    height: 36px;
-  }
+  /* HIER STANDEN 36 HARTKODIERTE PIXEL, und sie haben eine fremde Begründung
+   * falsch gemacht: `birthdays.css` beruft sich darauf, dass „Kontakte, das
+   * Nachbarmodul derselben Familie, ihr Zeilenbild seit jeher auf
+   * `--target-md` tragen" - am Telefon, wo diese Regel griff, waren es 36 statt
+   * 40. Die beiden Zeilen derselben Familie standen also genau dort
+   * auseinander, wo die Begründung sie zusammen sah. Der Wert ist ersatzlos
+   * weg: --target-md kostet die Zeile nichts, ihre Höhe kommt aus Text und
+   * Bedienzone, nicht aus dem 40px-Bild. */
 }
 
 /* ================================================================
@@ -550,8 +586,12 @@
   border-radius: var(--radius-sm);
 }
 
+/* Text auf primary, sobald die Hover-Flaeche steht - siehe .btn--ghost:hover
+ * und .modal-panel__action:hover. Auf #EBEBF0 lag der Modul-Akzent hier bei
+ * 4,37 (light) und 4,46 (dark), beides unter AA fuer 14px. */
 .vcard-import__toggle:hover {
   background: var(--color-surface-hover);
+  color: var(--color-text-primary);
 }
 
 .vcard-import__list {
@@ -621,8 +661,23 @@
   height: 16px;
 }
 
-.vcard-import-row--exists {
-  opacity: 0.72;
+/* Schon vorhanden: Zuruecknehmen-Muster (tokens.css, #1230) statt
+ * `opacity: 0.72`. Das Badge sagt den Zustand; auf der vertieften Flaeche
+ * nimmt es die naechste Stufe, sonst verschwaende seine Pille im Grund. */
+/* Auch unter Zeiger und Fokus: `.vcard-import-row:hover`/`:focus-within`
+ * (0-2-0) setzten sonst die Hover-Flaeche einer neuen Zeile (#1230). */
+.vcard-import-row--exists,
+.vcard-import-row--exists:hover,
+.vcard-import-row--exists:focus-within {
+  background: var(--color-surface-receded);
+}
+
+.vcard-import-row--exists .vcard-import-row__detail {
+  color: var(--color-text-receded);
+}
+
+.vcard-import-row--exists .vcard-import-row__badge {
+  background: var(--color-surface-3);
 }
 
 .vcard-import-row__badge {
@@ -647,6 +702,9 @@
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  /* Umbruch statt Quetschen - Begruendung an `.modal-panel__footer`
+   * (layout.css, #872). */
+  flex-wrap: wrap;
   gap: var(--space-3);
   margin-top: var(--space-4);
 }

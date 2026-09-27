@@ -1,0 +1,932 @@
+/**
+ * Modul: Doku-Seiten (GitHub Pages) - Struktur- und Drift-Guard
+ * Zweck: Die fünf Seiten unter `docs/` sind eigenständige Dateien ohne Build-Schritt
+ *        und ohne Framework. Was sie behaupten, steht handgepflegt an mehreren
+ *        Stellen gleichzeitig - und genau daran ist es wiederholt auseinander
+ *        gelaufen. Diese Suite hält die fünf Kopplungen, die schon gerissen sind:
+ *
+ *        (1) Kein Quelltextkommentar rendert als sichtbarer Text.
+ *            Der Sektionsumbau vom 2026-08-16 hat einen Kommentar in zwei
+ *            Hälften geschnitten. Die Schlusszeile stand danach als Textknoten
+ *            bei 32 % Scrolltiefe auf der Seite, der Kopf blieb unterminiert
+ *            zurück und verschluckte die nächste Kommentar-Marke. Weder
+ *            Kontrast- noch Überlauf- noch Konsolenprüfung sieht so etwas, und
+ *            Sektions-Screenshots erst recht nicht: der Rest stand ZWISCHEN
+ *            zwei Sektionen.
+ *
+ *        (2) Die Substitutionstabelle stimmt wörtlich mit der README überein.
+ *            Die zehn Zeilen in `docs/index.html` sind aus der README-Tabelle
+ *            übernommen. Nichts hielt sie zusammen.
+ *
+ *        (3) Die Modulzahl der Proof-Leiste ist die Summe dessen, was die Seite
+ *            zeigt. "Die übrigen dreizehn" stand über vierzehn Karten, weil das
+ *            achtzehnte Modul dazukam und die Zahl im Absatz darüber nicht.
+ *
+ *        (4) Jede referenzierte Aufnahme hat ihre zwei WebP-Ableitungen, in
+ *            BEIDEN Sprachordnern. `onerror` greift nur bei FEHLENDEN Dateien,
+ *            nicht bei veralteten - eine fehlende Ableitung fällt still auf das
+ *            5-10x größere PNG zurück.
+ *
+ *        (5) Die Wörterbücher sind vollständig und deckungsgleich. Ein `data-t`
+ *            ohne Eintrag rendert stumm den englischen Fallback, auch auf der
+ *            deutschen Seite.
+ *
+ *        (6) Jede Sektion schliesst genau die `div`s, die sie oeffnet.
+ *            Ein einziges ueberzaehliges `</div>` in `.showcase` schloss dort
+ *            `.wrap` statt `.feat-grid`; alles danach - Modulraster, Vorspann,
+ *            Telefonreihe, Abgrenzungsabsatz - fiel aus dem 1152px-Container.
+ *            `.mod-grid` mass danach `left:0 width:1440 padding:0`, mobil
+ *            klebten die Karten bei `left:0/right:390` an beiden Bildschirm-
+ *            raendern. Vier Prueflaeufe haben es nicht gesehen, weil alle nach
+ *            UEBERLAUF fragten: volle Viewport-Breite laeuft nicht ueber,
+ *            `scrollWidth > clientWidth` bleibt still. Der Browser repariert
+ *            solches Markup klaglos, deshalb ist auch die Konsole leer. Was
+ *            fehlte, war die Frage nach der BILANZ.
+ *
+ *        (7) Ein Telefonrahmen hat die Proportion eines Telefons.
+ *            Vier Stellen zeichnen denselben Handyrahmen (26px Ecke, 4px Steg),
+ *            zwei davon standen auf erfundenen Zuschnitten: `.feat-phone` auf
+ *            1320/1780 und `.mod-shot img` auf 1320/1900, waehrend `.hero-float
+ *            img` und der schmale Galerierahmen daneben das echte Mass 1320/2867
+ *            fuehrten. Dasselbe Objekt sprach auf einer Seite zwei Sprachen, und
+ *            die beiden falschen Kaesten machten aus dem Telefon ein gedrungenes
+ *            Tablet - 200x270 statt 200x434. Kein Kontrast-, Ueberlauf- oder
+ *            Bilanz-Guard sieht das: die Aufnahme darin ist unverzerrt, nur
+ *            unten abgeschnitten. Der Guard fragt deshalb nach der QUELLE des
+ *            Verhaeltnisses (ein Name, `--ar-phone`) und danach, ob dieser Name
+ *            noch das misst, was die Aufnahmen wirklich sind.
+ *
+ * Ausführen: node --test test/test-docs-landing.js   (bzw. npm run test:docs-landing)
+ */
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+import { dictBlock, dictValue, decodeEntities, stripTags, unescapeJs } from './docs-dict.js';
+import { eachRule } from './css-rules.js';
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const DOCS = resolve(ROOT, 'docs');
+const SHOTS = resolve(DOCS, 'screenshots');
+const PAGES = ['index.html', 'install.html', 'datenschutz.html', 'impressum.html', 'privacy.html'];
+
+const read = (p) => readFileSync(resolve(DOCS, p), 'utf8');
+/**
+ * Entities aufloesen und Woerterbuch-Bloecke schneiden - beides aus
+ * `docs-dict.js`, weil `test-readme-consistency.js` dieselben Bloecke liest.
+ * Zwei Kopien desselben Extraktors haben in diesem Repo schon zweimal zwei
+ * verschiedene Blindstellen behalten (siehe den Kopf von `css-rules.js`).
+ */
+const decode = decodeEntities;
+
+// ── (1) Kein Kommentar rendert als Text ──────────────────────────────────────
+
+/**
+ * Kommentare entfernen und schauen, was an Kommentar-Syntax übrig bleibt.
+ *
+ * Bewusst so herum und nicht als Zählung von `<!--` gegen `-->`: die war beim
+ * echten Schaden AUSGEGLICHEN. Der abgetrennte Rest hatte ein `-->` und der
+ * unterminierte Kopf ein `<!--`, die Bilanz stimmte also, während beide Hälften
+ * kaputt waren. Ein Guard, der Paare zählt, wäre hier grün gewesen.
+ *
+ * `--!>` schliesst einen Kommentar genauso wie `-->` (HTML-Parser, "comment end
+ * bang state"). Ohne diese Variante haette der Guard einen so geschlossenen
+ * Kommentar fuer unterminiert gehalten und Fehlalarm geschlagen.
+ * (CodeQL js/bad-tag-filter, PR #782.)
+ */
+const COMMENT_END = /--!?>/g;
+const COMMENT = /<!--[\s\S]*?--!?>/g;
+
+/**
+ * In einem Durchgang zu entfernen reicht nicht: `<!<!-- x -->-- y -->` setzt
+ * beim Herausschneiden des inneren Kommentars ein neues `<!--` zusammen, das der
+ * erste Lauf nie gesehen hat. Es wird deshalb wiederholt, bis sich nichts mehr
+ * aendert. (CodeQL js/incomplete-multi-character-sanitization, PR #782.)
+ */
+function stripComments(html) {
+  let prev;
+  let out = html;
+  do { prev = out; out = out.replace(COMMENT, ''); } while (out !== prev);
+  return out;
+}
+
+function commentDamage(html) {
+  const stripped = stripComments(html);
+  const strayClose = [...stripped.matchAll(COMMENT_END)].map((m) => ({
+    line: stripped.slice(0, m.index).split('\n').length,
+    context: stripped.slice(Math.max(0, m.index - 60), m.index + 3).replace(/\s+/g, ' ').trim(),
+  }));
+  const unterminated = (stripped.match(/<!--/g) || []).length;
+  return { strayClose, unterminated };
+}
+
+for (const page of PAGES) {
+  test(`${page}: kein Kommentarrest steht als sichtbarer Text im Dokument`, () => {
+    const { strayClose, unterminated } = commentDamage(read(page));
+    assert.equal(
+      strayClose.length, 0,
+      `Kommentar-Ende ausserhalb eines Kommentars (rendert als Text):\n` +
+      strayClose.map((s) => `  Zeile ~${s.line}: …${s.context}`).join('\n')
+    );
+    assert.equal(unterminated, 0, 'nicht geschlossener <!-- Kommentar: verschluckt allen Text bis zum nächsten -->');
+  });
+}
+
+test('der Kommentar-Guard erkennt den Schaden, gegen den er gebaut ist', () => {
+  // Gegenprobe gegen den ECHTEN alten Stand: ein Kommentar, dessen Schlusszeile
+  // abgetrennt wurde, plus der unterminierte Kopf. Die Paar-Bilanz ist hier
+  // ausgeglichen (je ein <!-- und ein -->), der Schaden trotzdem da.
+  const broken = [
+    '</section>',
+    '     with modules the reader has just been introduced to. -->',
+    '<section class="handoff">',
+    '</section>',
+    '<!-- HANDOFFS - the payoff for the feature list above. Each row is one piece',
+    '     of data crossing from the module that produces it to the module that',
+    '<section class="longevity">',
+  ].join('\n');
+
+  assert.equal((broken.match(/<!--/g) || []).length, (broken.match(/--!?>/g) || []).length,
+    'Vorbedingung: die Paar-Bilanz ist ausgeglichen, ein zaehlender Guard waere hier gruen');
+
+  const { strayClose, unterminated } = commentDamage(broken);
+  assert.equal(strayClose.length, 1, 'der abgetrennte Rest muss gefunden werden');
+  assert.match(strayClose[0].context, /introduced to\. -->/);
+  assert.equal(unterminated, 1, 'der unterminierte Kopf muss gefunden werden');
+});
+
+// ── (2) Substitutionstabelle == README ───────────────────────────────────────
+
+/** Die zehn Zeilen aus der README-Tabelle "Instead of juggling… | Yuvomi gives you". */
+function readmeSwapRows() {
+  const readme = readFileSync(resolve(ROOT, 'README.md'), 'utf8');
+  return readme.split('\n')
+    .map((l) => l.match(/^\| (.+?) \| \*\*(.+?)\*\* - (.+?) \|$/))
+    .filter(Boolean)
+    .map((m) => [decode(m[1]).trim(), decode(m[2]).trim(), decode(m[3]).trim()]);
+}
+
+/** Dieselben Zeilen aus dem englischen Wörterbuch von index.html. */
+function pageSwapRows(html) {
+  const en = dictBlock(html, 'en');
+  const rows = [];
+  for (let i = 1; ; i++) {
+    const a = en.match(new RegExp(`\\bswap_${i}_a:'((?:[^'\\\\]|\\\\.)*)'`));
+    const b = en.match(new RegExp(`\\bswap_${i}_b:'<b>(.*?)</b> - ((?:[^'\\\\]|\\\\.)*)'`));
+    if (!a || !b) break;
+    rows.push([decode(a[1]).trim(), decode(b[1]).trim(), decode(b[2]).trim()]);
+  }
+  return rows;
+}
+
+test('die Substitutionszeilen stimmen woertlich mit der README-Tabelle ueberein', () => {
+  const readme = readmeSwapRows();
+  const page = pageSwapRows(read('index.html'));
+
+  assert.ok(readme.length >= 5, `README-Tabelle nicht gefunden oder zu kurz (${readme.length} Zeilen)`);
+  assert.equal(page.length, readme.length,
+    `Die Seite zeigt ${page.length} Zeilen, die README hat ${readme.length}. ` +
+    'Beide sind handgepflegt - wer eine aendert, aendert die andere mit.');
+
+  for (let i = 0; i < readme.length; i++) {
+    assert.deepEqual(page[i], readme[i],
+      `Zeile ${i + 1} weicht ab.\n  README: ${JSON.stringify(readme[i])}\n  Seite : ${JSON.stringify(page[i])}`);
+  }
+});
+
+// ── (3) Modulzahl == was die Seite zeigt ─────────────────────────────────────
+
+test('die Modulzahl der Proof-Leiste ist die Summe aus Feature-Zeilen und Modulkarten', () => {
+  const html = read('index.html');
+  const claimed = Number(html.match(/<b>(\d+)<\/b>\s*<span data-t="proof_modules"/)?.[1]);
+  const featureRows = (html.match(/class="feat-row/g) || []).length;
+  const modCards = (html.match(/class="mod-card/g) || []).length;
+
+  assert.ok(Number.isInteger(claimed), 'Modulzahl in der Proof-Leiste nicht gefunden');
+  assert.equal(featureRows + modCards, claimed,
+    `Die Proof-Leiste behauptet ${claimed} Module, die Seite zeigt ${featureRows} Feature-Zeilen ` +
+    `plus ${modCards} Modulkarten = ${featureRows + modCards}.`);
+});
+
+test('der Absatz ueber dem Modulraster nennt die Zahl der Karten, nicht irgendeine', () => {
+  const html = read('index.html');
+  const modCards = (html.match(/class="mod-card/g) || []).length;
+  const WORDS = {
+    ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16,
+    zehn: 10, elf: 11, zwoelf: 12, zwölf: 12, dreizehn: 13, vierzehn: 14, fuenfzehn: 15, fünfzehn: 15, sechzehn: 16,
+  };
+  for (const lang of ['en', 'de']) {
+    const desc = dictBlock(html, lang).match(/\bmore_desc:'((?:[^'\\]|\\.)*)'/)?.[1];
+    assert.ok(desc, `more_desc fehlt im ${lang}-Woerterbuch`);
+    const hit = Object.entries(WORDS).find(([w]) => new RegExp(`\\b${w}\\b`, 'i').test(desc));
+    assert.ok(hit, `more_desc (${lang}) nennt keine Zahl: "${desc}"`);
+    assert.equal(hit[1], modCards,
+      `more_desc (${lang}) sagt "${hit[0]}" (${hit[1]}), es sind aber ${modCards} Modulkarten.`);
+  }
+});
+
+// ── (4) WebP-Ableitungen je referenzierter Aufnahme ──────────────────────────
+
+/** Sprachordner unter docs/screenshots/ - am Namen erkannt, nicht am Inhalt. */
+function localeDirs() {
+  return ['', ...readdirSync(SHOTS, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && /^[a-z]{2}(-[a-z]{2})?$/.test(e.name))
+    .map((e) => e.name)];
+}
+
+test('jede referenzierte Aufnahme hat beide WebP-Ableitungen in allen Sprachordnern', () => {
+  const bases = new Set();
+  for (const page of PAGES) {
+    for (const m of read(page).matchAll(/(?:src|data-light|data-dark|data-light-m|data-dark-m)="screenshots\/([^"]+\.png)"/g)) {
+      bases.add(m[1]);
+    }
+  }
+  assert.ok(bases.size > 0, 'keine referenzierten Screenshots gefunden - Regex veraltet?');
+
+  const missing = [];
+  for (const base of bases) {
+    for (const dir of localeDirs()) {
+      for (const suffix of ['.webp', '@1x.webp']) {
+        const rel = (dir ? `${dir}/` : '') + base.replace(/\.png$/, suffix);
+        if (!existsSync(resolve(SHOTS, rel))) missing.push(`screenshots/${rel}`);
+      }
+    }
+  }
+  assert.deepEqual(missing, [],
+    'Fehlende WebP-Ableitungen. onerror faengt nur FEHLENDE Dateien ab, der Fallback landet also ' +
+    'still auf dem 5-10x groesseren PNG:\n  ' + missing.join('\n  '));
+});
+
+// ── (5) Woerterbuecher vollstaendig und deckungsgleich ───────────────────────
+
+/**
+ * Schlüssel eines Blocks.
+ *
+ * Verlangt `key:'` oder `key:"` direkt hinter Zeilenanfang, Komma oder Klammer.
+ * Ohne diese Verankerung liest das Muster Wörter INNERHALB von Werten als
+ * Schlüssel (ein Satzteil wie "own: " in einem Fließtext) und meldet dann
+ * Phantom-Einträge.
+ */
+function dictKeys(block) {
+  return new Set([...block.matchAll(/(?:^|[{,]\s*)\s*([a-z][a-z0-9_]*)\s*:\s*['"]/gm)].map((m) => m[1]));
+}
+
+/** Alle über `data-t`/`data-alt-t`/`data-t-aria` verlangten Schlüssel im Markup. */
+function usedKeys(html) {
+  const body = html.split(/\n\s*(?:var |const )?(?:DICT|T)\s*=/)[0];
+  const keys = new Set();
+  for (const attr of ['data-t', 'data-alt-t', 'data-t-aria']) {
+    for (const m of body.matchAll(new RegExp(`${attr}="([^"]+)"`, 'g'))) keys.add(m[1]);
+  }
+  return keys;
+}
+
+/* ---------------------------------------------------------------------------
+ * (7) Die beiden Rechtsseiten sind ein Zwillingspaar.
+ *
+ * `privacy.html` ist die englische Fassung von `datenschutz.html` und als Kopie
+ * entstanden. Eine Kopie erbt das CSS zuverlaessig und das MARKUP nicht: die
+ * englische Seite kam mit den `.toc`-Klassen-losen Zwillingen ihrer eigenen
+ * Regeln auf die Welt, wodurch der gesamte Inhaltsverzeichnis-Block in
+ * `privacy.html:224-234` tot war - Kartenflaeche, Rahmen, Zweispalten-Raster und
+ * `min-height: 44px` auf 13 Links, die daraufhin 18px hoch waren. Die
+ * BEGRUENDUNG des Fixes war mitkopiert und stand als Kommentar ueber totem CSS.
+ *
+ * Geprueft wird auf der Ebene STRUKTUR, nicht Text: gleiche Klassenmenge im
+ * Rumpf und gleiche Kopf-Folge. Beides ist sprachunabhaengig und faengt genau
+ * die Kopier-Luecke, die der Anlass war - ein Textvergleich koennte das
+ * grundsaetzlich nicht, weil die Seiten verschiedene Sprachen sprechen sollen.
+ * ------------------------------------------------------------------------- */
+
+const TWINS = ['datenschutz.html', 'privacy.html'];
+
+/** Alle im Rumpf verwendeten CSS-Klassen (der Kopf traegt die Regeln, nicht die Nutzung). */
+function markupClasses(html) {
+  const body = html.split(/<\/head>/)[1] || html;
+  return new Set([...body.matchAll(/class="([^"]+)"/g)].flatMap((m) => m[1].trim().split(/\s+/)));
+}
+
+/** Die Kopf-Folge in Dokumentreihenfolge, z.B. ['h1','h2','h2','h3']. */
+function headingShape(html) {
+  const body = html.split(/<\/head>/)[1] || html;
+  return [...body.matchAll(/<(h[1-6])\b/g)].map((m) => m[1]);
+}
+
+test('die beiden Rechtsseiten benutzen dieselben Klassen', () => {
+  const [de, en] = TWINS.map((p) => markupClasses(read(p)));
+  assert.ok(de.size > 10, `nur ${de.size} Klassen gefunden - Regex veraltet?`);
+
+  const onlyDe = [...de].filter((c) => !en.has(c)).sort();
+  const onlyEn = [...en].filter((c) => !de.has(c)).sort();
+  assert.deepEqual([onlyDe, onlyEn], [[], []],
+    `Klassen nur auf einer der beiden Rechtsseiten - die Regeln der anderen laufen ins Leere.\n`
+    + `  nur datenschutz.html: ${onlyDe.join(', ') || '-'}\n  nur privacy.html: ${onlyEn.join(', ') || '-'}`);
+});
+
+test('die beiden Rechtsseiten haben dieselbe Abschnittsstruktur', () => {
+  const [de, en] = TWINS.map((p) => headingShape(read(p)));
+  assert.ok(de.length > 5, `nur ${de.length} Ueberschriften gefunden - Regex veraltet?`);
+  assert.deepEqual(en, de,
+    `Kopf-Folge der Rechtsseiten unterschiedlich - eine Fassung fuehrt einen Abschnitt, den die andere nicht hat.\n`
+    + `  datenschutz.html: ${de.join(' ')}\n  privacy.html    : ${en.join(' ')}`);
+});
+
+test('der Zwillings-Guard erkennt den Schaden, gegen den er gebaut ist', () => {
+  // Der Anlassfall: dieselbe Struktur, aber die Klassen fehlen auf einer Seite.
+  const withClasses = '</head><nav class="toc"><p class="toc-title">x</p><ol class="toc-list"></ol></nav>';
+  const without = '</head><nav><h2>x</h2><ol></ol></nav>';
+  const a = markupClasses(withClasses);
+  const b = markupClasses(without);
+  assert.notDeepEqual([...a].sort(), [...b].sort(),
+    'der Klassen-Guard sieht die fehlenden toc-Klassen nicht');
+  assert.notDeepEqual(headingShape(without), headingShape(withClasses),
+    'der Struktur-Guard sieht den zusaetzlichen Kopf nicht');
+});
+
+/* ---------------------------------------------------------------------------
+ * (6) Der Markup-Fallback sagt dasselbe wie der englische Woerterbucheintrag.
+ *
+ * Der Text im Markup ist NICHT nur Platzhalter: er ist das, was ein Besucher
+ * ohne JavaScript zu sehen bekommt - also ausgerechnet der Teil des Publikums,
+ * das eine selbstgehostete, telemetriefreie App sucht. Kopplung (5) prueft, dass
+ * jeder Schluessel EXISTIERT; dass sein Fallback noch dasselbe SAGT, prueft sie
+ * nicht.
+ *
+ * Der Anlass war kein Schoenheitsfehler. v2.15.0 hat drei falsche Zusagen in den
+ * Woerterbuechern korrigiert und das Markup stehen lassen; danach sagte die Seite
+ * mit JavaScript "One update check against the GitHub releases API" und ohne
+ * JavaScript "Nothing until you configure it." Zwei Antworten auf dieselbe Frage,
+ * und die falsche stand fuer den misstrauischsten Leser.
+ *
+ * Verglichen wird der TEXT, nicht das Markup: der Fallback darf sein `<b>` anders
+ * setzen als der Woerterbuchwert. Was er nicht darf, ist etwas anderes behaupten.
+ * ------------------------------------------------------------------------- */
+
+/** Alle `<tag data-t="key">…</tag>`-Paare einer Seite, als [key, Innentext]. */
+function fallbackNodes(html) {
+  const body = html.split(/\n\s*(?:var |const )?(?:DICT|T)\s*=/)[0];
+  return [...body.matchAll(/<(\w+)[^>]*\sdata-t="([\w-]+)"[^>]*>([\s\S]*?)<\/\1>/g)]
+    .map((m) => [m[2], stripTags(m[3])]);
+}
+
+/** Der englische Woerterbuchwert als reiner Text, Escapes und Markup aufgeloest. */
+function englishText(block, key) {
+  const raw = dictValue(block, key);
+  return raw === null ? null : stripTags(unescapeJs(raw));
+}
+
+for (const page of ['index.html', 'install.html']) {
+  test(`${page}: der Markup-Fallback sagt dasselbe wie das englische Woerterbuch`, () => {
+    const html = read(page);
+    const en = dictBlock(html, 'en');
+    assert.ok(en, 'en-Woerterbuch nicht gefunden');
+
+    const nodes = fallbackNodes(html);
+    assert.ok(nodes.length > 20, `nur ${nodes.length} data-t-Knoten gefunden - Regex veraltet?`);
+
+    const drift = [];
+    for (const [key, markup] of nodes) {
+      const dict = englishText(en, key);
+      if (dict === null || markup === dict) continue;
+      drift.push(`${key}\n    Markup: ${markup}\n    T.en  : ${dict}`);
+    }
+    assert.deepEqual(drift, [],
+      `Markup-Fallback und en-Woerterbuch sagen Verschiedenes (ohne JS steht der Markup-Text da):\n  ${drift.join('\n  ')}`);
+  });
+}
+
+test('der Fallback-Guard erkennt den Schaden, gegen den er gebaut ist', () => {
+  // Der Anlassfall im Original-Wortlaut, gegen ein Woerterbuch, das die
+  // korrigierte Fassung fuehrt. Ohne diese Gegenprobe waere ein Guard, dessen
+  // Regex ins Leere greift, gruen und blind.
+  const damaged = [
+    '<p data-t="tb_out_v">Nothing until you configure it.</p>',
+    'const T = {',
+    "  en: {",
+    "tb_out_v:'One update check against the GitHub releases API, nothing else.',",
+    '  },',
+    '  de: {',
+    "tb_out_v:'Eine Update-Abfrage an die GitHub-Releases-API, sonst nichts.',",
+    '  }',
+    '};',
+  ].join('\n');
+
+  const en = dictBlock(damaged, 'en');
+  assert.ok(en, 'Testvorlage: en-Block muss auffindbar sein');
+  const [[key, markup]] = fallbackNodes(damaged);
+  assert.equal(key, 'tb_out_v');
+  assert.notEqual(markup, englishText(en, key),
+    'der Guard sieht den Drift nicht, gegen den er geschrieben wurde');
+});
+
+test('der Fallback-Guard vergleicht Text, nicht Markup', () => {
+  // Gegenrichtung: unterschiedliche Auszeichnung bei gleichem Text ist KEIN
+  // Befund. Ohne diese Zusicherung waere die erste Fassung, die ein <b> im
+  // Woerterbuch anders setzt als im Markup, ein Fehlalarm - und der naechste
+  // Reflex waere, den Guard abzuschwaechen statt ihn zu praezisieren.
+  const same = [
+    '<dd data-t="long_a1"><b>Nothing changes.</b> It is MIT-licensed.</dd>',
+    'const T = {',
+    '  en: {',
+    "long_a1:'<b>Nothing changes.</b> It is MIT-licensed.',",
+    '  },',
+    '  de: {',
+    "long_a1:'<b>Nichts aendert sich.</b> Es ist MIT-lizenziert.',",
+    '  }',
+    '};',
+  ].join('\n');
+
+  const [[key, markup]] = fallbackNodes(same);
+  assert.equal(markup, englishText(dictBlock(same, 'en'), key));
+});
+
+for (const page of ['index.html', 'install.html']) {
+  test(`${page}: jeder benutzte Schluessel steht in beiden Woerterbuechern`, () => {
+    const html = read(page);
+    const used = usedKeys(html);
+    assert.ok(used.size > 20, `nur ${used.size} data-t-Schluessel gefunden - Regex veraltet?`);
+
+    for (const lang of ['en', 'de']) {
+      const block = dictBlock(html, lang);
+      assert.ok(block, `${lang}-Woerterbuch nicht gefunden`);
+      const missing = [...used].filter((k) => !dictKeys(block).has(k)).sort();
+      assert.deepEqual(missing, [],
+        `Schluessel ohne Eintrag im ${lang}-Woerterbuch (rendert stumm den Markup-Fallback): ${missing.join(', ')}`);
+    }
+  });
+}
+
+// ── (6) Jede Sektion schliesst, was sie oeffnet ──────────────────────────────
+
+/**
+ * Kommentare, `<script>` und `<style>` werden MASKIERT statt entfernt: die
+ * Zeilennummern in der Fehlermeldung sollen auf die echte Datei zeigen, und die
+ * Woerterbuecher am Dateiende tragen Markup in Zeichenketten (`<code>`, `<a>`),
+ * das sonst als Struktur mitzaehlte. Ein `</div>` IM Kommentar ueber
+ * `.mod-shots` war genau die Falle, die beim Auffinden dieses Befunds zuerst
+ * einen Fehlalarm erzeugt hat.
+ */
+function maskNonMarkup(html) {
+  const blank = (m) => m.replace(/[^\n]/g, ' ');
+  // Bis zum Fixpunkt: die Maskierung ist idempotent (sie zerstoert ihr eigenes
+  // Muster), aber erst die Schleife belegt das auch fuer verschraenkte Faelle.
+  // Der $-Ersatz danach frisst einen UNTERMINIERTEN Kommentar: den matcht die
+  // COMMENT-Regex nie, und im Browser waere ab dort ohnehin alles Kommentar.
+  // End-Tags duerfen Attribute tragen (</script bar> schliesst) - daher [^>]*.
+  let out = html, prev;
+  do {
+    prev = out;
+    out = out
+      .replace(COMMENT, blank)
+      .replace(/<!--[\s\S]*$/, blank)
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script\b[^>]*>/gi, blank)
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style\b[^>]*>/gi, blank);
+  } while (out !== prev);
+  return out;
+}
+
+const classOf = (tag) => (tag.match(/class="([^"]*)"/) || [])[1] || '(ohne class)';
+
+/**
+ * Prueft je Sektion, ob sie genau die `div`s schliesst, die sie oeffnet.
+ *
+ * Die gemeldete Zeile ist der Punkt, an dem die BILANZ REISST - nicht die
+ * Fehlstelle. Das ist keine Nachlaessigkeit, sondern die Grenze der Methode:
+ * ein ueberzaehliges `</div>` sieht an seiner eigenen Stelle voellig gueltig
+ * aus, es schliesst nur das falsche Element. Beim echten Befund lag zwischen
+ * beidem fast das ganze Modulraster (Fehler Z1119, Riss Z1210).
+ *
+ * Zur Fehlstelle fuehren die `groundings`: die Stellen, an denen die Sektion
+ * auf ihre GRUNDTIEFE zurueckfaellt, also kein div mehr offen hat. Eine
+ * gesunde Sektion tut das genau einmal, mit ihrem letzten Tag. Kommt es
+ * frueher vor, ist genau dort ein `</div>` zu viel - beim echten Befund
+ * schloss Z1119 das `.wrap` von Z1038, waehrend `.feat-grid` noch offen sein
+ * musste. Eine simple Liste der letzten Schliessungen taugt dafuer NICHT: die
+ * Fehlstelle lag 91 Zeilen und zwei Dutzend Modulkarten vor dem Riss.
+ */
+function sectionDivBalance(html) {
+  const masked = maskNonMarkup(html);
+  const lineAt = (i) => masked.slice(0, i).split('\n').length;
+  const sections = [];
+  const divs = [];
+  const problems = [];
+
+  for (const m of masked.matchAll(/<(\/?)(section|div)\b[^>]*>/gi)) {
+    const closing = m[1] === '/';
+    const tag = m[2].toLowerCase();
+    const line = lineAt(m.index);
+
+    if (tag === 'section') {
+      if (closing) {
+        const sec = sections.pop();
+        if (!sec) continue;
+        if (divs.length !== sec.divDepth) {
+          problems.push({
+            kind: 'balance', section: sec.cls, line: sec.line, end: line,
+            delta: divs.length - sec.divDepth, groundings: sec.groundings,
+          });
+          while (divs.length > sec.divDepth) divs.pop();
+        }
+      } else {
+        sections.push({ cls: classOf(m[0]), line, divDepth: divs.length, groundings: [] });
+      }
+      continue;
+    }
+
+    const sec = sections[sections.length - 1];
+    if (!closing) { divs.push({ cls: classOf(m[0]), line }); continue; }
+
+    if (sec && divs.length <= sec.divDepth) {
+      problems.push({ kind: 'underflow', section: sec.cls, line, groundings: sec.groundings });
+      continue;
+    }
+    const opened = divs.pop();
+    // Nur die Rueckfaelle auf die Grundtiefe festhalten - siehe Kopfkommentar.
+    if (sec && opened && divs.length === sec.divDepth) {
+      sec.groundings.push(`Z${line} </div> schliesst .${opened.cls} von Z${opened.line}`);
+    }
+  }
+  return problems;
+}
+
+const describeProblems = (problems) => problems.map((p) => {
+  const head = p.kind === 'underflow'
+    ? `  <section class="${p.section}">: in Z${p.line} schliesst ein </div> ueber die Sektionsgrenze hinaus`
+    : `  <section class="${p.section}"> (Z${p.line}-${p.end}): Bilanz ${p.delta > 0 ? '+' : ''}${p.delta}` +
+      ` (${p.delta > 0 ? `${p.delta} div nicht geschlossen` : `${-p.delta} div zu viel geschlossen`})`;
+  // Der Riss steht oben, die Fehlstelle ist der erste ueberzaehlige Rueckfall.
+  if (p.groundings.length < 2) return head;
+  const list = p.groundings.map((t, i) => `      ${i === 0 ? '-> ' : '   '}${t}`).join('\n');
+  return `${head}\n    die Sektion steht ${p.groundings.length}x ohne offenes div da, gesund waere 1x`
+       + ` - der erste Rueckfall ist die Fehlstelle:\n${list}`;
+}).join('\n');
+
+for (const page of PAGES) {
+  test(`${page}: jede Sektion schliesst genau die divs, die sie oeffnet`, () => {
+    const problems = sectionDivBalance(read(page));
+    assert.equal(
+      problems.length, 0,
+      'Sektion mit unausgeglichener div-Bilanz - alles danach faellt aus seinem Container:\n' +
+      describeProblems(problems)
+    );
+  });
+}
+
+test('der Bilanz-Guard erkennt den Schaden, gegen den er gebaut ist', () => {
+  // Der ECHTE Stand vor dem Fix, verkuerzt: das </div> in Z7 schloss .wrap
+  // statt .feat-grid, .mod-grid stand danach ausserhalb des Containers.
+  const broken = [
+    '<section class="showcase" id="modules">',   // 1
+    '  <div class="wrap">',                      // 2
+    '    <div class="feat-grid">',               // 3
+    '      <div class="feat-row">',              // 4
+    '      </div>',                              // 5
+    '    </div>',                                // 6
+    '    </div>',                                // 7  <- die Fehlstelle
+    '    <div class="mod-grid">',                // 8
+    '    </div>',                                // 9
+    '  </div>',                                  // 10 <- hier reisst die Bilanz
+    '</section>',                                // 11
+  ].join('\n');
+
+  const problems = sectionDivBalance(broken);
+  assert.equal(problems.length, 1, 'der Bruch muss gefunden werden');
+  assert.equal(problems[0].kind, 'underflow');
+  assert.equal(problems[0].section, 'showcase');
+
+  // Der Riss wird dort gemeldet, wo er auffaellt - NICHT an der Fehlstelle.
+  // Diese Zusicherung haelt die Grenze der Methode fest, damit niemand die
+  // gemeldete Zeile fuer den Fehler haelt.
+  assert.equal(problems[0].line, 10, 'gemeldet wird der Riss, nicht die Fehlstelle');
+
+  // Zur Fehlstelle fuehren die Rueckfaelle auf die Grundtiefe: eine gesunde
+  // Sektion hat genau einen, hier sind es zwei, und der ERSTE ist der Fehler.
+  assert.equal(problems[0].groundings.length, 2, 'zwei Rueckfaelle statt einem');
+  assert.equal(problems[0].groundings[0], 'Z7 </div> schliesst .wrap von Z2',
+    `der erste Rueckfall muss die Fehlstelle sein, war:\n${problems[0].groundings.join('\n')}`);
+
+  // Gegenprobe zur Gegenprobe: der reparierte Stand ist still.
+  const fixed = broken.split('\n').filter((_, i) => i !== 6).join('\n');
+  assert.deepEqual(sectionDivBalance(fixed), [], 'ohne das ueberzaehlige Tag meldet der Guard nichts');
+});
+
+test('der Bilanz-Guard zaehlt kein Markup aus Kommentaren, Skripten und Woerterbuechern', () => {
+  // Alle drei Quellen haetten in dieser Datei einen Fehlalarm erzeugt: der
+  // Kommentar ueber .mod-shots ENTHAELT die Zeichenfolge </div>, und die
+  // Woerterbuecher tragen <code>- und <a>-Markup in Zeichenketten.
+  const noise = [
+    '<section class="platforms">',
+    '  <div class="wrap">',
+    '    <!-- The </div> above closes .mod-grid, which was missing. -->',
+    '    <script>var s = "<div class=\\"x\\">";</script>',
+    '    <style>.x::after { content: "</div>"; }</style>',
+    '  </div>',
+    '</section>',
+  ].join('\n');
+
+  assert.deepEqual(sectionDivBalance(noise), [], 'nur echtes Struktur-Markup zaehlt');
+});
+
+// ── (7) Eine Rechtsseite nennt ihren Stand nur EINMAL ────────────────────────
+
+/**
+ * `datenschutz.html` trug den Stand an zwei Stellen: im Untertitel oben
+ * (16.08.2026) und in Abschnitt 14 unten (09.06.2026). Zwei Monate
+ * Unterschied, in einem Dokument, dessen einziger Zweck Verbindlichkeit ist.
+ * Das englische Gegenstueck war an beiden Stellen konsistent - die deutsche
+ * Fassung widersprach also nur sich selbst, und keiner der bestehenden
+ * Zwillings-Guards konnte das sehen: sie vergleichen Klassen und
+ * Abschnittsstruktur, nicht Inhalte.
+ *
+ * Geprueft wird je Seite gegen sich selbst, nicht Seite gegen Seite: die
+ * Rechtstexte duerfen unterschiedliche Staende haben (das Impressum ist ein
+ * eigenes Dokument), eine einzelne Seite darf sich nur nicht widersprechen.
+ */
+const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june',
+  'july', 'august', 'september', 'october', 'november', 'december'];
+
+const D_NUM = String.raw`(\d{1,2})\.(\d{1,2})\.(\d{4})`;
+const D_WORD = String.raw`(\d{1,2})\s+(${MONTHS.join('|')})\s+(\d{4})`;
+
+/**
+ * Nur Daten zaehlen, die einen STAND nennen. Ein Rechtstext ist voller anderer
+ * Daten - `datenschutz.html` nennt den Angemessenheitsbeschluss vom 10.07.2023,
+ * und der ist ein Sachdatum, kein Stand. Die erste Fassung dieses Guards hat
+ * genau daran auf beiden Seiten falsch angeschlagen.
+ *
+ * `\bStand\b` steht bewusst als ganzes Wort: "Standardvertragsklauseln"
+ * enthaelt denselben Stamm und stand im selben Absatz wie das Sachdatum.
+ */
+function statedDates(html) {
+  const text = stripComments(html).replace(/<[^>]+>/g, ' ');
+  const found = new Map(); // ISO -> Originalschreibweise
+  const anchor = String.raw`(?:\bStand\b|last updated)[\s\S]{0,45}?`;
+
+  for (const m of text.matchAll(new RegExp(anchor + D_NUM, 'gi'))) {
+    found.set(`${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`, `${m[1]}.${m[2]}.${m[3]}`);
+  }
+  for (const m of text.matchAll(new RegExp(anchor + D_WORD, 'gi'))) {
+    const month = String(MONTHS.indexOf(m[2].toLowerCase()) + 1).padStart(2, '0');
+    found.set(`${m[3]}-${month}-${m[1].padStart(2, '0')}`, `${m[1]} ${m[2]} ${m[3]}`);
+  }
+  return found;
+}
+
+for (const page of ['datenschutz.html', 'privacy.html', 'impressum.html']) {
+  test(`${page}: nennt genau einen Stand`, () => {
+    const dates = statedDates(read(page));
+    assert.ok(dates.size > 0, 'die Seite muss einen Stand nennen');
+    assert.equal(
+      dates.size, 1,
+      `widersprechende Standsangaben in einem Dokument:\n` +
+      [...dates].map(([iso, raw]) => `  ${iso}  ("${raw}")`).join('\n')
+    );
+  });
+}
+
+test('der Stands-Guard erkennt den Schaden, gegen den er gebaut ist', () => {
+  // Der ECHTE Stand vor dem Fix, beide Schreibweisen gemischt.
+  const de = '<p class="subtitle">Stand: 16.08.2026</p><p>Diese Erklaerung hat den Stand vom <strong>09.06.2026</strong>.</p>';
+  const found = statedDates(de);
+  assert.equal(found.size, 2, 'der Widerspruch muss gefunden werden');
+  assert.deepEqual([...found.keys()].sort(), ['2026-06-09', '2026-08-16']);
+
+  // Beide Schreibweisen zaehlen als DASSELBE Datum, sonst schluege der Guard
+  // auf jeder englischen Seite grundlos an.
+  assert.equal(statedDates('<p>Stand: 16.08.2026</p><p>Last updated: 16 August 2026</p>').size, 1);
+
+  // Und ein Sachdatum ohne "Stand" davor bleibt aussen vor - das ist der Fall,
+  // an dem die erste Fassung dieses Guards falsch angeschlagen hat.
+  assert.equal(statedDates(
+    '<p>Stand: 16.08.2026</p><p>Angemessenheitsbeschluss der EU-Kommission vom 10.07.2023, '
+    + 'ergaenzt durch Standardvertragsklauseln nach Art. 46 DSGVO.</p>').size, 1);
+
+  // Und der reparierte Stand ist still.
+  assert.equal(statedDates(de.replace('09.06.2026', '16.08.2026')).size, 1);
+});
+
+// ── (8) Die Kapitelmarken bleiben in der Minderheit ──────────────────────────
+
+/**
+ * `docs/index.html` fuehrt zwei Sorten Sektionskopf, und die Regel steht dort
+ * ausformuliert im CSS: `.sec-head.lead` ist eine KAPITELMARKE (linksbuendig,
+ * unter einem Eyebrow, groesser gesetzt), `.sec-head.center` gehoert zum
+ * Kapitel darueber. Der Quelltext haelt ausdruecklich fest, dass die Zahl der
+ * Kapitelmarken nicht weiter wachsen darf: "ab der Haelfte ist die
+ * Unterscheidung wieder eine Liste."
+ *
+ * Genau diese Regel hat eine Design-Critique am 2026-08-20 als "Koepfe mal
+ * links, mal zentriert ohne erkennbares Kriterium" gemeldet und vorgeschlagen,
+ * alle Koepfe linksbuendig zu stellen - also den einen Schritt zu tun, vor dem
+ * der Kommentar warnt. Eine Regel, die nur als Prosa im Stylesheet steht, ist
+ * gegen so einen Vorschlag wehrlos; sie steht deshalb jetzt auch hier.
+ */
+function sectionHeads(html) {
+  const body = stripComments(html);
+  return [...body.matchAll(/<div class="sec-head([^"]*)"[^>]*>([\s\S]{0,400}?)<\/div>/g)].map((m) => ({
+    lead: /\blead\b/.test(m[1]),
+    centered: /\bcenter\b/.test(m[1]),
+    eyebrow: /class="eyebrow"/.test(m[2]),
+  }));
+}
+
+/**
+ * Gezaehlt werden SEKTIONEN, nicht Sektionskoepfe - das ist die Grundmenge, die
+ * der Kommentar im Stylesheet nennt ("vier von acht"). Zwei Flaechen tragen
+ * keinen `.sec-head` (der Hero und die CTA-Box) und wuerden als Nenner fehlen:
+ * gegen die Koepfe gerechnet stuenden dieselben vier Kapitelmarken bei 4 von 6
+ * und der Guard schluege auf dem gesunden Stand an. Der Hero zaehlt mit, er ist
+ * eine Flaeche der Seite wie die anderen.
+ */
+function sectionCount(html) {
+  const body = stripComments(html);
+  return (body.match(/<section\b/g) || []).length + (body.match(/<header class="hero"/g) || []).length;
+}
+
+test('index.html: Kapitelmarken bleiben hoechstens die Haelfte der Sektionen', () => {
+  const html = read('index.html');
+  const heads = sectionHeads(html);
+  const sections = sectionCount(html);
+  assert.ok(heads.length >= 6, `zu wenige Sektionskoepfe gefunden (${heads.length}) - Extraktor gebrochen?`);
+  assert.ok(sections >= 7, `zu wenige Sektionen gefunden (${sections}) - Extraktor gebrochen?`);
+  const lead = heads.filter((h) => h.lead).length;
+  assert.ok(
+    lead * 2 <= sections,
+    `${lead} von ${sections} Sektionen sind Kapitelmarken. Ab der Haelfte ist die `
+    + `Unterscheidung wieder eine Liste - siehe die Begruendung an .sec-head.lead.`
+  );
+});
+
+test('index.html: der Eyebrow markiert die Kapitelmarke, nicht die Folgesektion', () => {
+  const heads = sectionHeads(read('index.html'));
+  const leadOhne = heads.filter((h) => h.lead && !h.eyebrow).length;
+  const centerMit = heads.filter((h) => h.centered && h.eyebrow).length;
+  assert.equal(leadOhne, 0, 'eine Kapitelmarke ohne Eyebrow: der Leser sieht keinen Kapitelanfang');
+  assert.equal(centerMit, 0, 'eine zentrierte Folgesektion mit Eyebrow: sie gibt sich als Kapitel aus');
+});
+
+test('der Kapitelmarken-Guard erkennt den Schaden, gegen den er gebaut ist', () => {
+  // Genau der Vorschlag aus der Critique vom 2026-08-20: alle Koepfe linksbuendig.
+  const kopf = '<div class="sec-head lead"><span class="eyebrow">A</span></div>';
+  const alleLead = ('<section>' + kopf + '</section>').repeat(6);
+  assert.equal(sectionHeads(alleLead).filter((h) => h.lead).length, 6, 'Vorbedingung: sechs Kapitelmarken');
+  assert.ok(6 * 2 > sectionCount(alleLead), 'der Guard muss hier anschlagen');
+
+  // Der echte Stand ist still - und zwar KNAPP: vier von acht ist der Hoechststand,
+  // den der Kommentar erlaubt. Eine fuenfte Kapitelmarke laesst diesen Test fallen,
+  // und das ist die Absicht.
+  const html = read('index.html');
+  const lead = sectionHeads(html).filter((h) => h.lead).length;
+  assert.equal(lead * 2, sectionCount(html), 'der Stand liegt exakt auf der erlaubten Grenze');
+});
+
+// ── (7) Ein Telefonrahmen hat die Proportion eines Telefons ──────────────────
+/**
+ * Zwei Fragen, die zusammen erst die Kopplung halten:
+ *
+ * a) Steht das Verhaeltnis an EINER Stelle? Ein Literal in einer Regel ist die
+ *    Bauart, an der es schon einmal auseinandergelaufen ist - dieselbe Drift,
+ *    die die Geraete-Radien in `site.css` schon hinter `--r-phone` gezwungen
+ *    hat, nur eine Ebene groeber. Der Guard fragt nicht nach den beiden
+ *    bekannten Klassennamen, sondern nach der REGEL: ein hochkant stehendes
+ *    `aspect-ratio` auf diesen Seiten beschreibt immer einen Handyrahmen, also
+ *    laeuft es ueber `var(--ar-phone)`. Querformat (die 4/3-Desktopaufnahme)
+ *    bleibt erlaubt - sie ist kein Geraeterahmen.
+ *
+ * b) Misst dieser Name noch die Wirklichkeit? Ein sauber getokenter falscher
+ *    Wert waere derselbe Fehler mit besserer Buchhaltung. Die 124 Mobil-PNGs
+ *    unter `docs/screenshots/` sind die Quelle, und sie sind alle gleich gross;
+ *    wer sie in einer anderen Geraetegroesse neu aufnimmt, faellt hier auf.
+ */
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function pngSize(file) {
+  const buf = readFileSync(file);
+  assert.ok(buf.subarray(0, 8).equals(PNG_SIG), `${file} ist kein PNG`);
+  return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+}
+
+function mobileShotFiles() {
+  const files = [];
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = resolve(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith('-mobile.png')) files.push(full);
+    }
+  };
+  walk(SHOTS);
+  return files;
+}
+
+/** Alle Stylesheet-Quellen der Doku-Seiten: die `<style>`-Bloecke plus site.css. */
+function docsStylesheets() {
+  const sheets = [{ where: 'assets/site.css', css: read('assets/site.css') }];
+  for (const page of PAGES) {
+    const html = read(page);
+    const blocks = html.match(/<style\b[^>]*>[\s\S]*?<\/style>/gi) || [];
+    blocks.forEach((block, i) => {
+      sheets.push({ where: `${page} <style> #${i + 1}`, css: block.replace(/^<style\b[^>]*>/i, '').replace(/<\/style>$/i, '') });
+    });
+  }
+  return sheets;
+}
+
+/**
+ * Liefert jedes `aspect-ratio`, das als LITERAL geschrieben ist und hochkant
+ * steht. `var(...)` zaehlt nicht - genau darauf soll es ja laufen.
+ */
+function portraitRatioLiterals(sheets) {
+  const found = [];
+  for (const { where, css } of sheets) {
+    for (const rule of eachRule(css)) {
+      for (const decl of rule.body.split(';')) {
+        const m = decl.match(/(^|[^-\w])aspect-ratio\s*:\s*([^;]+)$/);
+        if (!m) continue;
+        const value = m[2].trim().replace(/\s*!important$/, '');
+        if (value.includes('var(')) continue;
+        const parts = value.split('/').map((n) => Number(n.trim()));
+        if (parts.length !== 2 || !parts.every((n) => Number.isFinite(n) && n > 0)) continue;
+        if (parts[0] >= parts[1]) continue;
+        found.push({ where, selector: rule.selector, value });
+      }
+    }
+  }
+  return found;
+}
+
+function tokenRatio() {
+  const css = read('assets/site.css');
+  const m = css.match(/--ar-phone\s*:\s*([^;]+);/);
+  assert.ok(m, '--ar-phone fehlt in docs/assets/site.css - die vier Handyrahmen haetten wieder keine gemeinsame Quelle');
+  const parts = m[1].split('/').map((n) => Number(n.trim()));
+  assert.equal(parts.length, 2, `--ar-phone muss ein Verhaeltnis "b / h" sein, war: ${m[1].trim()}`);
+  return { w: parts[0], h: parts[1] };
+}
+
+test('docs: kein Handy-Seitenverhaeltnis steht als Literal in einer Regel', () => {
+  const found = portraitRatioLiterals(docsStylesheets());
+  assert.deepEqual(
+    found, [],
+    'hochkantes aspect-ratio als Literal - das ist die Bauart, an der .feat-phone (1320/1780) und '
+    + '.mod-shot img (1320/1900) vom echten Mass weggelaufen sind. Es gehoert auf var(--ar-phone):\n'
+    + found.map((f) => `  ${f.where}: ${f.selector} { aspect-ratio: ${f.value} }`).join('\n')
+  );
+});
+
+test('docs: --ar-phone misst die Aufnahmen, die es rahmt', () => {
+  const token = tokenRatio();
+  const files = mobileShotFiles();
+  assert.ok(files.length > 0, 'keine -mobile.png gefunden - der Guard haette nichts zu vergleichen');
+
+  const sizes = new Map();
+  for (const file of files) {
+    const { w, h } = pngSize(file);
+    const key = `${w}x${h}`;
+    if (!sizes.has(key)) sizes.set(key, []);
+    sizes.get(key).push(file.slice(SHOTS.length + 1));
+  }
+
+  assert.equal(
+    sizes.size, 1,
+    'die Handyaufnahmen haben nicht mehr alle dasselbe Mass, ein Token kann sie also nicht mehr '
+    + 'gemeinsam rahmen:\n'
+    + [...sizes].map(([k, v]) => `  ${k}: ${v.length}x, z.B. ${v[0]}`).join('\n')
+  );
+
+  const [w, h] = [...sizes.keys()][0].split('x').map(Number);
+  assert.deepEqual(
+    { w: token.w, h: token.h }, { w, h },
+    `--ar-phone steht auf ${token.w} / ${token.h}, die ${files.length} Aufnahmen sind aber ${w}x${h}. `
+    + 'Ein getokenter falscher Wert ist derselbe Fehler mit besserer Buchhaltung.'
+  );
+});
+
+test('der Ratio-Guard erkennt den Schaden, gegen den er gebaut ist', () => {
+  // Der ECHTE Stand vor dem Fix, beide Fundstellen woertlich.
+  const kaputt = [{
+    where: 'test',
+    css: '.feat-phone { display: block; width: 100%; aspect-ratio: 1320 / 1780; object-fit: cover; }\n'
+      + '@media (max-width: 700px) { .mod-shot img { width: 100%; aspect-ratio: 1320 / 1900; } }',
+  }];
+  const treffer = portraitRatioLiterals(kaputt);
+  assert.equal(treffer.length, 2, 'beide Fundstellen muessen anschlagen - auch die im @media-Block');
+  assert.deepEqual(treffer.map((f) => f.value), ['1320 / 1780', '1320 / 1900']);
+
+  // Gegenprobe zur Gegenprobe: der reparierte Stand ist still - und das echte
+  // Mass als Literal waere es NICHT. Ein Name, nicht ein richtiger Wert.
+  const repariert = [{ where: 'test', css: kaputt[0].css.replace(/1320 \/ (?:1780|1900)/g, 'var(--ar-phone)') }];
+  assert.deepEqual(portraitRatioLiterals(repariert), [], 'ueber den Token gefuehrt meldet der Guard nichts');
+  assert.equal(
+    portraitRatioLiterals([{ where: 'test', css: '.x { aspect-ratio: 1320 / 2867; }' }]).length, 1,
+    'auch das RICHTIGE Verhaeltnis als Literal ist ein Treffer'
+  );
+
+  // Und Querformat bleibt erlaubt: die Desktopaufnahme ist kein Geraeterahmen.
+  assert.deepEqual(
+    portraitRatioLiterals([{ where: 'test', css: '.gal-frame img { aspect-ratio: 4 / 3; }' }]), [],
+    '4/3 ist die Desktopaufnahme und darf als Literal stehen'
+  );
+});

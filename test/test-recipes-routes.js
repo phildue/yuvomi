@@ -23,7 +23,7 @@ const { default: recipesRouter } = await import('../server/routes/recipes.js');
 // ihn läuft (POST /shopping/items/undo-transfer) - ohne ihn wäre nur die halbe
 // Handlung getestet.
 const { default: shoppingRouter } = await import('../server/routes/shopping.js');
-const mealieSync = await import('../server/services/mealie-sync.js');
+const recipeProviders = await import('../server/services/recipe-providers/index.js');
 const db = dbmod.get();
 
 const OWNER = db.prepare(`INSERT INTO users (username, display_name, avatar_color, password_hash, role) VALUES ('owner','Owner','#112233','x','member')`).run().lastInsertRowid;
@@ -41,7 +41,7 @@ app.use((req, _res, next) => {
 });
 app.use('/shopping', shoppingRouter);
 app.use('/', recipesRouter);
-const server = app.listen(0);
+const server = app.listen(0, '127.0.0.1');
 const baseUrl = await new Promise((r) => server.on('listening', () => r(`http://127.0.0.1:${server.address().port}`)));
 test.after(() => server.close());
 
@@ -97,6 +97,7 @@ test('POST /: meal_types werden dedupliziert und Ungültiges verworfen', async (
   const row = db.prepare('SELECT meal_types FROM recipes WHERE id = ?').get(r.body.data.id);
   assert.equal(row.meal_types, 'lunch,dinner');
 });
+
 
 test('POST /: Zutaten-Regeln - leerer Name übersprungen, quantity leer→null, category-Default, Slicing', async () => {
   const longName = 'N'.repeat(250);
@@ -366,129 +367,258 @@ test('POST /:id/to-shopping-list: added_ids erlauben ein exaktes Zuruecknehmen',
 });
 
 // --------------------------------------------------------------------------
-// Mealie-Mirror: source-Feld, PUT/DELETE-Gate für gespiegelte Rezepte
+// Recipe-Provider-Mirror: source-Feld, PUT/DELETE-Gate für gespiegelte Rezepte,
+// GET /:id/provider-thumbnail. Läuft einmal je unterstütztem Provider (mealie,
+// tandoor), um zu belegen, dass der generalisierte Code-Pfad nicht heimlich
+// noch Mealie-spezifisch ist.
 // --------------------------------------------------------------------------
 
-// Ein Account reicht für alle Tests (base_url ist UNIQUE); jedes Rezept
-// braucht nur eine eigene mealie_recipe_id, um den Partial-Unique-Index
-// (mealie_account_id, mealie_recipe_id) nicht zu verletzen.
-const MEALIE_ACCOUNT_ID = db.prepare(`
-  INSERT INTO mealie_accounts (name, base_url, api_token, created_by) VALUES ('Testkonto', 'https://mealie.example.com', 'tok', ?)
-`).run(OWNER).lastInsertRowid;
+// Ein Account je Provider reicht für alle Tests (base_url ist UNIQUE); jedes
+// Rezept braucht nur eine eigene provider_recipe_id, um den Partial-Unique-Index
+// (provider_account_id, provider_recipe_id) nicht zu verletzen.
+const PROVIDER_ACCOUNTS = {
+  mealie: {
+    name: 'Testkonto',
+    id: db.prepare(`
+      INSERT INTO recipe_provider_accounts (name, base_url, api_token, provider, created_by) VALUES ('Testkonto', 'https://mealie.example.com', 'tok', 'mealie', ?)
+    `).run(OWNER).lastInsertRowid,
+  },
+  tandoor: {
+    name: 'Tandoor-Testkonto',
+    id: db.prepare(`
+      INSERT INTO recipe_provider_accounts (name, base_url, api_token, provider, created_by) VALUES ('Tandoor-Testkonto', 'https://tandoor.example.com', 'tok', 'tandoor', ?)
+    `).run(OWNER).lastInsertRowid,
+  },
+};
 
-function mirroredRecipe(title, mealieRecipeId) {
+function mirroredRecipe(title, providerRecipeId, provider = 'mealie') {
+  const accountId = PROVIDER_ACCOUNTS[provider].id;
   const recipeId = db.prepare(`
-    INSERT INTO recipes (title, created_by, mealie_account_id, mealie_recipe_id) VALUES (?, ?, ?, ?)
-  `).run(title, OWNER, MEALIE_ACCOUNT_ID, mealieRecipeId).lastInsertRowid;
-  return { accountId: MEALIE_ACCOUNT_ID, recipeId };
+    INSERT INTO recipes (title, created_by, provider_account_id, provider_recipe_id) VALUES (?, ?, ?, ?)
+  `).run(title, OWNER, accountId, providerRecipeId).lastInsertRowid;
+  return { accountId, recipeId, provider };
 }
 
-test('GET /: native Rezept trägt source "native", gespiegeltes trägt "mealie" + Account-Name', async () => {
-  const native = await call('POST', '/', { title: 'Eigenes Rezept' });
-  const { recipeId } = mirroredRecipe('Mealie-Rezept', 'mirror-source-test');
+test.after(() => recipeProviders._setAdapterFactory(null));
 
+test('GET /:id/provider-thumbnail: natives Rezept → 404', async () => {
+  const native = await call('POST', '/', { title: 'Kein Provider' });
+  const r = await call('GET', `/${native.body.data.id}/provider-thumbnail`);
+  assert.equal(r.status, 404);
+});
+
+function registerMirrorTests(provider) {
+  const { name: accountName, id: accountId } = PROVIDER_ACCOUNTS[provider];
+
+  test(`GET /: native Rezept trägt source "native", gespiegeltes trägt "${provider}" + Account-Name`, async () => {
+    const native = await call('POST', '/', { title: 'Eigenes Rezept' });
+    const { recipeId } = mirroredRecipe(`${provider}-Rezept`, `mirror-source-test-${provider}`, provider);
+
+    const r = await call('GET', '/');
+    const nativeRow = r.body.data.find((x) => x.id === native.body.data.id);
+    const mirroredRow = r.body.data.find((x) => x.id === recipeId);
+
+    assert.equal(nativeRow.source, 'native');
+    assert.equal(mirroredRow.source, provider);
+    assert.equal(mirroredRow.provider_account_name, accountName);
+  });
+
+  test(`PUT /:id: gespiegeltes Rezept (${provider}) → 403, auch für den Nutzer, der den Account angelegt hat`, async () => {
+    const { recipeId } = mirroredRecipe('Unveränderlich', `mirror-put-test-${provider}`, provider);
+    // OWNER ist zugleich created_by dieses Mirror-Rezepts (via recipe_provider_accounts.created_by) -
+    // der bloße created_by-Vergleich würde das durchlassen; das provider_account_id-Gate muss davor greifen.
+    const r = await call('PUT', `/${recipeId}`, { title: 'Gehackt' });
+    assert.equal(r.status, 403);
+    const row = db.prepare('SELECT title FROM recipes WHERE id = ?').get(recipeId);
+    assert.equal(row.title, 'Unveränderlich');
+  });
+
+  test(`DELETE /:id: gespiegeltes Rezept (${provider}) → 403`, async () => {
+    const { recipeId } = mirroredRecipe('Unlöschbar', `mirror-delete-test-${provider}`, provider);
+    const r = await call('DELETE', `/${recipeId}`);
+    assert.equal(r.status, 403);
+    assert.ok(db.prepare('SELECT id FROM recipes WHERE id = ?').get(recipeId));
+  });
+
+  test(`POST /:id/to-shopping-list: funktioniert unverändert für gespiegelte Rezepte (${provider})`, async () => {
+    const listId = newList(`Transfer ${provider}`);
+    const { recipeId } = mirroredRecipe(`${provider}-Transfer`, `mirror-shopping-test-${provider}`, provider);
+    db.prepare(`INSERT INTO recipe_ingredients (recipe_id, name, quantity, category) VALUES (?, 'Reis', '1 kg', 'Sonstiges')`).run(recipeId);
+
+    const r = await call('POST', `/${recipeId}/to-shopping-list`, { listId });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.data.transferred, 1);
+    assert.equal(r.body.data.added_ids.length, 1);
+  });
+
+  test(`GET /:id/provider-thumbnail: gespiegelt (${provider}), aber provider_has_image=0 → 404, Adapter wird nicht aufgerufen`, async () => {
+    const recipeId = db.prepare(`
+      INSERT INTO recipes (title, created_by, provider_account_id, provider_recipe_id, provider_has_image) VALUES (?, ?, ?, ?, 0)
+    `).run('Ohne Bild', OWNER, accountId, `thumb-none-${provider}`).lastInsertRowid;
+    recipeProviders._setAdapterFactory(() => ({
+      fetchThumbnail: async () => { throw new Error('sollte nicht aufgerufen werden'); },
+    }));
+    const r = await call('GET', `/${recipeId}/provider-thumbnail`);
+    recipeProviders._setAdapterFactory(null);
+    assert.equal(r.status, 404);
+  });
+
+  test(`GET /:id/provider-thumbnail: proxied Bytes und Content-Type vom Fake-Adapter (${provider})`, async () => {
+    const recipeId = db.prepare(`
+      INSERT INTO recipes (title, created_by, provider_account_id, provider_recipe_id, provider_slug, provider_has_image) VALUES (?, ?, ?, ?, ?, 1)
+    `).run('Mit Bild', OWNER, accountId, `thumb-yes-${provider}`, `slug-yes-${provider}`).lastInsertRowid;
+
+    const png1x1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+    recipeProviders._setAdapterFactory(() => ({
+      fetchThumbnail: async ({ id, slug }) => {
+        assert.equal(id, `thumb-yes-${provider}`);
+        assert.equal(slug, `slug-yes-${provider}`);
+        return { buffer: png1x1, mime: 'image/png' };
+      },
+    }));
+
+    const res = await fetch(`${baseUrl}/${recipeId}/provider-thumbnail`);
+    recipeProviders._setAdapterFactory(null);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'image/png');
+    const buf = Buffer.from(await res.arrayBuffer());
+    assert.equal(buf.length, png1x1.length);
+  });
+
+  test(`GET /:id/provider-thumbnail: Bild seit letztem Sync beim Provider gelöscht (404 vom Adapter, ${provider}) → 404 statt 500`, async () => {
+    const recipeId = db.prepare(`
+      INSERT INTO recipes (title, created_by, provider_account_id, provider_recipe_id, provider_has_image) VALUES (?, ?, ?, ?, 1)
+    `).run('Geloescht', OWNER, accountId, `thumb-gone-${provider}`).lastInsertRowid;
+    recipeProviders._setAdapterFactory(() => ({
+      fetchThumbnail: async () => { const err = new Error('Thumbnail request failed (404)'); err.status = 404; throw err; },
+    }));
+    const r = await call('GET', `/${recipeId}/provider-thumbnail`);
+    recipeProviders._setAdapterFactory(null);
+    assert.equal(r.status, 404);
+  });
+
+  test(`GET /:id/provider-thumbnail: nicht in der MIME-Allowlist (z. B. SVG, ${provider}) → 415`, async () => {
+    const recipeId = db.prepare(`
+      INSERT INTO recipes (title, created_by, provider_account_id, provider_recipe_id, provider_has_image) VALUES (?, ?, ?, ?, 1)
+    `).run('SVG', OWNER, accountId, `thumb-svg-${provider}`).lastInsertRowid;
+    recipeProviders._setAdapterFactory(() => ({
+      fetchThumbnail: async () => ({ buffer: Buffer.from('<svg/>'), mime: 'image/svg+xml' }),
+    }));
+    const r = await call('GET', `/${recipeId}/provider-thumbnail`);
+    recipeProviders._setAdapterFactory(null);
+    assert.equal(r.status, 415);
+  });
+}
+
+registerMirrorTests('mealie');
+registerMirrorTests('tandoor');
+
+// --------------------------------------------------------------------------
+// #750: Eine leere Auswahl ist eine Antwort, keine Lücke. Vorher machte die
+// Normalisierung daraus stillschweigend alle vier Mahlzeiten - sichtbar erst,
+// wenn der Nutzer das Rezept wieder zum Bearbeiten öffnete.
+// --------------------------------------------------------------------------
+
+test('POST /: eine leere meal_types-Liste bleibt leer (#750)', async () => {
+  const r = await call('POST', '/', { title: 'Grundbrühe', meal_types: [] });
+  assert.equal(r.status, 201);
+  assert.deepEqual(r.body.data.meal_types, [], 'die Abwahl darf nicht in alle vier umschlagen');
+  const row = db.prepare('SELECT meal_types FROM recipes WHERE id = ?').get(r.body.data.id);
+  assert.equal(row.meal_types, '', 'in der Spalte steht der leere Wert, nicht die volle Liste');
+});
+
+test('PUT /:id: die leere Auswahl übersteht das erneute Öffnen (#750)', async () => {
+  // Der gemeldete Ablauf: anlegen, alle Haken entfernen, speichern, wieder
+  // öffnen. Genau hier standen vorher wieder alle vier Haken.
+  const created = await call('POST', '/', { title: 'Fond', meal_types: ['dinner'] });
+  const id = created.body.data.id;
+
+  const cleared = await call('PUT', `/${id}`, { title: 'Fond', meal_types: [] });
+  assert.equal(cleared.status, 200);
+  assert.deepEqual(cleared.body.data.meal_types, []);
+
+  // Das Formular befüllt sich aus der Liste (ein GET /:id gibt es nicht), also
+  // muss der leere Stand genau dort ankommen - das war die Stelle, an der
+  // vorher wieder alle vier Haken standen.
+  const list = await call('GET', '/');
+  const reopened = list.body.data.find((x) => x.id === id);
+  assert.deepEqual(reopened.meal_types, []);
+});
+
+test('PUT /:id: ein Teil-Update ohne meal_types lässt die Auswahl stehen (#750)', async () => {
+  // Sonst nähme jeder Aufruf, der das Feld nicht mitschickt, die bewusst leere
+  // Auswahl wieder mit - die Nachbar-Falle des eigentlichen Fehlers.
+  const created = await call('POST', '/', { title: 'Sud', meal_types: [] });
+  const id = created.body.data.id;
+
+  const renamed = await call('PUT', `/${id}`, { title: 'Sud, verfeinert' });
+  assert.equal(renamed.status, 200);
+  assert.deepEqual(renamed.body.data.meal_types, []);
+
+  const kept = db.prepare('SELECT title, meal_types FROM recipes WHERE id = ?').get(id);
+  assert.equal(kept.title, 'Sud, verfeinert');
+  assert.equal(kept.meal_types, '');
+});
+
+// --------------------------------------------------------
+// Eigenes Rezeptbild (#1059, Schritt 2)
+// --------------------------------------------------------
+
+const PNG_1X1 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+
+test('POST /recipes: ein eigenes Bild wird gespeichert, aber nie mitgeliefert', async () => {
+  const r = await call('POST', '/', { title: 'Mit Bild', image_data: PNG_1X1 });
+  assert.equal(r.status, 201);
+  // DIE DATEN SELBST GEHEN NIE MIT: eine Data-URL von bis zu 5 MB in jeder
+  // Listenzeile waere ein Vielfaches der Antwort, fuer eine 32px-Vorschau.
+  assert.equal(r.body.data.image_data, undefined, 'image_data darf nicht in der Antwort stehen');
+  assert.equal(r.body.data.has_own_image, true, 'das Flag sagt, dass es eins gibt');
+});
+
+test('GET /recipes: die Liste traegt das Flag, nicht das Bild', async () => {
   const r = await call('GET', '/');
-  const nativeRow = r.body.data.find((x) => x.id === native.body.data.id);
-  const mirroredRow = r.body.data.find((x) => x.id === recipeId);
-
-  assert.equal(nativeRow.source, 'native');
-  assert.equal(mirroredRow.source, 'mealie');
-  assert.equal(mirroredRow.mealie_account_name, 'Testkonto');
+  const mitBild = r.body.data.find((x) => x.title === 'Mit Bild');
+  assert.ok(mitBild, 'das Rezept muss in der Liste stehen');
+  assert.equal(mitBild.image_data, undefined);
+  assert.equal(mitBild.has_own_image, true);
 });
 
-test('PUT /:id: gespiegeltes Rezept → 403, auch für den Nutzer, der den Mealie-Account angelegt hat', async () => {
-  const { recipeId } = mirroredRecipe('Unveränderlich', 'mirror-put-test');
-  // OWNER ist zugleich created_by dieses Mirror-Rezepts (via mealie_accounts.created_by) -
-  // der bloße created_by-Vergleich würde das durchlassen; das mealie_account_id-Gate muss davor greifen.
-  const r = await call('PUT', `/${recipeId}`, { title: 'Gehackt' });
-  assert.equal(r.status, 403);
-  const row = db.prepare('SELECT title FROM recipes WHERE id = ?').get(recipeId);
-  assert.equal(row.title, 'Unveränderlich');
-});
-
-test('DELETE /:id: gespiegeltes Rezept → 403', async () => {
-  const { recipeId } = mirroredRecipe('Unlöschbar', 'mirror-delete-test');
-  const r = await call('DELETE', `/${recipeId}`);
-  assert.equal(r.status, 403);
-  assert.ok(db.prepare('SELECT id FROM recipes WHERE id = ?').get(recipeId));
-});
-
-test('POST /:id/to-shopping-list: funktioniert unverändert für gespiegelte Rezepte', async () => {
-  const listId = newList('Transfer Mealie');
-  const { recipeId } = mirroredRecipe('Mealie-Transfer', 'mirror-shopping-test');
-  db.prepare(`INSERT INTO recipe_ingredients (recipe_id, name, quantity, category) VALUES (?, 'Reis', '1 kg', 'Sonstiges')`).run(recipeId);
-
-  const r = await call('POST', `/${recipeId}/to-shopping-list`, { listId });
-  assert.equal(r.status, 200);
-  assert.equal(r.body.data.transferred, 1);
-  assert.equal(r.body.data.added_ids.length, 1);
-});
-
-// --------------------------------------------------------------------------
-// GET /:id/mealie-thumbnail: proxied Bild-Bytes (kein direkter Browser-Link,
-// der Bearer-Token darf den Client nie erreichen)
-// --------------------------------------------------------------------------
-test.after(() => mealieSync._setAdapterFactory(null));
-
-test('GET /:id/mealie-thumbnail: natives Rezept → 404', async () => {
-  const native = await call('POST', '/', { title: 'Kein Mealie' });
-  const r = await call('GET', `/${native.body.data.id}/mealie-thumbnail`);
-  assert.equal(r.status, 404);
-});
-
-test('GET /:id/mealie-thumbnail: gespiegelt, aber mealie_has_image=0 → 404, Adapter wird nicht aufgerufen', async () => {
-  const recipeId = db.prepare(`
-    INSERT INTO recipes (title, created_by, mealie_account_id, mealie_recipe_id, mealie_has_image) VALUES (?, ?, ?, ?, 0)
-  `).run('Ohne Bild', OWNER, MEALIE_ACCOUNT_ID, 'thumb-none').lastInsertRowid;
-  mealieSync._setAdapterFactory(() => ({
-    fetchThumbnail: async () => { throw new Error('sollte nicht aufgerufen werden'); },
-  }));
-  const r = await call('GET', `/${recipeId}/mealie-thumbnail`);
-  mealieSync._setAdapterFactory(null);
-  assert.equal(r.status, 404);
-});
-
-test('GET /:id/mealie-thumbnail: proxied Bytes und Content-Type vom Fake-Adapter', async () => {
-  const recipeId = db.prepare(`
-    INSERT INTO recipes (title, created_by, mealie_account_id, mealie_recipe_id, mealie_has_image) VALUES (?, ?, ?, ?, 1)
-  `).run('Mit Bild', OWNER, MEALIE_ACCOUNT_ID, 'thumb-yes').lastInsertRowid;
-
-  const png1x1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
-  mealieSync._setAdapterFactory(() => ({
-    fetchThumbnail: async (mealieRecipeId) => {
-      assert.equal(mealieRecipeId, 'thumb-yes');
-      return { buffer: png1x1, mime: 'image/png' };
-    },
-  }));
-
-  const res = await fetch(`${baseUrl}/${recipeId}/mealie-thumbnail`);
-  mealieSync._setAdapterFactory(null);
+test('GET /recipes/:id/image liefert das Bild als Datei', async () => {
+  const created = await call('POST', '/', { title: 'Bildabruf', image_data: PNG_1X1 });
+  const res = await fetch(`${baseUrl}/${created.body.data.id}/image`);
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('content-type'), 'image/png');
+  assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
   const buf = Buffer.from(await res.arrayBuffer());
-  assert.equal(buf.length, png1x1.length);
+  assert.ok(buf.length > 0, 'die Datei darf nicht leer sein');
 });
 
-test('GET /:id/mealie-thumbnail: Bild seit letztem Sync in Mealie gelöscht (404 vom Adapter) → 404 statt 500', async () => {
-  const recipeId = db.prepare(`
-    INSERT INTO recipes (title, created_by, mealie_account_id, mealie_recipe_id, mealie_has_image) VALUES (?, ?, ?, ?, 1)
-  `).run('Geloescht', OWNER, MEALIE_ACCOUNT_ID, 'thumb-gone').lastInsertRowid;
-  mealieSync._setAdapterFactory(() => ({
-    fetchThumbnail: async () => { const err = new Error('Mealie thumbnail request failed (404)'); err.status = 404; throw err; },
-  }));
-  const r = await call('GET', `/${recipeId}/mealie-thumbnail`);
-  mealieSync._setAdapterFactory(null);
-  assert.equal(r.status, 404);
+test('GET /recipes/:id/image: ohne Bild 404', async () => {
+  const ohne = await call('POST', '/', { title: 'Ohne Bild' });
+  assert.equal(ohne.body.data.has_own_image, false);
+  const res = await fetch(`${baseUrl}/${ohne.body.data.id}/image`);
+  assert.equal(res.status, 404);
 });
 
-test('GET /:id/mealie-thumbnail: nicht in der MIME-Allowlist (z. B. SVG) → 415', async () => {
-  const recipeId = db.prepare(`
-    INSERT INTO recipes (title, created_by, mealie_account_id, mealie_recipe_id, mealie_has_image) VALUES (?, ?, ?, ?, 1)
-  `).run('SVG', OWNER, MEALIE_ACCOUNT_ID, 'thumb-svg').lastInsertRowid;
-  mealieSync._setAdapterFactory(() => ({
-    fetchThumbnail: async () => ({ buffer: Buffer.from('<svg/>'), mime: 'image/svg+xml' }),
-  }));
-  const r = await call('GET', `/${recipeId}/mealie-thumbnail`);
-  mealieSync._setAdapterFactory(null);
-  assert.equal(r.status, 415);
+test('PUT /recipes: ohne das Feld bleibt das Bild stehen, null loescht es', async () => {
+  // Der wichtigere Fall ist der erste: ein Speichern, das nur den Titel aendert,
+  // darf das Bild nicht stillschweigend abraeumen - und es auch nicht erneut
+  // hochladen muessen.
+  const created = await call('POST', '/', { title: 'Bleibt', image_data: PNG_1X1 });
+  const id = created.body.data.id;
+
+  const ohneFeld = await call('PUT', `/${id}`, { title: 'Bleibt, neuer Titel' });
+  assert.equal(ohneFeld.body.data.has_own_image, true, 'ohne Feld unveraendert');
+
+  const geloescht = await call('PUT', `/${id}`, { title: 'Bleibt', image_data: null });
+  assert.equal(geloescht.body.data.has_own_image, false, 'null loescht');
+  assert.equal((await fetch(`${baseUrl}/${id}/image`)).status, 404);
+});
+
+test('POST /recipes: ein Bild, dessen Inhalt nicht zum Typ passt -> 400', async () => {
+  // Der Praefix kommt aus dem Browser des Absenders (#937); geprueft wird der
+  // Inhalt. Hier steht ein PNG-Rumpf unter einer JPEG-Deklaration.
+  const gelogen = PNG_1X1.replace('image/png', 'image/jpeg');
+  const r = await call('POST', '/', { title: 'Gelogen', image_data: gelogen });
+  assert.equal(r.status, 400);
 });

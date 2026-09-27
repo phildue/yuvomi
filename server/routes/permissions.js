@@ -11,15 +11,32 @@ import express from 'express';
 import * as db from '../db.js';
 import { createLogger } from '../logger.js';
 import { requireAdmin } from '../auth.js';
+import { listModules } from '../services/modules.js';
+import { accessScopeSql, householdMemberSql } from '../services/household-members.js';
 import {
   permissionCatalog,
   getSubjectPermissions,
-  replaceSubjectPermissions,
+  writeSubjectPermissions,
   isValidFamilyRole,
 } from '../permissions.js';
+import { syncFastingRemindersForUser } from '../services/fasting-reminders.js';
 
 const log = createLogger('Permissions');
 const router = express.Router();
+
+function syncFastingForUsers(database, userIds) {
+  for (const userId of userIds) {
+    syncFastingRemindersForUser(database, userId);
+  }
+}
+
+function replacePermissionsAndSync(database, subjectType, subjectId, input, userIds) {
+  return database.transaction(() => {
+    writeSubjectPermissions(database, subjectType, subjectId, input);
+    syncFastingForUsers(database, userIds);
+    return getSubjectPermissions(database, subjectType, subjectId);
+  })();
+}
 
 // requireAuth + csrfMiddleware werden global in server/index.js angewandt.
 router.use(requireAdmin);
@@ -28,14 +45,13 @@ router.use(requireAdmin);
  * GET /api/v1/permissions/catalog
  * Liefert Module, Widgets, Rollen und die Mitgliederliste für die Rechte-Matrix.
  */
-router.get('/catalog', (req, res) => {
+router.get('/catalog', async (req, res) => {
   try {
+    await listModules({ admin: true });
     const catalog = permissionCatalog();
     const members = db.get().prepare(`
       SELECT id, display_name, username, avatar_color, avatar_data, role, family_role,
-        CASE WHEN EXISTS (
-          SELECT 1 FROM split_expense_guest_users sg WHERE sg.user_id = users.id
-        ) THEN 'split_guest' ELSE 'family' END AS access_scope
+        ${accessScopeSql('users')} AS access_scope
       FROM users
       ORDER BY display_name
     `).all();
@@ -65,8 +81,9 @@ router.get('/role/:familyRole', (req, res) => {
 
 /**
  * PUT /api/v1/permissions/role/:familyRole
- * Body: { modules: { <key>: 'none'|'read'|'write' }, widgets: { <id>: 'none'|'allow' } }
- * Ersetzt das komplette Rollen-Profil (Standard-Werte werden nicht gespeichert).
+ * Body: { modules, widgets, capabilities }. Modul- und Widget-Achse werden bei
+ * jedem Aufruf ersetzt; Capabilities nur, wenn das Feld ausdrücklich vorkommt.
+ * So bleiben ältere Clients kompatibel. Standard-Werte werden nicht gespeichert.
  */
 router.put('/role/:familyRole', (req, res) => {
   try {
@@ -74,7 +91,12 @@ router.put('/role/:familyRole', (req, res) => {
     if (!isValidFamilyRole(familyRole)) {
       return res.status(400).json({ error: 'Invalid family role.', code: 400 });
     }
-    const data = replaceSubjectPermissions(db.get(), 'role', familyRole, req.body || {});
+    const database = db.get();
+    const userIds = database.prepare(`
+      SELECT u.id FROM users u
+      WHERE u.family_role = ? AND ${householdMemberSql('u')}
+    `).all(familyRole).map((row) => row.id);
+    const data = replacePermissionsAndSync(database, 'role', familyRole, req.body || {}, userIds);
     res.json({ data });
   } catch (err) {
     if (/Unknown|Invalid/.test(err.message)) {
@@ -104,7 +126,8 @@ router.get('/user/:userId', (req, res) => {
 
 /**
  * PUT /api/v1/permissions/user/:userId
- * Body wie bei role. Leere Maps = „von Rolle erben" (alle Overrides entfernt).
+ * Body wie bei role. Leere Maps leeren jeweils ihre eigene Achse. Zum Entfernen
+ * aller Overrides müssen modules, widgets und capabilities leer gesendet werden.
  */
 router.put('/user/:userId', (req, res) => {
   try {
@@ -117,7 +140,7 @@ router.put('/user/:userId', (req, res) => {
     if (target.role === 'admin') {
       return res.status(400).json({ error: 'Administrators always have full access; per-member restrictions do not apply.', code: 400 });
     }
-    const data = replaceSubjectPermissions(db.get(), 'user', userId, req.body || {});
+    const data = replacePermissionsAndSync(db.get(), 'user', userId, req.body || {}, [userId]);
     res.json({ data });
   } catch (err) {
     if (/Unknown|Invalid/.test(err.message)) {
