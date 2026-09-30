@@ -1433,6 +1433,8 @@
         "statsExpenses": "Pengeluaran",
         "statsBalance": "Saldo",
         "statsTrendTitle": "Tren",
+        "statsAverage": "Rata-rata",
+        "statsMedian": "Median",
         "statsCategoryTitle": "Menurut kategori",
         "statsDonutTitle": "Proporsi pengeluaran",
         "statsExport": "Ekspor CSV",

@@ -1732,6 +1732,16 @@ button.budget-entry__title {
 .budget-stats__swatch { display:inline-block; width:16px; height:0; border-top:2px solid transparent; margin-right:var(--space-1); vertical-align:middle; }
 .budget-stats__swatch--income { border-top-color:var(--color-success); }
 .budget-stats__swatch--expense { border-top-style:dashed; border-top-color:var(--color-danger); }
+.budget-stats__swatch--average { border-top-style:dotted; border-top-color:var(--color-text-secondary); }
+.budget-stats__swatch--median { border-top-width:1px; border-top-color:var(--color-text-secondary); }
+/* Hilfslinien im Verlauf: Durchschnitt gepunktet, Median durchgezogen und duenn -
+ * beide neutral, damit sie nicht als dritte und vierte Datenreihe lesen. */
+.budget-stats__ref { stroke:var(--color-text-secondary); fill:none; }
+.budget-stats__ref--average { stroke-width:1.5; stroke-dasharray:2 4; }
+.budget-stats__ref--median { stroke-width:1; }
+/* Hof in der Seitenfarbe: die Zahl steht am rechten Rand ueber Kurve und
+ * Gitter und waere ohne ihn dort durchgestrichen. */
+.budget-stats__ref-label { fill:var(--color-text-secondary); paint-order:stroke; stroke:var(--color-bg); stroke-width:3px; stroke-linejoin:round; }
 .budget-stats__donut-wrap { display:flex; gap:var(--space-4); align-items:center; flex-wrap:wrap; }
 .budget-stats__donut { width:160px; height:160px; }
 .budget-stats__export { margin-top:var(--space-4); }

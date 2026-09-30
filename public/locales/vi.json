@@ -1421,6 +1421,8 @@
         "statsExpenses": "Chi tiêu",
         "statsBalance": "Số dư",
         "statsTrendTitle": "Xu hướng",
+        "statsAverage": "Trung bình",
+        "statsMedian": "Trung vị",
         "statsCategoryTitle": "Theo danh mục",
         "statsDonutTitle": "Tỷ lệ chi tiêu",
         "statsExport": "Xuất CSV",

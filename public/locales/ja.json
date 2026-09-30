@@ -1421,6 +1421,8 @@
         "statsExpenses": "支出",
         "statsBalance": "残高",
         "statsTrendTitle": "推移",
+        "statsAverage": "平均",
+        "statsMedian": "中央値",
         "statsCategoryTitle": "カテゴリ別",
         "statsDonutTitle": "支出の内訳",
         "statsExport": "CSVエクスポート",

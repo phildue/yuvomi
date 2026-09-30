@@ -1433,6 +1433,8 @@
         "statsExpenses": "Wydatki",
         "statsBalance": "Saldo",
         "statsTrendTitle": "Trend",
+        "statsAverage": "Średnia",
+        "statsMedian": "Mediana",
         "statsCategoryTitle": "Według kategorii",
         "statsDonutTitle": "Udziały wydatków",
         "statsExport": "Eksportuj CSV",

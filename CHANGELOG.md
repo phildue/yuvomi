@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The trend in the budget statistics follows the selected category, and shows average and median.**
+  With a category or subcategory selected, the trend line shows only that category across the week,
+  month or year instead of the whole household. Two reference lines mark the average and the median
+  per period, each labelled with its amount and repeated in the legend. Periods that lie in the
+  future are left out of both, so a year that is not over yet is not averaged down by its empty months.
+
 ## [2.68.0] - 2026-09-27
 
 ### Added

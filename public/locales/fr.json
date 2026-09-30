@@ -1421,6 +1421,8 @@
         "statsExpenses": "Dépenses",
         "statsBalance": "Solde",
         "statsTrendTitle": "Évolution",
+        "statsAverage": "Moyenne",
+        "statsMedian": "Médiane",
         "statsCategoryTitle": "Par catégorie",
         "statsDonutTitle": "Répartition des dépenses",
         "statsExport": "Exporter CSV",

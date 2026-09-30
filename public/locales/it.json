@@ -1421,6 +1421,8 @@
         "statsExpenses": "Uscite",
         "statsBalance": "Saldo",
         "statsTrendTitle": "Andamento",
+        "statsAverage": "Media",
+        "statsMedian": "Mediana",
         "statsCategoryTitle": "Per categoria",
         "statsDonutTitle": "Quote spese",
         "statsExport": "Esporta CSV",

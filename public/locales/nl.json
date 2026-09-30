@@ -1421,6 +1421,8 @@
         "statsExpenses": "Uitgaven",
         "statsBalance": "Saldo",
         "statsTrendTitle": "Verloop",
+        "statsAverage": "Gemiddelde",
+        "statsMedian": "Mediaan",
         "statsCategoryTitle": "Per categorie",
         "statsDonutTitle": "Uitgavenaandelen",
         "statsExport": "CSV exporteren",

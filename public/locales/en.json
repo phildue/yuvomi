@@ -1421,6 +1421,8 @@
         "statsExpenses": "Expenses",
         "statsBalance": "Balance",
         "statsTrendTitle": "Trend",
+        "statsAverage": "Average",
+        "statsMedian": "Median",
         "statsCategoryTitle": "By category",
         "statsDonutTitle": "Expense shares",
         "statsExport": "Export CSV",

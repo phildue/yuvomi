@@ -1421,6 +1421,8 @@
         "statsExpenses": "Kiadások",
         "statsBalance": "Egyenleg",
         "statsTrendTitle": "Tendencia",
+        "statsAverage": "Átlag",
+        "statsMedian": "Medián",
         "statsCategoryTitle": "Kategória szerint",
         "statsDonutTitle": "Kiadások megoszlása",
         "statsExport": "CSV exportálása",

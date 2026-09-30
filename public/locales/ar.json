@@ -1421,6 +1421,8 @@
         "statsExpenses": "المصروفات",
         "statsBalance": "الرصيد",
         "statsTrendTitle": "الاتجاه",
+        "statsAverage": "المتوسط",
+        "statsMedian": "الوسيط",
         "statsCategoryTitle": "حسب الفئة",
         "statsDonutTitle": "توزيع المصروفات",
         "statsExport": "تصدير CSV",

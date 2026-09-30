@@ -1421,6 +1421,8 @@
         "statsExpenses": "व्यय",
         "statsBalance": "शेष",
         "statsTrendTitle": "प्रवृत्ति",
+        "statsAverage": "औसत",
+        "statsMedian": "माध्यिका",
         "statsCategoryTitle": "श्रेणी के अनुसार",
         "statsDonutTitle": "व्यय हिस्सेदारी",
         "statsExport": "CSV निर्यात करें",

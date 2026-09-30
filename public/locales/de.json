@@ -1433,6 +1433,8 @@
         "statsExpenses": "Ausgaben",
         "statsBalance": "Saldo",
         "statsTrendTitle": "Verlauf",
+        "statsAverage": "Durchschnitt",
+        "statsMedian": "Median",
         "statsCategoryTitle": "Nach Kategorie",
         "statsDonutTitle": "Ausgaben-Anteile",
         "statsExport": "CSV exportieren",

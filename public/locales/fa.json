@@ -1433,6 +1433,8 @@
         "statsExpenses": "هزینه‌ها",
         "statsBalance": "مانده",
         "statsTrendTitle": "روند",
+        "statsAverage": "میانگین",
+        "statsMedian": "میانه",
         "statsCategoryTitle": "بر اساس دسته",
         "statsDonutTitle": "سهم هزینه‌ها",
         "statsExport": "برون‌ریزی CSV",

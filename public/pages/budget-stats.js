@@ -7,8 +7,9 @@ import { t, formatDate, getLocale } from '/i18n.js';
 import { wireTablist } from '/utils/tablist.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
 import { mountEmptyState, mountLoadError } from '/utils/empty-state.js';
-import { CHART, chartX, chartY, chartGridMarkup, chartXLabelsMarkup } from '/utils/chart.js';
+import { CHART, chartX, chartY, chartScales, chartGridMarkup, chartXLabelsMarkup } from '/utils/chart.js';
 import { formatMoneyAxis } from '/utils/money.js';
+import { todayKey } from '/utils/date.js';
 
 // Zeitraum und Anker gehören dem Modul (budget.js) und kommen über ctx herein.
 // Vorher hielt dieser View beides selbst - damit gab es zwei Zeitachsen im selben
@@ -20,6 +21,9 @@ const view = {
   // der Filter den Wechsel Woche/Monat/Jahr und den Tabwechsel überlebt.
   filter: { category: null, subcategory: null, type: null },
   entries: null, entriesError: false, entriesSeq: 0,
+  // Für welchen Filter `entries` geladen wurde - der Verlauf rechnet daraus
+  // und darf keine Zeilen des vorherigen Filters zeigen.
+  entriesKey: null,
 };
 
 const RANGE_LABELS = {
@@ -384,13 +388,17 @@ async function loadEntries() {
     if (seq !== view.entriesSeq) return;
     view.entries = res.data;
     view.entriesError = false;
+    view.entriesKey = entriesKey();
   } catch (err) {
     if (seq !== view.entriesSeq) return;
     console.error('[Budget] stats entries load error:', err);
     view.entries = null;
     view.entriesError = true;
+    view.entriesKey = null;
   }
   renderEntryRows();
+  // Der Verlauf einer Kategorie rechnet aus genau diesen Zeilen.
+  if (view.filter.category) renderTrendChart();
 }
 
 function renderEntryRows() {
@@ -519,15 +527,120 @@ function renderExport() {
   if (window.lucide) lucide.createIcons({ el: host });
 }
 
+function entriesKey() {
+  const f = view.filter;
+  return [view.data?.from, view.data?.to, f.category ?? '', f.subcategory ?? ''].join('|');
+}
+
+/**
+ * Verteilt Buchungen auf die Abschnitte einer Serie (Tage oder Monate).
+ * Rein, damit es ohne DOM prüfbar ist.
+ *
+ * @param {{period: string}[]} base     Serie des Zeitraums, liefert die Abschnitte
+ * @param {{date: string, amount: number}[]} entries
+ */
+export function bucketEntries(base, entries) {
+  const len = base[0]?.period.length ?? 10;
+  const byPeriod = new Map(base.map((p) => [p.period, { period: p.period, income: 0, expenses: 0, balance: 0 }]));
+  for (const e of entries) {
+    const bucket = byPeriod.get(String(e.date).slice(0, len));
+    if (!bucket) continue;
+    if (e.amount > 0) bucket.income += e.amount; else bucket.expenses += e.amount;
+    bucket.balance += e.amount;
+  }
+  return [...byPeriod.values()];
+}
+
+/**
+ * Durchschnitt und Median über die Abschnitte einer Kurve.
+ *
+ * ABSCHNITTE IN DER ZUKUNFT ZÄHLEN NICHT MIT: im laufenden Jahr stehen Oktober
+ * bis Dezember als Nullen in der Serie, und mit ihnen läge der Durchschnitt im
+ * September um ein Viertel zu tief. Ein vergangener Abschnitt ohne Buchung
+ * zählt dagegen als 0 - ein Monat ohne Ausgabe ist eine Auskunft, keine Lücke.
+ *
+ * @param {number[]} values
+ * @param {string[]} periods  'YYYY-MM' oder 'YYYY-MM-DD', parallel zu values
+ * @param {string} today      'YYYY-MM-DD'
+ * @returns {{average: number, median: number, count: number}}
+ */
+export function seriesStats(values, periods, today) {
+  const past = values.filter((_, i) => periods[i] <= today.slice(0, periods[i].length));
+  const used = past.length ? past : values;
+  if (!used.length) return { average: 0, median: 0, count: 0 };
+  const sorted = [...used].sort((x, y) => x - y);
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  const average = used.reduce((sum, v) => sum + v, 0) / used.length;
+  return { average, median, count: used.length };
+}
+
+// Unter einer Kategorie zeigt der Verlauf nur sie. Die Zeilen dafür lädt die
+// Buchungsliste ohnehin; bis sie da sind, steht das leere Raster in voller
+// Höhe, damit die Seite unter dem Klick nicht springt - ohne die Gesamtkurve,
+// die unter dem Kategorie-Titel eine falsche Auskunft wäre.
+function trendSeries() {
+  const base = view.data.series;
+  if (!view.filter.category) return { series: base, filtered: false, pending: false };
+  if (view.entriesKey !== entriesKey() || !view.entries) return { series: base, filtered: false, pending: true };
+  return { series: bucketEntries(base, view.entries), filtered: true, pending: false };
+}
+
+function trendTitleSuffix() {
+  const f = view.filter;
+  if (!f.category) return '';
+  const sub = f.subcategory ? ` · ${view.ctx.esc(view.ctx.subcategoryLabel(f.subcategory))}` : '';
+  return ` · ${view.ctx.esc(view.ctx.categoryLabel(f.category))}${sub}`;
+}
+
 function renderTrendChart() {
   const host = view.root.querySelector('#budget-stats-trend');
   if (!host) return;
-  const s = view.data.series;
+  if (view.filter.category && view.entriesError) {
+    host.replaceChildren();
+    host.insertAdjacentHTML('beforeend', `
+      <div class="budget-chart-section">
+        <div class="budget-chart-section__title">${t('budget.statsTrendTitle')}${trendTitleSuffix()}</div>
+        <p class="budget-stats__note">${view.ctx.esc(t('budget.statsError'))}</p>
+      </div>`);
+    return;
+  }
+  const { series: s, filtered, pending } = trendSeries();
   const incomes  = s.map((p) => p.income);
   const expenses = s.map((p) => Math.abs(p.expenses));
-  const max = Math.max(1, ...incomes, ...expenses);
+  // Welche Kurven stehen: die Einnahmen/Ausgaben-Kachel blendet die andere
+  // Seite aus, und unter einer Kategorie entfällt die Seite, die sie nicht hat -
+  // eine Ausgabenkategorie zöge sonst eine Einnahmenlinie auf der Null mit.
+  const type = view.filter.type;
+  let showIncome   = type !== 'expenses' && (!filtered || incomes.some((v) => v));
+  let showExpenses = type !== 'income' && (!filtered || expenses.some((v) => v));
+  if (!showIncome && !showExpenses) { showExpenses = type !== 'income'; showIncome = !showExpenses; }
+  const max = Math.max(1, ...(showIncome ? incomes : []), ...(showExpenses ? expenses : []));
   const points = (arr) => arr.map((v, i) => `${chartX(i, s.length).toFixed(1)},${chartY(v, 0, max).toFixed(1)}`).join(' ');
   const sum = (arr) => arr.reduce((a, b) => a + b, 0);
+
+  // Durchschnitt und Median gelten EINER Kurve - vier Hilfslinien über zwei
+  // Kurven läse niemand mehr. Es ist die der Ausgaben, solange sie steht.
+  const refValues = showExpenses ? expenses : incomes;
+  const stats = seriesStats(refValues, s.map((p) => p.period), todayKey());
+  const { left, right, top } = chartScales();
+  // Beschriftung über der einen, unter der anderen Linie: liegen beide Werte
+  // gleich, stehen die Zahlen trotzdem nicht aufeinander.
+  const refLine = (value, cls, label, above) => {
+    const y = chartY(value, 0, max);
+    const ty = above ? Math.max(top + 8, y - 4) : y + 11;
+    return `
+      <line class="budget-stats__ref ${cls}" x1="${left}" y1="${y.toFixed(1)}" x2="${right}" y2="${y.toFixed(1)}"
+            vector-effect="non-scaling-stroke" />
+      <text class="chart__axis budget-stats__ref-label" x="${right}" y="${ty.toFixed(1)}" text-anchor="end">${view.ctx.esc(label)}</text>`;
+  };
+  const avgText = `${t('budget.statsAverage')} ${fmtAmount(stats.average)}`;
+  const medText = `${t('budget.statsMedian')} ${fmtAmount(stats.median)}`;
+  const averageAbove = stats.average >= stats.median;
+  const refLines = stats.count
+    ? refLine(stats.average, 'budget-stats__ref--average', avgText, averageAbove)
+      + refLine(stats.median, 'budget-stats__ref--median', medText, !averageAbove)
+    : '';
 
   // DIE ACHSE STEHT JETZT IM BILD (utils/chart.js).
   //
@@ -544,12 +657,12 @@ function renderTrendChart() {
   // gestrichelt - so trennen sich die Serien auch bei Rot-Grün-Schwäche. Der
   // Screenreader-Zugang liegt in der sr-only-Summary + den Punkt-Buttons; das
   // rein visuelle SVG bleibt daher bewusst aria-hidden.
-  const summary = t('budget.statsTrendSummary', {
+  const summary = `${t('budget.statsTrendSummary', {
     periods: s.length,
     income: fmtAmount(sum(incomes)),
     expenses: fmtAmount(sum(expenses)),
     peak: fmtAmount(max),
-  });
+  })}${stats.count ? ` · ${avgText} · ${medText}` : ''}`;
 
   // Ablesbare Einzelwerte: die Kurve allein sagt nur "irgendwann im Mai war es
   // viel". Je Datenpunkt eine unsichtbare Schaltfläche über dem Diagramm — der
@@ -568,29 +681,40 @@ function renderTrendChart() {
               aria-label="${view.ctx.esc(label)}"></button>`;
   }).join('');
 
+  const incomeLine = showIncome
+    ? `<polyline fill="none" stroke="var(--color-success)" stroke-width="2"
+                      vector-effect="non-scaling-stroke" points="${points(incomes)}" />`
+    : '';
+  const expenseLine = showExpenses
+    ? `<polyline fill="none" stroke="var(--color-danger)" stroke-width="2" stroke-dasharray="6 4"
+                      vector-effect="non-scaling-stroke" points="${points(expenses)}" />`
+    : '';
+  const legend = [
+    showIncome ? `<span><i class="budget-stats__swatch budget-stats__swatch--income"></i>${t('budget.statsIncome')} · ${fmtAmount(sum(incomes))}</span>` : '',
+    showExpenses ? `<span><i class="budget-stats__swatch budget-stats__swatch--expense"></i>${t('budget.statsExpenses')} · ${fmtAmount(sum(expenses))}</span>` : '',
+    stats.count ? `<span><i class="budget-stats__swatch budget-stats__swatch--average"></i>${view.ctx.esc(t('budget.statsAverage'))} · ${fmtAmount(stats.average)}</span>` : '',
+    stats.count ? `<span><i class="budget-stats__swatch budget-stats__swatch--median"></i>${view.ctx.esc(t('budget.statsMedian'))} · ${fmtAmount(stats.median)}</span>` : '',
+  ].join('');
+
   host.replaceChildren();
   host.insertAdjacentHTML('beforeend', `
     <div class="budget-chart-section">
-      <div class="budget-chart-section__title">${t('budget.statsTrendTitle')}</div>
+      <div class="budget-chart-section__title">${t('budget.statsTrendTitle')}${trendTitleSuffix()}</div>
       <p class="sr-only">${view.ctx.esc(summary)}</p>
-      <div class="budget-stats__trend-wrap">
+      <div class="budget-stats__trend-wrap"${pending ? ' aria-busy="true"' : ''}>
         <div class="budget-stats__plot">
           <svg class="budget-stats__trend" viewBox="0 0 ${CHART.W} ${CHART.H}" aria-hidden="true">
             ${chartGridMarkup(0, max, (val) => formatMoneyAxis(val, view.ctx.currency))}
             ${chartXLabelsMarkup(s.map((p) => periodLabel(p.period)))}
-            <polyline fill="none" stroke="var(--color-success)" stroke-width="2"
-                      vector-effect="non-scaling-stroke" points="${points(incomes)}" />
-            <polyline fill="none" stroke="var(--color-danger)" stroke-width="2" stroke-dasharray="6 4"
-                      vector-effect="non-scaling-stroke" points="${points(expenses)}" />
+            ${pending ? '' : refLines}
+            ${pending ? '' : incomeLine}
+            ${pending ? '' : expenseLine}
           </svg>
-          <div class="budget-stats__points" role="group" aria-label="${t('budget.statsPointsLabel')}">${hotspots}</div>
+          <div class="budget-stats__points" role="group" aria-label="${t('budget.statsPointsLabel')}">${pending ? '' : hotspots}</div>
         </div>
       </div>
       <div class="budget-stats__readout" id="budget-stats-readout" aria-hidden="true"></div>
-      <div class="budget-stats__legend">
-        <span><i class="budget-stats__swatch budget-stats__swatch--income"></i>${t('budget.statsIncome')} · ${fmtAmount(sum(incomes))}</span>
-        <span><i class="budget-stats__swatch budget-stats__swatch--expense"></i>${t('budget.statsExpenses')} · ${fmtAmount(sum(expenses))}</span>
-      </div>
+      <div class="budget-stats__legend">${pending ? '' : legend}</div>
     </div>`);
   wireTrendPoints(host, s);
 }
