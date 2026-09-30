@@ -140,10 +140,12 @@ jobs:
     needs: build-and-push
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: self-hosted
-    # Der "Wait for CI"-Schritt deckelt sich selbst auf 5 Minuten; der Rest ist
-    # ein SSH-Deploy. 10 Minuten sind Puffer genug, ohne einen haengenden
+    # Der "Wait for CI"-Schritt deckelt sich selbst auf 15 Minuten; der Rest ist
+    # ein SSH-Deploy. Die 5 Minuten davor reichten nicht mehr: CI braucht seit
+    # dem Upstream-Sync rund 10 Minuten, und v2.68.0 fiel deshalb beim ersten
+    # Anlauf durch. 20 Minuten decken Warten plus Deploy, ohne einen haengenden
     # Runner sechs Stunden lang zu blockieren (Default-Timeout ohne Deckel).
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
       - name: Wait for CI to pass on this commit
@@ -160,7 +162,7 @@ jobs:
           # both treated as "pending" and retried; only a definitive terminal
           # conclusion other than success (failure, cancelled, timed_out,
           # etc.) fails immediately.
-          DEADLINE=$((SECONDS + 300))
+          DEADLINE=$((SECONDS + 900))
           while true; do
             conclusion=$(curl -sS \
               -H "Authorization: Bearer $GH_TOKEN" \
@@ -179,7 +181,7 @@ jobs:
             fi
 
             if [ "$SECONDS" -ge "$DEADLINE" ]; then
-              echo "::error::Timed out after 5m waiting for CI to conclude for this commit — refusing to deploy."
+              echo "::error::Timed out after 15m waiting for CI to conclude for this commit — refusing to deploy."
               exit 1
             fi
 
