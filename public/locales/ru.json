@@ -1421,6 +1421,8 @@
         "statsExpenses": "Расходы",
         "statsBalance": "Баланс",
         "statsTrendTitle": "Динамика",
+        "statsAverage": "Среднее",
+        "statsMedian": "Медиана",
         "statsCategoryTitle": "По категориям",
         "statsDonutTitle": "Доли расходов",
         "statsExport": "Экспорт CSV",

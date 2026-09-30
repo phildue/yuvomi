@@ -1433,6 +1433,8 @@
         "statsExpenses": "Gastos",
         "statsBalance": "Balanse",
         "statsTrendTitle": "Takbo",
+        "statsAverage": "Karaniwan",
+        "statsMedian": "Median",
         "statsCategoryTitle": "Ayon sa kategorya",
         "statsDonutTitle": "Bahagi ng gastos",
         "statsExport": "I-export ang CSV",

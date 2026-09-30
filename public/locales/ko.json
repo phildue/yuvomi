@@ -1433,6 +1433,8 @@
         "statsExpenses": "지출",
         "statsBalance": "잔액",
         "statsTrendTitle": "추이",
+        "statsAverage": "평균",
+        "statsMedian": "중앙값",
         "statsCategoryTitle": "카테고리별",
         "statsDonutTitle": "지출 비율",
         "statsExport": "CSV 내보내기",

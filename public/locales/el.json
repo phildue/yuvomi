@@ -1421,6 +1421,8 @@
         "statsExpenses": "Έξοδα",
         "statsBalance": "Υπόλοιπο",
         "statsTrendTitle": "Τάση",
+        "statsAverage": "Μέσος όρος",
+        "statsMedian": "Διάμεσος",
         "statsCategoryTitle": "Ανά κατηγορία",
         "statsDonutTitle": "Μερίδια εξόδων",
         "statsExport": "Εξαγωγή CSV",

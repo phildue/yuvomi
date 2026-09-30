@@ -1421,6 +1421,8 @@
         "statsExpenses": "Utgifter",
         "statsBalance": "Balans",
         "statsTrendTitle": "Trend",
+        "statsAverage": "Genomsnitt",
+        "statsMedian": "Median",
         "statsCategoryTitle": "Per kategori",
         "statsDonutTitle": "Utgiftsandelar",
         "statsExport": "Exportera CSV",

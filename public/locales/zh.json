@@ -1421,6 +1421,8 @@
         "statsExpenses": "支出",
         "statsBalance": "余额",
         "statsTrendTitle": "趋势",
+        "statsAverage": "平均值",
+        "statsMedian": "中位数",
         "statsCategoryTitle": "按类别",
         "statsDonutTitle": "支出占比",
         "statsExport": "导出 CSV",

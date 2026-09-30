@@ -1421,6 +1421,8 @@
         "statsExpenses": "Витрати",
         "statsBalance": "Баланс",
         "statsTrendTitle": "Динаміка",
+        "statsAverage": "Середнє",
+        "statsMedian": "Медіана",
         "statsCategoryTitle": "За категоріями",
         "statsDonutTitle": "Частки витрат",
         "statsExport": "Експорт CSV",

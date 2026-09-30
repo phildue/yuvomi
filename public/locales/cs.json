@@ -1421,6 +1421,8 @@
         "statsExpenses": "Výdaje",
         "statsBalance": "Zůstatek",
         "statsTrendTitle": "Vývoj",
+        "statsAverage": "Průměr",
+        "statsMedian": "Medián",
         "statsCategoryTitle": "Podle kategorie",
         "statsDonutTitle": "Podíly výdajů",
         "statsExport": "Exportovat CSV",

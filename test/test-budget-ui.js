@@ -1759,3 +1759,51 @@ test('Gruppe löschen trägt eine andere Gewichtung als bearbeiten/archivieren',
   assert.match(splitExpenses, /class="btn btn--icon btn--danger-outline" id="split-delete-group"/,
     'Löschen muss sich sichtbar von Bearbeiten/Archivieren abheben, ohne die Zeile zu dominieren');
 });
+
+// --------------------------------------------------------
+// Statistik-Verlauf: Kategorie-Serie, Durchschnitt, Median
+// --------------------------------------------------------
+
+const { bucketEntries, seriesStats } = await import('../public/pages/budget-stats.js');
+
+test('bucketEntries verteilt Buchungen auf Monats- und Tagesabschnitte', () => {
+  const months = [{ period: '2026-01' }, { period: '2026-02' }, { period: '2026-03' }];
+  const out = bucketEntries(months, [
+    { date: '2026-01-05', amount: -100 },
+    { date: '2026-01-20', amount: -50 },
+    { date: '2026-03-01', amount: 30 },
+    { date: '2025-12-31', amount: -999 }, // ausserhalb: faellt weg
+  ]);
+  assert.deepEqual(out.map((b) => b.expenses), [-150, 0, 0]);
+  assert.deepEqual(out.map((b) => b.income), [0, 0, 30]);
+  assert.deepEqual(out.map((b) => b.period), ['2026-01', '2026-02', '2026-03']);
+
+  const days = [{ period: '2026-06-01' }, { period: '2026-06-02' }];
+  assert.deepEqual(bucketEntries(days, [{ date: '2026-06-02', amount: -7 }]).map((b) => b.expenses), [0, -7]);
+});
+
+test('seriesStats: Durchschnitt und Median ohne die Abschnitte in der Zukunft', () => {
+  const periods = ['2026-01', '2026-02', '2026-03', '2026-04', '2026-05', '2026-06'];
+  // Heute ist April: Mai und Juni stehen als Nullen in der Serie und duerfen
+  // den Durchschnitt nicht druecken. Der leere Februar zaehlt dagegen mit.
+  const r = seriesStats([100, 0, 300, 200, 0, 0], periods, '2026-04-15');
+  assert.equal(r.count, 4);
+  assert.equal(r.average, 150);
+  assert.equal(r.median, 150);
+
+  // Ungerade Anzahl: der mittlere Wert, nicht das Mittel zweier.
+  assert.equal(seriesStats([5, 1, 9], ['2026-01', '2026-02', '2026-03'], '2026-12-31').median, 5);
+  // Tagesraster vergleicht gegen den ganzen Tagesschluessel.
+  assert.equal(seriesStats([10, 20, 90], ['2026-06-01', '2026-06-02', '2026-06-03'], '2026-06-02').average, 15);
+  // Ein Zeitraum ganz in der Zukunft hat keine vergangenen Abschnitte: dann alle.
+  assert.equal(seriesStats([4, 8], ['2030-01', '2030-02'], '2026-01-01').count, 2);
+  assert.equal(seriesStats([], [], '2026-01-01').count, 0);
+});
+
+test('der Verlauf folgt der Kategorie und traegt Durchschnitt und Median', () => {
+  assert.match(stats, /if \(view\.filter\.category\) renderTrendChart\(\);/, 'nach dem Laden der Buchungen neu zeichnen');
+  assert.match(stats, /budget-stats__ref--average/);
+  assert.match(stats, /budget-stats__ref--median/);
+  assert.match(stats, /t\('budget\.statsAverage'\)/);
+  assert.match(stats, /t\('budget\.statsMedian'\)/);
+});

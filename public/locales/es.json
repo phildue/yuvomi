@@ -1421,6 +1421,8 @@
         "statsExpenses": "Gastos",
         "statsBalance": "Saldo",
         "statsTrendTitle": "Evolución",
+        "statsAverage": "Promedio",
+        "statsMedian": "Mediana",
         "statsCategoryTitle": "Por categoría",
         "statsDonutTitle": "Distribución de gastos",
         "statsExport": "Exportar CSV",

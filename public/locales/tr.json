@@ -1421,6 +1421,8 @@
         "statsExpenses": "Giderler",
         "statsBalance": "Bakiye",
         "statsTrendTitle": "Eğilim",
+        "statsAverage": "Ortalama",
+        "statsMedian": "Medyan",
         "statsCategoryTitle": "Kategoriye göre",
         "statsDonutTitle": "Gider payları",
         "statsExport": "CSV dışa aktar",
