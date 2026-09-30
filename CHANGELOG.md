@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.69.0] - 2026-09-30
+
 ### Added
 
 - **The trend in the budget statistics follows the selected category, and shows average and median.**
