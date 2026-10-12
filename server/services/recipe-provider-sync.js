@@ -13,12 +13,15 @@
  *        abgelaufener Token oder eine leere Antwort dürfen den lokalen Spiegel nie
  *        leeren (gleicher Leer-Guard wie calendar-prune.js für CalDAV/Apple).
  *
- * Dependencies: server/db.js, ./recipe-providers/index.js
+ * Dependencies: server/db.js, ./recipe-providers/index.js, ./household-modules.js
  */
+import { runExternalJob } from '../utils/restore-state.js';
 import { createLogger } from '../logger.js';
 import * as db from '../db.js';
 import { getAdapter } from './recipe-providers/index.js';
+import { householdDisabledModules } from './household-modules.js';
 import { withPrivateNetworkHint } from './recipe-providers/private-network.js';
+import { ingredientMatchKey } from '../../public/utils/ingredient-match-key.js';
 
 const log = createLogger('RecipeProviderSync');
 
@@ -132,6 +135,34 @@ async function syncAccount(account) {
   `);
   const delRecipe = conn.prepare('DELETE FROM recipes WHERE id = ?');
 
+  // VERWAISTE VORRATS-ZUORDNUNGEN, DERSELBE FALL WIE IN PUT /recipes/:id (#1314).
+  //
+  // Ein Spiegel-Lauf schreibt die Zutaten eines Rezepts neu. Die bestaetigte
+  // Zuordnung Zutat -> Vorratszeile haengt am normalisierten Namen (genau damit
+  // sie das Neuschreiben ueberlebt), also bleibt sie liegen, wenn der Provider
+  // eine Zutat umbenennt: unsichtbar, aber wiederbelebbar, sobald derselbe Name
+  // wieder auftaucht. Dann haengt die Leseseite eine Vorratszeile an eine Zutat,
+  // fuer die das niemand bestaetigt hat - die geratene Aussage aus
+  // docs/DECISIONS.md Abschnitt 7, hier sogar ohne Zutun des Haushalts, weil
+  // der Provider ueber den Namen entscheidet.
+  //
+  // GESCHRIEBEN WIRD HIER NIE. Der Import setzt keine Zuordnung, auch nicht bei
+  // gleichem Namen; DELETE ist die einzige Richtung, die dieser Weg kennt, und
+  // test/test-recipe-ingredient-pantry-match.js haelt genau das fest.
+  const selMatchKeys = conn.prepare('SELECT ingredient_key FROM recipe_ingredient_pantry_matches WHERE recipe_id = ?');
+  const delMatch = conn.prepare('DELETE FROM recipe_ingredient_pantry_matches WHERE recipe_id = ? AND ingredient_key = ?');
+  const ingredientNamesOf = conn.prepare('SELECT name FROM recipe_ingredients WHERE recipe_id = ?');
+  function pruneOrphanedMatches(recipeId) {
+    const vorhanden = selMatchKeys.all(recipeId);
+    if (!vorhanden.length) return;
+    // Gemessen an der Tabelle, nicht am Adapter-Ergebnis: eingefuegt wurde
+    // gerade genau das hier.
+    const gueltig = new Set(ingredientNamesOf.all(recipeId).map((r) => ingredientMatchKey(r.name)));
+    for (const row of vorhanden) {
+      if (!gueltig.has(row.ingredient_key)) delMatch.run(recipeId, row.ingredient_key);
+    }
+  }
+
   let imported = 0;
   let updated = 0;
 
@@ -153,6 +184,7 @@ async function syncAccount(account) {
       }
       delIngredients.run(id);
       for (const ing of detail.ingredients) insIngredient.run(id, ing.name, ing.quantity, ing.category);
+      pruneOrphanedMatches(id);
     }
     for (const r of urlRefresh) updUrl.run(r.recipeUrl, r.id);
     for (const r of stale) delRecipe.run(r.id);
@@ -176,7 +208,45 @@ function recordAccountResult(account, result) {
 }
 
 /** Sync-Durchlauf über alle aktivierten Accounts, egal welchen Providers. */
-export async function sync() {
+/**
+ * Als Job, der liest, auf einen Anbieter wartet und dann schreibt: waehrend
+ * eines Restores beginnt er nicht, ein laufender wird abgewartet - sonst
+ * schriebe er sein Ergebnis in die gerade eingespielte Datenbank (Codex-Befund
+ * in #1431, siehe server/utils/restore-state.js).
+ */
+export function sync() {
+  return runExternalJob(() => syncUntracked());
+}
+
+/**
+ * Der Stundenlauf - `sync()` mit der einen Frage davor, die nur er stellt.
+ *
+ * REZEPTE HAUSHALTSWEIT ABGESCHALTET: DER STUNDENLAUF HOLT NICHTS (#1660).
+ * Gleiche Regel wie die URL-Quellen der Entsorgung (waste-source-scheduler.js):
+ * ein Haushalt, der das Modul nicht nutzt, soll nicht im Hintergrund bei Mealie
+ * oder Tandoor abfragen und Rezepte anlegen, aendern und loeschen. Der Spiegel
+ * bleibt stehen, der erste Lauf nach dem Wiedereinschalten zieht ihn nach.
+ *
+ * EIGENE FUNKTION UND NICHT EINE ZEILE IN `sync()`: `sync()` ruft auch
+ * `POST /recipe-providers/sync` (alle Konten, von Hand), und das ist wie
+ * `syncOne()` die Handlung einer Person - sie bleibt offen wie die Modul-Routen.
+ * Die Pruefung in `sync()` haette diesen Aufruf still mit null Treffern
+ * beantwortet (Codex-Befund in #1662).
+ *
+ * Die Frage steht IM Job: sie liest die Datenbank, und waehrend eines Restores
+ * ist die Verbindung zu.
+ */
+export function scheduledSync() {
+  return runExternalJob(() => {
+    if (householdDisabledModules(db.get()).has('recipes')) {
+      log.debug('Recipes are switched off for the household - scheduled provider sync skipped.');
+      return { success: true, syncedAccounts: 0, imported: 0, updated: 0, deleted: 0 };
+    }
+    return syncUntracked();
+  });
+}
+
+async function syncUntracked() {
   const accounts = getEnabledAccounts();
   if (accounts.length === 0) {
     log.debug('No enabled recipe provider accounts configured.');
@@ -205,7 +275,11 @@ export async function sync() {
 }
 
 /** Manueller Sync eines einzelnen Accounts (Settings-Seite "Sync now"). */
-export async function syncOne(accountId) {
+export function syncOne(accountId) {
+  return runExternalJob(() => syncOneUntracked(accountId));
+}
+
+async function syncOneUntracked(accountId) {
   const account = getAccountById(accountId);
   if (!account) throw new Error('Recipe provider account not found.');
 
@@ -236,7 +310,7 @@ export function getStatus() {
 
 export function startScheduler() {
   const run = () => {
-    sync().catch((err) => log.error('Recipe provider sync scheduler run failed:', err?.message || err));
+    scheduledSync().catch((err) => log.error('Recipe provider sync scheduler run failed:', err?.message || err));
   };
   setTimeout(run, 10_000).unref();
   setInterval(run, SYNC_INTERVAL_MS).unref();

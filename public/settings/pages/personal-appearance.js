@@ -1,15 +1,25 @@
 import {
+  formatUnit,
   getLocale,
   getSupportedLocales,
   setLocale,
   t,
 } from '/i18n.js';
+import { api } from '/api.js';
 import { esc } from '/utils/html.js';
 import { appendCurrencyOptions, persistCurrencySelection } from '/settings/currency.js';
-import { getPreferences, savePreferences } from '/settings/preferences-cache.js';
-import { toggleRowHtml } from '/settings/components.js';
+import { getPreferences, resetPreferencesCache, savePreferences } from '/settings/preferences-cache.js';
+import { settingRowHtml, settingSwitchRowHtml } from '/settings/components.js';
+import { wireTablist } from '/utils/tablist.js';
+import { attachSegmentIndicator } from '/utils/segment-indicator.js';
 import { isWallModeEnabled, setWallModeEnabled } from '/utils/wall-mode.js';
+import {
+  SCREENSAVER_IDLE_STEPS,
+  getScreensaverIdleSeconds,
+  setScreensaverIdleSeconds,
+} from '/utils/screensaver-idle.js';
 import { setDisplayTimeZone } from '/utils/timezone.js';
+import { adoptZone, zoneHintEl, zoneMismatch } from '/utils/household-zone-hint.js';
 import {
   CUSTOM_REGION,
   REGION_CODES,
@@ -19,6 +29,15 @@ import {
   regionLabel,
   numberLocaleFor,
 } from '/settings/region-presets.js';
+
+// Der Name jedes Segments ist sein sichtbares Wort - vorher trug es ein
+// abweichendes aria-label („Dunkles Design" zu „Dunkel"), und die Gruppe
+// selbst heisst schon „Design" (WCAG 2.5.3, Label im Namen).
+const THEME_OPTIONS = [
+  { value: 'system', icon: 'monitor', labelKey: 'settings.themeSystem' },
+  { value: 'light', icon: 'sun', labelKey: 'settings.themeLight' },
+  { value: 'dark', icon: 'moon', labelKey: 'settings.themeDark' },
+];
 
 const DATE_FORMATS = [
   ['mdy', 'MM/DD/YYYY'],
@@ -184,6 +203,33 @@ function clearError(element) {
   element.hidden = true;
 }
 
+// Minutes in the UI language (CLDR via formatUnit), so the five steps need no
+// plural keys of their own in 26 locales.
+function screensaverIdleText(seconds) {
+  return formatUnit(seconds / 60, 'minute', { unitDisplay: 'long' });
+}
+
+// Exported so test:screensaver-idle can check the select opens on the stored
+// value.
+export function screensaverIdleOptions() {
+  const current = getScreensaverIdleSeconds();
+  return SCREENSAVER_IDLE_STEPS.map((seconds) => `
+    <option value="${seconds}"${seconds === current ? ' selected' : ''}>${esc(screensaverIdleText(seconds))}</option>`).join('');
+}
+
+/**
+ * Device-local like wall mode: no server request, no preference. The
+ * screensaver watches the attribute this sets, so the new delay applies without
+ * a reload, and the toast confirms it like the wall-mode toggle above it.
+ * Exported so test:screensaver-idle can drive the real handler.
+ */
+export function bindScreensaverIdleSelect(select) {
+  select?.addEventListener('change', () => {
+    const seconds = setScreensaverIdleSeconds(Number(select.value));
+    window.yuvomi?.showToast(t('settings.screensaverIdleSaved', { delay: screensaverIdleText(seconds) }), 'success');
+  });
+}
+
 function renderLoadError(container) {
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
@@ -219,79 +265,102 @@ function renderPage(container, preferences, isAdmin) {
   container.insertAdjacentHTML('beforeend', `
     <section class="settings-section">
       <h2 class="settings-section__title">${t('settings.sectionDesign')}</h2>
-      <div class="settings-card">
-        <div class="theme-toggle" id="theme-toggle">
-          <button class="theme-toggle__btn ${theme === 'system' ? 'theme-toggle__btn--active' : ''}" type="button" data-theme-value="system" aria-label="${t('settings.themeSysLabel')}" aria-pressed="${theme === 'system'}">
-            <i data-lucide="monitor" class="icon-md" aria-hidden="true"></i>
-            ${t('settings.themeSystem')}
-          </button>
-          <button class="theme-toggle__btn ${theme === 'light' ? 'theme-toggle__btn--active' : ''}" type="button" data-theme-value="light" aria-label="${t('settings.themeLightLabel')}" aria-pressed="${theme === 'light'}">
-            <i data-lucide="sun" class="icon-md" aria-hidden="true"></i>
-            ${t('settings.themeLight')}
-          </button>
-          <button class="theme-toggle__btn ${theme === 'dark' ? 'theme-toggle__btn--active' : ''}" type="button" data-theme-value="dark" aria-label="${t('settings.themeDarkLabel')}" aria-pressed="${theme === 'dark'}">
-            <i data-lucide="moon" class="icon-md" aria-hidden="true"></i>
-            ${t('settings.themeDark')}
-          </button>
+      <!-- EIN TRAEGER JE ABSCHNITT (R17, E9): bis dahin stand jede dieser
+           Einstellungen in ihrer eigenen Karte - zehn Einstellungen in acht
+           Karten, drei davon im ersten Bild. -->
+      <div class="row-carrier settings-group">
+        <!-- Hell / Dunkel / System ist EIN Wert aus drei - das Segment der
+             Shell im Well (.segmented, panel.css; DESIGN.md "Segmented
+             Controls"). Bis 2026-09-26 standen hier drei getrennte
+             Rahmenknoepfe ohne Traeger (Critique A7). radiogroup statt
+             aria-pressed: genau einer gilt, und Pfeiltasten gehoeren dazu.
+             Die Zeile traegt kein eigenes Label: die Abschnittsueberschrift
+             direkt darueber IST es (aria-label am Segment). -->
+        <div class="settings-setting-row settings-setting-row--stacked">
+          <div class="settings-setting-row__control">
+            <div class="segmented settings-segmented" id="theme-toggle" role="radiogroup" aria-label="${esc(t('settings.sectionDesign'))}">
+              ${THEME_OPTIONS.map(({ value, icon, labelKey }) => {
+                const on = theme === value;
+                return `<button type="button" class="segmented__item${on ? ' is-active' : ''}" role="radio"
+                  data-tab-id="${value}" aria-checked="${on}" tabindex="${on ? '0' : '-1'}">
+                  <i data-lucide="${icon}" class="icon-md" aria-hidden="true"></i>${esc(t(labelKey))}
+                </button>`;
+              }).join('')}
+            </div>
+          </div>
         </div>
-      </div>
-      <!-- DER WAND-MODUS WOHNT HIER UND NICHT IM ANPASSEN-PANEL.
-           Er ist wie Theme und Sprache GERÄTELOKAL (localStorage) - das
-           Anpassen-Panel schreibt dagegen die haushaltweite Widget-Konfiguration
-           auf den Server. Ein gerätelokaler Schalter dort wäre eine zweite
-           Speicher-Semantik im selben Panel; und der Anpassen-Modus bearbeitet
-           das Raster, während dieser Schalter eine Betriebsart wählt. -->
-      <div class="settings-card">
-        ${toggleRowHtml({
+        <!-- DER WAND-MODUS WOHNT HIER UND NICHT IM ANPASSEN-PANEL.
+             Er ist wie Theme und Sprache GERÄTELOKAL (localStorage) - das
+             Anpassen-Panel schreibt dagegen die haushaltweite Widget-Konfiguration
+             auf den Server. Ein gerätelokaler Schalter dort wäre eine zweite
+             Speicher-Semantik im selben Panel; und der Anpassen-Modus bearbeitet
+             das Raster, während dieser Schalter eine Betriebsart wählt. -->
+        ${settingSwitchRowHtml({
           label: t('settings.wallModeLabel'),
           checked: isWallModeEnabled(),
           icon: 'tablet',
+          description: t('settings.wallModeHint'),
+          descriptionId: 'wall-mode-hint',
           attrs: { id: 'wall-mode-toggle', 'aria-describedby': 'wall-mode-hint' },
         })}
-        <p class="form-hint" id="wall-mode-hint">${t('settings.wallModeHint')}</p>
+        <!-- Next to wall mode and for the same reason: device-local (#885). A
+             photo frame and a kitchen tablet in one household want different
+             delays, and a household value would reach every phone too. The
+             Immich connection itself stays under Household -> Integrations. -->
+        ${settingRowHtml({
+          label: t('settings.screensaverIdleLabel'),
+          labelFor: 'screensaver-idle-select',
+          description: t('settings.screensaverIdleHint'),
+          descriptionId: 'screensaver-idle-hint',
+          control: `<select class="form-input" id="screensaver-idle-select" aria-describedby="screensaver-idle-hint">
+            ${screensaverIdleOptions()}
+          </select>`,
+        })}
       </div>
     </section>
 
     <section class="settings-section">
       <h2 class="settings-section__title">${t('settings.languageTitle')}</h2>
-      <div class="settings-card">
-        <div class="form-group">
-          <label class="form-label" for="locale-select">${t('settings.localeLabel')}</label>
-          <select class="form-input locale-picker__select" id="locale-select" aria-describedby="locale-error">
+      <div class="row-carrier settings-group">
+        ${settingRowHtml({
+          label: t('settings.localeLabel'),
+          labelFor: 'locale-select',
+          extra: '<div id="locale-error" class="form-error" role="alert" hidden></div>',
+          control: `<select class="form-input locale-picker__select" id="locale-select" aria-describedby="locale-error">
             ${localeOptions()}
-          </select>
-        </div>
-        <div id="locale-error" class="form-error" role="alert" hidden></div>
-      </div>
-      <!-- Eigene Karte, nicht angehängt an die Sprachauswahl darüber: als
-           Nachbar im selben Block läse sich der Hinweis wie die Erklärung der
-           Anzeigesprache - und beide sagen etwas Gegensätzliches aus. -->
-      <div class="settings-card">
-        ${isAdmin ? `
-        <p class="form-hint" id="data-language-hint">${t('settings.dataLanguageHint')}</p>
-        <div class="form-group">
-          <label class="form-label" for="data-language-select">${t('settings.dataLanguageLabel')}</label>
-          <select class="form-input" id="data-language-select" aria-describedby="data-language-hint data-language-error">
+          </select>`,
+        })}
+        <!-- Eigene Zeile mit eigenem Hinweis, nicht als Fuss der Gruppe: unter
+             beiden Zeilen läse sich der Hinweis wie die Erklärung der
+             Anzeigesprache - und beide sagen etwas Gegensätzliches aus. -->
+        ${isAdmin ? settingRowHtml({
+          label: t('settings.dataLanguageLabel'),
+          labelFor: 'data-language-select',
+          description: t('settings.dataLanguageHint'),
+          descriptionId: 'data-language-hint',
+          extra: '<div id="data-language-error" class="form-error" role="alert" hidden></div>',
+          control: `<select class="form-input" id="data-language-select" aria-describedby="data-language-hint data-language-error">
             ${dataLanguageOptions(preferences.language, preferences.language_auto)}
-          </select>
-        </div>
-        <div id="data-language-error" class="form-error" role="alert" hidden></div>` : `
-        <p class="form-hint">${t('settings.dataLanguageAdminOnly')}</p>`}
+          </select>`,
+        }) : ''}
       </div>
+      ${isAdmin ? '' : `<p class="form-hint settings-group__footer">${t('settings.dataLanguageAdminOnly')}</p>`}
     </section>
 
     <section class="settings-section">
       <h2 class="settings-section__title">${t('settings.regionTitle')}</h2>
       ${isAdmin ? `
-      <div class="settings-card">
-        <p class="form-hint" id="region-hint">${t('settings.regionHint')}</p>
-        <div class="form-group">
-          <label class="form-label" for="region-select">${t('settings.regionLabel')}</label>
-          <select class="form-input" id="region-select" aria-describedby="region-hint region-error">
+      <div class="row-carrier settings-group">
+        ${settingRowHtml({
+          label: t('settings.regionLabel'),
+          labelFor: 'region-select',
+          description: t('settings.regionHint'),
+          descriptionId: 'region-hint',
+          extra: '<div id="region-error" class="form-error" role="alert" hidden></div>',
+          control: `<select class="form-input" id="region-select" aria-describedby="region-hint region-error">
             ${regionOptions(activeRegion)}
-          </select>
-        </div>
-        <div id="region-error" class="form-error" role="alert" hidden></div>
+          </select>`,
+        })}
         <!-- Die Waehrung stand bis #934 in der Formatkarte darunter, die
              ausgeblendet ist, solange eine Region-Voreinstellung genau passt.
              Das ergab eine Falle mit Ansage: sichtbar wurde das Feld erst, WENN
@@ -306,52 +375,62 @@ function renderPage(container, preferences, isAdmin) {
              deutsche Formate und ein Konto in Dollar haben. Die Region belegt
              sie weiterhin vor; das bleibt der bequeme Weg, nur nicht mehr der
              einzige. -->
-        <div class="form-group">
-          <label class="form-label" for="currency-select">${t('settings.currencyLabel')}</label>
-          <select class="form-input" id="currency-select" aria-describedby="currency-hint currency-error"></select>
-        </div>
-        <p class="form-hint" id="currency-hint">${t('settings.currencyHint')}</p>
-        <div id="currency-error" class="form-error" role="alert" hidden></div>
-      </div>` : `
-      <div class="settings-card">
-        <p class="form-hint">${t('settings.regionAdminOnly')}</p>
-      </div>`}
-      <!-- Eigene Karte, nicht in den Formatblock darunter: die Zeitzone ist
-           keine Formatierung. Datum und Uhrzeit dort ändern nur, WIE ein Wert
-           dasteht; die Zone ändert, WELCHER Tag "heute" ist, wann Erinnerungen
-           auslösen und mit welcher Uhrzeit ein Termin bei Google ankommt. -->
-      <div class="settings-card">
-        <h3 class="settings-card__title">${t('settings.timezoneTitle')}</h3>
-        ${isAdmin ? `
-        <p class="form-hint" id="timezone-hint">${t('settings.timezoneHint')}</p>
-        <div class="form-group">
-          <label class="form-label" for="timezone-select">${t('settings.timezoneLabel')}</label>
-          <select class="form-input" id="timezone-select" aria-describedby="timezone-hint timezone-error">
+        ${settingRowHtml({
+          label: t('settings.currencyLabel'),
+          labelFor: 'currency-select',
+          description: t('settings.currencyHint'),
+          descriptionId: 'currency-hint',
+          extra: '<div id="currency-error" class="form-error" role="alert" hidden></div>',
+          control: '<select class="form-input" id="currency-select" aria-describedby="currency-hint currency-error"></select>',
+        })}
+        <!-- Eigene Zeile, nicht im Formatblock darunter: die Zeitzone ist
+             keine Formatierung. Datum und Uhrzeit dort ändern nur, WIE ein Wert
+             dasteht; die Zone ändert, WELCHER Tag "heute" ist, wann Erinnerungen
+             auslösen und mit welcher Uhrzeit ein Termin bei Google ankommt.
+             Die Zeile traegt den Namen des Feldes ("Zeitzone des Haushalts",
+             der Suchtreffer); der Kartentitel "Zeitzone" darueber sagte
+             dasselbe ein zweites Mal. -->
+        ${settingRowHtml({
+          label: t('settings.timezoneLabel'),
+          labelFor: 'timezone-select',
+          description: t('settings.timezoneHint'),
+          descriptionId: 'timezone-hint',
+          extra: '<div id="timezone-error" class="form-error" role="alert" hidden></div>',
+          control: `<select class="form-input" id="timezone-select" aria-describedby="timezone-hint timezone-error">
             ${timeZoneOptions(preferences.timezone, preferences.timezone_effective)}
-          </select>
-        </div>
-        <div id="timezone-error" class="form-error" role="alert" hidden></div>` : `
-        <p class="form-hint">${t('settings.timezoneAdminOnly')}</p>
-        <p class="form-hint">${esc(t('settings.timezoneAuto', { zone: preferences.timezone_effective || 'UTC' }))}</p>`}
+          </select>`,
+          attrs: { id: 'timezone-card' },
+        })}
+      </div>` : `
+      <div class="row-carrier settings-group">
+        ${settingRowHtml({
+          label: t('settings.timezoneTitle'),
+          description: t('settings.timezoneAdminOnly'),
+          control: `<span class="settings-setting-row__value">${esc(t('settings.timezoneAuto', { zone: preferences.timezone_effective || 'UTC' }))}</span>`,
+          attrs: { id: 'timezone-card' },
+        })}
       </div>
-      <div class="settings-card" id="custom-formats"${customHidden ? ' hidden' : ''}>
-        <p class="form-hint" id="formats-household-hint">${t('settings.formatsHouseholdHint')}</p>
-        <div class="form-group">
-          <label class="form-label" for="date-format-select">${t('settings.dateFormatLabel')}</label>
-          <select class="form-input" id="date-format-select" aria-describedby="formats-household-hint date-format-error">
+      <p class="form-hint settings-group__footer">${t('settings.regionAdminOnly')}</p>`}
+      <div class="row-carrier settings-group" id="custom-formats"${customHidden ? ' hidden' : ''}>
+        ${settingRowHtml({
+          label: t('settings.dateFormatLabel'),
+          labelFor: 'date-format-select',
+          extra: '<div id="date-format-error" class="form-error" role="alert" hidden></div>',
+          control: `<select class="form-input" id="date-format-select" aria-describedby="formats-household-hint date-format-error">
             ${formatOptions(preferences.date_format)}
-          </select>
-        </div>
-        <div id="date-format-error" class="form-error" role="alert" hidden></div>
-        <div class="form-group">
-          <label class="form-label" for="time-format-select">${t('settings.timeFormatLabel')}</label>
-          <select class="form-input" id="time-format-select" aria-describedby="formats-household-hint time-format-error">
+          </select>`,
+        })}
+        ${settingRowHtml({
+          label: t('settings.timeFormatLabel'),
+          labelFor: 'time-format-select',
+          extra: '<div id="time-format-error" class="form-error" role="alert" hidden></div>',
+          control: `<select class="form-input" id="time-format-select" aria-describedby="formats-household-hint time-format-error">
             <option value="24h"${preferences.time_format === '24h' ? ' selected' : ''}>24 ${t('settings.timeFormatHours')}</option>
             <option value="12h"${preferences.time_format === '12h' ? ' selected' : ''}>AM/PM</option>
-          </select>
-        </div>
-        <div id="time-format-error" class="form-error" role="alert" hidden></div>
+          </select>`,
+        })}
       </div>
+      <p class="form-hint settings-group__footer" id="formats-household-hint"${customHidden ? ' hidden' : ''}>${t('settings.formatsHouseholdHint')}</p>
     </section>
   `);
 }
@@ -410,6 +489,9 @@ function readFormatState(container) {
 function applyCustomVisibility(container, region) {
   const customBlock = container.querySelector('#custom-formats');
   if (customBlock) customBlock.hidden = region !== CUSTOM_REGION;
+  // Der Gruppenfuss steht unter dem Traeger, nicht in ihm - er geht mit.
+  const customHint = container.querySelector('#formats-household-hint');
+  if (customHint) customHint.hidden = region !== CUSTOM_REGION;
 }
 
 /**
@@ -461,17 +543,49 @@ async function refreshDataLanguageOptions(container) {
   ));
 }
 
+/**
+ * Die Zeile zum Zonen-Hinweis (#1607) in der Zeitzonen-Karte: solange der
+ * Haushalt keine Zone gewaehlt hat und der Browser in einer anderen steht, als
+ * der Server dann rechnet. Dieselbe Zeile wie auf der Uebersicht, hier ohne
+ * Wegklick - wer dort "So lassen" gesagt hat, findet die Handlung hier wieder.
+ * Ein Mitglied sieht den Zustand, aber keinen Knopf: der Server beantwortete
+ * ihn mit 403.
+ */
+function mountTimezoneMismatch(container, preferences, isAdmin) {
+  const card = container.querySelector('#timezone-card');
+  const mismatch = zoneMismatch(preferences);
+  if (!card || !mismatch) return;
+  const errorElement = container.querySelector('#timezone-error');
+  card.appendChild(zoneHintEl({
+    mismatch,
+    t,
+    onAdopt: isAdmin ? async () => {
+      clearError(errorElement);
+      // Schreiben ueber savePreferences(), damit der geteilte Cache der
+      // Settings-Blaetter faellt; gelesen wird am Cache vorbei, sonst saehe
+      // die Gegenprobe "hat inzwischen jemand entschieden?" nur den alten Stand.
+      const result = await adoptZone(mismatch.browser, {
+        api: { get: (path) => api.get(path), put: (_path, patch) => savePreferences(patch) },
+      });
+      resetPreferencesCache();
+      if (result.adopted) window.yuvomi?.showToast(t('settings.timezoneSaved'), 'success');
+    } : undefined,
+    onError: (error) => {
+      if (errorElement) showError(errorElement, error?.message);
+      else window.yuvomi?.showToast(error?.message || t('common.errorGeneric'), 'danger');
+    },
+  }));
+}
+
 function bindEvents(container, user) {
+  // Geteilte gleitende Kapsel (Re-Critique 2026-09-27, D8).
   const themeToggle = container.querySelector('#theme-toggle');
-  themeToggle?.addEventListener('click', (event) => {
-    const button = event.target.closest('[data-theme-value]');
-    if (!button) return;
-    applyTheme(button.dataset.themeValue);
-    themeToggle.querySelectorAll('.theme-toggle__btn').forEach((candidate) => {
-      const active = candidate === button;
-      candidate.classList.toggle('theme-toggle__btn--active', active);
-      candidate.setAttribute('aria-pressed', String(active));
-    });
+  if (themeToggle) attachSegmentIndicator(themeToggle);
+  wireTablist(themeToggle, {
+    activeId: currentTheme(),
+    activeClass: 'is-active',
+    mode: 'select',
+    onChange: (value) => applyTheme(value),
   });
 
   // Gerätelokal wie das Theme darüber: kein Server-Request, keine Preference.
@@ -488,7 +602,12 @@ function bindEvents(container, user) {
     );
   });
 
+  bindScreensaverIdleSelect(container.querySelector('#screensaver-idle-select'));
+
   const localeSelect = container.querySelector('#locale-select');
+  // Die Auswahl, die wirklich gilt (auch "System") - dorthin geht ein
+  // gescheiterter Wechsel zurueck.
+  const appliedLocaleChoice = localeSelect?.value;
   localeSelect?.addEventListener('change', async () => {
     const errorElement = container.querySelector('#locale-error');
     clearError(errorElement);
@@ -502,8 +621,13 @@ function bindEvents(container, user) {
       const locale = localeSelect.value;
       await setLocale(locale);
       await render(container, { user });
-    } catch (error) {
-      showError(errorElement, error.message);
+    } catch {
+      // Die Sprachdatei kam nicht (offline, und dieses Geraet hat die Sprache
+      // nie geladen). setLocale() hat dann nichts umgestellt - die Auswahl geht
+      // zurueck auf die Sprache, die wirklich gilt, und die Zeile sagt warum.
+      // Vorher stand hier der Parserfehler der Offline-Seite im Wortlaut.
+      localeSelect.value = appliedLocaleChoice;
+      showError(errorElement, t('common.errorOffline'));
     } finally {
       if (localeSelect.isConnected) localeSelect.disabled = false;
     }
@@ -738,6 +862,7 @@ export async function render(container, { user }) {
       appendCurrencyOptions(container.querySelector('#currency-select'), preferences.currency);
     }
     bindEvents(container, user);
+    mountTimezoneMismatch(container, preferences, isAdmin);
     window.lucide?.createIcons({ el: container });
   } catch {
     renderLoadError(container);

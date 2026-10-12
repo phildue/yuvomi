@@ -6,9 +6,11 @@
  *
  * Verhalten:
  *   - configure({ basePath, groups, groupField, supportsSubcategories, labelResolver, titleKey, hintKey,
- *                 addMaxLength,
+ *                 addMaxLength, localizedLabels,
  *                 deleteConfirmKey, deleteDetailKey, subDeleteDetailKey })
  *   - Lädt via api.get(basePath); mutiert über post/put/patch/delete relativ zu basePath
+ *   - `localizedLabels: true` haengt der Listenanfrage `?lang=<Oberflaechensprache>` an -
+ *     fuer Routen, die ihre Labels auf dem Server uebersetzen (heute nur Budget, #1859)
  *   - Dispatcht nach jeder Mutation `category-manager-changed`
  *   - Zeigt Server-Guard-Fehler (in-use/last) als Toast
  *   - Räumt Listener in disconnectedCallback() auf
@@ -22,18 +24,20 @@
  * der Seite, die ihn oeffnet (`/tasks/categories` in tasks.js, `/pantry/locations`
  * in pantry.js ...) - die Frage ist also dieselbe, die die Seite fuer ihre
  * anderen Knoepfe ohnehin mit ihrem `readOnly()` stellt, und der Aufrufer
- * versteckt bei Nur-lesen den AUSLOESER (Vorbild: `#btn-manage-categories` in
- * tasks.js). Fragte die Komponente selbst, stuende die Frage zweimal da, und
- * der Ausloeser bliebe trotzdem stehen - er oeffnete dann einen Dialog, in dem
+ * versteckt bei Nur-lesen den AUSLOESER (Vorbild: der Menue-Eintrag
+ * `manage-categories` im Werkzeugmenue von tasks.js). Fragte die Komponente
+ * selbst, stuende die Frage zweimal da, und der Ausloeser bliebe trotzdem
+ * stehen - er oeffnete dann einen Dialog, in dem
  * es nichts zu tun gibt. `npm run test:module-write-access` haelt die
  * Voraussetzung: ein `basePath` in ein FREMDES Modul macht die Suite rot, denn
  * dort muesste der Aufrufer `mayWritePath()` aus /utils/module-access.js fragen.
  */
 import { api } from '/api.js';
-import { t } from '/i18n.js';
+import { t, getLocale } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { makeSortable, isDragActive } from '/utils/sortable.js';
 import { wireTablist } from '/utils/tablist.js';
+import { rowActionHtml } from '/utils/row-action.js';
 
 /** Platzhalter-Id fuer den Eintrag ohne Ton: eine leere `data-tab-id` waere kein Knopf. */
 const NO_COLOR_ID = '__none__';
@@ -135,6 +139,7 @@ class CategoryManagerElement extends HTMLElement {
     if (Array.isArray(opts.groups) && opts.groups.length) this._groups = opts.groups;
     if (typeof opts.groupField === 'string' && opts.groupField) this._groupField = opts.groupField;
     this._supportsSub = !!opts.supportsSubcategories;
+    this._localizedLabels = !!opts.localizedLabels;
     if (typeof opts.labelResolver === 'function') this._labelResolver = opts.labelResolver;
     if (opts.titleKey) this._titleKey = opts.titleKey;
     if (opts.hintKey) this._hintKey = opts.hintKey;
@@ -180,11 +185,23 @@ class CategoryManagerElement extends HTMLElement {
     this._root.addEventListener('submit', this._onSubmit);
   }
 
+  // Der Pfad der Listenanfrage. Uebersetzt die Route ihre Labels selbst
+  // (`localizedLabels`), nennt die Komponente ihr die Sprache der Oberflaeche:
+  // die ist je Browser gewaehlt, und ohne `lang` antwortet die Route in der
+  // Sprache des Haushalts - richtig fuer die meisten, falsch fuer das Mitglied,
+  // dessen Browser eine andere spricht (#1859). Gelesen je Abruf, nicht in
+  // configure(): die Sprache kann zwischen zwei Abrufen wechseln. Nur am GET -
+  // die Schreibwege bauen ihre Pfade weiter aus dem nackten basePath.
+  _listPath() {
+    if (!this._localizedLabels) return this._basePath;
+    return `${this._basePath}?lang=${encodeURIComponent(getLocale())}`;
+  }
+
   // GET ohne Render: setzt this._cats aus der Server-Antwort. Wirft weiter,
   // damit der aufrufende Mutations-Handler (mit eigenem try/catch) selbst
   // entscheidet, welchen Ausschnitt er danach neu zeichnet.
   async _fetch() {
-    const res = await api.get(this._basePath);
+    const res = await api.get(this._listPath());
     this._cats = res.data ?? [];
   }
 
@@ -476,27 +493,37 @@ class CategoryManagerElement extends HTMLElement {
         ${this._markHtml(cat)}
         <button type="button" class="cat-row__name" data-action="rename"
               title="${esc(t('category.renameHint'))}">${esc(this._labelResolver(cat))}</button>
-        <div class="cat-row__actions">
-          <button class="btn btn--icon btn--ghost" data-action="rename"
-                  aria-label="${esc(t('category.renameHint'))}" title="${esc(t('category.renameHint'))}">
-            <i data-lucide="pencil" class="icon-sm" aria-hidden="true"></i>
-          </button>
-          <button class="btn btn--icon btn--ghost" data-action="up"
-                  aria-label="${esc(t('category.moveUp'))}" ${isFirst ? 'disabled' : ''}>
-            <i data-lucide="chevron-up" class="icon-md" aria-hidden="true"></i>
-          </button>
-          <button class="btn btn--icon btn--ghost" data-action="down"
-                  aria-label="${esc(t('category.moveDown'))}" ${isLast ? 'disabled' : ''}>
-            <i data-lucide="chevron-down" class="icon-md" aria-hidden="true"></i>
-          </button>
-          <button class="btn btn--icon btn--danger-outline" data-action="delete"
-                  aria-label="${esc(t('category.delete'))}">
-            <i data-lucide="trash-2" class="icon-sm" aria-hidden="true"></i>
-          </button>
+        <div class="cat-row__actions row-actions">
+          ${this._rowActionsHtml(this._labelResolver(cat), { isFirst, isLast })}
         </div>
         ${this._colorStripHtml(cat)}
         ${this._subListHtml(cat, group)}
       </li>`;
+  }
+
+  /**
+   * Die vier Zeilenaktionen einer Kategorie oder Unterkategorie.
+   *
+   * ZEILENAKTION DER SHELL (Komponenten-Kanon 2026-09-26): `.row-action`, das
+   * Loeschen `.row-action--danger`, und jeder Knopf nennt sein OBJEKT. Vorher
+   * standen hier `btn--icon btn--ghost` und fuer das Loeschen ein roter Ring
+   * (`btn--danger-outline`) - fuenfmal untereinander, und alle fuenf hiessen fuer
+   * einen Screenreader nur „Loeschen" (Critique A7, Sam), waehrend die Familie
+   * nebenan „Alex Johnson loeschen" sagte.
+   */
+  _rowActionsHtml(name, { isFirst, isLast, sub = false }) {
+    const prefix = sub ? 'sub-' : '';
+    return [
+      rowActionHtml({ icon: 'pencil', action: `${prefix}rename`, label: t('category.renameNamed', { name }) }),
+      rowActionHtml({ icon: 'chevron-up', action: `${prefix}up`, label: t('category.moveUpNamed', { name }), attrs: { disabled: isFirst } }),
+      rowActionHtml({ icon: 'chevron-down', action: `${prefix}down`, label: t('category.moveDownNamed', { name }), attrs: { disabled: isLast } }),
+      rowActionHtml({
+        icon: 'trash-2',
+        tone: 'danger',
+        action: `${prefix}delete`,
+        label: t(sub ? 'category.deleteSubNamed' : 'category.deleteNamed', { name }),
+      }),
+    ].join('');
   }
 
   /**
@@ -569,15 +596,8 @@ class CategoryManagerElement extends HTMLElement {
               <i data-lucide="grip-vertical" class="icon-sm" aria-hidden="true"></i>
             </span>
             <button type="button" class="cat-subrow__name" data-action="sub-rename">${esc(this._labelResolver(s))}</button>
-            <div class="cat-row__actions">
-              <button class="btn btn--icon btn--ghost" data-action="sub-rename" aria-label="${esc(t('category.renameHint'))}" title="${esc(t('category.renameHint'))}">
-                <i data-lucide="pencil" class="icon-sm" aria-hidden="true"></i></button>
-              <button class="btn btn--icon btn--ghost" data-action="sub-up" aria-label="${esc(t('category.moveUp'))}" ${j === 0 ? 'disabled' : ''}>
-                <i data-lucide="chevron-up" class="icon-sm" aria-hidden="true"></i></button>
-              <button class="btn btn--icon btn--ghost" data-action="sub-down" aria-label="${esc(t('category.moveDown'))}" ${j === arr.length - 1 ? 'disabled' : ''}>
-                <i data-lucide="chevron-down" class="icon-sm" aria-hidden="true"></i></button>
-              <button class="btn btn--icon btn--danger-outline" data-action="sub-delete" aria-label="${esc(t('category.delete'))}">
-                <i data-lucide="trash-2" class="icon-sm" aria-hidden="true"></i></button>
+            <div class="cat-row__actions row-actions">
+              ${this._rowActionsHtml(this._labelResolver(s), { isFirst: j === 0, isLast: j === arr.length - 1, sub: true })}
             </div>
           </li>`).join('')}
         <li><form class="cat-subadd-form" data-parent="${esc(this._keyOf(cat))}" novalidate autocomplete="off">

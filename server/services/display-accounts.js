@@ -7,9 +7,11 @@
  * Abhaengigkeiten: node:crypto, server/db.js (synchroner Treiber - kein `await`
  *        vor DB-Calls).
  *
- * WARUM KEIN NORMALES KONTO. Eine Sitzung endet nach sieben Tagen, also tippte
- * jemand regelmaessig ein Passwort auf ein Geraet, das an der Wand haengt - und
- * dieses Passwort ist das wertvollste, was auf dem Tablett liegt. In einem
+ * WARUM KEIN NORMALES KONTO. Ein normales Konto meldet sich mit Passwort an,
+ * also tippte jemand ein Passwort auf ein Geraet, das an der Wand haengt - und
+ * dieses Passwort ist das wertvollste, was auf dem Tablett liegt. Damals endete
+ * eine Sitzung nach sieben Tagen; seit #1356 gleitet sie ueber 90 Tage ohne
+ * Benutzung (server/utils/session-lifetime.js), am Passwort aendert das nichts. In einem
  * Haushalt, der nur per SSO anmeldet, koennte so ein Konto gar nicht erst
  * existieren. Und ein zweiter Faktor auf einem Geraet, von dem sich nie jemand
  * abmeldet, schuetzt nichts.
@@ -74,14 +76,14 @@ export const DISPLAY_COOKIE_MAX_AGE = 365 * 24 * 60 * 60 * 1000;
  * Wie selten das Cookie neu datiert wird - und warum ueberhaupt selten.
  *
  * DAS CREDENTIAL STEHT IM KLARTEXT IM `Set-Cookie`-KOPF. Bei jedem Request neu
- * zu setzen hiess, es an JEDE Antwort zu heften - auch an die eine, die hinter
- * `requireAuth` bewusst oeffentlich cachebar ist: `GET /weather/icon/:code`
- * antwortet mit `Cache-Control: public, max-age=86400`, und ein Display hat
- * `weather:read`. nginx und Cloudflare cachen eine Antwort mit `Set-Cookie`
- * zwar von Haus aus nicht, aber `proxy_ignore_headers Set-Cookie` steht in
- * genug Selfhosting-Anleitungen, und dann liegt das Credential im Cache fuer
- * den naechsten Abholer. Dazu landet es in jedem Proxy-Log, das Antwortkoepfe
- * mitschreibt.
+ * zu setzen hiess, es an JEDE Antwort zu heften, und damit in jedes Proxy-Log,
+ * das Antwortkoepfe mitschreibt. Bis 2026-09-25 kam ein Cache dazu:
+ * `GET /weather/icon/:code` antwortete hinter `requireAuth` mit
+ * `Cache-Control: public, max-age=86400`, und ein Proxy mit
+ * `proxy_ignore_headers Set-Cookie` haette das Credential fuer den naechsten
+ * Abholer aufbewahrt. Die Route sendet seitdem `no-store`; die Drossel bleibt
+ * wegen der Logs und als Schutz, falls je wieder eine cachebare Antwort hinter
+ * dem Guard entsteht.
  *
  * Zwoelf Stunden halten beides zusammen: die Ein-Jahres-Zusage bleibt (ein
  * Tablett an der Wand meldet sich vielfach oefter), und das Cookie steht nur
@@ -363,6 +365,10 @@ export function authenticateDisplayDevice(token, { db } = {}) {
   // schon das Feststellen die Frist verbrauchen, bekaeme ausgerechnet
   // `/auth/me` - die Route, die ein Tablett beim Start fragt - nie eine
   // Auffrischung zu sehen.
+  // Waehrend eines Restores nimmt die Datenbank keine Schreibzugriffe an
+  // (#1431): kein `last_seen_at` und keine Auffrischung, deren Frist sich
+  // nicht festhalten liesse. Das Tablett bleibt angemeldet wie zuvor.
+  if (dbModule.isRestoreRunning()) return { userId: row.user_id, deviceId: row.id, refreshCookie: false };
   const refreshCookie = cookieRefreshDue(row.cookie_refreshed_at, seen);
   database.prepare('UPDATE display_devices SET last_seen_at = ? WHERE id = ?').run(seen, row.id);
   return { userId: row.user_id, deviceId: row.id, refreshCookie };
@@ -391,6 +397,24 @@ export function revokeDisplayDevice(deviceId, { db } = {}) {
   return database.prepare(
     'UPDATE display_devices SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?',
   ).run(nowIso(), deviceId).changes > 0;
+}
+
+/**
+ * Die Zeile eines WIDERRUFENEN Geraets entfernen (D#1672).
+ *
+ * Jede neue Kopplung widerruft das Geraet davor, und die Zeile blieb fuer
+ * immer in der Liste - nach dem dritten Tablettwechsel standen drei tote
+ * Eintraege ueber dem einen, das an der Wand haengt. Entfernt wird nur, was
+ * widerrufen ist: ein gekoppeltes Geraet verliert seinen Zugang ueber den
+ * Widerruf, der den Zeitpunkt hinterlaesst, nicht ueber eine Luecke. Pruefen
+ * und Loeschen sind eine Anweisung.
+ * @returns {boolean} ob eine Zeile ging
+ */
+export function removeRevokedDisplayDevice(deviceId, { db } = {}) {
+  const database = db || dbModule.get();
+  return database.prepare(
+    'DELETE FROM display_devices WHERE id = ? AND revoked_at IS NOT NULL',
+  ).run(deviceId).changes > 0;
 }
 
 /** Die Geraete eines Displays, neueste zuerst - ohne jedes Geheimnis. */

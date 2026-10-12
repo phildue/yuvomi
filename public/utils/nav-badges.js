@@ -203,7 +203,7 @@ export function moduleCountsFrom(data, { isAdmin = false, shoppingVisible = fals
      * keine, warb das Badge mit Arbeit, hinter der nichts stand (Codex-Review
      * zu PR #754). Eine mitgliedseigene Zahl gaebe es nur mit einem neuen Feld
      * in der Nutzlast; bis dahin ist keine Zahl richtiger als eine falsche. */
-    rewards: isAdmin ? (data?.rewards?.pending ?? 0) : 0,
+    rewards: isAdmin ? (Number(data?.rewards?.pending) || 0) + (Number(data?.rewards?.moneyPending) || 0) : 0,
     health: openDoses,
   };
   /* Die Küche ist im mobilen Menü EIN Ziel für vier Module; was dort wartet,
@@ -213,7 +213,8 @@ export function moduleCountsFrom(data, { isAdmin = false, shoppingVisible = fals
    * einzige, die einen FREMDEN Modulzähler tragen kann - die anderen erscheinen
    * gar nicht erst, wenn ihr Modul fehlt, diese hier bleibt stehen, solange
    * eines der vier da ist. Der Server zählt `shoppingOpenCount` ungefiltert über
-   * den ganzen Haushalt (`routes/dashboard.js`), also warb die Kachel mit
+   * den ganzen Haushalt (`routes/dashboard.js`) - auch wenn die Einkaufs-Kachel
+   * eine Listen-Auswahl trägt: die füllt nur `shoppingTile` (#1818) -, also warb die Kachel mit
    * Arbeit in einem Modul, das sich nicht öffnen lässt, und führte beim Antippen
    * nach Mahlzeiten (Codex-Review zu PR #754). */
   counts.kitchen = shoppingVisible ? counts.shopping : 0;

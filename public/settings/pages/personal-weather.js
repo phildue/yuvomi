@@ -42,8 +42,8 @@ function renderPage(container, prefs) {
           })}
           <div id="pweather-form-error" class="form-error" role="alert" hidden></div>
           <div class="settings-form-actions">
-            <button type="submit" class="btn btn--primary">${t('settings.weatherSave')}</button>
             ${own ? `<button type="button" class="btn btn--secondary" id="pweather-reset-btn">${t('settings.personalWeatherUseHousehold')}</button>` : ''}
+            <button type="submit" class="btn btn--primary">${t('settings.weatherSave')}</button>
           </div>
         </form>
       </div>
@@ -62,7 +62,7 @@ function bindEvents(container, user) {
     errorElement.hidden = true;
     const location = readWeatherLocation(container, SCOPE);
     if (!hasValidWeatherCoords(location.lat, location.lon)) {
-      errorElement.textContent = `${t('settings.weatherLatLabel')} / ${t('settings.weatherLonLabel')}`;
+      errorElement.textContent = t('settings.weatherCoordsInvalid');
       errorElement.hidden = false;
       return;
     }

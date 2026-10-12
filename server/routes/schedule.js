@@ -12,13 +12,27 @@ import { dateKeysInRange, scheduleData, fieldsForShiftTypes, fieldValuesFor, typ
 // routes/schedule-extras.js' eigener Kopfkommentar seit jeher vermeidet.
 export { scheduleData, fieldValuesFor } from '../services/schedule.js';
 import { daysBetweenDateKeys } from '../utils/timezone.js';
-import { householdMemberSql, newNonMembers, nonMemberMessage } from '../services/household-members.js';
+import { householdMemberSql, memberOrderSql, memberPositionSql, newNonMembers, nonMemberMessage } from '../services/household-members.js';
 import { syncScheduleRemindersForUser } from '../services/schedule-reminders.js';
 
 const router = express.Router();
 const log = createLogger('Schedule');
+// Startfarbe einer Schichtart ohne eigene Wahl (nur NEUE Datensaetze; keine
+// Migration). Vorher '#6C3AED' - die Marke selbst. Wert aus der EINEN
+// Startpalette `USER_COLOR_DEFAULT` in public/utils/color.js (der Server kann
+// das Frontend-Modul nicht importieren; test-schedule.js haelt beide gleich).
+const SHIFT_COLOR_DEFAULT = '#0891B2';
 const actorId = (req) => req.authUserId || req.session?.userId;
-const fail = (res, code, error) => res.status(code).json({ error, code });
+// "Von liegt nach Bis" traegt neben dem Satz einen `reason` (#1777): die
+// Oberflaeche uebersetzt ueber ihn, nicht ueber den Wortlaut. Der Satz bleibt
+// Teil der /api/v1-Antwort und unveraendert. `errors` ist die Fehlerliste oder
+// ihr zusammengefuegter Satz - beides kennt `includes`. Eine 403-Absage
+// bekommt ihn nicht: dort ist das fehlende Recht die Auskunft.
+export const RANGE_REVERSED_MESSAGE = 'from must be before to.';
+export const rangeReason = (errors) => (
+  errors.includes(RANGE_REVERSED_MESSAGE) && !errors.includes('Forbidden.') ? { reason: 'range_reversed' } : {}
+);
+const fail = (res, code, error) => res.status(code).json({ error, code, ...(code === 400 ? rangeReason(String(error)) : {}) });
 const userExists = (value) => !!db.get().prepare('SELECT 1 FROM users WHERE id = ?').get(value);
 /**
  * Ein NEUER Dienstplan-Besitzer muss Haushaltsmitglied sein (#1207). Wer schon
@@ -46,7 +60,7 @@ const mineOrAdmin = (req, userId) => isAdminRequest(req) || actorId(req) === use
 // als Einzelpruefung je Zeile, nicht neu geschrieben.
 router.get('/household-members', (_req, res) => {
   const rows = db.get()
-    .prepare(`SELECT u.id, u.display_name, u.avatar_color, u.avatar_data FROM users u WHERE ${householdMemberSql('u')} ORDER BY u.display_name COLLATE NOCASE`)
+    .prepare(`SELECT u.id, u.display_name, u.avatar_color, u.avatar_data, ${memberPositionSql('u')} AS sort_order FROM users u WHERE ${householdMemberSql('u')} ORDER BY ${memberOrderSql('u')}`)
     .all();
   res.json({ data: rows });
 });
@@ -132,7 +146,7 @@ router.get('/entries', (req, res) => {
   const from = date(req.query.from, 'from', true); const to = date(req.query.to, 'to', true);
   const requested = req.query.user_id == null ? null : id(req.query.user_id, 'user_id');
   const errors = collectErrors([from, to, requested].filter(Boolean));
-  if (errors.length || (from.value && to.value && from.value > to.value)) return fail(res, 400, errors.join(' ') || 'from must be before to.');
+  if (errors.length || (from.value && to.value && from.value > to.value)) return fail(res, 400, errors.join(' ') || RANGE_REVERSED_MESSAGE);
   const span = daysBetweenDateKeys(from.value, to.value);
   if (span === null || span + 1 > MAX_RANGE_DAYS) {
     return fail(res, 400, `The range must not exceed ${MAX_RANGE_DAYS} days.`);
@@ -211,7 +225,7 @@ router.get('/shift-types', (_req, res) => {
 });
 router.post('/shift-types', (req, res) => {
   const name = str(req.body?.name, 'name'); const shortCode = str(req.body?.short_code, 'short_code', { required: false, max: 12 });
-  const start = time(req.body?.start_time, 'start_time'); const end = time(req.body?.end_time, 'end_time'); const shade = color(req.body?.color || '#6C3AED', 'color');
+  const start = time(req.body?.start_time, 'start_time'); const end = time(req.body?.end_time, 'end_time'); const shade = color(req.body?.color || SHIFT_COLOR_DEFAULT, 'color');
   const icon = shiftIcon(req.body?.icon);
   const errors = collectErrors([name, shortCode, start, end, shade, icon]);
   if ((start.value == null) !== (end.value == null)) errors.push('start_time and end_time must be provided together.');
@@ -450,7 +464,7 @@ router.put('/patterns/:id/days', (req, res) => {
 });
 router.get('/overrides', (req, res) => {
   const user = req.query.user_id == null ? null : id(req.query.user_id, 'user_id'); const from = date(req.query.from, 'from'); const to = date(req.query.to, 'to');
-  const errors = collectErrors([user, from, to].filter(Boolean)); if (from.value && to.value && from.value > to.value) errors.push('from must be before to.');
+  const errors = collectErrors([user, from, to].filter(Boolean)); if (from.value && to.value && from.value > to.value) errors.push(RANGE_REVERSED_MESSAGE);
   if (errors.length) return fail(res, 400, errors.join(' ')); if (user && !userExists(user.value)) return fail(res, 404, 'User not found.');
   const where = []; const args = []; if (user) { where.push('user_id=?'); args.push(user.value); } if (from.value) { where.push('date_key>=?'); args.push(from.value); } if (to.value) { where.push('date_key<=?'); args.push(to.value); }
   const rows = db.get().prepare(`SELECT * FROM schedule_overrides${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY user_id,date_key`).all(...args);
@@ -473,12 +487,12 @@ router.post('/overrides/fill', (req, res) => {
   const fields = validateFieldValues(req.body?.field_values, typeId?.value ?? null);
   const errors = collectErrors([user, from, to, typeId, note].filter(Boolean));
   if (fields.error) errors.push(fields.error);
-  if (from.value && to.value && from.value > to.value) errors.push('from must be before to.');
+  if (from.value && to.value && from.value > to.value) errors.push(RANGE_REVERSED_MESSAGE);
   if (user.value && !userExists(user.value)) errors.push('user_id does not exist.');
   else if (user.value && rejectedScheduleOwner(user.value)) errors.push(nonMemberMessage([user.value]));
   if (typeId && !typeExists(typeId.value)) errors.push('shift_type_id does not exist.');
   if (!mineOrAdmin(req, user.value)) errors.push('Forbidden.');
-  if (errors.length) return res.status(errors.includes('Forbidden.') ? 403 : 400).json({ error: errors.join(' '), code: errors.includes('Forbidden.') ? 403 : 400 });
+  if (errors.length) return res.status(errors.includes('Forbidden.') ? 403 : 400).json({ error: errors.join(' '), code: errors.includes('Forbidden.') ? 403 : 400, ...rangeReason(errors) });
   const span = daysBetweenDateKeys(from.value, to.value);
   if (span === null || span + 1 > MAX_FILL_DAYS) {
     return fail(res, 400, `The range must not exceed ${MAX_FILL_DAYS} days.`);
@@ -519,10 +533,10 @@ router.delete('/overrides', (req, res) => {
   const from = date(req.query.from, 'from', true);
   const to = date(req.query.to, 'to', true);
   const errors = collectErrors([user, from, to]);
-  if (from.value && to.value && from.value > to.value) errors.push('from must be before to.');
+  if (from.value && to.value && from.value > to.value) errors.push(RANGE_REVERSED_MESSAGE);
   if (user.value && !userExists(user.value)) errors.push('user_id does not exist.');
   if (!mineOrAdmin(req, user.value)) errors.push('Forbidden.');
-  if (errors.length) return res.status(errors.includes('Forbidden.') ? 403 : 400).json({ error: errors.join(' '), code: errors.includes('Forbidden.') ? 403 : 400 });
+  if (errors.length) return res.status(errors.includes('Forbidden.') ? 403 : 400).json({ error: errors.join(' '), code: errors.includes('Forbidden.') ? 403 : 400, ...rangeReason(errors) });
   const span = daysBetweenDateKeys(from.value, to.value);
   if (span === null || span + 1 > MAX_RANGE_DAYS) {
     return fail(res, 400, `The range must not exceed ${MAX_RANGE_DAYS} days.`);

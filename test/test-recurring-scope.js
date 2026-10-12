@@ -13,6 +13,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { getSupportedLocales } from '../public/i18n.js';
 import { readFileSync, readdirSync } from 'node:fs';
 
 const { withoutBlockComments } = await import('./source-text.js');
@@ -587,10 +588,13 @@ test('a local series without occurrence authority confirms edit and delete as wh
   const renderBody = calendarSrc.slice(renderStart, renderEnd);
   assert.match(renderBody, /requiresWholeSeriesConfirmation\(event\)/);
   assert.match(renderBody, /calendar\.wholeSeriesOnlyNotice/);
+  // Seit #1284 fragt das Speichern nach der Reichweite, nicht mehr ein Feld im
+  // Formular. Die Frage haengt an derselben Berechtigung wie zuvor das Feld;
+  // wie sie sich verhaelt, misst test:calendar-occurrence-scope am Aufrufer.
   assert.match(
-    renderBody,
-    /isLocalRecurringSeries\(event\)\s*&&\s*canEditCalendarOccurrence\(event\)[\s\S]*renderRecurringScopeChooser/,
-    'occurrence scope chooser is not guarded by occurrence authority',
+    saveBody,
+    /isLocalRecurringSeries\(event\)\s*&&\s*canEditCalendarOccurrence\(event\)\)\s*\{[\s\S]*?recurringScopeChoice\(/,
+    'occurrence scope question is not guarded by occurrence authority',
   );
 });
 
@@ -638,7 +642,7 @@ test('Die Schlüssel beider Rückfragen stehen in allen Locales', () => {
   const locales = readdirSync(dir)
     .filter((file) => file.endsWith('.json'))
     .map((file) => file.replace(/\.json$/, ''));
-  assert.equal(locales.length, 24);
+  assert.equal(locales.length, getSupportedLocales().length);
   for (const loc of locales) {
     const cal = JSON.parse(readFileSync(new URL(`${loc}.json`, dir), 'utf-8')).calendar;
     for (const k of keys) {
@@ -664,7 +668,7 @@ test('whole-series-only warnings are meaningful in every locale and use no dash 
   ];
   const dir = new URL('../public/locales/', import.meta.url);
   const locales = readdirSync(dir).filter((file) => file.endsWith('.json'));
-  assert.equal(locales.length, 24);
+  assert.equal(locales.length, getSupportedLocales().length);
   for (const file of locales) {
     const cal = JSON.parse(readFileSync(new URL(file, dir), 'utf-8')).calendar;
     for (const key of keys) {

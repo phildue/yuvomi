@@ -18,6 +18,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { eachRule } from './css-rules.js';
 
 global.HTMLElement = class HTMLElement {};
 global.customElements = { define() {}, get() { return undefined; } };
@@ -39,6 +40,7 @@ const {
   splitUpcomingByType, deepLinkNeedsExpand, nearestOrdinalAnchorDateKey,
   typeCardHtml, scheduleRowHtml, sourceRowHtml, TYPE_PRESETS, WASTE_TYPE_COLORS,
   activeSwatchColor, resolveSwatchColors,
+  isOnboarding, onboardingHtml, sectionVisibility, fabIntent,
 } = __test;
 
 // Quelltext-Schnappschuss fuer die Zusicherungen weiter unten. Er steht VOR dem
@@ -491,6 +493,100 @@ test('WASTE_TYPE_COLORS: jede Preset-Farbe liegt im Raster', () => {
   }
 });
 
+/**
+ * DER FARBNAME NENNT DEN FARBTON (#1507).
+ *
+ * Die Swatches tragen ihren Namen als `aria-label` und `title` - wer die Farbe
+ * nicht sieht, hat nur ihn. Nach dem Wechsel auf die geteilte Palette hiess
+ * #D946EF (Fuchsia, Farbton 292) weiter "Violett" und #059669 (Smaragd, 161)
+ * weiter "Tuerkis": die Hex-Werte waren gewandert, die Namen nicht.
+ *
+ * Gemessen wird der Farbton des Hex-Werts gegen den Sektor, den der
+ * Schluesselname behauptet. Die Sektoren sind grob und ueberlappen nicht; sie
+ * sollen einen vertauschten Namen fangen, keine Nuance.
+ *
+ * Eine Ausnahme vom Nicht-Ueberlappen (#1723): Magenta und Fuchsia teilen
+ * sich einen Sektor, weil sie derselbe Farbton sind (300 Grad, in CSS sogar
+ * derselbe Wert). #EC4899 liegt bei 330 und hiess trotzdem "Magenta" - der
+ * Sektor stand hier zu weit und hat den Namen gedeckt, statt ihn zu pruefen.
+ * 310 bis 345 ist Pink.
+ */
+const HUE_SECTORS = {
+  colorRed: [345, 15],
+  colorOrange: [15, 28],
+  colorOcher: [28, 50],
+  colorGreen: [90, 150],
+  colorEmerald: [150, 170],
+  colorTeal: [170, 185],
+  colorCyan: [185, 200],
+  colorBlue: [200, 250],
+  colorViolet: [250, 280],
+  colorFuchsia: [280, 310],
+  colorMagenta: [280, 310],
+  colorPink: [310, 345],
+};
+
+function hueAndSaturation(hex) {
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const delta = max - min;
+  let hue = 0;
+  if (delta > 0) {
+    if (max === r) hue = ((g - b) / delta) % 6;
+    else if (max === g) hue = (b - r) / delta + 2;
+    else hue = (r - g) / delta + 4;
+    hue = (hue * 60 + 360) % 360;
+  }
+  return { hue, saturation: max === 0 ? 0 : delta / max };
+}
+
+test('WASTE_TYPE_COLOR_NAMES: jeder Farbname liegt im Farbton seines Hex-Werts (#1507)', () => {
+  const pairs = [...WASTE_CODE.matchAll(/'(#[0-9A-F]{6})':\s*t\('waste\.(color\w+)'\)/g)].map((m) => [m[1], m[2]]);
+  assert.equal(pairs.length, WASTE_TYPE_COLORS.length, 'nicht jede Palettenfarbe hat einen Namen');
+  assert.deepEqual(pairs.map(([hex]) => hex).sort(), [...WASTE_TYPE_COLORS].sort());
+  const failures = [];
+  for (const [hex, key] of pairs) {
+    const { hue, saturation } = hueAndSaturation(hex);
+    if (key === 'colorGray') {
+      if (saturation > 0.2) failures.push(`${hex} heisst ${key}, ist aber bunt (Saettigung ${saturation.toFixed(2)})`);
+      continue;
+    }
+    const sector = HUE_SECTORS[key];
+    assert.ok(sector, `${key}: kein Farbton-Sektor hinterlegt`);
+    const [from, to] = sector;
+    const inside = from < to ? hue >= from && hue < to : hue >= from || hue < to;
+    if (!inside) failures.push(`${hex} heisst ${key}, liegt aber bei Farbton ${Math.round(hue)}`);
+  }
+  assert.deepEqual(failures, []);
+});
+
+test('#EC4899 heisst in jeder Sprache Pink, und der alte Name ist kein zweiter (#1723)', async () => {
+  const { readFileSync, readdirSync } = await import('node:fs');
+  // Das Etikett ist neu, der gespeicherte Wert nicht: eine Abfallart traegt den
+  // Hex-Wert, und der bleibt in der Palette.
+  assert.ok(WASTE_TYPE_COLORS.includes('#EC4899'), '#EC4899 ist nicht mehr waehlbar - Bestandsdaten zeigten dann auf nichts');
+  const name = WASTE_CODE.match(/'#EC4899':\s*t\('waste\.(color\w+)'\)/);
+  assert.ok(name, '#EC4899 hat keinen Namen mehr');
+  assert.equal(name[1], 'colorPink');
+  const dir = new URL('../public/locales/', import.meta.url);
+  const files = readdirSync(dir).filter((file) => file.endsWith('.json'));
+  assert.ok(files.length >= 20, 'zu wenige Locale-Dateien gelesen');
+  const seen = new Map();
+  for (const file of files) {
+    const { waste } = JSON.parse(readFileSync(new URL(file, dir), 'utf8'));
+    assert.equal(typeof waste.colorPink, 'string', `${file}: waste.colorPink fehlt`);
+    assert.equal(waste.colorMagenta, undefined, `${file}: waste.colorMagenta ist ein toter zweiter Name`);
+    // Kein Name darf doppelt in der Palette stehen - ein Screenreader koennte
+    // die zwei Swatches sonst nicht unterscheiden.
+    const names = Object.entries(waste).filter(([key]) => /^color[A-Z]/.test(key) && key !== 'colorCurrent').map(([, value]) => value);
+    assert.equal(new Set(names).size, names.length, `${file}: zwei Farben heissen gleich (${names.join(', ')})`);
+    seen.set(file, waste.colorPink);
+  }
+  assert.equal(seen.get('de.json'), 'Pink');
+  assert.equal(seen.get('en.json'), 'Pink');
+});
+
 test('WASTE_TYPE_COLORS: eine kuratierte Auswahl ohne Dubletten und ohne Extremwerte', () => {
   assert.equal(new Set(WASTE_TYPE_COLORS).size, WASTE_TYPE_COLORS.length, 'keine doppelten Farben');
   assert.ok(WASTE_TYPE_COLORS.length >= 8, 'zu wenig Auswahl ist auch keine');
@@ -504,6 +600,65 @@ test('WASTE_TYPE_COLORS: eine kuratierte Auswahl ohne Dubletten und ohne Extremw
     assert.ok(luminance > 0.08 && luminance < 0.72,
       `${hex} liegt ausserhalb des Helligkeitsbands der Palette (${luminance.toFixed(3)})`);
   }
+});
+
+// -------------------------------------------------------------------------
+// EINE Startpalette fuer Nutzerfarben (Re-Critique 2026-09-28, P9)
+// -------------------------------------------------------------------------
+
+// Die Flaechen, auf denen ein Farbsymbol oder Swatch landet, gerechnet aus
+// tokens.css selbst - Light UND Dark, Grundflaeche UND gehobene Karte. Kein
+// abgeschriebener Hex hier: aendert sich ein Flaechenton, misst der Test mit.
+const TOKENS_CSS = readFileSync(new URL('../public/styles/tokens.css', import.meta.url), 'utf8');
+const SURFACES = [...new Set([...TOKENS_CSS.matchAll(/--_color-surface(?:-raised)?:\s*(#[0-9A-Fa-f]{6})/g)].map((m) => m[1].toUpperCase()))];
+function relLum(hex) {
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+    .map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+function contrast(a, b) {
+  const [x, y] = [relLum(a), relLum(b)];
+  return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+}
+function hueOf(hex) {
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
+  const mx = Math.max(r, g, b); const d = mx - Math.min(r, g, b);
+  if (!d) return null;
+  const h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return (h * 60 + 360) % 360;
+}
+
+test('USER_COLORS: eine Startpalette, die auf jeder Flaeche beider Themes >= 3:1 haelt', async () => {
+  const { USER_COLORS } = await import('../public/utils/color.js');
+  assert.ok(Array.isArray(USER_COLORS) && USER_COLORS.length >= 8, 'geteilte Palette fehlt in utils/color.js');
+  assert.ok(SURFACES.length >= 4, `Flaechen aus tokens.css nicht gefunden: ${SURFACES}`);
+  for (const hex of USER_COLORS) {
+    for (const surface of SURFACES) {
+      assert.ok(contrast(hex, surface) >= 3, `${hex} auf ${surface}: ${contrast(hex, surface).toFixed(2)}:1 < 3:1`);
+    }
+  }
+});
+
+test('USER_COLORS: kein Ton im Markenband (#6C3AED/#7C3AED), der Primaerknopf bleibt die eine Stimme', async () => {
+  const { USER_COLORS, USER_COLOR_DEFAULT } = await import('../public/utils/color.js');
+  for (const hex of USER_COLORS) {
+    const hue = hueOf(hex);
+    assert.ok(hue === null || hue < 245 || hue > 275, `${hex} (Hue ${hue?.toFixed(0)}) liegt im Markenband`);
+  }
+  assert.ok(USER_COLORS.includes(USER_COLOR_DEFAULT), 'die Vorgabe fuer neue Datensaetze ist ein Palettenmitglied');
+});
+
+test('Farb-Swatch traegt eine Innenkante, damit er im Dark nicht in den Kartengrund laeuft', () => {
+  const css = readFileSync(new URL('../public/styles/waste.css', import.meta.url), 'utf8');
+  const base = [...eachRule(css)].find((r) => r.selector.trim() === '.waste-color-swatch' && !r.at.length);
+  assert.ok(base, '.waste-color-swatch fehlt');
+  assert.match(base.body, /box-shadow:\s*inset 0 0 0 1px var\(--color-border[a-z-]*\)/);
+});
+
+test('WASTE_TYPE_COLORS ist die geteilte Palette, und Sperrmuell traegt nicht mehr die Stimme', async () => {
+  const { USER_COLORS } = await import('../public/utils/color.js');
+  assert.deepEqual(WASTE_TYPE_COLORS, USER_COLORS);
+  assert.ok(!TYPE_PRESETS.some((p) => /^#7C3AED$/i.test(p.color)), 'kein Preset in #7C3AED');
 });
 
 // -------------------------------------------------------------------------
@@ -534,9 +689,18 @@ test('die Seite hat einen sichtbaren, beschrifteten Weg zur ersten Abfallart, un
   // die Variante hier ausdruecklich im Test und nicht nur im Kommentar.
   assert.match(WASTE_SRC, /class="btn btn--secondary" id="waste-add-type-btn" data-action="add-type"/);
   assert.doesNotMatch(WASTE_CODE, /class="btn btn--primary" id="waste-add-type-btn"/);
-  // Und genau einmal: der Menueeintrag ist beim Befoerdern entfallen.
+  // Und genau einmal als Knopf. Seit R16 (Kopfregel mobil 1a) gibt es den
+  // Menueeintrag wieder, aber nie NEBEN dem Knopf: unter 768px traegt die
+  // Titelzeile nur Icon-Knoepfe, der beschriftete Knopf ist dort ausgeblendet
+  // und der Eintrag steht; ab 768px umgekehrt. Je Breite EIN Weg.
   assert.equal((WASTE_SRC.match(/data-action="add-type"/g) ?? []).length, 1);
-  assert.doesNotMatch(WASTE_SRC, /action: 'add-type'/, 'add-type darf nicht mehr im Ueberlaufmenue stehen');
+  assert.equal((WASTE_CODE.match(/action: 'add-type'/g) ?? []).length, 1);
+  const wasteCss = readFileSync(new URL('../public/styles/waste.css', import.meta.url), 'utf8');
+  const hides = (sel, media) => [...eachRule(wasteCss)].some((r) => r.selector.trim() === sel
+    && /display:\s*none/.test(r.body) && (media ? r.at.some((a) => media.test(a)) : r.at.length === 0));
+  assert.ok(hides('#waste-add-type-btn', /max-width:\s*767px/), 'unter 768px weicht der Kopfknopf dem Menueeintrag');
+  assert.ok(hides('#waste-page-menu [data-action="add-type"]', /min-width:\s*768px/), 'ab 768px weicht der Eintrag dem Knopf');
+  assert.ok(hides('.waste-page--onboarding #waste-page-menu [data-action="add-type"]'), 'im Onboarding traegt der FAB den Weg');
   // Die drei uebrigen Kopf-Aktionen bleiben im Menue.
   for (const a of ['open-import', 'open-url-source', 'open-reminder-settings']) {
     assert.match(WASTE_SRC, new RegExp(`action: '${a}'`), `${a} gehoert weiter ins Ueberlaufmenue`);
@@ -554,19 +718,26 @@ test('der neue Kopfknopf traegt bewusst KEIN toolbar-new-btn', () => {
 
 test('der FAB fuehrt ohne Abfallart nicht mehr ins Leere', () => {
   // Vorher: Toast, `return`, Ende - der prominenteste Knopf einer frischen
-  // Installation war der einzige, der garantiert nirgendwohin fuehrte.
-  const branch = WASTE_SRC.match(/if \(!state\.types\.filter\([\s\S]{0,400}?\n {4}\}/);
-  assert.ok(branch, 'der Zweig ohne Abfallart muss auffindbar bleiben');
-  assert.match(branch[0], /openTypeModal\(\)/, 'der Hinweis muss jetzt auch den Weg oeffnen');
-  // Der Satz bleibt: der FAB ist mit "Abholung" beschriftet, und ein Dialog,
-  // der unangekuendigt nach einer Abfallart fragt, braucht seine Erklaerung.
-  assert.match(branch[0], /waste\.addTypeFirstHint/);
+  // Installation war der einzige, der garantiert nirgendwohin fuehrte. Seit
+  // der Re-Critique 2026-09-28 nennt er in diesem Zustand selbst "Abfallart"
+  // (fabIntent, oben geprueft) und oeffnet genau diesen Dialog - der
+  // erklaerende Toast entfiel, er legte sich ueber das Namensfeld.
+  const handler = WASTE_SRC.match(/onClick: \(\) => \{[\s\S]{0,300}?\n {6}\}/);
+  assert.ok(handler, 'der FAB-Handler in applyPageMode muss auffindbar bleiben');
+  assert.match(handler[0], /if \(readOnly\(\)\) return;/);
+  assert.match(handler[0], /creates === 'type'\) openTypeModal\(\)/);
+  assert.match(handler[0], /else openScheduleModal\(null\)/, 'mit Abfallart legt der Primaerknopf den Termin an (R17/E2)');
+  assert.doesNotMatch(WASTE_CODE, /addTypeFirstHint/, 'kein Umleitungs-Toast mehr');
+  assert.match(WASTE_CODE, /setPageFabAction\(fab, \{[\s\S]{0,120}dockLabel: t\(intent\.dockLabelKey\)/,
+    'der angedockte Knopf zieht sein Nomen mit');
 });
 
 test('beide Leerzustaende bieten ihren Weg an - und beide nur dem, der schreiben darf', () => {
   // Der Quellen-Leerzustand nannte den Weg in seiner Beschreibung, ohne ihn
   // anzubieten ("Importiere eine ICS-Datei deiner Kommune...").
-  assert.match(WASTE_SRC, /action: readOnly\(\) \? null : \{ label: t\('waste\.addType'\)/);
+  // Abfallarten: der EINE Onboarding-Block (Re-Critique 2026-09-28), dessen
+  // Schreibwege am Nur-lesen-Schalter haengen (onboardingHtml, oben geprueft).
+  assert.match(WASTE_SRC, /onboardingHtml\(\{ readOnly: readOnly\(\) \}\)/);
   assert.match(WASTE_SRC, /action: readOnly\(\) \? null : \{ label: t\('waste\.importFileAction'\)/);
   assert.match(WASTE_SRC, /#waste-empty-add-source'\)\?\.addEventListener\('click', \(\) => openImportWizard\(\)\)/);
 });
@@ -619,7 +790,7 @@ test('resolveSwatchColors: eine Farbe ausserhalb der Palette bekommt weiterhin g
 });
 
 test('resolveSwatchColors: bereits grossgeschriebene Palettenfarben verhalten sich unveraendert', () => {
-  const { swatchColors } = resolveSwatchColors('#2563EB');
+  const { swatchColors } = resolveSwatchColors('#3B82F6');
   assert.deepEqual(swatchColors, WASTE_TYPE_COLORS);
 });
 
@@ -651,4 +822,208 @@ test('activeSwatchColor: liest die Farbe des aktiven Swatch, nicht die Oeffnungs
 test('activeSwatchColor: faellt ohne aktiven Swatch auf die uebergebene Oeffnungsfarbe zurueck', () => {
   const panel = stubSwatchPanel(null);
   assert.equal(activeSwatchColor(panel, '#16A34A'), '#16A34A');
+});
+
+// -------------------------------------------------------------------------
+// EIN Leerzustand statt drei (Re-Critique 2026-09-28, P4). Ohne Abfallart
+// standen drei "Noch nichts"-Bloecke untereinander, der erste Weg lag bei
+// y683 unter dem Toast, und der FAB hiess "Abholung", fuehrte aber in den
+// Abfallart-Dialog.
+// -------------------------------------------------------------------------
+
+test('isOnboarding: nur ohne jede Abfallart, nicht beim Laden, nicht bei nur archivierten', () => {
+  assert.equal(isOnboarding({ types: [], loading: false, error: null }), true);
+  assert.equal(isOnboarding({ types: [], loading: true, error: null }), false, 'Skelett statt Onboarding');
+  assert.equal(isOnboarding({ types: [], loading: false, error: new Error('x') }), false, 'Ladefehler bleibt Ladefehler');
+  assert.equal(isOnboarding({ types: [{ id: 1, archived: true }], loading: false, error: null }), false,
+    'eine archivierte Art muss wiederherstellbar bleiben - sie steht nur in der vollen Ansicht');
+});
+
+test('sectionVisibility: im Onboarding nur EIN Block, Abholungen und Quellen erst mit Daten', () => {
+  const on = sectionVisibility({ types: [], loading: false, error: null });
+  assert.deepEqual(on, { upcoming: false, sources: false, addTypeButton: false });
+  const full = sectionVisibility({ types: [{ id: 1, archived: false }], loading: false, error: null });
+  assert.deepEqual(full, { upcoming: true, sources: true, addTypeButton: true });
+});
+
+test('onboardingHtml: Vorlagen als direkt anlegbare Chips plus ICS-Import, ein Leerzustand', () => {
+  const html = onboardingHtml({ readOnly: false, emptyHtml: '<div class="empty-state">E</div>' });
+  for (const preset of TYPE_PRESETS) {
+    assert.match(html, new RegExp(`data-action="create-preset-type"[^>]*data-preset="${preset.key}"`), `Chip ${preset.key} fehlt`);
+  }
+  assert.equal((html.match(/class="empty-state/g) || []).length, 1, 'genau ein Leerzustand');
+  assert.match(html, /data-action="open-import"/, 'ICS-Import als zweiter Weg');
+  assert.match(html, /role="group"[^>]*aria-label="waste\.typePresetLabel"/);
+});
+
+test('onboardingHtml: Nur-lesen bekommt den Leerzustand ohne jeden Schreibweg', () => {
+  const html = onboardingHtml({ readOnly: true, emptyHtml: '<div class="empty-state">E</div>' });
+  assert.doesNotMatch(html, /create-preset-type|open-import/);
+  assert.equal((html.match(/class="empty-state/g) || []).length, 1);
+});
+
+test('fabIntent: ohne Abfallart nennt der FAB "Abfallart" und legt sie an', () => {
+  assert.deepEqual(fabIntent({ types: [] }), { creates: 'type', labelKey: 'waste.addType', dockLabelKey: 'newLabel.wasteType' });
+  assert.deepEqual(fabIntent({ types: [{ id: 1, archived: true }] }),
+    { creates: 'type', labelKey: 'waste.addType', dockLabelKey: 'newLabel.wasteType' }, 'nur archivierte: keine Abholung moeglich');
+  // Entscheidung R17 (E2): mit Abfallart legt der Primaerknopf den
+  // WIEDERKEHRENDEN TERMIN an - bis dahin die Einzelabholung, die seltenste
+  // Handlung des Moduls.
+  assert.deepEqual(fabIntent({ types: [{ id: 1, archived: false }] }),
+    { creates: 'schedule', labelKey: 'waste.addSchedule', dockLabelKey: 'newLabel.wasteSchedule' });
+});
+
+/* #1775: mit NUR archivierten Abfallarten ist die Seite kein Onboarding (die
+ * Karten bleiben wiederherstellbar), der Eintrag "Abholung hinzufuegen" stand
+ * also im Menue - und oeffnete den Abfallart-Dialog. Gemessen wird die Klasse,
+ * an der waste.css den Eintrag herausnimmt, an genau diesem Zustand. */
+test('#1775: sind alle Abfallarten archiviert, traegt die Seite die Klasse, die "Abholung hinzufuegen" ausblendet', () => {
+  const { pageModeClasses } = __test;
+  const state = (types) => ({ loading: false, error: null, types });
+  const archived = pageModeClasses(state([{ id: 1, archived: true }, { id: 2, archived: 1 }]));
+  assert.equal(archived['waste-page--onboarding'], false, 'kein Onboarding: die Karten muessen bleiben');
+  assert.equal(archived['waste-page--no-active-type'], true, 'aber auch keine aktive Abfallart');
+  assert.equal(pageModeClasses(state([]))['waste-page--no-active-type'], true, 'im Onboarding ebenso');
+  assert.deepEqual(pageModeClasses(state([{ id: 1, archived: true }, { id: 2, archived: false }])),
+    { 'waste-page--onboarding': false, 'waste-page--no-active-type': false },
+    'eine aktive genuegt: der Eintrag steht');
+  // Dieselbe Regel wie der Primaerknopf - der Eintrag fehlt genau dann, wenn
+  // sein Klick eine Abfallart anlegen wuerde.
+  for (const types of [[], [{ archived: true }], [{ archived: false }]]) {
+    assert.equal(pageModeClasses(state(types))['waste-page--no-active-type'], fabIntent({ types }).creates === 'type');
+  }
+  // Verdrahtung: applyPageMode() setzt JEDE dieser Klassen, und das Blatt
+  // haengt die Regel an die neue, nicht mehr nur an das Onboarding.
+  assert.match(WASTE_CODE, /for \(const \[name, on\] of Object\.entries\(pageModeClasses\(state\)\)\) page\?\.classList\.toggle\(name, on\);/);
+  const css = readFileSync(new URL('../public/styles/waste.css', import.meta.url), 'utf8');
+  const rule = [...eachRule(css)].find((r) => r.selector.split(',').some((x) => x.trim() === '.waste-page--no-active-type #waste-page-menu [data-action="add-pickup"]'));
+  assert.ok(rule && /display:\s*none/.test(rule.body));
+});
+
+// ---------------------------------------------------------------------------
+// Critique R17 (E2): der Termin ist der Hauptweg, die Abholung sagt, wann sie ist
+// ---------------------------------------------------------------------------
+
+test('R17/E2: die Einzelabholung steht im Werkzeugmenue, der Termin-Dialog waehlt seine Abfallart', () => {
+  const menu = WASTE_SRC.slice(WASTE_SRC.indexOf("id: 'waste-page-menu'"), WASTE_SRC.indexOf('id="waste-add-type-btn"'));
+  assert.match(menu, /\{ action: 'add-pickup', label: t\('waste\.addPickup'\), icon: 'calendar-plus' \}/);
+  assert.match(WASTE_CODE, /kind === 'add-pickup'\) \{[\s\S]{0,200}?else openPickupModal\(\);/, 'der Eintrag oeffnet den Dialog der Einzelabholung');
+  const css = readFileSync(new URL('../public/styles/waste.css', import.meta.url), 'utf8');
+  const hidden = [...eachRule(css)].filter((r) => /display:\s*none/.test(r.body))
+    .flatMap((r) => r.selector.split(',').map((x) => x.trim()));
+  assert.ok(hidden.includes('.waste-page--no-active-type #waste-page-menu [data-action="add-pickup"]'),
+    'ohne aktive Abfallart gibt es nichts, wofuer man eine Einzelabholung eintraegt');
+
+  // Vom Primaerknopf kommt der Dialog ohne Abfallart: vorgeschlagen wird die
+  // erste aktive OHNE Termin, sonst die erste aktive.
+  const types = [{ id: 1 }, { id: 2 }, { id: 3, archived: true }];
+  assert.equal(__test.defaultScheduleType(types, [{ type_id: 1 }]).id, 2);
+  assert.equal(__test.defaultScheduleType(types, [{ type_id: 1 }, { type_id: 2 }]).id, 1);
+  assert.equal(__test.defaultScheduleType([{ id: 3, archived: true }], []), null);
+  const modal = WASTE_SRC.slice(WASTE_SRC.indexOf('function openScheduleModal(type, schedule = null) {'), WASTE_SRC.indexOf('function openPickupModal('));
+  assert.match(modal, /const pickType = !type;/);
+  assert.match(modal, /<select class="form-input" id="wsm-type">/);
+  assert.match(modal, /const typeId = typeSelect \? Number\(typeSelect\.value\) : type\.id;/);
+});
+
+test('R17/E2: eine Abholung nennt Wochentag, Datum und Abstand', () => {
+  // t() ist im Loader der Schluessel plus seine Parameter, formatDate() gibt
+  // den Key zurueck: geprueft wird die Zusammensetzung, nicht die Uebersetzung.
+  const today = '2026-10-07'; // Mittwoch
+  assert.equal(__test.pickupWhenLabel('2026-10-07', today), 'Mi, 2026-10-07 · common.today');
+  assert.equal(__test.pickupWhenLabel('2026-10-08', today), 'Do, 2026-10-08 · common.tomorrow');
+  assert.equal(__test.pickupWhenLabel('2026-10-09', today), 'Fr, 2026-10-09 · dashboard.daysLeft{"count":2}');
+  assert.equal(__test.pickupWhenLabel('2026-12-21', today), 'Mo, 2026-12-21 · dashboard.countdownMonths{"count":2}');
+  assert.equal(__test.pickupWhenLabel('2026-10-05', today), 'Mo, 2026-10-05', 'ein vergangener Tag traegt keinen Abstand');
+  // Der Wochentag haengt am KEY, nicht an der Zone des Prozesses.
+  const before = process.env.TZ;
+  try {
+    for (const zone of ['Pacific/Auckland', 'America/Los_Angeles']) {
+      process.env.TZ = zone;
+      assert.equal(__test.pickupWhenLabel('2026-10-09', today), 'Fr, 2026-10-09 · dashboard.daysLeft{"count":2}', zone);
+    }
+  } finally {
+    if (before === undefined) delete process.env.TZ; else process.env.TZ = before;
+  }
+  const row = __test.occurrenceRowHtml({ key: 'k', type_id: 1, type_name: 'Papier', date_key: '2099-01-02', origins: [] });
+  assert.match(row, /<span class="list-row__meta">Fr, 2099-01-02 · /, 'die Abholzeile traegt das Label');
+});
+
+test('R17/E2: eine Abfallart mit anstehender Abholung sagt nicht "Noch kein Termin"', () => {
+  const occurrences = [
+    { type_id: 2, date_key: '2099-01-02', origins: [{ kind: 'one_off' }] },
+    { type_id: 2, date_key: '2099-02-02', origins: [{ kind: 'one_off' }] },
+  ];
+  assert.match(__test.typeWithoutScheduleLine(2, occurrences), /^waste\.nextPickupLabel: Fr, 2099-01-02/, 'die naechste Abholung dieser Art');
+  assert.equal(__test.typeWithoutScheduleLine(1, occurrences), 'waste.noSchedulesYet', 'wirklich nichts: der bisherige Satz');
+  assert.match(WASTE_SRC, /<p class="waste-schedule-list__empty">\$\{esc\(typeWithoutScheduleLine\(type\.id\)\)\}<\/p>/, 'die Karte liest die Zeile dort');
+});
+
+test('create-preset-type schreibt und steht deshalb NICHT in READ_SAFE_ACTIONS', () => {
+  assert.match(WASTE_CODE, /const READ_SAFE_ACTIONS = new Set\(\['open-source', 'toggle-upcoming-rest'\]\)/);
+  assert.match(WASTE_CODE, /kind === 'create-preset-type'/);
+});
+
+test('Onboarding-CSS: Abholungen, Quellen, Abschnittstitel und Kopfknopf treten zurueck', () => {
+  const css = readFileSync(new URL('../public/styles/waste.css', import.meta.url), 'utf8');
+  const hidden = [...eachRule(css)].filter((r) => /display:\s*none/.test(r.body))
+    .flatMap((r) => r.selector.split(',').map((x) => x.trim()));
+  for (const sel of [
+    '.waste-page--onboarding .waste-upcoming-section',
+    '.waste-page--onboarding .waste-sources-section',
+    '.waste-page--onboarding .waste-types-section .waste-section-title',
+    '.waste-page--onboarding #waste-add-type-btn',
+  ]) assert.ok(hidden.includes(sel), `${sel} fehlt`);
+  // #1771: ab der Schwelle des Spaltenrasters ueberspannt der Leerzustand beide
+  // Spuren, sonst steht er links der Mitte neben einer leeren Spalte. Die
+  // Schwelle ist wortgleich die des Rasters (PAGE-019, test-frontend-audit.js).
+  assert.match(
+    css,
+    /@container module-surface \(min-width: 65rem\)\s*\{\s*\.waste-page--onboarding \.page-columns__rail\s*\{\s*grid-column:\s*1 \/ -1;\s*\}\s*\}/,
+    'Onboarding: die Seitenspalte ueberspannt das Raster ab 65rem',
+  );
+  // Seit #1775 kommen die Zustandsklassen aus pageModeClasses() - gemessen
+  // wird, was die Funktion fuer das Onboarding sagt, nicht ihre Schreibweise.
+  assert.equal(__test.pageModeClasses({ loading: false, error: null, types: [] })['waste-page--onboarding'], true);
+  assert.equal(__test.pageModeClasses({ loading: true, error: null, types: [] })['waste-page--onboarding'], false);
+  assert.match(WASTE_CODE, /Object\.entries\(pageModeClasses\(state\)\)\) page\?\.classList\.toggle\(name, on\)/);
+});
+
+// R17 (E6), Critique 2026-10-07 (A3 P1): der Termin-Dialog trug sieben rohe
+// 13x13-Checkboxen in 31px-Labels und "Aktiv" als Checkbox statt als Schalter.
+test('R17 E6: Wochentage sind Chips mit Zustand, "Aktiv" ist ein Schalter', () => {
+  const html = __test.weekdayPickerHtml('MO,TH');
+  const chips = [...html.matchAll(/<button type="button" class="([^"]*)" data-weekday="(\w+)"\s+aria-pressed="(true|false)">/g)];
+  assert.equal(chips.length, 7, 'sieben Chips, je Wochentag einer');
+  assert.ok(chips.every((m) => m[1].split(' ').includes('filter-chip')), 'der Chip des Kanons');
+  assert.deepEqual(chips.filter((m) => m[3] === 'true').map((m) => m[2]), ['MO', 'TH'], 'der Zustand steht in aria-pressed');
+  assert.deepEqual(chips.filter((m) => m[1].includes('filter-chip--active')).map((m) => m[2]), ['MO', 'TH'], 'und im Bild');
+  assert.doesNotMatch(html, /type="checkbox"/, 'keine rohe Checkbox mehr');
+  assert.match(html, /role="group" aria-labelledby="wsm-weekdays-label"/, 'die Gruppe hat einen Namen');
+  assert.match(html, /<input type="hidden" name="weekdays" value="MO,TH">/, 'der Stand steht fuer den Verwerfen-Schutz in einem Feld');
+
+  // Lesen: genau die gedrueckten Chips, in Wochenreihenfolge.
+  const pressed = [{ dataset: { weekday: 'MO' } }, { dataset: { weekday: 'TH' } }];
+  const root = { querySelectorAll: (sel) => (/\[aria-pressed="true"\]/.test(sel) ? pressed : []) };
+  assert.deepEqual(__test.weekdayPickerValue(root), ['MO', 'TH']);
+
+  const modal = WASTE_SRC.slice(WASTE_SRC.indexOf('function openScheduleModal(type, schedule = null) {'), WASTE_SRC.indexOf('function openPickupModal('));
+  assert.match(modal, /<label class="toggle">\s*<input type="checkbox" id="wsm-active"[^>]*>\s*<span class="toggle__track"><\/span>/,
+    '"Aktiv" traegt die Schalter-Bahn');
+  assert.match(modal, /body\.weekdays = weekdayPickerValue\(panel\)/, 'der Speicherweg liest die Chips');
+  assert.match(modal, /wireWeekdayPicker\(panel\)/, 'und die Chips sind verdrahtet');
+});
+
+// #1795: a refusal the server names by reason is said in the household
+// language; the server's English sentence is only the fallback.
+test('importErrorText: a named refusal gets its own sentence, anything else the server sentence or the generic one', () => {
+  const { importErrorText } = __test;
+  assert.equal(importErrorText({ status: 409, data: { error: 'English sentence', reason: 'preview_changed' } }), 'waste.importPreviewChangedError');
+  assert.equal(importErrorText({ status: 409, data: { error: 'English sentence', reason: 'source_changed' } }), 'waste.importSourceChangedError');
+  assert.equal(importErrorText({ status: 400, data: { error: 'No mapping decision was given.' } }), 'No mapping decision was given.');
+  assert.equal(importErrorText({ status: 409, data: { error: 'Other', reason: 'toString' } }), 'Other', 'an inherited property name is not a refusal');
+  assert.equal(importErrorText(new Error('offline')), 'common.unknownError');
+
+  const wizard = WASTE_SRC.slice(WASTE_SRC.indexOf('function openImportWizard('), WASTE_SRC.indexOf('function sourceMappingRowHtml('));
+  assert.match(wizard, /api\.post\(endpoint, body\);[\s\S]*?catch \(err\) \{\s*showError\(importErrorText\(err\)\);/, 'the commit step of the wizard uses it');
 });

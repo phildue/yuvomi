@@ -19,10 +19,54 @@
 
 import { createLogger } from '../../logger.js';
 import * as db from '../../db.js';
+import { householdTimeZone, utcToWall } from '../../utils/timezone.js';
 
 export const log = createLogger('Health');
 
 export const VISIBILITIES = ['private', 'family'];
+
+/**
+ * Der OFFENE Wert eines Bereichs - das Gegenstueck zu 'private'.
+ *
+ * Die Gesundheit schreibt seit jeher 'family'. Ein Bereich, der nach
+ * docs/DECISIONS.md Abschnitt 5 neu dazukommt, nimmt den kanonischen Satz von
+ * Anfang an und schreibt dort 'all'; Abschnitt 5 nennt das Lesen als die
+ * Stelle, an der beide Schreibweisen zusammenkommen ("der Lesepfad bildet
+ * `family` und `shared` auf `all` ab"), und genau das ist dieser Parameter.
+ *
+ * Er steht als Vorgabewert auf 'family', damit jede bestehende Aufrufstelle
+ * unveraendert dasselbe SQL bekommt wie vorher - ein neuer Bereich muss den
+ * Wert nennen, ein alter merkt nichts.
+ */
+export const OPEN_FAMILY = 'family';
+export const OPEN_ALL    = 'all';
+export const NUTRITION_VISIBILITIES = ['private', OPEN_ALL];
+
+/**
+ * Wie die Zeitstempel der Gesundheit geprueft werden (`measured_at`,
+ * `performed_at`, `consumed_at`, `scheduled_at`, `taken_at`): sie sind
+ * Wanduhrzeit des Haushalts. Ein Wert mit `Z` oder Offset wird dorthin
+ * umgerechnet statt abgeschnitten (#1364) - `utcnow()` aus einer
+ * Home-Assistant-Automation landete sonst um den Offset verschoben.
+ * @returns {{ to: 'wall', zone: string }} Optionen fuer `datetime()`
+ */
+export function wallClockInput() {
+  return { to: 'wall', zone: householdTimeZone(db.get()) };
+}
+
+/**
+ * "Jetzt" in derselben Form: Wanduhrzeit des Haushalts, `YYYY-MM-DDTHH:MM`.
+ * Fuer den Fall, dass eine Route den Zeitstempel selbst setzt - dort stand
+ * `new Date().toISOString()`, der einzige UTC-Instant in einer Spalte, die
+ * sonst nur Wanduhrzeit fuehrt (Export, Tagesschluessel).
+ * @returns {string}
+ */
+export function wallClockNow() {
+  const nowIso = new Date().toISOString();
+  const wall = utcToWall(nowIso, householdTimeZone(db.get()));
+  return wall ? `${wall.date}T${wall.time.slice(0, 5)}` : nowIso;
+}
+
 export const LOG_STATUS   = ['taken', 'skipped', 'pending'];
 export const FLOW_LEVELS  = ['spotting', 'light', 'medium', 'heavy'];
 export const MAX_UNIT     = 30;
@@ -48,34 +92,41 @@ const CARED_FOR_SUBQUERY = 'SELECT subject_id FROM health_care_grants WHERE care
  * @param {string} alias         - Tabellen-Alias mit user_id + visibility
  * @param {number} viewer        - eingeloggter Nutzer
  * @param {number|null} personId  - optionaler Personen-Filter (?user_id=)
+ * @param {string} open          - der offene Wert dieses Bereichs (siehe OPEN_FAMILY)
  * @returns {{ sql: string, params: any[] }}
  */
-export function visibilityClause(alias, viewer, personId) {
+export function visibilityClause(alias, viewer, personId, open = OPEN_FAMILY) {
   if (personId) {
     if (personId === viewer) return { sql: `${alias}.user_id = ?`, params: [viewer] };
-    return { sql: `${alias}.user_id = ? AND ${alias}.visibility = 'family'`, params: [personId] };
+    return { sql: `${alias}.user_id = ? AND ${alias}.visibility = ?`, params: [personId, open] };
   }
-  return { sql: `(${alias}.user_id = ? OR ${alias}.visibility = 'family')`, params: [viewer] };
+  return { sql: `(${alias}.user_id = ? OR ${alias}.visibility = ?)`, params: [viewer, open] };
 }
 
 /**
  * Wie `visibilityClause()`, zusätzlich mit den Daten betreuter Personen - auch
- * deren privaten (#584). Gilt für Vitalwerte, Medikamente, Laborbefunde und
- * Aktivitäten.
+ * deren privaten (#584). Gilt für Vitalwerte, Medikamente, Laborbefunde,
+ * Aktivitäten, Vorsorge und die Naehrwerte (#1326).
+ *
+ * `open` ist der Wert, den DIESE Tabelle fuer "der Haushalt darf mitlesen"
+ * schreibt. Er wandert als Bind-Parameter ins SQL statt als eingebautes
+ * 'family', weil die Naehrwert-Tabelle den kanonischen Satz fuehrt und dort
+ * 'all' steht - ein fest verdrahtetes 'family' haette dort NIE getroffen, und
+ * zwar lautlos: die Abfrage bliebe gueltig und lieferte einfach nichts.
  */
-export function careAwareClause(alias, viewer, personId) {
+export function careAwareClause(alias, viewer, personId, open = OPEN_FAMILY) {
   if (personId) {
     if (personId === viewer) return { sql: `${alias}.user_id = ?`, params: [viewer] };
     // Betreute Person: volle Sicht wie der Eigentümer. Für alle anderen bleibt
     // es beim Familien-Filter.
     return {
-      sql: `${alias}.user_id = ? AND (${alias}.visibility = 'family' OR ? IN (${CARED_FOR_SUBQUERY}))`,
-      params: [personId, personId, viewer],
+      sql: `${alias}.user_id = ? AND (${alias}.visibility = ? OR ? IN (${CARED_FOR_SUBQUERY}))`,
+      params: [personId, open, personId, viewer],
     };
   }
   return {
-    sql: `(${alias}.user_id = ? OR ${alias}.visibility = 'family' OR ${alias}.user_id IN (${CARED_FOR_SUBQUERY}))`,
-    params: [viewer, viewer],
+    sql: `(${alias}.user_id = ? OR ${alias}.visibility = ? OR ${alias}.user_id IN (${CARED_FOR_SUBQUERY}))`,
+    params: [viewer, open, viewer],
   };
 }
 

@@ -4,9 +4,39 @@
  *        getConfig() führt Discovery durch und cached die Configuration für die Laufzeit.
  *        resetClient() wird in Tests verwendet um den Cache zu leeren.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import * as client from 'openid-client';
 
 let _config = null;
+
+/**
+ * Die Redirect-URI des laufenden Code-Tauschs, je Aufruf (#1768).
+ * Siehe `exchangeAuthorizationCode`.
+ */
+const grantRedirectUri = new AsyncLocalStorage();
+
+/**
+ * `fetch` fuer die Anfragen an den Anbieter. Reicht alles unveraendert durch,
+ * nur die Token-Anfrage des Code-Tauschs bekommt die Redirect-URI, die die
+ * Authorize-Anfrage getragen hat. Das ist der Weg, den `openid-client` dafuer
+ * dokumentiert (`customFetch`, Beispiel "Correcting the redirect_uri token
+ * endpoint request parameter"): die Bibliothek leitet den Wert sonst aus der
+ * Callback-URL ab, und zusaetzliche Token-Parameter ueberschreibt sie.
+ *
+ * Ein Code-Tausch ohne festgehaltenen Wert wird abgewiesen statt mit dem
+ * abgeleiteten gesendet: der abgeleitete ist genau der, der abweichen kann.
+ */
+function providerFetch(url, options) {
+  const body = options?.body;
+  if (body instanceof URLSearchParams && body.get('grant_type') === 'authorization_code') {
+    const redirectUri = grantRedirectUri.getStore();
+    if (typeof redirectUri !== 'string' || !redirectUri) {
+      throw new Error('OIDC code exchange without the redirect URI of its authorize request.');
+    }
+    body.set('redirect_uri', redirectUri);
+  }
+  return fetch(url, options);
+}
 
 /**
  * Gibt true zurück wenn alle vier OIDC-Umgebungsvariablen gesetzt sind.
@@ -152,9 +182,46 @@ export async function getConfig() {
     process.env.OIDC_CLIENT_ID,
     process.env.OIDC_CLIENT_SECRET,
     client.ClientSecretBasic(process.env.OIDC_CLIENT_SECRET),
+    { [client.customFetch]: providerFetch },
   );
 
   return _config;
+}
+
+/**
+ * Tauscht den Code aus dem Callback gegen Tokens - mit GENAU der Redirect-URI,
+ * die die Authorize-Anfrage dieses Laufs getragen hat (#1768).
+ *
+ * RFC 6749, 4.1.3: der Anbieter muss einen Tausch ablehnen, dessen
+ * `redirect_uri` nicht identisch mit der aus der Authorize-Anfrage ist.
+ * `authorizationCodeGrant` bekommt nur eine URL und nimmt deren Form ohne Query
+ * als Redirect-URI. Aus `OIDC_REDIRECT_URI` und dem Pfad der eingehenden
+ * Anfrage gebaut, war das die NORMALISIERTE Herkunft der Variable mit dem Pfad,
+ * der bei Express ankam: `https://Host:443/...` wurde zu `https://host/...`,
+ * und ein Pfad, den der Reverse Proxy umschreibt, ging mit. Die Anmeldung
+ * scheiterte dann nach dem erfolgreichen Login beim Anbieter mit `invalid_grant`.
+ *
+ * Von der eingehenden Anfrage kommen deshalb nur die Antwortparameter (`code`,
+ * `state`, `iss`, `error`): die URL fuer die Bibliothek traegt den
+ * festgehaltenen Wert als Basis, und `providerFetch` setzt ihn in der
+ * Token-Anfrage Zeichen fuer Zeichen. Der Wert reist ueber AsyncLocalStorage
+ * und nicht ueber die geteilte Configuration, weil zwei Anmeldungen
+ * gleichzeitig laufen koennen.
+ *
+ * @param {import('openid-client').Configuration} config
+ * @param {object} args
+ * @param {string} args.redirectUri  Wert aus der Authorize-Anfrage dieses Laufs
+ * @param {string} args.query        Query der eingehenden Callback-Anfrage, mit oder ohne `?`
+ * @param {object} args.checks       expectedState, expectedNonce, pkceCodeVerifier
+ */
+export function exchangeAuthorizationCode(config, { redirectUri, query, checks }) {
+  if (typeof redirectUri !== 'string' || !redirectUri) {
+    throw new TypeError('exchangeAuthorizationCode needs the redirect URI of the authorize request.');
+  }
+  const currentUrl = new URL(redirectUri);
+  currentUrl.search = query ?? '';
+  currentUrl.hash = '';
+  return grantRedirectUri.run(redirectUri, () => client.authorizationCodeGrant(config, currentUrl, checks));
 }
 
 /**
@@ -162,4 +229,71 @@ export async function getConfig() {
  */
 export function resetClient() {
   _config = null;
+}
+
+const ERROR_TEXT_MAX = 300;
+
+function errorText(value) {
+  return typeof value === 'string' && value ? value.slice(0, ERROR_TEXT_MAX) : undefined;
+}
+
+/**
+ * Macht aus einem Fehler des OIDC-Wegs das, was ins Log gehoert (#1675).
+ *
+ * Der Logger schreibt von einem Error nur `name`, `message` und `stack`. Bei
+ * einem Fehler vom Anbieter steht die eigentliche Auskunft aber in den Feldern
+ * daneben: `oauth4webapi` meldet eine abgelehnte Token-Anfrage als
+ * `ResponseBodyError` mit der immer gleichen Meldung "server responded with an
+ * error in the response body", und ob dahinter `invalid_client` (Client-ID oder
+ * Secret) oder `invalid_grant` (Code, Redirect-URI, PKCE) steckt, sagen nur
+ * `error` und `error_description`. Ohne sie kann niemand seine eigene
+ * Konfiguration einordnen.
+ *
+ * Uebernommen wird eine feste Liste, nie das Fehlerobjekt als Ganzes: an
+ * `response` haengt die Anfrage samt Authorization-Header, und der Antwortkoerper
+ * (`cause`) gehoert dem Anbieter. Code, Tokens und Secret kommen in keinem der
+ * gelisteten Felder vor. Texte sind gekappt, weil sie von aussen kommen.
+ *
+ * - `error`, `error_description`, `status`: Antwort des Token-Endpunkts, oder
+ *   die Fehlerparameter, mit denen der Anbieter zum Callback zurueckleitet.
+ * - `challenges`: ein 401 mit `WWW-Authenticate` statt eines JSON-Koerpers.
+ * - `cause`: der Netzwerkfehler unter einem "fetch failed" (DNS, Zertifikat,
+ *   Verbindung) - der haeufigste Grund, warum schon die Discovery scheitert.
+ *
+ * @param {unknown} err
+ * @returns {object}
+ */
+export function describeOidcError(err) {
+  if (!(err instanceof Error)) return { message: errorText(String(err)) };
+
+  const detail = { name: err.name, message: err.message };
+  const code = errorText(err.code);
+  if (code) detail.code = code;
+  const error = errorText(err.error);
+  if (error) detail.error = error;
+  const description = errorText(err.error_description);
+  if (description) detail.error_description = description;
+  if (Number.isInteger(err.status)) detail.status = err.status;
+
+  const { cause } = err;
+  if (Array.isArray(cause)) {
+    const challenges = cause
+      .filter((entry) => entry && typeof entry === 'object')
+      .map((entry) => {
+        const challenge = { scheme: errorText(entry.scheme) };
+        const challengeError = errorText(entry.parameters?.error);
+        if (challengeError) challenge.error = challengeError;
+        const challengeDescription = errorText(entry.parameters?.error_description);
+        if (challengeDescription) challenge.error_description = challengeDescription;
+        return challenge;
+      });
+    if (challenges.length) detail.challenges = challenges;
+  } else if (cause instanceof Error) {
+    detail.cause = { name: cause.name, message: errorText(cause.message) };
+    const causeCode = errorText(cause.code);
+    if (causeCode) detail.cause.code = causeCode;
+  }
+
+  detail.stack = err.stack;
+  return detail;
 }

@@ -1,8 +1,10 @@
 import { api } from '/api.js';
-import { formatDate, formatTime, t } from '/i18n.js';
+import { formatDate, formatTime, getLocale, t } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { weekStartIndex, weekdayOrder } from '/utils/date.js';
-import { toggleRowHtml } from '/settings/components.js';
+import { bindInstantSwitch, settingRowHtml, toggleRowHtml } from '/settings/components.js';
+import { wireTablist } from '/utils/tablist.js';
+import { attachSegmentIndicator } from '/utils/segment-indicator.js';
 import { getPreferences, savePreferences } from '/settings/preferences-cache.js';
 
 // Wochenstart-Optionen; Labels aus dem bestehenden Kalender-i18n (kein neuer
@@ -47,7 +49,8 @@ function durationOptionLabel(minutes) {
 // `calendar_default_reminders` und `calendar_default_assign_me` schreiben per
 // `cfgUserSet`, hinter diesem adminOnly-Blatt kam kein Mitglied an sie heran
 // (Critique 2026-07-27). Hier bleibt, was haushaltweit gilt.
-const PERSONAL_CALENDAR_PATH = '/settings/personal/calendar';
+// Die Termin-Vorgaben stehen seit R10 im selben Blatt, unter "Fuer mich".
+const PERSONAL_CALENDAR_PATH = '/settings/modules/calendar?section=personal-calendar';
 // #965: ein Verweis auf externe ICS-Feeds (fuer Laender ohne eigene Liste)
 // gehoert bewusst NICHT hierher - dieses Blatt haelt sich per `test-frontend-
 // audit.js` ausdruecklich von jeder Erwaehnung des per-Nutzer-Abo-Blatts frei
@@ -62,41 +65,50 @@ function renderPage(container, preferences) {
   container.insertAdjacentHTML('beforeend', `
     <section class="settings-section">
       <h2 class="settings-section__title">${t('settings.calendarSectionEvents')}</h2>
-      <div class="settings-card">
-        <h3 class="settings-card__title">${t('settings.calendarDurationTitle')}</h3>
-        <p class="settings-card-description">${t('settings.calendarDurationDescription')}</p>
-
-        <div class="form-group">
-          <label class="form-label" for="calendar-default-duration">${t('settings.calendarDurationLabel')}</label>
-          <select class="form-input" id="calendar-default-duration">
+      <!-- Zeilen statt je einer Karte (R17, E9). Die Zeile heisst wie die
+           fruehere Karte ("Standard-Termindauer", der Suchtreffer); das Feld
+           darin hiess nur "Dauer". -->
+      <div class="row-carrier settings-group">
+        ${settingRowHtml({
+          label: t('settings.calendarDurationTitle'),
+          labelFor: 'calendar-default-duration',
+          description: t('settings.calendarDurationDescription'),
+          descriptionId: 'calendar-default-duration-hint',
+          control: `<select class="form-input" id="calendar-default-duration" aria-describedby="calendar-default-duration-hint">
             ${DURATION_OPTIONS.map((m) => `<option value="${m}"${m === currentDuration ? ' selected' : ''}>${esc(durationOptionLabel(m))}</option>`).join('')}
-          </select>
-        </div>
-
-        <p class="form-hint">
-          ${t('settings.calendarPersonalDefaultsHint')}
-          <a href="${PERSONAL_CALENDAR_PATH}" id="calendar-personal-link">${t('settings.pageCalendarDefaults')}</a>
-        </p>
+          </select>`,
+        })}
       </div>
+      <p class="form-hint settings-group__footer">
+        ${t('settings.calendarPersonalDefaultsHint')}
+        <a href="${PERSONAL_CALENDAR_PATH}" id="calendar-personal-link">${t('settings.pageCalendarDefaults')}</a>
+      </p>
     </section>
 
     <section class="settings-section">
       <h2 class="settings-section__title">${t('settings.calendarSectionView')}</h2>
-      <div class="settings-card">
-        <h3 class="settings-card__title">${t('settings.weekStartTitle')}</h3>
-        <p class="settings-card-description">${t('settings.weekStartDescription')}</p>
-
-        <div class="theme-toggle" id="week-start-toggle" role="group" aria-label="${t('settings.weekStartTitle')}">
-          ${WEEK_START_OPTIONS.map((o) => `
-            <button type="button" class="theme-toggle__btn ${o.value === currentWeekStart ? 'theme-toggle__btn--active' : ''}"
-              data-week-start="${o.value}" aria-pressed="${o.value === currentWeekStart}">
-              ${t(o.labelKey)}
-            </button>`).join('')}
-        </div>
-
-        <div class="week-start-preview" id="week-start-preview" aria-hidden="true">
-          ${weekStartPreviewHtml(currentWeekStart)}
-        </div>
+      <div class="row-carrier settings-group">
+        <!-- Das Segment der Shell (.segmented, panel.css), wie das Theme -
+             genau einer von drei Werten gilt. -->
+        ${settingRowHtml({
+          stacked: true,
+          label: t('settings.weekStartTitle'),
+          labelId: 'week-start-label',
+          description: t('settings.weekStartDescription'),
+          control: `<div class="segmented settings-segmented" id="week-start-toggle" role="radiogroup" aria-labelledby="week-start-label">
+            ${WEEK_START_OPTIONS.map((o) => {
+              const on = o.value === currentWeekStart;
+              return `
+              <button type="button" class="segmented__item${on ? ' is-active' : ''}" role="radio"
+                data-tab-id="${o.value}" aria-checked="${on}" tabindex="${on ? '0' : '-1'}">
+                ${t(o.labelKey)}
+              </button>`;
+            }).join('')}
+          </div>
+          <div class="week-start-preview" id="week-start-preview" aria-hidden="true">
+            ${weekStartPreviewHtml(currentWeekStart)}
+          </div>`,
+        })}
       </div>
     </section>
 
@@ -131,9 +143,10 @@ function renderPage(container, preferences) {
           </div>
           <div class="form-group">
             ${toggleRowHtml({
+              control: 'switch',
               label: t('settings.holidayPublicLabel'),
               checked: !!preferences.holiday_show_public,
-              attrs: { id: 'holiday-show-public' },
+              attrs: { id: 'holiday-show-public', 'data-instant-save': true },
             })}
           </div>
           <div class="form-group" id="holiday-public-color-group"${preferences.holiday_show_public ? '' : ' hidden'}>
@@ -143,9 +156,10 @@ function renderPage(container, preferences) {
           </div>
           <div class="form-group">
             ${toggleRowHtml({
+              control: 'switch',
               label: t('settings.holidaySchoolLabel'),
               checked: !!preferences.holiday_show_school,
-              attrs: { id: 'holiday-show-school' },
+              attrs: { id: 'holiday-show-school', 'data-instant-save': true },
             })}
           </div>
           <p class="form-hint" id="holiday-school-unavailable-hint" hidden>
@@ -184,6 +198,52 @@ function appendOptions(select, entries, selectedCode) {
     option.selected = entry.isoCode === selectedCode;
     select.appendChild(option);
   }
+}
+
+/**
+ * Eine Auswahlliste in der UI-Sprache sortieren (#1723). Der Server sortiert
+ * nach dem Namen, den ER kennt; sobald die Seite die Namen uebersetzt oder in
+ * einer anderen Sprache anfragt, stimmt dessen Reihenfolge nicht mehr.
+ * Gibt eine neue Liste zurueck, die Eingabe bleibt unberuehrt.
+ */
+export function sortHolidayEntries(entries, locale = getLocale()) {
+  const list = Array.isArray(entries) ? [...entries] : [];
+  let compare = (a, b) => a.localeCompare(b);
+  try {
+    compare = new Intl.Collator([locale]).compare;
+  } catch {
+    // Eine Sprache, die Intl nicht annimmt, kostet die Feinheiten der Sortierung, nicht die Liste.
+  }
+  return list.sort((a, b) => compare(String(a?.name ?? ''), String(b?.name ?? '')));
+}
+
+/**
+ * Die Feiertagslaender in der UI-Sprache (#1723). Der Server liefert englische
+ * Namen (OpenHolidays ohne Sprachwunsch, dazu die lokal berechneten Laender),
+ * die Seite druckte sie in jeder Sprache so. Der Name entsteht hier aus dem
+ * ISO-Code, wie bei Sprachen (personal-appearance.js) und Waehrungen
+ * (currency.js); was Intl nicht benennen kann, behaelt den Namen des Servers.
+ * `fallback: 'none'` ist dafuer noetig: sonst gaebe `of()` fuer ein
+ * unbekanntes Land den Code zurueck und der Servername kaeme nie zum Zug.
+ * Alle uebrigen Felder (`schoolHolidays`) reisen mit.
+ */
+export function localizeHolidayCountries(countries, locale = getLocale()) {
+  let displayNames = null;
+  try {
+    displayNames = new Intl.DisplayNames([locale], { type: 'region', fallback: 'none' });
+  } catch {
+    // Ohne DisplayNames bleiben die Namen des Servers stehen.
+  }
+  const named = (Array.isArray(countries) ? countries : []).map((entry) => {
+    let name = null;
+    try {
+      name = displayNames?.of(entry.isoCode) || null;
+    } catch {
+      // `of()` wirft bei einem Code, der keine Region sein kann.
+    }
+    return name ? { ...entry, name } : { ...entry };
+  });
+  return sortHolidayEntries(named, locale);
 }
 
 export function shouldApplySubdivisionResponse({
@@ -324,7 +384,7 @@ export async function runHolidayDiscovery(load, onError) {
   }
 }
 
-async function loadSubdivisions(
+export async function loadSubdivisions(
   select,
   countrySelect,
   countryCode,
@@ -340,7 +400,10 @@ async function loadSubdivisions(
   if (!countryCode) return { selectedResolved: true };
 
   try {
-    const response = await api.get(`/preferences/holidays/subdivisions/${countryCode}`);
+    // `lang` ist die UI-Sprache: die Regionsnamen kommen vom Server, Intl kennt
+    // sie nicht (#1723). Der Pfad bleibt als Literal am Aufruf stehen, damit
+    // test:frontend-audit den Endpunkt dieses Blatts weiter sieht.
+    const response = await api.get(`/preferences/holidays/subdivisions/${countryCode}?lang=${encodeURIComponent(getLocale())}`);
     if (!shouldApplySubdivisionResponse({
       requestId,
       latestRequestId: requestState.latestRequestId,
@@ -351,7 +414,7 @@ async function loadSubdivisions(
     }
 
     const subdivisions = Array.isArray(response?.data) ? response.data : [];
-    appendOptions(select, subdivisions, selectedCode);
+    appendOptions(select, sortHolidayEntries(subdivisions), selectedCode);
     select.disabled = subdivisions.length === 0;
     return {
       selectedResolved: isHolidayValueResolved(subdivisions, selectedCode),
@@ -485,6 +548,25 @@ function holidayPreferenceData(container, discoveryState) {
   };
 }
 
+/**
+ * Feiertage/Schulferien anzeigen: jeder Schalter speichert nur seinen eigenen
+ * Wert. Exportiert fuer test:settings-navigation (als Programm gemessen).
+ */
+export function bindHolidayLayerSwitches({
+  showPublic, showSchool, publicColorGroup, schoolColorGroup, save = savePreferences,
+}) {
+  bindInstantSwitch(showPublic, {
+    save: (on) => save({ holiday_show_public: on }),
+    savedMessage: t('settings.holidaySaved'),
+    onRevert: (on) => { publicColorGroup.hidden = !on; },
+  });
+  bindInstantSwitch(showSchool, {
+    save: (on) => save({ holiday_show_school: on }),
+    savedMessage: t('settings.holidaySaved'),
+    onRevert: (on) => { schoolColorGroup.hidden = !on; },
+  });
+}
+
 function bindWeekStart(container, preferences) {
   const toggle = container.querySelector('#week-start-toggle');
   const preview = container.querySelector('#week-start-preview');
@@ -494,38 +576,40 @@ function bindWeekStart(container, preferences) {
     ? preferences.week_start
     : 'monday';
 
-  const paint = (value) => {
-    toggle.querySelectorAll('.theme-toggle__btn').forEach((btn) => {
-      const active = btn.dataset.weekStart === value;
-      btn.classList.toggle('theme-toggle__btn--active', active);
-      btn.setAttribute('aria-pressed', String(active));
-    });
-    if (preview) {
-      preview.replaceChildren();
-      preview.insertAdjacentHTML('beforeend', weekStartPreviewHtml(value));
-    }
+  const paintPreview = (value) => {
+    if (!preview) return;
+    preview.replaceChildren();
+    preview.insertAdjacentHTML('beforeend', weekStartPreviewHtml(value));
   };
 
-  toggle.addEventListener('click', async (event) => {
-    const button = event.target.closest('[data-week-start]');
-    if (!button) return;
-    const value = button.dataset.weekStart;
-    if (value === current || !VALID_WEEK_STARTS.includes(value)) return;
-
-    const previous = current;
-    current = value;
-    paint(value); // optimistisch – Klick fühlt sich sofort an
-    try {
-      await savePreferences({ week_start: value });
-      // Parität zu date-format-changed/time-format-changed: erlaubt offenen
-      // Ansichten, den Wochenstart ohne Neuladen zu übernehmen.
-      window.dispatchEvent(new CustomEvent('week-start-changed', { detail: { weekStart: value } }));
-      window.yuvomi?.showToast(t('settings.weekStartSaved'), 'success');
-    } catch (error) {
-      current = previous;
-      paint(previous); // Rollback bei Fehler
-      window.yuvomi?.showToast(error.message || t('common.errorGeneric'), 'danger');
-    }
+  // Rollback per setActive() ruft onChange erneut auf - dieser Merker haelt
+  // den zweiten Aufruf davon ab, den alten Wert gleich wieder zu speichern.
+  let reverting = false;
+  // Geteilte gleitende Kapsel (Re-Critique 2026-09-27, D8).
+  attachSegmentIndicator(toggle);
+  const tablist = wireTablist(toggle, {
+    activeId: current,
+    activeClass: 'is-active',
+    mode: 'select',
+    onChange: async (value) => {
+      paintPreview(value); // optimistisch – Klick fühlt sich sofort an
+      if (reverting || value === current || !VALID_WEEK_STARTS.includes(value)) return;
+      const previous = current;
+      current = value;
+      try {
+        await savePreferences({ week_start: value });
+        // Parität zu date-format-changed/time-format-changed: erlaubt offenen
+        // Ansichten, den Wochenstart ohne Neuladen zu übernehmen.
+        window.dispatchEvent(new CustomEvent('week-start-changed', { detail: { weekStart: value } }));
+        window.yuvomi?.showToast(t('settings.weekStartSaved'), 'success');
+      } catch (error) {
+        current = previous;
+        reverting = true;
+        tablist.setActive(previous); // Rollback bei Fehler
+        reverting = false;
+        window.yuvomi?.showToast(error.message || t('common.errorGeneric'), 'danger');
+      }
+    },
   });
 }
 
@@ -678,6 +762,11 @@ async function bindEvents(container, preferences) {
   showSchool.addEventListener('change', () => {
     schoolColorGroup.hidden = !showSchool.checked;
   });
+  // DIE EBENEN SCHALTEN SOFORT (R15 A7 P1-1): ein Schalter verspricht
+  // sofortige Wirkung wie die Termindauer darueber; vorher warteten sie auf
+  // "Speichern" und gingen beim Blattwechsel still verloren. Land, Region,
+  // Gruppe und Farben bleiben im Formular - sie haengen aneinander.
+  bindHolidayLayerSwitches({ showPublic, showSchool, publicColorGroup, schoolColorGroup });
 
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -753,9 +842,9 @@ async function bindEvents(container, preferences) {
   );
   if (!countriesResult.ok || !container.isConnected) return;
 
-  const countries = Array.isArray(countriesResult.value?.data)
-    ? countriesResult.value.data
-    : [];
+  const countries = localizeHolidayCountries(
+    Array.isArray(countriesResult.value?.data) ? countriesResult.value.data : [],
+  );
   countriesData = countries;
   appendOptions(
     countrySelect,

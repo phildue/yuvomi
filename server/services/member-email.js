@@ -33,7 +33,7 @@
  * zurueck in sein eigenes Konto. Die beiden Fragen bleiben deshalb getrennt.
  */
 import * as dbModule from '../db.js';
-import { householdMemberSql } from './household-members.js';
+import { activeAccountSql, householdMemberSql, memberOrderSql, memberPositionSql } from './household-members.js';
 
 /**
  * Genau EINE Adresse, oder gar keine.
@@ -76,6 +76,9 @@ export function memberEmail(userId, { db } = {}) {
   const row = database.prepare(`
     SELECT email FROM contacts
     WHERE family_user_id = ? AND email IS NOT NULL AND email != ''
+      -- An ein ehemaliges Konto geht keine Mail mehr (#1381): kein Reset-Link,
+      -- keine Einkaufsliste. Die Karteikarte selbst bleibt stehen.
+      AND EXISTS (SELECT 1 FROM users account WHERE account.id = contacts.family_user_id AND ${activeAccountSql('account')})
     LIMIT 1
   `).get(userId);
   return singleAddress(row?.email);
@@ -92,10 +95,10 @@ export function memberEmail(userId, { db } = {}) {
 export function listHouseholdMembers({ db } = {}) {
   const database = db || dbModule.get();
   return database.prepare(`
-    SELECT u.id, u.display_name, u.family_role
+    SELECT u.id, u.display_name, u.family_role, ${memberPositionSql('u')} AS sort_order
     FROM users u
     WHERE ${householdMemberSql('u')}
-    ORDER BY u.display_name COLLATE NOCASE ASC
+    ORDER BY ${memberOrderSql('u')}
   `).all();
 }
 
@@ -111,7 +114,7 @@ export function listEmailableMembers({ db } = {}) {
     FROM users u
     JOIN contacts c ON c.family_user_id = u.id
     WHERE c.email IS NOT NULL AND c.email != '' AND ${householdMemberSql('u')}
-    ORDER BY u.display_name COLLATE NOCASE ASC
+    ORDER BY ${memberOrderSql('u')}
   `).all()
     .map((row) => ({ ...row, email: singleAddress(row.email) }))
     .filter((row) => row.email !== null);

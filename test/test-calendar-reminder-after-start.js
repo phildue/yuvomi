@@ -45,6 +45,7 @@ globalThis.window.yuvomi = { showToast: (message, type) => toasts.push({ message
 
 const { __test: calendar } = await import('../public/pages/calendar.js');
 const recurrenceScope = await import('../public/utils/recurrence-scope.js');
+const { scopeQuestion, settles } = await import('./calendar-scope-question.js');
 
 // Der Messfall aus dem Issue: Beginn 18.09. 09:00 Ortszeit (07:00 UTC), die
 // Erinnerung sieben Tage spaeter, 25.09. 06:00 UTC = 08:00 Ortszeit.
@@ -117,10 +118,14 @@ class FakeEl {
   get lastElementChild() { return this.children.at(-1) ?? null; }
 
   matches(selector) {
+    // Listen und Tag-Namen: das Speichern eines Serientermins liest jedes
+    // Bedienelement des Formulars (#1284, `input, select, textarea`).
+    if (selector.includes(',')) return selector.split(',').some((part) => this.matches(part.trim()));
     if (selector.startsWith('#')) return this.id === selector.slice(1);
     if (selector.startsWith('.')) return this.classes.has(selector.slice(1));
     const attr = /^\[([\w-]+)\]$/.exec(selector);
     if (attr) return attr[1] in this.attrs;
+    if (/^[a-z]+$/.test(selector)) return this.tagName === selector.toUpperCase();
     return false;
   }
 
@@ -246,7 +251,6 @@ function openDialog({
   reminders = [],
   start = event.start_datetime,
   end = event.end_datetime,
-  scope = null,
 } = {}) {
   const section = calendar.renderCalendarReminderSection(reminders, event, []);
   const panel = new FakeEl('div');
@@ -256,7 +260,9 @@ function openDialog({
     return el;
   };
   field('modal-title', event.title);
-  field('modal-allday').checked = false;
+  const allday = field('modal-allday');
+  allday.type = 'checkbox';
+  allday.checked = false;
   field('time-fields', '', 'div');
   field('allday-fields', '', 'div');
   field('modal-start-date', start.slice(0, 10));
@@ -269,12 +275,9 @@ function openDialog({
   field('modal-description');
   field('modal-cancel', '', 'button');
   field('modal-save', '', 'button');
-  if (scope) {
-    const select = field('modal-edit-scope', '', 'select');
-    select.options = ['this', 'following', 'series'].map((value) => ({ value, selected: value === scope }));
-  }
 
   const toggle = field('modal-reminder-toggle');
+  toggle.type = 'checkbox';
   toggle.checked = /id="modal-reminder-toggle"\s+checked/.test(section);
   const fields = field('modal-reminder-fields', '', 'div');
   const rowsEl = fields.append(new FakeEl('div', { id: 'modal-reminder-rows' }));
@@ -303,10 +306,18 @@ function userSets(el, value, type = 'change') {
  * dieser Suite nicht - das endet in einem Fehler-Toast. Er ist ein Artefakt der
  * Umgebung, nicht der Befund; gemessen werden die Anfragen, und die liegen
  * alle davor.
+ *
+ * `scope` beantwortet die Frage, fuer welche Termine einer Serie das Speichern
+ * gilt (#1284) - sie kommt erst beim Speichern, als Dialog ueber dem Formular.
+ * `closes` zaehlt, wie oft etwas geschlossen wurde: der Dialog schliesst sich
+ * selbst, ein Speichern, das durchlaeuft, schliesst danach das Formular.
  */
-async function save(panel, { event = EVENT, reminders = [], master = null } = {}) {
+async function save(panel, { event = EVENT, reminders = [], master = null, scope } = {}) {
   const calls = [];
   const fieldErrors = [];
+  const closes = [];
+  const question = scopeQuestion(scope);
+  globalThis.__closeModal = (options) => closes.push(options ?? {});
   globalThis.__apiStub = {
     get: async (path) => {
       calls.push({ method: 'get', path });
@@ -325,13 +336,15 @@ async function save(panel, { event = EVENT, reminders = [], master = null } = {}
   globalThis.__rruleValues = { recurrence_rule: event.recurrence_rule ?? null, valid_until: true };
   globalThis.__reportFieldError = (input, message) => fieldErrors.push({ input, message });
   try {
-    await calendar.saveEvent(panel, 'edit', event, reminders, null);
+    await settles(calendar.saveEvent(panel, 'edit', event, reminders, null), 'Speichern');
   } finally {
+    question.uninstall();
     delete globalThis.__apiStub;
     delete globalThis.__rruleValues;
     delete globalThis.__reportFieldError;
+    delete globalThis.__closeModal;
   }
-  return { calls, fieldErrors };
+  return { calls, fieldErrors, closes, dialogs: question.dialogs };
 }
 
 const reminderPut = (calls) => calls.find((c) => c.method === 'put' && c.path.startsWith('/reminders'));
@@ -590,6 +603,11 @@ test('ein halb getippter Beginn stellt nichts um', () => {
 // ueber `PUT /reminders` absolute Zeitpunkte - dort reicht die Zeile durch wie
 // beim Einzeltermin. „Nur dieser" / „dieser und folgende" sprechen mit dem
 // Server nur in Vorlaeufen ab 0; eine Zeile nach dem Beginn hat keinen.
+//
+// Welcher Weg es wird, fragt seit #1284 das Speichern selbst, und nur, wenn
+// sich etwas geaendert hat. Die Pruefung auf die Zeile nach dem Beginn greift
+// deshalb NACH der Wahl: der Dialog ist beantwortet und zu, die Meldung steht
+// an der Zeile im Formular, das offen bleibt.
 // --------------------------------------------------------------------------
 
 const SERIES_OCCURRENCE = {
@@ -616,8 +634,9 @@ test('Serie: die Zeile bewertet sich am Serienbeginn, nicht am offenen Vorkommen
 
 test('ganze Serie: der gespeicherte Zeitpunkt geht unveraendert an den Serienkopf', async () => {
   const reminders = [AFTER, DAY_BEFORE];
-  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders, scope: 'series' });
-  const { calls } = await save(panel, { event: SERIES_OCCURRENCE, reminders, master: MASTER });
+  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders });
+  userSets(panel.querySelector('#modal-title'), 'Training (Halle 2)', 'input');
+  const { calls } = await save(panel, { event: SERIES_OCCURRENCE, reminders, master: MASTER, scope: 'series' });
   assert.equal(calls.find((c) => c.method === 'put')?.path, '/calendar/41', 'die Serie wurde gespeichert');
   const put = reminderPut(calls);
   assert.equal(put?.path, '/reminders?entity_type=event&entity_id=41');
@@ -626,9 +645,9 @@ test('ganze Serie: der gespeicherte Zeitpunkt geht unveraendert an den Serienkop
 
 test('nur dieser, nichts an den Erinnerungen geaendert: das Speichern fasst sie nicht an', async () => {
   const reminders = [AFTER, DAY_BEFORE];
-  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders, scope: 'this' });
+  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders });
   userSets(panel.querySelector('#modal-title'), 'Training (Halle 2)', 'input');
-  const { calls, fieldErrors } = await save(panel, { event: SERIES_OCCURRENCE, reminders });
+  const { calls, fieldErrors } = await save(panel, { event: SERIES_OCCURRENCE, reminders, scope: 'this' });
   assert.deepEqual(fieldErrors, []);
   const put = calls.find((c) => c.method === 'put' && c.path === '/calendar/41/occurrences/2026-10-02');
   assert.ok(put, 'das Vorkommen wurde gespeichert');
@@ -639,22 +658,89 @@ test('nur dieser, nichts an den Erinnerungen geaendert: das Speichern fasst sie 
 
 test('nur dieser, daneben eine Erinnerung geaendert: Meldung an der Zeile statt Verschieben', async () => {
   const reminders = [AFTER, DAY_BEFORE];
-  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders, scope: 'this' });
+  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders });
   const [after, dayBefore] = rowsOf(panel);
   userSets(offsetOf(dayBefore), '60');
-  const { calls, fieldErrors } = await save(panel, { event: SERIES_OCCURRENCE, reminders });
+  const { calls, fieldErrors, closes, dialogs } = await save(panel, { event: SERIES_OCCURRENCE, reminders, scope: 'this' });
   assert.deepEqual(calls.filter((c) => c.method !== 'get'), [], 'nichts gespeichert - weder verschoben noch verworfen');
+  // #1284: erst die Wahl, dann die Pruefung - der Dialog ist beantwortet und
+  // zu, das Formular bleibt offen, die Meldung steht dort an der Zeile.
+  assert.equal(dialogs.length, 1, 'die Frage nach der Reichweite kam zuerst');
+  assert.equal(dialogs[0].answered, 'this');
+  assert.deepEqual(closes, [{ force: true }], 'geschlossen hat sich nur der Dialog, nicht das Formular');
   assert.equal(fieldErrors.length, 1);
   assert.equal(fieldErrors[0].input, offsetOf(after), 'die Meldung steht an der Zeile nach dem Beginn');
   assert.equal(fieldErrors[0].message, 'reminders.afterStartNeedsLeadTime');
   assert.equal(panel.querySelector('#modal-save').disabled, false, 'und der Knopf ist wieder frei');
 });
 
+test('dieser und folgende, daneben eine Erinnerung geaendert: dieselbe Meldung nach der Wahl', async () => {
+  const reminders = [AFTER, DAY_BEFORE];
+  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders });
+  const [after, dayBefore] = rowsOf(panel);
+  userSets(offsetOf(dayBefore), '60');
+  const { calls, fieldErrors, dialogs } = await save(panel, { event: SERIES_OCCURRENCE, reminders, scope: 'following' });
+  assert.equal(dialogs[0]?.answered, 'following');
+  assert.deepEqual(calls.filter((c) => c.method !== 'get'), []);
+  assert.equal(fieldErrors[0]?.input, offsetOf(after));
+});
+
+test('daneben geaendert, aber „Ganze Serie" gewaehlt: keine Meldung, der Zeitpunkt geht durch', async () => {
+  // Die Serie schreibt absolute Zeitpunkte - dort gibt es nichts abzulehnen.
+  const reminders = [AFTER, DAY_BEFORE];
+  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders });
+  userSets(offsetOf(rowsOf(panel)[1]), '60');
+  const { calls, fieldErrors } = await save(panel, { event: SERIES_OCCURRENCE, reminders, master: MASTER, scope: 'series' });
+  assert.deepEqual(fieldErrors, []);
+  assert.deepEqual(reminderPut(calls)?.body, { remind_ats: ['2026-09-25T06:00:00', '2026-09-18T06:00:00'] });
+});
+
+test('Abbrechen der Frage: weder Meldung noch Anfrage - zurueck ins Formular', async () => {
+  const reminders = [AFTER, DAY_BEFORE];
+  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders });
+  userSets(offsetOf(rowsOf(panel)[1]), '60');
+  const { calls, fieldErrors, closes } = await save(panel, { event: SERIES_OCCURRENCE, reminders, scope: 'cancel' });
+  assert.deepEqual(calls, []);
+  assert.deepEqual(fieldErrors, [], 'die Pruefung kommt erst nach einer Wahl');
+  assert.deepEqual(closes, [{ force: true }], 'nur der Dialog ging zu');
+});
+
+test('eine entfernte Erinnerungszeile ist eine Aenderung - die Frage kommt (#1284)', async () => {
+  // Nur die Zahl der Bedienelemente verraet sie: die uebrigen Felder stehen,
+  // wie sie standen.
+  const reminders = [DAY_BEFORE, HOUR_BEFORE];
+  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders });
+  rowsOf(panel)[1].querySelector('.js-reminder-remove').dispatch('click');
+  assert.equal(rowsOf(panel).length, 1);
+  const { calls, dialogs } = await save(panel, { event: SERIES_OCCURRENCE, reminders, scope: 'this' });
+  assert.equal(dialogs.length, 1, 'gefragt, nicht still geschlossen');
+  const put = calls.find((c) => c.path === '/calendar/41/occurrences/2026-10-02');
+  assert.deepEqual(put?.body.reminder_offsets, [1440]);
+});
+
+test('eine neue Erinnerungszeile ist ebenso eine Aenderung (#1284)', async () => {
+  const reminders = [DAY_BEFORE];
+  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders });
+  panel.querySelector('#modal-reminder-add').dispatch('click');
+  assert.equal(rowsOf(panel).length, 2);
+  const { dialogs } = await save(panel, { event: SERIES_OCCURRENCE, reminders, scope: 'cancel' });
+  assert.equal(dialogs.length, 1);
+});
+
+test('nichts angefasst: keine Frage, nichts gesendet - auch nicht an den Erinnerungen (#1284)', async () => {
+  const reminders = [AFTER, DAY_BEFORE];
+  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders });
+  const { calls, dialogs, closes } = await save(panel, { event: SERIES_OCCURRENCE, reminders, scope: 'this' });
+  assert.equal(dialogs.length, 0);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(closes, [{ force: true }], 'das Formular geht einfach zu');
+});
+
 test('nur dieser, die Zeile nach dem Beginn selbst umgestellt: normale Vorlaeufe', async () => {
   const reminders = [AFTER, DAY_BEFORE];
-  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders, scope: 'this' });
+  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders });
   userSets(offsetOf(rowsOf(panel)[0]), '15');
-  const { calls } = await save(panel, { event: SERIES_OCCURRENCE, reminders });
+  const { calls } = await save(panel, { event: SERIES_OCCURRENCE, reminders, scope: 'this' });
   const put = calls.find((c) => c.path === '/calendar/41/occurrences/2026-10-02');
   assert.deepEqual(put?.body.reminder_offsets, [15, 1440]);
 });
@@ -666,11 +752,11 @@ test('nur dieser, die Zeile nach dem Beginn selbst umgestellt: normale Vorlaeufe
 // Beginn des Vorkommens.
 test('nur dieser, Beginn hinter die Erinnerung geschoben: die Erinnerungen bleiben unangefasst', async () => {
   const reminders = [AFTER];
-  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders, scope: 'this' });
+  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders });
   userSets(panel.querySelector('#modal-start-date'), '2026-10-16');
   const [row] = rowsOf(panel);
   assert.equal(offsetOf(row).value, 'custom', 'Vorbedingung: die Zeile zeigt jetzt einen Vorlauf');
-  const { calls, fieldErrors } = await save(panel, { event: SERIES_OCCURRENCE, reminders });
+  const { calls, fieldErrors } = await save(panel, { event: SERIES_OCCURRENCE, reminders, scope: 'this' });
   assert.deepEqual(fieldErrors, []);
   const put = calls.find((c) => c.method === 'put' && c.path === '/calendar/41/occurrences/2026-10-02');
   assert.equal(put?.body.start_datetime, '2026-10-16T09:00', 'das Vorkommen wurde verschoben');
@@ -680,11 +766,11 @@ test('nur dieser, Beginn hinter die Erinnerung geschoben: die Erinnerungen bleib
 
 test('nur dieser, Beginn verschoben und daneben eine Erinnerung geaendert: Meldung an der Zeile', async () => {
   const reminders = [AFTER, DAY_BEFORE];
-  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders, scope: 'this' });
+  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders });
   userSets(panel.querySelector('#modal-start-date'), '2026-10-16');
   const [after, dayBefore] = rowsOf(panel);
   userSets(offsetOf(dayBefore), '60');
-  const { calls, fieldErrors } = await save(panel, { event: SERIES_OCCURRENCE, reminders });
+  const { calls, fieldErrors } = await save(panel, { event: SERIES_OCCURRENCE, reminders, scope: 'this' });
   assert.deepEqual(calls.filter((c) => c.method !== 'get'), [], 'nichts gespeichert');
   assert.equal(fieldErrors.length, 1);
   assert.equal(fieldErrors[0].input, offsetOf(after), 'die Meldung steht an der Zeile, die noch durchreicht');
@@ -693,8 +779,9 @@ test('nur dieser, Beginn verschoben und daneben eine Erinnerung geaendert: Meldu
 
 test('nur dieser ohne Zeile nach dem Beginn: Vorlaeufe wie bisher (Regression)', async () => {
   const reminders = [DAY_BEFORE];
-  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders, scope: 'this' });
-  const { calls } = await save(panel, { event: SERIES_OCCURRENCE, reminders });
+  const panel = openDialog({ event: SERIES_OCCURRENCE, reminders });
+  userSets(panel.querySelector('#modal-title'), 'Training (Halle 2)', 'input');
+  const { calls } = await save(panel, { event: SERIES_OCCURRENCE, reminders, scope: 'this' });
   const put = calls.find((c) => c.path === '/calendar/41/occurrences/2026-10-02');
   assert.deepEqual(put?.body.reminder_offsets, [1440]);
 });
@@ -710,4 +797,107 @@ test('die Vorkommens-Anfrage laesst reminder_offsets bei null weg, bei [] nicht'
   }
   assert.deepEqual(sent, [{ title: 'x' }, { title: 'x', reminder_offsets: [] }],
     'null heisst „nicht anfassen", ein leeres Array weiterhin „alle entfernen"');
+});
+
+// --------------------------------------------------------------------------
+// Haushaltszone und Geraetezone liegen auseinander (#1522)
+//
+// Der Beginn eines Termins ist Wanduhrzeit der HAUSHALTSZONE, `remind_at` ein
+// Zeitpunkt. Der Dialog las den Beginn per `new Date('YYYY-MM-DDTHH:MM')` in
+// der Zone des Geraets: auf einem Geraet ausserhalb des Haushalts lag jede
+// Erinnerung um den Zonenabstand daneben, und eine Stunde Vorlauf kam beim
+// Wiederoeffnen als „nach dem Terminbeginn" zurueck. Der Prozess laeuft in
+// Europe/Berlin (siehe oben), der Haushalt hier in America/New_York - 09:00
+// dort ist 13:00 UTC, in Berlin waere es 07:00 UTC.
+//
+// Dazu EIN Fall, in dem beide Zonen dieselbe sind: er haelt fest, dass die
+// Umrechnung in der Haushaltszone dort genau das bisherige Ergebnis liefert.
+// --------------------------------------------------------------------------
+
+const { setDisplayTimeZone } = await import('../public/utils/timezone.js');
+
+async function inHouseholdZone(zone, fn) {
+  setDisplayTimeZone(zone);
+  try { return await fn(); } finally { setDisplayTimeZone(null); }
+}
+
+const NY_HOUR_BEFORE = { remind_at: '2026-09-18T12:00:00' }; // 08:00 in New York, 60 Minuten vor 09:00
+const NY_DAY_BEFORE = { remind_at: '2026-09-17T13:00:00' };  // 17.09. 09:00 in New York
+
+test('#1522: die Vorbedingung - Geraet und Haushalt stehen in verschiedenen Zonen', () => {
+  assert.equal(process.env.TZ, 'Europe/Berlin');
+});
+
+test('#1522: Wiederoeffnen zeigt den Vorlauf in der Haushaltszone, nicht in der des Geraets', async () => {
+  await inHouseholdZone('America/New_York', () => {
+    const [hour] = rowsOf(openDialog({ reminders: [NY_HOUR_BEFORE] }));
+    assert.equal(offsetOf(hour).value, '60', 'eine Stunde vorher, nicht „nach dem Terminbeginn"');
+    assert.equal(hintOf(hour), null, 'kein Warnton');
+    const [day] = rowsOf(openDialog({ reminders: [NY_DAY_BEFORE] }));
+    assert.equal(offsetOf(day).value, '1440', 'ein Tag vorher, nicht 18 Stunden');
+  });
+});
+
+test('#1522: Speichern rechnet den Vorlauf vom Beginn in der Haushaltszone', async () => {
+  await inHouseholdZone('America/New_York', async () => {
+    const reminders = [NY_DAY_BEFORE];
+    const panel = openDialog({ reminders });
+    const [row] = rowsOf(panel);
+    userSets(offsetOf(row), '60');
+    const { calls } = await save(panel, { reminders });
+    assert.deepEqual(reminderPut(calls)?.body, { remind_ats: ['2026-09-18T12:00:00'] },
+      '09:00 New York minus 60 Minuten = 12:00 UTC, nicht 06:00 UTC');
+  });
+});
+
+test('#1522: Speichern und Wiederoeffnen - 60 Minuten bleiben 60 Minuten', async () => {
+  await inHouseholdZone('America/New_York', async () => {
+    let reminders = [NY_DAY_BEFORE];
+    let panel = openDialog({ reminders });
+    userSets(offsetOf(rowsOf(panel)[0]), '60');
+    for (let round = 0; round < 3; round++) {
+      const { calls } = await save(panel, { reminders });
+      const [remindAt] = reminderPut(calls)?.body.remind_ats ?? [];
+      assert.equal(remindAt, '2026-09-18T12:00:00', `Runde ${round + 1}: der Zeitpunkt wandert nicht`);
+      reminders = [{ remind_at: remindAt }];
+      panel = openDialog({ reminders });
+      assert.equal(offsetOf(rowsOf(panel)[0]).value, '60', `Runde ${round + 1}: der Vorlauf bleibt`);
+    }
+  });
+});
+
+test('#1522: an der Sommerzeitgrenze des Haushalts zaehlt der Vorlauf in echter Zeit', async () => {
+  await inHouseholdZone('America/New_York', async () => {
+    // 01.11.2026: New York stellt um 02:00 EDT auf 01:00 EST zurueck, Berlin
+    // hat das schon am 25.10. getan. 09:00 EST = 14:00 UTC; ein Tag Vorlauf
+    // ist 24 Stunden davor, 31.10. 14:00 UTC (10:00 EDT).
+    const event = { ...EVENT, start_datetime: '2026-11-01T09:00', end_datetime: '2026-11-01T10:00' };
+    const reminders = [{ remind_at: '2026-10-31T14:00:00' }];
+    const panel = openDialog({ event, reminders });
+    assert.equal(offsetOf(rowsOf(panel)[0]).value, '1440', 'Wiederoeffnen nennt einen Tag');
+    userSets(offsetOf(rowsOf(panel)[0]), '60');
+    const { calls } = await save(panel, { event, reminders });
+    assert.deepEqual(reminderPut(calls)?.body, { remind_ats: ['2026-11-01T13:00:00'] });
+
+    // 08.03.2026: 02:30 gibt es in New York nicht (02:00 EST -> 03:00 EDT).
+    // Der Server schiebt eine solche Uhrzeit um die Luecke vor (03:30 EDT =
+    // 07:30 UTC, `localToUTCPrecise`), der Dialog muss denselben Anker nehmen.
+    const gap = { ...EVENT, start_datetime: '2026-03-08T02:30', end_datetime: '2026-03-08T04:00' };
+    const gapReminders = [{ remind_at: '2026-03-07T07:30:00' }]; // 24 Stunden vor 07:30 UTC
+    const gapPanel = openDialog({ event: gap, reminders: gapReminders });
+    assert.equal(offsetOf(rowsOf(gapPanel)[0]).value, '1440', 'Wiederoeffnen nennt einen Tag');
+    userSets(offsetOf(rowsOf(gapPanel)[0]), '60');
+    const gapSave = await save(gapPanel, { event: gap, reminders: gapReminders });
+    assert.deepEqual(reminderPut(gapSave.calls)?.body, { remind_ats: ['2026-03-08T06:30:00'] });
+  });
+});
+
+test('#1522: steht der Haushalt in der Zone des Geraets, bleibt alles, wie es war', async () => {
+  await inHouseholdZone('Europe/Berlin', async () => {
+    const [row] = rowsOf(openDialog({ reminders: [HOUR_BEFORE] }));
+    assert.equal(offsetOf(row).value, '60');
+    const reminders = [DAY_BEFORE];
+    const { calls } = await save(openDialog({ reminders }), { reminders });
+    assert.deepEqual(reminderPut(calls)?.body, { remind_ats: ['2026-09-17T07:00:00'] });
+  });
 });

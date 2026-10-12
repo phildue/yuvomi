@@ -1,5 +1,5 @@
 import { t } from '/i18n.js';
-import { toggleRowHtml } from '/settings/components.js';
+import { settingSwitchRowHtml } from '/settings/components.js';
 import { getPreferences, savePreferences } from '/settings/preferences-cache.js';
 
 /**
@@ -58,79 +58,104 @@ function checkedState(preferences) {
   return new Map(TOGGLES.map((toggle) => [toggle.id, toggle.read(preferences)]));
 }
 
-function renderPage(container, preferences) {
-  const checked = checkedState(preferences);
-  container.replaceChildren();
-  container.insertAdjacentHTML('beforeend', `
-    <section class="settings-section">
-      <h2 class="settings-section__title">${t('settings.sectionBudget')}</h2>
-      <div class="settings-card">
-        <h3 class="settings-card__title">${t('settings.budgetModeTitle')}</h3>
-        <p class="form-hint">${t('settings.budgetModeHint')}</p>
-        ${toggleRowHtml({
+/**
+ * SEIT R10 KEIN EIGENES BLATT MEHR (Re-Critique 2026-09-27, A7 P1-3): die
+ * "Modul-Optionen" waren eine Sammelschublade fuer fuenf Module. Jeder Teil
+ * steht jetzt als Abschnitt "Fuer den Haushalt" im Blatt SEINES Moduls
+ * (registry.js, `part`). Die Ueberschrift mit dem Modulnamen entfaellt deshalb:
+ * das Blatt heisst schon so, und darueber steht die Reichweite.
+ */
+const PARTS = ['budget', 'health', 'housekeeping', 'tasks', 'schedule'];
+
+/**
+ * EIN TRAEGER JE TEIL, ZEILEN DARIN (R17, E9). Bis dahin stand jeder Schalter
+ * in einer eigenen Karte mit Kartentitel und Hinweis darueber - 154 bis 225px
+ * fuer eine Ja/Nein-Frage. Der Hinweis ist jetzt der Fuss der Gruppe.
+ *
+ * EINE ZEILE BRAUCHT KEINE UEBERSCHRIFT: der Kartentitel ueber einem einzelnen
+ * Schalter ("Zyklus" ueber "Zyklus-Tab anzeigen", "Unteraufgaben" ueber
+ * "Unteraufgaben in Aufgaben aufgeklappt lassen") sagte in einem Wort, was die
+ * Zeile ausschreibt - und als Abschnittsueberschrift stuende "Zyklus" im Blatt
+ * Gesundheit zweimal, wie vorher "Termine" im Kalender. Einen Titel traegt nur
+ * die Gruppe mit mehreren Zeilen (Schichtplan-Vorlagen); er ist dort der
+ * Suchtreffer.
+ */
+function groupHtml({ titleKey = null, rows, footer }) {
+  return `
+      ${titleKey ? `<h2 class="settings-section__title">${t(titleKey)}</h2>` : ''}
+      <div class="row-carrier settings-group">${rows}</div>
+      ${footer}`;
+}
+
+function partHtml(part, preferences, checked) {
+  switch (part) {
+    case 'budget':
+      return groupHtml({
+        rows: settingSwitchRowHtml({
           label: t('settings.budgetModePersonalLabel'),
           checked: checked.get('budget-mode-personal'),
-          attrs: { id: 'budget-mode-personal' },
-        })}
-        <p class="form-hint">
-          ${t('settings.currencyMovedHint')}
-          <a href="${APPEARANCE_PATH}" id="budget-region-link">${t('settings.regionTitle')}</a>
-        </p>
-      </div>
-    </section>
-
-    <section class="settings-section">
-      <h2 class="settings-section__title">${t('nav.health')}</h2>
-      <div class="settings-card">
-        <h3 class="settings-card__title">${t('health.tabs.cycle')}</h3>
-        <p class="form-hint">${t('settings.healthCycleHint')}</p>
-        ${toggleRowHtml({
+          attrs: { id: 'budget-mode-personal', 'aria-describedby': 'budget-mode-hint' },
+        }),
+        footer: `
+      <p class="form-hint settings-group__footer" id="budget-mode-hint">${t('settings.budgetModeHint')}</p>
+      <p class="form-hint settings-group__footer">
+        ${t('settings.currencyMovedHint')}
+        <a href="${APPEARANCE_PATH}" id="budget-region-link">${t('settings.regionTitle')}</a>
+      </p>`,
+      });
+    case 'health':
+      return groupHtml({
+        rows: settingSwitchRowHtml({
           label: t('settings.healthCycleEnableLabel'),
           checked: checked.get('health-cycle-enabled'),
-          attrs: { id: 'health-cycle-enabled' },
-        })}
-      </div>
-    </section>
-
-    <section class="settings-section">
-      <h2 class="settings-section__title">${t('settings.sectionHousekeeping')}</h2>
-      <div class="settings-card">
-        <h3 class="settings-card__title">${t('settings.housekeepingPaymentsTitle')}</h3>
-        <p class="form-hint">${t('settings.housekeepingPaymentTasksHint')}</p>
-        ${toggleRowHtml({
+          attrs: { id: 'health-cycle-enabled', 'aria-describedby': 'health-cycle-hint' },
+        }),
+        footer: `
+      <p class="form-hint settings-group__footer" id="health-cycle-hint">${t('settings.healthCycleHint')}</p>`,
+      });
+    case 'housekeeping':
+      return groupHtml({
+        rows: settingSwitchRowHtml({
           label: t('settings.housekeepingPaymentTasksLabel'),
           checked: checked.get('housekeeping-payment-tasks'),
-          attrs: { id: 'housekeeping-payment-tasks' },
-        })}
-      </div>
-    </section>
-
-    <section class="settings-section">
-      <h2 class="settings-section__title">${t('nav.tasks')}</h2>
-      <div class="settings-card">
-        <h3 class="settings-card__title">${t('settings.tasksSubtasksExpandedTitle')}</h3>
-        <p class="form-hint">${t('settings.tasksSubtasksExpandedHint')}</p>
-        ${toggleRowHtml({
+          attrs: { id: 'housekeeping-payment-tasks', 'aria-describedby': 'housekeeping-payment-tasks-hint' },
+        }),
+        footer: `
+      <p class="form-hint settings-group__footer" id="housekeeping-payment-tasks-hint">${t('settings.housekeepingPaymentTasksHint')}</p>`,
+      });
+    case 'tasks':
+      return groupHtml({
+        rows: settingSwitchRowHtml({
           label: t('settings.tasksSubtasksExpandedLabel'),
           checked: checked.get('tasks-subtasks-expanded'),
-          attrs: { id: 'tasks-subtasks-expanded' },
-        })}
-      </div>
-    </section>
-
-    <section class="settings-section">
-      <h2 class="settings-section__title">${t('nav.schedule')}</h2>
-      <div class="settings-card">
-        <h3 class="settings-card__title">${t('settings.scheduleTemplatesTitle')}</h3>
-        <p class="form-hint">${t('settings.scheduleTemplatesHint')}</p>
-        ${SCHEDULE_TEMPLATES.map(([key, labelKey]) => toggleRowHtml({
+          attrs: { id: 'tasks-subtasks-expanded', 'aria-describedby': 'tasks-subtasks-expanded-hint' },
+        }),
+        footer: `
+      <p class="form-hint settings-group__footer" id="tasks-subtasks-expanded-hint">${t('settings.tasksSubtasksExpandedHint')}</p>`,
+      });
+    case 'schedule':
+      return groupHtml({
+        titleKey: 'settings.scheduleTemplatesTitle',
+        rows: SCHEDULE_TEMPLATES.map(([key, labelKey]) => settingSwitchRowHtml({
           label: t(labelKey),
           checked: !(preferences.schedule_hidden_templates ?? []).includes(key),
           attrs: { id: `schedule-template-${key}`, 'data-template': key },
-        })).join('')}
-      </div>
-    </section>
-  `);
+        })).join(''),
+        footer: `
+      <p class="form-hint settings-group__footer">${t('settings.scheduleTemplatesHint')}</p>`,
+      });
+    default:
+      return '';
+  }
+}
+
+function renderPage(container, preferences, part) {
+  const checked = checkedState(preferences);
+  const parts = PARTS.includes(part) ? [part] : PARTS;
+  container.replaceChildren();
+  container.insertAdjacentHTML('beforeend', parts
+    .map((entry) => `<section class="settings-section">${partHtml(entry, preferences, checked)}</section>`)
+    .join(''));
 }
 
 function bindEvents(container) {
@@ -178,9 +203,11 @@ function bindEvents(container) {
   }
 }
 
+// Welcher Teil, sagt der Abschnitt (registry.js `props.part`): die Shell
+// schreibt ihn an den Traeger, die Signatur bleibt die aller Blaetter.
 export async function render(container, { user }) {
   void user;
   const preferences = await getPreferences();
-  renderPage(container, preferences);
+  renderPage(container, preferences, container.dataset.part);
   bindEvents(container);
 }

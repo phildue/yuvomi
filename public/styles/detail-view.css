@@ -31,6 +31,146 @@
   flex-shrink: 0;
 }
 
+/* --------------------------------------------------------
+ * Der Kopf (detail-view.js `detailHeadEl`, Critique R18)
+ *
+ * Was die Entitaet AUSMACHT, steht ueber den Zeilen, die sie beschreiben: die
+ * Zeit in Worten, die Personen als Avatar mit Namen, beim Geburtstag das Bild
+ * und zwei Kennzahlen. Der Titel selbst bleibt in der Kopfzeile seines Rahmens
+ * (Blatt, Popover, Spalte) - alle drei tragen ihn in Title 3.
+ *
+ * Die Unterzeile steht eine Stufe ueber den Zeilenwerten (Subheadline in
+ * Primaertinte gegen Caption-Label und Wert darunter): sie ist die Antwort,
+ * derentwegen man die Ansicht oeffnet. Eine Haarlinie trennt Kopf und Zeilen -
+ * dieselbe wie zwischen Zeilen eines Traegers, keine neue Flaeche.
+ * -------------------------------------------------------- */
+.detail-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  padding-block-end: var(--space-3);
+  border-block-end: var(--space-px) solid var(--color-border-subtle);
+}
+
+.detail-head__subtitle {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--type-secondary);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--line-height-snug);
+  color: var(--color-text-primary);
+  font-variant-numeric: tabular-nums;
+  hyphens: auto;
+  hyphenate-limit-chars: 6 4 4;
+  -webkit-hyphenate-limit-before: 4;
+  -webkit-hyphenate-limit-after: 4;
+  overflow-wrap: anywhere;
+}
+
+/* Der Farbpunkt: die Kalenderfarbe als Zeichen am Text statt als Streifen ueber
+ * dem Blatt. Er sitzt auf der Mittellinie der ersten Zeile (die Unterzeile
+ * richtet an der Grundlinie aus, der Punkt hebt sich um seine halbe Hoehe). */
+.detail-head__dot {
+  flex: 0 0 auto;
+  inline-size: var(--space-2h);
+  block-size: var(--space-2h);
+  border-radius: var(--radius-full);
+  background-color: var(--detail-accent, var(--active-module-accent, var(--color-accent)));
+  transform: translateY(var(--space-px));
+}
+
+/* Hoechstens zwei Kennzahlen, als ganze Woerter ("wird 41", "in 26 Tagen"):
+ * die Zahl laesst sich nicht aus dem Satz ihrer Sprache loesen. Title 3,
+ * tabellarisch; eine Haarlinie zwischen beiden. */
+.detail-head__facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+  font-size: var(--type-section-title);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-snug);
+  color: var(--color-text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.detail-head__fact + .detail-head__fact {
+  padding-inline-start: var(--space-3);
+  border-inline-start: var(--space-px) solid var(--color-border);
+  color: var(--color-text-secondary);
+}
+
+.detail-head__people {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.detail-head__person {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  font-size: var(--type-secondary);
+  color: var(--color-text-primary);
+}
+
+/* 24px-Scheibe mit 11px-Initialen (Caption 2, die kleinste Textrolle): das
+ * Verhaeltnis von 0,46 liegt unter der Lesbarkeitsgrenze des Avatar-Stapels
+ * (<= 0,55, user-multi-select.js). Farbe und Tinte setzt die Komponente aus
+ * der Identitaetsfarbe der Person. */
+.detail-head__avatar {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  inline-size: var(--space-6);
+  block-size: var(--space-6);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  font-size: var(--type-micro);
+  font-weight: var(--font-weight-bold);
+  line-height: 1;
+}
+
+.detail-head__avatar img {
+  inline-size: 100%;
+  block-size: 100%;
+  object-fit: cover;
+}
+
+.detail-head__name {
+  min-width: 0;
+  hyphens: auto;
+  hyphenate-limit-chars: 6 4 4;
+  -webkit-hyphenate-limit-before: 4;
+  -webkit-hyphenate-limit-after: 4;
+  overflow-wrap: anywhere;
+}
+
+/* Mit Bild: mittig gestapelt wie eine Kontaktkarte - Bild, dann die Kennzahlen. */
+.detail-head--media {
+  align-items: center;
+  text-align: center;
+}
+
+.detail-head--media .detail-head__facts,
+.detail-head--media .detail-head__people {
+  justify-content: center;
+}
+
+.detail-head__media {
+  display: flex;
+  justify-content: center;
+}
+
 .detail-view__rows {
   display: flex;
   flex-direction: column;
@@ -90,6 +230,43 @@
 .detail-row--multiline .detail-row__value {
   white-space: pre-wrap;
   text-wrap: pretty;
+}
+
+/* Folgeaktion am Ende einer Zeile („In Maps oeffnen" an der Ort-Zeile,
+ * detail-view.js detailRowEl `action`). Leise und rechts, auf der Hoehe des
+ * Labels - der Wert bleibt Text, die Aktion ist ausdruecklich (#1110). */
+.detail-row__action {
+  flex-shrink: 0;
+  margin-block-start: calc(-1 * var(--space-1));
+  margin-inline-start: auto;
+}
+
+/* Benannte Gruppe von Metazeilen (`{ group, rows }`): Abschnittstitel wie in
+ * einer Kontaktkarte, darunter die Zeilen im selben Takt wie ungegliedert. */
+.detail-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.detail-group + .detail-group,
+.detail-row + .detail-group {
+  padding-block-start: var(--space-3);
+  border-block-start: var(--space-px) solid var(--color-border-subtle);
+}
+
+.detail-group__title {
+  margin: 0;
+  font-size: var(--type-caption);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-secondary);
+}
+
+.detail-group__rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
 }
 
 /* Zeilen, die statt Text eine Gruppe tragen (Chips, Badges, Anhang). */
@@ -165,17 +342,20 @@
   cursor: default;
 }
 
-.detail-subtask i {
-  flex-shrink: 0;
-  color: var(--color-text-tertiary);
-}
-
 .detail-subtask--done {
   color: var(--color-text-tertiary);
   text-decoration: line-through;
 }
 
-.detail-subtask--done i {
+/* Das Zeichen vor dem Teilschritt: ruhig, erledigt in Erfolgsfarbe. Bis
+ * 2026-09-26 zielten diese Regeln auf `i` - Lucide ersetzt das `<i>` aber
+ * durch `<svg>`, sie trafen also nie (Komponenten-Kanon, Regel dead-i). */
+.detail-subtask svg {
+  flex-shrink: 0;
+  color: var(--color-text-tertiary);
+}
+
+.detail-subtask--done svg {
   color: var(--color-success);
 }
 
@@ -185,6 +365,20 @@
    Sekundaerfarbe wie sein Gegenstueck in der aufgeklappten Kartenliste
    (.subtask-item__add) - er ist eine Einladung, kein Teilschritt. */
 .detail-subtask--add {
+  /* Nach Inhalt breit, ohne den Negativrand der Zeilen: die Liste ist in der
+   * Detailzeile nur so breit wie ihr Inhalt, und `width: 100%` plus -8px Rand
+   * je Seite machte den Knopf 16px schmaler als seinen Text - "Teilaufgabe /
+   * hinzufuegen" brach auf 60px Hoehe um (Sichtpruefung 2026-09-26). */
+  width: auto;
+  margin-inline: 0;
+  /* EINE BUTTONFORM: die Kapsel (tokens.css, Sonde 3 der Dokument-Guards).
+   * Er ist kein Teilschritt, also keine Zeile der Liste, sondern ein Knopf
+   * nach Inhalt breit - wie die gestrichelte Kapsel `.list-tab__new` im
+   * Einkauf. Mit dem 10px-Radius der Zeilen stand er seit der Detailspalte
+   * ab 1280px (R10) als zweite Form im Dokument. Das Polster rueckt den Text
+   * aus der Rundung. */
+  padding-inline: var(--space-3);
+  border-radius: var(--radius-full);
   color: var(--color-text-secondary);
   border: var(--space-px) dashed var(--color-border);
   transition: border-color var(--transition-fast), color var(--transition-fast);
@@ -196,8 +390,39 @@
   background: none;
 }
 
-.detail-subtask--add:hover i {
+.detail-subtask--add:hover svg {
   color: var(--color-accent);
+}
+
+/* Die Eingabezeile, in die sich „Teilaufgabe hinzufuegen" verwandelt (A3
+ * P1-1, task-detail.js `subtaskComposer`): ein kanonisches Feld ueber die
+ * Breite der Liste, so hoch wie eine Teilaufgaben-Zeile. Enter oder der Knopf
+ * daneben legt an, der Fokus bleibt fuer die naechste. `[hidden]` braucht fuer Feld UND Knopf die
+ * eigene Regel, weil `display: flex` das Browser-`hidden` sonst sticht
+ * (gemessen: der Knopf stand ueber dem offenen Feld). */
+.detail-subtask-compose {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.detail-subtask-compose[hidden],
+.detail-subtask--add[hidden] {
+  display: none;
+}
+
+.detail-subtask-compose__input {
+  flex: 1;
+  min-width: 0;
+  min-height: var(--target-base);
+}
+
+/* Der sichtbare Absender (#1598): Enter allein reichte im Blatt nicht, und auf
+ * dem Telefon gab es sonst keinen Weg. Er behaelt seine Breite - das Feld gibt
+ * nach, nicht der Knopf. */
+.detail-subtask-compose__submit {
+  flex-shrink: 0;
+  min-height: var(--target-base);
 }
 
 /* --------------------------------------------------------
@@ -226,14 +451,25 @@
   color: var(--active-module-accent, var(--color-accent));
 }
 
+/* Ein Anhang, den der Server diesem Betrachter nicht nennt (#1358): Zustand,
+ * kein Link - deshalb ohne Akzentfarbe. */
+.detail-attachment--locked {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target-base);
+  color: var(--color-text-secondary);
+}
+
 /* --------------------------------------------------------
  * Fußzeile: Objektaktionen
  * -------------------------------------------------------- */
 
-/* Eine Aktion, die links steht (Löschen), schiebt den Rest nach rechts -
- * dasselbe Muster wie in den Formular-Fußzeilen der Module. */
+/* Eine Aktion, die am Anfang steht (Löschen), schiebt den Rest ans Ende -
+ * dasselbe Muster wie in den Formular-Fußzeilen der Module. Logisch statt
+ * `margin-right`: in RTL steht der Anfang rechts. Am Ende, in der Daumenzone,
+ * steht mit `edit.primary` die Hauptaktion (detail-view.js, openAsSheet). */
 .detail-view__action--start {
-  margin-right: auto;
+  margin-inline-end: auto;
 }
 
 /* --------------------------------------------------------
@@ -287,7 +523,7 @@
    * Sichtbarkeit kamen hinzu. Ohne Grenze läuft die Karte auf einem kurzen
    * Fenster unten aus dem Bild, und mit ihr die Fußzeile, in der „Bearbeiten"
    * und „Löschen" stehen; es bliebe nur Escape. */
-  max-height: calc(100dvh - 2 * var(--space-2));
+  max-height: calc(var(--viewport-height) - 2 * var(--space-2));
   padding: var(--space-4);
   background-color: var(--color-surface);
   border: var(--space-px) solid var(--glass-border-subtle);
@@ -300,6 +536,22 @@
   animation: detail-pane-enter var(--duration-sm) var(--ease-out);
 }
 
+/* DER AUSGANG (Critique R18): die Karte blendete ein und war beim Schliessen
+ * in einem Frame weg. Jetzt die Grammatik des Popover-Menues: sie blendet aus
+ * und nimmt 4 % zurueck, zum Anker hin (`transform-origin` setzt
+ * positionPopover in detail-view.js), kuerzer als die Einfahrt und ohne noch
+ * einen Zeiger zu nehmen. detail-view.js nimmt den Knoten danach aus dem Baum.
+ * ZWEI KLASSEN IM SELEKTOR: der Ausgang muss die Einfahrt schlagen, gleich wo
+ * er steht (test:motion, Guard 1). */
+@keyframes detail-popover-out {
+  to { opacity: 0; transform: scale(0.96); }
+}
+
+.detail-popover.detail-popover--closing {
+  animation: detail-popover-out var(--duration-xs) var(--ease-out) forwards;
+  pointer-events: none;
+}
+
 /* Nur die Zeilen scrollen; Titel und Fußzeile bleiben stehen. Dieselbe
  * Aufteilung, die .modal-panel im Sheet-Modus ohnehin hat. */
 .detail-popover > .detail-view {
@@ -308,9 +560,9 @@
   min-height: 0;
 }
 
+/* Groesse und Gewicht kommen aus der Rollenschicht (typography.css): Title 3,
+ * wie der Titel des Blatts und der Spalte (R18, vorher 17px). */
 .detail-popover__title {
-  font-size: var(--type-card-title);
-  font-weight: var(--font-weight-semibold);
   color: var(--color-text-primary);
   text-wrap: balance;
 }
@@ -334,7 +586,78 @@
     animation: none;
   }
 
+  /* Ohne Bewegung ist der Ausgang ein Schnitt: die Karte ist sofort weg. */
+  .detail-popover.detail-popover--closing {
+    animation: none;
+    opacity: 0;
+  }
+
   .modal-panel--resizing {
     transition: none;
+  }
+}
+
+/* --------------------------------------------------------
+ * Präsentation: Detailspalte (Liste + Detail, utils/master-detail.js)
+ *
+ * Kopf und Fußzeile bringt die Spalte mit (layout.css, `.split-view__*`);
+ * hier nur der Innenabstand des Lese-Körpers, damit er mit Titel und
+ * Aktionen darüber fluchtet.
+ * -------------------------------------------------------- */
+.detail-view--in-pane {
+  display: flex;
+  flex-direction: column;
+  /* Die Ansicht fuellt die Spalte, damit ihr Fuss bei kurzem Inhalt unten an
+   * der Spalte steht und bei langem unten klebt (layout.css,
+   * `.split-view__detail-footer`). */
+  flex: 1 0 auto;
+}
+
+.detail-view--in-pane > .detail-view {
+  padding: var(--space-4) var(--space-5) 0;
+}
+
+/* MOBIL EINE REIHE IM AUFGABEN-FUSS (Re-Critique 2026-09-28, P8 / A3 P3-2).
+ * Der Fuss einer offenen Aufgabe brach auf dem Telefon auf zwei Reihen
+ * (gemessen 133px; "Aufgabe archivieren" allein 188px). Starten und
+ * Archivieren treten dort in EIN Mehr-Menue (task-detail.js,
+ * wireDetailDoerMenu-Muster); ihre Knoepfe bleiben verborgen im Fuss, weil
+ * das Menue sie ausloest. Am Desktop passen alle Aktionen - dort gibt es den
+ * Mehr-Knopf nicht. */
+.detail-view__footer > .task-detail__more {
+  display: none;
+}
+
+@media (max-width: 639px) {
+  .detail-view__footer:has(> .task-detail__more) > .task-detail__overflow {
+    display: none;
+  }
+
+  .detail-view__footer > .task-detail__more {
+    display: inline-flex;
+  }
+}
+
+/* DER FUSS DES LESEBLATTS AUF DEM TELEFON (R17, E7). Mit Bearbeiten als
+ * Primaerknopf am Ende (`edit.primary`) stehen im Kontakt drei Aktionen im
+ * Fuss; "Als vCard exportieren" brach in 332px auf zwei Zeilen (Knopf 57px,
+ * Fuss 82 statt 73). Dieselbe Antwort wie in der schmalen Detailspalte
+ * (layout.css, `@container detail-pane`): ein leiser Knopf mit Icon zeigt nur
+ * das Icon, sein Name bleibt fuer Screenreader und als Tooltip. Loeschen und
+ * die Hauptaktion behalten ihr Wort bzw. ihre eigene Regel. */
+@media (max-width: 639px) {
+  .modal-panel > .detail-view__footer:has(> .btn--primary) > .btn--ghost:has(> svg, > i) > .btn__label {
+    position: absolute;
+    width: var(--space-px);
+    height: var(--space-px);
+    margin: calc(-1 * var(--space-px));
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+
+  .modal-panel > .detail-view__footer:has(> .btn--primary) > .btn--ghost:has(> svg, > i):has(> .btn__label) {
+    min-width: var(--target-base);
+    padding-inline: var(--space-2);
   }
 }

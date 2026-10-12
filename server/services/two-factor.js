@@ -26,6 +26,7 @@ import {
 } from '../utils/totp.js';
 import { qrToDataUrl } from '../utils/qrcode.js';
 import { createLogger } from '../logger.js';
+import { activeAccountSql } from './account-state.js';
 
 const log = createLogger('2fa');
 
@@ -280,15 +281,26 @@ export function regenerateRecoveryCodes(db, userId) {
  * Wiederherstellungscodes - das geht auch einen Admin nichts an.
  *
  * @param {object} db
+ * @param {string} orderSql  `memberOrderSql('u')` - die users-Zeile heisst hier `u`
  * @returns {Array<{ user_id: number, display_name: string, enabled: boolean }>}
  */
-export function householdOverview(db) {
+export function householdOverview(db, orderSql) {
+  // DIE REIHENFOLGE WIRD GEREICHT, NICHT HIER GESCHRIEBEN (#1644). Sie steht in
+  // `memberOrderSql()` (household-members.js), und jenes Modul importiert
+  // `server/db.js` - dieses hier bewusst nicht (siehe account-state.js). Der
+  // Aufrufer hat die Verbindung und damit auch die Reihenfolge; ein eigener
+  // Standardwert hier waere die zweite Reihenfolge neben der einen.
+  if (typeof orderSql !== 'string' || !orderSql) {
+    throw new TypeError('two-factor: householdOverview() needs the member order (memberOrderSql) from its caller');
+  }
   return db.prepare(`
     SELECT u.id                          AS user_id,
            u.display_name                AS display_name,
            (t.confirmed_at IS NOT NULL)  AS enabled
       FROM users u
       LEFT JOIN user_totp t ON t.user_id = u.id
-     ORDER BY u.display_name
+     -- Ein Ehemaliger hat keinen Zugang mehr, den ein zweiter Faktor schuetzte (#1381).
+     WHERE ${activeAccountSql('u')}
+     ORDER BY ${orderSql}
   `).all().map((row) => ({ ...row, enabled: row.enabled === 1 }));
 }

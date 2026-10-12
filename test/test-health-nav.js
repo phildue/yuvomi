@@ -3,9 +3,10 @@
  * Läuft mit: node --loader ./test/test-browser-loader.mjs test/test-health-nav.js
  *
  * Deckt ab:
- *  - health-tabs.js: HEALTH_ROUTES, HEALTH_TABS(), getLastHealthRoute-Fallback,
- *    isHealthRoute
- *  - Router-Registrierung (Routen, ROUTE_ORDER, topLevelSection, Shortcut, Nav)
+ *  - health-tabs.js: HEALTH_ROUTES, HEALTH_AREAS(), getLastHealthRoute-Fallback,
+ *    isHealthRoute, die Pfad-Adresse je Bereich und die Umleitung alter
+ *    `?tab=`-Adressen (R10 G1)
+ *  - Router-Registrierung (Routen, topLevelSection, Shortcut, Nav)
  *  - Modul abschaltbar (Server-Allowlist + Settings-Toggle-Definition)
  *  - i18n-Parität der neuen Keys über ALLE Locales
  *  - Zyklus-Tagebuch-Modal (health.js): Quelltext-Guards ohne DOM/Browser fuer
@@ -23,7 +24,8 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(ROOT, rel), 'utf8');
 
 const {
-  HEALTH_ROUTES, HEALTH_STORAGE_KEY, HEALTH_TABS, getLastHealthRoute, isHealthRoute,
+  HEALTH_ROUTES, HEALTH_STORAGE_KEY, HEALTH_AREAS, getLastHealthRoute, isHealthRoute,
+  healthAddress, healthAreaId, healthAreaRoute, legacyHealthTabPath, rememberHealthRoute,
 } = await (async () => {
   global.window = { yuvomi: null };
   global.document = {
@@ -46,9 +48,9 @@ const {
 // --------------------------------------------------------
 // health-tabs.js: Konstanten & Tab-Definitionen
 // --------------------------------------------------------
-test('HEALTH_ROUTES enthält die acht Sub-Routen in kanonischer Reihenfolge', () => {
+test('HEALTH_ROUTES enthält die neun Sub-Routen in kanonischer Reihenfolge', () => {
   assert.deepEqual(HEALTH_ROUTES, [
-    '/health', '/health/vitals', '/health/cycle', '/health/fasting', '/health/meds', '/health/prevention', '/health/labs', '/health/activity',
+    '/health', '/health/vitals', '/health/cycle', '/health/fasting', '/health/meds', '/health/prevention', '/health/labs', '/health/activity', '/health/nutrition',
   ]);
 });
 
@@ -60,26 +62,105 @@ test('HEALTH_STORAGE_KEY ist korrekt', () => {
   assert.equal(HEALTH_STORAGE_KEY, 'yuvomi-health-tab');
 });
 
-test('HEALTH_TABS(): sieben Tabs mit passenden Routen, Label-Keys und Icons', () => {
-  const tabs = HEALTH_TABS();
-  assert.equal(tabs.length, 7);
-  assert.deepEqual(tabs.map((tab) => tab.route), HEALTH_ROUTES.filter((route) => route !== '/health/fasting'));
-  assert.deepEqual(tabs.map((tab) => tab.labelKey), [
+test('HEALTH_AREAS(): Uebersicht plus sieben Bereiche mit Kennung, Route, Label-Key und Icon', () => {
+  const areas = HEALTH_AREAS();
+  assert.equal(areas.length, 8);
+  assert.deepEqual(areas.map((a) => a.route), HEALTH_ROUTES.filter((route) => route !== '/health/fasting'));
+  assert.deepEqual(areas.map((a) => a.id), [
+    'overview', 'vitals', 'cycle', 'meds', 'prevention', 'labs', 'activity', 'nutrition',
+  ]);
+  assert.deepEqual(areas.map((a) => a.labelKey), [
     'health.tabs.overview', 'health.tabs.vitals', 'health.tabs.cycle',
     'health.tabs.meds', 'health.tabs.prevention', 'health.tabs.labs', 'health.tabs.activity',
+    'health.tabs.nutrition',
   ]);
-  assert.deepEqual(tabs.map((tab) => tab.icon), [
-    'heart-pulse', 'activity', 'droplet', 'pill', 'syringe', 'flask-conical', 'dumbbell',
+  assert.deepEqual(areas.map((a) => a.icon), [
+    'heart-pulse', 'activity', 'droplet', 'pill', 'syringe', 'flask-conical', 'dumbbell', 'salad',
   ]);
 });
 
-test('HEALTH_TABS({ cycleEnabled: false }): blendet den Zyklus-Tab aus', () => {
-  const tabs = HEALTH_TABS({ cycleEnabled: false });
-  assert.equal(tabs.length, 6);
-  assert.ok(!tabs.some((tab) => tab.route === '/health/cycle'), 'kein Zyklus-Tab');
-  assert.deepEqual(tabs.map((tab) => tab.route), [
-    '/health', '/health/vitals', '/health/meds', '/health/prevention', '/health/labs', '/health/activity',
+test('HEALTH_AREAS({ cycleEnabled: false }): blendet den Zyklus aus', () => {
+  const areas = HEALTH_AREAS({ cycleEnabled: false });
+  assert.equal(areas.length, 7);
+  assert.ok(!areas.some((a) => a.route === '/health/cycle'), 'kein Zyklus-Bereich');
+  assert.deepEqual(areas.map((a) => a.route), [
+    '/health', '/health/vitals', '/health/meds', '/health/prevention', '/health/labs', '/health/activity', '/health/nutrition',
   ]);
+});
+
+// --------------------------------------------------------
+// R10 G1: jeder Bereich hat seine Adresse, alte `?tab=`-Adressen leiten um
+// --------------------------------------------------------
+test('jeder Bereich hat eine eigene, registrierte Adresse - und die Adresse nennt genau ihn', () => {
+  const all = HEALTH_AREAS({ cycleEnabled: true, fastingEnabled: true });
+  assert.equal(all.length, HEALTH_ROUTES.length, 'jede Health-Route ist ein Bereich und umgekehrt');
+  for (const area of all) {
+    assert.ok(HEALTH_ROUTES.includes(area.route), `${area.id}: Route ${area.route} ist nicht registriert`);
+    assert.equal(healthAreaRoute(area.id), area.route, `${area.id}: Adresse`);
+    assert.equal(healthAreaId(area.route), area.id, `${area.route}: Kennung`);
+    // Der Liste-+-Detail-Baustein liest und schreibt die Auswahl ueber diese Adresse.
+    assert.equal(healthAddress.read({ pathname: area.route, search: '', hash: '' }), area.id);
+    assert.equal(healthAddress.href(area.id), area.route);
+  }
+  // Die Uebersicht ist `/health` - eine Seite ohne Auswahl gibt es nicht.
+  assert.equal(healthAddress.href(null), '/health');
+  // Fremde Adressen gehoeren nicht zu dieser Seite: der Router zeichnet neu.
+  assert.equal(healthAddress.read({ pathname: '/tasks', search: '', hash: '' }), undefined);
+  assert.equal(healthAddress.read({ pathname: '/health/unknown', search: '', hash: '' }), undefined);
+  assert.equal(healthAreaRoute('unknown'), '/health');
+});
+
+test('alte /health?tab=<bereich>-Adressen landen auf der Adresse des Bereichs', () => {
+  const loc = (search, hash = '') => ({ pathname: '/health', search, hash });
+  for (const area of HEALTH_AREAS({ cycleEnabled: true, fastingEnabled: true })) {
+    assert.equal(legacyHealthTabPath(loc(`?tab=${area.id}`)), area.route, `?tab=${area.id}`);
+  }
+  // Die Tab-Route als Wert, Grossschreibung, uebrige Parameter und Anker bleiben.
+  assert.equal(legacyHealthTabPath(loc('?tab=/health/meds')), '/health/meds');
+  assert.equal(legacyHealthTabPath(loc('?tab=Labs')), '/health/labs');
+  assert.equal(legacyHealthTabPath(loc('?tab=fasting&x=1', '#history')), '/health/fasting?x=1#history');
+  // Ein Tab, den es nicht gibt, faellt auf die Uebersicht - der Parameter geht.
+  assert.equal(legacyHealthTabPath(loc('?tab=nope')), '/health');
+  // Nichts umzuleiten: keine alte Adresse oder gar keine Gesundheit.
+  assert.equal(legacyHealthTabPath(loc('')), null);
+  assert.equal(legacyHealthTabPath(loc('?x=1')), null);
+  assert.equal(legacyHealthTabPath({ pathname: '/tasks', search: '?tab=meds', hash: '' }), null);
+  assert.equal(legacyHealthTabPath({ pathname: '/health/meds', search: '?tab=labs', hash: '' }), null);
+});
+
+test('health.js leitet die alte Adresse um, BEVOR die Seite die Auswahl liest', () => {
+  // Der Baustein liest die Auswahl beim Einhaengen aus der Adresse
+  // (healthAddress.read). Stuende die Umleitung danach, zeigte die Seite fuer
+  // `/health?tab=meds` die Uebersicht und schriebe erst dann die neue Adresse.
+  const src = read('public/pages/health.js');
+  const redirect = src.search(/const legacy = legacyHealthTabPath\(location\);\s*if \(legacy\) history\.replaceState\(/);
+  const mount = src.search(/mountMasterDetail\(\{[\s\S]{0,200}address: healthAddress/);
+  assert.ok(redirect > 0, 'render() muss legacyHealthTabPath per replaceState einloesen');
+  assert.ok(mount > redirect, 'der Baustein wird mit healthAddress und NACH der Umleitung eingehaengt');
+});
+
+test('auch die Soft-Navigation (update) loest eine alte ?tab=-Adresse ein, bevor sie auswaehlt', () => {
+  // Ein Zurueck auf einen Verlaufseintrag `/health?tab=labs`, waehrend die
+  // Seite steht, laeuft ueber update() statt render() - gemessen 2026-09-27:
+  // Adresse blieb `/health?tab=labs`, gezeigt wurde die Uebersicht.
+  const src = read('public/pages/health.js');
+  const start = src.indexOf('export async function update(');
+  assert.ok(start > 0, 'update() fehlt');
+  const body = src.slice(start, src.indexOf('\n}\n', start));
+  const redirect = body.search(/const legacy = legacyHealthTabPath\(location\);\s*if \(legacy\) history\.replaceState\(/);
+  const select = body.search(/md\.select\(/);
+  assert.ok(redirect > 0, 'update() muss legacyHealthTabPath per replaceState einloesen');
+  assert.ok(select > redirect, 'erst umleiten, dann auswaehlen');
+  assert.match(body, /normalizeHealthPath\(legacy \? window\.location\.pathname/,
+    'nach der Umleitung zaehlt die neue Adresse, nicht der alte Pfad /health');
+});
+
+test('rememberHealthRoute merkt nur Health-Routen (Kurzbefehl g h)', () => {
+  global.sessionStorage._d = {};
+  rememberHealthRoute('/health/labs');
+  assert.equal(getLastHealthRoute(), '/health/labs');
+  rememberHealthRoute('/tasks');
+  assert.equal(getLastHealthRoute(), '/health/labs');
 });
 
 // --------------------------------------------------------
@@ -114,13 +195,6 @@ test('router.js registriert alle Health-Routen auf das Health-Seitenmodul', () =
   const src = read('public/router.js');
   assert.match(src, /HEALTH_ROUTES\.map\(\(path\) => \(\{[\s\S]*page: '\/pages\/health\.js'[\s\S]*module: 'health'/);
   assert.match(src, /ROUTES\.push\(\.\.\.HEALTH_PAGE_ROUTES\)/);
-});
-
-test('router.js: /health in ROUTE_ORDER (vor /settings)', () => {
-  const src = read('public/router.js');
-  const order = src.match(/const ROUTE_ORDER = \[([\s\S]*?)\];/)[1];
-  assert.ok(order.includes("'/health'"), '/health fehlt in ROUTE_ORDER');
-  assert.ok(order.indexOf("'/health'") < order.indexOf("'/settings'"), '/health muss vor /settings stehen');
 });
 
 test('router.js: topLevelSection faltet /health/* auf /health', () => {
@@ -187,8 +261,8 @@ test('i18n: nav.health, shortcuts.goHealth und health.* in allen Locales', () =>
   const files = readdirSync(join(ROOT, 'public/locales')).filter((f) => f.endsWith('.json'));
   assert.ok(files.length >= 20, 'erwartet mindestens 20 Locales');
 
-  const tabKeys = ['overview', 'vitals', 'cycle', 'fasting', 'meds', 'prevention', 'labs', 'activity'];
-  const panels = ['overview', 'vitals', 'cycle', 'fasting', 'meds', 'prevention', 'labs', 'activity'];
+  const tabKeys = ['overview', 'vitals', 'cycle', 'fasting', 'meds', 'prevention', 'labs', 'activity', 'nutrition'];
+  const panels = ['overview', 'vitals', 'cycle', 'fasting', 'meds', 'prevention', 'labs', 'activity', 'nutrition'];
 
   for (const file of files) {
     const data = JSON.parse(read(join('public/locales', file)));
@@ -314,15 +388,15 @@ test('PMS-Fenster wird EINMAL (own-gated) in renderCycleShell berechnet und an B
   assert.ok(shellFn, 'renderCycleShell() nicht gefunden');
   assert.match(shellFn, /const pms = own\s*\?\s*pmsWindow\(cycle\.logs,\s*cycle\.periods,\s*cycleSettings\(\),\s*todayKey\(\)\)\s*:\s*null;/,
     'pms muss genau einmal, own-gated berechnet werden');
-  assert.match(shellFn, /cycleBubbleMarkup\(prediction,\s*pms\)/, 'die Bubble muss das vorberechnete pms erhalten');
-  assert.match(shellFn, /cycleCalendarMarkup\(own,\s*pms\)/, 'der Kalender muss das vorberechnete pms erhalten');
+  assert.match(shellFn, /cycleBubbleMarkup\(prediction,\s*pms[,)]/, 'die Bubble muss das vorberechnete pms erhalten');
+  assert.match(shellFn, /cycleCalendarMarkup\(own,\s*pms[,)]/, 'der Kalender muss das vorberechnete pms erhalten');
 
   const fn = functionSource('cycleCalendarMarkup');
   assert.ok(fn, 'cycleCalendarMarkup() nicht gefunden');
   // Nur der tatsächliche Funktionsaufruf ist verboten - der Dokblock darf
   // "pmsWindow()" weiterhin als Prosa-Verweis erwähnen.
   assert.ok(!/pmsWindow\(cycle\.logs/.test(fn), 'cycleCalendarMarkup() darf pmsWindow() nicht mehr selbst aufrufen');
-  assert.match(fn, /function cycleCalendarMarkup\(own,\s*pms\)/, 'pms muss Parameter sein');
+  assert.match(fn, /function cycleCalendarMarkup\(own,\s*pms[,)]/, 'pms muss Parameter sein');
   assert.match(fn, /!c\.phase[\s\S]{0,20}inPmsWindow/, 'PMS-Shading darf nur auf Zellen ohne eigene Phase greifen');
   assert.match(fn, /pmsVisibleInMonth/, 'Sichtbarkeits-Flag fuer die Legende fehlt');
   const legendFn = functionSource('cycleLegendMarkup');
@@ -336,7 +410,7 @@ test('Schnellzugriffs-Links schliessen ueber den regulaeren (Dirty-Check-)Pfad, 
   // eingebauten Dirty-Check umgehen (ungespeicherte Eingaben giengen
   // stillschweigend verloren) - deshalb explizit das NICHT erzwungene
   // closeModal(), das bei ungespeicherten Aenderungen selbst nachfragt.
-  assert.match(fn, /cycle-log-painkiller[\s\S]{0,200}await closeModal\(\)[\s\S]{0,80}navigate\('\/health\/medications'\)/,
+  assert.match(fn, /cycle-log-painkiller[\s\S]{0,200}await closeModal\(\)[\s\S]{0,80}navigate\('\/health\/meds'\)/,
     'painkiller-Link muss vor der Navigation ein nicht erzwungenes closeModal() abwarten');
   assert.match(fn, /cycle-log-weight[\s\S]{0,200}await closeModal\(\)[\s\S]{0,80}navigate\('\/health\/vitals'\)/,
     'weight-Link muss vor der Navigation ein nicht erzwungenes closeModal() abwarten');
@@ -351,7 +425,7 @@ test('Bubble bietet "Periode starten" NICHT an, solange eine Periode noch offen 
   const fn = functionSource('cycleBubbleMarkup');
   assert.ok(fn, 'cycleBubbleMarkup() nicht gefunden');
   assert.match(fn, /const openPeriod = cycleOpenPeriod\(\);/, 'muss cycleOpenPeriod() bei faelliger/ueberfaelliger Vorhersage abfragen');
-  assert.match(fn, /if \(openPeriod\)[\s\S]{0,300}cycle-bubble-end-period/,
+  assert.match(fn, /if \(openPeriod\)[\s\S]{0,500}cycle-bubble-end-period/,
     'bei offener Periode muss die Bubble den Beenden-Knopf (eigener data-action) zeigen');
   assert.match(fn, /health\.cycle\.bubble\.periodStillOpen/, 'die "laeuft die noch?"-Zeile fehlt');
   // Die "Periode starten"-CTA darf danach (else-Zweig) weiterhin stehen -
@@ -383,4 +457,328 @@ test('cycleBubbleShell() nimmt einen icon-Parameter, der Schwangerschafts-Zweig 
   const fn = functionSource('cycleBubbleMarkup');
   assert.match(fn, /return cycleBubbleShell\(line1,\s*'',\s*'baby'\)/,
     'der Schwangerschafts-Zweig muss cycleBubbleShell() mit icon="baby" statt eigener Wrapper-HTML nutzen');
+});
+
+// --------------------------------------------------------
+// Komponenten-Kanon (Runde 5, 2026-09-26): Kopf-Pille, Dialogfuss, Lesemass,
+// Radius-Skala. Der Ratchet in test:control-dialect zaehlt die Abweichler
+// app-weit; diese Guards halten, was er nicht sieht - die Verdrahtung.
+// --------------------------------------------------------
+
+test('Kanon: der Kontext-FAB dockt am Desktop an - Aktions-Slot im Kopf, Nomen je Tab, Nomen bleibt beim Ausblenden', () => {
+  // Ohne `.page-toolbar__actions` im Kopf dockt der Router (dockFabIntoToolbar)
+  // stumm nicht an, und das Nomen waere nur ein Attribut, das niemand zeigt.
+  const render = HEALTH_JS.match(/export async function render\(container[\s\S]*?\n}\n/)?.[0];
+  assert.ok(render, 'render() nicht gefunden');
+  // Seit R16 traegt der Slot einen eigenen Traeger fuer das Werkzeug des Kopfs
+  // (CSV-Export); der Router dockt die Pille daneben in denselben Slot.
+  assert.match(render, /<header class="page-toolbar page-toolbar--title-tools health-toolbar">[\s\S]*?<div class="page-toolbar__actions"><span class="health-toolbar__tools" id="health-tools">[^\n]*<\/span><\/div>[\s\S]*?<\/header>/,
+    'der Gesundheitskopf braucht den Aktions-Slot, in den der Router die Kopf-Pille legt');
+  assert.match(render, /createPageFab\(\{[^}]*dockLabel: t\('newLabel\.\w+'\)/, 'createPageFab ohne Nomen dockt nie an');
+
+  const update = functionSource('updateHealthFab');
+  assert.ok(update, 'updateHealthFab() nicht gefunden');
+  const actions = update.match(/setPageFabAction\(_fab, \{[^\n]*\}\)/g) ?? [];
+  assert.ok(actions.length >= 8, `erwartet: ein Aufruf je Tab plus der Ausblend-Zweig, gefunden ${actions.length}`);
+  for (const call of actions) {
+    // Auch der Ausblend-Zweig: der Router dockt nur beim Seitenaufbau an und
+    // nur mit `data-dock-label` - wer auf der Uebersicht einsteigt und das
+    // Nomen hier loeschte, behielte den schwebenden Knopf fuer den ganzen Besuch.
+    assert.match(call, /dockLabel:/, `ohne Nomen: ${call}`);
+  }
+});
+
+test('Kanon: Dialogknoepfe stehen im Fuss (.modal-panel__footer), und der Absende-Handler sucht seinen Knopf am Panel', () => {
+  assert.doesNotMatch(HEALTH_JS, /class="modal-actions"/, 'Knopfzeile im Dialogkoerper statt im Fuss');
+  // mountFooter() (modal.js) hebt den Fuss aus dem <form> ans Panel. Ein
+  // `form.querySelector('[type="submit"]')` findet ihn danach nicht mehr und
+  // liefert null - im Messwert-Dialog warf `submitBtn.disabled` dann beim
+  // ersten Absenden einen TypeError.
+  assert.doesNotMatch(HEALTH_JS, /form\.querySelector\(\s*['"]\[type="submit"\]/,
+    'der Absende-Knopf liegt nach dem Heben nicht mehr im <form> - am Panel suchen');
+  assert.doesNotMatch(HEALTH_JS, /class="btn btn--ghost"[^>]*>\$\{esc\(t\('common\.cancel'\)\)\}/, 'Abbrechen ist btn--secondary, nie ghost');
+  assert.doesNotMatch(HEALTH_JS, /btn--danger btn--ghost/, 'Loeschen im Dialog ist btn--danger-outline mit Icon und Text');
+});
+
+test('Beifang: Karten der Uebersicht auf der Radius-Skala, Disclaimer im Lesemass', async () => {
+  const { eachRule } = await import('./css-rules.js');
+  const css = read('public/styles/health.css');
+  for (const { selector, body } of eachRule(css)) {
+    // calc(--radius-* + Npx) erfindet eine Stufe (14px), die die Skala nicht kennt.
+    // Erlaubt bleibt die Konzentrik-Formel mit MINUS (tokens.css).
+    assert.doesNotMatch(body, /border-radius:\s*calc\(var\(--radius-[a-z0-9]+\)\s*\+/, `${selector}: Radius ausserhalb der Skala`);
+  }
+  const disclaimer = [...eachRule(css)].find((r) => r.selector.trim() === '.health-disclaimer' && !r.at.length);
+  assert.ok(disclaimer, '.health-disclaimer nicht gefunden');
+  const measure = disclaimer.body.match(/max-inline-size:\s*(\d+)ch/);
+  assert.ok(measure, 'der Disclaimer lief am Desktop ueber die volle Breite (~198 Zeichen je Zeile)');
+  const ch = Number(measure[1]);
+  assert.ok(ch >= 45 && ch <= 75, `Lesemass ${ch}ch ausserhalb 45-75ch`);
+});
+
+// --------------------------------------------------------
+// R14 P3/P6: Personenwahl in den Kopf, Heute vor die Bereichsliste
+// --------------------------------------------------------
+//
+// Gemessen 390x844: auf jeder Bereichsseite stand die Personenwahl als eigene
+// Zeile (y122-170, erste Karte y186); auf der Uebersicht bei y=594 HINTER der
+// Bereichsliste, „Heute faellig" bei y=658, „Schnell erfassen" bei y=1916. Am
+// Desktop fehlte der Detailspalte ein Kopf mit dem Bereichsnamen (nur sr-only).
+
+test('R14 P3/P6: der Umzugsplan - Desktop Detailkopf, Bereich schmal Kopfzeile, Telefon-Uebersicht vor die Liste', async () => {
+  const { hoistPlan } = await import('../public/utils/health-hoist.js');
+  assert.deepEqual(hoistPlan({ split: true, overview: false, phone: false }), [{ part: 'person', slot: 'detail' }]);
+  assert.deepEqual(hoistPlan({ split: true, overview: true, phone: false }), [{ part: 'person', slot: 'detail' }]);
+  assert.deepEqual(hoistPlan({ split: false, overview: false, phone: true }), [{ part: 'person', slot: 'toolbar' }],
+    'Bereichsseite: die Pille teilt die Zeile mit „‹ Gesundheit" statt eine eigene zu kosten');
+  assert.deepEqual(hoistPlan({ split: false, overview: true, phone: true }).map((p) => `${p.part}>${p.slot}`),
+    ['person>priority', 'banner>priority', 'due>priority', 'quick>priority'],
+    'Telefon-Uebersicht: Person, Hinweis, Heute faellig, Schnell erfassen stehen VOR der Bereichsliste');
+  assert.deepEqual(hoistPlan({ split: false, overview: true, phone: false }), [], 'Tablet: das Raster bleibt, wie es ist');
+});
+
+test('R14 P3/P6: der Umzug haengt verdrahtete Knoten um und bringt sie zurueck oder verwirft sie', async () => {
+  const { applyHoistPlan, hoistPlan } = await import('../public/utils/health-hoist.js');
+  // Kleines DOM-Doppel: genug Baum fuer matches/querySelector/insertBefore.
+  class El {
+    constructor(cls) { this.cls = cls; this.children = []; this.parentElement = null; this.connected = true; }
+    get isConnected() { let n = this; while (n.parentElement) n = n.parentElement; return n.connected; }
+    get firstChild() { return this.children[0] ?? null; }
+    get nextSibling() { const p = this.parentElement; return p ? p.children[p.children.indexOf(this) + 1] ?? null : null; }
+    matches(sel) { return sel.split(',').some((s) => s.trim() === `.${this.cls}`); }
+    contains(n) { for (let x = n; x; x = x.parentElement) if (x === this) return true; return false; }
+    querySelector(sel) { for (const c of this.children) { if (c.matches(sel)) return c; const d = c.querySelector(sel); if (d) return d; } return null; }
+    remove() { if (this.parentElement) { const p = this.parentElement; p.children.splice(p.children.indexOf(this), 1); this.parentElement = null; } }
+    appendChild(n) { n.remove(); this.children.push(n); n.parentElement = this; return n; }
+    insertBefore(n, ref) { n.remove(); const i = ref ? this.children.indexOf(ref) : -1; if (i < 0) this.children.push(n); else this.children.splice(i, 0, n); n.parentElement = this; return n; }
+  }
+  const page = new El('page');
+  const mk = (cls, parent) => parent.appendChild(new El(cls));
+  const toolbar = mk('slot-toolbar', page);
+  const detail = mk('slot-detail', page);
+  const priority = mk('slot-priority', page);
+  const panel = mk('health-panel', page);
+  const root = mk('root', panel);
+  const person = mk('health-person-switcher', root);
+  const grid = mk('health-overview__grid', root);
+  const due = mk('health-overview__card--due', grid);
+  mk('health-overview__card--other', grid);
+  const quick = mk('health-overview__card--quick', grid);
+  const slots = { toolbar, detail, priority };
+
+  applyHoistPlan(hoistPlan({ split: false, overview: true, phone: true }), { panel, slots });
+  assert.deepEqual(priority.children, [person, due, quick], 'in Planreihenfolge vor der Liste');
+  applyHoistPlan(hoistPlan({ split: true, overview: true, phone: false }), { panel, slots });
+  assert.deepEqual(detail.children, [person], 'Desktop: die Pille steht im Detailkopf');
+  assert.equal(priority.children.length, 0);
+  assert.deepEqual(grid.children.map((c) => c.cls), ['health-overview__card--due', 'health-overview__card--other', 'health-overview__card--quick'],
+    'die Karten stehen wieder an ihrem Platz im Raster');
+  // Das Panel baut neu (Personenwechsel): die umgezogene alte Pille ist veraltet.
+  root.children.splice(0, 1, new El('health-person-switcher'));
+  root.children[0].parentElement = root;
+  const frisch = root.children[0];
+  applyHoistPlan(hoistPlan({ split: false, overview: false, phone: true }), { panel, slots });
+  assert.deepEqual(toolbar.children, [frisch], 'die FRISCHE Pille zieht um');
+  assert.equal(detail.children.length, 0, 'die alte ist weg, nicht doppelt zurueck im Panel');
+  assert.equal(root.children.filter((c) => c.cls === 'health-person-switcher').length, 0);
+});
+
+test('R14 P3/P6: Kopf, Streifen und Detailkopf stehen im Markup, die Karten sind benannt', async () => {
+  assert.match(HEALTH_JS, /class="health-toolbar__person" data-health-person-slot/, 'Slot in der Zeile „‹ Gesundheit"');
+  // Seit R18 folgt dem Umzugsziel sein Skelett (Geschwister, nicht Kind - siehe den R18-Test unten).
+  assert.match(HEALTH_JS, /class="health-priority" data-health-priority><\/div>\s*\$\{prioritySkeletonMarkup\(\)\}\s*<\/section>\s*\$\{areasNavMarkup\(\)\}/, 'Streifen VOR der Bereichsliste');
+  assert.match(HEALTH_JS, /overviewCard\('calendar-check', 'health\.overview\.dueToday\.title', overviewDueMarkup\(\), 'due'\)/);
+  assert.match(HEALTH_JS, /overviewCard\('plus-circle', 'health\.overview\.quick\.title', quickCaptureMarkup\(\), 'quick'\)/);
+  assert.match(HEALTH_JS, /class="split-view__detail-head health-detail-head"/, 'Detailkopf wie die anderen Split-Views (A8 P2-2)');
+  const { eachRule } = await import('./css-rules.js');
+  const css = read('public/styles/health.css');
+  const rules = [...eachRule(css)];
+  assert.ok(rules.some((r) => /\.health-page\[data-health-pushed\] \.health-priority-region/.test(r.selector) && /display:\s*none/.test(r.body)),
+    'in einem Bereich gibt es den Streifen nicht');
+  assert.ok(rules.some((r) => /\.health-priority-region:not\(\[data-health-priority-pending\]\):not\(:has\(> \.health-priority > \*\)\)/.test(r.selector) && /display:\s*none/.test(r.body)), 'leer kostet er nichts');
+});
+
+// Sonde 10 (document-guards) nach R14 P3: mobil stand „Heute faellig" (h3) als
+// erste Ueberschrift nach dem Seitentitel (h1) - ein Sprung h1 -> h3 fuer jeden
+// Screenreader, der die Seite nach Ueberschriften abgeht. Die Karten tragen im
+// Raster ihre h3 unter der Panel-h2; im Streifen vor der Bereichsliste fehlte
+// die Ebene dazwischen. Gemessen wird die Regel, nicht die Schreibweise: die
+// letzte Ueberschrift VOR dem Umzugsziel liegt hoechstens eine Ebene ueber der
+// Kartenueberschrift, und sie steht AUSSERHALB des Ziels (applyHoistPlan raeumt
+// dort alles weg, was es nicht selbst umgehaengt hat).
+test('R14 P3: vor den hochgezogenen Karten steht eine Ueberschrift eine Ebene darueber', async () => {
+  const shellStart = HEALTH_JS.indexOf('<div class="health-page app-page');
+  assert.ok(shellStart >= 0, 'Seitenrahmen nicht gefunden');
+  const slotAt = HEALTH_JS.indexOf('data-health-priority>', shellStart);
+  assert.ok(slotAt > shellStart, 'Umzugsziel data-health-priority nicht im Seitenrahmen');
+  const before = [...HEALTH_JS.slice(shellStart, slotAt).matchAll(/<h([1-6])\b/g)].map((m) => Number(m[1]));
+  assert.ok(before.length, 'keine Ueberschrift vor dem Streifen');
+  const lead = before.at(-1);
+  const cardStart = HEALTH_JS.indexOf('function overviewCard(');
+  const card = HEALTH_JS.slice(cardStart, HEALTH_JS.indexOf('\n}\n', cardStart)).match(/<h([1-6]) class="health-overview__card-title/);
+  assert.ok(card, 'Kartenueberschrift in overviewCard nicht gefunden');
+  assert.ok(Number(card[1]) <= lead + 1,
+    `hochgezogene Karte h${card[1]} folgt auf h${lead} - Ueberschriftensprung (Sonde 10, mobile/health)`);
+  // Die Ueberschrift des Streifens gibt es nur, wenn er etwas traegt: leer
+  // (Desktop, Tablet) oder in einem Bereich faellt die ganze Region weg.
+  const { eachRule } = await import('./css-rules.js');
+  const rules = [...eachRule(read('public/styles/health.css'))];
+  const hides = (re) => rules.some((r) => re.test(r.selector) && /display:\s*none/.test(r.body));
+  assert.ok(hides(/\.health-priority-region:not\(\[data-health-priority-pending\]\):not\(:has\(> \.health-priority > \*\)\)/), 'leere Region mit Ueberschrift bliebe stehen');
+  assert.ok(hides(/\.health-page\[data-health-pushed\] \.health-priority-region/), 'in einem Bereich bliebe die Region stehen');
+});
+
+// R14 P4 (A6 P2-7): „Noch keine Eintraege." zentriert oben, ohne Weg - in der
+// 676px-Detailspalte 21 % genutzt. Jetzt der geteilte Leerzustand mit Titel,
+// Satz und dem Anlege-Weg (nur mit Schreibrecht).
+test('R14 P4: Vorsorge und Naehrwerte leer = EIN Leerzustand mit Aktion statt einer Hinweiszeile', () => {
+  const fnBody = (name) => {
+    const start = HEALTH_JS.indexOf(`function ${name}(`);
+    assert.ok(start >= 0, `${name} fehlt`);
+    return HEALTH_JS.slice(start, HEALTH_JS.indexOf('\n}\n', start));
+  };
+  const prev = fnBody('renderPreventionShell');
+  assert.doesNotMatch(prev, /emptyHintHTML\(t\('health\.prevention\.noRecords'\)\)/, 'Vorsorge: keine nackte Hinweiszeile mehr');
+  assert.match(prev, /emptyStateHTML\(\{[\s\S]*?title: t\('health\.prevention\.emptyTitle'\)[\s\S]*?id: 'health-prevention-empty-add'/,
+    'Vorsorge: Leerzustand mit Titel und Anlege-Knopf');
+  assert.match(fnBody('wirePrevention'), /#health-prevention-empty-add'\)\?\.addEventListener\('click', \(\) => openPreventionModal\(null\)\)/);
+  const nut = fnBody('renderNutritionShell');
+  assert.doesNotMatch(nut, /emptyHintHTML\(t\('health\.nutrition\.noEntries'\)\)/, 'Naehrwerte: keine nackte Hinweiszeile mehr');
+  assert.match(nut, /emptyStateHTML\(\{[\s\S]*?title: t\('health\.nutrition\.emptyTitle'\)[\s\S]*?id: 'health-nutrition-empty-add'/);
+  assert.match(fnBody('wireNutrition'), /#health-nutrition-empty-add'\)\?\.addEventListener\('click', \(\) => openNutritionModal\(null\)\)/);
+});
+
+// R14 P8 (A6 P2-5): die Vorsorge trug zwei native Datumsfelder, direkt neben
+// dem Export mit dem Kanon-Picker. Jedes Datumsfeld der Gesundheit ist jetzt
+// `yuvomi-datepicker`.
+test('R14 P8: kein natives Datumsfeld in der Gesundheit', () => {
+  const nativ = [...HEALTH_JS.matchAll(/<input[^>]*type="date"[^>]*>/g)].map((m) => m[0]);
+  assert.deepEqual(nativ, [], 'native Datumsfelder statt yuvomi-datepicker');
+  assert.match(HEALTH_JS, /<yuvomi-datepicker id="prevention-given-on" type="date"/);
+  assert.match(HEALTH_JS, /<yuvomi-datepicker id="prevention-next-due" type="date"/);
+});
+
+// R14 P8 (A6 P2-6): Zyklus-Verlauf und Trainings-Liste lagen nackt auf der
+// Buehne, waehrend „Letzte Messungen" und Labor in Karten stehen. Jede
+// Verlaufsliste traegt jetzt die Flaeche eines Zeilentraegers.
+test('R14 P8: Verlaufslisten der Gesundheit stehen auf einem Traeger', async () => {
+  const { eachRule } = await import('./css-rules.js');
+  const rules = [...eachRule(read('public/styles/health.css'))].filter((r) => !r.at.length);
+  for (const list of ['.cycle-history__list', '.health-activity-list']) {
+    const own = rules.filter((r) => r.selector.split(',').map((x) => x.trim()).includes(list));
+    assert.ok(own.some((r) => /background(?:-color)?:\s*var\(--color-surface\)/.test(r.body)), `${list}: keine Flaeche`);
+    assert.ok(own.some((r) => /border-radius:\s*var\(--radius-lg\)/.test(r.body)), `${list}: kein Kartenradius`);
+  }
+});
+
+// R14 P11 (A6 P2-9) / R16 (Bewegung): der Bereichswechsel schaltete `hidden`
+// um - schmal blendete er seit R14, am Desktop schnitt die Detailspalte hart.
+// Jetzt blendet der neue Bereich in JEDER Breite, ueber den geteilten Helfer
+// (Regeln und reduzierte Bewegung: test:motion).
+test('R16: der Bereichswechsel blendet in jeder Breite ueber swapContent', async () => {
+  const start = HEALTH_JS.indexOf('function activateArea(');
+  const body = HEALTH_JS.slice(start, HEALTH_JS.indexOf('\n}\n', start));
+  // R18: schmal traegt der Wechsel Uebersicht <-> Bereich zusaetzlich eine Richtung (test:motion, Drill-down).
+  assert.match(body, /if \(previous && previous !== id\) markAreaEntering\(route, drill\);/, 'nicht mehr nur schmal');
+  const fn = HEALTH_JS.slice(HEALTH_JS.indexOf('function markAreaEntering('), HEALTH_JS.indexOf('function markAreaEntering(') + 400);
+  assert.match(fn, /function markAreaEntering\(route, direction = 0\)/, 'ohne Angabe: Blende ohne Versatz');
+  assert.match(fn, /swapContent\(panel, null, \{ direction \}\)/, 'ueber den geteilten Helfer am Panel');
+  const { eachRule } = await import('./css-rules.js');
+  assert.ok(![...eachRule(read('public/styles/health.css'))].some((r) => /health-panel--entering/.test(r.selector)), 'die eigene Klasse ist weg');
+});
+
+// R14 P6 (A8 P2-2, A6 §5): die angedockte Pille hiess in Vorsorge und
+// Naehrwerte „Eintrag", in Aktivitaet „Einheit" - kein Nomen des Objekts
+// (Kanon DESIGN.md: die Pille nennt, was entsteht). Jeder Bereich traegt sein
+// eigenes Nomen, in jeder Sprache verschieden von den anderen.
+test('R14 P6: die Kopf-Pille nennt je Bereich ihr Objekt', () => {
+  const keys = ['healthVitals', 'healthCycle', 'healthMeds', 'healthPrevention', 'healthLabs', 'healthActivity', 'healthNutrition'];
+  for (const file of readdirSync(join(ROOT, 'public/locales')).filter((f) => f.endsWith('.json'))) {
+    const labels = JSON.parse(read(`public/locales/${file}`)).newLabel;
+    const values = keys.map((k) => labels[k]);
+    assert.equal(new Set(values).size, values.length, `${file}: zwei Bereiche teilen ein Nomen (${values.join(' / ')})`);
+  }
+  const de = JSON.parse(read('public/locales/de.json')).newLabel;
+  for (const k of keys) assert.ok(!['Eintrag', 'Einheit'].includes(de[k]), `de ${k}: „${de[k]}" ist kein Objekt`);
+});
+
+/* R18 (Ursache zu #1770): DIE "HEUTE"-REGION SPRINGT NICHT INS BILD.
+ *
+ * Gemessen bei 390x844, drei Laeufe: die Region stand per `:has()` auf
+ * `display: none`, bis die Uebersicht geladen war, und erschien dann mit 480px
+ * auf einmal - `.health-areas` von y=81 auf y=577, Layout-Shift 0,58. Dazu
+ * wuchs jede Bereichszeile von 49 auf 63px, wenn ihr Status eintraf.
+ * Nachher: 0,003 (PerformanceObserver 'layout-shift', derselbe Weg).
+ *
+ * Der Browser misst das Ergebnis; hier steht, was es traegt - und die drei
+ * Stellen, an denen es wieder kippen kann. */
+test('R18: die Heute-Region steht auf dem Telefon vom ersten Bild an - mit Skelett, sonst nie leer', async () => {
+  const { eachRule } = await import('./css-rules.js');
+  const rules = [...eachRule(read('public/styles/health.css'))];
+  const body = (sel) => rules.filter((r) => r.selector.trim() === sel).map((r) => r.body).join(';');
+
+  // 1. Solange Inhalt erwartet wird, faellt die Region NICHT weg - und nur dann.
+  const hide = rules.filter((r) => /\.health-priority-region\b[^,]*:has\(/.test(r.selector) && /display:\s*none/.test(r.body));
+  assert.equal(hide.length, 1, 'genau eine Leer-Regel');
+  assert.match(hide[0].selector, /:not\(\[data-health-priority-pending\]\)/,
+    'ohne die Ausnahme ist die Region bis zum Eintreffen der Daten weg und springt dann ins Bild');
+
+  // 2. Das Skelett ist GESCHWISTER des Umzugsziels: applyHoistPlan raeumt im
+  //    Ziel alles weg, was es nicht selbst umgehaengt hat - als Kind waere es
+  //    beim ersten Abgleich fort, vor den Daten.
+  const fn = HEALTH_JS.slice(HEALTH_JS.indexOf('function prioritySkeletonMarkup()'), HEALTH_JS.indexOf('function syncPriorityRegion()'));
+  assert.match(fn, /class="health-priority-skeleton" data-health-priority-skeleton aria-hidden="true"/);
+  assert.match(fn, /health-priority-skeleton__pill[\s\S]*health-priority-skeleton__card--due[\s\S]*health-priority-skeleton__card--quick/,
+    'die Form dessen, was kommt: Pille, Heute faellig, Schnell erfassen');
+  assert.match(body('.health-priority-skeleton'), /display:\s*none/, 'ohne die Marke steht kein Skelett');
+  const show = rules.find((r) => /\[data-health-priority-pending\]\s*>\s*\.health-priority:empty\s*~\s*\.health-priority-skeleton/.test(r.selector));
+  assert.ok(show && /display:\s*flex/.test(show.body), 'es steht nur, solange die Region wartet UND ihr Ziel leer ist');
+  // Zielgeometrie: dieselben Abstaende wie der Streifen, den es vertritt.
+  for (const prop of ['gap', 'padding-inline']) {
+    const want = body('.health-priority').match(new RegExp(`${prop}:\\s*([^;]+)`))?.[1].trim();
+    assert.ok(want, `Reichweite: .health-priority setzt ${prop}`);
+    assert.equal(body('.health-priority-skeleton').match(new RegExp(`${prop}:\\s*([^;]+)`))?.[1].trim(), want, `das Skelett traegt ${prop} des Streifens`);
+  }
+
+  // 3. Die Marke gilt nur auf dem Telefon in der Uebersicht und faellt, sobald
+  //    Inhalt da ist - oder keiner mehr kommt (Ladefehler).
+  assert.match(HEALTH_JS, /_priorityPending = activeRoute === '\/health' && isPhone\(\);/, 'gesetzt beim Seitenaufbau, nur Telefon + Uebersicht');
+  assert.match(HEALTH_JS, /\$\{priorityPending \? ' data-health-priority-pending' : ''\}/, 'und schon im ERSTEN Markup, nicht erst nach einem Abgleich');
+  const sync = HEALTH_JS.slice(HEALTH_JS.indexOf('function syncPriorityRegion()'), HEALTH_JS.indexOf('function syncHoists()'));
+  assert.match(sync, /if \(filled \|\| !overviewActive \|\| !isPhone\(\)\) _priorityPending = false;/);
+  assert.match(sync, /toggleAttribute\('data-health-priority-pending', _priorityPending\)/);
+  const hoists = HEALTH_JS.slice(HEALTH_JS.indexOf('function syncHoists()'), HEALTH_JS.indexOf('let _hoistObserver'));
+  assert.match(hoists, /applyHoistPlan\([\s\S]*syncPriorityRegion\(\);/, 'nach jedem Umzug nachgefuehrt');
+  const shell = HEALTH_JS.slice(HEALTH_JS.indexOf('function renderOverviewShell()'), HEALTH_JS.indexOf('function overviewGridMarkup('));
+  assert.match(shell, /if \(overview\.error\) \{[\s\S]*?_priorityPending = false;\s*syncPriorityRegion\(\);[\s\S]*?return;/,
+    'nach einem Ladefehler bleibt kein Skelett stehen');
+});
+
+test('R18: eine Bereichszeile ist immer zwei Zeilen hoch - ihr Status schiebt nichts mehr', async () => {
+  const { eachRule } = await import('./css-rules.js');
+  const rules = [...eachRule(read('public/styles/health.css'))];
+  const main = rules.filter((r) => r.selector.trim() === '.health-area-row__main').map((r) => r.body).join(';');
+  assert.match(main, /min-block-size:\s*calc\(1lh \+ var\(--space-0h\) \+ var\(--text-sm\) \* var\(--line-height-base\)\)/,
+    'Name plus Statuszeile, ob der Status schon da ist oder nie kommt');
+  assert.match(main, /justify-content:\s*center/, 'ein Name ohne Status steht mittig');
+  // Der Name darf die reservierte Hoehe nicht selbst fuellen (.list-row__name waechst im Flex-Traeger).
+  const name = rules.find((r) => r.selector.trim() === '.health-area-row__main > .health-area-row__name');
+  assert.ok(name && /flex:\s*0 0 auto/.test(name.body), 'sonst steht der Name oben statt mittig');
+  // Reichweite der Rechnung: der Status laeuft wirklich in --text-sm.
+  const status = rules.filter((r) => r.selector.trim() === '.health-area-row__status').map((r) => r.body).join(';');
+  assert.match(status, /font-size:\s*var\(--text-sm\)/);
+  assert.match(status, /white-space:\s*nowrap/, 'und bleibt eine Zeile');
+});
+
+test('R18: kein Bereich laedt mehr mit dem Wort "Lade..." - jeder traegt ein Skelett', () => {
+  const texts = [...HEALTH_JS.matchAll(/__loading">\$\{esc\(t\('common\.loading'\)\)\}<\/div>/g)];
+  assert.equal(texts.length, 0, 'ein Ladezustand, der nur aus dem Wort besteht');
+  const calls = [...HEALTH_JS.matchAll(/areaLoadingMarkup\('([a-z]+)', '(list|chart)'\)/g)].map((m) => m[1]).sort();
+  assert.deepEqual(calls, ['activity', 'labs', 'meds', 'nutrition', 'overview', 'prevention', 'vitals']);
+  const fn = HEALTH_JS.slice(HEALTH_JS.indexOf('function areaLoadingMarkup('), HEALTH_JS.indexOf('function cycleSkeletonMarkup()'));
+  assert.match(fn, /role="status"/, 'der Ladezustand bleibt eine Statusmeldung');
+  assert.match(fn, /<span class="sr-only">\$\{esc\(t\('common\.loading'\)\)\}<\/span>/, 'und das Wort bleibt fuer Screenreader');
+  assert.match(fn, /renderSkeletonChart\(\{ charts: 2 \}\)/);
+  assert.match(fn, /renderSkeletonList\(\{ rows: 3, lines: 2 \}\)/);
+  assert.match(HEALTH_JS, /import \{ renderSkeletonList, renderSkeletonChart \} from '\/utils\/skeleton\.js';/);
 });

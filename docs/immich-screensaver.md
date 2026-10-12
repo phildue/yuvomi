@@ -1,7 +1,8 @@
 # Immich photo screensaver
 
 Yuvomi can replace the dashboard with photos from an [Immich](https://immich.app/) server after
-five minutes without keyboard, pointer, touch, or scroll activity. It requests a random set of
+a period without keyboard, pointer, touch, or scroll activity - five minutes unless the device
+chooses otherwise (see [Delay on each device](#delay-on-each-device)). It requests a random set of
 photos, changes the photo every 20 seconds, and returns to Yuvomi on the next interaction. Photo
 metadata moves between corners so that the screensaver does not introduce another fixed bright
 area. If Immich is unavailable, Yuvomi leaves the current screen visible and tries again after a
@@ -22,7 +23,7 @@ Yuvomi's server can reach Immich.
 ## Configure in Yuvomi
 
 1. Sign in as an administrator.
-2. Open **Settings → Administration → Immich**.
+2. Open **Settings → Household → Photos and weather → Immich**.
 3. Enter the Immich server URL. Both the server root and a URL ending in `/api` are accepted.
 4. Enter the API key.
 5. Optionally enter an Immich album UUID. Leave it empty to use the whole library.
@@ -34,6 +35,15 @@ exists. Leaving the field empty preserves the saved key.
 
 The album UUID is the UUID portion of an Immich album URL. Only image assets are selected; videos
 are not shown by the screensaver.
+
+## Delay on each device
+
+How long a device waits before the screensaver starts is chosen on that device, under
+**Settings → Account → Appearance → Start the screensaver after**: 1, 2, 5, 10 or 15 minutes,
+five by default. It is stored in the browser like wall mode, so a photo frame can start after one
+minute while a kitchen tablet and every phone in the household keep their own delay. A new value
+applies at once, without a reload. There is deliberately no household setting or environment
+variable for it: one value for the whole household would reach every signed-in device.
 
 ## Configure through environment variables
 

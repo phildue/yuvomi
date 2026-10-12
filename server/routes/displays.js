@@ -24,8 +24,9 @@ import rateLimit from 'express-rate-limit';
 import * as db from '../db.js';
 import { createLogger } from '../logger.js';
 import { requireAdmin } from '../middleware/require-admin.js';
-import { householdMemberSql } from '../services/household-members.js';
+import { householdMemberSql, memberOrderSql, memberPositionSql } from '../services/household-members.js';
 import { resolvePermissions } from '../permissions.js';
+import { DISPLAY_AREA_MODULES } from '../display-scopes.js';
 import { isEnrolled } from '../services/rewards.js';
 import { CURRENT_ONBOARDING_VERSION, LEGACY_SESSION_COOKIE, SESSION_COOKIE } from '../auth.js';
 import {
@@ -35,6 +36,7 @@ import {
   issuePairingCode,
   listDisplayDevices,
   redeemPairingCode,
+  removeRevokedDisplayDevice,
   revokeDisplayDevice,
 } from '../services/display-accounts.js';
 
@@ -184,14 +186,15 @@ peopleRouter.get('/people', (req, res) => {
     // ist 403 und nicht 404: den Pfad gibt es, er ist nur nicht fuer diesen
     // Aufrufer.
     if (req.authMethod !== 'display') {
-      return res.status(403).json({ error: 'This route is for paired displays.', code: 403 });
+      return res.status(403).json({ error: 'This route is for paired displays.', code: 403, reason: 'display_only' });
     }
     const d = db.get();
     const rows = d.prepare(`
-      SELECT u.id, u.display_name, u.avatar_color, u.avatar_data, u.role, u.family_role
+      SELECT u.id, u.display_name, u.avatar_color, u.avatar_data, u.role, u.family_role,
+             ${memberPositionSql('u')} AS sort_order
       FROM users u
       WHERE ${householdMemberSql('u')}
-      ORDER BY u.display_name COLLATE NOCASE ASC
+      ORDER BY ${memberOrderSql('u')}
     `).all();
     const data = rows.map((row) => {
       const { admin, modules } = resolvePermissions(d, row);
@@ -247,7 +250,9 @@ router.get('/', (_req, res) => {
       ...row,
       devices: listDisplayDevices(row.id),
     }));
-    return res.json({ data });
+    // `area_modules` steht NEBEN der Liste, nicht in jedem Eintrag: es ist eine
+    // Tatsache ueber Displays, nicht ueber dieses eine (#1808).
+    return res.json({ data, area_modules: DISPLAY_AREA_MODULES });
   } catch (err) {
     log.error('GET / error:', err);
     return res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -360,6 +365,38 @@ router.post('/:id/devices/:deviceId/revoke', (req, res) => {
     return res.json({ data: { id: deviceId, revoked: true } });
   } catch (err) {
     log.error('POST /:id/devices/:deviceId/revoke error:', err);
+    return res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+/**
+ * Die Zeile eines widerrufenen Geraets entfernen (D#1672).
+ *
+ * Dieselbe Regel wie `POST /auth/api-tokens/:id/remove`: nur was nicht mehr
+ * gilt, geht. Ein gekoppeltes Geraet antwortet 409 mit `reason` - sein Weg
+ * hinaus ist der Widerruf eine Route darueber.
+ */
+router.post('/:id/devices/:deviceId/remove', (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const deviceId = Number(req.params.deviceId);
+    if (!Number.isInteger(id) || !Number.isInteger(deviceId)) {
+      return res.status(400).json({ error: 'Invalid id.', code: 400 });
+    }
+    // Wie beim Widerruf: das Geraet muss zu DIESEM Display gehoeren.
+    const device = db.get().prepare('SELECT id FROM display_devices WHERE id = ? AND user_id = ?').get(deviceId, id);
+    if (!device) return res.status(404).json({ error: 'Device not found.', code: 404 });
+
+    if (!removeRevokedDisplayDevice(deviceId)) {
+      return res.status(409).json({
+        error: 'A paired device cannot be removed. Revoke it first.',
+        code: 409,
+        reason: 'display_device_active',
+      });
+    }
+    return res.json({ data: { id: deviceId, removed: true } });
+  } catch (err) {
+    log.error('POST /:id/devices/:deviceId/remove error:', err);
     return res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });

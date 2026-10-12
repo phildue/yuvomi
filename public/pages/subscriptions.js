@@ -8,18 +8,31 @@ import { closeModal, confirmModal, confirmOverModal, openModal, advancedSection,
 import {
   formatDate,
   getLocale,
+  getNumberFormat,
   isDateInputValid,
   parseDateInput,
   t,
 } from '/i18n.js';
-import { esc } from '/utils/html.js';
+import { esc, REQUIRED_MARK } from '/utils/html.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
 import { emptyStateHTML, mountLoadError } from '/utils/empty-state.js';
 import { todayKey } from '/utils/date.js';
 import { CURRENCY_CODES } from '/utils/currency-codes.js';
 import { wireSwipeRows, maybeShowSwipeHint } from '/utils/swipe-row.js';
+import { redrawList, collapseRow } from '/utils/list-motion.js';
 import { formatMoney, amountPlaceholder, amountStep, applyAmountFormat, amountIsSavable, smallestUnitLabel } from '/utils/money.js';
 import { attachOverlay } from '/utils/overlay-history.js';
+import { isNavModuleReadOnly } from '/permissions.js';
+import { openDetailView } from '/components/detail-view.js';
+import { rowActionHtml } from '/utils/row-action.js';
+import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
+import { metricGlanceHtml, wireMetricGlance } from '/utils/metric-glance.js';
+import { toggleRowHtml } from '/settings/components.js';
+import { leadCardClass } from '/utils/metric-card.js';
+
+// Auslastung, ab der ein Budget „knapp" ist - dieselbe Zahl wie im Plan
+// (budget-plans.js `toneForRatio`), damit beide Tabs dieselbe Grenze ziehen.
+const PLAN_NEAR_RATIO = 0.85;
 
 let state = {
   subscriptions: [],
@@ -33,8 +46,31 @@ let state = {
   status: 'all',
   sort: 'due',
   user: null,
+  summaryExpanded: false, // mobil: Kennzahl-Karten unter der Glance-Zeile aufgeklappt (R14 P1)
 };
 let container = null;
+/** Handle des geteilten Suchfelds (wirePageSearch) - Zuruecksetzen leert es mit. */
+let searchField = null;
+
+// --------------------------------------------------------
+// Nur-lesen (#467, #1265 P7)
+// --------------------------------------------------------
+
+/**
+ * Darf dieser Nutzer Abos pflegen? Die Abos sind ein Budget-Reiter und liegen
+ * unter `/budget/subscriptions`, also fragt die Seite dasselbe Modul wie
+ * budget.js. Ohne diese Frage trug sie bei `budget: read` jeden Schreibweg:
+ * anlegen, bearbeiten, verlaengern, loeschen (Knopf UND Wischgeste),
+ * Kategorien und Zahlungsarten, Monatsbudget und Basiswaehrung.
+ */
+function readOnly() {
+  return isNavModuleReadOnly('budget');
+}
+
+// Jede `data-action` dieser Seite, die NICHT schreibt: nur `view`, der Weg in
+// die Leseansicht eines Abos. Eine Positivliste - eine morgen ergaenzte Aktion
+// ist damit standardmaessig gesperrt statt standardmaessig offen.
+const READ_SAFE_ACTIONS = new Set(['view']);
 
 function setHtml(element, html) {
   element.replaceChildren();
@@ -185,51 +221,55 @@ export async function render(target, { user } = {}) {
   // Werkzeugzeile, Raster und Liste dasselbe Mass lesen.
   setHtml(container, `
     <div class="subscriptions-page app-page app-page--full" data-composition="full" aria-busy="true">
-      <div class="subscriptions-toolbar">
-        <label class="subscriptions-search">
-          <i data-lucide="search" aria-hidden="true"></i>
-          <span class="sr-only">${t('subscriptions.searchLabel')}</span>
-          <input id="subscriptions-search" type="search" placeholder="${t('subscriptions.searchPlaceholder')}" autocomplete="off">
-        </label>
-        <label class="subscriptions-filter-field">
-          <span class="subscriptions-filter-field__label">${t('subscriptions.filterLabelCategory')}</span>
-          <select class="form-input subscriptions-filter" id="subscriptions-category-filter"></select>
-        </label>
-        <label class="subscriptions-filter-field">
-          <span class="subscriptions-filter-field__label">${t('subscriptions.filterLabelMethod')}</span>
-          <select class="form-input subscriptions-filter" id="subscriptions-method-filter"></select>
-        </label>
-        <label class="subscriptions-filter-field">
-          <span class="subscriptions-filter-field__label">${t('subscriptions.filterLabelStatus')}</span>
-          <select class="form-input subscriptions-filter" id="subscriptions-status-filter">
-            <option value="all">${t('common.all')}</option>
-            <option value="active">${t('subscriptions.statusActive')}</option>
-            <option value="paused">${t('subscriptions.statusDisabled')}</option>
-            <option value="completed">${t('subscriptions.completed')}</option>
-          </select>
-        </label>
-        <label class="subscriptions-filter-field">
-          <span class="subscriptions-filter-field__label">${t('subscriptions.filterLabelSort')}</span>
-          <select class="form-input subscriptions-filter" id="subscriptions-sort">
-            <option value="due">${t('subscriptions.sortDue')}</option>
-            <option value="cost-desc">${t('subscriptions.sortCostDesc')}</option>
-            <option value="cost-asc">${t('subscriptions.sortCostAsc')}</option>
-            <option value="name">${t('subscriptions.sortName')}</option>
-          </select>
-        </label>
-        <button class="btn btn--ghost subscriptions-filter-reset" id="subscriptions-reset-filters" type="button" hidden>
-          <i data-lucide="filter-x" class="icon-sm" aria-hidden="true"></i>${t('subscriptions.resetFilters')}
-        </button>
-        <div class="subscriptions-toolbar__actions">
-          <button class="btn btn--secondary btn--icon" id="subscriptions-manage" aria-label="${t('subscriptions.manageMetadata')}" title="${t('subscriptions.manageMetadata')}">
-            <i data-lucide="tags" aria-hidden="true"></i>
+      <!-- EINE WERKZEUGZEILE STATT VIER SELECTS (Critique 2026-09-25, P2).
+           Hier standen Suche, vier beschriftete Selects, Zuruecksetzen und zwei
+           Icon-Knoepfe - mobil 213px hoch, die erste Abo-Zeile bei y=1123.
+           Die Zeile fuehrt jetzt die Grammatik der anderen Module: Suche,
+           EIN Filterknopf mit der Zahl der aktiven Filter (Blatt wie im
+           Kalender), EIN Werkzeug-Menue (Sortierung + Verwaltung wie in den
+           Dokumenten und der Buchungsliste). Was gerade einschraenkt, steht
+           darunter als abwaehlbarer Chip - nur dann, sonst kostet es nichts.
+
+           IM KOPF DER LISTE, DIE SIE FILTERT (R14 P8, A5 P2-7): die Zeile
+           stand als eigene Werkzeugzeile ueber allem, die Suche 448px breit
+           und mobil als volles Feld. Jetzt ist sie der Abschnittskopf wie im
+           Hauptbuch (.section-toolbar): Titel links, Suche mit
+           --page-search-width, mobil in der Icon-Form. Kennzahlen stehen
+           davor, damit Kopf und Liste zusammen bleiben; der Kopf wird nie neu
+           gebaut, sonst verloere die Suche beim Tippen ihren Fokus.
+
+           AUF DER BUEHNE, NICHT IN DER KARTE (R16 Schritt 2b, Reiter-Skelett
+           des Budgets): der Kopf stand samt Titel IN der weissen Flaeche der
+           Liste, waehrend "Transaktionen" und "Kategorie-Budgets" nebenan
+           ueber ihrem Traeger stehen. Jetzt h2.u-section-title mit den
+           Werkzeugen rechts, darunter der Zeilentraeger (.row-carrier). -->
+      <div class="subscriptions-summary" id="subscriptions-summary"></div>
+      <section class="subscriptions-list-section" aria-labelledby="subscriptions-list-title">
+        <div class="subscriptions-section-head section-toolbar">
+          <div class="subscriptions-section-head__lead">
+            <h2 class="u-section-title" id="subscriptions-list-title" tabindex="-1">${t('subscriptions.listTitle')}</h2>
+            <span class="list-group__count" id="subscriptions-list-count"></span>
+          </div>
+          <span class="subscriptions-rates-slot" id="subscriptions-rates-slot"></span>
+          ${renderPageSearch({
+    id: 'subscriptions-search',
+    label: t('subscriptions.searchLabel'),
+    placeholder: t('subscriptions.searchPlaceholder'),
+    value: state.query,
+    clearLabel: t('common.searchClear'),
+    className: 'subscriptions-search',
+  })}
+          <button type="button" class="btn btn--secondary subscriptions-filter-btn" id="subscriptions-filters" aria-haspopup="dialog" aria-label="${esc(t('subscriptions.filters'))}">
+            <i data-lucide="sliders-horizontal" class="icon-md" aria-hidden="true"></i>
+            <span class="subscriptions-filter-btn__label">${t('subscriptions.filters')}</span>
+            <span class="subscriptions-filter-btn__count" aria-hidden="true" hidden></span>
           </button>
-          <button class="btn btn--secondary btn--icon" id="subscriptions-settings" aria-label="${t('subscriptions.settingsTitle')}" title="${t('subscriptions.settingsTitle')}">
-            <i data-lucide="settings-2" aria-hidden="true"></i>
-          </button>
+          ${toolsMenuHtml()}
         </div>
-      </div>
-      <div id="subscriptions-content">${renderSkeletonList({ rows: 5, lines: 2 })}</div>
+        <div class="subscriptions-active-filters" id="subscriptions-active-filters" role="group" aria-label="${t('subscriptions.activeFiltersLabel')}" hidden></div>
+        <div id="subscriptions-content">${renderSkeletonList({ rows: 5, lines: 2 })}</div>
+      </section>
+      <div id="subscriptions-analytics"></div>
     </div>
   `);
   if (window.lucide) window.lucide.createIcons({ el: container });
@@ -256,89 +296,264 @@ export async function render(target, { user } = {}) {
   }
 }
 
+// Die drei Filter, die WEGNEHMEN, was man sieht. Die Sortierung gehoert nicht
+// dazu (sie ordnet nur) und steht deshalb im Werkzeug-Menue, nicht im Blatt
+// und nicht in der Chip-Zeile - dieselbe Trennung wie in den Dokumenten.
+const STATUS_OPTIONS = [
+  ['all', 'common.all'],
+  ['active', 'subscriptions.statusActive'],
+  ['paused', 'subscriptions.statusDisabled'],
+  ['completed', 'subscriptions.completed'],
+];
+const SORT_OPTIONS = [
+  ['due', 'subscriptions.sortDue'],
+  ['cost-desc', 'subscriptions.sortCostDesc'],
+  ['cost-asc', 'subscriptions.sortCostAsc'],
+  ['name', 'subscriptions.sortName'],
+];
+
+/** Die gerade aktiven Filter als { key, field, value } - Quelle fuer Zahl und Chips. */
+function activeFilters() {
+  const out = [];
+  if (state.categoryId) {
+    const item = state.meta.categories.find((row) => String(row.id) === String(state.categoryId));
+    out.push({ key: 'category', field: t('subscriptions.filterLabelCategory'), value: categoryLabel(item) });
+  }
+  if (state.paymentMethodId) {
+    const item = state.meta.payment_methods.find((row) => String(row.id) === String(state.paymentMethodId));
+    out.push({ key: 'method', field: t('subscriptions.filterLabelMethod'), value: paymentMethodLabel(item) });
+  }
+  if (state.status !== 'all') {
+    const option = STATUS_OPTIONS.find(([id]) => id === state.status);
+    out.push({ key: 'status', field: t('subscriptions.filterLabelStatus'), value: t(option?.[1] ?? 'common.all') });
+  }
+  return out;
+}
+
+/**
+ * Filterknopf und Chip-Zeile nachziehen. Die Zeile erscheint NUR, wenn etwas
+ * einschraenkt - ein leerer Streifen „keine Filter" waere Chrome ohne Auskunft.
+ * Jeder Chip nimmt genau seinen Filter zurueck; ab zwei Filtern steht dahinter
+ * „Filter zuruecksetzen" fuer alle auf einmal.
+ */
 function renderFilters() {
-  // Die Neutral-Option jedes Filters heisst „Alle", nicht „Alle Kategorien" /
-  // „Alle Zahlungsarten" / „Alle Status": das Feldlabel steht sichtbar darueber
-  // und der Wert wiederholte es nur. Die Wiederholung forderte fuer alle vier
-  // Selects dieselbe Breite und kappte am Ende den einzigen Wert, der wirklich
-  // Platz braucht (die Sortierung).
-  const category = container.querySelector('#subscriptions-category-filter');
-  const method = container.querySelector('#subscriptions-method-filter');
-  setHtml(category, `
-    <option value="">${t('common.all')}</option>
-    ${state.meta.categories.map((item) => `<option value="${item.id}">${esc(categoryLabel(item))}</option>`).join('')}
-  `);
-  setHtml(method, `
-    <option value="">${t('common.all')}</option>
-    ${state.meta.payment_methods.map((item) => `<option value="${item.id}">${esc(paymentMethodLabel(item))}</option>`).join('')}
-  `);
-  category.value = state.categoryId;
-  method.value = state.paymentMethodId;
-  container.querySelector('#subscriptions-status-filter').value = state.status;
-  container.querySelector('#subscriptions-sort').value = state.sort;
-  updateResetButton();
+  const filters = activeFilters();
+  const button = container.querySelector('#subscriptions-filters');
+  if (button) {
+    const count = button.querySelector('.subscriptions-filter-btn__count');
+    button.classList.toggle('subscriptions-filter-btn--active', filters.length > 0);
+    if (count) {
+      count.hidden = filters.length === 0;
+      count.textContent = String(filters.length);
+    }
+    // Der Name steht immer als aria-label: mobil faellt die Beschriftung weg
+    // (Label-Verlust-Regel), der Knopf ist dann nur noch sein Icon.
+    button.setAttribute('aria-label', filters.length ? t('subscriptions.filtersActive', { count: filters.length }) : t('subscriptions.filters'));
+  }
+  const row = container.querySelector('#subscriptions-active-filters');
+  if (row) {
+    row.hidden = filters.length === 0;
+    setHtml(row, `
+      ${filters.map((filter) => {
+        const label = t('subscriptions.filterChip', { field: filter.field, value: filter.value });
+        return `<button type="button" class="filter-chip filter-chip--sm filter-chip--active subscriptions-filter-chip"
+                data-remove-filter="${filter.key}" aria-label="${esc(t('subscriptions.removeFilter', { label }))}">
+          <span>${esc(label)}</span><i data-lucide="x" class="icon-sm" aria-hidden="true"></i>
+        </button>`;
+      }).join('')}
+      ${filters.length > 1 ? `<button type="button" class="btn btn--ghost btn--sm subscriptions-filter-reset" id="subscriptions-reset-filters">${t('subscriptions.resetFilters')}</button>` : ''}
+    `);
+    if (window.lucide) window.lucide.createIcons({ el: row });
+  }
+  syncToolsMenu();
 }
 
-// Vier Filter plus Suche können gleichzeitig greifen — ohne Ausweg wirkt eine
-// leere Liste wie „keine Abos" statt „nichts passt zum Filter". Der Knopf
-// erscheint nur, wenn tatsächlich etwas eingeschränkt ist.
+// Filter plus Suche koennen gleichzeitig greifen - ohne Ausweg wirkt eine
+// leere Liste wie „keine Abos" statt „nichts passt zum Filter". Die Sortierung
+// zaehlt nicht: sie nimmt nichts weg und kann keine Liste leeren.
 function hasActiveFilters() {
-  return Boolean(state.query) || Boolean(state.categoryId) || Boolean(state.paymentMethodId)
-    || state.status !== 'all' || state.sort !== 'due';
+  return Boolean(state.query) || activeFilters().length > 0;
 }
 
-function updateResetButton() {
-  const btn = container.querySelector('#subscriptions-reset-filters');
-  if (btn) btn.hidden = !hasActiveFilters();
-}
-
-async function resetFilters() {
+/**
+ * Nimmt Suche und Filter weg, OHNE zu zeichnen - fuer einen Aufrufer, der
+ * gleich danach in diesen Reiter wechselt und dort ein bestimmtes Abo
+ * erwartet (die erwartete Abo-Zeile der Budgetliste, #1844). Der Zustand lebt
+ * im Modul und ueberdauert den Reiterwechsel: mit einem Filter aus einem
+ * frueheren Besuch fuehrte die Zeile auf eine Liste, in der ihr Abo fehlt.
+ * Die Sortierung bleibt, sie nimmt nichts weg.
+ */
+export function clearSubscriptionFilters() {
   state.query = '';
   state.categoryId = '';
   state.paymentMethodId = '';
   state.status = 'all';
-  state.sort = 'due';
-  const search = container.querySelector('#subscriptions-search');
-  if (search) search.value = '';
+}
+
+async function resetFilters() {
+  clearSubscriptionFilters();
+  searchField?.clear();
+  syncFilterSheet();
   await reload();
 }
 
-function bindToolbar() {
-  let searchTimer;
-  container.querySelector('#subscriptions-search').addEventListener('input', (event) => {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(async () => {
-      state.query = event.target.value.trim();
-      await reload();
-    }, 250);
-  });
-  container.querySelector('#subscriptions-category-filter').addEventListener('change', async (event) => {
-    state.categoryId = event.target.value;
-    await reload();
-  });
-  container.querySelector('#subscriptions-method-filter').addEventListener('change', async (event) => {
-    state.paymentMethodId = event.target.value;
-    await reload();
-  });
-  container.querySelector('#subscriptions-status-filter').addEventListener('change', async (event) => {
-    state.status = event.target.value;
-    await reload();
-  });
-  container.querySelector('#subscriptions-sort').addEventListener('change', (event) => {
-    state.sort = event.target.value;
-    updateResetButton();
-    renderContent();
-  });
-  container.querySelector('#subscriptions-reset-filters').addEventListener('click', resetFilters);
-  container.querySelector('#subscriptions-manage').addEventListener('click', openMetadataModal);
-  container.querySelector('#subscriptions-settings').addEventListener('click', openSettingsModal);
+async function removeFilter(key) {
+  if (key === 'category') state.categoryId = '';
+  if (key === 'method') state.paymentMethodId = '';
+  if (key === 'status') state.status = 'all';
+  syncFilterSheet();
+  await reload();
+  // Der entfernte Chip ist weg - der Fokus faellt auf den naechsten Chip oder,
+  // wenn keiner bleibt, zurueck auf den Filterknopf, nicht aufs Dokument.
+  const next = container.querySelector('#subscriptions-active-filters [data-remove-filter]')
+    ?? container.querySelector('#subscriptions-filters');
+  next?.focus();
 }
 
-async function reload(options) {
+/**
+ * Das Werkzeug-Menue der Abos (Muster: listToolsMenuHtml in budget.js,
+ * documentsToolsMenuHtml): Sortierung als Einfachauswahl mit Haken, darunter
+ * die beiden Verwaltungswege. Die Verwaltung schreibt und faellt bei
+ * `budget: read` weg; die Sortierung liest und bleibt. Positionierung, Esc und
+ * Pfeiltasten kommen vom geteilten popover-menu, das budget.js an der
+ * Seitenwurzel verdrahtet (installPopoverMenus).
+ */
+function toolsMenuHtml() {
+  const label = t('common.moreActions');
+  const check = (on) => `<i data-lucide="check" class="icon-md popover-menu__item-check${on ? '' : ' popover-menu__item-check--hidden'}" aria-hidden="true"></i>`;
+  return `
+    <button type="button" class="btn btn--secondary btn--icon subscriptions-tools popover-menu__trigger"
+            popovertarget="subscriptions-tools-menu" aria-haspopup="menu" aria-expanded="false"
+            aria-label="${esc(label)}" title="${esc(label)}">
+      <i data-lucide="ellipsis" class="icon-md" aria-hidden="true"></i>
+    </button>
+    <div class="popover-menu subscriptions-tools-menu" id="subscriptions-tools-menu" popover role="menu" aria-label="${esc(label)}">
+      <div class="popover-menu__group" role="group" aria-labelledby="subscriptions-tools-sort-label">
+        <div class="popover-menu__label" id="subscriptions-tools-sort-label">${esc(t('subscriptions.filterLabelSort'))}</div>
+        ${SORT_OPTIONS.map(([id, key]) => {
+          const on = state.sort === id;
+          return `
+        <button type="button" role="menuitemradio" aria-checked="${on}" class="popover-menu__item" data-sort="${id}">
+          ${check(on)}<span>${esc(t(key))}</span>
+        </button>`;
+        }).join('')}
+      </div>
+      ${readOnly() ? '' : `<div class="popover-menu__separator" role="separator"></div>
+      <button type="button" role="menuitem" class="popover-menu__item" id="subscriptions-manage">
+        <i data-lucide="tags" class="icon-md" aria-hidden="true"></i><span>${esc(t('subscriptions.manageMetadata'))}</span>
+      </button>
+      <button type="button" role="menuitem" class="popover-menu__item" id="subscriptions-settings">
+        <i data-lucide="settings-2" class="icon-md" aria-hidden="true"></i><span>${esc(t('subscriptions.settingsTitle'))}</span>
+      </button>`}
+    </div>`;
+}
+
+/** Haken und aria-checked der Sortierung nachziehen, ohne das Menue neu zu bauen. */
+function syncToolsMenu() {
+  container?.querySelectorAll('#subscriptions-tools-menu [data-sort]').forEach((item) => {
+    const on = item.dataset.sort === state.sort;
+    item.setAttribute('aria-checked', String(on));
+    item.querySelector('.popover-menu__item-check')?.classList.toggle('popover-menu__item-check--hidden', !on);
+  });
+}
+
+function setSort(sort) {
+  if (!SORT_OPTIONS.some(([id]) => id === sort)) return;
+  state.sort = sort;
+  syncToolsMenu();
+  renderContent();
+}
+
+function selectHtml(id, label, options, value) {
+  return `
+    <div class="form-group">
+      <label class="form-label" for="${id}">${esc(label)}</label>
+      <select class="form-input" id="${id}">
+        ${options.map(([optionValue, optionLabel]) => `<option value="${esc(String(optionValue))}"${String(optionValue) === String(value) ? ' selected' : ''}>${esc(optionLabel)}</option>`).join('')}
+      </select>
+    </div>`;
+}
+
+/**
+ * Das Filterblatt (Muster: openCalendarFilters). Ein ANSICHTSBLATT, kein
+ * Formular: jede Auswahl wirkt sofort, also `dirtyGuard: false` und kein
+ * Speichern-Knopf. Die Neutral-Option heisst „Alle" - das Feldlabel steht
+ * darueber. Filtern ist Lesen: das Blatt steht auch bei `budget: read`.
+ */
+function openFilterSheet() {
+  const content = `
+    <div class="subscriptions-filter-sheet">
+      ${selectHtml('subscriptions-category-filter', t('subscriptions.filterLabelCategory'),
+        [['', t('common.all')], ...state.meta.categories.map((item) => [item.id, categoryLabel(item)])], state.categoryId)}
+      ${selectHtml('subscriptions-method-filter', t('subscriptions.filterLabelMethod'),
+        [['', t('common.all')], ...state.meta.payment_methods.map((item) => [item.id, paymentMethodLabel(item)])], state.paymentMethodId)}
+      ${selectHtml('subscriptions-status-filter', t('subscriptions.filterLabelStatus'),
+        STATUS_OPTIONS.map(([id, key]) => [id, t(key)]), state.status)}
+    </div>
+    <div class="modal-panel__footer">
+      <button type="button" class="btn btn--secondary" id="subscriptions-sheet-reset">${t('subscriptions.resetFilters')}</button>
+    </div>
+  `;
+  openModal({ title: t('subscriptions.filters'), content, size: 'sm', initialFocus: 'first-field', dirtyGuard: false });
+  const panel = document.querySelector('#shared-modal-overlay .modal-panel');
+  if (!panel) return;
+  const FIELDS = {
+    'subscriptions-category-filter': 'categoryId',
+    'subscriptions-method-filter': 'paymentMethodId',
+    'subscriptions-status-filter': 'status',
+  };
+  panel.addEventListener('change', async (event) => {
+    const field = FIELDS[event.target.id];
+    if (!field) return;
+    state[field] = event.target.value;
+    await reload();
+  });
+  panel.querySelector('#subscriptions-sheet-reset')?.addEventListener('click', resetFilters);
+}
+
+/** Ein offenes Filterblatt zeigt den Stand, den Chips oder Zuruecksetzen gerade gesetzt haben. */
+function syncFilterSheet() {
+  const values = {
+    'subscriptions-category-filter': state.categoryId,
+    'subscriptions-method-filter': state.paymentMethodId,
+    'subscriptions-status-filter': state.status,
+  };
+  for (const [id, value] of Object.entries(values)) {
+    const select = document.querySelector(`#shared-modal-overlay #${id}`);
+    if (select) select.value = value;
+  }
+}
+
+function bindToolbar() {
+  // 250ms wie vorher: die Suche ist ein SERVER-Filter (`?q=`), kein Client-Filter.
+  searchField = wirePageSearch(container, {
+    id: 'subscriptions-search',
+    delay: 250,
+    onQuery: async (value) => {
+      state.query = value.trim();
+      await reload();
+    },
+  });
+  container.querySelector('#subscriptions-filters')?.addEventListener('click', openFilterSheet);
+  container.querySelector('#subscriptions-active-filters')?.addEventListener('click', (event) => {
+    const chip = event.target.closest('[data-remove-filter]');
+    if (chip) { removeFilter(chip.dataset.removeFilter); return; }
+    if (event.target.closest('#subscriptions-reset-filters')) resetFilters();
+  });
+  container.querySelector('#subscriptions-tools-menu')?.addEventListener('click', (event) => {
+    const item = event.target.closest('.popover-menu__item');
+    if (!item) return;
+    if (item.dataset.sort) setSort(item.dataset.sort);
+    else if (item.id === 'subscriptions-manage') openMetadataModal();
+    else if (item.id === 'subscriptions-settings') openSettingsModal();
+  });
+}
+
+async function reload(options, { motion = false } = {}) {
   try {
     await load(options);
     renderFilters();
-    renderContent();
+    renderContent({ motion });
   } catch (err) {
     window.yuvomi?.showToast(err.data?.error || t('subscriptions.loadError'), 'danger');
   }
@@ -353,36 +568,54 @@ function sortedSubscriptions() {
   });
 }
 
-function renderContent() {
+const SUBSCRIPTION_ROW = '.swipe-row[data-swipe-id]';
+
+/* `motion: true` setzt, wer die DATEN geaendert hat (Abo angelegt, gespeichert,
+ * verlaengert, geloescht): die neue Zeile zieht auf, und was dadurch die
+ * Stelle wechselt, gleitet (utils/list-motion.js). Traeger ist
+ * `#subscriptions-content` - `#subscriptions-list` darin baut jedes Zeichnen
+ * neu. Filter und Sortierung zeichnen ohne Bewegung neu - dort wechselt die
+ * Frage, nicht die Liste. */
+function renderContent({ motion = false } = {}) {
+  const content = container.querySelector('#subscriptions-content');
+  if (motion && content) redrawList(content, drawContent, { selector: SUBSCRIPTION_ROW, keyAttr: 'data-swipe-id' });
+  else drawContent();
+}
+
+function drawContent() {
   const content = container.querySelector('#subscriptions-content');
   const rows = sortedSubscriptions();
   // Kurs-Status/-Aktion nur, wenn überhaupt ein Abo in Fremdwährung läuft -
   // sonst ist „Wechselkurse nicht verfügbar" eine Dauerwarnung ohne Anlass.
   const baseCurrency = state.summary?.base_currency || state.settings.base_currency;
   const hasForeignCurrency = rows.some((s) => s.currency && s.currency !== baseCurrency);
+  // DIE LISTE VOR DER AUSWERTUNG (Critique 2026-09-25): mobil stand die erste
+  // Abo-Zeile bei y=1123, hinter Kennzahlen UND drei Diagrammen (592px). Die
+  // Liste ist, woran man handelt (verlaengern, bearbeiten); die Diagramme sind
+  // die Auswertung dazu und folgen ihr - auf jeder Breite in derselben
+  // Reihenfolge, damit Fokus- und Lesereihenfolge dem Bild entsprechen.
+  const summary = container.querySelector('#subscriptions-summary');
+  if (summary) setHtml(summary, renderSummary());
+  const count = container.querySelector('#subscriptions-list-count');
+  if (count) count.textContent = String(rows.length);
+  const rates = container.querySelector('#subscriptions-rates-slot');
+  if (rates) {
+    setHtml(rates, !hasForeignCurrency ? ''
+      : state.rates?.source === 'unavailable'
+        ? `<span class="subscriptions-rate-status subscriptions-rate-status--warning">${t('subscriptions.ratesUnavailable')}</span>`
+        : `<button class="btn btn--secondary" id="subscriptions-refresh-rates">
+          <i data-lucide="refresh-cw" aria-hidden="true"></i>${t('subscriptions.refreshRates')}
+        </button>`);
+  }
   setHtml(content, `
-    ${renderSummary()}
-    ${renderAnalytics()}
-    <section class="subscriptions-list-section">
-      <div class="subscriptions-section-head">
-        <div>
-          <h2>${t('subscriptions.listTitle')}</h2>
-          <span>${t('subscriptions.listCount', { count: rows.length })}</span>
-        </div>
-        ${!hasForeignCurrency ? ''
-          : state.rates?.source === 'unavailable'
-            ? `<span class="subscriptions-rate-status subscriptions-rate-status--warning">${t('subscriptions.ratesUnavailable')}</span>`
-            : `<button class="btn btn--secondary" id="subscriptions-refresh-rates">
-              <i data-lucide="refresh-cw" aria-hidden="true"></i>${t('subscriptions.refreshRates')}
-            </button>`}
-      </div>
-      <div class="subscriptions-list row-divided" id="subscriptions-list">
+      <div class="subscriptions-list row-carrier" id="subscriptions-list">
         ${rows.length ? rows.map(renderCard).join('') : renderEmpty()}
       </div>
-    </section>
   `);
+  const analytics = container.querySelector('#subscriptions-analytics');
+  if (analytics) setHtml(analytics, renderAnalytics());
   bindContent();
-  if (window.lucide) window.lucide.createIcons({ el: content });
+  if (window.lucide) window.lucide.createIcons({ el: container.querySelector('.subscriptions-page') ?? content });
 }
 
 function renderSummary() {
@@ -400,38 +633,91 @@ function renderSummary() {
   const realPercentage = hasBudget ? Math.round((used / budget) * 100) : 0;
   const percentage = Math.min(100, realPercentage);
   const isOverBudget = hasBudget && summary.remaining_budget < 0;
+  // Dieselbe Schwelle wie der Plan (budget-plans.js `toneForRatio`): ab 85 %
+  // Auslastung der Warnton, darueber hinaus die Tatsache.
+  const isNearBudget = hasBudget && !isOverBudget && used / budget > PLAN_NEAR_RATIO;
   // Geteilte Kennzahl-Zeile und -Karte des Budget-Moduls (budget.css). Die
   // frühere eigene .subscriptions-summary-card war die zweite von fünf
   // Bauarten im selben Modul (Critique 2026-07-30, P0).
   // Rolle `plain`: Abo-Kosten sind Rechnungsbeträge ohne Kontorichtung.
+  //
+  // UEBER BUDGET SAGT DASSELBE WIE IM PLAN (Critique 2026-09-25). Eine
+  // tatsaechliche Ueberschreitung ist eine Tatsache und traegt den Danger-Ton
+  // wie die ueberzogene Plan-Kategorie (`.metric-card--over`, Symbol und
+  // Label als Text); die Annaeherung ab 85 % traegt den Warnton am Balken -
+  // wie im Plan. Neu ist der Weg zur Handlung: zur Liste, teuerste zuerst.
+  // Das ist Lesen, kein Schreiben - der Weg steht bei jedem Recht.
+  //
+  // DIE WAEHRUNG STEHT EINMAL: die Jahresprognose trug unter „1.363,20 €"
+  // noch „EUR". Die Fussnote sagt jetzt, woraus die Zahl entsteht.
+  // MOBIL EINE ZEILE (R14 P1, A5 P1-3): vier Karten (2x2, 200px) standen vor
+  // der ersten Abo-Zeile (y=478 bei 390x844). Unter 640px nennt eine Zeile die
+  // Monatskosten und daneben Zahl und Budgetstand; ein Tipp klappt die Karten
+  // auf (metric-glance.js, dieselbe Form wie die Budget-Uebersicht).
+  //
+  // OHNE MONATSBUDGET DREI KARTEN (#1607). Die Karte „Monatsbudget" zeigte
+  // dann „0,00 €" mit leerem Balken, direkt neben „Kein Budgetlimit -
+  // Unbegrenzt". Wo kein Budget gesetzt ist, gibt es keine Zahl dafuer; den
+  // Zustand nennt die Karte daneben. Drei Karten sind die Grundform der Reihe
+  // (panel.css), `--quad` traegt die Reihe nur mit vier.
+  const budgetFlow = hasBudget
+    ? { label: t(isOverBudget ? 'subscriptions.overBudget' : 'subscriptions.remainingBudget'),
+      amount: money(Math.abs(summary.remaining_budget)), tone: isOverBudget ? 'negative' : '' }
+    : null;
   return `
-    <section class="metric-grid metric-grid--quad">
-      <article class="metric-card">
+    ${metricGlanceHtml({
+    id: 'subscriptions-glance-more',
+    controls: 'subscriptions-summary-details',
+    expanded: state.summaryExpanded,
+    label: t('subscriptions.monthlyCost'),
+    value: money(used),
+    lead: true,
+    flows: [{ label: t('subscriptions.activeCount', { count: summary.active_count }) }, budgetFlow],
+  })}
+    <section class="metric-grid metric-grid--led${hasBudget ? ' metric-grid--quad' : ''} budget-glance-details${state.summaryExpanded ? ' is-expanded' : ''}" id="subscriptions-summary-details">
+      <article class="metric-card ${leadCardClass(money(used))}">
         <div class="metric-card__label">${t('subscriptions.monthlyCost')}</div>
         <div class="metric-card__value">${money(used)}</div>
         <div class="metric-card__note">${t('subscriptions.activeCount', { count: summary.active_count })}</div>
       </article>
-      <article class="metric-card">
+      ${hasBudget ? `<article class="metric-card">
         <div class="metric-card__label">${t('subscriptions.monthlyBudget')}</div>
         <div class="metric-card__value">${money(budget)}</div>
-        <div class="metric-card__progress${isOverBudget ? ' metric-card__progress--over' : ''}"
+        <div class="metric-card__progress${isOverBudget ? ' metric-card__progress--over' : isNearBudget ? ' metric-card__progress--near' : ''}"
              role="progressbar" aria-label="${esc(t('subscriptions.monthlyBudget'))}"
              aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percentage}" aria-valuetext="${realPercentage}%">
           <span style="--fill:${percentage / 100}"></span>
         </div>
-      </article>
-      <article class="metric-card${isOverBudget ? ' metric-card--negative' : ''}">
-        <div class="metric-card__label">${hasBudget ? (isOverBudget ? t('subscriptions.overBudget') : t('subscriptions.remainingBudget')) : t('subscriptions.noBudgetLimit')}</div>
+      </article>` : ''}
+      <article class="metric-card${isOverBudget ? ' metric-card--over' : ''}">
+        <div class="metric-card__label">${isOverBudget ? '<i data-lucide="triangle-alert" class="icon-sm" aria-hidden="true"></i>' : ''}${hasBudget ? (isOverBudget ? t('subscriptions.overBudget') : t('subscriptions.remainingBudget')) : t('subscriptions.noBudgetLimit')}</div>
         <div class="metric-card__value">${hasBudget ? money(Math.abs(summary.remaining_budget)) : t('subscriptions.unlimited')}</div>
-        <div class="metric-card__note${isOverBudget ? ' metric-card__note--danger' : ''}">${hasBudget ? `${realPercentage}% ${t('subscriptions.budgetUsed')}` : t('subscriptions.setBudgetHint')}</div>
+        <div class="metric-card__note">${hasBudget ? `${realPercentage}% ${t('subscriptions.budgetUsed')}` : (readOnly() ? '' : t('subscriptions.setBudgetHint'))}${isOverBudget ? ` <button type="button" class="subscriptions-over-budget-action" id="subscriptions-over-budget-action">${t('subscriptions.overBudgetAction')}</button>` : ''}</div>
       </article>
       <article class="metric-card">
         <div class="metric-card__label">${t('subscriptions.yearlyProjection')}</div>
         <div class="metric-card__value">${money(used * 12)}</div>
-        <div class="metric-card__note">${esc(summary.base_currency)}</div>
+        <div class="metric-card__note">${t('subscriptions.yearlyProjectionNote')}</div>
       </article>
     </section>
   `;
+}
+
+/** „Teuerste zuerst": sortiert die Liste und bringt ihren Kopf in den Blick. */
+function showMostExpensive() {
+  setSort('cost-desc');
+  const heading = container.querySelector('#subscriptions-list-title');
+  if (!heading) return;
+  // NUR der eigene Scrollport bewegt sich. `scrollIntoView` scrollte auch die
+  // Vorfahren mit und schob den Budget-Kopf samt Tabs aus dem Bild.
+  const port = heading.closest('.page-scrollport');
+  if (port) {
+    const section = heading.closest('.subscriptions-list-section') ?? heading;
+    const top = section.getBoundingClientRect().top - port.getBoundingClientRect().top + port.scrollTop;
+    const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    port.scrollTo({ top: Math.max(0, top), behavior: reduce ? 'auto' : 'smooth' });
+  }
+  heading.focus({ preventScroll: true });
 }
 
 function renderAnalytics() {
@@ -441,7 +727,7 @@ function renderAnalytics() {
   return `
     <section class="subscriptions-analytics">
       ${renderAreaChart(t('subscriptions.renewalForecast'), forecast)}
-      ${renderPieChart(t('subscriptions.byCategory'), categories)}
+      ${renderBreakdown(t('subscriptions.byCategory'), categories)}
       ${renderBreakdown(t('subscriptions.byPaymentMethod'), methods)}
     </section>
   `;
@@ -494,6 +780,11 @@ function renewalForecast() {
 // einen 100x52-viewBox auf rund 300x72, also X um Faktor 3 und Y um 1,4 - ohne
 // den Ausschalter wird die 2,5px-Linie in einer Achse dicker als in der
 // anderen. Dieselbe Zeile steht an jeder anderen gestreckten Kurve der App.
+//
+// DIE ZAHL IM KOPF SAGT, WAS SIE IST (Critique 2026-09-25): dort stand nackt
+// „196,86 €" - der hoechste Monat, aber weder sichtbar noch vorlesbar als
+// solcher benannt, und die Kurve selbst ist aria-hidden. Jetzt traegt die Zahl
+// ihr Label, und die sechs Monatswerte stehen als Liste fuer Screenreader.
 function renderAreaChart(title, rows) {
   const max = Math.max(...rows.map((row) => row.amount), 1);
   const points = rows.map((row, index) => {
@@ -502,73 +793,54 @@ function renderAreaChart(title, rows) {
     return `${x},${y}`;
   }).join(' ');
   const areaPoints = `0,52 ${points} 100,52`;
+  const peak = rows.reduce((best, row) => (row.amount > (best?.amount ?? 0) ? row : best), null);
   return `
     <article class="subscriptions-chart subscriptions-chart--area">
-      <div class="subscriptions-chart__head">
-        <h2>${title}</h2>
-        <strong>${money(Math.max(...rows.map((row) => row.amount), 0))}</strong>
-      </div>
+      <h2 class="u-section-title subscriptions-chart__title">${title}</h2>
+      <div class="subscriptions-chart__card">
+      ${peak ? `<p class="subscriptions-chart__figure">
+          <span>${esc(t('subscriptions.forecastPeak', { month: peak.label }))}</span>
+          <strong>${money(peak.amount)}</strong>
+        </p>` : ''}
       <svg class="subscriptions-area-chart" viewBox="0 0 100 52" preserveAspectRatio="none" aria-hidden="true">
         <polygon points="${areaPoints}"></polygon>
         <polyline points="${points}" vector-effect="non-scaling-stroke"></polyline>
       </svg>
-      <div class="subscriptions-chart-axis">
+      <div class="subscriptions-chart-axis" aria-hidden="true">
         ${rows.map((row) => `<span>${esc(row.label)}</span>`).join('')}
       </div>
-    </article>
-  `;
-}
-
-function renderPieChart(title, rows) {
-  // Datenreihen-Tokens statt Hex-Literalen: tokens.css definiert die Serie im
-  // Dark Mode auf hellere Werte um, Literale machten das nicht mit - der Donut
-  // behielt dort seine Light-Mode-Sättigung, während der Statistik-Donut nebenan
-  // korrekt aufhellte (Critique 2026-07-30). conic-gradient und der Legenden-
-  // Hintergrund verarbeiten var() unverändert.
-  const colors = Array.from({ length: 6 }, (_, i) => `var(--chart-series-${i + 1})`);
-  const total = rows.reduce((sum, row) => sum + row.amount, 0);
-  let offset = 0;
-  const gradient = total > 0
-    ? rows.slice(0, 6).map((row, index) => {
-      const start = offset;
-      offset += (row.amount / total) * 360;
-      return `${colors[index % colors.length]} ${start}deg ${offset}deg`;
-    }).join(', ')
-    : 'var(--color-surface-3) 0deg 360deg';
-  return `
-    <article class="subscriptions-chart subscriptions-chart--pie">
-      <div class="subscriptions-chart__head">
-        <h2>${title}</h2>
-        <strong>${money(total)}</strong>
+      <ul class="sr-only">
+        ${rows.map((row) => `<li>${esc(row.label)}: ${money(row.amount)}</li>`).join('')}
+      </ul>
       </div>
-      ${rows.length ? `
-        <div class="subscriptions-pie-layout">
-          <div class="subscriptions-pie" style="background:conic-gradient(${gradient})"></div>
-          <div class="subscriptions-pie-legend">
-            ${rows.slice(0, 4).map((row, index) => `
-              <span><i style="background:${colors[index % colors.length]}"></i>${esc(row.label)}</span>
-            `).join('')}
-          </div>
-        </div>
-      ` : `<p>${t('subscriptions.noAnalytics')}</p>`}
     </article>
   `;
 }
 
+// EIN BALKEN-BAUSTEIN FUER BEIDE AUFTEILUNGEN. „Nach Kategorie" war eine Torte
+// (conic-gradient auf einem div): ohne Textalternative, die Legende ohne Werte,
+// und sie zeigte nur vier von sechs Segmenten (Critique 2026-09-25). Jetzt
+// dieselbe Zeile wie „Nach Zahlungsart": Name, Balken, Betrag und Anteil. Die
+// Zeile IST ihr Textaequivalent - eine Liste mit Name, Betrag und Anteil in
+// Klartext; nur der Balken ist Dekor. Die Balkenlaenge misst am groessten
+// Posten, der Anteil am Ganzen - beides ehrlich, kein Mindestbreiten-Trick.
 function renderBreakdown(title, rows) {
   const max = Math.max(...rows.map((row) => row.amount), 1);
+  const total = rows.reduce((sum, row) => sum + row.amount, 0) || 1;
+  const percent = getNumberFormat({ style: 'percent', maximumFractionDigits: 0 });
   return `
     <article class="subscriptions-chart">
-      <div class="subscriptions-chart__head">
-        <h2>${title}</h2>
-      </div>
-      ${rows.length ? rows.map((row) => `
-        <div class="subscriptions-chart-row">
-          <span title="${esc(row.label)}">${esc(row.label)}</span>
-          <div><i style="width:${Math.round((row.amount / max) * 100)}%"></i></div>
+      <h2 class="u-section-title subscriptions-chart__title">${title}</h2>
+      <div class="subscriptions-chart__card">
+      ${rows.length ? `<ul class="subscriptions-chart-rows">${rows.map((row) => `
+        <li class="subscriptions-chart-row">
+          <span class="subscriptions-chart-row__label" title="${esc(row.label)}">${esc(row.label)}</span>
+          <span class="subscriptions-chart-row__track" aria-hidden="true"><i style="width:${Math.round((row.amount / max) * 100)}%"></i></span>
           <strong>${money(row.amount)}</strong>
-        </div>
-      `).join('') : `<p>${t('subscriptions.noAnalytics')}</p>`}
+          <span class="subscriptions-chart-row__share">${percent.format(row.amount / total)}</span>
+        </li>
+      `).join('')}</ul>` : `<p>${t('subscriptions.noAnalytics')}</p>`}
+      </div>
     </article>
   `;
 }
@@ -611,25 +883,49 @@ function endInfoLabel(subscription) {
 // Phrasing Content. Was der Knopf TUT, kommt als sr-only Zusatz ans Ende.
 function renderCard(subscription) {
   const brandColor = subscription.brand_color || subscription.category_color || '#0F766E';
-  const converted = subscription.monthly_base === null
-    ? t('subscriptions.conversionUnavailable')
-    : t('subscriptions.monthlyEquivalent', { amount: money(subscription.monthly_base) });
   const status = statusMeta(subscription);
   const endInfo = endInfoLabel(subscription);
+  // BEI `budget: read` OEFFNET DER ZEILENKOERPER DIE LESEANSICHT statt des
+  // Bearbeitens (`view` statt `edit`, P1-Muster) und sagt kein „Bearbeiten"
+  // mehr an. Verlaengern und Loeschen daneben schreiben und fallen weg, die
+  // Wischflaechen mit ihnen, weil die Geste nicht verdrahtet wird.
+  const ro = readOnly();
+  // KOMPAKT IN DER GRAMMATIK DER BUCHUNGSZEILE (Critique 2026-09-25): mobil war
+  // eine Abo-Zeile 173px hoch - Name, Beschreibung, Status-Pille, fuenf
+  // Metaangaben mit je einem Symbol, darunter Betrag UND „39,00 € pro Monat".
+  // Jetzt: eine Titelzeile (Name, dahinter leise die Beschreibung), eine
+  // Metazeile, rechts der Betrag. Was sich wiederholte, faellt:
+  // - „Aktiv" ist der Normalfall der Liste und stand an jeder Zeile; die Pille
+  //   bleibt dort, wo sie etwas unterscheidet (pausiert, abgeschlossen).
+  // - Der Monatswert steht nur, wenn er vom Betrag abweicht (anderer Zyklus,
+  //   Fremdwaehrung) oder nicht umgerechnet werden konnte.
+  // - Nur Faelligkeit und Erinnerung tragen ein Symbol; Zyklus und Zahlungsart
+  //   sind Woerter, die sich selbst erklaeren.
+  // - In einer schmalen Liste (Telefon) bleiben Faelligkeit, Zyklus und Ende;
+  //   Zahlungsart und Erinnerung (`__meta-extra`) stehen in der Detailansicht,
+  //   die der Tap auf die Zeile oeffnet. Ziel war <=100px je Zeile.
+  const baseCurrency = state.summary?.base_currency || state.settings.base_currency;
+  const sameAsMonthly = subscription.billing_cycle === 'monthly'
+    && Number(subscription.cycle_interval || 1) === 1
+    && subscription.currency === baseCurrency;
+  const converted = subscription.monthly_base === null
+    ? t('subscriptions.conversionUnavailable')
+    : (sameAsMonthly ? '' : t('subscriptions.monthlyEquivalent', { amount: money(subscription.monthly_base) }));
+  const overdue = daysUntil(subscription.next_payment_date) < 0 && status.cardClass !== 'subscription-card--completed';
   return `
-    <div class="swipe-row" data-swipe-id="${subscription.id}">
-      <div class="swipe-reveal swipe-reveal--done swipe-reveal--leading" aria-hidden="true">
+    <div class="swipe-row${ro ? ' swipe-row--static' : ''}" data-swipe-id="${subscription.id}">
+      ${ro ? '' : `<div class="swipe-reveal swipe-reveal--done swipe-reveal--leading" aria-hidden="true">
         <i data-lucide="calendar-check" class="icon-md"></i>
         <span>${t('subscriptions.markRenewed')}</span>
       </div>
       <div class="swipe-reveal swipe-reveal--delete swipe-reveal--trailing" aria-hidden="true">
         <i data-lucide="trash-2" class="icon-md"></i>
         <span>${t('common.delete')}</span>
-      </div>
+      </div>`}
     <article class="subscription-card ${status.cardClass}"
              data-id="${subscription.id}" style="--subscription-color:${esc(brandColor)}">
       <button type="button" class="subscription-card__main list-row__main--interactive"
-              data-action="edit">
+              data-action="${ro ? 'view' : 'edit'}">
         <span class="subscription-card__brand">
           ${subscription.logo_data
             ? `<img src="${esc(subscription.logo_data)}" alt="">`
@@ -637,36 +933,28 @@ function renderCard(subscription) {
         </span>
         <span class="subscription-card__body">
           <span class="subscription-card__title-row">
-            <span>
-              <span class="subscription-card__name">${esc(subscription.name)}</span>
-              <span class="subscription-card__desc">${esc(subscription.description || rowCategoryLabel(subscription))}</span>
-            </span>
-            <span class="subscription-status ${status.badgeClass}">
-              ${status.label}
-            </span>
+            <span class="subscription-card__name">${esc(subscription.name)}</span>
+            <span class="subscription-card__desc">${esc(subscription.description || rowCategoryLabel(subscription))}</span>
+            ${status.badgeClass === 'subscription-status--active' ? '' : `<span class="subscription-status ${status.badgeClass}">${status.label}</span>`}
           </span>
           <span class="subscription-card__meta">
-            <span><i data-lucide="calendar-clock" aria-hidden="true"></i>${formatDate(subscription.next_payment_date)} · ${dueLabel(subscription)}</span>
-            <span><i data-lucide="repeat-2" aria-hidden="true"></i>${cycleLabel(subscription)}</span>
-            <span><i data-lucide="wallet-cards" aria-hidden="true"></i>${esc(rowPaymentMethodLabel(subscription))}</span>
-            <span><i data-lucide="bell" aria-hidden="true"></i>${t('subscriptions.reminderMeta', { count: subscription.reminder_days })}</span>
+            <span class="subscription-card__due${overdue ? ' subscription-card__due--overdue' : ''}"><i data-lucide="${overdue ? 'triangle-alert' : 'calendar-clock'}" aria-hidden="true"></i><span>${formatDate(subscription.next_payment_date)} ·</span> <span>${dueLabel(subscription)}</span></span>
+            <span class="subscription-card__meta-cycle">${cycleLabel(subscription)}</span>
+            <span class="subscription-card__meta-extra">${esc(rowPaymentMethodLabel(subscription))}</span>
+            <span class="subscription-card__meta-extra"><i data-lucide="${subscription.reminder_enabled === false ? 'bell-off' : 'bell'}" aria-hidden="true"></i>${subscription.reminder_enabled === false ? t('subscriptions.noReminder') : t('subscriptions.reminderMeta', { count: subscription.reminder_days })}</span>
             ${endInfo ? `<span><i data-lucide="${endInfo.icon}" aria-hidden="true"></i>${esc(endInfo.text)}</span>` : ''}
           </span>
         </span>
         <span class="subscription-card__cost">
           <strong>${money(subscription.amount, subscription.currency)}</strong>
-          <span>${converted}</span>
+          ${converted ? `<span>${converted}</span>` : ''}
+          <span class="subscription-card__cost-cycle">${cycleLabel(subscription)}</span>
         </span>
-        <span class="sr-only">${t('common.edit')}</span>
+        ${ro ? '' : `<span class="sr-only">${t('common.edit')}</span>`}
       </button>
-      <div class="subscription-card__actions">
-        <button class="btn btn--secondary btn--icon" data-action="renew" aria-label="${t('subscriptions.markRenewed')}">
-          <i data-lucide="calendar-check" aria-hidden="true"></i>
-        </button>
-        <button class="btn btn--secondary btn--icon" data-action="delete" aria-label="${t('subscriptions.delete')}">
-          <i data-lucide="trash-2" aria-hidden="true"></i>
-        </button>
-      </div>
+      ${ro ? '' : `<div class="row-actions subscription-card__actions">
+        ${rowActionHtml({ icon: 'calendar-check', action: 'renew', label: t('subscriptions.markRenewedNamed', { name: subscription.name }) })}
+      </div>`}
     </article>
     </div>
   `;
@@ -727,18 +1015,24 @@ function renderEmpty() {
       action: { label: t('subscriptions.resetFilters'), attrs: { id: 'subscriptions-empty-reset' } },
     });
   }
+  // Bei `budget: read` bleibt nur der Titel: Beschreibung und CTA sind die
+  // Aufforderung zum Anlegen. Der Filter-Leerzustand oben bleibt ganz - sein
+  // Weg zurueck ist ein Filter, kein Schreibweg.
+  const ro = readOnly();
   return emptyStateHTML({
     icon: 'repeat-2',
     title: t('subscriptions.emptyTitle'),
-    description: t('subscriptions.emptyDescription'),
-    action: { label: t('subscriptions.add'), attrs: { id: 'subscriptions-empty-add' } },
+    description: ro ? '' : t('subscriptions.emptyDescription'),
+    action: ro ? null : { label: t('subscriptions.add'), attrs: { id: 'subscriptions-empty-add' } },
   });
 }
 
 function bindContent() {
+  wireMetricGlance(container, 'subscriptions-glance-more', (on) => { state.summaryExpanded = on; });
   container.querySelector('#subscriptions-refresh-rates')?.addEventListener('click', () => reload({ refreshRates: true }));
   container.querySelector('#subscriptions-empty-add')?.addEventListener('click', () => openSubscriptionModal());
   container.querySelector('#subscriptions-empty-reset')?.addEventListener('click', resetFilters);
+  container.querySelector('#subscriptions-over-budget-action')?.addEventListener('click', showMostExpensive);
   const list = container.querySelector('#subscriptions-list');
   list?.addEventListener('click', async (event) => {
     const action = event.target.closest('[data-action]');
@@ -747,16 +1041,24 @@ function bindContent() {
     if (!subscription) return;
 
     if (!action) return;
+    // Der Riegel vor der ersten Aktion: das Markup nimmt die Affordanz, das hier
+    // auch einem Knoten aus einem aelteren Render die Wirkung.
+    if (readOnly() && !READ_SAFE_ACTIONS.has(action.dataset.action)) return;
     // Der Zeilenkoerper OEFFNET das Bearbeiten und ist dafuer ein echter
     // `<button>` (`.list-row__main--interactive`, das app-weite Vokabular fuer
     // eine klickbare Zeile). Ein blosser Tap-Handler auf dem `<article>` haette
     // den Bearbeiten-Knopf entfernt, ohne einen Tastaturweg an seine Stelle zu
     // setzen - das waere kein Aufraeumen, sondern ein Regress.
+    if (action.dataset.action === 'view') openSubscriptionReadView(subscription);
     if (action.dataset.action === 'edit') openSubscriptionModal(subscription);
     if (action.dataset.action === 'renew') await renewSubscription(subscription);
     if (action.dataset.action === 'delete') await deleteSubscription(subscription);
   });
-  if (list) {
+  // Wischen hat kein Markup, das man wegnehmen koennte (Regel 3 in
+  // utils/module-access.js): bei `read` bleibt die VERDRAHTUNG aus - ein Riegel
+  // im Ende-Handler kaeme erst, wenn die Zeile schon verschoben ist. Und ohne
+  // Geste auch kein Hinweis auf eine.
+  if (list && !readOnly()) {
     wireSubscriptionSwipe(list);
     maybeShowSwipeHint(list);
   }
@@ -775,14 +1077,18 @@ function currencyItems() {
   }));
 }
 
-function comboboxMarkup({ id, label, items, value = '', placeholder }) {
+// Ein Auswahlfeld mit Tippfilter, kein Suchfeld: es steht im Formular neben
+// anderen Feldern, traegt ein sichtbares Label und zeigt den GEWAEHLTEN Wert
+// („EUR · Euro"). Deshalb `type="text"` (die Rolle kommt aus role="combobox")
+// und die Feldform des Formulars, nicht die Suchkapsel (Komponenten-Kanon).
+function comboboxMarkup({ id, label, items, value = '', placeholder, required = false }) {
   const selected = items.find((item) => String(item.value) === String(value));
   return `
     <div class="form-group subscriptions-combobox" data-combobox="${id}">
-      <label class="form-label" for="${id}-search">${label}</label>
+      <label class="form-label" for="${id}-search">${label}${required ? REQUIRED_MARK : ''}</label>
       <div class="subscriptions-combobox__control">
         <i data-lucide="search" aria-hidden="true"></i>
-        <input class="form-input" id="${id}-search" type="search" role="combobox"
+        <input class="form-input" id="${id}-search" type="text" role="combobox"
                aria-autocomplete="list" aria-expanded="false" aria-controls="${id}-options"
                autocomplete="off" placeholder="${esc(placeholder)}" value="${esc(selected?.label || '')}">
         <input id="${id}" type="hidden" value="${esc(selected?.value ?? '')}">
@@ -884,7 +1190,59 @@ function wireCombobox(panel, id) {
   }, 0));
 }
 
+/**
+ * Die Zeilen der Leseansicht eines Abos (#1265 P7): was der Bearbeiten-Dialog
+ * zeigt, als Text. Die Karte traegt schon Name, Status, Faelligkeit, Zyklus,
+ * Zahlungsart, Erinnerung und Betrag; nur der Dialog kannte bisher Kategorie
+ * (wo eine Beschreibung sie auf der Karte verdraengt), das Konto, unter dem
+ * das Abo laeuft, und die Notizen. Die Markenfarbe traegt der Farbstreifen.
+ * Leere Zeilen faellt `detailRowEl` selbst weg - die Antwort folgt dem Datensatz.
+ */
+function subscriptionReadSections(subscription) {
+  const converted = subscription.monthly_base === null
+    ? t('subscriptions.conversionUnavailable')
+    : t('subscriptions.monthlyEquivalent', { amount: money(subscription.monthly_base) });
+  const endInfo = endInfoLabel(subscription);
+  return [
+    { icon: 'banknote', label: t('subscriptions.detailAmountLabel'),
+      value: `${money(subscription.amount, subscription.currency)} · ${converted}` },
+    { icon: 'info', label: t('subscriptions.filterLabelStatus'), value: statusMeta(subscription).label },
+    { icon: 'align-left', label: t('subscriptions.descriptionLabel'), value: subscription.description || '', multiline: true },
+    { icon: 'repeat-2', label: t('subscriptions.billingCycleLabel'), value: cycleLabel(subscription) },
+    { icon: 'calendar-clock', label: t('subscriptions.detailNextPaymentLabel'),
+      value: subscription.next_payment_date ? `${formatDate(subscription.next_payment_date)} · ${dueLabel(subscription)}` : '' },
+    { icon: subscription.reminder_enabled === false ? 'bell-off' : 'bell', label: t('subscriptions.reminderDaysLabel'),
+      value: subscription.reminder_enabled === false ? t('subscriptions.noReminder') : t('subscriptions.reminderMeta', { count: subscription.reminder_days }) },
+    { icon: endInfo?.icon || 'calendar-x', label: t('subscriptions.endLabel'), value: endInfo?.text || '' },
+    { icon: 'tags', label: t('subscriptions.categoryLabel'), value: subscription.category_id ? rowCategoryLabel(subscription) : '' },
+    { icon: 'wallet-cards', label: t('subscriptions.paymentMethodLabel'),
+      value: subscription.payment_method_id ? rowPaymentMethodLabel(subscription) : '' },
+    { icon: 'at-sign', label: t('subscriptions.accountUsernameLabel'), value: subscription.account_username || '' },
+    { icon: 'sticky-note', label: t('subscriptions.notesLabel'), value: subscription.notes || '', multiline: true },
+  ];
+}
+
+/**
+ * Das Abo bei `budget: read`: eine Leseansicht, sonst nichts. Dieselbe Bauart
+ * wie die Buchung in budget.js (P1-Muster: der Einstieg in den Editor verzweigt,
+ * die geteilte Leseansicht ohne `edit` und ohne `actions`).
+ */
+function openSubscriptionReadView(subscription) {
+  return openDetailView({
+    title: subscription.name,
+    accentColor: subscription.brand_color || subscription.category_color || 'var(--module-budget)',
+    size: 'sm',
+    sections: subscriptionReadSections(subscription),
+  });
+}
+
 export function openSubscriptionModal(subscription = null) {
+  // Der Riegel steht VOR jeder Vorbereitung: der Anlegeweg entfaellt ganz, ein
+  // bestehendes Abo geht als Leseansicht auf (P1-Muster wie openNoteModal).
+  if (readOnly()) {
+    if (subscription) openSubscriptionReadView(subscription);
+    return;
+  }
   const edit = Boolean(subscription);
   // Jedes Abo trägt seine eigene Währung; das Betragsfeld richtet sich danach
   // und wird beim Wechsel der Währungs-Combobox nachgezogen.
@@ -982,7 +1340,7 @@ export function openSubscriptionModal(subscription = null) {
         </div>
         <div class="subscription-form__identity-fields">
           <div class="form-group">
-            <label class="form-label" for="subscription-name">${t('subscriptions.nameLabel')}</label>
+            <label class="form-label" for="subscription-name">${t('subscriptions.nameLabel')}${REQUIRED_MARK}</label>
             <input class="form-input" id="subscription-name" maxlength="200" required value="${esc(initialName)}">
           </div>
           <div class="form-group">
@@ -996,7 +1354,7 @@ export function openSubscriptionModal(subscription = null) {
         <h3><i data-lucide="receipt-text" aria-hidden="true"></i>${t('subscriptions.billingDetails')}</h3>
         <div class="subscription-form__billing-grid">
           <div class="form-group">
-            <label class="form-label" for="subscription-amount">${t('subscriptions.amountLabel')}</label>
+            <label class="form-label" for="subscription-amount">${t('subscriptions.amountLabel')}${REQUIRED_MARK}</label>
             <input class="form-input" id="subscription-amount" type="number"
                    min="0"
                    step="${amountStep(formCurrency, subscription?.amount ?? '')}"
@@ -1006,6 +1364,7 @@ export function openSubscriptionModal(subscription = null) {
           ${comboboxMarkup({
             id: 'subscription-currency',
             label: t('subscriptions.currencyLabel'),
+            required: true,
             items: currencyItems(),
             value: subscription?.currency || state.settings.base_currency,
             placeholder: t('subscriptions.currencySearchPlaceholder'),
@@ -1026,15 +1385,20 @@ export function openSubscriptionModal(subscription = null) {
 
       <section class="subscription-form__section">
         <h3><i data-lucide="calendar-clock" aria-hidden="true"></i>${t('subscriptions.renewalDetails')}</h3>
+        ${toggleRowHtml({
+          label: t('subscriptions.reminderEnabledLabel'), control: 'switch',
+          checked: subscription?.reminder_enabled !== false,
+          attrs: { id: 'subscription-reminder-enabled' },
+        })}
         <div class="form-grid-2">
           <div class="form-group">
-            <label class="form-label" for="subscription-next-date">${t('subscriptions.nextPaymentLabel')}</label>
+            <label class="form-label" for="subscription-next-date">${t('subscriptions.nextPaymentLabel')}${REQUIRED_MARK}</label>
             <yuvomi-datepicker id="subscription-next-date" type="date"
                    value="${esc(subscription?.next_payment_date || todayKey())}"></yuvomi-datepicker>
           </div>
           <div class="form-group">
             <label class="form-label" for="subscription-reminder">${t('subscriptions.reminderDaysLabel')}</label>
-            <input class="form-input" id="subscription-reminder" type="number" min="0" max="365" step="1" value="${subscription?.reminder_days ?? 3}">
+            <input class="form-input" id="subscription-reminder" type="number" min="0" max="365" step="1" value="${subscription?.reminder_days ?? 3}"${subscription?.reminder_enabled === false ? ' disabled' : ''}>
           </div>
         </div>
         <div class="form-group">
@@ -1060,6 +1424,10 @@ export function openSubscriptionModal(subscription = null) {
 
       ${advancedSection(advancedFieldsHtml, { open: advancedOpen })}
       <div class="modal-panel__footer subscriptions-modal-footer">
+        ${edit ? `<button type="button" class="btn btn--danger-outline" id="subscription-delete"
+                aria-label="${esc(t('common.deleteNamed', { name: subscription.name }))}" style="margin-inline-end:auto">
+          <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i><span>${esc(t('common.delete'))}</span>
+        </button>` : ''}
         <button class="btn btn--secondary" type="button" id="subscription-cancel">${t('common.cancel')}</button>
         <button class="btn btn--primary" type="submit">${edit ? t('common.save') : t('common.add')}</button>
       </div>
@@ -1090,6 +1458,10 @@ export function openSubscriptionModal(subscription = null) {
       wireCombobox(panel, 'subscription-cycle');
       wireCombobox(panel, 'subscription-category');
       wireCombobox(panel, 'subscription-method');
+      const reminderEnabled = panel.querySelector('#subscription-reminder-enabled');
+      reminderEnabled.addEventListener('change', () => {
+        panel.querySelector('#subscription-reminder').disabled = !reminderEnabled.checked;
+      });
       // Ende-Bedingung (#594): das passende Zusatzfeld ein-/ausblenden.
       const endTypeSelect = panel.querySelector('#subscription-end-type');
       endTypeSelect.value = subscription?.end_type || 'never';
@@ -1100,6 +1472,13 @@ export function openSubscriptionModal(subscription = null) {
       endTypeSelect.addEventListener('change', syncEndFields);
       syncEndFields();
       panel.querySelector('#subscription-cancel').addEventListener('click', closeModal);
+      // EINE ZEILENBEDIENUNG (R14 P8): Loeschen steht hier im Fuss, nicht mehr
+      // als Papierkorb an der Zeile. Erst schliessen, dann fragen - die
+      // Rueckfrage steht dann nicht ueber einem offenen Formular.
+      panel.querySelector('#subscription-delete')?.addEventListener('click', () => {
+        closeModal({ force: true });
+        void deleteSubscription(subscription);
+      });
       panel.querySelector('#subscription-logo').addEventListener('change', async (event) => {
         const file = event.target.files[0];
         if (!file) return;
@@ -1150,6 +1529,7 @@ async function fileToDataUrl(file) {
 }
 
 async function saveSubscription(panel, existing, searchedLogoData = null) {
+  if (readOnly()) return;
   const dateInput = panel.querySelector('#subscription-next-date');
   const currencyInput = panel.querySelector('#subscription-currency');
   if (!isDateInputValid(dateInput.value)) {
@@ -1215,6 +1595,7 @@ async function saveSubscription(panel, existing, searchedLogoData = null) {
       cycle_interval: Number(panel.querySelector('#subscription-interval').value),
       next_payment_date: parseDateInput(dateInput.value),
       reminder_days: Number(panel.querySelector('#subscription-reminder').value),
+      reminder_enabled: panel.querySelector('#subscription-reminder-enabled').checked,
       category_id: Number(panel.querySelector('#subscription-category').value) || null,
       payment_method_id: Number(panel.querySelector('#subscription-method').value) || null,
       website_url: existing?.website_url || null,
@@ -1232,7 +1613,7 @@ async function saveSubscription(panel, existing, searchedLogoData = null) {
     if (existing) await api.put(`/budget/subscriptions/${existing.id}`, payload);
     else await api.post('/budget/subscriptions', payload);
     await closeModal({ force: true });
-    await reload();
+    await reload(undefined, { motion: true });
     refocusAfterRender();
     window.yuvomi?.showToast(t(existing ? 'subscriptions.savedToast' : 'subscriptions.addedToast'), 'success');
   } catch (err) {
@@ -1256,7 +1637,7 @@ function openLogoPickerModal(panel, initialQuery, onSelect) {
   panel.insertAdjacentHTML('beforeend', `
     <div class="subscriptions-logo-picker-modal" role="dialog" aria-modal="true" aria-labelledby="subscription-logo-picker-title">
       <div class="subscriptions-logo-picker-panel">
-        <div class="subscriptions-logo-picker-head">
+        <div class="subscriptions-logo-picker-head" data-dialog-actions>
           <h3 id="subscription-logo-picker-title">${t('subscriptions.logoSearchTitle')}</h3>
           <button class="btn btn--secondary btn--icon" type="button" id="subscription-logo-picker-close" aria-label="${esc(t('common.close'))}">
             <i data-lucide="x" aria-hidden="true"></i>
@@ -1264,7 +1645,7 @@ function openLogoPickerModal(panel, initialQuery, onSelect) {
         </div>
         <form id="subscription-logo-search-form" class="subscriptions-logo-search-form">
           <label class="form-label" for="subscription-logo-search-input">${t('subscriptions.logoSearchLabel')}</label>
-          <div class="subscriptions-logo-search">
+          <div class="subscriptions-logo-search" data-dialog-actions>
             <input class="form-input" id="subscription-logo-search-input" inputmode="url"
                    placeholder="${esc(t('subscriptions.logoSearchPlaceholder'))}" value="${esc(initialQuery || '')}">
             <button class="btn btn--primary" type="submit">
@@ -1333,13 +1714,14 @@ function openLogoPickerModal(panel, initialQuery, onSelect) {
 // Bestaetigung, die nur an einem der beiden haengt, ist keine Regel, sondern
 // eine Eigenschaft des Wegs.
 async function renewSubscription(subscription) {
+  if (readOnly()) return;
   const confirmed = await confirmModal(
     t('subscriptions.renewConfirm', { name: subscription.name }),
     { detail: t('subscriptions.renewConfirmDetail', { date: formatDate(subscription.next_payment_date) }) });
   if (!confirmed) return;
   try {
     const response = await api.post(`/budget/subscriptions/${subscription.id}/renew`, {});
-    await reload();
+    await reload(undefined, { motion: true });
     refocusAfterRender();
     const completed = response.data?.status === 'completed';
     window.yuvomi?.showToast(t(completed ? 'subscriptions.completedToast' : 'subscriptions.renewedToast'), 'success');
@@ -1349,12 +1731,17 @@ async function renewSubscription(subscription) {
 }
 
 async function deleteSubscription(subscription) {
+  if (readOnly()) return;
   const confirmed = await confirmModal(t('subscriptions.deleteConfirm', { name: subscription.name }),
     { danger: true, detail: t('subscriptions.deleteConfirmDetail') });
   if (!confirmed) return;
   try {
     await api.delete(`/budget/subscriptions/${subscription.id}`);
-    await reload();
+    // Die Zeile klappt aus, die Nachbarn ruecken nach - erst dann steht die
+    // Liste ohne sie neu (der Server hat schon geloescht; ohne Bewegung loest
+    // collapseRow sofort auf).
+    await collapseRow(container.querySelector(`#subscriptions-list .swipe-row[data-swipe-id="${subscription.id}"]`));
+    await reload(undefined, { motion: true });
     refocusAfterRender();
     window.yuvomi?.showToast(t('subscriptions.deletedToast'), 'success');
   } catch (err) {
@@ -1363,6 +1750,7 @@ async function deleteSubscription(subscription) {
 }
 
 async function openSettingsModal() {
+  if (readOnly()) return;
   const content = `
     <form id="subscriptions-settings-form">
       <div class="form-group">
@@ -1400,6 +1788,7 @@ async function openSettingsModal() {
       panel.querySelector('#subscriptions-settings-cancel').addEventListener('click', closeModal);
       panel.querySelector('#subscriptions-settings-form').addEventListener('submit', async (event) => {
         event.preventDefault();
+        if (readOnly()) return;
         const baseCurrency = panel.querySelector('#subscriptions-base-currency').value;
         if (!baseCurrency) {
           reportFieldError(panel.querySelector('#subscriptions-base-currency-search'), t('subscriptions.currencyRequired'));
@@ -1438,25 +1827,22 @@ async function openSettingsModal() {
 function metadataRows(items, kind) {
   const isCat = kind === 'categories';
   const editLabel = isCat ? t('subscriptions.editCategory') : t('subscriptions.editPaymentMethod');
-  const deleteLabel = isCat ? t('subscriptions.deleteCategory') : t('subscriptions.deletePaymentMethod');
-  return items.map((item, index) => `
+  return items.map((item, index) => {
+    // Die Zeilenaktionen nennen, WORAN sie wirken: vier Knoepfe je Zeile, die
+    // alle nur „Nach oben" oder „Kategorie loeschen" hiessen, waren fuer einen
+    // Screenreader in jeder Zeile dieselben (Komponenten-Kanon, DESIGN.md).
+    const name = isCat ? categoryLabel(item) : paymentMethodLabel(item);
+    const named = (catKey, methodKey) => t(isCat ? catKey : methodKey, { name });
+    return `
     <li data-id="${item.id}" data-kind="${kind}">
       <div class="subscriptions-metadata-row__view">
         ${isCat ? `<i style="background:${esc(item.color)}"></i>` : '<i data-lucide="credit-card" aria-hidden="true"></i>'}
-        <span>${esc(isCat ? categoryLabel(item) : paymentMethodLabel(item))}</span>
-        <div class="subscriptions-metadata-row__actions">
-          <button class="btn btn--icon" data-move="-1" ${index === 0 ? 'aria-disabled="true"' : ''} aria-label="${t('subscriptions.moveUp')}">
-            <i data-lucide="chevron-up" aria-hidden="true"></i>
-          </button>
-          <button class="btn btn--icon" data-move="1" ${index === items.length - 1 ? 'aria-disabled="true"' : ''} aria-label="${t('subscriptions.moveDown')}">
-            <i data-lucide="chevron-down" aria-hidden="true"></i>
-          </button>
-          <button class="btn btn--icon" data-act="edit" aria-label="${editLabel}">
-            <i data-lucide="pencil" aria-hidden="true"></i>
-          </button>
-          <button class="btn btn--icon" data-act="delete" aria-label="${deleteLabel}">
-            <i data-lucide="trash-2" aria-hidden="true"></i>
-          </button>
+        <span>${esc(name)}</span>
+        <div class="row-actions subscriptions-metadata-row__actions">
+          ${rowActionHtml({ icon: 'chevron-up', label: t('subscriptions.moveUpNamed', { name }), attrs: { 'data-move': '-1', 'aria-disabled': index === 0 ? 'true' : null } })}
+          ${rowActionHtml({ icon: 'chevron-down', label: t('subscriptions.moveDownNamed', { name }), attrs: { 'data-move': '1', 'aria-disabled': index === items.length - 1 ? 'true' : null } })}
+          ${rowActionHtml({ icon: 'pencil', label: named('subscriptions.editCategoryNamed', 'subscriptions.editPaymentMethodNamed'), attrs: { 'data-act': 'edit' } })}
+          ${rowActionHtml({ icon: 'trash-2', tone: 'danger', label: named('subscriptions.deleteCategoryNamed', 'subscriptions.deletePaymentMethodNamed'), attrs: { 'data-act': 'delete' } })}
         </div>
       </div>
       <div class="subscriptions-metadata-row__edit" hidden>
@@ -1472,10 +1858,12 @@ function metadataRows(items, kind) {
         </div>
       </div>
     </li>
-  `).join('');
+  `;
+  }).join('');
 }
 
 function openMetadataModal() {
+  if (readOnly()) return;
   const content = `
     <div class="subscriptions-metadata">
       <section>
@@ -1507,6 +1895,7 @@ function openMetadataModal() {
     onSave(panel) {
       panel.querySelector('#subscriptions-metadata-close').addEventListener('click', closeModal);
       panel.querySelector('#subscription-add-category').addEventListener('click', async () => {
+        if (readOnly()) return;
         const name = panel.querySelector('#subscription-new-category').value.trim();
         if (!name) return;
         await api.post('/budget/subscriptions/categories', {
@@ -1519,6 +1908,7 @@ function openMetadataModal() {
         openMetadataModal();
       });
       panel.querySelector('#subscription-add-method').addEventListener('click', async () => {
+        if (readOnly()) return;
         const name = panel.querySelector('#subscription-new-method').value.trim();
         if (!name) return;
         await api.post('/budget/subscriptions/payment-methods', { name });
@@ -1529,6 +1919,7 @@ function openMetadataModal() {
       });
       panel.querySelectorAll('[data-move]').forEach((button) => {
         button.addEventListener('click', async () => {
+          if (readOnly()) return;
           // aria-disabled statt disabled: der Button bleibt fokussierbar, der
           // No-op-Klick am Listenrand wird hier verworfen (siehe layout.css).
           if (button.getAttribute('aria-disabled') === 'true') return;
@@ -1585,6 +1976,7 @@ function openMetadataModal() {
       });
       panel.querySelectorAll('[data-act="save"]').forEach((button) => {
         button.addEventListener('click', async () => {
+          if (readOnly()) return;
           const li = button.closest('li');
           const id = Number(li.dataset.id);
           const editRow = li.querySelector('.subscriptions-metadata-row__edit');
@@ -1616,6 +2008,7 @@ function openMetadataModal() {
       });
       panel.querySelectorAll('[data-act="delete"]').forEach((button) => {
         button.addEventListener('click', async () => {
+          if (readOnly()) return;
           const li = button.closest('li');
           const id = Number(li.dataset.id);
           const isCat = li.dataset.kind === 'categories';
@@ -1655,3 +2048,13 @@ function openMetadataModal() {
     },
   });
 }
+
+/**
+ * Messflaeche fuer die Nur-lesen-Regel (#1265 P7): Karten- und Leerzustands-
+ * Renderer sind reine Funktionen ueber `state`.
+ */
+export const __test = {
+  readOnly, READ_SAFE_ACTIONS, renderCard, renderEmpty, renderSummary, state, toolsMenuHtml, activeFilters,
+  renderBreakdown, renderAreaChart,
+  subscriptionReadSections, openSubscriptionModal, saveSubscription,
+};

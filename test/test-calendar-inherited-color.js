@@ -25,13 +25,12 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
+import { tempDir } from './tmp-dir.js';
 
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'test-secret';
-process.env.DB_PATH = join(mkdtempSync(join(tmpdir(), 'yuvomi-colmig-')), 'unused.db');
+process.env.DB_PATH = join(tempDir('yuvomi-colmig-'), 'unused.db');
 const { MIGRATIONS } = await import('../server/db.js');
 
 const NULLABLE_COLOR_VERSION  = 166;
@@ -65,7 +64,7 @@ function applyWithMigrateSemantics(db, migration) {
  * Bestandsnutzer mitbringt, wenn genau diese Migration ansteht.
  */
 function buildDatabaseBefore(version = NULLABLE_COLOR_VERSION) {
-  const db = new Database(join(mkdtempSync(join(tmpdir(), 'yuvomi-colmig-')), 'db.sqlite'));
+  const db = new Database(join(tempDir('yuvomi-colmig-'), 'db.sqlite'));
   db.pragma('foreign_keys = ON');
   for (const migration of MIGRATIONS.filter((m) => m.version < version)) {
     applyMigration(db, migration);
@@ -251,7 +250,7 @@ test('der Test-Schema-Auszug haelt die Spalte ebenfalls nullable', async () => {
   for (const key of [1, 11]) {
     const sql = MIGRATIONS_SQL[key];
     if (!sql || !/CREATE TABLE[^;]*calendar_events/.test(sql)) continue;
-    const db = new Database(join(mkdtempSync(join(tmpdir(), 'yuvomi-auszug-')), 'db.sqlite'));
+    const db = new Database(join(tempDir('yuvomi-auszug-'), 'db.sqlite'));
     // Jeder Eintrag ist fuer sich lesbar, seine Nachbartabellen fehlen aber - die
     // Suiten fahren jeweils die, die sie brauchen. Geprueft wird hier die
     // Spalte, nicht die Verweisintegritaet, deshalb ohne Fremdschluessel.
@@ -320,7 +319,7 @@ test('der Test-Schema-Auszug kennt den Zustand ebenfalls', async () => {
   // hat. Der Beleg ist deshalb ein INSERT, keine Spaltendefinition.
   const { MIGRATIONS_SQL } = await import('../server/db-schema-test.js');
   const sql = MIGRATIONS_SQL[11];
-  const db = new Database(join(mkdtempSync(join(tmpdir(), 'yuvomi-auszug-')), 'db.sqlite'));
+  const db = new Database(join(tempDir('yuvomi-auszug-'), 'db.sqlite'));
   db.pragma('foreign_keys = OFF');
   db.exec(sql);
   db.prepare(`INSERT INTO calendar_events (title, start_datetime, created_by)
@@ -386,22 +385,61 @@ test('der Upload merkt sich, dass die hinausgeschickte Farbe unsere ist (#899)',
   // gespiegelten wird - das ist genau der Moment, in dem die Farbe erstmals
   // hinausgeht, und er ist in jedem Dienst als `external_source = '<anbieter>'`
   // in einer UPDATE-SET-Liste erkennbar.
+  //
+  // Seit #1837 teilen sich CalDAV und Apple diese Stelle: beide rufen
+  // `markEventUploaded` in calendar-outbound.js, das die Quelle als Parameter
+  // bindet (`external_source = ?`). Gezaehlt werden deshalb ANBIETER, nicht
+  // UPDATEs: jeder der drei muss auf einem der beiden Wege ankommen, und jedes
+  // UPDATE, das einen Termin zum Spiegel macht, muss das Flag tragen - das
+  // geteilte genauso wie ein woertliches.
   const { readFile } = await import('node:fs/promises');
+  const lies = async (datei) => ohneKommentare(await readFile(new URL(`../${datei}`, import.meta.url), 'utf8'));
   const UPDATE_RE = /UPDATE calendar_events\s+SET([\s\S]*?)WHERE/g;
+  const HELFER_DATEI = 'server/services/calendar-outbound.js';
 
-  let gefunden = 0;
   const ohneFlag = [];
+  const angekommen = new Set();
+
+  // Der geteilte Helfer: genau das UPDATE, das die Quelle gebunden setzt.
+  const helferQuelle = await lies(HELFER_DATEI);
+  const helferStart = helferQuelle.indexOf('export function markEventUploaded(');
+  assert.ok(helferStart >= 0, 'markEventUploaded fehlt in calendar-outbound.js - stimmt der Guard noch?');
+  const helferRumpf = helferQuelle.slice(helferStart, helferQuelle.indexOf('\nexport ', helferStart + 1));
+  const helferUpdates = [...helferRumpf.matchAll(UPDATE_RE)]
+    .filter((treffer) => /external_source\s*=\s*\?/.test(treffer[1]));
+  assert.equal(helferUpdates.length, 1,
+    'markEventUploaded setzt external_source nicht mehr in genau einem UPDATE - stimmt der Guard noch?');
+  const helferHatFlag = /color_modified/.test(helferUpdates[0][1]);
+  if (!helferHatFlag) ohneFlag.push(HELFER_DATEI);
+
   for (const datei of SYNC_DIENSTE) {
-    const quelle = ohneKommentare(await readFile(new URL(`../${datei}`, import.meta.url), 'utf8'));
+    const quelle = await lies(datei);
     for (const treffer of quelle.matchAll(UPDATE_RE)) {
       const setListe = treffer[1];
-      if (!/external_source\s*=\s*'(caldav|apple|google)'/.test(setListe)) continue;
-      gefunden++;
+      const woertlich = setListe.match(/external_source\s*=\s*'(caldav|apple|google)'/);
+      if (!woertlich) continue;
+      angekommen.add(woertlich[1]);
       if (!/color_modified/.test(setListe)) ohneFlag.push(datei);
+    }
+    // Der Aufruf muss die Quelle woertlich nennen: nur so ist belegt, WELCHER
+    // Anbieter ueber den Helfer laeuft. Seit #1862 rufen die Upload-Schleifen
+    // `bookEventUpload`, das gegen den Stand nach dem await bucht und dafuer
+    // `markEventUploaded` ruft (unten geprueft) - beide Namen zaehlen.
+    for (const treffer of quelle.matchAll(/(?:markEventUploaded|bookEventUpload)\(\s*[^,]+,\s*\{[^}]*?source:\s*'(caldav|apple|google)'/g)) {
+      angekommen.add(treffer[1]);
     }
   }
 
-  assert.equal(gefunden, 3, `drei Anbieter, drei Upload-Stellen - gefunden: ${gefunden}`);
+  // `bookEventUpload` zaehlt nur, solange es wirklich bei `markEventUploaded`
+  // ankommt und die Quelle durchreicht.
+  const buchStart = helferQuelle.indexOf('export function bookEventUpload(');
+  assert.ok(buchStart >= 0, 'bookEventUpload fehlt in calendar-outbound.js - stimmt der Guard noch?');
+  const buchRumpf = helferQuelle.slice(buchStart, helferQuelle.indexOf('\nexport ', buchStart + 1));
+  assert.match(buchRumpf, /markEventUploaded\(\s*sent\.id,\s*\{\s*source,/,
+    'bookEventUpload reicht die Quelle nicht mehr an markEventUploaded weiter');
+
+  assert.deepEqual([...angekommen].sort(), ['apple', 'caldav', 'google'],
+    'jeder der drei Anbieter braucht eine Upload-Stelle, die den Termin zum Spiegel macht');
   assert.deepEqual(ohneFlag, [],
     'der Upload muss color_modified setzen, sonst verliert der Termin seine exakte Farbe an die gemappte');
 });

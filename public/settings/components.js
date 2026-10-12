@@ -2,6 +2,7 @@ import { t } from '/i18n.js';
 import { moduleIconHTML } from '/nav-icons.js';
 import { esc } from '/utils/html.js';
 import { getReadableTextColor } from '/utils/color.js';
+import { formRowHtml } from '/utils/form-row.js';
 
 let settingRowIdCounter = 0;
 
@@ -91,9 +92,20 @@ export function toggleRowHtml({
   // sie mit Initialen, wenn sie groß genug dafür ist.
   swatchColor = null,
   swatchLabel = '',
+  // SCHALTER ODER HAKEN (Komponenten-Kanon, 2026-09-26). Eine Boolean-
+  // EINSTELLUNG ist ein Schalter wie in Apples Einstellungen: der Zustand
+  // steht rechts, das Label links, und das Umlegen wirkt sofort. Die native
+  // 18px-Checkbox bleibt der Default, weil dieselbe Zeile auch Filterblaetter
+  // traegt (Kalender, Aufgaben), deren Zeilen eine AUSWAHL sind - die Frage,
+  // ob auch dort Schalter stehen, ist offen und nicht Teil dieser Runde.
+  // `'switch'` rendert die geteilte `.toggle`-Bahn und `role="switch"`; der
+  // Knoten bleibt eine `input[type=checkbox]`, Leser (`.checked`, `change`)
+  // aendern sich nicht. Ratchet: test:control-dialect "settings-checkbox".
+  control = 'checkbox',
   attrs = {},
 }) {
-  const rowClass = ['toggle-row', className].filter(Boolean).join(' ');
+  const isSwitch = control === 'switch';
+  const rowClass = ['toggle-row', isSwitch ? 'toggle-row--switch' : '', className].filter(Boolean).join(' ');
   const iconHtml = icon ? moduleIconHTML(icon) : '';
   // DIE TINTE WIRD GERECHNET, NICHT GESETZT. `--color-ink-on-vivid` gilt fuer
   // KURATIERTE Toene, deren Helligkeit bekannt ist. Eine frei gewaehlte Farbe
@@ -106,6 +118,18 @@ export function toggleRowHtml({
       + `${esc(String(swatchLabel ?? ''))}</span>`
     : '';
   const labelClass = labelVisible ? '' : ' class="sr-only"';
+  if (isSwitch) {
+    const textClass = labelVisible ? 'toggle-row__label' : 'toggle-row__label sr-only';
+    return `<label class="${rowClass}">`
+      + iconHtml
+      + swatchHtml
+      + `<span class="${textClass}">${esc(String(label ?? ''))}</span>`
+      + '<span class="toggle">'
+      + `<input type="checkbox" role="switch"${attrsHtml({ ...attrs, checked, disabled })}>`
+      + '<span class="toggle__track" aria-hidden="true"></span>'
+      + '</span>'
+      + '</label>';
+  }
   return `<label class="${rowClass}">`
     + `<input type="checkbox"${attrsHtml({ ...attrs, checked, disabled })}>`
     + iconHtml
@@ -114,10 +138,115 @@ export function toggleRowHtml({
     + '</label>';
 }
 
+/**
+ * EIN SCHALTER WIRKT SOFORT (Komponenten-Kanon "Schalter in Einstellungen",
+ * Re-Critique 2026-09-28 R15 A7 P1-1). Auch wenn er in einem Formular mit
+ * "Speichern" steht: umlegen speichert, ein Fehler legt ihn zurueck. Das
+ * Element traegt dazu `data-instant-save` im Markup - daran erkennt der
+ * Verlassen-Schutz (settings/dirty-guard.js), dass er keinen offenen Stand
+ * hinterlaesst. Dasselbe Muster wie die Sofort-Speicherer in
+ * modules-options.js, nur einmal statt je Blatt.
+ *
+ * @param {HTMLInputElement|null} input
+ * @param {object} options
+ * @param {(checked: boolean) => Promise<unknown>} options.save
+ * @param {string} options.savedMessage  Toast nach dem Speichern
+ * @param {(checked: boolean) => void} [options.onRevert]  Folgezustand nach dem Zuruecklegen nachziehen
+ */
+export function bindInstantSwitch(input, { save, savedMessage, onRevert = () => {} }) {
+  if (!input) return;
+  input.addEventListener('change', async () => {
+    const value = input.checked;
+    input.disabled = true;
+    try {
+      await save(value);
+      window.yuvomi?.showToast(savedMessage, 'success');
+    } catch (error) {
+      input.checked = !value;
+      onRevert(!value);
+      window.yuvomi?.showToast(error?.message || t('common.errorGeneric'), 'danger');
+    } finally {
+      if (input.isConnected) input.disabled = false;
+    }
+  });
+}
+
 export function createToggleRow(options) {
   const host = document.createElement('div');
   host.insertAdjacentHTML('afterbegin', toggleRowHtml(options));
   return host.firstElementChild;
+}
+
+/**
+ * DIE GRUPPIERTE ZEILE ALS MARKUP (Critique 2026-10-07, R17 E9).
+ *
+ * Bis dahin trug in den Einstellungen jede Option ihre eigene Karte: das Blatt
+ * Darstellung zeigte zehn Einstellungen in acht Karten (1650px, drei davon im
+ * ersten Bild), waehrend "Aktive Module" daneben laengst die Form hatte, die
+ * Apples Einstellungen fuehren - EIN Traeger je Abschnitt, darin Zeilen mit
+ * dem Label links und dem Bedienelement rechts. Diese zwei Helfer sind die
+ * Zeile dazu; der Traeger ist `<div class="row-carrier settings-group">`, ein
+ * Hinweis fuer die ganze Gruppe steht als `.settings-group__footer` darunter
+ * auf dem Grund.
+ *
+ * `createSettingRow()` darunter baut dieselbe Zeile als Knoten; die Blaetter
+ * schreiben ihr Markup als Zeichenkette, also gibt es sie auch so. Texte
+ * (`label`, `description`) laufen durch `esc()`; `control` und `extra` sind
+ * Markup des Aufrufers.
+ *
+ * @param {object} options
+ * @param {string} options.label
+ * @param {string|null} [options.labelFor]  id des Bedienelements - dann ist das Label ein `<label for>`
+ * @param {string|null} [options.labelId]   id am Label, fuer `aria-labelledby` einer Gruppe
+ * @param {string} [options.description]    Sekundaerzeile: ein Hinweis, der nur DIESE Zeile betrifft
+ * @param {string|null} [options.descriptionId]
+ * @param {string} [options.control]        Markup des Bedienelements
+ * @param {string} [options.extra]          Markup unter dem Text (Fehlerzeile, verborgener Zusatzhinweis)
+ * @param {boolean} [options.stacked]       Bedienelement UNTER dem Text: Segmente und Chip-Gruppen, die neben einem Label nicht stehen koennen
+ */
+export function settingRowHtml({
+  label,
+  labelFor = null,
+  labelId = null,
+  description = '',
+  descriptionId = null,
+  control = '',
+  extra = '',
+  stacked = false,
+  className = '',
+  attrs = {},
+}) {
+  // DIE EINSTELLUNGSZEILE IST EINE FORMULARZEILE (R18, 2026-10-07): derselbe
+  // Baustein wie in den Erfassungsdialogen (utils/form-row.js). Die Klassen
+  // `settings-setting-row*` bleiben vorn - unter ihnen fuehrt settings.css die
+  // Masse des Blatts -, `form-row*` kommt dazu und bringt, was in der Zeile
+  // steht: die randlose Auswahl, das Datum als Wert, das zusammengesetzte Feld.
+  return formRowHtml({
+    label, labelFor, labelId, description, descriptionId, control, extra, stacked, className, attrs,
+    variant: 'settings-setting-row',
+  });
+}
+
+/**
+ * Die Schalterzeile einer Gruppe: `toggleRowHtml({ control: 'switch' })` bleibt
+ * das Label und damit die Trefferflaeche der ganzen Zeile; die Sekundaerzeile
+ * steht DARUNTER und ausserhalb des Labels, sonst laese ein Screenreader den
+ * Hinweis als Teil des Namens. Verknuepft wird sie ueber `aria-describedby`.
+ *
+ * Nimmt dieselben Optionen wie `toggleRowHtml()`, dazu `description`,
+ * `descriptionId` und `extra`.
+ */
+export function settingSwitchRowHtml({ description = '', descriptionId = null, extra = '', rowAttrs = {}, ...toggle }) {
+  const attrs = { ...(toggle.attrs ?? {}) };
+  if (description && descriptionId && !attrs['aria-describedby']) attrs['aria-describedby'] = descriptionId;
+  const descriptionHtml = description
+    ? `<p class="settings-setting-row__description"${attrsHtml({ id: descriptionId })}>${esc(String(description))}</p>`
+    : '';
+  return `<div class="settings-setting-row settings-setting-row--switch"${attrsHtml(rowAttrs)}>`
+    + toggleRowHtml({ ...toggle, control: 'switch', attrs })
+    + descriptionHtml
+    + extra
+    + '</div>';
 }
 
 export function createSettingRow({ label, description, control }) {
@@ -130,14 +259,15 @@ export function createSettingRow({ label, description, control }) {
     formControl.id = `${rowId}-control`;
   }
 
+  // Dieselben Klassenpaare wie `settingRowHtml()` (utils/form-row.js).
   const row = document.createElement('div');
-  row.className = 'settings-setting-row';
+  row.className = 'settings-setting-row form-row';
 
   const copy = document.createElement('div');
-  copy.className = 'settings-setting-row__copy';
+  copy.className = 'settings-setting-row__copy form-row__copy';
 
   const title = document.createElement(formControl ? 'label' : 'div');
-  title.className = 'settings-setting-row__label';
+  title.className = 'settings-setting-row__label form-row__label';
   title.textContent = String(label ?? '');
   if (formControl) title.htmlFor = formControl.id;
   copy.appendChild(title);
@@ -145,7 +275,7 @@ export function createSettingRow({ label, description, control }) {
   if (description) {
     const detail = document.createElement('p');
     detail.id = `${rowId}-description`;
-    detail.className = 'settings-setting-row__description';
+    detail.className = 'settings-setting-row__description form-row__description';
     detail.textContent = String(description);
     copy.appendChild(detail);
 
@@ -159,7 +289,7 @@ export function createSettingRow({ label, description, control }) {
   }
 
   const controlContainer = document.createElement('div');
-  controlContainer.className = 'settings-setting-row__control';
+  controlContainer.className = 'settings-setting-row__control form-row__control';
   appendContent(controlContainer, control);
 
   row.append(copy, controlContainer);

@@ -7,9 +7,15 @@
 import { clearApiCache } from '/sw-register.js';
 import { setPermissions, clearPermissions } from '/permissions.js';
 import { setHouseholdSize, setOtherReaders, clearHouseholdSize } from '/utils/household.js';
+import { setInitialsRoster, clearInitialsRoster } from '/utils/initials.js';
 import { forgetLayoutHint } from '/utils/dashboard-layout-hint.js';
+import { t } from '/i18n.js';
+import { REFUSAL_MESSAGES } from '/utils/friendly-error.js';
 
 const API_BASE = '/api/v1';
+
+/** Der Grund, mit dem `server/middleware/csrf.js` ein ungueltiges Token ablehnt. */
+const CSRF_INVALID_REASON = 'csrf_invalid';
 
 /** In-Memory CSRF-Token (zuverlaessiger als document.cookie auf iOS Safari/PWA). */
 let _csrfToken = '';
@@ -38,7 +44,10 @@ async function apiFetch(path, options = {}, _retried = false) {
   const stateChanging = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method);
   // `withSource` ist KEINE fetch-Option und wird deshalb hier herausgeloest,
   // bevor der Rest weitergereicht wird.
-  const { headers: optionHeaders = {}, withSource = false, ...fetchOptions } = options;
+  // `quietExpiry` ebenso: ein 401 feuert dann KEIN `auth:expired`. Nur fuer die
+  // Vorab-Frage des Starts (utils/start-handoff.js) - dort feuert das Ereignis
+  // spaeter, wenn der Auth-Guard die Antwort abholt.
+  const { headers: optionHeaders = {}, withSource = false, quietExpiry = false, ...fetchOptions } = options;
 
   let response;
   try {
@@ -53,6 +62,9 @@ async function apiFetch(path, options = {}, _retried = false) {
       },
     });
   } catch (err) {
+    // Vom Aufrufer abgebrochen (`{ signal }`): kein Netzfehler und schon gar
+    // kein "offline" - siehe ApiAbortError.
+    if (fetchOptions.signal?.aborted) throw new ApiAbortError();
     // Offline/Netzfehler bei state-changing Requests (POST/PUT/PATCH/DELETE):
     // klaren ApiError werfen statt nacktem TypeError, damit die UI eine
     // verständliche „offline"-Meldung zeigen kann (read-only Offline-Modus).
@@ -67,15 +79,30 @@ async function apiFetch(path, options = {}, _retried = false) {
     // "der Wartezustand ist abgelaufen" - beides gehört auf die Anmeldeseite
     // gesagt und nicht in einen Sitzungsabbruch übersetzt (#672).
     if (path !== '/auth/login' && path !== '/auth/2fa/verify') {
+      if (quietExpiry) throw Object.assign(new Error('Sitzung abgelaufen.'), { status: 401 });
       window.dispatchEvent(new CustomEvent('auth:expired'));
       throw new Error('Sitzung abgelaufen.');
     }
     // Für beide: fall-through zum generischen !response.ok-Handler unten.
   }
 
+  // Der Rumpf wird VOR der Wiederholung gelesen: ob sie sich lohnt, steht im `reason`.
+  const data = await response.json().catch(() => null);
+  // Ein Abbruch WAEHREND des Rumpfs laesst `json()` scheitern - das catch oben
+  // machte daraus `null` unter einem Status 200, also eine leere Erfolgsantwort.
+  if (fetchOptions.signal?.aborted) throw new ApiAbortError();
+
   // CSRF-Token-Desync (haeufig nach iOS-PWA-Resume): einmal GET /auth/me
   // ausfuehren um den CSRF-Token zu erneuern, dann den Request wiederholen.
-  if (response.status === 403 && stateChanging && !_retried) {
+  //
+  // Nur, wenn die Absage das Token meint oder es offen laesst (#1669). Der
+  // Server nennt es immer `csrf_invalid` (middleware/csrf.js, die einzige
+  // Stelle, die das Token prueft). Eine 403 OHNE `reason` bleibt aus Vorsicht
+  // dabei: sie kann von etwas vor der App stammen (Proxy), das seinen Grund
+  // nicht nennt. Jeder andere Grund (gesperrte Aufgabe, fehlendes Recht) ist
+  // mit frischem Token dieselbe Absage - sie ging bis dahin zweimal an den Server.
+  const tokenMayBeStale = !data?.reason || data.reason === CSRF_INVALID_REASON;
+  if (response.status === 403 && stateChanging && !_retried && tokenMayBeStale) {
     // Token aus der 403-Antwort selbst extrahieren (Server liefert den
     // korrekten Token im Header mit, auch bei Fehlschlag)
     const errorCsrf = response.headers.get('X-CSRF-Token');
@@ -98,12 +125,40 @@ async function apiFetch(path, options = {}, _retried = false) {
   const csrfHeader = response.headers.get('X-CSRF-Token');
   if (csrfHeader) _csrfToken = csrfHeader;
 
-  const data = await response.json().catch(() => null);
-
   // Fallback: CSRF-Token aus Response-Body (fuer /auth/me und /auth/login)
   if (data?.csrfToken) _csrfToken = data.csrfToken;
 
   if (!response.ok) {
+    // Waehrend ein Backup eingespielt wird, lehnt der Server Schreibzugriffe
+    // mit 503 ab (#1431). Die Seiten zeigen meist `err.message` - also hier
+    // uebersetzen, statt den englischen Servertext durchzureichen.
+    if (response.status === 503 && data?.reason === 'restore_in_progress') {
+      throw new ApiError(t('common.errorRestoreInProgress'), response.status, data, response.headers.get('Retry-After'));
+    }
+    // Eine Absage, die ihren Grund nennt (#1607 das Modul-Gate, #1640 gesperrte
+    // Aufgabe, gespiegeltes Rezept, CSRF): der Satz zum Grund statt des
+    // englischen vom Server. Manche Seiten zeigen `err.data.error` statt
+    // `err.message` (Gesundheit, deren Einstellungen) - deshalb traegt beides
+    // die Uebersetzung. Die Liste steht bei friendlyError, das denselben Satz zeigt.
+    const refusalKey = response.status === 403 ? REFUSAL_MESSAGES.get(data?.reason) : undefined;
+    if (refusalKey) {
+      const text = t(refusalKey);
+      throw new ApiError(text, response.status, { ...data, error: text }, response.headers.get('Retry-After'));
+    }
+    // Jede andere Absage OHNE Grund (#1607): "Not authorized.", "Admin access
+    // required." und rund hundert Geschwister sagen nur "das darfst du nicht",
+    // und zwar englisch - also ein uebersetzter Satz, an beiden Stellen wie
+    // beim Gate darueber. Der Server bleibt sprachfrei, sein Text unveraendert.
+    //
+    // NUR OHNE `reason`. Wer einen nennt, traegt eine Auskunft, die dieser Satz
+    // verschluckte (Display-Konto, fehlendes Recht in einem zweiten Modul), oder
+    // eine Seite liest ihn selbst (Anmeldung, Zwei-Faktor, Kalender-Anhang). Eine
+    // neue 403 mit eigener Auskunft bekommt am Server einen `reason` - die Liste
+    // haelt test:api. Ein Rumpf ohne `error` ist keine Absage der App (Proxy).
+    if (response.status === 403 && typeof data?.error === 'string' && !data.reason) {
+      const text = t('common.errorNoPermission');
+      throw new ApiError(text, response.status, { ...data, error: text }, response.headers.get('Retry-After'));
+    }
     const message = data?.error || `HTTP ${response.status}`;
     throw new ApiError(message, response.status, data, response.headers.get('Retry-After'));
   }
@@ -169,12 +224,43 @@ class ApiError extends Error {
   }
 }
 
+/**
+ * Der Aufrufer hat seine Anfrage selbst abgebrochen (`{ signal }`).
+ *
+ * EIN EIGENER, STILLER FEHLER. Was `fetch` bei einem Abbruch wirft, haengt vom
+ * Grund ab, den der Aufrufer `abort()` mitgibt - mal ein DOMException namens
+ * AbortError, mal der Grund selbst. Hier wird daraus immer dasselbe, erkennbar
+ * ueber `isAbortError()`. Still heisst: der Sammelhandler fuer unbehandelte
+ * Ablehnungen im Router zeigt dafuer KEINEN Fehler-Toast. Eine Seite, die ihre
+ * Abrufe beim Verlassen abbricht, hat nichts falsch gemacht.
+ */
+class ApiAbortError extends Error {
+  constructor() {
+    super('Request aborted.');
+    this.name = 'AbortError';
+    this.aborted = true;
+  }
+}
+
+/**
+ * Ist dieser Fehler ein Abbruch durch den Aufrufer? Erkennt auch den rohen
+ * AbortError eines `fetch`, das nicht durch diesen Client lief.
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isAbortError(err) {
+  return err instanceof ApiAbortError || err?.name === 'AbortError';
+}
+
 // --------------------------------------------------------
 // Convenience-Methoden
 // --------------------------------------------------------
 
 const api = {
-  get: (path) => apiFetch(path, { method: 'GET' }),
+  // opts wie bei post/put/patch/delete, zuerst fuer `{ signal }`: eine Seite
+  // kann einen Abruf abbrechen, dessen Antwort niemand mehr braucht. Die
+  // Methode steht zuletzt, damit kein opts aus einem GET etwas anderes macht.
+  get: (path, opts = {}) => apiFetch(path, { ...opts, method: 'GET' }),
 
   /**
    * Wie `get`, liefert aber `{ data, fromCache }` statt nur den Rumpf.
@@ -234,6 +320,7 @@ const auth = {
     setPermissions(res?.permissions);
     setHouseholdSize(res?.householdSize);
     setOtherReaders(res?.othersCanRead);
+    setInitialsRoster(res?.initialsRoster);
     return res;
   },
   // Zweiter Schritt der Anmeldung (#672). Der Code darf ein TOTP-Code oder ein
@@ -243,6 +330,7 @@ const auth = {
     setPermissions(res?.permissions);
     setHouseholdSize(res?.householdSize);
     setOtherReaders(res?.othersCanRead);
+    setInitialsRoster(res?.initialsRoster);
     return res;
   },
   // Verwaltung des eigenen zweiten Faktors.
@@ -251,12 +339,15 @@ const auth = {
   enableTwoFactor: (code) => api.post('/auth/2fa/enable', { code }),
   disableTwoFactor: (code) => api.post('/auth/2fa/disable', { code }),
   regenerateRecoveryCodes: (code) => api.post('/auth/2fa/recovery-codes', { code }),
+  // Beendet jede andere Sitzung des Kontos, diese bleibt (#1354). Antwort: { ok, ended }.
+  logoutOthers: () => api.post('/auth/logout-others', {}),
   logout: async () => {
     try {
       return await api.post('/auth/logout');
     } finally {
       clearPermissions();
       clearHouseholdSize();
+      clearInitialsRoster();
       // API-Cache IMMER leeren — auch wenn der Logout-Request offline oder bei
       // nicht erreichbarem Server fehlschlägt. Der Settings-Handler navigiert in
       // seinem finally trotzdem zu /login, daher darf hier kein offline gecachter
@@ -268,16 +359,20 @@ const auth = {
       forgetLayoutHint();
     }
   },
-  me: async () => {
-    const res = await api.get('/auth/me');
+  // opts nur fuer den Start des Routers (`quietExpiry`, siehe apiFetch).
+  me: async (opts = {}) => {
+    const res = await api.get('/auth/me', opts);
     setPermissions(res?.permissions);
     // Neben den Rechten die zweite Angabe, die JEDE Seite braucht und die
     // niemand einzeln holen soll: die Haushaltsgroesse (utils/household.js).
     setHouseholdSize(res?.householdSize);
     setOtherReaders(res?.othersCanRead);
+    setInitialsRoster(res?.initialsRoster);
     return res;
   },
-  setup: (username, display_name, password) => api.post('/auth/setup', { username, display_name, password }),
+  // `language` und `timezone` sind optional: fehlt eines, laesst JSON.stringify
+  // das Feld weg, und der Server verhaelt sich wie vor seiner Einfuehrung.
+  setup: (username, display_name, password, language, timezone) => api.post('/auth/setup', { username, display_name, password, language, timezone }),
   getUsers: () => api.get('/auth/users'),
   // DER HAUSHALT KANN SICH AENDERN, UND DANN AENDERT SICH, WAS GEFRAGT WIRD.
   // `householdSize` kommt sonst nur aus /auth/me und /auth/login, wird also
@@ -298,7 +393,15 @@ const auth = {
     await auth.me().catch(() => {});
     return res;
   },
-  updateProfile: (data) => api.patch('/auth/me/profile', data),
+  // Der eigene Name steht in der Liste, aus der gleiche Initialen aufgeloest
+  // werden (`initialsRoster`, utils/initials.js, #1464): derselbe Rundweg,
+  // sonst truege ein umbenanntes Konto bis zum naechsten Kaltstart die Zeichen
+  // seines alten Namens - oder dieselben wie ein anderes.
+  updateProfile: async (data) => {
+    const res = await api.patch('/auth/me/profile', data);
+    await auth.me().catch(() => {});
+    return res;
+  },
   markOnboardingSeen: () => api.post('/auth/onboarding-seen', {}),
   deleteUser: async (id) => {
     const res = await api.delete(`/auth/users/${id}`);
@@ -387,4 +490,4 @@ const recipeProviders = {
   getStatus: () => api.get('/recipe-providers/status'),
 };
 
-export { api, auth, email, notifications, recipeProviders, ApiError };
+export { api, auth, email, notifications, recipeProviders, ApiError, isAbortError };

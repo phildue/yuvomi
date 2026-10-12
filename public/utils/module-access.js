@@ -82,27 +82,68 @@
  *    Seite, die sich selbst eine baut, verspricht einen Knopf, den der Server
  *    abweist.
  *
- * 6. NAMENSKOLLISION: `renderExpenses(readOnly)` in `split-expenses.js` meint
- *    „archivierte Gruppe", nicht das Modulrecht. Wer dort das Recht
- *    einfuehrt, benennt den Parameter um (etwa `archived`) oder odert die
- *    Modulfrage ausdruecklich hinein - zwei Bedeutungen unter einem Namen
- *    sind ein Rueckfall, der beim naechsten Umbau passiert.
+ * 6. NAMENSKOLLISION: `renderExpenses(readOnly)` in `split-expenses.js` meinte
+ *    „archivierte Gruppe", nicht das Modulrecht. Seit P7 heisst der Parameter
+ *    `asList`, und der Aufrufer odert Archiv und Modulrecht ausdruecklich
+ *    hinein. Dieselbe Regel fuer jede weitere Stelle: zwei Bedeutungen unter
+ *    einem Namen sind ein Rueckfall, der beim naechsten Umbau passiert.
  *
  * 7. KATEGORIE-VERWALTER (`components/category-manager.js`): der AUFRUFER
  *    versteckt den Ausloeser mit seinem `readOnly()`, die Komponente fragt
  *    nicht selbst. Jeder `basePath` gehoert dem Modul der Seite, die ihn
  *    oeffnet (der Guard in der Suite haelt das), also ist die Frage dieselbe,
  *    die die Seite fuer ihre anderen Knoepfe ohnehin stellt. Vorbild:
- *    `tasks.js` (`#btn-manage-categories` hinter `readOnly()`).
+ *    `tasks.js` (Menue-Eintrag `manage-categories` im Werkzeugmenue hinter
+ *    `readOnly()`).
  *
  * 8. KREUZTRANSFER DER KUECHE, ENTSCHIEDEN (#1290): `POST /meals/:id/to-shopping-list`,
  *    `/meals/week-to-shopping-list` und `/recipes/:id/to-shopping-list`
  *    schreiben Einkaufsdaten, obwohl der Pfad-Guard sie als `meals` misst.
  *    Der Server verlangt dort jetzt zusaetzlich das Schreibrecht auf
  *    `shopping` - und umgekehrt `meals` fuer
- *    `/shopping/:listId/import-meal-plan`. Die Knoepfe fragen es noch NICHT;
- *    das ist Sache von P3/P4, und dann mit dem Pfad des ZIELS statt dem der
- *    Seite (Regel 1).
+ *    `/shopping/:listId/import-meal-plan`. Die Knoepfe fragen BEIDE Riegel,
+ *    den Pfad, den sie posten (der Pfad-Guard), UND das Ziel (Regel 1):
+ *    `mayTransferMealToShopping()`, `mayTransferRecipeToShopping()` und
+ *    `mayImportMealPlan()` in `utils/kitchen-transfer.js`. Fuer das REZEPT
+ *    senkt der Server den Pfad-Guard auf `meals: read` (entschieden am
+ *    22.09.2026: die Route liest die Quelle und schreibt nur das Ziel;
+ *    `READ_LEVEL_WRITES` in server/scopes.js, fuer Mitglieder und Tokens).
+ *    `mayWritePath()` bildet das ueber die Kopie derselben Tabelle exakt ab
+ *    wie Regel 5 - dieselbe Warnung gilt: keine Seite baut sich so etwas
+ *    selbst. Die Mahlzeit bleibt bei `meals: write`, ihre Route kippt
+ *    `on_shopping_list` im Plan. Nur das Ziel zu fragen zeigte dort einem
+ *    Mitglied mit `meals: read` einen Knopf, den der Pfad-Guard abweist. Das
+ *    Zielrecht gilt nur fuer AUSDRUECKLICHE Uebertraege.
+ *    VORRAT UND EINKAUF (#1265 P4) sind das einfachere Paar: beide Routen
+ *    lesen die Quelle nur. Der Pfad-Guard misst das ZIEL -
+ *    `POST /shopping/:id/import-pantry` als `shopping`,
+ *    `POST /pantry/import-shopping` als `pantry` -, das Leserecht der QUELLE
+ *    fragt die Route selbst (`mayReadModule()` in server/permissions.js).
+ *    Am Knopf ist das keine zweite Frage: er steht auf der Seite der Quelle,
+ *    und die sieht nur, wer sie lesen darf. Also EIN Riegel je Richtung:
+ *    `mayTransferPantryToShopping()` und `mayTransferShoppingToPantry()`,
+ *    ebenfalls in `utils/kitchen-transfer.js`. Wandert einer dieser Knoepfe
+ *    auf eine fremde Seite, braucht er das Quellrecht als zweiten Riegel.
+ *    Was eine Aktion bloss MITerzeugt (der Check-in der Haushaltshilfe legt
+ *    Termin und Zahlungsaufgabe an), fragt kein Zielrecht, weder am Server
+ *    noch am Knopf - die Abgrenzung steht in docs/DECISIONS.md, Abschnitt 10.
+ *
+ * 9. LESEANSICHT BEI `read`, ENTSCHIEDEN (#1265): ein Datensatz oeffnet bei
+ *    `read` eine Leseansicht mit ALLEM, was der Editor zeigt - nicht den
+ *    Editor mit abgeschalteten Teilen und nicht bloss die Felder der Zeile.
+ *    Vorbild ist `openNoteReadModal()` in `notes.js` (P1, #1311). Damit gilt
+ *    Regel 2 auch fuer Felder, die NUR im Editor stehen: wer lesen darf, sieht
+ *    sie, als Zeichen statt als Eingabe. Und ein Leertext, der zu einer
+ *    Handlung einlaedt („Tippe auf + ...“), entfaellt bei `read` zusammen mit
+ *    dem Knopf, den er meint: `action: readOnly() ? null : ...` allein laesst
+ *    `hint` und `description` des Leerzustands stehen.
+ *    FUEHRT DER TIPP SCHON WOANDERSHIN, weil er nicht den Datensatz selbst
+ *    oeffnet, steht ein Wert, der sonst nur im Editor stand, bei `read` dort,
+ *    wo der Tipp landet - einen neuen Knopf nur zum Lesen gibt es nicht. Ein
+ *    Konto oeffnet den Kontoauszug, also kommt der Kreditrahmen in dessen
+ *    Kopf; eine Split-Gruppe wird per Tipp nur ausgewaehlt, also kommen
+ *    Standardwaehrung, Standardaufteilung und Mitglieder als kompakte Zeile
+ *    in den Gruppenkopf (entschieden am 21.09.2026 fuer #1352).
  */
 
 import { moduleAccess } from '/permissions.js';
@@ -174,14 +215,46 @@ export function pathAccess(path) {
 }
 
 /**
+ * Kopie von `READ_LEVEL_WRITES` aus server/scopes.js - die benannten
+ * Ausnahmen, fuer die der Server bei einem schreibenden Aufruf `read` reicht
+ * (Regel 5 und Regel 8 im Kopf). Der Drift-Guard in
+ * `npm run test:module-write-access` vergleicht Eintrag fuer Eintrag. Aendern
+ * heisst: dort aendern, hier nachziehen - eine Seite baut sich keine eigene.
+ */
+export const READ_LEVEL_WRITES = Object.freeze([
+  Object.freeze({
+    id: 'schedule-preferences',
+    pattern: '^\\/schedule\\/preferences$',
+    flags: '',
+    methods: null,
+    axes: Object.freeze(['session']),
+  }),
+  Object.freeze({
+    id: 'recipe-to-shopping',
+    pattern: '^\\/recipes\\/\\d+\\/to-shopping-list\\/?$',
+    flags: 'i',
+    methods: Object.freeze(['POST']),
+    axes: Object.freeze(['session', 'token']),
+  }),
+]);
+
+// Die Oberflaeche ist eine Sitzung: sie liest nur die Eintraege dieser Achse.
+// Die Methode kennt der Helfer nicht - `mayWritePath()` fragt immer nach einem
+// Schreibaufruf, und unter den Pfaden der Tabelle gibt es jeweils nur die
+// Methoden, die sie nennt.
+const SESSION_READ_LEVEL = READ_LEVEL_WRITES
+  .filter((entry) => entry.axes.includes('session'))
+  .map((entry) => new RegExp(entry.pattern, entry.flags));
+
+/**
  * Wuerde der Server einen SCHREIBENDEN Aufruf auf diesen Pfad annehmen?
- * Mit der einen Serverausnahme `/schedule/preferences` (Regel 5 im Kopf):
- * dort reicht `read`, und zwar nur bei exakt diesem Pfad.
+ * Fuer die Pfade aus `READ_LEVEL_WRITES` reicht `read` (nie `none`).
  * @param {string} path
  * @returns {boolean}
  */
 export function mayWritePath(path) {
   const access = pathAccess(path);
-  if (requestPath(path) === '/schedule/preferences') return access !== 'none';
+  const p = requestPath(path);
+  if (SESSION_READ_LEVEL.some((re) => re.test(p))) return access !== 'none';
   return access === 'write';
 }

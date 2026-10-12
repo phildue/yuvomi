@@ -15,14 +15,17 @@
  *
  * Die Übersetzungen kommen aus denselben `public/locales/*.json`, die auch der
  * Client lädt - sie werden als Daten gelesen (readFileSync), nicht importiert.
- * Die Schichtgrenze aus `test/test-layer-boundary.js` bleibt damit gewahrt: es
- * gibt keinen Modul-Import über `public/` hinweg, und die Übersetzungen können
- * nicht auseinanderlaufen.
+ * Die Schichtgrenze aus `test/test-layer-boundary.js` bleibt damit gewahrt, und
+ * die Übersetzungen können nicht auseinanderlaufen. Der eine Modul-Import über
+ * `public/` hinweg ist der Partikel-Auflöser fürs Koreanische: eine reine
+ * Funktion, die dort in der Liste der geteilten Module steht, damit die Regel
+ * nicht zweimal formuliert ist.
  */
 
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveKoreanParticles } from '../../public/utils/korean-particles.js';
 
 const LOCALES_DIR = fileURLToPath(new URL('../../public/locales/', import.meta.url));
 
@@ -35,7 +38,73 @@ const REFERENCE_LOCALE = 'de';
 // ("Birthday: <Name>") - ein Bestandshaushalt erlebt so keinen stillen Wechsel.
 const DEFAULT_LOCALE = 'en';
 
-const LOCALE_FILE_RE = /^([a-z]{2})\.json$/;
+// Die Form, die BCP-47 fuer einen Locale-Dateinamen zulaesst: Sprache, optional
+// Schrift, optional Region - `de`, `fil`, `pt-BR`, `zh-Hant`, `sr-Latn-RS`.
+//
+// Dieselbe Naht ist hier zweimal gerissen, beide Male an einer Laengenangabe,
+// die genau den Bestand beschrieb statt die Regel. Erst forderte der
+// Regionscode in preferences.js `{2}` und wies `fil-PH` ab; dann forderte
+// dieses Muster `{2}` und verlor `fil.json` (#1322), waehrend das Auswahlmenue
+// Filipino weiter anbot, weil es seine Optionen aus SUPPORTED_LOCALES im
+// Frontend baut - `isSupportedLocale('fil')` war false und das Speichern
+// antwortete mit 400. Nach `{2,3}` waere `zh-Hant.json` das dritte Mal gewesen.
+//
+// Die Erweiterung kostet nichts, solange sie eine Form beschreibt und keine
+// beliebige Datei durchlaesst: `README.json` oder ein `de-de.json` mit
+// kleingeschriebener Region bleiben draussen, sonst gaebe die Liste einem
+// Nicht-Locale den Rang einer Sprache. Der Test dazu nagelt beide Richtungen
+// fest, weil der Bestand selbst keine einzige dieser Formen traegt.
+const LOCALE_FILE_RE = /^([a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-[A-Z]{2})?)\.json$/;
+
+/**
+ * Der Locale-Code eines Dateinamens, oder null. Exportiert, weil der Bestand
+ * die Erweiterung kaum misst: bis auf `pt-BR.json` (#1437) heissen alle
+ * Dateien `xx.json` oder `xxx.json`, ein Test ueber getSupportedLocales() liefe
+ * an jeder Schrift-Form vorbei. getSupportedLocales() ruft genau diese Funktion, es gibt also keinen
+ * zweiten Pfad, der auseinanderlaufen koennte.
+ */
+export function localeFromFileName(file) {
+  return file.match(LOCALE_FILE_RE)?.[1] ?? null;
+}
+
+// Die gespeicherte Region des Haushalts, in derselben BCP-47-Form: Sprache,
+// optional Schrift, dann die Region. Die Region ist hier NICHT optional - ein
+// blosser Sprachcode ist keine Region, und `region` soll genau die Frage
+// beantworten, wo der Haushalt lebt.
+//
+// Ein Muster und nicht vier: dieselbe Form stand bis 20.09.2026 an vier Stellen
+// im Server (Schreibpruefung in preferences.js, Sprachableitung, Zahlenformat,
+// Regionsabfrage), jede mit einem eigenen Literal. Ein solcher Satz Kopien
+// wandert nie vollstaendig - als `fil-PH` die Erweiterung auf `{2,3}` erzwang,
+// blieb die Locale-Dateiliste zurueck, und genau daraus wurde #1322.
+const REGION_RE = /^([a-z]{2,3})(?:-[A-Z][a-z]{3})?-[A-Z]{2}$/;
+
+/** Ist `region` ein vollstaendiger Regions-Tag? `custom` zaehlt hier NICHT. */
+export function isRegionTag(region) {
+  return typeof region === 'string' && REGION_RE.test(region);
+}
+
+/**
+ * Die spezifischste unterstuetzte Locale einer Region, oder null: erst der
+ * volle Tag, dann ohne den jeweils letzten Subtag - `pt-BR` -> `pt-BR`,
+ * `pt-PT` -> `pt`, `zh-Hant-TW` -> `zh-Hant` -> `zh`, `fil-PH` -> `fil`.
+ * Dieselbe Richtung wie pickLocale() in public/i18n.js fuer Browser-Tags.
+ *
+ * Bis #1437 stand hier der blosse Sprachteil, weil jede Locale-Datei einen
+ * reinen Sprachcode trug. Mit `pt-BR.json` schrieb ein brasilianischer
+ * Haushalt seine Geburtstagstitel dann auf europaeischem Portugiesisch,
+ * obwohl die passende Datei daneben lag.
+ */
+export function regionLocale(region) {
+  if (!isRegionTag(region)) return null;
+  const teile = region.split('-');
+  while (teile.length) {
+    const tag = teile.join('-');
+    if (isSupportedLocale(tag)) return tag;
+    teile.pop();
+  }
+  return null;
+}
 
 let supportedLocales = null;
 const localeCache = new Map();
@@ -50,7 +119,7 @@ export function getSupportedLocales() {
   if (supportedLocales) return supportedLocales;
   try {
     supportedLocales = readdirSync(LOCALES_DIR)
-      .map((file) => file.match(LOCALE_FILE_RE)?.[1])
+      .map(localeFromFileName)
       .filter(Boolean)
       .sort();
   } catch {
@@ -63,6 +132,57 @@ export function getSupportedLocales() {
 /** Ist `locale` eine Sprache mit vorhandener Locale-Datei? */
 export function isSupportedLocale(locale) {
   return typeof locale === 'string' && getSupportedLocales().includes(locale);
+}
+
+/**
+ * Sprachcodes, die eine vorhandene Locale meinen, aber anders heissen: `no` ist
+ * die Makrosprache Norwegisch, `nn` (Nynorsk) hat keine eigene Datei. Beide
+ * fallen auf `nb`. Das Gegenstueck heisst in public/i18n.js genauso; kein Import
+ * verbindet die beiden (Schichtgrenze), test:language-lists haelt sie gleich.
+ */
+const LANGUAGE_ALIAS = Object.freeze({ no: 'nb', nn: 'nb' });
+
+/**
+ * Die spezifischste unterstuetzte Locale eines frei eingegebenen Sprach-Tags,
+ * oder null. Fuer Werte, die von aussen kommen (`?lang=` der API): Gross- und
+ * Kleinschreibung und `_` statt `-` werden in BCP-47-Form gebracht, dann faellt
+ * wie bei regionLocale() Subtag fuer Subtag weg - `pt_br` -> `pt-BR`,
+ * `pt-PT` -> `pt`, `DE-de` -> `de`.
+ *
+ * #1523: Vorher hielt jede Stelle, die so einen Wert annimmt, ihre eigene Liste
+ * (Budget-Kategorien, die OpenAPI-Beschreibung), und keine wuchs mit, als
+ * Sprachen dazukamen. Diese Funktion liest dieselben Dateien wie
+ * getSupportedLocales() und hat keine Liste, die zurueckbleiben koennte.
+ */
+export function supportedLocaleFor(tag) {
+  if (typeof tag !== 'string') return null;
+  const teile = tag.trim().replace(/_/g, '-').split('-');
+  // Sprache aus Buchstaben, danach Schrift oder Region - auch numerisch (`es-419`).
+  if (!/^[A-Za-z]{2,8}$/.test(teile[0]) || teile.slice(1).some((teil) => !/^[A-Za-z0-9]{1,8}$/.test(teil))) return null;
+  teile[0] = teile[0].toLowerCase();
+  for (let i = 1; i < teile.length; i++) {
+    const teil = teile[i];
+    teile[i] = teil.length === 4
+      ? teil[0].toUpperCase() + teil.slice(1).toLowerCase()
+      : teil.toUpperCase();
+  }
+  const sprache = teile[0];
+  const rest = teile.slice(1);
+  while (teile.length) {
+    const kandidat = teile.join('-');
+    if (isSupportedLocale(kandidat)) return kandidat;
+    teile.pop();
+  }
+  // Rueckfall ueber den Alias, erst nachdem der Tag selbst nichts fand.
+  if (Object.hasOwn(LANGUAGE_ALIAS, sprache)) {
+    const alias = [LANGUAGE_ALIAS[sprache], ...rest];
+    while (alias.length) {
+      const kandidat = alias.join('-');
+      if (isSupportedLocale(kandidat)) return kandidat;
+      alias.pop();
+    }
+  }
+  return null;
 }
 
 /**
@@ -112,12 +232,13 @@ export function translate(locale, key, params = {}) {
   const chain = [isSupportedLocale(locale) ? locale : DEFAULT_LOCALE, DEFAULT_LOCALE, REFERENCE_LOCALE];
 
   let str;
+  let strLocale;
   for (const candidate of chain) {
     const hit = resolveKey(loadLocale(candidate), key);
     // Ein Key, der auf einen Teilbaum zeigt, ist ein Aufruffehler und kein Text.
     // Ohne diese Prüfung würde das replaceAll unten mit einem TypeError brechen -
     // ausgerechnet in einer Funktion, die nie werfen soll.
-    if (typeof hit === 'string') { str = hit; break; }
+    if (typeof hit === 'string') { str = hit; strLocale = candidate; break; }
   }
   if (str === undefined) return key;
 
@@ -131,9 +252,17 @@ export function translate(locale, key, params = {}) {
   //     date-Durchgang in das Datum.
   // Unbekannte Platzhalter bleiben stehen, statt zu verschwinden - so ist ein
   // fehlender Parameter im Ergebnis sichtbar und nicht still weggekürzt.
-  return str.replace(/\{\{(\w+)\}\}/g, (placeholder, name) => (
+  const fill = (text) => text.replace(/\{\{(\w+)\}\}/g, (placeholder, name) => (
     Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : placeholder
   ));
+  // Koreanisch schreibt hinter einen Platzhalter beide Formen der Partikel
+  // (`{{name}}이(가)`), weil die richtige am eingesetzten Wort hängt (#1607).
+  // Dieselbe Regel wie in t() (public/i18n.js), aus derselben Datei: aufgelöst
+  // wird an der Vorlage, der eingesetzte Wert bleibt, wie er ist.
+  // Es entscheidet die Sprache des GELIEFERTEN Texts, nicht die angefragte:
+  // fällt ein koreanischer Key auf en oder de zurück, ist der Text kein
+  // Koreanisch. Jede andere Sprache zahlt genau diesen einen Vergleich.
+  return strLocale === 'ko' ? resolveKoreanParticles(str, fill) : fill(str);
 }
 
 const VALID_DATE_FORMATS = ['mdy', 'dmy', 'ymd', 'mdy_dot', 'dmy_dot', 'dmy_slash', 'ymd_dot', 'ymd_slash'];
@@ -177,8 +306,8 @@ function cfgValue(database, key) {
 /**
  * Datensprache des Haushalts.
  *
- * Reihenfolge: explizit gesetzte `language` → Sprachteil der `region`
- * (`de-DE` → `de`) → Englisch. Die Ableitung aus der Region ist der Grund,
+ * Reihenfolge: explizit gesetzte `language` → spezifischste Locale der
+ * `region` (`de-DE` → `de`, `pt-BR` → `pt-BR`) → Englisch. Die Ableitung aus der Region ist der Grund,
  * warum die meisten Haushalte nichts einstellen müssen: wer seine Region auf
  * "Deutschland" gesetzt hat, bekommt deutsche Titel, ohne davon zu wissen.
  *
@@ -208,8 +337,8 @@ export function resolveHouseholdLocale(database, { ignoreExplicit = false } = {}
     if (isSupportedLocale(explicit)) return explicit;
   }
 
-  const regionLanguage = /^([a-z]{2,3})-[A-Z]{2}$/.exec(cfgValue(database, 'region') ?? '')?.[1];
-  if (isSupportedLocale(regionLanguage)) return regionLanguage;
+  const ausDerRegion = regionLocale(cfgValue(database, 'region'));
+  if (ausDerRegion) return ausDerRegion;
 
   return DEFAULT_LOCALE;
 }
@@ -245,7 +374,7 @@ export function resolveHouseholdFormats(database) {
  * @returns {string}
  */
 export function formatMoney(amount, { locale, currency, region = null }) {
-  const numberLocale = /^[a-z]{2,3}-[A-Z]{2}$/.test(region ?? '') ? region : locale;
+  const numberLocale = isRegionTag(region) ? region : locale;
   try {
     return new Intl.NumberFormat(numberLocale, { style: 'currency', currency }).format(amount);
   } catch {
@@ -256,7 +385,7 @@ export function formatMoney(amount, { locale, currency, region = null }) {
 /** Gespeicherte Region des Haushalts (voller BCP-47-Tag) oder null. */
 export function householdRegion(database) {
   const region = cfgValue(database, 'region');
-  return /^[a-z]{2,3}-[A-Z]{2}$/.test(region ?? '') ? region : null;
+  return isRegionTag(region) ? region : null;
 }
 
 export { DEFAULT_LOCALE, REFERENCE_LOCALE };
