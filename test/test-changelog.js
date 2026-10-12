@@ -519,7 +519,23 @@ const RELEASED_SECTION_EDITS = {
   // sync gap pre-dating the upstream merge and never got a CHANGELOG entry.
   // Added retroactively so the tagged-release guard has something to compare.
   '1.21.1': '90592366ace8',
+  // Fork-Sync mit upstream v2.76.0: die Fork-Tags v2.68.0/v2.69.0 tragen die
+  // Fork-Releases, die Abschnitte stehen jetzt in der Fassung von upstream
+  // (die Fork-Eintraege liegen unter [Unreleased]). 2.68.1 gab es nur upstream.
+  '2.69.0': 'a087d8082e93',
+  '2.68.1': '3b7bdb18da96',
+  '2.68.0': '8adab746b40a',
 };
+
+/* Releases von upstream (ulsklyc/yuvomi), die per Merge in den Fork kamen und
+ * hier keinen Tag haben: upstreams Tags werden nicht gespiegelt, weil ein
+ * v*-Tag im Fork das Deployment ausloest (docker-publish.yml). Sie sind
+ * veroeffentlicht, nur nicht in diesem Repository getaggt - kein erfundener
+ * Abschnitt. Mit dem naechsten Fork-Tag liegen sie unter dem Referenz-Tag und
+ * werden wieder Zeile fuer Zeile verglichen. */
+const UPSTREAM_RELEASES_WITHOUT_FORK_TAG = new Set([
+  '2.69.1', '2.70.0', '2.71.0', '2.72.0', '2.73.0', '2.74.0', '2.75.0',
+]);
 
 const sectionHash = (section) => createHash('sha256').update(section).digest('hex').slice(0, 12);
 
@@ -549,7 +565,7 @@ function firstDifference(section, published) {
   return `Zeile ${i + 1}: jetzt ${cut(now[i])}, am Tag ${cut(then[i])}`;
 }
 
-function releasedSectionDrift(headText, referenceText, referenceVersion, edits = {}, { packageVersion } = {}) {
+function releasedSectionDrift(headText, referenceText, referenceVersion, edits = {}, { packageVersion, untagged = new Set() } = {}) {
   const current = releasedSections(headText);
   const published = releasedSections(referenceText);
   const offenders = [];
@@ -560,7 +576,7 @@ function releasedSectionDrift(headText, referenceText, referenceVersion, edits =
     if (compareVersions(version, referenceVersion) > 0) {
       // Neuer als der Referenz-Tag darf nur der Release-Commit sein, und der hat die
       // Version schon gebumpt (#1184).
-      if (packageVersion !== undefined && current.has(version) && version !== packageVersion) {
+      if (packageVersion !== undefined && current.has(version) && version !== packageVersion && !untagged.has(version)) {
         offenders.push({ version, hash: null,
           detail: `neuer Abschnitt ohne Tag, package.json steht aber auf ${packageVersion} - eine Versionsueberschrift schreibt nur release-prep, ein Eintrag gehoert unter [Unreleased]` });
       }
@@ -616,7 +632,8 @@ test('veroeffentlichte CHANGELOG-Abschnitte stehen noch so da wie am Tag', (t) =
   const packageVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
   assert.match(packageVersion, /^\d+\.\d+\.\d+$/, 'package.json traegt keine lesbare Version');
   const { offenders, checked } = releasedSectionDrift(
-    headText, referenceText, referenceVersion, RELEASED_SECTION_EDITS, { packageVersion });
+    headText, referenceText, referenceVersion, RELEASED_SECTION_EDITS,
+    { packageVersion, untagged: UPSTREAM_RELEASES_WITHOUT_FORK_TAG });
 
   // Reichweite: bricht die Abschnittstrennung, vergleicht der Guard nichts und ist gruen.
   assert.ok(checked >= 10, `nur ${checked} Abschnitte gegen v${referenceVersion} verglichen`);
