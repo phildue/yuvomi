@@ -818,7 +818,11 @@ function renderTrendChart() {
   // Die Flaeche unter den Einnahmen reicht bis heute: die Linie, unten
   // geschlossen auf der Grundlinie (Bauart der Abo-Prognose, subscriptions.js).
   const baseY = chartY(0, 0, axis.max, geo).toFixed(1);
-  const areaPoints = `${chartX(0, s.length, geo).toFixed(1)},${baseY} ${points(incomes, 0, lastPast)} ${chartX(lastPast, s.length, geo).toFixed(1)},${baseY}`;
+  // Eine ausgeblendete Serie (oder alle, solange die Kategorie laedt) behaelt
+  // ihr Element mit leeren Punkten: die Gruppe zeichnet sich als Ganzes ein.
+  const incomeOn = showIncome && !pending;
+  const expensesOn = showExpenses && !pending;
+  const areaPoints = !incomeOn ? '' : `${chartX(0, s.length, geo).toFixed(1)},${baseY} ${points(incomes, 0, lastPast)} ${chartX(lastPast, s.length, geo).toFixed(1)},${baseY}`;
   // DER PUNKT MIT WERT (R18): am heutigen Tag, ohne Zukunft am letzten Tag mit
   // Daten. Er traegt, was die Kurve sonst nur ueber die Achse hergab.
   let markIndex = lastPast;
@@ -917,20 +921,19 @@ function renderTrendChart() {
             ${chartXLabelsMarkup(axisLabels(s.map((p) => p.period)), geo)}
             ${todayIndex >= 0 ? todayMarkerMarkup(chartX(todayIndex, s.length, geo), geo) : ''}
             ${refLines}
-            ${pending ? '' : `<g class="budget-stats__lines">
-              ${showIncome ? `<polygon class="budget-stats__area" fill="url(#budget-stats-area)" points="${areaPoints}" />
+            <g class="budget-stats__lines">
+              <polygon class="budget-stats__area" fill="url(#budget-stats-area)" points="${areaPoints}" />
               <polyline class="budget-stats__line budget-stats__line--income" fill="none" stroke-width="2"
-                        vector-effect="non-scaling-stroke" points="${points(incomes, 0, lastPast)}" />` : ''}
-              ${showExpenses ? `<polyline class="budget-stats__line budget-stats__line--expense" fill="none" stroke-width="2"
-                        vector-effect="non-scaling-stroke" points="${points(expenses, 0, lastPast)}" />` : ''}
-              ${todayIndex >= 0 && showIncome ? `
+                        vector-effect="non-scaling-stroke" points="${incomeOn ? points(incomes, 0, lastPast) : ''}" />
+              <polyline class="budget-stats__line budget-stats__line--expense" fill="none" stroke-width="2"
+                        vector-effect="non-scaling-stroke" points="${expensesOn ? points(expenses, 0, lastPast) : ''}" />
+              ${todayIndex >= 0 ? `
               <polyline class="budget-stats__line budget-stats__line--income budget-stats__future" fill="none" stroke-width="2"
-                        vector-effect="non-scaling-stroke" points="${points(incomes, todayIndex)}" />` : ''}
-              ${todayIndex >= 0 && showExpenses ? `
+                        vector-effect="non-scaling-stroke" points="${incomeOn ? points(incomes, todayIndex) : ''}" />
               <polyline class="budget-stats__line budget-stats__line--expense budget-stats__future" fill="none" stroke-width="2"
-                        vector-effect="non-scaling-stroke" points="${points(expenses, todayIndex)}" />` : ''}
-              ${markMarkup({ x: chartX(markIndex, s.length, geo), income: showIncome ? incomes[markIndex] : null, expenses: showExpenses ? expenses[markIndex] : null, axisMax: axis.max, geo })}
-            </g>`}
+                        vector-effect="non-scaling-stroke" points="${expensesOn ? points(expenses, todayIndex) : ''}" />` : ''}
+              ${markMarkup({ x: chartX(markIndex, s.length, geo), income: incomeOn ? incomes[markIndex] : null, expenses: expensesOn ? expenses[markIndex] : null, axisMax: axis.max, geo })}
+            </g>
           </svg>
           <div class="budget-stats__points" role="group" aria-label="${t('budget.statsPointsLabel')}">${pending ? '' : hotspots}</div>
         </div>

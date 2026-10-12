@@ -1028,7 +1028,6 @@ button.budget-summary-card--clickable {
   transition: box-shadow var(--transition-fast);
 }
 
-button.budget-summary-card--clickable:hover { box-shadow: var(--shadow-md); }
 button.budget-summary-card--clickable:focus-visible { outline: 2px solid var(--module-accent); outline-offset: 2px; }
 button.budget-summary-card--clickable.is-active {
   border-color: var(--module-accent);
@@ -1310,7 +1309,6 @@ button.budget-bar-row--clickable {
   transition: background var(--transition-fast);
 }
 
-button.budget-bar-row--clickable:hover { background-color: var(--color-surface-2); }
 button.budget-bar-row--clickable:focus-visible { outline: 2px solid var(--module-accent); outline-offset: 2px; }
 button.budget-bar-row--clickable.is-active {
   background-color: color-mix(in srgb, var(--module-accent) var(--tint-state), transparent);
@@ -2636,7 +2634,6 @@ button.budget-stats__legend-toggle {
   background: none; border: 1px solid transparent; border-radius: var(--radius-full, 999px);
   font: inherit; color: inherit; cursor: pointer; padding: 0 var(--space-2);
 }
-button.budget-stats__legend-toggle:hover { border-color: var(--color-border); }
 button.budget-stats__legend-toggle:focus-visible { outline: 2px solid var(--module-accent); outline-offset: 2px; }
 button.budget-stats__legend-toggle.is-active { border-color: var(--module-accent); }
 .budget-stats__export { margin-top:var(--space-4); }
@@ -3076,4 +3073,12 @@ button.budget-stats__legend-toggle.is-active { border-color: var(--module-accent
 .split-expense__amount,
 .split-debt strong {
   font-variant-numeric: tabular-nums;
+}
+
+/* Hover der Drilldown-Flaechen nur mit Zeiger: auf Touch klebt :hover nach
+ * dem Tipp (R18). */
+@media (hover: hover) {
+  button.budget-summary-card--clickable:not(.is-active):hover { box-shadow: var(--shadow-md); }
+  button.budget-bar-row--clickable:not(.is-active):hover { background-color: var(--color-surface-2); }
+  button.budget-stats__legend-toggle:not(.is-active):hover { border-color: var(--color-border); }
 }
