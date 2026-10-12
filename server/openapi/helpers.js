@@ -1,3 +1,5 @@
+import { DEFAULT_LOCALE, getSupportedLocales } from '../utils/i18n.js';
+
 function authSecurity() {
   return [{ bearerAuth: [] }, { apiKeyAuth: [] }, { cookieAuth: [] }];
 }
@@ -29,6 +31,20 @@ function idempotencyHeaderParam() {
   };
 }
 
+// Belege gehoeren dem Dokumente-Modul (#1358, server/services/document-links.js):
+// ein Text je Richtung, damit Budget, Ausgaben und Inventar dasselbe sagen.
+const DOCUMENT_LINKS_READ_NOTE = 'Linked documents follow the Documents module: a document the caller cannot see is left out, and '
+  + 'without access to the Documents module (for API tokens a `documents:read` scope) `attachments` is `null` - neither the documents '
+  + 'nor their number are told, and a record with receipts looks the same as one without.';
+
+const BUDGET_LINKS_READ_NOTE = 'Linked budget entries follow the Budget module: without access to it (for API tokens a '
+  + '`budget:read` scope) `linked_entries` is empty and `linked_entries_total` is 0, and any request that looks up a budget entry '
+  + 'answers 404 as for an unknown one.';
+
+const DOCUMENT_LINK_REFUSAL = 'Linking a document needs access to the Documents module (for API tokens a `documents:read` scope). '
+  + 'Without it, any document id - a stored one, a visible one or one that does not exist - is refused with this same 403, before any '
+  + 'visibility or deletion check. An empty list or leaving the field out is not a link and changes nothing.';
+
 function jsonBody(schemaRef, description = 'JSON request body') {
   return {
     required: true,
@@ -52,6 +68,7 @@ function op({
   responses = null,
   stateChanging = false,
   documentDeleteConflict = false,
+  documentLinkRefusal = false,
 }) {
   const operation = {
     tags: [tag],
@@ -73,6 +90,9 @@ function op({
     operation.responses[409] = {
       description: 'A requested document is being deleted. Retry after the operation finishes. The response body reason is `DOCUMENT_DELETE_IN_PROGRESS`.',
     };
+  }
+  if (documentLinkRefusal) {
+    operation.responses[403] = { description: DOCUMENT_LINK_REFUSAL };
   }
   if (params.length || stateChanging) {
     operation.parameters = [...params];
@@ -102,18 +122,44 @@ function stringPathParam(name, description) {
   };
 }
 
-function langParam() {
+// Die Werte kommen aus den Locale-Dateien (getSupportedLocales), dieselbe Quelle,
+// aus der die Route ihren `lang` aufloest. Bis #1523 stand hier eine Liste mit
+// 15 Codes, und jede spaeter hinzugekommene Sprache war als ungueltig
+// dokumentiert, obwohl die Route sie bediente.
+//
+// `fallback` sagt, was ohne brauchbares `lang` gilt, denn das ist je Route
+// verschieden: 'household' fuer die Budget-Kategorien (#1859, die Sprache des
+// Haushalts - ein fester `default` waere dort gelogen, er haengt an einer
+// Einstellung), sonst Englisch.
+function langParam({ fallback = 'default' } = {}) {
+  const locales = getSupportedLocales();
+  const supported = `Language code for localized labels. Supported values: ${locales.join(', ')}.`;
+  if (fallback === 'household') {
+    return {
+      name: 'lang',
+      in: 'query',
+      required: false,
+      description: `${supported} Without it, or with a value that is not supported, the labels come in the household language (the \`language\` preference, else derived from \`region\`, else ${DEFAULT_LOCALE}). The response names the language it used in \`lang\`.`,
+      schema: {
+        type: 'string',
+        enum: [...locales],
+      },
+    };
+  }
   return {
     name: 'lang',
     in: 'query',
     required: false,
-    description: 'Language code for localized labels. Supported values: ar, de, el, en, es, fr, hi, it, ja, pt, ru, sv, tr, uk, zh. Defaults to en.',
+    description: `${supported} Defaults to ${DEFAULT_LOCALE}.`,
     schema: {
       type: 'string',
-      default: 'en',
-      enum: ['ar', 'de', 'el', 'en', 'es', 'fr', 'hi', 'it', 'ja', 'pt', 'ru', 'sv', 'tr', 'uk', 'zh'],
+      default: DEFAULT_LOCALE,
+      enum: [...locales],
     },
   };
 }
 
-export { authSecurity, csrfHeaderParam, idempotencyHeaderParam, jsonBody, op, idParam, stringPathParam, langParam };
+export {
+  authSecurity, csrfHeaderParam, idempotencyHeaderParam, jsonBody, op, idParam, stringPathParam, langParam,
+  DOCUMENT_LINKS_READ_NOTE, DOCUMENT_LINK_REFUSAL, BUDGET_LINKS_READ_NOTE,
+};

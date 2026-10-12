@@ -32,6 +32,7 @@ export function authPaths() {
             content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginResponse' } } },
           },
           401: { description: 'Invalid code, or no pending sign-in' },
+          403: { description: 'The account may no longer sign in, for example because it was deactivated in the meantime (`reason: "account_cannot_sign_in"`). No recovery code is spent.' },
           429: { description: 'Too many attempts' },
         },
       }),
@@ -125,6 +126,24 @@ export function authPaths() {
     '/api/v1/auth/logout': {
       post: op({ summary: 'Logout current session', tag: 'Auth', stateChanging: true }),
     },
+    '/api/v1/auth/logout-others': {
+      post: op({
+        summary: 'Sign out all other sessions',
+        tag: 'Auth',
+        stateChanging: true,
+        description: 'Ends every browser session of the signed-in user except the calling one (#1354) and '
+          + 'answers `{ ok: true, ended }` with the number of sessions ended. Only a browser session may call '
+          + 'it: an API token or a wall display has no current session to keep and gets 403. API tokens and '
+          + 'paired wall displays are not sessions and stay valid; revoke them under API tokens and Displays.',
+        responses: {
+          200: { description: 'Other sessions ended; `ended` is their number' },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          403: { $ref: '#/components/responses/Forbidden' },
+          429: { description: 'Too many requests' },
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
+      }),
+    },
     '/api/v1/auth/oidc/config': {
       get: op({
         summary: 'Get sign-in availability',
@@ -159,7 +178,12 @@ export function authPaths() {
         summary: 'Handle OIDC callback',
         tag: 'Auth',
         auth: false,
-        description: 'Consumes the OIDC callback, validates state/nonce/PKCE, creates or finds the linked user, establishes a session, and redirects back to the app. With OIDC_ALLOW_SIGNUP=false an identity that matches no existing account is redirected to /login?error=oidc_signup_disabled instead of being provisioned.',
+        description: 'Consumes the OIDC callback, validates state/nonce/PKCE, creates or finds the linked user, establishes a session, and redirects back to the app. '
+          + 'An identity without a linked account is matched by its verified email address against accounts not yet linked (split-expense guests excluded). '
+          + 'It links only an account whose address nobody but an admin can have set: an account without a password (SSO-only) or an admin account. '
+          + 'Two or more matching accounts redirect to /login?error=oidc_email_ambiguous; a single matching member account that has a password redirects to /login?error=oidc_link_required, and that member links SSO while signed in (POST /api/v1/auth/oidc/link/start). '
+          + 'Neither case creates or links an account, whatever OIDC_ALLOW_SIGNUP says. '
+          + 'With OIDC_ALLOW_SIGNUP=false an identity that matches no existing account is redirected to /login?error=oidc_signup_disabled instead of being provisioned.',
         responses: {
           302: { description: 'Redirect to app or login error page' },
         },
@@ -199,8 +223,12 @@ export function authPaths() {
         tag: 'Auth',
         auth: false,
         requestBody: jsonBody('#/components/schemas/SetupRequest'),
+        description: 'Unknown body fields are ignored. `language` and `timezone` are optional; servers before they were added ignore them as well. '
+          + 'A rejected `timezone` answers 400 with `reason: "invalid_timezone"`, so a client can retry without the field; other validation errors carry no `reason`. '
+          + 'Every failed request counts against the login rate limit.',
         responses: {
           201: { description: 'Admin user created' },
+          400: { $ref: '#/components/responses/BadRequest' },
           403: { $ref: '#/components/responses/Forbidden' },
           409: { description: 'Username already taken' },
         },
@@ -210,7 +238,9 @@ export function authPaths() {
       post: op({
         summary: 'Request a password-reset link',
         description: 'Always responds 200 with a generic body to prevent account enumeration. '
-          + 'A reset email is sent only when the account exists, has a linked email, SMTP is configured, and BASE_URL is set.',
+          + 'A reset email is sent only when the account exists, has a linked email, SMTP is configured, and BASE_URL is set. '
+          + 'The response is sent before the account is looked up; the lookup and the email run afterwards in the background, so the response time does not reveal whether the account exists. '
+          + 'An email address matches regardless of surrounding whitespace and capitalisation; if it belongs to more than one account, no email is sent (guests of shared expenses do not count towards that), so such accounts reset by username.',
         tag: 'Auth',
         auth: false,
         requestBody: {
@@ -393,15 +423,28 @@ export function authPaths() {
       patch: op({
         summary: 'Update current user profile',
         tag: 'Auth',
+        description: 'An address that already belongs to another account (primary or additional address, compared without surrounding whitespace and ASCII letter case; guests of shared expenses do not count) is refused with 409 and `reason: "email_in_use"` when the caller is not an admin. Only newly introduced addresses are checked, so saving an unchanged address stays possible.',
         stateChanging: true,
         requestBody: jsonBody('#/components/schemas/ProfileUpdateRequest'),
+        responses: {
+          200: { description: 'Successful response' },
+          400: { $ref: '#/components/responses/BadRequest' },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          409: { description: 'The email address already belongs to another account (`reason: "email_in_use"`)' },
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
       }),
     },
     '/api/v1/auth/users': {
       get: op({
         summary: 'List family users',
         tag: 'Auth',
-        description: 'Authenticated endpoint used for assignment pickers. Returns public user fields for all family members. '
+        description: 'Lists every account except wall displays: user administration, and the way clients name a person a record already stores. '
+          + 'It is not a picker source: pickers read `GET /api/v1/family/members`. '
+          + 'A deactivated account (see `DELETE /api/v1/auth/users/{id}`) stays in this list, sorted after the active ones, '
+          + 'with `deactivated_at` set to the moment it was deactivated; the field is `null` for an active account. '
+          + 'Within the active and within the deactivated accounts the list follows the household member order (see `GET /api/v1/family/members`): '
+          + '`sort_order` is the position of a household member, `null` for an unplaced member and for every account that is no household member; `is_household_member` tells the two apart. '
           + 'Administrators additionally get sso_only per member; how someone else signs in is not a detail every '
           + 'member needs, for the same reason the 2FA overview is a separate admin endpoint.',
       }),
@@ -430,11 +473,59 @@ export function authPaths() {
         requestBody: jsonBody('#/components/schemas/UserUpdateRequest'),
       }),
       delete: op({
-        summary: 'Delete user',
+        summary: 'Remove user (deactivate or delete)',
+        description: 'Removes an account. What that means depends on what the account leaves behind. '
+          + 'An account with traces in shared data is DEACTIVATED: the row stays, so records keep their author, assignee and balances, '
+          + 'and the answer carries `outcome: "deactivated"`. A trace is any row that references the account outside its own private data, '
+          + 'for example a task, event, note or document it created, an assignment, a shared expense it paid, took part in or recorded, a quick link, or reward points. '
+          + 'An account without traces is deleted as before (`outcome: "deleted"`), together with its private data. '
+          + 'Deactivating ends every way in at once and in one transaction: sessions are ended, API tokens acting as the account or issued by it are revoked, open invitations and display pairing codes it created stop working, '
+          + 'calendar feed addresses stop working, password and SSO sign-in are refused, pending password reset links are dropped, '
+          + 'and push subscriptions, personal notification channels and pending reminders are removed. The role falls back to member. '
+          + 'Private data of the account (health, cycle, private notes, shift plans, its contact card and birthday) is kept. '
+          + 'A deactivated account is no household member any more: it is missing from `GET /api/v1/family/members` and cannot be newly chosen as assignee, attendee or group member, '
+          + 'while references already stored stay valid. `traces` lists the referencing columns with their row counts. '
+          + 'Refused with 400 and a `reason`: `own_account` (the caller\'s own account), `last_admin`, `last_sso_admin`. '
+          + 'Wall displays are managed under `/api/v1/displays` and answer 404 here.',
         tag: 'Auth',
         admin: true,
         stateChanging: true,
         params: [idParam('id', 'User ID')],
+        responses: {
+          200: {
+            description: 'Account deactivated or deleted',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['ok', 'outcome', 'traces'],
+                  properties: {
+                    ok: { type: 'boolean', enum: [true] },
+                    outcome: { type: 'string', enum: ['deactivated', 'deleted'] },
+                    traces: {
+                      type: 'array',
+                      description: 'Columns that reference the account from shared data. Empty when the account was deleted.',
+                      items: {
+                        type: 'object',
+                        required: ['table', 'column', 'rows'],
+                        properties: {
+                          table: { type: 'string' },
+                          column: { type: 'string' },
+                          rows: { type: 'integer', minimum: 1 },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          400: { $ref: '#/components/responses/BadRequest' },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          403: { $ref: '#/components/responses/Forbidden' },
+          404: { description: 'User not found' },
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
       }),
     },
     '/api/v1/auth/api-tokens': {
@@ -463,7 +554,26 @@ export function authPaths() {
         tag: 'Auth',
         admin: true,
         stateChanging: true,
+        description: 'Sets `revoked_at` and keeps the row, so the revocation stays on record. To drop the row of a token that no longer works, use `POST /api/v1/auth/api-tokens/{id}/remove`.',
         params: [idParam('id', 'API token ID')],
+      }),
+    },
+    '/api/v1/auth/api-tokens/{id}/remove': {
+      post: op({
+        summary: 'Remove a revoked or expired API token',
+        tag: 'Auth',
+        admin: true,
+        stateChanging: true,
+        description: 'Deletes the row of a token that is revoked or past its expiry. This cannot be undone. A token that still works is refused with 409 and `reason: "api_token_active"`: revoke it first (`DELETE /api/v1/auth/api-tokens/{id}`), which ends the access and keeps the moment on record.',
+        params: [idParam('id', 'API token ID')],
+        responses: {
+          200: { description: 'The token row was removed' },
+          400: { $ref: '#/components/responses/BadRequest' },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          404: { description: 'No API token with this ID' },
+          409: { description: 'The token is still active. The response body reason is `api_token_active`.' },
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
       }),
     },
   };

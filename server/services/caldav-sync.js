@@ -9,20 +9,30 @@ const log = createLogger('CalDAV');
 
 import * as db from '../db.js';
 import { upsertExternalCalendar } from './external-calendars.js';
-import { assignDefaultToEvent } from './sync-assignment.js';
-import { pruneDeletedEvents, countMirroredEvents, deleteMirroredEvents } from './calendar-prune.js';
+import {
+  legacyColorSnapshotKey, forgetLegacyColorSnapshot, legacyColorChosenIds,
+  legacyColorHealKey, legacyColorHealEnded, legacyColorCutoff,
+} from './legacy-color-snapshot.js';
+import { assignDefaultToEvent, reassignDefaultOnCalendarMove } from './sync-assignment.js';
+import {
+  pruneDeletedEvents, countMirroredEvents, deleteMirroredEvents,
+  countAccountEvents as countEventsOfAccount, deleteAccountEvents,
+} from './calendar-prune.js';
 import * as outbound from './calendar-outbound.js';
-import { processPendingDeletions, processPendingUpdates, flushAccount } from './caldav-outbound.js';
+import { processPendingDeletions, processPendingUpdates, flushAccount, ObjectIndex } from './caldav-outbound.js';
 import { detachAccountRows } from './caldav-todo-outbound.js';
 import { runSerialized } from '../utils/sync-lock.js';
 import { toICSDatetime, escapeICSText } from '../utils/ics-format.js';
 import { eventDateTimeFields } from '../utils/ics-datetime.js';
 import { vtimezoneFor } from '../utils/vtimezone.js';
 import { householdTimeZone } from '../utils/timezone.js';
-import { createCalDAVClient, supportsComponent } from '../utils/caldav-client.js';
+import { createCalDAVClient, supportsComponent, createUploadGate, withAccountOrigin } from '../utils/caldav-client.js';
+import { sqlLooksLikeOwnEventUid } from '../utils/own-uid.js';
+import { sameCredentialOrigin } from '../utils/credential-origin.js';
 import { rruleLine } from './recurrence.js';
 import { nearestIcalColorName } from '../utils/ical-color.js';
 import { outboundEvent } from './outbound-dtstart.js';
+import { followInboundStartChange } from './calendar-occurrence-overrides.js';
 
 // Reused functions from apple-calendar.js
 import {
@@ -38,7 +48,7 @@ import {
 export { toICSDatetime };
 
 function buildCalDAVICS(event, householdZone = null) {
-  const uid  = `oikos-${event.id}@oikos.local`;
+  const uid  = outbound.eventUidFor(event.id);
   const now  = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
   // Die Zeiten und ihre Zone bestimmt eventDateTimeFields; bis #938 stand hier
   // ein blankes `DTSTART:20260830T100000`, das keinen Zeitpunkt bezeichnet,
@@ -81,6 +91,267 @@ function buildCalDAVICS(event, householdZone = null) {
 // --------------------------------------------------------
 // Helper Functions
 // --------------------------------------------------------
+
+/**
+ * SQL-Bedingung der Farb-Heilung (#1270) fuer selbst hochgeladene Zeilen, mit
+ * dem Tabellenpraefix `t` (leer oder `e.`).
+ *
+ * Eine solche Zeile kann eine eingebrannte Farbe tragen: vor v2.49 angelegt,
+ * ohne COLOR hochgeladen (vor #897), und der naechste Inbound schrieb die
+ * Farbe des Kalenders hinein, in dem sie lag - ihres Zielkalenders. Wurde sie
+ * spaeter bearbeitet, fror Migration 167 diese Farbe ein. Das ist die
+ * haeufigste Gruppe von #1270, pauschal ausnehmen darf man sie nicht.
+ *
+ * Sie ist aber auch der Weg fuer Zeilen, die NIE eingebrannt wurden - etwa ein
+ * von `retireLegacyInstances()` (google-calendar.js) abgeloestes
+ * Google-Vorkommen mit user_modified = 1, altem created_at und bewusst
+ * gewaehlter Farbe. Deshalb gilt fuer sie die engere Frage: ist ihre Farbe
+ * genau die ihres EIGENEN Zielkalenders, also die, die damals eingebrannt
+ * wurde? Die Farbe eines anderen Kalenders des Kontos spricht fuer eine Wahl.
+ * Das Ziel hat der Upload seit jeher stehen lassen; eine Zeile ohne Ziel ist
+ * kein Kandidat (der Vergleich mit einem Ziel NULL findet keine Farbe).
+ */
+function uploadedRowRule(t) {
+  // Selbst hochgeladen: beide UID-Muster, aus der einen Quelle (own-uid.js).
+  return `(NOT ${sqlLooksLikeOwnEventUid(`${t}external_calendar_id`)}
+       OR (lower(${t}color) IN (
+             SELECT lower(calendar_color) FROM caldav_calendar_selection
+              WHERE calendar_url = ${t}target_caldav_calendar_url AND calendar_color IS NOT NULL
+             UNION
+             SELECT lower(color) FROM external_calendars
+              WHERE source = 'caldav' AND external_id = ${t}target_caldav_calendar_url AND color IS NOT NULL)))`;
+}
+
+/**
+ * Das Kalender-Home einer Sammlungs-URL fuer die Zurechnung verwaister
+ * Kalender (#1270): Origin plus Pfad ohne letztes Segment, oder null, wenn es
+ * keinen Besitzer erkennen laesst - Query-adressiert oder direkt an der Wurzel.
+ */
+function calendarHome(url) {
+  let parsed;
+  try { parsed = new URL(String(url)); } catch { return null; }
+  if (parsed.search) return null;
+  const segments = parsed.pathname.split('/').filter(Boolean);
+  if (segments.length < 2) return null;
+  return `${parsed.origin}/${segments.slice(0, -1).join('/')}/`;
+}
+
+/**
+ * Zeigen zwei Konto-URLs auf dieselbe Adresse? Host klein, Standardport weg
+ * (beides erledigt `URL`), Schraegstriche am Ende des Pfads weg. Gespeichert
+ * wird die URL unveraendert; verglichen wird normalisiert (#1270).
+ */
+function sameAccountUrl(a, b) {
+  const norm = (raw) => {
+    try {
+      const u = new URL(String(raw).trim());
+      return `${u.protocol}//${u.host}${u.pathname.replace(/\/+$/, '')}${u.search}`;
+    } catch { return String(raw).trim(); }
+  };
+  return norm(a) === norm(b);
+}
+
+
+/**
+ * Laeuft die Farb-Heilung fuer dieses Konto, und mit welchen Farben? null,
+ * wenn nicht. Beim ersten Lauf nach dem Update startet sie die Frist und legt
+ * den Schnappschuss an.
+ *
+ * DER SCHNAPPSCHUSS haelt fest, welche Farbe eine Altzeile bei Fristbeginn
+ * trug. Geheilt wird nur, solange sie genau diese Farbe traegt: waehlt jemand
+ * innerhalb der Frist eine Farbe - auch eine Kalenderfarbe, und auch an einer
+ * schon geheilten Zeile -, ist das eine Wahl nach Fristbeginn, und die bleibt,
+ * selbst wenn der Server die COLOR-Zeile verwirft. Ein Zeitstempel, den nur
+ * eine lokale Bearbeitung setzt, gibt es nicht (`updated_at` setzt ein Trigger
+ * bei jedem UPDATE, auch beim Sync); die Farbe selbst ist der Vergleich.
+ *
+ * EINE FRIST STATT EINES FERTIG-MERKERS. Wann ein Konto "fertig" ist, laesst
+ * sich nicht sicher sagen: eine leere Antwort, ein abgewaehlter oder kurz
+ * fehlender Kalender, ein verworfener VEVENT - jede Regel dafuer liess die
+ * Heilung entweder zu frueh enden oder nie. Eine feste Zeit endet sicher und
+ * gibt jedem Termin, den ein Lauf in dieser Zeit sieht, seine Heilung.
+ */
+function legacyHealState(conn, accountId, { serverCalendars = [], cutoff = null, now = new Date() } = {}) {
+  const key = legacyColorHealKey(accountId);
+  const snapshotKey = legacyColorSnapshotKey(accountId);
+  const value = conn.prepare('SELECT value FROM sync_config WHERE key = ?').get(key)?.value;
+  if (value == null) {
+    // Fristbeginn: Frist und Schnappschuss in EINER Anweisung, damit es keinen
+    // Stand mit dem einen und ohne das andere gibt.
+    const colors = legacyCalendarColors(conn, accountId, serverCalendars);
+    // Schon lokal umgefaerbt, bevor dieser Schnappschuss entsteht: keine
+    // Altlast. Ist die Vormerkliste unlesbar, nimmt er nichts auf.
+    const chosen = legacyColorChosenIds(conn);
+    const snapshot = new Map();
+    for (const row of chosen === null ? [] : legacyCandidateRows(conn, cutoff)) {
+      const color = String(row.color).toLowerCase();
+      if (colors.has(color) && !chosen.has(row.id)) snapshot.set(row.id, color);
+    }
+    conn.prepare('INSERT INTO sync_config (key, value) VALUES (?, ?), (?, ?)').run(
+      key, now.toISOString(), snapshotKey, JSON.stringify(Object.fromEntries(snapshot))
+    );
+    return { colors, snapshot };
+  }
+  // `never` (und jeder andere Wert, der kein Datum ist) schaltet die Heilung
+  // aus. Ein Beginn in der Zukunft - die Uhr ging beim Start vor - verlaengert
+  // sie nicht.
+  //
+  // Bekannte Grenze: die Frist beginnt mit dem ersten Lauf, bei einem Konto,
+  // das lange nicht synchronisiert, also spaet. Das ist dasselbe Risiko wie
+  // ein frueher Beginn; eine gerade gewaehlte Farbe schuetzt der Schnappschuss
+  // (und fuer den laufenden Sync die Neupruefung im UPDATE).
+  //
+  // Ist die Frist vorbei, faellt der Schnappschuss (#1442): aus ihm heilt
+  // nichts mehr. Der Fristbeginn bleibt, sonst finge sie neu an.
+  if (legacyColorHealEnded(value, now)) {
+    conn.prepare('DELETE FROM sync_config WHERE key = ?').run(snapshotKey);
+    return null;
+  }
+  if (now.getTime() < Date.parse(value)) return null;
+  // Fehlt der Schnappschuss oder ist er unlesbar, heilt nichts (fail closed).
+  let parsed;
+  try { parsed = JSON.parse(conn.prepare('SELECT value FROM sync_config WHERE key = ?').get(snapshotKey)?.value ?? ''); }
+  catch { return null; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const snapshot = new Map(Object.entries(parsed).map(([id, color]) => [Number(id), String(color).toLowerCase()]));
+  return { colors: legacyCalendarColors(conn, accountId, serverCalendars), snapshot };
+}
+
+/**
+ * Die Altzeilen, die die Heilung ueberhaupt fassen darf, ohne die Frage nach
+ * der Farbe des Kontos: CalDAV, color_modified = 1, user_modified = 1, mit
+ * Farbe, vor dem Fix entstanden, und hochgeladene nur mit ihrer Zielfarbe.
+ */
+function legacyCandidateRows(conn, cutoff) {
+  return conn.prepare(`
+    SELECT id, color FROM calendar_events
+    WHERE external_source = 'caldav'
+      AND color_modified = 1 AND user_modified = 1 AND color IS NOT NULL
+      AND ${uploadedRowRule('calendar_events.')}
+      AND (? IS NULL OR datetime(created_at) <= datetime(?))
+  `).all(cutoff, cutoff);
+}
+
+/**
+ * Gibt es Altzeilen, die an keinem Kalender eines ANDEREN Kontos haengen und
+ * die dieses Konto damit per UID uebernehmen koennte? Nur dann heilt ein neu
+ * angelegtes oder umgehaengtes Konto (#1270).
+ *
+ * Ein wirklich neues Konto hat keine Termine aus der Zeit vor v2.50. Ein WIEDER
+ * angelegtes schon: `deleteAccount` laesst die Termine standardmaessig stehen,
+ * und der Inbound uebernimmt sie per UID - samt eingebrannter Farbe. Loeschen
+ * und neu Anlegen ist genau das, was jemand mit falschen Farben versucht.
+ * Abgegrenzt wird ueber die Zeilen selbst, nicht ueber die URLs des Kontos:
+ * die Zeile kann noch auf einen Kalender zeigen, der auf dem Server laengst
+ * geloescht ist, waehrend ihr Termin in einem anderen liegt.
+ */
+function hasOrphanedLegacyRows(conn, accountId) {
+  const cutoff = legacyColorCutoff(conn);
+  return !!conn.prepare(`
+    SELECT 1 FROM calendar_events e
+    LEFT JOIN external_calendars x ON x.id = e.calendar_ref_id
+    WHERE e.external_source = 'caldav'
+      AND e.color_modified = 1 AND e.user_modified = 1 AND e.color IS NOT NULL
+      AND ${uploadedRowRule('e.')}
+      AND (? IS NULL OR datetime(e.created_at) <= datetime(?))
+      AND (x.external_id IS NULL
+           OR x.external_id NOT IN (SELECT calendar_url FROM caldav_calendar_selection WHERE account_id <> ?))
+    LIMIT 1
+  `).get(cutoff, cutoff, accountId);
+}
+
+/** Heilung fuer dieses Konto neu entscheiden: Frist verwerfen, ggf. ganz aus. */
+function decideLegacyHeal(conn, accountId) {
+  const key = legacyColorHealKey(accountId);
+  conn.prepare('DELETE FROM sync_config WHERE key IN (?, ?)').run(key, legacyColorSnapshotKey(accountId));
+  if (!hasOrphanedLegacyRows(conn, accountId)) {
+    conn.prepare("INSERT INTO sync_config (key, value) VALUES (?, 'never')").run(key);
+  }
+}
+
+/**
+ * Die Kalenderfarben, die der alte Import (bis v2.48) in Termine DIESES Kontos
+ * eingebrannt haben kann (#1270), kleingeschrieben.
+ *
+ * Nur Sammlungen, die Termine fuehren: eine reine Aufgabenliste (VTODO) hat
+ * nie eine Farbe in einen VEVENT eingebrannt. Konten von vor dem
+ * Komponentenfilter tragen solche Listen noch in der Auswahl (#617). Soweit
+ * `serverCalendars` die Faehigkeiten einer Sammlung kennt, zaehlt ihre Farbe
+ * deshalb nur mit VEVENT; eine Sammlung, die der Server nicht (mehr) meldet,
+ * zaehlt wie bisher.
+ *
+ * Zwei Quellen. Die Auswahl des Kontos traegt jeden Kalender, den der Server
+ * noch meldet, auch abgewaehlte. Ein inzwischen auf dem Server GELOESCHTER
+ * Kalender faellt beim Aktualisieren aus der Auswahl, seine Farbe steht dann
+ * nur noch in `external_calendars` - und genau das ist der Fall, in dem jemand
+ * Termine aus einem alten Kalender umzieht und ihn danach aufgibt. Diese
+ * Tabelle kennt aber kein Konto. Einem Konto zugerechnet wird ein Eintrag dort
+ * deshalb nur, wenn er in keiner fremden Auswahl steht UND im selben
+ * Kalender-Home liegt wie ein Kalender dieses Kontos (die URL ohne ihr letztes
+ * Segment: `/calendars/<nutzer>/` bei Nextcloud und Radicale, `/<dsid>/calendars/`
+ * bei iCloud). Sonst heilte die Farbe eines fremden Kontos eine hier bewusst
+ * gewaehlte.
+ *
+ * Das Home ist eine Schaetzung, und im Zweifel wird NICHT zugerechnet: bei
+ * einer Sammlung, die per Query adressiert wird (`urlParts()` in
+ * utils/caldav-client.js haelt den Query bewusst als Teil der Identitaet),
+ * sagt der Pfad nichts ueber den Besitzer; ein Home direkt an der Wurzel
+ * teilen sich alle Konten eines Servers; und ein Home, in dem auch ein anderes
+ * Konto Kalender fuehrt, gehoert keinem allein. Die Auswahl des Kontos selbst
+ * ist davon nicht betroffen - sie ist gespeicherter Besitz, keine Schaetzung.
+ *
+ * Bekannte Grenze: manche Server legen alle Konten unter ein gemeinsames erstes
+ * Segment ohne Nutzersegment (OX/mailbox.org: `/caldav/<base64-id>/`). Deren
+ * Home ist `/caldav/` fuer jeden. `foreignHomes` erkennt das nur, solange das
+ * andere Konto lebt und eine Auswahl hat - der Kalender eines GELOESCHTEN
+ * OX-Kontos kann dem verbliebenen zugerechnet werden. Ein Schaden entsteht dann
+ * nur bei einer exakt gleichen, bewusst gewaehlten Farbe. Von Radicale
+ * (`/<nutzer>/<kalender>/`, Home ebenfalls ein Segment tief) ist das am Pfad
+ * nicht zu unterscheiden, deshalb bleibt es bei diesem Hinweis.
+ */
+function legacyCalendarColors(conn, accountId, serverCalendars = []) {
+  const byUrl = new Map(serverCalendars.map((sc) => [sc.url, sc]));
+  // Meldet der Server die Sammlung, entscheiden ihre Faehigkeiten. Meldet er
+  // sie nicht mehr, weiss niemand, was sie war: die Auswahl speichert weder
+  // Komponenten noch den Grund einer Abschaltung. Eine ABGESCHALTETE Auswahl,
+  // die der Server nicht mehr listet, zaehlt deshalb nicht mit - sie kann eine
+  // frueher automatisch abgeschaltete Aufgabenliste sein. Ein auf dem Server
+  // geloeschter Kalender, der Termine fuehrte, zaehlt weiter ueber
+  // `external_calendars`: dort landen nur Sammlungen, die als Terminkalender
+  // gelesen wurden.
+  const holdsEvents = (url, enabled = true) => (byUrl.has(url)
+    ? supportsComponent(byUrl.get(url), 'VEVENT')
+    : enabled);
+  const colors = new Set();
+  const homes = new Set();
+  const own = conn.prepare(
+    'SELECT calendar_url, calendar_color, enabled FROM caldav_calendar_selection WHERE account_id = ?'
+  ).all(accountId);
+  for (const row of own) {
+    const h = calendarHome(row.calendar_url);
+    if (h) homes.add(h);
+    if (row.calendar_color && holdsEvents(row.calendar_url, row.enabled === 1)) {
+      colors.add(String(row.calendar_color).toLowerCase());
+    }
+  }
+  const foreignRows = conn.prepare(
+    'SELECT calendar_url FROM caldav_calendar_selection WHERE account_id <> ?'
+  ).all(accountId);
+  const foreign = new Set(foreignRows.map((row) => row.calendar_url));
+  // Ein Home, in dem auch ein anderes Konto Kalender fuehrt, ist nicht
+  // eindeutig: ein verwaister Kalender darin koennte jedem der beiden gehoeren.
+  const foreignHomes = new Set(foreignRows.map((row) => calendarHome(row.calendar_url)).filter(Boolean));
+  const known = conn.prepare(
+    "SELECT external_id, color FROM external_calendars WHERE source = 'caldav' AND color IS NOT NULL"
+  ).all();
+  for (const row of known) {
+    if (foreign.has(row.external_id)) continue;
+    const h = calendarHome(row.external_id);
+    if (!h || !homes.has(h) || foreignHomes.has(h) || !holdsEvents(row.external_id)) continue;
+    colors.add(String(row.color).toLowerCase());
+  }
+  return colors;
+}
 
 function normalizeCalColor(c) {
   if (!c) return null;
@@ -167,32 +438,44 @@ async function addAccount(name, caldavUrl, username, password, { createClient } 
     log.warn('WARNING: DB_ENCRYPTION_KEY is not set - CalDAV credentials will be stored unencrypted.');
   }
 
-  // Insert account
-  const result = db.get().prepare(`
-    INSERT INTO caldav_accounts (name, caldav_url, username, password)
-    VALUES (?, ?, ?, ?)
-  `).run(name, caldavUrl, username, password);
+  // Konto, Kalenderauswahl und die Entscheidung ueber die Farb-Heilung
+  // (#1270) in EINEM Zug: ein Konto ohne diese Entscheidung heilte, obwohl es
+  // nichts zu heilen gibt, und eine Entscheidung ohne Konto zeigte ins Leere.
+  const insertAccount = db.get().transaction(() => {
+    const result = db.get().prepare(`
+      INSERT INTO caldav_accounts (name, caldav_url, username, password)
+      VALUES (?, ?, ?, ?)
+    `).run(name, caldavUrl, username, password);
+    const accountId = result.lastInsertRowid;
 
-  const accountId = result.lastInsertRowid;
+    // OPT-IN, NICHT OPT-OUT (#732): Ein neues Konto bringt seine Kalender
+    // abgewaehlt mit. Vorher lief nach dem Verbinden sofort jeder gefundene
+    // Kalender in den Haushalt - bei einem Konto mit Arbeits-, Geburtstags- und
+    // Feiertagskalendern also drei Kalender, die niemand bestellt hat, und deren
+    // Termine man einzeln wieder loswerden musste. Wer verbindet, waehlt danach
+    // aus; das ist ein Klick mehr und eine Ueberraschung weniger.
+    const calendarData = [];
+    for (const cal of eventCalendars(calendars)) {
+      const calColor = normalizeCalColor(cal.calendarColor) || '#4A90E2';
+      const calName = cal.displayName || 'Unnamed Calendar';
 
-  // OPT-IN, NICHT OPT-OUT (#732): Ein neues Konto bringt seine Kalender
-  // abgewaehlt mit. Vorher lief nach dem Verbinden sofort jeder gefundene
-  // Kalender in den Haushalt - bei einem Konto mit Arbeits-, Geburtstags- und
-  // Feiertagskalendern also drei Kalender, die niemand bestellt hat, und deren
-  // Termine man einzeln wieder loswerden musste. Wer verbindet, waehlt danach
-  // aus; das ist ein Klick mehr und eine Ueberraschung weniger.
-  const calendarData = [];
-  for (const cal of eventCalendars(calendars)) {
-    const calColor = normalizeCalColor(cal.calendarColor) || '#4A90E2';
-    const calName = cal.displayName || 'Unnamed Calendar';
+      db.get().prepare(`
+        INSERT INTO caldav_calendar_selection (account_id, calendar_url, calendar_name, calendar_color, enabled)
+        VALUES (?, ?, ?, ?, 0)
+      `).run(accountId, cal.url, calName, calColor);
 
-    db.get().prepare(`
-      INSERT INTO caldav_calendar_selection (account_id, calendar_url, calendar_name, calendar_color, enabled)
-      VALUES (?, ?, ?, ?, 0)
-    `).run(accountId, cal.url, calName, calColor);
+      calendarData.push({ url: cal.url, name: calName, color: calColor, enabled: false });
+    }
 
-    calendarData.push({ url: cal.url, name: calName, color: calColor, enabled: false });
-  }
+    // Hat das neue Konto nichts zu heilen, laeuft die Heilung dort nie (#1270).
+    // NACH der neuen Auswahl entschieden: eine hochgeladene Altzeile zaehlt nur
+    // mit der Farbe ihres Zielkalenders, und die kann allein in dieser Auswahl
+    // stehen. Die Auswahl des neuen Kontos selbst macht keine Zeile zu einer
+    // mit lebendem Konto - die Abfrage sieht nur die ANDERER Konten.
+    decideLegacyHeal(db.get(), accountId);
+    return { accountId, calendarData };
+  });
+  const { accountId, calendarData } = insertAccount();
 
   log.info(`Added CalDAV account "${name}" with ${calendarData.length} calendars.`);
 
@@ -220,10 +503,31 @@ function listAccounts() {
   }));
 }
 
+/**
+ * Zugangsdaten eines Kontos aendern; ein leeres Feld laesst den gespeicherten
+ * Wert stehen.
+ *
+ * DAS GESPEICHERTE PASSWORT GEHOERT ZU EINEM SERVER UND EINEM BENUTZER, wie bei
+ * CardDAV (server/utils/credential-origin.js). Wer den Server (Schema, Host,
+ * Port) oder den Benutzernamen wechselt, muss es neu eingeben; sonst wirft die
+ * Funktion mit `code = 'password_required'`, bevor irgendetwas gesendet oder
+ * geschrieben ist. Ohne diese Regel testete der Verbindungstest unten die neue
+ * Adresse mit dem gespeicherten Passwort - ein PUT mit fremder Adresse schickte
+ * die Zugangsdaten des Haushalts sofort per Basic Auth dorthin. Ein anderer Pfad
+ * auf demselben Server bleibt ohne Passwort moeglich.
+ */
 async function updateAccount(accountId, { name, caldavUrl, username, password, createClient }) {
   const account = getAccountById(accountId);
   if (!account) {
     throw new Error(`Account ${accountId} not found.`);
+  }
+
+  if (!password
+      && ((caldavUrl && !sameCredentialOrigin(caldavUrl, account.caldav_url))
+        || (username && username !== account.username))) {
+    const err = new Error('A new server or username needs the password again.');
+    err.code = 'password_required';
+    throw err;
   }
 
   // If credentials changed, test connection
@@ -280,9 +584,34 @@ async function updateAccount(accountId, { name, caldavUrl, username, password, c
 
   values.push(accountId);
 
-  db.get().prepare(`
-    UPDATE caldav_accounts SET ${updates.join(', ')} WHERE id = ?
-  `).run(...values);
+  // Neue Adresse oder neuer Benutzer heisst: ein anderes Konto unter derselben
+  // ID. Nur bei einer ECHTEN Aenderung: ein Schraegstrich am Ende, ein
+  // grossgeschriebener Host oder der Standardport sind dieselbe Adresse. Ein
+  // neues Passwort aendert daran nichts.
+  const rehomed = (caldavUrl && !sameAccountUrl(caldavUrl, account.caldav_url))
+    || (username && username !== account.username);
+
+  db.get().transaction(() => {
+    db.get().prepare(`
+      UPDATE caldav_accounts SET ${updates.join(', ')} WHERE id = ?
+    `).run(...values);
+
+    if (rehomed) {
+      // Die Termine bleiben am Konto: liefert der neue Server ihre UIDs,
+      // findet der naechste Abruf dieselben Zeilen wieder (#1860). Die
+      // wartenden Loeschauftraege dagegen meinen Objekte des alten Servers und
+      // fallen im selben Zug - am neuen gibt es fuer sie nichts zu loeschen.
+      const dropped = Number(db.get().prepare(
+        "DELETE FROM calendar_pending_deletions WHERE source = 'caldav' AND caldav_account_id = ?"
+      ).run(accountId).changes) || 0;
+      if (dropped) {
+        log.warn(`Account ${accountId} points to a new server or user: dropped ${dropped} pending deletion(s) meant for the old one.`);
+      }
+      // Die Frist der Farb-Heilung (#1270) gilt dem alten Konto und wird neu
+      // entschieden.
+      decideLegacyHeal(db.get(), accountId);
+    }
+  })();
 
   log.info(`Updated CalDAV account ${accountId}.`);
 
@@ -295,8 +624,15 @@ async function updateAccount(accountId, { name, caldavUrl, username, password, c
  * blieben, aber ihre Kalenderzuordnung verloren (`calendar_ref_id ON DELETE SET
  * NULL`) - Waisen, denen niemand mehr ansieht, woher sie kamen.
  *
- * Die URLs muessen VOR dem Loeschen des Kontos gelesen werden: die Auswahlzeilen
- * haengen per CASCADE am Konto und sind danach fort.
+ * Geloescht wird ueber das Konto der Zeile (`caldav_account_id`, #1860), nicht
+ * ueber die Kalender der Auswahl: dieselbe Kalender-URL kann in zwei Konten
+ * stehen, und die Termine des anderen bleiben.
+ *
+ * OHNE `deleteEvents` bleiben die Termine als Zeilen ohne Konto stehen. Das
+ * naechste Konto, das ihre UID liefert, uebernimmt sie. Was an ihnen noch auf
+ * den Versand wartete, faellt mit dem Konto: es gibt keinen Server mehr, an
+ * den es gehen koennte, und eine wartende Bearbeitung hielte die Zeile sonst
+ * von jeder Uebernahme fern.
  */
 function deleteAccount(accountId, { deleteEvents = false } = {}) {
   const account = getAccountById(accountId);
@@ -313,15 +649,27 @@ function deleteAccount(accountId, { deleteEvents = false } = {}) {
   // lokal nicht mehr löschen, während die entfernte Kopie ohne Konto ohnehin
   // unerreichbar ist. Also entkoppeln, bevor das Konto verschwindet - beides in
   // einem Zug, damit keine Hälfte allein stehen bleibt.
-  const calendarUrls = accountCalendarUrls(accountId);
-
   const { detached, removed } = db.get().transaction(() => {
     // Ohne deleteEvents bleiben die Termine sichtbar stehen, verlieren aber ihre
     // Kalenderzuordnung - das war bis #732 der einzige Ausgang und ist jetzt der
     // ausdruecklich gewaehlte.
-    const cleared = deleteEvents ? deleteMirroredEvents(db.get(), calendarUrls) : 0;
+    const cleared = deleteEvents ? deleteAccountEvents(db.get(), accountId) : 0;
+    // Termine und Loeschauftraege loest der Fremdschluessel vom Konto (SET
+    // NULL bzw. CASCADE). Hier steht es noch einmal ausdruecklich, damit es
+    // nicht davon abhaengt, dass er auf dieser Datei durchgesetzt wird.
+    db.get().prepare(`
+      UPDATE calendar_events
+      SET caldav_account_id = NULL, outbound_dirty = 0, outbound_move_to = NULL, outbound_attempts = 0
+      WHERE caldav_account_id = ?
+    `).run(accountId);
+    db.get().prepare(
+      "DELETE FROM calendar_pending_deletions WHERE source = 'caldav' AND caldav_account_id = ?"
+    ).run(accountId);
     const rows = detachAccountRows(accountId);
     db.get().prepare('DELETE FROM caldav_accounts WHERE id = ?').run(accountId);
+    // Die Frist der Farb-Heilung (#1270) haengt an keinem Fremdschluessel.
+    db.get().prepare('DELETE FROM sync_config WHERE key IN (?, ?)')
+      .run(legacyColorHealKey(accountId), legacyColorSnapshotKey(accountId));
     return { detached: rows, removed: cleared };
   })();
 
@@ -368,7 +716,7 @@ async function getCalendars(accountId, { refresh = false, createClient } = {}) {
       // Die Zahl reist mit der Liste, damit die Rückfrage beim Abwählen sie
       // sofort nennen kann (#732). Ein eigener Endpunkt dafür wäre ein zweiter
       // Roundtrip genau in dem Moment, in dem der Nutzer auf eine Antwort wartet.
-      eventCount: countMirroredEvents(db.get(), [cal.calendar_url]),
+      eventCount: countMirroredEvents(db.get(), [cal.calendar_url], { accountId }),
     }));
   }
 
@@ -441,7 +789,7 @@ function updateCalendarSelection(accountId, calendarUrl, enabled, { deleteEvents
   }
 
   const removed = (!enabled && deleteEvents)
-    ? deleteMirroredEvents(db.get(), [calendarUrl])
+    ? deleteMirroredEvents(db.get(), [calendarUrl], { accountId })
     : 0;
 
   log.info(`Calendar selection updated: account ${accountId}, calendar ${calendarUrl}, enabled=${enabled}`
@@ -450,16 +798,25 @@ function updateCalendarSelection(accountId, calendarUrl, enabled, { deleteEvents
   return { success: true, removed };
 }
 
-/** Die Kalender-URLs eines Kontos - Grundlage für Zählen und Aufräumen (#732). */
-function accountCalendarUrls(accountId) {
-  return db.get().prepare(
-    'SELECT calendar_url FROM caldav_calendar_selection WHERE account_id = ?'
-  ).all(accountId).map((r) => r.calendar_url);
+/**
+ * Die Adressen, an die dieses Konto gezielte Anfragen stellen darf: sein Server
+ * und die Kalender seiner Auswahl (`withAccountOrigin`, #1860).
+ */
+function accountUrls(account) {
+  return [
+    account.caldav_url,
+    ...db.get().prepare(
+      'SELECT calendar_url FROM caldav_calendar_selection WHERE account_id = ?'
+    ).all(account.id).map((r) => r.calendar_url),
+  ];
 }
 
-/** Wie viele gespiegelte Termine hängen an diesem Konto? Für die Rückfrage. */
+/**
+ * Wie viele gespiegelte Termine gehören diesem Konto? Für die Rückfrage vor dem
+ * Löschen - dieselbe Zahl, die `deleteEvents` danach entfernt.
+ */
 function countAccountEvents(accountId) {
-  return countMirroredEvents(db.get(), accountCalendarUrls(accountId));
+  return countEventsOfAccount(db.get(), accountId);
 }
 
 // --------------------------------------------------------
@@ -471,6 +828,35 @@ function countAccountEvents(accountId) {
 // gesamte Dauer blockiert (App friert beim Navigieren ein, #519), wird nach je
 // YIELD_EVERY verarbeiteten Objekten kurz an den Event-Loop zurückgegeben.
 const YIELD_EVERY = 50;
+
+/**
+ * Lokale Termine, die auf ihren Upload in dieses Konto warten. EINE Auswahl für
+ * zwei Fragesteller: der Upload nimmt seine Termine daraus, und der Abruf
+ * übernimmt ein schon oben liegendes eigenes Objekt nur für einen Termin, der
+ * hier steht (adoptOwnEventUpload).
+ *
+ * Ein Ziel ist ein PAAR aus Konto und Kalender, und es zählt nur, solange
+ * dieser Kalender in der Auswahl dieses Kontos eingeschaltet ist (#1860) -
+ * dieselbe Menge, die das Formular anbietet und die die Route annimmt
+ * (`caldavTargetOffered`). Ein gespeichertes Ziel ausserhalb davon bleibt
+ * stehen und wartet: wird der Kalender wieder eingeschaltet, geht der Termin
+ * hinaus.
+ */
+function localUploadsOf(accountId, id = null) {
+  // Mit `id` dieselbe Frage für EINEN Termin: die Upload-Schleife liest ihn
+  // frisch, wenn er an der Reihe ist (#1862) - durch dieselbe Auswahl.
+  return db.get().prepare(`
+    SELECT e.* FROM calendar_events e
+    WHERE e.external_source = 'local' AND e.target_caldav_account_id = ?
+      AND EXISTS (
+        SELECT 1 FROM caldav_calendar_selection s
+        WHERE s.account_id = e.target_caldav_account_id
+          AND s.calendar_url = e.target_caldav_calendar_url
+          AND s.enabled = 1
+      )
+      AND (? IS NULL OR e.id = ?)
+  `).all(accountId, id, id);
+}
 
 /** Echter tsdav-Client für einen Account; in Tests durch eine Factory ersetzbar. */
 const defaultClientFactory = createCalDAVClient;
@@ -485,6 +871,13 @@ async function sync(opts = {}) {
 }
 
 async function runSync({ createClient } = {}) {
+  // Was keinem Konto gehört, wird nie gesendet (#1860), darf aber auch nicht
+  // still liegen bleiben: ein Löschauftrag ohne Konto fällt, eine wartende
+  // Bearbeitung ohne Konto zählt einen Versuch und wird am Ende aufgegeben.
+  // Vor der Kontoschleife und auch ohne Konten: einmal je Lauf.
+  outbound.dropDeletionsWithoutAccount();
+  outbound.ageUpdatesWithoutAccount();
+
   const accounts = getAllAccounts();
 
   if (accounts.length === 0) {
@@ -505,11 +898,61 @@ async function runSync({ createClient } = {}) {
   // Hot-Path-Statements einmal vorbereiten statt pro Event neu (#519): das spart bei
   // großen Kalendern spürbar Zeit und verkürzt damit das synchrone Verarbeitungsfenster.
   const conn = db.get();
-  const selExistingEvent = conn.prepare(
-    `SELECT id, outbound_dirty FROM calendar_events WHERE external_calendar_id = ? AND external_source = 'caldav'`
-  );
-  // Offene Löschungen einmal je Lauf, nicht je eingehendem Termin.
-  const pendingDeletionUids = outbound.pendingDeletionUids('caldav');
+  const selEventsWithUid = conn.prepare(`
+    SELECT id, outbound_dirty, calendar_ref_id, start_datetime, color, color_modified,
+           caldav_account_id, external_object_url
+    FROM calendar_events
+    WHERE external_calendar_id = ? AND external_source = 'caldav'
+    ORDER BY id
+  `);
+  // Eine Zeile ohne Konto an dieses Konto binden. Die Bedingungen stehen im
+  // UPDATE selbst, damit zwischen Prüfen und Schreiben nichts liegt:
+  //   - nichts wartet an ihr (eine Bearbeitung oder ein Umzug ginge sonst an
+  //     das Konto, das zufällig zuerst ihre UID liefert);
+  //   - sie ist nicht für ein ANDERES Konto bestimmt. Ein Ziel, dessen Konto
+  //     es nicht mehr gibt, bestimmt nichts: `target_caldav_account_id` trägt
+  //     keinen Fremdschlüssel und überlebt sein Konto.
+  const claimEvent = conn.prepare(`
+    UPDATE calendar_events SET caldav_account_id = ?
+    WHERE id = ? AND external_source = 'caldav' AND caldav_account_id IS NULL
+      AND outbound_dirty = 0 AND outbound_move_to IS NULL
+      AND (target_caldav_account_id IS NULL OR target_caldav_account_id = ?
+           OR NOT EXISTS (SELECT 1 FROM caldav_accounts a WHERE a.id = calendar_events.target_caldav_account_id))
+  `);
+  /**
+   * EINE ZEILE JE UID, DAS ERSTE KONTO BESITZT SIE (#1860). Welche Zeile gehört
+   * zu dieser UID, wenn `accountId` sie liefert?
+   *
+   *   - die eigene: sie wird aktualisiert;
+   *   - die eines ANDEREN Kontos: `false`. Dieses Konto legt keine zweite an,
+   *     übernimmt, ändert und entfernt die bestehende nicht. Dieselbe UID ist
+   *     fast immer derselbe Termin (ein geteilter Kalender, eine Einladung bei
+   *     beiden Eltern), und der soll einmal im Kalender stehen. Fällt das
+   *     besitzende Konto weg oder liefert es die UID nicht mehr, ist die Zeile
+   *     beim nächsten Abruf frei bzw. fort;
+   *   - eine ohne Konto: sie wird übernommen, wenn `claimEvent` es zulässt,
+   *     sonst `false` - nicht übernommen und nicht verdoppelt;
+   *   - keine: `null`, der Aufrufer legt sie an.
+   *
+   * Unter mehreren Zeilen zählt zuerst die mit genau dieser Objektadresse.
+   */
+  const rowForUid = (uid, objectUrl, accountId) => {
+    const rows = selEventsWithUid.all(uid);
+    if (rows.length === 0) return null;
+    const addressFirst = (list) => [...list].sort(
+      (a, b) => Number(b.external_object_url === objectUrl) - Number(a.external_object_url === objectUrl)
+    );
+    const own = rows.filter((row) => row.caldav_account_id === accountId);
+    if (own.length) return addressFirst(own)[0];
+    if (rows.some((row) => row.caldav_account_id != null)) return false;
+    for (const row of addressFirst(rows)) {
+      if (claimEvent.run(accountId, row.id, accountId).changes > 0) {
+        log.info(`Event ${row.id} (${uid}) had no account and now belongs to account ${accountId}.`);
+        return { ...row, caldav_account_id: accountId };
+      }
+    }
+    return false;
+  };
   // Der Vergleich in der WHERE-Klausel hält das Statement von Schreibvorgängen
   // ab, die nichts ändern: ohne ihn meldet SQLite auch bei identischen Werten
   // changes = 1, sodass sich ein Tick über einen unveränderten Kalender nicht
@@ -545,12 +988,70 @@ async function runSync({ createClient } = {}) {
            OR external_object_url IS NOT COALESCE(?, external_object_url)
           )
   `);
+  // Eingebrannte Kalenderfarbe aus der Zeit vor #891 loesen (#1270). Bis
+  // v2.48 schrieb der Import die Farbe des Kalenders in die Eigenfarb-Spalte,
+  // und Migration 167 hat jede damals schon bearbeitete Zeile als "lokal
+  // umgefaerbt" uebernommen (color_modified = user_modified). Seitdem gewinnt
+  // diese geerbte Farbe dauerhaft gegen die der zugewiesenen Person - und nach
+  // einem Umzug in einen anderen Kalender ist es sogar die Farbe des ALTEN.
+  //
+  // DAS KEHRT DIE ABWAEGUNG VON MIGRATION 167 UM, und zwar nur hier. Die
+  // Migration hat alle bearbeiteten Zeilen geschuetzt, weil sie eine
+  // eingebrannte Farbe von einer bewusst gewaehlten nicht trennen konnte: sie
+  // sah nur die Zeile. Der Sync sieht mehr. Seit #897/#899 schreibt der
+  // Ausgang eine in Yuvomi gewaehlte Farbe als COLOR-Zeile auf den Server, und
+  // der Inbound liest sie als Eigenfarbe - eine Farbe, die dem Termin wirklich
+  // gehoert, steht also am VEVENT. Fehlt dort die COLOR-Zeile und ist der
+  // gespeicherte Wert genau die Farbe eines Kalenders DIESES Kontos, bleibt als
+  // Herkunft praktisch nur der alte Import. Der Farbwaehler bietet nur die
+  // feste Palette an; eine bewusste Wahl trifft einen Kalenderwert also nur
+  // zufaellig.
+  //
+  // EINE FEST BEGRENZTE ZEIT JE KONTO (LEGACY_HEAL_DAYS ab seinem ersten Lauf
+  // nach dem Update), nicht fuer immer: es ist eine Reparatur von Altlasten,
+  // und jeder weitere Lauf truege nur das Fehlalarm-Risiko weiter. Geheilt
+  // wird erst, wenn alle Kalender des Laufs gelesen sind: ein Termin, der beim
+  // Umzug kurz in zwei Kalendern steht, gehoert sich selbst, sobald IRGENDEINE
+  // Kopie eine COLOR-Zeile traegt - die Reihenfolge der Kalender darf das
+  // Ergebnis nicht bestimmen.
+  //
+  // `user_modified = 1`: nur diese Zeilen hat Migration 167 als "umgefaerbt"
+  // uebernommen. Ein alter lokaler Termin, der jetzt hochgeladen wird, bleibt
+  // bei 0 und ist kein Kandidat. Bearbeitet ihn danach jemand, setzt die Route
+  // user_modified = 1 (routes/calendar/crud.js) - dann kann er geheilt werden,
+  // sofern er vor dem Fix entstand und der Server ihn ohne COLOR-Zeile
+  // zurueckgibt. Das ist hingenommen: die Bearbeitung schickt seine Farbe als
+  // COLOR-Zeile hinaus, und behaelt der Server sie, gehoert sie dem Termin.
+  // Geheilt wird zum Zustand "nie eine gelernt" (color_modified = 0), damit
+  // der Ausgang auf dem Server nichts loescht.
+  //
+  // NUR ZEILEN, DIE AELTER SIND ALS DER FIX. Eingebrannt hat allein der Import
+  // vor #891, und #891 kam mit Migration 166. Eine Zeile, die nach deren
+  // `applied_at` angelegt wurde, hat nie eine geerbte Farbe bekommen - auch
+  // nicht auf einem Konto, das zwischen v2.49 und diesem Update angelegt
+  // wurde, und auch nicht nach einem Loeschen und Neuanlegen des Kontos. Ohne
+  // `schema_migrations` (nur in gekuerzten Test-Fixtures, nie nach
+  // `migrate()`) gilt keine Altersgrenze.
+  //
+  // `<=`, nicht `<`: beide Zeitstempel haben nur Sekunden. Eine Zeile aus der
+  // Sekunde der Migration kann noch vom alten Import stammen. Eine Zeile NACH
+  // dem Fix in derselben Sekunde muesste importiert UND von Hand bearbeitet
+  // (user_modified = 1) UND auf eine Kalenderfarbe umgefaerbt sein - in einer
+  // Sekunde, in der der Server gerade erst migriert hat.
+  const legacyCutoff = legacyColorCutoff(conn);
+  const healBurntInColor = conn.prepare(`
+    UPDATE calendar_events SET color = NULL, color_modified = 0
+    WHERE id = ? AND color_modified = 1 AND user_modified = 1
+      AND outbound_dirty = 0 AND outbound_move_to IS NULL AND lower(color) = lower(?)
+      AND ${uploadedRowRule('calendar_events.')}
+      AND (? IS NULL OR datetime(created_at) <= datetime(?))
+  `);
   const insEvent = conn.prepare(`
     INSERT INTO calendar_events
       (title, description, start_datetime, end_datetime, all_day,
        location, color, external_calendar_id, external_source, recurrence_rule, tzid, calendar_ref_id, created_by,
-       external_object_url)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'caldav', ?, ?, ?, ?, ?)
+       external_object_url, caldav_account_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'caldav', ?, ?, ?, ?, ?, ?)
   `);
   // EXDATE-Ausnahmen der Serie (#489/#549). Additiv (INSERT OR IGNORE): entfernt
   // keine lokal vom Nutzer ausgenommenen Einzeltermine.
@@ -565,8 +1066,9 @@ async function runSync({ createClient } = {}) {
     try {
       log.debug(`Syncing CalDAV account ${account.id} ("${account.name}")...`);
 
-      // Create tsdav client (oder injizierte Test-Factory)
-      const client = await makeClient(account);
+      // Create tsdav client (oder injizierte Test-Factory). Gezielte Anfragen
+      // stellt er nur an den Server dieses Kontos.
+      const client = withAccountOrigin(await makeClient(account), accountUrls(account));
 
       // Get enabled calendars for this account
       const enabledCalendars = db.get().prepare(`
@@ -583,6 +1085,28 @@ async function runSync({ createClient } = {}) {
       // Fetch all calendars from server
       const serverCalendars = await client.fetchCalendars();
 
+      // Der Server nennt KEINEN Kalender, obwohl welche ausgewählt sind: das
+      // ist eine unvollständige Antwort (ein Multistatus, der nur die
+      // Home-Collection nennt oder jede Ressource mit 403 quittiert), kein
+      // leeres Konto. Derselbe Leer-Guard wie beim Prune (#508) - sonst gälte
+      // jeder Kalender als verschwunden und würde abgeschaltet.
+      if (serverCalendars.length === 0) {
+        log.warn(
+          `Account ${account.id}: the server listed no calendars, but ${enabledCalendars.length} are selected. ` +
+          `Skipping this run - assuming an incomplete answer rather than a deleted account.`
+        );
+        continue;
+      }
+
+      // Heilung eingebrannter Kalenderfarben (#1270), siehe oben. Nach dem
+      // Abruf der Kalender, weil deren Faehigkeiten die Farbmenge begrenzen.
+      const heal = legacyHealState(conn, account.id, { serverCalendars, cutoff: legacyCutoff });
+      // Kandidaten erst sammeln, geheilt wird nach allen Kalendern: UIDs, die
+      // in IRGENDEINER Kopie dieses Laufs eine COLOR-Zeile tragen, bleiben.
+      const healCandidates = new Map();
+      const coloredUids = new Set();
+      const changedIds = new Set();
+
       // Inbound sync: CalDAV → Yuvomi
       let accountEventCount = 0;
       let accountChangedCount = 0;
@@ -594,9 +1118,18 @@ async function runSync({ createClient } = {}) {
       const accountUids = new Set();
       // UID → das Kalenderobjekt, in dem sie steht (#593). Ausgehende Löschungen
       // brauchen dessen URL, Änderungen zusätzlich seinen Originalinhalt.
-      const objectIndex   = new Map();
+      const objectIndex   = new ObjectIndex();
       const calendarsByUrl = new Map();
       const ownCalendarUrls = new Set();
+      // Wurde jeder eingeschaltete Kalender gelesen? Nur dann belegt ein
+      // fehlendes Objekt, dass es auf dem Server fort ist.
+      let fetchedEveryCalendar = true;
+      // Offene Löschungen DIESES Kontos, einmal je Konto statt je Termin. Die
+      // Löschung in einem Konto verdeckt nicht den Termin, den ein anderes
+      // unter derselben UID führt. Und je OBJEKT, nicht je UID (#1861): nach
+      // einem Umzug, dessen Quelle ihr Objekt nicht hergibt, liegt dieselbe
+      // UID in zwei Kalendern, und gemeint ist nur das Objekt in der Quelle.
+      const awaitsDeletion = outbound.pendingDeletionGuard('caldav', { accountId: account.id });
 
       for (const selCal of enabledCalendars) {
         // Find matching calendar from server
@@ -627,15 +1160,21 @@ async function runSync({ createClient } = {}) {
           continue;
         }
 
+        // Als Umzugsziel zählt der Kalender, sobald die AUFLISTUNG ihn nennt -
+        // vor dem Objektabruf. Ein Umzug schreibt in das Ziel, er liest es
+        // nicht; scheitert nur dessen Abruf, gälte es sonst als verschwunden
+        // und der wartende Umzug würde verworfen.
+        calendarsByUrl.set(selCal.calendar_url, serverCal);
+
         // Fetch calendar objects
         let calObjects;
         try {
           calObjects = await client.fetchCalendarObjects({ calendar: serverCal });
         } catch (err) {
           log.error(`Failed to fetch calendar objects from ${selCal.calendar_name}:`, err.message);
+          fetchedEveryCalendar = false;
           continue;
         }
-        calendarsByUrl.set(selCal.calendar_url, serverCal);
         ownCalendarUrls.add(selCal.calendar_url);
 
         // Upsert external calendar metadata
@@ -684,9 +1223,32 @@ async function runSync({ createClient } = {}) {
 
               // Vom Nutzer gelöscht und noch nicht auf dem Server: nicht wieder
               // anlegen, sonst kehrt der Termin bei jedem Sync zurück (#593).
-              if (pendingDeletionUids.has(ev.uid)) continue;
+              if (awaitsDeletion(ev.uid, selCal.calendar_url, obj.url ?? null)) continue;
 
-              const existing = selExistingEvent.get(ev.uid);
+              let existing = rowForUid(ev.uid, obj.url ?? null, account.id);
+              // Die Zeile gehört einem anderen Konto, oder sie hat keines und
+              // ist nicht zu übernehmen: nicht anfassen, keine zweite anlegen.
+              if (existing === false) continue;
+
+              // Der eigene Upload, dessen Antwort verloren ging: die Zeile ist
+              // noch lokal, das Objekt liegt schon hier. In die bestehende
+              // Zeile übernehmen statt eine zweite anzulegen; sie ist danach
+              // als geändert vorgemerkt, der Zweig darunter lässt sie stehen
+              // und der Outbound dieses Laufs trägt den lokalen Stand hinauf.
+              if (!existing && obj.url
+                  && outbound.adoptOwnEventUpload({
+                    source: 'caldav', uid: ev.uid, objectUrl: obj.url, calRefId,
+                    calendarUrl: selCal.calendar_url, accountId: account.id,
+                    // Nur ein Termin, der auf den Upload in GENAU diesen
+                    // Kalender dieses Kontos wartet - die UID kommt vom
+                    // Server und weist nichts aus.
+                    isWaitingHere: (eventId) => localUploadsOf(account.id).some(
+                      (e) => e.id === eventId && e.target_caldav_calendar_url === selCal.calendar_url
+                    ),
+                  })) {
+                existing = rowForUid(ev.uid, obj.url ?? null, account.id);
+                if (existing === false) continue;
+              }
 
               // Eine lokale Bearbeitung, die noch auf ihren Push wartet, darf der
               // Inbound nicht mit dem alten Serverstand überschreiben (#593).
@@ -709,14 +1271,33 @@ async function runSync({ createClient } = {}) {
                   ev.allDay ? 1 : 0, ev.location, ev.rrule, ev.tzid ?? null, evColor, calRefId,
                   obj.url ?? null,
                 ];
+                // `hasColor`, nicht `evColor`: auch eine COLOR-Zeile mit einem
+                // unlesbaren Wert (etwa #RRGGBBAA) sagt, dass der Server ueber
+                // DIESEN Termin spricht.
+                if (ev.hasColor) coloredUids.add(ev.uid);
+                else if (heal !== null
+                  && existing.color_modified === 1 && existing.color != null
+                  && heal.colors.has(String(existing.color).toLowerCase())
+                  && heal.snapshot.get(existing.id) === String(existing.color).toLowerCase()) {
+                  healCandidates.set(existing.id, { uid: ev.uid, color: existing.color });
+                }
                 changed = updEvent.run(...values, existing.id, ...values).changes > 0;
                 eventId = existing.id;
+                // Auf dem Server verschoben (#1377): die Erinnerungen ziehen mit.
+                if (changed) followInboundStartChange(conn, eventId, existing.start_datetime, ev.dtstart);
+                // Von einem Kalender in einen anderen verschoben (#1270): die
+                // unangetastete Standard-Zuweisung zieht mit um.
+                reassignDefaultOnCalendarMove(db.get(), eventId, {
+                  fromCalRefId: existing.calendar_ref_id,
+                  toCalRefId: calRefId,
+                  toDefaultUserId: calDefaultAssignee,
+                });
               } else {
                 // Insert
                 const inserted = insEvent.run(
                   ev.summary, ev.description, ev.dtstart, ev.dtend,
                   ev.allDay ? 1 : 0, ev.location, evColor, ev.uid, ev.rrule, ev.tzid ?? null, calRefId, createdBy,
-                  obj.url ?? null
+                  obj.url ?? null, account.id
                 );
                 eventId = Number(inserted.lastInsertRowid);
                 changed = true;
@@ -735,10 +1316,18 @@ async function runSync({ createClient } = {}) {
               }
 
               accountEventCount++;
-              if (changed) accountChangedCount++;
+              if (changed) { accountChangedCount++; changedIds.add(eventId); }
             } catch (err) {
               log.error(`Failed to upsert event UID ${ev.uid}:`, err.message);
             }
+          }
+
+          // Auch ein Objekt, aus dem sich kein Termin lesen liess, liegt an
+          // seiner Adresse: eine wartende Löschung findet es darüber.
+          if (obj.url) {
+            objectIndex.noteObject({
+              url: obj.url, etag: obj.etag, data: obj.data, calendarUrl: selCal.calendar_url,
+            });
           }
 
           // Nach je YIELD_EVERY Objekten dem Event-Loop Luft geben, damit ein großer
@@ -749,6 +1338,29 @@ async function runSync({ createClient } = {}) {
         }
       }
 
+      // Farb-Heilung (#1270): erst jetzt, nachdem jede Kopie jeder UID gesehen
+      // wurde. Eine reine Heilung zaehlt als Aenderung, aber nur einmal je Termin.
+      // Zwischen dem Sammeln und hier liegen die awaits der uebrigen Kalender:
+      // waehlt in der Zeit jemand eine Farbe, steht der Termin auf
+      // outbound_dirty und traegt eine andere Farbe. Das UPDATE prueft beides
+      // neu, sonst naehme es die gerade gewaehlte Farbe mit. Ein anstehender
+      // Umzug (outbound_move_to) schuetzt ebenso: ein reiner Umzug setzt kein
+      // outbound_dirty, und danach zeigt target_caldav_calendar_url schon auf
+      // den neuen Kalender.
+      const healedIds = [];
+      for (const [eventId, { uid, color }] of healCandidates) {
+        if (coloredUids.has(uid)) continue;
+        if (healBurntInColor.run(eventId, color, legacyCutoff, legacyCutoff).changes > 0) {
+          healedIds.push(eventId);
+          if (!changedIds.has(eventId)) accountChangedCount++;
+        }
+      }
+      // Geheilt faellt die Zeile aus dem Schnappschuss: eine spaetere Wahl
+      // derselben Farbe ist dann eine Wahl, keine Altlast. Gelesen wird der
+      // gespeicherte Stand, nicht der dieses Laufs - eine Umfaerbung ueber die
+      // Route waehrend des Laufs hat ihn womoeglich schon verkleinert.
+      forgetLegacyColorSnapshot(conn, healedIds);
+
       // Löschphase: erst nach allen Kalendern, damit `accountUids` vollständig ist
       // und ein zwischen Kalendern verschobener Termin nicht fälschlich verschwindet.
       let deletedCount = 0;
@@ -756,6 +1368,7 @@ async function runSync({ createClient } = {}) {
         try {
           const removed = pruneDeletedEvents(db.get(), {
             calRefId, calendarUids, accountUids, source: 'caldav', calendarName,
+            accountId: account.id,
           });
           if (removed > 0) {
             log.info(`Calendar "${calendarName}": removed ${removed} event(s) deleted on the server.`);
@@ -770,24 +1383,34 @@ async function runSync({ createClient } = {}) {
       // Weg zum Objekt für Bestandstermine erst aus dessen Abruf bekannt wird;
       // der Inbound überspringt dafür alles, was hier noch aussteht.
       try {
-        const removed = await processPendingDeletions(client, 'caldav', objectIndex, ownCalendarUrls);
-        if (removed) log.info(`${removed} pending deletion(s) applied on the server.`);
-        const pushed = await processPendingUpdates(client, 'caldav', objectIndex, calendarsByUrl);
+        // Gemeldet wird, was der Server gelöscht hat - nicht, was ohne Anfrage fiel.
+        const deletions = { sent: 0 };
+        await processPendingDeletions(client, 'caldav', objectIndex, ownCalendarUrls, {
+          accountId: account.id, complete: fetchedEveryCalendar, outcome: deletions,
+        });
+        if (deletions.sent) log.info(`${deletions.sent} pending deletion(s) applied on the server.`);
+        const pushed = await processPendingUpdates(client, 'caldav', objectIndex, calendarsByUrl, {
+          accountId: account.id, fullRun: true,
+        });
         if (pushed) log.info(`${pushed} local change(s) pushed to the server.`);
       } catch (err) {
         log.error(`Outbound changes failed for account ${account.id}:`, err.message);
       }
 
       // Outbound sync: Yuvomi → CalDAV (events with target_caldav_account_id)
-      const localEvents = db.get().prepare(`
-        SELECT * FROM calendar_events
-        WHERE external_source = 'local' AND target_caldav_account_id = ?
-      `).all(account.id);
+      const localEvents = localUploadsOf(account.id);
 
       // Einmal je Lauf: die Zone, an der naive Zeiten haengen (#938).
       const householdZone = householdTimeZone(db.get());
 
-      for (const event of localEvents) {
+      const uploadGate = createUploadGate();
+      for (const listed of localEvents) {
+        // Frisch lesen (#1862): die Liste stammt von vor der Schleife, und
+        // jeder Upload davor war ein await. Wer inzwischen bearbeitet wurde,
+        // geht mit dem Stand von jetzt hinauf; wer gelöscht wurde oder nicht
+        // mehr auf den Upload in dieses Konto wartet, gar nicht.
+        const [event] = localUploadsOf(account.id, listed.id);
+        if (!event) continue;
         try {
           // Find target calendar
           const targetCal = serverCalendars.find(sc => sc.url === event.target_caldav_calendar_url);
@@ -797,45 +1420,42 @@ async function runSync({ createClient } = {}) {
             continue;
           }
 
-          const uid     = `oikos-${event.id}@oikos.local`;
+          // Der Kalender hat in diesem Lauf schon abgelehnt: nicht für jeden
+          // wartenden Termin dieselbe Absage abholen.
+          if (uploadGate.isClosed(targetCal.url)) continue;
+
+          const uid     = outbound.eventUidFor(event.id);
           const icsData = buildCalDAVICS(event, householdZone);
 
-          // Upload to CalDAV
-          await client.createCalendarObject({
-            calendar: targetCal,
-            filename: `${uid}.ics`,
-            iCalString: icsData,
-          });
+          // Upload to CalDAV. Ein 412 auf den eigenen Namen ist der eigene
+          // frühere Upload und wird übernommen (uploadNewEvent).
+          const { objectUrl, adopted } = await outbound.uploadNewEvent(client, targetCal, uid, icsData);
 
-          // Objekt-URL und Kalenderzuordnung festhalten: ohne sie wäre der frisch
-          // hochgeladene Termin für spätere Änderungen und Löschungen unerreichbar,
-          // bis ihn der nächste Inbound-Lauf wiederfindet (#593).
-          const objectUrl = `${String(targetCal.url).replace(/\/?$/, '/')}${uid}.ics`;
           const calRefId  = upsertExternalCalendar(
             'caldav', event.target_caldav_calendar_url,
             targetCal.displayName || event.target_caldav_calendar_url, null
           );
-          // `color_modified` mit hoch: die Farbe, die gerade als CSS3-Name
-          // hinausging, ist unsere. Der Name ist eine verlustbehaftete Abbildung
-          // des Hex-Werts, und ohne das Flag holte der nächste Inbound-Lauf
-          // genau ihn zurück und überschriebe den exakten Wert mit dem
-          // gerundeten (#899). Ein Termin, der gar keine eigene Farbe trägt,
-          // behält seinen Zustand - dann ist nichts hinausgegangen, was wir
-          // verteidigen müssten.
-          db.get().prepare(`
-            UPDATE calendar_events
-            SET external_source = 'caldav', external_calendar_id = ?,
-                external_object_url = ?, calendar_ref_id = ?,
-                color_modified = CASE WHEN color IS NOT NULL THEN 1 ELSE color_modified END
-            WHERE id = ?
-          `).run(uid, objectUrl, calRefId, event.id);
+          // Gebucht wird gegen den Stand NACH dem await (bookEventUpload).
+          const booked = outbound.bookEventUpload(event, {
+            source: 'caldav', uid, objectUrl, calRefId, adopted, accountId: account.id,
+            calendarUrl: event.target_caldav_calendar_url,
+          });
+          if (booked !== 'mirrored') continue;
 
           accountEventCount++;
           accountChangedCount++;
         } catch (err) {
-          log.error(`Failed to upload event ${event.id} to CalDAV:`, err.message);
+          const calendarUrl = event.target_caldav_calendar_url;
+          if (!uploadGate.refused(calendarUrl, err)) {
+            log.error(`Failed to upload event ${event.id} to CalDAV:`, err.message);
+          }
         }
       }
+      // EINE Zeile je Kalender, der in diesem Lauf abgelehnt hat.
+      uploadGate.report((calendarUrl, err, waiting) => log.error(
+        `Calendar ${calendarUrl} is not accepting uploads (${err.message}); `
+        + `${waiting} event(s) stay local and are tried again on the next run.`
+      ));
 
       // Update last_sync for account
       db.get().prepare(`
@@ -888,58 +1508,43 @@ async function flushOutbound(opts = {}) {
 }
 
 async function runFlushOutbound({ createClient } = {}) {
-  const idle = { deleted: 0, updated: 0 };
-  const deletions = outbound.pendingDeletions('caldav');
-  const updates   = outbound.pendingUpdates('caldav');
-  if (!deletions.length && !updates.length) return idle;
-
-  const conn = db.get();
-  const accountForCalendar = conn.prepare(
-    'SELECT account_id FROM caldav_calendar_selection WHERE calendar_url = ? LIMIT 1'
-  );
-  const calendarForRef = conn.prepare(
+  const calendarForRef = db.get().prepare(
     `SELECT external_id FROM external_calendars WHERE id = ? AND source = 'caldav'`
   );
 
-  // Beides nach Account bündeln: ein Client je Konto, nicht je Termin.
-  const buckets = new Map();
-  const bucket = (accountId) => {
-    if (!buckets.has(accountId)) buckets.set(accountId, { deletions: [], updates: [], needsCalendars: false });
-    return buckets.get(accountId);
-  };
-
-  for (const row of deletions) {
-    if (!row.object_url) continue; // ohne URL hilft nur der volle Abruf des Syncs
-    const accountId = accountForCalendar.get(row.calendar_external_id)?.account_id;
-    if (accountId) bucket(accountId).deletions.push(row);
-  }
-
-  for (const event of updates) {
-    const calendarUrl = (event.calendar_ref_id ? calendarForRef.get(event.calendar_ref_id)?.external_id : null)
-      || event.target_caldav_calendar_url || null;
-    if (!calendarUrl || !event.external_object_url) continue;
-    const accountId = accountForCalendar.get(calendarUrl)?.account_id;
-    if (!accountId) continue;
-    const b = bucket(accountId);
-    b.updates.push({ ...event, __calendarUrl: calendarUrl });
-    if (event.outbound_move_to) b.needsCalendars = true;
-  }
-
-  if (buckets.size === 0) return idle;
-
+  // Je Konto die Arbeit, die IHM gehört (#1860): das Konto steht an der Zeile
+  // und am Löschauftrag. Vorher wurde es über die Kalender-URL gesucht, und
+  // führten zwei Konten denselben Kalender, gewann das erste.
   const makeClient = createClient || defaultClientFactory;
   const total = { deleted: 0, updated: 0 };
-  for (const [accountId, work] of buckets) {
-    const account = getAccountById(accountId);
-    if (!account) continue;
+  for (const account of getAllAccounts()) {
+    // Was in einem Kalender ausserhalb der Auswahl dieses Kontos liegt, fasst
+    // der Sofortversuch nicht an.
+    const calendarUrls = new Set(accountUrls(account).slice(1));
+    // Ohne URL hilft nur der volle Abruf des Syncs.
+    const deletions = outbound.pendingDeletions('caldav', { accountId: account.id })
+      .filter((row) => row.object_url && (!row.calendar_external_id || calendarUrls.has(row.calendar_external_id)));
+    const updates = [];
+    let needsCalendars = false;
+    for (const event of outbound.pendingUpdates('caldav', { accountId: account.id })) {
+      const calendarUrl = (event.calendar_ref_id ? calendarForRef.get(event.calendar_ref_id)?.external_id : null)
+        || event.target_caldav_calendar_url || null;
+      if (!calendarUrl || !event.external_object_url || !calendarUrls.has(calendarUrl)) continue;
+      updates.push({ ...event, __calendarUrl: calendarUrl });
+      if (event.outbound_move_to) needsCalendars = true;
+    }
+    if (!deletions.length && !updates.length) continue;
+
     try {
-      const client = await makeClient(account);
-      const res = await flushAccount(client, 'caldav', work);
+      const client = withAccountOrigin(await makeClient(account), accountUrls(account));
+      const res = await flushAccount(client, 'caldav', {
+        deletions, updates, needsCalendars, accountId: account.id, calendarUrls,
+      });
       total.deleted += res.deleted;
       total.updated += res.updated;
     } catch (err) {
       // Unkritisch: alles bleibt vorgemerkt, der nächste Sync-Lauf zieht nach.
-      log.warn(`Immediate outbound attempt failed for account ${accountId}: ${err.message}`);
+      log.warn(`Immediate outbound attempt failed for account ${account.id}: ${err.message}`);
     }
   }
   return total;

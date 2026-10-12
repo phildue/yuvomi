@@ -54,6 +54,7 @@ function errorMessage(err) {
     account_duplicate: 'settings.cardavErrorDuplicate',
     account_not_found: 'settings.cardavErrorAccountNotFound',
     addressbook_not_found: 'settings.cardavErrorAddressbookNotFound',
+    password_required: 'settings.cardavErrorPasswordRequired',
     internal: 'common.errorGeneric',
     invalid_id: 'common.errorGeneric',
   };
@@ -544,9 +545,9 @@ function openAccountModal(account, onDone) {
              am Fuß gelesen, nicht als dritter Hinweis unter einem leeren Feld. -->
         <p class="form-hint settings-form-note">${t('settings.cardavCredentialsTrustHint')}</p>
         <div id="cardav-account-error" class="form-error" role="alert" hidden></div>
-        <div class="modal-actions">
-          <button type="button" class="btn btn--ghost" id="cardav-account-cancel">${t('common.cancel')}</button>
-          <button type="submit" class="btn btn--primary">${t('common.save')}</button>
+        <div class="modal-panel__footer modal-panel__footer--plain">
+          <button type="button" class="btn btn--secondary" id="cardav-account-cancel">${t('common.cancel')}</button>
+          <button type="submit" class="btn btn--primary">${isEdit ? t('common.save') : t('common.add')}</button>
         </div>
       </form>
     `,

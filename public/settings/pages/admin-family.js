@@ -6,10 +6,14 @@ import {
   t,
 } from '/i18n.js';
 import { esc } from '/utils/html.js';
+import { initials } from '/utils/initials.js';
 import { prefersInkText } from '/utils/contrast.js';
 import { AVATAR_COLORS } from '/utils/color.js';
+import { sortMembers } from '/utils/member-order.js';
+import { makeSortable } from '/utils/sortable.js';
+import { vibrate } from '/utils/ux.js';
 import { openModal, closeModal, confirmModal, refocusAfterRender } from '/components/modal.js';
-import { createRetryState, toggleRowHtml } from '/settings/components.js';
+import { createRetryState, toggleRowHtml, settingSwitchRowHtml } from '/settings/components.js';
 import {
   renderUserMultiSelect, getSelectedUserIds, bindUserMultiSelect,
 } from '/components/user-multi-select.js';
@@ -69,11 +73,6 @@ function appendCapabilityState(text, state) {
   return state ? `${text} · ${state}` : text;
 }
 
-function initials(name) {
-  if (!name) return '?';
-  return name.split(' ').map((w) => w[0]).slice(0, 2).join('').toUpperCase();
-}
-
 function familyRoleLabel(role) {
   return t(`settings.familyRole${String(role || 'other').replace(/(^|_)([a-z])/g, (_, __, c) => c.toUpperCase())}`);
 }
@@ -98,7 +97,7 @@ function clearError(element) {
 
 function avatarHtml(user, className = 'settings-avatar') {
   const safeName = esc(user?.display_name || '');
-  const fallback = esc(initials(user?.display_name || ''));
+  const fallback = esc(initials(user?.display_name, '?'));
   const background = esc(user?.avatar_color) || 'var(--color-accent)';
   // Die Farbe waehlt das Mitglied selbst; auf hellen Toenen lagen die weissen
   // Initialen bei 3,5:1 und 2,8:1 (Critique 2026-07-27).
@@ -116,7 +115,8 @@ function avatarEditorHtml(user, prefix) {
       <button type="button" class="settings-avatar-button" id="${prefix}-avatar-preview" aria-label="${t('settings.profilePictureLabel')}">
         ${avatarHtml(user, 'settings-avatar settings-avatar--lg')}
       </button>
-      <input class="sr-only" type="file" id="${prefix}-avatar-file" accept="image/png,image/jpeg,image/webp" />
+      <input class="sr-only" type="file" id="${prefix}-avatar-file" accept="image/png,image/jpeg,image/webp"
+        aria-label="${t('settings.profilePictureLabel')}" tabindex="-1" />
       <div class="settings-avatar-actions">
         <button type="button" class="settings-avatar-action" id="${prefix}-avatar-edit" aria-label="${t('settings.profilePictureLabel')}" title="${t('settings.profilePictureLabel')}">
           <i data-lucide="edit-2" aria-hidden="true"></i>
@@ -147,11 +147,37 @@ function bindAvatarPicker(container, prefix) {
   });
 }
 
-function memberHtml(u, currentUserId) {
+function memberHtml(u, currentUserId, { orderable = false, aligned = false } = {}) {
+  // Der Griff der Haushaltsreihenfolge (#1644). Ein BUTTON wie in der
+  // Einkaufsliste: er traegt den Tastaturpfad selbst (Pfeiltasten bei Fokus),
+  // statt ein Auf/Ab-Paar neben Bearbeiten und Entfernen zu stellen. Nur an
+  // Zeilen, die eine Position haben koennen - Hauspersonal, Gaeste und
+  // Ehemalige stehen in dieser Verwaltung, aber nicht in der Reihenfolge.
+  const handle = orderable ? `
+      <button type="button" class="row-action settings-member__drag" data-member-handle="${u.id}"
+              aria-label="${esc(t('shopping.reorderHandle', { name: u.display_name }))}"
+              title="${esc(t('shopping.reorderHandleHint'))}">
+        <i data-lucide="grip-vertical" class="icon-md" aria-hidden="true"></i>
+      </button>`
+    // Eine Zeile ohne Position (Personal, Gast, ehemalig) haelt den Platz des
+    // Griffs frei, solange die Liste Griffe zeigt - sonst stuende ihr Avatar
+    // links neben der Flucht der anderen. Ein leerer Platz, kein toter Knopf.
+    : aligned ? `
+      <span class="row-action settings-member__drag settings-member__drag--none" aria-hidden="true">
+        <i data-lucide="grip-vertical" class="icon-md"></i>
+      </span>` : '';
   // Konten der Haushaltshilfe sind keine Familienmitglieder: sie tragen das
-  // Personal-Label statt einer Familienrolle (Audit A2-25e).
-  const familyRole = u.is_worker ? t('housekeeping.staff') : familyRoleLabel(u.family_role);
+  // Label ihrer Rolle statt einer Familienrolle (Audit A2-25e). Ein eigener
+  // Schluessel: der Reiter im Modul nennt die Mehrzahl, der Ersatz fuer einen
+  // fehlenden Namen ist kein Rollenname (#1723).
+  const familyRole = u.is_worker ? t('housekeeping.workerRole') : familyRoleLabel(u.family_role);
   const systemRole = u.role === 'admin' ? ` · ${esc(t('settings.systemAdminBadge'))}` : '';
+  // Ein ehemaliges Konto (#1381): die Zeile bleibt, damit sichtbar ist, wen
+  // die Verwaltung deaktiviert hat - Eintraege nennen die Person weiter.
+  // Bearbeiten laesst sich so ein Konto hier nicht mehr; entfernen schon, das
+  // loescht es, sobald nichts Geteiltes mehr auf es zeigt.
+  const former = Boolean(u.deactivated_at);
+  const formerBadge = former ? ` · ${esc(t('settings.memberFormerBadge'))}` : '';
   const profileMeta = [
     u.phone ? t('settings.memberPhoneMeta', { value: u.phone }) : '',
     u.email || '',
@@ -161,48 +187,35 @@ function memberHtml(u, currentUserId) {
   // erst bei Hover/Fokus laut. Der eigene Account bekommt keine Lösch-Aktion
   // in der Mitgliederliste (Audit A2-25d).
   const deleteBtn = u.id === currentUserId ? '' : `
-      <button class="row-action row-action--danger" data-delete-user="${u.id}" data-name="${esc(u.display_name)}" aria-label="${esc(u.display_name)} ${t('settings.deleteMemberLabel')}" title="${t('settings.deleteMemberLabel')}">
+      <button class="row-action row-action--danger" data-delete-user="${u.id}" data-name="${esc(u.display_name)}" aria-label="${esc(t('settings.removeMemberNamed', { name: u.display_name }))}" title="${esc(t('settings.removeMemberLabel'))}">
         <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>
       </button>`;
+  const editBtn = former ? '' : `
+      <button class="row-action" data-edit-user="${u.id}" aria-label="${esc(t('common.editNamed', { name: u.display_name }))}" title="${t('settings.editMemberLabel')}">
+        <i data-lucide="edit-2" class="icon-md" aria-hidden="true"></i>
+      </button>`;
   return `
-    <li class="settings-member" data-id="${u.id}">
+    <li class="settings-member${former ? ' settings-member--former' : ''}${orderable ? ' settings-member--orderable' : ''}" data-id="${u.id}">${handle}
       ${avatarHtml(u, 'settings-avatar settings-avatar--sm')}
       <div class="settings-member__info">
-        <span class="settings-member__name">${esc(u.display_name)}</span>
-        <span class="settings-member__meta">@${esc(u.username)} · ${esc(familyRole)}${systemRole}</span>
+        <span class="settings-member__name" data-member-name>${esc(u.display_name)}</span>
+        <span class="settings-member__meta">@${esc(u.username)} · ${esc(familyRole)}${systemRole}${formerBadge}</span>
         ${profileMeta ? `<span class="settings-member__meta">${profileMeta}</span>` : ''}
-      </div>
-      <button class="row-action" data-edit-user="${u.id}" aria-label="${esc(u.display_name)} ${t('settings.editMemberLabel')}" title="${t('settings.editMemberLabel')}">
-        <i data-lucide="edit-2" class="icon-md" aria-hidden="true"></i>
-      </button>${deleteBtn}
+      </div>${editBtn}${deleteBtn}
     </li>
   `;
 }
 
-function renderPage(container) {
-  container.replaceChildren();
-  container.insertAdjacentHTML('beforeend', `
-    <section class="settings-section">
-      <h2 class="settings-section__title">${t('settings.sectionFamily')}</h2>
-      <div class="settings-card" id="members-card">
-        <ul class="settings-members" id="members-list"></ul>
-        <button class="btn btn--primary settings-add-btn" id="add-member-btn" hidden>${t('settings.addMember')}</button>
-      </div>
-
-      <div class="settings-card" id="two-factor-household-card">
-        <h3 class="settings-card__title">${t('settings.twoFactorTitle')}</h3>
-        <p class="form-hint">${t('settings.twoFactorHouseholdHint')}</p>
-        ${toggleRowHtml({
-          label: t('settings.twoFactorRequireLabel'),
-          attrs: { id: 'two-factor-require' },
-          disabled: true,
-        })}
-        <ul class="settings-2fa__members" id="two-factor-members"></ul>
-        <div id="two-factor-household-error" class="form-error" role="alert" hidden></div>
-      </div>
-
-      <div class="settings-card settings-card--hidden" id="add-member-form-card">
-        <h3 class="settings-card__title">${t('settings.newMemberTitle')}</h3>
+/* FAMILIE SPRICHT DEN KANON (R14, A7 P2-4). "Mitglied hinzufuegen" und
+ * "Einladung erstellen" oeffneten 850px Inline-Formular unter der Liste, mit
+ * [Erstellen][Abbrechen] - die einzige Stelle der App mit der Primaeraktion
+ * links. Jetzt ist es ein Blatt-Dialog wie jedes Anlegen, Fuss
+ * [Abbrechen][Primaer] (`.modal-panel__footer`, von mountFooter an den
+ * Blattrand gehoben), und der Fokus kehrt beim Schliessen von selbst zum
+ * Knopf zurueck (modal.js). Der Knopf selbst ist kein violetter Balken ueber
+ * die volle Breite mehr, sondern ein ruhiger Knopf unter der Liste. */
+function addMemberFormHtml() {
+  return `
         <form id="add-member-form" class="settings-form">
           <div class="form-group">
             <label class="form-label" for="new-username">${t('settings.usernameLabel')}</label>
@@ -220,6 +233,7 @@ function renderPage(container) {
           </div>
           ${ssoAvailable ? `
           ${toggleRowHtml({
+            control: 'switch',
             label: t('settings.memberSsoOnlyLabel'),
             attrs: { id: 'new-member-sso-only' },
           })}
@@ -251,27 +265,21 @@ function renderPage(container) {
             <p class="form-hint">${t('settings.memberContactBirthdayHint')}</p>
           </div>
           ${toggleRowHtml({
+            control: 'switch',
             label: t('settings.systemAdminLabel'),
             attrs: { id: 'new-system-admin' },
           })}
           <p class="form-hint">${t('settings.systemAdminHint')}</p>
           <div id="member-error" class="form-error" role="alert" hidden></div>
-          <div class="settings-form-actions">
-            <button type="submit" class="btn btn--primary">${t('settings.createMember')}</button>
+          <div class="modal-panel__footer modal-panel__footer--plain">
             <button type="button" class="btn btn--secondary" id="cancel-add-member">${t('settings.cancelAddMember')}</button>
+            <button type="submit" class="btn btn--primary">${t('settings.createMember')}</button>
           </div>
-        </form>
-      </div>
+        </form>`;
+}
 
-      <div class="settings-card" id="invites-card">
-        <h3 class="settings-card__title">${t('settings.invites.title')}</h3>
-        <p class="form-hint">${t('settings.invites.intro')}</p>
-        <ul class="settings-members" id="invites-list"></ul>
-        <button class="btn btn--primary settings-add-btn" id="add-invite-btn" hidden>${t('settings.invites.add')}</button>
-      </div>
-
-      <div class="settings-card settings-card--hidden" id="add-invite-form-card">
-        <h3 class="settings-card__title">${t('settings.invites.submit')}</h3>
+function addInviteFormHtml() {
+  return `
         <form id="add-invite-form" class="settings-form">
           <div class="form-group">
             <label class="form-label" for="invite-username">${t('settings.usernameLabel')}</label>
@@ -301,19 +309,17 @@ function renderPage(container) {
             <input class="form-input" type="email" id="invite-email" autocomplete="email" />
           </div>
           ${toggleRowHtml({
+            control: 'switch',
             label: t('settings.invites.sendEmail'),
             attrs: { id: 'invite-send-email' },
           })}
           ${toggleRowHtml({
+            control: 'switch',
             label: t('settings.systemAdminLabel'),
             attrs: { id: 'invite-system-admin' },
           })}
           <p class="form-hint">${t('settings.systemAdminHint')}</p>
           <div id="invite-error" class="form-error" role="alert" hidden></div>
-          <div class="settings-form-actions">
-            <button type="submit" class="btn btn--primary">${t('settings.invites.submit')}</button>
-            <button type="button" class="btn btn--secondary" id="cancel-add-invite">${t('settings.cancelAddMember')}</button>
-          </div>
         </form>
         <div id="invite-link-output" class="settings-token-output" hidden>
           <label class="form-label" for="invite-link-value">${t('settings.invites.linkTitle')}</label>
@@ -327,24 +333,295 @@ function renderPage(container) {
           <p class="form-hint">${t('settings.invites.linkOnce')}</p>
           <p class="form-hint" id="invite-email-note" hidden></p>
         </div>
+        <div class="modal-panel__footer modal-panel__footer--plain">
+          <button type="button" class="btn btn--secondary" id="cancel-add-invite">${t('settings.cancelAddMember')}</button>
+          <button type="submit" class="btn btn--primary" form="add-invite-form">${t('settings.invites.submit')}</button>
+        </div>`;
+}
+
+function renderPage(container) {
+  container.replaceChildren();
+  container.insertAdjacentHTML('beforeend', `
+    <section class="settings-section">
+      <h2 class="settings-section__title">${t('settings.sectionFamily')}</h2>
+      <div class="settings-card" id="members-card">
+        <ul class="settings-members row-divided" id="members-list"></ul>
+        <p class="form-hint" id="members-order-hint" hidden>${t('settings.memberOrderHint')}</p>
+        <div class="sr-only" role="status" aria-live="polite" id="members-order-announce"></div>
+        <button class="btn btn--secondary settings-add-btn" id="add-member-btn" hidden>${t('settings.addMember')}</button>
       </div>
+
+      <!-- Zeilen im Traeger (R17, E9): der Schalter, darunter als zweite Zeile
+           die Liste, wen die Pflicht trifft - beides zusammen ist die
+           Entscheidung (#672). -->
+      <div id="two-factor-household-card">
+        <h3 class="settings-card__title settings-group__title">${t('settings.twoFactorTitle')}</h3>
+        <div class="row-carrier settings-group">
+          ${settingSwitchRowHtml({
+            label: t('settings.twoFactorRequireLabel'),
+            description: t('settings.twoFactorHouseholdHint'),
+            descriptionId: 'two-factor-household-hint',
+            extra: '<div id="two-factor-household-error" class="form-error" role="alert" hidden></div>',
+            attrs: { id: 'two-factor-require', 'aria-describedby': 'two-factor-household-hint' },
+            disabled: true,
+          })}
+          <div class="settings-setting-row settings-setting-row--stacked settings-2fa__row">
+            <ul class="settings-setting-row__control settings-2fa__members" id="two-factor-members"></ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-card" id="invites-card">
+        <h3 class="settings-card__title">${t('settings.invites.title')}</h3>
+        <p class="form-hint">${t('settings.invites.intro')}</p>
+        <ul class="settings-members row-divided" id="invites-list"></ul>
+        <button class="btn btn--secondary settings-add-btn" id="add-invite-btn" hidden>${t('settings.invites.add')}</button>
+      </div>
+
     </section>
   `);
 }
 
-function renderMemberList(container, users, currentUserId) {
+/**
+ * Leerzustand oder Fehlerkarte einer der beiden `<ul>` (Mitglieder,
+ * Einladungen). Eine Liste traegt nur `<li>`: ein `<p>` oder `<div>` direkt
+ * darin ist ungueltiges Markup, und Screenreader zaehlen die Liste falsch
+ * (axe `list`, a11y-Runde). Ein Text wird zum Hinweis, ein Knoten kommt so,
+ * wie er ist, in die Zeile.
+ * @param {string|Node} content
+ * @returns {HTMLLIElement}
+ */
+function listNotice(content) {
+  const item = document.createElement('li');
+  if (typeof content === 'string') {
+    item.className = 'form-hint';
+    item.textContent = content;
+  } else {
+    item.appendChild(content);
+  }
+  return item;
+}
+
+/** Die Zeilen in der Folge, in der die Liste sie zeigt: Aktive, dann Ehemalige, je in der Haushaltsreihenfolge. */
+function orderedMembers(users) {
+  return [...sortMembers(users.filter((u) => !u.deactivated_at)), ...sortMembers(users.filter((u) => u.deactivated_at))];
+}
+
+/**
+ * Welche Zeilen lassen sich ordnen? (#1644)
+ *
+ * Nur ein Administrator ordnet, und nur Haushaltsmitglieder haben eine
+ * Position - `is_household_member` kommt vom Server und ist dieselbe Menge,
+ * die `PATCH /family/members/reorder` annimmt. Ein einzelnes Mitglied hat
+ * keine Reihenfolge: dann gibt es keinen Griff, statt eine folgenlose
+ * Handlung anzubieten.
+ */
+function orderableIds(users, currentUser) {
+  if (currentUser?.role !== 'admin') return [];
+  const ids = users.filter((u) => u.is_household_member && !u.deactivated_at).map((u) => u.id);
+  return ids.length > 1 ? ids : [];
+}
+
+/** Die id-Folge nach einem Schritt um einen Platz; unveraendert, wenn es dort nicht weitergeht. */
+function movedOrder(ids, id, delta) {
+  const from = ids.indexOf(id);
+  const to = from + delta;
+  if (from === -1 || to < 0 || to >= ids.length) return ids;
+  const next = [...ids];
+  next.splice(from, 1);
+  next.splice(to, 0, id);
+  return next;
+}
+
+function renderMemberList(container, users, currentUserId, currentUser = null) {
   const list = container.querySelector('#members-list');
   if (!list) return;
   list.replaceChildren();
+  const canOrder = new Set(orderableIds(users, currentUser));
+  const hint = container.querySelector('#members-order-hint');
+  if (hint) hint.hidden = canOrder.size === 0;
   if (!users.length) {
-    const empty = document.createElement('p');
-    empty.className = 'form-hint';
-    empty.textContent = t('settings.familyEmpty');
-    list.appendChild(empty);
+    list.appendChild(listNotice(t('settings.familyEmpty')));
   } else {
-    list.insertAdjacentHTML('beforeend', users.map((u) => memberHtml(u, currentUserId)).join(''));
+    // Ehemalige ans Ende, davor und darin die Haushaltsreihenfolge (#1644).
+    // Der Server liefert die Liste schon so; sortiert wird hier, weil sie
+    // zwischen zwei Abrufen lokal weiterlebt - ein eben angelegtes Mitglied
+    // haengt am Ende des Arrays und gehoert ins Alphabet der Unplatzierten.
+    const ordered = orderedMembers(users);
+    list.insertAdjacentHTML('beforeend', ordered.map((u) => memberHtml(u, currentUserId, { orderable: canOrder.has(u.id), aligned: canOrder.size > 0 })).join(''));
   }
   window.lucide?.createIcons({ el: list });
+}
+
+// --------------------------------------------------------
+// Haushaltsreihenfolge: Ziehen und Pfeiltasten (#1644)
+// --------------------------------------------------------
+
+/** Die laufende Sortable-Instanz der Mitgliederliste; ein Neuaufbau raeumt sie ab. */
+let memberSortable = null;
+/** Was der delegierte Tastaturpfad braucht - je Aufbau der Liste neu gesetzt. */
+let memberOrderCtx = null;
+/** Laufende Sicherung: `{ again }`, solange eine Anfrage unterwegs ist. */
+let memberOrderRun = null;
+
+function orderableRows(list) {
+  return [...list.querySelectorAll(':scope > .settings-member--orderable')];
+}
+
+/** Position und Gesamtzahl in die Griff-Beschriftung: die einzige Rueckmeldung am fokussierten Griff. */
+function refreshMemberHandles(list) {
+  const rows = orderableRows(list);
+  rows.forEach((row, idx) => {
+    const name = row.querySelector('[data-member-name]')?.textContent?.trim() ?? '';
+    row.querySelector('.settings-member__drag')?.setAttribute('aria-label',
+      `${t('shopping.reorderHandle', { name })}, ${t('shopping.reorderPosition', { index: idx + 1, total: rows.length })}`);
+  });
+}
+
+function announceMemberMove(container, row) {
+  const el = container.querySelector('#members-order-announce');
+  const list = row?.parentElement;
+  if (!el || !list) return;
+  const rows = orderableRows(list);
+  const idx = rows.indexOf(row);
+  if (idx === -1) return;
+  // Derselbe Satz wie im Kategorie-Manager und in der Einkaufsliste - eine
+  // zweite Fassung derselben Aussage waeren 26 Uebersetzungen mehr.
+  el.textContent = t('category.reorderAnnounce', {
+    name: row.querySelector('[data-member-name]')?.textContent?.trim() ?? '',
+    position: idx + 1,
+    total: rows.length,
+  });
+}
+
+/** Liste neu zeichnen und alles daran wieder verdrahten; der Fokus kehrt zum Griff von `focusId` zurueck. */
+function repaintMembers(container, currentUser, users, focusId = null) {
+  renderMemberList(container, users, currentUser?.id, currentUser);
+  bindDeleteButtons(container, currentUser, users);
+  bindEditButtons(container, currentUser, users);
+  wireMemberOrder(container, currentUser, users);
+  if (focusId != null) container.querySelector(`[data-member-handle="${Number(focusId)}"]`)?.focus();
+}
+
+/**
+ * Einen Sicherungslauf: liest die Reihenfolge JETZT aus dem DOM und schickt
+ * die vollstaendige Liste - die Route nimmt nur alle Mitglieder zusammen.
+ */
+async function sendMemberOrder(container, currentUser, users) {
+  const list = container.querySelector('#members-list');
+  if (!list) return true;
+  const order = orderableRows(list).map((row) => Number(row.dataset.id)).filter(Number.isInteger);
+  try {
+    const res = await api.patch('/family/members/reorder', { order });
+    // Die Positionen aus der Antwort in den lokalen Stand: die Liste lebt
+    // zwischen zwei Abrufen weiter, und die naechste Zeichnung sortiert danach.
+    const positions = new Map((res?.data ?? []).map((member) => [member.id, member.sort_order ?? null]));
+    users.forEach((u, idx) => {
+      if (positions.has(u.id)) users[idx] = { ...u, sort_order: positions.get(u.id) };
+    });
+    return true;
+  } catch {
+    // Der Satz der App und nicht der englische der API: was nicht geklappt
+    // hat, ist hier immer dasselbe. Die Liste geht auf den Stand von vorher.
+    window.yuvomi?.showToast(t('quickLinks.orderError'), 'danger');
+    return false;
+  }
+}
+
+/**
+ * Die neue Reihenfolge sichern - der EINE Weg fuer Ziehen und Pfeiltasten,
+ * beide haben das DOM vorher schon umgestellt.
+ *
+ * IMMER NUR EINE LAUFENDE ANFRAGE. Zwei schnell gedrueckte Pfeiltasten
+ * schickten sonst zwei PATCHes parallel, und es entschiede die Ankunft beim
+ * Server statt die Bedienung. Weitere Zuege waehrend eines Laufs werden zu
+ * EINER Nachfolge: die liest die dann aktuelle Reihenfolge.
+ */
+function persistMemberOrder(container, currentUser, users, movedRow) {
+  const list = container.querySelector('#members-list');
+  if (!list) return;
+  refreshMemberHandles(list);
+  announceMemberMove(container, movedRow);
+  if (memberOrderRun) { memberOrderRun.again = true; return; }
+
+  const run = { again: false };
+  memberOrderRun = run;
+  (async () => {
+    let ok = true;
+    try {
+      do {
+        run.again = false;
+        ok = await sendMemberOrder(container, currentUser, users);
+      } while (run.again && ok);
+    } finally {
+      memberOrderRun = null;
+    }
+    // Der Griff, auf dem der Fokus JETZT steht, bekommt ihn nach dem
+    // Neuzeichnen zurueck - mitten in einer Tastaturbedienung waere ein
+    // verlorener Fokus das Ende der Bedienkette.
+    const focused = Number(document.activeElement?.dataset?.memberHandle) || null;
+    const shown = [...list.querySelectorAll(':scope > .settings-member')].map((row) => Number(row.dataset.id));
+    const wanted = orderedMembers(users).map((u) => u.id);
+    // Nach einem Fehler zurueck auf den gespeicherten Stand. Nach einem Erfolg
+    // nur, wenn die Liste anders dasteht als sie sortiert stuende: beim ersten
+    // Ordnen ruecken Konten ohne Position (Hauspersonal) hinter die Mitglieder.
+    if (!ok || shown.join(',') !== wanted.join(',')) repaintMembers(container, currentUser, users, focused);
+  })();
+}
+
+/** Verschiebt eine Zeile um einen Platz unter den ordenbaren und haelt den Fokus auf ihrem Griff. */
+function moveMemberRow(row, delta, ctx) {
+  const list = row?.parentElement;
+  if (!list) return;
+  const rows = orderableRows(list);
+  const ids = rows.map((r) => Number(r.dataset.id));
+  const id = Number(row.dataset.id);
+  const next = movedOrder(ids, id, delta);
+  if (next === ids) return;
+  const target = rows[ids.indexOf(id) + delta];
+  if (delta < 0) list.insertBefore(row, target);
+  else list.insertBefore(row, target.nextSibling);
+  vibrate(15);
+  row.querySelector('.settings-member__drag')?.focus();
+  persistMemberOrder(ctx.container, ctx.currentUser, ctx.users, row);
+}
+
+/**
+ * Verdrahtet Ziehen und Pfeiltasten an der Mitgliederliste.
+ *
+ * Wer nicht ordnen darf, bekommt weder Griff noch Sortable noch Tastaturpfad:
+ * die Reihenfolge bleibt sichtbar, die Handlung entfaellt (Nur-lesen-Regel).
+ */
+function wireMemberOrder(container, currentUser, users) {
+  const list = container.querySelector('#members-list');
+  if (!list) return;
+  try { memberSortable?.destroy?.(); } catch { /* schon abgeraeumt */ }
+  memberSortable = null;
+  memberOrderCtx = { container, currentUser, users };
+  if (!orderableIds(users, currentUser).length) return;
+  refreshMemberHandles(list);
+
+  makeSortable(list, {
+    handle: '.settings-member__drag',
+    draggable: '.settings-member--orderable',
+    onEnd: (evt) => persistMemberOrder(container, currentUser, users, evt?.item),
+  }).then((instance) => {
+    // Die Liste kann waehrend des lazy Imports neu gebaut worden sein.
+    if (instance && memberOrderCtx?.users === users && list.isConnected) memberSortable = instance;
+    else instance?.destroy?.();
+  }).catch(() => { /* ohne SortableJS bleibt der Tastaturpfad */ });
+
+  // Tastaturpfad, delegiert und einmal je Listenelement: `renderMemberList`
+  // tauscht nur den Inhalt, ein Listener je Aufbau haette sich gestapelt.
+  if (list.dataset.orderWired) return;
+  list.dataset.orderWired = '1';
+  list.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+    const handle = e.target.closest?.('.settings-member__drag');
+    if (!handle || !memberOrderCtx) return;
+    e.preventDefault();
+    moveMemberRow(handle.closest('.settings-member'), e.key === 'ArrowUp' ? -1 : 1, memberOrderCtx);
+  });
 }
 
 function inviteHtml(invite) {
@@ -377,10 +654,7 @@ function renderInviteList(container, invites) {
   if (!list) return;
   list.replaceChildren();
   if (!invites.length) {
-    const empty = document.createElement('p');
-    empty.className = 'form-hint';
-    empty.textContent = t('settings.invites.empty');
-    list.appendChild(empty);
+    list.appendChild(listNotice(t('settings.invites.empty')));
   } else {
     list.insertAdjacentHTML('beforeend', invites.map(inviteHtml).join(''));
   }
@@ -410,142 +684,140 @@ async function copyInviteLink(input) {
 }
 
 function bindInviteEvents(container, initialInvites) {
-  const card = container.querySelector('#add-invite-form-card');
-  const form = container.querySelector('#add-invite-form');
   const list = container.querySelector('#invites-list');
   const addBtn = container.querySelector('#add-invite-btn');
-  if (!card || !form || !list || !addBtn) return;
+  if (!list || !addBtn) return;
 
   let invites = [...initialInvites];
-  const output = container.querySelector('#invite-link-output');
-  const outputValue = container.querySelector('#invite-link-value');
-  const emailNote = container.querySelector('#invite-email-note');
-  const errorEl = container.querySelector('#invite-error');
-
-  // Startrechte (#869): das Feld waehlt eine Vorlage, der Hinweis darunter sagt,
-  // was sie im MOMENT bedeutet. Ohne ihn waere "wie das Rollenprofil" eine
-  // Angabe ueber etwas, das man nur auf einem anderen Blatt nachsehen kann -
-  // und genau das Nachsehen unterbleibt beim Einladen.
-  const presetSelect = container.querySelector('#invite-permission-preset');
-  const roleSelect = container.querySelector('#invite-family-role');
-  const presetHint = container.querySelector('#invite-preset-hint');
-  // Ein Rollenprofil aendert sich waehrend eines Formularaufrufs nicht, und
-  // jeder Wechsel zwischen zwei Rollen wuerde es sonst erneut holen.
-  const roleProfiles = new Map();
-
-  async function updatePresetHint() {
-    if (!presetSelect || !presetHint) return;
-    const role = roleSelect?.value || 'other';
-    if (presetSelect.value === 'restricted') {
-      const names = (permissionCatalog?.invitePresets?.restrictedModules || []).map(moduleLabel);
-      const base = names.length
-        ? t('settings.invites.presetHintRestricted', { modules: names.join(', ') })
-        : t('settings.invites.presetHintUnavailable');
-      presetHint.textContent = appendCapabilityState(base, capabilityStateText('health_use_fasting', null, true));
-      return;
-    }
-    if (!roleProfiles.has(role)) {
-      try {
-        roleProfiles.set(role, (await api.get(`/permissions/role/${encodeURIComponent(role)}`))?.data || null);
-      } catch {
-        // Kein Profil zu holen heisst nicht "kein Profil vorhanden": eine
-        // Behauptung waere hier schlimmer als keine.
-        roleProfiles.set(role, null);
-      }
-    }
-    // Zwischen Anfrage und Antwort kann eine andere Rolle gewaehlt worden sein.
-    if ((roleSelect?.value || 'other') !== role || presetSelect.value !== 'role') return;
-    const profile = roleProfiles.get(role);
-    const roleName = familyRoleLabel(role);
-    if (!profile) {
-      presetHint.textContent = t('settings.invites.presetHintUnavailable');
-      return;
-    }
-    const denied = deniedModuleNames(profile.modules);
-    const base = denied.length
-      ? t('settings.invites.presetHintRoleLimited', { role: roleName, modules: denied.join(', ') })
-      : t('settings.invites.presetHintRoleOpen', { role: roleName });
-    presetHint.textContent = appendCapabilityState(
-      base,
-      capabilityStateText('health_use_fasting', profile, profile.modules?.health === 'none'),
-    );
-  }
-
-  presetSelect?.addEventListener('change', updatePresetHint);
-  roleSelect?.addEventListener('change', updatePresetHint);
 
   addBtn.hidden = false;
-  addBtn.addEventListener('click', () => {
-    card.classList.remove('settings-card--hidden');
-    addBtn.hidden = true;
-    updatePresetHint();
-    container.querySelector('#invite-username')?.focus();
-  });
+  addBtn.addEventListener('click', () => openInviteModal());
 
-  container.querySelector('#cancel-add-invite')?.addEventListener('click', () => {
-    card.classList.add('settings-card--hidden');
-    addBtn.hidden = false;
-    form.reset();
-    updatePresetHint();
-    errorEl.hidden = true;
-    output.hidden = true;
-  });
+  function openInviteModal() {
+    openModal({
+      title: t('settings.invites.submit'),
+      size: 'md',
+      content: addInviteFormHtml(),
+      onSave(panel) {
+        const form = panel.querySelector('#add-invite-form');
+        const output = panel.querySelector('#invite-link-output');
+        const outputValue = panel.querySelector('#invite-link-value');
+        const emailNote = panel.querySelector('#invite-email-note');
+        const errorEl = panel.querySelector('#invite-error');
 
-  form.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    errorEl.hidden = true;
-    output.hidden = true;
-    const sendEmail = container.querySelector('#invite-send-email')?.checked === true;
-    const payload = {
-      username: container.querySelector('#invite-username').value.trim(),
-      display_name: container.querySelector('#invite-display-name').value.trim(),
-      email: container.querySelector('#invite-email').value.trim(),
-      family_role: container.querySelector('#invite-family-role').value,
-      permission_preset: container.querySelector('#invite-permission-preset').value,
-      system_admin: container.querySelector('#invite-system-admin')?.checked === true,
-      send_email: sendEmail,
-    };
+        // Startrechte (#869): das Feld waehlt eine Vorlage, der Hinweis darunter sagt,
+        // was sie im MOMENT bedeutet. Ohne ihn waere "wie das Rollenprofil" eine
+        // Angabe ueber etwas, das man nur auf einem anderen Blatt nachsehen kann -
+        // und genau das Nachsehen unterbleibt beim Einladen.
+        const presetSelect = panel.querySelector('#invite-permission-preset');
+        const roleSelect = panel.querySelector('#invite-family-role');
+        const presetHint = panel.querySelector('#invite-preset-hint');
+        // Ein Rollenprofil aendert sich waehrend eines Formularaufrufs nicht, und
+        // jeder Wechsel zwischen zwei Rollen wuerde es sonst erneut holen.
+        const roleProfiles = new Map();
 
-    const btn = form.querySelector('[type=submit]');
-    btn.disabled = true;
-    try {
-      const res = await auth.createInvite(payload);
-      invites.unshift(res.data.invite);
-      renderInviteList(container, invites);
-      form.reset();
-      updatePresetHint();
-      // Der Klartext-Token kommt nur aus dieser einen Antwort. Die Karte bleibt
-      // deshalb offen: würde sie sich wie beim Mitglied-Anlegen schließen, wäre
-      // der Link im selben Moment weg, in dem er entsteht.
-      outputValue.value = `${window.location.origin}/join?token=${encodeURIComponent(res.data.token)}`;
-      output.hidden = false;
-      if (sendEmail) {
-        emailNote.textContent = res.data.email_sent
-          ? t('settings.invites.emailSent')
-          : t('settings.invites.emailNotSent');
-        emailNote.hidden = false;
-      } else {
-        emailNote.hidden = true;
-      }
-      window.lucide?.createIcons({ el: output });
-      outputValue.focus();
-      outputValue.select();
-      window.yuvomi?.showToast(t('settings.invites.created'), 'success');
-    } catch (err) {
-      showError(errorEl, err.message);
-    } finally {
-      btn.disabled = false;
-    }
-  });
+        async function updatePresetHint() {
+          if (!presetSelect || !presetHint) return;
+          const role = roleSelect?.value || 'other';
+          if (presetSelect.value === 'restricted') {
+            const names = (permissionCatalog?.invitePresets?.restrictedModules || []).map(moduleLabel);
+            const base = names.length
+              ? t('settings.invites.presetHintRestricted', { modules: names.join(', ') })
+              : t('settings.invites.presetHintUnavailable');
+            presetHint.textContent = appendCapabilityState(base, capabilityStateText('health_use_fasting', null, true));
+            return;
+          }
+          if (!roleProfiles.has(role)) {
+            try {
+              roleProfiles.set(role, (await api.get(`/permissions/role/${encodeURIComponent(role)}`))?.data || null);
+            } catch {
+              // Kein Profil zu holen heisst nicht "kein Profil vorhanden": eine
+              // Behauptung waere hier schlimmer als keine.
+              roleProfiles.set(role, null);
+            }
+          }
+          // Zwischen Anfrage und Antwort kann eine andere Rolle gewaehlt worden sein.
+          if ((roleSelect?.value || 'other') !== role || presetSelect.value !== 'role') return;
+          const profile = roleProfiles.get(role);
+          const roleName = familyRoleLabel(role);
+          if (!profile) {
+            presetHint.textContent = t('settings.invites.presetHintUnavailable');
+            return;
+          }
+          const denied = deniedModuleNames(profile.modules);
+          const base = denied.length
+            ? t('settings.invites.presetHintRoleLimited', { role: roleName, modules: denied.join(', ') })
+            : t('settings.invites.presetHintRoleOpen', { role: roleName });
+          presetHint.textContent = appendCapabilityState(
+            base,
+            capabilityStateText('health_use_fasting', profile, profile.modules?.health === 'none'),
+          );
+        }
 
-  container.querySelector('#invite-link-copy')?.addEventListener('click', async () => {
-    if (!outputValue.value) return;
-    const copied = await copyInviteLink(outputValue);
-    window.yuvomi?.showToast(
-      copied ? t('settings.invites.copied') : t('settings.invites.copyFailed'),
-      copied ? 'success' : 'danger',
-    );
-  });
+        presetSelect?.addEventListener('change', updatePresetHint);
+        roleSelect?.addEventListener('change', updatePresetHint);
+        updatePresetHint();
+
+        panel.querySelector('#cancel-add-invite')?.addEventListener('click', () => closeModal());
+
+        form.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          errorEl.hidden = true;
+          output.hidden = true;
+          const sendEmail = panel.querySelector('#invite-send-email')?.checked === true;
+          const payload = {
+            username: panel.querySelector('#invite-username').value.trim(),
+            display_name: panel.querySelector('#invite-display-name').value.trim(),
+            email: panel.querySelector('#invite-email').value.trim(),
+            family_role: panel.querySelector('#invite-family-role').value,
+            permission_preset: panel.querySelector('#invite-permission-preset').value,
+            system_admin: panel.querySelector('#invite-system-admin')?.checked === true,
+            send_email: sendEmail,
+          };
+
+          const btn = panel.querySelector('[type=submit]');
+          btn.disabled = true;
+          try {
+            const res = await auth.createInvite(payload);
+            invites.unshift(res.data.invite);
+            renderInviteList(container, invites);
+            form.reset();
+            updatePresetHint();
+            // Der Klartext-Token kommt nur aus dieser einen Antwort. Der Dialog
+            // bleibt deshalb offen: wuerde er sich wie beim Mitglied-Anlegen
+            // schliessen, waere der Link im selben Moment weg, in dem er entsteht.
+            outputValue.value = `${window.location.origin}/join?token=${encodeURIComponent(res.data.token)}`;
+            output.hidden = false;
+            if (sendEmail) {
+              emailNote.textContent = res.data.email_sent
+                ? t('settings.invites.emailSent')
+                : t('settings.invites.emailNotSent');
+              emailNote.hidden = false;
+            } else {
+              emailNote.hidden = true;
+            }
+            window.lucide?.createIcons({ el: output });
+            outputValue.focus();
+            outputValue.select();
+            window.yuvomi?.showToast(t('settings.invites.created'), 'success');
+          } catch (err) {
+            showError(errorEl, err.message);
+          } finally {
+            btn.disabled = false;
+          }
+        });
+
+        panel.querySelector('#invite-link-copy')?.addEventListener('click', async () => {
+          if (!outputValue.value) return;
+          const copied = await copyInviteLink(outputValue);
+          window.yuvomi?.showToast(
+            copied ? t('settings.invites.copied') : t('settings.invites.copyFailed'),
+            copied ? 'success' : 'danger',
+          );
+        });
+      },
+    });
+  }
 
   list.addEventListener('click', async (event) => {
     const btn = event.target.closest('[data-revoke-invite]');
@@ -577,10 +849,10 @@ async function loadInvites(container) {
     const res = await auth.getInvites();
     invites = res.data?.invites ?? [];
   } catch (err) {
-    list.replaceChildren(createRetryState({
+    list.replaceChildren(listNotice(createRetryState({
       message: err.message || t('common.errorGeneric'),
       onRetry: () => loadInvites(container),
-    }));
+    })));
     return;
   }
 
@@ -588,7 +860,7 @@ async function loadInvites(container) {
   bindInviteEvents(container, invites);
 }
 
-function bindDeleteButtons(container) {
+function bindDeleteButtons(container, currentUser, users) {
   container.querySelectorAll('[data-delete-user]').forEach((btn) => {
     btn.replaceWith(btn.cloneNode(true));
   });
@@ -596,18 +868,32 @@ function bindDeleteButtons(container) {
     btn.addEventListener('click', async () => {
       const id = parseInt(btn.dataset.deleteUser, 10);
       const name = btn.dataset.name;
-      // Die Folgen stehen im Dialog, nicht in der Dokumentation: `created_by`
-      // kaskadiert (server/db.js), `assigned_to` wird auf NULL gesetzt. In
-      // einer selbstgehosteten Instanz gibt es weder Support noch Undo.
-      if (!await confirmModal(t('settings.deleteMemberConfirm', { name }), {
+      // Die Folgen stehen im Dialog, nicht in der Dokumentation. Was geschieht,
+      // entscheidet der Server (#1381): ein Konto mit Spuren in geteilten Daten
+      // wird deaktiviert, eines ohne wird geloescht. Der Dialog sagt beides,
+      // statt die Kaskade als sichere Folge zu beschreiben. In einer
+      // selbstgehosteten Instanz gibt es weder Support noch Undo.
+      if (!await confirmModal(t('settings.removeMemberConfirm', { name }), {
         danger: true,
-        confirmLabel: t('common.delete'),
-        detail: t('settings.deleteMemberConfirmDetail', { name }),
+        confirmLabel: t('settings.removeMemberLabel'),
+        detail: t('settings.removeMemberConfirmDetail', { name }),
       })) return;
       try {
-        await auth.deleteUser(id);
-        btn.closest('.settings-member').remove();
-        window.yuvomi?.showToast(t('settings.memberDeletedToast', { name }), 'default');
+        const res = await auth.deleteUser(id);
+        const idx = users.findIndex((u) => u.id === id);
+        if (res?.outcome === 'deactivated') {
+          // Die Zeile bleibt und traegt die Marke. Rolle und Zeitpunkt wie der
+          // Server sie gesetzt hat; die Liste liest sie beim naechsten Laden neu.
+          if (idx !== -1) users[idx] = { ...users[idx], role: 'member', deactivated_at: new Date().toISOString() };
+          window.yuvomi?.showToast(t('settings.memberDeactivatedToast', { name }), 'default');
+        } else {
+          if (idx !== -1) users.splice(idx, 1);
+          window.yuvomi?.showToast(t('settings.memberDeletedToast', { name }), 'default');
+        }
+        repaintMembers(container, currentUser, users);
+        // Der Knopf, an den der Dialog den Fokus zurueckgibt, ist eben
+        // weggerendert worden.
+        refocusAfterRender();
       } catch (err) {
         window.yuvomi?.showToast(err.message, 'danger');
       }
@@ -703,6 +989,7 @@ async function openEditMemberModal(member, currentUser, users, container) {
         </div>
         ${ssoAvailable ? `
         ${toggleRowHtml({
+          control: 'switch',
           label: t('settings.memberSsoOnlyLabel'),
           checked: member.sso_only === true,
           attrs: { id: 'edit-member-sso-only' },
@@ -715,13 +1002,14 @@ async function openEditMemberModal(member, currentUser, users, container) {
           <p class="form-hint">${t('settings.resetPasswordHint')}</p>
         </div>
         ${toggleRowHtml({
+          control: 'switch',
           label: t('settings.systemAdminLabel'),
           checked: member.role === 'admin',
           attrs: { id: 'edit-member-system-admin' },
         })}
         <p class="form-hint">${t('settings.systemAdminHint')}</p>
         <div id="edit-member-error" class="form-error" role="alert" hidden></div>
-        <div class="settings-form-actions">
+        <div class="modal-panel__footer modal-panel__footer--plain">
           <button type="button" class="btn btn--secondary" id="edit-member-cancel">${t('common.cancel')}</button>
           <button type="submit" class="btn btn--primary">${t('settings.saveMember')}</button>
         </div>
@@ -823,9 +1111,7 @@ async function openEditMemberModal(member, currentUser, users, container) {
           if (currentUser?.id === member.id) Object.assign(currentUser, res.user);
           closeModal({ force: true });
           window.yuvomi?.showToast(t('settings.memberUpdatedToast', { name: res.user.display_name }), 'success');
-          renderMemberList(container, users, currentUser?.id);
-          bindDeleteButtons(container);
-          bindEditButtons(container, currentUser, users);
+          repaintMembers(container, currentUser, users);
         } catch (err) {
           showError(errorEl, err.message ?? t('common.errorGeneric'));
         } finally {
@@ -863,82 +1149,71 @@ function syncSsoOnlyField(container) {
   if (email) email.required = on;
 }
 
+function openAddMemberModal(container, currentUser, users) {
+  openModal({
+    title: t('settings.newMemberTitle'),
+    size: 'md',
+    content: addMemberFormHtml(),
+    onSave(panel) {
+      const form = panel.querySelector('#add-member-form');
+      form.querySelector('#new-member-sso-only')
+        ?.addEventListener('change', () => syncSsoOnlyField(panel));
+      syncSsoOnlyField(panel);
+      panel.querySelector('#cancel-add-member')?.addEventListener('click', () => closeModal());
+
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const errorEl = panel.querySelector('#member-error');
+        errorEl.hidden = true;
+        const birthDateRaw = panel.querySelector('#new-member-birth-date')?.value || '';
+        if (!isDateInputValid(birthDateRaw)) {
+          showError(errorEl, t('settings.memberBirthDateInvalid'));
+          return;
+        }
+
+        const ssoOnly = panel.querySelector('#new-member-sso-only')?.checked === true;
+        const data = {
+          username: panel.querySelector('#new-username').value.trim(),
+          display_name: panel.querySelector('#new-display-name').value.trim(),
+          // Beides zugleich weist der Server ab - er kann nicht raten, welches
+          // von beidem gemeint war.
+          ...(ssoOnly ? { sso_only: true } : { password: panel.querySelector('#new-member-password').value }),
+          avatar_color: panel.querySelector('#new-avatar-color').value,
+          family_role: panel.querySelector('#new-family-role').value,
+          system_admin: panel.querySelector('#new-system-admin')?.checked === true,
+          phone: panel.querySelector('#new-member-phone')?.value.trim() || null,
+          email: panel.querySelector('#new-member-email')?.value.trim() || null,
+          birth_date: parseDateInput(birthDateRaw) || null,
+        };
+
+        const btn = panel.querySelector('[type=submit]');
+        btn.disabled = true;
+        try {
+          const res = await auth.createUser(data);
+          users.push(res.user);
+          repaintMembers(container, currentUser, users);
+          // Der Dialog gibt den Fokus beim Schliessen an "Mitglied hinzufuegen"
+          // zurueck (modal.js) - kein Fall auf BODY wie beim Inline-Formular.
+          closeModal({ force: true });
+          window.yuvomi?.showToast(t('settings.memberAddedToast', { name: res.user.display_name }), 'success');
+        } catch (err) {
+          showError(errorEl, err.message);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    },
+  });
+}
+
 function bindEvents(container, currentUser, users) {
   const addMemberBtn = container.querySelector('#add-member-btn');
   if (addMemberBtn) {
     addMemberBtn.hidden = false;
-    addMemberBtn.addEventListener('click', () => {
-      container.querySelector('#add-member-form-card').classList.remove('settings-card--hidden');
-      addMemberBtn.hidden = true;
-    });
+    addMemberBtn.addEventListener('click', () => openAddMemberModal(container, currentUser, users));
   }
 
-  const cancelAddMember = container.querySelector('#cancel-add-member');
-  if (cancelAddMember) {
-    cancelAddMember.addEventListener('click', () => {
-      container.querySelector('#add-member-form-card').classList.add('settings-card--hidden');
-      container.querySelector('#add-member-btn').hidden = false;
-      container.querySelector('#add-member-form').reset();
-      syncSsoOnlyField(container);
-      container.querySelector('#new-avatar-color').value = randomAvatarColor();
-      container.querySelector('#member-error').hidden = true;
-    });
-  }
-
-  const addMemberForm = container.querySelector('#add-member-form');
-  if (addMemberForm) {
-    addMemberForm.querySelector('#new-member-sso-only')
-      ?.addEventListener('change', () => syncSsoOnlyField(container));
-    syncSsoOnlyField(container);
-
-    addMemberForm.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const errorEl = container.querySelector('#member-error');
-      errorEl.hidden = true;
-      const birthDateRaw = container.querySelector('#new-member-birth-date')?.value || '';
-      if (!isDateInputValid(birthDateRaw)) {
-        showError(errorEl, t('settings.memberBirthDateInvalid'));
-        return;
-      }
-
-      const ssoOnly = container.querySelector('#new-member-sso-only')?.checked === true;
-      const data = {
-        username: container.querySelector('#new-username').value.trim(),
-        display_name: container.querySelector('#new-display-name').value.trim(),
-        // Beides zugleich weist der Server ab - er kann nicht raten, welches
-        // von beidem gemeint war.
-        ...(ssoOnly ? { sso_only: true } : { password: container.querySelector('#new-member-password').value }),
-        avatar_color: container.querySelector('#new-avatar-color').value,
-        family_role: container.querySelector('#new-family-role').value,
-        system_admin: container.querySelector('#new-system-admin')?.checked === true,
-        phone: container.querySelector('#new-member-phone')?.value.trim() || null,
-        email: container.querySelector('#new-member-email')?.value.trim() || null,
-        birth_date: parseDateInput(birthDateRaw) || null,
-      };
-
-      const btn = addMemberForm.querySelector('[type=submit]');
-      btn.disabled = true;
-      try {
-        const res = await auth.createUser(data);
-        users.push(res.user);
-        renderMemberList(container, users, currentUser?.id);
-        addMemberForm.reset();
-        syncSsoOnlyField(container);
-        container.querySelector('#new-avatar-color').value = randomAvatarColor();
-        container.querySelector('#add-member-form-card').classList.add('settings-card--hidden');
-        container.querySelector('#add-member-btn').hidden = false;
-        window.yuvomi?.showToast(t('settings.memberAddedToast', { name: res.user.display_name }), 'success');
-        bindDeleteButtons(container);
-        bindEditButtons(container, currentUser, users);
-      } catch (err) {
-        showError(errorEl, err.message);
-      } finally {
-        btn.disabled = false;
-      }
-    });
-  }
-
-  bindDeleteButtons(container);
+  bindDeleteButtons(container, currentUser, users);
   bindEditButtons(container, currentUser, users);
 }
 
@@ -953,15 +1228,16 @@ async function loadMembers(container, currentUser) {
     const res = await auth.getUsers();
     users = res.data ?? [];
   } catch (err) {
-    list.replaceChildren(createRetryState({
+    list.replaceChildren(listNotice(createRetryState({
       message: err.message || t('common.errorGeneric'),
       onRetry: reload,
-    }));
+    })));
     return;
   }
 
-  renderMemberList(container, users, currentUser?.id);
+  renderMemberList(container, users, currentUser?.id, currentUser);
   bindEvents(container, currentUser, users);
+  wireMemberOrder(container, currentUser, users);
   window.lucide?.createIcons({ el: container });
 }
 
@@ -1045,3 +1321,7 @@ export async function render(container, { user } = {}) {
   await loadInvites(container);
   window.lucide?.createIcons({ el: container });
 }
+
+// Der Avatar als Programm (test:initials): welche Zeichen ohne Bild auf der
+// Scheibe stehen.
+export const __test = { avatarHtml, memberHtml, orderableIds, movedOrder, orderedMembers, wireMemberOrder, renderMemberList };

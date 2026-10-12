@@ -50,7 +50,7 @@ const { default: permissionsRouter } = await import('../server/routes/permission
 const { default: documentsRouter } = await import('../server/routes/documents.js');
 const { householdOverview } = await import('../server/services/two-factor.js');
 const { listEmailableMembers } = await import('../server/services/member-email.js');
-const { householdMemberSql, isHouseholdMember } = await import('../server/services/household-members.js');
+const { householdMemberSql, isHouseholdMember, memberOrderSql } = await import('../server/services/household-members.js');
 const { pushService } = await import('../server/services/push.js');
 const { hashPassword } = await import('../server/utils/password.js');
 
@@ -218,7 +218,7 @@ test('members only: GET /family/members (the source of the pickers)', async () =
 test('accounts: the 2FA overview lists every account', async () => {
   // Der zweite Faktor schuetzt Konten, nicht Mitgliedschaft (Entscheidung
   // vom 15.09.2026, #1207): die Admin-Uebersicht listet deshalb jedes Konto.
-  assert.deepEqual(idsOf(householdOverview(db), 'user_id'), EVERYONE);
+  assert.deepEqual(idsOf(householdOverview(db, memberOrderSql('u')), 'user_id'), EVERYONE);
   const r = await call('GET', '/auth/2fa/overview');
   assert.equal(r.status, 200);
   assert.deepEqual(idsOf(r.body.data, 'user_id'), EVERYONE);
@@ -339,6 +339,55 @@ test('access_scope: /auth/me and the login answer name a guest a split_guest', a
     assert.equal(body.user.id, id);
     assert.equal(body.user.access_scope, SCOPES[id]);
   }
+});
+
+// --------------------------------------------------------------------------
+// initialsRoster: die Namen, aus denen der Client gleiche Initialen aufloest
+// (#1464, public/utils/initials.js)
+// --------------------------------------------------------------------------
+
+test('initialsRoster: /auth/me and the login answer name every account, also a deactivated one, but no display - and nothing to a guest', async () => {
+  const ALL_NAMES = ['Anna', 'Ben', 'Clara', 'Dora', 'Emil'];
+  const sorted = (names) => [...names].sort();
+
+  const me = await call('GET', '/auth/me', { as: ANNA });
+  assert.equal(me.status, 200);
+  assert.deepEqual(sorted(me.body.initialsRoster), ALL_NAMES, 'members, staff and guests - every account /auth/users lists');
+  const staff = await call('GET', '/auth/me', { as: CLARA });
+  assert.deepEqual(sorted(staff.body.initialsRoster), ALL_NAMES, 'staff sees the same discs as a member');
+  // Ein Gast erreicht nur die geteilten Ausgaben; die Namen des Haushalts
+  // gehen ihn nichts an.
+  const guest = await call('GET', '/auth/me', { as: DORA });
+  assert.equal(guest.status, 200);
+  assert.deepEqual(guest.body.initialsRoster, [], 'a split guest gets no names');
+
+  // Ein deaktiviertes Konto bleibt: sonst aenderten sich die Zeichen eines
+  // aktiven Mitglieds in dem Moment, in dem ein anderes geht.
+  db.prepare("UPDATE users SET deactivated_at = '2026-10-01T00:00:00Z' WHERE id = ?").run(BEN);
+  const display = addUser('wall', 'Wand', 'member', 'other');
+  db.prepare('INSERT INTO display_accounts (user_id, created_by) VALUES (?, ?)').run(display, ANNA);
+  try {
+    const after = await call('GET', '/auth/me', { as: ANNA });
+    assert.equal(after.status, 200);
+    assert.deepEqual(sorted(after.body.initialsRoster), ALL_NAMES, 'Ben is deactivated and still listed; the display is not');
+    const listed = await call('GET', '/auth/users', { as: ANNA });
+    assert.deepEqual(sorted(listed.body.data.map((row) => row.display_name)), ALL_NAMES, 'the same accounts as /auth/users');
+    assert.ok(listed.body.data.find((row) => row.id === BEN).deactivated_at, 'control: Ben really is deactivated');
+  } finally {
+    db.prepare('DELETE FROM users WHERE id = ?').run(display);
+    db.prepare('UPDATE users SET deactivated_at = NULL WHERE id = ?').run(BEN);
+  }
+
+  actor = null;
+  const anonymous = await fetch(`${base}/auth/me`);
+  const cookies = anonymous.headers.getSetCookie().map((raw) => raw.split(';')[0]).join('; ');
+  const res = await fetch(`${base}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: cookies },
+    body: JSON.stringify({ username: 'ben', password: PASSWORD }),
+  });
+  assert.equal(res.status, 200);
+  assert.deepEqual(sorted((await res.json()).initialsRoster), ALL_NAMES, 'the login answer carries it too - the router does not ask /auth/me again');
 });
 
 // --------------------------------------------------------------------------

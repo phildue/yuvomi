@@ -120,7 +120,7 @@ function loadSw({ fetchImpl } = {}) {
     fetch: (...a) => ctl.fetchImpl(...a),
     Request: MockRequest, Response: MockResponse, Headers: MockHeaders,
     URL, Date, Promise, JSON, Number, String, Object, Array, Math, Map, Set,
-    parseInt, console,
+    parseInt, console, Symbol, setTimeout, clearTimeout,
   };
   sandbox.globalThis = sandbox;
   runInContext(SRC, createContext(sandbox));
@@ -227,6 +227,19 @@ test('Nicht-Whitelist- und /auth/*-GETs werden durchgereicht', async () => {
     assert.equal(responded, false, `${path} darf nicht gecacht werden`);
   }
   assert.equal(await apiCacheName(env), undefined);
+});
+
+test('Dokumentdateien gehen nie in einen Cache des Service Workers', async () => {
+  // Die Vorschaubilder der Dokumentenseite (Critique 2026-09-25) holen jede
+  // lokale Datei ueber /preview. Arztbriefe und Ausweise duerfen nicht als
+  // Kopie in der Cache-API landen - sie laege unverschluesselt auf dem Geraet.
+  const env = loadSw({ fetchImpl: async () => new MockResponse('%PDF-1.4', { status: 200 }) });
+  for (const path of ['/documents', '/documents/7', '/documents/7/preview', '/documents/7/download', '/documents/7/thumbnail']) {
+    const req = new MockRequest(apiUrl(path), { method: 'GET' });
+    const { responded } = dispatchFetch(env, req);
+    assert.equal(responded, false, `${path} muss unangetastet ans Netz`);
+  }
+  assert.equal(await apiCacheName(env), undefined, 'kein API-Cache durch Dokumentdateien');
 });
 
 test('die Laufnummern-Abfrage /shopping/versions wird durchgereicht, /shopping/:id/items daneben gecacht', async () => {

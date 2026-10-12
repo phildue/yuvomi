@@ -7,6 +7,12 @@
 import { esc } from '/utils/html.js';
 import { t } from '/i18n.js';
 import { getReadableTextColor, AVATAR_FALLBACK_COLOR } from '/utils/color.js';
+import { initials, compactInitials } from '/utils/initials.js';
+
+// Der Rand von `.avatar-stack__item` (user-multi-select.css). Er steht hier
+// als Zahl, weil die Scheibe ihre Groesse und Schrift ohnehin inline in px
+// bekommt und die Passrechnung beides braucht.
+const STACK_BORDER_PX = 2;
 
 /**
  * Rendert einen Avatar-Stack für mehrere zugewiesene Benutzer.
@@ -14,9 +20,10 @@ import { getReadableTextColor, AVATAR_FALLBACK_COLOR } from '/utils/color.js';
  * @param {object} opts
  * @param {number} [opts.size=28]      Avatar-Größe in px
  * @param {number} [opts.maxVisible=3] Maximale Avatare vor "+N"-Anzeige
+ * @param {number} [opts.minFont=11]   Untergrenze der Initialen in px
  * @returns {string} HTML-String
  */
-export function renderAvatarStack(users, { size = 28, maxVisible = 3 } = {}) {
+export function renderAvatarStack(users, { size = 28, maxVisible = 3, minFont = 11 } = {}) {
   if (!users?.length) return '';
   const visible = users.slice(0, maxVisible);
   const overflow = users.length - visible.length;
@@ -28,18 +35,26 @@ export function renderAvatarStack(users, { size = 28, maxVisible = 3 } = {}) {
   // (Verhaeltnis <= 0.55); darunter ist die Scheibe der Kanal - die Nutzerfarbe
   // ist per User-Farben-Regel ohnehin das Identitaetssignal, und der Name
   // steht weiter im title. Ein 9px-Text sagt weniger als ein sauberer Punkt.
-  const fs = Math.max(11, Math.round(size * 0.4));
+  // `minFont` hebt die Untergrenze dort, wo der Stapel neben Fliesstext steht
+  // (Agenda-Zeile: 12px neben 14px-Metazeile, Critique 2026-09-24). Wer sie
+  // hebt, gibt die Scheibe mit: 12px brauchen 22px, damit das Verhaeltnis
+  // <= 0.55 bleibt.
+  const fs = Math.max(minFont, Math.round(size * 0.4));
   const showText = size >= 20;
+  // ZWEI GEVIERT-ZEICHEN BRAUCHEN BIS ZU 2em (#1607; gemessen: Noto Sans CJK
+  // 1em je Zeichen, die Apple-Systemschrift rund 0.9em). Der Rand der Scheibe (2px je
+  // Seite, user-multi-select.css) zaehlt bei `border-box` in ihre Breite, und
+  // `overflow: hidden` schneidet an seiner Innenkante. In eine 24px-Scheibe
+  // mit 11px Schrift passen deshalb 20px Text: zwei lateinische Buchstaben,
+  // aber keine zwei Hangul- oder Han-Zeichen (22px). Wo sie nicht passen,
+  // steht eines - die Schrift zu verkleinern hiesse unter die Untergrenze
+  // oben zu gehen.
+  const fitsTwoWide = size - 2 * STACK_BORDER_PX >= 2 * fs;
   const avatars = visible.map((u) => {
-    const initials = (u.display_name ?? '')
-      .split(' ')
-      .map((w) => w[0] ?? '')
-      .join('')
-      .toUpperCase()
-      .slice(0, 2);
+    const text = fitsTwoWide ? initials(u.display_name) : compactInitials(u.display_name);
     const inner = u.avatar_data
       ? `<img src="${esc(u.avatar_data)}" alt="${esc(u.display_name ?? '')}" loading="lazy">`
-      : (showText ? esc(initials) : '');
+      : (showText ? esc(text) : '');
     return `<span class="avatar-stack__item"
       style="width:${size}px;height:${size}px;font-size:${fs}px;background-color:${esc(u.color ?? AVATAR_FALLBACK_COLOR)};color:${getReadableTextColor(u.color ?? AVATAR_FALLBACK_COLOR)}"
       title="${esc(u.display_name ?? '')}">
@@ -70,15 +85,9 @@ export function renderUserMultiSelect(allUsers, selectedIds, inputName, labelKey
   const selectedSet = new Set(selectedIds ?? []);
   const items = allUsers.map((u) => {
     const checked = selectedSet.has(u.id) ? 'checked' : '';
-    const initials = (u.display_name ?? '')
-      .split(' ')
-      .map((w) => w[0] ?? '')
-      .join('')
-      .toUpperCase()
-      .slice(0, 2);
     const inner = u.avatar_data
       ? `<img src="${esc(u.avatar_data)}" alt="${esc(u.display_name ?? '')}" loading="lazy">`
-      : esc(initials);
+      : esc(initials(u.display_name));
     return `
       <label class="user-ms__option">
         <input type="checkbox" class="user-ms__checkbox" value="${u.id}" ${checked}
@@ -90,15 +99,18 @@ export function renderUserMultiSelect(allUsers, selectedIds, inputName, labelKey
       </label>`;
   });
 
+  // „Niemand" ist ein ruhiger Eintrag, keine Person: kein Avatar und keine
+  // Striche um das Wort. Hier stand ein grauer Kreis mit einem Gedankenstrich
+  // und „- Niemand -" daneben - ein Platzhalter-Gesicht, das neben echten
+  // Initialen wie ein weiteres Mitglied aussah (Critique 2026-09-24).
   const noneLabel = t(noneLabelKey);
   return `
     <div class="user-ms" data-ms-name="${esc(inputName)}">
       <label class="label">${t(labelKey)}</label>
       <div class="user-ms__options">
-        <label class="user-ms__option">
+        <label class="user-ms__option user-ms__option--none">
           <input type="checkbox" class="user-ms__checkbox user-ms__none" value=""
                  data-ms-input="${esc(inputName)}" ${selectedSet.size === 0 ? 'checked' : ''}>
-          <span class="user-ms__avatar user-ms__avatar--none">–</span>
           <span class="user-ms__name">${noneLabel}</span>
         </label>
         ${items.join('')}
@@ -123,22 +135,37 @@ export function getSelectedUserIds(container, inputName) {
  * Bindet die Checkbox-Logik:
  * - "Niemand" deselektiert alle anderen
  * - Andere Auswahl deselektiert "Niemand"
+ * - `single`: hoechstens EINE Person. Eine neue Wahl loest die vorige ab, und
+ *   wer die gewaehlte Person abwaehlt, landet wieder bei "Niemand" - sonst
+ *   stuende die Reihe ohne jede Markierung da. Fuer Felder, die genau eine
+ *   Person tragen (der Koch einer Mahlzeit, #1679): dieselbe Auswahl wie bei
+ *   den Zustaendigen einer Aufgabe, nur dass der Server eine einzige id
+ *   erwartet. Das Markup bleibt dasselbe; `getSelectedUserIds()` liefert dann
+ *   null oder eine id.
  * @param {Element} container
  * @param {string}  inputName
+ * @param {{ single?: boolean }} [options]
  */
-export function bindUserMultiSelect(container, inputName) {
+export function bindUserMultiSelect(container, inputName, { single = false } = {}) {
   const widget = container.querySelector(`.user-ms[data-ms-name="${CSS.escape(inputName)}"]`);
   if (!widget) return;
 
   widget.addEventListener('change', (e) => {
     const cb = e.target;
     if (!cb.matches('.user-ms__checkbox')) return;
+    const none = widget.querySelector('.user-ms__none');
 
     if (cb.classList.contains('user-ms__none') && cb.checked) {
       widget.querySelectorAll('.user-ms__checkbox:not(.user-ms__none)').forEach((c) => { c.checked = false; });
     } else if (!cb.classList.contains('user-ms__none') && cb.checked) {
-      const none = widget.querySelector('.user-ms__none');
       if (none) none.checked = false;
+      if (single) {
+        widget.querySelectorAll('.user-ms__checkbox:not(.user-ms__none)').forEach((c) => {
+          if (c !== cb) c.checked = false;
+        });
+      }
+    } else if (single && none && !widget.querySelector('.user-ms__checkbox:checked')) {
+      none.checked = true;
     }
   });
 }

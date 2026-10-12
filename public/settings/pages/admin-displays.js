@@ -2,7 +2,7 @@
  * Einstellungen: Wandtabletts (#1208, entschieden in #913)
  *
  * Ein Display anlegen, ihm einen Kopplungscode ausstellen, sein Geraet
- * widerrufen. Die Seite ist bewusst duenn - die ganze Entscheidung liegt im
+ * widerrufen, ein widerrufenes Geraet entfernen. Die Seite ist bewusst duenn - die ganze Entscheidung liegt im
  * Server, hier steht nur, was ein Mensch davon sieht.
  *
  * DER CODE STEHT GENAU EINMAL AUF DEM SCHIRM, wie der Klartext eines
@@ -12,7 +12,7 @@
  */
 
 import { api, auth } from '/api.js';
-import { formatDate, formatTime, t } from '/i18n.js';
+import { formatDate, formatTime, getLocale, t } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { confirmModal, refocusAfterRender } from '/components/modal.js';
 
@@ -61,7 +61,11 @@ function renderDevice(display, device) {
       <span class="form-hint">${revoked
         ? esc(t('settings.displayDeviceRevokedAt', { when: revoked }))
         : esc(seen ? t('settings.displayDeviceLastSeen', { when: seen }) : t('settings.displayDeviceNeverSeen'))}</span>
-      ${revoked ? '' : `
+      ${revoked ? `
+      <button type="button" class="btn btn--ghost btn--sm"
+              data-display-remove-device="${display.id}" data-device="${device.id}">
+        ${esc(t('settings.displayRemoveDevice'))}
+      </button>` : `
       <button type="button" class="btn btn--secondary btn--sm"
               data-display-revoke="${display.id}" data-device="${device.id}">
         ${esc(t('settings.displayRevokeDevice'))}
@@ -118,7 +122,14 @@ function renderPage(container) {
            (test:typography haelt das fest). settings.displaysTitle traegt
            weiterhin den Namen in der Navigation. -->
       <div class="settings-card">
-        <p class="form-hint" style="margin-bottom:var(--space-3)">${esc(t('settings.displaysHint'))}</p>
+        <div style="margin-bottom:var(--space-3)">
+        <p class="form-hint">${esc(t('settings.displaysHint'))}</p>
+        <!-- Zweiter Absatz desselben Hinweises (#1808). Er kommt mit der Liste:
+             WELCHE Bereiche ein Tablett zeigt, weiss nur der Server
+             (DISPLAY_SCOPES), und eine zweite Handliste hier bliebe beim
+             naechsten Scope stehen. Bis dahin leer und versteckt. -->
+        <p class="form-hint" id="display-areas-hint" style="margin-top:var(--space-2)" hidden></p>
+        </div>
         <ul class="settings-cards" id="display-list"></ul>
         <form id="display-form" class="settings-form" autocomplete="off">
           <div class="form-group">
@@ -133,16 +144,44 @@ function renderPage(container) {
             <p class="form-hint">${esc(t('settings.displayDeviceNameHint'))}</p>
           </div>
           <div id="display-error" class="form-error" role="alert" hidden></div>
-          <button type="submit" class="btn btn--primary">${esc(t('settings.displayCreate'))}</button>
+          <div class="settings-form-actions">
+            <button type="submit" class="btn btn--primary">${esc(t('settings.displayCreate'))}</button>
+          </div>
         </form>
       </div>
     </section>
   `);
 }
 
+/**
+ * Die Bereiche eines Displays als Satz (#1808).
+ *
+ * Die Namen sind die der Scope-Module, wie sie der API-Zugriff nebenan nennt
+ * (`settings.apiTokenScopeModules.*`) - dieselben Schluessel, die der Server
+ * liefert, also keine zweite Zuordnung. Dass es zu jedem Bereich in jeder
+ * Sprache einen Namen gibt, haelt `test:display-account` fest. Ohne Liste (alte
+ * Antwort aus dem Cache) bleibt der Absatz aus, statt einen halben Satz zu zeigen.
+ */
+function displayAreasText(modules) {
+  const names = (Array.isArray(modules) ? modules : [])
+    .map((key) => t(`settings.apiTokenScopeModules.${key}`));
+  if (!names.length) return '';
+  const areas = new Intl.ListFormat(getLocale(), { style: 'long', type: 'conjunction' }).format(names);
+  return t('settings.displaysAreasHint', { areas });
+}
+
+function renderAreasHint(container, modules) {
+  const hint = container.querySelector('#display-areas-hint');
+  if (!hint) return;
+  const text = displayAreasText(modules);
+  hint.textContent = text;
+  hint.hidden = !text;
+}
+
 async function reload(container) {
   const res = await api.get('/displays');
   const displays = res.data ?? [];
+  renderAreasHint(container, res.area_modules);
   renderList(container, displays);
   window.lucide?.createIcons({ el: container });
   return displays;
@@ -247,6 +286,39 @@ function bindEvents(container) {
       return;
     }
 
+    // EIN WIDERRUFENES GERAET LAESST SICH ENTFERNEN (D#1672). Jede neue Kopplung
+    // widerruft das Geraet davor, und dessen Zeile blieb fuer immer stehen.
+    // Rueckgaengig gibt es nicht - die Zeile ist danach weg -, also die
+    // Rueckfrage vorab, mit der Folge im Detail.
+    const remove = event.target.closest('[data-display-remove-device]');
+    if (remove) {
+      const ok = await confirmModal(t('settings.displayRemoveDeviceConfirm'), {
+        danger: true,
+        confirmLabel: t('settings.displayRemoveDevice'),
+        detail: t('settings.displayRemoveDeviceDetail'),
+      });
+      if (!ok) return;
+      clearError(errorEl);
+      try {
+        await api.post(`/displays/${remove.dataset.displayRemoveDevice}/devices/${remove.dataset.device}/remove`, {});
+      } catch (err) {
+        // 404 heisst: schon weg. Alles andere bekommt seinen Satz - der Grund
+        // des Servers uebersetzt, nicht sein englischer Text.
+        if (err?.status !== 404) {
+          showError(errorEl, err?.status === 409 && err.data?.reason === 'display_device_active'
+            ? t('settings.displayRemoveDeviceActive')
+            : err.message);
+        }
+      }
+      try {
+        await reload(container);
+        refocusAfterRender();
+      } catch (err) {
+        showError(errorEl, err.message);
+      }
+      return;
+    }
+
     const del = event.target.closest('[data-display-delete]');
     if (del) {
       const ok = await confirmModal(t('settings.displayDeleteConfirm', { name: del.dataset.name }), {
@@ -280,3 +352,5 @@ export async function render(container) {
   bindEvents(container);
   window.lucide?.createIcons({ el: container });
 }
+
+export const __test = { displayAreasText };

@@ -13,6 +13,40 @@ const noteInputProperties = {
   category_ids: { type: 'array', maxItems: 50, uniqueItems: true, items: { type: 'integer', minimum: 1 } },
 };
 
+// Die Erinnerungsfelder spiegeln `validateReminder()` in
+// server/routes/birthdays.js; die Obergrenze ist 999 Wochen in Minuten.
+const BIRTHDAY_REMINDER_MAX_MINUTES = 999 * 10080;
+
+const birthdayInputProperties = {
+  name: { type: 'string', maxLength: 200 },
+  birth_date: { type: 'string', format: 'date' },
+  name_day: { type: ['string', 'null'], pattern: '^\\d{2}-\\d{2}$', description: 'Month and day (`MM-DD`), or null to clear it.' },
+  notes: { type: ['string', 'null'], maxLength: 5000 },
+  photo_data: { type: ['string', 'null'], description: 'A base64 image data URL (png, jpeg, webp, gif), or null to remove it.' },
+  reminder_offset: {
+    description: 'Lead time before 12:00 on the birthday in the household time zone. Whole minutes as a number or digit string (`"1440"` = one day before), `"custom"` to use `reminder_custom_amount` and `reminder_custom_unit`, `""` for no reminder and no calendar event, or null for the day itself. On update, a value equal to the one already stored is accepted unchanged even if it lies outside these rules, so older records stay editable.',
+    oneOf: [
+      { type: 'null' },
+      { type: 'string', enum: ['', 'custom'] },
+      { type: 'string', pattern: '^\\d{1,9}$' },
+      { type: 'integer', minimum: 0, maximum: BIRTHDAY_REMINDER_MAX_MINUTES },
+    ],
+  },
+  reminder_custom_amount: {
+    description: 'Amount for a custom lead time, 1-999. Empty or null means unset (counted as 1).',
+    oneOf: [
+      { type: 'null' },
+      { type: 'integer', minimum: 1, maximum: 999 },
+      { type: 'string', pattern: '^([1-9]\\d{0,2})?$' },
+    ],
+  },
+  reminder_custom_unit: {
+    description: 'Unit for a custom lead time. Empty or null means unset (counted as days).',
+    type: ['string', 'null'],
+    enum: ['minutes', 'hours', 'days', 'weeks', '', null],
+  },
+};
+
 const calendarOccurrenceProperties = {
   series_id: { type: 'integer', minimum: 1 },
   recurrence_id: { type: 'string', format: 'date' },
@@ -29,10 +63,10 @@ const calendarOccurrenceProperties = {
 const calendarOccurrenceMutationProperties = {
   title: { type: 'string', maxLength: 200 },
   description: { type: ['string', 'null'], maxLength: 5000 },
-  start_datetime: { $ref: '#/components/schemas/CalendarDateOrDateTime' },
+  start_datetime: { $ref: '#/components/schemas/CalendarDateOrDateTimeInput' },
   end_datetime: {
     oneOf: [
-      { $ref: '#/components/schemas/CalendarDateOrDateTime' },
+      { $ref: '#/components/schemas/CalendarDateOrDateTimeInput' },
       { type: 'null' },
     ],
   },
@@ -141,6 +175,15 @@ export const schemas = {
         NoteUpdateInput: {
           type: 'object',
           properties: noteInputProperties,
+        },
+        BirthdayCreateInput: {
+          type: 'object',
+          required: ['name', 'birth_date'],
+          properties: birthdayInputProperties,
+        },
+        BirthdayUpdateInput: {
+          type: 'object',
+          properties: birthdayInputProperties,
         },
         NoteCategoryInput: {
           type: 'object',
@@ -538,8 +581,15 @@ export const schemas = {
           },
           required: ['data'],
         },
+        // ZWEI SCHEMATA, weil Anfrage und Antwort nicht dieselbe Menge sind
+        // (#1364): eine Anfrage mit `Z` oder Offset wird in die Haushaltszone
+        // umgerechnet und kommt als Wanduhrzeit zurueck, ein aus einem
+        // Fremdkalender synchronisierter Termin behaelt dagegen seinen Instant
+        // samt Offset. Ein gemeinsames Schema hat beides als "normalized"
+        // beschrieben und damit das Abschneiden wie eine Umrechnung aussehen
+        // lassen.
         CalendarDateOrDateTime: {
-          description: 'A calendar date or date-time accepted by calendar mutations.',
+          description: 'A calendar date or date-time as stored and returned. Events created or edited through the API or the app carry household wall-clock time; events that came in through calendar sync (CalDAV, Google, Outlook, ICS) keep the instant they arrived with, including its Z or numeric offset.',
           oneOf: [
             {
               type: 'string',
@@ -550,12 +600,33 @@ export const schemas = {
             {
               type: 'string',
               pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?$',
-              description: 'Yuvomi local wall-clock value. Seconds and fractional seconds are optional and are normalized to YYYY-MM-DDTHH:MM.',
+              description: 'Yuvomi local wall-clock value in the household time zone, without offset.',
             },
             {
               type: 'string',
               pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:?\\d{2})$',
-              description: 'Accepted UTC or numeric-offset input. Seconds, fractional seconds, and the offset are normalized to YYYY-MM-DDTHH:MM.',
+              description: 'Instant with Z or a numeric offset, as stored for a synchronized event. Returned unchanged.',
+            },
+          ],
+        },
+        CalendarDateOrDateTimeInput: {
+          description: 'A calendar date or date-time accepted by calendar mutations. What is stored is household wall-clock time: a value without offset is taken as such, a value with Z or a numeric offset is converted into the household time zone.',
+          oneOf: [
+            {
+              type: 'string',
+              format: 'date',
+              pattern: '^\\d{4}-\\d{2}-\\d{2}$',
+              description: 'Date-only value in YYYY-MM-DD form.',
+            },
+            {
+              type: 'string',
+              pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?$',
+              description: 'Yuvomi local wall-clock value in the household time zone. Seconds and fractional seconds are optional and are dropped; stored as YYYY-MM-DDTHH:MM.',
+            },
+            {
+              type: 'string',
+              pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:?\\d{2})$',
+              description: 'UTC or numeric-offset input. Read as an instant and converted into household wall-clock time, stored as YYYY-MM-DDTHH:MM - 2026-09-21T16:00:00Z in a Europe/Berlin household becomes 2026-09-21T18:00. For an all-day event only the date counts: the value is stored as its YYYY-MM-DD date as sent, so a midnight-UTC start stays on its day west of UTC. In the hour a DST change repeats, two instants map to the same wall-clock time; the stored value cannot tell them apart, so one of the two reads back an hour off.',
             },
           ],
         },
@@ -573,12 +644,19 @@ export const schemas = {
               type: ['string', 'null'],
               description: 'Inherited colour of the source calendar or ICS subscription, read-only. Applies to every event of that source and therefore says nothing about this one; it is the fallback below color and the assignee.',
             },
-            attachment_name: { type: ['string', 'null'] },
-            attachment_mime: { type: ['string', 'null'] },
-            attachment_size: { type: ['integer', 'null'] },
-            attachment_document_id: { type: ['integer', 'null'] },
-            attachment_preview_url: { type: ['string', 'null'] },
-            attachment_download_url: { type: ['string', 'null'] },
+            attachment_name: { type: ['string', 'null'], description: 'Null when the event has no attachment or the caller may not read its document (see attachment_document_id).' },
+            attachment_mime: { type: ['string', 'null'], description: 'Null when the event has no attachment or the caller may not read its document (see attachment_document_id).' },
+            attachment_size: { type: ['integer', 'null'], description: 'Null when the event has no attachment or the caller may not read its document (see attachment_document_id).' },
+            attachment_document_id: {
+              type: ['integer', 'null'],
+              description: 'The attachment\'s document in the Documents module. Null unless the caller may read that document: access to the Documents module (for API tokens a `documents:read` scope) and the document\'s own visibility. Without it the event carries no attachment at all - id, URLs, name, MIME type and size are null.',
+            },
+            attachment_locked: {
+              type: ['boolean', 'null'],
+              description: 'True when the event has an attachment whose document the caller may not see (for example a private document of another member); it names nothing about that document, and such an attachment cannot be replaced or removed by this caller. False otherwise. Null without read access to the Documents module (for API tokens a `documents:read` scope).',
+            },
+            attachment_preview_url: { type: ['string', 'null'], description: 'Null whenever attachment_document_id is null.' },
+            attachment_download_url: { type: ['string', 'null'], description: 'Null whenever attachment_document_id is null.' },
             attachment_data: {
               type: ['string', 'null'],
               description: 'Legacy attachment data URL. Null for attachments linked through attachment_document_id.',
@@ -705,6 +783,16 @@ export const schemas = {
               description: 'Only present on GET /auth/users for administrators: the account carries no '
                 + 'password and can only be entered through SSO.',
             },
+            sort_order: {
+              type: ['integer', 'null'],
+              description: 'Position in the household member order, or null: for a member that has not been '
+                + 'placed, and for every account that is no household member (staff, guest, deactivated).',
+            },
+            is_household_member: {
+              type: 'boolean',
+              description: 'Whether the account is a household member - the accounts GET /family/members '
+                + 'lists and the only ones the member order takes.',
+            },
           },
           required: ['id', 'username', 'display_name', 'avatar_color', 'role', 'family_role'],
         },
@@ -720,8 +808,27 @@ export const schemas = {
             email: { type: ['string', 'null'] },
             birth_date: { type: ['string', 'null'], format: 'date' },
             created_at: { type: 'string', format: 'date-time' },
+            sort_order: {
+              type: ['integer', 'null'],
+              description: 'Position in the household member order (set with PATCH /family/members/reorder), '
+                + 'or null for a member that has not been placed. Placed members come first, by position; '
+                + 'unplaced ones after them, by display name.',
+            },
           },
           required: ['id', 'display_name', 'avatar_color', 'family_role'],
+        },
+        FamilyMemberReorderInput: {
+          type: 'object',
+          required: ['order'],
+          properties: {
+            order: {
+              type: 'array',
+              minItems: 1,
+              uniqueItems: true,
+              items: { type: 'integer', minimum: 1 },
+              description: 'The ids of all household members, in the wanted order.',
+            },
+          },
         },
         FamilyMembersResponse: {
           type: 'object',
@@ -763,6 +870,20 @@ export const schemas = {
             username: { type: 'string' },
             display_name: { type: 'string' },
             password: { type: 'string' },
+            language: {
+              type: 'string',
+              nullable: true,
+              description: 'Optional. Language code of a supported app locale (e.g. `de`, `pt`, `fil`). '
+                + 'Sets the household data language (the language of server-generated titles such as birthday events), '
+                + 'unless the automatic choice already yields it. Region, currency and date format are not derived from it. '
+                + 'Unsupported values are rejected with 400; omitted, null or empty keeps the previous behaviour.',
+            },
+            timezone: {
+              type: 'string',
+              nullable: true,
+              description: 'Optional. IANA time zone of the household (e.g. `Europe/Berlin`). '
+                + 'Unknown zones are rejected with 400; omitted, null or empty keeps the fallback to TZ, the system zone and UTC.',
+            },
           },
           required: ['username', 'display_name', 'password'],
         },
@@ -931,6 +1052,7 @@ export const schemas = {
             },
             expires_at: { type: ['string', 'null'], format: 'date-time' },
             revoked_at: { type: ['string', 'null'], format: 'date-time' },
+            active: { type: 'boolean', description: 'Whether the token still signs in: not revoked and not past `expires_at`, judged by the server clock. Only a token with `active: false` can be removed.' },
             last_used_at: { type: ['string', 'null'], format: 'date-time' },
             created_at: { type: 'string', format: 'date-time' },
           },

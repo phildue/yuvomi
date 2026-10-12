@@ -49,6 +49,7 @@
 import { api } from '/api.js';
 import { t, formatDate } from '/i18n.js';
 import { esc } from '/utils/html.js';
+import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
 import { isPreviewable } from '/utils/document-preview.js';
 import { maxUploadBytes, maxUploadMb } from '/utils/upload-limit.js';
 import { attachOverlay } from '/utils/overlay-history.js';
@@ -123,9 +124,52 @@ export function renderDocumentAttachField({
         </button>
       </div>
       ${canUpload ? `<input class="sr-only" type="file" multiple accept="${ACCEPT}" data-doc-attach-input
-             aria-labelledby="doc-attach-label">` : ''}
+             aria-labelledby="doc-attach-label" tabindex="-1">` : ''}
       ${hintText ? `<p class="form-hint">${esc(hintText)}</p>` : ''}
     </div>`;
+}
+
+/**
+ * Die verknüpften Belege für eine LESEANSICHT (#1265 P7): je Dokument ein Link,
+ * als DOM gebaut, damit er als `node` in `openDetailView`-Zeilen passt.
+ *
+ * Dieselbe Rechtefrage wie das Feld oben, und aus demselben Grund: die Belege
+ * gehören dem Dokumente-Modul. Bei `documents: none` antwortet schon das Lesen
+ * mit 403, jeder Link ginge ins Leere - dann gibt es keine Zeile (`null`), und
+ * die Leseansicht schweigt über sie wie P6 über den Beleg eines Einsatzes.
+ * Bei `read` und `write` öffnet der Link das Dokument; Lösen und Hochladen
+ * gibt es hier nicht, eine Leseansicht bietet keine Handlung an.
+ *
+ * @param {object[]} attachments - `{ document_id, name, original_name, mime_type }`
+ * @returns {HTMLElement|null}
+ */
+export function attachmentLinksNode(attachments = []) {
+  if (pathAccess('/documents') === 'none') return null;
+  // Ohne Leserecht auf die Dokumente kommt `attachments: null` (#1358): kein
+  // Beleg und keine Anzahl, also auch keine Zeile und kein Hinweis. Eine Zeile
+  // ohne ID wird nie zum Link auf `/documents/null`.
+  const docs = (attachments || []).filter((a) => a?.document_id);
+  if (!docs.length) return null;
+  const wrap = document.createElement('div');
+  wrap.className = 'detail-chips';
+  for (const doc of docs) {
+    const name = doc.name || doc.original_name || '';
+    const link = document.createElement('a');
+    link.className = 'detail-attachment detail-attachment--file';
+    // Vorschaubar -> /preview, sonst /download: dieselbe Weiche wie die Chips
+    // des Felds, sonst endete eine DOCX im 415.
+    link.href = `/api/v1/documents/${Number(doc.document_id)}/${isPreviewable(doc.mime_type) ? 'preview' : 'download'}`;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.title = t('documentAttach.openAction', { name });
+    const icon = document.createElement('i');
+    icon.dataset.lucide = 'paperclip';
+    icon.className = 'icon-md';
+    icon.setAttribute('aria-hidden', 'true');
+    link.append(icon, document.createTextNode(name));
+    wrap.appendChild(link);
+  }
+  return wrap;
 }
 
 /**
@@ -372,20 +416,23 @@ function openDocumentPicker(panel, { excludeIds = new Set(), single = false } = 
     overlay.insertAdjacentHTML('afterbegin', `
       <div class="doc-attach-picker__panel" role="dialog" aria-modal="true"
            aria-label="${esc(t('documentAttach.pickerTitle'))}">
-        <div class="doc-attach-picker__header">
+        <div class="doc-attach-picker__header" data-dialog-actions>
           <strong>${esc(t('documentAttach.pickerTitle'))}</strong>
           <button class="btn btn--icon" type="button" data-picker-close
                   aria-label="${esc(t('common.cancel'))}">
             <i data-lucide="x" aria-hidden="true"></i>
           </button>
         </div>
-        <input class="form-input doc-attach-picker__search" type="search" data-picker-search
-               placeholder="${esc(t('documentAttach.searchPlaceholder'))}"
-               aria-label="${esc(t('documentAttach.searchPlaceholder'))}">
+        ${renderPageSearch({
+          id: 'doc-attach-picker-search',
+          label: t('documentAttach.searchPlaceholder'),
+          clearLabel: t('common.searchClear'),
+          className: 'doc-attach-picker__search',
+        })}
         <div class="doc-attach-picker__list" data-picker-list>
           <p class="doc-attach-picker__status">${esc(t('common.loading'))}</p>
         </div>
-        <div class="doc-attach-picker__footer">
+        <div class="doc-attach-picker__footer" data-dialog-actions>
           <button class="btn btn--secondary" type="button" data-picker-close>${esc(t('common.cancel'))}</button>
           <button class="btn btn--primary" type="button" data-picker-confirm disabled>
             ${esc(t('documentAttach.confirmSelection'))}
@@ -396,7 +443,7 @@ function openDocumentPicker(panel, { excludeIds = new Set(), single = false } = 
     if (window.lucide) window.lucide.createIcons({ el: overlay });
 
     const listEl = overlay.querySelector('[data-picker-list]');
-    const searchEl = overlay.querySelector('[data-picker-search]');
+    const searchEl = overlay.querySelector('#doc-attach-picker-search');
     const confirmEl = overlay.querySelector('[data-picker-confirm]');
     // Der Auslöser bekommt den Fokus zurück - das Overlay liegt über einem
     // offenen Modal, sonst fiele der Fokus auf <body>.
@@ -455,7 +502,7 @@ function openDocumentPicker(panel, { excludeIds = new Set(), single = false } = 
       confirmEl.disabled = selected.size === 0;
     });
 
-    searchEl.addEventListener('input', renderList);
+    wirePageSearch(overlay, { id: 'doc-attach-picker-search', delay: 0, onQuery: renderList });
     overlay.querySelectorAll('[data-picker-close]').forEach((button) => {
       button.addEventListener('click', () => close([]));
     });

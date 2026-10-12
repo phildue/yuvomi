@@ -12,7 +12,7 @@ import { defaultVisibilityFor } from './visibility-defaults.js';
 import {
   log, VISIBILITIES, LOG_STATUS, MAX_UNIT,
   viewerId, careAwareClause, toBit, applyUpdate, badRequest,
-  resolveOwner, writableClause, writableChild,
+  resolveOwner, writableClause, writableChild, wallClockInput, wallClockNow,
 } from './helpers.js';
 
 const router = express.Router();
@@ -362,9 +362,10 @@ router.post('/medications/:id/logs', (req, res) => {
     if (!medicationWritable(medId, viewer)) return res.status(404).json({ error: 'Medikament nicht gefunden.', code: 404 });
 
     const b = req.body || {};
-    const scheduledAt = v.datetime(b.scheduled_at, 'scheduled_at');
+    const wall        = wallClockInput();
+    const scheduledAt = v.datetime(b.scheduled_at, 'scheduled_at', false, wall);
     const status      = v.oneOf(b.status, LOG_STATUS, 'status');
-    const takenAt     = v.datetime(b.taken_at, 'taken_at');
+    const takenAt     = v.datetime(b.taken_at, 'taken_at', false, wall);
     const dose        = v.num(b.dose_qty, 'dose_qty');
     const note        = v.str(b.note, 'note', { max: v.MAX_TEXT, required: false });
 
@@ -382,10 +383,19 @@ router.post('/medications/:id/logs', (req, res) => {
     const errors = v.collectErrors(checks);
     if (errors.length) return badRequest(res, errors);
 
+    // Wie /take und PATCH: eine genommene Dosis ohne Zeit bekommt "jetzt" als
+    // Wanduhrzeit des Haushalts. NULL neben `taken` waere eine Einnahme ohne
+    // Einnahmezeit - im CSV-Export stuende die Spalte leer, und die Anzeige
+    // muesste auf `created_at` ausweichen, einen UTC-Instant. Umgekehrt traegt
+    // nur `taken` eine Einnahmezeit: ein mitgeschicktes `taken_at` neben
+    // pending/skipped faellt weg, wie bei PATCH und skip.
+    const nextStatus  = status.value || 'pending';
+    const nextTakenAt = nextStatus === 'taken' ? (takenAt.value || wallClockNow()) : null;
+
     const result = db.get().prepare(`
       INSERT INTO medication_logs (medication_id, schedule_id, scheduled_at, status, taken_at, dose_qty, note)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(medId, scheduleId, scheduledAt.value, status.value || 'pending', takenAt.value, dose.value, note.value);
+    `).run(medId, scheduleId, scheduledAt.value, nextStatus, nextTakenAt, dose.value, note.value);
 
     const row = db.get().prepare('SELECT * FROM medication_logs WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json({ data: row });
@@ -406,9 +416,9 @@ function updateLogStatus(req, res, newStatus) {
 
   const b = req.body || {};
   if (newStatus === 'taken') {
-    const takenAt = v.datetime(b.taken_at, 'taken_at');
+    const takenAt = v.datetime(b.taken_at, 'taken_at', false, wallClockInput());
     if (takenAt.error) return badRequest(res, [takenAt.error]);
-    const when = takenAt.value || new Date().toISOString();
+    const when = takenAt.value || wallClockNow();
     db.get().prepare('UPDATE medication_logs SET status = ?, taken_at = ? WHERE id = ?').run('taken', when, id);
   } else {
     db.get().prepare('UPDATE medication_logs SET status = ?, taken_at = NULL WHERE id = ?').run('skipped', id);
@@ -459,7 +469,7 @@ router.patch('/logs/:id', (req, res) => {
 
     const b = req.body || {};
     const status  = v.oneOf(b.status, LOG_STATUS, 'status');
-    const takenAt = v.datetime(b.taken_at, 'taken_at');
+    const takenAt = v.datetime(b.taken_at, 'taken_at', false, wallClockInput());
     const dose    = v.num(b.dose_qty, 'dose_qty');
     const note    = v.str(b.note, 'note', { max: v.MAX_TEXT, required: false });
 
@@ -473,7 +483,7 @@ router.patch('/logs/:id', (req, res) => {
     // widerspricht, und genau so einer stünde nachher im Export.
     let nextTakenAt;
     if (nextStatus === 'taken') {
-      nextTakenAt = takenAt.value ?? logRow.taken_at ?? new Date().toISOString();
+      nextTakenAt = takenAt.value ?? logRow.taken_at ?? wallClockNow();
     } else {
       nextTakenAt = null;
     }

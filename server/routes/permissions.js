@@ -12,7 +12,7 @@ import * as db from '../db.js';
 import { createLogger } from '../logger.js';
 import { requireAdmin } from '../auth.js';
 import { listModules } from '../services/modules.js';
-import { accessScopeSql, householdMemberSql } from '../services/household-members.js';
+import { accessScopeSql, activeAccountSql, householdMemberSql, memberOrderSql } from '../services/household-members.js';
 import {
   permissionCatalog,
   getSubjectPermissions,
@@ -53,7 +53,9 @@ router.get('/catalog', async (req, res) => {
       SELECT id, display_name, username, avatar_color, avatar_data, role, family_role,
         ${accessScopeSql('users')} AS access_scope
       FROM users
-      ORDER BY display_name
+      -- Rechte vergibt man an Konten, die noch hereinkommen (#1381).
+      WHERE ${activeAccountSql('users')}
+      ORDER BY ${memberOrderSql('users')}
     `).all();
     res.json({ data: { ...catalog, members } });
   } catch (err) {

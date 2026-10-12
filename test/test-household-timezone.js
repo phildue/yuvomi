@@ -35,8 +35,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const {
-  householdTimeZone, isValidTimeZone, serverTimeZone, shiftDateKey,
-  storedToInstantMs, todayKey,
+  householdTimeZone, isValidTimeZone, localToUTC, localToUTCPrecise, serverTimeZone,
+  shiftDateKey, storedToInstantMs, storedToInstantMsPrecise, todayKey, utcToWall,
 } = await import('../server/utils/timezone.js');
 
 const dbmod = await import('../server/db.js');
@@ -173,6 +173,216 @@ test('storedToInstantMs: der Stringvergleich, den er ersetzt, war falsch', () =>
     storedToInstantMs(local, 'America/Toronto') > Date.parse(nowIso),
     'Der Zeitpunktvergleich stellt ihn richtig',
   );
+});
+
+// --------------------------------------------------------
+// Warum es ZWEI Umrechnungen gibt (#786, #1300)
+// --------------------------------------------------------
+
+/** Wanduhrzeit -> Zeitpunkt -> Wanduhrzeit. Was hier nicht zurueckkommt, war nicht eindeutig. */
+function roundTrip(toUTC, local, zone) {
+  const wall = utcToWall(toUTC(local, zone), zone);
+  return wall ? `${wall.date}T${wall.time}` : null;
+}
+
+test('localToUTC bildet ein ganzes Wanduhr-Band am Umstelltag auf denselben Zeitpunkt ab', () => {
+  // Die Ein-Durchgang-Fassung liest die lokalen Ziffern als UTC, bestimmt den
+  // Offset AN DIESEM falschen Punkt und wendet ihn einmal an. Rund um eine
+  // DST-Grenze ist der Offset dort ein anderer als am richtigen Punkt, und das
+  // Ergebnis ist nicht umkehrbar. Das ist kein Fehler dieser Funktion - es ist
+  // ihr dokumentiertes Verhalten, und mehrere Aufrufer haengen daran. Es ist
+  // der Grund, warum `localToUTCPrecise()` daneben steht.
+  const zone = 'Europe/Berlin';
+  assert.equal(
+    localToUTC('2026-03-29T00:30:00', zone),
+    localToUTC('2026-03-29T01:30:00', zone),
+    'zwei verschiedene, beide existierende Uhrzeiten, ein Ergebnis',
+  );
+  assert.deepEqual(
+    ['2026-03-29T00:30:00', '2026-03-29T01:30:00', '2026-10-25T01:30:00']
+      .map((local) => roundTrip(localToUTC, local, zone)),
+    ['2026-03-29T00:30:00', '2026-03-29T00:30:00', '2026-10-25T02:30:00'],
+  );
+});
+
+test('localToUTCPrecise trifft jede Wanduhrzeit, die es wirklich gibt', () => {
+  const zone = 'Europe/Berlin';
+  // Beide 2026er Grenzen, je die Stunde davor und danach, dazu die doppelte
+  // Stunde im Herbst. Alles ausser der Fruehjahrsluecke muss zurueckkommen.
+  const existing = [
+    '2026-03-29T00:30:00', '2026-03-29T01:00:00', '2026-03-29T01:59:00',
+    '2026-03-29T03:00:00', '2026-03-29T03:30:00',
+    '2026-10-25T00:30:00', '2026-10-25T01:30:00', '2026-10-25T02:30:00',
+    '2026-10-25T03:30:00',
+  ];
+  assert.deepEqual(existing.map((local) => roundTrip(localToUTCPrecise, local, zone)), existing);
+
+  // In der doppelten Stunde sind zwei Antworten richtig; gewaehlt ist die
+  // SPAETERE, also die Lage nach der Umstellung (CET, +01:00). Die Zusicherung
+  // nennt sie, weil eine, die es offenliesse, nichts hielte.
+  assert.equal(localToUTCPrecise('2026-10-25T02:30:00', zone), '2026-10-25T01:30:00Z');
+
+  // Die Fruehjahrsluecke gibt es nicht; dokumentierter Ausweg ist, um ihre
+  // Breite vorzuschieben. 02:30 wird damit zu 03:30 Ortszeit.
+  assert.equal(localToUTCPrecise('2026-03-29T02:30:00', zone), '2026-03-29T01:30:00Z');
+  assert.equal(roundTrip(localToUTCPrecise, '2026-03-29T02:30:00', zone), '2026-03-29T03:30:00');
+});
+
+test('die Fruehjahrsluecke faellt in JEDER Zone gleich aus, nicht nur bei positivem Offset', () => {
+  // Der Ausweg aus der Luecke war vorzeichenabhaengig und damit in der halben
+  // Welt falsch: `guessA + Luecke` stimmt nur, solange `guessA` der FRUEHERE
+  // der beiden Kandidaten ist - und das ist er nur bei positivem Offset. In
+  // jeder US-Zone ist guessA bereits der spaetere, das Addieren schob um eine
+  // volle Stunde zu weit (gemessen: 04:30 EDT statt 03:30). Richtig ist der
+  // SPAETERE Kandidat, und den nennt `Math.max` ohne Fallunterscheidung.
+  //
+  // Je Zone die Wanduhrzeit MITTEN in der uebersprungenen Stunde; erwartet ist
+  // dieselbe Minute direkt hinter der Luecke.
+  const luecken = [
+    ['Europe/Berlin', '2026-03-29T02:30:00', '2026-03-29T03:30:00'],
+    ['America/New_York', '2026-03-08T02:30:00', '2026-03-08T03:30:00'],
+    ['America/Chicago', '2026-03-08T02:30:00', '2026-03-08T03:30:00'],
+    ['America/Los_Angeles', '2026-03-08T02:30:00', '2026-03-08T03:30:00'],
+    ['Australia/Sydney', '2026-10-04T02:30:00', '2026-10-04T03:30:00'],
+    // Halbstunden- und Viertelstunden-Zonen: die Luecke ist auch hier 60
+    // Minuten breit, aber der Offset selbst ist krumm - ein Rechenweg, der
+    // insgeheim mit vollen Stunden rechnet, faellt hier auf.
+    ['Pacific/Chatham', '2026-09-27T02:45:00', '2026-09-27T03:45:00'],
+  ];
+  for (const [zone, luecke, erwartet] of luecken) {
+    assert.equal(roundTrip(localToUTCPrecise, luecke, zone), erwartet,
+      `${zone}: ${luecke} gibt es nicht, erwartet ist ${erwartet} - eine Zone mit `
+      + 'negativem Offset darf nicht eine Stunde weiter landen als eine mit positivem.');
+  }
+});
+
+test('storedToInstantMsPrecise erbt die Formregeln und tauscht nur die Umrechnung', () => {
+  const zone = 'Europe/Berlin';
+  // Dieselben drei Formen wie oben bei `storedToInstantMs`, damit ein
+  // Auseinanderdriften der beiden Rumpfe auffaellt.
+  assert.equal(
+    storedToInstantMsPrecise('2026-08-21T19:00', zone),
+    storedToInstantMs('2026-08-21T19:00', zone),
+  );
+  assert.equal(
+    storedToInstantMsPrecise('2026-08-21T23:00:00Z', 'Asia/Tokyo'),
+    Date.parse('2026-08-21T23:00:00Z'),
+  );
+  assert.equal(storedToInstantMsPrecise('2026-08-21', zone), Date.parse('2026-08-20T22:00:00Z'));
+  assert.equal(storedToInstantMsPrecise('', 'UTC'), null);
+
+  // Und der Unterschied, um den es geht: im Band am Umstelltag liefern die
+  // beiden Fassungen verschiedene Zeitpunkte, und nur der praezise ist der,
+  // den die Uhr an der Wand zeigte.
+  assert.equal(storedToInstantMsPrecise('2026-03-29T01:30', zone), Date.parse('2026-03-29T00:30:00Z'));
+  assert.equal(storedToInstantMs('2026-03-29T01:30', zone), Date.parse('2026-03-28T23:30:00Z'));
+});
+
+// --------------------------------------------------------
+// Sekundenbruchteile einer zonenlosen Wanduhrzeit (#1658)
+//
+// Der Offset wurde als "Wanduhr minus Zeitpunkt" abgelesen, die Wanduhr aber
+// in ganzen Sekunden: der Bruchteil fehlte im Offset und kam beim Anwenden ein
+// zweites Mal dazu, ueber den Fixpunkt ein drittes. Kein Codepfad schreibt so
+// einen Wert, von Hand eingespielte Zeilen tragen ihn aber - und knapp vor
+// Mitternacht reicht das fuer den Nachbartag.
+// --------------------------------------------------------
+
+const FRACTION_READERS = [
+  ['storedToInstantMs', (value, zone) => storedToInstantMs(value, zone)],
+  ['storedToInstantMsPrecise', (value, zone) => storedToInstantMsPrecise(value, zone)],
+  ['localToUTC', (value, zone) => Date.parse(localToUTC(value, zone))],
+  ['localToUTCPrecise', (value, zone) => Date.parse(localToUTCPrecise(value, zone))],
+];
+const isoOf = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : String(ms));
+
+test('Sekundenbruchteil: die gemessenen Werte aus #1658, oestlich und westlich von UTC', () => {
+  const cases = [
+    ['Europe/Berlin', '2031-07-15T11:00:00.250', '2031-07-15T09:00:00.250Z'],
+    ['Europe/Berlin', '2031-07-15T11:00:00.750', '2031-07-15T09:00:00.750Z'],
+    ['America/New_York', '2031-07-15T11:00:00.250', '2031-07-15T15:00:00.250Z'],
+    ['America/New_York', '2031-07-15T11:00:00.750', '2031-07-15T15:00:00.750Z'],
+    // Krummer Offset (+05:45): ein Rechenweg, der in vollen Stunden denkt, faellt hier auf.
+    ['Asia/Kathmandu', '2031-07-15T11:00:00.250', '2031-07-15T05:15:00.250Z'],
+    // Vor 1970 ist der Zeitpunkt negativ - die ganze Sekunde ist dort die kleinere Zahl.
+    ['Europe/Berlin', '1965-07-15T11:00:00.250', '1965-07-15T10:00:00.250Z'],
+    ['America/New_York', '1965-07-15T11:00:00.750', '1965-07-15T15:00:00.750Z'],
+  ];
+  for (const [name, read] of FRACTION_READERS) {
+    for (const [zone, value, expected] of cases) {
+      assert.equal(isoOf(read(value, zone)), expected, `${name}: ${value} in ${zone}`);
+    }
+  }
+});
+
+test('Sekundenbruchteil: der letzte Moment eines Tages bleibt in seinem Tag', () => {
+  // Der Schaden, um den es geht: 23:59:59.900 wurde zu 00:00:00.800 des
+  // Folgetags - ein anderer Tag, am Monatsletzten ein anderer Monat.
+  const cases = [
+    ['UTC', '2035-07-31T23:59:59.900', '2035-07-31T23:59:59.900Z', '2035-07-31'],
+    ['Europe/Berlin', '2035-07-31T23:59:59.900', '2035-07-31T21:59:59.900Z', '2035-07-31'],
+    ['America/New_York', '2035-07-31T23:59:59.900', '2035-08-01T03:59:59.900Z', '2035-07-31'],
+  ];
+  for (const [name, read] of FRACTION_READERS) {
+    for (const [zone, value, expected, day] of cases) {
+      const ms = read(value, zone);
+      assert.equal(isoOf(ms), expected, `${name}: ${value} in ${zone}`);
+      assert.equal(utcToWall(new Date(ms).toISOString(), zone).date, day, `${name}: Tag in ${zone}`);
+    }
+  }
+});
+
+test('Sekundenbruchteil: ueber die Umstellnaechte ist der Wert die ganze Sekunde plus Bruchteil', () => {
+  // Nicht gegen abgeschriebene Erwartungen, sondern gegen die Umrechnung der
+  // ganzen Sekunde, die oben fuer Luecke, Doppelstunde und Band belegt ist: der
+  // Bruchteil darf an KEINER Stelle des Tages etwas anderes tun, als einmal
+  // dazuzukommen. Viertelstundenraster ueber beide Umstelltage je Zone.
+  const nights = [
+    ['Europe/Berlin', '2031-03-30'], ['Europe/Berlin', '2031-10-26'],
+    ['America/New_York', '2031-03-09'], ['America/New_York', '2031-11-02'],
+    ['Australia/Lord_Howe', '2031-04-06'], ['Australia/Lord_Howe', '2031-10-05'],
+  ];
+  const pad = (n) => String(n).padStart(2, '0');
+  const wrong = [];
+  let compared = 0;
+  let shifted = 0;
+  for (const [zone, day] of nights) {
+    const offsets = new Set();
+    for (let minute = 0; minute < 24 * 60; minute += 15) {
+      const wall = `${day}T${pad(Math.floor(minute / 60))}:${pad(minute % 60)}:00`;
+      offsets.add(Date.parse(`${wall}Z`) - storedToInstantMsPrecise(wall, zone));
+      for (const [name, read] of FRACTION_READERS) {
+        for (const [suffix, extra] of [['.001', 1], ['.250', 250], ['.5', 500], ['.999', 999]]) {
+          compared += 1;
+          const actual = read(`${wall}${suffix}`, zone);
+          const expected = read(wall, zone) + extra;
+          if (actual !== expected) wrong.push(`${name} ${zone} ${wall}${suffix}: ${isoOf(actual)} statt ${isoOf(expected)}`);
+        }
+      }
+    }
+    // Ohne diese Probe liefe das Raster auch dann gruen, wenn der Tag gar
+    // keine Umstellung haette.
+    if (offsets.size > 1) shifted += 1;
+  }
+  assert.deepEqual(wrong.slice(0, 10), [], `${wrong.length} von ${compared} Werten tragen den Bruchteil nicht genau einmal`);
+  assert.equal(shifted, nights.length, 'jeder der Tage ist ein Umstelltag');
+
+  // Und drei davon ausgeschrieben, damit die Aussage nicht nur relativ ist.
+  // Berlin, 30.03.2031: 01:30 ist noch CET, 03:30 schon CEST.
+  assert.equal(isoOf(storedToInstantMsPrecise('2031-03-30T01:30:00.250', 'Europe/Berlin')), '2031-03-30T00:30:00.250Z');
+  assert.equal(isoOf(storedToInstantMsPrecise('2031-03-30T03:30:00.250', 'Europe/Berlin')), '2031-03-30T01:30:00.250Z');
+  // New York, 09.03.2031: 03:30 ist schon EDT.
+  assert.equal(isoOf(storedToInstantMsPrecise('2031-03-09T03:30:00.750', 'America/New_York')), '2031-03-09T07:30:00.750Z');
+});
+
+test('Sekundenbruchteil: ganze Sekunden behalten ihre Schreibweise', () => {
+  // `localToUTC*` schreibt ganze Sekunden ohne '.000' - Aufrufer vergleichen
+  // und speichern den String (ICS-Parser, Expansion). Der Bruchteil kommt nur
+  // dort in die Ausgabe, wo er in der Eingabe stand.
+  assert.equal(localToUTC('2031-07-15T11:00:00', 'Europe/Berlin'), '2031-07-15T09:00:00Z');
+  assert.equal(localToUTCPrecise('2031-07-15T11:00:00', 'Europe/Berlin'), '2031-07-15T09:00:00Z');
+  assert.equal(localToUTC('2031-07-15T11:00:00.250', 'Europe/Berlin'), '2031-07-15T09:00:00.250Z');
+  assert.equal(localToUTCPrecise('2031-07-15T11:00:00.250', 'Europe/Berlin'), '2031-07-15T09:00:00.250Z');
 });
 
 // --------------------------------------------------------

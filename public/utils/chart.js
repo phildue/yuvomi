@@ -41,18 +41,27 @@ import { esc } from '/utils/html.js';
  * der Preis dafür, EINE Geometrie zu haben statt einer pro Modul.
  * 600x200 ist ein Seitenverhältnis, kein Pixelmaß: das SVG skaliert
  * proportional (kein `preserveAspectRatio="none"`), die Strichstärken hält
- * `vector-effect="non-scaling-stroke"` konstant.
+ * `vector-effect="non-scaling-stroke"` konstant, die Achsenschrift die Klasse
+ * `.chart` am SVG (panel.css) - jedes SVG dieser Geometrie traegt sie.
  */
 export const CHART = Object.freeze({ W: 600, H: 200, PAD_L: 56, PAD_R: 12, PAD_T: 14, PAD_B: 26 });
 
-/** Die vier Plotgrenzen im viewBox-Koordinatensystem. */
-export function chartScales() {
-  const { W, H, PAD_L, PAD_R, PAD_T, PAD_B } = CHART;
+/** Abstand zwischen dem rechten Ende eines Y-Werts und der Plotkante, in
+ *  viewBox-Einheiten. Die Werte stehen rechtsbuendig bei PAD_L - AXIS_GAP;
+ *  `.chart-host` (panel.css) rechnet mit derselben Zahl, test-chart-gutter.js
+ *  haelt beide Stellen gleich. */
+export const AXIS_GAP = 6;
+
+/** Die vier Plotgrenzen im viewBox-Koordinatensystem.
+ *  `geo` ist eine andere Flaeche mit DENSELBEN Raendern (`{ ...CHART, H }`),
+ *  etwa das hoehere Diagramm im mobilen Vitalwerte-Blatt (health.js). */
+export function chartScales(geo = CHART) {
+  const { W, H, PAD_L, PAD_R, PAD_T, PAD_B } = geo;
   return { left: PAD_L, right: W - PAD_R, top: PAD_T, bottom: H - PAD_B };
 }
 
 /**
- * Fünf horizontale Gitterlinien mit Y-Wert-Beschriftung am linken Rand - eine
+ * Horizontale Gitterlinien (Voreinstellung fuenf) mit Y-Wert-Beschriftung links - eine
  * echte Werteachse statt zweier frei schwebender Min-/Max-Zahlen.
  *
  * @param {number} min  unterster Wert der Skala
@@ -62,20 +71,164 @@ export function chartScales() {
  *        genug für ganzzahlige Labels ist: bei Spannen ab 4 Einheiten sind
  *        Nachkommastellen Pseudo-Präzision („125,9 mmHg", Audit A2-21), bei
  *        kleinen Spannen (Laborwerte 0,5-1,2) sind sie die eigentliche Auskunft.
+ * @param {number} [steps=4]  Zahl der Schritte, `niceDomain().steps`
  */
-export function chartGridMarkup(min, max, formatTick) {
-  const { W, PAD_L, PAD_R } = CHART;
-  const { top, bottom } = chartScales();
+export function chartGridMarkup(min, max, formatTick, geo = CHART, steps = 4) {
+  const { W, PAD_L, PAD_R } = geo;
+  const { top, bottom } = chartScales(geo);
   const out = [];
-  const wholeTicks = (max - min) >= 4;
-  for (let k = 0; k <= 4; k++) {
-    const gy = top + (k * (bottom - top)) / 4;
-    const val = max - (k * (max - min)) / 4;
+  const step = (max - min) / steps;
+  // Eine runde Skala (niceDomain) zeigt Nachkommastellen genau dann, wenn ihr
+  // Schritt oder ihre Unterkante welche hat - 2,5 bleibt 2,5 und wird nicht 3.
+  // Eine freie Skala (feste Grenzen) behaelt die Spannen-Regel.
+  const whole = (v) => Math.abs(v - Math.round(v)) < 1e-9;
+  const wholeTicks = isNiceStep(step) ? whole(step) && whole(min) : (max - min) >= 4;
+  for (let k = 0; k <= steps; k++) {
+    const gy = top + (k * (bottom - top)) / steps;
+    const val = max - k * step;
     out.push(`<line class="chart__grid" x1="${PAD_L}" y1="${gy.toFixed(1)}" x2="${W - PAD_R}" y2="${gy.toFixed(1)}" vector-effect="non-scaling-stroke" />`);
-    out.push(`<text x="${PAD_L - 6}" y="${(gy + 3.5).toFixed(1)}" class="chart__axis chart__axis--y" text-anchor="end">${esc(formatTick(val, wholeTicks))}</text>`);
+    // y = die Gitterlinie selbst: `.chart__axis--y` zentriert per
+    // dominant-baseline. Der fruehere Versatz (+3.5 Einheiten) passte nur zu
+    // einer Schrift, die mit dem Diagramm skaliert (panel.css, `.chart`).
+    // DER UNTERSTE WERT SITZT AUF SEINER LINIE, NICHT MITTIG DARAUF (Critique
+    // 2026-10-05, R16). Die Achsenschrift ist fest 12px, die Geometrie skaliert:
+    // bei 358px Breite ist PAD_B nur noch 14px hoch, und "0 €" stand mittig auf
+    // der Grundlinie halb in der Zeile der X-Beschriftung - 3px neben
+    // "01.10.2026", gelesen als ein Wort. Um eine halbe Schrifthoehe gehoben
+    // (`dy` in em, also in Bildschirmpixeln) steht er ueber der Linie, das
+    // Datum darunter. Gilt fuer jedes Diagramm dieser Geometrie (Budget-Verlauf
+    // und die Kurven der Gesundheit).
+    const base = k === steps ? ' dy="-0.6em"' : '';
+    out.push(`<text x="${PAD_L - AXIS_GAP}" y="${gy.toFixed(1)}" class="chart__axis chart__axis--y" text-anchor="end"${base}>${esc(formatTick(val, wholeTicks))}</text>`);
   }
   return out.join('');
 }
+
+/**
+ * DER GUTTER FOLGT DEM BREITESTEN ACHSENWERT (#1607).
+ *
+ * `--chart-inset` (panel.css) haelt dem Gutter eine Mindestbreite frei, und die
+ * war eine feste Zahl: var(--space-16), bemessen an "5.550 €". Die Achsenschrift
+ * ist aber fest 12px, und wie breit ein Wert darin steht, entscheiden Region
+ * und Waehrung des Haushalts. Gemessen in koreanischer Region mit Won:
+ * "₩6,000,000" ist 67px breit und stand bei 375px Fensterbreite 6px, bei 1280px
+ * 13px links ausserhalb seines Scrollports - ohne Waehrungszeichen und ohne den
+ * Anfang der Zahl. Eine groessere feste Zahl haette denselben Fehler eine
+ * Groessenordnung weiter wieder ("CHF 125'000'000" ist 100px breit) und naehme
+ * jedem Diagramm mit kurzen Werten die Breite; eine Kurzschreibweise traegt
+ * auch nicht ueberall ("1,25 Mio. €" ist 62px breit, "600.000 €" hat gar keine).
+ *
+ * Deshalb wird gemessen statt geschaetzt: die Breite des breitesten Werts der
+ * Werteachse geht als `--chart-label-width` an das Elternelement des SVG, und
+ * `.chart-host` (panel.css) rechnet das Polster daraus. Das Elternelement, weil
+ * dort auch steht, was UEBER der Flaeche liegt und gegen dieselbe Zeichenbreite
+ * rechnet (die Punkte des Budget-Verlaufs). Einmal je Aufbau genuegt: die
+ * Schrift skaliert nicht mit, die Breite eines Werts haengt also nicht an der
+ * des Fensters.
+ *
+ * Ein Wert, der nicht im Bild steht, hat keine Breite, und dann bleibt es bei
+ * der Mindestbreite. Keine Seite ruft das selbst: `watchChartGutters()` unten
+ * misst jedes `svg.chart`, sobald es im Dokument steht.
+ *
+ * @param {ParentNode} root  enthaelt die `svg.chart`, die im Dokument stehen
+ */
+export function fitChartGutter(root) {
+  if (!root || typeof root.querySelectorAll !== 'function') return;
+  const labels = [...root.querySelectorAll('svg.chart .chart__axis--y')];
+  const fitted = new Map();
+  // ZWEIMAL GEMESSEN, DER GROESSERE WERT GILT (#1722). Das Polster aendert den
+  // Massstab des Diagramms, und Chrome setzt denselben Text je nach Massstab
+  // um bis zu einem Zehntel anders breit: "Umiarkowane" mass 69px, 71px und
+  // 78px in derselben 12px-Schrift. Der zweite Durchgang misst im Massstab,
+  // den der erste hergestellt hat. Nur nach oben, damit nichts pendelt.
+  for (let pass = 0; pass < 2; pass += 1) {
+    const widest = new Map();
+    for (const label of labels) {
+      const host = label.closest('svg.chart')?.parentElement;
+      if (!host) continue;
+      widest.set(host, Math.max(widest.get(host) ?? 0, label.getBoundingClientRect().width));
+    }
+    let changed = false;
+    for (const [host, measured] of widest) {
+      const width = Math.ceil(measured);
+      if (!(width > (fitted.get(host) ?? 0))) continue;
+      fitted.set(host, width);
+      host.classList.add('chart-host');
+      host.style.setProperty('--chart-label-width', `${width}px`);
+      changed = true;
+    }
+    if (!changed) break;
+  }
+}
+
+/**
+ * EINSETZEN UND MESSEN SIND EIN SCHRITT (#1722).
+ *
+ * `fitChartGutter()` rief nur der Budget-Verlauf. Die sieben Diagramme der
+ * Gesundheit und der Kilometerstand des Inventars behielten die Mindestbreite,
+ * und die traegt Zahlen, aber keine Woerter: an der Achse des
+ * Schweregrad-Verlaufs steht in polnischer Sprache "Umiarkowane", 78px breit
+ * bei 375px Fensterbreite - das Wort begann 16px links vom Diagramm und 1px
+ * vor der Kante seiner Karte. Acht Aufrufe haetten das behoben und der neunte
+ * Aufrufer haette ihn wieder vergessen, still, mit der Mindestbreite als
+ * Ergebnis. Deshalb beobachtet EINE Stelle das Dokument: was als `svg.chart`
+ * hineinkommt, wird gemessen. Der Beobachter laeuft als Mikrotask, also nach
+ * dem Skript, das eingesetzt hat, und vor dem naechsten Bild.
+ *
+ * EIN DIAGRAMM, DAS BEIM EINSETZEN NICHT IM BILD STEHT, HAT KEINE BREITE - der
+ * Schweregrad-Verlauf liegt in einem geschlossenen Aufklapper. Ein solches
+ * SVG wartet in einem ResizeObserver, bis es eine Flaeche hat, wird dann
+ * gemessen und wieder entlassen. Geht es vorher aus dem Dokument, ebenfalls.
+ *
+ * @param {Node} root  beobachtete Wurzel, im Betrieb `document.body` (Blaetter
+ *        und Dialoge haengen dort, nicht im Seiteninhalt)
+ * @returns {() => void}  beendet die Beobachtung
+ */
+export function watchChartGutters(root, {
+  MutationObserver: Added = globalThis.MutationObserver,
+  ResizeObserver: Sized = globalThis.ResizeObserver,
+} = {}) {
+  if (!root || typeof Added !== 'function') return () => {};
+  const waiting = typeof Sized === 'function'
+    ? new Sized((entries) => {
+      for (const { target } of entries) {
+        if (!(target.getBoundingClientRect().width > 0)) continue;
+        fitChartGutter(target.parentElement);
+        waiting.unobserve(target);
+      }
+    })
+    : null;
+  // Auch ein Knoten IN einem Diagramm zaehlt: wer nur die Achse austauscht,
+  // hat andere Werte an derselben Flaeche.
+  const chartsAt = (node) => {
+    if (node.nodeType !== 1) return [];
+    const own = node.closest('svg.chart');
+    return own ? [own] : [...node.querySelectorAll('svg.chart')];
+  };
+  const fit = (svg) => {
+    if (!svg.isConnected) return;
+    if (svg.getBoundingClientRect().width > 0) fitChartGutter(svg.parentElement);
+    else waiting?.observe(svg);
+  };
+  const added = new Added((records) => {
+    for (const record of records) {
+      for (const node of record.removedNodes) for (const svg of chartsAt(node)) waiting?.unobserve(svg);
+      for (const node of record.addedNodes) for (const svg of chartsAt(node)) fit(svg);
+    }
+  });
+  added.observe(root, { childList: true, subtree: true });
+  for (const svg of chartsAt(root)) fit(svg);
+  return () => {
+    added.disconnect();
+    waiting?.disconnect();
+  };
+}
+
+// Hier und nicht im Router: ein `.chart__axis--y` entsteht nur ueber
+// `chartGridMarkup()` oben. Wer ein Diagramm zeichnen kann, hat dieses Modul
+// geladen und damit den Beobachter - einen Aufruf, den eine Seite vergessen
+// koennte, gibt es nicht.
+if (typeof document !== 'undefined' && document.body) watchChartGutters(document.body);
 
 /**
  * X-Achsen-Labels (erstes, mittleres, letztes) unter dem Plot, an den
@@ -85,9 +238,9 @@ export function chartGridMarkup(min, max, formatTick) {
  *
  * @param {string[]} labels  bereits formatierte Beschriftungen
  */
-export function chartXLabelsMarkup(labels) {
+export function chartXLabelsMarkup(labels, geo = CHART) {
   if (!labels.length) return '';
-  const { H, W, PAD_L, PAD_R } = CHART;
+  const { H, W, PAD_L, PAD_R } = geo;
   const y = H - 7;
   const picks = labels.length <= 2
     ? labels.slice()
@@ -103,15 +256,176 @@ export function chartXLabelsMarkup(labels) {
  * Rechnet einen Wert auf seine Y-Koordinate im Plot. Steht hier, weil jede
  * Zeitreihe sie braucht und drei Module sie bisher je eigen geschrieben haben.
  */
-export function chartY(value, min, max) {
-  const { top, bottom } = chartScales();
+export function chartY(value, min, max, geo = CHART) {
+  const { top, bottom } = chartScales(geo);
   if (max === min) return (top + bottom) / 2;
   return bottom - ((value - min) / (max - min)) * (bottom - top);
 }
 
 /** Rechnet einen Index auf seine X-Koordinate im Plot. */
-export function chartX(index, count) {
-  const { left, right } = chartScales();
+export function chartX(index, count, geo = CHART) {
+  const { left, right } = chartScales(geo);
   if (count <= 1) return left;
   return left + (index * (right - left)) / (count - 1);
+}
+
+/* RUNDE ACHSENWERTE (Re-Critique 2026-09-27, C4).
+ *
+ * Das Gitter teilte die rohe Spanne in Viertel: die Blutdruck-Achse stand bei
+ * 126/108/91/73/55, die Budget-Achse bei 5.550/4.163/2.775/1.388. Solche Werte
+ * liest niemand ab - man rechnet sie nach. Die Spanne wird deshalb auf drei
+ * bis sechs Schritte von 1, 2, 2,5 oder 5 mal einer Zehnerpotenz gelegt, und
+ * die Unterkante auf ein Vielfaches davon. Genommen wird die knappste Skala,
+ * die die Daten ganz enthaelt; bei Gleichstand die mit vier Schritten, dann
+ * fuenf, drei, sechs. Der Preis ist etwas Luft ueber und unter der Kurve.
+ *
+ * Wer eine feste Skala hat (Stimmung 1-5, Schweregrad 1-3), ruft das nicht:
+ * dort SIND die Grenzen die Aussage. */
+const NICE_FACTORS = [1, 2, 2.5, 5];
+const STEP_COUNTS = [4, 5, 3, 6];
+
+/** Ist `step` ein runder Schritt (1, 2, 2,5 oder 5 mal 10^n)? */
+function isNiceStep(step) {
+  if (!(step > 0)) return false;
+  const f = step / 10 ** Math.floor(Math.log10(step) + 1e-9);
+  return NICE_FACTORS.some((n) => Math.abs(f - n) < 1e-6);
+}
+
+/**
+ * Legt [min, max] auf eine Skala mit runden Schritten.
+ * @param {number} min  kleinster Datenwert
+ * @param {number} max  groesster Datenwert
+ * @param {{ integer?: boolean }} [opts]  `integer`: nur ganzzahlige Schritte -
+ *        fuer eine Achse, die ohne Nachkommastellen beschriftet (Geldachse:
+ *        2,5 stuende dort als "3 €").
+ * @returns {{ min: number, max: number, step: number, steps: number }}
+ *          `steps` geht an `chartGridMarkup` als Zahl der Schritte.
+ */
+export function niceDomain(min, max, { integer = false } = {}) {
+  let lo = Number(min);
+  let hi = Number(max);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return { min: 0, max: 4, step: 1, steps: 4 };
+  if (lo > hi) [lo, hi] = [hi, lo];
+  if (lo === hi) {
+    // Ein einzelner Wert braucht eine Spanne; unter 0 wird keine erfunden.
+    const pad = lo !== 0 ? Math.abs(lo) * 0.1 : 1;
+    hi += pad;
+    lo = lo >= 0 && lo - pad < 0 ? 0 : lo - pad;
+  }
+  // Gleitkomma-Reste (0.1 + 0.2) bleiben aus den Labels: jeder Wert wird auf
+  // die Stellen seines Schritts gerundet.
+  const fix = (v, step) => Number(v.toFixed(Math.max(0, 2 - Math.floor(Math.log10(step)))));
+  let best = null;
+  for (const steps of STEP_COUNTS) {
+    const mag = 10 ** Math.floor(Math.log10((hi - lo) / steps));
+    const step = [...NICE_FACTORS.map((f) => f * mag), 10 * mag, 20 * mag].find((s) =>
+      (!integer || Math.abs(s - Math.round(s)) < 1e-9)
+      && Math.floor(lo / s + 1e-9) * s + steps * s >= hi - 1e-9);
+    if (step === undefined) continue;
+    const start = fix(Math.floor(lo / step + 1e-9) * step, step);
+    const cand = { min: start, max: fix(start + steps * step, step), step, steps };
+    // STEP_COUNTS steht in Vorzugsreihenfolge: nur eine echt knappere Skala
+    // verdraengt die fruehere.
+    if (!best || cand.max - cand.min < best.max - best.min - 1e-9) best = cand;
+  }
+  return best;
+}
+
+/* RUHIGE ACHSE: DREI LINIEN (Critique R18, 2026-10-07).
+ *
+ * `niceDomain` legt drei bis sechs Schritte - hinter zwei Kurven oder sieben
+ * Balken standen damit bis zu sieben Gitterlinien. Wo die Werte am Punkt, am
+ * Balken und in der Tabelle stehen, fluestert die Achse nur noch die
+ * Groessenordnung: Grundlinie, Mitte, Obergrenze. Fuer Diagramme ab null
+ * (Summen, Dauern, Betraege); eine Kurve mit freier Unterkante (Blutdruck)
+ * bleibt bei `niceDomain`.
+ *
+ * Die Obergrenze laesst mindestens 15 % Luft ueber dem Spitzenwert: darin
+ * steht der Wert des hoechsten Punkts oder Balkens, ohne die oberste Linie zu
+ * beruehren. Die Schrittfolge ist dichter als die der runden Skala (auch 3,5
+ * und 4,5): bei nur zwei Schritten verschenkte der Sprung von 3 auf 4 sonst
+ * ein Viertel der Flaeche (5.550 -> 0 / 4.000 / 8.000 statt 0 / 3.500 / 7.000). */
+const CALM_FACTORS = [1, 1.2, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 6, 7, 8, 9, 10];
+
+/**
+ * @param {number} max  groesster Datenwert (die Skala beginnt bei 0)
+ * @param {{ integer?: boolean }} [opts]  `integer`: nur ganzzahlige Schritte
+ * @returns {{ min: 0, max: number, step: number, steps: 2 }}
+ */
+export function calmDomain(max, { integer = false } = {}) {
+  const need = (Math.max(integer ? 1 : 1e-9, Number(max) || 0) * 1.15) / 2;
+  const mag = 10 ** Math.floor(Math.log10(need));
+  const whole = (v) => Math.abs(v - Math.round(v)) < 1e-9;
+  const fix = (v) => Number(v.toFixed(Math.max(0, 2 - Math.floor(Math.log10(mag)))));
+  const step = CALM_FACTORS.map((f) => fix(f * mag)).find((v) => v >= need - 1e-9 && (!integer || whole(v)))
+    ?? Math.ceil(need);
+  return { min: 0, max: fix(step * 2), step, steps: 2 };
+}
+
+/* EINE ZEITACHSE RECHNET NACH DEM DATUM, NICHT NACH DER NUMMER (C4).
+ *
+ * `chartX(index, count)` setzt Punkte in gleichen Abstaenden - richtig fuer
+ * luekenlose Buckets (jeder Tag des Monats, jeder Monat des Jahres), falsch
+ * fuer Befunde vom Januar, Februar und Dezember: dort stand der Februar in der
+ * Mitte und der Trend war verzerrt. `chartTimeX` rechnet einen Tagesschluessel
+ * auf seine Lage in [from, to]. Reine Schluessel-Arithmetik (UTC-Tage), keine
+ * Zone: die Schluessel sind schon lokale Kalendertage. */
+function dayNumber(dateKey) {
+  const [y, m, d] = String(dateKey).slice(0, 10).split('-').map(Number);
+  return Date.UTC(y, m - 1, d) / 86400000;
+}
+
+/** X-Koordinate eines Tagesschluessels (YYYY-MM-DD) auf der Zeitachse [fromKey, toKey].
+ *  Bewusst nicht exportiert: bei Nullspanne liefert sie fuer JEDEN Punkt die
+ *  linke Kante - Datenreihen gehen ueber `chartTimePositions`. */
+function chartTimeX(dateKey, fromKey, toKey, geo = CHART) {
+  const { left, right } = chartScales(geo);
+  const span = dayNumber(toKey) - dayNumber(fromKey);
+  if (!(span > 0)) return left;
+  return left + ((dayNumber(dateKey) - dayNumber(fromKey)) / span) * (right - left);
+}
+
+/**
+ * X-Koordinaten einer nach Datum sortierten Reihe auf der Zeitachse
+ * [erster, letzter Tag]. Liegen ALLE Punkte am selben Tag, hat die Achse keine
+ * Spanne - dann verteilt der Index sie gleichmaessig (`chartX`), statt sie
+ * uebereinander auf die linke Kante zu legen: zwei Wartungen oder zwei
+ * Laborbefunde vom selben Tag waren sonst ein einziger Punkt ohne Linie
+ * (Review R11). Die Regel steht hier, damit kein Aufrufer sie vergessen kann.
+ * @param {string[]} dateKeys  YYYY-MM-DD, aufsteigend
+ * @returns {number[]}
+ */
+export function chartTimePositions(dateKeys, geo = CHART) {
+  const n = dateKeys.length;
+  if (!n) return [];
+  const from = dateKeys[0];
+  const to = dateKeys[n - 1];
+  if (!(dayNumber(to) - dayNumber(from) > 0)) return dateKeys.map((_, i) => chartX(i, n, geo));
+  return dateKeys.map((key) => chartTimeX(key, from, to, geo));
+}
+
+/**
+ * Beschriftung einer Zeitachse: Anfang, Mitte und Ende des ZEITRAUMS, jede an
+ * ihrer wahren Stelle. Die Mitte ist ein Datum, kein Datenpunkt - auf einer
+ * Zeitachse steht sie genau dort, wo sie hingehoert.
+ * @param {string} fromKey
+ * @param {string} toKey
+ * @param {(dateKey: string) => string} formatDate
+ */
+export function chartTimeLabelsMarkup(fromKey, toKey, formatDate, geo = CHART) {
+  const { H } = geo;
+  const y = H - 7;
+  const a = dayNumber(fromKey);
+  const b = dayNumber(toKey);
+  const keys = [fromKey];
+  if (b - a >= 2) {
+    const mid = new Date((a + Math.round((b - a) / 2)) * 86400000);
+    keys.push(`${mid.getUTCFullYear()}-${String(mid.getUTCMonth() + 1).padStart(2, '0')}-${String(mid.getUTCDate()).padStart(2, '0')}`);
+  }
+  if (b > a) keys.push(toKey);
+  return keys.map((key, idx) => {
+    const anchor = idx === 0 ? 'start' : idx === keys.length - 1 ? 'end' : 'middle';
+    const px = chartTimeX(key, fromKey, toKey, geo);
+    return `<text x="${px.toFixed(1)}" y="${y}" class="chart__axis" text-anchor="${anchor}">${esc(formatDate(key))}</text>`;
+  }).join('');
 }

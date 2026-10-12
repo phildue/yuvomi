@@ -5,6 +5,7 @@
  */
 import { createLogger } from '../logger.js';
 import * as dbModule from '../db.js';
+import { activeAccountSql } from './account-state.js';
 import { pushService as defaultPushService } from './push.js';
 import { createNotificationChannelStore } from './notification-channels.js';
 import { gotifyProvider } from './notification-providers/gotify.js';
@@ -20,8 +21,10 @@ import { syncAllCycleReminders } from './cycle-reminders.js';
 import { syncAllScheduleReminders } from './schedule-reminders.js';
 import { syncAllWasteReminders } from './waste-reminders.js';
 import { withoutModulesDeniedToRecipient, withoutSwitchedOffModules } from './reminder-origins.js';
+import { reminderTargetPublicSql, reminderTargetVisibleSql } from './reminder-targets.js';
 import { syncAllPreventionReminders } from './prevention-reminders.js';
 import { syncAllFastingReminders } from './fasting-reminders.js';
+import { remindAtCompareKey, remindAtUtcSql } from '../utils/reminder-schedule.js';
 
 const log = createLogger('Notifications');
 const APP_NAME = 'Yuvomi';
@@ -416,7 +419,8 @@ export async function processDueNotifications({
   const nowIso = iso(now);
   const store = channelStore || createNotificationChannelStore({ db: activeDb });
 
-  const users = activeDb.prepare('SELECT id FROM users').all();
+  // Ohne Ehemalige (#1381): ihre Erinnerungen legt kein Abgleich neu an.
+  const users = activeDb.prepare(`SELECT id FROM users WHERE ${activeAccountSql('users')}`).all();
   for (const user of users) {
     try {
       syncAllBirthdayReminders(activeDb, user.id, now);
@@ -479,6 +483,9 @@ export async function processDueNotifications({
 
   const dueRows = activeDb.prepare(`
     SELECT r.id, r.created_by, r.entity_type, r.entity_id, r.assigned_from,
+      -- Sieht JEDER das Ziel dieser Zeile? Davon haengt ab, ob sie in einen
+      -- Kanal des ganzen Haushalts darf (siehe die Kanalwahl in der Schleife).
+      CASE WHEN ${reminderTargetPublicSql(activeDb, 'r')} THEN 1 ELSE 0 END AS target_public,
       CASE r.entity_type
         WHEN 'task'  THEN (SELECT title FROM tasks           WHERE id = r.entity_id)
         WHEN 'event' THEN (SELECT title FROM calendar_events WHERE id = r.entity_id)
@@ -561,7 +568,9 @@ export async function processDueNotifications({
         WHERE pr.id = r.entity_id
       ) END AS prevention_subject_name
     FROM reminders r
-    WHERE r.dismissed = 0 AND r.pushed_at IS NULL AND r.remind_at <= ?
+    -- Als Zeitpunkt verglichen, nicht als Text (#1364): eine roh gespeicherte
+    -- Zeile mit Offset kam sonst um genau diesen Offset zu spaet oder zu frueh.
+    WHERE r.dismissed = 0 AND r.pushed_at IS NULL AND ${remindAtUtcSql('r.remind_at')} <= ?
       -- Kein Push an eine Aufgabe/einen Termin, den es nicht mehr gibt. Seit
       -- Migration v217 raeumen zwei AFTER-DELETE-Trigger diese Erinnerungen mit
       -- ab; der Verweis bleibt aber ein weicher (kein Fremdschluessel auf
@@ -571,8 +580,20 @@ export async function processDueNotifications({
       -- als Body durch. routes/reminders.js#/pending traegt denselben Riegel.
       AND (r.entity_type != 'task'  OR EXISTS (SELECT 1 FROM tasks           WHERE id = r.entity_id))
       AND (r.entity_type != 'event' OR EXISTS (SELECT 1 FROM calendar_events WHERE id = r.entity_id))
+      -- Kein Titel an jemanden, der die Zeile nicht sieht - dieselbe Klausel
+      -- wie in routes/reminders.js#/pending (services/reminder-targets.js).
+      -- Die Zeile bleibt ausstehend (pushed_at leer) und geht raus, sobald
+      -- der Empfaenger ihr Ziel wieder sieht. Der Filter steht in der Abfrage
+      -- und damit vor Push UND Kanaelen.
+      AND ${reminderTargetVisibleSql(activeDb, 'r')}
+      -- NICHTS GEHT AN EIN EHEMALIGES KONTO (#1381). Das Deaktivieren loescht
+      -- die offenen Erinnerungen, Push-Abos und eigenen Kanaele des Kontos;
+      -- einer der Abgleiche oben kann eine Zeile aber neu anlegen, und fuer
+      -- eine oeffentliche Zeile kaeme sonst auch der Haushaltskanal in Frage.
+      -- Der Filter steht in der Abfrage und damit vor Push UND Kanaelen.
+      AND EXISTS (SELECT 1 FROM users recipient WHERE recipient.id = r.created_by AND ${activeAccountSql('recipient')})
     ORDER BY r.remind_at ASC
-  `).all(nowIso);
+  `).all(remindAtCompareKey(nowIso));
 
   // EIN ABGESCHALTETES MODUL MELDET SICH NICHT (#1279). Die Syncs oben raeumen
   // nur die Quellen ab, die sie selbst herstellen; eine Aufgabe, ein Termin, ein
@@ -620,7 +641,24 @@ export async function processDueNotifications({
   for (const reminder of due) {
     reminder.cycle_owner_name = cycleOwnerName(reminder);
     const payload = reminderPayload(reminder, locale, dateFormat);
-    const channels = store.listEnabledChannelsForUser(reminder.created_by);
+    // EIN KANAL DES HAUSHALTS IST EIN LESER WIE JEDER ANDERE. Er bekam jede
+    // faellige Erinnerung jedes Mitglieds mit Titel - auch die an eine private
+    // Aufgabe, an einen Termin nur fuer die Zugewiesenen, an ein privates Abo.
+    // Anlegen kann so einen Kanal nur ein Admin (routes/notifications.js), und
+    // genau vor dem verbirgt `private` die Zeile ebenfalls: die Sichtbarkeit
+    // kennt keinen Admin-Bypass (#474). In den Haushaltskanal geht deshalb nur,
+    // was jeder sehen darf; alles andere bleibt bei Web Push und den Kanaelen,
+    // die der Person selbst gehoeren (`scope = 'user'`).
+    //
+    // WER WEDER PUSH NOCH EINEN EIGENEN KANAL HAT, bekommt fuer so eine Zeile
+    // keine Meldung nach draussen - der Toast in der App (`/pending`) zeigt
+    // sie weiter. Die Zeile gilt dann als erledigt (kein Ziel, nichts offen),
+    // sonst liefe sie in jedem Durchgang wieder an.
+    const channels = store.listEnabledChannelsForUser(reminder.created_by)
+      // Allowlist: fuer eine nicht oeffentliche Zeile zaehlt nur ein Kanal, der
+      // ausdruecklich der Person gehoert - ein Kanal ohne oder mit unbekanntem
+      // `scope` gilt als Haushaltskanal.
+      .filter((channel) => reminder.target_public || channel.scope === 'user');
     const pushCount = activeDb.prepare('SELECT COUNT(*) AS c FROM push_subscriptions WHERE user_id = ?').get(reminder.created_by).c;
     const targets = [];
     if (pushCount > 0) {

@@ -4,6 +4,7 @@
  * Abhängigkeiten: express, helmet, server/db.js, server/auth.js, server/routes/*
  */
 
+import './utils/claim-instance-lock.js';
 import express from 'express';
 import helmet from 'helmet';
 import compression from 'compression';
@@ -16,6 +17,9 @@ import * as db from './db.js';
 import { router as authRouter, sessionMiddleware, requireAuth, requireAdmin, isPasswordLoginEnabled } from './auth.js';
 import { csrfMiddleware } from './middleware/csrf.js';
 import idempotencyMiddleware from './middleware/idempotency.js';
+import { createRestoreWriteGate, trackAdmittedWrite } from './middleware/restore-gate.js';
+import { runExternalJob } from './utils/restore-state.js';
+import { createErrorHandler } from './middleware/error-handler.js';
 import { buildOpenApiSpec } from './openapi.js';
 import * as googleCalendar from './services/google-calendar.js';
 import * as appleCalendar from './services/apple-calendar.js';
@@ -32,6 +36,7 @@ import * as carddavSync from './services/cardav-sync.js';
 import * as holidays from './services/holidays.js';
 import { startScheduler as startBackupScheduler } from './services/backup-scheduler.js';
 import { startScheduler as startSplitExpenseScheduler } from './services/split-expenses-scheduler.js';
+import { startRewardMoneyScheduler } from './services/reward-money-scheduler.js';
 import { startScheduler as startPushScheduler } from './services/push-scheduler.js';
 import { startScheduler as startMedicationScheduler } from './services/medication-scheduler.js';
 import { startScheduler as startRecipeProviderScheduler } from './services/recipe-provider-sync.js';
@@ -95,10 +100,11 @@ import scheduleRouter from './routes/schedule.js';
 import scheduleFeedRouter from './routes/schedule-feed.js';
 import schedulePreferencesRouter from './routes/schedule-preferences.js';
 import scheduleExtrasRouter from './routes/schedule-extras.js';
-import { moduleForPath, requiredAccess, sessionModuleAccessRequirement, tokenAllows } from './scopes.js';
+import { sessionModuleAccessRequirement, tokenAccessRequirement, tokenAllows } from './scopes.js';
 import { moduleAccessVerdict, MODULE_ACCESS_DENIED, MODULE_ACCESS_READ_ONLY } from './permissions.js';
 import { BODY_LIMIT, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from './utils/upload-limit.js';
 import { createServiceWorkerResponseLoader } from './utils/service-worker.js';
+import { createStaticAssets } from './utils/static-assets.js';
 
 const log     = createLogger('Server');
 const logSync = createLogger('Sync');
@@ -175,11 +181,17 @@ app.use(compression());
 // --------------------------------------------------------
 // Request-Parsing
 // --------------------------------------------------------
+// Schreibsperre waehrend eines Restores (#1431). Vor den Body-Parsern: ein
+// zweiter Restore wird abgewiesen, bevor sein Upload gelesen wird. Vor den
+// Sessions: auch deren Schreiben (Login, Logout) gehoert dazu. Vor /mcp und
+// allen Routern, damit kein Schreibzugriff durchrutscht.
+app.use(createRestoreWriteGate(db.isRestoreRunning, db.isDatabaseOpen));
 app.use(express.json({ limit: BODY_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 
-// JSON-Parse-Fehler abfangen (gibt sonst HTML zurück)
-app.use((err, req, res, next) => {
+// JSON-Parse-Fehler abfangen (gibt sonst HTML zurück). Benannt, weil
+// test/test-restore-gate-routes.js globale Middleware am Namen erkennt (#1531).
+app.use(function bodyParseErrorHandler(err, req, res, next) {
   if (err.type === 'entity.parse.failed') {
     return res.status(400).json({ error: 'Invalid JSON in request body.', code: 400 });
   }
@@ -246,35 +258,76 @@ app.get('/sw.js', (_req, res) => {
   res.send(response.body);
 });
 
-app.use(express.static(path.join(import.meta.dirname, '..', 'public'), {
+const PUBLIC_DIR = path.join(import.meta.dirname, '..', 'public');
+
+/**
+ * Header jeder Datei aus public/ - EINE Funktion fuer beide Wege, auf denen sie
+ * das Haus verlaesst: express.static und die Brotli-Fassung aus dem Speicher
+ * (utils/static-assets.js). Sonst traegt dieselbe Adresse je nach Weg ein
+ * anderes Cache-Control.
+ */
+function setStaticHeaders(res, filePath, stat) {
+  const ext = path.extname(filePath).toLowerCase();
+  const isPwaIcon = /\/icons\/(icon-|apple-touch-icon|favicon)/.test(filePath);
+  if (isPwaIcon) {
+    // PWA-Icons müssen bei Deployments sofort aktualisiert werden
+    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+  } else if (['.png', '.jpg', '.jpeg', '.ico', '.svg', '.webp', '.woff2', '.woff'].includes(ext)) {
+    res.setHeader('Cache-Control', 'public, max-age=2592000, immutable'); // 30 Tage
+  } else {
+    // HTML, JS, CSS, JSON und manifest immer revalidieren.
+    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+  }
+  // manifest.json: korrekter MIME-Type für PWA-Erkennung durch Chrome/Android
+  if (filePath.endsWith('manifest.json')) {
+    res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+  }
+  // .mjs (z. B. gevendorte pdf.js-Module + Worker) müssen als JS-Modul ausgeliefert
+  // werden; nicht jede `send`-Version mappt die Endung, sonst schlägt der Modul-Import fehl.
+  if (ext === '.mjs') {
+    res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+  }
+  // ETag aus dem Inhalt statt aus Groesse und Aenderungszeit (Begruendung in
+  // utils/static-assets.js): der Service Worker revalidiert beim Precache und
+  // verlaesst sich darauf, dass ein gleicher ETag gleichen Inhalt heisst.
+  // Scheitert das Lesen, setzt express.static seinen eigenen wie bisher.
+  try {
+    res.setHeader('ETag', staticAssets.etagFor(filePath, stat));
+  } catch { /* siehe oben */ }
+}
+
+// STATIC_BROTLI=off schaltet nur die vorkomprimierte Auslieferung ab; die
+// compression()-Middleware oben uebernimmt dann jede Anfrage wie vor R18.
+const staticAssets = createStaticAssets(PUBLIC_DIR, {
+  brotli: String(process.env.STATIC_BROTLI || '').trim().toLowerCase() !== 'off',
+  setHeaders: setStaticHeaders,
+});
+// Die Bremse vor dem Speicher (Begruendung in utils/static-assets.js, Punkt 3).
+// Grosszuegig: ein kalter Start holt rund 125 Dateien, der Precache eines neuen
+// Workers rund 310, und hinter einem Router teilen sich alle Geraete eines
+// Haushalts EINE Adresse - fuenf Telefone, die nach einem Release gleichzeitig
+// aktualisieren, bleiben darunter. Wer darueber liegt, verliert nur die
+// vorkomprimierte Fassung, nie die Datei.
+const staticStoreLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 3000,
+  standardHeaders: false,
+  legacyHeaders: false,
+  handler: staticAssets.overLimit,
+});
+// Benannt: der Guard ueber die globalen Middlewares (test:restore-gate-routes)
+// fuehrt jede mit Namen und Begruendung, und rateLimit() liefert eine namenlose.
+Object.defineProperty(staticStoreLimiter, 'name', { value: 'staticStoreLimiter' });
+app.use(staticStoreLimiter, staticAssets.middleware);
+
+app.use(express.static(PUBLIC_DIR, {
   etag: true,
   lastModified: true,
   // Kein automatischer Trailing-Slash-Redirect für Verzeichnisse (z. B. /settings →
   // /settings/), sonst kollidiert das public/settings/-Verzeichnis mit der SPA-Route
   // /settings und der Client-Router landet beim Hard-Load auf dem Dashboard.
   redirect: false,
-  setHeaders(res, filePath) {
-    const ext = path.extname(filePath).toLowerCase();
-    const isPwaIcon = /\/icons\/(icon-|apple-touch-icon|favicon)/.test(filePath);
-    if (isPwaIcon) {
-      // PWA-Icons müssen bei Deployments sofort aktualisiert werden
-      res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-    } else if (['.png', '.jpg', '.jpeg', '.ico', '.svg', '.webp', '.woff2', '.woff'].includes(ext)) {
-      res.setHeader('Cache-Control', 'public, max-age=2592000, immutable'); // 30 Tage
-    } else {
-      // HTML, JS, CSS, JSON und manifest immer revalidieren.
-      res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-    }
-    // manifest.json: korrekter MIME-Type für PWA-Erkennung durch Chrome/Android
-    if (filePath.endsWith('manifest.json')) {
-      res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
-    }
-    // .mjs (z. B. gevendorte pdf.js-Module + Worker) müssen als JS-Modul ausgeliefert
-    // werden; nicht jede `send`-Version mappt die Endung, sonst schlägt der Modul-Import fehl.
-    if (ext === '.mjs') {
-      res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
-    }
-  },
+  setHeaders: setStaticHeaders,
 }));
 
 // Globaler API-Rate-Limiter auf alle /api/-Endpunkte (Definition siehe oben).
@@ -283,7 +336,12 @@ app.use('/api/', apiLimiter);
 // --------------------------------------------------------
 // API-Routen
 // --------------------------------------------------------
-app.use('/api/v1/auth', authRouter);
+// Anmeldung, Passwort-Reset und Einladungen schreiben ebenfalls - /auth/login
+// liest den Nutzer, wartet auf bcrypt und schreibt dann die Sitzung. Ein
+// Restore in dieser Luecke wartet sie ab, statt dass die Sitzung nach dem Tausch
+// in der eingespielten Datenbank landet (#1441). Der Koerper ist hier schon
+// gelesen (express.json oben), eine langsame Anfrage haelt also nichts auf.
+app.use('/api/v1/auth', trackAdmittedWrite, authRouter);
 
 function buildVersionPayload(includeVersion = false) {
   let appName = DEFAULT_APP_NAME;
@@ -518,7 +576,7 @@ app.get('/feed/waste/:token.ics', feedLimiter, (req, res) => {
 
 // MCP-Endpoint (Streamable HTTP, stateless): Auth über bestehende Bearer-API-Tokens.
 // Eigener Namespace außerhalb von /api/v1 → kein CSRF, kein Guest-Guard.
-app.use('/mcp', apiLimiter, requireAuth, mcpRouter);
+app.use('/mcp', apiLimiter, requireAuth, trackAdmittedWrite, mcpRouter);
 
 // Alle weiteren API-Routen erfordern Authentifizierung + CSRF-Schutz
 // Kopplung eines Wandtabletts (#1208): VOR requireAuth, wie /auth/login. Ein
@@ -528,6 +586,8 @@ app.use('/mcp', apiLimiter, requireAuth, mcpRouter);
 // im Administrator-Router hinter requireAuth.
 app.use('/api/v1/displays', pairingRouter);
 app.use('/api/v1', requireAuth);
+// Ab hier steht die Identitaet fest: schreibende Anfragen wartet ein Restore ab (#1431).
+app.use('/api/v1', trackAdmittedWrite);
 // System-Metadaten: authentifiziert, aber bewusst vor Guest-/Token-Scope-Gates
 // wie /version behandelt. Keine Haushaltsdaten, nur upstream Release Notes.
 app.use('/api/v1/changelog', changelogRouter);
@@ -540,9 +600,9 @@ app.use('/api/v1', (req, res, next) => {
       || req.path === '/auth/logout'
       || req.path === '/version';
     if (allowed) return next();
-    return res.status(403).json({ error: 'This account can only access Shared expenses.', code: 403 });
+    return res.status(403).json({ error: 'This account can only access Shared expenses.', code: 403, reason: 'split_guest_scope' });
   } catch {
-    return res.status(403).json({ error: 'This account can only access Shared expenses.', code: 403 });
+    return res.status(403).json({ error: 'This account can only access Shared expenses.', code: 403, reason: 'split_guest_scope' });
   }
 });
 // Scopes: Ein gescoptes Zugangsmittel (scopes !== null) darf ein Modul nur in
@@ -568,8 +628,10 @@ app.use('/api/v1', (req, res, next) => {
   // gilt NUR fuer `authMethod === 'display'`; fuer ein gescoptes Token aendert
   // sich nichts.
   if (req.authMethod === 'display' && displayMayAct(req.method, req.path)) return next();
-  const moduleKey = moduleForPath(req.path);
-  const access = requiredAccess(req.method);
+  // `tokenAccessRequirement()` statt `moduleForPath()` + `requiredAccess()`:
+  // dieselbe Regel, plus die EINE Ausnahme, die fuer beide Achsen gilt
+  // (Rezept -> Einkauf liest `meals`, #1290 - Begruendung in server/scopes.js).
+  const { moduleKey, access } = tokenAccessRequirement(req.path, req.method);
   if (tokenAllows(req.authScopes, moduleKey, access)) return next();
   return res.status(403).json({ error: 'Token scope does not permit this operation.', code: 403 });
 });
@@ -592,6 +654,11 @@ app.use('/api/v1', (req, res, next) => {
   // Schlüssel bleibt `schedule`, damit `none` weiterhin verweigert wird; die
   // API-Token-Scope-Prüfung oben bleibt unveraendert an `schedule:write`
   // gebunden.
+  //
+  // AUSNAHME POST /recipes/:id/to-shopping-list (#1290, 22.09.2026): die Route
+  // liest das Rezept und schreibt nur in den Einkauf, also reicht `meals: read`;
+  // `shopping: write` verlangt die Route selbst. Anders als oben gilt diese
+  // Ausnahme auch im Token-Gate darueber (server/scopes.js).
   // DIESELBE DISPLAY-AUSNAHME WIE IM GATE DARUEBER (#1209), und sie muss hier
   // ein zweites Mal stehen. Ein Display traegt `modules.tasks === 'read'` -
   // absichtlich, denn seine Oberflaeche soll kein Anlegen und kein Bearbeiten
@@ -615,11 +682,14 @@ app.use('/api/v1', (req, res, next) => {
     scopedModuleKey,
     scopedAccess,
   );
+  // `reason` ist der maschinenlesbare Grund (#1607): der Satz in `error` ist
+  // englisch und stand so in jeder Oberflaechensprache im Toast. Die App
+  // uebersetzt ueber den Grund (public/api.js), API-Nutzer behalten den Satz.
   if (verdict === MODULE_ACCESS_DENIED) {
-    return res.status(403).json({ error: 'You do not have access to this module.', code: 403 });
+    return res.status(403).json({ error: 'You do not have access to this module.', code: 403, reason: 'module_access_denied' });
   }
   if (verdict === MODULE_ACCESS_READ_ONLY) {
-    return res.status(403).json({ error: 'You have read-only access to this module.', code: 403 });
+    return res.status(403).json({ error: 'You have read-only access to this module.', code: 403, reason: 'module_read_only' });
   }
   return next();
 });
@@ -723,10 +793,7 @@ app.get('/{*path}', spaLimiter, (req, res) => {
 // --------------------------------------------------------
 // Globaler Error-Handler
 // --------------------------------------------------------
-app.use((err, req, res, _next) => {
-  log.error('Unhandled error:', err);
-  res.status(500).json({ error: 'Internal server error.', code: 500 });
-});
+app.use(createErrorHandler(log));
 
 // --------------------------------------------------------
 // Auto-Sync Scheduler (Google + Apple Calendar)
@@ -808,9 +875,19 @@ const server = app.listen(PORT, BIND_ADDRESS, () => {
   // zwei Timer offen - und Suiten, die server/index.js als Programm
   // importieren, muessten den Prozess mit `process.exit(0)` erschlagen, was
   // den Exit-Code von node:test ueberschreibt (siehe test/server-ready.js).
+  //
+  // Der Takt selbst als Job (#1532): `runSync` liest vor dem ersten Lauf
+  // synchron die DB (`getStatus()`). Faellt der Takt in einen Restore bei
+  // geschlossener Verbindung, wirft `db.get()`, und aus der async-Funktion
+  // wird eine Rejection ohne Handler - Node beendet den Prozess mitten im
+  // Tausch. Waehrend eines Restores faellt der Takt deshalb aus; die
+  // einzelnen Laeufe sind ohnehin Jobs.
+  const syncTick = () => {
+    runExternalJob(runSync).catch((e) => logSync.error('Sync tick failed:', e.message));
+  };
   setTimeout(() => {
-    runSync();
-    setInterval(runSync, SYNC_INTERVAL_MS).unref();
+    syncTick();
+    setInterval(syncTick, SYNC_INTERVAL_MS).unref();
     logSync.info(`Auto-sync active every ${SYNC_INTERVAL_MS / 60_000} minutes.`);
   }, 10_000).unref();
 
@@ -822,6 +899,7 @@ const server = app.listen(PORT, BIND_ADDRESS, () => {
   // Backup-Scheduler starten
   startBackupScheduler();
   startSplitExpenseScheduler();
+  startRewardMoneyScheduler();
   startPushScheduler();
   startMedicationScheduler();
   startRecipeProviderScheduler();

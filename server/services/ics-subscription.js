@@ -7,6 +7,7 @@
  *                  server/utils/http.js (node-nativer Safe-HTTP-Client)
  */
 
+import { runExternalJob } from '../utils/restore-state.js';
 import dns from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { createLogger } from '../logger.js';
@@ -15,6 +16,7 @@ import { assignDefaultToEvent } from './sync-assignment.js';
 import { parseICS, expandRRULE, normalizeRecurrenceOverrides } from './ics-parser.js';
 import { isBlockedAddress, readPrivateNetworkOptIn, createGuardedLookup } from '../utils/ssrf.js';
 import { safeRequest } from '../utils/http.js';
+import { followInboundStartChange } from './calendar-occurrence-overrides.js';
 
 const log = createLogger('ICS');
 
@@ -178,7 +180,7 @@ async function syncOne(sub) {
     // wird. Ein unveränderter Lauf würde also weiterhin schreiben, nur für
     // changes und total_changes() unsichtbar.
     const findExisting = db.get().prepare(`
-      SELECT id FROM calendar_events
+      SELECT id, start_datetime FROM calendar_events
       WHERE subscription_id = ? AND external_calendar_id = ?
     `);
 
@@ -237,7 +239,12 @@ async function syncOne(sub) {
               ev.summary, ev.description, ev.dtstart, ev.dtend,
               ev.allDay ? 1 : 0, ev.location, color,
             ];
-            changedEvents += updateEvent.run(...values, existing.id, ...values).changes;
+            const updated = updateEvent.run(...values, existing.id, ...values).changes;
+            changedEvents += updated;
+            // Im Feed verschoben (#1377): die Erinnerungen ziehen mit. Nur wenn
+            // das UPDATE griff - eine lokal bearbeitete Zeile (user_modified)
+            // behaelt ihren Start und damit auch ihre Erinnerungen.
+            if (updated) followInboundStartChange(db.get(), existing.id, existing.start_datetime, ev.dtstart);
           } else {
             insertEvent.run(ev.summary, ev.description, ev.dtstart, ev.dtend,
               ev.allDay ? 1 : 0, ev.location, color, ev.uid, sub.id, ev.rrule, createdBy);
@@ -270,7 +277,17 @@ async function syncOne(sub) {
   } finally { syncingNow.delete(sub.id); }
 }
 
-async function sync(subscriptionId) {
+/**
+ * Als Job, der liest, auf einen Anbieter wartet und dann schreibt: waehrend
+ * eines Restores beginnt er nicht, ein laufender wird abgewartet - sonst
+ * schriebe er sein Ergebnis in die gerade eingespielte Datenbank (Codex-Befund
+ * in #1431, siehe server/utils/restore-state.js).
+ */
+function sync(subscriptionId) {
+  return runExternalJob(() => syncUntracked(subscriptionId));
+}
+
+async function syncUntracked(subscriptionId) {
   const subs = subscriptionId
     ? db.get().prepare('SELECT * FROM ics_subscriptions WHERE id = ?').all(subscriptionId)
     : db.get().prepare('SELECT * FROM ics_subscriptions').all();

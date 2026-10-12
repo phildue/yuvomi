@@ -11,10 +11,18 @@ import crypto from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import * as db from './db.js';
 import { generateToken, csrfMiddleware } from './middleware/csrf.js';
+import { refuseWhileRestoring } from './middleware/restore-gate.js';
+import { restoreInProgressError } from './utils/restore-messages.js';
+import { runExternalJob } from './utils/restore-state.js';
+import { SESSION_MAX_AGE_MS, sessionCookieRefreshDue } from './utils/session-lifetime.js';
 import { collectErrors, date as validateDate, str, MAX_SHORT, MAX_TITLE } from './middleware/validate.js';
 import { createLogger } from './logger.js';
 import { memberEmail } from './services/member-email.js';
-import { accessScopeSql, householdMemberSql } from './services/household-members.js';
+import {
+  accessScopeSql, activeAccountSql, deactivatedAtColumnSql, householdMemberSql, isActiveAccount,
+  memberOrderSql, memberPositionSql,
+} from './services/household-members.js';
+import { RemovalRefused, removeUser } from './services/user-removal.js';
 import {
   DISPLAY_COOKIE, DISPLAY_SCOPES, authenticateDisplayDevice, displayCookieIdentity, displayCookieOptions,
   displayMayRead, displayTokenFromRequest, isDisplayAccount, markDisplayCookieRefreshed,
@@ -29,18 +37,24 @@ import {
   isSsoOnlyAccount,
   OIDC_PASSWORD_SENTINEL,
   getConfig as getOidcConfig,
+  exchangeAuthorizationCode,
+  describeOidcError,
 } from './services/oidc.js';
 import { emailService as defaultEmailService } from './services/email.js';
 import { passwordResetService as defaultResetService } from './services/password-reset.js';
 import { inviteService as defaultInviteService } from './services/invites.js';
 import { parseScopes, serializeScopes, normalizeScopes } from './scopes.js';
 import { hashPassword, normalizePassword, verifyPassword } from './utils/password.js';
+import { getSupportedLocales, isSupportedLocale, resolveHouseholdLocale } from './utils/i18n.js';
+import { isValidTimeZone } from './utils/timezone.js';
+import { accountIdsByEmail } from './utils/email-match.js';
 import {
   resolvePermissions, buildSessionModuleAccess, clientPermissions,
   invitePresetPermissions, isValidInvitePreset, writeSubjectPermissions,
   INVITE_PRESET_DEFAULT,
 } from './permissions.js';
-import { requireAdmin } from './middleware/require-admin.js';
+import { isAdminRequest, requireAdmin } from './middleware/require-admin.js';
+import { EMAIL_IN_USE_MESSAGE, emailsTakenByOtherAccounts, storedAccountEmails } from './services/contact-identity.js';
 import * as twoFactor from './services/two-factor.js';
 
 const log = createLogger('Auth');
@@ -92,6 +106,35 @@ function householdSize(database) {
 }
 
 /**
+ * Die Namen, aus denen der Client gleiche Initialen aufloest (#1464,
+ * public/utils/initials.js): Linda Johnson und Leo Johnson tragen sonst beide
+ * "LJ". Die Liste reist an jeder Auth-Antwort mit, wie `householdSize`, damit
+ * JEDE Avatar-Scheibe dieselbe Antwort gibt - auch die eines Aufrufers, der nur
+ * einen Namen in der Hand hat.
+ *
+ * WER DARIN STEHT: jedes Konto, das `/auth/users` zeigt, also auch Hauspersonal
+ * und Gaeste (sie stehen als Scheibe neben Mitgliedern), aber kein Wandtablett.
+ * EHEMALIGE BLEIBEN DARIN: fiele ein deaktiviertes Konto heraus, aenderten sich
+ * die Zeichen eines aktiven Mitglieds in dem Moment, in dem ein anderes geht -
+ * und der Ehemalige steht weiter an alten Eintraegen.
+ *
+ * WER SIE NICHT BEKOMMT: ein Gast geteilter Ausgaben. Er erreicht ausserhalb
+ * jenes Moduls keine Seite (Gast-Sperre in server/index.js), und dort steht
+ * keine Avatar-Scheibe - die Namen des Haushalts gehen ihn nichts an.
+ */
+const INITIALS_ROSTER_SQL = `
+  SELECT display_name FROM users
+  WHERE NOT EXISTS (SELECT 1 FROM display_accounts da WHERE da.user_id = users.id)
+  ORDER BY id
+`;
+
+function initialsRoster(database, userId) {
+  const guest = database.prepare('SELECT 1 FROM split_expense_guest_users WHERE user_id = ?').get(userId);
+  if (guest) return [];
+  return database.prepare(INITIALS_ROSTER_SQL).all().map((row) => row.display_name);
+}
+
+/**
  * Welche Module ausser diesem Konto noch jemand lesen kann - fuer die
  * Schutzsteuerungen (Sichtbarkeit, Sperre, Freigabe), nicht fuer die Anzeige.
  *
@@ -120,6 +163,8 @@ function othersCanRead(database, userId) {
   const others = database.prepare(`
     SELECT u.id, u.role, u.family_role, ${accessScopeSql('u')} AS access_scope FROM users u
     WHERE u.id != ? AND ${accessScopeSql('u')} IN ('family', 'display')
+      -- Ein Ehemaliger liest nichts mehr (#1381) und haelt keine Schutzfelder offen.
+      AND ${activeAccountSql('u')}
   `).all(userId);
   const resolved = others.map((other) => resolvePermissions(database, other, {
     isDisplay: other.access_scope === 'display',
@@ -151,6 +196,9 @@ const USER_PUBLIC_COLUMNS = `
   changelog_seen_version,
   changelog_seen_latest,
   ${accessScopeSql('users')} AS access_scope,
+  ${deactivatedAtColumnSql('users')},
+  ${memberPositionSql('users')} AS sort_order,
+  ${householdMemberSql('users')} AS is_household_member,
   created_at,
   (SELECT phone FROM contacts WHERE contacts.family_user_id = users.id LIMIT 1) AS phone,
   (SELECT email FROM contacts WHERE contacts.family_user_id = users.id LIMIT 1) AS email,
@@ -175,11 +223,22 @@ class BetterSQLiteStore extends session.Store {
     `);
     // Abgelaufene Sessions regelmäßig aufräumen (alle 15 Minuten)
     setInterval(() => {
-      db.get().prepare('DELETE FROM sessions WHERE expired_at <= ?').run(Date.now());
+      // Waehrend eines Restores ist die Verbindung gesperrt oder zu (#1431) -
+      // ein Wurf hier waere eine ungefangene Ausnahme im Timer.
+      if (db.isRestoreRunning()) return;
+      try {
+        db.get().prepare('DELETE FROM sessions WHERE expired_at <= ?').run(Date.now());
+      } catch (err) {
+        log.warn(`Session cleanup failed: ${err?.message ?? err}`);
+      }
     }, 15 * 60_000).unref();
   }
 
   get(sid, callback) {
+    // Waehrend eines Restores ist die Verbindung zeitweise zu (#1431). API-
+    // Anfragen beantwortet `restoreWriteGate` dann schon mit 503; hier kommen
+    // nur noch statische Dateien an, die keine Sitzung brauchen.
+    if (db.isRestoreRunning() && !db.isDatabaseOpen()) return callback(null, null);
     try {
       const row = db.get()
         .prepare('SELECT sess FROM sessions WHERE sid = ? AND expired_at > ?')
@@ -191,8 +250,15 @@ class BetterSQLiteStore extends session.Store {
   }
 
   set(sid, sess, callback) {
+    // Waehrend eines Restores nimmt die Datenbank keine Schreibzugriffe an
+    // (#1431). Nicht still verwerfen: eine Sitzung, die als gespeichert gilt,
+    // aber fehlt, verliert etwa den OAuth-`state` (Codex-Befund in #1431). Ein
+    // gewoehnlicher Seitenaufruf ruft `set()` gar nicht - er aendert die
+    // Sitzung nicht, und die Cookie-Verlaengerung setzt waehrend eines Restores
+    // aus. Der Fehler wird im globalen Fehlerbehandler zu 503.
+    if (db.isRestoreRunning()) return callback(restoreInProgressError());
     try {
-      const ttl = sess.cookie?.maxAge ?? 7 * 24 * 60 * 60 * 1000;
+      const ttl = sess.cookie?.maxAge ?? SESSION_MAX_AGE_MS;
       const expiredAt = Date.now() + ttl;
       db.get()
         .prepare('INSERT OR REPLACE INTO sessions (sid, sess, expired_at) VALUES (?, ?, ?)')
@@ -204,6 +270,7 @@ class BetterSQLiteStore extends session.Store {
   }
 
   destroy(sid, callback) {
+    if (db.isRestoreRunning()) return callback(restoreInProgressError());
     try {
       db.get().prepare('DELETE FROM sessions WHERE sid = ?').run(sid);
       callback(null);
@@ -212,9 +279,32 @@ class BetterSQLiteStore extends session.Store {
     }
   }
 
+  /**
+   * Die Auffrischung des Cookies (#1356) im Store nachtragen: neuer Ablauf in
+   * `sess.cookie` (daraus liest `refreshSessionCookieIfDue` die Frist) und in
+   * `expired_at`. NUR `UPDATE`: eine Zeile, die inzwischen widerrufen wurde,
+   * bleibt weg - anders als `set()`, das ein `INSERT OR REPLACE` ist.
+   */
+  extendCookie(sid, expiresAt) {
+    db.get()
+      .prepare(`UPDATE sessions
+                   SET sess = json_set(sess, '$.cookie.expires', ?, '$.cookie.originalMaxAge', ?),
+                       expired_at = ?
+                 WHERE sid = ?`)
+      .run(new Date(expiresAt).toISOString(), SESSION_MAX_AGE_MS, expiresAt, sid);
+  }
+
+  // Laeuft bei JEDEM Request mit Sitzung, auch bei statischen Dateien: der
+  // Eintrag gleitet also mindestens so weit wie das Cookie, das `requireAuth`
+  // nur alle zwoelf Stunden nachdatiert (#1356). Der Store endet damit nie vor
+  // dem Cookie, hoechstens eine Drosselfrist danach - ein gueltiges Cookie
+  // fuehrt nie ins Leere.
   touch(sid, sess, callback) {
+    // Waehrend eines Restores: die Sitzung bleibt einfach so lange gueltig,
+    // wie sie war (#1431) - statt jeden Seitenaufruf mit 500 zu beenden.
+    if (db.isRestoreRunning()) return callback(null);
     try {
-      const ttl = sess.cookie?.maxAge ?? 7 * 24 * 60 * 60 * 1000;
+      const ttl = sess.cookie?.maxAge ?? SESSION_MAX_AGE_MS;
       const expiredAt = Date.now() + ttl;
       db.get()
         .prepare('UPDATE sessions SET expired_at = ? WHERE sid = ?')
@@ -273,13 +363,14 @@ if (process.env.SESSION_SECRET.startsWith('REPLACE_WITH_')) {
 const SESSION_COOKIE = 'yuvomi.sid';
 const LEGACY_SESSION_COOKIE = 'oikos.sid';
 
-const expressSession = session({
-  store: sessionStore,
-  secret: process.env.SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  name: SESSION_COOKIE,
-  cookie: {
+/**
+ * Die Attribute des Session-Cookies - EINE Quelle fuer express-session, die
+ * oikos.sid-Uebernahme und die Auffrischung. Weichen sie ab, legt der Browser
+ * ein zweites Cookie gleichen Namens an (Pfad und Domain gehoeren zur
+ * Identitaet). `secure` wird bei jedem Aufruf frisch gelesen.
+ */
+function sessionCookieOptions() {
+  return {
     httpOnly: true,
     // secure=false by default; set SESSION_SECURE=true when behind an HTTPS reverse proxy
     secure: process.env.SESSION_SECURE === 'true',
@@ -287,8 +378,19 @@ const expressSession = session({
     // (e.g. reverse proxy, direct URL entry), causing 401 on login. Lax is safe
     // because CSRF is protected by the double-submit token and HTTPS secure flag.
     sameSite: 'lax',
-    maxAge: 1000 * 60 * 60 * 24 * 7, // 7 Tage in ms
-  },
+    // Gleitend: `requireAuth` datiert das Cookie gedrosselt nach (#1356).
+    maxAge: SESSION_MAX_AGE_MS,
+    path: '/',
+  };
+}
+
+const expressSession = session({
+  store: sessionStore,
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  name: SESSION_COOKIE,
+  cookie: sessionCookieOptions(),
 });
 
 /**
@@ -312,11 +414,7 @@ function sessionMiddleware(req, res, next) {
       //    die die Session nicht verändern, KEIN Set-Cookie — und der Browser bliebe
       //    nach dem Verwerfen von oikos.sid komplett ohne Session-Cookie zurück.
       res.cookie(SESSION_COOKIE, legacyValue, {
-        httpOnly: true,
-        sameSite: 'lax',
-        secure: process.env.SESSION_SECURE === 'true',
-        maxAge: 1000 * 60 * 60 * 24 * 7,
-        path: '/',
+        ...sessionCookieOptions(),
         encode: (v) => v, // Wert ist bereits kodiert → kein Doppel-Encoding
       });
       // 3. Erst jetzt das Legacy-Cookie verwerfen (der neue Cookie ist gesetzt).
@@ -363,6 +461,21 @@ const twoFactorLimiter = rateLimit({
   message: { error: 'Zu viele Versuche. Bitte warte kurz.', code: 429 },
 });
 
+// Eigener Limiter fuer "Auf anderen Geraeten abmelden" (#1354). Zaehlt alle
+// Antworten wie der Reset-Limiter: jeder Aufruf liest die ganze Sitzungstabelle.
+// Gezaehlt wird JE MITGLIED, nicht je Adresse: hinter einem Proxy ohne
+// `trust proxy` kommt der ganze Haushalt von einer IP, und ein Mitglied saehe
+// sich sonst von den Klicks eines anderen gesperrt. Der Limiter sitzt hinter
+// `requireAuth`, `req.authUserId` steht also immer.
+const sessionRevokeLimiter = rateLimit({
+  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 60_000,
+  max: parseInt(process.env.RATE_LIMIT_MAX_ATTEMPTS) || 5,
+  keyGenerator: (req) => `user:${req.authUserId}`,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Zu viele Anfragen. Bitte warte kurz.', code: 429 },
+});
+
 // Wie lange ein bestandenes Passwort auf den zweiten Faktor warten darf.
 const TWO_FACTOR_WINDOW_MS = 5 * 60 * 1000;
 
@@ -388,6 +501,13 @@ function publicApiToken(row) {
     scopes: parseScopes(row.scopes),
     expires_at: row.expires_at,
     revoked_at: row.revoked_at,
+    // Das Urteil des SERVERS, ob das Token noch gilt (D#1672, Codex zu #1681).
+    // Die Oberflaeche teilt ihre Liste danach - entschiede sie mit der Uhr des
+    // Browsers, hielte ein vorgehendes Geraet ein Token fuer abgelaufen, boete
+    // nur "Entfernen" an, bekaeme 409 und koennte es auch nicht widerrufen.
+    // `usable` kommt aus `apiTokenUsableSql()`; wo eine Abfrage es nicht
+    // mitliefert, fehlt das Feld, statt etwas zu behaupten.
+    ...(row.usable === undefined ? {} : { active: row.usable === 1 }),
     last_used_at: row.last_used_at,
     created_at: row.created_at,
   };
@@ -456,7 +576,7 @@ router.use((req, res, next) => {
     // Liste aber `/api/v1`-relativ gefuehrt wird - eine Liste, zwei Verankerungen
     // waeren zwei Wahrheiten darueber, was ein Display lesen darf.
     if (device && !displayMayRead(req.method, `/auth${req.path}`)) {
-      return res.status(403).json({ error: 'A paired display cannot use the account routes.', code: 403 });
+      return res.status(403).json({ error: 'A paired display cannot use the account routes.', code: 403, reason: 'display_account' });
     }
     // Ein Cookie OHNE gueltiges Geraet dahinter kommt hier durch - ein Mensch
     // soll sich an einem zurueckgebauten Tablett anmelden koennen. Es wird dabei
@@ -481,6 +601,21 @@ function publicUser(row) {
     email: row.email ?? null,
     birth_date: row.birth_date ?? null,
     created_at: row.created_at,
+    // Seit wann dieses Konto ein ehemaliges ist (#1381), sonst `null`. Die
+    // Zeile bleibt, damit Urheberschaft und Salden bleiben; die Oberflaeche
+    // markiert sie, statt sie zu verbergen.
+    deactivated_at: row.deactivated_at ?? null,
+    // Position in der Haushaltsreihenfolge (#1644), `null` fuer ein nicht
+    // platziertes Mitglied und fuer jedes Konto, das kein Mitglied ist. Kommt
+    // aus `memberPositionSql()` und nie als rohe Spalte: der Vergleich im
+    // Browser (public/utils/member-order.js) liest dieses Feld.
+    sort_order: row.sort_order ?? null,
+    // Ob dieses Konto ein Haushaltsmitglied ist - die Menge, die
+    // `/family/members` zeigt und die allein eine Position haben kann. Die
+    // Familien-Einstellungen ordnen genau diese Zeilen; `sort_order: null`
+    // sagt es nicht, das traegt auch ein unplatziertes Mitglied. Unbedingt,
+    // weil auch die Antworten auf Anlegen und Aendern in dieser Liste landen.
+    is_household_member: Boolean(row.is_household_member),
     // Ob DIESES Konto den Onboarding-Rundgang noch braucht - jede Abfrage
     // ueber USER_PUBLIC_COLUMNS traegt die Spalte, daher hier unbedingt statt
     // ueber die `!== undefined`-Bedingung der beiden Felder darunter.
@@ -675,6 +810,7 @@ function assertSsoAdminWouldRemain(targetUserId, nextRole) {
   const other = db.get().prepare(`
     SELECT 1 FROM users
     WHERE oidc_sub IS NOT NULL AND role = 'admin' AND id != ?
+      AND ${activeAccountSql('users')}
     LIMIT 1
   `).get(targetUserId);
   if (other) return null;
@@ -697,17 +833,46 @@ function updateUserRoleSessions(userId, role) {
   }
 }
 
-function invalidateUserSessions(userId, exceptSid) {
-  const allSessions = db.get().prepare('SELECT sid, sess FROM sessions').all();
+/**
+ * Beendet alle Sitzungen eines Mitglieds ausser `exceptSid` und meldet, wie
+ * viele es waren. Der eine Weg fuer Passwortwechsel, 2FA, Admin-Passwort,
+ * Passwort-Reset, Loeschen und "Auf anderen Geraeten abmelden" (#1354).
+ * API-Tokens und Wandtabletts sind keine Zeilen dieser Tabelle und bleiben
+ * unberuehrt. `database` nur fuer die per DI gebauten Reset-Routen.
+ */
+function invalidateUserSessions(userId, exceptSid, database = db.get()) {
+  const allSessions = database.prepare('SELECT sid, sess, expired_at FROM sessions').all();
+  const now = Date.now();
+  let ended = 0;
   for (const row of allSessions) {
     if (row.sid === exceptSid) continue;
     try {
       const sess = JSON.parse(row.sess);
       if (sess.userId === userId) {
-        db.get().prepare('DELETE FROM sessions WHERE sid = ?').run(row.sid);
+        const { changes } = database.prepare('DELETE FROM sessions WHERE sid = ?').run(row.sid);
+        // Geloescht wird auch eine abgelaufene Zeile, die der 15-Minuten-Sweep
+        // noch nicht erwischt hat - gezaehlt nur eine, die noch galt. Sonst
+        // meldete die Seite "1 andere Sitzung beendet", wo keine mehr lebte.
+        if (row.expired_at > now) ended += changes;
       }
     } catch { /* ignore malformed session */ }
   }
+  return ended;
+}
+
+/**
+ * Wann ein API-Token noch gilt: nicht widerrufen und nicht abgelaufen.
+ *
+ * EINE Schreibweise fuer zwei Stellen (D#1672): die Anmeldung laesst genau
+ * diese Tokens durch, und `POST /api-tokens/:id/remove` loescht genau die
+ * anderen. Stuenden dort zwei Fassungen, koennte eine davon ein Token fuer
+ * tot halten, mit dem sich noch jemand anmeldet - und die Zeile samt
+ * Widerrufszeitpunkt waere weg, waehrend das Credential noch gilt.
+ * @param {string} alias - Tabellenalias von `api_tokens` in der Abfrage
+ */
+function apiTokenUsableSql(alias) {
+  return `(${alias}.revoked_at IS NULL
+      AND (${alias}.expires_at IS NULL OR ${alias}.expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')))`;
 }
 
 function authenticateApiToken(req) {
@@ -724,16 +889,29 @@ function authenticateApiToken(req) {
       subject.display_name AS subject_name
     FROM api_tokens t
     JOIN users subject ON subject.id = COALESCE(t.subject_user_id, t.created_by)
+      -- EIN TOKEN HANDELT ALS SEIN SUBJEKT, UND EIN EHEMALIGER HANDELT NICHT
+      -- MEHR (#1381). Das Deaktivieren widerruft die Tokens des Kontos in
+      -- derselben Transaktion; diese Zeile haelt, was der Widerruf verspricht,
+      -- auch fuer eine Token-Zeile, die danach entsteht oder aus einer
+      -- Sicherung zurueckkommt.
+      AND ${activeAccountSql('subject')}
     JOIN users creator ON creator.id = t.created_by
+      -- Dasselbe fuer den AUSSTELLER: den Klartext eines Tokens sieht nur er,
+      -- also ist ein Token eines Ehemaligen ein Geheimnis in seiner Hand, auch
+      -- wenn es als ein anderes Konto handelt.
+      AND ${activeAccountSql('creator')}
     WHERE t.token_hash = ?
-      AND t.revoked_at IS NULL
-      AND (t.expires_at IS NULL OR t.expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      AND ${apiTokenUsableSql('t')}
   `).get(tokenHash);
   if (!row) return null;
 
-  db.get().prepare(`
-    UPDATE api_tokens SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?
-  `).run(row.id);
+  // Buchfuehrung, kein Teil der Anfrage: waehrend eines Restores (#1431)
+  // entfaellt sie, statt jeden Token-Aufruf mit 500 zu beenden.
+  if (!db.isRestoreRunning()) {
+    db.get().prepare(`
+      UPDATE api_tokens SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?
+    `).run(row.id);
+  }
 
   req.apiToken = publicApiToken(row);
   req.user = {
@@ -814,9 +992,9 @@ function requireAuth(req, res, next) {
       // Tablett an der Wand waere irgendwann von selbst leer, ohne dass jemand
       // etwas widerrufen haette. Warum trotzdem gedrosselt: das Credential
       // steht im Klartext im Set-Cookie-Kopf, und an jede Antwort geheftet
-      // landet es auch an der einen oeffentlich cachebaren hinter diesem Guard
-      // (`/weather/icon/:code`). Beide Begruendungen samt Zahlen stehen bei
-      // `DISPLAY_COOKIE_MAX_AGE` und `DISPLAY_COOKIE_REFRESH_AFTER_MS`.
+      // landet es in jedem Proxy-Log, das Antwortkoepfe mitschreibt. Beide
+      // Begruendungen samt Zahlen stehen bei `DISPLAY_COOKIE_MAX_AGE` und
+      // `DISPLAY_COOKIE_REFRESH_AFTER_MS`.
       if (device.refreshCookie) {
         res.cookie(DISPLAY_COOKIE, displayToken, displayCookieOptions());
         // Erst JETZT ist die Frist verbraucht - hier geht das Cookie wirklich
@@ -843,12 +1021,32 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Not authenticated.', code: 401 });
   }
 
+  // EINE SITZUNG EINES EHEMALIGEN GILT NICHT, AUCH WENN SIE NOCH DASTEHT (#1381).
+  // Das Deaktivieren loescht die Sitzungen des Kontos in seiner Transaktion.
+  // Ein Request, der in diesem Moment noch lief und seine Sitzung veraendert
+  // hat, schreibt sie am Ende aber per `INSERT OR REPLACE` zurueck (siehe
+  // `refreshSessionCookieIfDue`). Bei einem geloeschten Konto zeigt so eine
+  // Zeile ins Leere; bei einem deaktivierten zeigte sie auf ein Konto, das es
+  // noch gibt - und waere bis zu ihrem Ablauf ein Zugang. Deshalb die eine
+  // Abfrage je Request, auf dem Primaerschluessel.
+  //
+  // UND DIE SITZUNG EINES GELOESCHTEN KONTOS GILT EBENSO WENIG. "Zeigt ins
+  // Leere" stimmt nur fuer Routen, die die Zeile nachschlagen: die Sitzung
+  // traegt Konto-Id UND Rolle, und `requireAdmin` liest die Rolle aus ihr. Die
+  // zurueckgeschriebene Sitzung eines geloeschten Administrators kaeme sonst
+  // weiter an jede Admin-Route. Gefragt wird deshalb "ist dieses Konto aktiv",
+  // nicht "ist es deaktiviert" - ein Konto, das es nicht gibt, ist es nicht.
+  if (req.session && req.session.userId && !isActiveAccount(req.session.userId, { db: db.get() })) {
+    return res.status(401).json({ error: 'Not authenticated.', code: 401 });
+  }
+
   if (req.session && req.session.userId) {
     req.authMethod = 'session';
     req.authUserId = req.session.userId;
     req.authRole = req.session.role;
     // Interaktive Sessions kennen kein Token-Scoping.
     req.authScopes = null;
+    refreshSessionCookieIfDue(req, res);
     applyRoleModuleAccess(req);
     return next();
   }
@@ -858,6 +1056,78 @@ function requireAuth(req, res, next) {
 /**
  * Prüft ob der authentifizierte User Admin-Rolle hat.
  */
+
+/**
+ * Datiert das Session-Cookie nach - gedrosselt, wie beim Wandtablett (#1356).
+ *
+ * DIE SITZUNG GLEITET: sie endet nach `SESSION_MAX_AGE_MS` ohne Benutzung,
+ * nicht so lange nach der Anmeldung. Der Store verlaengert sich ohnehin bei
+ * jedem Request (`touch`); das Cookie im Browser tat es nie, weil
+ * express-session ohne `rolling` bei unveraenderter Sitzung kein `Set-Cookie`
+ * schickt. Deshalb stellt diese Funktion das Cookie hoechstens alle zwoelf
+ * Stunden SELBST neu aus.
+ *
+ * `req.session` WIRD DABEI NICHT VERAENDERT, und das ist der Kern (Review zu
+ * #1407). Eine veraenderte Sitzung nimmt am Ende des Requests `store.set()`,
+ * und das ist ein `INSERT OR REPLACE`: wurde die Sitzung widerrufen, waehrend
+ * dieser Request noch lief (Passwort-Reset, 2FA, `invalidateUserSessions`,
+ * Kontoloeschung), legte es die geloeschte Zeile fuer 90 Tage neu an. Hier
+ * laufen nur `UPDATE ... WHERE sid = ?` - auf eine geloeschte Zeile wirken sie
+ * nicht. `req.session.cookie` darf sich aendern: express-session nimmt das
+ * Cookie aus seiner Aenderungspruefung heraus, der Request bleibt auf `touch()`.
+ *
+ * DER WERT IST DERSELBE SIGNIERTE, DEN DER BROWSER GESCHICKT HAT - wie bei der
+ * oikos.sid-Uebernahme in `sessionMiddleware`. Neu signiert wird nichts, und
+ * gehoert der Wert nicht zu `req.sessionID`, wird nichts gesetzt.
+ *
+ * DIE FRIST STEHT IM ABLAUF, DEN DER STORE SPEICHERT. `sess.cookie.expires` ist
+ * der Ablauf, den der Browser zuletzt bekommen hat: beim Login, bei jedem
+ * Speichern einer veraenderten Sitzung und hier per `extendCookie`. Faellig ist
+ * die Auffrischung, wenn davon weniger als 90 Tage minus zwoelf Stunden
+ * uebrig sind. Eine Sitzung von vor #1356 (alte Woche) ist das sofort.
+ *
+ * NUR HIER, NICHT IN DER SESSION-MIDDLEWARE: die haengt vor den statischen
+ * Dateien, eine Auffrischung dort schriebe die Session-ID in oeffentlich
+ * cachebare Asset-Antworten (Begruendung bei `SESSION_COOKIE_REFRESH_AFTER_MS`).
+ *
+ * DIE LAUFZEIT IM SPEICHER WIRD MITGESETZT, weil express-session am Ende
+ * `touch()` ruft und auf `originalMaxAge` zuruecksetzt; eine Sitzung mit der
+ * alten Woche schriebe sonst `expired_at` wieder auf sieben Tage.
+ */
+function refreshSessionCookieIfDue(req, res) {
+  // Waehrend eines Restores nicht nachdatieren (#1431): der Store nimmt nichts
+  // an, und ein neues Cookie ohne passende Zeile liefe auseinander. Der
+  // naechste Request danach holt es nach.
+  if (db.isRestoreRunning()) return;
+  const cookie = req.session.cookie;
+  // Ohne Cookie-Objekt ist es keine express-session (Routentests haengen ein
+  // nacktes `{ userId, role }` an) - es gibt nichts nachzudatieren.
+  if (!cookie) return;
+  const now = Date.now();
+  const expiresAt = cookie.expires instanceof Date ? cookie.expires.getTime() : null;
+  if (!sessionCookieRefreshDue(expiresAt, now)) return;
+  const value = signedSessionCookieValue(req);
+  if (!value) return;
+  res.cookie(SESSION_COOKIE, value, {
+    ...sessionCookieOptions(),
+    encode: (v) => v, // Wert ist bereits signiert und kodiert
+  });
+  cookie.maxAge = SESSION_MAX_AGE_MS;
+  cookie.originalMaxAge = SESSION_MAX_AGE_MS;
+  sessionStore.extendCookie(req.sessionID, now + SESSION_MAX_AGE_MS);
+}
+
+/**
+ * Der rohe, signierte `yuvomi.sid`-Wert aus dem Request - nur, wenn er zu
+ * `req.sessionID` gehoert. Erster Treffer, wie `cookie.parse` in express-session.
+ */
+function signedSessionCookieValue(req) {
+  const match = (req.headers.cookie || '').match(/(?:^|;\s*)yuvomi\.sid=([^;]+)/);
+  if (!match) return null;
+  let decoded;
+  try { decoded = decodeURIComponent(match[1]); } catch { return null; }
+  return decoded.startsWith(`s:${req.sessionID}.`) ? match[1] : null;
+}
 
 /**
  * Richtet eine neue Session nach erfolgter Authentifizierung ein.
@@ -886,7 +1156,7 @@ function setupAuthSession(req, res, user) {
         httpOnly: false,
         sameSite: 'lax',
         secure: process.env.SESSION_SECURE === 'true',
-        maxAge: 1000 * 60 * 60 * 24 * 7,
+        maxAge: SESSION_MAX_AGE_MS,
       });
       resolve();
     });
@@ -917,6 +1187,11 @@ function canSignIn(database, userId) {
   // gesperrt und beim OIDC-Rueckweg nicht. Diese eine Zeile schliesst beide
   // Wege und die Konten-Verknuepfung per E-Mail zugleich.
   if (isDisplayAccount(userId, { db: database })) return false;
+  // Ein Ehemaliger (#1381). Dieselbe Stelle aus demselben Grund: Passwort,
+  // SSO-Rueckweg, E-Mail-Verknuepfung und zweiter Faktor fragen alle hier. Die
+  // Zeile samt `oidc_sub` bleibt, damit der SSO-Rueckweg dieses Konto FINDET
+  // und abweist, statt derselben Person ein Ersatzkonto anzulegen.
+  if (!isActiveAccount(userId, { db: database })) return false;
   return true;
 }
 
@@ -959,6 +1234,7 @@ function loginPayload(req, user) {
     // stuende ein Solo-Haushalt bis zum naechsten Kaltstart wieder voller
     // Familienfelder.
     householdSize: householdSize(db.get()),
+    initialsRoster: initialsRoster(db.get(), user.id),
     othersCanRead: othersCanRead(db.get(), user.id),
     csrfToken: req.session.csrfToken,
   };
@@ -989,19 +1265,60 @@ function sanitizeOidcUsername(raw) {
 }
 
 /**
+ * Konten, die eine verifizierte Adresse bei der ersten SSO-Anmeldung meinen
+ * kann (GHSA-6pmj-w42g-g6qv). EINE Funktion fuer den Linker und fuer die
+ * Pruefung vor einem Konto ohne Passwort (`assertSsoOnlyAllowed`), denn die
+ * muss genau das vorhersagen, woran der Linker scheitert.
+ *
+ * - nur noch nicht verknuepfte Konten: ein verknuepftes findet sein `sub`;
+ * - ohne die Gaeste der geteilten Ausgaben: deren Adresse setzt jedes
+ *   Mitglied frei, das eine Gruppe verwaltet (auch ueber einen beliebigen
+ *   Kontakt). Zaehlten sie mit, koennte ein Mitglied damit die erste
+ *   Anmeldung eines anderen mehrdeutig machen oder sie auf den Gast ziehen.
+ *   Ein Gast gehoert nicht zum Haushalt und steht nicht in dessen
+ *   Identitaetsanbieter; verknuepft wird er nie ueber die Adresse.
+ *
+ * @param {object} database
+ * @param {unknown} address
+ * @param {{ excludeUserId?: number|null }} [opts]
+ * @returns {number[]}
+ */
+function ssoLinkCandidates(database, address, { excludeUserId = null } = {}) {
+  return accountIdsByEmail(database, address, {
+    secondary: true, unlinkedOnly: true, withoutSplitGuests: true, excludeUserId,
+  });
+}
+
+/**
  * Findet oder erstellt einen User anhand der (validierten) OIDC-Claims.
  *
  * Identität primär über den (kryptografisch validierten) `sub`. Existiert kein
  * sub-Match, wird ein bestehender lokaler Account NUR verknüpft, wenn der IdP
- * `email_verified: true` liefert UND genau ein noch nicht OIDC-gebundener Account
- * dieselbe E-Mail führt. Ohne verifizierte E-Mail (oder bei Mehrdeutigkeit) wird
- * ein separater Account angelegt — Linking auf unverifizierte E-Mails wäre ein
- * Account-Takeover-Vektor.
+ * `email_verified: true` liefert UND genau ein Kandidat (`ssoLinkCandidates`)
+ * die E-Mail führt UND dessen Adresse nur ein Admin gesetzt haben kann. Ohne
+ * verifizierte E-Mail wird ein separater Account angelegt - Linking auf
+ * unverifizierte E-Mails wäre ein Account-Takeover-Vektor.
  *
- * Ausnahme: `OIDC_TRUST_EMAIL_WITHOUT_VERIFIED_CLAIM=true` — Opt-in für IdPs, die
- * den Claim zwar weglassen, aber nur verifizierte Adressen ausgeben (z. B. ältere
- * Authentik-Deployments). Nur setzen, wenn der IdP vollständig unter eigener
- * Kontrolle steht und keine unverifizierten E-Mails zulässt.
+ * Zwei Fälle weisen die Anmeldung ab, statt zu raten (GHSA-6pmj-w42g-g6qv):
+ * - mehrere Kandidaten (`oidc_email_ambiguous`): welches Konto gemeint ist,
+ *   weiß nur ein Admin. Früher entstand hier still ein neues Konto, das den
+ *   `sub` für immer band.
+ * - genau ein Kandidat, aber ein Mitgliedskonto mit Passwort
+ *   (`oidc_link_required`): dessen Adresse kann das Mitglied selbst gesetzt
+ *   haben, auch die einer fremden Person. Die Person verknüpft dann angemeldet
+ *   unter Einstellungen → Konto (#832), oder ein Admin stellt das Konto auf
+ *   „Nur SSO-Anmeldung". Verknüpft wird über die Adresse nur ein Konto ohne
+ *   Passwort oder ein Admin-Konto - deren Adresse kann nur ein Admin gesetzt
+ *   haben.
+ * Rückgabe dann `{ refused, accountIds }` statt einer users-Zeile.
+ *
+ * Ausnahme: `OIDC_TRUST_EMAIL_WITHOUT_VERIFIED_CLAIM=true` - Opt-in für IdPs, die
+ * den Claim zwar weglassen, aber nur verifizierte Adressen ausgeben. Nur setzen,
+ * wenn der IdP vollständig unter eigener Kontrolle steht und keine
+ * unverifizierten E-Mails zulässt. Das Opt-in deckt NUR den fehlenden Claim: ein
+ * ausdrückliches `email_verified: false` verknüpft nie. Authentik ist dafür kein
+ * Beispiel - sein Standard-Mapping sendete bis 2025.10 `true` und sendet seither
+ * `false`, weggelassen hat es den Claim nicht (#1780).
  *
  * Mit `OIDC_ALLOW_SIGNUP=false` entfällt ausschließlich der letzte Schritt, das
  * Anlegen (#654); die Rückgabe ist dann `null`. Erkennen und Verknüpfen laufen
@@ -1010,11 +1327,18 @@ function sanitizeOidcUsername(raw) {
  *
  * @param {import('better-sqlite3-multiple-ciphers').Database} database
  * @param {{ sub: string, iss?: string, email?: string, email_verified?: boolean, name?: string, preferred_username?: string, username?: string }} claims
- * @returns {{ id: number, role: string, [key: string]: any }|null} `null`, wenn
- *   das Konto neu wäre und die automatische Kontoerstellung abgeschaltet ist.
+ * @returns {{ id: number, role: string, [key: string]: any }|{ refused: string, accountIds: number[] }|null}
+ *   `null`, wenn das Konto neu wäre und die automatische Kontoerstellung
+ *   abgeschaltet ist; `{ refused }` mit dem Redirect-Grund, wenn die Adresse
+ *   kein Konto eindeutig und sicher benennt.
  */
 export function findOrCreateOidcUser(database, claims) {
-  const { sub, iss, email, email_verified, name, preferred_username, username: usernameClaim } = claims;
+  const { sub, iss, email_verified, name, preferred_username, username: usernameClaim } = claims;
+  // Die Adresse EINMAL normalisieren und denselben Wert fuers Verknuepfen und
+  // fuer den Kontakt nehmen: verglich die Verknuepfung die rohe Adresse und
+  // speicherte der Kontakt die getrimmte, verfehlte `'  a@x.de '` das lokale
+  // Konto, und der Haushalt hatte zwei Mitglieder mit derselben Adresse (#1357).
+  const email = typeof claims.email === 'string' ? (claims.email.trim() || undefined) : claims.email;
 
   // Der Issuer aus dem validierten ID-Token kennt sich selbst am besten; OIDC_ISSUER
   // ist nur der konfigurierte Einstiegspunkt und kann davon abweichen (CNAME o. Ä.).
@@ -1027,32 +1351,50 @@ export function findOrCreateOidcUser(database, claims) {
   // 2. Linking an bestehenden lokalen Account — ausschließlich bei verifizierter
   //    E-Mail oder explizitem Opt-in via OIDC_TRUST_EMAIL_WITHOUT_VERIFIED_CLAIM.
   //    Family-User-E-Mails hängen an contacts.email (Primär) bzw.
-  //    contact_emails.value (Sekundär). Verknüpft wird nur, wenn GENAU EIN noch
-  //    nicht OIDC-gebundener Account die E-Mail führt; 0 oder >1 Treffer →
-  //    sicherheitshalber neuer Account.
+  //    contact_emails.value (Sekundär). Wer in Frage kommt, sagt
+  //    `ssoLinkCandidates` (dieselbe Funktion fragt `assertSsoOnlyAllowed`):
+  //    noch nicht gebundene Konten ohne die Gäste der geteilten Ausgaben, über
+  //    die eine Regel aus utils/email-match.js (Leerraum, Tab, NBSP, A-Z).
   const trustMissingVerified = process.env.OIDC_TRUST_EMAIL_WITHOUT_VERIFIED_CLAIM === 'true';
   if (email && (email_verified === true || (trustMissingVerified && email_verified !== false))) {
-    const matches = database.prepare(`
-      SELECT DISTINCT u.id
-      FROM users u
-      JOIN contacts c ON c.family_user_id = u.id
-      LEFT JOIN contact_emails ce ON ce.contact_id = c.id
-      WHERE u.oidc_sub IS NULL
-        AND (lower(c.email) = lower(?) OR lower(ce.value) = lower(?))
-    `).all(email, email);
+    const candidates = ssoLinkCandidates(database, email);
 
-    if (matches.length === 1) {
+    // Mehrere Konten tragen die Adresse: abweisen, nicht raten und nicht still
+    // ein drittes Konto anlegen. Ein neues Konto bände den sub für immer, und
+    // jede spätere Anmeldung landete dort - auch nachdem die Doppelung
+    // behoben ist. Das gilt unabhängig von OIDC_ALLOW_SIGNUP.
+    if (candidates.length > 1) {
+      return { refused: 'oidc_email_ambiguous', accountIds: candidates };
+    }
+
+    if (candidates.length === 1) {
+      const account = database.prepare('SELECT * FROM users WHERE id = ?').get(candidates[0]);
       // Ein Konto, das sich nicht anmelden darf, wird nicht verknuepft: es
       // truege sonst den sub, und jede weitere Anmeldung faende es schon in
       // Schritt 1. Zurueck kommt es trotzdem, unverknuepft - der Callback weist
       // es mit eigenem Grund ab, statt derselben Person ein Ersatzkonto anzulegen.
-      if (!canSignIn(database, matches[0].id)) {
-        return database.prepare('SELECT * FROM users WHERE id = ?').get(matches[0].id);
+      if (!canSignIn(database, account.id)) return account;
+      // UEBER DIE ADRESSE VERKNUEPFT NUR EIN KONTO, DESSEN ADRESSE NIEMAND
+      // AUSSER EINEM ADMIN GESETZT HABEN KANN. Die Adressen eines Mitglieds-
+      // Kontakts aendern nur die Person selbst und ein Admin
+      // (services/contact-identity.js). Also:
+      // - ein Konto ohne Passwort: ohne Passwort und ohne sub kommt niemand
+      //   hinein, der die Adresse am eigenen Profil aendern koennte;
+      // - ein Admin-Konto: die Person selbst IST Admin.
+      // Die Adresse eines Mitglieds-Kontos MIT Passwort pflegt das Mitglied
+      // selbst - auch auf die Adresse einer Person, die sich erst noch per SSO
+      // anmeldet, und deren erste Anmeldung landete dann im Konto des
+      // Mitglieds, das das Passwort kennt. Dieses Konto verknuepft deshalb nur
+      // angemeldet (Einstellungen → Konto, #832) oder nachdem ein Admin es auf
+      // „Nur SSO-Anmeldung" gestellt hat. Abgewiesen wird mit eigenem Grund,
+      // damit niemand still ein zweites Konto bekommt.
+      if (!isSsoOnlyAccount(account.password_hash) && account.role !== 'admin') {
+        return { refused: 'oidc_link_required', accountIds: candidates };
       }
       database.prepare(
         'UPDATE users SET oidc_sub = ?, oidc_provider = ? WHERE id = ?',
-      ).run(sub, provider, matches[0].id);
-      return database.prepare('SELECT * FROM users WHERE id = ?').get(matches[0].id);
+      ).run(sub, provider, account.id);
+      return database.prepare('SELECT * FROM users WHERE id = ?').get(account.id);
     }
   }
 
@@ -1081,13 +1423,35 @@ export function findOrCreateOidcUser(database, claims) {
   const display_name = (name || preferred_username || usernameClaim || email || username).slice(0, 128);
   const avatar_color = avatarColors[Math.floor(Math.random() * avatarColors.length)];
 
-  // oidc_provider = Issuer-URL (zukunftssicher für mehrere Provider)
-  const result = database.prepare(`
-    INSERT INTO users (username, display_name, password_hash, avatar_color, role, oidc_sub, oidc_provider)
-    VALUES (?, ?, ?, ?, 'member', ?, ?)
-  `).run(username, display_name, OIDC_PASSWORD_SENTINEL, avatar_color, sub, provider);
+  // 5. Der Kontakt entsteht wie auf jedem anderen Anlageweg (#1357, D#1254):
+  //    Einladung, Ersteinrichtung und Admin rufen `syncFamilyMemberArtifacts`
+  //    in DERSELBEN Transaktion wie das INSERT, sonst kennt der Haushalt die
+  //    Adresse des neuen Mitglieds nicht. Uebernommen werden nur Name und eine
+  //    VERIFIZIERTE Adresse - strikt `email_verified === true`, das Opt-in
+  //    OIDC_TRUST_EMAIL_WITHOUT_VERIFIED_CLAIM gilt dem Verknuepfen, nicht dem
+  //    Kontakt. Kein Bild (eine fremde URL, die CSP laesst nur eigene Bilder
+  //    zu), kein Geburtsdatum (ein Geburtstag, den die Person hier nie
+  //    eingetragen hat) und bewusst nur hier, beim ANLEGEN: Schritt 1 gibt ein
+  //    bekanntes Konto unveraendert zurueck, bis D#848 den Abgleich regelt.
+  const contactEmail = email_verified === true && typeof email === 'string' && email.length <= MAX_TITLE
+    ? email
+    : undefined;
 
-  return database.prepare('SELECT * FROM users WHERE id = ?').get(result.lastInsertRowid);
+  // oidc_provider = Issuer-URL (zukunftssicher für mehrere Provider)
+  const userId = database.transaction(() => {
+    const result = database.prepare(`
+      INSERT INTO users (username, display_name, password_hash, avatar_color, role, oidc_sub, oidc_provider)
+      VALUES (?, ?, ?, ?, 'member', ?, ?)
+    `).run(username, display_name, OIDC_PASSWORD_SENTINEL, avatar_color, sub, provider);
+    syncFamilyMemberArtifacts(database, result.lastInsertRowid, {
+      displayName: display_name,
+      email: contactEmail,
+      actorUserId: result.lastInsertRowid,
+    });
+    return result.lastInsertRowid;
+  })();
+
+  return database.prepare('SELECT * FROM users WHERE id = ?').get(userId);
 }
 
 /**
@@ -1306,8 +1670,8 @@ router.post('/login', loginLimiter, async (req, res) => {
     }
 
     if (!canSignIn(db.get(), user.id)) {
-      log.warn('Login blocked for housekeeping staff account', { ip: req.ip, username });
-      return res.status(403).json({ error: 'This account cannot sign in.', code: 403 });
+      log.warn('Login blocked: this account cannot sign in', { ip: req.ip, username });
+      return res.status(403).json({ error: 'This account cannot sign in.', code: 403, reason: 'account_cannot_sign_in' });
     }
 
     // Wer die eingebaute Anmeldung abgeschaltet hat, hat sie auch fuer alles
@@ -1326,7 +1690,7 @@ router.post('/login', loginLimiter, async (req, res) => {
     // Ausschluss darueber: erst die Zugangsdaten, dann die Berechtigung.
     if (!isPasswordLoginEnabled() && !isSplitExpenseGuest(user.id)) {
       log.warn('Login rejected: password login is disabled', { ip: req.ip, username });
-      return res.status(403).json({ error: 'Password login is disabled.', code: 403 });
+      return res.status(403).json({ error: 'Password login is disabled.', code: 403, reason: 'password_login_disabled' });
     }
 
     // Zweiter Faktor (#672): das Passwort stimmt, die Sitzung entsteht aber
@@ -1365,6 +1729,7 @@ export function buildResetRoutes(targetRouter, {
   resetService = defaultResetService,
   baseUrl = process.env.BASE_URL || '',
   limiter = passwordResetLimiter,
+  defer = (fn) => setImmediate(fn),
 } = {}) {
   const getDb = () => (database || db.get());
 
@@ -1373,10 +1738,18 @@ export function buildResetRoutes(targetRouter, {
     if (!id) return null;
     const byName = getDb().prepare('SELECT id FROM users WHERE username = ?').get(id);
     if (byName) return byName.id;
-    const byEmail = getDb().prepare(
-      'SELECT family_user_id AS id FROM contacts WHERE email = ? AND family_user_id IS NOT NULL LIMIT 1'
-    ).get(id);
-    return byEmail?.id ?? null;
+    // Dieselbe Vergleichsregel wie die SSO-Verknuepfung (utils/email-match.js),
+    // gezaehlt nur Kontakte, die auf ein bestehendes Konto zeigen, und nur
+    // GENAU EIN Konto zaehlt. Bei zwei Treffern ging der Link sonst an
+    // irgendeines; so geht er an keines, und die Antwort bleibt dieselbe.
+    // Gaeste der geteilten Ausgaben machen eine Adresse nicht mehrdeutig: ein
+    // Gast entsteht aus einem beliebigen Kontakt und sperrte sonst den Reset
+    // des Mitglieds mit derselben Adresse. Allein bleibt ein Gast erreichbar.
+    const ids = accountIdsByEmail(getDb(), id);
+    const members = ids.filter((uid) => !isSplitExpenseGuest(uid, getDb()));
+    if (members.length === 1) return members[0];
+    if (members.length === 0 && ids.length === 1) return ids[0];
+    return null;
   }
 
   /**
@@ -1398,42 +1771,104 @@ export function buildResetRoutes(targetRouter, {
   // eine Antwort behaelt.
   const emailFor = (userId) => memberEmail(userId, { db: getDb() });
 
-  targetRouter.post('/forgot-password', limiter, async (req, res) => {
+  // Versand je Konto (userId -> { tail, waiting }): hoechstens einer laeuft
+  // und einer wartet. Kein globaler Takt: verschiedene Konten laufen weiter
+  // nebeneinander.
+  const resetMailChain = new Map();
+
+  /**
+   * Die eigentliche Arbeit hinter "Passwort vergessen": Konto aufloesen und
+   * gegebenenfalls den Link verschicken. Laeuft NACH der Antwort (`defer`),
+   * damit deren Dauer nicht verraet, ob es das Konto gibt - ein Mailversand
+   * dauert messbar laenger als "nichts gefunden". Fehler landen nur im Log.
+   *
+   * Je Konto hintereinander: kommt eine zweite Anfrage, bevor der Mailserver
+   * die erste Mail angenommen hat, loescht ihr `createToken()` den ersten
+   * Token. Liefen beide Versande nebeneinander, koennte die erste Mail zuletzt
+   * ankommen - mit einem Link, der nicht mehr gilt. Frueher hielt das die
+   * wartende Antwort; seit sie vorher rausgeht, haelt es diese Kette. Ein
+   * Token-Check direkt vor `sendMail` reicht dafuer nicht: zwischen
+   * `createToken()` und `sendMail()` liegt kein await, er waere immer wahr.
+   *
+   * Die Kette ist auf einen laufenden und einen wartenden Job begrenzt. Wartet
+   * schon einer, faellt eine weitere Anfrage weg: der wartende Job erzeugt
+   * ohnehin das neueste Token, und eine Schleife staute sonst beliebig viele
+   * Jobs samt Mails auf.
+   */
+  // async, damit ein Wurf in resolveUser() als Rejection beim .catch() des
+  // Aufrufers landet statt als ungefangene Ausnahme im setImmediate.
+  async function sendResetLinkFor(identifier) {
+    const userId = resolveUser(identifier);
+    if (!userId) return undefined;
+    const entry = resetMailChain.get(userId);
+    if (entry?.waiting) return undefined;
+    const state = { tail: null, waiting: !!entry };
+    const job = (entry ? entry.tail : Promise.resolve()).then(() => {
+      state.waiting = false;
+      return issueResetMail(userId);
+    });
+    state.tail = job.catch(() => {});
+    resetMailChain.set(userId, state);
+    state.tail.then(() => {
+      if (resetMailChain.get(userId) === state) resetMailChain.delete(userId);
+    });
+    return job;
+  }
+
+  async function issueResetMail(userId) {
+    // Anti-enumeration: die Antwort ist schon raus und fuer jeden Ausgang
+    // gleich. Deshalb gehen auch die beiden Gruende aus #847 hier still durch -
+    // ein eigener Statuscode fuer "dieses Konto hat kein Passwort" wuerde
+    // verraten, welche Konten per SSO gefuehrt werden. Geprueft wird erst
+    // hier, nach dem Warten auf einen vorigen Versand: der Zustand kann sich
+    // in der Zwischenzeit geaendert haben.
+    //
+    // Und ein Ehemaliger bekommt keinen Link (#1381): ebenso still, aus
+    // demselben Grund.
+    if (!(isPasswordLoginEnabled(getDb()) || isSplitExpenseGuest(userId, getDb()))
+        || !hasResettablePassword(userId)
+        || !isActiveAccount(userId, { db: getDb() })
+        || !emailService.isConfigured()) {
+      return;
+    }
+    const to = emailFor(userId);
+    // Reset links MUST use an explicitly configured, trusted origin.
+    // Never derive it from the request Host header (password-reset
+    // poisoning: a forged Host would point the victim's token at an
+    // attacker-controlled domain).
+    const origin = String(baseUrl || '').trim().replace(/\/$/, '');
+    if (to && origin) {
+      const { token } = resetService.createToken(userId);
+      const link = `${origin}/reset-password?token=${token}`;
+      await emailService.sendMail({
+        to,
+        subject: 'Reset your Yuvomi password',
+        text: `Open this link to choose a new password (valid for 1 hour): ${link}`,
+        html: `<p>Open this link to choose a new password (valid for 1 hour):</p>`
+          + `<p><a href="${link}">${link}</a></p>`,
+      }).catch((err) => log.error('Reset mail failed:', err.message));
+    } else if (to && !origin) {
+      log.warn('BASE_URL not configured; password-reset link not sent.');
+    }
+  }
+
+  targetRouter.post('/forgot-password', limiter, (req, res) => {
     try {
       const { identifier } = req.body || {};
-      const userId = resolveUser(identifier);
-      // Anti-enumeration: identical response regardless of outcome. Deshalb
-      // gehen auch die beiden neuen Gruende (#847) durch dieselbe Antwort -
-      // ein eigener Statuscode fuer "dieses Konto hat kein Passwort" wuerde
-      // verraten, welche Konten per SSO gefuehrt werden.
-      if (userId && (isPasswordLoginEnabled(getDb()) || isSplitExpenseGuest(userId, getDb()))
-          && hasResettablePassword(userId)
-          && emailService.isConfigured()) {
-        const to = emailFor(userId);
-        // Reset links MUST use an explicitly configured, trusted origin.
-        // Never derive it from the request Host header (password-reset
-        // poisoning: a forged Host would point the victim's token at an
-        // attacker-controlled domain).
-        const origin = String(baseUrl || '').trim().replace(/\/$/, '');
-        if (to && origin) {
-          const { token } = resetService.createToken(userId);
-          const link = `${origin}/reset-password?token=${token}`;
-          await emailService.sendMail({
-            to,
-            subject: 'Reset your Yuvomi password',
-            text: `Open this link to choose a new password (valid for 1 hour): ${link}`,
-            html: `<p>Open this link to choose a new password (valid for 1 hour):</p>`
-              + `<p><a href="${link}">${link}</a></p>`,
-          }).catch((err) => log.error('Reset mail failed:', err.message));
-        } else if (to && !origin) {
-          log.warn('BASE_URL not configured; password-reset link not sent.');
-        }
-      }
+      // Erst antworten, dann arbeiten: dieselbe Antwort, dieselbe Zeit, fuer ein
+      // bekanntes wie fuer ein unbekanntes Konto.
       res.json({ data: { ok: true } });
+      // Als Job (#1532): der Versand legt das Token an, ein zweiter Antrag erst
+      // nach dem await auf den ersten Versand. Die Anfrage ist da schon
+      // freigegeben - ohne Job liefe ein Restore darueber hinweg, und das Token
+      // landete in der eingespielten Datenbank.
+      defer(() => runExternalJob(() => sendResetLinkFor(identifier)).catch((err) => {
+        log.error('forgot-password error:', err.message);
+      }));
     } catch (err) {
       log.error('forgot-password error:', err.message);
-      // Still return generic success to avoid leaking failures.
-      res.json({ data: { ok: true } });
+      // Auch hier die generische Antwort: ein Fehler darf nichts verraten.
+      if (!res.headersSent) res.json({ data: { ok: true } });
     }
   });
 
@@ -1455,8 +1890,12 @@ export function buildResetRoutes(targetRouter, {
       // haben (#847). Ein noch gueltiger Token darf diese Entscheidung nicht
       // ueberholen. Bewusst dieselbe Meldung wie ein ungueltiger Token: der
       // Unterschied ginge sonst an jemanden, der das Konto nicht besitzt.
+      // Dasselbe fuer ein Konto, das zwischen Ausstellen und Einloesen
+      // deaktiviert wurde (#1381). Das Deaktivieren loescht seine Reset-Tokens;
+      // diese Zeile haelt es auch fuer eines, das danach noch auftaucht.
       if ((!isPasswordLoginEnabled(getDb()) && !isSplitExpenseGuest(userId, getDb()))
-          || !hasResettablePassword(userId)) {
+          || !hasResettablePassword(userId)
+          || !isActiveAccount(userId, { db: getDb() })) {
         resetService.consumeToken(token);
         return res.status(400).json({ error: 'Invalid or expired token.', code: 400 });
       }
@@ -1464,13 +1903,8 @@ export function buildResetRoutes(targetRouter, {
       getDb().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, userId);
       resetService.consumeToken(token);
       // Best-effort: invalidate existing sessions for this user.
-      try {
-        const rows = getDb().prepare('SELECT sid, sess FROM sessions').all();
-        for (const r of rows) {
-          try { if (JSON.parse(r.sess)?.userId === userId) getDb().prepare('DELETE FROM sessions WHERE sid = ?').run(r.sid); }
-          catch { /* ignore malformed session rows */ }
-        }
-      } catch { /* sessions table may not exist in tests */ }
+      try { invalidateUserSessions(userId, null, getDb()); }
+      catch { /* sessions table may not exist in tests */ }
       res.json({ data: { ok: true } });
     } catch (err) {
       log.error('reset-password error:', err.message);
@@ -1785,6 +2219,29 @@ router.post('/logout', requireAuth, csrfMiddleware, (req, res) => {
 });
 
 /**
+ * POST /api/v1/auth/logout-others
+ * Beendet jede andere Sitzung des angemeldeten Mitglieds, die aufrufende bleibt
+ * (#1354). Seit D#1242 lebt eine unbenutzte Sitzung 90 Tage - das hier ist der
+ * Widerruf dazu. Nur fuer eine Browser-Sitzung: ein API-Token oder ein
+ * Wandtablett hat keine "aktuelle" Sitzung, die es ausnehmen koennte, und wuerde
+ * sonst auch die des Mitglieds selbst beenden. Tokens und Tabletts selbst
+ * bleiben gueltig; sie werden unter API-Tokens bzw. Displays widerrufen.
+ * Response: { ok: true, ended: number }
+ */
+router.post('/logout-others', requireAuth, csrfMiddleware, sessionRevokeLimiter, (req, res) => {
+  if (req.authMethod !== 'session' || !req.sessionID) {
+    return res.status(403).json({ error: 'Only a signed-in browser session can sign out other sessions.', code: 403, reason: 'browser_session_required' });
+  }
+  try {
+    const ended = invalidateUserSessions(req.authUserId, req.sessionID);
+    res.json({ ok: true, ended });
+  } catch (err) {
+    log.error('Sign out other sessions error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+/**
  * GET /api/v1/auth/oidc/config
  * Öffentlicher Endpunkt — kein Auth, kein CSRF.
  * Beantwortet vollständig, welche Anmeldewege dieser Server anbietet.
@@ -1831,14 +2288,19 @@ async function beginOidcFlow(req, config, extra = {}) {
   const codeVerifier  = oidcClient.randomPKCECodeVerifier();
   const codeChallenge = await oidcClient.calculatePKCECodeChallenge(codeVerifier);
 
-  req.session.oidc = { state, nonce, codeVerifier, ...extra };
+  // Der Wert, den die Authorize-Anfrage traegt, wird EINMAL gelesen und mit dem
+  // Lauf festgehalten: der Code-Tausch muss ihn Zeichen fuer Zeichen
+  // wiederholen (RFC 6749, 4.1.3) und leitet ihn deshalb nicht neu her (#1768).
+  const redirectUri = process.env.OIDC_REDIRECT_URI;
+
+  req.session.oidc = { state, nonce, codeVerifier, redirectUri, ...extra };
 
   await new Promise((resolve, reject) =>
     req.session.save(err => (err ? reject(err) : resolve()))
   );
 
   return oidcClient.buildAuthorizationUrl(config, {
-    redirect_uri:          process.env.OIDC_REDIRECT_URI,
+    redirect_uri:          redirectUri,
     scope:                 'openid email profile',
     state,
     nonce,
@@ -1847,7 +2309,7 @@ async function beginOidcFlow(req, config, extra = {}) {
   }).href;
 }
 
-router.get('/oidc/start', async (req, res) => {
+router.get('/oidc/start', refuseWhileRestoring, async (req, res) => {
   try {
     const config = await getOidcConfig();
     if (!config) {
@@ -1855,7 +2317,7 @@ router.get('/oidc/start', async (req, res) => {
     }
     res.redirect(await beginOidcFlow(req, config));
   } catch (err) {
-    log.error('OIDC start error:', err);
+    log.error('OIDC start error:', describeOidcError(err));
     res.status(500).json({ error: 'OIDC initialization failed.', code: 500 });
   }
 });
@@ -1865,7 +2327,7 @@ router.get('/oidc/start', async (req, res) => {
  * Verknüpfungsstand des eigenen Kontos (#832).
  * Response: { enabled, linked, provider, can_unlink }
  */
-router.get('/oidc/link', requireAuth, (req, res) => {
+router.get('/oidc/link', requireAuth, refuseWhileRestoring, (req, res) => {
   const user = db.get()
     .prepare('SELECT oidc_sub, oidc_provider, password_hash FROM users WHERE id = ?')
     .get(req.authUserId);
@@ -1904,7 +2366,7 @@ router.post('/oidc/link/start', requireAuth, csrfMiddleware, async (req, res) =>
 
     res.json({ url: await beginOidcFlow(req, config, { linkUserId: req.authUserId }) });
   } catch (err) {
-    log.error('OIDC link start error:', err);
+    log.error('OIDC link start error:', describeOidcError(err));
     res.status(500).json({ error: 'OIDC initialization failed.', code: 500 });
   }
 });
@@ -1938,7 +2400,7 @@ router.delete('/oidc/link', requireAuth, csrfMiddleware, (req, res) => {
  * prüft Signatur, iss, aud, exp, nonce), ermittelt/erstellt den User über den
  * validierten sub und richtet die Session ein.
  */
-router.get('/oidc/callback', async (req, res) => {
+router.get('/oidc/callback', refuseWhileRestoring, async (req, res) => {
   try {
     const config = await getOidcConfig();
     if (!config) return res.redirect('/login?error=oidc_not_configured');
@@ -1952,16 +2414,28 @@ router.get('/oidc/callback', async (req, res) => {
       return res.redirect('/login?error=oidc_state_mismatch');
     }
 
-    // Aktuelle Callback-URL: Host/Schema aus der registrierten redirect_uri (zuverlässig
-    // hinter Reverse-Proxy), Query (code, state, …) aus der eingehenden Anfrage.
-    const currentUrl = new URL(req.originalUrl, process.env.OIDC_REDIRECT_URI);
+    // Ein Lauf ohne festgehaltene Redirect-URI (vor dem Update begonnen) wird
+    // abgewiesen statt mit einem neu hergeleiteten Wert getauscht: der Anbieter
+    // vergleicht mit dem Wert der Authorize-Anfrage, und raten hiesse, genau
+    // den Fehler aus #1768 zu wiederholen. Ein zweiter Klick startet neu.
+    if (typeof stored.redirectUri !== 'string' || !stored.redirectUri) {
+      log.warn('OIDC callback: Session-State ohne redirect_uri (vor dem Update begonnen)');
+      return res.redirect('/login?error=oidc_state_mismatch');
+    }
 
-    // authorizationCodeGrant validiert state, tauscht den Code gegen Tokens und prüft
-    // Signatur, iss, aud, exp sowie nonce (über expectedNonce) am ID-Token.
-    const tokens = await oidcClient.authorizationCodeGrant(config, currentUrl, {
-      expectedState:    stored.state,
-      expectedNonce:    stored.nonce,
-      pkceCodeVerifier: stored.codeVerifier,
+    // Der Tausch sendet die redirect_uri der Authorize-Anfrage woertlich; von
+    // der eingehenden Anfrage kommt nur die Query (code, state, ...), weder
+    // Pfad noch Host oder Schema (#1768). Er validiert state, tauscht den Code
+    // gegen Tokens und prüft Signatur, iss, aud, exp sowie nonce am ID-Token.
+    const queryStart = req.originalUrl.indexOf('?');
+    const tokens = await exchangeAuthorizationCode(config, {
+      redirectUri: stored.redirectUri,
+      query:       queryStart === -1 ? '' : req.originalUrl.slice(queryStart),
+      checks: {
+        expectedState:    stored.state,
+        expectedNonce:    stored.nonce,
+        pkceCodeVerifier: stored.codeVerifier,
+      },
     });
 
     // Identität aus dem validierten ID-Token; fetchUserInfo erzwingt sub-Abgleich
@@ -1974,10 +2448,13 @@ router.get('/oidc/callback', async (req, res) => {
     // begann, und der linkUserId stammt aus derselben signierten Session wie
     // der state.
     if (stored.linkUserId) {
-      const result = linkOidcAccount(db.get(), stored.linkUserId, {
-        sub: claims.sub,
-        iss: claims.iss,
-      });
+      // Der Lauf begann angemeldet; bis zum Rueckweg kann das Konto deaktiviert
+      // worden sein (#1381). Ein Konto, das sich nicht anmelden darf, bekommt
+      // keine neue Bindung - `user_gone` ist dieselbe Antwort wie fuer ein
+      // Konto, das es nicht mehr gibt.
+      const result = canSignIn(db.get(), stored.linkUserId)
+        ? linkOidcAccount(db.get(), stored.linkUserId, { sub: claims.sub, iss: claims.iss })
+        : { ok: false, reason: 'user_gone' };
       if (!result.ok) {
         log.warn(`OIDC link rejected for user ${stored.linkUserId}: ${result.reason}`);
       }
@@ -2010,6 +2487,22 @@ router.get('/oidc/callback', async (req, res) => {
       return res.redirect('/login?error=oidc_signup_disabled');
     }
 
+    // Die Adresse benennt kein Konto eindeutig und sicher (GHSA-6pmj-w42g-g6qv).
+    // Kein Konto angelegt, keins verknuepft; der Grund steht im Redirect, und
+    // das Log sagt dem Admin, welche Konten er ansehen muss. Die Adresse selbst
+    // steht nicht im Log, die Konto-IDs genuegen.
+    if (user.refused) {
+      const ids = user.accountIds.join(', ');
+      if (user.refused === 'oidc_email_ambiguous') {
+        log.warn(`OIDC sign-in refused: the verified email address is on more than one unlinked account (user ids ${ids}). `
+          + `Keep the address on one account only, or have the person link SSO under Settings > Account. sub=${claims.sub}`);
+      } else {
+        log.warn(`OIDC sign-in refused: the verified email address belongs to user ${ids}, which has a password and is not linked to SSO. `
+          + `The person links SSO under Settings > Account, or an admin switches the account to SSO-only sign-in. sub=${claims.sub}`);
+      }
+      return res.redirect(`/login?error=${user.refused}`);
+    }
+
     // Ein Konto der Haushaltshilfe meldet sich auch ueber SSO nicht an (#243).
     // Die Pruefung steht VOR dem zweiten Faktor: dahinter legte der Callback
     // erst einen Wartezustand an, und der Code oeffnete dann die Sitzung.
@@ -2039,7 +2532,7 @@ router.get('/oidc/callback', async (req, res) => {
 
     res.redirect('/');
   } catch (err) {
-    log.error('OIDC callback error:', err);
+    log.error('OIDC callback error:', describeOidcError(err));
     res.redirect('/login?error=oidc_failed');
   }
 });
@@ -2048,8 +2541,28 @@ router.get('/oidc/callback', async (req, res) => {
  * POST /api/v1/auth/setup
  * First-run bootstrap: creates the first admin when no users exist.
  * Returns 403 if any user already exists.
- * Body: { username: string, display_name: string, password: string }
+ * Body: { username: string, display_name: string, password: string,
+ *         language?: string, timezone?: string }
  * Response: { user: { id, username, display_name, avatar_color, role } }
+ *
+ * `language` und `timezone` sind optional und additiv (die Route ist Teil der
+ * zugesagten `/api/v1`-Oberflaeche): fehlen sie, oder sind sie `null`/leer,
+ * verhaelt sich das Setup exakt wie vorher. Unbekannte Felder im Body werden
+ * weiterhin still ignoriert - darauf verlaesst sich der Web-Installer, der die
+ * Felder auch an aeltere Images schicken darf.
+ *
+ * Die Anzeigesprache eines Nutzers kennt der Server nicht (sie lebt im
+ * localStorage des Geraets, siehe public/i18n.js). Was er kennt, ist die
+ * Datensprache des Haushalts (`sync_config.language`), und genau die fiel beim
+ * Setup bisher still auf Englisch. `language` setzt deshalb sie - aber nur,
+ * wenn die Automatik (Region → Englisch) nicht ohnehin dasselbe ergaebe. Ein
+ * explizites `en` wuerde sonst eine spaetere Regionswahl ueberstimmen, die die
+ * Datensprache heute noch mitzieht.
+ *
+ * Region, Waehrung und Datumsformat bleiben unberuehrt: aus einer Sprache folgt
+ * keine Region (`de` kann DE, AT oder CH sein), und es gibt keine Ableitung,
+ * die das entscheiden koennte. `timezone` schreibt `household_timezone`, mit
+ * derselben Pruefung wie PUT /preferences.
  */
 router.post('/setup', loginLimiter, async (req, res) => {
   try {
@@ -2058,7 +2571,7 @@ router.post('/setup', loginLimiter, async (req, res) => {
       if (process.env.NODE_ENV === 'production') {
         return res.status(404).json({ error: 'Not found.', code: 404 });
       }
-      return res.status(403).json({ error: 'Setup has already been completed.', code: 403 });
+      return res.status(403).json({ error: 'Setup has already been completed.', code: 403, reason: 'setup_completed' });
     }
 
     const username = (req.body.username || '').trim();
@@ -2077,6 +2590,17 @@ router.post('/setup', loginLimiter, async (req, res) => {
     if (normalizePassword(password).length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters long.', code: 400 });
     }
+    // `null` und '' zaehlen als "nicht gesendet", wie bei PUT /preferences.
+    const { language = null, timezone = null } = req.body;
+    if (language !== null && language !== '' && !isSupportedLocale(language)) {
+      return res.status(400).json({ error: `Unsupported language. Allowed: ${getSupportedLocales().join(', ')}`, code: 400 });
+    }
+    if (timezone !== null && timezone !== '' && !isValidTimeZone(timezone)) {
+      // `reason` ist der Anker fuer Clients: die Setup-Seite wiederholt genau
+      // diese Ablehnung einmal ohne Zone. Am Status allein darf sie das nicht
+      // festmachen - jedes 400 zaehlt gegen den loginLimiter.
+      return res.status(400).json({ error: 'Invalid time zone. Expected an IANA zone such as "Europe/Berlin".', code: 400, reason: 'invalid_timezone' });
+    }
 
     const avatarColor = avatarColors[Math.floor(Math.random() * avatarColors.length)];
     const hash = await hashPassword(password);
@@ -2094,11 +2618,22 @@ router.post('/setup', loginLimiter, async (req, res) => {
           displayName: display_name,
           actorUserId: created.lastInsertRowid,
         });
+        // In derselben Transaktion: scheitert das Anlegen, bleibt auch keine
+        // halbe Haushaltseinstellung zurueck.
+        const setCfg = db.get().prepare(`
+          INSERT INTO sync_config (key, value) VALUES (?, ?)
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        `);
+        if (language && language !== resolveHouseholdLocale(db.get(), { ignoreExplicit: true })) {
+          setCfg.run('language', language);
+        }
+        if (timezone) setCfg.run('household_timezone', timezone);
         return created;
       });
     } catch (txErr) {
       if (txErr === SETUP_DONE) {
-        return res.status(403).json({ error: 'Setup has already been completed.', code: 403 });
+        return res.status(403).json({ error: 'Setup has already been completed.', code: 403, reason: 'setup_completed' });
       }
       throw txErr;
     }
@@ -2138,6 +2673,7 @@ router.get('/me', requireAuth, (req, res) => {
         user: publicUser(user),
         permissions: clientPermissions(db.get(), user),
         householdSize: householdSize(db.get()),
+        initialsRoster: initialsRoster(db.get(), user.id),
         othersCanRead: othersCanRead(db.get(), user.id),
       });
     }
@@ -2169,7 +2705,7 @@ router.get('/me', requireAuth, (req, res) => {
       httpOnly: false,
       sameSite: 'lax',
       secure: process.env.SESSION_SECURE === 'true',
-      maxAge: 1000 * 60 * 60 * 24 * 7,
+      maxAge: SESSION_MAX_AGE_MS,
     });
 
     res.json({
@@ -2179,6 +2715,7 @@ router.get('/me', requireAuth, (req, res) => {
       // (`canSignIn()` weist es ab). Sie bleiben deshalb beim Standard `false`.
       permissions: clientPermissions(db.get(), user, { isDisplay: req.authMethod === 'display' }),
       householdSize: householdSize(db.get()),
+      initialsRoster: initialsRoster(db.get(), user.id),
       othersCanRead: othersCanRead(db.get(), user.id),
       csrfToken: req.session.csrfToken,
     });
@@ -2268,6 +2805,15 @@ router.post('/2fa/verify', twoFactorLimiter, async (req, res) => {
     const pending = consumePendingTwoFactor(req);
     if (!pending) {
       return res.status(401).json({ error: 'No pending sign-in.', code: 401 });
+    }
+
+    // Zwischen Passwort und Code kann das Konto deaktiviert worden sein
+    // (#1381). `setupAuthSession` wiese es ohnehin ab - aber erst NACH der
+    // Pruefung, die einen Wiederherstellungscode verbraucht, und als 500.
+    // Hier ist es dieselbe Absage wie beim Passwort, vor jedem Verbrauch.
+    if (!canSignIn(db.get(), pending.userId)) {
+      delete req.session.pendingTwoFactor;
+      return res.status(403).json({ error: 'This account cannot sign in.', code: 403, reason: 'account_cannot_sign_in' });
     }
 
     const code = String(req.body?.code || '');
@@ -2441,7 +2987,7 @@ router.post('/2fa/recovery-codes', requireAuth, csrfMiddleware, twoFactorLimiter
  */
 router.get('/2fa/overview', requireAuth, requireAdmin, (_req, res) => {
   try {
-    res.json({ data: twoFactor.householdOverview(db.get()), required: twoFactor.isRequiredForHousehold(db.get()) });
+    res.json({ data: twoFactor.householdOverview(db.get(), memberOrderSql('u')), required: twoFactor.isRequiredForHousehold(db.get()) });
   } catch (err) {
     log.error('2FA overview error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -2507,6 +3053,17 @@ router.get('/users', requireAuth, (req, res) => {
     // und einen Geburtstag anlegen wuerde. Ein Display ist kein Konto, das man
     // hier verwaltet: es hat seine eigene Seite, auf der es angelegt, gekoppelt
     // und widerrufen wird.
+    // EHEMALIGE STEHEN WEITER HIER, ANS ENDE SORTIERT UND MIT `deactivated_at`
+    // (#1381). Diese Liste benennt Personen, die ein Datensatz schon speichert
+    // - den Zustaendigen einer alten Aufgabe, den Ersteller eines Termins -,
+    // und die Verwaltung muss sehen, wen sie deaktiviert hat. Auswaehlen laesst
+    // sich ein Ehemaliger nirgends: jede Auswahl liest `/family/members`.
+    //
+    // INNERHALB DER AKTIVEN GILT DIE HAUSHALTSREIHENFOLGE (#1644). Stundenplan,
+    // Uebersicht und Kalender lesen ihre Personen aus dieser Liste; sortierte
+    // sie nach dem Namen, stuenden dieselben fuenf Menschen dort anders als in
+    // jeder Auswahl. Personal und Gaeste haben keine Position und stehen mit
+    // den unplatzierten Mitgliedern im Alphabet.
     const users = isAdmin
       ? db.get().prepare(`
           SELECT ${USER_PUBLIC_COLUMNS},
@@ -2514,14 +3071,14 @@ router.get('/users', requireAuth, (req, res) => {
                  (password_hash = ?) AS sso_only
           FROM users
           WHERE NOT EXISTS (SELECT 1 FROM display_accounts da WHERE da.user_id = users.id)
-          ORDER BY display_name
+          ORDER BY ${activeAccountSql('users')} DESC, ${memberOrderSql('users')}
         `).all(OIDC_PASSWORD_SENTINEL)
       : db.get().prepare(`
           SELECT ${USER_PUBLIC_COLUMNS},
                  EXISTS(SELECT 1 FROM housekeeping_workers hw WHERE hw.user_id = users.id) AS is_worker
           FROM users
           WHERE NOT EXISTS (SELECT 1 FROM display_accounts da WHERE da.user_id = users.id)
-          ORDER BY display_name
+          ORDER BY ${activeAccountSql('users')} DESC, ${memberOrderSql('users')}
         `).all();
     res.json({ data: users.map(publicUser) });
   } catch (err) {
@@ -2533,7 +3090,8 @@ router.get('/users', requireAuth, (req, res) => {
 router.get('/api-tokens', requireAuth, requireAdmin, (req, res) => {
   try {
     const rows = db.get().prepare(`
-      SELECT t.*, creator.display_name AS creator_name,
+      SELECT t.*, ${apiTokenUsableSql('t')} AS usable,
+        creator.display_name AS creator_name,
         subject.id AS effective_subject_user_id,
         subject.display_name AS subject_name
       FROM api_tokens t
@@ -2549,7 +3107,9 @@ router.get('/api-tokens', requireAuth, requireAdmin, (req, res) => {
       SELECT u.id, u.username, u.display_name
       FROM users u
       WHERE ${accessScopeSql('u')} = 'family'
-      ORDER BY u.display_name
+        -- Kein Token fuer einen Ehemaligen (#1381): POST weist ihn ebenfalls ab.
+        AND ${activeAccountSql('u')}
+      ORDER BY ${memberOrderSql('u')}
     `).all();
     res.json({ data: rows.map(publicApiToken), subjects });
   } catch (err) {
@@ -2623,6 +3183,13 @@ router.post('/api-tokens', requireAuth, requireAdmin, csrfMiddleware, (req, res)
     if (isDisplayAccount(subjectUserId, { db: db.get() })) {
       return res.status(400).json({ error: 'A display cannot be an API token subject.', code: 400 });
     }
+    // Und ein Ehemaliger handelt nicht mehr (#1381): die Anmeldung wiese das
+    // Token ohnehin ab, also entsteht es gar nicht erst.
+    if (!isActiveAccount(subjectUserId, { db: db.get() })) {
+      return res.status(400).json({
+        error: 'A deactivated account cannot be an API token subject.', code: 400, reason: 'account_deactivated',
+      });
+    }
 
     const result = db.get().prepare(`
       INSERT INTO api_tokens (name, token_hash, token_prefix, created_by, subject_user_id, expires_at, scopes)
@@ -2630,7 +3197,8 @@ router.post('/api-tokens', requireAuth, requireAdmin, csrfMiddleware, (req, res)
     `).run(name, tokenHash, tokenPrefix, req.authUserId, subjectUserId, normalizedExpiresAt, serializedScopes);
 
     const row = db.get().prepare(`
-      SELECT t.*, creator.display_name AS creator_name,
+      SELECT t.*, ${apiTokenUsableSql('t')} AS usable,
+        creator.display_name AS creator_name,
         subject.id AS effective_subject_user_id,
         subject.display_name AS subject_name
       FROM api_tokens t
@@ -2661,6 +3229,47 @@ router.delete('/api-tokens/:id', requireAuth, requireAdmin, csrfMiddleware, (req
     res.json({ ok: true });
   } catch (err) {
     log.error('API token revocation error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+/**
+ * POST /api/v1/auth/api-tokens/:id/remove
+ * Entfernt die Zeile eines Tokens, das nicht mehr gilt (D#1672).
+ *
+ * EIGENE ROUTE, WEIL `DELETE /api-tokens/:id` SCHON "WIDERRUFEN" HEISST und in
+ * der zugesagten /api/v1-Oberflaeche so bleibt: ein Client, der dort loescht,
+ * erwartet eine Zeile mit `revoked_at`, keine Luecke. Die Form folgt
+ * `POST /displays/:id/devices/:deviceId/revoke` - das Verb als letztes Segment.
+ *
+ * NUR WAS NICHT MEHR GILT. Ein aktives Token zu entfernen hiesse, einen
+ * Zugang zu beenden, ohne dass davon etwas stehen bleibt: der Widerruf ist der
+ * Weg, und er hinterlaesst den Zeitpunkt. Erst die tote Zeile darf gehen - sie
+ * blieb bis hierhin fuer immer in der Liste. Loeschen und Pruefen sind EINE
+ * Anweisung, damit zwischen beiden nichts liegt.
+ * Response: { ok: true }
+ */
+router.post('/api-tokens/:id/remove', requireAuth, requireAdmin, csrfMiddleware, (req, res) => {
+  try {
+    // Strenger als `parseInt` beim Widerruf darueber: `12abc` ist keine Id.
+    // Eine Route, die endgueltig loescht, raet nicht, welche Zeile gemeint war.
+    const id = /^\d+$/.test(req.params.id) ? Number(req.params.id) : NaN;
+    if (!Number.isSafeInteger(id)) return res.status(400).json({ error: 'Invalid token ID.', code: 400 });
+
+    const result = db.get().prepare(`
+      DELETE FROM api_tokens WHERE id = ? AND NOT ${apiTokenUsableSql('api_tokens')}
+    `).run(id);
+    if (result.changes > 0) return res.json({ ok: true });
+
+    const exists = db.get().prepare('SELECT 1 FROM api_tokens WHERE id = ?').get(id);
+    if (!exists) return res.status(404).json({ error: 'API token not found.', code: 404 });
+    return res.status(409).json({
+      error: 'An active API token cannot be removed. Revoke it first.',
+      code: 409,
+      reason: 'api_token_active',
+    });
+  } catch (err) {
+    log.error('API token removal error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
@@ -2702,7 +3311,7 @@ function adminUserRow(userId) {
  * @param {string|undefined} password
  * @returns {string|null} Fehlermeldung oder null
  */
-function assertSsoOnlyAllowed(ssoOnly, password, { linked = false, email = null, excludeUserId = null } = {}) {
+export function assertSsoOnlyAllowed(ssoOnly, password, { linked = false, email = null, excludeUserId = null } = {}) {
   if (!ssoOnly) return null;
   if (!isOidcEnabled()) {
     return 'An account without a password requires OIDC to be configured.';
@@ -2726,22 +3335,14 @@ function assertSsoOnlyAllowed(ssoOnly, password, { linked = false, email = null,
   // Und sie muss dieses eine Konto meinen: `findOrCreateOidcUser` verknuepft
   // nur bei GENAU einem Treffer und laesst zwei Kandidaten unangetastet.
   //
-  // Die Bedingung ist bewusst dieselbe wie dort - `lower()` UND die
-  // Zweitadressen aus `contact_emails`. Eine engere Pruefung hier waere
+  // Die Bedingung ist bewusst dieselbe wie dort - dieselbe Funktion
+  // (`ssoLinkCandidates`: Leerraum, Schreibweise, die Zweitadressen aus
+  // `contact_emails`, ohne Gaeste). Eine engere Pruefung hier waere
   // schlimmer als keine: sie gaebe gruenes Licht fuer genau die Faelle, an
   // denen der Linker spaeter scheitert (andere Gross-/Kleinschreibung, oder
   // dieselbe Adresse als Zweitadresse eines anderen Mitglieds), und das Konto
   // stuende dann ohne Passwort und ohne Verknuepfung da.
-  const clash = db.get().prepare(`
-    SELECT 1
-    FROM users u
-    JOIN contacts c ON c.family_user_id = u.id
-    LEFT JOIN contact_emails ce ON ce.contact_id = c.id
-    WHERE u.id IS NOT ?
-      AND u.oidc_sub IS NULL
-      AND (lower(c.email) = lower(?) OR lower(ce.value) = lower(?))
-    LIMIT 1
-  `).get(excludeUserId, address, address);
+  const clash = ssoLinkCandidates(db.get(), address, { excludeUserId }).length > 0;
   if (clash) {
     return 'This email address already belongs to another member, so SSO could not tell the accounts apart.';
   }
@@ -2936,6 +3537,14 @@ router.patch('/users/:id', requireAuth, requireAdmin, csrfMiddleware, async (req
       return res.status(400).json({ error: 'Turning off SSO-only requires setting a password.', code: 400 });
     }
 
+    // Ein Ehemaliger wird nicht Administrator (#1381): er kaeme nie an
+    // `requireAdmin` vorbei, stuende aber als Administrator in der Verwaltung.
+    if (nextRole === 'admin' && existing.role !== 'admin' && !isActiveAccount(userId, { db: db.get() })) {
+      return res.status(400).json({
+        error: 'A deactivated account cannot become an administrator.', code: 400, reason: 'account_deactivated',
+      });
+    }
+
     const adminError = assertAdminWouldRemain(userId, nextRole);
     if (adminError) return res.status(400).json({ error: adminError, code: 400 });
 
@@ -3026,6 +3635,22 @@ router.patch('/me/profile', requireAuth, csrfMiddleware, (req, res) => {
       return res.status(400).json({ error: memberFields.errors.join(' '), code: 400 });
     }
 
+    // Eine Adresse, die schon ein anderes Konto traegt, setzt sich ein
+    // Mitglied nicht selbst (GHSA-6pmj-w42g-g6qv): sonst stellte es die
+    // Mehrdeutigkeit her, an der SSO-Verknuepfung und Passwort-Reset des
+    // anderen scheitern. Ein Admin darf das bewusst (Familienpostfach).
+    // Synchron bis zum Schreiben: kein await zwischen Pruefung und UPDATE.
+    if (memberFields.values.email !== undefined && !isAdminRequest(req)) {
+      const taken = emailsTakenByOtherAccounts(db.get(), {
+        userId: req.authUserId,
+        before: storedAccountEmails(db.get(), req.authUserId),
+        after: [memberFields.values.email],
+      });
+      if (taken.length) {
+        return res.status(409).json({ error: EMAIL_IN_USE_MESSAGE, code: 409, reason: 'email_in_use' });
+      }
+    }
+
     db.transaction(() => {
       db.get().prepare(`
         UPDATE users
@@ -3087,15 +3712,22 @@ router.patch('/me/password', requireAuth, csrfMiddleware, async (req, res) => {
 
 /**
  * DELETE /api/v1/auth/users/:id
- * Admin only. Löscht ein Familienmitglied.
- * Response: { ok: true }
+ * Admin only. Entfernt ein Konto - und was das heisst, haengt davon ab, was es
+ * hinterlaesst (#1381, server/services/user-removal.js):
+ *
+ *   - Hat es Spuren in geteilten Daten, wird es DEAKTIVIERT: die Zeile bleibt,
+ *     damit Urheberschaft und Salden bleiben, jeder Zugang endet sofort.
+ *   - Sonst wird es geloescht wie bisher.
+ *
+ * Die Antwort bleibt 200 `{ ok: true }` und sagt zusaetzlich, was geschah.
+ * Response: { ok: true, outcome: 'deactivated'|'deleted', traces: [{ table, column, rows }] }
  */
 router.delete('/users/:id', requireAuth, requireAdmin, csrfMiddleware, (req, res) => {
   try {
     const userId = parseInt(req.params.id, 10);
 
     if (userId === req.authUserId) {
-      return res.status(400).json({ error: 'You cannot delete your own account.', code: 400 });
+      return res.status(400).json({ error: 'You cannot delete your own account.', code: 400, reason: 'own_account' });
     }
     // Wie beim Aendern: ein Display wird unter /displays verwaltet, nicht hier.
     // Zwei Tueren zu demselben Konto waeren zwei Stellen, an denen die Regeln
@@ -3104,49 +3736,40 @@ router.delete('/users/:id', requireAuth, requireAdmin, csrfMiddleware, (req, res
       return res.status(404).json({ error: 'User not found.', code: 404 });
     }
 
-    // Der dritte Weg, auf dem der letzte SSO-Administrator verschwinden kann
-    // (#847). `null` = das Konto bleibt gar keine Rolle uebrig.
-    const ssoAdminError = assertSsoAdminWouldRemain(userId, null);
-    if (ssoAdminError) return res.status(400).json({ error: ssoAdminError, code: 400 });
-
-    const result = db.transaction(() => {
-      const birthday = db.get().prepare('SELECT * FROM birthdays WHERE family_user_id = ?').get(userId);
-      if (birthday) deleteBirthdayArtifacts(db.get(), birthday);
-      // Standard-Zuweisungen von Sync-Zielen lösen (kein FK auf diesen Spalten, #459).
-      db.get().prepare('UPDATE ics_subscriptions SET default_assignee_user_id = NULL WHERE default_assignee_user_id = ?').run(userId);
-      db.get().prepare('UPDATE external_calendars SET default_assignee_user_id = NULL WHERE default_assignee_user_id = ?').run(userId);
-      // Schichtplan (Migration 189): schedule_patterns→pattern_days, schedule_overrides
-      // und schedule_extra_shifts kaskadieren gleich mit weg (FK CASCADE auf user_id),
-      // ihre schedule_custom_field_values-Zeilen nicht - polymorph, kein echter
-      // Fremdschluessel. Deshalb hier vorab entfernt, solange die Ids noch auffindbar
-      // sind, sonst blieben sie als verwaiste Zeilen unter fremder Bedeutung liegen.
-      const patternIds = db.get().prepare('SELECT id FROM schedule_patterns WHERE user_id = ?').all(userId).map((row) => row.id);
-      if (patternIds.length) {
-        const dayIds = db.get().prepare(`SELECT id FROM schedule_pattern_days WHERE pattern_id IN (${patternIds.map(() => '?').join(',')})`).all(...patternIds).map((row) => row.id);
-        if (dayIds.length) db.get().prepare(`DELETE FROM schedule_custom_field_values WHERE entry_type='pattern_day' AND entry_id IN (${dayIds.map(() => '?').join(',')})`).run(...dayIds);
-      }
-      db.get().prepare(`DELETE FROM schedule_custom_field_values WHERE entry_type='override' AND entry_id IN (SELECT id FROM schedule_overrides WHERE user_id=?)`).run(userId);
-      db.get().prepare(`DELETE FROM schedule_custom_field_values WHERE entry_type='extra_shift' AND entry_id IN (SELECT id FROM schedule_extra_shifts WHERE user_id=?)`).run(userId);
-      return db.get().prepare('DELETE FROM users WHERE id = ?').run(userId);
+    // Synchron bis zum Ende: Entscheidung, die beiden Administrator-Riegel und
+    // jedes Schreiben laufen in EINER Transaktion, ohne `await` dazwischen.
+    const result = removeUser(db.get(), userId, {
+      // Beide Riegel gelten fuer beide Ausgaenge: auch ein deaktiviertes Konto
+      // ist kein Administrator mehr (`member` bzw. `null` = keine Rolle uebrig).
+      // Der zweite ist der dritte Weg, auf dem der letzte SSO-Administrator
+      // verschwinden kann (#847).
+      refuse: () => {
+        const adminError = assertAdminWouldRemain(userId, 'member');
+        if (adminError) return new RemovalRefused(adminError, 'last_admin');
+        const ssoAdminError = assertSsoAdminWouldRemain(userId, null);
+        if (ssoAdminError) return new RemovalRefused(ssoAdminError, 'last_sso_admin');
+        return null;
+      },
     });
 
-    if (result.changes === 0) {
+    if (result.outcome === 'not_found') {
       return res.status(404).json({ error: 'User not found.', code: 404 });
     }
-
-    // Alle aktiven Sessions des geloeschten Users invalidieren
-    const allSessions = db.get().prepare('SELECT sid, sess FROM sessions').all();
-    for (const row of allSessions) {
-      try {
-        const sess = JSON.parse(row.sess);
-        if (sess.userId === userId) {
-          db.get().prepare('DELETE FROM sessions WHERE sid = ?').run(row.sid);
-        }
-      } catch { /* ignore malformed session */ }
+    if (result.outcome === 'deactivated') {
+      log.info('User deactivated instead of deleted', {
+        userId, traces: result.traces.map((trace) => `${trace.table}.${trace.column}:${trace.rows}`),
+      });
     }
 
-    res.json({ ok: true });
+    res.json({ ok: true, outcome: result.outcome, traces: result.traces });
   } catch (err) {
+    if (err instanceof RemovalRefused) {
+      // Die beiden Gruende als Literale: `test:api` fuehrt jede Stelle, an der
+      // ein `reason` durch eine Variable gereicht wird.
+      return err.reason === 'last_sso_admin'
+        ? res.status(400).json({ error: err.message, code: 400, reason: 'last_sso_admin' })
+        : res.status(400).json({ error: err.message, code: 400, reason: 'last_admin' });
+    }
     log.error('User deletion error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
   }

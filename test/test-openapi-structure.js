@@ -6,6 +6,14 @@
  * buildPaths() gespreadet sein, jedes Fragment nicht leer, und kein Pfad-Key
  * darf über zwei Modul-Dateien kollidieren. Verhindert, dass eine kuenftig
  * angelegte Modul-Datei still aus der Spec faellt.
+ *
+ * Seit #1344 dazu die Verweise IM Dokument: jeder `$ref` der fertigen Spec
+ * (paths UND components) ist ein String und zeigt auf ein Ziel, das im selben
+ * Dokument existiert. Die uebrigen Tests hier und in test:openapi-coverage
+ * pruefen die Liste der Routen oder einzelne, namentlich genannte Schemas -
+ * keiner lief ueber alle Verweise. Ein `jsonBody(schemaObjekt)` statt
+ * `jsonBody('#/components/schemas/Name')` war dort so gruen wie ein Verweis
+ * auf ein Schema, das es nicht gibt.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -43,6 +51,53 @@ test('fasting clients receive concrete lifecycle schemas, revision transports an
   assert.match(paths['/api/v1/health/fasting/history'].get.description, /Date filters select completion dates in the household display time zone/);
   assert.match(paths['/api/v1/health/export/fasting'].get.description, /same household display-zone completion-date filters as history/);
   assert.ok(paths['/api/v1/health/export/fasting'].get.responses[200].content['text/csv']);
+});
+test('meals apply-plan describes what the route does: additive without replace_existing, 201', () => {
+  // Die Route (server/routes/meals.js, POST /apply-plan) hat belegte Slots nie
+  // uebersprungen; die Spec versprach es seit v2.52.0. Pinnt den korrigierten
+  // Vertrag, das Verhalten selbst halten die Tests in test:meals-routes.
+  const post = buildOpenApiSpec({}).paths['/api/v1/meals/apply-plan'].post;
+  assert.doesNotMatch(post.description, /instead of skipping/);
+  assert.match(post.description, /added next to any meal already planned for the same date and meal type/);
+  assert.match(post.description, /date and meal type pair named in `assignments` is deleted first/);
+  assert.ok(post.responses[201]);
+  assert.ok(!post.responses[200]);
+  assert.ok(post.responses[400]);
+});
+test('meals PUT documents the series fields the route reads: repeat_until and ingredients, never repeat_weekly', () => {
+  // PUT /:id?scope=series (server/routes/meals.js) liest `repeat_until` und
+  // `ingredients`; der Body nannte beide nur fuer POST. `repeat_weekly` liest
+  // PUT nie - eine Mahlzeit wird nicht nachtraeglich zur Serie.
+  const spec = buildOpenApiSpec({});
+  const props = (op) => op.requestBody.content['application/json'].schema.properties;
+  const put = props(spec.paths['/api/v1/meals/{id}'].put);
+  const post = props(spec.paths['/api/v1/meals'].post);
+  for (const field of ['repeat_until', 'ingredients']) {
+    assert.ok(put[field], `PUT nennt ${field}`);
+    assert.match(put[field].description, /scope=series/, `PUT: ${field} gilt nur im Serien-Umfang`);
+    assert.ok(post[field], `POST nennt ${field}`);
+  }
+  assert.equal(put.ingredients.type, 'array');
+  assert.ok(post.repeat_weekly, 'POST legt die Serie an');
+  assert.equal(put.repeat_weekly, undefined, 'PUT nicht');
+  assert.ok(put.cook_user_id && post.cook_user_id);
+});
+
+test('meals apply-plan documents skip_occupied and the skipped answer (Discussion #1380)', () => {
+  // Die Route legt mit skip_occupied nur in vorher leere Slots an und nennt
+  // die uebrigen in `skipped`; das Verhalten halten die Tests in test:meals-routes.
+  const post = buildOpenApiSpec({}).paths['/api/v1/meals/apply-plan'].post;
+  const body = post.requestBody.content['application/json'].schema;
+  assert.equal(body.properties.skip_occupied.type, 'boolean');
+  assert.equal(body.properties.replace_existing.type, 'boolean');
+  assert.deepEqual(body.required, ['assignments']);
+  const ok = post.responses[201].content['application/json'].schema;
+  assert.deepEqual(ok.required, ['data']);
+  assert.deepEqual(ok.properties.skipped.items.required, ['index', 'date', 'meal_type', 'reason']);
+  assert.equal(ok.properties.skipped.items.properties.index.type, 'integer');
+  assert.deepEqual(ok.properties.skipped.items.properties.reason.enum, ['occupied']);
+  assert.match(post.description, /`skip_occupied` and `replace_existing` together are refused with 400/);
+  assert.match(post.responses[400].description, /`skip_occupied` that is not a boolean/);
 });
 const indexSrc = readFileSync(new URL('index.js', pathsDir), 'utf8');
 const moduleFiles = readdirSync(pathsDir)
@@ -158,6 +213,120 @@ test('kein Pfad-Parameter mit Namens-Bedeutung ist als Zahl deklariert', () => {
 
   assert.deepEqual(offenders, [],
     `Diese Pfad-Parameter tragen einen Namen, sind aber als integer deklariert:\n${offenders.join('\n')}`);
+});
+
+/**
+ * Jeder `$ref` der fertigen Spec, mit seinem Fundort.
+ *
+ * DIE GANZE SPEC, NICHT NUR `paths`. Verweise stehen auch in
+ * `components.schemas` (Schema auf Schema) und in den 409-Antworten, die
+ * `buildOpenApiSpec` erst nachtraegt; ein Leser, der Teile auslaesst, prueft
+ * sie nie und meldet trotzdem gruen. Gelaufen wird deshalb rekursiv durch
+ * Objekte UND Arrays (`allOf`, `oneOf`, `parameters`, `items`). `$ref` zaehlt
+ * als eigene Eigenschaft auch mit dem Wert `undefined`: im ausgelieferten JSON
+ * faellt so ein Schluessel still weg und hinterlaesst ein Schema, das alles
+ * erlaubt.
+ */
+function collectRefs(node, path = [], out = []) {
+  if (node === null || typeof node !== 'object') return out;
+  if (Array.isArray(node)) {
+    node.forEach((child, i) => collectRefs(child, [...path, i], out));
+    return out;
+  }
+  if (Object.hasOwn(node, '$ref')) out.push({ path: [...path, '$ref'], value: node.$ref });
+  for (const [key, child] of Object.entries(node)) collectRefs(child, [...path, key], out);
+  return out;
+}
+
+/** Fundort lesbar wie ein Zugriff: `paths["/api/v1/x"].post.requestBody...` */
+function refLocation(path) {
+  return path.map((key, i) => {
+    if (typeof key === 'number') return `[${key}]`;
+    if (/^[A-Za-z_$][\w$]*$/.test(key)) return i === 0 ? key : `.${key}`;
+    return `[${JSON.stringify(key)}]`;
+  }).join('');
+}
+
+/**
+ * Loest `#/a/b/c` gegen das DOKUMENT auf, nie gegen eine angenommene Sektion.
+ *
+ * Gemessen fuer #1344: ein Pruefer, der nur in `components.schemas`
+ * nachschlug, meldete vier Fehlalarme - `#/components/responses/Unauthorized`
+ * und seine drei Geschwister leben unter `components.responses`. Derselbe
+ * Pruefer waere in der Gegenrichtung blind fuer jeden Verweis in eine Sektion,
+ * die er nicht kennt. Gefolgt wird deshalb genau dem Pfad, den der Verweis
+ * nennt (JSON Pointer nach RFC 6901: `~1` ist `/`, `~0` ist `~`), und nur ueber
+ * EIGENE Schluessel: `(o || {})[k]` faende unter `#/components/schemas/constructor`
+ * die Funktion aus dem Prototyp und hielte den Verweis fuer aufgeloest.
+ *
+ * Ein Ziel ist immer ein Objekt (Schema, Antwort, Parameter); ein Verweis auf
+ * einen Text wie `#/info/title` ist kaputt, obwohl es den Pfad gibt. Verweise
+ * ausserhalb des Dokuments (`other.json#/...`) loesen nie auf: die Spec wird
+ * als EINE Datei ausgeliefert, ein Integrator hat nichts anderes in der Hand.
+ * `undefined` heisst hier "kaputt" und wird gemeldet, nicht verschluckt.
+ */
+function resolveRef(doc, ref) {
+  if (!ref.startsWith('#/')) return undefined;
+  let node = doc;
+  for (const raw of ref.slice(2).split('/')) {
+    let key;
+    try {
+      key = decodeURIComponent(raw).replace(/~1/g, '/').replace(/~0/g, '~');
+    } catch {
+      return undefined;
+    }
+    if (node === null || typeof node !== 'object' || !Object.hasOwn(node, key)) return undefined;
+    node = node[key];
+  }
+  return node !== null && typeof node === 'object' ? node : undefined;
+}
+
+// Die Verweis-Tests lesen die fertige Spec, nicht buildPaths(): nur dort
+// stehen `components` und die nachgetragenen Antworten mit drin.
+const refSpec = buildOpenApiSpec({}, 'test');
+const specRefs = collectRefs(refSpec);
+
+test('der $ref-Sammler erreicht jeden Verweis der Spec (#1344)', () => {
+  // Gegen einen Sammler, der gruen ist, weil er nichts findet: die Zahl darf
+  // wachsen und schrumpfen, aber nicht auf null fallen.
+  assert.ok(specRefs.length > 0,
+    'kein einziger $ref gefunden - der Sammler laeuft ins Leere, und die Tests unten pruefen nichts');
+  // Und gegen einen Sammler, der nur TEILE erreicht: eine zweite, unabhaengige
+  // Zaehlung ueber den serialisierten Text. Ein `$ref`-Schluessel steht dort
+  // genau einmal als `"$ref":`, in einem Text-Wert waeren die Anfuehrungszeichen
+  // maskiert. Verglichen werden nur Verweise, die JSON ueberhaupt schreibt -
+  // ein `$ref: undefined` faellt beim Serialisieren weg und meldet sich unten.
+  const textual = JSON.stringify(refSpec).match(/"\$ref":/g)?.length ?? 0;
+  const serialised = specRefs.filter((r) => r.value !== undefined).length;
+  assert.equal(serialised, textual,
+    `der Sammler sieht ${serialised} Verweise, der Text der Spec enthaelt ${textual} - `
+    + 'er laesst einen Teil des Dokuments aus');
+});
+
+test('jeder $ref der Spec ist ein String (#1344)', () => {
+  // `jsonBody()` nimmt einen Verweis-STRING und baut `{ $ref: schemaRef }`.
+  // Bekommt es ein Schema-Objekt, entsteht `{ $ref: { type: 'object', ... } }`:
+  // gueltiges JSON, kein gueltiges OpenAPI, und der Request-Body der Route
+  // beschreibt still nichts. Beim Bau von #1326 nur durch Lesen der Spec
+  // aufgefallen, kein Test hatte hineingeschaut.
+  const kaputt = specRefs
+    .filter((r) => typeof r.value !== 'string')
+    .map((r) => `${refLocation(r.path)} = ${JSON.stringify(r.value)?.slice(0, 120) ?? String(r.value)}`);
+  assert.deepEqual(kaputt, [],
+    'Diese $ref sind kein String. jsonBody() nimmt nur einen Verweis wie \'#/components/schemas/Name\'; '
+    + 'ein Schema-Objekt gehoert nach components.schemas oder ohne $ref direkt unter `schema`:\n  '
+    + kaputt.join('\n  '));
+});
+
+test('jeder $ref-String zeigt auf ein Ziel im selben Dokument (#1344)', () => {
+  // Die zweite Haelfte: ein String allein ist noch kein Verweis. Ein Tippfehler
+  // im Namen oder ein umbenanntes Schema laesst `#/components/schemas/Alt`
+  // ins Leere zeigen, und ein Pruefer, der nur den Typ ansieht, bleibt gruen.
+  const toteVerweise = specRefs
+    .filter((r) => typeof r.value === 'string' && resolveRef(refSpec, r.value) === undefined)
+    .map((r) => `${refLocation(r.path)} -> ${r.value}`);
+  assert.deepEqual(toteVerweise, [],
+    'Diese $ref zeigen auf kein Objekt in der Spec:\n  ' + toteVerweise.join('\n  '));
 });
 
 test('calendar occurrence conflicts and split successes have exact schemas', () => {
@@ -293,7 +462,9 @@ test('calendar occurrence endpoints expose route-specific requests and occurrenc
   assert.equal(onlyMutation.properties.recurrence_rule, undefined);
   assert.equal(onlyMutation.properties.confirmed_orphan_count, undefined);
   assert.equal(onlyMutation.properties.start_datetime.$ref,
-    '#/components/schemas/CalendarDateOrDateTime');
+    '#/components/schemas/CalendarDateOrDateTimeInput');
+  assert.equal(onlyMutation.properties.end_datetime.oneOf[0].$ref,
+    '#/components/schemas/CalendarDateOrDateTimeInput');
   assert.deepEqual(onlyMutation.properties.end_datetime.oneOf[1], { type: 'null' });
   assert.equal(onlyMutation.properties.reminder_offsets.maxItems, 5);
   assert.equal(onlyMutation.properties.reminder_offsets.items.minimum, 0);
@@ -303,16 +474,29 @@ test('calendar occurrence endpoints expose route-specific requests and occurrenc
 
 test('calendar datetime schema distinguishes dates, local wall-clock values, and offsets', () => {
   const spec = buildOpenApiSpec({}, 'test');
-  const dateTime = spec.components.schemas.CalendarDateOrDateTime;
-  assert.equal(dateTime.oneOf.length, 3);
-  assert.deepEqual(dateTime.oneOf.map((variant) => variant.format), ['date', undefined, undefined]);
-  assert.deepEqual(dateTime.oneOf.map((variant) => variant.pattern), [
+  const patterns = [
     '^\\d{4}-\\d{2}-\\d{2}$',
     '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?$',
     '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:?\\d{2})$',
-  ]);
-  assert.ok(dateTime.oneOf[1].description.includes('local wall-clock'));
-  assert.ok(dateTime.oneOf[2].description.includes('normalized'));
+  ];
+  // Anfrage und Antwort sind zwei Schemata (#1364): dieselben drei Formen,
+  // aber eine Anfrage mit Offset wird umgerechnet, ein synchronisierter
+  // Termin behaelt seinen. Ein Schema fuer beides nannte das Abschneiden
+  // "normalized" und beschrieb damit keine der beiden Seiten richtig.
+  for (const name of ['CalendarDateOrDateTime', 'CalendarDateOrDateTimeInput']) {
+    const dateTime = spec.components.schemas[name];
+    assert.equal(dateTime.oneOf.length, 3, name);
+    assert.deepEqual(dateTime.oneOf.map((variant) => variant.format), ['date', undefined, undefined], name);
+    assert.deepEqual(dateTime.oneOf.map((variant) => variant.pattern), patterns, name);
+    assert.ok(dateTime.oneOf[1].description.includes('local wall-clock'), name);
+    assert.ok(!dateTime.oneOf[2].description.includes('normalized'), `${name} calls a conversion "normalized"`);
+  }
+  const input = spec.components.schemas.CalendarDateOrDateTimeInput.oneOf[2].description;
+  assert.ok(input.includes('converted into household wall-clock time'), input);
+  assert.ok(input.includes('only the date counts'), input);
+  const stored = spec.components.schemas.CalendarDateOrDateTime.oneOf[2].description;
+  assert.ok(stored.includes('synchronized event'), stored);
+  assert.ok(!stored.includes('converted'), stored);
 });
 
 test('Outlook account activation documents its exact linked-override conflict', () => {

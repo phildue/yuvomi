@@ -14,24 +14,31 @@ import {
   str, oneOf, num, date, id as idParam, collectErrors, MAX_TITLE, MAX_TEXT, MAX_SHORT,
 } from '../../middleware/validate.js';
 import {
-  assertDocumentLinkTargetsAvailable, documentLinksFor, loadDocumentLinks, replaceDocumentLinks,
+  assertDocumentLinkTargetsAvailable, documentLinksFor, documentLinksOf, documentViewer, loadDocumentLinks, replaceDocumentLinks,
+  sendDocumentLinkRefusal,
 } from '../../services/document-links.js';
 import { sendDocumentDeletionConflict } from '../../services/document-deletion-lock.js';
 import {
-  ROLES, visibleEntry, linkabilityError, entryHasLinks, linkEntry, unlinkEntry,
+  ROLES, visibleEntry, linkabilityError, entryHasLinks, linkEntry, unlinkEntry, budgetViewer,
   loadLinkedEntriesForItems, loadLinkedEntries, computeTotal,
 } from './entry-links.js';
 import { warrantyEndDate, reminderDateForWarranty } from '../../services/inventory-deadlines.js';
 import { dataUrlContentMatches } from '../../utils/file-signature.js';
+import { todayKey } from '../../utils/timezone.js';
 import {
   validateTrackedDatesInput, writeTrackedDates, removeTrackedDateReminders, loadTrackedDates, loadTrackedDatesForItems,
 } from './item-dates.js';
+import {
+  validateServiceLogInput, validateCompletionInput, odometerBaselineExcluding, loadServiceLog, createServiceLogEntry,
+  updateServiceLogEntry, deleteServiceLogEntry, completeTrackedDate, loadHistory,
+} from './service-log.js';
 
 const log = createLogger('Inventory');
 const router = express.Router();
 
 const CONDITIONS = ['new', 'good', 'fair', 'poor'];
 const STATUSES = ['active', 'sold', 'disposed', 'lost'];
+const ODOMETER_UNITS = ['km', 'mi'];
 const CURRENCY_RE = /^[A-Z]{3}$/;
 const MAX_PHOTO_LENGTH = 6_990_507; // ~5 MB raw image in base64, same cap as birthdays.js
 const PHOTO_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
@@ -90,6 +97,14 @@ function validCategoryKeys() {
   return db.get().prepare('SELECT key FROM inventory_categories').all().map((r) => r.key);
 }
 
+/** Traegt DIESE Kategorie den Kilometerstand (Review #1257: eine Eigenschaft
+ *  der Kategorie-Zeile, kein hartcodierter Vergleich gegen 'vehicles' - eine
+ *  geloeschte oder umbenannte Kategorie bricht die Funktion damit nicht mehr,
+ *  und ein selbst angelegtes Fahrzeug-Aequivalent kann sie ebenso tragen). */
+function categoryTracksOdometer(key) {
+  return db.get().prepare('SELECT tracks_odometer FROM inventory_categories WHERE key = ?').get(key)?.tracks_odometer === 1;
+}
+
 /**
  * Ortspfad fuer die Anzeige, z. B. "Keller · Regal 2" fuer einen Unterort,
  * "Garage" fuer einen Top-Ebene-Ort. NULL fuer ortlose Gegenstaende.
@@ -103,25 +118,27 @@ function locationPath(locationId) {
   return parent ? `${parent.name} · ${loc.name}` : loc.name;
 }
 
-function loadItem(id, userId) {
+// `viewer` ist `documentViewer(req)`: Belege folgen dem Dokumentenrecht (#1358).
+// `budget` ist `budgetViewer(req)`: verknuepfte Buchungen folgen dem Budgetrecht.
+function loadItem(id, budget, viewer) {
   const item = db.get().prepare('SELECT * FROM inventory_items WHERE id = ?').get(id);
   if (!item) return null;
   const category = db.get().prepare('SELECT name, icon, label_key FROM inventory_categories WHERE key = ?').get(item.category);
-  const linkedEntries = loadLinkedEntries(item.id, userId);
+  const linkedEntries = loadLinkedEntries(item.id, budget);
   return {
     ...item,
     category_name: category?.name ?? item.category,
     category_icon: category?.icon ?? 'package',
     category_label_key: category?.label_key ?? null,
     location_path: locationPath(item.location_id),
-    attachments: documentLinksFor(db.get(), { ...DOCS, ownerId: item.id, userId }),
+    attachments: documentLinksFor(db.get(), { ...DOCS, ownerId: item.id, viewer }),
     linked_entries: linkedEntries,
     linked_entries_total: computeTotal(linkedEntries),
     tracked_dates: loadTrackedDates(item.id),
   };
 }
 
-function loadItems({ category, locationId, status, q } = {}, userId) {
+function loadItems({ category, locationId, status, q } = {}, budget, viewer) {
   const clauses = [];
   const params = [];
   if (category !== undefined) { clauses.push('ii.category = ?'); params.push(category); }
@@ -143,15 +160,15 @@ function loadItems({ category, locationId, status, q } = {}, userId) {
     ${where}
     ORDER BY ii.name COLLATE NOCASE ASC
   `).all(...params);
-  const byItem = loadDocumentLinks(db.get(), { ...DOCS, ownerIds: rows.map((r) => r.id), userId });
-  const entriesByItem = loadLinkedEntriesForItems(rows.map((r) => r.id), userId);
+  const byItem = loadDocumentLinks(db.get(), { ...DOCS, ownerIds: rows.map((r) => r.id), viewer });
+  const entriesByItem = loadLinkedEntriesForItems(rows.map((r) => r.id), budget);
   const datesByItem = loadTrackedDatesForItems(rows.map((r) => r.id));
   return rows.map((row) => {
     const linkedEntries = entriesByItem.get(row.id) || [];
     return {
       ...row,
       location_path: locationPath(row.location_id),
-      attachments: byItem.get(row.id) || [],
+      attachments: documentLinksOf(byItem, row.id, viewer),
       linked_entries: linkedEntries,
       linked_entries_total: computeTotal(linkedEntries),
       tracked_dates: datesByItem.get(row.id) || [],
@@ -248,6 +265,51 @@ function validateItemFields(body) {
     values.warranty_months = vWarranty.value;
   }
 
+  // Manuelle Kilometerstand-Ablesung - bewusst auf Kategorien begrenzt, die
+  // tracks_odometer tragen (per Voreinstellung nur "Fahrzeuge", Nutzer-
+  // Entscheidung 2026-09-17). Fuer jede andere Kategorie wird still auf NULL
+  // genullt statt mit 400 abgelehnt - dasselbe volle-Replace-Verhalten wie ein
+  // weggelassenes Feld (siehe Modulkopf dieser Funktion): ein Kategoriewechsel
+  // weg von einer odometer-tragenden Kategorie raeumt einen vorher gesetzten
+  // Wert automatisch ab, statt ihn unsichtbar (das Formular blendet das Feld
+  // dann aus) stehen zu lassen.
+  if (!categoryTracksOdometer(values.category)) {
+    values.odometer = null;
+    values.odometer_unit = null;
+    values.odometer_on = null;
+  } else {
+    if (body.odometer === null || body.odometer === '' || body.odometer === undefined) {
+      values.odometer = null;
+    } else {
+      const vOdometer = num(body.odometer, 'Kilometerstand');
+      results.push(vOdometer);
+      if (vOdometer.value !== null && (!Number.isInteger(vOdometer.value) || vOdometer.value < 0)) {
+        results.push({ error: 'Kilometerstand darf nicht negativ sein.' });
+      }
+      values.odometer = vOdometer.value;
+    }
+
+    if (body.odometer_unit === null || body.odometer_unit === '' || body.odometer_unit === undefined) {
+      // Ohne explizite Einheit, aber mit Zahl: 'km' als Standard, damit kein
+      // Wert ohne Einheit dasteht - dasselbe Muster wie currency weiter oben.
+      values.odometer_unit = values.odometer != null ? 'km' : null;
+    } else {
+      const vUnit = oneOf(body.odometer_unit, ODOMETER_UNITS, 'Einheit');
+      results.push(vUnit);
+      values.odometer_unit = vUnit.value;
+    }
+
+    const vOdometerOn = date(body.odometer_on, 'Ablesedatum');
+    results.push(vOdometerOn);
+    // Eine Ablesung ohne Datum bekommt "heute" (Haushalts-Zeitzone) - derselbe
+    // Ersatzwert wie 'km' fuer odometer_unit direkt darueber. Ohne ein Datum
+    // haelt odometerRegressionError() (service-log.js) jeden neuen Log-Eintrag
+    // fuer nicht-konkurrierend und laesst ihn den aktuellen Stand unbemerkt
+    // ueberschreiben - der Tippfehler-Schutz waere fuer dieses Item dauerhaft
+    // aus, sobald eine Ablesung ohne Datum stand (Review #1257).
+    values.odometer_on = vOdometerOn.value ?? (values.odometer != null ? todayKey(db.get(), new Date()) : null);
+  }
+
   const vCondition = oneOf(body.condition || 'good', CONDITIONS, 'Zustand');
   results.push(vCondition);
   values.condition = vCondition.value ?? 'good';
@@ -284,9 +346,8 @@ router.get('/', (req, res) => {
     }
     const status = typeof req.query.status === 'string' && STATUSES.includes(req.query.status) ? req.query.status : undefined;
     const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 100) : undefined;
-    const userId = req.authUserId || req.session.userId;
 
-    res.json({ data: loadItems({ category, locationId, status, q }, userId) });
+    res.json({ data: loadItems({ category, locationId, status, q }, budgetViewer(req), documentViewer(req)) });
   } catch (err) {
     log.error('GET / error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -300,8 +361,7 @@ router.get('/:id', (req, res) => {
   try {
     const vId = idParam(req.params.id, 'Gegenstand-ID');
     if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
-    const userId = req.authUserId || req.session.userId;
-    const item = loadItem(vId.value, userId);
+    const item = loadItem(vId.value, budgetViewer(req), documentViewer(req));
     if (!item) return res.status(404).json({ error: 'Item not found.', code: 404 });
     res.json({ data: item });
   } catch (err) {
@@ -327,7 +387,7 @@ router.post('/', (req, res) => {
     if (rawEntryId !== undefined && rawEntryId !== null && rawEntryId !== '') {
       const vEntryId = idParam(rawEntryId, 'Buchung');
       if (vEntryId.error) return res.status(400).json({ error: vEntryId.error, code: 400 });
-      entry = visibleEntry(vEntryId.value, userId);
+      entry = visibleEntry(vEntryId.value, budgetViewer(req));
       if (!entry) return res.status(404).json({ error: 'Booking not found.', code: 404 });
       const linkError = linkabilityError(entry);
       if (linkError) return res.status(linkError.code).json({ error: linkError.error, code: linkError.code });
@@ -348,19 +408,20 @@ router.post('/', (req, res) => {
     // DELETE /:id): wirft syncReminder - etwa an einem Kaufdatum, das die
     // Datumsrechnung nicht parsen kann -, darf der Gegenstand nicht trotzdem
     // geschrieben bleiben, waehrend die Anfrage mit 500 endet.
-    assertDocumentLinkTargetsAvailable(db.get(), req.body.attachment_document_ids, userId);
+    assertDocumentLinkTargetsAvailable(db.get(), req.body.attachment_document_ids, documentViewer(req));
     const result = db.get().transaction(() => {
       const inserted = db.get().prepare(`
         INSERT INTO inventory_items
           (name, brand, model, serial_number, category, location_id, purchase_date,
            purchase_price, currency, vendor, warranty_months, condition,
-           status, notes, photo_data, account_username, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           status, notes, photo_data, account_username, odometer, odometer_unit, odometer_on, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         values.name, values.brand, values.model, values.serial_number, values.category,
         values.location_id, values.purchase_date, values.purchase_price,
         values.currency, values.vendor, values.warranty_months, values.condition, values.status,
-        values.notes, values.photo_data, values.account_username, userId,
+        values.notes, values.photo_data, values.account_username,
+        values.odometer, values.odometer_unit, values.odometer_on, userId,
       );
 
       syncReminder({
@@ -378,16 +439,17 @@ router.post('/', (req, res) => {
     // Belege sind optional, deshalb erst nach dem Insert - der Gegenstand
     // steht auch ohne sie, ein unbekanntes Dokument darf ihn nicht scheitern lassen.
     replaceDocumentLinks(db.get(), {
-      ...DOCS, ownerId: result.lastInsertRowid, documentIds: req.body.attachment_document_ids, userId,
+      ...DOCS, ownerId: result.lastInsertRowid, documentIds: req.body.attachment_document_ids, viewer: documentViewer(req),
     });
 
     if (entry) {
-      linkEntry({ itemId: result.lastInsertRowid, entryId: entry.id, role: 'purchase', amountShare: null, userId });
+      linkEntry({ itemId: result.lastInsertRowid, entryId: entry.id, role: 'purchase', amountShare: null, viewer: budgetViewer(req) });
     }
 
-    res.status(201).json({ data: loadItem(result.lastInsertRowid, userId) });
+    res.status(201).json({ data: loadItem(result.lastInsertRowid, budgetViewer(req), documentViewer(req)) });
   } catch (err) {
     if (sendDocumentDeletionConflict(res, err)) return;
+    if (sendDocumentLinkRefusal(res, err)) return;
     log.error('POST / error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
@@ -415,9 +477,8 @@ router.put('/:id', (req, res) => {
 
     // A rejected in-flight attachment must not leave the item fields or its
     // reminders half-updated.
-    const userId = req.authUserId || req.session.userId;
     if (req.body.attachment_document_ids !== undefined) {
-      assertDocumentLinkTargetsAvailable(db.get(), req.body.attachment_document_ids, userId);
+      assertDocumentLinkTargetsAvailable(db.get(), req.body.attachment_document_ids, documentViewer(req));
     }
 
     // Update und Erinnerungs-Sync in einer Transaktion, gleiche Begruendung wie
@@ -428,13 +489,14 @@ router.put('/:id', (req, res) => {
         SET name = ?, brand = ?, model = ?, serial_number = ?, category = ?, location_id = ?,
             purchase_date = ?, purchase_price = ?, currency = ?, vendor = ?,
             warranty_months = ?, condition = ?, status = ?, notes = ?, photo_data = ?,
-            account_username = ?
+            account_username = ?, odometer = ?, odometer_unit = ?, odometer_on = ?
         WHERE id = ?
       `).run(
         values.name, values.brand, values.model, values.serial_number, values.category,
         values.location_id, values.purchase_date, values.purchase_price,
         values.currency, values.vendor, values.warranty_months, values.condition, values.status,
-        values.notes, values.photo_data, values.account_username, item.id,
+        values.notes, values.photo_data, values.account_username,
+        values.odometer, values.odometer_unit, values.odometer_on, item.id,
       );
 
       syncReminder({
@@ -454,13 +516,14 @@ router.put('/:id', (req, res) => {
     // (gleiches Muster wie server/routes/budget/entries.js#PUT /:id).
     if (req.body.attachment_document_ids !== undefined) {
       replaceDocumentLinks(db.get(), {
-        ...DOCS, ownerId: item.id, documentIds: req.body.attachment_document_ids, userId,
+        ...DOCS, ownerId: item.id, documentIds: req.body.attachment_document_ids, viewer: documentViewer(req),
       });
     }
 
-    res.json({ data: loadItem(item.id, userId) });
+    res.json({ data: loadItem(item.id, budgetViewer(req), documentViewer(req)) });
   } catch (err) {
     if (sendDocumentDeletionConflict(res, err)) return;
+    if (sendDocumentLinkRefusal(res, err)) return;
     log.error('PUT /:id error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
@@ -492,11 +555,10 @@ router.post('/:id/entries', (req, res) => {
       amountShare = vShare.value;
     }
 
-    const userId = req.authUserId || req.session.userId;
-    const result = linkEntry({ itemId: item.id, entryId: vEntryId.value, role: vRole.value, amountShare, userId });
+    const result = linkEntry({ itemId: item.id, entryId: vEntryId.value, role: vRole.value, amountShare, viewer: budgetViewer(req) });
     if (result.error) return res.status(result.code).json({ error: result.error, code: result.code });
 
-    res.status(201).json({ data: loadItem(item.id, userId) });
+    res.status(201).json({ data: loadItem(item.id, budgetViewer(req), documentViewer(req)) });
   } catch (err) {
     log.error('POST /:id/entries error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -517,13 +579,144 @@ router.delete('/:id/entries/:entryId', (req, res) => {
     const vEntryId = idParam(req.params.entryId, 'Buchung-ID');
     if (vEntryId.error) return res.status(400).json({ error: vEntryId.error, code: 400 });
 
-    const userId = req.authUserId || req.session.userId;
-    const result = unlinkEntry({ itemId: item.id, entryId: vEntryId.value, userId });
+    const result = unlinkEntry({ itemId: item.id, entryId: vEntryId.value, viewer: budgetViewer(req) });
     if (result.error) return res.status(result.code).json({ error: result.error, code: result.code });
 
-    res.json({ data: loadItem(item.id, userId) });
+    res.json({ data: loadItem(item.id, budgetViewer(req), documentViewer(req)) });
   } catch (err) {
     log.error('DELETE /:id/entries/:entryId error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// --------------------------------------------------------
+// POST /api/v1/inventory/items/:id/dates/:dateId/complete
+// Body: { performed_on, odometer?, vendor?, note? }
+// --------------------------------------------------------
+router.post('/:id/dates/:dateId/complete', (req, res) => {
+  try {
+    const vId = idParam(req.params.id, 'Gegenstand-ID');
+    if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
+    const vDateId = idParam(req.params.dateId, 'Frist-ID');
+    if (vDateId.error) return res.status(400).json({ error: vDateId.error, code: 400 });
+
+    const item = db.get().prepare('SELECT id, created_by, odometer, odometer_on FROM inventory_items WHERE id = ?').get(vId.value);
+    if (!item) return res.status(404).json({ error: 'Item not found.', code: 404 });
+
+    const { value, errors } = validateCompletionInput(req.body, item);
+    if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
+
+    const userId = req.authUserId || req.session.userId;
+    const result = completeTrackedDate({ item, dateId: vDateId.value, values: value, userId });
+    if (result.error) return res.status(result.code).json({ error: result.error, code: result.code });
+
+    res.status(201).json({ data: loadItem(item.id, budgetViewer(req), documentViewer(req)) });
+  } catch (err) {
+    log.error('POST /:id/dates/:dateId/complete error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// --------------------------------------------------------
+// GET|POST /api/v1/inventory/items/:id/service-log
+// --------------------------------------------------------
+router.get('/:id/service-log', (req, res) => {
+  try {
+    const vId = idParam(req.params.id, 'Gegenstand-ID');
+    if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
+    const item = db.get().prepare('SELECT id FROM inventory_items WHERE id = ?').get(vId.value);
+    if (!item) return res.status(404).json({ error: 'Item not found.', code: 404 });
+
+    res.json({ data: loadServiceLog(item.id) });
+  } catch (err) {
+    log.error('GET /:id/service-log error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+router.post('/:id/service-log', (req, res) => {
+  try {
+    const vId = idParam(req.params.id, 'Gegenstand-ID');
+    if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
+    const item = db.get().prepare('SELECT id, odometer, odometer_on FROM inventory_items WHERE id = ?').get(vId.value);
+    if (!item) return res.status(404).json({ error: 'Item not found.', code: 404 });
+
+    const { value, errors } = validateServiceLogInput(req.body, item);
+    if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
+
+    const userId = req.authUserId || req.session.userId;
+    const entry = createServiceLogEntry({ itemId: item.id, values: value, userId });
+    res.status(201).json({ data: entry });
+  } catch (err) {
+    log.error('POST /:id/service-log error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// --------------------------------------------------------
+// PUT|DELETE /api/v1/inventory/items/:id/service-log/:logId
+// PUT statt PATCH (Review #1257): validateServiceLogInput() verlangt label +
+// performed_on und loescht jedes weggelassene Feld - volles Replace, nicht
+// Teil-Update. Kein bestehender Aufrufer haengt daran: die App ruft bisher
+// nur /complete und /history auf, dieser Weg ist reine /api/v1-Oberflaeche.
+// --------------------------------------------------------
+router.put('/:id/service-log/:logId', (req, res) => {
+  try {
+    const vId = idParam(req.params.id, 'Gegenstand-ID');
+    if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
+    const vLogId = idParam(req.params.logId, 'Eintrag-ID');
+    if (vLogId.error) return res.status(400).json({ error: vLogId.error, code: 400 });
+    const item = db.get().prepare('SELECT id, odometer, odometer_on FROM inventory_items WHERE id = ?').get(vId.value);
+    if (!item) return res.status(404).json({ error: 'Item not found.', code: 404 });
+
+    // Die bearbeitete Zeile darf den Tippfehler-Schutz nicht gegen ihren
+    // eigenen alten Wert pruefen (Review #1257).
+    const baseline = odometerBaselineExcluding(item, item.id, vLogId.value);
+    const { value, errors } = validateServiceLogInput(req.body, baseline);
+    if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
+
+    const updated = updateServiceLogEntry({ itemId: item.id, logId: vLogId.value, values: value });
+    if (!updated) return res.status(404).json({ error: 'Service log entry not found.', code: 404 });
+    res.json({ data: updated });
+  } catch (err) {
+    log.error('PUT /:id/service-log/:logId error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+router.delete('/:id/service-log/:logId', (req, res) => {
+  try {
+    const vId = idParam(req.params.id, 'Gegenstand-ID');
+    if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
+    const vLogId = idParam(req.params.logId, 'Eintrag-ID');
+    if (vLogId.error) return res.status(400).json({ error: vLogId.error, code: 400 });
+    const item = db.get().prepare('SELECT id FROM inventory_items WHERE id = ?').get(vId.value);
+    if (!item) return res.status(404).json({ error: 'Item not found.', code: 404 });
+
+    const deleted = deleteServiceLogEntry({ itemId: item.id, logId: vLogId.value });
+    if (deleted.changes === 0) return res.status(404).json({ error: 'Service log entry not found.', code: 404 });
+    res.status(204).end();
+  } catch (err) {
+    log.error('DELETE /:id/service-log/:logId error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// --------------------------------------------------------
+// GET /api/v1/inventory/items/:id/history
+// Read-only aggregation: service log + linked maintenance/accessory bookings
+// + linked documents, merged into one dated timeline (DECISIONS #6).
+// --------------------------------------------------------
+router.get('/:id/history', (req, res) => {
+  try {
+    const vId = idParam(req.params.id, 'Gegenstand-ID');
+    if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
+    const item = db.get().prepare('SELECT id FROM inventory_items WHERE id = ?').get(vId.value);
+    if (!item) return res.status(404).json({ error: 'Item not found.', code: 404 });
+
+    res.json({ data: loadHistory(item.id, budgetViewer(req), documentViewer(req)) });
+  } catch (err) {
+    log.error('GET /:id/history error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });

@@ -186,6 +186,66 @@ deletions cannot be learned at all. Tracked as #1002.
   that looks like an answer is worse than no table. The price on a shopping item is the
   part that fits, and that part is wanted.
 
+  **What this does not decline, since #1293:** nutrition itself. A figure a household types
+  about its own recipe - this pot serves four, one portion is roughly this much - is a
+  statement about their own thing and not a fact about a product, and so are a daily target
+  per person and a meal somebody logs. Those are agreed and ticketed (#1326 to #1329): the
+  daily target and the logged intake shipped in v2.69.0 (#1326), the other three are not yet
+  built. They carry a fixed set of eight values: the seven the EU requires on a
+  package, plus fibre. What stays declined is the step
+  between them, deriving a total from what the ingredients *are*, which is the catalogue
+  again and nothing else. The line and its reasons are entry 8 in
+  [DECISIONS.md](DECISIONS.md).
+- **One event in several CalDAV calendars** (#1297) is declined for now, and this one is *not this
+  way* rather than *not at all*. An event has one CalDAV target (`target_caldav_account_id` and
+  `target_caldav_calendar_url` on `calendar_events`); for an event with several people on it the
+  dialog says since #1346 that the assignment picks no calendar, and which one is used instead.
+  Several targets do exist for Outlook (`outlook_event_links`, one row per event and account), and
+  only because nothing ever comes back from Outlook. CalDAV reads back, and the return path
+  recognises an event by its UID alone, without the calendar it came from
+  (`server/services/caldav-sync.js`, the lookup on `external_calendar_id`, the column that holds
+  the UID): three copies would fall onto one row, and whichever calendar was read last would win.
+  Several targets would be a rebuild at the core of the sync, and every one of its conflict cases -
+  moving an event, deleting it, editing it in two calendars at once - multiplies with the number of
+  copies.
+
+  **The route that works today** is the usual one in CalDAV: a shared family calendar that everybody
+  subscribes to, set as the target for such events. That also matches how Yuvomi reads an event
+  with several people on it, as a family event. Two routes stay out even if this comes back:
+  matching copies by date, time and title, which stores a guessed identity (entry 7 in
+  [DECISIONS.md](DECISIONS.md)), and a fingerprint in the notes field, because `description` is a
+  mirrored field and would travel as visible text with every edit. *Opens with:* a return path that
+  knows which calendar an event came from.
+- **Address lookup for a calendar location** (#1047) is *not this way* rather than *not at all*.
+  The request had two halves. The map half shipped in v2.66.0 (#1110): an action on the event that
+  opens its location in a map, built on the device from the location text, so nothing is sent
+  anywhere until somebody taps it. The other half - type "Sydney Opera House" and get the address
+  suggested - means sending what is being typed to somebody's geocoder, once per keystroke. That
+  is the case of #656 in section 3 in a sharper form: where a family goes is not less sensitive
+  than what it eats, and in an app whose promise is that nothing leaves the machine, a lookup
+  against a public endpoint cannot be the default, however clearly it is labelled. So a lookup
+  that works out of the box is declined.
+
+  There is a second reason that has nothing to do with privacy. `location` is free text and a
+  sync surface: it is written to and read from ICS and CalDAV (`ics-export.js`, `ics-parser.js`,
+  `caldav-sync.js`, `caldav-outbound.js` and `apple-calendar.js` under `server/services/`). A
+  resolved address that replaced what somebody typed would not stay local, it would travel to
+  every calendar that mirrors the event - and the field holds "Zoom", "Kitchen" and "Room 3B" as
+  often as it holds an address.
+
+  *Opens with:* a geocoder URL the household configures itself - its own Nominatim, for example -
+  that is off unless set, with nothing sent while it is unset. That shape is settled, the work is
+  not scheduled; the person who asked said a self-hosted lookup would be enough for them.
+- **A training log** (#1733) - exercises with sets and repetitions, weights over time, saved
+  routines such as "Push day" - is *not here*. Yuvomi coordinates what several people in one home
+  have to settle together; a training log is one person's tool, with a data model as large as one
+  of the bigger modules and no tie to anything the family shares, and dedicated apps do it well.
+  What fits today is everything around the log: the gym slot as a recurring calendar event or
+  task, the session itself as a Health activity (type, duration, intensity, a note), and body
+  weight under Health. The full log is a third-party module, with a page of its own in the app
+  and its state in a separate service beside Yuvomi rather than in `yuvomi.db`
+  ([MODULES.md](../MODULES.md)).
+
 ---
 
 ## 3. Dependencies
@@ -262,7 +322,7 @@ argument.
   ([CONTRIBUTING.md](../CONTRIBUTING.md#what-a-human-guarantees)); two automated reviewers
   comment on every pull request and merge nothing. A required second approval with one person
   holding the key would be theatre. *Opens with:* the same second maintainer.
-- **No translation platform.** The 24 locales live in the repository as JSON, and a guard
+- **No translation platform.** The 26 locales live in the repository as JSON, and a guard
   (`test:i18n-translated`) refuses a locale that regresses toward untranslated English. A hosted
   platform would not run that guard, so a pull request from it could turn a translated file back
   into a copy of the reference without anyone seeing it. Translations arrive as pull requests

@@ -7,7 +7,7 @@ import { api, notifications } from '/api.js';
 import { confirmModal } from '/components/modal.js';
 import { esc } from '/utils/html.js';
 import { getPwaInstallState } from '/utils/pwa-install.js';
-import { toggleRowHtml } from '/settings/components.js';
+import { toggleRowHtml, settingSwitchRowHtml } from '/settings/components.js';
 
 const DEFAULT_PROVIDERS = [
   { id: 'gotify', name: 'Gotify' },
@@ -78,19 +78,21 @@ function renderPage(container, user) {
   container.insertAdjacentHTML('beforeend', `
     <section class="settings-section">
       <h2 class="settings-section__title">${t('settings.pushToggleTitle')}</h2>
-      <div class="settings-card">
-        <div class="settings-card__body">
-          <p class="form-hint">${t('settings.pushDeviceDescription')}</p>
-          <p class="form-hint" id="push-ios-hint" hidden>${t('settings.pushIosHomescreenHint')}</p>
-          <p class="form-hint" id="push-status" aria-live="polite">${t('settings.pushChecking')}</p>
-          <div class="settings-form-actions">
-            ${toggleRowHtml({
-              label: t('settings.pushToggleLabel'),
-              disabled: true,
-              attrs: { id: 'push-toggle' },
-            })}
-          </div>
-          <div class="settings-form-actions">
+      <!-- Zeilen im Traeger (R17, E9): der Schalter mit seinem Hinweis und
+           dem Zustand darunter, die Probe als eigene Zeile. Vorher eine Karte,
+           in der drei Hinweise UEBER dem Schalter standen, den sie erklaeren. -->
+      <div class="row-carrier settings-group">
+        ${settingSwitchRowHtml({
+          label: t('settings.pushToggleLabel'),
+          disabled: true,
+          description: t('settings.pushDeviceDescription'),
+          descriptionId: 'push-device-description',
+          extra: `<p class="form-hint" id="push-ios-hint" hidden>${t('settings.pushIosHomescreenHint')}</p>
+            <p class="form-hint" id="push-status" aria-live="polite">${t('settings.pushChecking')}</p>`,
+          attrs: { id: 'push-toggle', 'aria-describedby': 'push-device-description push-status' },
+        })}
+        <div class="settings-setting-row settings-setting-row--stacked">
+          <div class="settings-setting-row__control settings-form-actions">
             <button type="button" class="btn btn--secondary" id="push-test-btn" disabled>
               <i data-lucide="bell-ring" aria-hidden="true"></i>
               <span>${t('settings.pushTestButton')}</span>
@@ -178,6 +180,7 @@ function renderChannelList(container, channels, providers = DEFAULT_PROVIDERS) {
           <input class="form-input" id="notification-name-${suffix}" name="name" value="${esc(channel.name)}" required>
         </div>
         ${toggleRowHtml({
+          control: 'switch',
           label: t('settings.notificationChannelEnabled'),
           checked: !!channel.enabled,
           attrs: { name: 'enabled' },
@@ -248,9 +251,9 @@ function renderChannelList(container, channels, providers = DEFAULT_PROVIDERS) {
           <p class="form-hint notification-email-not-ready${notReady ? '' : ' settings-card--hidden'}">${t('settings.notificationChannelEmailNotConfigured')}</p>
         </div>
         <div class="settings-form-actions">
-          <button type="submit" class="btn btn--primary">${t('settings.notificationChannelSave')}</button>
           ${channel.id ? `<button type="button" class="btn btn--secondary" data-action="test">${t('settings.notificationChannelTest')}</button>` : ''}
           ${channel.id ? `<button type="button" class="btn btn--danger" data-action="delete">${t('settings.notificationChannelDelete')}</button>` : ''}
+          <button type="submit" class="btn btn--primary">${t('settings.notificationChannelSave')}</button>
         </div>
       </form>
     `);
@@ -467,16 +470,38 @@ export async function render(container, { user } = {}) {
       else status.textContent = st.subscribed ? t('settings.pushEnabled') : t('settings.pushDisabled');
     };
 
-    applyState(await pushStatus());
+    // Ohne aktiven Service Worker (Registrierung gescheitert, Proxy ohne SW)
+    // meldet pushStatus nach einer Frist "nicht verfuegbar" - vorher stand hier
+    // "Status wird geprueft ..." fuer immer, und das Blatt hielt die Shell fest
+    // (Re-Critique 2026-09-28, A7 P1-2). Wird der Worker spaeter doch bereit,
+    // holt das Blatt den echten Stand nach.
+    const applyAvailability = (st) => {
+      if (st.available !== false) {
+        applyState(st);
+        return true;
+      }
+      toggle.checked = false;
+      toggle.disabled = true;
+      testBtn.disabled = true;
+      status.textContent = t('settings.pushUnavailable');
+      return false;
+    };
+    if (!applyAvailability(await pushStatus())) {
+      navigator.serviceWorker.ready.then(async () => {
+        if (container.isConnected) applyAvailability(await pushStatus());
+      }).catch(() => {});
+    }
 
     toggle.addEventListener('change', async () => {
       toggle.disabled = true;
       try {
         const st = toggle.checked ? await enablePush() : await disablePush();
-        applyState({ ...await pushStatus(), ...st });
+        applyAvailability({ ...await pushStatus(), ...st });
       } catch {
-        status.textContent = t('settings.pushError');
-        applyState(await pushStatus());
+        // Erst den Stand, dann die Meldung - umgekehrt ueberschrieb applyState
+        // den Fehler sofort wieder.
+        const st = await pushStatus();
+        if (applyAvailability(st)) status.textContent = t('settings.pushError');
       }
     });
 

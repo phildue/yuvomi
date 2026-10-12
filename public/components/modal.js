@@ -12,10 +12,14 @@
  *   closeModal({ force }) → Promise<void>
  *   confirmModal(message, opts) → Promise<boolean>       (ersetzt ein offenes Modal)
  *   confirmOverModal(message, opts) → Promise<boolean>   (parkt es und gibt es zurück)
+ *   askOverModal(ask) → Promise<Antwort>                 (dasselbe für einen eigenen Dialog)
  *
  * Nachträglich gemountete Panes (Detailansicht → Formular, detail-view.js)
  *   mountFooter(panel)             → hebt eine neu gerenderte Fußzeile ans Panel
+ *   decorateFooterDelete(footer)   → erkennt Löschen im Fuß (mobil Icon-Knopf)
  *   refreshDirtySnapshot()         → Dirty-Basis auf den jetzigen Stand setzen
+ *   swapFieldsKeepingDirtyBase(panel, swap) → Felder im offenen Formular
+ *                                    tauschen, ohne dass der Tausch als Eingabe zählt
  *   focusFirstField(panel)         → Fokus nach dem Pane-Wechsel, touch-bewusst
  *   updateHeaderAction(panel, …)   → Beschriftung/Handler des Kopf-Buttons tauschen
  */
@@ -23,6 +27,9 @@
 import { t } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { pushOverlay, dropOverlay, isOverlayOpen } from '/utils/overlay-history.js';
+import { wireSheetDrag } from '/utils/sheet-drag.js';
+import { iconElement } from '/utils/lucide-icons.js';
+import { expandIn, durationToken } from '/utils/ux.js';
 
 let activeOverlay = null;
 let previouslyFocused = null;
@@ -30,7 +37,13 @@ let previouslyFocused = null;
 // zurueck, wenn die Seite erst nach einem `await` fertig gerendert hat.
 let _lastRestore = null;
 let focusTrapHandler = null;
+// Die Dirty-Basis des offenen Formulars: `{ fields, entries }` - die Felder vom
+// Snapshot und je Feld sein Eintrag (siehe _takeDirtyBase).
 let _initialFormSnapshot = null;
+// Dieselbe Basis, auffindbar ueber ihr Panel - auch waehrend das Formular unter
+// einer Rueckfrage geparkt ist und `_initialFormSnapshot` dem Dialog darueber
+// gehoert (swapFieldsKeepingDirtyBase).
+const _dirtyBaseByPanel = new WeakMap();
 let _initialFormTimeout = null;
 let _modalFormSeq = 0;
 // Monotone Kennung des zuletzt tatsaechlich eingesetzten Shared-Modals. Ein
@@ -216,12 +229,42 @@ const FOCUSABLE = [
 ].join(', ');
 
 // Erstes echtes Eingabefeld eines Formulars - der Ort, an den der Fokus bei
-// Dateneingabe gehört.
-const FIRST_FIELD = 'input:not([type="hidden"]):not([disabled]), textarea:not([disabled]), select:not([disabled])';
+// Dateneingabe gehört. `tabindex="-1"` zaehlt nicht: ein Feld ausserhalb der
+// Tab-Folge ist ein Werkzeug eines anderen Bedienelements, kein Einstieg. In
+// "Mitglied bearbeiten" landete der Erstfokus sonst auf dem versteckten
+// Datei-Input der Avatar-Vorschau, und `.sr-only:focus-visible` zeigte ihn als
+// Streifen ueber dem Dialogkopf (a11y-Runde). Dasselbe gilt fuer das native
+// Feld hinter dem Datepicker (`.ydp__native`).
+const FIRST_FIELD = [
+  'input:not([type="hidden"]):not([disabled]):not([tabindex="-1"])',
+  'textarea:not([disabled]):not([tabindex="-1"])',
+  'select:not([disabled]):not([tabindex="-1"])',
+].join(', ');
 
 // --------------------------------------------------------
 // Focus-Trap (Spec §5.2)
 // --------------------------------------------------------
+
+/**
+ * Der Knopf, den Enter in einem einzeiligen Feld ausloest.
+ *
+ * 1. Der Absender des Formulars, dem das Feld gehoert. `button.form` ist der
+ *    Formular-BESITZER: das umgebende <form> oder das per `form="id"`
+ *    zugeordnete - so bindet `mountFooter()` das "Speichern" der Fusszeile an
+ *    sein Formular, obwohl es nicht mehr darin steht (#543).
+ * 2. Sonst die Hauptaktion des Panels, aber nie die eines FREMDEN Formulars.
+ *
+ * Versteckte Aeste (`[hidden]`, `[inert]`) zaehlen in beiden Stufen nicht. Ein
+ * GESPERRTER eigener Absender bleibt der Treffer und loest nichts aus: gesperrt
+ * heisst "unterwegs", nicht "nimm einen anderen".
+ */
+function enterSubmitTarget(active, container) {
+  const form = active.form ?? null;
+  const candidates = [...container.querySelectorAll('button[type="submit"], .btn--primary')]
+    .filter((btn) => !btn.closest?.('[hidden], [inert]'));
+  const own = form ? candidates.find((btn) => btn.type === 'submit' && btn.form === form) : null;
+  return own ?? candidates.find((btn) => !form || !btn.form || btn.form === form) ?? null;
+}
 
 function trapFocus(container, initialFocus = 'first-field') {
   focusTrapHandler = (e) => {
@@ -251,7 +294,13 @@ function trapFocus(container, initialFocus = 'first-field') {
       const isSelect = active.tagName === 'SELECT';
 
       if (isInput || isSelect) {
-        const submitBtn = container.querySelector('button[type="submit"], .btn--primary');
+        // WEM GEHOERT DIESES ENTER (#1598)? Ein Blatt kann mehr als ein
+        // Formular tragen - die Aufgabe hat die Teilaufgaben-Zeile UND das
+        // Kommentarfeld -, und nach "Bearbeiten" steht die Leseansicht samt
+        // beiden `hidden` VOR dem Formular im DOM. Der erste Treffer im
+        // Dokument war deshalb "Kommentieren" bzw. ein Knopf, den niemand
+        // sieht; `preventDefault()` nahm dem richtigen Formular die Absendung.
+        const submitBtn = enterSubmitTarget(active, container);
         if (submitBtn && !submitBtn.disabled) {
           e.preventDefault();
           submitBtn.click();
@@ -377,22 +426,49 @@ export function focusFirstField(panel) {
 // fieldsets: a real field that starts disabled/hidden (e.g. a conditional
 // fieldset a mode enables) must still count once it holds typed content.
 function serializeForm(container) {
-  const inputs = container.querySelectorAll(
+  return formFields(container).map(serializeField).join('&');
+}
+
+function formFields(container) {
+  return Array.from(container.querySelectorAll(
     'input:not([type="file"]):not([data-dirty-ignore]), select:not([data-dirty-ignore]), textarea:not([data-dirty-ignore])'
-  );
-  return Array.from(inputs).map((el) => `${el.name || el.id}=${el.value}`).join('&');
+  ));
+}
+
+// EIN HAKEN IST SEIN ZUSTAND, NICHT SEIN WERT (#1775). Eine Checkbox traegt
+// als `value` "on" (oder was das Markup ihr gab), ob sie gesetzt ist oder
+// nicht - verglichen wurde also ein Text, der sich nie aendert: wer nur
+// "Aktiv" umlegte und den Dialog schloss, verlor die Aenderung ohne die
+// Verwerfen-Frage. Fuer Checkbox und Radio steht deshalb `checked` mit im
+// Schnappschuss. Ein Blatt, dessen Haken SOFORT wirken und gespeichert sind,
+// ist ein Ansichtsblatt und oeffnet mit `dirtyGuard: false`.
+function serializeField(el) {
+  const state = el.type === 'checkbox' || el.type === 'radio' ? `:${el.checked ? 1 : 0}` : '';
+  return `${el.name || el.id}=${el.value}${state}`;
 }
 
 function isFormDirty(container) {
   // Ein Ansichtsblatt hat nichts Ungespeichertes - siehe _dirtyGuardEnabled.
   if (!_dirtyGuardEnabled) return false;
   if (_initialFormSnapshot === null) return false;
-  return serializeForm(container) !== _initialFormSnapshot;
+  return serializeForm(container) !== _initialFormSnapshot.entries.join('&');
+}
+
+// Die Basis steht JE FELD da, nicht als ein Text, und merkt sich das ELEMENT
+// zu jedem Eintrag: nur so laesst sich spaeter sagen, welcher Eintrag zu
+// welchem Feld gehoert, egal wie viele Felder inzwischen dazukamen oder
+// gingen (swapFieldsKeepingDirtyBase). Verglichen wird weiter der eine Text -
+// fuer jeden Dialog, der nie Felder tauscht, ist das der Vergleich von immer.
+function _takeDirtyBase(panel) {
+  const fields = formFields(panel);
+  const base = { fields, entries: fields.map(serializeField) };
+  _dirtyBaseByPanel.set(panel, base);
+  return base;
 }
 
 function _snapshotNow() {
   if (!activeOverlay) return;
-  _initialFormSnapshot = serializeForm(activeOverlay.querySelector('.modal-panel') ?? activeOverlay);
+  _initialFormSnapshot = _takeDirtyBase(activeOverlay.querySelector('.modal-panel') ?? activeOverlay);
 }
 
 /**
@@ -413,6 +489,78 @@ export function refreshDirtySnapshot() {
   _initialFormTimeout = setTimeout(_snapshotNow, 150);
 }
 
+/**
+ * Tauscht Felder im offenen Formular, ohne dass der Tausch als Eingabe zaehlt
+ * (#1784).
+ *
+ * Wer einem offenen Dialog Felder NACHREICHT (eine Auswahl, deren Optionen erst
+ * jetzt geladen sind), veraendert, was `serializeForm` liest - und das
+ * Schliessen fragt "Aenderungen verwerfen?", obwohl niemand etwas angefasst
+ * hat. `refreshDirtySnapshot()` waere hier die falsche Antwort: es friert den
+ * JETZIGEN Stand ein und damit auch, was der Nutzer inzwischen getippt hat -
+ * das Schliessen ginge ohne Frage durch, und die Eingabe waere still weg.
+ *
+ * Deshalb je ELEMENT. Die Basis kennt zu jedem Eintrag sein Feld:
+ *   - was der Tausch ENTFERNT, faellt aus der Basis;
+ *   - was er NEU bringt, geht mit dem Stand hinein, den `swap` ihm gegeben hat,
+ *     an der Stelle, an der es im Formular steht;
+ *   - alles andere bleibt, wie es war. Eine getippte Eingabe bleibt eine
+ *     Aenderung, und wer sie zuruecknimmt, ist wieder sauber. Eine Zeile, die
+ *     der Nutzer vor dem Tausch hinzugefuegt hat, bleibt ebenfalls eine - sie
+ *     war schon da und kommt deshalb NICHT in die Basis; nimmt er sie wieder
+ *     weg, steht der Dialog im Oeffnungszustand.
+ *
+ * Die Basis wird ueber das Panel gefunden und AN ORT UND STELLE geaendert. Sie
+ * ist dasselbe Objekt, das ein geparktes Formular in seinem Token traegt - der
+ * Tausch erreicht es also auch unter einer Rueckfrage, und das Zurueckholen
+ * bringt die nachgefuehrte Basis mit.
+ *
+ * `swap` laeuft synchron und IMMER - auch fuer ein Panel ohne Basis.
+ *
+ * @param {Element} panel - das `.modal-panel`, das `onSave` bekommen hat
+ * @param {() => void} swap - der Tausch samt allem, was die neuen Felder
+ *   programmatisch setzt (Vorauswahl), bevor der Nutzer sie zu sehen bekommt
+ */
+export function swapFieldsKeepingDirtyBase(panel, swap) {
+  const base = _dirtyBaseByPanel.get(panel) ?? null;
+  const before = base ? new Set(formFields(panel)) : null;
+  swap();
+  if (!base) return;
+  const after = formFields(panel);
+  const present = new Set(after);
+  // Vom Tausch entfernt: vorher da, jetzt weg. Was schon VOR dem Tausch
+  // fehlte, hat der Nutzer entfernt - das bleibt als Aenderung in der Basis.
+  const swappedOut = (el) => before.has(el) && !present.has(el);
+  const rows = base.fields.map((el, i) => [el, base.entries[i]]).filter(([el]) => !swappedOut(el));
+  const known = new Set(rows.map(([el]) => el));
+  // Neu ist, was weder vorher da war noch in der Basis steht. Was vorher da
+  // war und nicht in der Basis steht, hat der Nutzer hinzugefuegt.
+  const added = after.filter((el) => !known.has(el) && !before.has(el));
+  const gap = base.fields.findIndex(swappedOut);
+  if (gap >= 0) {
+    // Der Tausch ERSETZT: das Neue nimmt den Platz dessen ein, was er entfernt
+    // hat - gezaehlt in der Basis, nicht im Formular, denn dort koennen Zeilen
+    // des Nutzers dazwischenstehen oder fehlen.
+    // `gap` ist das ERSTE Entfernte - davor steht also nichts, was fehlt.
+    rows.splice(gap, 0, ...added.map((el) => [el, serializeField(el)]));
+  } else {
+    // Der Tausch fuegt nur HINZU: hinter das naechste Feld davor, das die
+    // Basis kennt.
+    const fresh = new Set(added);
+    let anchor = null;
+    for (const el of after) {
+      if (known.has(el)) { anchor = el; continue; }
+      if (!fresh.has(el)) continue;
+      const at = anchor ? rows.findIndex(([row]) => row === anchor) + 1 : 0;
+      rows.splice(at, 0, [el, serializeField(el)]);
+      known.add(el);
+      anchor = el;
+    }
+  }
+  base.fields = rows.map(([el]) => el);
+  base.entries = rows.map(([, entry]) => entry);
+}
+
 // --------------------------------------------------------
 // Escape-Handler
 // --------------------------------------------------------
@@ -425,81 +573,23 @@ function onEscape(e) {
 // Swipe-to-Close (Mobile)
 // --------------------------------------------------------
 
-// Beruehrungs-Schlupf der Wischgeste, in BEIDE Richtungen derselbe: unterhalb
-// davon entscheidet sie weder "Sheet ziehen" noch "Inhalt scrollen".
-const SHEET_SWIPE_SLOP_PX = 10;
-
+// EINE Sheet-Grammatik fuer Dialog und Mehr-Blatt (utils/sheet-drag.js,
+// Re-Critique 2026-09-27): 1:1 mitgehen, schliessen ab 80px Weg ODER
+// Flick-Tempo > 0.5px/ms, sonst zurueckfedern (`--duration-lg` + `--ease-out`),
+// nach oben ein Gummiband. Richtungssperre (#981) und das Aufraeumen per rAF
+// (iOS-Click-Konvertierung) stehen dort.
+//
+// Bei ungespeicherten Aenderungen schliesst `closeModal()` nicht, sondern
+// fragt nach - dann federt die Tafel in ihre Ruhelage unter die Rueckfrage,
+// statt am alten Zug stehen zu bleiben.
 function _wireSheetSwipe(panel) {
-  let startY = 0;
-  let dragging = false;
-  // Hat dieser Finger das Sheet schon nach unten gezogen? Erst dann gehört eine
-  // Aufwärtsbewegung zum Zug; davor ist sie Scrollen des Inhalts (#981).
-  let pulled = false;
-
-  // Scroll position is now on the body, not the panel itself
-  const scrollBody = panel.querySelector('.modal-panel__body');
-
-  panel.addEventListener('touchstart', (e) => {
-    // Nur von der Handle-Zone (obere 48px) oder wenn Panel ganz oben → Swipe erlauben
-    const touchY = e.touches[0].clientY;
-    const rect = panel.getBoundingClientRect();
-    const isHandleZone = touchY - rect.top < 48;
-    const isScrolledToTop = (scrollBody ? scrollBody.scrollTop : panel.scrollTop) <= 0;
-    if (!isHandleZone && !isScrolledToTop) return;
-    startY = touchY;
-    dragging = true;
-    pulled = false;
-  }, { passive: true });
-
-  panel.addEventListener('touchmove', (e) => {
-    if (!dragging) return;
-    const dy = e.touches[0].clientY - startY;
-    if (dy < 0) {
-      // RICHTUNGSSPERRE (#981). Ein frisch geöffneter Dialog steht oben, also
-      // begann JEDE Wischgeste im Inhalt als verfolgter Zug, und der schrieb
-      // bei jedem Aufwärts-Frame `translateY(0)` ans Panel. Solange die
-      // Einfahranimation das Panel hält (`forwards`), aendert das nichts; mit
-      // "Bewegung reduzieren" gibt es keine Animation, das Inline-transform
-      // wirkt, und iOS bricht das Scrollen des Inhalts ab - gemessen im
-      // Simulator: 0 bis 30 px statt 500 bis 675 px fuer dieselbe Geste.
-      // Aufwärts, bevor das Sheet gezogen wurde, ist deshalb kein Zug: die
-      // Geste gibt ab und fasst das Panel nicht an.
-      //
-      // Aber erst jenseits derselben Schwelle, die abwärts gilt: ein Finger
-      // zittert beim Aufsetzen, und ein einzelner Pixel nach oben durfte eine
-      // gewollte Schliessgeste nicht verwerfen. Innerhalb der Schwelle
-      // passiert nichts - kein Abbruch, kein Schreibzugriff.
-      if (!pulled) {
-        if (dy < -SHEET_SWIPE_SLOP_PX) dragging = false;
-        return;
-      }
-      // Ein begonnener Zug bleibt verfolgt, wenn der Finger zurückkehrt - sonst
-      // endete touchend ohne Rücksetzen und das Panel stünde verschoben
-      // (b7c0312c). Zurückgesetzt wird einmal, nicht in jedem Frame.
-      if (panel.style.transform) panel.style.transform = '';
-      return;
-    }
-    // Erst ab der Schwelle animieren: Verhindert winzige Transforms durch
-    // normale Taps, die danach zurückgesetzt werden müssten.
-    if (dy > SHEET_SWIPE_SLOP_PX) {
-      pulled = true;
-      panel.style.transform = `translateY(${(dy - SHEET_SWIPE_SLOP_PX) * 0.6}px)`;
-    }
-  }, { passive: true });
-
-  panel.addEventListener('touchend', (e) => {
-    if (!dragging) return;
-    dragging = false;
-    const dy = e.changedTouches[0].clientY - startY;
-    if (dy > 80) {
-      panel.style.transform = '';
+  return wireSheetDrag(panel, {
+    scroller: () => panel.querySelector('.modal-panel__body') ?? panel,
+    onDismiss: () => {
+      const dirty = isFormDirty(panel);
       closeModal();
-    } else {
-      // Transform-Reset per rAF verzögern: DOM-Mutationen direkt in touchend
-      // unterbrechen auf iOS WebKit die Touch→Click-Konvertierung - der click-Event
-      // auf Child-Elementen (Buttons) wird gecancelt → Buttons reagieren nicht.
-      requestAnimationFrame(() => { panel.style.transform = ''; });
-    }
+      return !dirty;
+    },
   });
 }
 
@@ -560,7 +650,7 @@ function _suspendActiveModal() {
     // hier: das gleich folgende openModal löscht den ausstehenden Timer, und ein
     // null-Snapshot schaltet isFormDirty() für die restliche Lebensdauer des
     // Formulars ab - der Dirty-Guard wäre danach still tot.
-    snapshot: _initialFormSnapshot ?? (panel ? serializeForm(panel) : null),
+    snapshot: _initialFormSnapshot ?? (panel ? _takeDirtyBase(panel) : null),
     // Mit demselben Grund wie der Snapshot daneben: der Dialog, der sich gleich
     // darüberlegt, läuft selbst durch openModal() und setzt den Wächter dabei
     // auf seinen Standardwert. Ohne dieses Merken käme ein geparktes
@@ -640,12 +730,21 @@ function _resumeSuspendedModal({ overlay, id, title, titleId, snapshot, dirtyGua
  * lässt sich sein Overlay direkt nach dem Aufruf greifen.
  */
 async function _confirmOverSuspended(message, opts, suspended) {
-  const pending = confirmModal(message, opts);
+  return _askOverSuspended(() => confirmModal(message, opts), suspended);
+}
+
+/**
+ * Derselbe Ablauf für einen Dialog, den der Aufrufer selbst baut (#1284): `ask`
+ * öffnet ihn über openModal und liefert ein Promise auf die Antwort. Auch hier
+ * entsteht der Dialog synchron, also greift der Overlay-Zugriff direkt danach.
+ */
+async function _askOverSuspended(ask, suspended) {
+  const pending = ask();
   const dialogOverlay = document.getElementById('shared-modal-overlay');
   try {
-    const confirmed = await pending;
+    const answer = await pending;
     await _awaitOverlayRemoval(dialogOverlay);
-    return confirmed;
+    return answer;
   } catch (err) {
     // Ein geparktes Modal ist inert und damit unbedienbar. Scheitert der Dialog,
     // muss es zurückkommen - sonst steht die App bis zum Reload.
@@ -1058,6 +1157,41 @@ export function restoreFocusAfterClose(memo) {
   return gesetzt;
 }
 
+/**
+ * Wartende auf das Ende EINES Overlays, je Knoten. Aufgeloest wird in
+ * `_doClose()` nach dem Focus-Restore - wer danach fokussiert, gewinnt.
+ * @type {Map<HTMLElement, Array<() => void>>}
+ */
+const _closeWaiters = new Map();
+
+/**
+ * Loest auf, sobald das gerade offene Modal wirklich weg ist und seinen Fokus
+ * zurueckgegeben hat; ohne offenes Modal sofort.
+ *
+ * `confirmModal()` loest schon beim Klick auf, mobil laeuft das Schliessen aber
+ * noch bis zu 400 ms weiter (Animation) und setzt am Ende den Fokus auf den
+ * Ausloeser. Wer nach der Rueckfrage selbst fokussiert - etwa ein Feld, das
+ * eine schnelle Serverantwort einblendet -, verliert ihn sonst an dieses Ende.
+ * Gilt fuer das Overlay, das beim Aufruf offen ist, nicht fuer ein spaeteres.
+ * @returns {Promise<void>}
+ */
+export function whenModalClosed() {
+  const overlay = activeOverlay;
+  if (!overlay || !overlay.isConnected) return Promise.resolve();
+  return new Promise((resolve) => {
+    const list = _closeWaiters.get(overlay) ?? [];
+    list.push(resolve);
+    _closeWaiters.set(overlay, list);
+  });
+}
+
+function _releaseCloseWaiters(overlay) {
+  const list = _closeWaiters.get(overlay);
+  if (!list) return;
+  _closeWaiters.delete(overlay);
+  for (const resolve of list) resolve();
+}
+
 function _doClose(overlayEl) {
   const target = overlayEl ?? activeOverlay;
   if (!target) return;
@@ -1079,6 +1213,18 @@ function _doClose(overlayEl) {
     // Focus-Restore
     const merkzettel = previouslyFocused;
     previouslyFocused = null;
+    // HAT DER AUFRUFER SCHON FOKUSSIERT, BLEIBT ES DABEI. closeModal() loest mit
+    // dem START des Ausgangs auf (seit 2026-09-26 auch am Desktop); wer darauf
+    // wartet, neu zeichnet und ein Steuerelement fokussiert, verloere es sonst
+    // ~150 ms spaeter an den alten Ausloeser. Im Dialog selbst kann der Fokus
+    // hier nicht mehr stehen - das Overlay ist schon entfernt, der Browser hat
+    // ihn auf <body> fallen lassen.
+    const aktiv = document.activeElement;
+    if (aktiv && aktiv !== document.body && aktiv !== document.documentElement && !target.contains?.(aktiv)) {
+      if (window.yuvomi?.restoreThemeColor) window.yuvomi.restoreThemeColor();
+      _releaseCloseWaiters(target);
+      return;
+    }
     const restoreTarget = focusRestoreTarget(merkzettel);
     // Das TATSAECHLICH fokussierte Element merken, nicht das gewuenschte: nimmt
     // der Ersatz den Fokus nicht an, steht danach die Wurzel dort, und die
@@ -1095,6 +1241,10 @@ function _doClose(overlayEl) {
       window.yuvomi.restoreThemeColor();
     }
   }
+
+  // Erst NACH dem Focus-Restore: wer auf das Schliessen gewartet hat, setzt
+  // seinen Fokus danach und behaelt ihn.
+  _releaseCloseWaiters(target);
 }
 
 // --------------------------------------------------------
@@ -1145,7 +1295,131 @@ export function mountFooter(panel) {
     .forEach((el) => el.remove());
 
   panel.appendChild(bodyFooter);
+  decorateFooterDelete(bodyFooter);
+  collapseEmptyBody(panel);
   return bodyFooter;
+}
+
+/**
+ * EIN RUMPF OHNE INHALT IST KEIN RUMPF (R18).
+ *
+ * Eine Rückfrage ohne `detail` besteht nur aus Frage (Titel) und Fuß. Nach dem
+ * Anheben der Fußzeile blieb ihr Rumpf als leerer Kasten stehen: zweimal 16px
+ * Polster zwischen der Linie des Kopfs und der des Fußes (Abmelden, gemessen
+ * 32px Leere zwischen zwei Haarlinien). Das trifft jede Rückfrage ohne
+ * Erklärtext, nicht eine bestimmte.
+ *
+ * Der Rumpf wird dafür nur WIRKLICH leer gemacht - übrig waren die
+ * Leerzeichen des Template-Literals, und an denen scheitert `:empty`. Den
+ * Rest trägt das Stylesheet (`.modal-panel__body:empty`, layout.css): keine
+ * Klasse, die jemand wieder abnehmen müsste, wenn ein Aufrufer den Rumpf
+ * später füllt - dann ist er nicht mehr `:empty` und steht von selbst wieder.
+ *
+ * @param {HTMLElement} panel
+ * @returns {boolean} true, wenn der Rumpf geleert wurde
+ */
+export function collapseEmptyBody(panel) {
+  const body = panel?.querySelector?.('.modal-panel__body');
+  if (!body) return false;
+  if (body.children.length > 0 || body.textContent.trim() !== '') return false;
+  body.replaceChildren();
+  return true;
+}
+
+/**
+ * Woran der Fuß sein Löschen erkennt. Die Module schreiben es seit Jahren als
+ * `.btn--danger-outline` (einige als `.btn--danger-ghost`) - die Klasse IST
+ * die Auszeichnung, kein Modul muss etwas nachtragen. `data-footer-delete`
+ * nimmt einen Knopf auf, der anders aussieht; `data-footer-delete="off"` nimmt
+ * einen heraus, bei dem Löschen die Primäraktion des Dialogs ist.
+ */
+export const FOOTER_DELETE_SELECTOR = '.btn--danger-outline, .btn--danger-ghost, [data-footer-delete]';
+
+/**
+ * Der Name des Objekts, das der Knopf löscht: ausdrücklich gesetzt
+ * (`data-delete-name`), sonst das erste Textfeld des Formulars - dort steht bei
+ * jedem Objekt sein Titel -, und in der Detailansicht der Dialogtitel, denn
+ * dort IST er der Objektname (detail-view.js).
+ */
+function footerDeleteObjectName(btn) {
+  const own = btn.dataset?.deleteName?.trim();
+  if (own) return own;
+  const panel = btn.closest?.('.modal-panel');
+  const scope = btn.form ?? panel?.querySelector('.modal-panel__body');
+  const field = scope?.querySelector?.('input[type="text"], input:not([type])');
+  const typed = field?.value?.trim();
+  if (typed) return typed;
+  if (btn.closest?.('.detail-view__footer')) return panel?.querySelector('.modal-panel__title')?.textContent?.trim() || '';
+  return '';
+}
+
+/**
+ * DER DIALOGFUSS MIT LÖSCHEN PASST MOBIL IN EINE ZEILE (Re-Critique
+ * 2026-09-27, R9 M8).
+ *
+ * WAS GEMESSEN WAR: Löschen · Abbrechen · Speichern brauchen bei 390px rund
+ * 345px, der Fuß hat 332. Der Umbruch aus #872 hielt alles im Bild, stellte
+ * aber „Speichern" allein in eine zweite Zeile - die Primäraktion stand unter
+ * der Nebenaktion, in jedem Dialog mit Löschen (Kalender, Medikament,
+ * Mahlzeit ...).
+ *
+ * DIE ANTWORT IST APPLES: Löschen wird auf dem Telefon ein 44px-Papierkorb links,
+ * Abbrechen und Primär bleiben rechts beschriftet. Einmal hier statt je Modul -
+ * deshalb erkennt die Shell den Knopf an seiner Klasse, packt seinen Text in
+ * eine eigene Spanne (die das CSS mobil ausblendet, ohne sie dem Screenreader
+ * zu nehmen), ergänzt ein fehlendes Papierkorb-Symbol und gibt ihm den
+ * Objektnamen: „Einkauf löschen" statt eines nackten „Löschen", sobald das
+ * Wort selbst nicht mehr dasteht. Ein vorhandenes `aria-label` gewinnt immer.
+ *
+ * Idempotent: ein zweiter Umzug derselben Fußzeile (Pane-Wechsel) ändert nichts.
+ *
+ * @param {HTMLElement|null} footer
+ * @returns {HTMLElement[]} die erkannten Löschen-Knöpfe
+ */
+export function decorateFooterDelete(footer) {
+  if (!footer?.querySelectorAll) return [];
+  const found = [...footer.querySelectorAll(FOOTER_DELETE_SELECTOR)]
+    .filter((btn) => btn.tagName === 'BUTTON' && btn.dataset?.footerDelete !== 'off');
+  footer.classList.toggle('modal-panel__footer--has-delete', found.length > 0);
+  // EINE ZEILE NUR FÜR DIE KANONISCHE DREIHEIT (Löschen · Abbrechen · Primär).
+  // Die Detailansicht trägt neben Löschen drei beschriftete Aktionen
+  // (Erledigen, Starten, Aufgabe archivieren) - in eine Zeile gezwungen,
+  // quetschten sie sich auf je ~80px. Dort bleibt der Umbruch aus #872, der
+  // Papierkorb spart trotzdem eine Knopfbreite. Icon-Knöpfe (Archivieren im
+  // Kontodialog) zählen nicht mit: sie brauchen nur ihre 44px.
+  const labelled = [...footer.querySelectorAll('button')]
+    .filter((b) => !found.includes(b) && !b.classList.contains('btn--icon'));
+  footer.classList.toggle('modal-panel__footer--one-row', found.length > 0 && labelled.length <= 2);
+  for (const btn of found) {
+    if (btn.classList.contains('modal-panel__delete')) continue;
+    btn.classList.add('modal-panel__delete');
+    // DIE DETAILANSICHT TRAEGT IHR WORT SCHON IN EINER SPANNE (`.btn__label`,
+    // components/detail-view.js), nicht als losen Text. Die blieb sichtbar und
+    // ragte mobil aus dem 48px-Quadrat (Re-Critique 2026-09-28, A5 P2-4) - sie
+    // wird deshalb selbst die Wortspanne, statt eine zweite zu bekommen.
+    const ownLabel = [...btn.childNodes].find((n) => n.nodeType === 1 && n.classList?.contains('btn__label'));
+    if (ownLabel) ownLabel.classList.add('modal-panel__delete-label');
+    const loose = [...btn.childNodes].filter((n) => n.nodeType === 3 && n.textContent.trim());
+    if (loose.length && ownLabel) {
+      ownLabel.textContent = [ownLabel.textContent.trim(), ...loose.map((n) => n.textContent.trim())].join(' ');
+      loose.forEach((n) => n.remove());
+    } else if (loose.length) {
+      const label = document.createElement('span');
+      label.className = 'modal-panel__delete-label';
+      label.textContent = loose.map((n) => n.textContent.trim()).join(' ');
+      loose.forEach((n) => n.remove());
+      btn.appendChild(label);
+    }
+    if (!btn.querySelector('svg, [data-lucide]')) {
+      const icon = iconElement('trash-2', { class: 'icon-md' });
+      if (icon) btn.prepend(icon);
+    }
+    if (!btn.hasAttribute('aria-label')) {
+      const name = footerDeleteObjectName(btn);
+      if (name) btn.setAttribute('aria-label', t('common.deleteNamed', { name }));
+    }
+  }
+  return found;
 }
 
 // --------------------------------------------------------
@@ -1167,6 +1441,100 @@ export function updateHeaderAction(panel, { label, onClick, hidden = false } = {
 }
 
 // --------------------------------------------------------
+// Totzeit gegen den Doppeltipp (#1284)
+// --------------------------------------------------------
+
+/**
+ * Wie lange eine frisch geöffnete RÜCKFRAGE keine Zeiger-Betätigung annimmt.
+ *
+ * DER DIALOG FÄHRT IN DIE HAND, DIE GERADE GETIPPT HAT. Auf Handybreite ist
+ * das Modal ein Sheet, und `glass-sheet-in` (glass.css) schiebt es 300 ms
+ * lang von unten nach oben - quer durch die Stelle, an der eben noch
+ * „Speichern" stand. Gemessen in headless Chrome: ein zweiter Tipp 40-70 ms
+ * nach dem Öffnen der Serien-Rückfrage wählte eine Reichweite aus, ohne dass
+ * die Frage je gelesen wurde; auf dem Desktop legte das Löschen aus dem
+ * Popover „Nur diesen Termin" unter den zweiten Klick eines Doppelklicks.
+ * Beides trifft jede Rückfrage des geteilten Systems, nicht nur den neuen
+ * Dialog: die Löschfrage geht denselben Weg durch `confirmModal` → `openModal`.
+ *
+ * NUR RÜCKFRAGEN, und das ist der Unterschied, der zählt. Die Sperre hing
+ * zuerst an `openModal` selbst und traf damit jedes Overlay - 62 Aufrufe in
+ * 20 Dateien, Formulare und Ansichtsblätter darunter. Dort ist der erste
+ * Zeigerklick Absicht: jemand hat das Blatt aufgemacht und tippt hinein. Im
+ * Notizblatt fiel so der Moduswechsel weg, und eine Sonde wartete 42 s auf
+ * eine Vorschlagsliste, die nie kam. Scharf gestellt wird deshalb einzeln,
+ * über `pointerDeadTime: true` - siehe openModal.
+ *
+ * 350 ms deckt die Einfahrt (280 ms) samt Rest ab und liegt unter der
+ * Schwelle, ab der ein GEWOLLTER zweiter Klick sich verschluckt anfühlt.
+ */
+const POINTER_DEAD_TIME_MS = 350;
+
+/**
+ * Genau die Ereignisse, mit denen ein Zeiger etwas auslöst.
+ *
+ * Die Touch-Ereignisse stehen bewusst NICHT dabei: `touchstart`/`touchmove`
+ * tragen das Scrollen des Inhalts und die Wischgeste des Sheets
+ * (`_wireSheetSwipe`), und sie abzufangen hieße, eine Geste mittendrin
+ * abzuschneiden. Der Tipp selbst kommt ohnehin hier vorbei - als `click` mit
+ * `pointerType: 'touch'`.
+ */
+const POINTER_ACTIVATION_EVENTS = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+
+/**
+ * Kommt dieses Ereignis von einem Zeiger - oder von Tastatur bzw. Screenreader?
+ *
+ * DIE TOTZEIT UNTERSCHEIDET DIE EREIGNISART, NICHT NUR DIE ZEIT. Eine Sperre,
+ * die auch `Enter`/`Space` schluckt, wäre kein Schutz, sondern ein Rückschritt
+ * in der Bedienbarkeit: wer mit Tastatur bedient, tabbt in den Dialog und
+ * drückt - dazwischen liegen keine 350 ms Nachdenkzeit, die man ihm abziehen
+ * dürfte, und er hat auch nie „danebengetippt", weil kein Sheet unter seinen
+ * Finger gefahren ist.
+ *
+ * Zwei Merkmale, und EINES genügt, weil keines für sich vollständig ist:
+ * Chrome liefert einen per Tastatur ausgelösten Klick als PointerEvent mit
+ * leerem `pointerType` und `detail === 0` - dasselbe gilt für `element.click()`
+ * und für die Betätigung durch einen Screenreader. Ein Tipp trägt
+ * `pointerType: 'touch'`, ein älterer MouseEvent ohne `pointerType` immerhin
+ * `detail >= 1`. Nur auf `pointerType` zu hören ließe den Tipp durch, sobald
+ * ein Browser den Kompatibilitätsklick ohne Zeigerart schickt; nur auf
+ * `detail` zu hören ließe `pointerdown` durch, das kein `detail` führt.
+ */
+function _isPointerActivation(event) {
+  if (typeof event?.pointerType === 'string' && event.pointerType !== '') return true;
+  return typeof event?.detail === 'number' && event.detail > 0;
+}
+
+/**
+ * Hängt die Totzeit an ein frisch geöffnetes Overlay.
+ *
+ * CAPTURE AUF DER WURZEL UND ALS ERSTER LISTENER. Capture, damit das Ereignis
+ * fällt, bevor irgendein Handler im Dialog es sieht; als erster, weil ein
+ * Klick auf das Overlay SELBST (der Schließweg über den Hintergrund) im
+ * AT_TARGET-Fall landet - dort laufen Capture- und Bubble-Listener desselben
+ * Knotens in Registrierungsreihenfolge, und `stopImmediatePropagation` wirkt
+ * nur auf das, was noch kommt.
+ *
+ * `now` und `duration` sind für die Sonden da: eine Totzeit belegt man, indem
+ * man die Zeit vorstellt, nicht indem man die Konstante im Quelltext sucht.
+ *
+ * @param {EventTarget} root
+ * @param {{now?: () => number, duration?: number}} [opts]
+ * @returns {(event: Event) => void} der angehängte Handler (für Sonden)
+ */
+export function armPointerDeadTime(root, { now = () => performance.now(), duration = POINTER_DEAD_TIME_MS } = {}) {
+  const openedAt = now();
+  const swallow = (event) => {
+    if (now() - openedAt >= duration) return;
+    if (!_isPointerActivation(event)) return;
+    event.preventDefault?.();
+    event.stopImmediatePropagation?.();
+  };
+  for (const type of POINTER_ACTIVATION_EVENTS) root.addEventListener(type, swallow, true);
+  return swallow;
+}
+
+// --------------------------------------------------------
 // openModal
 // --------------------------------------------------------
 
@@ -1185,10 +1553,16 @@ export function updateHeaderAction(panel, { label, onClick, hidden = false } = {
  * @param {boolean} [opts.dirtyGuard=true] - `false` für Ansichtsblätter, deren
  *   Felder sofort wirken und nichts zu speichern haben (siehe _dirtyGuardEnabled).
  *   Für alles mit einem Speichern-Knopf bleibt es an.
+ * @param {boolean} [opts.pointerDeadTime=false] - `true` NUR für Rückfragen, also
+ *   Dialoge, deren Knöpfe eine Frage beantworten. Sie nehmen dann 350 ms lang
+ *   keinen Zeigerklick an, damit ein Tipp, der noch zum Öffnen gehörte, nicht
+ *   ungelesen antwortet (siehe POINTER_DEAD_TIME_MS). Ein Formular, das jemand
+ *   selbst aufgemacht hat, bekommt das NICHT: dort ist der erste Klick Absicht.
  */
 export function openModal({
   title, content, onSave, onDelete, onClose, size = 'md',
   initialFocus = 'first-field', headerAction = null, dirtyGuard = true,
+  pointerDeadTime = false,
 } = {}) {
   // Vorheriges Modal schließen (kein Stacking).
   if (activeOverlay) {
@@ -1237,6 +1611,18 @@ export function openModal({
   document.body.insertAdjacentHTML('beforeend', html);
   activeOverlay = document.getElementById('shared-modal-overlay');
   activeOverlay._onCloseCallback = onClose;
+
+  // VOR JEDEM ANDEREN LISTENER AUF DIESEM KNOTEN: die Totzeit schluckt einen
+  // Zeigerklick, der noch zum Öffnen gehört, und ihre Reihenfolge entscheidet
+  // mit - siehe armPointerDeadTime.
+  //
+  // NUR FÜR RÜCKFRAGEN. Sie schluckt jeden Zeigerklick auf dem Overlay, also
+  // auch den auf ein Feld oder einen Umschalter. In einer Rückfrage ist der
+  // verfrühte Klick eine ANTWORT auf eine ungelesene Frage; in einem Formular,
+  // das jemand selbst aufgemacht hat, ist er Absicht, und ihn zu schlucken ist
+  // der Fehler. Gemessen: der Moduswechsel im Notizblatt fiel weg, und die
+  // Sonde wartete 42 s auf eine Vorschlagsliste, die nie kam.
+  if (pointerDeadTime) armPointerDeadTime(activeOverlay);
 
   // Lucide-Icons rendern
   if (window.lucide) window.lucide.createIcons({ el: activeOverlay });
@@ -1406,24 +1792,47 @@ export async function closeModal({ force = false } = {}) {
     panel.removeEventListener('focusin', panel._onInputFocus);
   }
 
-  // Animation handling
-  const isMobile = window.innerWidth < 768;
-  if (isMobile && panel) {
+  // Ausgang: Tafel und Overlay auf JEDER Breite (Critique 2026-09-26, P1-1).
+  // Bis dahin gab es ihn nur mobil, und auch dort lief er nie - glass.css
+  // schlug die Schliess-Regel, `animationend` kam nicht, und dieser Timer
+  // raeumte nach 400ms eine Tafel ab, die die ganze Zeit reglos stand. Die
+  // Kaskade haelt jetzt test-motion.js; der Timer bleibt als Sicherheitsnetz
+  // fuer den Fall, dass das Ende doch ausbleibt (verdeckter Tab, abgehaengter
+  // Knoten).
+  //
+  // Unter reduzierter Bewegung gibt es keinen Ausgang, also auch kein Warten:
+  // die Regeln setzen die Animation dort auf `none`, und ein `animationend`
+  // kaeme nie.
+  const reduceMotion = typeof matchMedia === 'function'
+    && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (panel && !reduceMotion) {
     panel.classList.add('modal-panel--closing');
+    capturedOverlay.classList.add('modal-overlay--closing');
     // _doClose setzt modalState auf 'idle', sobald der Overlay final entfernt wird.
     const fallback = setTimeout(() => {
+      panel.removeEventListener('animationend', onExitEnd);
       _doClose(capturedOverlay);
-    }, 400); // Slightly longer fallback
-    panel.addEventListener('animationend', () => {
+    }, MODAL_EXIT_FALLBACK_MS);
+    // NUR das Ende der eigenen Ausgangs-Animation. `animationend` blubbert: ein
+    // Kind, das gerade fertig wird (Haken-Pop, Fehler-Wackeln), raeumte die
+    // Tafel sonst mitten im Ausgang ab.
+    function onExitEnd(event) {
+      if (event.target !== panel) return;
+      panel.removeEventListener('animationend', onExitEnd);
       clearTimeout(fallback);
       _doClose(capturedOverlay);
-    }, { once: true });
+    }
+    panel.addEventListener('animationend', onExitEnd);
     return true;
   }
 
   _doClose(capturedOverlay);
   return true;
 }
+
+/* Laenger als der laengste Ausgang (mobil `--duration-md` = 200ms), damit das
+ * Netz nur greift, wenn das Ende wirklich ausbleibt. */
+const MODAL_EXIT_FALLBACK_MS = 400;
 
 // --------------------------------------------------------
 // promptModal
@@ -1441,6 +1850,7 @@ export function promptModal(label, defaultValue = '') {
     }
 
     openModal({
+      pointerDeadTime: true,
       title: label,
       size: 'sm',
       content: `
@@ -1450,7 +1860,7 @@ export function promptModal(label, defaultValue = '') {
             <input class="form-input" id="prompt-modal-input" type="text"
                    value="${esc(defaultValue)}" autocomplete="off">
           </div>
-          <div class="modal-actions">
+          <div class="modal-panel__footer">
             <button type="button" class="btn btn--secondary" id="prompt-modal-cancel">${t('common.cancel')}</button>
             <button type="submit" class="btn btn--primary" id="prompt-modal-ok">${t('common.save')}</button>
           </div>
@@ -1463,7 +1873,17 @@ export function promptModal(label, defaultValue = '') {
 
         form.addEventListener('submit', (e) => {
           e.preventDefault();
-          finish(input.value.trim() || null);
+          // Ein leeres Feld ist keine Antwort (#1607). Bis dahin loeste es mit
+          // null auf - demselben Wert wie Abbrechen -, der Dialog ging zu und
+          // nichts geschah: Speichern sah aus wie ein Fehler ohne Text. null
+          // heisst jetzt nur noch "abgebrochen"; kein Aufrufer liest ein leeres
+          // Feld als gueltige Eingabe.
+          const value = input.value.trim();
+          if (!value) {
+            reportFieldError(input, t('common.required'));
+            return;
+          }
+          finish(value);
         });
 
         cancel.addEventListener('click', () => finish(null));
@@ -1497,6 +1917,7 @@ export function selectModal(label, options) {
       .join('');
 
     openModal({
+      pointerDeadTime: true,
       title: label,
       size: 'sm',
       content: `
@@ -1505,7 +1926,7 @@ export function selectModal(label, options) {
             <label class="sr-only" for="select-modal-input">${esc(label)}</label>
             <select class="form-input" id="select-modal-input">${optionsHtml}</select>
           </div>
-          <div class="modal-actions">
+          <div class="modal-panel__footer">
             <button type="button" class="btn btn--secondary" id="select-modal-cancel">${t('common.cancel')}</button>
             <button type="submit" class="btn btn--primary" id="select-modal-ok">${t('common.save')}</button>
           </div>
@@ -1555,11 +1976,12 @@ export function confirmModal(message, { confirmLabel, cancelLabel, danger = fals
     }
 
     openModal({
+      pointerDeadTime: true,
       title: message,
       size: 'sm',
       content: `
         ${detail ? `<p class="modal-confirm__detail">${esc(detail)}</p>` : ''}
-        <div class="modal-actions">
+        <div class="modal-panel__footer">
           <button type="button" class="btn btn--secondary" id="confirm-modal-cancel">${cancelLabel ?? t('common.cancel')}</button>
           <button type="button" class="btn ${danger ? 'btn--danger' : 'btn--primary'}" id="confirm-modal-ok">
             ${confirmLabel ?? t('common.confirm')}
@@ -1640,12 +2062,70 @@ function createConfirmOverModal({
 
 export const confirmOverModal = createConfirmOverModal();
 
+/**
+ * Eine Rückfrage ÜBER einem offenen Modal, deren Dialog der Aufrufer selbst
+ * baut - für Fragen, die mehr als zwei Ausgänge haben (#1284: „Nur diesen
+ * Termin" / „Diesen und folgende" / „Ganze Serie" / Abbrechen beim Speichern
+ * eines Serientermins).
+ *
+ * Dieselbe Mechanik wie `confirmOverModal` mit `closeOnConfirm: false`: das
+ * Formular wird geparkt, `ask()` öffnet den Dialog über `openModal` und liefert
+ * ein Promise auf die Antwort, danach kommt das Formular in JEDEM Fall zurück -
+ * samt Dirty-Snapshot, Escape-Handler und Fokus auf dem auslösenden Knopf. Was
+ * mit der Antwort geschieht (speichern, eine Meldung an einem Feld zeigen,
+ * abbrechen), entscheidet der Aufrufer am wiederhergestellten Formular.
+ *
+ * Ohne offenes Modal ruft es `ask()` einfach auf.
+ *
+ * @param {() => Promise<*>} ask - öffnet den Dialog, löst zur Antwort auf
+ * @returns {Promise<*>} die Antwort von `ask`
+ */
+function createAskOverModal({
+  getActiveOverlay = () => activeOverlay,
+  getModalState = () => modalState,
+  suspend = _suspendActiveModal,
+  askSuspended = _askOverSuspended,
+  resume = _resumeSuspendedModal,
+} = {}) {
+  return async function askOverModal(ask) {
+    // Dieselbe Bedingung wie bei confirmOverModal: nur ein regulär offenes
+    // Modal lässt sich parken.
+    if (!getActiveOverlay() || getModalState() !== 'open') return ask();
+    const suspended = suspend();
+    const answer = await askSuspended(ask, suspended);
+    resume(suspended);
+    return answer;
+  };
+}
+
+export const askOverModal = createAskOverModal();
+
 /** Nur fuer Tests: Gesten und Bestaetigungen ohne echtes Panel treiben. */
 export const __test = {
+  serializeForm,
+  // #1784: die Dirty-Basis als Programm - ein Overlay ohne openModal() zum
+  // offenen Formular erklaeren (Basis sofort, ohne den 150-ms-Nachlauf), den
+  // Waechter fragen und wieder aufraeumen.
+  isFormDirty,
+  adoptOverlayForTest(overlay) {
+    activeOverlay = overlay;
+    _dirtyGuardEnabled = true;
+    _snapshotNow();
+  },
+  releaseOverlayForTest() {
+    activeOverlay = null;
+    _initialFormSnapshot = null;
+  },
+  // Das echte Parken und Zurueckholen (confirmOverModal/askOverModal), ohne
+  // den Dialog dazwischen: die Basis wandert im Token mit.
+  suspendActiveModal: _suspendActiveModal,
+  resumeSuspendedModal: _resumeSuspendedModal,
   wireSheetSwipe: _wireSheetSwipe,
   createConfirmOverModal,
+  createAskOverModal,
   finishSuspendedConfirmation,
   applyInitialFocus,
+  trapFocus,
 };
 
 // --------------------------------------------------------
@@ -1723,10 +2203,18 @@ function _focusField(input) {
 function _validateField(input) {
   const group = input.closest('.form-field') ?? input.parentElement;
   const hasValue = input.value.trim().length > 0;
+  const wasShown = Boolean(group?.classList.contains?.('form-field--error'));
   if (group) _ensureFieldError(group, input);
   group?.classList.toggle('form-field--error', !hasValue);
   group?.classList.toggle('form-field--valid', hasValue);
   input.setAttribute('aria-invalid', String(!hasValue));
+  // Die Meldung zieht auf, statt zu erscheinen: sie ist eine Zeile hoch, und
+  // alles darunter rueckte in einem Frame um rund 24px - auch der Knopf, auf
+  // den der Zeiger gerade zielt (R18). `expandIn` ist der Baustein dafuer.
+  if (!hasValue && !wasShown) {
+    const el = typeof group?.querySelector === 'function' ? group.querySelector('.form-field__error') : null;
+    if (el) expandIn(el, { duration: durationToken('--duration-md', 200), absorbGap: true });
+  }
 
   if (!hasValue && group) {
     const count = parseInt(group.dataset.errorCount ?? '0', 10) + 1;
@@ -1744,12 +2232,32 @@ function _validateField(input) {
   return hasValue;
 }
 
+/**
+ * Felder, in die schon jemand geschrieben hat - je Knoten, ohne Spur im DOM.
+ *
+ * EIN UNBERUEHRTES PFLICHTFELD RUEGT NICHT (R18). Der Dialog oeffnet mit dem
+ * Fokus im ersten Feld; der erste Tab, der Griff zum Datumswaehler, ein Klick
+ * daneben - alles ein `blur` auf einem leeren Titel, und jedes davon meldete
+ * "Dieses Feld ist erforderlich.", bevor irgendwer etwas versaeumt hatte
+ * ("Neuer Termin", zwei Laeufe). Geruegt wird, wo eine Eingabe FEHLT: nach
+ * dem Absenden (`validateAll`) oder wenn jemand das Feld beschrieben und
+ * wieder geleert hat. Wer es nur durchquert, hat nichts falsch gemacht.
+ */
+const _touchedFields = new WeakSet();
+
 export function wireBlurValidation(formContainer) {
   formContainer.querySelectorAll('input[required], select[required], textarea[required]').forEach((input) => {
-    input.addEventListener('blur', () => _validateField(input));
+    input.addEventListener('blur', () => {
+      const pristineEmpty = input.value.trim().length === 0
+        && !_touchedFields.has(input)
+        && input.getAttribute('aria-invalid') !== 'true';
+      if (pristineEmpty) return;
+      _validateField(input);
+    });
     // Sofortige Entwarnung: ist das Feld bereits als fehlerhaft markiert,
     // räumt die nächste Eingabe den Fehler ohne erneuten Blur auf.
     input.addEventListener('input', () => {
+      _touchedFields.add(input);
       if (input.getAttribute('aria-invalid') === 'true') _validateField(input);
     });
   });
@@ -1782,9 +2290,15 @@ export function reportFieldError(input, message) {
   const group = (typeof input.closest === 'function' ? input.closest('.form-field') : null) ?? input.parentElement;
   if (!group) return false;
 
+  const wasShown = Boolean(group.classList?.contains?.('form-field--error'));
   _ensureFieldError(group, input, message);
   group.classList?.add('form-field--error');
   group.classList?.remove('form-field--valid');
+  // Dieselbe Bewegung wie in _validateField: die Meldung zieht auf.
+  if (!wasShown && typeof group.querySelector === 'function') {
+    const el = group.querySelector('.form-field__error');
+    if (el) expandIn(el, { duration: durationToken('--duration-md', 200), absorbGap: true });
+  }
   input.setAttribute?.('aria-invalid', 'true');
   _focusField(input);
 
@@ -1871,13 +2385,20 @@ export function btnError(btn) {
  * @param {Object} [opts]
  * @param {string} [opts.label]     - Aufklapper-Beschriftung (Default: t('modal.moreSettings'))
  * @param {boolean} [opts.open=false] - Initial geöffnet (z. B. wenn Sekundärfelder bereits befüllt sind)
+ * @param {string} [opts.hint]      - Zweite Zeile unter der Beschriftung: was hinter dem
+ *   Aufklapper liegt (Klartext, wird escaped). Ohne sie findet ein Feld dort nur, wer
+ *   schon weiss, dass es existiert.
  * @returns {string} HTML-String
  */
-export function advancedSection(innerHtml, { label, open = false } = {}) {
+export function advancedSection(innerHtml, { label, open = false, hint = '' } = {}) {
+  const text = esc(label ?? t('modal.moreSettings'));
+  const labelHtml = hint
+    ? `<span class="form-advanced__label"><span>${text}</span><span class="form-advanced__hint">${esc(hint)}</span></span>`
+    : `<span>${text}</span>`;
   return `
     <details class="form-advanced"${open ? ' open' : ''}>
       <summary class="form-advanced__summary">
-        <span>${esc(label ?? t('modal.moreSettings'))}</span>
+        ${labelHtml}
         <i data-lucide="chevron-down" class="form-advanced__chevron" aria-hidden="true"></i>
       </summary>
       <div class="form-advanced__body">

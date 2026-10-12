@@ -21,13 +21,13 @@
 
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, existsSync, readFileSync, readdirSync, copyFileSync, writeFileSync, chmodSync, rmSync, renameSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, copyFileSync, writeFileSync, chmodSync, rmSync, renameSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3-multiple-ciphers';
+import { tempDir } from './tmp-dir.js';
 
 const KEY = 'test-encryption-key-0123456789';
 const PLAINTEXT_HEADER = Buffer.from('SQLite format 3\0', 'binary');
@@ -48,7 +48,7 @@ async function bootDb(dbPath, encryptionKey) {
 }
 
 function tmpDir() {
-  return mkdtempSync(join(tmpdir(), 'yuvomi-encryption-'));
+  return tempDir('yuvomi-encryption-');
 }
 
 /** true, wenn die Datei mit dem unverschlüsselten SQLite-Header beginnt. */
@@ -1698,8 +1698,10 @@ for (const [fall, key] of SCHLUESSEL_FAELLE) {
     const run = cliRestore(backupDasNachDemKopierenScheitert(), { dbPath: ziel, key });
     assert.equal(run.status, 1, 'der Restore muss scheitern');
     assert.ok(run.failure, `als „Restore failed: ...": ${run.stderr}`);
-    const rollbacks = readdirSync(dir).filter((name) => /\.pre-restore-[^.]+$/.test(name) && !/-(wal|shm)$/.test(name));
-    assert.equal(rollbacks.length, 1, 'Vorbedingung: gescheitert ist er erst nach dem Kopieren, die Rollback-Kopie steht');
+    // Gescheitert ist er erst nach dem Tausch, in init(): die Validierung
+    // meldet sich mit „Backup ...". Den Rollback macht seit Review #1431 ein
+    // rename - die Rollback-Kopie IST danach wieder DB_PATH.
+    assert.doesNotMatch(run.failure, /^Backup /, 'Vorbedingung: gescheitert ist er erst nach dem Tausch, nicht in der Validierung');
     assert.ok(
       !/Rollback after failed restore also failed/.test(run.stderr),
       `die leere Datei wieder zu verweigern ist der alte Stand, kein gescheiterter Rollback: ${run.stderr}`
@@ -1713,9 +1715,9 @@ for (const [fall, key] of SCHLUESSEL_FAELLE) {
     );
     assert.equal(existsSync(`${ziel}-shm`) && sha256(`${ziel}-shm`), shmVorher, 'samt -shm');
     assert.deepEqual(
-      readdirSync(dir).filter((name) => name.startsWith(rollbacks[0]) && name !== rollbacks[0]),
+      readdirSync(dir).filter((name) => name.includes('.pre-restore-') || name.includes('.restore-tmp')),
       [],
-      'und nichts mehr neben der Rollback-Kopie, unter keinem Namen'
+      'und nichts mehr von der Rollback-Kopie oder der Arbeitsdatei, unter keinem Namen'
     );
     await assert.rejects(
       () => bootDb(ziel, key),
@@ -1807,23 +1809,59 @@ const ERSTSTART_QUELLE = `
 `;
 
 /** Env eines Erststarts in einem eigenen Prozess. */
-function startEnv(dbPath, key) {
-  const env = { ...process.env, DB_PATH: dbPath, LOG_LEVEL: 'error' };
+function startEnv(dbPath, key, logLevel = 'error') {
+  const env = { ...process.env, DB_PATH: dbPath, LOG_LEVEL: logLevel };
   if (key) env.DB_ENCRYPTION_KEY = key;
   else delete env.DB_ENCRYPTION_KEY;
   return env;
 }
 
-/** Erststart als eigener Prozess; aufgeloest mit Exit-Code und Ausgabe. */
-function ersterStart(dbPath, key) {
+/**
+ * Erststart als eigener Prozess; aufgeloest mit Exit-Code, Ausgabe und Fehlern.
+ *
+ * `logLevel` hebt das Log des Startwegs an, wo es zur Diagnose gehoert. Wer
+ * `ausgabe()` als Signal „der Start ist hochgekommen" liest, muss bei 'error'
+ * bleiben: ab 'info' steht dort auch jede angewendete Migration.
+ */
+function ersterStart(dbPath, key, logLevel) {
   const kind = spawn(process.execPath, ['--input-type=module', '-e', ERSTSTART_QUELLE], {
-    cwd: tmpDir(), env: startEnv(dbPath, key), stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: tmpDir(), env: startEnv(dbPath, key, logLevel), stdio: ['ignore', 'pipe', 'pipe'],
   });
   let ausgabe = '';
+  let fehler = '';
   kind.stdout.on('data', (stueck) => { ausgabe += stueck; });
-  kind.stderr.resume();
-  const ende = new Promise((fertig) => kind.on('exit', (code) => fertig(code)));
-  return { kind, ende, ausgabe: () => ausgabe };
+  // Nicht `resume()`: der Grund, warum ein Start ausstieg, steht genau hier
+  // (#1312). Verworfen kostete jeder rote CI-Lauf einen Rerun und sagte nichts
+  // Neues - der Exit-Code allein nennt keine der moeglichen Ursachen.
+  kind.stderr.on('data', (stueck) => { fehler += stueck; });
+  // `close`, nicht `exit`: `exit` feuert, sobald der Prozess endet, und kann den
+  // gepufferten `data`-Ereignissen der Pipes zuvorkommen - `close` kommt erst,
+  // wenn beide stdio-Stroeme zu sind. Mit `exit` haette `startBericht()` genau
+  // im Fall eines abrupten Absturzes unter Last abgeschnittene oder leere
+  // Ausgabe gelesen, also in dem Fall, fuer den dieser Bericht gebaut ist.
+  // Den Exit-Code reicht `close` als erstes Argument genauso durch.
+  const ende = new Promise((fertig) => kind.on('close', (code) => fertig(code)));
+  return { kind, ende, ausgabe: () => ausgabe, fehler: () => fehler };
+}
+
+/**
+ * Warum jeder Start ausstieg, als Anhang an eine Zusicherung (#1312).
+ *
+ * Zeilen „Migration N applied" laesst der Bericht weg, falls ein Aufrufer den
+ * Log-Level doch anhebt: 220 je Prozess wuerden den Stacktrace begraben.
+ */
+function startBericht(laeufe, codes) {
+  const ohneMigrationen = (text) => text
+    .split('\n')
+    .filter((zeile) => !/^\[DB\] Migration \d+ applied:/.test(zeile))
+    .join('\n')
+    .trim();
+  const block = (text) => (text ? `\n${text.split('\n').map((z) => `      ${z}`).join('\n')}` : ' <leer>');
+  return laeufe.map((lauf, i) => [
+    `  Start ${i + 1}, exit ${codes[i]}`,
+    `    stdout:${block(ohneMigrationen(lauf.ausgabe()))}`,
+    `    stderr:${block(ohneMigrationen(lauf.fehler()))}`,
+  ].join('\n')).join('\n');
 }
 
 /**
@@ -1989,17 +2027,36 @@ test('#1287 zwei Erststarts gleichzeitig: DB_PATH ist danach eine Datenbank, nie
   // hoch, DB_PATH traegt danach dessen Datenbank. Der letzte Zug ist deshalb
   // `link()`: mit `rename()` ueberschrieb der Verlierer in 1 von 10 Laeufen die
   // schon migrierte Datenbank des Gewinners.
+  //
+  // Dass hier BEIDE Starts ausfallen koennen, ist gemessen (#1312, zweimal auf
+  // CI, lokal 7 von 325 Paaren): die Uebergabe der Arbeitsdatei ist daran
+  // unbeteiligt - DB_PATH ist jedes Mal eine Datenbank und keine Arbeitsdatei
+  // bleibt liegen. Beide sterben in `migrate()`: der eine daran, dass der
+  // andere dieselbe Migration schon angewendet hat (SQLITE_CONSTRAINT_PRIMARYKEY
+  // auf `schema_migrations.version` oder „table ... already exists"), der
+  // andere mit SQLITE_BUSY. Wer das nachsieht, faengt deshalb bei `migrate()`
+  // an und nicht bei `createDatabaseFile()`.
   const dir = tmpDir();
   const dbPath = join(dir, 'yuvomi.db');
 
-  const laeufe = [ersterStart(dbPath, KEY), ersterStart(dbPath, KEY)];
+  // LOG_LEVEL 'warn' statt 'error': die eine Zeile, die `createDatabaseFile()`
+  // schreibt, wenn es eine liegengebliebene Arbeitsdatei WEGRAEUMT und den
+  // Vorgang wiederholt, trennt diese Ursache von den anderen (#1312) - sie
+  // steht nur im Zweig, in dem der Start eine fremde Arbeitsdatei vorfand.
+  // Nicht 'info': das waeren 220 Zeilen „Migration N applied" je Prozess, und
+  // eine Diagnose, die den gemessenen Ablauf verlangsamt, misst ihn nicht mehr.
+  const laeufe = [ersterStart(dbPath, KEY, 'warn'), ersterStart(dbPath, KEY, 'warn')];
   const codes = await Promise.all(laeufe.map((lauf) => lauf.ende));
+  const bericht = startBericht(laeufe, codes);
 
-  assert.ok(codes.includes(0), `mindestens ein Start muss hochkommen: ${codes.join(', ')}`);
-  assert.ok(groesse(dbPath) > 0, 'DB_PATH darf danach keine leere Datei sein');
+  assert.ok(
+    codes.includes(0),
+    `mindestens ein Start muss hochkommen: ${codes.join(', ')}\n${bericht}`
+  );
+  assert.ok(groesse(dbPath) > 0, `DB_PATH darf danach keine leere Datei sein\n${bericht}`);
   assert.deepEqual(
     readdirSync(dir).filter((name) => name.includes('.creating')), [],
-    'keine Arbeitsdatei darf liegen bleiben'
+    `keine Arbeitsdatei darf liegen bleiben\n${bericht}`
   );
 
   // Die Datenbank des Gewinners, nicht eine frisch drueber gelegte Huelle.

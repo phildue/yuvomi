@@ -9,10 +9,67 @@
 // Bootstrap setzt das Attribut rechtzeitig auf die echte Locale, sodass deklarierte
 // Sprache und gerenderter Inhalt übereinstimmen.
 //
-// Resolve-Logik gespiegelt aus i18n.js (resolveLocale): bei Änderung dort mitziehen.
+// Resolve-Logik gespiegelt aus i18n.js (pickLocale/resolveLocale): bei Änderung
+// dort mitziehen. Ein Import ginge nicht - das hier läuft vor jedem Modul -, und
+// deshalb hält test:lang-init beide Fassungen und beide Sprachlisten aneinander:
+// `fil` kam am 04.08.2026 dazu und fehlte hier bis zum 21.09.2026 (#1324), also
+// bekam ein philippinisches System lang="en" auf einen Body auf Filipino.
 (function() {
-  var SUPPORTED = ['de', 'en', 'es', 'fr', 'it', 'sv', 'el', 'ru', 'tr', 'zh', 'ja', 'ar', 'hi', 'pt', 'uk', 'pl', 'nl', 'cs', 'vi', 'hu', 'ko', 'id', 'fa'];
+  var SUPPORTED = ['de', 'en', 'es', 'fr', 'it', 'sv', 'el', 'ru', 'tr', 'zh', 'ja', 'ar', 'hi', 'pt-BR', 'pt', 'uk', 'pl', 'nl', 'cs', 'vi', 'hu', 'ko', 'id', 'fa', 'fil', 'nb'];
   var STORAGE_KEY = 'yuvomi-locale';
+  // Regionen, die eine Schrift implizieren: ein Browser meldet `zh-TW`, nie
+  // `zh-Hant-TW`. `CN` und `SG` fehlen bewusst - unser `zh` ist Vereinfacht.
+  var REGION_SCRIPT = { TW: 'Hant', HK: 'Hant', MO: 'Hant' };
+  // Sprachcodes, die eine vorhandene Locale meinen: `no` (Makrosprache) und `nn`
+  // (Nynorsk, ohne eigene Datei) fallen auf `nb`, aber erst, wenn der Tag selbst
+  // nichts findet - siehe LANGUAGE_ALIAS in i18n.js.
+  var LANGUAGE_ALIAS = { no: 'nb', nn: 'nb' };
+
+  /** Kanonische BCP-47-Schreibweise: Sprache klein, Schrift Titlecase, Region groß. */
+  function canonicalTag(tag) {
+    var teile = String(tag).split('-');
+    for (var i = 0; i < teile.length; i++) {
+      if (i === 0) teile[i] = teile[i].toLowerCase();
+      else if (teile[i].length === 4) teile[i] = teile[i].charAt(0).toUpperCase() + teile[i].slice(1).toLowerCase();
+      else if (teile[i].length === 2) teile[i] = teile[i].toUpperCase();
+      else teile[i] = teile[i].toLowerCase();
+    }
+    return teile.join('-');
+  }
+
+  /** Ein Tag als Subtag-Liste gegen SUPPORTED: vom vollen Tag abwärts, oder null. */
+  function matchTag(teile) {
+    // Eine Schrift, die im Tag STEHT, schlaegt jede, die eine Region nahelegt
+    // (`zh-Hans-HK` meint Vereinfacht) - siehe i18n.js#matchTag.
+    var traegtSchrift = false;
+    for (var k = 1; k < teile.length; k++) if (teile[k].length === 4) traegtSchrift = true;
+    while (teile.length) {
+      var tag = teile.join('-');
+      if (SUPPORTED.indexOf(tag) !== -1) return tag;
+      if (!traegtSchrift) {
+        var letzter = teile[teile.length - 1];
+        var schrift = Object.prototype.hasOwnProperty.call(REGION_SCRIPT, letzter) ? REGION_SCRIPT[letzter] : null;
+        if (schrift && SUPPORTED.indexOf(teile[0] + '-' + schrift) !== -1) return teile[0] + '-' + schrift;
+      }
+      teile.pop();
+    }
+    return null;
+  }
+
+  /** Die spezifischste unterstützte Locale: `zh-Hant-TW` > `zh-Hant` > `zh`. */
+  function pickLocale(tags) {
+    for (var i = 0; i < tags.length; i++) {
+      if (!tags[i]) continue;
+      var teile = canonicalTag(tags[i]).split('-');
+      var treffer = matchTag(teile.slice());
+      if (treffer) return treffer;
+      if (Object.prototype.hasOwnProperty.call(LANGUAGE_ALIAS, teile[0])) {
+        var alias = matchTag([LANGUAGE_ALIAS[teile[0]]].concat(teile.slice(1)));
+        if (alias) return alias;
+      }
+    }
+    return 'en';
+  }
 
   function resolve() {
     try {
@@ -20,12 +77,7 @@
       if (stored && SUPPORTED.indexOf(stored) !== -1) return stored;
     } catch (e) { /* localStorage kann blockiert sein (Privatmodus) */ }
 
-    var browserLocales = navigator.languages || [navigator.language || ''];
-    for (var i = 0; i < browserLocales.length; i++) {
-      var base = String(browserLocales[i]).split('-')[0].toLowerCase();
-      if (SUPPORTED.indexOf(base) !== -1) return base;
-    }
-    return 'en';
+    return pickLocale(navigator.languages || [navigator.language || '']);
   }
 
   var locale = resolve();

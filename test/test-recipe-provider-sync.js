@@ -405,3 +405,193 @@ test('sync(): eine Lookup-Ablehnung schreibt last_error MIT dem Schalter, ein an
   const plain = conn.prepare('SELECT last_error FROM recipe_provider_accounts WHERE id = ?').get(accountId);
   assert.equal(plain.last_error, 'network down', 'kein Hinweis, wo er nicht hingehoert');
 });
+
+// =========================================================================
+// Die bestaetigte Zuordnung Zutat -> Vorratszeile (#1314) am Spiegel-Weg
+// =========================================================================
+
+/*
+ * DERSELBE VORGANG WIE `PUT /recipes/:id`, NUR OHNE MENSCHEN DAVOR: ein
+ * Spiegel-Lauf loescht die Zutaten eines Rezepts und legt sie neu an. Die
+ * Zuordnung aus #1314 haengt am normalisierten Zutatennamen, also ueberlebt sie
+ * das - und bleibt liegen, wenn der Provider die Zutat umbenennt. Sie ist dann
+ * unsichtbar, aber wiederbelebbar: heisst spaeter wieder eine Zutat so, haengt
+ * die Leseseite die alte Vorratszeile erneut an, ohne dass irgendwer DIESE
+ * Zuordnung bestaetigt haette.
+ *
+ * Und hier entscheidet der Provider ueber den Namen, nicht der Haushalt: die
+ * Umbenennung passiert, ohne dass jemand hier etwas tut.
+ *
+ * Gemessen wird der LAUF, nicht der Quelltext. Ein Textguard laesst offen, ob
+ * ihn ueberhaupt jemand als Programm ausfuehrt.
+ */
+
+function pantryRow(name) {
+  return Number(conn.prepare(
+    "INSERT INTO pantry_items (name, quantity, unit, created_by) VALUES (?, 2, 'pcs', ?)",
+  ).run(name, OWNER).lastInsertRowid);
+}
+// Immer auf EIN Rezept eingegrenzt: die Suite teilt sich eine Datenbank, und
+// eine Zeile aus einem Nachbartest waere ein Fehlschlag aus dem falschen Grund.
+const matchRowsFor = (recipeId) => conn.prepare(
+  'SELECT ingredient_key, pantry_item_id FROM recipe_ingredient_pantry_matches WHERE recipe_id = ? ORDER BY ingredient_key',
+).all(recipeId);
+
+test('sync(): ein Spiegel-Lauf setzt nie eine Zuordnung, auch bei identischem Namen', async () => {
+  pantryRow('Mehl');
+  const accountId = newAccount('Nie-geraten');
+  _setAdapterFactory(fakeAdapter(
+    [{ id: 'uuid-brot', ref: 'brot', updatedAt: '2026-01-01T00:00:00Z' }],
+    { brot: { id: 'uuid-brot', updatedAt: '2026-01-01T00:00:00Z', slug: 'brot', title: 'Brot', notes: null, hasImage: false, ingredients: [{ name: 'Mehl', quantity: null, category: 'Sonstiges' }] } },
+  ));
+  await sync.sync();
+
+  assert.deepEqual(ingredientsFor(accountId, 'uuid-brot').map((i) => i.name), ['Mehl'], 'Vorbedingung: die Zutat ist da');
+  const brotId = conn.prepare('SELECT id FROM recipes WHERE provider_account_id = ?').get(accountId).id;
+  assert.deepEqual(matchRowsFor(brotId), [],
+    'ein gleicher Name ist eine Namensaehnlichkeit, keine Aussage des Haushalts (docs/DECISIONS.md Abschnitt 7)');
+});
+
+test('sync(): benennt der Provider eine zugeordnete Zutat um, faellt die Zuordnung weg statt liegen zu bleiben', async () => {
+  const glas = pantryRow('Weizenmehl 405');
+  const accountId = newAccount('Umbenannte-Zutat');
+  _setAdapterFactory(fakeAdapter(
+    [{ id: 'uuid-waffel', ref: 'waffel', updatedAt: '2026-01-01T00:00:00Z' }],
+    { waffel: { id: 'uuid-waffel', updatedAt: '2026-01-01T00:00:00Z', slug: 'waffel', title: 'Waffeln', notes: null, hasImage: false, ingredients: [{ name: 'Mehl', quantity: null, category: 'Sonstiges' }] } },
+  ));
+  await sync.sync();
+  const recipeId = conn.prepare('SELECT id FROM recipes WHERE provider_account_id = ?').get(accountId).id;
+
+  // Der Haushalt bestaetigt die Zuordnung von Hand - der einzige Weg, auf dem
+  // eine entsteht (PUT /recipes/:id/ingredient-match verbietet Mirror-Rezepte
+  // nicht, es haengt nur eine Vorratszeile an eine Zutat).
+  conn.prepare(`
+    INSERT INTO recipe_ingredient_pantry_matches (recipe_id, ingredient_key, pantry_item_id, confirmed_by)
+    VALUES (?, 'mehl', ?, ?)
+  `).run(recipeId, glas, OWNER);
+  assert.equal(matchRowsFor(recipeId).length, 1, 'Vorbedingung: die Zuordnung steht');
+
+  // Der Provider benennt die Zutat um. Hier tut niemand etwas.
+  _setAdapterFactory(fakeAdapter(
+    [{ id: 'uuid-waffel', ref: 'waffel', updatedAt: '2026-02-01T00:00:00Z' }],
+    { waffel: { id: 'uuid-waffel', updatedAt: '2026-02-01T00:00:00Z', slug: 'waffel', title: 'Waffeln', notes: null, hasImage: false, ingredients: [{ name: 'Dinkelmehl', quantity: null, category: 'Sonstiges' }] } },
+  ));
+  await sync.sync();
+
+  assert.deepEqual(matchRowsFor(recipeId), [],
+    'die Aussage galt einer Zutat, die dieses Rezept nicht mehr hat - sie bleibt nicht als Blindgaenger liegen');
+
+  // Und sie kommt auch nicht zurueck, wenn der alte Name wieder auftaucht.
+  _setAdapterFactory(fakeAdapter(
+    [{ id: 'uuid-waffel', ref: 'waffel', updatedAt: '2026-03-01T00:00:00Z' }],
+    { waffel: { id: 'uuid-waffel', updatedAt: '2026-03-01T00:00:00Z', slug: 'waffel', title: 'Waffeln', notes: null, hasImage: false, ingredients: [{ name: 'Mehl', quantity: null, category: 'Sonstiges' }] } },
+  ));
+  await sync.sync();
+  assert.deepEqual(matchRowsFor(recipeId), [], 'eine auferstandene Zuordnung ist eine geratene');
+});
+
+test('sync(): ein unveraenderter Lauf laesst eine bestaetigte Zuordnung in Ruhe', async () => {
+  // Die Gegenrichtung, und ohne sie sagt jedes leere Ergebnis oben nichts: ein
+  // Aufraeumen, das immer alles wegnimmt, saehe genauso aus.
+  const glas = pantryRow('Rohrzucker');
+  const accountId = newAccount('Bleibt-stehen');
+  const details = { kuchen: { id: 'uuid-kuchen', updatedAt: '2026-01-01T00:00:00Z', slug: 'kuchen', title: 'Kuchen', notes: null, hasImage: false, ingredients: [{ name: 'Zucker', quantity: null, category: 'Sonstiges' }] } };
+  _setAdapterFactory(fakeAdapter([{ id: 'uuid-kuchen', ref: 'kuchen', updatedAt: '2026-01-01T00:00:00Z' }], details));
+  await sync.sync();
+  const recipeId = conn.prepare('SELECT id FROM recipes WHERE provider_account_id = ?').get(accountId).id;
+  conn.prepare(`
+    INSERT INTO recipe_ingredient_pantry_matches (recipe_id, ingredient_key, pantry_item_id, confirmed_by)
+    VALUES (?, 'zucker', ?, ?)
+  `).run(recipeId, glas, OWNER);
+
+  // Neues updatedAt, gleiche Zutat: die Zutaten werden wirklich neu geschrieben.
+  _setAdapterFactory(fakeAdapter(
+    [{ id: 'uuid-kuchen', ref: 'kuchen', updatedAt: '2026-02-01T00:00:00Z' }],
+    { kuchen: { ...details.kuchen, updatedAt: '2026-02-01T00:00:00Z' } },
+  ));
+  await sync.sync();
+
+  assert.deepEqual(
+    matchRowsFor(recipeId), [{ ingredient_key: 'zucker', pantry_item_id: glas }],
+    'die Zutat heisst noch so, also gilt die Bestaetigung weiter',
+  );
+});
+
+// --------------------------------------------------------
+// Rezepte haushaltsweit abgeschaltet (#1660)
+// --------------------------------------------------------
+function setDisabledModules(modules) {
+  conn.prepare(`
+    INSERT INTO sync_config (key, value) VALUES ('disabled_modules', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(JSON.stringify(modules));
+}
+
+function countingAdapter(calls) {
+  const inner = fakeAdapter(
+    [{ id: 'uuid-stew', ref: 'stew', updatedAt: '2026-01-01T00:00:00Z' }],
+    { stew: { id: 'uuid-stew', updatedAt: '2026-01-01T00:00:00Z', slug: 'stew', title: 'Stew', notes: null, hasImage: false, ingredients: [] } },
+  );
+  return (account) => {
+    const adapter = inner(account);
+    return {
+      ...adapter,
+      testConnection: async (...args) => { calls.push('testConnection'); return adapter.testConnection(...args); },
+      listRecipeSummaries: async (...args) => { calls.push('listRecipeSummaries'); return adapter.listRecipeSummaries(...args); },
+    };
+  };
+}
+
+test('Stundenlauf: Rezepte abgeschaltet → fragt den Anbieter nicht und schreibt nichts, nach dem Einschalten schon', async () => {
+  const accountId = newAccount('Abgeschaltet');
+  const calls = [];
+  _setAdapterFactory(countingAdapter(calls));
+
+  try {
+    setDisabledModules(['recipes']);
+    const skipped = await sync.scheduledSync();
+    assert.deepEqual(calls, [], 'kein Abruf beim Anbieter');
+    assert.equal(skipped.imported, 0);
+    assert.equal(mirroredRecipes(accountId).length, 0);
+    const account = conn.prepare('SELECT last_sync FROM recipe_provider_accounts WHERE id = ?').get(accountId);
+    assert.equal(account.last_sync, null, 'ein uebersprungener Lauf gilt nicht als Sync');
+  } finally {
+    setDisabledModules([]);
+  }
+
+  const result = await sync.scheduledSync();
+  assert.equal(result.imported, 1);
+  assert.equal(mirroredRecipes(accountId).length, 1);
+});
+
+// Der Zeitgeber ruft den Stundenlauf und nicht `sync()` direkt: sonst stuende
+// die Pruefung in einer Funktion, die niemand faehrt (Verdrahtung, am Text
+// gemessen, weil startScheduler() nur Timer stellt).
+test('startScheduler() faehrt scheduledSync(), nicht sync()', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('../server/services/recipe-provider-sync.js', import.meta.url), 'utf8');
+  const body = source.slice(source.indexOf('export function startScheduler()'));
+  assert.match(body, /scheduledSync\(\)\.catch/);
+  assert.doesNotMatch(body, /[^d]sync\(\)\.catch/);
+});
+
+test('sync() und syncOne(): der Sync von Hand bleibt bei abgeschaltetem Modul offen - die Handlung einer Person', async () => {
+  const allId = newAccount('HandAlle');
+  const calls = [];
+  _setAdapterFactory(countingAdapter(calls));
+  try {
+    setDisabledModules(['recipes']);
+    // POST /recipe-providers/sync ruft sync() (alle Konten).
+    const all = await sync.sync();
+    assert.equal(all.imported, 1);
+    assert.ok(calls.includes('listRecipeSummaries'), 'der Anbieter wurde gefragt');
+    assert.equal(mirroredRecipes(allId).length, 1);
+
+    // POST /recipe-providers/accounts/:id/sync ruft syncOne().
+    const oneId = newAccount('HandEins');
+    const one = await sync.syncOne(oneId);
+    assert.equal(one.imported, 1);
+  } finally {
+    setDisabledModules([]);
+  }
+});

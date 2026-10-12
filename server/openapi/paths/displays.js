@@ -6,7 +6,7 @@ export function displaysPaths() {
       get: op({
         summary: 'List wall displays and their paired devices',
         tag: 'Displays',
-        description: 'Admin only. A display is a `users` row of its own kind (#1208, DECISIONS entry 4): not a household member, without a password, and unable to sign in with a username and password or through SSO. This list is the exact counterpart of the member predicate - it shows only the accounts every list of people leaves out. Each entry carries its devices with "last seen" and, for a revoked one, the moment it was revoked; no secret is ever returned.',
+        description: 'Admin only. A display is a `users` row of its own kind (#1208, DECISIONS entry 4): not a household member, without a password, and unable to sign in with a username and password or through SSO. This list is the exact counterpart of the member predicate - it shows only the accounts every list of people leaves out. Each entry carries its devices with "last seen" and, for a revoked one, the moment it was revoked; no secret is ever returned. Beside `data` the answer carries `area_modules`: the modules a paired display reads besides the overview itself, derived from its fixed scope list.',
       }),
       post: op({
         summary: 'Create a wall display',
@@ -114,6 +114,25 @@ export function displaysPaths() {
         params: [idParam('id', 'Display ID'), idParam('deviceId', 'Device ID')],
         requestBody: null,
         description: 'Admin only. Sets `revoked_at` rather than deleting the row, so a revocation stays provable. Access ends on the device\'s next request - the credential is checked against the database every time, so there is no cached state a revocation would have to catch up with. The device has to belong to the display named in the path.',
+      }),
+    },
+    '/api/v1/displays/{id}/devices/{deviceId}/remove': {
+      post: op({
+        summary: 'Remove a revoked device',
+        tag: 'Displays',
+        stateChanging: true,
+        params: [idParam('id', 'Display ID'), idParam('deviceId', 'Device ID')],
+        requestBody: null,
+        description: 'Admin only. Deletes the row of a device that has been revoked - every new pairing revokes the device before it, and those rows otherwise stay in the list for good. This cannot be undone. A device that is still paired is refused with 409 and `reason: "display_device_active"`: revoke it first. The device has to belong to the display named in the path.',
+        responses: {
+          200: { description: 'The device row was removed' },
+          400: { $ref: '#/components/responses/BadRequest' },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          403: { $ref: '#/components/responses/Forbidden' },
+          404: { description: 'No such device on this display' },
+          409: { description: 'The device is still paired. The response body reason is `display_device_active`.' },
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
       }),
     },
   };

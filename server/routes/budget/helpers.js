@@ -9,11 +9,12 @@ import { readFileSync } from 'node:fs';
 import path from 'path';
 import * as db from '../../db.js';
 import {
-  budgetVisibilityWhere, budgetScopeWhere, budgetDetailsHiddenWhere, canEditEntry,
+  budgetVisibilityWhere, budgetDetailsVisibleWhere, budgetScopeWhere, budgetDetailsHiddenWhere, canEditEntry,
   resolveBudgetMode, maskBudgetEntry, BUDGET_MASKED_CATEGORY,
 } from '../../services/budget-visibility.js';
-import { computeLoanSchedule, remainingPrincipalFromPayments, remainingInstallmentsForBalance } from '../../services/loan-amortization.js';
+import { computeLoanSchedule, remainingPrincipalFromPayments, remainingInstallmentsForBalance, rateForInstallment } from '../../services/loan-amortization.js';
 import { todayKey } from '../../utils/timezone.js';
+import { DEFAULT_LOCALE, resolveHouseholdLocale, supportedLocaleFor } from '../../utils/i18n.js';
 import { newNonMembers } from '../../services/household-members.js';
 
 // --------------------------------------------------------
@@ -52,6 +53,42 @@ export function budgetFilter(req, alias, { scoped = true } = {}) {
     if (scope === 'mine') params.push(me); // household-Fragment hat keinen Bind
   }
   return { clause, params };
+}
+
+/**
+ * Wer sieht die erwarteten Abo-Zahlungen der Folgemonate (#1844)? Das
+ * WHERE-Fragment fuer services/subscription-budget-projection.js, Aliase `b`
+ * (die verknuepfte Buchung) und `sub` (das Abo).
+ *
+ * AUSLASSEN STATT MASKIEREN, und zwar an EINER Stelle. Eine erwartete Zeile
+ * bekommt nur, wer
+ *   - die gebuchte Zeile in dieser Ansicht sieht (budgetFilter, wie jede Buchung),
+ *   - sie MIT IHREM ZWECK sieht (budgetDetailsVisibleWhere), und
+ *   - das Abo selbst sieht (budgetVisibilityWhere, die Regel der Abo-Liste).
+ *
+ * Eine Buchung, die nur ihren Betrag teilt, bleibt maskiert in der Liste
+ * stehen, weil ihr Betrag in den Summen steckt und sie ohne die Zeile nicht
+ * aufgingen (#659). Eine erwartete Zeile steckt in KEINER Summe - ihr Fehlen
+ * verfaelscht nichts. Maskiert waere sie dagegen eine Reihe gleicher Betraege
+ * im Rhythmus eines Abos: der Zweck, nur ohne Titel, und gegen die Abo-Liste
+ * zu lesen. Das ist die Faustregel aus services/budget-visibility.js: geht es
+ * um den Zweck und gibt es keinen Saldo, den ein Weglassen verfaelscht, gilt
+ * die Zweck-Regel. Eine maskierte erwartete Zeile gibt es deshalb nicht, und
+ * damit auch keine Form, an der man sie erkennen koennte.
+ *
+ * @returns {{ clause: string, params: number[] }}  clause beginnt mit ' AND ' oder ''
+ */
+export function expectedSubscriptionFilter(req) {
+  const mode = getBudgetMode();
+  if (mode !== 'personal') return { clause: '', params: [] };
+  const me = viewerId(req);
+  const entry = budgetFilter(req, 'b');
+  return {
+    clause: `${entry.clause}`
+      + ` AND ${budgetDetailsVisibleWhere('b', '?', { mode })}`
+      + ` AND ${budgetVisibilityWhere('sub', '?', { mode })}`,
+    params: [...entry.params, me, me],
+  };
 }
 
 /**
@@ -113,10 +150,6 @@ export function mayEdit(req, row) {
 }
 
 const LOCALE_CACHE = new Map();
-const SUPPORTED_LANGS = new Set([
-  'ar', 'cs', 'de', 'el', 'en', 'es', 'fr', 'hi', 'it', 'ja',
-  'nl', 'pl', 'pt', 'ru', 'sv', 'tr', 'uk', 'vi', 'zh',
-]);
 const CATEGORY_LABEL_KEYS = {
   housing: 'catHousing',
   food: 'catFood',
@@ -176,10 +209,23 @@ const SUBCATEGORY_LABEL_KEYS = {
   subscription_other: 'subcatSubscriptionOther',
 };
 
+// Die Sprachen kommen aus den Locale-Dateien selbst (supportedLocaleFor), nicht
+// aus einer Liste hier: die alte hielt 19 Codes, und jede spaeter hinzugekommene
+// Sprache bekam ihre Kategorienamen still auf Englisch (#1523).
 export function normalizeLang(raw) {
-  const lang = String(raw || 'en').trim().toLowerCase();
-  const base = lang.split(/[-_]/)[0];
-  return SUPPORTED_LANGS.has(base) ? base : 'en';
+  return supportedLocaleFor(raw) ?? DEFAULT_LOCALE;
+}
+
+// Die Sprache einer Leseanfrage: ein brauchbares `?lang=` gewinnt, sonst die
+// Haushaltssprache (#1859). Bis dahin fiel ein fehlendes `lang` auf Englisch,
+// und der Kategorie-Manager, der die Liste ohne Parameter holt, zeigte die
+// eingebauten Kategorien in jedem Haushalt englisch. Ein unbekannter Code
+// nimmt denselben Weg wie ein fehlender: er nennt keine Sprache, die sich
+// bedienen liesse, und die naechstbeste Antwort ist die des Haushalts, nicht
+// Englisch. `resolveHouseholdLocale` endet selbst bei Englisch, wenn der
+// Haushalt weder Sprache noch Region gesetzt hat.
+export function requestLang(raw) {
+  return supportedLocaleFor(raw) ?? resolveHouseholdLocale(db.get());
 }
 
 export function budgetMessages(lang) {
@@ -284,11 +330,12 @@ const MS_PER_DAY = 86_400_000;
 /**
  * Alle Fälligkeitstage einer Serie innerhalb eines Monats, aufsteigend.
  *
- * Der Starttag selbst zählt nicht mit: er ist der Eintrag, der die Serie trägt.
+ * Der Starttag selbst zählt nicht mit: dieses Vorkommen ist die erste Buchung,
+ * die die Serie trägt - auch wenn ihr Datum seither einzeln korrigiert wurde.
  * Wochenserien liefern hier mehrere Tage - genau daran hing bisher, dass es
  * keine gab: die Materialisierung kannte nur einen Termin je Monat.
  *
- * @param {string} startDate  YYYY-MM-DD, Datum des Serien-Originals
+ * @param {string} startDate  YYYY-MM-DD, Starttag der Serie (budget_series.start_date)
  * @param {string} interval   'weekly' | 'monthly' | 'yearly'
  * @param {number} count      Anzahl der Einheiten zwischen zwei Vorkommen
  * @param {string} month      YYYY-MM
@@ -324,26 +371,30 @@ export function occurrenceDatesInMonth(startDate, interval, count, month) {
 }
 
 /**
- * Erstellt fehlende Instanzen wiederkehrender Budget-Einträge für den angefragten Monat.
- * Läuft idempotent - bereits vorhandene oder explizit übersprungene Instanzen werden ignoriert.
- *
- * Virtuelle Serien (recurrence_virtual = 1) halten im Original bereits den
- * geglätteten Monatsanteil (amount); es wird in JEDEM Monat eine Instanz erzeugt.
- * Nicht-virtuelle Serien erzeugen den vollen Betrag nur in Fälligkeitsmonaten
- * (an den Tagen aus occurrenceDatesInMonth).
- * @param {import('better-sqlite3-multiple-ciphers').Database} database
- * @param {string} month  YYYY-MM
+ * Die Serien einer Abfrage: Starttag und Werte aus der Definition, Rhythmus
+ * und Eigentuemer vom Anker (#1035, #1545). Ob eine Zeile eine Serie traegt,
+ * sagt die Definition - nicht mehr `recurrence_parent_id IS NULL`, das seit
+ * #1035 nur "von Hand erfasst" heisst.
  */
-export function generateRecurringInstances(database, month) {
-  const [y, m] = month.split('-').map(Number);
+const SERIES_SELECT = `
+    SELECT a.id, COALESCE(s.start_date, a.date) AS start_date, a.created_by, a.owner_id,
+           a.recurrence_interval, a.recurrence_interval_count,
+           a.recurrence_virtual, a.recurrence_confirm,
+           s.title, s.amount, s.category, s.subcategory, s.account_id, s.visibility,
+           s.grid_from
+      FROM budget_series s
+      JOIN budget_entries a ON a.id = s.anchor_id
+     WHERE a.is_recurring = 1`;
 
-  // Alle Serien-Originale, die vor diesem Monat begonnen haben
-  const originals = database.prepare(`
-    SELECT * FROM budget_entries
-    WHERE is_recurring = 1 AND recurrence_parent_id IS NULL
-      AND strftime('%Y-%m', date) < ?
-  `).all(month);
-
+/**
+ * Schreibt ein Vorkommen einer Serie an einem Tag - oder nichts, wenn es dort
+ * schon eines gibt oder es geloescht (uebersprungen) wurde. Die eine Stelle,
+ * an der aus einer Definition eine Buchung wird: generateRecurringInstances()
+ * und materializeSeriesStart() teilen sie.
+ * @param {import('better-sqlite3-multiple-ciphers').Database} database
+ * @returns {(orig: object, date: string) => boolean} true, wenn eine Buchung entstand
+ */
+function occurrenceWriter(database) {
   const skipStmt = database.prepare(
     'SELECT 1 FROM budget_recurrence_skipped WHERE parent_id = ? AND date = ?'
   );
@@ -356,70 +407,195 @@ export function generateRecurringInstances(database, month) {
        created_by, owner_id, visibility, is_pending, account_id)
     VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
   `);
-  // Die Zustaendigen des Originals auf die frische Instanz kopieren (#1057).
+  // Die Zustaendigen der Serie auf die frische Instanz kopieren (#1057) - aus
+  // der Definition, nicht vom Anker (#1035).
   const copyResponsiblesStmt = database.prepare(`
     INSERT OR IGNORE INTO budget_entry_responsibles (entry_id, user_id)
-    SELECT ?, user_id FROM budget_entry_responsibles WHERE entry_id = ?
+    SELECT ?, user_id FROM budget_series_responsibles WHERE anchor_id = ?
   `);
 
-  for (const orig of originals) {
-    const interval = orig.recurrence_interval || 'monthly';
+  return (orig, date) => {
+    // VOR DER LETZTEN RASTERAENDERUNG ENTSTEHT NICHTS (#1545, Review-Befund in
+    // #1585). Hat eine Serien-Aenderung den Starttag oder den Rhythmus
+    // verschoben, stehen die Buchungen davor auf dem ALTEN Raster - ein
+    // Vorkommen auf dem neuen daneben waere eine zweite Buchung fuer denselben
+    // Zeitraum. Ein Monat davor, der noch nie aufgeschlagen wurde, bleibt
+    // deshalb leer: welches Raster damals galt, weiss die Serie nicht mehr.
+    if (orig.grid_from && date < orig.grid_from) return false;
+    // Übersprungen (eine gelöschte Instanz) oder schon vorhanden? Beides wird am
+    // Fälligkeitstag geprüft, nicht am Monat: eine Wochenserie hat mehrere pro
+    // Monat, und ein gelöschter Dienstag darf die übrigen nicht mitnehmen.
+    if (skipStmt.get(orig.id, date)) return false;
+    if (existsStmt.get(orig.id, date)) return false;
 
-    // Virtuelle Serien tragen im Original bereits den Monatsanteil: sie kommen in
-    // JEDEM Monat einmal vor, unabhängig vom Rhythmus - auch bei Wochenserien,
-    // deren Anteil sonst über den Monat verstreut läge, ohne dass eine der
-    // Buchungen die Zahlung wäre.
-    const dates = orig.recurrence_virtual
-      ? [`${month}-${String(Math.min(
-          parseInt(orig.date.split('-')[2], 10),
-          new Date(Date.UTC(y, m, 0)).getUTCDate(),
-        )).padStart(2, '0')}`]
-      : occurrenceDatesInMonth(orig.date, interval, orig.recurrence_interval_count, month);
+    // Materialisierte Instanz erbt Eigentümer + Sichtbarkeit der Serie
+    // (#476/#505). Ohne das würde jede Instanz owner_id=NULL + visibility='shared'
+    // (Spalten-Default) bekommen: eine private Serie würde im Haushalt sichtbar und
+    // für die Eigentümer:in in scope=mine unsichtbar.
+    // Verlangt die Serie eine Bestätigung (#637), entsteht die Buchung als
+    // erwartet: sichtbar und planbar, aber in keiner Summe. Der Ursprung
+    // selbst bleibt eine echte Buchung - er wurde von Hand eingetragen.
+    // Das KONTO gehört in dieselbe Liste (#973): eine Dauerlastschrift geht
+    // jeden Monat vom selben Konto ab. Es fehlte hier, seit es die Spalte
+    // gibt, und die Wirkung war unauffällig, weil nur die erste Buchung von
+    // Hand entsteht - ab dem zweiten Monat trug die Instanz kein Konto, und
+    // wer nach Konto filtert, sah die Serie ab dort nicht mehr.
+    //
+    // AUSSER bei einer virtuellen Serie, und das ist keine Feinheit:
+    // deren Instanzen sind Planwerte, keine Zahlungen. 1200 im Jahr stehen
+    // dort als 100 je Monat, während die Bank einmal 1200 abbucht.
+    // `listAccounts()` summiert jeden nicht-erwarteten Eintrag mit Konto in
+    // den Saldo, und die Instanz trägt kein eigenes `recurrence_virtual` -
+    // die Saldo-Abfrage könnte einen Planwert also gar nicht erkennen.
+    // Gemessen: acht Monate einer virtuellen Jahresserie ergaben -800
+    // Kontosaldo für eine Abbuchung, die noch gar nicht stattgefunden hat.
+    // Ohne Konto bleibt der Saldo exakt so, wie er vor #973 war.
+    const inheritsAccount = orig.recurrence_virtual ? null : (orig.account_id ?? null);
+    const created = insertStmt.run(
+      orig.title, orig.amount, orig.category, orig.subcategory || '', date,
+      orig.id, orig.created_by, orig.owner_id, orig.visibility || 'shared',
+      orig.recurrence_confirm ? 1 : 0, inheritsAccount,
+    );
 
-    for (const date of dates) {
-      // Übersprungen (eine gelöschte Instanz) oder schon vorhanden? Beides wird am
-      // Fälligkeitstag geprüft, nicht am Monat: eine Wochenserie hat mehrere pro
-      // Monat, und ein gelöschter Dienstag darf die übrigen nicht mitnehmen.
-      if (skipStmt.get(orig.id, date)) continue;
-      if (existsStmt.get(orig.id, date)) continue;
+    // ZUSTAENDIGE ERBEN MIT (#1057). Anders als das Konto gilt das auch fuer
+    // virtuelle Serien: das Etikett bewegt kein Geld, es kann also keinen
+    // Saldo verfaelschen - und "wer kuemmert sich darum" ist am Planwert
+    // genauso richtig wie an der Zahlung. Als eigene Anweisung statt im
+    // INSERT, weil die Zustaendigkeit in einer n:m-Tabelle liegt.
+    copyResponsiblesStmt.run(created.lastInsertRowid, orig.id);
+    return true;
+  };
+}
 
-      // Materialisierte Instanz erbt Eigentümer + Sichtbarkeit des Serien-Originals
-      // (#476/#505). Ohne das würde jede Instanz owner_id=NULL + visibility='shared'
-      // (Spalten-Default) bekommen: eine private Serie würde im Haushalt sichtbar und
-      // für die Eigentümer:in in scope=mine unsichtbar.
-      // Verlangt die Serie eine Bestätigung (#637), entsteht die Buchung als
-      // erwartet: sichtbar und planbar, aber in keiner Summe. Der Ursprung
-      // selbst bleibt eine echte Buchung - er wurde von Hand eingetragen.
-      // Das KONTO gehört in dieselbe Liste (#973): eine Dauerlastschrift geht
-      // jeden Monat vom selben Konto ab. Es fehlte hier, seit es die Spalte
-      // gibt, und die Wirkung war unauffällig, weil nur die erste Buchung von
-      // Hand entsteht - ab dem zweiten Monat trug die Instanz kein Konto, und
-      // wer nach Konto filtert, sah die Serie ab dort nicht mehr.
-      //
-      // AUSSER bei einer virtuellen Serie, und das ist keine Feinheit:
-      // deren Instanzen sind Planwerte, keine Zahlungen. 1200 im Jahr stehen
-      // dort als 100 je Monat, während die Bank einmal 1200 abbucht.
-      // `listAccounts()` summiert jeden nicht-erwarteten Eintrag mit Konto in
-      // den Saldo, und die Instanz trägt kein eigenes `recurrence_virtual` -
-      // die Saldo-Abfrage könnte einen Planwert also gar nicht erkennen.
-      // Gemessen: acht Monate einer virtuellen Jahresserie ergaben -800
-      // Kontosaldo für eine Abbuchung, die noch gar nicht stattgefunden hat.
-      // Ohne Konto bleibt der Saldo exakt so, wie er vor #973 war.
-      const inheritsAccount = orig.recurrence_virtual ? null : (orig.account_id ?? null);
-      const created = insertStmt.run(
-        orig.title, orig.amount, orig.category, orig.subcategory || '', date,
-        orig.id, orig.created_by, orig.owner_id, orig.visibility || 'shared',
-        orig.recurrence_confirm ? 1 : 0, inheritsAccount,
-      );
-
-      // ZUSTAENDIGE ERBEN MIT (#1057). Anders als das Konto gilt das auch fuer
-      // virtuelle Serien: das Etikett bewegt kein Geld, es kann also keinen
-      // Saldo verfaelschen - und "wer kuemmert sich darum" ist am Planwert
-      // genauso richtig wie an der Zahlung. Als eigene Anweisung statt im
-      // INSERT, weil die Zustaendigkeit in einer n:m-Tabelle liegt.
-      copyResponsiblesStmt.run(created.lastInsertRowid, orig.id);
-    }
+/**
+ * Die Faelligkeitstage einer Serie (Zeile aus SERIES_SELECT) in einem Monat.
+ *
+ * Virtuelle Serien tragen in der Definition bereits den Monatsanteil: sie
+ * kommen in JEDEM Monat einmal vor, am Tag des Starts, unabhaengig vom
+ * Rhythmus - auch Wochenserien, deren Anteil sonst ueber den Monat verstreut
+ * laege, ohne dass eine der Buchungen die Zahlung waere.
+ * @param {object} orig
+ * @param {string} month  YYYY-MM
+ * @returns {string[]}
+ */
+function seriesDatesInMonth(orig, month) {
+  if (!orig.recurrence_virtual) {
+    return occurrenceDatesInMonth(orig.start_date, orig.recurrence_interval || 'monthly',
+      orig.recurrence_interval_count, month);
   }
+  const [y, m] = month.split('-').map(Number);
+  const day = Math.min(parseInt(orig.start_date.split('-')[2], 10), new Date(Date.UTC(y, m, 0)).getUTCDate());
+  return [`${month}-${String(day).padStart(2, '0')}`];
+}
+
+/**
+ * Erstellt fehlende Instanzen wiederkehrender Budget-Einträge für den angefragten Monat.
+ * Läuft idempotent - bereits vorhandene oder explizit übersprungene Instanzen werden ignoriert.
+ *
+ * Virtuelle Serien (recurrence_virtual = 1) halten in der Definition bereits den
+ * geglätteten Monatsanteil (amount); es wird in JEDEM Monat eine Instanz erzeugt.
+ * Nicht-virtuelle Serien erzeugen den vollen Betrag nur in Fälligkeitsmonaten
+ * (an den Tagen aus occurrenceDatesInMonth).
+ *
+ * DIE WERTE KOMMEN AUS DER DEFINITION, NICHT VOM ANKER (#1035). Titel, Betrag,
+ * Kategorie, Unterkategorie, Konto, Sichtbarkeit und Zustaendige stehen in
+ * `budget_series` / `budget_series_responsibles`; der Anker - die erste, von
+ * Hand erfasste Buchung - traegt nur noch seine eigenen. Bis v227 las diese
+ * Funktion sie von dort, und deshalb schrieb jede Serien-Aenderung auf eine
+ * Buchung, die schon passiert war. Vom Anker kommen weiterhin der Rhythmus und
+ * Ersteller/Eigentuemer, die nie wechseln.
+ *
+ * AUCH DER STARTTAG KOMMT AUS DER DEFINITION (#1545), nicht aus dem Datum der
+ * ersten Buchung. Aus ihm folgt das ganze Raster (Tag im Monat, Wochentag,
+ * "alle N"); stand er am Anker, verschob eine Korrektur NUR der ersten Buchung
+ * jedes Vorkommen, das noch nicht angelegt war. Ohne Starttag (eine Zeile, die
+ * an v229 vorbei entstand) gilt das Datum des Ankers - das Verhalten bis v228.
+ * @param {import('better-sqlite3-multiple-ciphers').Database} database
+ * @param {string} month  YYYY-MM
+ */
+export function generateRecurringInstances(database, month) {
+  // Alle laufenden Serien, die vor diesem Monat begonnen haben.
+  const originals = database.prepare(`
+    ${SERIES_SELECT}
+       AND strftime('%Y-%m', COALESCE(s.start_date, a.date)) < ?
+  `).all(month);
+
+  const writeOccurrence = occurrenceWriter(database);
+
+  for (const orig of originals) {
+    for (const date of seriesDatesInMonth(orig, month)) writeOccurrence(orig, date);
+  }
+}
+
+/**
+ * Legt das Vorkommen AM Starttag einer Serie an (#1545).
+ *
+ * generateRecurringInstances() laesst den Starttag bewusst aus: dieses
+ * Vorkommen ist die erste Buchung, der Anker - auch nachdem ihr Datum einzeln
+ * korrigiert wurde. Verlegt "alle kuenftigen aendern" den Starttag aber,
+ * waehrend die erste Buchung schon gebucht ist, bleibt sie, wo sie war (sie
+ * behaelt ihre Werte, #1035), und der neue Starttag hat keine Buchung. Liegt
+ * er ab heute, entsteht sie hier; was davor liegt, ist gebucht und wird von
+ * einer Serien-Aenderung nicht mehr angefasst.
+ * @param {import('better-sqlite3-multiple-ciphers').Database} database
+ * @param {number} anchorId
+ */
+export function materializeSeriesStart(database, anchorId) {
+  const orig = database.prepare(`${SERIES_SELECT} AND a.id = ?`).get(anchorId);
+  if (orig) occurrenceWriter(database)(orig, orig.start_date);
+}
+
+/**
+ * Friert die Vergangenheit einer Serie ein, BEVOR sich ihr Raster aendert
+ * (#1545, Entscheidung in #1585): jedes Vorkommen vom Monat nach dem Start
+ * bis vor `cutoffDate`, das noch nicht angelegt ist, entsteht jetzt - im
+ * ALTEN Raster, mit den Werten der Definition, wie es ein Aufruf des Monats
+ * vor der Aenderung angelegt haette.
+ *
+ * Ohne das waere ein vergangener Monat, der nie aufgeschlagen wurde, nach der
+ * Aenderung leer: vor grid_from entsteht nichts mehr, und das alte Raster
+ * kennt danach niemand. Vorhandene und geloeschte (uebersprungene) Vorkommen
+ * laesst occurrenceWriter() stehen, ein zweiter Aufruf legt also nichts
+ * doppelt an. Laeuft in der Transaktion des Aufrufers, vor jeder Aenderung
+ * an Anker und Definition.
+ *
+ * Menge: der kleinste Schritt ist eine Woche (52 im Jahr). Gemessen, einmalig
+ * je Aenderung: woechentlich seit 2000 rund 1400 Zeilen in 24 ms, seit 1970
+ * rund 3000 in 54 ms; das Aeusserste, was die Datumspruefung zulaesst
+ * (woechentlich seit dem Jahr 1000), rund 54.000 in 0,9 s. Linear nur dank
+ * idx_budget_parent_date (v229) - ohne ihn las jede Existenzfrage alle
+ * Buchungen der Serie. Eine Obergrenze gibt es deshalb nicht: sie risse
+ * genau die Luecken wieder auf, die das Einfrieren schliesst.
+ * @param {import('better-sqlite3-multiple-ciphers').Database} database
+ * @param {number} anchorId
+ * @param {string} cutoffDate  YYYY-MM-DD, heute in der Haushaltszone
+ * @returns {number} neu angelegte Vorkommen
+ */
+export function freezeSeriesPast(database, anchorId, cutoffDate) {
+  const orig = database.prepare(`${SERIES_SELECT} AND a.id = ?`).get(anchorId);
+  if (!orig) return 0;
+  const writeOccurrence = occurrenceWriter(database);
+  const lastMonth = cutoffDate.slice(0, 7);
+  // Wie generateRecurringInstances(): ab dem Monat NACH dem Starttag (dessen
+  // Monat gehoert der ersten Buchung), und vor einer frueheren
+  // Rasteraenderung entsteht ohnehin nichts (grid_from) - dort beginnen.
+  let [y, m] = orig.start_date.slice(0, 7).split('-').map(Number);
+  m += 1;
+  if (orig.grid_from) {
+    const [gy, gm] = orig.grid_from.slice(0, 7).split('-').map(Number);
+    if (gy * 12 + gm > y * 12 + m) { y = gy; m = gm; }
+  }
+  let created = 0;
+  for (;;) {
+    if (m > 12) { y += 1; m = 1; }
+    const month = `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}`;
+    if (month > lastMonth) break;
+    for (const date of seriesDatesInMonth(orig, month)) {
+      if (date < cutoffDate && writeOccurrence(orig, date)) created += 1;
+    }
+    m += 1;
+  }
+  return created;
 }
 
 export const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -583,10 +759,70 @@ export function validateSubcategory(category, subcategory) {
   return row ? subcategory : null;
 }
 
+/** Ganze Monate von `from` bis `to` (beide YYYY-MM); 0, wenn eines fehlt. */
+export function monthsBetween(from, to) {
+  const re = /^(\d{4})-(0[1-9]|1[0-2])$/;
+  const a = re.exec(String(from ?? ''));
+  const b = re.exec(String(to ?? ''));
+  if (!a || !b) return 0;
+  return (Number(b[1]) - Number(a[1])) * 12 + (Number(b[2]) - Number(a[2]));
+}
+
 export function addMonths(ym, n) {
   const [y, m] = ym.split('-').map(Number);
   const d = new Date(y, m - 1 + n, 1);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+/**
+ * Der Faelligkeitstag eines Darlehens in einem Monat, als Tagesschluessel (#1631).
+ *
+ * DIE EINE STELLE, AN DER GEKLEMMT WIRD: ein Tag, den der Monat nicht hat, wird
+ * zu dessen letztem - der 31. im April zum 30., im Februar zum 28. oder 29.
+ * Gerechnet wird am Schluessel, nicht an einem Zeitpunkt: `Date.UTC(y, m, 0)`
+ * fragt nur nach der Laenge des Monats, eine Zone kommt nicht vor, und "heute"
+ * auch nicht - der Faelligkeitstag einer Rate haengt nicht daran, wann jemand
+ * fragt.
+ *
+ * @param {string} ym       Monat "YYYY-MM"
+ * @param {unknown} dueDay  1 bis 31; alles andere heisst "kein Faelligkeitstag"
+ * @returns {string|null}   "YYYY-MM-DD" oder null
+ */
+export function dueDateInMonth(ym, dueDay) {
+  if (!Number.isInteger(dueDay) || dueDay < 1 || dueDay > 31) return null;
+  const match = /^(\d{4})-(\d{2})$/.exec(String(ym ?? ''));
+  if (!match) return null;
+  const month = Number(match[2]);
+  if (month < 1 || month > 12) return null;
+  const lastDay = new Date(Date.UTC(Number(match[1]), month, 0)).getUTCDate();
+  return `${match[1]}-${match[2]}-${String(Math.min(dueDay, lastDay)).padStart(2, '0')}`;
+}
+
+/**
+ * Das Datum, das ein Darlehen fuer seine naechste Rate nennt (`next_due_date`).
+ *
+ * Mit Faelligkeitstag ist es dieser Tag im Faelligkeitsmonat (#1631) - keine
+ * Frage an die Uhr. Ohne Faelligkeitstag kennt das Darlehen nur den Monat, und
+ * dann entscheidet der Monat des Haushalts (#1741):
+ *   - liegt der Faelligkeitsmonat VOR dem laufenden, ist es dessen Erster. Wer
+ *     ein Darlehen von 2022 nachtraegt, bucht die Raten sonst alle in den Monat
+ *     des Tippens. Der Erste ist die Konvention, die "bereits gezahlte Raten"
+ *     (`seedPaidInstallments`) ohne Faelligkeitstag schon benutzen - eine
+ *     Buchungskonvention, keine Faelligkeit: die Karte nennt weiter den Monat.
+ *   - sonst (laufender oder kuenftiger Monat) null, und "Als bezahlt markieren"
+ *     bleibt bei heute.
+ *
+ * @param {string} ym       Faelligkeitsmonat "YYYY-MM"
+ * @param {unknown} dueDay  1 bis 31 oder kein Faelligkeitstag
+ * @param {string} today    Tagesschluessel des Haushalts (`todayKey(db)`), nie der UTC-Tag
+ * @returns {string|null}   "YYYY-MM-DD" oder null
+ */
+export function nextInstallmentDate(ym, dueDay, today) {
+  const onDueDay = dueDateInMonth(ym, dueDay);
+  if (onDueDay) return onDueDay;
+  if (dueDay != null) return null;
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(ym ?? ''))) return null;
+  return ym < String(today ?? '').slice(0, 7) ? `${ym}-01` : null;
 }
 
 export function cents(value) {
@@ -653,7 +889,13 @@ export function bookingFor(direction) {
   return REPAYMENT_BOOKING[direction] || REPAYMENT_BOOKING.lent;
 }
 
-export function loanSummaryRow(loan, baseCurrency = budgetCurrency()) {
+/**
+ * @param {object} loan
+ * @param {string} [baseCurrency]
+ * @param {string} [today]  Tagesschluessel des Haushalts; die Liste reicht ihn
+ *                          einmal durch, statt ihn je Darlehen neu zu lesen.
+ */
+export function loanSummaryRow(loan, baseCurrency = budgetCurrency(), today = todayKey(db.get())) {
   const payments = db.get().prepare(`
     SELECT p.*, u.display_name AS creator_name,
            b.title AS entry_title,
@@ -675,7 +917,13 @@ export function loanSummaryRow(loan, baseCurrency = budgetCurrency()) {
   // nicht der Durchschnitt total_amount/installment_count (die letzte Rate ist
   // kleiner). Sonst weicht der gebuchte Ratenbetrag von der angezeigten Monatsrate
   // ab. Die letzte Rate wird im Zahlungs-Default ohnehin über remaining_amount getrued.
-  const interest = loanInterestSummary(loan, payments);
+  // Wo der VERTRAG heute steht (#1706): die Rate, die im laufenden Monat des
+  // Haushalts faellig ist, mindestens die naechste ungebuchte. Wer Raten nicht
+  // nachgetragen hat, steht im Vertrag trotzdem dort, wo der Kalender ihn
+  // hinstellt - die Zinsbindung endet nicht spaeter, weil Buchungen fehlen.
+  const currentMonth = String(today ?? '').slice(0, 7);
+  const lagMonths = Math.max(0, monthsBetween(addMonths(loan.start_month, paidInstallments), currentMonth));
+  const interest = loanInterestSummary(loan, payments, paidInstallments + 1 + lagMonths);
   const installmentAmount = interest ? interest.monthly_payment : cents(loan.total_amount / loan.installment_count);
   // Restschuld: das noch offene Kapital, seit #954 aus den gebuchten Beträgen
   // nachgerechnet statt an der Planposition abgelesen. remainingAmount oben ist
@@ -699,6 +947,20 @@ export function loanSummaryRow(loan, baseCurrency = budgetCurrency()) {
   const currency = loan.currency || baseCurrency;
   const rate = currency === baseCurrency ? 1 : loanRate(loan);
 
+  const nextDueMonth = !settled ? addMonths(loan.start_month, paidInstallments) : null;
+
+  // Restlaufzeit, die dem Geld folgt (#964); ohne Zinsteil ist die Planzahl die
+  // Antwort. Ein Zins-Darlehen ohne Prognose (die Rate deckt den Zins nicht)
+  // hat kein Enddatum - die Planzahl wuerde dort eines behaupten.
+  const forecastInstallments = forecastRemainingInstallments(loan, interest, paidInstallments);
+  const installmentsToGo = interest ? forecastInstallments : remainingInstallments;
+  // Gezaehlt wird ab dem spaeteren von naechster Faelligkeit und laufendem
+  // Monat: ein laufendes Darlehen mit Buchungsrueckstand endet nicht in der
+  // Vergangenheit. Die ungebuchten Raten stehen noch aus, also ab heute.
+  const projectedEndMonth = nextDueMonth && installmentsToGo > 0
+    ? addMonths(nextDueMonth, lagMonths + installmentsToGo - 1)
+    : null;
+
   return {
     ...loan,
     currency,
@@ -714,10 +976,19 @@ export function loanSummaryRow(loan, baseCurrency = budgetCurrency()) {
     // Dieselbe Zahl, aber am Kontostand statt am Vertrag gerechnet (#964).
     // Ohne Zinsteil oder bei nicht amortisierender Rate bleibt sie null, und die
     // Oberflaeche zeigt dann allein die Planzahl.
-    remaining_installments_forecast: forecastRemainingInstallments(loan, interest, paidInstallments),
+    remaining_installments_forecast: forecastInstallments,
+    // Der Monat der letzten Rate (#1706), aus DERSELBEN Restlaufzeit gerechnet:
+    // die naechste Faelligkeit plus die noch faelligen Raten. Null, wenn nichts
+    // mehr offen ist oder die Restlaufzeit selbst keine Antwort hat.
+    projected_end_month: projectedEndMonth,
     is_settled: settled,
     next_installment_number: !settled ? paidInstallments + 1 : null,
-    next_due_month: !settled ? addMonths(loan.start_month, paidInstallments) : null,
+    next_due_month: nextDueMonth,
+    // Der Tag dazu (#1631), wenn das Darlehen einen nennt. Ohne Faelligkeitstag
+    // der Erste des Monats, sobald dieser vorbei ist (#1741), sonst null, und
+    // "Als bezahlt markieren" bleibt bei heute. Die Oberflaeche reicht den Wert
+    // als paid_date durch, statt selbst zu rechnen.
+    next_due_date: nextDueMonth ? nextInstallmentDate(nextDueMonth, loan.due_day, today) : null,
     interest,
     payments,
   };
@@ -729,7 +1000,7 @@ export function loanSummaryRow(loan, baseCurrency = budgetCurrency()) {
 // payments steuert nur remaining_principal: die Restschuld folgt seit #954 den
 // gebuchten Beträgen (Sondertilgung senkt sie, Minderzahlung nicht), alle
 // anderen Kennzahlen bleiben planbasiert und vom Zahlungsfortschritt unabhängig.
-export function loanInterestSummary(loan, payments = []) {
+export function loanInterestSummary(loan, payments = [], currentInstallment = payments.length + 1) {
   if (!loan.interest_mode || loan.interest_mode === 'none' || loan.principal == null) return null;
   const calc = computeLoanSchedule({
     principal: loan.principal,
@@ -756,6 +1027,16 @@ export function loanInterestSummary(loan, payments = []) {
       fixedPeriodMonths: loan.fixed_period_months,
       followupRate: loan.followup_rate,
     }, payments),
+    // Der Satz, der HEUTE gilt (#1706): nach ihm sortiert die Darlehensliste.
+    // Es ist der Satz der Rate, die im laufenden Monat faellig ist (mindestens
+    // der naechsten ungebuchten) - waehrend der Zinsbindung der feste, danach
+    // der Anschlusssatz, nach derselben Phasenregel wie der Tilgungsplan.
+    current_rate: rateForInstallment({
+      fixedRate: loan.fixed_rate,
+      interestMode: loan.interest_mode,
+      fixedPeriodMonths: loan.fixed_period_months,
+      followupRate: loan.followup_rate,
+    }, currentInstallment),
     remaining_after_binding: calc.remainingAfterBinding,
     binding_end_month: loan.fixed_period_months ? addMonths(loan.start_month, loan.fixed_period_months) : null,
   };
@@ -859,6 +1140,45 @@ export function replaceResponsibles(entryId, rawUserIds) {
 }
 
 /**
+ * Die Zustaendigen einer Serien-DEFINITION ersetzen (#1035) - dieselbe Regel
+ * wie replaceResponsibles(), nur fuer die Vorlage statt fuer eine Buchung.
+ * Ohne Definition (Serie beendet) gibt es nichts zu schreiben.
+ *
+ * @param {number} anchorId
+ * @param {Array<number>|undefined} rawUserIds
+ */
+export function replaceSeriesResponsibles(anchorId, rawUserIds) {
+  if (rawUserIds === undefined) return;
+  if (!db.get().prepare('SELECT 1 FROM budget_series WHERE anchor_id = ?').get(anchorId)) return;
+  const ids = Array.isArray(rawUserIds)
+    ? [...new Set(rawUserIds.map(Number).filter((n) => Number.isInteger(n) && n > 0))]
+    : [];
+  db.get().prepare('DELETE FROM budget_series_responsibles WHERE anchor_id = ?').run(anchorId);
+  const ins = db.get().prepare(`
+    INSERT OR IGNORE INTO budget_series_responsibles (anchor_id, user_id)
+    SELECT ?, id FROM users WHERE id = ?
+  `);
+  for (const id of ids) ins.run(anchorId, id);
+}
+
+/**
+ * Wird eine Buchung zur Serie, ist sie deren Vorlage - auch fuer die
+ * Zustaendigen (#1035). Die Werte uebernimmt der Trigger aus v228; die
+ * Zustaendigen liegen in einer eigenen Tabelle und werden erst NACH dem
+ * Insert/Update der Buchung geschrieben, deshalb hier.
+ *
+ * @param {number} anchorId
+ */
+export function seedSeriesResponsibles(anchorId) {
+  if (!db.get().prepare('SELECT 1 FROM budget_series WHERE anchor_id = ?').get(anchorId)) return;
+  db.get().prepare('DELETE FROM budget_series_responsibles WHERE anchor_id = ?').run(anchorId);
+  db.get().prepare(`
+    INSERT OR IGNORE INTO budget_series_responsibles (anchor_id, user_id)
+    SELECT entry_id, user_id FROM budget_entry_responsibles WHERE entry_id = ?
+  `).run(anchorId);
+}
+
+/**
  * Wer unter den mitgeschickten Zustaendigen NEU waere und kein Haushaltsmitglied
  * ist (#1207) - gegen den gespeicherten Stand des Eintrags `entryId`: wer dort
  * schon steht, bleibt gueltig. `undefined` heisst "nicht mitgeschickt", wie in
@@ -869,12 +1189,15 @@ export function replaceResponsibles(entryId, rawUserIds) {
  * @param {Array<number>|undefined} rawUserIds
  * @returns {number[]}
  */
-export function responsibleNonMembers(entryId, rawUserIds) {
+export function responsibleNonMembers(entryId, rawUserIds, { series = false } = {}) {
   if (!Array.isArray(rawUserIds)) return [];
   const ids = rawUserIds.map(Number).filter((n) => Number.isInteger(n) && n > 0);
-  const stored = entryId == null
-    ? []
-    : db.get().prepare('SELECT user_id FROM budget_entry_responsibles WHERE entry_id = ?').all(entryId).map((r) => r.user_id);
+  // Fuer eine Serien-Aenderung zaehlt der Stand der Definition (#1035), nicht
+  // der ihrer ersten Buchung.
+  const sql = series
+    ? 'SELECT user_id FROM budget_series_responsibles WHERE anchor_id = ?'
+    : 'SELECT user_id FROM budget_entry_responsibles WHERE entry_id = ?';
+  const stored = entryId == null ? [] : db.get().prepare(sql).all(entryId).map((r) => r.user_id);
   return newNonMembers(ids, { stored });
 }
 
@@ -911,15 +1234,48 @@ export function entryWithLoanMeta(id) {
 export const ACCOUNT_TYPE_KEYS = ['checking', 'savings', 'cash', 'credit', 'investment', 'other'];
 
 /**
+ * Eine Absage mit ihrem Grund (#1656, #1668).
+ *
+ * Der Satz bleibt, wie er war - er ist die zugesagte Antwort der API. Der Grund
+ * kommt dazu, damit die Seite die Absage am Feld und in der Sprache der
+ * Oberflaeche zeigen kann, statt den Satz des Servers durchzureichen. Wer hier
+ * einen Grund ergaenzt, ordnet ihn in `LOAN_REFUSALS` bzw. `BUDGET_REFUSALS`
+ * (public/pages/budget.js) ein; test:budget-ui haelt die Listen deckungsgleich.
+ *
+ * `extra` traegt, was der Satz der Oberflaeche nennen soll und nur der Server
+ * weiss - heute `max` (die Grenze, an der die Absage haengt).
+ */
+export const refusal = (reason, error, extra = {}) => ({ ...extra, reason, error });
+
+/** Die Fehler allgemeiner Validatoren (str/num/date/oneOf) unter einem Grund. */
+export const refusals = (reason, results) => results
+  .filter((result) => result.error)
+  .map((result) => refusal(reason, result.error));
+
+/**
+ * Absage aus einer Liste: alle Saetze wie bisher in `error`, Grund (und `max`)
+ * der ERSTEN in `reason` - ein Dialog zeigt ohnehin ein Feld nach dem anderen.
+ */
+export function refuse(res, errors, status = 400) {
+  const [first] = errors;
+  return res.status(status).json({
+    error: errors.map((e) => e.error).join(' '),
+    code: status,
+    reason: first.reason,
+    ...(first.max !== undefined ? { max: first.max } : {}),
+  });
+}
+
+/**
  * Prüft eine optionale Konto-Zuordnung aus dem Request.
  * @returns {{ value: number|null }|{ error: string }} value=null ⇒ keinem Konto zugeordnet.
  */
 export function validateAccountRef(raw) {
   if (raw === undefined || raw === null || raw === '') return { value: null };
   const id = Number(raw);
-  if (!Number.isInteger(id) || id <= 0) return { error: 'account_id muss eine gültige Konto-ID sein.' };
+  if (!Number.isInteger(id) || id <= 0) return { error: 'account_id must be a valid account id.' };
   const row = db.get().prepare('SELECT id FROM budget_accounts WHERE id = ?').get(id);
-  if (!row) return { error: 'Konto nicht gefunden.' };
+  if (!row) return { error: 'Account not found.' };
   return { value: id };
 }
 

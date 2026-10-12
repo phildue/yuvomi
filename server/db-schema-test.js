@@ -1373,6 +1373,135 @@ const MIGRATIONS_SQL = {
     ALTER TABLE health_fasting_settings ADD COLUMN remind_goal INTEGER NOT NULL DEFAULT 0 CHECK(remind_goal IN (0, 1));
     ALTER TABLE health_fasting_settings ADD COLUMN remind_next_start INTEGER NOT NULL DEFAULT 0 CHECK(remind_next_start IN (0, 1));
   `,
+
+  // Bestaetigte Zuordnung Rezeptzutat -> Vorratszeile (#1314). Der Anker ist
+  // (recipe_id, ingredient_key), NICHT recipe_ingredients.id: die Zutatenzeilen
+  // werden beim Speichern eines Rezepts komplett neu geschrieben. Begruendung
+  // samt Loeschverhalten steht bei Migration 222 in server/db.js.
+  222: `
+    CREATE TABLE IF NOT EXISTS recipe_ingredient_pantry_matches (
+      recipe_id      INTEGER NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
+      ingredient_key TEXT    NOT NULL,
+      pantry_item_id INTEGER NOT NULL REFERENCES pantry_items(id) ON DELETE CASCADE,
+      confirmed_by   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      updated_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      PRIMARY KEY (recipe_id, ingredient_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ripm_pantry_item
+      ON recipe_ingredient_pantry_matches(pantry_item_id);
+  `,
+
+  // Tagesziel je Person und erfasster Eintrag (#1326). Die acht Naehrwerte
+  // sind fest und heissen ueberall gleich; NULL heisst "nicht gesetzt" und 0
+  // ist ein ausdrueckliches Ziel - die Begruendung dazu, samt der Wahl des
+  // kanonischen Sichtbarkeits-Vokabulars, steht bei Migration 223 in
+  // server/db.js. Die Trigger bleiben hier weg: eine Testdatenbank braucht
+  // kein updated_at, das sich selbst nachzieht.
+  223: `
+    CREATE TABLE health_nutrition_targets (
+      user_id          INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      energy_kcal      REAL CHECK (energy_kcal      IS NULL OR energy_kcal      >= 0),
+      fat_g            REAL CHECK (fat_g            IS NULL OR fat_g            >= 0),
+      saturated_fat_g  REAL CHECK (saturated_fat_g  IS NULL OR saturated_fat_g  >= 0),
+      carbs_g          REAL CHECK (carbs_g          IS NULL OR carbs_g          >= 0),
+      sugar_g          REAL CHECK (sugar_g          IS NULL OR sugar_g          >= 0),
+      protein_g        REAL CHECK (protein_g        IS NULL OR protein_g        >= 0),
+      salt_g           REAL CHECK (salt_g           IS NULL OR salt_g           >= 0),
+      fiber_g          REAL CHECK (fiber_g          IS NULL OR fiber_g          >= 0),
+      created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    );
+    CREATE TABLE health_nutrition_entries (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      consumed_at     TEXT    NOT NULL,
+      meal_type       TEXT    CHECK (meal_type IS NULL OR meal_type IN ('breakfast', 'lunch', 'dinner', 'snack')),
+      title           TEXT    NOT NULL,
+      energy_kcal     REAL CHECK (energy_kcal     IS NULL OR energy_kcal     >= 0),
+      fat_g           REAL CHECK (fat_g           IS NULL OR fat_g           >= 0),
+      saturated_fat_g REAL CHECK (saturated_fat_g IS NULL OR saturated_fat_g >= 0),
+      carbs_g         REAL CHECK (carbs_g         IS NULL OR carbs_g         >= 0),
+      sugar_g         REAL CHECK (sugar_g         IS NULL OR sugar_g         >= 0),
+      protein_g       REAL CHECK (protein_g       IS NULL OR protein_g       >= 0),
+      salt_g          REAL CHECK (salt_g          IS NULL OR salt_g          >= 0),
+      fiber_g         REAL CHECK (fiber_g         IS NULL OR fiber_g         >= 0),
+      note            TEXT,
+      visibility      TEXT    NOT NULL DEFAULT 'private' CHECK (visibility IN ('private', 'all')),
+      created_by      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    );
+    CREATE INDEX idx_health_nutrition_entries_user_date
+      ON health_nutrition_entries(user_id, consumed_at);
+  `,
+  // v231 (#1381): ein deaktiviertes Konto behaelt seine Zeile. Das
+  // Mitglieder-Praedikat liest die Spalte, also braucht sie jede Suite, die
+  // `householdMemberSql()` gegen ein handgebautes Schema faehrt.
+  231: `
+    ALTER TABLE users ADD COLUMN deactivated_at TEXT;
+  `,
+  // v232 (#1644): die eine Haushaltsreihenfolge der Mitglieder. NULL = nicht
+  // platziert; `memberOrderSql()` liest die Spalte, also braucht sie jede
+  // Suite, die eine Mitgliederliste gegen dieses Schema sortiert.
+  232: `
+    ALTER TABLE users ADD COLUMN sort_order INTEGER;
+  `,
+  // v235 (#1679): der Koch einer Mahlzeit und einer Wochenserie. Die
+  // Meals-Routen und die Uebersicht lesen die Spalte, also braucht sie jede
+  // Suite, die deren Abfragen gegen dieses Schema faehrt.
+  235: `
+    ALTER TABLE meals ADD COLUMN cook_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE meal_recurrence_templates ADD COLUMN cook_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL;
+  `,
+  // Taschengeld (#1734): `unit` an jeder Ledger-Zeile, `kind` an jeder Anfrage
+  // und der Plan je Person. Jede Summe ueber das Ledger liest `unit`
+  // (`ledgerBalanceSql()`). DIE BELOHNUNGSTABELLEN SELBST (v70) STEHEN NICHT IN
+  // DIESEM SPIEGEL: die Belohnungs-Suiten fahren die echten Migrationen ueber
+  // server/db.js. Wer die Tabellen einmal von Hand baut, haengt diesen Eintrag
+  // an - allein laeuft er nicht.
+  236: `
+    ALTER TABLE reward_ledger ADD COLUMN unit TEXT NOT NULL DEFAULT 'points'
+      CHECK(unit IN ('points', 'money'));
+    ALTER TABLE reward_ledger ADD COLUMN allowance_date TEXT;
+    ALTER TABLE reward_ledger ADD COLUMN currency TEXT
+      CHECK((unit = 'money') = (currency IS NOT NULL));
+    CREATE UNIQUE INDEX uniq_reward_allowance_credit
+      ON reward_ledger(user_id, allowance_date) WHERE allowance_date IS NOT NULL;
+
+    ALTER TABLE reward_redemptions ADD COLUMN kind TEXT NOT NULL DEFAULT 'reward'
+      CHECK(kind IN ('reward', 'withdrawal', 'deposit'));
+    ALTER TABLE reward_redemptions ADD COLUMN currency TEXT
+      CHECK((kind = 'reward') = (currency IS NULL));
+
+    CREATE TABLE reward_money_accounts (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+      currency   TEXT    NOT NULL,
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      updated_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    );
+
+    CREATE TABLE reward_allowances (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id       INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+      amount_minor  INTEGER NOT NULL CHECK(amount_minor > 0),
+      currency      TEXT    NOT NULL,
+      frequency     TEXT    NOT NULL CHECK(frequency IN ('weekly', 'monthly')),
+      anchor_day    INTEGER NOT NULL CHECK(anchor_day BETWEEN 1 AND 31),
+      next_run_date TEXT    NOT NULL,
+      paused_at     TEXT,
+      created_by    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    );
+    CREATE INDEX idx_reward_allowances_next_run ON reward_allowances(next_run_date, paused_at);
+  `,
+  237: `
+      ALTER TABLE budget_subscriptions ADD COLUMN reminder_enabled INTEGER NOT NULL DEFAULT 1
+        CHECK(reminder_enabled IN (0,1));
+  `,
 };
 
 export { MIGRATIONS_SQL };
