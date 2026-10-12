@@ -272,6 +272,10 @@ test('beim Deaktivieren enden offene Geld-Anfragen und der Plan; das Restguthabe
   const kid = await member('abschied');
   assert.equal((await credit(kid, 500)).status, 201);
   money.savePlan(db, kid.id, { amountMinor: 100, frequency: 'weekly', anchorDay: 1, paused: false }, { today: '2026-10-07' });
+  // Der naechste Termin liegt nach heute, wann immer die Suite laeuft: am
+  // 2026-10-07 gespeichert war er der 2026-10-12, und ab da buchte das
+  // Deaktivieren ihn zuerst - das Guthaben stand bei 600 statt 500.
+  db.prepare('UPDATE reward_allowances SET next_run_date = ? WHERE user_id = ?').run(shiftDateKey(todayKey(db), 7), kid.id);
   const dep = await kid.call('POST', '/rewards/redemptions', { kind: 'deposit', amount: '3.00' });
   const wd = await kid.call('POST', '/rewards/redemptions', { kind: 'withdrawal', amount: '1.00' });
   // Eine offene PRAEMIEN-Anfrage bleibt, was sie ist: die Regel gilt dem Geld.
@@ -419,7 +423,9 @@ test('beim Deaktivieren wird erst gebucht, was faellig war, dann pausiert', asyn
   // erst spaeter findet: gebucht wird bis zum Tag des Deaktivierens, nicht bis heute.
   const late = freshKid();
   sqlMoney(late, 100);
-  money.savePlan(db, late, { amountMinor: 200, frequency: 'weekly', anchorDay: 1, paused: false }, { today });
+  // Gespeichert an einem Mittwoch: an einem Montag (dem Termin-Wochentag)
+  // buchte savePlan sonst schon beim Anlegen den heutigen Termin.
+  money.savePlan(db, late, { amountMinor: 200, frequency: 'weekly', anchorDay: 1, paused: false }, { today: '2026-10-07' });
   db.prepare('UPDATE reward_allowances SET next_run_date = ? WHERE user_id = ?').run(shiftDateKey(today, -21), late);
   db.prepare('UPDATE users SET deactivated_at = ? WHERE id = ?').run(`${shiftDateKey(today, -10)}T12:00:00Z`, late);
   money.creditDueAllowances(db, { today });
