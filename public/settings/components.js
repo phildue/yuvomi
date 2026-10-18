@@ -213,16 +213,20 @@ export function settingRowHtml({
   control = '',
   extra = '',
   stacked = false,
+  field = false,
   className = '',
   attrs = {},
 }) {
+  // `field`: die Zeile ist der Traeger eines Feldfehlers (reportFieldError,
+  // components/modal.js) - die Meldung steht dann unter der Zeile, ueber beide
+  // Spalten, statt das Feld zu quetschen (layout.css, `.form-row`).
   // DIE EINSTELLUNGSZEILE IST EINE FORMULARZEILE (R18, 2026-10-07): derselbe
   // Baustein wie in den Erfassungsdialogen (utils/form-row.js). Die Klassen
   // `settings-setting-row*` bleiben vorn - unter ihnen fuehrt settings.css die
   // Masse des Blatts -, `form-row*` kommt dazu und bringt, was in der Zeile
   // steht: die randlose Auswahl, das Datum als Wert, das zusammengesetzte Feld.
   return formRowHtml({
-    label, labelFor, labelId, description, descriptionId, control, extra, stacked, className, attrs,
+    label, labelFor, labelId, description, descriptionId, control, extra, stacked, field, className, attrs,
     variant: 'settings-setting-row',
   });
 }
@@ -246,6 +250,22 @@ export function settingSwitchRowHtml({ description = '', descriptionId = null, e
     + toggleRowHtml({ ...toggle, control: 'switch', attrs })
     + descriptionHtml
     + extra
+    + '</div>';
+}
+
+/**
+ * Die Schalterzeile eines DIALOGS (R19, Einstellungen B7): `toggleRowHtml` als
+ * Zeile des Dialog-Traegers `.form-rows` (utils/form-row.js), der Hinweis
+ * darunter und per `aria-describedby` verknuepft. Das Gegenstueck zu
+ * `settingSwitchRowHtml` fuer die Blaetter - dort traegt die Gruppe
+ * (`.settings-group`) ihre eigenen Masse, im Dialog der Formular-Traeger.
+ */
+export function formSwitchRowHtml({ hint = '', hintId = null, ...toggle }) {
+  const attrs = { ...(toggle.attrs ?? {}) };
+  if (hint && hintId && !attrs['aria-describedby']) attrs['aria-describedby'] = hintId;
+  return '<div class="form-switch">'
+    + toggleRowHtml({ ...toggle, control: 'switch', attrs })
+    + (hint ? `<p class="form-hint form-switch__hint"${attrsHtml({ id: hintId })}>${esc(String(hint))}</p>` : '')
     + '</div>';
 }
 

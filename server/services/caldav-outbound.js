@@ -22,14 +22,15 @@
 import { createLogger } from '../logger.js';
 import * as outbound from './calendar-outbound.js';
 import { patchICSEvent } from '../utils/ics-patch.js';
-import { eventDateTimeFields } from '../utils/ics-datetime.js';
+import { eventDateTimeFields, rruleForDtstart } from '../utils/ics-datetime.js';
 import { householdTimeZone } from '../utils/timezone.js';
 import * as db from '../db.js';
 import { nearestIcalColorName } from '../utils/ical-color.js';
 import { outboundEvent } from './outbound-dtstart.js';
+import { icsSnapshot } from './outbound-echo.js';
 import { findObjectWithUid } from '../utils/own-uid.js';
 import { upsertExternalCalendar } from './external-calendars.js';
-import { isOriginRefusal } from '../utils/caldav-client.js';
+import { isOriginRefusal, sameObjectAddress } from '../utils/caldav-client.js';
 
 const log = createLogger('CalDAVOutbound');
 
@@ -79,6 +80,11 @@ export class ObjectIndex extends Map {
    */
   uidAt(url) {
     return url ? this.#byUrl.get(url)?.uid : undefined;
+  }
+
+  /** Was der Abruf an genau dieser Adresse gesehen hat: `{ uid, entry }` oder `undefined`. */
+  at(url) {
+    return url ? this.#byUrl.get(url) : undefined;
   }
 
   /**
@@ -194,13 +200,14 @@ function deletedByUser(source, uid, sourceObjectUrl, sourceCalendarUrl, accountI
 export function icsFieldsForEvent(event, householdZone = null) {
   // Start/Ende mit der eigenen Wiederholungsregel in Einklang (#986); ein
   // importiertes DTSTART bleibt unberuehrt (#756).
-  const when = eventDateTimeFields(outboundEvent(event), householdZone);
+  const when = eventDateTimeFields(outboundEvent(event, { householdZone }), householdZone);
 
   const fields = {
     SUMMARY:     event.title,
     DESCRIPTION: event.description || null,
     LOCATION:    event.location || null,
-    RRULE:       event.recurrence_rule || null,
+    // Reines Datum als UNTIL neben getimtem DTSTART -> Ende des Ortstags (#1974).
+    RRULE:       event.recurrence_rule ? rruleForDtstart(event.recurrence_rule, when) : null,
     DTSTART:     when.dtstart,
     DTEND:       when.dtend,
   };
@@ -273,10 +280,10 @@ export async function fetchObjectsByUrl(client, wanted) {
       // Über die URL zurück auf den Termin abbilden - verlässlicher als die UID
       // erneut aus dem Objekt zu parsen.
       for (const obj of objects || []) {
-        const match = items.find((i) => i.url === obj.url) || (items.length === 1 ? items[0] : null);
+        const match = items.find((i) => sameObjectAddress(i.url, obj.url));
         if (!match) continue;
         index.set(match.uid, {
-          url: obj.url || match.url, etag: obj.etag, data: obj.data, calendarUrl,
+          url: match.url, etag: obj.etag, data: obj.data, calendarUrl,
         });
       }
     } catch (err) {
@@ -296,11 +303,12 @@ export async function fetchObjectsByUrl(client, wanted) {
  *
  * `accountId`: bei CalDAV das Konto, mit dessen Client gearbeitet wird. Die
  * Arbeit wird unten je Konto neu gelesen; ohne es ginge für 'caldav' nichts
- * hinaus. `calendarUrls`: die Auswahl dieses Kontos - ein Löschauftrag für
- * einen Kalender ausserhalb davon bleibt liegen.
+ * hinaus. `isSelected`: ist dieser Kalender für das Konto EINGESCHALTET? Ein
+ * Löschauftrag für einen anderen bleibt liegen (#1884), siehe
+ * `processPendingDeletions`.
  * @returns {Promise<{deleted:number,updated:number}>}
  */
-export async function flushAccount(client, source, { deletions, updates, needsCalendars, accountId = null, calendarUrls = null }) {
+export async function flushAccount(client, source, { deletions, updates, needsCalendars, accountId = null, isSelected = null }) {
   const wanted = updates
     .filter((e) => e.external_object_url)
     .map((e) => ({
@@ -331,7 +339,7 @@ export async function flushAccount(client, source, { deletions, updates, needsCa
   // ownCalendarUrls bewusst nicht gesetzt: ohne vollen Abruf ist "der Server
   // führt das Objekt nicht mehr" nicht belegbar, und ein Tombstone ohne bekannte
   // URL darf hier nicht als erledigt gelten. Er bleibt für den Sync liegen.
-  const deleted = deletions.length ? await processPendingDeletions(client, source, objectIndex, null, { accountId, calendarUrls }) : 0;
+  const deleted = deletions.length ? await processPendingDeletions(client, source, objectIndex, null, { accountId, isSelected }) : 0;
   const updated = objectIndex.size ? await processPendingUpdates(client, source, objectIndex, calendarsByUrl, { accountId }) : 0;
   return { deleted, updated };
 }
@@ -350,11 +358,34 @@ export async function flushAccount(client, source, { deletions, updates, needsCa
  *   3. Ohne Anfrage fällt der Auftrag nur, wenn an der gespeicherten Adresse
  *      inzwischen ein anderer Termin liegt oder gar keine Adresse gespeichert
  *      ist und der Abruf das Objekt nicht führt.
+ * EIN BEDINGTER AUFTRAG (#1883, `isConditionalDeletion`) gilt nur dem Objekt
+ * an seiner Adresse in dem Stand, für den er vorgemerkt wurde - der Rest eines
+ * Umzugs, dessen Quelle ihr Löschen abgelehnt hat. Er sucht sein Objekt NICHT
+ * über die UID: das DELETE geht an die gespeicherte Adresse, mit dem
+ * gespeicherten ETag als If-Match. Führt der Abruf dort einen anderen Stand
+ * oder einen anderen Termin, fällt der Auftrag ohne Anfrage; antwortet der
+ * Server mit 412, fällt er ebenfalls. Beides heisst: was dort liegt, ist nicht
+ * mehr der Rest des Umzugs (der Termin wurde woanders zurückgelegt), und ein
+ * Löschen nähme ihn aus beiden Kalendern. Das gilt auch im Sofortversuch und
+ * für Apple.
+ *
  * Liegt die Adresse nicht auf dem Server des Kontos, stellt der Client die
  * Anfrage nicht (`withAccountOrigin`). Im Lauf heisst das: dieses Objekt liegt
  * nicht bei diesem Konto, der Auftrag wird mit Meldung abgeräumt. Im
  * Sofortversuch, der keinen Abruf hat, bleibt er ohne gezählten Versuch für den
  * Lauf liegen.
+ *
+ * EIN AUFTRAG FÜR EINEN ABGEWÄHLTEN KALENDER WARTET (#1884, `isSelected`).
+ * Abschalten heisst nicht aufräumen: solange der Kalender abgewählt ist, geht
+ * dorthin kein DELETE, weder im Lauf noch im Sofortversuch. Der Auftrag bleibt
+ * stehen, zählt dabei keinen Versuch und läuft, sobald der Kalender wieder
+ * eingeschaltet ist. Vorher übersprang ihn nur der Lauf; der Sofortversuch
+ * schickte das DELETE trotzdem, und jede Absage dort zählte, bis der Auftrag
+ * nach fünf aufgegeben war und der gelöschte Termin beim Wieder-Einschalten
+ * zurückkam. Endgültig fällt ein wartender Auftrag, wenn es seinen Kalender
+ * nicht mehr gibt (`dropDeletionsOfMissingCalendars`) oder sein Konto gelöscht
+ * wird. Gefragt wird je Auftrag unmittelbar vor seiner Anfrage: davor liegen
+ * die awaits der Aufträge davor, und die Auswahl kann sich in jedem ändern.
  *
  * @param {object} client       tsdav-Client
  * @param {string} source       'caldav' | 'apple'
@@ -363,13 +394,15 @@ export async function flushAccount(client, source, { deletions, updates, needsCa
  * @param {object} [scope]
  * @param {number} [scope.accountId] CalDAV-Konto, dem der Client gehört
  * @param {boolean} [scope.complete] jeder eingeschaltete Kalender des Kontos wurde abgerufen
- * @param {Set}    [scope.calendarUrls] Sofortversuch: nur Aufträge für diese Kalender
- *   (die Auswahl des Kontos); ein Auftrag ohne Kalender zählt immer dazu
+ * @param {(calendarUrl: string) => boolean} [scope.isSelected] ist der Kalender
+ *   für dieses Konto jetzt eingeschaltet? Ein Auftrag ohne Kalender wird nicht
+ *   gefragt. Ohne die Funktion (Apple kennt keine Auswahl) gilt jeder als
+ *   eingeschaltet.
  * @param {{sent: number}} [scope.outcome] zählt mit, was der Server wirklich gelöscht hat
  * @returns {Promise<number>} erledigte Tombstones - auch die, die ohne Anfrage fielen
  */
 export async function processPendingDeletions(client, source, objectIndex, ownCalendarUrls = null, {
-  accountId = null, complete = true, calendarUrls = null, outcome = null,
+  accountId = null, complete = true, isSelected = null, outcome = null,
 } = {}) {
   const rows = outbound.pendingDeletions(source, { accountId });
   if (rows.length === 0) return 0;
@@ -382,11 +415,32 @@ export async function processPendingDeletions(client, source, objectIndex, ownCa
     // dieses Auftrags wurde in diesem Lauf nicht gelesen (abgewählt, Abruf
     // gescheitert), also weiss niemand, ob sein Objekt noch dort liegt.
     if (ownCalendarUrls && row.calendar_external_id && !ownCalendarUrls.has(row.calendar_external_id)) continue;
-    if (calendarUrls && row.calendar_external_id && !calendarUrls.has(row.calendar_external_id)) continue;
+    // Abgewählt (#1884): dort wird nichts gelöscht, und der Auftrag altert nicht.
+    if (isSelected && row.calendar_external_id && !isSelected(row.calendar_external_id)) continue;
 
     let known;
     let url;
-    if (index) {
+    const conditional = outbound.isConditionalDeletion(row);
+    if (conditional) {
+      // Was dieser Durchgang an der Adresse des Auftrags gesehen hat. Ohne
+      // Konto (Apple) kennt die Map nur ein Objekt je UID.
+      let seen;
+      if (index) {
+        seen = index.at(row.object_url);
+      } else {
+        const entry = objectIndex.get(row.event_external_id);
+        seen = entry?.url === row.object_url ? { uid: row.event_external_id, entry } : undefined;
+      }
+      const otherEvent = seen && seen.uid !== null && seen.uid !== row.event_external_id;
+      const otherState = seen?.entry?.etag && seen.entry.etag !== row.etag;
+      if (otherEvent || otherState) {
+        log.info(`[${label(source)}] The entry of event ${row.event_external_id} in its old calendar has changed since its removal was queued, dropping the pending deletion.`);
+        outbound.dropDeletion(row.id);
+        done++;
+        continue;
+      }
+      url = row.object_url;
+    } else if (index) {
       known = index.find({
         uid: row.event_external_id, url: row.object_url,
         calendarUrl: row.calendar_external_id || null,
@@ -424,11 +478,21 @@ export async function processPendingDeletions(client, source, objectIndex, ownCa
     }
 
     try {
-      await client.deleteCalendarObject({ calendarObject: { url, etag: known?.etag } });
+      await client.deleteCalendarObject({ calendarObject: { url, etag: conditional ? row.etag : known?.etag } });
       outbound.dropDeletion(row.id);
       done++;
       if (outcome) outcome.sent++;
     } catch (err) {
+      // 412 auf den gespeicherten ETag: das Objekt hat sich geändert, seit der
+      // Auftrag vorgemerkt wurde. Kein Wiederholungsfall - ein späterer Versuch
+      // käme nur mit einem frischen ETag durch, und der löschte genau das, was
+      // die Vorbedingung schützt.
+      if (conditional && outbound.outboundErrorStatus(err) === 412) {
+        log.info(`[${label(source)}] The entry of event ${row.event_external_id} in its old calendar has changed since its removal was queued, dropping the pending deletion.`);
+        outbound.dropDeletion(row.id);
+        done++;
+        continue;
+      }
       if (isOriginRefusal(err)) {
         // Nichts wurde gesendet.
         if (ownCalendarUrls) {
@@ -594,9 +658,14 @@ export async function processPendingUpdates(client, source, objectIndex, calenda
           // Zeile, die einen anderen Kalender nennen kann. Hat der Nutzer
           // gelöscht, steht der Auftrag der Route schon.
           if (sourceRefusal && !userDeletedIt) {
+            // Der Auftrag gilt dem Objekt in dem Stand, den dieser Umzug
+            // kopiert hat (#1883): sein ETag geht mit. Nach einem 412 ist
+            // gerade dieser Stand schon überholt - dann bleibt der Auftrag
+            // ohne Bedingung, wie vor #1883.
             const queued = outbound.queueRefusedDeletion({
               source, calendarExternalId: known.calendarUrl,
               eventExternalId: event.external_calendar_id, objectUrl: known.url, accountId,
+              etag: outbound.outboundErrorStatus(sourceRefusal) === 412 ? null : (known.etag ?? null),
             }, sourceRefusal);
             if (queued) {
               log.warn(`[${label(source)}] Event ${event.id} was copied to ${moveTo} but could not be removed from its old calendar (${sourceRefusal.message}); the removal is tried again.`);
@@ -627,7 +696,8 @@ export async function processPendingUpdates(client, source, objectIndex, calenda
           outbound.dropDeletionsIn({
             source, calendarExternalId: moveTo, eventExternalId: event.external_calendar_id, accountId,
           });
-          outbound.settleOutbound(fresh, moveTo);
+          // Mit dem Anlegen ging der Patch hinaus: sein Schnappschuss (#1956).
+          outbound.settleOutbound(fresh, moveTo, fresh, { snapshot: icsSnapshot(fresh, patched, event.external_calendar_id, zone) });
           done++;
           continue; // der Patch ist mit dem Anlegen bereits geschrieben
         } catch (err) {
@@ -656,7 +726,7 @@ export async function processPendingUpdates(client, source, objectIndex, calenda
       // Die Adresse kam aus dem Abruf; die Zeile merkt sich die, an der ihr
       // Objekt wirklich liegt.
       if (index && url !== event.external_object_url) outbound.recordObjectUrl(event.id, url);
-      outbound.settleOutbound(fresh);
+      outbound.settleOutbound(fresh, null, fresh, { snapshot: icsSnapshot(fresh, patched, event.external_calendar_id, zone) });
       done++;
     } catch (err) {
       outbound.handleUpdateError(err, event, 'update', label(source));

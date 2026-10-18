@@ -1,12 +1,10 @@
-<!-- version: 2.76.0 -->
-This update makes the app quieter to look at and quicker to start, and fixes a number of sync problems.
+<!-- version: 2.77.2 -->
+This update makes the app start again on 64-bit ARM devices and brings a few budget and subscription fixes.
 
-Lists carry fewer buttons: editing, deleting and the other actions of a row now sit behind one menu or a swipe. Fields, settings rows, dialogs and the sidebar share one look, the reading views of events, tasks, notes, documents and recipes show what matters first, and the budget screens each have one leading figure. Rows and cards answer a tap, sheets and deeper pages move in a direction, and the app starts faster on a slow connection because an update now transfers only the files that changed.
+On ARM-based systems the 2.77.1 image stopped right at startup because two libraries were missing from it. They are back, and every image is now checked for its libraries on each platform before it is published.
 
-There are a few new things. Loans can be put in order by interest rate or by remaining balance, the payment reminder can be turned off for a single subscription, the shopping tile on the overview shows the lists you choose, and "Grant bonus" is on the Rewards overview. On a wall tablet, today's programme names the calendar and the time span of an appointment.
+Subscriptions with an end behave as expected: the last payment stays in the budget, a completed subscription can no longer be marked as paid again, and switching one back on continues with the payment after the last one instead of booking it twice. A private subscription no longer shows its expense in the household budget when two changes meet. The budget overview shows each category's share of the total, and error messages on the recipes, documents and subscriptions pages now speak the language of the app.
 
-Sync is more careful. A calendar or reminder server that refuses a change is no longer taken for a success, an entry no longer doubles when the server's answer gets lost, and an event written to Google keeps its time when the Google calendar is set to another time zone, provided the household time zone is set in the settings. A subscription now shows in every month of the budget it is due in, and a wall tablet shows events again when the overview is set to "Assigned to me". Single sign-on no longer fails over the spelling of the redirect address.
+No database migration and no action is needed. As always, a backup before updating is a good idea.
 
-The update runs one database migration on first start, which adds the reminder switch to subscriptions. No existing entry is changed and no action is needed; as always, a backup before updating is a good idea.
-
-Full release notes are available at https://github.com/ulsklyc/yuvomi/releases/tag/v2.76.0
+Full release notes are available at https://github.com/ulsklyc/yuvomi/releases/tag/v2.77.2

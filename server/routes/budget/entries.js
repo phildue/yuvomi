@@ -56,8 +56,13 @@ function intervalCountCheck(value) {
 /**
  * GET /api/v1/budget/summary
  * Monatsübersicht: Einnahmen, Ausgaben, Saldo, Aufschlüsselung nach Kategorie.
- * Query: ?month=YYYY-MM  (default: aktueller Monat)
+ * Query: ?month=YYYY-MM  (default: aktueller Monat), optional &account_id=
  * Response: { data: { month, income, expenses, balance, byCategory: [] } }
+ *
+ * `account_id` grenzt alle Summen auf ein Konto ein, wie die Liste
+ * (Re-Critique 2026-10-17): mit gefiltertem Hauptbuch blieben Saldo und
+ * Kategorien der Seitenleiste beim ganzen Haushalt, die Bilanz neben dem
+ * Kontoauszug sprach also ueber andere Buchungen als die Liste darunter.
  */
 router.get('/summary', (req, res) => {
   try {
@@ -80,6 +85,13 @@ router.get('/summary', (req, res) => {
     // Sichtbarkeit/Scope (#476/#505): dieselbe Filterung wie die Eintragsliste,
     // damit Summen private Fremd-Einträge nicht mit einrechnen.
     const filter = budgetFilter(req, 'budget_entries');
+    // Dieselbe Lesart wie die Liste: nur eine positive ganze Zahl filtert.
+    const accountId = parseInt(req.query.account_id, 10);
+    if (Number.isInteger(accountId) && accountId > 0) {
+      filter.clause += ' AND budget_entries.account_id = ?';
+      filter.params = [...filter.params, accountId];
+    }
+    const accountFiltered = Number.isInteger(accountId) && accountId > 0;
 
     const totals = db.get().prepare(`
       SELECT
@@ -118,35 +130,18 @@ router.get('/summary', (req, res) => {
       WHERE date BETWEEN ? AND ?${filter.clause} AND is_pending = 1
     `).get(from, to, ...filter.params);
 
-    // Nur Ausgabenkategorien haben Subkategorien (validateSubcategory erzwingt
-    // '' für Einnahmen) — der Filter auf subcategory != '' reicht daher aus,
-    // ohne zusätzlich nach Kategorie-Typ zu joinen. Der Filter prüft die echte
-    // Spalte (vor der Maskierung): er soll Einnahmen aussortieren, nicht
-    // maskierte Fremdeinträge.
-    //
-    // Category UND Subcategory laufen durch dieselbe Maskierung wie byCategory
-    // (#659): subcategory allein verriete die Kategorie schon durch den Schlüssel
-    // (z.B. "rent_mortgage" ⇒ "housing"), s. budgetSubcategoryExpr().
-    const subExpr = budgetSubcategoryExpr(req, 'budget_entries');
-    const bySubcategory = db.get().prepare(`
-      SELECT ${catExpr.expr} AS category, ${subExpr.expr} AS subcategory,
-             SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) AS income,
-             SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END) AS expenses,
-             SUM(amount) AS total
-      FROM budget_entries
-      WHERE date BETWEEN ? AND ? AND subcategory != ''${filter.clause}${bookedOnly()}
-      GROUP BY 1, 2
-      ORDER BY 1, ABS(SUM(amount)) DESC
-    `).all(...catExpr.params, ...subExpr.params, from, to, ...filter.params);
-
     // ABO-ZAHLUNGEN DER FOLGEMONATE GEHOEREN IN DIESELBE ZAHL (#1844). Sie
     // stehen in der Liste als erwartet und in keiner Summe - genau der Fall,
     // fuer den es `pending` gibt. Gerechnet beim Lesen
     // (services/subscription-budget-projection.js), mit demselben Filter wie
     // die Buchungen: was der Betrachter nicht sieht, zaehlt er auch nicht.
-    const expected = expectedSubscriptionTotals(db.get(), {
-      from, to, filter: expectedSubscriptionFilter(req),
-    });
+    // Mit Kontofilter keine: eine erwartete Abo-Zahlung haengt an keinem Konto,
+    // und die Liste laesst sie aus demselben Grund weg.
+    const expected = accountFiltered
+      ? { count: 0, income: 0, expenses: 0, omitted: false }
+      : expectedSubscriptionTotals(db.get(), {
+        from, to, filter: expectedSubscriptionFilter(req),
+      });
 
     res.json({
       data: {
@@ -155,7 +150,6 @@ router.get('/summary', (req, res) => {
         expenses:   totals.expenses || 0,
         balance:    totals.balance  || 0,
         byCategory,
-        bySubcategory,
         pending: {
           count:    pending.count + expected.count,
           income:   cents(pending.income + expected.income),

@@ -7,6 +7,7 @@ import express from 'express';
 import * as db from '../../db.js';
 import * as v from '../../middleware/validate.js';
 import { defaultVisibilityFor, vitalScopeKey } from './visibility-defaults.js';
+import { vitalLimitError, refuseImpossibleVital } from './vital-limits.js';
 import {
   log, VISIBILITIES, MAX_UNIT,
   viewerId, careAwareClause, applyUpdate, badRequest,
@@ -53,6 +54,13 @@ router.post('/vitals', (req, res) => {
     const errors = v.collectErrors([type, valueNum, valueNum2, valueNum3, unit, measuredAt, note, visibility]);
     if (errors.length) return badRequest(res, errors);
 
+    // Unmoegliches gar nicht erst speichern (Critique R19, vital-limits.js).
+    const impossible = vitalLimitError({
+      type: type.value, unit: unit.value,
+      value_num: valueNum.value, value_num2: valueNum2.value, value_num3: valueNum3.value,
+    });
+    if (impossible) return refuseImpossibleVital(res, impossible);
+
     // Optionales user_id: eine betreuende Person trägt für die betreute ein (#584).
     const owner = resolveOwner(req, viewer);
     if (owner.error) return res.status(owner.status).json({ error: owner.error, code: owner.status });
@@ -83,7 +91,7 @@ router.patch('/vitals/:id', (req, res) => {
 
     const w = writableClause('', viewer);
     const existing = db.get().prepare(`SELECT * FROM health_vitals WHERE id = ? AND ${w.sql}`).get(id, ...w.params);
-    if (!existing) return res.status(404).json({ error: 'Vitalwert nicht gefunden.', code: 404 });
+    if (!existing) return res.status(404).json({ error: 'Measurement not found.', code: 404, reason: 'health_vital_not_found' });
 
     const b = req.body || {};
     const fields = {};
@@ -100,6 +108,11 @@ router.patch('/vitals/:id', (req, res) => {
 
     const errors = v.collectErrors(checks);
     if (errors.length) return badRequest(res, errors);
+
+    // Geprueft wird die Messung, wie sie NACH dem Speichern stuende: eine
+    // Diastole, die einzeln ueber die Systole gehoben wird, ist derselbe Fehler.
+    const impossible = vitalLimitError({ ...existing, ...fields });
+    if (impossible) return refuseImpossibleVital(res, impossible);
 
     applyUpdate('health_vitals', id, fields);
     res.json({ data: db.get().prepare('SELECT * FROM health_vitals WHERE id = ?').get(id) });
@@ -118,7 +131,7 @@ router.delete('/vitals/:id', (req, res) => {
 
     const w = writableClause('', viewer);
     const existing = db.get().prepare(`SELECT id FROM health_vitals WHERE id = ? AND ${w.sql}`).get(id, ...w.params);
-    if (!existing) return res.status(404).json({ error: 'Vitalwert nicht gefunden.', code: 404 });
+    if (!existing) return res.status(404).json({ error: 'Measurement not found.', code: 404, reason: 'health_vital_not_found' });
 
     db.get().prepare('DELETE FROM health_vitals WHERE id = ?').run(id);
     res.status(204).end();

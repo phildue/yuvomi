@@ -47,6 +47,11 @@ const STUBS = {
       logout: async () => ({ ok: true }),
       updateProfile: async () => ({ user: null }),
     };
+    export const email = {
+      getConfig: async () => ({ data: null }),
+      saveConfig: async () => ({ data: null }),
+      test: async () => ({ data: null }),
+    };
     export const notifications = {
       providers: async () => ({ data: [] }),
       listChannels: async () => ({ data: [] }),
@@ -159,7 +164,8 @@ const STUBS = {
     // dasselbe Muster wie __apiStub in /api.js.
     export const getRRuleValues = () => globalThis.__rruleValues ?? ({});
     export const describeRRule = () => '';
-    export const recurrenceRow = () => ({ icon: 'repeat', label: '', value: '' });
+    // Wer die Verdrahtung der Detailzeile pruefen will, setzt globalThis.__recurrenceRow.
+    export const recurrenceRow = (...args) => globalThis.__recurrenceRow?.(...args) ?? ({ icon: 'repeat', label: '', value: '' });
     export const intervalUnitLabel = () => '';
   `,
   '/components/modal.js': `
@@ -208,7 +214,29 @@ const STUBS = {
       globalThis.__reportFieldError?.(...args);
       return false;
     };
+    // Das Gegenstueck: wer sehen will, dass ein Handler einen alten
+    // Feldfehler raeumt, setzt globalThis.__clearFieldError.
+    export const clearFieldError = (...args) => {
+      globalThis.__clearFieldError?.(...args);
+    };
+    // Wie das Original (components/modal.js): alle Eintraege mit Feld, je Feld
+    // der erste - ueber __reportFieldError gemeldet, in der Reihenfolge der
+    // Liste (eine Dokumentreihenfolge kennt der Stub nicht).
+    export const reportFieldErrors = (errors) => {
+      const seen = new Set();
+      let any = false;
+      for (const entry of errors ?? []) {
+        if (!Array.isArray(entry) || !entry[0] || seen.has(entry[0])) continue;
+        seen.add(entry[0]);
+        any = true;
+        globalThis.__reportFieldError?.(entry[0], entry[1]);
+      }
+      return any;
+    };
     export const mountFooter = () => null;
+    // Wer sehen will, WOHIN ein Formular sich legt (R19, Bearbeiten in der
+    // Detailspalte), setzt globalThis.__dockNextModal.
+    export const dockNextModal = (...args) => globalThis.__dockNextModal?.(...args);
     export const refreshDirtySnapshot = () => {};
     // Der Tausch selbst muss laufen, genau einmal und synchron. Wer die
     // Dirty-Basis dahinter messen will, haengt die ECHTE Funktion aus
@@ -224,6 +252,11 @@ const STUBS = {
         ? true
         : globalThis.__modalContextId() === context
     );
+    // Ob der festgehaltene Dialog noch offen ist (#1997). Ohne Sonde: ja - wer
+    // die spaete Antwort messen will, setzt globalThis.__isOwnModalOpen.
+    export const isOwnModalOpen = (context) => (
+      typeof globalThis.__isOwnModalOpen === 'function' ? globalThis.__isOwnModalOpen(context) : true
+    );
     export const focusFirstField = () => null;
     export const updateHeaderAction = () => null;
     export const validateAll = () => true;
@@ -236,8 +269,12 @@ const STUBS = {
     export const btnLoading = () => () => {};
     export const btnSuccess = () => {};
     export const btnError = () => {};
-    export const refocusAfterRender = () => {};
-    export const renderKeepingFocus = (render) => { render(); return null; };
+    // Wer sehen will, OB eine Seite den Fokus nach dem Neuzeichnen
+    // zuruecktraegt, setzt globalThis.__refocusAfterRender.
+    export const refocusAfterRender = () => { globalThis.__refocusAfterRender?.(); };
+    // Wer sehen will, OB ein Neuzeichnen den Fokus mitnimmt, setzt
+    // globalThis.__renderKeepingFocus (bekommt den Neuaufbau mitgeliefert).
+    export const renderKeepingFocus = (render) => { globalThis.__renderKeepingFocus?.(render); render(); return null; };
     export const forgetRestore = () => {};
     // Die Fokus-Merker der Detailansicht (Popover): ohne Browser nichts zu merken.
     export const rememberFocus = () => null;
@@ -256,6 +293,30 @@ const STUBS = {
       return { update: () => true, isOpen: () => true };
     };
     export const closeDetailView = () => {};
+    // Dieselbe Regel wie im Original (R19): Bearbeiten als der eine
+    // Primaerknopf am Ende, andere Primaerknoepfe treten zurueck.
+    export const withPrimaryEdit = (actions = [], edit = null) => {
+      const list = (actions ?? []).filter(Boolean);
+      if (!edit) return list;
+      return [...list.map((a) => (a.variant === 'primary' ? { ...a, variant: 'secondary' } : a)), { icon: 'pencil', ...edit, variant: 'primary' }];
+    };
+    // Der Fuss als schlichte Knopfreihe - genug fuer Tests, die nach einer
+    // id oder einem Primaerknopf fragen.
+    export const detailFooterEl = (actions = []) => {
+      const visible = (actions ?? []).filter((a) => a && !a.hidden);
+      if (!visible.length || typeof document === 'undefined') return null;
+      const footer = document.createElement('div');
+      footer.className = 'detail-view__footer';
+      for (const action of visible) {
+        const btn = document.createElement('button');
+        btn.className = 'btn btn--' + (action.variant ?? 'secondary');
+        if (action.id) btn.id = action.id;
+        btn.textContent = action.label ?? '';
+        if (typeof action.onClick === 'function') btn.addEventListener('click', () => action.onClick({ close: () => {}, button: btn }));
+        footer.appendChild(btn);
+      }
+      return footer;
+    };
     export const detailRowEl = () => null;
     export const visibilityRow = () => ({ icon: 'users', label: '', value: '' });
     export const assignedRow = () => ({ icon: 'user', label: '', value: '' });
@@ -281,6 +342,8 @@ const STUBS = {
     // Token-Leser ohne Stylesheet: der Rueckfall ist der Wert (utils/flip.js).
     // Region auf-/zuklappen: ohne Layout bleibt nur der Zustand selbst (hidden).
     export const toggleRegion = (region, open) => { if (region) region.hidden = !open; return Promise.resolve(); };
+    // Ohne Layout kein Ladezustand am Knopf: nur die Arbeit selbst.
+    export const withBusy = (_el, work) => work();
     // Balken wachsen lassen: ohne Layout nichts zu tun, der Endwert steht im Markup.
     export const growBars = () => 0;
     export const drawChartOnce = () => 0;
@@ -300,6 +363,14 @@ const STUBS = {
       globalThis.__motionStub?.('swapContent', host, opts);
       if (typeof update === 'function') update();
       return null;
+    }
+    export const REGION_NAME = 'region-swap';
+    export function canSwapRegion() { return false; }
+    export function regionSwapType(d) { return d > 0 ? 'region-forward' : d < 0 ? 'region-back' : 'region-fade'; }
+    export async function swapRegion(host, update, opts = {}) {
+      globalThis.__motionStub?.('swapRegion', host, opts);
+      if (typeof update === 'function') await update();
+      return { transition: false, finished: Promise.resolve() };
     }
   `,
   '/utils/list-motion.js': `
@@ -366,6 +437,9 @@ const STUBS = {
     // die echte Komponente. Ohne das bleibt es beim leeren Markup wie bisher.
     export const bindUserMultiSelect = (...args) => globalThis.__bindUserMultiSelect?.(...args);
     export const renderAvatarStack = (...args) => globalThis.__renderAvatarStack?.(...args) ?? '';
+    // Der geteilte Nachname (Chips ohne "Johnson"): Suiten, die ihn pruefen,
+    // setzen globalThis.__sharedSurname auf die echte Funktion; sonst keiner.
+    export const sharedSurname = (...args) => globalThis.__sharedSurname?.(...args) ?? '';
   `,
   '/utils/shopping-categories.js': `
     export const DEFAULT_CATEGORY_NAME = 'Sonstiges';

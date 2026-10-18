@@ -25,6 +25,7 @@ import * as googleCalendar from './services/google-calendar.js';
 import * as appleCalendar from './services/apple-calendar.js';
 import * as icsSubscription from './services/ics-subscription.js';
 import * as icsExport from './services/ics-export.js';
+import { findCalendarByFeedToken } from './services/local-calendars.js';
 import * as inventoryDeadlinesIcs from './services/inventory-deadlines-ics.js';
 import * as cycleIcs from './services/cycle-ics.js';
 import * as scheduleIcs from './services/schedule-ics.js';
@@ -57,6 +58,7 @@ import quickLinksRouter from './routes/quick-links.js';
 import contactsRouter from './routes/contacts.js';
 import cardavRouter from './routes/cardav.js';
 import birthdaysRouter from './routes/birthdays.js';
+import * as birthdayIcs from './services/birthday-ics.js';
 import budgetRouter from './routes/budget.js';
 import subscriptionsRouter from './routes/subscriptions.js';
 import documentsRouter from './routes/documents.js';
@@ -88,6 +90,7 @@ import housekeepingRouter from './routes/housekeeping.js';
 import wasteRouter from './routes/waste/index.js';
 import modulesRouter from './routes/modules.js';
 import { listModules } from './services/modules.js';
+import { recoverInterruptedInstalls } from './services/module-install.js';
 import pushRouter from './routes/push.js';
 import emailRouter from './routes/email.js';
 import notificationsRouter from './routes/notifications.js';
@@ -481,13 +484,30 @@ const feedLimiter = rateLimit({
 app.get('/feed/calendar/:token.ics', feedLimiter, (req, res) => {
   try {
     const userId = icsExport.findUserIdByFeedToken(db.get(), req.params.token);
-    if (!userId) return res.status(404).type('text/plain').send('Not found');
-    const ics = icsExport.buildFeed(db.get(), userId);
+    const localCalendar = userId ? null : findCalendarByFeedToken(db.get(), req.params.token);
+    if (!userId && !localCalendar) return res.status(404).type('text/plain').send('Not found');
+    const ics = userId
+      ? icsExport.buildFeed(db.get(), userId)
+      : icsExport.buildCalendarFeed(db.get(), localCalendar.id);
     res.set('Cache-Control', 'private, no-store');
-    res.set('Content-Disposition', 'inline; filename="yuvomi.ics"');
+    res.set('Content-Disposition', `inline; filename="${localCalendar ? `yuvomi-${localCalendar.id}.ics` : 'yuvomi.ics'}"`);
     res.type('text/calendar; charset=utf-8').send(ics);
   } catch (err) {
     log.error('', err);
+    res.status(500).type('text/plain').send('Internal error');
+  }
+});
+
+app.get('/feed/birthdays/:token.ics', feedLimiter, (req, res) => {
+  try {
+    if (!birthdayIcs.findUserIdByFeedToken(db.get(), req.params.token)) {
+      return res.status(404).type('text/plain').send('Not found');
+    }
+    res.set('Cache-Control', 'private, no-store');
+    res.set('Content-Disposition', 'inline; filename="yuvomi-birthdays.ics"');
+    res.type('text/calendar; charset=utf-8').send(birthdayIcs.buildBirthdayFeed(db.get()));
+  } catch (err) {
+    log.error('Birthday feed', err);
     res.status(500).type('text/plain').send('Internal error');
   }
 });
@@ -620,14 +640,17 @@ app.use('/api/v1', (req, res, next) => {
 // `authScopes === null` und steigen in derselben Zeile aus wie vorher.
 app.use('/api/v1', (req, res, next) => {
   if (req.authScopes == null) return next();
-  // Ein gekoppeltes Display darf zusaetzlich zu seinen Modulen drei Geruestpfade
-  // LESEN (services/display-accounts.js, `DISPLAY_READ_PATHS`): die eigene
-  // Zeile, die Darstellungseinstellungen und die Modulliste. Keiner davon ist
-  // ein scopebares Modul, also verwuerfe dieses Gate sie samt und sonders - und
-  // die App auf dem Tablett kaeme nie ueber ihren Start hinaus. Die Ausnahme
-  // gilt NUR fuer `authMethod === 'display'`; fuer ein gescoptes Token aendert
-  // sich nichts.
-  if (req.authMethod === 'display' && displayMayAct(req.method, req.path)) return next();
+  // Ein gekoppeltes Display darf zusaetzlich zu seinen Modulen eine Handvoll
+  // Geruestpfade LESEN (display-scopes.js, `DISPLAY_READ_PATHS`): die eigene
+  // Zeile, die Darstellungseinstellungen, die Modulliste, die Personen fuer
+  // seine Aktionen - und, nur wenn ein Administrator es fuer dieses Display
+  // eingeschaltet hat, die Fotos des Bildschirmschoners (`DISPLAY_READ_ROUTES`,
+  // #1766). Keiner davon ist ein scopebares Modul, also verwuerfe dieses Gate
+  // sie samt und sonders - und die App auf dem Tablett kaeme nie ueber ihren
+  // Start hinaus. Die Ausnahme gilt NUR fuer `authMethod === 'display'`; fuer
+  // ein gescoptes Token aendert sich nichts.
+  if (req.authMethod === 'display'
+    && displayMayAct(req.method, req.path, { screensaver: req.displayShowsScreensaver === true })) return next();
   // `tokenAccessRequirement()` statt `moduleForPath()` + `requiredAccess()`:
   // dieselbe Regel, plus die EINE Ausnahme, die fuer beide Achsen gilt
   // (Rezept -> Einkauf liest `meals`, #1290 - Begruendung in server/scopes.js).
@@ -674,7 +697,13 @@ app.use('/api/v1', (req, res, next) => {
   // Anlegen-, Bearbeiten- und Loeschen-Knoepfe, die der Server hinterher
   // abweist. Die Erlaubnis ist keine Modulstufe, sondern genau zwei Routen, und
   // beide Gates fragen dieselbe Liste.
-  if (req.authMethod === 'display' && displayMayAct(req.method, req.path)) return next();
+  // Die Bildschirmschoner-Wahl geht auch hier mit, damit beide Gates dieselbe
+  // Frage stellen - entscheidend ist sie an dieser Stelle nicht, und kein Test
+  // misst sie hier: das Scope-Gate davor hat ein ausgeschaltetes Display
+  // schon abgewiesen, und `/screensaver` ist kein Modul, das dieses Gate
+  // sperren koennte (#1766). Die Regel steht im Scope-Gate.
+  if (req.authMethod === 'display'
+    && displayMayAct(req.method, req.path, { screensaver: req.displayShowsScreensaver === true })) return next();
   const { moduleKey: scopedModuleKey, access: scopedAccess } =
     sessionModuleAccessRequirement(req.path, req.method);
   const verdict = moduleAccessVerdict(
@@ -802,8 +831,10 @@ app.use(createErrorHandler(log));
 const SYNC_INTERVAL_MS = (parseInt(process.env.SYNC_INTERVAL_MINUTES, 10) || 15) * 60_000;
 
 async function runSync() {
-  const { connected: googleConnected } = googleCalendar.getStatus();
-  if (googleConnected) {
+  // Ein abgelehntes Token (#2019) steht auf der Karte; jeder Takt schriebe
+  // sonst denselben Fehler ins Log, ohne dass ein Lauf etwas ändern könnte.
+  const { connected: googleConnected, needsReauth: googleNeedsReauth } = googleCalendar.getStatus();
+  if (googleConnected && !googleNeedsReauth) {
     googleCalendar.sync().catch((e) => logSync.error('Google error:', e.message));
   }
 
@@ -842,6 +873,10 @@ async function runSync() {
 // drops unknown ext:* rows, and moduleAccessVerdict is a deny-list — a missing
 // key means allow. Starting the scan inside the listen callback left that window
 // open until the first GET /api/v1/modules (or /permissions/catalog).
+// Davor: ein Ersetzen, das ein Neustart zwischen seinen zwei Umbenennungen
+// abgeschnitten hat, holt die alte Fassung aus `.backup-<id>-*` zurueck, damit
+// schon die erste Liste das Modul wieder kennt. Wirft nie.
+await recoverInterruptedInstalls();
 try {
   await listModules({ admin: true });
 } catch (err) {

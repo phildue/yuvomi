@@ -10637,7 +10637,404 @@ const MIGRATIONS = [
       END;
     `,
   },
+  {
+    version: 240,
+    description: 'Calendar: a pending deletion can carry the ETag of the entry it was queued for (#1883)',
+    // EIN LOESCHAUFTRAG, DER WARTET, KANNTE NUR DIE ADRESSE SEINES OBJEKTS. Der
+    // Auftrag aus einem Umzug, dessen Quelle ihr Loeschen abgelehnt hat (#1861),
+    // wartet ueber Laeufe hinweg; liegt der Termin dann wieder im alten Kalender
+    // (auf einem anderen Geraet zurueckgeschoben), traf ihn der naechste Versuch,
+    // und er war in beiden Kalendern fort.
+    //
+    // `etag` ist der Stand des Objekts, fuer den der Auftrag vorgemerkt wurde.
+    // Traegt ein Auftrag einen, gilt er genau diesem Objekt in genau diesem
+    // Stand: das DELETE geht mit ihm als If-Match hinaus, und ein anderer Stand
+    // verwirft den Auftrag. NULL heisst "gleich in welchem Stand" - das Loeschen
+    // durch den Nutzer und jeder Auftrag von vor dieser Migration; fuer sie
+    // aendert sich nichts.
+    up: `
+      ALTER TABLE calendar_pending_deletions ADD COLUMN etag TEXT;
+    `,
+  },
+  {
+    version: 241,
+    description: 'CalDAV: an upload is noted before it is sent, so a lost answer leaves a trace (#1882)',
+    // EIN UPLOAD, DESSEN ANTWORT VERLOREN GING, HINTERLIESS NICHTS. Der PUT kam
+    // an, das Objekt liegt auf dem Server, und lokal stand nur eine Zeile wie
+    // jede andere, die noch nie hinaufging. Wartet sie weiter auf denselben
+    // Platz, uebernimmt der naechste Lauf das Objekt (#1837). Wird sie aber
+    // vorher geloescht oder bekommt sie ein anderes Ziel, wusste niemand mehr,
+    // dass dort etwas von ihr liegt: der naechste Abruf holte den geloeschten
+    // Eintrag als neue Zeile zurueck bzw. legte neben die bestehende eine
+    // zweite.
+    //
+    // Die UID des Objekts allein darf das nicht entscheiden. Sie kommt vom
+    // Server, und wer dort schreiben darf, kann eine im Muster dieser
+    // Installation bauen (`server/utils/own-uid.js`); nach dem Einspielen
+    // eines aelteren Backups traegt ausserdem eine NEUE Zeile die Id einer
+    // frueheren, deren Objekt noch oben liegt. Geloescht wird ein Objekt
+    // deshalb nur, wenn der LOKALE Stand belegt, dass genau diese Zeile an
+    // genau diesen Platz hinaufgeschickt wurde.
+    //
+    // Dieser Beleg ist die Zeile hier: geschrieben VOR der Anfrage, entfernt,
+    // sobald ihr Ergebnis gebucht ist. Bleibt sie stehen, ist die Antwort nie
+    // angekommen. Sie ueberlebt die Zeile, von der sie handelt (kein
+    // Fremdschluessel auf calendar_events/tasks/shopping_items: drei Tabellen,
+    // und der Fall ist gerade der, in dem die Zeile fort ist); ihr Konto
+    // ueberlebt sie nicht - ohne Konto gibt es keinen Weg zum Objekt.
+    //
+    // `account_id` ist NULL fuer iCloud (eine Verbindung, kein Konto). Der
+    // Schluessel nennt den Platz: eine Zeile kann nacheinander an mehrere
+    // Plaetze geschickt worden sein, ohne dass eine Antwort ankam.
+    up: `
+      CREATE TABLE IF NOT EXISTS caldav_upload_attempts (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        source         TEXT    NOT NULL CHECK (source IN ('caldav', 'apple')),
+        account_id     INTEGER REFERENCES caldav_accounts(id) ON DELETE CASCADE,
+        kind           TEXT    NOT NULL CHECK (kind IN ('event', 'task', 'item')),
+        row_id         INTEGER NOT NULL,
+        collection_url TEXT    NOT NULL,
+        uid            TEXT    NOT NULL,
+        object_url     TEXT    NOT NULL,
+        created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_caldav_upload_attempts_place
+        ON caldav_upload_attempts(source, COALESCE(account_id, 0), kind, row_id, collection_url);
+      CREATE INDEX IF NOT EXISTS idx_caldav_upload_attempts_uid
+        ON caldav_upload_attempts(uid);
+    `,
+  },
+  {
+    version: 242,
+    description: 'Tasks: manual order within a category (tasks.sort_order)',
+    // NULL = nie von Hand eingeordnet. Solche Aufgaben behalten die bisherige
+    // Reihenfolge (Faelligkeit, dann Prioritaet) und stehen HINTER den von Hand
+    // eingeordneten: eine neue Aufgabe landet damit am Ende ihrer Kategorie,
+    // statt eine bestehende Handordnung zu verschieben. Kein Backfill - bis zum
+    // ersten Zug aendert sich nichts an der Anzeige.
+    //
+    // Der Rang gilt in der Kategorie, in der er vergeben wurde: wechselt eine
+    // Aufgabe die Kategorie, setzt PUT /tasks/:id ihn auf NULL zurueck, und sie
+    // steht dort, wo jede neue Aufgabe steht. Die Folgeinstanz einer
+    // Wiederholung erbt den Rang ihrer Vorgaengerin. Gelesen wird er nur beim
+    // Gruppieren nach Kategorie.
+    up(db) {
+      const has = (table, column) => db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+      if (!has('tasks', 'sort_order')) db.exec('ALTER TABLE tasks ADD COLUMN sort_order INTEGER');
+    },
+  },
+  {
+    version: 243,
+    description: 'Shopping: a mirrored item waits to be carried to the list it was moved to',
+    // Ein gespiegelter Artikel, der auf eine andere gespiegelte Liste umzieht
+    // (#1700), nimmt sein Objekt auf dem CalDAV-Server mit. `outbound_move = 1`
+    // heisst: die Zeile steht schon auf der neuen Liste, ihr Objekt liegt noch
+    // in der Collection der alten (`external_object_url`) und soll in die
+    // Collection, die der Liste zugeordnet ist, in der die Zeile JETZT steht.
+    // Das Ziel steht deshalb nicht hier - es folgt aus `list_id`. Solange die
+    // Vormerkung steht, ordnet der Abruf die Zeile nicht nach dem Server um.
+    // `outbound_move_attempts` zaehlt die Absagen des Ziels; nach der fuenften
+    // faellt die Vormerkung, und die Zeile steht wieder auf der Liste ihres
+    // Objekts. Ein eigener Zaehler, weil `outbound_attempts` der Bearbeitung
+    // gehoert und mit ihr zurueckgesetzt wird.
+    up(db) {
+      const has = (column) => db.prepare('PRAGMA table_info(shopping_items)').all().some((c) => c.name === column);
+      if (!has('outbound_move')) {
+        db.exec('ALTER TABLE shopping_items ADD COLUMN outbound_move INTEGER NOT NULL DEFAULT 0');
+      }
+      if (!has('outbound_move_attempts')) {
+        db.exec('ALTER TABLE shopping_items ADD COLUMN outbound_move_attempts INTEGER NOT NULL DEFAULT 0');
+      }
+    },
+  },
+  {
+    version: 244,
+    description: 'Displays: the photo screensaver is switched on per display by an administrator (#1766)',
+    // OB EIN WANDTABLETT DEN FOTO-SCHONER ZEIGT, ENTSCHEIDET EIN ADMINISTRATOR,
+    // JE DISPLAY (#1766, PR #1793). Ohne diese Spalte haette jedes gekoppelte
+    // Tablett in einem Haushalt mit Immich nach fuenf Minuten Fotos gezeigt -
+    // und ein Display aendert keine Einstellungen: die Wartezeit kennt kein
+    // "nie", und die Display-Oberflaeche hat keine Einstellungen. Ein
+    // Haushaltsschalter (Modul) koennte die Kueche nicht vom Flur
+    // unterscheiden, deshalb steht die Wahl am Display.
+    //
+    // DEFAULT 0, KEIN BACKFILL: ein Display, das bisher den Kalender zeigte,
+    // zeigt ihn nach dem Update weiter. Bei 0 sperrt das Gate in
+    // server/index.js die beiden Bildrouten, nicht erst die Seite.
+    //
+    // Der CHECK geht mit ADD COLUMN, weil der Default konstant ist und den
+    // Ausdruck erfuellt. Ein kuenftiger Rebuild von display_accounts muss die
+    // Spalte samt CHECK mitnehmen.
+    up: `
+      ALTER TABLE display_accounts ADD COLUMN show_screensaver INTEGER NOT NULL DEFAULT 0 CHECK(show_screensaver IN (0, 1));
+    `,
+  },
+  {
+    version: 245,
+    description: 'Calendar: first-class local calendars with per-calendar feeds',
+    up: `
+      CREATE TABLE local_calendars (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT    NOT NULL,
+        color       TEXT    NOT NULL DEFAULT '#007AFF',
+        is_default  INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
+        sort_order  INTEGER NOT NULL DEFAULT 0,
+        feed_token  TEXT UNIQUE,
+        created_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE UNIQUE INDEX idx_local_calendars_default
+        ON local_calendars(is_default) WHERE is_default = 1;
+      CREATE INDEX idx_local_calendars_sort ON local_calendars(sort_order, name);
+      CREATE TRIGGER trg_local_calendars_updated_at
+        AFTER UPDATE ON local_calendars FOR EACH ROW
+        BEGIN UPDATE local_calendars SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = OLD.id; END;
+
+      -- Local calendar moves never push outward (see MIRRORED_FIELDS).
+      ALTER TABLE calendar_events ADD COLUMN local_calendar_id INTEGER
+        REFERENCES local_calendars(id) ON DELETE SET NULL;
+      CREATE INDEX IF NOT EXISTS idx_calendar_local_calendar ON calendar_events(local_calendar_id);
+
+      INSERT INTO local_calendars (name, color, is_default, sort_order, created_by)
+      SELECT 'Yuvomi', '#007AFF', 1, 0, NULL
+      WHERE NOT EXISTS (SELECT 1 FROM local_calendars WHERE is_default = 1);
+      CREATE TRIGGER IF NOT EXISTS trg_event_local_calendar_insert
+      BEFORE INSERT ON calendar_events
+      WHEN NEW.local_calendar_id IS NOT NULL AND (NEW.external_source IS NOT 'local'
+        OR NEW.target_google_calendar_id IS NOT NULL OR NEW.target_caldav_account_id IS NOT NULL)
+      BEGIN SELECT RAISE(ABORT, 'Local and sync calendars are mutually exclusive'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_event_local_calendar_update
+      BEFORE UPDATE OF local_calendar_id, external_source, target_google_calendar_id, target_caldav_account_id ON calendar_events
+      WHEN NEW.local_calendar_id IS NOT NULL AND (NEW.external_source IS NOT 'local'
+        OR NEW.target_google_calendar_id IS NOT NULL OR NEW.target_caldav_account_id IS NOT NULL)
+      BEGIN SELECT RAISE(ABORT, 'Local and sync calendars are mutually exclusive'); END;
+    `,
+  },
+  {
+    version: 246,
+    description: 'Calendar: an event remembers that its start and rule were written in Yuvomi (#1935)',
+    // WER START UND WIEDERHOLUNGSREGEL ZULETZT GESCHRIEBEN HAT, STEHT AB HIER
+    // IN EINER EIGENEN SPALTE. Bisher las der ausgehende Weg das aus
+    // `external_source` ('local' = hier angelegt), und die Spalte verliert genau
+    // diese Auskunft, sobald der Upload gebucht ist: sie sagt dann, WO die Zeile
+    // gespiegelt liegt. Eine hier angelegte Serie "am letzten Tag des Monats"
+    // ging deshalb nur beim ersten Upload mit einem Start hinaus, den ihre Regel
+    // trifft (#986), und nach jeder Bearbeitung mit dem eingegebenen.
+    //
+    // `series_authored = 1`: Start und Regel stammen aus Yuvomi - gesetzt beim
+    // Anlegen und bei jeder Aenderung von Start oder Regel in Yuvomi, auch an
+    // einer eingelesenen Serie. Der Abruf nimmt die Marke zurueck, wenn er vom
+    // Anbieter einen anderen Start oder eine andere Regel uebernimmt.
+    // `0`: nicht von hier, oder unbekannt - die Serie geht Wort fuer Wort
+    // zurueck (#756). Regel und Leser: services/outbound-dtstart.js.
+    //
+    // BESTAND. Eine Zeile mit `external_source = 'local'` ist nie durch einen
+    // Abruf gegangen, ihr Start ist der eingegebene: 1. Das ist auch, wie der
+    // ausgehende Weg sie bis hierher behandelt hat. Fuer schon gespiegelte
+    // Zeilen (google, caldav, apple, ics) laesst sich die Herkunft NICHT mehr
+    // feststellen - die eigene, hochgeladene Serie und die eingelesene sehen in
+    // der Zeile gleich aus, und ein Start neben der eigenen Regel kommt in
+    // beiden vor. Sie bleiben 0 und verhalten sich wie vor dieser Migration;
+    // die Marke bekommen sie mit der naechsten Aenderung von Start oder Regel.
+    // Geraten wird nicht: eine faelschlich gesetzte Marke schriebe einem fremden
+    // Kalender ein anderes DTSTART.
+    //
+    // DIE TRIGGER VON calendar_events RUHEN WAEHREND DES NACHTRAGS, wie in
+    // Migration 238: `trg_calendar_events_updated_at` setzte sonst jeden
+    // lokalen Termin auf "eben geaendert". Sie werden mit ihrem gespeicherten
+    // Wortlaut wieder angelegt, in derselben Reihenfolge, in derselben
+    // Transaktion.
+    //
+    // ADD COLUMN, KEIN REBUILD: der Default ist konstant und erfuellt den CHECK.
+    // Ein kuenftiger Rebuild von calendar_events muss die Spalte mitnehmen.
+    up(database) {
+      // Eine gedriftete Datenbank kann die Spalte schon tragen: dann nur noch
+      // der Nachtrag.
+      const hasColumn = database.prepare('PRAGMA table_info(calendar_events)').all()
+        .some((column) => column.name === 'series_authored');
+      if (!hasColumn) {
+        database.exec(`
+          ALTER TABLE calendar_events ADD COLUMN series_authored INTEGER NOT NULL DEFAULT 0
+            CHECK(series_authored IN (0, 1));
+        `);
+      }
+
+      backfillSeriesAuthored(database);
+    },
+  },
+  {
+    version: 247,
+    description: 'waste: a source remembers the case of its last failed fetch',
+    // DER FALL DES LETZTEN FEHLSCHLAGS STEHT NEBEN SEINEM TEXT (#1909). Bisher
+    // trug die Quelle nur `last_error`, den englischen Text des Servers ("No
+    // calendar entries in the response"), und der Quellen-Dialog zeigte ihn
+    // so. `last_error_reason` haelt den Grund, den dieselbe Antwort schon als
+    // `reason` trug (waste_source_fetch_*), `last_error_params` seine Zahlen
+    // als JSON (Status, Grenze) - den Satz baut die App. Bestandszeilen
+    // bleiben NULL: sie bekommen den allgemeinen Satz, bis der naechste Abruf
+    // seinen Fall schreibt.
+    up(database) {
+      const columns = new Set(database.prepare('PRAGMA table_info(waste_sources)').all().map((c) => c.name));
+      if (!columns.has('last_error_reason')) database.exec('ALTER TABLE waste_sources ADD COLUMN last_error_reason TEXT');
+      if (!columns.has('last_error_params')) database.exec('ALTER TABLE waste_sources ADD COLUMN last_error_params TEXT');
+    },
+  },
+  {
+    version: 248,
+    description: 'calendar: an event remembers what its last aligned push sent',
+    // DER ABRUF ERKENNT DAS ECHO DES EIGENEN PUSHS (#1956). Eine hier verfasste
+    // Serie geht mit einem Start hinaus, den ihre Regel trifft (#986, #1935):
+    // eingegeben am 15. Januar, beim Anbieter der 31. Der Abruf las genau das
+    // zurueck und schrieb es in die Zeile - die Eingabe war weg, die Marke fiel
+    // und die Erinnerungen zogen mit, ohne dass beim Anbieter jemand etwas
+    // getan hatte.
+    //
+    // `outbound_snapshot` haelt, was der letzte Push gesendet hat, in der
+    // Lesart des Abrufs, und den Zeilenstand, aus dem er entstand (JSON, Regel
+    // und Leser: services/outbound-echo.js). Geschrieben nur, wenn das
+    // Ausrichten den Start verschoben hat; sonst NULL. Bestandszeilen bleiben
+    // NULL und nehmen den Weg von vorher, bis ihr naechster Push sie schreibt -
+    // ein Nachtrag liesse sich nicht ableiten, denn was gesendet wurde, steht
+    // nirgends.
+    up(database) {
+      const columns = new Set(database.prepare('PRAGMA table_info(calendar_events)').all().map((c) => c.name));
+      if (!columns.has('outbound_snapshot')) database.exec('ALTER TABLE calendar_events ADD COLUMN outbound_snapshot TEXT');
+    },
+  },
+  {
+    version: 249,
+    description: 'Birthdays: independently revocable ICS subscriptions',
+    up: `
+      ALTER TABLE users ADD COLUMN birthday_feed_token TEXT;
+      ALTER TABLE users ADD COLUMN calendar_feed_include_birthdays INTEGER NOT NULL DEFAULT 1
+        CHECK(calendar_feed_include_birthdays IN (0, 1));
+      CREATE UNIQUE INDEX idx_users_birthday_feed_token ON users(birthday_feed_token)
+        WHERE birthday_feed_token IS NOT NULL;
+    `,
+  },
+  {
+    version: 250,
+    description: 'housekeeping: open payment tasks belong to the adults who pay',
+    // DER OFFENE ALTBESTAND DER ZAHLUNGSAUFGABEN (R20, Ulas 2026-10-17). Seit
+    // R20 entsteht eine Zahlungsaufgabe auf `assignees`, zugewiesen der Person,
+    // die eincheckt (wenn sie Betraege sehen darf), und den aktiven Admins.
+    // Aeltere stehen auf `all` und nennen den Lohn jedem Konto mit
+    // Aufgabenrecht, auch einem Kind ohne `housekeeping_view_amounts`.
+    //
+    // Nachgezogen werden nur OFFENE (nicht erledigt, nicht archiviert), die
+    // ueber `housekeeping_work_sessions.payment_task_id` verknuepft sind und
+    // noch auf `all` stehen. Erledigte bleiben stehen (Ulas' Entscheidung);
+    // sie zieht das naechste Bearbeiten ihres Besuchs nach. Gibt es fuer eine
+    // Aufgabe niemanden, dem sie gehoeren darf (Ersteller ohne Betragsrecht und
+    // kein aktiver Admin), wird sie privat fuer die Erstellerin, ohne
+    // Zuweisungen und ohne Beschreibung (die nennt den Lohn) - nie `all`.
+    //
+    // EINGEFROREN - NIE AN DIE LAUFZEITREGEL ANGLEICHEN. Die Regel steht hier
+    // als selbsttragende Kopie von services/payment-task-audience.js im Stand
+    // von Version 250, und sie liest nur Tabellen und Spalten, die es bei 250
+    // gibt. Eine Migration muss fuer immer dasselbe tun: rief sie die
+    // Laufzeitregel auf, aenderte jede spaetere Aenderung dort rueckwirkend,
+    // was 250 auf einer noch nicht migrierten Installation tut, und eine
+    // Spalte, die erst eine juengere Migration anlegt, braeche das
+    // Durchmigrieren alter Installationen ab. Dass beide HEUTE dasselbe
+    // ergeben, haelt der Aequivalenztest in test/test-payment-task-backfill.js;
+    // weicht die Laufzeitregel spaeter bewusst ab, wird dieser Test angepasst,
+    // nicht diese Migration. Wiederholt laufen aendert nichts, die Auswahl
+    // trifft nur `all`.
+    up(database) {
+      const FAMILY_ROLES_AT_250 = new Set(['dad', 'mom', 'parent', 'child', 'grandparent', 'relative', 'other']);
+      const capabilityRow = database.prepare(`
+        SELECT access FROM access_permissions
+        WHERE subject_type = ? AND subject_id = ? AND resource_type = 'capability'
+          AND resource_key = 'housekeeping_view_amounts' AND access IN ('none', 'allow')
+      `);
+      // Betragsrecht wie resolvePermissions() bei 250: Admin immer, sonst
+      // Standard `allow`, dann das Rollenprofil, dann die Mitglied-Zeile.
+      const seesAmounts = (user) => {
+        if (user.role === 'admin') return true;
+        let access = 'allow';
+        if (user.family_role && FAMILY_ROLES_AT_250.has(user.family_role)) {
+          access = capabilityRow.get('role', user.family_role)?.access ?? access;
+        }
+        access = capabilityRow.get('user', String(user.id))?.access ?? access;
+        return access === 'allow';
+      };
+      // Admins als Haushaltsmitglieder, wie householdMemberSql() bei 250 (aktiv,
+      // kein Hauspersonal, kein Gast, kein Wandtablett) - als Text eingefroren.
+      // Die Zuweisung schreibt die Datenbank selbst (INSERT ... SELECT), die
+      // erste Admin-Person holt eine Einzelzeile.
+      const ADMIN_MEMBER_AT_250 = `u.role = 'admin' AND u.deactivated_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM housekeeping_workers hw WHERE hw.user_id = u.id)
+        AND NOT EXISTS (SELECT 1 FROM split_expense_guest_users sg WHERE sg.user_id = u.id)
+        AND NOT EXISTS (SELECT 1 FROM display_accounts da WHERE da.user_id = u.id)`;
+      const firstAdmin = database.prepare(`
+        SELECT u.id FROM users u WHERE ${ADMIN_MEMBER_AT_250} ORDER BY u.id ASC LIMIT 1
+      `);
+      const assignAdmins = database.prepare(`
+        INSERT OR IGNORE INTO task_assignments (task_id, user_id)
+        SELECT ?, u.id FROM users u WHERE ${ADMIN_MEMBER_AT_250}
+      `);
+      const tasks = database.prepare(`
+        SELECT DISTINCT t.id, t.created_by FROM housekeeping_work_sessions s
+        JOIN tasks t ON t.id = s.payment_task_id
+        WHERE t.visibility = 'all' AND t.status <> 'done' AND t.archived_at IS NULL
+        ORDER BY t.id
+      `).all();
+      const readUser = database.prepare('SELECT id, role, family_role, deactivated_at FROM users WHERE id = ?');
+      const update = database.prepare(`
+        UPDATE tasks SET visibility = 'assignees', created_by = ?, assigned_to = ? WHERE id = ?
+      `);
+      const clear = database.prepare('DELETE FROM task_assignments WHERE task_id = ?');
+      const closeTask = database.prepare(`
+        UPDATE tasks SET visibility = 'private', assigned_to = NULL, description = NULL WHERE id = ?
+      `);
+      const assign = database.prepare('INSERT OR IGNORE INTO task_assignments (task_id, user_id) VALUES (?, ?)');
+      for (const task of tasks) {
+        const creator = task.created_by == null ? null : readUser.get(task.created_by);
+        const creatorPays = Boolean(creator && creator.deactivated_at == null && seesAmounts(creator));
+        const owner = creatorPays ? creator.id : firstAdmin.get()?.id;
+        if (owner == null) {
+          // Niemand, dem sie gehoeren darf (kein aktiver Admin, Erstellerin
+          // ohne Betragsrecht): schliessen statt auf `all` lassen - privat fuer
+          // die Erstellerin, ohne Zuweisungen und ohne die Beschreibung, die
+          // den Lohn nennt (wie normalizePaymentTaskAudience, R20).
+          closeTask.run(task.id);
+          clear.run(task.id);
+          continue;
+        }
+        update.run(owner, owner, task.id);
+        clear.run(task.id);
+        if (creatorPays) assign.run(task.id, creator.id);
+        assignAdmins.run(task.id);
+      }
+    },
+  },
 ];
+
+/**
+ * Der Nachtrag zu Migration 246 (#1935): lokale Zeilen sind hier verfasst.
+ *
+ * Eine eigene Funktion, weil ZWEI Wege ihn brauchen - die Migration und
+ * `reconcileCriticalSchema()`. Legt die Selbstheilung die Spalte auf einer
+ * gedrifteten Datenbank neu an (Migration vermerkt, Spalte fehlt), stuende
+ * sonst jede Zeile auf 0, und die hier angelegten Serien gingen danach wie
+ * eingelesene hinaus.
+ *
+ * Die Trigger von calendar_events ruhen dabei (Begruendung an Migration 246)
+ * und werden mit ihrem gespeicherten Wortlaut wieder angelegt. Die Aufrufer
+ * sorgen fuer die Transaktion.
+ */
+function backfillSeriesAuthored(database) {
+  const triggers = database.prepare(`
+    SELECT name, sql FROM sqlite_master
+    WHERE type = 'trigger' AND tbl_name = 'calendar_events' AND sql IS NOT NULL
+    ORDER BY rowid
+  `).all();
+  for (const trigger of triggers) database.exec(`DROP TRIGGER "${trigger.name}"`);
+  database.exec("UPDATE calendar_events SET series_authored = 1 WHERE external_source = 'local'");
+  for (const trigger of triggers) database.exec(trigger.sql);
+}
 
 /**
  * Hat ein ANDERER Prozess genau diese Migration inzwischen verbucht? (#1331)
@@ -10847,6 +11244,10 @@ function allowNewerSchema() {
  * Kritische additive Spalten, die real vorhanden sein MÜSSEN, sobald ihre
  * Migration als angewendet gilt. Jede Spalte ist eine gefahrlos wiederholbare
  * `ADD COLUMN` (NULL-Default) - die einzige idempotente Reparaturform.
+ *
+ * `backfill` (optional): der Nachtrag, den die Migration der Spalte nach dem
+ * `ADD COLUMN` faehrt. Er laeuft nur, wenn die Spalte hier wirklich neu
+ * angelegt wurde, und in derselben Transaktion wie sie.
  */
 const CRITICAL_COLUMNS = [
   // #538: v54 trägt reminders.pushed_at nach; ohne die Spalte scheitert der
@@ -10862,6 +11263,30 @@ const CRITICAL_COLUMNS = [
     type: 'INTEGER REFERENCES caldav_accounts(id) ON DELETE SET NULL' },
   { table: 'calendar_pending_deletions', column: 'caldav_account_id',
     type: 'INTEGER REFERENCES caldav_accounts(id) ON DELETE CASCADE' },
+  // #1883: v240 traegt den ETag eines Loeschauftrags nach; ohne die Spalte
+  // scheitert das Lesen der Auftraege und damit jeder ausgehende Durchgang.
+  { table: 'calendar_pending_deletions', column: 'etag', type: 'TEXT' },
+  // #1700: v243 traegt die Vormerkung eines Umzugs zwischen gespiegelten
+  // Einkaufslisten nach; ohne die Spalten scheitert der Abruf jedes
+  // Einkaufsartikels (er liest sie, bevor er die Zeile anfasst) und jeder
+  // Sofortversuch.
+  { table: 'shopping_items', column: 'outbound_move', type: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'shopping_items', column: 'outbound_move_attempts', type: 'INTEGER NOT NULL DEFAULT 0' },
+  // #1935: v246 traegt nach, wer Start und Regel eines Termins verfasst hat;
+  // ohne die Spalte scheitert das Anlegen jedes Termins und jeder Abruf von
+  // Google, CalDAV und iCloud (er liest sie, bevor er die Zeile anfasst).
+  // MIT NACHTRAG: die Spalte allein stellte jede Zeile auf 0 ("unbekannt"),
+  // auch die hier angelegten, die Migration 246 auf 1 gesetzt hatte. Eine
+  // einst gesetzte Marke an einer gespiegelten Zeile ist mit der Spalte
+  // verloren und bleibt unbekannt.
+  { table: 'calendar_events', column: 'series_authored',
+    type: 'INTEGER NOT NULL DEFAULT 0 CHECK(series_authored IN (0, 1))',
+    backfill: backfillSeriesAuthored },
+  // #1956: v248 traegt den Sende-Schnappschuss nach; ohne die Spalte scheitert
+  // jeder Abruf von Google, CalDAV und iCloud (er liest sie, bevor er die
+  // Zeile anfasst) und jede Buchung eines Pushs. Kein Nachtrag: NULL heisst
+  // "kein Schnappschuss", der Abruf nimmt den Weg von vorher.
+  { table: 'calendar_events', column: 'outbound_snapshot', type: 'TEXT' },
 ];
 
 /**
@@ -10881,7 +11306,7 @@ const CRITICAL_COLUMNS = [
  */
 function reconcileCriticalSchema(database = db) {
   if (!database) return;
-  for (const { table, column, type } of CRITICAL_COLUMNS) {
+  for (const { table, column, type, backfill } of CRITICAL_COLUMNS) {
     let columns;
     try {
       columns = database.prepare(`PRAGMA table_info(${table})`).all();
@@ -10891,7 +11316,24 @@ function reconcileCriticalSchema(database = db) {
     if (!columns.length) continue;                          // Tabelle existiert nicht
     if (columns.some((c) => c.name === column)) continue;   // Spalte bereits vorhanden
     try {
-      database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      if (backfill) {
+        // Spalte und Nachtrag zusammen oder gar nicht: eine Spalte ohne ihren
+        // Nachtrag gaelte beim naechsten Start als vorhanden, und der Nachtrag
+        // liefe nie mehr. SAVEPOINT, weil es unter better-sqlite3 und
+        // node:sqlite gleich geht und auch in einer offenen Transaktion.
+        database.exec('SAVEPOINT reconcile_column');
+        try {
+          database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+          backfill(database);
+          database.exec('RELEASE SAVEPOINT reconcile_column');
+        } catch (err) {
+          database.exec('ROLLBACK TO SAVEPOINT reconcile_column');
+          database.exec('RELEASE SAVEPOINT reconcile_column');
+          throw err;
+        }
+      } else {
+        database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      }
       log.warn(`Schema-Drift behoben: ${table}.${column} fehlte trotz vermerkter Migration und wurde nachgetragen (#538).`);
     } catch (err) {
       log.error(`Schema-Reconciliation ${table}.${column} fehlgeschlagen:`, err?.message || err);

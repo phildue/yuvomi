@@ -10,6 +10,8 @@ import { t, formatDate } from '/i18n.js';
 import { isPushSubscribed } from '/push.js';
 import { moduleIconEl } from '/nav-icons.js';
 import { toastSurface } from '/utils/toast-surface.js';
+import { dashboardRequest, fetchPendingReminders, forgetPendingReminders } from '/utils/dashboard-widgets.js';
+import { wallShowsOn } from '/utils/wall-mode.js';
 
 // --------------------------------------------------------
 // Konfiguration
@@ -179,8 +181,8 @@ const REMINDER_ORIGINS = {
   pantry_item:            { accent: 'var(--module-pantry)',    icon: 'archive',      labelKey: 'nav.pantry' },
   cycle_period:           { accent: 'var(--module-health)',    icon: 'droplet',      labelKey: 'health.cycle.title' },
   cycle_log_nudge:        { accent: 'var(--module-health)',    icon: 'droplet',      labelKey: 'health.cycle.title' },
-  schedule_entry:         { accent: 'var(--module-schedule)',  icon: 'calendar-clock', labelKey: 'nav.schedule' },
-  schedule_extra_entry:   { accent: 'var(--module-schedule)',  icon: 'calendar-clock', labelKey: 'nav.schedule' },
+  schedule_entry:         { accent: 'var(--module-schedule)',  icon: 'briefcase-business', labelKey: 'nav.schedule' },
+  schedule_extra_entry:   { accent: 'var(--module-schedule)',  icon: 'briefcase-business', labelKey: 'nav.schedule' },
   waste_pickup:           { accent: 'var(--module-waste)',     icon: 'trash-2',      labelKey: 'nav.waste' },
   document_expiry:        { accent: 'var(--module-documents)', icon: 'calendar-clock', labelKey: 'nav.documents' },
   health_prevention_due:  { accent: 'var(--module-health)',    icon: 'syringe',      labelKey: 'health.tabs.prevention' },
@@ -391,6 +393,7 @@ function showReminderToast(reminder) {
 async function dismissReminder(id) {
   try {
     await api.patch(`/reminders/${id}/dismiss`, {});
+    forgetPendingReminders();
     _shownIds.delete(id);
   } catch {
     // Netzwerkfehler ignorieren
@@ -399,10 +402,26 @@ async function dismissReminder(id) {
 
 /**
  * Lädt fällige Erinnerungen vom Server und verarbeitet sie.
+ *
+ * UEBER EINER WAND FRAGT AUCH DIE GLOCKE DIE HAUSHALTSFASSUNG AB (#1817), und
+ * die traegt keine Erinnerung: sonst stuende, was die Wand aus ihrem Programm
+ * laesst, eine halbe Minute als Toast darueber und ginge als
+ * Browser-Benachrichtigung hinaus. Derselbe Parameter wie beim Abruf der
+ * Uebersicht (`dashboardRequest`), der Server entscheidet. Nichts wird als
+ * gezeigt verbucht: verlaesst jemand die Wand, kommt die Erinnerung mit dem
+ * naechsten Abruf. Ein gekoppeltes Display pollt gar nicht (router-navigate.js).
  */
-async function poll() {
+async function poll({ fresh = false } = {}) {
   try {
-    const data = await api.get('/reminders/pending');
+    const wall = wallShowsOn();
+    // Geteilt mit der Uebersicht (fetchPendingReminders in utils/dashboard-widgets.js):
+    // beim Start ging dieselbe Frage sonst zweimal hinaus. Das Intervall fragt ohnehin neu.
+    const data = await fetchPendingReminders(dashboardRequest('/reminders/pending', { wall }), { get: (path) => api.get(path), fresh });
+    // Persoenlich gefragt, ueber einer Wand angekommen (jemand ist waehrend
+    // des Abrufs zur Uebersicht gewechselt): die Antwort gehoert nicht auf
+    // diese Flaeche. Verworfen, nicht verbucht - der naechste Abruf fragt
+    // passend.
+    if (!wall && wallShowsOn()) return;
     const reminders = data.data ?? [];
     updateBellBadge(reminders.length);
     processReminders(reminders);
@@ -434,6 +453,7 @@ function stop() {
     _pollTimer = null;
   }
   _isInitialized = false;
+  forgetPendingReminders();
   _shownIds.clear();
   _deferredRetries = 0;
   updateBellBadge(0);
@@ -443,7 +463,7 @@ function stop() {
  * Erzwingt sofortigen Poll (z.B. nach Erstellen einer Erinnerung).
  */
 function refresh() {
-  poll();
+  poll({ fresh: true });
 }
 
 export {

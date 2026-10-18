@@ -6,8 +6,10 @@ import {
 } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { initials } from '/utils/initials.js';
-import { confirmModal } from '/components/modal.js';
+import { confirmModal, reportFieldError, reportFieldErrors } from '/components/modal.js';
+import { errorSentence } from '/utils/friendly-error.js';
 import { prefersInkText } from '/utils/contrast.js';
+import { settingRowHtml } from '/settings/components.js';
 
 function avatarHtml(user, className = 'settings-avatar') {
   const safeName = esc(user?.display_name || '');
@@ -21,7 +23,36 @@ function avatarHtml(user, className = 'settings-avatar') {
   `;
 }
 
-function avatarEditorHtml(user) {
+/**
+ * Gravatar ist ein einmaliger Import, kein Anbieter: der Server holt das Bild
+ * zur GESPEICHERTEN Adresse und legt es wie einen Upload in avatar_data ab.
+ * Deshalb zaehlt hier die geladene Adresse, nicht das Eingabefeld - was im
+ * Feld steht, kennt der Server noch nicht.
+ * @param {{ email?: string|null }|null|undefined} user
+ * @returns {boolean}
+ */
+// Dieselbe Regel wie memberEmail() auf dem Server (singleAddress in
+// member-email.js): GENAU eine Adresse, kein Trenner, kein zweites @. Eine
+// Liste aus CardDAV ("a@x, b@y") steht zwar im Feld, aber der Server weist sie
+// als no_email ab - der Knopf soll dann gar nicht erst aktiv sein.
+export function hasSavedEmail(user) {
+  const raw = typeof user?.email === 'string' ? user.email.trim() : '';
+  if (!raw || /[,;\s]/.test(raw)) return false;
+  const at = raw.indexOf('@');
+  return at > 0 && raw.indexOf('@', at + 1) === -1;
+}
+
+/**
+ * Der Bild-Editor. Den Gravatar-Knopf gibt es nur, wenn der Server ihn
+ * anbietet (`gravatarAvailable` aus GET /auth/me: der Betreiber hat
+ * GRAVATAR_BASE_URL gesetzt, und das Konto ist ein Haushaltsmitglied). Sonst
+ * steht er gar nicht erst da - kein Knopf, der erst nach dem Klick mit 404
+ * sagt, dass es ihn nicht gibt.
+ * @param {object} user
+ * @param {{ gravatarAvailable?: boolean }} [options]
+ */
+function avatarEditorHtml(user, { gravatarAvailable = false } = {}) {
+  const gravatarReady = hasSavedEmail(user);
   return `
     <div class="settings-avatar-editor">
       <button type="button" class="settings-avatar-button" id="profile-avatar-preview" aria-label="${t('settings.profilePictureLabel')}">
@@ -35,9 +66,85 @@ function avatarEditorHtml(user) {
         <button type="button" class="settings-avatar-action settings-avatar-action--danger" id="profile-avatar-remove" aria-label="${t('settings.profilePictureRemove')}" title="${t('settings.profilePictureRemove')}">
           <i data-lucide="trash-2" aria-hidden="true"></i>
         </button>
+        ${gravatarAvailable ? `<button type="button" class="settings-avatar-action" id="profile-avatar-gravatar" aria-label="${t('settings.gravatarUse')}" title="${t('settings.gravatarUse')}" aria-describedby="profile-gravatar-hint"${gravatarReady ? '' : ' aria-disabled="true"'}>
+          <i data-lucide="cloud-download" aria-hidden="true"></i>
+        </button>` : ''}
       </div>
     </div>
   `;
+}
+
+/**
+ * Die Hinweiszeile unter dem Bild-Editor: ohne gespeicherte Adresse nennt sie
+ * den Grund, warum der Gravatar-Knopf gesperrt ist; mit Adresse NENNT sie die
+ * Adresse, die gehasht wird - sie steht auf einer Kontaktkarte, die auch andere
+ * Mitglieder bearbeiten koennen - und sagt, was den Server beim Klick verlaesst
+ * (nur ein Hash der Adresse und die Server-IP) und WOHIN: zu dem Dienst, den
+ * der Betreiber eingetragen hat. `host` ist dessen Hostname aus GET /auth/me
+ * (`gravatarHost`), nie ein fester Name - mit einem Libravatar-Spiegel waere
+ * "erreicht gravatar.com" eine falsche Aussage. Ohne Host (die Basis-URL ist
+ * falsch gesetzt, der Klick meldet das) nennt der Satz keinen Dienst.
+ *
+ * Reiner Text, nie HTML: er geht nur ueber textContent auf die Seite
+ * (fillGravatarHint), deshalb hier kein esc() - das ergaebe `&amp;` im Satz.
+ * @param {{ email?: string|null }|null|undefined} user
+ * @param {string} [host]
+ * @returns {string}
+ */
+function gravatarHintText(user, host = '') {
+  if (!hasSavedEmail(user)) return t('settings.gravatarNeedsEmail');
+  const email = user.email.trim();
+  return host
+    ? t('settings.gravatarHint', { email, host })
+    : t('settings.gravatarHintUnnamed', { email });
+}
+
+/**
+ * Das leere Element der Hinweiszeile - nur, wenn der Knopf angeboten wird.
+ * Gefuellt wird es erst in bindEvents() ueber fillGravatarHint().
+ * @param {boolean} gravatarAvailable
+ * @returns {string}
+ */
+function gravatarHintHtml(gravatarAvailable) {
+  return gravatarAvailable ? '<p class="form-hint" id="profile-gravatar-hint"></p>' : '';
+}
+
+/**
+ * Schreibt den Hinweis als Text in das Element. Die Adresse kommt aus einer
+ * Kontaktkarte und darf `<` oder `&` enthalten; sie erscheint woertlich.
+ * @param {{ textContent: string }|null|undefined} element
+ * @param {{ email?: string|null }|null|undefined} user
+ */
+function fillGravatarHint(element, user, host = '') {
+  if (element) element.textContent = gravatarHintText(user, host);
+}
+
+/** Mindestlaenge des neuen Passworts, wie server/auth.js (Zeichen der NFC-Form). */
+const PASSWORD_MIN_LENGTH = 8;
+
+/**
+ * Was am Passwortformular fehlt oder nicht passt, als `[feld, schluessel]` -
+ * alle Probleme zugleich, damit reportFieldErrors sie an ihre Felder stellt.
+ * @returns {Array<['current'|'next'|'confirm', string]>}
+ */
+function passwordProblems(current, next, confirm) {
+  const problems = [];
+  if (!current) problems.push(['current', 'common.required']);
+  if (!next) problems.push(['next', 'common.required']);
+  else if (next.normalize('NFC').length < PASSWORD_MIN_LENGTH) problems.push(['next', 'settings.passwordTooShort']);
+  if (!confirm) problems.push(['confirm', 'common.required']);
+  else if (next !== confirm) problems.push(['confirm', 'settings.passwordMismatch']);
+  return problems;
+}
+
+/** Die Absage des Servers, die ans Feld "Aktuelles Passwort" gehoert, oder null. */
+function passwordRefusalKey(err) {
+  return err?.data?.reason === 'wrong_password' ? 'settings.currentPasswordWrong' : null;
+}
+
+/** Eine Adresse mit genau einem @ und Text davor und danach (wie server/routes/email.js). */
+function isEmailAddress(value) {
+  return /^[^\s@]+@[^\s@]+$/.test(value);
 }
 
 function showError(element, message) {
@@ -209,8 +316,8 @@ function renderTwoFactorSetup(card, setup) {
     </div>
     <p class="form-hint">${t('settings.twoFactorManualHint')}</p>
     <p class="settings-2fa__secret"><code>${esc(grouped)}</code></p>
-    <form id="two-factor-enable-form" class="settings-form">
-      <div class="form-group">
+    <form id="two-factor-enable-form" class="settings-form" novalidate>
+      <div class="form-group form-field">
         <label class="form-label" for="two-factor-code">${t('settings.twoFactorCodeLabel')}</label>
         <input class="form-input settings-2fa__code" type="text" id="two-factor-code"
                inputmode="numeric" autocomplete="one-time-code" spellcheck="false"
@@ -293,8 +400,8 @@ function askForCode(card, texts, onConfirm, onCancel) {
   card.insertAdjacentHTML('beforeend', `
     <h3 class="settings-card__title">${esc(texts.title)}</h3>
     <p class="form-hint">${esc(texts.lead)}</p>
-    <form id="two-factor-confirm-form" class="settings-form settings-2fa__form">
-      <div class="form-group">
+    <form id="two-factor-confirm-form" class="settings-form settings-2fa__form" novalidate>
+      <div class="form-group form-field">
         <label class="form-label" for="two-factor-confirm-code">${t('settings.twoFactorCodeOrRecoveryLabel')}</label>
         <input class="form-input settings-2fa__code" type="text" id="two-factor-confirm-code"
                inputmode="text" autocomplete="one-time-code" spellcheck="false"
@@ -319,7 +426,7 @@ function askForCode(card, texts, onConfirm, onCancel) {
     clearError(error);
     const code = input.value.trim();
     if (!code) {
-      showError(error, t('settings.twoFactorCodeMissing'));
+      reportFieldError(input, t('settings.twoFactorCodeMissing'));
       return;
     }
     const button = form.querySelector('button[type="submit"]');
@@ -328,7 +435,10 @@ function askForCode(card, texts, onConfirm, onCancel) {
       await onConfirm(code);
     } catch (err) {
       button.disabled = false;
-      showError(error, twoFactorErrorText(err));
+      // Ein falscher Code gehoert ans Feld, alles andere (Bremse, Haushaltspflicht)
+      // an die Karte.
+      if (err?.data?.reason === 'invalid_code') reportFieldError(input, twoFactorErrorText(err));
+      else showError(error, twoFactorErrorText(err));
       input.select();
     }
   });
@@ -366,6 +476,42 @@ export function otherSessionsCardHtml() {
 export function logoutOthersErrorText(err) {
   if (err?.status === 429) return t('settings.otherSessionsTooManyAttempts');
   return t('settings.otherSessionsError');
+}
+
+/**
+ * Grund -> Schluessel fuer den Gravatar-Abruf (POST /auth/me/avatar/gravatar).
+ * Der Server nennt den Grund in `reason`; jede Antwort, die er geben kann,
+ * steht hier, damit die Seite nie am englischen Text haengt. `no_email` ist
+ * derselbe Satz wie die Hinweiszeile: die Adresse fehlt, speichern hilft.
+ * Die Schluessel stehen in Anfuehrungszeichen, weil test:api die 403-Gruende
+ * (not_a_household_member) woertlich in der Seite sucht, die sie liest.
+ */
+export const GRAVATAR_REASON_KEYS = Object.freeze({
+  'no_email':               'settings.gravatarNeedsEmail',
+  'gravatar_disabled':      'settings.gravatarErrorDisabled',
+  'gravatar_not_found':     'settings.gravatarErrorNotFound',
+  'gravatar_unreachable':   'settings.gravatarErrorUnreachable',
+  'gravatar_too_large':     'settings.gravatarErrorTooLarge',
+  'gravatar_not_image':     'settings.gravatarErrorNotImage',
+  'gravatar_rate_limited':  'settings.gravatarErrorRateLimited',
+  'gravatar_stale':         'settings.gravatarErrorStale',
+  'not_a_household_member': 'settings.gravatarErrorNotMember',
+});
+
+/**
+ * Fehlertext fuer den Gravatar-Abruf. Ein 429 ohne `reason` (etwa vom
+ * allgemeinen Limit davor) liest sich ebenfalls als "zu oft", nicht als
+ * Fehlschlag; alles Unbekannte faellt auf den Servertext zurueck.
+ * `host` ist der Dienst, den die Saetze nennen (`gravatarHost` aus /auth/me).
+ * @param {{ status?: number, data?: { reason?: string }, message?: string }} err
+ * @param {string} [host]
+ * @returns {string}
+ */
+export function gravatarErrorText(err, host = '') {
+  const key = GRAVATAR_REASON_KEYS[err?.data?.reason];
+  if (key) return host ? t(key, { host }) : t(key);
+  if (err?.status === 429) return t('settings.gravatarErrorRateLimited');
+  return err?.message || t('common.errorGeneric');
 }
 
 /**
@@ -451,7 +597,7 @@ function bindSetupForm(card, reload) {
     clearError(error);
     const code = input.value.trim();
     if (!code) {
-      showError(error, t('settings.twoFactorCodeMissing'));
+      reportFieldError(input, t('settings.twoFactorCodeMissing'));
       return;
     }
     const button = form.querySelector('button[type="submit"]');
@@ -461,13 +607,16 @@ function bindSetupForm(card, reload) {
       renderRecoveryCodes(card, data.recovery_codes, () => { reload(); });
     } catch (err) {
       button.disabled = false;
-      showError(error, twoFactorErrorText(err));
+      // Ein falscher Code gehoert ans Feld, alles andere (Bremse, Haushaltspflicht)
+      // an die Karte.
+      if (err?.data?.reason === 'invalid_code') reportFieldError(input, twoFactorErrorText(err));
+      else showError(error, twoFactorErrorText(err));
       input.select();
     }
   });
 }
 
-function renderPage(container, user, refreshFailed, accessNotice, oidcState, oidcNotice, twoFactorState) {
+function renderPage(container, user, refreshFailed, accessNotice, oidcState, oidcNotice, twoFactorState, gravatarAvailable = false) {
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
     ${accessNotice ? `
@@ -484,48 +633,61 @@ function renderPage(container, user, refreshFailed, accessNotice, oidcState, oid
     ` : ''}
 
     <section class="settings-section">
-      <h2 class="settings-section__title">${t('settings.sectionAccount')}</h2>
+      ${/* "Mein Konto" unter dem Blatt "Konto" benennt keine Ebene, es
+            wiederholt sie (Keine-sichtbare-Titelwiederholung-Regel, DESIGN.md;
+            Critique 2026-10-16: drei Ueberschriften vor dem ersten Feld). Die
+            Ueberschrift bleibt fuer die Gliederung, unsichtbar. */ ''}
+      <h2 class="settings-section__title sr-only">${t('settings.sectionAccount')}</h2>
 
       <div class="settings-card">
         <h3 class="settings-card__title">${t('settings.profileCardTitle')}</h3>
-        <form id="profile-form" class="settings-form">
+        <form id="profile-form" class="settings-form" novalidate>
           <div class="settings-profile-editor">
-            ${avatarEditorHtml(user)}
-            <div class="settings-profile-editor__fields">
-              <div class="settings-name-color-row">
-                <div class="form-group settings-name-color-row__name">
-                  <label class="form-label" for="profile-display-name">${t('settings.displayNameLabel')}</label>
-                  <input class="form-input" type="text" id="profile-display-name" maxlength="128" value="${esc(user?.display_name || '')}" aria-describedby="profile-error" required>
-                </div>
-                <div class="form-group settings-color-field">
-                  <label class="form-label" for="profile-avatar-color">${t('settings.colorLabel')}</label>
-                  <input class="settings-color-button" type="color" id="profile-avatar-color" value="${esc(user?.avatar_color || '')}" aria-describedby="profile-error">
-                </div>
-              </div>
-              <div class="form-group">
-                <label class="form-label" for="profile-username">${t('settings.usernameLabel')}</label>
-                <input class="form-input" type="text" id="profile-username" value="@${esc(user?.username || '')}" readonly>
-                <p class="form-hint">${t('settings.usernameFixedHint')}</p>
-              </div>
+            ${avatarEditorHtml(user, { gravatarAvailable })}
+            ${/* NAME, FARBE UND BENUTZERNAME ALS ZEILEN (Re-Kritik 2026-10-17):
+                 sie standen als Felder unter Etiketten neben dem Bild, die
+                 Kontaktdaten darunter schon als Zeilen - zwei Dialekte in einer
+                 Karte. Der Kopf mit Bild bleibt; daneben dieselbe Zeilengruppe.
+                 Der Benutzername ist nicht aenderbar und steht als Wert, nicht
+                 als gesperrtes Feld. */ ''}
+            <div class="settings-profile-editor__fields row-carrier settings-group">
+              ${settingRowHtml({
+                label: t('settings.displayNameLabel'), labelFor: 'profile-display-name', field: true,
+                control: `<input class="form-input" type="text" id="profile-display-name" maxlength="128" value="${esc(user?.display_name || '')}" autocomplete="name" aria-describedby="profile-error" required>`,
+              })}
+              ${settingRowHtml({
+                label: t('settings.colorLabel'), labelFor: 'profile-avatar-color',
+                control: `<input class="settings-color-button" type="color" id="profile-avatar-color" value="${esc(user?.avatar_color || '')}" aria-describedby="profile-error">`,
+              })}
+              ${settingRowHtml({
+                label: t('settings.usernameLabel'), labelId: 'profile-username-label',
+                description: t('settings.usernameFixedHint'), descriptionId: 'profile-username-hint',
+                control: `<span class="settings-setting-row__value" id="profile-username" aria-labelledby="profile-username-label" aria-describedby="profile-username-hint">@${esc(user?.username || '')}</span>`,
+              })}
             </div>
           </div>
+          ${gravatarHintHtml(gravatarAvailable)}
+          ${/* KONTAKTDATEN ALS ZEILEN (R19, Einstellungen B7): Telefon, E-Mail und
+               Geburtstag standen als drei gestapelte Felder (zwei davon im
+               Raster) unter ihrer Legende. Jetzt eine Gruppe im Zeilen-Dialekt
+               der Einstellungen - Etikett links, Feld rechts. */ ''}
           <fieldset class="settings-fieldset">
             <legend class="settings-fieldset__legend">${t('settings.contactDetailsLegend')}</legend>
-            <div class="modal-grid modal-grid--2">
-              <div class="form-group">
-                <label class="form-label" for="profile-phone">${t('settings.memberPhoneLabel')}</label>
-                <input class="form-input" type="tel" id="profile-phone" value="${esc(user?.phone || '')}" autocomplete="tel" aria-describedby="profile-error">
-              </div>
-              <div class="form-group">
-                <label class="form-label" for="profile-email">${t('settings.memberEmailLabel')}</label>
-                <input class="form-input" type="email" id="profile-email" value="${esc(user?.email || '')}" autocomplete="email" aria-describedby="profile-error">
-              </div>
+            <div class="row-carrier settings-group">
+              ${settingRowHtml({
+                label: t('settings.memberPhoneLabel'), labelFor: 'profile-phone',
+                control: `<input class="form-input" type="tel" id="profile-phone" value="${esc(user?.phone || '')}" autocomplete="tel" aria-describedby="profile-error">`,
+              })}
+              ${settingRowHtml({
+                label: t('settings.memberEmailLabel'), labelFor: 'profile-email', field: true,
+                control: `<input class="form-input" type="email" id="profile-email" value="${esc(user?.email || '')}" autocomplete="email" aria-describedby="profile-error">`,
+              })}
+              ${settingRowHtml({
+                label: t('settings.memberBirthDateLabel'), labelFor: 'profile-birth-date', field: true,
+                control: `<yuvomi-datepicker type="date" id="profile-birth-date" value="${esc(user?.birth_date || '')}" aria-describedby="profile-error"></yuvomi-datepicker>`,
+              })}
             </div>
-            <div class="form-group">
-              <label class="form-label" for="profile-birth-date">${t('settings.memberBirthDateLabel')}</label>
-              <yuvomi-datepicker type="date" id="profile-birth-date" value="${esc(user?.birth_date || '')}" aria-describedby="profile-error"></yuvomi-datepicker>
-              <p class="form-hint">${t('settings.memberContactBirthdayHint')}</p>
-            </div>
+            <p class="form-hint settings-group__footer">${t('settings.memberContactBirthdayHint')}</p>
           </fieldset>
           <div id="profile-error" class="form-error" role="alert" hidden></div>
           <div class="settings-form-actions">
@@ -536,18 +698,20 @@ function renderPage(container, user, refreshFailed, accessNotice, oidcState, oid
 
       <div class="settings-card">
         <h3 class="settings-card__title">${t('settings.changePassword')}</h3>
-        <form id="password-form" class="settings-form">
-          <div class="form-group">
-            <label class="form-label" for="current-password">${t('settings.currentPasswordLabel')}</label>
-            <input class="form-input" type="password" id="current-password" autocomplete="current-password" aria-describedby="password-error" required>
-          </div>
-          <div class="form-group">
-            <label class="form-label" for="new-password">${t('settings.newPasswordLabel')}</label>
-            <input class="form-input" type="password" id="new-password" autocomplete="new-password" minlength="8" aria-describedby="password-error" required>
-          </div>
-          <div class="form-group">
-            <label class="form-label" for="confirm-password">${t('settings.confirmPasswordLabel')}</label>
-            <input class="form-input" type="password" id="confirm-password" autocomplete="new-password" minlength="8" aria-describedby="password-error" required>
+        <form id="password-form" class="settings-form" novalidate>
+          <div class="row-carrier settings-group">
+            ${settingRowHtml({
+              label: t('settings.currentPasswordLabel'), labelFor: 'current-password', field: true,
+              control: '<input class="form-input" type="password" id="current-password" autocomplete="current-password" aria-describedby="password-error" required>',
+            })}
+            ${settingRowHtml({
+              label: t('settings.newPasswordLabel'), labelFor: 'new-password', field: true,
+              control: '<input class="form-input" type="password" id="new-password" autocomplete="new-password" minlength="8" aria-describedby="password-error" required>',
+            })}
+            ${settingRowHtml({
+              label: t('settings.confirmPasswordLabel'), labelFor: 'confirm-password', field: true,
+              control: '<input class="form-input" type="password" id="confirm-password" autocomplete="new-password" minlength="8" aria-describedby="password-error" required>',
+            })}
           </div>
           <div id="password-error" class="form-error" role="alert" hidden></div>
           <div class="settings-form-actions">
@@ -608,7 +772,7 @@ function bindOidcEvents(container) {
   });
 }
 
-function bindEvents(container, user, profileState) {
+function bindEvents(container, user, profileState, { gravatarHost = '' } = {}) {
   bindOidcEvents(container);
   const profileError = container.querySelector('#profile-error');
   const avatarFile = container.querySelector('#profile-avatar-file');
@@ -653,16 +817,82 @@ function bindEvents(container, user, profileState) {
     updatePreview();
   });
 
+  // Gravatar holen. Der Server speichert das Bild selbst (wie PATCH /me/profile
+  // es taete), darum ist nach der Antwort nichts mehr zu sichern: Vorschau und
+  // Seitenleiste ziehen mit, das Formular bleibt, wie es war - ein Klick auf
+  // diesen Knopf ist kein `input` und weckt den Verlassen-Schutz nicht
+  // (dirty-guard.js). Gesperrt per aria-disabled statt disabled, damit der
+  // Knopf per Tastatur erreichbar bleibt und die Hinweiszeile den Grund nennt.
+  const gravatarButton = container.querySelector('#profile-avatar-gravatar');
+  const gravatarHint   = container.querySelector('#profile-gravatar-hint');
+  let gravatarBusy = false;
+  const syncGravatarButton = () => {
+    fillGravatarHint(gravatarHint, user, gravatarHost);
+    if (!gravatarButton) return;
+    if (hasSavedEmail(user) && !gravatarBusy) gravatarButton.removeAttribute('aria-disabled');
+    else gravatarButton.setAttribute('aria-disabled', 'true');
+  };
+  // Die Hinweiszeile kommt leer aus dem HTML und wird hier zum ersten Mal
+  // gefuellt - als Text, damit die Adresse woertlich dasteht.
+  syncGravatarButton();
+  const labelGravatarButton = (label) => {
+    gravatarButton.setAttribute('aria-label', label);
+    gravatarButton.title = label;
+  };
+  gravatarButton?.addEventListener('click', async () => {
+    if (gravatarBusy || !hasSavedEmail(user)) return;
+    clearError(profileError);
+    gravatarBusy = true;
+    gravatarButton.setAttribute('aria-disabled', 'true');
+    labelGravatarButton(t('settings.gravatarFetching'));
+    try {
+      // Die Adresse, die der Hinweis nennt: hat sie sich auf dem Server
+      // inzwischen geaendert, sagt die Route 409 statt eine fremde zu hashen.
+      const { data } = await api.post('/auth/me/avatar/gravatar', { email: user.email.trim() }) ?? {};
+      if (data) {
+        Object.assign(user, data);
+        profileState.avatarData = data.avatar_data ?? null;
+        updatePreview();
+        window.dispatchEvent(new CustomEvent('yuvomi:profile-changed', { detail: {
+          display_name: data.display_name,
+          avatar_color: data.avatar_color,
+          avatar_data: data.avatar_data ?? null,
+        } }));
+      }
+      window.yuvomi?.showToast(t('settings.gravatarDone'), 'success');
+    } catch (error) {
+      // EINE Stelle sagt den Fehler an: die Fehlerzeile des Formulars
+      // (role="alert"), wie bei jedem anderen Fehler dieser Karte. Ein Toast
+      // daneben liesse die Vorlesehilfe denselben Satz zweimal sprechen. Die
+      // Zeile liegt unter den Kontaktfeldern - auf dem Telefon eine
+      // Bildschirmhoehe unter dem Knopf -, deshalb wird sie in den Blick
+      // geholt statt verdoppelt ('nearest': steht sie schon da, bewegt sich nichts).
+      showError(profileError, gravatarErrorText(error, gravatarHost));
+      profileError?.scrollIntoView?.({ block: 'nearest' });
+    } finally {
+      gravatarBusy = false;
+      labelGravatarButton(t('settings.gravatarUse'));
+      syncGravatarButton();
+    }
+  });
+
   const profileForm = container.querySelector('#profile-form');
   profileForm?.addEventListener('submit', async (event) => {
     event.preventDefault();
     clearError(profileError);
 
-    const birthDateRaw = container.querySelector('#profile-birth-date')?.value || '';
-    if (!isDateInputValid(birthDateRaw)) {
-      showError(profileError, t('settings.memberBirthDateInvalid'));
-      return;
-    }
+    // FEHLER AM FELD, NICHT IN DER BROWSER-BLASE (Re-Critique 2026-10-17):
+    // das Formular traegt `novalidate`, alle Meldungen stehen zugleich an
+    // ihren Zeilen, der Fokus geht aufs erste (reportFieldErrors).
+    const birthDatePicker = container.querySelector('#profile-birth-date');
+    const birthDateRaw = birthDatePicker?.value || '';
+    const emailInput = container.querySelector('#profile-email');
+    const emailValue = emailInput?.value.trim() || '';
+    if (reportFieldErrors([
+      !displayName.value.trim() && [displayName, t('common.required')],
+      emailValue && !isEmailAddress(emailValue) && [emailInput, t('common.emailInvalid')],
+      !isDateInputValid(birthDateRaw) && [birthDatePicker, t('settings.memberBirthDateInvalid')],
+    ])) return;
 
     const submitButton = profileForm.querySelector('[type="submit"]');
     submitButton.disabled = true;
@@ -679,6 +909,9 @@ function bindEvents(container, user, profileState) {
         Object.assign(user, response.user);
         profileState.avatarData = response.user.avatar_data ?? null;
         updatePreview();
+        // Eine eben gespeicherte Adresse schaltet den Gravatar-Knopf frei und
+        // steht ab jetzt im Hinweis.
+        syncGravatarButton();
         // Die Kontozeile der Seitenleiste zeigt Name und Avatar (router.js,
         // syncSidebarAccount) und zieht mit, ohne dass die Shell neu baut.
         window.dispatchEvent(new CustomEvent('yuvomi:profile-changed', { detail: {
@@ -689,9 +922,8 @@ function bindEvents(container, user, profileState) {
       }
       window.yuvomi?.showToast(t('settings.profileSavedToast'), 'success');
     } catch (error) {
-      showError(profileError, error.data?.reason === 'email_in_use'
-        ? t('common.emailInUse')
-        : error.message);
+      if (error?.data?.reason === 'email_in_use') reportFieldError(emailInput, t('common.emailInUse'));
+      else showError(profileError, errorSentence(error));
     } finally {
       submitButton.disabled = false;
     }
@@ -703,13 +935,15 @@ function bindEvents(container, user, profileState) {
     const passwordError = container.querySelector('#password-error');
     clearError(passwordError);
 
-    const currentPassword = container.querySelector('#current-password').value;
-    const newPassword = container.querySelector('#new-password').value;
-    const confirmPassword = container.querySelector('#confirm-password').value;
-    if (newPassword !== confirmPassword) {
-      showError(passwordError, t('settings.passwordMismatch'));
-      return;
-    }
+    const currentInput = container.querySelector('#current-password');
+    const newInput = container.querySelector('#new-password');
+    const confirmInput = container.querySelector('#confirm-password');
+    const currentPassword = currentInput.value;
+    const newPassword = newInput.value;
+    const confirmPassword = confirmInput.value;
+    const inputs = { current: currentInput, next: newInput, confirm: confirmInput };
+    if (reportFieldErrors(passwordProblems(currentPassword, newPassword, confirmPassword)
+      .map(([field, key]) => [inputs[field], t(key)]))) return;
 
     const submitButton = passwordForm.querySelector('[type="submit"]');
     submitButton.disabled = true;
@@ -721,7 +955,16 @@ function bindEvents(container, user, profileState) {
       passwordForm.reset();
       window.yuvomi?.showToast(t('settings.passwordSavedToast'), 'success');
     } catch (error) {
-      showError(passwordError, error.message);
+      // Ein falsches aktuelles Passwort ist ein 400 mit Grund (server/auth.js),
+      // kein 401 mehr: die Sitzung bleibt, die Eingaben auch, und der Satz
+      // steht am Feld. Alles andere sagt die Karte, nie im Text des Servers.
+      const atField = passwordRefusalKey(error);
+      if (atField) {
+        reportFieldError(currentInput, t(atField));
+        currentInput.select?.();
+      } else {
+        showError(passwordError, errorSentence(error));
+      }
     } finally {
       submitButton.disabled = false;
     }
@@ -775,11 +1018,19 @@ function bindEvents(container, user, profileState) {
 export async function render(container, { user }) {
   let currentUser = user || {};
   let refreshFailed = false;
+  // Ohne frische Antwort kein Gravatar-Knopf: ob der Betreiber ihn
+  // eingeschaltet hat, weiss nur der Server.
+  let gravatarAvailable = false;
+  // Der Dienst, den Hinweis und Fehlersaetze nennen: der Hostname, den der
+  // Server aus der Basis-URL des Betreibers ableitet. Nie ein fester Name.
+  let gravatarHost = '';
 
   try {
     const response = await auth.me();
     if (response?.user && user) Object.assign(user, response.user);
     else if (response?.user) currentUser = response.user;
+    gravatarAvailable = response?.gravatarAvailable === true;
+    gravatarHost = gravatarAvailable && typeof response?.gravatarHost === 'string' ? response.gravatarHost : '';
   } catch {
     refreshFailed = true;
   }
@@ -805,10 +1056,10 @@ export async function render(container, { user }) {
   }
 
   try {
-    renderPage(container, currentUser, refreshFailed, accessNotice, oidcState, oidcNotice, twoFactorState);
+    renderPage(container, currentUser, refreshFailed, accessNotice, oidcState, oidcNotice, twoFactorState, gravatarAvailable);
     bindEvents(container, currentUser, {
       avatarData: currentUser?.avatar_data ?? null,
-    });
+    }, { gravatarHost });
     bindTwoFactorEvents(container, () => render(container, { user: currentUser }));
     container.querySelector('#account-retry')?.addEventListener('click', () => {
       render(container, { user: currentUser });
@@ -822,4 +1073,4 @@ export async function render(container, { user }) {
 
 // Der Avatar als Programm (test:initials): welche Zeichen ohne Bild auf der
 // Scheibe stehen.
-export const __test = { avatarHtml };
+export const __test = { avatarHtml, avatarEditorHtml, gravatarHintText, gravatarHintHtml, fillGravatarHint, passwordProblems, passwordRefusalKey, isEmailAddress };

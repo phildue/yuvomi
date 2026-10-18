@@ -60,6 +60,8 @@ describe('CalDAV Multi-Account Sync', () => {
         -- sich, dass sie unsere ist (#899).
         color                       TEXT,
         color_modified              INTEGER NOT NULL DEFAULT 0,
+        series_authored INTEGER NOT NULL DEFAULT 0,
+        outbound_snapshot TEXT,
         target_caldav_account_id    INTEGER,
         target_caldav_calendar_url  TEXT
       );
@@ -447,6 +449,8 @@ describe('CalDAV sync yields to the event loop (#519)', () => {
         -- Der eigene Zustand der Farbe (#899, Migration v167): das Farb-Gatter
         -- des Inbound haengt daran, nicht mehr an user_modified.
         color_modified INTEGER NOT NULL DEFAULT 0,
+        series_authored INTEGER NOT NULL DEFAULT 0,
+        outbound_snapshot TEXT,
         target_caldav_account_id INTEGER, target_caldav_calendar_url TEXT,
         -- Ausgehende Vormerkungen (#593, Migrationen v104-v106)
         outbound_dirty INTEGER NOT NULL DEFAULT 0,
@@ -465,8 +469,20 @@ describe('CalDAV sync yields to the event loop (#519)', () => {
         last_error TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
         object_url TEXT,
+        etag TEXT,
         UNIQUE(source, calendar_external_id, event_external_id)
       );
+      CREATE TABLE caldav_upload_attempts (
+        -- Notiz eines Uploads, dessen Ergebnis noch nicht gebucht ist (Migration 241, #1882)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        account_id INTEGER REFERENCES caldav_accounts(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL, row_id INTEGER NOT NULL,
+        collection_url TEXT NOT NULL, uid TEXT NOT NULL, object_url TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE UNIQUE INDEX idx_caldav_upload_attempts_place
+        ON caldav_upload_attempts(source, COALESCE(account_id, 0), kind, row_id, collection_url);
       CREATE TABLE event_assignments (
         event_id INTEGER, user_id INTEGER, UNIQUE(event_id, user_id)
       );
@@ -608,6 +624,8 @@ describe('CalDAV: RECURRENCE-ID-Overrides killen die Serie nicht (#549)', () => 
         -- Der eigene Zustand der Farbe (#899, Migration v167): das Farb-Gatter
         -- des Inbound haengt daran, nicht mehr an user_modified.
         color_modified INTEGER NOT NULL DEFAULT 0,
+        series_authored INTEGER NOT NULL DEFAULT 0,
+        outbound_snapshot TEXT,
         target_caldav_account_id INTEGER, target_caldav_calendar_url TEXT,
         -- Ausgehende Vormerkungen (#593, Migrationen v104-v106)
         outbound_dirty INTEGER NOT NULL DEFAULT 0,
@@ -626,8 +644,20 @@ describe('CalDAV: RECURRENCE-ID-Overrides killen die Serie nicht (#549)', () => 
         last_error TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
         object_url TEXT,
+        etag TEXT,
         UNIQUE(source, calendar_external_id, event_external_id)
       );
+      CREATE TABLE caldav_upload_attempts (
+        -- Notiz eines Uploads, dessen Ergebnis noch nicht gebucht ist (Migration 241, #1882)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        account_id INTEGER REFERENCES caldav_accounts(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL, row_id INTEGER NOT NULL,
+        collection_url TEXT NOT NULL, uid TEXT NOT NULL, object_url TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE UNIQUE INDEX idx_caldav_upload_attempts_place
+        ON caldav_upload_attempts(source, COALESCE(account_id, 0), kind, row_id, collection_url);
       CREATE TABLE event_assignments (event_id INTEGER, user_id INTEGER, UNIQUE(event_id, user_id));
       CREATE TABLE calendar_event_exceptions (
         event_id INTEGER NOT NULL, exception_date TEXT NOT NULL,
@@ -798,6 +828,8 @@ describe('CalDAV: No-op-Syncs bleiben im Standard-Log-Level still', () => {
         -- Der eigene Zustand der Farbe (#899, Migration v167): das Farb-Gatter
         -- des Inbound haengt daran, nicht mehr an user_modified.
         color_modified INTEGER NOT NULL DEFAULT 0,
+        series_authored INTEGER NOT NULL DEFAULT 0,
+        outbound_snapshot TEXT,
         target_caldav_account_id INTEGER, target_caldav_calendar_url TEXT,
         outbound_dirty INTEGER NOT NULL DEFAULT 0,
         outbound_attempts INTEGER NOT NULL DEFAULT 0,
@@ -815,8 +847,20 @@ describe('CalDAV: No-op-Syncs bleiben im Standard-Log-Level still', () => {
         last_error TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
         object_url TEXT,
+        etag TEXT,
         UNIQUE(source, calendar_external_id, event_external_id)
       );
+      CREATE TABLE caldav_upload_attempts (
+        -- Notiz eines Uploads, dessen Ergebnis noch nicht gebucht ist (Migration 241, #1882)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        account_id INTEGER REFERENCES caldav_accounts(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL, row_id INTEGER NOT NULL,
+        collection_url TEXT NOT NULL, uid TEXT NOT NULL, object_url TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE UNIQUE INDEX idx_caldav_upload_attempts_place
+        ON caldav_upload_attempts(source, COALESCE(account_id, 0), kind, row_id, collection_url);
       CREATE TABLE event_assignments (
         event_id INTEGER, user_id INTEGER, UNIQUE(event_id, user_id)
       );
@@ -1038,8 +1082,11 @@ describe('CalDAV: eine Bearbeitung friert die Farbe nicht mehr ein (#899)', () =
         location TEXT, color TEXT, recurrence_rule TEXT, tzid TEXT,
         external_calendar_id TEXT, external_source TEXT,
         calendar_ref_id INTEGER, created_by INTEGER,
+        local_calendar_id INTEGER,
         user_modified INTEGER NOT NULL DEFAULT 0, assigned_to INTEGER,
         color_modified INTEGER NOT NULL DEFAULT 0,
+        series_authored INTEGER NOT NULL DEFAULT 0,
+        outbound_snapshot TEXT,
         target_caldav_account_id INTEGER, target_caldav_calendar_url TEXT,
         outbound_dirty INTEGER NOT NULL DEFAULT 0,
         outbound_attempts INTEGER NOT NULL DEFAULT 0,
@@ -1054,8 +1101,20 @@ describe('CalDAV: eine Bearbeitung friert die Farbe nicht mehr ein (#899)', () =
         event_external_id TEXT NOT NULL,
         attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
         object_url TEXT,
+        etag TEXT,
         UNIQUE(source, calendar_external_id, event_external_id)
       );
+      CREATE TABLE caldav_upload_attempts (
+        -- Notiz eines Uploads, dessen Ergebnis noch nicht gebucht ist (Migration 241, #1882)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        account_id INTEGER REFERENCES caldav_accounts(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL, row_id INTEGER NOT NULL,
+        collection_url TEXT NOT NULL, uid TEXT NOT NULL, object_url TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE UNIQUE INDEX idx_caldav_upload_attempts_place
+        ON caldav_upload_attempts(source, COALESCE(account_id, 0), kind, row_id, collection_url);
       CREATE TABLE event_assignments (
         event_id INTEGER, user_id INTEGER, UNIQUE(event_id, user_id)
       );
@@ -1228,8 +1287,11 @@ describe('CalDAV: die eingebrannte Kalenderfarbe loest sich (#1270)', () => {
         location TEXT, color TEXT, recurrence_rule TEXT, tzid TEXT,
         external_calendar_id TEXT, external_source TEXT,
         calendar_ref_id INTEGER, created_by INTEGER,
+        local_calendar_id INTEGER,
         user_modified INTEGER NOT NULL DEFAULT 0, assigned_to INTEGER,
         color_modified INTEGER NOT NULL DEFAULT 0,
+        series_authored INTEGER NOT NULL DEFAULT 0,
+        outbound_snapshot TEXT,
         target_caldav_account_id INTEGER, target_caldav_calendar_url TEXT,
         outbound_dirty INTEGER NOT NULL DEFAULT 0,
         outbound_attempts INTEGER NOT NULL DEFAULT 0,
@@ -1244,8 +1306,20 @@ describe('CalDAV: die eingebrannte Kalenderfarbe loest sich (#1270)', () => {
         event_external_id TEXT NOT NULL,
         attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
         object_url TEXT,
+        etag TEXT,
         UNIQUE(source, calendar_external_id, event_external_id)
       );
+      CREATE TABLE caldav_upload_attempts (
+        -- Notiz eines Uploads, dessen Ergebnis noch nicht gebucht ist (Migration 241, #1882)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        account_id INTEGER REFERENCES caldav_accounts(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL, row_id INTEGER NOT NULL,
+        collection_url TEXT NOT NULL, uid TEXT NOT NULL, object_url TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE UNIQUE INDEX idx_caldav_upload_attempts_place
+        ON caldav_upload_attempts(source, COALESCE(account_id, 0), kind, row_id, collection_url);
       CREATE TABLE event_assignments (
         event_id INTEGER, user_id INTEGER, UNIQUE(event_id, user_id)
       );
@@ -2172,6 +2246,8 @@ describe('CalDAV: eine Aufgabenliste bleibt kein Terminziel (#617)', () => {
         -- Der eigene Zustand der Farbe (#899, Migration v167): das Farb-Gatter
         -- des Inbound haengt daran, nicht mehr an user_modified.
         color_modified INTEGER NOT NULL DEFAULT 0,
+        series_authored INTEGER NOT NULL DEFAULT 0,
+        outbound_snapshot TEXT,
         target_caldav_account_id INTEGER, target_caldav_calendar_url TEXT,
         outbound_dirty INTEGER NOT NULL DEFAULT 0,
         outbound_attempts INTEGER NOT NULL DEFAULT 0,
@@ -2189,8 +2265,20 @@ describe('CalDAV: eine Aufgabenliste bleibt kein Terminziel (#617)', () => {
         last_error TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
         object_url TEXT,
+        etag TEXT,
         UNIQUE(source, calendar_external_id, event_external_id)
       );
+      CREATE TABLE caldav_upload_attempts (
+        -- Notiz eines Uploads, dessen Ergebnis noch nicht gebucht ist (Migration 241, #1882)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        account_id INTEGER REFERENCES caldav_accounts(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL, row_id INTEGER NOT NULL,
+        collection_url TEXT NOT NULL, uid TEXT NOT NULL, object_url TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE UNIQUE INDEX idx_caldav_upload_attempts_place
+        ON caldav_upload_attempts(source, COALESCE(account_id, 0), kind, row_id, collection_url);
       CREATE TABLE event_assignments (
         event_id INTEGER, user_id INTEGER, UNIQUE(event_id, user_id)
       );
@@ -2456,6 +2544,17 @@ describe('CalDAV: das Aufräumen beim Abwählen ist eine Wahl (#732)', () => {
         event_external_id TEXT NOT NULL,
         UNIQUE(source, calendar_external_id, event_external_id)
       );
+      CREATE TABLE caldav_upload_attempts (
+        -- Notiz eines Uploads, dessen Ergebnis noch nicht gebucht ist (Migration 241, #1882)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        account_id INTEGER REFERENCES caldav_accounts(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL, row_id INTEGER NOT NULL,
+        collection_url TEXT NOT NULL, uid TEXT NOT NULL, object_url TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE UNIQUE INDEX idx_caldav_upload_attempts_place
+        ON caldav_upload_attempts(source, COALESCE(account_id, 0), kind, row_id, collection_url);
       -- detachAccountRows() entkoppelt die gespiegelten Aufgaben/Einkaufsposten
       -- und braucht dafuer deren volle Outbound-Spalten.
       CREATE TABLE tasks (
@@ -2468,7 +2567,8 @@ describe('CalDAV: das Aufräumen beim Abwählen ist eine Wahl (#732)', () => {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         external_source TEXT NOT NULL DEFAULT 'local', external_uid TEXT,
         external_account_id INTEGER, external_object_url TEXT,
-        outbound_dirty INTEGER NOT NULL DEFAULT 0, outbound_attempts INTEGER NOT NULL DEFAULT 0
+        outbound_dirty INTEGER NOT NULL DEFAULT 0, outbound_attempts INTEGER NOT NULL DEFAULT 0,
+        outbound_move INTEGER NOT NULL DEFAULT 0, outbound_move_attempts INTEGER NOT NULL DEFAULT 0
       );
 
       INSERT INTO caldav_accounts (name, caldav_url, username, password)

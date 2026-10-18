@@ -113,12 +113,49 @@ const calendarProviderTargetProperties = {
 };
 
 export const schemas = {
+        CalendarImportInput: {
+          type: 'object',
+          description: 'Import an ICS document or URL into a household local calendar.',
+          properties: {
+            ics: { type: 'string', description: 'Raw ICS file text. Required when url is omitted.' },
+            url: { type: 'string', format: 'uri', description: 'Shared calendar URL. Required when ics is omitted.' },
+            color: { type: 'string', pattern: '^#[0-9A-Fa-f]{6}$', description: 'Fallback event color for imported events without their own color.' },
+            local_calendar_id: { type: 'integer', minimum: 1, description: 'Target local calendar. Omit to use the default calendar.' },
+          },
+          oneOf: [{ required: ['ics'] }, { required: ['url'] }],
+        },
+        LocalCalendarCreateInput: {
+          type: 'object', required: ['name'],
+          properties: {
+            name: { type: 'string', minLength: 1, maxLength: 80 },
+            color: { type: 'string', pattern: '^#[0-9A-Fa-f]{6}$' },
+          },
+        },
+        LocalCalendarReorderInput: {
+          type: 'object', required: ['order'], properties: {
+            order: { type: 'array', uniqueItems: true, items: { type: 'integer', minimum: 1 } },
+          },
+        },
+        LocalCalendarUpdateInput: {
+          type: 'object',
+          minProperties: 1,
+          properties: {
+            name: { type: 'string', minLength: 1, maxLength: 80 },
+            color: { type: 'string', pattern: '^#[0-9A-Fa-f]{6}$' },
+            sort_order: { type: 'integer', minimum: 0 },
+          },
+        },
         ApiError: {
           type: 'object',
           properties: {
             error: { type: 'string' },
             code: { type: 'integer' },
             reason: { type: 'string' },
+            params: {
+              type: 'object',
+              additionalProperties: { type: 'integer' },
+              description: 'Only next to a `reason` whose cause carries a number (waste import and URL sources): the limit or status itself, e.g. `{ "limit_mb": 5 }`, so a client can put it into its own sentence instead of parsing `error`.',
+            },
             storage_code: { $ref: '#/components/schemas/DocumentStorageErrorCode' },
           },
         },
@@ -644,6 +681,18 @@ export const schemas = {
               type: ['string', 'null'],
               description: 'Inherited colour of the source calendar or ICS subscription, read-only. Applies to every event of that source and therefore says nothing about this one; it is the fallback below color and the assignee.',
             },
+            local_calendar_id: {
+              type: ['integer', 'null'],
+              description: 'Resolved local calendar for an authored event; null for generated or externally synchronized events and events with a Google/CalDAV target. Omit on create to resolve to the default without storing it. Membership applies to a whole series, never a single occurrence.',
+            },
+            local_calendar_name: {
+              type: ['string', 'null'],
+              description: 'Display name of the local Yuvomi calendar, read-only.',
+            },
+            local_calendar_color: {
+              type: ['string', 'null'],
+              description: 'Colour of the local Yuvomi calendar, read-only. Used after event, assignee, and external source colours.',
+            },
             attachment_name: { type: ['string', 'null'], description: 'Null when the event has no attachment or the caller may not read its document (see attachment_document_id).' },
             attachment_mime: { type: ['string', 'null'], description: 'Null when the event has no attachment or the caller may not read its document (see attachment_document_id).' },
             attachment_size: { type: ['integer', 'null'], description: 'Null when the event has no attachment or the caller may not read its document (see attachment_document_id).' },
@@ -861,6 +910,19 @@ export const schemas = {
           properties: {
             user: { $ref: '#/components/schemas/User' },
             csrfToken: { type: 'string' },
+            gravatarAvailable: {
+              type: 'boolean',
+              description: 'Whether the calling account may use the one-time Gravatar import '
+                + '(`POST /api/v1/auth/me/avatar/gravatar`): true only when the operator set `GRAVATAR_BASE_URL` '
+                + 'and the account is a household member. The configured URL itself is never exposed.',
+            },
+            gravatarHost: {
+              type: ['string', 'null'],
+              description: 'Host name of the service the operator configured in `GRAVATAR_BASE_URL` '
+                + '(e.g. `gravatar.com` or a Libravatar mirror), so the account page can name where the hash goes. '
+                + 'Host name only - no scheme, port, path or credentials. `null` unless `gravatarAvailable` is true, '
+                + 'and `null` when the configured value is not a valid public https URL.',
+            },
           },
           required: ['user'],
         },
@@ -1276,6 +1338,20 @@ export const schemas = {
                 style: { type: ['string', 'null'] },
               },
             },
+            settings: {
+              type: ['object', 'null'],
+              description: 'Optional settings sheet. sections controls visibility only; the module API enforces authorization.',
+              required: ['entry', 'sections'],
+              properties: {
+                entry: { type: 'string', description: 'Protected module asset URL for the settings JavaScript entry.' },
+                sections: {
+                  type: 'array', minItems: 1, maxItems: 2, uniqueItems: true,
+                  items: { type: 'string', enum: ['mine', 'household'] },
+                  description: 'mine is visible to members; household only to administrators. No default.',
+                },
+                labelKey: { type: ['string', 'null'] },
+              },
+            },
             menu: {
               type: 'object',
               properties: {
@@ -1296,8 +1372,112 @@ export const schemas = {
               },
             },
             capabilities: { $ref: '#/components/schemas/ExtensionModuleCapabilities' },
+            manifestVersion: { type: 'integer', description: 'Manifest format version the module is written for (absent on errored modules).' },
+            entry: { type: 'string', description: 'Entry file relative to the module folder (absent on errored modules).' },
+            style: { type: ['string', 'null'], description: 'Stylesheet relative to the module folder, or null.' },
+            page: {
+              type: 'object',
+              description: 'Normalized page declaration (absent on errored modules).',
+              properties: {
+                composition: { type: 'string', enum: ['reading', 'data', 'dashboard', 'form', 'split', 'full'] },
+                width: { type: 'string', enum: ['reading', 'content', 'wide'] },
+                navigation: { type: 'string', enum: ['standard'] },
+                responsive: { type: 'string', enum: ['standard'] },
+              },
+            },
+            install: { $ref: '#/components/schemas/ExtensionModuleInstall' },
           },
           required: ['id', 'name', 'enabled', 'status'],
+        },
+        ExtensionModuleInstall: {
+          type: ['object', 'null'],
+          description: 'How the module was installed from Settings (read from `.yuvomi-install.json` in its folder) and whether an admin has approved it since. null when the folder was copied onto the server by hand. Only present in the admin listing (`GET /api/v1/modules?admin=1` by an admin) and in install responses.',
+          properties: {
+            source: { type: 'string', enum: ['zip', 'github'] },
+            url: { type: ['string', 'null'], description: 'GitHub repository URL.' },
+            ref: { type: ['string', 'null'], description: 'Branch, tag or commit that was downloaded.' },
+            commit: { type: ['string', 'null'], description: 'Commit SHA of the GitHub archive, when known.' },
+            path: { type: ['string', 'null'], description: 'Folder inside the archive the module came from.' },
+            installedAt: { type: ['string', 'null'], format: 'date-time' },
+            approved: { type: 'boolean', description: 'False after every install and replace; true once an admin enabled the module from a browser session. While false the module is disabled whatever the household switch says, so a restored or fresh database cannot turn on code nobody looked at. Stored in the module folder.' },
+            installedByName: { type: ['string', 'null'], description: 'Display name of the admin who installed it, resolved from the user id in the record; null when that account no longer exists. Only in the admin listing.' },
+          },
+          required: ['source', 'approved'],
+        },
+        ModuleInstallInfoResponse: {
+          type: 'object',
+          properties: {
+            data: {
+              type: 'object',
+              properties: {
+                writable: { type: 'boolean', description: 'False when the modules folder is read-only; installs then answer 503.' },
+                persistent: { type: ['boolean', 'null'], description: 'Best-effort guess whether the modules folder survives an update of the server. False when Yuvomi runs in a container and the folder is not on a volume or bind mount (installed modules would be lost with the next image update); null when it cannot be determined. The routes still answer when false; the Settings page then shows the manual way, like for a read-only folder.' },
+                webInstall: { type: 'boolean', description: 'Whether the operator switched installing from Settings on (`MODULES_ALLOW_WEB_INSTALL=true`). False by default; the install and delete routes then answer 403 `module_web_install_disabled`.' },
+                maxZipMb: { type: 'integer', description: 'Archive size limit in MB.' },
+              },
+              required: ['writable', 'persistent', 'webInstall', 'maxZipMb'],
+            },
+          },
+          required: ['data'],
+        },
+        ModuleInstallGithubRequest: {
+          type: 'object',
+          properties: {
+            url: { type: 'string', maxLength: 2000, description: 'GitHub URL or `owner/repo`.' },
+            ref: { type: 'string', maxLength: 200, description: 'Branch, tag or commit; overrides the ref from the URL.' },
+            path: { type: 'string', maxLength: 500, description: 'Folder inside the repository that holds module.json. Overrides the folder of a tree URL; an empty string selects the repository root.' },
+            overwrite: { type: 'boolean', description: 'Replace an installed module with the same id.' },
+          },
+          required: ['url'],
+        },
+        ModuleInstallResponse: {
+          type: 'object',
+          properties: {
+            data: { $ref: '#/components/schemas/ExtensionModule' },
+            replaced: { type: 'boolean', description: 'True when an installed module with the same id was replaced.' },
+            skipped: { type: 'array', items: { type: 'string' }, description: 'Files in the module folder that were not copied (not a web asset type, or a dotfile).' },
+          },
+          description: 'The module is disabled either way, after a fresh install and after a replace: `data.install.approved` is false until an admin enables it from a browser session.',
+          required: ['data', 'replaced', 'skipped'],
+        },
+        ModuleInstallError: {
+          type: 'object',
+          properties: {
+            error: { type: 'string' },
+            code: { type: 'integer' },
+            reason: { type: 'string', description: 'Stable machine-readable reason.' },
+            existing: {
+              type: 'object',
+              description: 'With `exists`: the installed module.',
+              properties: {
+                id: { type: 'string' },
+                name: { type: 'string' },
+                version: { type: 'string' },
+                install: { $ref: '#/components/schemas/ExtensionModuleInstall' },
+              },
+            },
+            incoming: {
+              type: 'object',
+              description: 'With `exists`: the module in the archive. A replace (retry with overwrite) always leaves the module disabled until it is approved again.',
+              properties: { id: { type: 'string' }, name: { type: 'string' }, version: { type: 'string' } },
+            },
+            candidates: {
+              type: 'array',
+              description: 'With `multiple`: the modules found in the archive.',
+              items: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string' },
+                  id: { type: ['string', 'null'] },
+                  name: { type: ['string', 'null'] },
+                  version: { type: ['string', 'null'] },
+                },
+                required: ['path'],
+              },
+            },
+            resetAt: { type: 'string', format: 'date-time', description: 'With `rate_limited` from GitHub, when GitHub names a time: when to try again (from `retry-after` for its secondary limit, otherwise from `x-ratelimit-reset`). Left out when GitHub names none.' },
+          },
+          required: ['error', 'code'],
         },
         ModulesListResponse: {
           type: 'object',
@@ -1524,7 +1704,9 @@ export const schemas = {
             coverage_end: { type: ['string', 'null'], format: 'date' },
             last_import_at: { type: ['string', 'null'], format: 'date-time' },
             last_success_at: { type: ['string', 'null'], format: 'date-time', description: 'Only updated on a successful commit; a failed attempt never clears it.' },
-            last_error: { type: ['string', 'null'] },
+            last_error: { type: ['string', 'null'], description: 'The English message of the last failed attempt, for logs and API consumers. Omitted for a caller without module write access, like url.' },
+            last_error_reason: { type: ['string', 'null'], description: 'The case of the last failed attempt (#1909): the same reason a manual refresh answers with (waste_source_fetch_http_status, waste_source_fetch_too_large, waste_source_fetch_blocked, waste_source_fetch_unreachable, waste_source_fetch_no_events, or the reason of a failed import). null when the attempt failed without a typed case, or before the first failure recorded after #1909. Omitted together with last_error.' },
+            last_error_params: { type: ['object', 'null'], description: 'The numbers of that case (status, limit_mb), as the refresh answer carries them in params. Omitted together with last_error.' },
             needs_refresh: { type: 'boolean', description: 'true when this source has no mapped pickup on or after today (invariant #6) - derived, not stored.' },
             url: { type: 'string', description: 'kind=url only. A credential: omitted entirely for a caller without module write access, never merely masked.' },
             refresh_interval_minutes: { type: 'integer', description: 'kind=url only. Bounded 60-43200 (hourly to monthly).' },
@@ -1678,8 +1860,14 @@ export const schemas = {
             outcome: {
               type: 'string',
               enum: ['committed', 'unchanged', 'needs_mapping', 'error'],
-              description: 'committed: every label had a remembered decision, applied via the same atomic path as a file re-import. unchanged: a conditional GET reported no change (304). needs_mapping: content changed but at least one label (or blocking diagnostic) has no remembered decision - see source.needs_mapping and the preview field. error: the fetch failed - see source.last_error.',
+              description: 'committed: every label had a remembered decision, applied via the same atomic path as a file re-import. unchanged: a conditional GET reported no change (304). needs_mapping: content changed but at least one label (or blocking diagnostic) has no remembered decision - see source.needs_mapping and the preview field. error: the fetch failed - see reason for its class and source.last_error for the stored message (source.last_error_reason keeps the same class for a later read).',
             },
+            reason: {
+              type: 'string',
+              enum: ['waste_source_fetch_http_status', 'waste_source_fetch_too_large', 'waste_source_fetch_blocked', 'waste_source_fetch_unreachable', 'waste_source_fetch_no_events', 'waste_source_url_invalid', 'waste_source_url_not_https'],
+              description: 'Only with outcome=error: the class of the failed fetch. http_status: the other side answered, but not with a success (params.status). too_large: the response exceeds the upload limit (params.limit_mb). blocked: a private or blocked address. unreachable: everything else (DNS, refused or reset connection, TLS, timeout, a redirect that is not followed). no_events: the other side answered with a success, but without a single calendar entry (a maintenance or login page, an empty calendar) - nothing is applied and the imported pickups stay (#1938). url_invalid / url_not_https: the stored URL no longer passes validation. Stored with the source as last_error_reason (and last_error_params) since #1909.',
+            },
+            params: { type: 'object', additionalProperties: { type: 'integer' }, description: 'Only with a reason that carries a number: `{ "status": 404 }` or `{ "limit_mb": 5 }`.' },
             diff: { $ref: '#/components/schemas/WasteImportDiff' },
             preview: { $ref: '#/components/schemas/WasteImportPreview' },
           },

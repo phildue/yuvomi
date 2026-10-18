@@ -72,6 +72,7 @@ d2.exec(MIGRATIONS_SQL[27]); // legacy calendar attachment bodies
 d2.exec(MIGRATIONS_SQL[61]);
 d2.exec("ALTER TABLE calendar_events ADD COLUMN visibility TEXT NOT NULL DEFAULT 'all';");
 d2.exec(MIGRATIONS_SQL[80]);
+d2.exec(MIGRATIONS_SQL[249]); // birthday token and default-on calendar inclusion
 d2.exec(MIGRATIONS_SQL[85]); // calendar_event_exceptions (EXDATE, #489)
 d2.exec(MIGRATIONS_SQL[97]); // calendar_events.tzid (DST-Export, #549)
 d2.exec(MIGRATIONS_SQL[194]); // linked occurrence overrides
