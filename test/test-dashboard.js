@@ -62,6 +62,15 @@ db.exec(`
 db.exec(MIGRATIONS_SQL[1]);
 db.exec(MIGRATIONS_SQL[2]);  // sync_config - traegt die Haushaltszone (siehe unten)
 db.exec(MIGRATIONS_SQL[85]); // calendar_event_exceptions (EXDATE, #489)
+db.exec(MIGRATIONS_SQL[174]); // birthday/name-day membership exclusions
+db.exec(`
+  ALTER TABLE calendar_events ADD COLUMN target_google_calendar_id TEXT;
+  ALTER TABLE calendar_events ADD COLUMN target_caldav_account_id INTEGER;
+  CREATE TABLE housekeeping_work_sessions (id INTEGER PRIMARY KEY, calendar_event_id INTEGER);
+`);
+db.exec(MIGRATIONS_SQL[245]);
+// Migration 246 (#1935) hat ein Funktions-up und steht nicht im Spiegel.
+db.exec('ALTER TABLE calendar_events ADD COLUMN series_authored INTEGER NOT NULL DEFAULT 0 CHECK(series_authored IN (0, 1));');
 
 // Testdaten einfügen
 const u1 = db.prepare(`INSERT INTO users (username, display_name, password_hash, avatar_color, role)
@@ -2001,6 +2010,14 @@ cdb.exec(`
   );
 `);
 
+cdb.exec(`
+  ALTER TABLE calendar_events ADD COLUMN target_caldav_account_id INTEGER;
+  CREATE TABLE housekeeping_work_sessions (id INTEGER PRIMARY KEY, calendar_event_id INTEGER);
+`);
+cdb.exec(MIGRATIONS_SQL[245]);
+// Migration 246 (#1935) hat ein Funktions-up und steht nicht im Spiegel.
+cdb.exec('ALTER TABLE calendar_events ADD COLUMN series_authored INTEGER NOT NULL DEFAULT 0 CHECK(series_authored IN (0, 1));');
+
 const cu1 = cdb.prepare(`INSERT INTO users (username, display_name, password_hash, avatar_color)
   VALUES ('theodore', 'Theodore', 'x', '#34C759')`).run();
 const cu2 = cdb.prepare(`INSERT INTO users (username, display_name, password_hash, avatar_color)
@@ -2400,7 +2417,9 @@ test('getUpcomingEvents: private ICS-Termine fremder User werden ausgeblendet', 
       recurrence_rule TEXT,
       subscription_id INTEGER,
       calendar_ref_id INTEGER,
-      visibility TEXT NOT NULL DEFAULT 'all'
+      visibility TEXT NOT NULL DEFAULT 'all',
+      -- Migration 246 (#1935): das Anlegen eines Geburtstagstermins setzt die Marke.
+      series_authored INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE birthdays (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2634,6 +2653,33 @@ test('Wand-Modus: der Fehlerzustand trägt keinen Retry-Knopf, aber die Uhr', as
   });
 });
 
+/* SPERRZONEN FUER MELDUNGEN (#1917). Der Hinweis beim Einschalten lag bis rund
+ * 834px Breite acht Sekunden auf der Uhr. Die Toast-Lage weicht jetzt allem,
+ * was ihr Attribut traegt - hier steht, DASS die Wand es setzt: an den beiden
+ * Zeilen der Uhr (nicht an ihrem Rahmen, der so breit ist wie die Flaeche) und
+ * am Fuss. Der Name kommt aus dem Modul, das ihn liest, nicht aus dem Test. */
+test('Wand-Modus: Uhrzeit, Datum und Fuss sind Sperrzonen der Toast-Lage, die Kachel-Uhr nicht (#1917)', async () => {
+  const { __test } = await import('../public/pages/dashboard.js');
+  const { KEEPOUT_SELECTOR } = await import('../public/utils/toast-placement.js');
+  const attr = KEEPOUT_SELECTOR.replace(/^\[|\]$/g, '');
+  nodeAssert.match(attr, /^data-[\w-]+$/, 'Reichweite: die Lage liest ein Attribut');
+  await withWallWindow(() => {
+    for (const options of [{}, { failed: true }, { loading: true }]) {
+      const html = __test.renderWallSurface({ urgentTasks: wallTasks(1), users: [] }, null, options);
+      const marked = [...html.matchAll(/<(\w+)\b[^>]*>/g)].map((m) => m[0])
+        .filter((tag) => new RegExp(`\\s${attr}(?=[\\s>])`).test(tag))
+        .map((tag) => tag.match(/class="([^"]+)"/)?.[1] ?? '');
+      nodeAssert.deepEqual(marked.sort(), ['clock-widget__date', 'clock-widget__time', 'wall__foot'],
+        `in jedem Zustand der Wand (${JSON.stringify(options)})`);
+    }
+    // Ausserhalb der Wand steht die Uhr als Kachel im Raster; dort laege eine
+    // Sperrzone mitten im Inhalt und bewegte jede Meldung der Uebersicht.
+    const tile = __test.renderDashboardLayout([{ id: 'clock', visible: true, size: '1x1' }], {}, null, 'EUR');
+    nodeAssert.match(tile, /id="clock-widget-time"/, 'Reichweite: die Uhr steht als Kachel im Raster');
+    nodeAssert.ok(!tile.includes(attr), 'die Kachel-Uhr traegt keine Sperrzone');
+  });
+});
+
 /* EIN LAUFENDER TIMER NIMMT EINE ZEILE (Integration 2026-09-23, Browser-Abnahme
  * bei 1280x800). Der Deckel von vier Zeilen ist fuer eine Flaeche OHNE die
  * Timer-Anzeige gerechnet; die Anzeige kostet 64px plus Abstand, und an einem
@@ -2692,11 +2738,24 @@ test('Wand-Modus: der Deckel greift, und der Überlauf sagt die Wahrheit', async
 test('Wand-Modus: „Wer heute dran ist" zählt den ganzen Tag, nicht nur die sichtbaren Zeilen', async () => {
   const { __test } = await import('../public/pages/dashboard.js');
   await withWallWindow(() => {
-    // Mia hat GENAU EINE Aufgabe, und die liegt hinter dem Deckel. Zählte der
+    // Mia hat GENAU EINEN Termin, und der liegt hinter dem Deckel. Zählte der
     // Abschnitt nur die gezeigten Zeilen, verschwände sie aus der Antwort.
+    //
+    // EIN TERMIN, KEINE AUFGABE, und ohne `wallTasks` für sie: seit #1817
+    // kommen die Aufgaben einer Person aus `wallTasks`, und mit einem Eintrag
+    // dort stünde Mia ohnehin da - gleich, welche Zeilen die Schleife liest.
     const spaet = { id: 42, display_name: 'Mia Muster', avatar_color: '#CE2A63' };
-    const tasks = wallTasks(8, { assignTo: (i) => (i === 7 ? spaet : null) });
-    const html = __test.renderWallSurface({ urgentTasks: tasks, users: [spaet] }, null, {});
+    const day = '2031-05-06';
+    const events = Array.from({ length: 8 }, (_, i) => ({
+      id: i + 1,
+      title: `Termin ${i + 1}`,
+      start_datetime: `${day}T${String(8 + i).padStart(2, '0')}:00`,
+      end_datetime: `${day}T${String(8 + i).padStart(2, '0')}:30`,
+      all_day: 0,
+      assigned_users: i === 7 ? [spaet] : [],
+    }));
+    const html = __test.renderWallSurface({ upcomingEvents: events, urgentTasks: [], users: [spaet] }, null, { now: new Date(`${day}T06:00:00`) });
+    nodeAssert.ok(!html.includes('Termin 8'), 'Vorbedingung: Mias Termin steht NICHT unter den gezeigten Zeilen');
     nodeAssert.match(html, /wall-who__member/, 'Reichweite: der Abschnitt wurde gebaut');
     nodeAssert.match(html, /Mia/, 'wer hinter dem Deckel steht, steht trotzdem in der Antwort');
     nodeAssert.match(html, /wall-who__count/, 'die Zahl beantwortet „wie viel"');
@@ -2830,13 +2889,18 @@ test('Wand-Modus: nach einem Reload in der Nacht ist die Wand dunkel (#1453)', a
   for (const stored of [null, 'light', 'dark']) {
     const root = makeRoot();
     const storage = makeStorage({ 'yuvomi-wall-mode': '1', ...(stored ? { 'yuvomi-theme': stored } : {}) });
-    const prev = { document: globalThis.document, localStorage: globalThis.localStorage, location: globalThis.location, window: globalThis.window };
-    globalThis.document = { documentElement: root, querySelectorAll: () => [] };
-    globalThis.localStorage = storage;
-    globalThis.location = { pathname: '/' };
-    globalThis.window = { yuvomi: { restoreThemeColor: () => {} } };
-    tz.setDisplayTimeZone('Europe/Berlin');
+    // `localStorage` per Deskriptor tauschen, nicht per Zuweisung: Node fuehrt
+    // es als Accessor ohne Setter (ab Node 25 eingebaut), eine Zuweisung wirft
+    // im Modul-Code - und zwar VOR dem try, sodass document/location/window des
+    // Stubs fuer die Nachbarfaelle stehen blieben (der Solo-Fall fiel mit).
+    const prev = { document: globalThis.document, location: globalThis.location, window: globalThis.window };
+    const prevStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
     try {
+      globalThis.document = { documentElement: root, querySelectorAll: () => [] };
+      Object.defineProperty(globalThis, 'localStorage', { value: storage, configurable: true, writable: true });
+      globalThis.location = { pathname: '/' };
+      globalThis.window = { yuvomi: { restoreThemeColor: () => {} } };
+      tz.setDisplayTimeZone('Europe/Berlin');
       // 1. theme-init.js, das echte Skript
       new Function('localStorage', 'sessionStorage', 'document', 'location', 'Date', themeInit)(
         storage, makeStorage({}), globalThis.document, globalThis.location, deviceNight,
@@ -2863,6 +2927,8 @@ test('Wand-Modus: nach einem Reload in der Nacht ist die Wand dunkel (#1453)', a
     } finally {
       tz.setDisplayTimeZone(null);
       Object.assign(globalThis, prev);
+      if (prevStorage) Object.defineProperty(globalThis, 'localStorage', prevStorage);
+      else delete globalThis.localStorage;
     }
   }
   nodeAssert.deepEqual(results, [
@@ -3843,6 +3909,277 @@ test('das Familienmitglieder-Widget kennt die eigene Schicht statt "Heute frei" 
   // Ein freier Tag (Schedule geladen, aber kein Eintrag fuer diese Person) sagt weiterhin "frei".
   const stillFree = __test.renderFamilyWidget(users, { schedule: { entries: [] } });
   nodeAssert.match(stillFree, /todayFree/, 'ein wirklich freier Tag darf weiterhin "Heute frei" sagen');
+});
+
+test('Wand-Modus: Screensaver-Knopf erscheint mit screensaverEnabled, nicht ohne (#1766)', async () => {
+  const { __test } = await import('../public/pages/dashboard.js');
+  await withWallWindow(() => {
+    const data = { urgentTasks: wallTasks(1), users: [] };
+    const on  = __test.renderWallSurface(data, null, { screensaverEnabled: true });
+    const off = __test.renderWallSurface(data, null, { screensaverEnabled: false });
+    nodeAssert.match(on,  /id="wall-screensaver-start"/, 'mit Flag: Knopf da');
+    nodeAssert.ok(!/id="wall-screensaver-start"/.test(off), 'ohne Flag: kein Knopf');
+    // Der Ausstieg muss in beiden Faellen vorhanden sein.
+    nodeAssert.match(on,  /id="wall-exit"/, 'Ausstieg bleibt mit Flag');
+    nodeAssert.match(off, /id="wall-exit"/, 'Ausstieg bleibt ohne Flag');
+  });
+});
+
+// `localStorage` fuer GENAU EINEN synchronen Aufruf ersetzen. Die Faelle dieser
+// Datei laufen nebenlaeufig an (`test()` reiht sie nur ein): wer einen Stub ueber
+// ein `await` hinweg stehen laesst, gibt ihn dem naechsten Fall als „vorher"
+// mit, und der stellt ihn am Ende wieder her - nach der Suite meldete
+// `localStorage` dann fuer jeden Schluessel einen laufenden Timer. Deshalb der
+// Deskriptor statt des Werts (Node fuehrt `localStorage` als Accessor) und kein
+// `await` zwischen Setzen und Zuruecksetzen.
+function withLocalStorageSync(stub, fn) {
+  const saved = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { value: stub, configurable: true, writable: true });
+  try {
+    return fn();
+  } finally {
+    if (saved) Object.defineProperty(globalThis, 'localStorage', saved);
+    else delete globalThis.localStorage;
+  }
+}
+
+test('Wand-Modus: Screensaver-Knopf faellt weg, solange ein Timer laeuft (#1766)', async () => {
+  const { __test } = await import('../public/pages/dashboard.js');
+  await withWallWindow(() => {
+    const data = { urgentTasks: wallTasks(1), users: [] };
+    // Einen laufenden Timer eintragen: der Schluesseleintrag ist ein zukuenftiger Zeitstempel.
+    const running = { getItem: () => String(Date.now() + 120_000), setItem() {}, removeItem() {} };
+    const html = withLocalStorageSync(running, () => __test.renderWallSurface(data, null, { screensaverEnabled: true }));
+    nodeAssert.match(html, /id="wall-timer-stop"/, 'Reichweite: der Timer laeuft in diesem Aufbau');
+    nodeAssert.ok(!/id="wall-screensaver-start"/.test(html),
+      'laufender Timer verdraengt den Screensaver-Knopf');
+  });
+});
+
+test('Wand-Modus: der Schoner-Knopf traegt nur sein Zeichen, Name und Tooltip stehen am Knopf (#1766)', async () => {
+  const { __test } = await import('../public/pages/dashboard.js');
+  await withWallWindow(() => {
+    const html = __test.renderWallSurface({ urgentTasks: wallTasks(1), users: [] }, null, { screensaverEnabled: true });
+    const button = html.match(/<button[^>]*id="wall-screensaver-start"[\s\S]*?<\/button>/)?.[0] ?? '';
+    nodeAssert.ok(button, 'Reichweite: der Knopf steht im Markup');
+    nodeAssert.match(button, /aria-label="dashboard\.wallScreensaverStart"/, 'zugaenglicher Name');
+    nodeAssert.match(button, /title="dashboard\.wallScreensaverStart"/, 'Tooltip fuer den Zeiger');
+    nodeAssert.match(button, /class="wall__foot-btn wall__foot-btn--icon"/, 'die Icon-Form des Fussknopfs');
+    nodeAssert.match(button, /data-lucide="image"/, 'das Zeichen');
+    // Ein sichtbares Wort machte die Gruppe wieder so breit wie die Sprache
+    // (gemessen: de 416px, die Startknoepfe rutschten um bis zu 100px).
+    nodeAssert.ok(!/wall__foot-btn-label/.test(button), 'kein sichtbares Wort im Schoner-Knopf');
+    // Der Ausstieg daneben behaelt seines (#1559).
+    const exit = html.match(/<button[^>]*id="wall-exit"[\s\S]*?<\/button>/)?.[0] ?? '';
+    nodeAssert.match(exit, /wall__foot-btn-label[^>]*>dashboard\.wallExit</, 'der Ausstieg bleibt beschriftet');
+  });
+});
+
+test('rebuildWall gibt screensaverEnabled an renderWallSurface weiter (Verdrahtungsschutz, #1766)', async () => {
+  const { __test } = await import('../public/pages/dashboard.js');
+  await withWallWindow(() => {
+    let captured = '';
+    // Minimale Shell-Attrappe: rebuildWall schreibt via setHtml(shell, html) hinein.
+    const shell = {
+      replaceChildren() { captured = ''; },
+      insertAdjacentHTML(_pos, html) { captured += html; },
+    };
+    // wireWallSurface bricht sofort ab, wenn container.querySelector('.wall') null liefert.
+    // Die Verdrahtung des Klicks misst der Fall weiter unten ueber render().
+    const container = { querySelector: () => null };
+    const signal = { addEventListener() {} };
+    const build = (screensaverEnabled) => __test.rebuildWall(container, shell, {
+      data: { urgentTasks: wallTasks(1), users: [] },
+      weather: null,
+      failed: false,
+      updatedAt: null,
+      rerender: () => {},
+      signal,
+      fit: { show() {} },
+      screensaverEnabled,
+    });
+    // Kein laufender Timer: safeGet gibt null zurueck, readWallTimer liefert state:'idle'.
+    const idle = { getItem: () => null, setItem() {}, removeItem() {} };
+    withLocalStorageSync(idle, () => build(true));
+    nodeAssert.match(captured, /id="wall-screensaver-start"/,
+      'screensaverEnabled:true kommt in der Shell-HTML an');
+    withLocalStorageSync(idle, () => build(false));
+    nodeAssert.match(captured, /id="wall-exit"/, 'Reichweite: die Shell wurde neu gefuellt');
+    nodeAssert.ok(!/id="wall-screensaver-start"/.test(captured),
+      'screensaverEnabled:false erzeugt keinen Knopf in der Shell');
+  });
+});
+
+// DIE DREI GELENKE DES SCHONER-KNOPFS, UEBER render() GEMESSEN (#1766).
+// Die Faelle oben rufen `renderWallSurface` und `rebuildWall` direkt und reichen
+// das Flag selbst hinein. Was die Seite daraus macht, sieht keiner von ihnen:
+//   (a) render() reicht das Flag an rebuildWall weiter,
+//   (b) es kommt aus `screensaver_enabled` der Praeferenzen,
+//   (c) der Klick ruft preview() und sagt bei `false` den einen Satz.
+// Jedes der drei liess sich einzeln abklemmen, ohne dass ein Fall rot wurde.
+// Hier laeuft deshalb die echte Seite gegen eine Attrappe des Containers, und
+// der Knopf, den `wireWallSurface` findet, ist der aus dem Markup, das die Seite
+// gerade geschrieben hat: ein Handler an einer anderen ID bleibt ungebunden.
+// `preview()` ist das echte aus components/photo-screensaver.js; gesteuert wird
+// nur, was die Fotoroute antwortet.
+//
+// Der Fall haelt seine Globals ueber mehrere `await` und wartet deshalb zuerst
+// auf alle Faelle davor - sonst saehen sie seine Attrappen.
+const beforeScreensaverWiring = pendingTests.slice();
+test('Wand-Modus: render() reicht screensaver_enabled bis zum Knopf, der Klick ruft preview() und meldet false (#1766)', async () => {
+  await Promise.allSettled(beforeScreensaverWiring);
+  const names = ['window', 'document', 'localStorage', 'location', 'history', 'MutationObserver', 'setTimeout', 'setInterval', '__apiStub'];
+  const saved = Object.fromEntries(names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  const realSetTimeout = globalThis.setTimeout;
+  const realSetInterval = globalThis.setInterval;
+  const timeouts = [];
+  const intervals = [];
+
+  const makeNode = () => {
+    const attrs = new Map();
+    const listeners = new Map();
+    return {
+      dataset: {},
+      style: {},
+      classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+      listeners,
+      addEventListener(type, fn) { listeners.set(type, [...(listeners.get(type) ?? []), fn]); },
+      removeEventListener() {},
+      setAttribute(name, value) { attrs.set(name, String(value)); },
+      getAttribute: (name) => attrs.get(name) ?? null,
+      removeAttribute(name) { attrs.delete(name); },
+      hasAttribute: (name) => attrs.has(name),
+      toggleAttribute(name, force) { if (force ?? !attrs.has(name)) attrs.set(name, ''); else attrs.delete(name); },
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      append() {},
+      appendChild() {},
+      remove() {},
+      contains: () => false,
+      focus() {},
+      getBoundingClientRect: () => ({ top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }),
+    };
+  };
+
+  // Der Container kennt genau das, was die Seite hineingeschrieben hat: die
+  // Shell traegt das Markup des letzten Aufbaus, `.wall` gibt es, sobald es
+  // darin steht, und ein Knopf existiert nur unter der ID aus diesem Markup.
+  let shellHtml = '';
+  let buttons = new Map();
+  const shell = Object.assign(makeNode(), {
+    replaceChildren() { shellHtml = ''; buttons = new Map(); },
+    insertAdjacentHTML(_position, html) { shellHtml += html; },
+  });
+  const wall = Object.assign(makeNode(), {
+    querySelector(selector) {
+      const id = /^#([\w-]+)$/.exec(selector)?.[1];
+      if (!id || !shellHtml.includes(`id="${id}"`)) return null;
+      if (!buttons.has(id)) buttons.set(id, makeNode());
+      return buttons.get(id);
+    },
+  });
+  const container = Object.assign(makeNode(), {
+    replaceChildren() { shellHtml = ''; buttons = new Map(); },
+    insertAdjacentHTML(_position, html) { shellHtml += html; },
+    querySelector(selector) {
+      if (selector === '#dashboard-shell') return shell;
+      if (selector === '.wall') return /class="wall"/.test(shellHtml) ? wall : null;
+      return null;
+    },
+  });
+
+  const toasts = [];
+  const asked = [];
+  let prefs = {};
+  let photos = { data: { enabled: true, photos: [] } };
+  const root = makeNode();
+  root.setAttribute('data-wall-mode', '');
+  const globals = {
+    window: Object.assign(makeNode(), {
+      yuvomi: { showToast: (...args) => toasts.push(args), isModuleDisabled: () => false },
+      requestAnimationFrame: () => 0,
+      cancelAnimationFrame() {},
+      innerWidth: 1280,
+      innerHeight: 800,
+      matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+    }),
+    document: Object.assign(makeNode(), {
+      documentElement: root,
+      body: makeNode(),
+      hidden: false,
+      createElement: () => makeNode(),
+      getElementById: () => null,
+    }),
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    location: { pathname: '/', search: '', hash: '', href: 'http://wall.test/' },
+    // Die Wand haelt einen History-Marker fuer Zurueck (#1559, overlay-history.js).
+    history: { state: null, pushState(state) { this.state = state; }, replaceState(state) { this.state = state; }, back() {}, go() {} },
+    MutationObserver: class { observe() {} disconnect() {} },
+    // Der Schoner bewaffnet seinen Wartetimer schon beim Laden des Moduls
+    // (fuenf Minuten) - er hielte den Prozess so lange offen. Die Timer laufen
+    // echt und werden am Ende geloescht.
+    setTimeout: (...args) => { const handle = realSetTimeout(...args); timeouts.push(handle); return handle; },
+    setInterval: (...args) => { const handle = realSetInterval(...args); intervals.push(handle); return handle; },
+    __apiStub: {
+      get: async (path) => {
+        asked.push(path);
+        if (path === '/preferences') return { data: prefs };
+        if (path === '/screensaver/photos') return photos;
+        if (path.startsWith('/dashboard')) return { urgentTasks: wallTasks(1), upcomingEvents: [], users: [] };
+        return { data: null };
+      },
+    },
+  };
+  for (const [name, value] of Object.entries(globals)) {
+    Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+  }
+  const settle = async () => { for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve)); };
+  const controller = new AbortController();
+  try {
+    const { render } = await import('../public/pages/dashboard.js');
+    const user = { id: 1, role: 'admin', display_name: 'Anna' };
+
+    // (b) Ohne das Flag in den Praeferenzen: eine Wand, aber kein Knopf.
+    prefs = { screensaver_enabled: false };
+    await render(container, { user, signal: controller.signal });
+    await settle();
+    nodeAssert.ok(asked.includes('/preferences'), 'Reichweite: render() hat die Praeferenzen geholt');
+    nodeAssert.match(shellHtml, /id="wall-exit"/, 'Reichweite: die Wand ist aufgebaut');
+    nodeAssert.ok(!/id="wall-screensaver-start"/.test(shellHtml), 'screensaver_enabled:false - kein Knopf');
+
+    // (a) + (b) Mit dem Flag: der Knopf steht im Markup, das render() schreibt.
+    prefs = { screensaver_enabled: true };
+    await render(container, { user, signal: controller.signal });
+    await settle();
+    nodeAssert.match(shellHtml, /id="wall-screensaver-start"/,
+      'screensaver_enabled:true kommt ueber render() und rebuildWall am Knopf an');
+
+    // (c) Der Handler haengt am Knopf aus diesem Markup.
+    const clicks = buttons.get('wall-screensaver-start')?.listeners.get('click') ?? [];
+    nodeAssert.equal(clicks.length, 1, 'genau ein Klick-Handler am Schoner-Knopf');
+
+    // preview() meldet false (keine Fotos): die Fotoroute wurde gefragt, und
+    // der eine Satz kommt als Toast.
+    asked.length = 0;
+    await clicks[0]({ detail: 1 });
+    nodeAssert.ok(asked.includes('/screensaver/photos'), 'der Klick ruft preview() - die Fotoroute wurde gefragt');
+    nodeAssert.deepEqual(toasts, [['dashboard.wallScreensaverNone', 'info']], 'false: der Toast sagt es');
+
+    // preview() meldet true (ein Foto): kein zweiter Toast.
+    photos = { data: { enabled: true, photos: [{ id: 'p1', takenAt: null }] } };
+    asked.length = 0;
+    await clicks[0]({ detail: 1 });
+    nodeAssert.ok(asked.includes('/screensaver/photos'), 'Reichweite: auch dieser Klick lief durch preview()');
+    nodeAssert.equal(toasts.length, 1, 'true: der Schoner laeuft, kein Toast');
+  } finally {
+    controller.abort();
+    for (const handle of timeouts) clearTimeout(handle);
+    for (const handle of intervals) clearInterval(handle);
+    for (const name of names) {
+      if (saved[name]) Object.defineProperty(globalThis, name, saved[name]);
+      else delete globalThis[name];
+    }
+  }
 });
 
 await Promise.all(pendingTests);

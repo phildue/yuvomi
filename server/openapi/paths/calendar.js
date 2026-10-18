@@ -76,10 +76,10 @@ export function calendarPaths() {
     '/api/v1/calendar/holidays': { get: op({ summary: 'List public & school holidays in a date range', tag: 'Calendar', description: 'Reads cached OpenHolidays entries that overlap `from`/`to` (both `YYYY-MM-DD`, required). Returns `{ data: [{ id, type (`public`|`school`), start_date, end_date, name, color }] }`. Empty when no holiday country is configured.' }) },
     '/api/v1/calendar/google/auth': { get: op({ summary: 'Start Google Calendar OAuth', tag: 'Calendar', admin: true }) },
     '/api/v1/calendar/google/callback': { get: op({ summary: 'Google Calendar OAuth callback', tag: 'Calendar' }) },
-    '/api/v1/calendar/google/sync': { post: op({ summary: 'Run Google Calendar sync', tag: 'Calendar', admin: true, stateChanging: true }) },
+    '/api/v1/calendar/google/sync': { post: op({ summary: 'Run Google Calendar sync', tag: 'Calendar', admin: true, stateChanging: true, description: 'When Google no longer accepts the stored sign-in (`invalid_grant`), the answer is `409` with reason `google_reauth_required`, and syncing pauses until the account is connected again (#2019).' }) },
     '/api/v1/calendar/google/status': { get: op({ summary: 'Get Google Calendar status', tag: 'Calendar' }) },
     '/api/v1/calendar/google/calendars': {
-      get: op({ summary: 'List available Google calendars', tag: 'Calendar', admin: true }),
+      get: op({ summary: 'List available Google calendars', tag: 'Calendar', admin: true, description: 'Calendars of the connected Google account. When Google no longer accepts the stored sign-in (`invalid_grant`), the answer is `409` with reason `google_reauth_required` instead of a list, and nothing is sent to Google until the account is connected again (#2019).' }),
       patch: op({ summary: 'Enable/disable a Google calendar to sync', tag: 'Calendar', admin: true, stateChanging: true }),
     },
     '/api/v1/calendar/google/disconnect': { delete: op({ summary: 'Disconnect Google Calendar', tag: 'Calendar', admin: true, stateChanging: true }) },
@@ -102,15 +102,89 @@ export function calendarPaths() {
       post: op({ summary: 'Sync ICS subscription', tag: 'Calendar', params: [idParam()], stateChanging: true }),
     },
     '/api/v1/calendar/import': {
-      post: op({ summary: 'Import events from an ICS file or shared calendar feed as editable local events', tag: 'Calendar', stateChanging: true, requestBody: jsonBody(null) }),
+      post: op({
+        summary: 'Import events from an ICS file or shared calendar feed as editable local events',
+        tag: 'Calendar',
+        stateChanging: true,
+        requestBody: jsonBody('#/components/schemas/CalendarImportInput'),
+      }),
     },
     '/api/v1/calendar/feed': {
       get: op({ summary: 'Get personal ICS export feed status', tag: 'Calendar' }),
-      put: op({ summary: 'Set personal ICS export feed options (showAssignees)', tag: 'Calendar', stateChanging: true, requestBody: jsonBody(null) }),
+      put: op({ summary: 'Set personal ICS export feed options (showAssignees, includeBirthdays)', tag: 'Calendar', stateChanging: true, requestBody: jsonBody(null, 'At least one boolean: showAssignees or includeBirthdays. Birthday inclusion defaults to true and affects only this member’s calendar feed.') }),
       delete: op({ summary: 'Disable personal ICS export feed', tag: 'Calendar', stateChanging: true }),
     },
     '/api/v1/calendar/feed/regenerate': {
       post: op({ summary: 'Regenerate personal ICS export feed token', tag: 'Calendar', stateChanging: true }),
+    },
+    '/api/v1/calendar/calendars': {
+      get: op({
+        summary: 'List local calendars',
+        tag: 'Calendar',
+        description: 'Feed URLs and tokens are included only for administrators. `uploads_to_icloud` is true on the default calendar while the legacy Apple Calendar connection is configured: its events upload to iCloud, events in other local calendars stay local.',
+      }),
+      post: op({
+        summary: 'Create local calendar',
+        tag: 'Calendar',
+        description: 'Requires write access to the calendar module.',
+        stateChanging: true,
+        responses: {
+          201: { description: 'Local calendar created' },
+          400: { $ref: '#/components/responses/BadRequest' },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          403: { $ref: '#/components/responses/Forbidden' },
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
+        requestBody: jsonBody('#/components/schemas/LocalCalendarCreateInput'),
+      }),
+    },
+    '/api/v1/calendar/calendars/reorder': {
+      patch: op({
+        summary: 'Reorder local calendars',
+        tag: 'Calendar',
+        description: 'Requires calendar write access. Supply every current calendar ID exactly once in `order`; all sort_order values are updated atomically to consecutive values starting at zero. An incomplete, duplicate or stale list returns 400 without changes.',
+        stateChanging: true,
+        requestBody: jsonBody('#/components/schemas/LocalCalendarReorderInput'),
+      }),
+    },
+    '/api/v1/calendar/calendars/{id}': {
+      put: op({
+        summary: 'Update local calendar',
+        tag: 'Calendar',
+        description: 'Requires write access to the calendar module.',
+        params: [idParam()],
+        stateChanging: true,
+        responses: {
+          200: { description: 'Local calendar updated' },
+          400: { $ref: '#/components/responses/BadRequest' },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          403: { $ref: '#/components/responses/Forbidden' },
+          404: apiError('Local calendar not found.'),
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
+        requestBody: jsonBody('#/components/schemas/LocalCalendarUpdateInput'),
+      }),
+      delete: op({
+        summary: 'Delete local calendar and reassign events to the default calendar',
+        tag: 'Calendar',
+        description: 'Requires calendar write access. An active feed link also requires admin access.',
+        params: [idParam()],
+        stateChanging: true,
+        responses: {
+          204: { description: 'Local calendar deleted' },
+          400: { $ref: '#/components/responses/BadRequest' },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          403: { $ref: '#/components/responses/Forbidden' },
+          404: apiError('Local calendar not found.'),
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
+      }),
+    },
+    '/api/v1/calendar/calendars/{id}/feed/regenerate': {
+      post: op({ summary: 'Regenerate local-calendar ICS export token', tag: 'Calendar', admin: true, params: [idParam()], stateChanging: true }),
+    },
+    '/api/v1/calendar/calendars/{id}/feed': {
+      delete: op({ summary: 'Disable local-calendar ICS export', tag: 'Calendar', admin: true, params: [idParam()], stateChanging: true }),
     },
     '/api/v1/calendar/sync-targets': {
       get: op({

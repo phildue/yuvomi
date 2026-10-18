@@ -18,9 +18,10 @@ import { SESSION_MAX_AGE_MS, sessionCookieRefreshDue } from './utils/session-lif
 import { collectErrors, date as validateDate, str, MAX_SHORT, MAX_TITLE } from './middleware/validate.js';
 import { createLogger } from './logger.js';
 import { memberEmail } from './services/member-email.js';
+import { GravatarError, fetchGravatar, gravatarEnabled, gravatarHost } from './services/gravatar.js';
 import {
   accessScopeSql, activeAccountSql, deactivatedAtColumnSql, householdMemberSql, isActiveAccount,
-  memberOrderSql, memberPositionSql,
+  isHouseholdMember, memberOrderSql, memberPositionSql,
 } from './services/household-members.js';
 import { RemovalRefused, removeUser } from './services/user-removal.js';
 import {
@@ -29,6 +30,7 @@ import {
 } from './services/display-accounts.js';
 import { deleteBirthdayArtifacts, syncBirthdayArtifacts } from './services/birthdays.js';
 import { syncFastingRemindersForUser } from './services/fasting-reminders.js';
+import { revokePaymentTasksForUsers } from './services/payment-task-audience.js';
 import * as oidcClient from 'openid-client';
 import {
   isOidcEnabled,
@@ -47,11 +49,11 @@ import { parseScopes, serializeScopes, normalizeScopes } from './scopes.js';
 import { hashPassword, normalizePassword, verifyPassword } from './utils/password.js';
 import { getSupportedLocales, isSupportedLocale, resolveHouseholdLocale } from './utils/i18n.js';
 import { isValidTimeZone } from './utils/timezone.js';
-import { accountIdsByEmail } from './utils/email-match.js';
+import { accountIdsByEmail, emailMatchKey } from './utils/email-match.js';
 import {
   resolvePermissions, buildSessionModuleAccess, clientPermissions,
   invitePresetPermissions, isValidInvitePreset, writeSubjectPermissions,
-  INVITE_PRESET_DEFAULT,
+  applyChildStartPermissions, INVITE_PRESET_DEFAULT,
 } from './permissions.js';
 import { isAdminRequest, requireAdmin } from './middleware/require-admin.js';
 import { EMAIL_IN_USE_MESSAGE, emailsTakenByOtherAccounts, storedAccountEmails } from './services/contact-identity.js';
@@ -474,6 +476,22 @@ const sessionRevokeLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Zu viele Anfragen. Bitte warte kurz.', code: 429 },
+});
+
+// Eigener Limiter fuer den Gravatar-Import. Jeder Aufruf ist ein Abruf bei
+// einem fremden Dienst mit dem Hash der eigenen Adresse; zehn in zehn Minuten
+// reichen fuer jeden ehrlichen Klick und halten einen Schleifenlauf vom
+// Spiegel fern. Je Mitglied gezaehlt, aus demselben Grund wie eine Zeile
+// darueber: hinter einem Proxy ohne `trust proxy` teilt der Haushalt eine IP.
+// Mit `reason`, damit die Oberflaeche den Fall benennen kann statt den Text
+// durchzureichen.
+const gravatarLimiter = rateLimit({
+  windowMs: 10 * 60_000,
+  max: 10,
+  keyGenerator: (req) => `user:${req.authUserId}`,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many Gravatar requests. Please wait a few minutes.', code: 429, reason: 'gravatar_rate_limited' },
 });
 
 // Wie lange ein bestandenes Passwort auf den zweiten Faktor warten darf.
@@ -986,6 +1004,7 @@ function requireAuth(req, res, next) {
       req.authRole = 'member';
       req.authScopes = [...DISPLAY_SCOPES];
       req.displayDeviceId = device.deviceId;
+      req.displayShowsScreensaver = device.showScreensaver === true;
       // DAS COOKIE WIRD NACHDATIERT, ABER NICHT BEI JEDEM ZUGRIFF. Browser
       // kappen die Lebensdauer persistenter Cookies (Chromium: 400 Tage), eine
       // einmal geschriebene Jahreszahl haelt also nicht, was sie sagt - ein
@@ -2168,6 +2187,13 @@ export function buildInviteRoutes(targetRouter, {
             }
             writeSubjectPermissions(getDb(), 'user', newUserId, parsed);
           }
+          // Kinder-Startrechte (R20) NACH der Vorlage: sie liest den Stand,
+          // den Rollenprofil und Vorlage schon ergeben, und verschaerft nur.
+          // Gilt auch bei der Vorlage 'role' - ein neues Kinderkonto startet
+          // nie mit Budget, Fasten oder den Loehnen der Haushaltshilfe.
+          applyChildStartPermissions(getDb(), {
+            id: newUserId, role: invite.role, family_role: invite.family_role,
+          });
           syncFamilyMemberArtifacts(getDb(), newUserId, {
             displayName,
             // Die eingeladene Adresse wird zur Kontaktadresse: ohne sie fände der
@@ -2675,6 +2701,7 @@ router.get('/me', requireAuth, (req, res) => {
         householdSize: householdSize(db.get()),
         initialsRoster: initialsRoster(db.get(), user.id),
         othersCanRead: othersCanRead(db.get(), user.id),
+        ...gravatarClientState(user.id),
       });
     }
 
@@ -2717,6 +2744,7 @@ router.get('/me', requireAuth, (req, res) => {
       householdSize: householdSize(db.get()),
       initialsRoster: initialsRoster(db.get(), user.id),
       othersCanRead: othersCanRead(db.get(), user.id),
+      ...gravatarClientState(user.id),
       csrfToken: req.session.csrfToken,
     });
   } catch (err) {
@@ -3419,6 +3447,11 @@ router.post('/users', requireAuth, requireAdmin, csrfMiddleware, async (req, res
           VALUES (?, ?, ?, ?, ?, ?, ?)
         `)
         .run(username, display_name, hash, avatar_color, normalizedAvatarData ?? null, role, family_role);
+      // Kinder-Startrechte (R20): in derselben Transaktion wie das Konto, damit
+      // es nie einen Moment mit Budget und Haushaltshilfe-Loehnen gibt.
+      applyChildStartPermissions(db.get(), {
+        id: Number(created.lastInsertRowid), role, family_role,
+      });
       syncFamilyMemberArtifacts(db.get(), created.lastInsertRowid, {
         displayName: display_name,
         phone: memberFields.values.phone,
@@ -3585,6 +3618,9 @@ router.patch('/users/:id', requireAuth, requireAdmin, csrfMiddleware, async (req
       });
       if (nextRole !== existing.role || familyRole !== existing.family_role) {
         syncFastingRemindersForUser(db.get(), userId);
+        // Herabstufung oder ein Rollenprofil ohne Betraege: die Zahlungs-
+        // aufgaben dieses Kontos gelten neu (services/payment-task-audience.js).
+        revokePaymentTasksForUsers(db.get(), [userId]);
       }
     });
 
@@ -3675,6 +3711,172 @@ router.patch('/me/profile', requireAuth, csrfMiddleware, (req, res) => {
   }
 });
 
+// Status je Grund aus services/gravatar.js. Ein Grund, der hier fehlt, ist ein
+// Betreiberfehler (gravatar_bad_base_url) und faellt auf 500 - absichtlich
+// laut, nicht als "abgeschaltet" getarnt: eine falsch gesetzte Variable soll
+// im Log stehen, nicht als Produktentscheidung durchgehen. Die 403 und die 409
+// der Route stehen NICHT hier, sondern als Literal an ihrer Stelle: sie kommen
+// nicht aus dem Dienst, sondern aus dem Konto.
+const GRAVATAR_STATUS = {
+  no_email: 400,
+  gravatar_disabled: 404,
+  gravatar_unreachable: 502,
+  gravatar_too_large: 413,
+  gravatar_not_image: 415,
+};
+
+/**
+ * Darf die Kontoseite den Gravatar-Knopf zeigen? Nur wenn der Betreiber den
+ * Import eingeschaltet hat (GRAVATAR_BASE_URL gesetzt) UND das Konto ein
+ * Haushaltsmitglied ist - dieselben zwei Riegel, die die Route vor dem Abruf
+ * prueft. Als Boolean an GET /auth/me; die URL selbst verlaesst den Server nie.
+ */
+function gravatarAvailable(userId) {
+  return gravatarEnabled() && isHouseholdMember(userId, { db: db.get() });
+}
+
+/**
+ * Was GET /auth/me der Kontoseite ueber den Import sagt: ob es den Knopf gibt,
+ * und WELCHEN Dienst der Hinweis nennen muss. `gravatarHost` ist der Hostname
+ * der geprueften Basis-URL (gravatarHost() im Dienst) und nur dann gesetzt,
+ * wenn es den Knopf gibt - ein Split-Gast oder ein Server ohne Import erfaehrt
+ * nicht, was eingetragen ist. null bei einer falsch gesetzten Basis: dann nennt
+ * die Seite keinen Dienst, und der Klick meldet den Betreiberfehler (500).
+ */
+function gravatarClientState(userId) {
+  const available = gravatarAvailable(userId);
+  return { gravatarAvailable: available, gravatarHost: available ? (gravatarHost() || null) : null };
+}
+
+/**
+ * POST /api/v1/auth/me/avatar/gravatar
+ * Holt das Gravatar zur eigenen gespeicherten Adresse EINMAL und legt es wie
+ * einen Upload ab: derselbe Weg wie PATCH /me/profile mit `avatar_data`
+ * (normalizeAvatarData, users.avatar_data, Geburtstagsfoto-Spiegel). Danach
+ * wird nichts mehr nachgeladen; ein spaeterer Upload ueberschreibt es, ein
+ * spaeterer Import den Upload - es gewinnt, was zuletzt gespeichert wurde.
+ *
+ * AUS, SOLANGE GRAVATAR_BASE_URL NICHT GESETZT IST: dann antwortet die Route
+ * vor allem anderen 404 gravatar_disabled, und es geht nichts hinaus.
+ *
+ * Nur fuer sich selbst und nur fuer ein Haushaltsmitglied: die Adresse eines
+ * Split-Gasts traegt ein, wer die Gruppe verwaltet, nicht der Gast - also
+ * 403 not_a_household_member, bevor irgendetwas abgerufen wird. Ein
+ * Wandtablett weist schon der Riegel des Routers ab (403 display_account).
+ *
+ * DER ABRUF DAUERT BIS ZU 8 SEKUNDEN, und in der Zeit kann sich das Konto
+ * aendern. Deshalb ein Schnappschuss VOR dem await (avatar_data und der
+ * Vergleichsschluessel der Adresse) und in der Transaktion derselbe Blick noch
+ * einmal: ist das Konto kein Mitglied mehr, die Adresse eine andere oder das
+ * Bild nicht mehr das von vorher, wird NICHTS geschrieben (409 gravatar_stale)
+ * - die spaetere Handlung des Mitglieds gewinnt, nicht der laufende Abruf.
+ *
+ * Response: { data: User } | { error, code, reason } mit reason aus
+ *   no_email, gravatar_disabled, gravatar_not_found, gravatar_unreachable,
+ *   gravatar_too_large, gravatar_not_image, gravatar_rate_limited,
+ *   not_a_household_member, gravatar_stale.
+ *
+ * Als Builder wie buildResetRoutes(): die Suite reicht einen Abruf ohne Netz
+ * hinein und prueft den Rest - Riegel, Limiter, Speicherung, Spiegel - gegen
+ * den echten Handler.
+ */
+export function buildGravatarRoute(targetRouter, { fetch = fetchGravatar, limiter = gravatarLimiter } = {}) {
+  targetRouter.post('/me/avatar/gravatar', requireAuth, csrfMiddleware, limiter, async (req, res) => {
+    try {
+      if (!gravatarEnabled()) {
+        return res.status(404).json({ error: 'Gravatar import is switched off on this server.', code: 404, reason: 'gravatar_disabled' });
+      }
+      const userId = req.authUserId;
+      const existing = db.get().prepare('SELECT id, avatar_data FROM users WHERE id = ?').get(userId);
+      if (!existing) return res.status(404).json({ error: 'User not found.', code: 404 });
+      if (!isHouseholdMember(userId, { db: db.get() })) {
+        return res.status(403).json({ error: 'Only household members can fetch a Gravatar.', code: 403, reason: 'not_a_household_member' });
+      }
+
+      // Der Schnappschuss, gegen den die Transaktion unten prueft.
+      const avatarBefore = existing.avatar_data ?? null;
+      const email = memberEmail(userId);
+      const keyBefore = emailMatchKey(email);
+      // Die Seite schickt die Adresse mit, die ihr Hinweis nennt. Hat ein
+      // anderes Mitglied den Kontakt seitdem geaendert, wird nicht das Bild
+      // einer Adresse geholt, die das Mitglied nie gesehen hat - Absage VOR dem
+      // Abruf. Ohne das Feld (API-Aufrufer) gilt die gespeicherte Adresse. Ist keine gespeichert,
+      // bleibt es beim 400 no_email unten.
+      if (keyBefore && typeof req.body?.email === 'string' && emailMatchKey(req.body.email) !== keyBefore) {
+        log.info('Gravatar import refused: the page showed another address', { userId });
+        return res.status(409).json({
+          error: 'Your email address changed since the page was loaded. Reload and try again.',
+          code: 409,
+          reason: 'gravatar_stale',
+        });
+      }
+      let fetched;
+      try {
+        fetched = await fetch(email);
+      } catch (err) {
+        if (!(err instanceof GravatarError)) throw err;
+        const status = GRAVATAR_STATUS[err.reason] ?? 500;
+        // Ohne Hash und ohne URL: das Log soll sagen, WAS schiefging, nicht WER
+        // gefragt wurde. Von der `cause` nur der Code (ENOTFOUND, ECONNRESET),
+        // nicht die Meldung - die traegt bei einem DNS-Fehler den Host der
+        // Basis-URL. Ein Betreiberfehler (500) bekommt nach aussen einen
+        // neutralen Satz; der genaue steht im Log, wo der Betreiber liest.
+        // Genau die 500, nicht "ab 500": ein 502 gravatar_unreachable ist kein
+        // Betreiberfehler, und sein Satz nennt den Dienst, der nicht antwortete.
+        const operatorError = status === 500;
+        log.info('Gravatar import refused', { userId, reason: err.reason, cause: err.cause?.code ?? err.cause?.name, detail: operatorError ? err.message : undefined });
+        const error = operatorError ? 'Gravatar import is misconfigured on this server.' : err.message;
+        return res.status(status).json({ error, code: status, reason: err.reason });
+      }
+      if (!fetched) {
+        log.info('Gravatar import: no picture', { userId });
+        return res.status(404).json({ error: `${gravatarHost()} has no picture for your email address.`, code: 404, reason: 'gravatar_not_found' });
+      }
+
+      // Derselbe Filter wie beim Upload. Er kann hier nur noch an der Laenge
+      // scheitern, und auch das nicht, solange MAX_GRAVATAR_BYTES in Base64
+      // unter MAX_AVATAR_DATA_LENGTH bleibt - geprueft wird trotzdem, damit die
+      // Zusicherung an der Stelle steht, an der sie gilt.
+      const avatarData = normalizeAvatarData(fetched.dataUrl);
+      if (avatarData?.error) {
+        return res.status(415).json({ error: avatarData.error, code: 415, reason: 'gravatar_not_image' });
+      }
+
+      // Synchron: zwischen dem zweiten Blick und dem Schreiben liegt kein await.
+      // Der Adressvergleich laeuft ueber emailMatchKey() - eine Aenderung nur
+      // der Grossschreibung ergibt denselben Hash und ist kein Grund zur Absage.
+      const stored = db.transaction(() => {
+        const now = db.get().prepare('SELECT avatar_data FROM users WHERE id = ?').get(userId);
+        if (!now
+          || !isHouseholdMember(userId, { db: db.get() })
+          || emailMatchKey(memberEmail(userId)) !== keyBefore
+          || (now.avatar_data ?? null) !== avatarBefore) {
+          return false;
+        }
+        db.get().prepare('UPDATE users SET avatar_data = ? WHERE id = ?').run(avatarData, userId);
+        syncFamilyMemberArtifacts(db.get(), userId, { avatarData, actorUserId: userId });
+        return true;
+      });
+      if (!stored) {
+        log.info('Gravatar import discarded: account changed during the fetch', { userId });
+        return res.status(409).json({
+          error: 'Your picture, address or account changed while the picture was being fetched. Nothing was stored.',
+          code: 409,
+          reason: 'gravatar_stale',
+        });
+      }
+
+      log.info('Gravatar imported', { userId, contentType: fetched.contentType, bytes: fetched.bytes });
+      const updated = db.get().prepare(`SELECT ${USER_PUBLIC_COLUMNS} FROM users WHERE id = ?`).get(userId);
+      res.json({ data: publicUser(updated) });
+    } catch (err) {
+      log.error('Gravatar import error:', err);
+      res.status(500).json({ error: 'Internal server error.', code: 500 });
+    }
+  });
+}
+buildGravatarRoute(router);
+
 /**
  * PATCH /api/v1/auth/me/password
  * Ändert das eigene Passwort.
@@ -3696,7 +3898,12 @@ router.patch('/me/password', requireAuth, csrfMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found.', code: 404 });
 
     const { valid } = await verifyPassword(current_password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: 'Current password is incorrect.', code: 401 });
+    // 400 mit Grund, nicht 401 (Re-Critique 2026-10-17): ein 401 heisst in
+    // dieser App "Sitzung weg" - api.js loeste darauf auth:expired aus, und wer
+    // sich beim alten Passwort vertippte, landete ohne Meldung auf der
+    // Anmeldung, die Eingaben verloren, obwohl die Sitzung gueltig war.
+    // Dieselbe Form wie ein falscher Code beim zweiten Faktor (invalid_code).
+    if (!valid) return res.status(400).json({ error: 'Current password is incorrect.', code: 400, reason: 'wrong_password' });
 
     const hash = await hashPassword(new_password);
     db.get().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, req.authUserId);

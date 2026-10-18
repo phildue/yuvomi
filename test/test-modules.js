@@ -52,8 +52,10 @@ function writeModule(folder, manifest, files = {}) {
 writeModule('alpha-mod', {
   id: 'alpha-mod', name: 'Alpha', version: '1.0.0', description: 'Alpha module',
   entry: 'index.js', style: 'style.css', icon: 'star', accent: '#112233',
+  settings: { entry: 'settings.js', sections: ['household'], labelKey: 'settings' },
   menu: { order: 10, label: 'Alpha Menu', icon: 'sparkles', show: true },
-}, { 'index.js': 'export default {};\n', 'style.css': '.alpha{}\n' });
+}, { 'index.js': 'export default {};\n', 'style.css': '.alpha{}\n',
+  'settings.js': 'export async function render() {}\n' });
 
 // Minimal-Manifest: prüft die Default-Ableitungen (accent-Fallback, menu-Defaults,
 // style=null). menu.show=false ist reine UI-Sichtbarkeit, NICHT enabled.
@@ -85,6 +87,7 @@ writeModule('cap-mod', {
   id: 'cap-mod',
   name: 'Capabilities Module',
   entry: 'index.js',
+  settings: { entry: 'settings/admin.js', sections: ['household', 'mine'] },
   capabilities: {
     permissions: {
       module: { label: 'Cap Module', icon: 'star' },
@@ -103,8 +106,13 @@ writeModule('cap-mod', {
   },
 }, {
   'index.js': 'export async function render() {}\n',
+  'settings/admin.js': 'export async function render() {}\n',
   'widgets/tile.js': 'export async function renderWidget(c) { c.textContent = "ok"; }\n',
 });
+
+writeModule('bad-settings-mod', {
+  id: 'bad-settings-mod', entry: 'index.js', settings: { entry: '../outside.js' },
+}, { 'index.js': '' });
 
 writeModule('bad-cap-mod', {
   id: 'bad-cap-mod',
@@ -130,7 +138,7 @@ writeModule('i18n-mod', {
 
 const VALID_IDS = ['alpha-mod', 'beta-mod', 'omega-mod', 'cap-mod', 'i18n-mod'];
 const ERROR_IDS = ['broken-json-mod', 'mismatch-mod', 'no-entry-mod', 'bad-entry-mod',
-  'bad-style-mod', 'no-style-file-mod', 'bad-cap-mod'];
+  'bad-style-mod', 'no-style-file-mod', 'bad-settings-mod', 'bad-cap-mod'];
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -150,6 +158,9 @@ app.use((req, _res, next) => {
   req.authUserId = actor.id;
   req.authRole = actor.role;
   req.session = { userId: actor.id, role: actor.role };
+  // Wie requireAuth fuer den Browser: Einschalten (PATCH enabled:true) verlangt
+  // seit #1671 eine Sitzung; die Token-Seite prueft test-module-install.js.
+  req.authMethod = 'session';
   next();
 });
 app.use(express.json());
@@ -202,6 +213,9 @@ test('listModules(admin): valide Manifeste werden vollständig normalisiert', as
   assert.equal(alpha.accent, '#112233');
   assert.equal(alpha.status, 'enabled');
   assert.equal(alpha.enabled, true);
+  assert.deepEqual(alpha.settings, {
+    entry: '/api/v1/modules/assets/alpha-mod/settings.js', sections: ['household'], labelKey: 'settings',
+  });
   // Öffentliche Asset-URLs werden aus id + relativem Pfad gebaut.
   assert.equal(alpha.route.path, '/m/alpha-mod');
   assert.equal(alpha.route.entry, '/api/v1/modules/assets/alpha-mod/index.js');
@@ -218,6 +232,69 @@ test('listModules(admin): valide Manifeste werden vollständig normalisiert', as
   assert.equal(beta.menu.show, false, 'menu.show wird übernommen');
   assert.equal(beta.menu.label, 'beta-mod', 'menu.label fällt auf name zurück');
   assert.equal(beta.enabled, true, 'menu.show=false lässt das Modul dennoch enabled');
+});
+
+test('settings require explicit valid sections and preserve their asset URL', async () => {
+  const norm = (settings) => svc.normalizeManifest({ id: 'x-mod', entry: 'index.js', settings }, 'x-mod');
+  assert.equal(norm(undefined).settings, null);
+  for (const sections of [['mine'], ['household'], ['mine', 'household'], ['household', 'mine']]) {
+    assert.deepEqual(norm({ entry: 'config/settings.js', sections, labelKey: 'settings' }).settings, {
+      entry: '/api/v1/modules/assets/x-mod/config/settings.js', sections, labelKey: 'settings',
+    });
+  }
+  for (const sections of [undefined, null, [], 'mine', {}, ['other'], ['mine', 'other'], ['mine', 'mine'], [null]]) {
+    assert.throws(() => norm({ entry: 'settings.js', sections }), /settings.sections/);
+  }
+  for (const settings of [null, [], {}, { entry: '../outside.js', sections: ['mine'] },
+    { entry: 'x.css', sections: ['mine'] }, { entry: 'x.js', sections: ['mine'], labelKey: '../bad' }]) {
+    assert.throws(() => norm(settings), /settings/);
+  }
+  const mods = await svc.listModules({ admin: true });
+  assert.equal(mods.find((mod) => mod.id === 'bad-settings-mod').status, 'error');
+});
+
+test('extension settings sheets follow enable state, role and module permissions', async () => {
+  const registry = await import('../public/settings/registry.js');
+  const permissions = await import('../public/permissions.js');
+  const admin = { role: 'admin' };
+  const member = { role: 'member' };
+  try {
+    registry.setExtensionSettingsModules(await svc.listModules());
+    assert.ok(registry.findSettingsLeaf('/settings/modules/ext/alpha-mod', admin));
+    assert.equal(registry.findSettingsLeaf('/settings/modules/ext/alpha-mod', admin).icon, 'sparkles',
+      'the sheet shows the same icon as the navigation (menu.icon before icon)');
+    assert.equal(registry.findSettingsLeaf('/settings/modules/ext/alpha-mod', member), null);
+    assert.equal(registry.settingsSheetsForDomain('modules', member)
+      .some((sheet) => sheet.path === '/settings/modules/ext/alpha-mod'), false);
+    assert.deepEqual(registry.searchSettings('Alpha', { user: member, translate: (key) => key }),
+      { leaves: [], sections: [], options: [] });
+    assert.ok(registry.searchSettings('Alpha', { user: admin, translate: (key) => key })
+      .leaves.some((sheet) => sheet.path === '/settings/modules/ext/alpha-mod'));
+    const mixed = registry.findSettingsLeaf('/settings/modules/ext/cap-mod', member);
+    assert.ok(mixed);
+    assert.deepEqual(registry.settingsSheetSections(mixed, member).map((section) => section.scope), ['mine']);
+    const adminSections = registry.settingsSheetSections(mixed, admin);
+    assert.deepEqual(adminSections.map((section) => section.scope), ['mine', 'household']);
+    assert.equal(new Set(adminSections.map((section) => section.id)).size, 2);
+    assert.ok(registry.settingsSheetsForDomain('modules', member)
+      .some((sheet) => sheet.path === '/settings/modules/ext/cap-mod'));
+    permissions.setExtensionNavMap(await svc.listModules());
+    permissions.setPermissions({ modules: { 'ext:cap-mod': 'none' } });
+    assert.equal(registry.findSettingsLeaf('/settings/modules/ext/cap-mod', member), null);
+    assert.deepEqual(registry.searchSettings('Capabilities', { user: member, translate: (key) => key }),
+      { leaves: [], sections: [], options: [] });
+    permissions.clearPermissions();
+    await svc.setModuleEnabled('cap-mod', false);
+    registry.setExtensionSettingsModules(await svc.listModules());
+    assert.equal(registry.findSettingsLeaf('/settings/modules/ext/cap-mod', admin), null);
+    assert.equal(registry.extensionSettingsPaths().includes('/settings/modules/ext/cap-mod'), false);
+  } finally {
+    permissions.clearPermissions();
+    permissions.setExtensionNavMap([]);
+    await svc.setModuleEnabled('cap-mod', true);
+    registry.setExtensionSettingsModules(await svc.listModules());
+    db.prepare("DELETE FROM sync_config WHERE key = 'third_party_disabled_modules'").run();
+  }
 });
 
 // ── Formatvertrag des Manifests (#919 Folgearbeit) ──────────────────────────────
@@ -283,7 +360,9 @@ test('jedes zugesagte capabilities-Feld kommt beim Modul auch an', async () => {
       },
     },
     'contract-mod',
-    '/nowhere',
+    // Absolut auf jedem System: unter Windows macht path.resolve aus '/nowhere'
+    // 'C:\nowhere', und der Widget-Eintrag laege scheinbar ausserhalb.
+    path.resolve('/nowhere'),
     (id, rel) => `/api/v1/modules/assets/${id}/${rel}`,
     async () => true,        // jede Datei existiert
     () => true,              // jeder Pfad ist sicher
@@ -501,6 +580,223 @@ test('listModules: fehlende widget entry datei → error status', async () => {
   assert.match(bad.error, /does not exist/i);
 });
 
+// ── Die Freigabe wohnt in der Installationsdatei (#1671, DECISIONS.md 12) ────────
+// Kein Backup enthaelt modules/. Eine zurueckgespielte oder frische Datenbank
+// darf kein Modul einschalten, das installiert und nie angesehen wurde - also
+// entscheidet die Datei im Ordner, nicht die Sperrliste in sync_config.
+const installRecord = (overrides = {}) => JSON.stringify({
+  source: 'zip', installedAt: '2026-10-06T10:00:00.000Z', installedBy: 1, approved: false, ...overrides,
+});
+const clearDisabledConfig = () => db.prepare("DELETE FROM sync_config WHERE key = 'third_party_disabled_modules'").run();
+const find = async (id) => (await svc.listModules({ admin: true })).find((m) => m.id === id);
+
+test('Installationsdatei ohne Freigabe + leere Datenbank → aus; ohne Datei entscheidet die Sperrliste', async () => {
+  writeModule('record-mod', { id: 'record-mod', entry: 'index.js' },
+    { 'index.js': '', '.yuvomi-install.json': installRecord() });
+  clearDisabledConfig();
+  const m = await find('record-mod');
+  assert.equal(m.enabled, false, 'die Datei sagt nicht freigegeben - die leere Sperrliste zaehlt nicht');
+  assert.equal(m.status, 'disabled');
+  assert.equal(m.install.approved, false);
+  assert.equal(m.install.installedBy, undefined, 'die Nutzer-Id bleibt in der Datei');
+  // Nur das Literal true ist eine Freigabe.
+  fs.writeFileSync(path.join(MODULES_DIR, 'record-mod', '.yuvomi-install.json'), installRecord({ approved: 'true' }));
+  assert.equal((await find('record-mod')).enabled, false, '"true" als Text ist keine Freigabe');
+  fs.writeFileSync(path.join(MODULES_DIR, 'record-mod', '.yuvomi-install.json'), installRecord({ approved: 1 }));
+  assert.equal((await find('record-mod')).enabled, false, '1 ist keine Freigabe');
+  // Von Hand kopiert (keine Datei): wie bisher, an bei leerer Sperrliste.
+  fs.rmSync(path.join(MODULES_DIR, 'record-mod', '.yuvomi-install.json'));
+  assert.equal((await find('record-mod')).enabled, true);
+  assert.equal((await find('record-mod')).install, null);
+});
+// Eine Datei, die DA ist, aber nicht lesbar (abgeschnitten, von Hand verdorben,
+// zu gross), darf das Modul nicht als "von Hand kopiert" durchwinken: sie sagt,
+// dass hier die Oberflaeche installiert hat, und was sie nicht freigibt, bleibt
+// aus. Als Fehler, nicht als bloss "aus" - der Admin soll sehen, warum der
+// Schalter fehlt, und die Datei auf dem Server richten oder den Ordner entfernen.
+test('Installationsdatei vorhanden, aber unlesbar → aus und als Fehler gemeldet, nie an', async () => {
+  writeModule('broken-record', { id: 'broken-record', entry: 'index.js' }, { 'index.js': '' });
+  clearDisabledConfig();
+  const file = path.join(MODULES_DIR, 'broken-record', '.yuvomi-install.json');
+  for (const [label, content] of [
+    ['abgeschnitten', installRecord().slice(0, 20)],
+    ['kein Objekt', '[]'],
+    ['unbekannte Quelle', installRecord({ source: 'ftp' })],
+    ['zu gross', JSON.stringify({ source: 'zip', approved: true, pad: 'x'.repeat(5000) })],
+  ]) {
+    fs.writeFileSync(file, content);
+    const m = await find('broken-record');
+    assert.equal(m.enabled, false, `${label}: laeuft trotz unlesbarer Datei`);
+    assert.equal(m.status, 'error', `${label}: nicht als Fehler gemeldet`);
+    assert.match(m.error, /.yuvomi-install.json/, `${label}: der Fehler nennt die Datei nicht`);
+  }
+  // Gegenprobe: dieselbe Datei lesbar und freigegeben → an.
+  fs.writeFileSync(file, installRecord({ approved: true }));
+  assert.equal((await find('broken-record')).enabled, true);
+});
+
+test('Einschalten schreibt die Freigabe in die Datei; eine leere Datenbank danach laesst das Modul an', async () => {
+  const file = path.join(MODULES_DIR, 'record-mod', '.yuvomi-install.json');
+  fs.writeFileSync(file, installRecord());
+  assert.equal((await find('record-mod')).enabled, false);
+  const on = await call('PATCH', '/record-mod', { actor: ADM, body: { enabled: true } });
+  assert.equal(on.status, 200, JSON.stringify(on.body));
+  assert.equal(on.body.data.enabled, true);
+  assert.equal(on.body.data.install.approved, true);
+  const written = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(written.approved, true, 'die Freigabe steht in der Datei');
+  assert.equal(written.installedBy, 1, 'die anderen Felder bleiben, wie die Installation sie schrieb');
+  assert.equal(written.source, 'zip');
+  assert.ok(!fs.readdirSync(path.join(MODULES_DIR, 'record-mod')).some((n) => n.endsWith('.tmp')), 'keine Temp-Datei bleibt liegen');
+  // Datenbank "zurueckgespielt": die Sperrliste ist weg - das Modul bleibt an.
+  clearDisabledConfig();
+  assert.equal((await find('record-mod')).enabled, true, 'die Freigabe ueberlebt die Datenbank');
+  // Runde 4: Ausschalten setzt die Sperrliste UND schreibt `approved: false`
+  // zurueck - `approved` heisst "ein Admin hat diese Fassung eingeschaltet",
+  // und "aus" soll den Ordner ebenso begleiten wie "an": eine zurueckgespielte
+  // Datenbank schaltete sonst wieder ein, was der Admin abgeschaltet hatte.
+  const off = await call('PATCH', '/record-mod', { actor: ADM, body: { enabled: false } });
+  assert.equal(off.body.data.enabled, false);
+  assert.equal(off.body.data.install.approved, false);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).approved, false, 'ausschalten nimmt die Freigabe zurueck');
+  assert.deepEqual(disabledConfig(), ['record-mod']);
+  clearDisabledConfig();
+  assert.equal((await find('record-mod')).enabled, false, 'leere Datenbank: das Aus ueberlebt in der Datei');
+  assert.equal((await call('PATCH', '/record-mod', { actor: ADM, body: { enabled: true } })).body.data.enabled, true);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).approved, true, 'wieder einschalten ist eine neue Freigabe');
+  assert.deepEqual(disabledConfig(), []);
+  // Ein Ordner, den der Server nicht schreiben kann: aus geht trotzdem - die
+  // Sperrliste reicht, und Code wegnehmen darf nie an der Datei scheitern.
+  const restore = svc.__setModulesFsOpsForTests({
+    writeFile: async () => { throw Object.assign(new Error('read-only'), { code: 'EROFS' }); },
+  });
+  try {
+    const ro = await call('PATCH', '/record-mod', { actor: ADM, body: { enabled: false } });
+    assert.equal(ro.status, 200, JSON.stringify(ro.body));
+    assert.equal(ro.body.data.enabled, false, 'aus ueber die Sperrliste');
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).approved, true, 'die Datei blieb, wie sie war (nur gewarnt)');
+  } finally {
+    restore();
+  }
+  fs.rmSync(path.join(MODULES_DIR, 'record-mod'), { recursive: true, force: true });
+});
+
+// Runde 5 der Review (#1671): auch das `approved: false` beim Ausschalten liest
+// die Datei und schreibt sie um. Landete ein Ersetzen dazwischen, truege es
+// installedAt/installedBy (und url/commit) der alten Fassung in den Ordner der
+// neuen. Haelt eine Installation die Sperre, schaltet Ausschalten darum nur
+// ueber die Sperrliste aus und laesst die Datei, wie sie ist - es wartet nie.
+test('Ausschalten waehrend einer Installation: aus, die Installationsdatei bleibt byte-gleich, danach wird sie geschrieben', async () => {
+  writeModule('locked-off-mod', { id: 'locked-off-mod', entry: 'index.js' },
+    { 'index.js': '', '.yuvomi-install.json': installRecord({ approved: true }) });
+  clearDisabledConfig();
+  const dir = path.join(MODULES_DIR, 'locked-off-mod');
+  const file = path.join(dir, '.yuvomi-install.json');
+  assert.equal((await find('locked-off-mod')).enabled, true);
+  const before = fs.readFileSync(file);
+  const release = svc.acquireInstallLock(); // eine laufende Installation
+  assert.ok(release, 'die Sperre war frei');
+  try {
+    const off = await call('PATCH', '/locked-off-mod', { actor: ADM, body: { enabled: false } });
+    assert.equal(off.status, 200, JSON.stringify(off.body));
+    assert.equal(off.body.data.enabled, false, 'aus ueber die Sperrliste');
+    assert.deepEqual(disabledConfig(), ['locked-off-mod']);
+    assert.ok(fs.readFileSync(file).equals(before), 'die Datei blieb byte-gleich, solange die Sperre vergeben war');
+    assert.deepEqual(fs.readdirSync(dir).filter((n) => n.endsWith('.tmp')), [], 'keine Temp-Datei');
+  } finally {
+    release();
+  }
+  // Das Ausschalten hat die Sperre nicht behalten: sie ist frei, und ein
+  // weiteres Ausschalten schreibt die Datei jetzt.
+  const probe = svc.acquireInstallLock();
+  assert.ok(probe, 'die Sperre ist wieder frei');
+  probe();
+  const off = await call('PATCH', '/locked-off-mod', { actor: ADM, body: { enabled: false } });
+  assert.equal(off.status, 200, JSON.stringify(off.body));
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).approved, false, 'mit freier Sperre schreibt Ausschalten die Datei');
+  const on = await call('PATCH', '/locked-off-mod', { actor: ADM, body: { enabled: true } });
+  assert.equal(on.status, 200, JSON.stringify(on.body));
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).approved, true);
+  const after = svc.acquireInstallLock();
+  assert.ok(after, 'auch nach dem Einschalten ist die Sperre frei');
+  after();
+  clearDisabledConfig();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('readInstallRecord/readInstallMeta/writeInstallApproval: Felder, Grenzen, Atomaritaet', async () => {
+  const dir = path.join(MODULES_DIR, 'rec-api-mod');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, '.yuvomi-install.json');
+  fs.writeFileSync(file, installRecord({ installedBy: 42, url: 'https://github.com/o/r', extra: 'ignored' }));
+  const record = await svc.readInstallRecord(dir);
+  assert.deepEqual(record, {
+    source: 'zip', url: 'https://github.com/o/r', ref: null, commit: null, path: null,
+    installedAt: '2026-10-06T10:00:00.000Z', approved: false, installedBy: 42,
+  });
+  const meta = await svc.readInstallMeta(dir);
+  assert.equal(meta.installedBy, undefined, 'die Antwortform traegt keine Nutzer-Id');
+  assert.equal(meta.approved, false);
+  // Eine Nutzer-Id, die keine Zahl ist, wird null - nie ein String in der Abfrage.
+  fs.writeFileSync(file, installRecord({ installedBy: '42' }));
+  assert.equal((await svc.readInstallRecord(dir)).installedBy, null);
+  await svc.writeInstallApproval(dir, true);
+  const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(after.approved, true);
+  assert.equal(after.installedBy, '42', 'die Datei wird umgeschrieben, nicht neu erfunden');
+  assert.deepEqual(fs.readdirSync(dir), ['.yuvomi-install.json'], 'die Temp-Datei ist nach dem rename weg');
+  await assert.rejects(svc.writeInstallApproval(path.join(MODULES_DIR, 'nope-mod'), true), 'ohne Datei kein Umschreiben');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// Runde 4 der Review (#1671): kann die Freigabe nicht geschrieben werden, weil
+// der Modulordner schreibgeschuetzt ist, antwortet die Route 503 not_writable -
+// nicht 500 mit der rohen Meldung, die den absoluten Serverpfad der Temp-Datei
+// nennt. Jeder andere Fehler bleibt 500, aber mit festem Satz. Simuliert ueber
+// den writeFile-Haken: chmod auf Ordnern ist unter Windows wirkungslos.
+test('Freigabe nicht schreibbar → 503 not_writable ohne Serverpfad; anderer Fehler → 500 mit festem Satz', async () => {
+  const dir = path.join(MODULES_DIR, 'ro-record-mod');
+  writeModule('ro-record-mod', { id: 'ro-record-mod', entry: 'index.js' }, { 'index.js': '', '.yuvomi-install.json': installRecord() });
+  const failWith = (code) => svc.__setModulesFsOpsForTests({
+    writeFile: async (p) => { throw Object.assign(new Error(`${code}: permission denied, open '${p}'`), { code }); },
+  });
+  for (const code of ['EACCES', 'EPERM', 'EROFS']) {
+    const restore = failWith(code);
+    try {
+      const r = await call('PATCH', '/ro-record-mod', { actor: ADM, body: { enabled: true } });
+      assert.equal(r.status, 503, `${code}: ${JSON.stringify(r.body)}`);
+      assert.equal(r.body.reason, 'not_writable', code);
+      assert.equal(r.body.code, 503);
+      assert.ok(!r.body.error.includes(MODULES_DIR), `${code}: der Serverpfad steht in der Antwort`);
+      assert.ok(!r.body.error.includes(code), `${code}: der rohe Fehlercode steht in der Antwort`);
+      assert.match(r.body.error, /modules\/ro-record-mod/, 'der relative Ordner darf genannt werden');
+      // Direkt am Service: status und reason am Fehler.
+      await assert.rejects(svc.setModuleEnabled('ro-record-mod', true), (e) => e.status === 503 && e.reason === 'not_writable');
+    } finally {
+      restore();
+    }
+  }
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, '.yuvomi-install.json'), 'utf8')).approved, false, 'nichts freigegeben');
+  assert.equal((await find('ro-record-mod')).enabled, false, 'und das Modul bleibt aus');
+  assert.deepEqual(fs.readdirSync(dir).filter((n) => n.endsWith('.tmp')), [], 'keine Temp-Datei bleibt liegen');
+  // Ein anderer Fehler (die Datei ist zwischen Lesen und Schreiben weg): 500
+  // mit festem Satz, ohne reason, ohne Pfad.
+  const restore = failWith('ENOENT');
+  try {
+    const r = await call('PATCH', '/ro-record-mod', { actor: ADM, body: { enabled: true } });
+    assert.equal(r.status, 500, JSON.stringify(r.body));
+    assert.deepEqual(r.body, { error: 'Module update failed.', code: 500 });
+  } finally {
+    restore();
+  }
+  assert.equal((await find('ro-record-mod')).enabled, false);
+  // Ohne Haken geht es, und die Freigabe steht in der Datei.
+  const ok = await call('PATCH', '/ro-record-mod', { actor: ADM, body: { enabled: true } });
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, '.yuvomi-install.json'), 'utf8')).approved, true);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 // Die Seitenerklaerung (`page.composition`, `page.width`) ist seit #929 Teil
 // des Manifests. Sie zaehlt nur, wenn der Router sie auch anwendet - der Guard
 // dafuer steht in test-frontend-audit.js (PAGE-012); hier wird die Normalisierung
@@ -569,4 +865,32 @@ test('isWidgetId nimmt Kern- und Namensraum-Ids an und weist kaputte ab (#1013)'
   // Fremdmodul-Widget gelten, sobald jemand die beiden Pruefungen verwechselt.
   assert.equal(isNamespacedWidgetId('weather'), false);
   assert.equal(isNamespacedWidgetId('my-addon:chart'), true);
+});
+
+test('web-installed settings sheets stay hidden until approval and validate the settings entry', async () => {
+  const registry = await import('../public/settings/registry.js');
+  const id = 'installed-settings';
+  const folder = path.join(MODULES_DIR, id);
+  const manifest = { id, name: 'Installed settings', entry: 'index.js',
+    settings: { entry: 'settings.js', sections: ['mine', 'household'] } };
+  writeModule(id, manifest, { 'index.js': '', 'settings.js': '', '.yuvomi-install.json': installRecord() });
+  try {
+    await svc.loadModuleDir(folder, id);
+    registry.setExtensionSettingsModules(await svc.listModules({ admin: true }));
+    assert.equal(registry.findSettingsLeaf(`/settings/modules/ext/${id}`, { role: 'admin' }), null);
+    assert.equal(registry.extensionSettingsPaths().includes(`/settings/modules/ext/${id}`), false);
+    await svc.setModuleEnabled(id, true);
+    registry.setExtensionSettingsModules(await svc.listModules());
+    assert.ok(registry.findSettingsLeaf(`/settings/modules/ext/${id}`, { role: 'member' }));
+    assert.equal(registry.settingsSheetsForDomain('modules', { role: 'admin' }).at(-1).placement, 'end');
+    await svc.setModuleEnabled(id, false);
+    registry.setExtensionSettingsModules(await svc.listModules({ admin: true }));
+    assert.equal(registry.findSettingsLeaf(`/settings/modules/ext/${id}`, { role: 'admin' }), null);
+    fs.rmSync(path.join(folder, 'settings.js'));
+    await assert.rejects(svc.loadModuleDir(folder, id), /settings.entry file does not exist/);
+  } finally {
+    registry.setExtensionSettingsModules([]);
+    fs.rmSync(folder, { recursive: true, force: true });
+    clearDisabledConfig();
+  }
 });

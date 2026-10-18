@@ -418,3 +418,298 @@ test('localizedLabels: Schreibwege tragen die Sprache nicht', async () => {
     delete globalThis.__confirmOverModal;
   }
 });
+
+// #1909: der Verwalter zeigt den Satz der App, nicht den des Servers - dort,
+// wo der Aufrufer es verlangt (`errorFallbackKey`, heute der Einkauf).
+const serverAnswer = (status, error, reason) => Object.assign(new Error(error), {
+  status, data: { error, code: status, ...(reason ? { reason } : {}) },
+});
+
+test('errorFallbackKey: ein Fehler ohne bekannten Grund zeigt den allgemeinen Satz, nie den des Servers', () => {
+  const manager = managerWithCategory({ basePath: '/shopping/stores', errorFallbackKey: 'common.errorGeneric' });
+  assert.equal(manager._errMsg(serverAnswer(400, 'Name ist erforderlich.')), 'common.errorGeneric');
+  assert.equal(manager._errMsg(serverAnswer(409, 'Diesen Laden gibt es schon.', 'some_future_reason')), 'common.errorGeneric');
+  // Ein Fall, den die App kennt, bekommt seinen Satz - auch ein fremder des Verwalters.
+  assert.equal(manager._errMsg(serverAnswer(409, 'Store already exists.', 'shopping_store_exists')), 'shopping.errorStoreExists');
+  assert.equal(manager._errMsg(serverAnswer(404, 'Store not found.', 'shopping_store_not_found')), 'shopping.errorStoreGone');
+  assert.equal(manager._errMsg(serverAnswer(403, 'Not authorized.')), 'common.errorNoPermission');
+  // Die eigenen Gruende des Verwalters bleiben, wie sie waren.
+  assert.equal(manager._errMsg(serverAnswer(409, 'Category already exists.', 'category_exists')), 'category.errorExists');
+  assert.equal(manager._errMsg(serverAnswer(400, 'The last category cannot be deleted.', 'category_last')), 'category.errorLast');
+});
+
+test('ohne errorFallbackKey bleibt der Rueckfall der anderen Module unveraendert', () => {
+  const manager = managerWithCategory();
+  assert.equal(manager._errMsg(serverAnswer(400, 'Name ist erforderlich.')), 'Name ist erforderlich.');
+  assert.equal(manager._errMsg(serverAnswer(409, 'Category already exists.', 'category_exists')), 'category.errorExists');
+});
+
+test('der Einkauf verlangt den allgemeinen Satz an beiden Verwaltern', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { withoutCommentsKeepingLines } = await import('./source-text.js');
+  const page = withoutCommentsKeepingLines(readFileSync(new URL('../public/pages/shopping.js', import.meta.url), 'utf8'));
+  const calls = [...page.matchAll(/manager\.configure\(\{[\s\S]*?\n\s*\}\);/g)].map((m) => m[0]);
+  assert.equal(calls.length, 2, 'Laeden und Kategorien');
+  for (const call of calls) assert.match(call, /errorFallbackKey:\s*'common\.errorGeneric'/);
+});
+
+// #1909: sagt der Server, dass es die Zeile nicht mehr gibt (jemand anderes hat
+// sie geloescht, waehrend der Dialog offen war), holt der Manager seine Liste
+// selbst neu und meldet dem Aufrufer eine Aenderung - der Satz raet nicht mehr
+// zum Neuladen. Gefahren wird das echte `_delete` bis in sein catch.
+async function deleteAnswering(err, { connected = true, options = {} } = {}) {
+  const manager = managerWithCategory({ basePath: '/shopping/stores', errorFallbackKey: 'common.errorGeneric', ...options });
+  let loads = 0;
+  manager._load = () => { loads += 1; };
+  manager.isConnected = connected;
+  let changed = 0;
+  const details = [];
+  manager.addEventListener('category-manager-changed', (e) => { changed += 1; details.push(e.detail); });
+  const toasts = [];
+  const previousToast = globalThis.window.yuvomi.showToast;
+  globalThis.window.yuvomi.showToast = (text, kind) => toasts.push([text, kind]);
+  globalThis.__confirmOverModal = () => true;
+  // Direkt gesetzt wie in den Faellen oben: sie haben `api.delete` ersetzt.
+  const previousDelete = api.delete;
+  api.delete = async () => { throw err; };
+  try {
+    await manager._delete('7');
+  } finally {
+    delete globalThis.__confirmOverModal;
+    api.delete = previousDelete;
+    globalThis.window.yuvomi.showToast = previousToast;
+  }
+  // Nicht aufzaehlbar: die Faelle oben vergleichen das Ergebnis als Ganzes.
+  return Object.defineProperties({ loads, changed, toasts }, {
+    details: { value: details }, rows: { value: manager._cats.length },
+  });
+}
+
+test('a row that is gone on the server reloads the manager and tells the page', async () => {
+  const gone = serverAnswer(404, 'Store not found.', 'shopping_store_not_found');
+  assert.deepEqual(await deleteAnswering(gone), {
+    loads: 1, changed: 1, toasts: [['shopping.errorStoreGone', 'danger']],
+  });
+  // Beim Loeschen ist das Element schon aus dem Dokument: nichts zu zeichnen,
+  // aber die Seite darunter muss es trotzdem erfahren.
+  const detached = await deleteAnswering(gone, { connected: false });
+  assert.equal(detached.loads, 0);
+  assert.equal(detached.changed, 1);
+});
+
+test('any other failure reloads nothing', async () => {
+  for (const err of [
+    serverAnswer(404, 'Not found.'),
+    serverAnswer(409, 'Store already exists.', 'shopping_store_exists'),
+    serverAnswer(403, 'Not authorized.', 'shopping_store_not_found'),
+    serverAnswer(500, 'Internal error.'),
+  ]) {
+    const { loads, changed, toasts } = await deleteAnswering(err);
+    assert.equal(loads, 0);
+    assert.equal(changed, 0);
+    assert.equal(toasts.length, 1);
+  }
+});
+
+test('a failing load does not start another load', async () => {
+  const manager = new CategoryManager();
+  manager._renderShell = () => {};
+  let fetches = 0;
+  let changed = 0;
+  manager.addEventListener('category-manager-changed', () => { changed += 1; });
+  manager._fetch = async () => { fetches += 1; throw serverAnswer(404, 'Store not found.', 'shopping_store_not_found'); };
+  await manager._load();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fetches, 1);
+  assert.equal(changed, 0);
+});
+
+// #1909, Folge: wer eine Zeile loescht, die jemand anderes schon geloescht hat,
+// hat sein Ziel erreicht. Den Grund dafuer nennt der AUFRUFER
+// (`alreadyDeletedReason`) - die Komponente kennt keinen Grund eines Moduls,
+// und ohne die Option aendert sich fuer niemanden etwas.
+test('alreadyDeletedReason: deleting a row that is already gone takes the success path', async () => {
+  for (const [basePath, reason] of [
+    ['/shopping/stores', 'shopping_store_not_found'],
+    ['/shopping/categories', 'shopping_category_not_found'],
+  ]) {
+    const result = await deleteAnswering(serverAnswer(404, 'Not found.', reason), {
+      options: { basePath, alreadyDeletedReason: reason },
+    });
+    assert.deepEqual(result.toasts, [['category.deleted', 'default']], reason);
+    assert.equal(result.rows, 0, 'the row left the manager');
+    assert.equal(result.changed, 1);
+    assert.deepEqual(result.details.map(({ action, key, item }) => ({ action, key, id: item?.id })),
+      [{ action: 'delete', key: '7', id: 7 }], 'the same event detail as any delete');
+    // Der Erfolgsweg laedt nicht neu - das tut nur `_fail`.
+    assert.equal(result.loads, 0);
+  }
+});
+
+test('alreadyDeletedReason: any other failure of a delete stays a failure', async () => {
+  const options = { alreadyDeletedReason: 'shopping_store_not_found' };
+  for (const [err, sentence, toldPage] of [
+    [serverAnswer(404, 'Not found.'), 'common.errorGeneric', false],
+    [serverAnswer(500, 'Internal error.'), 'common.errorGeneric', false],
+    [serverAnswer(403, 'Not authorized.', 'shopping_store_not_found'), 'common.errorNoPermission', false],
+    [serverAnswer(404, 'Not found.', 'some_future_not_found'), 'common.errorGeneric', false],
+    [serverAnswer(400, 'The last category cannot be deleted.', 'category_last'), 'category.errorLast', false],
+    // Ein anderes Ding ist weg, nicht diese Zeile: Fehler, und `_fail` laedt neu.
+    [serverAnswer(404, 'Category not found.', 'shopping_category_not_found'), 'shopping.errorCategoryGone', true],
+    [Object.assign(new Error('offline'), { status: 0 }), 'common.errorOfflineMutation', false],
+  ]) {
+    const result = await deleteAnswering(err, { options });
+    assert.deepEqual(result.toasts, [[sentence, 'danger']]);
+    assert.equal(result.rows, 1, 'the row stays');
+    assert.equal(result.changed, toldPage ? 1 : 0);
+    assert.ok(result.details.every((d) => d.action !== 'delete'));
+  }
+});
+
+test('alreadyDeletedReason: a reason outside the allowlist of gone reasons never counts', async () => {
+  // `isAlreadyDeleted` fragt GONE_REASONS: ein Aufrufer kann keinen beliebigen
+  // Grund zum Erfolg erklaeren (etwa "in Benutzung").
+  for (const reason of ['category_in_use', 'category_last', 'some_future_not_found']) {
+    const result = await deleteAnswering(serverAnswer(409, 'Refused.', reason), {
+      options: { alreadyDeletedReason: reason },
+    });
+    assert.equal(result.rows, 1, reason);
+    assert.equal(result.toasts[0][1], 'danger', reason);
+  }
+});
+
+test('without alreadyDeletedReason nothing changes for the other modules', async () => {
+  // Die Routen der anderen Module nennen keinen `reason`: eine blanke 404.
+  // Und selbst ein Grund des Einkaufs zaehlt ohne die Option nicht.
+  const base = { basePath: '/notes/categories', errorFallbackKey: undefined };
+  const blank = await deleteAnswering(serverAnswer(404, 'Category not found.'), { options: base });
+  assert.deepEqual(blank.toasts, [['Category not found.', 'danger']], 'der alte Rueckfall auf den Servertext');
+  assert.equal(blank.rows, 1);
+  assert.equal(blank.changed, 0);
+  const named = await deleteAnswering(serverAnswer(404, 'Store not found.', 'shopping_store_not_found'), { options: base });
+  assert.equal(named.rows, 1);
+  assert.equal(named.toasts[0][1], 'danger');
+  for (const ignored of ['', null, 42, {}]) {
+    const result = await deleteAnswering(serverAnswer(404, 'Store not found.', 'shopping_store_not_found'), {
+      options: { alreadyDeletedReason: ignored },
+    });
+    assert.equal(result.rows, 1, `alreadyDeletedReason: ${JSON.stringify(ignored)}`);
+  }
+});
+
+test('only shopping names an alreadyDeletedReason, once per manager', async () => {
+  const { readFileSync, readdirSync } = await import('node:fs');
+  const { withoutCommentsKeepingLines } = await import('./source-text.js');
+  const dir = new URL('../public/pages/', import.meta.url);
+  const found = [];
+  for (const file of readdirSync(dir).filter((f) => f.endsWith('.js'))) {
+    const page = withoutCommentsKeepingLines(readFileSync(new URL(file, dir), 'utf8'));
+    for (const m of page.matchAll(/alreadyDeletedReason:\s*'([^']+)'/g)) found.push(`${file}: ${m[1]}`);
+  }
+  assert.deepEqual(found.sort(), [
+    'shopping.js: shopping_category_not_found',
+    'shopping.js: shopping_store_not_found',
+  ]);
+});
+
+// #1929: der Einkauf verwaltet mit dieser Komponente Laeden. Die Rueckfrage hatte
+// schon eigene Keys, die drei Erfolgs-Toasts und der Name des Loeschknopfs nicht:
+// wer einen Laden loeschte, las "Kategorie geloescht". Gefahren werden die echten
+// Wege (`_onSubmit`, `_rename`, `_delete`, `_rowActionsHtml`), je einmal MIT den
+// Optionen und einmal OHNE - ohne sie bleibt exakt der bisherige Key.
+const STORE_WORDING = {
+  addedKey: 'shopping.storeAdded',
+  renamedKey: 'shopping.storeRenamed',
+  deletedKey: 'shopping.storeDeleted',
+  deleteNamedKey: 'shopping.storeDeleteNamed',
+};
+
+/** Anlegen, umbenennen und loeschen: die drei Toasts in dieser Reihenfolge. */
+async function successToasts(options) {
+  const manager = managerWithCategory(options);
+  const toasts = [];
+  const previousToast = globalThis.window.yuvomi.showToast;
+  globalThis.window.yuvomi.showToast = (text, kind) => toasts.push([text, kind]);
+  const previous = { post: api.post, put: api.put, delete: api.delete };
+  api.post = async (_path, body) => ({ data: { id: 8, ...body } });
+  api.put = async (_path, body) => ({ data: { id: 7, ...body } });
+  api.delete = async () => ({ data: null });
+  globalThis.__promptModal = () => 'Renamed';
+  globalThis.__confirmOverModal = () => true;
+  try {
+    const input = { value: 'Fresh' };
+    const form = { dataset: { group: '' }, querySelector: (selector) => (selector === 'input' ? input : null) };
+    await manager._onSubmit({
+      preventDefault() {},
+      target: { closest: (selector) => (selector === '.cat-add-form' ? form : null) },
+    });
+    await manager._rename('7');
+    await manager._delete('7');
+  } finally {
+    Object.assign(api, previous);
+    delete globalThis.__promptModal;
+    delete globalThis.__confirmOverModal;
+    globalThis.window.yuvomi.showToast = previousToast;
+  }
+  return toasts;
+}
+
+/** Die Namen der Zeilenaktionen, wie `t` aus dem Loader sie schreibt. Seit R19
+ *  stehen sie als Eintraege im Mehr-Menue der Zeile (Text des Eintrags). */
+function rowActionLabels(options, rowOptions = {}) {
+  const manager = managerWithCategory(options);
+  const html = manager._rowActionsHtml('Rewe', { isFirst: false, isLast: false, ...rowOptions });
+  return [...html.matchAll(/class="popover-menu__item[^"]*"[\s\S]*?<span>([a-zA-Z.]+)\{/g)].map((m) => m[1]);
+}
+
+// R19 (Critique 2026-10-16): "Lagerorte verwalten" kuerzte die Namen mobil auf
+// fuenf Zeichen - vier 48px-Icons standen in jeder Zeile. Jetzt EIN Mehr-Knopf
+// (Regel R18: hoechstens zwei sichtbare Zeilenaktionen plus Mehr); der Name
+// bleibt das Umbenennen-Ziel, Auf/Ab stehen fuer Tastatur und Schalter im Menue.
+test('R19: eine Kategoriezeile traegt einen Mehr-Knopf statt vier Icons', () => {
+  const manager = managerWithCategory({});
+  const html = manager._rowActionsHtml('Rewe', { isFirst: true, isLast: false });
+  assert.equal((html.match(/class="row-action /g) ?? []).length, 1, 'genau ein sichtbarer Zeilenknopf');
+  assert.match(html, /class="row-action row-action--more[^"]*"[^>]*aria-label="common\.moreActionsNamed\{/);
+  assert.match(html, /data-action="up"[^>]*disabled|disabled[^>]*data-action="up"/, 'an der Kante ist der Schritt gesperrt');
+  assert.match(html, /popover-menu__item--danger[^"]*"\s*data-action="delete"/, 'Loeschen bleibt als Gefahr markiert');
+});
+
+test('wording options: a manager configured for stores names the store in all three toasts', async () => {
+  assert.deepEqual(await successToasts(STORE_WORDING), [
+    ['shopping.storeAdded', 'success'],
+    ['shopping.storeRenamed', 'success'],
+    ['shopping.storeDeleted', 'default'],
+  ]);
+});
+
+test('wording options: without them the three toasts are exactly the keys they were', async () => {
+  assert.deepEqual(await successToasts({}), [
+    ['category.added', 'success'],
+    ['category.renamed', 'success'],
+    ['category.deleted', 'default'],
+  ]);
+});
+
+test('wording options: the delete button is named after the caller\'s thing', () => {
+  assert.deepEqual(rowActionLabels(STORE_WORDING), [
+    'category.renameNamed', 'category.moveUpNamed', 'category.moveDownNamed', 'shopping.storeDeleteNamed',
+  ]);
+  // Eine Unterzeile ist keine Zeile des Aufrufers: sie behaelt ihren eigenen Namen.
+  assert.equal(rowActionLabels(STORE_WORDING, { sub: true }).at(-1), 'category.deleteSubNamed');
+});
+
+test('wording options: without them the delete button keeps today\'s name', () => {
+  assert.deepEqual(rowActionLabels({}), [
+    'category.renameNamed', 'category.moveUpNamed', 'category.moveDownNamed', 'category.deleteNamed',
+  ]);
+  assert.equal(rowActionLabels({}, { sub: true }).at(-1), 'category.deleteSubNamed');
+});
+
+test('wording options: an empty or missing value never blanks a text', async () => {
+  const blank = { addedKey: '', renamedKey: null, deletedKey: undefined, deleteNamedKey: '' };
+  assert.deepEqual((await successToasts(blank)).map(([text]) => text), [
+    'category.added', 'category.renamed', 'category.deleted',
+  ]);
+  assert.equal(rowActionLabels(blank).at(-1), 'category.deleteNamed');
+});

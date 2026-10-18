@@ -25,14 +25,16 @@ import { runSerialized } from '../utils/sync-lock.js';
 import { unfoldLines, parseICS, formatICSDate, tzLocalToUTC, applyDuration, normalizeRecurrenceOverrides } from './ics-parser.js';
 import { decodeHtmlEntities } from '../utils/html-entities.js';
 import * as outbound from './calendar-outbound.js';
+import { dropUploadAttemptsOf } from './caldav-upload-attempts.js';
 import { processPendingDeletions, processPendingUpdates, flushAccount } from './caldav-outbound.js';
 import { rruleLine } from './recurrence.js';
-import { eventDateTimeFields } from '../utils/ics-datetime.js';
+import { eventDateTimeFields, rruleForDtstart } from '../utils/ics-datetime.js';
 import { vtimezoneFor } from '../utils/vtimezone.js';
 import { householdTimeZone } from '../utils/timezone.js';
 import { createCalDAVClient, createUploadGate } from '../utils/caldav-client.js';
 import { nearestIcalColorName } from '../utils/ical-color.js';
-import { outboundEvent } from './outbound-dtstart.js';
+import { authoredAfterInbound, outboundEvent } from './outbound-dtstart.js';
+import { icsReading, icsSnapshot, isEcho } from './outbound-echo.js';
 import { followInboundStartChange } from './calendar-occurrence-overrides.js';
 
 const APPLE_COLOR = '#FC3C44';
@@ -46,6 +48,10 @@ function collectLocalOutboundEvents(database, id = null) {
   return database.prepare(`
     SELECT e.* FROM calendar_events e
     WHERE e.external_source = 'local' AND e.external_calendar_id IS NULL
+      AND (e.local_calendar_id IS NULL OR EXISTS (
+        SELECT 1 FROM local_calendars lc
+        WHERE lc.id = e.local_calendar_id AND lc.is_default = 1
+      ))
       AND e.recurrence_parent_id IS NULL
       AND NOT EXISTS (
         SELECT 1 FROM calendar_events child
@@ -114,6 +120,18 @@ function getCredentials() {
   return { url, username, password };
 }
 
+/**
+ * Lädt diese Verbindung lokale Termine zu iCloud hoch? Genau dann, wenn sie
+ * Zugangsdaten hat: der Scheduler startet den Lauf nur dann (getStatus), und
+ * runSync() steigt ohne sie vor dem Upload aus. Die Kalenderverwaltung fragt
+ * dasselbe, bevor ein Kalender gelöscht wird - seine Termine fallen in den
+ * Standardkalender, und der geht hinauf (collectLocalOutboundEvents). Eine
+ * zweite, ähnliche Prüfung an anderer Stelle sagte irgendwann etwas anderes.
+ */
+function uploadsLocalEvents() {
+  return getCredentials() !== null;
+}
+
 function saveCredentials(url, username, password) {
   // Warnung wenn DB-Verschluesselung nicht aktiv - Credentials liegen dann im Klartext
   if (!process.env.DB_ENCRYPTION_KEY) {
@@ -137,6 +155,11 @@ function clearCredentials({ deleteEvents = false } = {}) {
     ['apple_caldav_url', 'apple_username', 'apple_app_password', 'apple_last_sync',
      // Der Fehlerstand gehoert zur Verbindung (#820).
      'apple_last_error', 'apple_last_error_at'].forEach(cfgDel);
+    // Die Notizen nie gebuchter Uploads gehören zur Verbindung (#1882): ohne
+    // sie gibt es keinen Weg mehr zu den Objekten, von denen sie handeln.
+    // Läuft sie über die APPLE_*-Umgebungsvariablen weiter (`getCredentials`),
+    // ist nichts getrennt, und die Notizen bleiben der einzige Beleg.
+    if (!getCredentials()) dropUploadAttemptsOf({ source: 'apple' });
     log.info('Disconnected.' + (removed ? ` ${removed} mirrored event(s) removed.` : ''));
     return { removed };
   })();
@@ -156,8 +179,7 @@ function clearMirroredEvents() {
 // --------------------------------------------------------
 
 function getStatus() {
-  const creds     = getCredentials();
-  const configured = !!creds;
+  const configured = uploadsLocalEvents();
   const connected  = !!(cfgGet('apple_caldav_url')); // via UI gespeichert
   const lastSync   = cfgGet('apple_last_sync');
   // Reist mit dem Status, damit die Rückfrage vor dem Löschen die Zahl sofort
@@ -205,7 +227,7 @@ function buildICS(event, householdZone = null) {
   // 10 Uhr auf wessen Uhr auch immer.
   // Start/Ende mit der eigenen Wiederholungsregel in Einklang (#986); ein
   // importiertes DTSTART bleibt unberuehrt (#756).
-  const when = eventDateTimeFields(outboundEvent(event), householdZone);
+  const when = eventDateTimeFields(outboundEvent(event, { householdZone }), householdZone);
   const lines = [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
@@ -233,8 +255,10 @@ function buildICS(event, householdZone = null) {
   // ICS-Zeile, lokal angelegte nur den Regelkörper (#756). Roh übernommen ergab
   // letzteres eine Zeile ohne Property-Namen - ein VEVENT, das kein Server als
   // Serie liest. patchICSEvent normalisiert an seiner Stelle genauso.
+  // Ein reines Datum als UNTIL wird neben einem getimten DTSTART zum Ende des
+  // Ortstags in UTC (#1974, utils/rrule-until.js).
   if (event.recurrence_rule) {
-    lines.push(rruleLine(event.recurrence_rule));
+    lines.push(rruleLine(rruleForDtstart(event.recurrence_rule, when)));
   }
 
   lines.push('END:VEVENT', 'END:VCALENDAR');
@@ -325,7 +349,7 @@ async function sync({ makeClient } = {}) {
 // einsetzbaren Client gibt es keinen Weg, den Inbound als Programm zu fahren -
 // tsdav spricht dann HTTP mit iCloud.
 async function runSync({ makeClient } = {}) {
-  const creds = getCredentials();
+  const creds = uploadsLocalEvents() ? getCredentials() : null;
   if (!creds) {
     throw new Error('[Apple] No credentials configured (neither in DB nor in .env).');
   }
@@ -348,6 +372,12 @@ async function runSync({ makeClient } = {}) {
 
   // Alle Kalender synchen (inklusive Geburtstags-Kalender)
   const syncCalendars = calendars;
+  // Will diese lokale Zeile weiter hinauf (#1882)? Gefragt wird NICHT, in
+  // welchen Kalender: hinauf geht es in den ersten der Auflistung, und die
+  // sagt keine Reihenfolge zu. Steht beim nächsten Lauf ein anderer vorn, ist
+  // das Objekt im früheren ersten erst dann ein Rest, wenn der Termin woanders
+  // angekommen ist - vorher wäre sein Löschen der einzige Stand auf dem Server.
+  const stillWantsUpload = (row) => collectLocalOutboundEvents(db.get(), row.id).length > 0;
 
   let totalObjects = 0;
 
@@ -402,8 +432,35 @@ async function runSync({ makeClient } = {}) {
       }));
       for (const ev of parsed) {
         try {
+          // Für den Leer-Guard des Prune zählt jedes gelieferte Objekt; als
+          // "iCloud führt diesen Termin noch" (`accountUids`) zählt die UID
+          // erst hinter dem Rest-Zweig darunter (#1905).
           calendarUids.add(ev.uid);
+          // Der eigene Upload, dessen Antwort verloren ging: übernommen wird
+          // nur ein Termin, den der Upload unten in GENAU diesen Kalender
+          // schicken würde (den ersten) - die UID kommt vom Server und weist
+          // nichts aus.
+          const adoptOwn = () => !!obj.url && outbound.adoptOwnEventUpload({
+            source: 'apple', uid: ev.uid, objectUrl: obj.url, calRefId, calendarUrl: cal.url,
+            isWaitingHere: (eventId) => cal.url === syncCalendars[0].url
+              && collectLocalOutboundEvents(db.get()).some((e) => e.id === eventId),
+          });
+
+          // Für dieses Objekt steht die Notiz eines nie gebuchten Uploads
+          // (#1882, wie im CalDAV-Sync): übernehmen, wenn sein Termin hier
+          // wartet, sonst weder importieren noch zuordnen. VOR dem Index
+          // darunter: der führt ein Objekt je UID, und der Rest im früheren
+          // ersten Kalender verdrängte sonst das Objekt, das die Zeile
+          // inzwischen woanders spiegelt - ihre nächste Bearbeitung ginge mit
+          // dem ETag des Rests hinaus.
+          // Und VOR `accountUids` (#1905): ein übersprungener Rest gehört zu
+          // keiner Zeile und zählt nicht als gesehen. Sonst hielte er die
+          // Zeile fest, die inzwischen woanders Spiegel derselben UID ist und
+          // dort auf dem Server gelöscht wurde - so lange, wie er liegt.
+          if (outbound.isUnbookedOwnUpload({ source: 'apple', uid: ev.uid, calendarUrl: cal.url })
+              && !adoptOwn()) continue;
           accountUids.add(ev.uid);
+
           // Objekt merken: ausgehende Löschungen brauchen die URL, Änderungen
           // zusätzlich den Originalinhalt zum Patchen (#593).
           if (obj.url) {
@@ -422,21 +479,15 @@ async function runSync({ makeClient } = {}) {
           if (pendingDeletionUids.has(ev.uid)) continue;
 
           const selExisting = db.get().prepare(
-            `SELECT id, outbound_dirty, calendar_ref_id, start_datetime FROM calendar_events WHERE external_calendar_id = ? AND external_source = 'apple'`
+            `SELECT id, outbound_dirty, calendar_ref_id, start_datetime, end_datetime, all_day, recurrence_rule, tzid,
+                    series_authored, outbound_snapshot
+             FROM calendar_events WHERE external_calendar_id = ? AND external_source = 'apple'`
           );
           let existing = selExisting.get(ev.uid);
 
           // Der eigene Upload, dessen Antwort verloren ging: in die noch lokale
           // Zeile übernehmen statt eine zweite anzulegen (wie im CalDAV-Sync).
-          if (!existing && obj.url
-              && outbound.adoptOwnEventUpload({
-                source: 'apple', uid: ev.uid, objectUrl: obj.url, calRefId, calendarUrl: cal.url,
-                // Nur ein Termin, den der Upload unten in GENAU diesen Kalender
-                // schicken würde (den ersten) - die UID kommt vom Server und
-                // weist nichts aus.
-                isWaitingHere: (eventId) => cal.url === syncCalendars[0].url
-                  && collectLocalOutboundEvents(db.get()).some((e) => e.id === eventId),
-              })) {
+          if (!existing && adoptOwn()) {
             existing = selExisting.get(ev.uid);
           }
 
@@ -452,22 +503,40 @@ async function runSync({ makeClient } = {}) {
             // Nicht `user_modified` (#899): das wird bei jeder Bearbeitung
             // gesetzt, eine Titeländerung hätte die Farbspalte also dauerhaft
             // eingefroren und eine Umfärbung auf dem Server nie mehr erreicht.
+            //
+            // Beim Echo des eigenen Pushs (#1956, services/outbound-echo.js)
+            // bleiben Start, Ende, ganztaegig, Regel und Zone wie eingegeben,
+            // die Marke bleibt, die Erinnerungen wandern nicht.
+            const echo = isEcho(existing, icsReading(ev));
+            const when = echo
+              ? {
+                dtstart: existing.start_datetime, dtend: existing.end_datetime, allDay: !!existing.all_day,
+                rrule: existing.recurrence_rule, tzid: existing.tzid,
+              }
+              : ev;
             db.get().prepare(`
               UPDATE calendar_events
               SET title = ?, description = ?, start_datetime = ?, end_datetime = ?,
                   all_day = ?, location = ?, recurrence_rule = ?, tzid = ?,
                   color = CASE WHEN color_modified = 0 THEN ? ELSE color END,
                   calendar_ref_id = ?,
-                  external_object_url = COALESCE(?, external_object_url)
+                  external_object_url = COALESCE(?, external_object_url),
+                  series_authored = ?
               WHERE id = ?
             `).run(
-              ev.summary, ev.description, ev.dtstart, ev.dtend,
-              ev.allDay ? 1 : 0, ev.location, ev.rrule, ev.tzid ?? null, evColor, calRefId,
-              obj.url ?? null, existing.id
+              ev.summary, ev.description, when.dtstart, when.dtend,
+              when.allDay ? 1 : 0, ev.location, when.rrule, when.tzid ?? null, evColor, calRefId,
+              obj.url ?? null,
+              // Die Marke (#1935) faellt, wenn hier ein anderer Start oder eine
+              // andere Regel in die Zeile kommt, als dort stand - wie im CalDAV-Sync.
+              echo
+                ? existing.series_authored
+                : authoredAfterInbound(existing, { start_datetime: ev.dtstart, recurrence_rule: ev.rrule }),
+              existing.id
             );
             eventId = existing.id;
             // In iCloud verschoben (#1377): die Erinnerungen ziehen mit.
-            followInboundStartChange(db.get(), eventId, existing.start_datetime, ev.dtstart);
+            followInboundStartChange(db.get(), eventId, existing.start_datetime, when.dtstart);
             // Von einem Kalender in einen anderen verschoben (#1270): die
             // unangetastete Standard-Zuweisung zieht mit um.
             reassignDefaultOnCalendarMove(db.get(), eventId, {
@@ -533,6 +602,15 @@ async function runSync({ makeClient } = {}) {
   // Inbound überspringt dafür alles, was hier noch aussteht.
   // --------------------------------------------------------
   try {
+    // Die Reste nie bestätigter Uploads entfernen (#1882).
+    await outbound.releaseLeftoverUploads(client, {
+      source: 'apple', wantsUploadHere: stillWantsUpload, calendarUrls: ownCalendarUrls,
+    });
+    // iCloud kennt keine Auswahl, also keinen abgewählten Kalender. Was es
+    // gibt, ist der Kalender, den die Auflistung nicht mehr nennt: sein
+    // Auftrag hat sein Ziel erreicht (#1884). Die Auflistung ist oben als
+    // nicht leer befunden.
+    outbound.dropDeletionsOfMissingCalendars('apple', { listedUrls: calendars.map((cal) => cal.url) });
     const removed = await processPendingDeletions(client, 'apple', objectIndex, ownCalendarUrls);
     if (removed) log.info(`${removed} pending deletion(s) applied in iCloud.`);
     const pushed = await processPendingUpdates(client, 'apple', objectIndex, calendarsByUrl);
@@ -568,15 +646,21 @@ async function runSync({ makeClient } = {}) {
 
       // Ein 412 auf den eigenen Namen ist der eigene frühere Upload und wird
       // übernommen (uploadNewEvent).
-      const { objectUrl, adopted } = await outbound.uploadNewEvent(client, defaultCal, uid, icsData);
+      const { objectUrl, adopted } = await outbound.uploadNewEvent(client, defaultCal, uid, icsData, {
+        source: 'apple', eventId: event.id,
+      });
 
       const calRefId  = upsertExternalCalendar(
         'apple', defaultCal.url, defaultCal.displayName || 'Apple Calendar',
         normalizeCalColor(defaultCal.calendarColor) || APPLE_COLOR
       );
-      // Gebucht wird gegen den Stand NACH dem await (bookEventUpload).
+      // Gebucht wird gegen den Stand NACH dem await (bookEventUpload) - und
+      // nur, wenn die Auswahl oben den Termin dann noch nennt (#1926): wer
+      // während des Uploads in einen anderen lokalen Kalender verschoben
+      // wurde, bleibt lokal, und sein Objekt wird wieder entfernt.
       outbound.bookEventUpload(event, {
         source: 'apple', uid, objectUrl, calRefId, adopted, calendarUrl: defaultCal.url,
+        wantsUploadHere: stillWantsUpload, snapshot: icsSnapshot(event, icsData, uid, householdZone),
       });
     } catch (err) {
       if (!uploadGate.refused(defaultCal.url, err)) {
@@ -597,7 +681,7 @@ async function runSync({ makeClient } = {}) {
 }
 
 export { sync, flushOutbound, getStatus, saveCredentials, clearCredentials,
-         clearMirroredEvents, testConnection };
+         clearMirroredEvents, testConnection, uploadsLocalEvents };
 
 // Nur fuer Tests: der ICS-Builder ist der einzige Weg, auf dem ein rein lokaler
 // Termin zum Anbieter kommt, und der Sync-Pfad drumherum ist zu gross, um ihn

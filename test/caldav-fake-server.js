@@ -17,6 +17,8 @@
  *   server.refuse({ method: 'PROPFIND', path: '/cal/', status: 503 })
  *   server.refuse({ method: 'PUT', status: 412, when: (req) => !req.headers['if-match'] })
  *   server.refuse({ method: 'PUT', status: 500, commit: true, once: true })   // gespeichert, Antwort verloren
+ *   server.refuse({ method: 'PUT', commit: true, drop: true, once: true })     // gespeichert, Verbindung abgerissen
+ *   server.refuse({ method: 'PUT', drop: true, once: true, defer: (run) => { late = run; } })  // wird erst bei late() gespeichert
  *   server.refuse({ method: 'PROPFIND', path: '/cal/', status: 207, contentType: 'application/xml', body: ... })
  * `server.allowAll()` nimmt alle Regeln zurück.
  */
@@ -54,6 +56,11 @@ export async function startFakeDavServer() {
   const requests = [];
   let rules = [];
   let etagCounter = 0;
+  // Ein Server, der kein getetag nennt: der Client kennt dann keinen Stand.
+  let announceEtags = true;
+  // Wie nennt ein Multiget einen fehlenden Namen? `false`: gar nicht.
+  let missingAs404 = false;
+  const etagProp = (obj) => (announceEtags ? `<d:getetag>${xmlEscape(obj.etag)}</d:getetag>` : '');
   const nextEtag = () => `"e${++etagCounter}"`;
 
   const principalPath = '/principals/u/';
@@ -78,7 +85,7 @@ export async function startFakeDavServer() {
   function objectResponse(collectionPath, filename, obj, dataTag) {
     return propResponse(
       `${collectionPath}${encodeSegment(filename)}`,
-      `<d:getetag>${xmlEscape(obj.etag)}</d:getetag><${dataTag}>${xmlEscape(obj.data)}</${dataTag}>`
+      `${etagProp(obj)}<${dataTag}>${xmlEscape(obj.data)}</${dataTag}>`
     );
   }
 
@@ -113,7 +120,7 @@ export async function startFakeDavServer() {
       if (col) {
         const members = req.headers.depth === '1'
           ? [...col.objects].map(([filename, obj]) => propResponse(
-            `${pathname}${encodeSegment(filename)}`, `<d:getetag>${xmlEscape(obj.etag)}</d:getetag>`))
+            `${pathname}${encodeSegment(filename)}`, etagProp(obj) || '<d:getcontenttype>text/calendar</d:getcontenttype>'))
           : [];
         return sendXml(multistatus([propResponse(pathname, collectionProps(col)), ...members]));
       }
@@ -129,7 +136,14 @@ export async function startFakeDavServer() {
         .map((m) => decodeURIComponent(new URL(m[1].trim(), 'http://fake.invalid').pathname.split('/').pop()));
       const isMultiget = /multiget/.test(body);
       const entries = [...col.objects].filter(([filename]) => !isMultiget || wanted.includes(filename));
-      return sendXml(multistatus(entries.map(([filename, obj]) => objectResponse(pathname, filename, obj, dataTag))));
+      // Ein Name, der fehlt: ausgelassen, oder - wie regelkonforme Server
+      // (RFC 4791 §7.9, sabre/dav) - als eigener Eintrag mit 404.
+      const missing = isMultiget && missingAs404 ? wanted.filter((name) => !col.objects.has(name)) : [];
+      return sendXml(multistatus([
+        ...entries.map(([filename, obj]) => objectResponse(pathname, filename, obj, dataTag)),
+        ...missing.map((name) => `<d:response><d:href>${xmlEscape(`${pathname}${encodeSegment(name)}`)}</d:href>`
+          + '<d:status>HTTP/1.1 404 Not Found</d:status></d:response>'),
+      ]));
     }
 
     if (req.method === 'PUT') {
@@ -172,7 +186,14 @@ export async function startFakeDavServer() {
         // `commit`: die Anfrage wird AUSGEFÜHRT, nur die Antwort ist die
         // Absage - der PUT, der ankam, dessen Antwort aber verloren ging.
         if (rule.commit) handle(req, body, { writeHead() {}, end() {} });
+        // `defer`: die Anfrage wird SPÄTER ausgeführt, wenn der Test es sagt -
+        // der PUT, den der Server noch verarbeitet, während der Client längst
+        // aufgegeben hat.
+        if (rule.defer) rule.defer(() => handle(req, body, { writeHead() {}, end() {} }));
         if (rule.once) rules = rules.filter((r) => r !== rule);
+        // `drop`: gar keine Antwort - die Verbindung reisst ab. Der Client
+        // sieht einen Netzfehler ohne Status.
+        if (rule.drop) { req.socket.destroy(); return; }
         res.writeHead(rule.status, { 'Content-Type': rule.contentType || 'text/plain' });
         res.end(rule.body ?? 'refused');
         return;
@@ -208,6 +229,21 @@ export async function startFakeDavServer() {
     objectNames(collectionUrl) {
       return [...(collections.get(new URL(collectionUrl).pathname)?.objects.keys() ?? [])];
     },
+    /** Nimmt eine Collection samt Inhalt fort, als hätte sie jemand auf dem Server gelöscht. */
+    removeCollection(collectionUrl) {
+      return collections.delete(new URL(collectionUrl).pathname);
+    },
+    /** Stellt eine Collection ans Ende der Auflistung: Server sagen keine Reihenfolge zu. */
+    moveToEnd(collectionUrl) {
+      const path = new URL(collectionUrl).pathname;
+      const col = collections.get(path);
+      collections.delete(path);
+      collections.set(path, col);
+    },
+    /** Nennt der Server ETags? `false`: weder im Abruf noch in der Auflistung. */
+    announceEtags(on) { announceEtags = !!on; },
+    /** Nennt ein Multiget fehlende Namen als 404-Eintrag? `false` (Vorgabe): er lässt sie aus. */
+    missingAs404(on) { missingAs404 = !!on; },
     refuse(rule) { rules.push(rule); },
     /** Ein Multistatus, der nur die Home-Collection nennt - gültig, aber leer. */
     homeOnlyListing: () => multistatus([propResponse(homePath, '<d:resourcetype><d:collection/></d:resourcetype>')]),
@@ -220,7 +256,7 @@ export async function startFakeDavServer() {
       + `<s:exception>Sabre\\DAV\\Exception</s:exception><s:message>${xmlEscape(message)}</s:message></d:error>`,
     allowAll() { rules = []; },
     /** Alles zurück auf leer: Collections, Regeln, Protokoll. */
-    reset() { collections.clear(); rules = []; requests.length = 0; },
+    reset() { collections.clear(); rules = []; requests.length = 0; announceEtags = true; missingAs404 = false; },
     /** Anfragen einer Methode seit dem letzten `reset()`. */
     seen(method) { return requests.filter((r) => r.method === method); },
     close: () => new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve); }),

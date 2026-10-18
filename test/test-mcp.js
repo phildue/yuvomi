@@ -38,6 +38,8 @@ db.exec(`
   ALTER TABLE calendar_events ADD COLUMN calendar_ref_id INTEGER;
   ALTER TABLE calendar_events ADD COLUMN target_google_calendar_id TEXT;
   ALTER TABLE calendar_events ADD COLUMN target_caldav_calendar_url TEXT;
+  ALTER TABLE calendar_events ADD COLUMN target_caldav_account_id INTEGER;
+  CREATE TABLE housekeeping_work_sessions (id INTEGER PRIMARY KEY, calendar_event_id INTEGER);
   ALTER TABLE calendar_events ADD COLUMN outbound_move_to TEXT;
   CREATE TABLE external_calendars (
     id INTEGER PRIMARY KEY,
@@ -50,6 +52,9 @@ db.exec(`
 db.exec(MIGRATIONS_SQL[85]);  // calendar_event_exceptions
 db.exec(MIGRATIONS_SQL[174]); // generated birthday/name-day joins
 db.exec(MIGRATIONS_SQL[44]); // search index rebuilt by migration 194
+db.exec(MIGRATIONS_SQL[245]);
+// Migration 246 (#1935) hat ein Funktions-up und steht nicht im Spiegel.
+db.exec('ALTER TABLE calendar_events ADD COLUMN series_authored INTEGER NOT NULL DEFAULT 0 CHECK(series_authored IN (0, 1));');
 db.exec(MIGRATIONS_SQL[194]); // linked occurrence overrides
 db.exec(MIGRATIONS_SQL[41]);  // tasks.start_date (geplante Aufgaben)
 db.exec(MIGRATIONS_SQL[74]);  // access_permissions (Modulrechte, #467)
@@ -808,6 +813,45 @@ test('get_api_operation: unbekannter operation_key → isError', async () => {
   const res = await toolCall('get_api_operation', { operation_key: 'does_not_exist' });
   assert.equal(res.result.isError, true);
   assert.match(res.result.content[0].text, /Unknown operation_key/i);
+});
+
+// Modul installieren/loeschen geht nur aus einer Browser-Sitzung. Die Bruecke
+// reicht aber auch ein Sitzungs-Cookie weiter (siehe Loopback-Test unten) -
+// darum tragen die drei Operationen `x-mcp-exclude` und fehlen hier ganz.
+test('x-mcp-exclude: Modul-Installation und -Loeschen sind ueber MCP weder gelistet noch aufrufbar', async () => {
+  const listed = parseContent(await toolCall('list_api_operations', { tag: 'Modules' }));
+  const keys = listed.operations.map((op) => op.operation_key);
+  assert.ok(keys.includes('get_modules'), 'die Modulliste bleibt erreichbar');
+  assert.ok(keys.includes('patch_modules_by_id'), 'das Ein-/Ausschalten bleibt erreichbar');
+  for (const key of ['post_modules_install_zip', 'post_modules_install_github', 'delete_modules_by_id']) {
+    assert.ok(!keys.includes(key), `${key} darf nicht gelistet sein`);
+  }
+
+  const calls = installFetchMock(() => jsonResponse({ data: {} }));
+  try {
+    for (const args of [
+      { operation_key: 'post_modules_install_github', payload: { url: 'o/r' } },
+      { operation_key: 'delete_modules_by_id', path_params: { id: 'x-mod' } },
+      { method: 'DELETE', path: '/api/v1/modules/{id}', path_params: { id: 'x-mod' } },
+    ]) {
+      const res = await toolCallWithHeaders('call_api_operation', args, { cookie: 'sid=abc' });
+      assert.equal(res.result.isError, true, JSON.stringify(args));
+      assert.match(res.result.content[0].text, /not available through MCP/);
+    }
+    assert.equal(calls.length, 0, 'kein Loopback-Aufruf');
+  } finally {
+    global.fetch = realFetch;
+  }
+  const described = await toolCall('get_api_operation', { operation_key: 'delete_modules_by_id' });
+  assert.equal(described.result.isError, true);
+
+  // Das Ein-/Ausschalten bleibt gelistet, weil Ausschalten per Token nuetzlich
+  // ist; dass Einschalten eine Sitzung braucht (Runde 3 von #1671), steht in
+  // der Beschreibung, die der Assistent liest - sonst plant er den Schritt.
+  const patch = parseContent(await toolCall('get_api_operation', { operation_key: 'patch_modules_by_id' }));
+  assert.match(patch.description, /browser session/);
+  assert.match(patch.description, /module_session_required/);
+  assert.match(patch.description, /Disabling .* token/);
 });
 
 // ── OpenAPI-Brücke: call_api_operation (Loopback via gemocktem fetch) ─────────

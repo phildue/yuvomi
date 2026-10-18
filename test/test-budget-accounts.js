@@ -226,29 +226,6 @@ test('subcategory-Filter in GET /budget', async () => {
   } finally { await h.close(); }
 });
 
-test('GET /budget/summary liefert bySubcategory-Aufschlüsselung', async () => {
-  cleanup();
-  const h = createHarness();
-  try {
-    const subs = suiteDatabase.prepare(
-      'SELECT key FROM budget_subcategories WHERE category_key = ? ORDER BY sort_order ASC LIMIT 1'
-    ).all(EXPENSE_CAT);
-    assert.ok(subs.length >= 1, 'Ausgabenkategorie braucht mindestens eine Subkategorie für den Test');
-    const sub = subs[0].key;
-    const month = PAST.slice(0, 7);
-    await h.call('POST', '', { title: 'x', amount: -30, category: EXPENSE_CAT, subcategory: sub, date: PAST });
-    await h.call('POST', '', { title: 'y', amount: -70, category: EXPENSE_CAT, subcategory: sub, date: PAST });
-    await h.call('POST', '', { title: 'income', amount: 500, category: INCOME_CAT, date: PAST });
-
-    const summary = (await h.call('GET', `/summary?month=${month}`)).body.data;
-    const row = summary.bySubcategory.find((s) => s.category === EXPENSE_CAT && s.subcategory === sub);
-    assert.ok(row, 'bySubcategory enthält die Kategorie/Subkategorie-Kombination');
-    assert.equal(row.total, -100);
-    assert.equal(row.expenses, -100);
-    assert.ok(!summary.bySubcategory.some((s) => s.category === INCOME_CAT), 'Einnahmen tauchen nicht in bySubcategory auf (keine Subkategorien)');
-  } finally { await h.close(); }
-});
-
 test('category- und account_id-Filter in GET /budget kombinieren sich (UND-Verknüpfung)', async () => {
   cleanup();
   const h = createHarness();

@@ -28,6 +28,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { register } from 'node:module';
+import { readFileSync } from 'node:fs';
 import Database from 'better-sqlite3-multiple-ciphers';
 import express from 'express';
 
@@ -632,8 +633,19 @@ test('#1829 Heute wichtig: Aufgabe und Sammelzeile behalten das Modulzeichen',
 test('#1828 Wand: auch eine Aufgabe fuer zwei zaehlt bei beiden', onTheWall(THU_14_BERLIN, 'Europe/Berlin', () => {
   const anna = { id: 8, display_name: 'Anna', avatar_color: '#7C3AED' };
   const leo = { id: 7, display_name: 'Leo', avatar_color: '#FF9500' };
+  // Seit #1817 zaehlt die Wand die Aufgaben einer Person aus `wallTasks`, nicht
+  // mehr aus den (gekappten) Programmzeilen: der Server liefert je zugewiesener
+  // Person einen Eintrag (test:wall-tasks, "mehrere Zugewiesene"). Die
+  // Programmzeile daneben darf die Aufgabe bei keinem der beiden ein zweites
+  // Mal zaehlen.
+  const task = wallTask('Zimmer aufraeumen', { assigned_users: [leo, anna] });
+  const entry = (user) => ({
+    user_id: user.id, open_count: 1, done_count: 0,
+    open: [{ id: task.id, title: task.title, due_date: task.due_date }], done: [],
+  });
   const html = dash.renderWallSurface({
-    urgentTasks: [wallTask('Zimmer aufraeumen', { assigned_users: [leo, anna] })],
+    urgentTasks: [task],
+    wallTasks: [entry(leo), entry(anna)],
     users: [anna, leo],
   }, null, { now: new Date() });
   assert.deepEqual(wallCounts(html), { Anna: 1, Leo: 1 });
@@ -898,3 +910,66 @@ test('#1698 Wand: Beginn UND Ende gehen durch den echten Formatierer (12-Stunden
       else delete globalThis.localStorage;
     }
   })));
+
+// --------------------------------------------------------------------------
+// 6. Kinder-Standards (R20): eigene Aufgaben zuerst, Punkte vor Budget
+// --------------------------------------------------------------------------
+
+const KIND = { id: 3, family_role: 'child', display_name: 'Emma' };
+const MAMA = { id: 1, family_role: 'mom', display_name: 'Linda' };
+const assigned = (task, ...people) => ({ ...task, assigned_users: people.map((p) => ({ id: p.id, display_name: p.display_name })) });
+const childTasks = () => [
+  assigned({ id: 11, title: 'Steuer', due_date: '2026-09-23', status: 'open' }, MAMA),
+  assigned({ id: 12, title: 'Arzt anrufen', due_date: '2026-09-23', status: 'open' }, MAMA),
+  assigned({ id: 13, title: 'Zimmer aufraeumen', due_date: '2026-09-24', due_time: '17:00', status: 'open' }, KIND),
+  { id: 14, title: 'Blumen giessen', due_date: '2026-09-24', status: 'open', assigned_users: [] },
+  assigned({ id: 15, title: 'Hausaufgaben', due_date: '2026-09-23', status: 'open' }, KIND),
+];
+
+test('R20: ein Kind sieht im Heute-Blatt eigene und freie Aufgaben vor denen der Eltern',
+  inProcessZone('Europe/Berlin', inBrowser(THU_10_BERLIN, 'Europe/Berlin', () => {
+    const titles = (viewer) => dash.buildTodayProgram({ urgentTasks: childTasks() }, {
+      includeCalendar: false, includeMeals: false, now: new Date(), viewer,
+    }).rows.map((row) => row.title);
+    assert.deepEqual(titles(KIND), ['Hausaufgaben', 'Blumen giessen', 'Zimmer aufraeumen', 'Steuer', 'Arzt anrufen'],
+      'eigene (auch ueberfaellige) und freie zuerst, die der Mutter am Ende');
+    assert.deepEqual(titles(MAMA), ['Steuer', 'Arzt anrufen', 'Hausaufgaben', 'Blumen giessen', 'Zimmer aufraeumen'],
+      'Erwachsene: unveraendert nach der Uhr');
+    assert.deepEqual(titles(null), titles(MAMA), 'ohne Betrachter wie bisher');
+  })));
+
+test('R20: bei knappem Platz fallen die fremden Aufgaben eines Kindes zuerst unter „+N weitere"',
+  inProcessZone('Europe/Berlin', inBrowser(THU_10_BERLIN, 'Europe/Berlin', () => {
+    const model = dash.buildTodayCockpitModel({ urgentTasks: childTasks() }, [], {
+      cap: 3, now: new Date(), groupOverdue: true, viewer: KIND,
+    });
+    const shown = model.rows.map((row) => row.title);
+    assert.deepEqual(shown, ['Hausaufgaben', 'Blumen giessen', 'Zimmer aufraeumen'], 'die Aufgaben der Mutter stehen nicht im sichtbaren Blatt');
+    assert.equal(model.overflow, 2);
+    assert.deepEqual(model.hiddenRows.map((row) => row.title).sort(), ['Arzt anrufen', 'Steuer']);
+  })));
+
+test('R20: die Kinder-Vorgabe der Kacheln - Punkte zuerst und sichtbar, Budget aus, nur bei gefolgter Vorgabe', async () => {
+  const { childDefaultWidgetConfig, DEFAULT_WIDGET_CONFIG } = await import('../public/utils/dashboard-widgets.js');
+  const kid = childDefaultWidgetConfig(DEFAULT_WIDGET_CONFIG);
+  assert.equal(kid[0].id, 'rewards');
+  assert.equal(kid[0].visible, true);
+  assert.equal(kid.find((w) => w.id === 'budget').visible, false);
+  assert.deepEqual(kid.map((w) => w.order), kid.map((_, i) => i));
+  assert.equal(kid.length, DEFAULT_WIDGET_CONFIG.length, 'keine Kachel verschwindet aus dem Anpassen-Tray');
+  assert.equal(DEFAULT_WIDGET_CONFIG.find((w) => w.id === 'budget').visible, true, 'die Eingabe bleibt unberuehrt');
+
+  assert.deepEqual(dash.childDefaultFor(DEFAULT_WIDGET_CONFIG, KIND, true), kid);
+  assert.equal(dash.childDefaultFor(DEFAULT_WIDGET_CONFIG, KIND, false), DEFAULT_WIDGET_CONFIG, 'ein eigenes Layout bleibt');
+  assert.equal(dash.childDefaultFor(DEFAULT_WIDGET_CONFIG, MAMA, true), DEFAULT_WIDGET_CONFIG, 'Erwachsene bekommen die Haushaltsvorgabe');
+});
+
+test('R20: die Seite setzt den Betrachter, den das Heute-Blatt fragt', () => {
+  // Die Optionen oben reichen den Betrachter selbst herein; diese Zeile haelt
+  // fest, dass der echte Aufrufer (render -> buildTodayCockpitModel ohne
+  // `viewer`) ihn auch bekommt.
+  const src = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
+  assert.match(src, /export async function render\([\s\S]{0,1500}?dashboardViewer = user \?\? null;/);
+  assert.match(src, /viewer = dashboardViewer,\n\} = \{\}\) \{/, 'buildTodayCockpitModel faellt auf den gesetzten Betrachter zurueck');
+  assert.match(src, /buildTodayProgram\(data, \{ includeTasks, includeCalendar, includeMeals, now, viewer \}\)/);
+});

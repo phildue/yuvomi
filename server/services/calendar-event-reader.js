@@ -6,12 +6,16 @@
  * two in one direction so neither foundational service imports the other.
  */
 
+import { localCalendarColorSql, localCalendarIdSql } from './local-calendars.js';
+
 import {
   ASSIGNED_USERS_SQL, expandRecurringEvents, loadEventExceptions, MAX_EXPANSION_ITERATIONS,
   SOURCE_CALENDAR_COLUMNS, SOURCE_CALENDAR_JOIN,
 } from './calendar-events.js';
 import { resolveEventRows } from './calendar-occurrence-overrides.js';
-import { icsSubscriptionVisibleWhere, visibilityWhere } from './visibility.js';
+import {
+  householdVisibleWhere, icsSubscriptionSharedWhere, icsSubscriptionVisibleWhere, visibilityWhere,
+} from './visibility.js';
 import { birthdaysSwitchedOff, notBirthdayEventSql } from './household-modules.js';
 import {
   householdTimeZone, localToUTC, shiftDateKey, storedToInstantMs, todayKey,
@@ -35,9 +39,13 @@ export const BODY_FREE_EVENT_COLUMNS = Object.freeze([
   'updated_at', 'target_google_calendar_id', 'outbound_dirty',
   'outbound_attempts', 'outbound_move_to', 'external_object_url',
   'target_outlook_account_id', 'target_outlook_calendar_id', 'color_modified',
+  'local_calendar_id',
   // Das CalDAV-Konto der Zeile (#1860), neben den uebrigen Sync-Spalten: wer
   // eine so gelesene Zeile an den Ausgang weitergibt, braucht es dort.
   'caldav_account_id',
+  // Wer Start und Regel verfasst hat (#1935): der Feed und jeder andere
+  // ausgehende Weg richten den Start nur aus, wenn die Zeile die Marke traegt.
+  'series_authored',
 ]);
 
 const eventColumnCache = new WeakMap();
@@ -104,7 +112,16 @@ export function resolveProjectedEventRows(database, rows, { lightweight = false 
   return resolveEventRows(database, rows, resolutionOptions).map((resolved) => {
     if (!resolved.is_occurrence_override) return resolved;
     const source = sourceById.get(Number(resolved.id));
-    return source ? { ...source, ...resolved } : resolved;
+    return source ? {
+      ...source, ...resolved,
+      // Membership was resolved by the query; a raw master's NULL must not
+      // overwrite its default calendar while merging a linked replacement.
+      ...(Object.hasOwn(source, 'local_calendar_name') ? {
+        local_calendar_id: source.local_calendar_id,
+        local_calendar_name: source.local_calendar_name,
+        local_calendar_color: source.local_calendar_color,
+      } : {}),
+    } : resolved;
   });
 }
 
@@ -122,7 +139,8 @@ export function expandAndResolveEventRows(database, rows, from, to, options = {}
     from,
     to,
     exceptions,
-    { ...options.expansion, includeRecurrenceIdentity: true },
+    // Die Zone kommt von hier, die Expansion kennt keine Datenbank (#1993).
+    { householdZone: householdTimeZone(database), ...options.expansion, includeRecurrenceIdentity: true },
   );
   return resolveProjectedEventRows(database, expanded, options)
     .sort((a, b) => String(a.start_datetime).localeCompare(String(b.start_datetime)));
@@ -167,14 +185,38 @@ function birthdayFilter(d, wantsBirthdays) {
 }
 
 /**
+ * Wer liest: eine Person oder eine geteilte Flaeche (#1817).
+ *
+ * Ein Termin traegt ZWEI Sichtbarkeitsachsen, und beide gehoeren an jeden
+ * Leser: die Stufe der Zeile (`visibility`: all | assignees | private, dazu
+ * Urheber und Zugewiesene) und das ICS-Abo, aus dem er stammt (`shared`, sonst
+ * nur fuer den, der es angelegt hat). CalDAV- und Google-Kalender haben keine
+ * eigene Achse: ihre Termine tragen die Stufe der Zeile.
+ *
+ * Fuer eine Person gelten die Fragmente mit Betrachter. Fuer die Wand
+ * (`household`) gilt, was jeder sehen darf - Stufe `all` und geteiltes Abo -,
+ * ohne Betrachter: auch der Urheber eines privaten Termins sieht ihn dort
+ * nicht, weil nicht er hinsieht, sondern die Kueche.
+ */
+function eventAudience(userId, household) {
+  return household
+    ? { where: `${icsSubscriptionSharedWhere('e')}\n    AND ${householdVisibleWhere('e')}`, params: [] }
+    : {
+      where: `${icsSubscriptionVisibleWhere('e')}\n    AND ${visibilityWhere('e', 'event_assignments', 'event_id')}`,
+      params: [userId, userId, userId],
+    };
+}
+
+/**
  * Loads upcoming calendar rows for the dashboard, calendar route, and MCP.
  * windowDays defaults to the dashboard's 90 days; null keeps the future open.
  * Each series contributes at most limit eligible occurrences before merging.
  */
 export function getUpcomingEvents(d, {
   userId = null, limit = 5, windowDays = 90, fromToday = false, assignedTo = null,
-  includeBirthdays: wantsBirthdays = true, now = new Date(), keepEndedToday = 0,
+  includeBirthdays: wantsBirthdays = true, now = new Date(), keepEndedToday = 0, household = false,
 } = {}) {
+  const audience = eventAudience(userId, household);
   const { includeBirthdays, birthdaySql } = birthdayFilter(d, wantsBirthdays);
   const tz      = householdTimeZone(d);
   const nowDate = todayKey(d, now);
@@ -215,6 +257,9 @@ export function getUpcomingEvents(d, {
            -- am Abo-Termin NULL, obwohl dessen Farbe schon herauskam (#1064).
            COALESCE(ec.name, isub.name)   AS cal_name,
            COALESCE(ec.color, isub.color) AS cal_color,
+           lc.id AS local_calendar_id,
+           lc.name  AS local_calendar_name,
+           ${localCalendarColorSql()} AS local_calendar_color,
            ${SOURCE_CALENDAR_COLUMNS},
            COALESCE(bd.name, nd.name) AS birthday_name,
            bd.birth_date AS birthday_date,
@@ -225,6 +270,7 @@ export function getUpcomingEvents(d, {
     FROM calendar_events e
     LEFT JOIN users u_assigned ON u_assigned.id = e.assigned_to
     LEFT JOIN external_calendars ec ON ec.id = e.calendar_ref_id
+    LEFT JOIN local_calendars lc ON lc.id = ${localCalendarIdSql()}
     ${SOURCE_CALENDAR_JOIN}
     LEFT JOIN ics_subscriptions isub ON isub.id = e.subscription_id
     LEFT JOIN birthdays bd ON bd.calendar_event_id = e.id
@@ -234,10 +280,9 @@ export function getUpcomingEvents(d, {
       OR
       (e.recurrence_rule IS NOT NULL AND DATE(e.start_datetime) <= ?)
     )
-    AND ${icsSubscriptionVisibleWhere('e')}
-    AND ${visibilityWhere('e', 'event_assignments', 'event_id')}${birthdaySql}
+    AND ${audience.where}${birthdaySql}
     ORDER BY e.start_datetime ASC
-  `).all(...singleParams, future, userId, userId, userId);
+  `).all(...singleParams, future, ...audience.params);
 
   const startInstant = (event) => storedToInstantMs(
     event.all_day ? event.start_datetime.slice(0, 10) : event.start_datetime,
@@ -368,8 +413,9 @@ export function getUpcomingEvents(d, {
  * @returns {object[]} aufgeloeste Zeilen, nach Beginn sortiert
  */
 export function getEventsOverlappingDays(d, {
-  userId = null, fromKey, days, assignedTo = null, includeBirthdays: wantsBirthdays = true, limit = 300,
+  userId = null, fromKey, days, assignedTo = null, includeBirthdays: wantsBirthdays = true, limit = 300, household = false,
 } = {}) {
+  const audience = eventAudience(userId, household);
   const { includeBirthdays, birthdaySql } = birthdayFilter(d, wantsBirthdays);
   const tz = householdTimeZone(d);
   const toKey = shiftDateKey(fromKey, days);          // exklusiv
@@ -409,10 +455,9 @@ export function getEventsOverlappingDays(d, {
       OR
       (e.recurrence_rule IS NOT NULL AND DATE(e.start_datetime) <= ?)
     )
-    AND ${icsSubscriptionVisibleWhere('e')}
-    AND ${visibilityWhere('e', 'event_assignments', 'event_id')}${birthdaySql}
+    AND ${audience.where}${birthdaySql}
     ORDER BY e.start_datetime ASC
-  `).all(sqlTo, sqlFrom, sqlTo, userId, userId, userId);
+  `).all(sqlTo, sqlFrom, sqlTo, ...audience.params);
 
   const isAllDay = (event) => Boolean(event.all_day) || !String(event.start_datetime).includes('T');
   const overlaps = (event) => {

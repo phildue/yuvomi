@@ -19,7 +19,7 @@
  *   → bypassCacheUntil (in-memory + Cache API für SW-Restart-Robustheit)
  */
 
-const APP_RELEASE        = '2.76.0';
+const APP_RELEASE        = '2.77.2';
 const APP_BUILD_REVISION = '__YUVOMI_BUILD_REVISION__';
 const CACHE_RELEASE      = `${APP_RELEASE}-${APP_BUILD_REVISION}`;
 const SHELL_CACHE        = `yuvomi-shell-${CACHE_RELEASE}`;
@@ -44,6 +44,7 @@ const APP_SHELL = [
   '/index.html',
   '/api.js',
   '/lang-init.js',
+  '/boot-fetch.js',
   '/router.js',
   '/i18n.js',
   '/rrule-ui.js',
@@ -115,6 +116,7 @@ const APP_SHELL = [
   '/components/user-multi-select.js',
   '/components/wall-timer.js',
   '/utils/birthday-event.js',
+  '/utils/budget-category-colors.js',
   '/utils/bulk-pill.js',
   '/utils/category-labels.js',
   '/utils/chart.js',
@@ -144,6 +146,7 @@ const APP_SHELL = [
   '/utils/fab.js',
   '/utils/flip.js',
   '/utils/list-motion.js',
+  '/utils/component-style.js',
   '/utils/content-swap.js',
   '/utils/filter-sheet.js',
   '/utils/folder-upload.js',
@@ -171,6 +174,7 @@ const APP_SHELL = [
   '/utils/household.js',
   '/utils/html-escape.js',
   '/utils/html.js',
+  '/utils/ingredient-match-key.js',
   '/utils/ingredient-row.js',
   '/utils/initials.js',
   '/utils/inventory-warranty.js',
@@ -180,6 +184,7 @@ const APP_SHELL = [
   '/utils/leave-guard.js',
   '/utils/live-feed.js',
   '/utils/loan-order.js',
+  '/utils/ledger-order.js',
   '/utils/markdown-checklist.js',
   '/utils/markdown-toolbar.js',
   '/utils/master-detail.js',
@@ -197,6 +202,8 @@ const APP_SHELL = [
   '/utils/note-category-overflow.js',
   '/utils/note-category-picker.js',
   '/utils/overlay-history.js',
+  '/utils/overlay-host.js',
+  '/utils/dialog-surface.js',
   '/utils/page-layout.js',
   '/utils/page-lifecycle.js',
   '/utils/page-search.js',
@@ -228,6 +235,7 @@ const APP_SHELL = [
   '/utils/screensaver-idle.js',
   '/utils/scroll-restore.js',
   '/utils/seal-pair.js',
+  '/utils/session-unreachable.js',
   '/utils/segment-indicator.js',
   '/utils/sheet-drag.js',
   '/utils/shopping-categories.js',
@@ -376,6 +384,7 @@ const PAGE_MODULES = [
   '/settings/region-presets.js',
   '/settings/weather-location.js',
   '/settings/family-users.js',
+  '/settings/module-install-errors.js',
   '/settings/pages/personal-account.js',
   '/settings/pages/personal-schedule.js',
   '/settings/pages/admin-email.js',
@@ -389,6 +398,7 @@ const PAGE_MODULES = [
   '/settings/pages/personal-calendar.js',
   '/settings/pages/personal-tasks.js',
   '/settings/pages/modules-active.js',
+  '/settings/pages/modules-install.js',
   '/settings/pages/modules-navigation.js',
   '/settings/pages/modules-kitchen.js',
   '/settings/pages/modules-calendar.js',

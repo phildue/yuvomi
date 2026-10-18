@@ -12,6 +12,8 @@
  *   google_calendar_id    - ID des zu synchronisierenden Kalenders (Default: 'primary')
  *   google_last_error     - Fehlermeldung des letzten Laufs, fehlt nach einem sauberen (#820)
  *   google_last_error_at  - ISO-8601-Timestamp dieses Fehlers
+ *   google_needs_reauth   - '1', wenn Google das Refresh-Token abgelehnt hat
+ *                           (invalid_grant); fällt erst mit einem neuen OAuth (#2019)
  */
 
 import { createLogger } from '../logger.js';
@@ -24,8 +26,12 @@ import * as outbound from './calendar-outbound.js';
 import { decodeHtmlEntities } from '../utils/html-entities.js';
 import { nearestColorId } from '../utils/ical-color.js';
 // Fallback-Zone für den Outbound-Sync, wenn Google für den Zielkalender keine liefert.
-import { configuredHouseholdTimeZone, householdTimeZone } from '../utils/timezone.js';
-import { outboundEvent } from './outbound-dtstart.js';
+import {
+  configuredHouseholdTimeZone, householdTimeZone, isValidTimeZone, localToUTCPrecise,
+} from '../utils/timezone.js';
+import { localDayEndUtc, utcStamp } from '../utils/rrule-until.js';
+import { authoredAfterInbound, outboundEvent } from './outbound-dtstart.js';
+import { alignmentMoved, googleReading, isEcho, sentSnapshot } from './outbound-echo.js';
 import { assignDefaultToEvent, reassignDefaultOnCalendarMove } from './sync-assignment.js';
 import { countSourceEvents, deleteSourceEvents } from './calendar-prune.js';
 import { readSyncOutcome, withSyncOutcome } from './sync-outcome.js';
@@ -110,6 +116,108 @@ function isConnected() {
 }
 
 // --------------------------------------------------------
+// Abgelehntes Refresh-Token (#2019)
+// Dasselbe Muster wie needs_reauth bei Outlook: Google hat das Token verworfen
+// (abgelaufen im Status "Testing", widerrufen, Passwortwechsel), und kein
+// weiterer Lauf ändert daran etwas. Die Karte sagt "neu verbinden", statt
+// verbunden auszusehen, und der Sync fasst Google bis zum neuen OAuth nicht an.
+// --------------------------------------------------------
+
+class GoogleReauthRequiredError extends Error {
+  constructor(detail = 'invalid_grant') {
+    super(`Reconnect required: ${detail}`);
+    this.name = 'GoogleReauthRequiredError';
+    this.reauthRequired = true;
+  }
+}
+
+/** Hat Google das Refresh-Token abgelehnt? gaxios meldet es als `invalid_grant`. */
+function isInvalidGrant(err) {
+  return err?.response?.data?.error === 'invalid_grant' || err?.message === 'invalid_grant';
+}
+
+function needsReauth() {
+  return cfgGet('google_needs_reauth') === '1';
+}
+
+/**
+ * Ist `token` noch das gespeicherte Refresh-Token? Die Identitätsprobe für alles,
+ * was ein Client NACH einem await über die Verbindung schreibt: abgelehnt
+ * (withReauthGuard) wie erneuert (`tokens`-Listener). Hat inzwischen ein
+ * Trennen, ein neues OAuth oder eine Rotation nebenan ein anderes Token
+ * gespeichert, gehört das Ergebnis zu einer abgelösten Verbindung. Aufrufer
+ * prüfen und schreiben synchron, ohne await dazwischen.
+ */
+function isCurrentRefreshToken(token) {
+  return token != null && cfgGet('google_refresh_token') === token;
+}
+
+/**
+ * Lässt eine Ablehnung des Tokens durch, bevor ein Handler den Fehler selbst
+ * einordnet. invalid_grant kommt als 400, und 400 gilt bei Vormerkungen als
+ * endgültig: die Löschung oder Änderung fiele, und der Lauf meldete nie
+ * "neu verbinden". Durchgereicht landet sie in withReauthGuard.
+ */
+function passOnRefusal(err) {
+  if (isInvalidGrant(err)) throw err;
+}
+
+/** Das Refresh-Token, das ein OAuth2-Client (oder der Kalender darüber) gerade trägt. */
+function refreshTokenOf(clientOrCalendar) {
+  const auth = clientOrCalendar?.context?._options?.auth ?? clientOrCalendar;
+  return auth?.credentials?.refresh_token ?? null;
+}
+
+/**
+ * Führt einen Google-Zugriff aus und hält ein abgelehntes Token fest. Der
+ * Fehler geht als GoogleReauthRequiredError weiter, damit der Lauf ihn als
+ * letzten Fehler verbucht.
+ *
+ * Festgehalten wird nur gegen das Token, mit dem der abgelehnte Refresh lief:
+ * das, das der Client zum Fehlerzeitpunkt trägt. `run` meldet seinen Client
+ * oder Kalender über `track` an; der `tokens`-Listener zieht dessen Token bei
+ * jeder Rotation mit, ein langer Lauf mit zwei Refreshes (r1 -> r2, dann r2
+ * abgelehnt) vergleicht also r2. Ohne angemeldeten Client (Attrappen) gilt das
+ * Token beim Start. Hat inzwischen ein neues OAuth oder ein Trennen ein anderes
+ * Token gespeichert, betrifft die Ablehnung ein abgelöstes Token, und die
+ * Verbindung bleibt stehen. Vergleich und Schreiben laufen in einer
+ * Transaktion, ohne await dazwischen.
+ */
+async function withReauthGuard(run) {
+  const startToken = cfgGet('google_refresh_token');
+  let source = null;
+  const track = (clientOrCalendar) => { source = clientOrCalendar; return clientOrCalendar; };
+  try {
+    return await run(track);
+  } catch (err) {
+    if (!isInvalidGrant(err)) throw err;
+    const usedToken = refreshTokenOf(source) ?? startToken;
+    const marked = db.get().transaction(() => {
+      if (!isCurrentRefreshToken(usedToken)) return false;
+      cfgSet('google_needs_reauth', '1');
+      return true;
+    })();
+    if (!marked) {
+      log.warn('Google refused a refresh token that has since been replaced; the current connection stays active.');
+      throw err;
+    }
+    log.warn('Google refused the refresh token (invalid_grant). Sync paused until the account is reconnected.');
+    throw new GoogleReauthRequiredError(err?.response?.data?.error_description || 'invalid_grant');
+  }
+}
+
+/**
+ * Holt das Access-Token VOR dem ersten API-Aufruf. Sonst träfe ein abgelehntes
+ * Token zuerst die vorgemerkten Löschungen und Änderungen: invalid_grant kommt
+ * als 400, und 400 gilt dort als endgültig abgelehnt - die Vormerkung fiele.
+ * Eine Attrappe ohne Auth-Client (Suiten) bleibt unberührt.
+ */
+async function ensureAccessToken(calendar) {
+  const auth = calendar?.context?._options?.auth;
+  if (typeof auth?.getAccessToken === 'function') await auth.getAccessToken();
+}
+
+// --------------------------------------------------------
 // Ausgehende Löschungen und Änderungen (Issue #593)
 // Vormerkung, Versuchslimit und Fehlereinordnung sind providerunabhängig und
 // liegen in calendar-outbound.js; hier steht nur die Google-Ausführung.
@@ -137,6 +245,7 @@ async function loadCalendarMeta(calendar, calendarId, cache) {
       refId:    upsertExternalCalendar('google', calendarId, name, color),
     };
   } catch (err) {
+    passOnRefusal(err);
     log.warn(`Calendar metadata is not accessible (${calendarId}):`, err.message);
     let failures = metaFailures.get(cache);
     if (!failures) metaFailures.set(cache, failures = new Map());
@@ -200,6 +309,7 @@ async function processPendingDeletions(calendar) {
       outbound.dropDeletion(row.id);
       done++;
     } catch (err) {
+      passOnRefusal(err);
       // 404/410 zählen als erledigt (bei Google bereits weg), alles andere
       // wandert in den Retry bis zum gemeinsamen Versuchslimit.
       if (outbound.handleDeletionError(err, row, 'Google')
@@ -315,6 +425,7 @@ async function processPendingUpdates(calendar, colorMap = {}, metaCache = new Ma
           applyMove.run(destMeta.refId, eventId, moveTo, event.id);
           movedTo = moveTo;
         } catch (err) {
+          passOnRefusal(err);
           // Der Umzug ist die Voraussetzung für den Patch im Zielkalender -
           // hier abbrechen, statt im alten Kalender zu patchen. Wird der Umzug
           // aufgegeben, bleibt eine vorgemerkte Feldänderung für den nächsten
@@ -352,12 +463,14 @@ async function processPendingUpdates(calendar, colorMap = {}, metaCache = new Ma
     }
 
     try {
-      const gEvent = localEventToGoogle(fresh, colorMap, outboundTimeZone(activeMeta?.timeZone));
+      const { body: gEvent, snapshot } = buildGoogleRequest(fresh, colorMap, outboundTimeZone(activeMeta?.timeZone));
       await calendar.events.patch({ calendarId, eventId, requestBody: gEvent });
-      // Während des Patches Eingetroffenes bleibt vorgemerkt.
-      outbound.settleOutbound(fresh, movedTo, event);
+      // Während des Patches Eingetroffenes bleibt vorgemerkt. Der Schnappschuss
+      // (#1956) geht im selben Schreibvorgang.
+      outbound.settleOutbound(fresh, movedTo, event, { snapshot });
       done++;
     } catch (err) {
+      passOnRefusal(err);
       // Mit dem Zähler des nachgeladenen Stands: eine Bearbeitung seit der Auswahl
       // hat ihn zurückgesetzt und bekommt ihre eigenen Versuche.
       handleError(err, fresh, 'update', clear);
@@ -378,13 +491,19 @@ async function flushOutbound({ createCalendar = authorizedCalendar } = {}) {
 
 async function runFlushOutbound(createCalendar) {
   const idle = { deleted: 0, updated: 0 };
-  if (!isConnected() || isReadonly()) return idle;
+  if (!isConnected() || isReadonly() || needsReauth()) return idle;
 
   const hasDeletions = pendingDeletionCount() > 0;
   const hasUpdates   = pendingUpdateCount() > 0;
   if (!hasDeletions && !hasUpdates) return idle;
 
+  return withReauthGuard((track) =>
+    runFlushWith(() => track(createCalendar()), hasDeletions, hasUpdates));
+}
+
+async function runFlushWith(createCalendar, hasDeletions, hasUpdates) {
   const calendar = createCalendar();
+  await ensureAccessToken(calendar);
   const deleted = hasDeletions ? await processPendingDeletions(calendar) : 0;
   const updated = hasUpdates
     ? await processPendingUpdates(calendar, await fetchEventColorMap(calendar), new Map())
@@ -469,7 +588,15 @@ function getSyncToken(calendarId) {
  * @returns {Promise<Array<{id,summary,primary,backgroundColor,enabled,accessRole,writable}>>}
  */
 async function listCalendars() {
-  const client   = loadAuthorizedClient();
+  // Abgelehntes Token (#2019): keine aussichtslose Anfrage an Google, egal wer
+  // fragt - Terminformular (sync-targets), Kalenderauswahl. Die Karte sagt
+  // "neu verbinden"; Ziele gibt es bis dahin keine.
+  if (needsReauth()) return [];
+  return withReauthGuard((track) => listCalendarsWith(track));
+}
+
+async function listCalendarsWith(track = (client) => client) {
+  const client   = track(loadAuthorizedClient());
   const calendar = google.calendar({ version: 'v3', auth: client });
   const enabledSet = new Set(enabledCalendarIds());
   // Standard-Zuweisung je Kalender (#459) aus der geteilten external_calendars-Tabelle.
@@ -520,13 +647,70 @@ function loadAuthorizedClient() {
     expiry_date:   cfgGet('google_token_expiry') ? parseInt(cfgGet('google_token_expiry'), 10) : undefined,
   });
 
-  // Token-Refresh automatisch speichern
+  // Token-Refresh automatisch speichern. Liefert Google beim Refresh ein neues
+  // Refresh-Token mit, ersetzt es das alte: das alte kann Google danach
+  // verwerfen, und der nächste Start schickte ein totes Token (#2019).
+  //
+  // Geschrieben wird nur, solange das Token, mit dem dieser Client arbeitet,
+  // noch das gespeicherte ist: ein Refresh, der erst nach einem Trennen oder
+  // neuen Verbinden zurückkommt, stellte sonst die alte Verbindung wieder her.
+  // Zum Zeitpunkt des Ereignisses trägt der Client noch das Token, mit dem
+  // dieser Refresh lief. Ein rotiertes Token übernimmt er selbst: google-auth-
+  // library setzt nach dem Ereignis wieder das Token ein, das in
+  // `client.credentials` steht - ohne diese Zeile das alte, und der nächste
+  // Refresh im selben Lauf schickte ein abgelöstes Token (#2019).
   client.on('tokens', (tokens) => {
-    if (tokens.access_token) cfgSet('google_access_token', tokens.access_token);
-    if (tokens.expiry_date)  cfgSet('google_token_expiry', String(tokens.expiry_date));
+    db.get().transaction(() => {
+      if (!isCurrentRefreshToken(client.credentials?.refresh_token)) {
+        log.debug('Refreshed Google token belongs to a replaced connection, not stored.');
+        return;
+      }
+      if (tokens.access_token)  cfgSet('google_access_token', tokens.access_token);
+      if (tokens.refresh_token) {
+        cfgSet('google_refresh_token', tokens.refresh_token);
+        client.credentials.refresh_token = tokens.refresh_token;
+      }
+      if (tokens.expiry_date)   cfgSet('google_token_expiry', String(tokens.expiry_date));
+      // Ein Refresh der aktuellen Generation ist gelungen: das Token gilt. Ein
+      // Marker aus einer überholten Ablehnung fällt im selben Schritt.
+      cfgDel('google_needs_reauth');
+    })();
   });
 
+  shareRefreshes(client);
   return client;
+}
+
+// Höchstens EIN Refresh je Token und Prozess (#2019). Sync, Sofortversuch und
+// Kalenderliste bauen je einen eigenen Client; refreshten zwei davon zugleich
+// mit demselben Token, könnte Google eine Anfrage annehmen und rotieren, die
+// andere ablehnen - kommt die Ablehnung zuerst an, stünde "neu verbinden" bei
+// gültigem Token. Ein zweiter Client mit DEMSELBEN Token wartet deshalb auf den
+// laufenden Refresh und übernimmt dessen Ergebnis. Geschlüsselt nach dem Token:
+// ein Client mit einem anderen (älteres Token, anderes Konto nach dem
+// Neuverbinden) bekäme sonst das Access-Token einer fremden Verbindung.
+const refreshesInFlight = new Map();
+
+function shareRefreshes(client) {
+  client.refreshTokenNoCache = function sharedRefresh(refreshToken) {
+    const running = refreshesInFlight.get(refreshToken);
+    if (!running) {
+      const own = Object.getPrototypeOf(this).refreshTokenNoCache.call(this, refreshToken);
+      // Der geteilte Ausgang lehnt nie ab: ohne Wartende bliebe eine Ablehnung
+      // sonst unbehandelt. Wer wartet, wirft sie selbst wieder.
+      const shared = own
+        .then((r) => ({ r }), (err) => ({ err }))
+        .finally(() => { refreshesInFlight.delete(refreshToken); });
+      refreshesInFlight.set(refreshToken, shared);
+      return own.then((r) => ({ ...r, tokens: { ...r.tokens } }));
+    }
+    return running.then(({ r, err }) => {
+      if (err) throw err;
+      // Rotiert: auch dieser Client arbeitet ab jetzt mit dem neuen Token.
+      if (r.tokens?.refresh_token) this.credentials.refresh_token = r.tokens.refresh_token;
+      return { ...r, tokens: { ...r.tokens } };
+    });
+  };
 }
 
 /**
@@ -577,11 +761,40 @@ async function handleCallback(code) {
     throw new Error('[Google] No refresh token received. Revoke access in your Google account and connect again.');
   }
 
+  // Neu verbinden ohne Trennen (#2019, Knopf "Neu verbinden"): Auswahl und
+  // syncTokens stehen noch. Gelesen nach dem await, im selben Schritt wie das
+  // Schreiben der Tokens.
+  const reconnect = isConnected();
   cfgSet('google_access_token',  tokens.access_token);
   cfgSet('google_refresh_token', tokens.refresh_token);
   if (tokens.expiry_date) cfgSet('google_token_expiry', String(tokens.expiry_date));
+  // Das neue Token gilt wieder: der Sync darf Google erneut ansprechen (#2019).
+  cfgDel('google_needs_reauth');
 
   log.info('OAuth successful - tokens saved.');
+  if (reconnect) await dropUnreachableSelection();
+}
+
+/**
+ * Nach einem Neuverbinden kann ein anderes Google-Konto dahinterstehen. Dessen
+ * Liste kennt die Kalender des alten nicht: events.list liefe für sie in ein
+ * 404, an dem jeder Lauf scheitert, und die Auswahl zeigt sie nicht mehr an -
+ * abwählen ginge nicht. Was das verbundene Konto nicht anbietet, fällt deshalb
+ * aus der Auswahl; gespiegelte Termine bleiben wie beim Trennen liegen.
+ * Scheitert der Abruf, bleibt die Auswahl, wie sie ist.
+ */
+async function dropUnreachableSelection() {
+  let offered;
+  try {
+    offered = new Set((await listCalendarsWith()).map((cal) => cal.id));
+  } catch (err) {
+    log.warn('Calendar list after reconnecting is not available, selection kept:', err.message);
+    return;
+  }
+  const del = db.get().prepare('DELETE FROM google_calendar_selection WHERE calendar_id = ?');
+  const gone = listSelection().map((row) => row.calendar_id).filter((id) => !offered.has(id));
+  for (const id of gone) del.run(id);
+  if (gone.length) log.info(`${gone.length} calendar(s) not offered by the reconnected account removed from the selection.`);
 }
 
 /**
@@ -596,6 +809,8 @@ function getStatus() {
     configured,
     connected,
     lastSync,
+    // Tokens stehen noch, aber Google nimmt sie nicht mehr an (#2019).
+    needsReauth: connected && needsReauth(),
     selectedCount: enabledCalendarIds().length,
     readonly: isReadonly(),
     // Reist mit dem Status, damit die Rückfrage vor dem Löschen die Zahl sofort
@@ -630,7 +845,7 @@ function disconnect({ deleteEvents = false } = {}) {
   return db.get().transaction(() => {
     const removed = deleteEvents ? clearMirroredEvents() : 0;
     ['google_access_token', 'google_refresh_token', 'google_token_expiry',
-     'google_last_sync', 'google_readonly',
+     'google_last_sync', 'google_readonly', 'google_needs_reauth',
      // Der Fehlerstand gehoert zur Verbindung: bliebe er stehen, meldete die
      // Karte nach dem Trennen einen Ausfall, den es nicht mehr gibt (#820).
      'google_last_error', 'google_last_error_at'].forEach(cfgDel);
@@ -654,12 +869,20 @@ function disconnect({ deleteEvents = false } = {}) {
  * Werfen bei fehlendem Token, das ohne Verbindung der wahrscheinlichste Fall ist.
  */
 async function sync({ createCalendar = authorizedCalendar } = {}) {
-  return runSerialized('google', 'sync',
-    () => withSyncOutcome(db.get(), 'google', () => runSync(createCalendar)));
+  // Abgelehntes Token: kein Zugriff, kein neuer Fehlereintrag. Der bleibt vom
+  // Lauf stehen, der die Ablehnung bemerkt hat, und die Karte sagt
+  // "neu verbinden". Der Scheduler ruft gar nicht erst (#2019). Geprüft wird
+  // in der Sperre: ein Lauf, der davor wartete, kann die Ablehnung gerade
+  // festgehalten haben.
+  return runSerialized('google', 'sync', async () => {
+    if (needsReauth()) throw new GoogleReauthRequiredError();
+    return withSyncOutcome(db.get(), 'google', () => withReauthGuard((track) => runSync(() => track(createCalendar()))));
+  });
 }
 
 async function runSync(createCalendar) {
   const calendar = createCalendar();
+  await ensureAccessToken(calendar);
 
   // Event-Farbpalette (colorId → Hex) einmalig für den ganzen Sync laden.
   const eventColorMap = await fetchEventColorMap(calendar);
@@ -758,7 +981,7 @@ async function runSync(createCalendar) {
         continue;
       }
       try {
-        const gEvent  = localEventToGoogle(event, eventColorMap, outboundTimeZone(meta?.timeZone));
+        const { body: gEvent, snapshot } = buildGoogleRequest(event, eventColorMap, outboundTimeZone(meta?.timeZone));
         const created = await calendar.events.insert({ calendarId: targetId, requestBody: gEvent });
         // refId aus den Metadaten: trägt Name und Farbe des Kalenders statt der
         // rohen ID als Notnamen.
@@ -767,13 +990,39 @@ async function runSync(createCalendar) {
         // Die elf `colorId`s sind eine verlustbehaftete Abbildung des Hex-Werts -
         // ohne das Flag holte der nächste Inbound-Lauf die gemappte Farbe zurück
         // und ersetzte damit die gewählte (#899).
-        db.get().prepare(`
+        // Gebucht wird gegen den Stand NACH dem await (#1926), und zwar in dem
+        // einen Schreibvorgang selbst: Spiegel wird nur die Zeile, die die
+        // Auswahl oben JETZT noch für diesen Kalender nennte. Wer inzwischen
+        // gelöscht wurde, sein Ziel gewechselt oder es für einen lokalen
+        // Kalender aufgegeben hat, bleibt, wie er ist - gebucht verlöre er den
+        // lokalen Kalender und stünde bei Google, obwohl ihn dort niemand mehr
+        // haben will. Der gerade angelegte Termin wird dann zum Löschen
+        // vorgemerkt; die Löschroute tut das für eine lokale Zeile nicht.
+        //
+        // Wer inzwischen BEARBEITET wurde (#1932), wird Spiegel und im selben
+        // Schreibvorgang als geändert vorgemerkt: bei Google liegt der Stand,
+        // aus dem die Anfrage gebaut wurde, und eine lokale Zeile merkt in der
+        // Route nichts vor. Als sauberer Spiegel ginge die Bearbeitung nie
+        // hinaus, und der nächste Inbound überschriebe sie mit dem alten Stand.
+        // Verglichen wird wie bei CalDAV und Apple (`bookEventUpload`) über die
+        // gespiegelten Felder; zwischen Nachlesen und Schreiben liegt kein await.
+        const now    = outbound.reloadEvent(event.id);
+        const edited = now && outbound.mirroredFieldsChanged(event, now) ? 1 : 0;
+        const booked = db.get().prepare(`
           UPDATE calendar_events
-          SET external_calendar_id = ?, external_source = 'google', calendar_ref_id = ?,
-              color_modified = CASE WHEN color IS NOT NULL THEN 1 ELSE color_modified END
-          WHERE id = ?
-        `).run(created.data.id, calRefId, event.id);
+          SET external_calendar_id = ?, external_source = 'google', local_calendar_id = NULL, calendar_ref_id = ?,
+              color_modified = CASE WHEN color IS NOT NULL THEN 1 ELSE color_modified END,
+              outbound_dirty = CASE WHEN ? = 1 THEN 1 ELSE outbound_dirty END,
+              outbound_attempts = CASE WHEN ? = 1 THEN 0 ELSE outbound_attempts END,
+              outbound_snapshot = ?
+          WHERE id = ? AND external_source = 'local' AND target_google_calendar_id = ?
+        `).run(created.data.id, calRefId, edited, edited, snapshot, event.id, targetId).changes > 0;
+        if (!booked) {
+          outbound.queueDeletion({ source: 'google', calendarExternalId: targetId, eventExternalId: created.data.id });
+          log.info(`Event ${event.id} stopped waiting for its upload to ${targetId} while it was in flight, queued the deletion of the created entry.`);
+        }
       } catch (err) {
+        passOnRefusal(err);
         log.error(`Outbound error for event ${event.id}:`, err.message);
       }
     }
@@ -836,6 +1085,7 @@ async function fetchEventColorMap(calendar) {
     _eventColorCache = { map, ts: Date.now() };
     return map;
   } catch (err) {
+    passOnRefusal(err);
     log.warn('Event color palette not available:', err.message);
     return _eventColorCache?.map || {};
   }
@@ -959,24 +1209,11 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
       if (master && date) insException.run(master.id, date);
     }
 
-    const allDay      = !!(item.start?.date && !item.start?.dateTime);
-    const startDt     = allDay ? item.start.date : (item.start?.dateTime || item.start?.date);
-    const endDt       = allDay
-      ? googleAllDayEndToInclusive(item.end?.date)
-      : (item.end?.dateTime || item.end?.date || null);
-    // Zeitzone der Serie (#829). Google liefert die IANA-Zone neben der Zeit;
-    // ohne sie wiederholt die Expansion den festen Offset des ersten Vorkommens
-    // und die Serie driftet über die Sommer-/Winterzeit-Grenze um eine Stunde -
-    // derselbe Fehler, der für CalDAV/Apple schon als #549 behoben wurde, nur
-    // hier nie nachgezogen. Ganztags-Termine tragen keine Zone.
-    const tzid        = allDay ? null : (item.start?.timeZone || calTimeZone || null);
+    const incoming    = inboundFields(item, calTimeZone);
+    let { allDay, startDt, endDt, tzid, rrule } = incoming;
     const title       = item.summary || '(kein Titel)';
     const description = item.description || null;
     const location    = item.location    || null;
-    // recurrence ist eine Liste von RFC-5545-Zeilen und enthält neben der RRULE
-    // auch EXDATE/RDATE. Gezielt die RRULE greifen statt blind die erste Zeile -
-    // steht ein EXDATE vorn, landete es sonst als Wiederholungsregel in der DB.
-    const rrule       = recurrenceRuleOf(item);
 
     // NUR die Eigenfarbe des Termins, aufgelöst aus Googles colorId (die API
     // liefert die Paletten-ID, nicht den Hex-Wert). Die Kalenderfarbe gehört
@@ -990,9 +1227,11 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
     // eigene Farbe folgerichtig keine colorId zurück.
     const evColor = (item.colorId && colorMap[item.colorId]) || null;
 
-    const existing = db.get().prepare(
-      'SELECT id, outbound_dirty, calendar_ref_id, start_datetime FROM calendar_events WHERE external_calendar_id = ? AND external_source = ?'
-    ).get(item.id, 'google');
+    const existing = db.get().prepare(`
+      SELECT id, outbound_dirty, calendar_ref_id, start_datetime, end_datetime, all_day, recurrence_rule, tzid,
+             series_authored, outbound_snapshot
+      FROM calendar_events WHERE external_calendar_id = ? AND external_source = ?
+    `).get(item.id, 'google');
 
     // Eine lokale Bearbeitung, die noch auf ihren Push wartet, darf der Inbound
     // nicht mit dem alten Google-Stand überschreiben (#593). Der Push kommt im
@@ -1016,15 +1255,34 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
       // muss; die Farbspalte wiederholt ihren SET-Ausdruck, damit eine lokale
       // Umfärbung (color_modified) nicht als Unterschied zählt. Die Bindings der
       // SET-Liste kommen dafür ein zweites Mal.
+      //
+      // DIE MARKE `series_authored` (#1935) faellt, wenn hier ein anderer Start
+      // oder eine andere Regel in die Zeile kommt, als dort stand - auch der
+      // ausgerichtete Start, den Yuvomi selbst hinaufgegeben hat
+      // (services/outbound-dtstart.js). Geschrieben wird wie bisher.
+      //
+      // DAS ECHO DES EIGENEN PUSHS (#1956, services/outbound-echo.js): liefert
+      // Google genau das zurueck, was der letzte ausgerichtete Push gesendet
+      // hat, und hat sich die Zeile seitdem nicht geaendert, bleiben Start,
+      // Ende, ganztaegig, Regel und Zone wie eingegeben, die Marke bleibt und
+      // die Erinnerungen wandern nicht. Die anderen Felder nimmt der Abruf.
+      const echo = isEcho(existing, googleReading(incoming));
+      if (echo) {
+        ({ start_datetime: startDt, end_datetime: endDt, recurrence_rule: rrule, tzid } = existing);
+        allDay = !!existing.all_day;
+      }
+      const authored = echo
+        ? existing.series_authored
+        : authoredAfterInbound(existing, { start_datetime: startDt, recurrence_rule: rrule });
       const values = [
-        title, description, startDt, endDt, allDay ? 1 : 0, location, rrule, tzid, evColor, calRefId,
+        title, description, startDt, endDt, allDay ? 1 : 0, location, rrule, tzid, evColor, calRefId, authored,
       ];
       db.get().prepare(`
         UPDATE calendar_events
         SET title = ?, description = ?, start_datetime = ?, end_datetime = ?,
             all_day = ?, location = ?, recurrence_rule = ?, tzid = ?,
             color = CASE WHEN color_modified = 0 THEN ? ELSE color END,
-            calendar_ref_id = ?
+            calendar_ref_id = ?, series_authored = ?
         WHERE id = ?
           AND (   title           IS NOT ?
                OR description     IS NOT ?
@@ -1036,6 +1294,7 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
                OR tzid            IS NOT ?
                OR color           IS NOT CASE WHEN color_modified = 0 THEN ? ELSE color END
                OR calendar_ref_id IS NOT ?
+               OR series_authored IS NOT ?
               )
       `).run(...values, existing.id, ...values);
       // In Google verschoben (#1377): die Erinnerungen ziehen mit.
@@ -1158,6 +1417,33 @@ function retireLegacyInstances(masterExternalId, seen) {
   }
 }
 
+/**
+ * Start, Ende, ganztaegig, Zone und Regel, wie sie der Abruf aus einem
+ * Google-Eintrag in die Zeile schreibt. EINE Stelle, weil der Sende-
+ * Schnappschuss (#1956) dieselbe Lesart auf den gesendeten Body anwendet.
+ *
+ * @param {object} item         Google-Eintrag (oder gesendeter Body)
+ * @param {string|null} calTimeZone  Zone des Kalenders, falls der Eintrag keine nennt
+ */
+function inboundFields(item, calTimeZone) {
+  const allDay  = !!(item.start?.date && !item.start?.dateTime);
+  const startDt = allDay ? item.start.date : (item.start?.dateTime || item.start?.date);
+  const endDt   = allDay
+    ? googleAllDayEndToInclusive(item.end?.date)
+    : (item.end?.dateTime || item.end?.date || null);
+  // Zeitzone der Serie (#829). Google liefert die IANA-Zone neben der Zeit;
+  // ohne sie wiederholt die Expansion den festen Offset des ersten Vorkommens
+  // und die Serie driftet über die Sommer-/Winterzeit-Grenze um eine Stunde -
+  // derselbe Fehler, der für CalDAV/Apple schon als #549 behoben wurde, nur
+  // hier nie nachgezogen. Ganztags-Termine tragen keine Zone.
+  const tzid    = allDay ? null : (item.start?.timeZone || calTimeZone || null);
+  // recurrence ist eine Liste von RFC-5545-Zeilen und enthält neben der RRULE
+  // auch EXDATE/RDATE. Gezielt die RRULE greifen statt blind die erste Zeile -
+  // steht ein EXDATE vorn, landete es sonst als Wiederholungsregel in der DB.
+  const rrule   = recurrenceRuleOf(item);
+  return { allDay, startDt, endDt, tzid, rrule };
+}
+
 // Yuvomi speichert getimte Events als "YYYY-MM-DDTHH:MM" (ohne Sekunden,
 // siehe validate.js). Die Google Calendar API verlangt RFC 3339 mit
 // Sekunden, sonst "Bad Request" bzw. bei Wiederholungen "Invalid
@@ -1168,20 +1454,47 @@ function toRfc3339(dt) {
 }
 
 // RFC 5545: Der Werttyp von UNTIL muss dem von DTSTART entsprechen.
-// buildRRule liefert UNTIL immer als DATE-TIME (YYYYMMDDTHHMMSSZ).
 //   - all-day-Events (start.date):    UNTIL muss DATE sein (YYYYMMDD)
 //   - getimte Events (start.dateTime): UNTIL muss UTC DATE-TIME sein
 // Andernfalls lehnt Google die Recurrence ab ("Invalid recurrence rule").
-function normalizeRecurrenceUntil(rule, allDay) {
+//
+// EIN REINES DATUM AN EINER GETIMTEN SERIE IST DAS ENDE EINES ORTSTAGS (#1974).
+// Google rechnet die Vorkommen in der mitgesendeten `timeZone` und vergleicht
+// sie mit einem UTC-Zeitpunkt; die Grenze ist deshalb das Ende des UNTIL-Tags in
+// `timeZone` (`localDayEndUtc`, utils/rrule-until.js - dort auch, warum nicht
+// 23:59:59 als Wanduhr).
+//
+// TRAEGT DIE SERIE EINE EIGENE ZONE, IST ES DIE IHRE (Review zu #1989). Yuvomi
+// expandiert eine Serie mit `tzid` in dieser Zone, auch wenn `timeZone` die
+// Haushaltszone ist: eine Serie aus Los Angeles in einem Berliner Haushalt
+// endete bei Google sonst am Berliner Tagesende, ein Vorkommen zu frueh.
+//
+// EINE UHRZEIT OHNE ZONE IST EINE ORTSZEIT (#1974). Yuvomi liest sie in der
+// Zone der Serie (`untilInstantMs`, services/recurrence.js). Hier bekam sie
+// bisher ein `Z` angehaengt und wurde damit zu einem anderen Zeitpunkt -
+// westlich von UTC frueher, oestlich spaeter. Ohne eigene Zone hat sie fuer
+// Yuvomi keinen Zeitpunkt, und es bleibt beim Tag (`nextOccurrence`): dann
+// geht wie bei einem reinen Datum das Ende dieses Ortstags hinaus.
+function normalizeRecurrenceUntil(rule, allDay, timeZone, seriesZone = null) {
+  const ownZone = isValidTimeZone(seriesZone) ? seriesZone : null;
   return rule.split(';').map((segment) => {
     const eq = segment.indexOf('=');
     if (eq === -1) return segment;
     if (segment.slice(0, eq).toUpperCase() !== 'UNTIL') return segment;
-    const digits   = segment.slice(eq + 1).replace(/\D/g, '');
+    const raw      = segment.slice(eq + 1).trim();
+    const digits   = raw.replace(/\D/g, '');
     const datePart = digits.slice(0, 8);
     if (allDay) return `UNTIL=${datePart}`;
-    const timePart = digits.length > 8 ? digits.slice(8, 14).padEnd(6, '0') : '235959';
-    return `UNTIL=${datePart}T${timePart}Z`;
+    if (digits.length > 8) {
+      const time = digits.slice(8, 14).padEnd(6, '0');
+      if (/Z$/i.test(raw)) return `UNTIL=${datePart}T${time}Z`;
+      if (!ownZone) return `UNTIL=${localDayEndUtc(datePart, timeZone)}`;
+      const wall = `${datePart.slice(0, 4)}-${datePart.slice(4, 6)}-${datePart.slice(6, 8)}`
+        + `T${time.slice(0, 2)}:${time.slice(2, 4)}:${time.slice(4, 6)}`;
+      const ms = Date.parse(localToUTCPrecise(wall, ownZone));
+      return Number.isFinite(ms) ? `UNTIL=${utcStamp(ms)}` : `UNTIL=${datePart}T${time}Z`;
+    }
+    return `UNTIL=${localDayEndUtc(datePart, ownZone ?? timeZone)}`;
   }).join(';');
 }
 
@@ -1220,10 +1533,31 @@ function outboundTimeZone(calendarTimeZone) {
  *                             (siehe outboundTimeZone()).
  */
 function localEventToGoogle(rawEvent, colorMap = {}, timeZone = outboundTimeZone(null)) {
+  return buildGoogleRequest(rawEvent, colorMap, timeZone).body;
+}
+
+/**
+ * Der Google-Body UND sein Sende-Schnappschuss (#1956, services/outbound-echo.js).
+ *
+ * Der Schnappschuss ist das, was der Abruf aus genau diesem Body lesen wuerde
+ * (`inboundFields`), dazu der Zeilenstand, aus dem er entstand - und null,
+ * wenn das Ausrichten den Start nicht verschoben hat.
+ *
+ * @returns {{ body: object, snapshot: string|null }}
+ */
+function buildGoogleRequest(rawEvent, colorMap = {}, timeZone = outboundTimeZone(null)) {
+  const body = googleBody(rawEvent, colorMap, timeZone);
+  const aligned = alignmentMoved(rawEvent, { zone: timeZone, householdZone: householdTimeZone(db.get()) });
+  return { body, snapshot: sentSnapshot(rawEvent, googleReading(inboundFields(body, null)), { aligned }) };
+}
+
+function googleBody(rawEvent, colorMap, timeZone) {
   // Start und Ende mit der eigenen Wiederholungsregel in Einklang (#986), bevor
   // irgendein Feld daraus abgeleitet wird - ein importiertes DTSTART bleibt
   // unberuehrt (#756). Begruendung in services/outbound-dtstart.js.
-  const event = outboundEvent(rawEvent);
+  // Ausgerichtet wird in der Zone, die unten als `timeZone` hinausgeht: in
+  // ihr rechnet Google die Vorkommen, nicht in der `tzid` der Zeile (#1935).
+  const event = outboundEvent(rawEvent, { zone: timeZone, householdZone: householdTimeZone(db.get()) });
   const allDay = !!event.all_day;
   const gEvent = {
     summary:     event.title,
@@ -1280,7 +1614,7 @@ function localEventToGoogle(rawEvent, colorMap = {}, timeZone = outboundTimeZone
   }
 
   if (event.recurrence_rule) {
-    gEvent.recurrence = [`RRULE:${normalizeRecurrenceUntil(rruleValue(event.recurrence_rule), allDay)}`];
+    gEvent.recurrence = [`RRULE:${normalizeRecurrenceUntil(rruleValue(event.recurrence_rule), allDay, timeZone, event.tzid)}`];
   }
 
   return gEvent;
@@ -1289,10 +1623,12 @@ function localEventToGoogle(rawEvent, colorMap = {}, timeZone = outboundTimeZone
 export { getAuthUrl, handleCallback, getStatus, disconnect, clearMirroredEvents, sync,
          listCalendars, listSelection, setCalendarEnabled, setReadonly, flushOutbound };
 export const __test = {
-  localEventToGoogle, googleAllDayEndToInclusive, localAllDayEndToExclusive,
+  localEventToGoogle, buildGoogleRequest, googleAllDayEndToInclusive, localAllDayEndToExclusive,
   upsertGoogleEvents, upsertExternalCalendar, setReadonly, isReadonly, isWritableRole,
   listSelection, setCalendarEnabled, recordSyncToken, getSyncToken, enabledCalendarIds,
   fetchEventColorMap, householdTimeZone, outboundTimeZone,
+  loadAuthorizedClient, isInvalidGrant,
+  needsReauth,
   processPendingDeletions, pendingDeletionCount,
   processPendingUpdates, pendingUpdateCount,
   googleCalendarIdForEvent, currentGoogleCalendarId, loadCalendarMeta,

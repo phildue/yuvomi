@@ -56,6 +56,18 @@ export function formatMoneyAxis(amount, currency) {
 }
 
 /**
+ * Anteil einer Zeile an der Gesamtsumme als Prozenttext in der Zahlenform der
+ * Region. Unter einem halben Prozent steht "<1 %" statt "0 %": eine Zeile mit
+ * Betrag hat einen Anteil. Der Text kann "<" enthalten und gehoert escaped.
+ */
+export function sharePercent(part, total) {
+  const sum = Math.abs(Number(total)) || 0;
+  const share = sum > 0 ? Math.abs(Number(part) || 0) / sum : 0;
+  const fmt = getNumberFormat({ style: 'percent', maximumFractionDigits: 0 });
+  return share > 0 && share < 0.005 ? `<${fmt.format(0.01)}` : fmt.format(share);
+}
+
+/**
  * Nachkommastellen einer Währung: EUR 2, JPY/HUF/VND 0, KWD/BHD 3.
  * Fällt bei fehlendem oder ungültigem ISO-Code auf zwei zurück.
  */
@@ -66,6 +78,25 @@ export function currencyFractionDigits(currency) {
   } catch {
     return 2;
   }
+}
+
+/**
+ * Ein Betrag, gerundet auf die Nachkommastellen seiner Währung - fuer
+ * VERGLEICHE, nicht zum Speichern (Critique R19, 2026-10-16).
+ *
+ * Eine Differenz zweier Summen ist ein Float: 1700,10 - 1700,00 ergibt
+ * 0,0999999…, und 300,30 - 300,20 - 0,10 ergibt 2,8e-14 statt 0. Wer darauf
+ * `delta === 0` fragt, bekommt "nein" und zeichnet einen steigenden roten
+ * Pfeil neben "0,00 €". Vor dem Vergleich auf die Waehrung runden; aus -0
+ * wird 0, damit kein Vorzeichen uebrig bleibt.
+ *
+ * @param {number} amount
+ * @param {string} currency ISO-Code
+ * @returns {number}
+ */
+export function roundToCurrency(amount, currency) {
+  const factor = 10 ** currencyFractionDigits(currency);
+  return (Math.round(Number(amount) * factor) / factor) || 0;
 }
 
 /**

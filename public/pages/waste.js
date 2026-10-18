@@ -15,7 +15,7 @@ import { api } from '/api.js';
 import { t, formatDate, getLocale } from '/i18n.js';
 import { esc, REQUIRED_MARK } from '/utils/html.js';
 import { todayKey, addLocalDays, parseLocalDateKey, toLocalDateKey } from '/utils/date.js';
-import { openModal, closeModal, confirmModal, confirmOverModal, btnLoading, refocusAfterRender } from '/components/modal.js';
+import { openModal, closeModal, confirmModal, confirmOverModal, btnLoading, refocusAfterRender, reportFieldError } from '/components/modal.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
 import { emptyStateHTML, mountLoadError } from '/utils/empty-state.js';
 import {
@@ -29,6 +29,8 @@ import { createPageController } from '/utils/page-lifecycle.js';
 import { USER_COLORS } from '/utils/color.js';
 import { redrawList } from '/utils/list-motion.js';
 import { daysBetweenDateKeys, countdownPhrase } from '/utils/countdown.js';
+import { errorSentence, isGone, isAlreadyDeleted } from '/utils/friendly-error.js';
+import { maxUploadBytes, maxUploadMb } from '/utils/upload-limit.js';
 
 const UPCOMING_WINDOW_DAYS = 90;
 const WEEKDAY_CODES = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
@@ -489,6 +491,55 @@ function typeWithoutScheduleLine(typeId, occurrences = state.occurrences) {
   return next ? `${t('waste.nextPickupLabel')}: ${pickupWhenLabel(next.date_key)}` : t('waste.noSchedulesYet');
 }
 
+/**
+ * "Noch kein Termin" MIT DEM WEG DORTHIN (R20, Re-Critique 2026-10-17 a2
+ * P2-5). Die Zeile sagte, was fehlt, und der Weg lag im "..." der Karte. Jetzt
+ * steht "Termin hinzufuegen" daneben - derselbe `add-schedule` wie im Menue.
+ * Nicht bei einer archivierten Abfallart (sie nimmt keine Termine an) und nicht
+ * bei `read`; und nicht, wenn eine Einzelabholung schon die naechste nennt.
+ */
+function typeWithoutScheduleHtml(type, ro = readOnly()) {
+  const line = typeWithoutScheduleLine(type.id);
+  const offer = !ro && !type.archived && !state.occurrences.some((occ) => occ.type_id === type.id);
+  if (!offer) return `<p class="waste-schedule-list__empty">${esc(line)}</p>`;
+  return `<div class="waste-schedule-list__empty waste-schedule-list__empty--action"><span>${esc(line)}</span>`
+    + `<button type="button" class="btn btn--secondary btn--sm" data-action="add-schedule" data-type-id="${type.id}"><i data-lucide="plus" aria-hidden="true"></i>${esc(t('waste.addSchedule'))}</button></div>`;
+}
+
+/**
+ * Die Vorlagen, die der Haushalt noch nicht hat (R20). Im Onboarding standen
+ * sechs Chips, nach der ersten Abfallart keiner mehr - wer Bio und Papier
+ * auch braucht, musste in den Dialog. Jetzt bleiben die uebrigen als leise
+ * Zeile unter den Karten.
+ *
+ * VORHANDEN HEISST: gleicher Name in der eigenen Sprache (ohne Gross/klein)
+ * ODER Symbol und Farbe der Vorlage. Der Name allein reicht nicht, weil die
+ * Vorlage ihn in der Sprache dessen anlegt, der getippt hat: legt ein
+ * Mitglied auf Deutsch "Bioabfall" an, bot die Zeile einem englischen
+ * Mitglied "Organic" erneut an, und ein Tipp legte die Dublette an
+ * (Codex-Review PR #2053). Symbol und Farbe schreibt die Vorlage in jeder
+ * Sprache gleich, und jede Vorlage traegt ein eigenes Symbol. Eine eigene
+ * Art trifft das Paar nur, wenn sie Symbol UND Farbe der Vorlage waehlt - dann
+ * ist sie diese Vorlage; ein Import landet auf `DEFAULT_TYPE_COLOR` (#22C55E),
+ * keiner Vorlagenfarbe. Ohne Schemaaenderung, ohne alle Sprachdateien zu laden.
+ */
+function remainingTypePresets(types = state.types) {
+  const names = new Set(types.map((type) => String(type.name ?? '').trim().toLowerCase()));
+  const looks = new Set(types.map((type) => `${type.icon ?? ''}|${String(type.color ?? '').toUpperCase()}`));
+  return TYPE_PRESETS.filter((preset) => !names.has(presetLabel(preset).trim().toLowerCase())
+    && !looks.has(`${preset.icon}|${preset.color.toUpperCase()}`));
+}
+
+function remainingPresetsHtml() {
+  if (readOnly()) return '';
+  const presets = remainingTypePresets();
+  if (!presets.length) return '';
+  return `<div class="waste-type-presets-more" role="group" aria-label="${esc(t('waste.typePresetLabel'))}">`
+    + presets.map((preset) => `<button type="button" class="filter-chip waste-onboarding__preset" data-action="create-preset-type" data-preset="${preset.key}">`
+      + `<i data-lucide="${esc(preset.icon)}" style="color:${esc(preset.color)}" aria-hidden="true"></i><span>${esc(presetLabel(preset))}</span></button>`).join('')
+    + '</div>';
+}
+
 function typeCardHtml(type, index, total) {
   const schedules = schedulesForType(type.id);
   const ro = readOnly();
@@ -529,7 +580,7 @@ function typeCardHtml(type, index, total) {
           </div>`}
       </div>
       <div class="waste-schedule-list">
-        ${schedules.length ? schedules.map(scheduleRowHtml).join('') : `<p class="waste-schedule-list__empty">${esc(typeWithoutScheduleLine(type.id))}</p>`}
+        ${schedules.length ? schedules.map(scheduleRowHtml).join('') : typeWithoutScheduleHtml(type, ro)}
       </div>
     </div>`;
 }
@@ -638,7 +689,7 @@ async function createPresetType(key, button) {
     window.yuvomi?.showToast(t('waste.typeSavedToast'), 'success');
   } catch (err) {
     if (button) button.disabled = false;
-    window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+    reportError(err);
   }
 }
 
@@ -653,6 +704,12 @@ async function createPresetType(key, button) {
  */
 function pageModeClasses(s) {
   return {
+    // WAEHREND DES LADENS STEHT DIE SEITENSPALTE NICHT DA (R20, Re-Critique
+    // 2026-10-17 a2 P2-3: CLS mobil 0,24-0,42). Ihr Skelett stand unter dem
+    // der Abholungen und sprang nach dem Laden nach oben (Onboarding: die
+    // Abholungen fallen weg) oder schrumpfte (mit Daten). Sie erscheint jetzt
+    // mit ihrem Inhalt - Erscheinen verschiebt nichts (waste.css).
+    'waste-page--loading': Boolean(s.loading),
     'waste-page--onboarding': isOnboarding(s),
     'waste-page--no-active-type': fabIntent(s).creates === 'type',
   };
@@ -698,7 +755,8 @@ function drawTypes(host) {
     return;
   }
   host.replaceChildren();
-  host.insertAdjacentHTML('beforeend', state.types.map((type, index) => typeCardHtml(type, index, state.types.length)).join(''));
+  host.insertAdjacentHTML('beforeend', state.types.map((type, index) => typeCardHtml(type, index, state.types.length)).join('')
+    + remainingPresetsHtml());
   if (window.lucide) window.lucide.createIcons({ el: host });
 }
 
@@ -815,6 +873,109 @@ async function reloadAndRender() {
 }
 
 /**
+ * EIN WEG FUER DIE FEHLER-TOASTS DER SEITE (#1909).
+ *
+ * Der Toast sagt den Satz der App (`errorSentence`): den des Falls, den der
+ * Server mit `reason` nennt, sonst den allgemeinen. Der Text des Servers kommt
+ * hier nie an. Sagt der Grund, dass es das Ziel der Handlung nicht mehr gibt
+ * (jemand anderes im Haushalt hat die Abfallart, den Termin, die Abholung oder
+ * die Quelle geloescht oder den Termin geaendert), ist der Stand der Seite
+ * veraltet - sie holt ihn dann selbst neu, statt dazu zu raten.
+ *
+ * Die Assistenten (Import, Quelle mit Adresse) zeigen ihren Fehler im Dialog
+ * statt im Toast und fragen `errorSentence` dafuer selbst; "gibt es nicht mehr"
+ * geben auch sie hierher. Wo nur die GEWAEHLTE Abfallart fehlt, bleibt der
+ * Dialog offen: `keepDialogForMissingType` und seine beiden Geschwister.
+ *
+ * @param {unknown} err
+ * @param {string} [fallbackKey] - der allgemeine Satz der Stelle
+ */
+function reportError(err, fallbackKey) {
+  window.yuvomi?.showToast(errorSentence(err, fallbackKey), 'danger');
+  if (isGone(err)) reloadAfterGone();
+}
+
+/**
+ * Nachladen nach "gibt es nicht mehr". Ein offener Dialog geht zu: er
+ * bearbeitet etwas, das es nicht mehr gibt, oder bietet eine Abfallart zur
+ * Wahl an, die fehlt. Der Weg ist derselbe `reloadAndRender()` wie nach jedem
+ * Speichern; er meldet seine eigenen Fehler nirgends, ein scheiterndes
+ * Nachladen kann also kein weiteres ausloesen.
+ */
+async function reloadAfterGone() {
+  await closeModal({ force: true });
+  await reloadAndRender();
+  refocusAfterRender();
+}
+
+/** Der Grund "die im Formular gewaehlte Abfallart gibt es nicht mehr". */
+const SELECTED_TYPE_GONE = 'waste_selected_type_not_found';
+
+function isSelectedTypeGone(err) {
+  return isGone(err) && err.data.reason === SELECTED_TYPE_GONE;
+}
+
+/** Die Optionen einer Abfallart-Auswahl: die aktiven, dazu `keepArchivedId`, wenn die Auswahl eine archivierte schon traegt. */
+function typeOptionsHtml(selectedId = null, keepArchivedId = null) {
+  return state.types.filter((t2) => !t2.archived || t2.id === keepArchivedId)
+    .map((t2) => `<option value="${t2.id}"${selectedId === t2.id ? ' selected' : ''}>${esc(t2.name)}</option>`).join('');
+}
+
+/**
+ * Baut eine Abfallart-Auswahl aus dem frischen Bestand neu. Gibt es die
+ * gewaehlte Art nicht mehr, steht danach KEINE andere an ihrer Stelle: eine
+ * leere Aufforderung ("Abfallart waehlen"), an der Speichern haelt - sonst
+ * laege der Termin nach einem zweiten Druck auf Speichern still bei der Art,
+ * die zufaellig als erste in der Liste steht.
+ */
+function refillTypeSelect(select, keepArchivedId = null) {
+  const chosen = Number(select.value);
+  const stillThere = state.types.some((t2) => t2.id === chosen && (!t2.archived || t2.id === keepArchivedId));
+  select.replaceChildren();
+  select.insertAdjacentHTML('beforeend',
+    (stillThere ? '' : `<option value="" disabled selected>${esc(t('waste.typeSelectPlaceholder'))}</option>`)
+    + typeOptionsHtml(stillThere ? chosen : null, keepArchivedId));
+  if (stillThere) select.removeAttribute('aria-invalid');
+  else select.setAttribute('aria-invalid', 'true');
+}
+
+/**
+ * SPEICHERN SCHEITERT NUR AN DER GEWAEHLTEN ABFALLART (#1909): jemand anderes
+ * im Haushalt hat sie geloescht, waehrend der Dialog offen war. Der Dialog
+ * bleibt, die Eingaben bleiben; die Seite holt den frischen Stand, die Auswahl
+ * zeigt ihn, und der Fokus steht auf ihr. Der Satz sagt, was los ist.
+ *
+ * Ohne Auswahl im Dialog (ein Termin, der aus der Zeile SEINER Abfallart
+ * angelegt wird) ist das kein Fall fuer hier: dann fehlt, worum der Dialog
+ * geht, und `reportError` schliesst ihn wie bisher.
+ *
+ * @returns {Promise<boolean>} true: behandelt, der Aufrufer meldet nichts mehr
+ */
+async function keepDialogForMissingType(err, select, keepArchivedId = null) {
+  if (!select || !isSelectedTypeGone(err)) return false;
+  window.yuvomi?.showToast(errorSentence(err), 'danger');
+  await reloadAndRender();
+  refillTypeSelect(select, keepArchivedId);
+  select.focus();
+  return true;
+}
+
+/**
+ * LOESCHEN, auch wenn es schon erledigt ist (#1909): wer etwas loescht, das
+ * ein anderes Haushaltsmitglied schon geloescht hat, bekommt "gibt es nicht
+ * mehr" - und hat damit, was er wollte. Der Aufrufer laeuft dann seinen
+ * Erfolgsweg (Dialog zu, nachladen, Erfolgs-Toast). Nur der Grund des Dings
+ * selbst zaehlt (`isAlreadyDeleted`); alles andere bleibt ein Fehler.
+ */
+async function deleteOrAlreadyGone(path, goneReason) {
+  try {
+    await api.delete(path);
+  } catch (err) {
+    if (!isAlreadyDeleted(err, goneReason)) throw err;
+  }
+}
+
+/**
  * Reorders by swapping sort_order with the adjacent type - no drag library
  * needed, and this is never the only path to reordering (up/down buttons are
  * themselves the keyboard-operable path, matching category-manager.js's
@@ -831,7 +992,7 @@ async function moveType(id, direction) {
     await api.put(`/waste/types/${b.id}`, { sort_order: a.sort_order });
     await reloadAndRender();
   } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+    reportError(err);
   }
 }
 
@@ -896,7 +1057,7 @@ async function pickTypeIcon(button) {
   const hidden = form?.querySelector('input[name="icon"]');
   if (!hidden) return;
   const { openIconPicker } = await import('/components/icon-picker.js');
-  const chosen = await openIconPicker(hidden.value || null, { suggestions: TYPE_ICON_SUGGESTIONS });
+  const chosen = await openIconPicker(hidden.value || null, { suggestions: TYPE_ICON_SUGGESTIONS, owner: button });
   if (chosen === undefined) return;
   hidden.value = chosen ?? '';
   setTypeIconButtonIcon(button, chosen);
@@ -1079,7 +1240,7 @@ function openTypeModal(type = null) {
           refocusAfterRender();
           window.yuvomi?.showToast(type.archived ? t('waste.typeRestoredToast') : t('waste.typeArchivedToast'), 'success');
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+          reportError(err);
         }
       });
 
@@ -1087,13 +1248,13 @@ function openTypeModal(type = null) {
         const ok = await confirmOverModal(t('waste.typeDeleteConfirm'), { danger: true, confirmLabel: t('common.delete'), detail: t('waste.typeDeleteConfirmDetail') });
         if (!ok) return;
         try {
-          await api.delete(`/waste/types/${type.id}`);
+          await deleteOrAlreadyGone(`/waste/types/${type.id}`, 'waste_type_not_found');
           closeModal({ force: true });
           await reloadAndRender();
           refocusAfterRender();
           window.yuvomi?.showToast(t('waste.typeDeletedToast'), 'success');
         } catch (err) {
-          window.yuvomi?.showToast(err.status === 409 ? t('waste.typeDeleteRefused') : (err.data?.error ?? t('common.unknownError')), 'danger');
+          reportError(err);
         }
       });
 
@@ -1116,7 +1277,7 @@ function openTypeModal(type = null) {
           refocusAfterRender();
           window.yuvomi?.showToast(t('waste.typeSavedToast'), 'success');
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+          reportError(err);
         }
       });
     },
@@ -1132,6 +1293,46 @@ function openTypeModal(type = null) {
  * in einer benannten Gruppe; der gewaehlte Stand steht zusaetzlich in einem
  * versteckten Feld, damit der Verwerfen-Schutz des Dialogs die Aenderung sieht.
  * `weekdayPickerValue()` liest die Chips, `wireWeekdayPicker()` schaltet sie. */
+/**
+ * "ALLE N WOCHEN" ALS STEPPER (R20, Re-Critique 2026-10-17 a2 P3). Ein nacktes
+ * Zahlenfeld verlangte fuer "alle 2 Wochen" die Tastatur; die Werte sind fast
+ * immer 1, 2 oder 4. Das Feld bleibt das native `<input type="number">` (sein
+ * `<label for>`, Tastatur und Pfeiltasten wie gehabt), links und rechts ein
+ * Knopf, der um eins schreibt und `input` meldet - der Dialog liest weiter
+ * `#wsm-interval`. An den Grenzen (1, 52) ist der Knopf `disabled`: hier ist
+ * das die Auskunft "weiter geht es nicht", kein toter Weg.
+ */
+function intervalStepperHtml(value) {
+  const v = Math.min(52, Math.max(1, Number(value) || 1));
+  return `<div class="waste-interval-stepper">`
+    + `<button type="button" class="btn btn--secondary btn--icon" data-interval-step="-1" aria-controls="wsm-interval" aria-label="${esc(t('waste.intervalDecrease'))}"${v <= 1 ? ' disabled' : ''}><i data-lucide="minus" class="icon-md" aria-hidden="true"></i></button>`
+    + `<input type="number" class="form-input waste-interval-stepper__input" id="wsm-interval" min="1" max="52" step="1" inputmode="numeric" value="${esc(String(v))}">`
+    + `<button type="button" class="btn btn--secondary btn--icon" data-interval-step="1" aria-controls="wsm-interval" aria-label="${esc(t('waste.intervalIncrease'))}"${v >= 52 ? ' disabled' : ''}><i data-lucide="plus" class="icon-md" aria-hidden="true"></i></button>`
+    + `</div>`;
+}
+
+/** Verdrahtet den Stepper: Knopf schreibt den Wert, das Feld haelt die Knoepfe nach. */
+function wireIntervalStepper(root) {
+  const input = root.querySelector('#wsm-interval');
+  if (!input) return;
+  const buttons = [...root.querySelectorAll('[data-interval-step]')];
+  const sync = () => {
+    const v = Number(input.value) || 1;
+    for (const btn of buttons) btn.disabled = Number(btn.dataset.intervalStep) < 0 ? v <= 1 : v >= 52;
+  };
+  for (const btn of buttons) {
+    btn.addEventListener('click', () => {
+      const next = Math.min(52, Math.max(1, (Number(input.value) || 1) + Number(btn.dataset.intervalStep)));
+      input.value = String(next);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      sync();
+      // An der Grenze wird der Knopf disabled und verloere den Fokus - dann zum Feld.
+      if (btn.disabled) input.focus();
+    });
+  }
+  input.addEventListener('input', sync);
+}
+
 function weekdayPickerHtml(selected) {
   const set = new Set(String(selected ?? '').split(',').filter(Boolean));
   const chosen = WEEKDAY_CODES.filter((code) => set.has(code));
@@ -1144,6 +1345,22 @@ function weekdayPickerHtml(selected) {
 function weekdayPickerValue(root) {
   return [...root.querySelectorAll('.waste-weekday-picker [data-weekday][aria-pressed="true"]')]
     .map((el) => el.dataset.weekday);
+}
+
+/**
+ * "Mindestens ein Wochentag" an der Tagesgruppe statt im Toast (Re-Critique
+ * 2026-10-17). Die Meldung steht unter den Chips, die Gruppe beschreibt sie
+ * (aria-describedby), der Fokus geht auf den ersten Tag - der Baustein selbst
+ * faende nur das versteckte Feld. Die naechste Wahl raeumt die Meldung weg:
+ * das versteckte Feld meldet `input`, und das blubbert zur Gruppe.
+ */
+function reportWeekdaysMissing(root) {
+  const picker = root.querySelector('.waste-weekday-picker');
+  if (!picker) return false;
+  reportFieldError(picker, t('waste.errorScheduleWeekdaysRequired'), { focus: false });
+  picker.querySelector('[data-weekday]')?.focus({ preventScroll: true });
+  picker.scrollIntoView?.({ block: 'center' });
+  return false;
 }
 
 function wireWeekdayPicker(root) {
@@ -1172,8 +1389,7 @@ function openScheduleModal(type, schedule = null) {
   const typeField = pickType ? `
     <div class="form-group">
       <label class="form-label" for="wsm-type">${t('waste.typeSelectLabel')}</label>
-      <select class="form-input" id="wsm-type">${state.types.filter((t2) => !t2.archived)
-        .map((t2) => `<option value="${t2.id}"${suggested?.id === t2.id ? ' selected' : ''}>${esc(t2.name)}</option>`).join('')}</select>
+      <select class="form-input" id="wsm-type">${typeOptionsHtml(suggested?.id ?? null)}</select>
     </div>` : '';
   const kind = schedule?.recurrence_kind ?? 'weekly';
   const isOrdinal = kind === 'monthly_ordinal_weekday';
@@ -1187,7 +1403,7 @@ function openScheduleModal(type, schedule = null) {
         <option value="monthly_ordinal_weekday"${isOrdinal ? ' selected' : ''}>${t('waste.recurrenceMonthlyOrdinal')}</option>
       </select>
     </div>
-    <div class="form-group" id="wsm-weekly-fields" ${kind === 'weekly' ? '' : 'hidden'}>
+    <div class="form-group form-field" id="wsm-weekly-fields" ${kind === 'weekly' ? '' : 'hidden'}>
       <span class="form-label" id="wsm-weekdays-label">${t('waste.weekdaysLabel')}</span>
       ${weekdayPickerHtml(schedule?.weekdays)}
     </div>
@@ -1211,7 +1427,7 @@ function openScheduleModal(type, schedule = null) {
     </div>
     <div class="form-group">
       <label class="form-label" for="wsm-interval">${t('waste.intervalLabelWeekly')}</label>
-      <input type="number" class="form-input" id="wsm-interval" min="1" max="52" value="${esc(String(schedule?.interval ?? 1))}">
+      ${intervalStepperHtml(schedule?.interval ?? 1)}
     </div>
     <div class="form-group">
       <label class="form-label" for="wsm-anchor">${t('waste.anchorDateLabel')}</label>
@@ -1244,6 +1460,7 @@ function openScheduleModal(type, schedule = null) {
       panel.querySelector('#wsm-cancel').addEventListener('click', () => closeModal());
 
       wireWeekdayPicker(panel);
+      wireIntervalStepper(panel);
       const kindSelect = panel.querySelector('#wsm-kind');
       const weeklyFields = panel.querySelector('#wsm-weekly-fields');
       const monthlyFields = panel.querySelector('#wsm-monthly-fields');
@@ -1251,6 +1468,7 @@ function openScheduleModal(type, schedule = null) {
       const ordinalPositionSelect = panel.querySelector('#wsm-ordinal-position');
       const ordinalWeekdaySelect = panel.querySelector('#wsm-ordinal-weekday');
       const anchorInput = panel.querySelector('#wsm-anchor');
+      panel.querySelector('#wsm-type')?.addEventListener('change', (e) => e.target.removeAttribute('aria-invalid'));
 
       // Der Anker wird bei jeder Ordinal-/Wochentags-Aenderung neu berechnet
       // (naechstes passendes Datum ab heute, wie jeder andere "ab jetzt"-
@@ -1274,13 +1492,13 @@ function openScheduleModal(type, schedule = null) {
         const ok = await confirmOverModal(t('waste.scheduleDeleteConfirm'), { danger: true, confirmLabel: t('common.delete'), detail: t('waste.scheduleDeleteConfirmDetail') });
         if (!ok) return;
         try {
-          await api.delete(`/waste/schedules/${schedule.id}`);
+          await deleteOrAlreadyGone(`/waste/schedules/${schedule.id}`, 'waste_schedule_not_found');
           closeModal({ force: true });
           await reloadAndRender();
           refocusAfterRender();
           window.yuvomi?.showToast(t('waste.scheduleDeletedToast'), 'success');
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+          reportError(err);
         }
       });
 
@@ -1297,6 +1515,7 @@ function openScheduleModal(type, schedule = null) {
         const body = { type_id: typeId, recurrence_kind: kindValue, anchor_date: anchor, interval, valid_until: validUntil, active };
         if (kindValue === 'weekly') {
           body.weekdays = weekdayPickerValue(panel);
+          if (!body.weekdays.length) return reportWeekdaysMissing(panel);
         } else if (kindValue === 'monthly_ordinal_weekday') {
           body.month_day = Number(ordinalPositionSelect.value);
           body.weekdays = ordinalWeekdaySelect.value;
@@ -1313,7 +1532,13 @@ function openScheduleModal(type, schedule = null) {
           refocusAfterRender();
           window.yuvomi?.showToast(t('waste.scheduleSavedToast'), 'success');
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+          if (await keepDialogForMissingType(err, typeSelect)) return;
+          // Dieselbe Absage vom Server (z. B. eine aeltere Seite): ans Feld.
+          if (err?.data?.reason === 'waste_schedule_weekdays_required' && kindValue === 'weekly') {
+            reportWeekdaysMissing(panel);
+            return;
+          }
+          reportError(err);
         }
       });
     },
@@ -1326,8 +1551,9 @@ function openScheduleModal(type, schedule = null) {
 
 function openPickupModal(pickup = null) {
   const isEdit = !!pickup;
-  const typeOptions = state.types.filter((t2) => !t2.archived || (isEdit && t2.id === pickup.type_id))
-    .map((t2) => `<option value="${t2.id}"${isEdit && pickup.type_id === t2.id ? ' selected' : ''}>${esc(t2.name)}</option>`).join('');
+  // Die eigene Abfallart einer Abholung bleibt waehlbar, auch wenn sie archiviert ist.
+  const ownTypeId = isEdit ? pickup.type_id : null;
+  const typeOptions = typeOptionsHtml(ownTypeId, ownTypeId);
 
   const content = `
     <div class="form-group">
@@ -1356,18 +1582,19 @@ function openPickupModal(pickup = null) {
     size: 'sm',
     onSave(panel) {
       panel.querySelector('#wpm-cancel').addEventListener('click', () => closeModal());
+      panel.querySelector('#wpm-type').addEventListener('change', (e) => e.target.removeAttribute('aria-invalid'));
 
       panel.querySelector('#wpm-delete')?.addEventListener('click', async () => {
         const ok = await confirmOverModal(t('waste.pickupDeleteConfirm'), { danger: true, confirmLabel: t('common.delete'), detail: t('waste.pickupDeleteConfirmDetail') });
         if (!ok) return;
         try {
-          await api.delete(`/waste/pickups/${pickup.id}`);
+          await deleteOrAlreadyGone(`/waste/pickups/${pickup.id}`, 'waste_pickup_not_found');
           closeModal({ force: true });
           await reloadAndRender();
           refocusAfterRender();
           window.yuvomi?.showToast(t('waste.pickupDeletedToast'), 'success');
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+          reportError(err);
         }
       });
 
@@ -1387,7 +1614,8 @@ function openPickupModal(pickup = null) {
           refocusAfterRender();
           window.yuvomi?.showToast(t('waste.pickupSavedToast'), 'success');
         } catch (err) {
-          window.yuvomi?.showToast(err.status === 409 ? t('waste.pickupDuplicateError') : (err.data?.error ?? t('common.unknownError')), 'danger');
+          if (await keepDialogForMissingType(err, typeSelect, ownTypeId)) return;
+          reportError(err);
         }
       });
     },
@@ -1466,20 +1694,25 @@ function importDiagnosticRowHtml(diag) {
   return `<p class="waste-import-diagnostic waste-import-diagnostic--info">${esc(importDiagnosticText(diag))}</p>`;
 }
 
+/** The options of one label's decision: ignore, every type, create a new one. `decision` is `'' | '__new__' | '<type id>'`. */
+function importDecisionOptionsHtml(decision) {
+  const typeOptions = state.types.filter((t2) => !t2.archived || decision === String(t2.id))
+    .map((t2) => `<option value="${t2.id}"${decision === String(t2.id) ? ' selected' : ''}>${esc(t2.name)}</option>`).join('');
+  return `<option value=""${decision === '' ? ' selected' : ''}>${esc(t('waste.importIgnoreLabel'))}</option>
+        ${typeOptions}
+        <option value="__new__"${decision === '__new__' ? ' selected' : ''}>${esc(t('waste.importCreateNewType'))}</option>`;
+}
+
 function importLabelRowHtml(label) {
   const decision = defaultLabelDecision(label);
   // Include an archived type only when it's the remembered/suggested decision
   // itself, so a since-archived mapping still renders as a real selected
   // option instead of silently falling back to "ignore" in the live DOM.
-  const typeOptions = state.types.filter((t2) => !t2.archived || decision === String(t2.id))
-    .map((t2) => `<option value="${t2.id}"${decision === String(t2.id) ? ' selected' : ''}>${esc(t2.name)}</option>`).join('');
   return `
     <div class="waste-import-label-row" data-label="${esc(label.normalized_label)}">
       <span class="waste-import-label-row__name">${esc(label.original_label)} <span class="waste-import-label-row__count">(${label.count})</span></span>
       <select class="form-input" data-role="label-decision-type">
-        <option value=""${decision === '' ? ' selected' : ''}>${esc(t('waste.importIgnoreLabel'))}</option>
-        ${typeOptions}
-        <option value="__new__"${decision === '__new__' ? ' selected' : ''}>${esc(t('waste.importCreateNewType'))}</option>
+        ${importDecisionOptionsHtml(decision)}
       </select>
       <input type="text" class="form-input waste-import-new-type-name" data-role="label-new-type-name"
         placeholder="${esc(t('waste.typeNameLabel'))}" value="${esc(label.original_label)}"${decision === '__new__' ? '' : ' hidden'}>
@@ -1495,17 +1728,38 @@ function importPreviewStepHtml(preview) {
     : `<p>${esc(t('waste.importNoLabels'))}</p>`}`;
 }
 
-// The import refusals the server names by `reason` (routes/waste/helpers.js),
-// each with its own sentence here. The server's own sentence is English and
-// stays the fallback for everything without an entry.
-const IMPORT_REFUSALS = new Map([
-  ['preview_changed', 'waste.importPreviewChangedError'],
-  ['source_changed', 'waste.importSourceChangedError'],
-]);
-
+/**
+ * The sentence an assistant shows inside its own dialog (#1909): the app's
+ * sentence for the case the server names by `reason` - a limit with its number,
+ * a calendar that changed since the preview, a failed fetch by its class - and
+ * the general one for everything else. Never the server's text.
+ */
 function importErrorText(err) {
-  const key = IMPORT_REFUSALS.get(err?.data?.reason);
-  return key ? t(key) : (err?.data?.error ?? t('common.unknownError'));
+  return errorSentence(err, 'common.unknownError');
+}
+
+/**
+ * The import commit failed only because a label was mapped to a type somebody
+ * deleted in the meantime: the assistant stays, every decision stays, and the
+ * selects are rebuilt from the fresh types. A row whose type is gone falls
+ * back to "create a new type" - the same default the assistant gives a label
+ * it knows no type for - and gets the focus.
+ */
+async function refreshImportTypeChoices(panel) {
+  await reloadAndRender();
+  let first = null;
+  for (const row of panel.querySelectorAll('.waste-import-label-row')) {
+    const select = row.querySelector('[data-role="label-decision-type"]');
+    const chosen = select.value;
+    const isType = chosen !== '' && chosen !== '__new__';
+    const stillThere = isType && state.types.some((t2) => String(t2.id) === chosen);
+    const decision = isType && !stillThere ? '__new__' : chosen;
+    select.replaceChildren();
+    select.insertAdjacentHTML('beforeend', importDecisionOptionsHtml(decision));
+    row.querySelector('[data-role="label-new-type-name"]').hidden = decision !== '__new__';
+    if (isType && !stillThere && !first) first = select;
+  }
+  first?.focus();
 }
 
 function openImportWizard(source = null) {
@@ -1563,6 +1817,10 @@ function openImportWizard(source = null) {
         if (!isUrlSource) {
           const file = panel.querySelector('#wiz-file').files?.[0];
           if (!file) { showError(t('waste.importNoFileError')); return; }
+          // Die Grenze kennt die Seite vom Server (/version). Ohne diese Probe
+          // scheitert eine deutlich zu grosse Datei schon am Rumpf der Anfrage
+          // (413), bevor die Route ihren Grund nennen kann.
+          if (file.size > maxUploadBytes()) { showError(t('waste.errorImportTooLarge', { limit_mb: maxUploadMb() })); return; }
           try { icsText = await file.text(); } catch { showError(t('waste.importReadError')); return; }
         }
 
@@ -1584,7 +1842,9 @@ function openImportWizard(source = null) {
           panel.querySelector('#wiz-commit').hidden = false;
           if (window.lucide) window.lucide.createIcons({ el: step2 });
         } catch (err) {
-          showError(err.data?.error ?? t('common.unknownError'));
+          // Die Quelle selbst ist weg: der Assistent hat nichts mehr zu tun.
+          if (isGone(err)) { reportError(err); return; }
+          showError(importErrorText(err));
         }
       });
 
@@ -1621,6 +1881,12 @@ function openImportWizard(source = null) {
           const { added, changed, removed } = res.data.diff;
           window.yuvomi?.showToast(t('waste.importCommittedToast', { added, changed, removed }), 'success');
         } catch (err) {
+          if (isSelectedTypeGone(err)) {
+            showError(importErrorText(err));
+            await refreshImportTypeChoices(panel);
+            return;
+          }
+          if (isGone(err)) { reportError(err); return; }
           showError(importErrorText(err));
         }
       });
@@ -1657,7 +1923,7 @@ async function exportMappingProfileFile(source) {
     link.click();
     URL.revokeObjectURL(url);
   } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+    reportError(err);
   }
 }
 
@@ -1705,7 +1971,7 @@ function openMappingProfileImportModal(source) {
     try {
       preview = (await api.post(`/waste/sources/${source.id}/mapping-profile/import/preview`, { profile })).data;
     } catch (err) {
-      window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+      reportError(err);
       return;
     }
 
@@ -1740,7 +2006,7 @@ function openMappingProfileImportModal(source) {
             window.yuvomi?.showToast(t('waste.mappingProfileAppliedToast'), 'success');
           } catch (err) {
             stopLoading();
-            window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+            reportError(err);
           }
         });
       },
@@ -1767,7 +2033,7 @@ function openSourceModal(source) {
       ${isUrl && source.url ? `<p>${esc(t('waste.sourceUrlLabel'))}: ${esc(source.url)}</p>` : ''}
       ${source.coverage_start ? `<p>${esc(t('waste.sourceCoverageLabel'))}: ${esc(formatDate(source.coverage_start))} - ${esc(formatDate(source.coverage_end))}</p>` : ''}
       ${source.last_success_at ? `<p>${esc(t('waste.sourceLastImportedLabel'))}: ${esc(formatDate(source.last_success_at.slice(0, 10)))}</p>` : ''}
-      ${source.last_error ? `<p class="waste-source-detail__error">${esc(source.last_error)}</p>` : ''}
+      ${source.last_error ? `<p class="waste-source-detail__error">${esc(lastFailureSentence(source))}</p>` : ''}
       ${badge ? `<span class="waste-badge waste-badge--${badge.code}">${esc(t(badge.labelKey))}</span>` : ''}
     </div>
     <h3 class="waste-section-title u-section-title u-compact">
@@ -1807,22 +2073,24 @@ function openSourceModal(source) {
         const ok = await confirmOverModal(t('waste.sourceDeleteConfirm'), { danger: true, confirmLabel: t('common.delete'), detail: t('waste.sourceDeleteConfirmDetail') });
         if (!ok) return;
         try {
-          await api.delete(`/waste/sources/${source.id}`);
+          await deleteOrAlreadyGone(`/waste/sources/${source.id}`, 'waste_source_not_found');
           closeModal({ force: true });
           await reloadAndRender();
           refocusAfterRender();
           window.yuvomi?.showToast(t('waste.sourceDeletedToast'), 'success');
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+          reportError(err);
         }
       });
 
       panel.querySelector('#wsrc-save').addEventListener('click', async () => {
         const name = panel.querySelector('#wsrc-name').value.trim();
+        let failedMappingId = null;
         try {
           if (name && name !== source.name) await api.put(`/waste/sources/${source.id}`, { name });
           for (const row of panel.querySelectorAll('.waste-source-mapping-row')) {
             const mappingId = Number(row.dataset.mappingId);
+            failedMappingId = mappingId;
             const mapping = source.mappings.find((m) => m.id === mappingId);
             const value = row.querySelector('[data-role="mapping-type"]').value;
             const ignored = value === '';
@@ -1835,11 +2103,68 @@ function openSourceModal(source) {
           refocusAfterRender();
           window.yuvomi?.showToast(t('waste.sourceSavedToast'), 'success');
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+          if (failedMappingId !== null && await keepSourceDialogForMissingType(err, panel, source, failedMappingId)) return;
+          reportError(err);
         }
       });
     },
   });
+}
+
+/**
+ * Wie `keepDialogForMissingType`, fuer die Zuordnungen einer Quelle: eine Zeile
+ * zeigt auf eine Abfallart, die inzwischen geloescht wurde. Der Dialog bleibt,
+ * der Name im Feld bleibt. Die Zeilen werden aus der frisch gelesenen Quelle neu
+ * gebaut - was vor der gescheiterten Zeile schon gespeichert wurde, steht damit
+ * als gespeichert da, und die gescheiterte zeigt wieder ihren Stand am Server
+ * statt still auf "Ignorieren" zu fallen. Der Fokus steht auf ihrer Auswahl.
+ *
+ * @returns {Promise<boolean>} true: behandelt
+ */
+async function keepSourceDialogForMissingType(err, panel, source, mappingId) {
+  if (!isSelectedTypeGone(err)) return false;
+  window.yuvomi?.showToast(errorSentence(err), 'danger');
+  await reloadAndRender();
+  let fresh;
+  try {
+    fresh = (await api.get(`/waste/sources/${source.id}`)).data;
+  } catch (reloadErr) {
+    // Auch die Quelle ist weg (oder nicht lesbar): dann der gewohnte Weg.
+    reportError(reloadErr);
+    return true;
+  }
+  // Der Dialog vergleicht beim naechsten Speichern gegen diesen Stand.
+  source.name = fresh.name;
+  source.mappings = fresh.mappings;
+  const host = panel.querySelector('#wsrc-mappings');
+  host.replaceChildren();
+  host.insertAdjacentHTML('beforeend', fresh.mappings.map(sourceMappingRowHtml).join(''));
+  const select = host.querySelector(`[data-mapping-id="${mappingId}"] [data-role="mapping-type"]`);
+  select?.setAttribute('aria-invalid', 'true');
+  select?.focus();
+  return true;
+}
+
+/**
+ * Der Satz zu einem Abruf, der mit `outcome: 'error'` endete (#1909): der
+ * Server nennt die Klasse des Fehlschlags in derselben Antwort (`reason`, dazu
+ * `params`), die Seite sagt ihren Satz dafuer. Der gespeicherte Text der Quelle
+ * (`last_error`) kommt nicht in den Toast.
+ */
+function fetchFailureSentence(data) {
+  return errorSentence({ data: { reason: data?.reason, params: data?.params } }, 'waste.errorSourceFetch');
+}
+
+/**
+ * Der Satz zum letzten gescheiterten Abruf einer Quelle (#1909): derselbe Fall,
+ * den der Handabruf in seiner Antwort nennt, steht seit Migration 247 an der
+ * Quelle (`last_error_reason`, `last_error_params`). `last_error` selbst ist der
+ * englische Text des Servers und kommt nie in den Dialog; eine Quelle ohne
+ * gespeicherten Fall (aelter als die Migration, oder ein Fehlschlag ohne
+ * getypten Grund) bekommt den allgemeinen Satz.
+ */
+function lastFailureSentence(source) {
+  return fetchFailureSentence({ reason: source.last_error_reason, params: source.last_error_params });
 }
 
 async function loadSourceAndOpen(id) {
@@ -1847,7 +2172,7 @@ async function loadSourceAndOpen(id) {
     const res = await api.get(`/waste/sources/${id}`);
     openSourceModal(res.data);
   } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+    reportError(err);
   }
 }
 
@@ -1868,12 +2193,12 @@ async function triggerManualRefresh(id) {
     } else if (res.data.outcome === 'needs_mapping') {
       window.yuvomi?.showToast(t('waste.sourceNeedsMappingToast'), 'default');
     } else if (res.data.outcome === 'error') {
-      window.yuvomi?.showToast(res.data.source.last_error ?? t('common.unknownError'), 'danger');
+      window.yuvomi?.showToast(fetchFailureSentence(res.data), 'danger');
     } else {
       window.yuvomi?.showToast(t('waste.sourceUnchangedToast'), 'default');
     }
   } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+    reportError(err);
   }
 }
 
@@ -1881,6 +2206,13 @@ async function triggerManualRefresh(id) {
 const URL_SOURCE_MIN_INTERVAL_MINUTES = 60;
 const URL_SOURCE_MAX_INTERVAL_MINUTES = 43_200;
 const URL_SOURCE_DEFAULT_INTERVAL_MINUTES = 1440;
+
+/** Welches Feld des Dialogs ein Grund meint - dorthin geht nach dem Fehler der Fokus. */
+const URL_SOURCE_ERROR_FIELDS = new Map([
+  ['waste_source_url_invalid', '#wurl-url'],
+  ['waste_source_url_not_https', '#wurl-url'],
+  ['waste_source_interval_invalid', '#wurl-interval'],
+]);
 
 function openUrlSourceWizard() {
   const content = `
@@ -1936,11 +2268,14 @@ function openUrlSourceWizard() {
           } else if (res.data.outcome === 'needs_mapping') {
             window.yuvomi?.showToast(t('waste.sourceNeedsMappingToast'), 'default');
           } else if (res.data.outcome === 'error') {
-            window.yuvomi?.showToast(res.data.source.last_error ?? t('common.unknownError'), 'danger');
+            window.yuvomi?.showToast(fetchFailureSentence(res.data), 'danger');
           }
         } catch (err) {
           stopLoading();
-          showError(err.data?.error ?? t('common.unknownError'));
+          showError(errorSentence(err, 'common.unknownError'));
+          // Der Fokus geht an das Feld, das der Satz meint.
+          const field = URL_SOURCE_ERROR_FIELDS.get(err?.data?.reason);
+          if (field) panel.querySelector(field).focus();
         }
       });
     },
@@ -1973,7 +2308,7 @@ async function openReminderSettingsModal() {
   try {
     settings = (await api.get('/waste/reminder-settings')).data;
   } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+    reportError(err);
     return;
   }
 
@@ -2018,7 +2353,7 @@ async function openReminderSettingsModal() {
           window.yuvomi?.showToast(t('waste.reminderSettingsSavedToast'), 'success');
         } catch (err) {
           stopLoading();
-          window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+          reportError(err);
         }
       });
     },
@@ -2068,7 +2403,7 @@ async function moveOccurrence(occurrenceKey) {
           refocusAfterRender();
           window.yuvomi?.showToast(t('waste.scheduleSavedToast'), 'success');
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+          reportError(err);
         }
       });
     },
@@ -2086,7 +2421,7 @@ async function skipOccurrence(occurrenceKey) {
     refocusAfterRender();
     window.yuvomi?.showToast(t('waste.scheduleSavedToast'), 'success');
   } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+    reportError(err);
   }
 }
 
@@ -2094,11 +2429,11 @@ async function restoreOccurrence(occurrenceKey) {
   const found = findScheduleOrigin(occurrenceKey);
   if (!found) return;
   try {
-    await api.delete(`/waste/schedules/${found.scheduleId}/overrides/${found.originalDate}`);
+    await deleteOrAlreadyGone(`/waste/schedules/${found.scheduleId}/overrides/${found.originalDate}`, 'waste_override_not_found');
     await reloadAndRender();
     window.yuvomi?.showToast(t('waste.scheduleSavedToast'), 'success');
   } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+    reportError(err);
   }
 }
 
@@ -2299,12 +2634,12 @@ function bindEvents() {
       confirmModal(t('waste.scheduleDeleteConfirm'), { danger: true, confirmLabel: t('common.delete'), detail: t('waste.scheduleDeleteConfirmDetail') }).then(async (ok) => {
         if (!ok) return;
         try {
-          await api.delete(`/waste/schedules/${schedule.id}`);
+          await deleteOrAlreadyGone(`/waste/schedules/${schedule.id}`, 'waste_schedule_not_found');
           await reloadAndRender();
           refocusAfterRender();
           window.yuvomi?.showToast(t('waste.scheduleDeletedToast'), 'success');
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+          reportError(err);
         }
       });
     } else if (kind === 'move-occurrence') {
@@ -2355,7 +2690,7 @@ async function loadPickupAndEdit(id) {
     const res = await api.get(`/waste/pickups/${id}`);
     openPickupModal(res.data);
   } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+    reportError(err);
   }
 }
 
@@ -2363,12 +2698,12 @@ async function deletePickup(id) {
   const ok = await confirmModal(t('waste.pickupDeleteConfirm'), { danger: true, confirmLabel: t('common.delete'), detail: t('waste.pickupDeleteConfirmDetail') });
   if (!ok) return;
   try {
-    await api.delete(`/waste/pickups/${id}`);
+    await deleteOrAlreadyGone(`/waste/pickups/${id}`, 'waste_pickup_not_found');
     await reloadAndRender();
     refocusAfterRender();
     window.yuvomi?.showToast(t('waste.pickupDeletedToast'), 'success');
   } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+    reportError(err);
   }
 }
 
@@ -2427,6 +2762,7 @@ export async function render(container, { signal: routeSignal = null } = {}) {
   _container = container;
   state = { types: [], schedules: [], occurrences: [], sources: [], loading: true, error: null, upcomingExpanded: false };
   renderPage();
+  _container.querySelector('.waste-page')?.classList.add('waste-page--loading');
   bindEvents();
 
   await loadData();
@@ -2439,6 +2775,7 @@ export async function render(container, { signal: routeSignal = null } = {}) {
   state.loading = false;
 
   if (state.error) {
+    _container.querySelector('.waste-page')?.classList.remove('waste-page--loading');
     const host = _container.querySelector('#waste-upcoming-list');
     if (host) mountLoadError(host, { title: t('waste.loadErrorTitle'), error: state.error, onRetry: () => reloadAndRender() });
     return;
@@ -2461,7 +2798,7 @@ export const __test = {
   // steht, und welche Abfallart der Termin-Dialog des Primaerknopfs vorschlaegt.
   pickupWhenLabel, typeWithoutScheduleLine, defaultScheduleType, occurrenceRowHtml,
   // R17/E6: die Wochentage des Termin-Dialogs als Chips.
-  weekdayPickerHtml, weekdayPickerValue,
+  weekdayPickerHtml, weekdayPickerValue, intervalStepperHtml, wireIntervalStepper,
   findScheduleOrigin, parseDeepLinkParams, deepLinkSelectors, recurrenceSummary, originBadges,
   defaultLabelDecision, unresolvedBlockingDiagnostics, buildMappingDecisions, sourceHealthBadgeInfo,
   splitUpcomingByType, deepLinkNeedsExpand, nearestOrdinalAnchorDateKey,
@@ -2469,8 +2806,17 @@ export const __test = {
   // Zeilengrammatik (Audit UX 2026-09-12) tragen sie Bedingungen, die man
   // nicht mehr am Markup ablesen kann - welcher Eintrag bei welcher Position
   // im Menue steht, und dass die Preset-Farben allesamt im Raster liegen.
-  typeCardHtml, scheduleRowHtml, sourceRowHtml, TYPE_PRESETS, WASTE_TYPE_COLORS,
+  typeCardHtml, scheduleRowHtml, sourceRowHtml, TYPE_PRESETS, typeWithoutScheduleHtml, remainingTypePresets, remainingPresetsHtml, WASTE_TYPE_COLORS,
   activeSwatchColor, resolveSwatchColors,
   isOnboarding, onboardingHtml, sectionVisibility, fabIntent, pageModeClasses,
   importErrorText,
+  // #1909: die echten Aufrufer hinter den Fehler-Toasts, fuer test:waste-errors.
+  state: () => state,
+  setStateForTest(patch) { Object.assign(state, patch); },
+  setContainerForTest(container) { _container = container; },
+  reportError, reloadAndRender, deleteOrAlreadyGone,
+  moveType, createPresetType, openTypeModal, openScheduleModal, openPickupModal, openSourceModal,
+  loadSourceAndOpen, loadPickupAndEdit, deletePickup, openReminderSettingsModal,
+  moveOccurrence, skipOccurrence, restoreOccurrence, exportMappingProfileFile,
+  openImportWizard, openUrlSourceWizard, openMappingProfileImportModal, triggerManualRefresh,
 };
