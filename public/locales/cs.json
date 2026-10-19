@@ -1722,6 +1722,7 @@
         "statsTrendTitleCumulative": "Průběžný součet",
         "statsCategoryTitle": "Podle kategorie",
         "statsCompareNote": "Změna oproti {{period}}",
+        "statsUntilNote": "Započteno do {{date}}: pouze uzavřená období",
         "statsDonutTitle": "Podíly výdajů",
         "statsExport": "Exportovat CSV",
         "statsEmptyTitle": "Žádná data v období",

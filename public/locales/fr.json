@@ -1645,6 +1645,7 @@
         "statsTrendTitleCumulative": "Cumul",
         "statsCategoryTitle": "Par catégorie",
         "statsCompareNote": "Évolution par rapport à {{period}}",
+        "statsUntilNote": "Compté jusqu’au {{date}}: périodes terminées uniquement",
         "statsDonutTitle": "Répartition des dépenses",
         "statsExport": "Exporter CSV",
         "statsEmptyTitle": "Aucune donnée sur la période",

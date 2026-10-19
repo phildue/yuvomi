@@ -1645,6 +1645,7 @@
         "statsTrendTitleCumulative": "累計",
         "statsCategoryTitle": "カテゴリ別",
         "statsCompareNote": "{{period}}との比較",
+        "statsUntilNote": "{{date}} までを集計(完了した期間のみ)",
         "statsDonutTitle": "支出の内訳",
         "statsExport": "CSVエクスポート",
         "statsEmptyTitle": "期間にデータがありません",

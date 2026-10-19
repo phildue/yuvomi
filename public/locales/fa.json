@@ -1661,6 +1661,7 @@
         "statsTrendTitleCumulative": "جمع تجمعی",
         "statsCategoryTitle": "بر اساس دسته",
         "statsCompareNote": "تغییر نسبت به {{period}}",
+        "statsUntilNote": "شمارش تا {{date}}؛ فقط دوره‌های کامل‌شده",
         "statsDonutTitle": "سهم هزینه‌ها",
         "statsExport": "برون‌ریزی CSV",
         "statsEmptyTitle": "در این بازه داده‌ای نیست",

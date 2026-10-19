@@ -1645,6 +1645,7 @@
         "statsTrendTitleCumulative": "Göngyölített összeg",
         "statsCategoryTitle": "Kategória szerint",
         "statsCompareNote": "Változás a következőhöz képest: {{period}}",
+        "statsUntilNote": "{{date}}-ig számolva: csak lezárt időszakok",
         "statsDonutTitle": "Kiadások megoszlása",
         "statsExport": "CSV exportálása",
         "statsEmptyTitle": "Nincs adat az időszakban",

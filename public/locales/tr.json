@@ -1645,6 +1645,7 @@
         "statsTrendTitleCumulative": "Kümülatif toplam",
         "statsCategoryTitle": "Kategoriye göre",
         "statsCompareNote": "{{period}} ile karşılaştırıldığında değişim",
+        "statsUntilNote": "{{date}} tarihine kadar sayıldı: yalnızca tamamlanan dönemler",
         "statsDonutTitle": "Gider payları",
         "statsExport": "CSV dışa aktar",
         "statsEmptyTitle": "Dönemde veri yok",
