@@ -140,12 +140,12 @@ jobs:
     needs: build-and-push
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: self-hosted
-    # Der "Wait for CI"-Schritt deckelt sich selbst auf 15 Minuten; der Rest ist
-    # ein SSH-Deploy. Die 5 Minuten davor reichten nicht mehr: CI braucht seit
-    # dem Upstream-Sync rund 10 Minuten, und v2.68.0 fiel deshalb beim ersten
-    # Anlauf durch. 20 Minuten decken Warten plus Deploy, ohne einen haengenden
-    # Runner sechs Stunden lang zu blockieren (Default-Timeout ohne Deckel).
-    timeout-minutes: 20
+    # Der "Wait for CI"-Schritt deckelt sich selbst auf 35 Minuten; der Rest ist
+    # ein SSH-Deploy. Die 15 Minuten davor reichten nicht mehr: CI braucht seit
+    # dem Upstream-Sync auf 2.77.2 rund 24 Minuten, und v2.77.2 fiel deshalb beim
+    # ersten Anlauf durch. 40 Minuten decken Warten plus Deploy, ohne einen
+    # haengenden Runner sechs Stunden lang zu blockieren (Default-Timeout ohne Deckel).
+    timeout-minutes: 40
 
     steps:
       - name: Wait for CI to pass on this commit
@@ -162,7 +162,7 @@ jobs:
           # both treated as "pending" and retried; only a definitive terminal
           # conclusion other than success (failure, cancelled, timed_out,
           # etc.) fails immediately.
-          DEADLINE=$((SECONDS + 900))
+          DEADLINE=$((SECONDS + 2100))
           while true; do
             conclusion=$(curl -sS \
               -H "Authorization: Bearer $GH_TOKEN" \
@@ -181,7 +181,7 @@ jobs:
             fi
 
             if [ "$SECONDS" -ge "$DEADLINE" ]; then
-              echo "::error::Timed out after 15m waiting for CI to conclude for this commit — refusing to deploy."
+              echo "::error::Timed out after 35m waiting for CI to conclude for this commit — refusing to deploy."
               exit 1
             fi
 
@@ -191,7 +191,7 @@ jobs:
       - name: Deploy over SSH
         run: |
           set -euo pipefail
-          trap 'rm -f ~/.ssh/yuvomi_deploy_key' EXIT
+          trap 'rm -f ~/.ssh/yuvomi_deploy_key ~/.ssh/yuvomi_known_hosts' EXIT
           # github.ref_name for a tag push is the tag itself, e.g. "v1.20.2".
           # Strip the leading "v" to match the image tag docker/metadata-action
           # produced (its type=semver pattern does the same stripping).
@@ -199,5 +199,14 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.YUVOMI_DEPLOY_SSH_KEY }}" > ~/.ssh/yuvomi_deploy_key
           chmod 600 ~/.ssh/yuvomi_deploy_key
-          ssh -i ~/.ssh/yuvomi_deploy_key -o StrictHostKeyChecking=accept-new \
+          # Host-Key fest hinterlegt statt accept-new (Trust on First Use): als
+          # ein anderer Container per DHCP dieselbe IP bekam, haette accept-new
+          # nach dem Leeren von known_hosts dem falschen Host vertraut. Eigene
+          # Datei, damit kein alter Eintrag im known_hosts des Runners mitredet.
+          # Neu aufgesetzter yuvomi-Host -> diese Zeile aktualisieren
+          # (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub zum Abgleich).
+          printf '%s\n' "192.168.178.95 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOhKQjxqd/duAn+SMM0spfOIvKlyw6FKPn0qW3yil8Ra" \
+            > ~/.ssh/yuvomi_known_hosts
+          ssh -i ~/.ssh/yuvomi_deploy_key \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/yuvomi_known_hosts \
             root@192.168.178.95 "$IMAGE_TAG"
