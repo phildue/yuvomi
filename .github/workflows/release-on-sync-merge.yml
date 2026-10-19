@@ -1,0 +1,68 @@
+name: Release on upstream sync merge
+
+# Fork-only. A merged `sync/upstream-X.Y.Z` PR becomes release vX.Y.Z of the
+# fork: the tag goes on the fork's merge commit (upstream's own vX.Y.Z tag sits
+# on a different commit and is never pushed here), the GitHub release carries
+# the PR body as notes, and Docker Publish is dispatched on the tag so its
+# deploy job runs.
+#
+# WHY DISPATCH INSTEAD OF RELYING ON THE TAG PUSH: a tag or release created with
+# GITHUB_TOKEN does not trigger other workflows, so `on: push: tags` in
+# docker-publish.yml would never fire. `workflow_dispatch` is the one event
+# GITHUB_TOKEN may start; dispatched with `--ref vX.Y.Z`, github.ref is
+# refs/tags/vX.Y.Z and the run behaves like a tag push (semver/latest image
+# tags, deploy job). No PAT needed.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: write
+  pull-requests: read
+
+jobs:
+  release:
+    name: Tag, release and dispatch Docker Publish
+    if: >-
+      github.repository == 'phildue/yuvomi' &&
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'sync/upstream-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Release the merge commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          version="${HEAD_REF#sync/upstream-}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Branch $HEAD_REF does not name a version (sync/upstream-X.Y.Z)."
+            exit 1
+          fi
+          tag="v$version"
+
+          pkg_version=$(gh api "repos/$REPO/contents/package.json?ref=$MERGE_SHA" --jq .content | base64 -d | jq -r .version)
+          if [ "$pkg_version" != "$version" ]; then
+            echo "::error::package.json on $MERGE_SHA says $pkg_version, branch says $version - not releasing."
+            exit 1
+          fi
+
+          if gh api "repos/$REPO/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::Tag $tag already exists in $REPO."
+            exit 1
+          fi
+
+          gh pr view "$PR_NUMBER" --repo "$REPO" --json body --jq .body > notes.md
+          gh release create "$tag" --repo "$REPO" --target "$MERGE_SHA" \
+            --title "$tag" --notes-file notes.md --latest
+          gh workflow run docker-publish.yml --repo "$REPO" --ref "$tag"
+          echo "Released $tag at $MERGE_SHA and dispatched Docker Publish."
