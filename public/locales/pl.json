@@ -1815,6 +1815,7 @@
         "statsTrendTitleCumulative": "Suma narastająco",
         "statsCategoryTitle": "Według kategorii",
         "statsCompareNote": "Zmiana w porównaniu z: {{period}}",
+        "statsUntilNote": "Liczone do {{date}}: tylko zakończone okresy",
         "statsDonutTitle": "Udziały wydatków",
         "statsExport": "Eksportuj CSV",
         "statsEmptyTitle": "Brak danych w okresie",

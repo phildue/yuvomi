@@ -1661,6 +1661,7 @@
         "statsTrendTitleCumulative": "Total berjalan",
         "statsCategoryTitle": "Menurut kategori",
         "statsCompareNote": "Perubahan dibandingkan {{period}}",
+        "statsUntilNote": "Dihitung hingga {{date}}: hanya periode yang selesai",
         "statsDonutTitle": "Proporsi pengeluaran",
         "statsExport": "Ekspor CSV",
         "statsEmptyTitle": "Tidak ada data pada periode",

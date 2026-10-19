@@ -1661,6 +1661,7 @@
         "statsTrendTitleCumulative": "누적 합계",
         "statsCategoryTitle": "카테고리별",
         "statsCompareNote": "{{period}} 대비 변화",
+        "statsUntilNote": "{{date}}까지 집계: 끝난 기간만",
         "statsDonutTitle": "지출 비율",
         "statsExport": "CSV 내보내기",
         "statsEmptyTitle": "해당 기간 데이터 없음",

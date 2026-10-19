@@ -6,7 +6,7 @@
 import express from 'express';
 import { createLogger } from '../../logger.js';
 import * as db from '../../db.js';
-import { bookedOnly, computeStatsRange, cents, budgetFilter, budgetCategoryExpr, budgetSubcategoryExpr, todayLocalDateKey, STATS_RANGES, DATE_RE } from './helpers.js';
+import { bookedOnly, computeStatsRange, statsCutoff, cents, budgetFilter, budgetCategoryExpr, budgetSubcategoryExpr, todayLocalDateKey, STATS_RANGES, DATE_RE } from './helpers.js';
 import { BUDGET_SAVINGS_KEY } from './plans.js';
 
 const log = createLogger('Budget');
@@ -16,10 +16,13 @@ const router = express.Router();
  * Aggregiert Budget-Daten für den Statistik-Tab.
  * @param {object} database  better-sqlite3/node:sqlite-Instanz mit .prepare()
  */
-export function computeStats(database, { range, anchor }, filter = { clause: '', params: [] },
+export function computeStats(database, { range, anchor, today = todayLocalDateKey(), until }, filter = { clause: '', params: [] },
                              categoryExpr = { expr: 'category', params: [] },
                              subcategoryExpr = { expr: 'subcategory', params: [] }) {
   const r = computeStatsRange(range, anchor);
+  // Nur abgeschlossene Einheiten (statsCutoff): jede Abfrage endet an `cut`,
+  // nicht am Zeitraumende. Buckets danach bleiben als Nullen in der Serie.
+  const cut = statsCutoff(r, today, until);
   const f = filter && filter.clause ? filter : { clause: '', params: [] };
   const c = categoryExpr && categoryExpr.expr ? categoryExpr : { expr: 'category', params: [] };
   const sc = subcategoryExpr && subcategoryExpr.expr ? subcategoryExpr : { expr: 'subcategory', params: [] };
@@ -30,7 +33,7 @@ export function computeStats(database, { range, anchor }, filter = { clause: '',
       COALESCE(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END), 0) AS expenses,
       COALESCE(SUM(amount), 0) AS balance
     FROM budget_entries WHERE date BETWEEN ? AND ?${f.clause}${bookedOnly()}
-  `).get(r.from, r.to, ...f.params);
+  `).get(r.from, cut.until, ...f.params);
 
   const prevRow = database.prepare(`
     SELECT
@@ -38,7 +41,7 @@ export function computeStats(database, { range, anchor }, filter = { clause: '',
       COALESCE(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END), 0) AS expenses,
       COALESCE(SUM(amount), 0) AS balance
     FROM budget_entries WHERE date BETWEEN ? AND ?${f.clause}${bookedOnly()}
-  `).get(r.prevFrom, r.prevTo, ...f.params);
+  `).get(r.prevFrom, cut.prevUntil, ...f.params);
 
   // Fremde 'shared_amount'-Eintraege zaehlen in totals und series voll mit,
   // erscheinen hier aber im Sammel-Bucket (#659): eine Kategorie-Auswertung ist
@@ -52,7 +55,7 @@ export function computeStats(database, { range, anchor }, filter = { clause: '',
     -- GROUP BY 1, nicht GROUP BY category: bei gleichnamigem Output-Alias
     -- gewinnt in SQLite die ECHTE Spalte, und der Sammel-Bucket bliebe leer.
     GROUP BY 1 ORDER BY ABS(SUM(amount)) DESC
-  `).all(...c.params, r.from, r.to, ...f.params);
+  `).all(...c.params, r.from, cut.until, ...f.params);
 
   // Unterkategorien je Kategorie, für den Drilldown im Statistik-Tab. Wie in
   // /summary: nur Ausgaben haben welche (validateSubcategory erzwingt '' für
@@ -66,7 +69,7 @@ export function computeStats(database, { range, anchor }, filter = { clause: '',
            COALESCE(SUM(amount), 0) AS total
     FROM budget_entries WHERE date BETWEEN ? AND ? AND subcategory != ''${f.clause}${bookedOnly()}
     GROUP BY 1, 2 ORDER BY ABS(SUM(amount)) DESC
-  `).all(...c.params, ...sc.params, r.from, r.to, ...f.params);
+  `).all(...c.params, ...sc.params, r.from, cut.until, ...f.params);
 
   // Bucket-Schlüssel: bei 'day' das volle Datum, bei 'month' die ersten 7 Zeichen.
   const keyExpr = r.granularity === 'month' ? "substr(date, 1, 7)" : "date";
@@ -77,7 +80,7 @@ export function computeStats(database, { range, anchor }, filter = { clause: '',
            COALESCE(SUM(amount), 0) AS balance
     FROM budget_entries WHERE date BETWEEN ? AND ?${f.clause}${bookedOnly()}
     GROUP BY period
-  `).all(r.from, r.to, ...f.params);
+  `).all(r.from, cut.until, ...f.params);
 
   const byPeriod = new Map(rawSeries.map((row) => [row.period, row]));
   const series = r.bucketKeys.map((period) =>
@@ -96,6 +99,10 @@ export function computeStats(database, { range, anchor }, filter = { clause: '',
 
   return {
     range: r.range, from: r.from, to: r.to,
+    // Letzter gezaehlter Tag; = to, wenn der Zeitraum vorbei ist, < from, wenn
+    // er noch nicht begonnen hat. prevUntil ist dasselbe fuer den Vorzeitraum -
+    // der Client reicht es als ?until= weiter, wenn er dessen Kategorien holt.
+    until: cut.until, prevUntil: cut.prevUntil,
     totals: { income: totalsRow.income, expenses: totalsRow.expenses, balance: totalsRow.balance },
     series,
     byCategory,
@@ -108,19 +115,22 @@ export function computeStats(database, { range, anchor }, filter = { clause: '',
 /**
  * GET /api/v1/budget/stats
  * Statistik-Aggregation über Woche/Monat/Jahr.
- * Query: ?range=week|month|year&anchor=YYYY-MM-DD
+ * Query: ?range=week|month|year&anchor=YYYY-MM-DD[&until=YYYY-MM-DD]
  */
 export function statsHandler(req, res) {
   try {
     const range  = req.query.range || 'month';
     const anchor = req.query.anchor || todayLocalDateKey();
+    const until  = req.query.until;
     if (!STATS_RANGES.has(range))
       return res.status(400).json({ error: 'range must be one of: week, month, year.', code: 400 });
     if (!DATE_RE.test(anchor))
       return res.status(400).json({ error: 'anchor must be in YYYY-MM-DD format.', code: 400 });
+    if (until !== undefined && !DATE_RE.test(until))
+      return res.status(400).json({ error: 'until must be in YYYY-MM-DD format.', code: 400 });
 
     res.json({
-      data: computeStats(db.get(), { range, anchor },
+      data: computeStats(db.get(), { range, anchor, until },
         budgetFilter(req, 'budget_entries'), budgetCategoryExpr(req, 'budget_entries'),
         budgetSubcategoryExpr(req, 'budget_entries')),
     });

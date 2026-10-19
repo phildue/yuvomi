@@ -1661,6 +1661,7 @@
         "statsTrendTitleCumulative": "Verlauf, aufsummiert",
         "statsCategoryTitle": "Nach Kategorie",
         "statsCompareNote": "Veränderung gegenüber {{period}}",
+        "statsUntilNote": "Gezählt bis {{date}}: nur abgeschlossene Zeitabschnitte",
         "statsDonutTitle": "Ausgaben-Anteile",
         "statsExport": "CSV exportieren",
         "statsEmptyTitle": "Keine Daten im Zeitraum",
