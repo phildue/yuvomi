@@ -4282,7 +4282,9 @@ Angabe braeuchte einen zweiten Timer, nur damit sie sich selbst aktuell haelt.
      `chartGridMarkup()` in health.js ist die Referenz - fuenf Linien mit Werteachse, EINE
      geteilte Geometrie (`CHART`) fuer alle drei Charts des Moduls.
   4. **Ein Diagramm ist nie der alleinige Traeger.** Die Zahl steht dabei; der Balken ist der
-     zweite Kanal, nicht der Ersatz.
+     zweite Kanal, nicht der Ersatz. Ein Anteil steht leiser HINTER seinem Betrag
+     (Sekundaertext, regular, `--space-1` Abstand), auf jeder Flaeche in derselben Form aus
+     EINER Rechnung (`sharePercent()` in money.js; Budget-Uebersicht und Statistik seit #1968).
 - **Do** jeder fixierten Shell-Flaeche ueber dem Scrollport einen NACHLAUF am Inhaltsende
   geben, und zwar als Summand (`--install-prompt-tail`), nicht als weitere `:has()`-Fassung:
   FAB, Sammelaktions-Pille und Install-Banner sind drei Flaechen und waeren als Kombinatorik

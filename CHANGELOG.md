@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The income and expenses cards in the budget overview filter the transactions list.** Tap one to
   see only that side of the month, tap it again or clear the chip to see everything. The filter
   combines with the category, subcategory and responsible filters.
+
+## [2.78.0] - 2026-10-18
+
+### Added
+
 - **New child accounts start with child defaults.** An account created or invited with the family
   role Child no longer starts with Budget and fasting, and sees Housekeeping read-only without wages
   and payments: the server leaves rates, totals, payment state and the unpaid amount out of every
@@ -179,10 +184,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Empty progress bars no longer look like holes in dark mode.** The track behind budget plans,
   loans, subscriptions, Health goals and the overview's budget card, and the circle behind reward
   history icons, sit as a soft well in the card instead of near-black.
-- **A budget category keeps its colour in every month.** It has one colour in overview, plan and
-  statistics, and the plan says "tight" or "over" in words with an icon instead of recolouring the
-  bar. Colours follow a category's place in your category list instead of how much it cost this
-  month, so "Housing" no longer turns from violet to teal when another category is more expensive.
+- **A budget category has one colour in overview, plan and statistics.** The plan says "tight" or
+  "over" in words with an icon instead of recolouring the bar. Colours follow a category's place in
+  your category list instead of how much it cost this month, so "Housing" no longer turns from
+  violet to teal when another category is more expensive. Only when two categories shown in the same
+  period would want the same colour, because there are more categories than chart colours, the
+  smaller one takes the next free colour, so no two segments of the ring share one.
   The ring in Reports leaves a small gap between segments, groups the rest in grey, and the light
   chart colours were adjusted so that no two of them look alike with red-green colour blindness. For
   blue-yellow colour blindness, where petrol and green or orange and magenta still look close, green
