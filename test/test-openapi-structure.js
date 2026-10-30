@@ -111,6 +111,15 @@ async function fragmentOf(file) {
   return { fn: fnNames[0], frag: mod[fnNames[0]]() };
 }
 
+// Refs #2056: die Bildroute antwortet `private, no-cache` mit ETag und 304,
+// nie mehr ein Cache-Jahr - ein `immutable` ueberlebte das Abmelden.
+test('people avatar dokumentiert das 304 und verspricht kein Cache-Jahr', () => {
+  const get = buildOpenApiSpec({}).paths['/api/v1/people/{id}/avatar'].get;
+  assert.ok(get.responses[304], '304 fehlt');
+  assert.match(get.description, /private, no-cache/);
+  assert.doesNotMatch(get.description, /max-age|immutable/, 'die Beschreibung verspricht kein Cache-Jahr');
+});
+
 test('es existiert eine plausible Zahl an Modul-Dateien', () => {
   assert.ok(moduleFiles.length >= 20, `unerwartet wenige Modul-Dateien: ${moduleFiles.length}`);
 });
@@ -404,7 +413,11 @@ test('calendar event responses expose optional occurrence metadata on every clie
   for (const field of occurrenceFields) {
     assert.deepEqual(occurrence.properties[field], event.properties[field]);
   }
-  assert.equal(event.properties.recurrence_id.format, 'date');
+  // Format A (#2034): drei Formen, ein Muster statt `format: date`.
+  assert.equal(event.properties.recurrence_id.format, undefined);
+  const recurrenceIdPattern = new RegExp(event.properties.recurrence_id.pattern);
+  for (const key of ['2035-03-24', '2035-03-24T23:30:00Z', '2035-03-24T01:30:00']) assert.match(key, recurrenceIdPattern);
+  for (const key of ['24.03.2035', '2035-03-24T23:30Z', '2035-03-24T01:30:00+01:00']) assert.doesNotMatch(key, recurrenceIdPattern);
   assert.equal(event.properties.reminder_anchor_start.$ref,
     '#/components/schemas/CalendarDateOrDateTime');
   for (const field of ['assignment_owner_id', 'attachment_owner_id', 'reminder_owner_id']) {
@@ -547,4 +560,46 @@ test('calendar occurrence errors consistently document numeric API codes', () =>
     spec.components.schemas.CalendarOverrideOrphanConflict.properties.code.type,
     'integer',
   );
+});
+
+// Codex-Review zu #2067: `v` stand nur in der Beschreibung. Generierte Clients
+// und die API-Oberflaeche lesen Parameter aus `parameters`, nie aus Prosa.
+test('#2048 provider-thumbnail deklariert ?v= und das 304 strukturell', () => {
+  const get = buildOpenApiSpec({}).paths['/api/v1/recipes/{id}/provider-thumbnail'].get;
+  const v = (get.parameters ?? []).find((p) => p.name === 'v');
+  assert.ok(v, 'Query-Parameter v fehlt');
+  assert.equal(v.in, 'query');
+  assert.equal(v.required, false);
+  assert.equal(v.schema?.type, 'string');
+  assert.ok(get.responses[304], '304 fehlt');
+  assert.ok(get.responses[200]?.content?.['image/webp'], '200 nennt die Bildtypen');
+  assert.doesNotMatch(get.description, /max-age|immutable/, 'die Beschreibung verspricht kein Cache-Jahr');
+});
+
+// Nachtrag zu #2268 (#2062): die Kalender-Auswahl der Kachel reist als
+// `?events_calendar=` zu `GET /dashboard`, ihr Katalog als `sources` neben
+// `data` von `GET /calendar/calendars`. Beides stand bis hier nur im Code.
+test('#2062 events_calendar an GET /dashboard ist als Query-Parameter deklariert', () => {
+  const get = buildOpenApiSpec({}).paths['/api/v1/dashboard'].get;
+  const param = (get.parameters ?? []).find((p) => p.name === 'events_calendar');
+  assert.ok(param, 'Query-Parameter events_calendar fehlt');
+  assert.equal(param.in, 'query');
+  assert.equal(param.required, false);
+  assert.equal(param.schema?.type, 'array');
+  assert.equal(param.schema.maxItems, 50);
+  assert.equal(param.schema.items?.pattern, '^(local|cal|sub):[1-9][0-9]{0,14}$');
+  assert.equal(param.explode, true);
+  assert.match(param.description, /GET \/calendar\/calendars/, 'nennt den Katalog');
+});
+
+test('#2062 GET /calendar/calendars beschreibt sources neben data', () => {
+  const get = buildOpenApiSpec({}).paths['/api/v1/calendar/calendars'].get;
+  const schema = get.responses?.[200]?.content?.['application/json']?.schema;
+  assert.ok(schema, '200 ohne Schema');
+  assert.deepEqual(schema.required, ['data', 'sources']);
+  const item = schema.properties?.sources?.items;
+  assert.ok(item, 'sources ohne items');
+  assert.deepEqual(item.required, ['key', 'name', 'color']);
+  assert.equal(item.properties.key.pattern, '^(local|cal|sub):[1-9][0-9]{0,14}$');
+  assert.match(get.description, /`sources`/);
 });

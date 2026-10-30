@@ -1,7 +1,7 @@
-import { op, jsonBody, idParam } from '../helpers.js';
+import { op, jsonBody, idParam, withCaseReasons } from '../helpers.js';
 
 export function rewardsPaths() {
-  return {
+  return withCaseReasons('rewards', CASE_REASONS, {
     '/api/v1/rewards/overview': {
       get: op({ summary: 'Reward overview (balances, catalog, pending count)', tag: 'Rewards', description: '`pendingCount` counts the open REWARD requests, as it always has. Open pocket money requests (#1734) are counted separately in `moneyPendingCount`, and only those the caller may read: all for an administrator, the own for a member, none for a paired display.' }),
     },
@@ -27,7 +27,7 @@ export function rewardsPaths() {
       post: op({ summary: 'Request a redemption (reserves points)', tag: 'Rewards', stateChanging: true, requestBody: jsonBody(null), description: 'Body: { catalog_id, user_id?, note? }. Points are reserved immediately; whether anyone has to approve stays with the household setting. `user_id` redeems on behalf of someone else and is otherwise ignored: an administrator may do it for any member, and a paired wall display must do it, naming the person chosen on the device (#1209). For a display the person is required rather than optional, because the display account takes no part in rewards itself, and it has to be a household member who may write this module. The request is booked as the display having asked and the person having received. A reward whose units are all fulfilled answers 409 with `reason: "out_of_stock"`; nothing is booked, so no points are taken. POCKET MONEY (#1734): with `kind: "withdrawal"` or `kind: "deposit"` the body is { kind, amount, note?, user_id? } and no catalogue entry is involved. `amount` is a decimal STRING in the currency of the ACCOUNT ("5.00"; whole units for a currency without decimals); an optional `currency` that is not the account\'s is 400 with `reason: "currency_mismatch"`; a number, an array or an object is 400, and so is a `note` that is not a string. Nothing is booked when the request is filed and it always waits for an administrator, whatever the approval setting says. The person needs a pocket money account (a plan or a money entry), otherwise 400 with `reason: "no_money_account"`. A withdrawal above the balance is 400 with `reason: "insufficient_funds"`. A paired display gets 403 with `reason: "money_not_on_display"`.' }),
     },
     '/api/v1/rewards/redemptions/{id}': {
-      patch: op({ summary: 'Decide a redemption (fulfill/reject/cancel)', tag: 'Rewards', params: [idParam()], stateChanging: true, requestBody: jsonBody(null), description: 'Body: { action: "fulfill" | "reject" | "cancel" }. Fulfilling a request whose reward has no units left does not fail silently: the request is REJECTED with `decision_reason: "out_of_stock"`, the reserved points go back through the usual `reversal`, and the answer is 409 with `reason: "out_of_stock"` and the decided row in `data`. Rejecting and cancelling stay untouched - sold out means only that fulfilling finds no unit. POCKET MONEY (#1734): fulfilling a withdrawal books the amount off the money balance, fulfilling a deposit credits it; rejecting and cancelling book nothing, because nothing was reserved. The cover is checked again when a withdrawal is fulfilled: if the balance no longer covers it, the answer is 409 with `reason: "insufficient_funds"` and the request STAYS pending. When a member is deactivated, their open money requests are cancelled with `decision_reason: "account_deactivated"`; fulfilling one that is still open for a deactivated member cancels it and answers 409 with `reason: "account_deactivated"`. A money request the caller may not read (somebody else\'s, for a non-administrator) answers 404 for every action, exactly like an id that does not exist.' }),
+      patch: op({ summary: 'Decide a redemption (fulfill/reject/cancel) or take the decision back (reopen)', tag: 'Rewards', params: [idParam()], stateChanging: true, requestBody: jsonBody(null), description: 'Body: { action: "fulfill" | "reject" | "cancel" | "reopen" }. REOPEN (R23) is the undo of a decision: only the account that decided may send it - for a fulfilment or rejection only an administrator, and never for a request fulfilled automatically at filing (`decided_by` equals `requested_by`; 403 `reason: "rewards_reopen_not_allowed"`), while whoever cancelled may reopen their own cancellation - within 10 minutes of the decision (later 409 `reason: "rewards_reopen_expired"`, an open request 409 `reason: "rewards_redemption_open"`). The request is pending again and the balance stands as before the decision: a fulfilled reward keeps its reserved points, a rejected or cancelled reward takes back exactly its `reversal` entry, a fulfilled money request drops its money entry. If the balance no longer allows that, the decision stays and the answer is 409 with `reason: "insufficient_points"` or `"insufficient_funds"`. Fulfilling a request whose reward has no units left does not fail silently: the request is REJECTED with `decision_reason: "out_of_stock"`, the reserved points go back through the usual `reversal`, and the answer is 409 with `reason: "out_of_stock"` and the decided row in `data`. Rejecting and cancelling stay untouched - sold out means only that fulfilling finds no unit. POCKET MONEY (#1734): fulfilling a withdrawal books the amount off the money balance, fulfilling a deposit credits it; rejecting and cancelling book nothing, because nothing was reserved. The cover is checked again when a withdrawal is fulfilled: if the balance no longer covers it, the answer is 409 with `reason: "insufficient_funds"` and the request STAYS pending. When a member is deactivated, their open money requests are cancelled with `decision_reason: "account_deactivated"`; fulfilling one that is still open for a deactivated member cancels it and answers 409 with `reason: "account_deactivated"`. A money request the caller may not read (somebody else\'s, for a non-administrator) answers 404 for every action, exactly like an id that does not exist.' }),
     },
     '/api/v1/rewards/bonus': {
       post: op({ summary: 'Grant manual bonus / correction points', tag: 'Rewards', admin: true, stateChanging: true, requestBody: jsonBody(null) }),
@@ -51,5 +51,26 @@ export function rewardsPaths() {
       put: op({ summary: 'Create or change the scheduled credit of a member', tag: 'Rewards', admin: true, params: [idParam('userId', 'User ID')], stateChanging: true, requestBody: jsonBody(null), description: 'Body: { amount, frequency: "weekly" | "monthly", anchor_day, paused? }. `anchor_day` is the day of the month (1-31) for a monthly plan and the weekday (1 = Monday to 7 = Sunday) for a weekly one. A month without the anchor day takes its last day and the day comes back afterwards (31 -> 28/29 -> 31). Due dates missed while the server was off are booked afterwards, each exactly once; a paused plan books nothing and skips its missed dates when it is resumed. A plan whose member is no longer part of the household is paused instead of credited. Changing only the amount keeps the next date. Dates that are due when the plan is changed are booked first, with the plan as it was, in the same transaction as the change - a new amount or a new anchor day never reaches back. `paused` left out keeps the stored state: a paused plan stays paused. The plan keeps the currency of the account; an optional `currency` that differs is 400 with `reason: "currency_mismatch"`. The plan of a deactivated member stays paused: changing or resuming it is 409 with `reason: "account_deactivated"`. A single amount is limited to 10^12 minor units.' }),
       delete: op({ summary: 'End the scheduled credit of a member', tag: 'Rewards', admin: true, params: [idParam('userId', 'User ID')], stateChanging: true, description: 'Removes the plan. Balance and history stay.' }),
     },
-  };
+  });
 }
+
+// #1909: die Faelle, die ein Nutzer erreicht, tragen einen `reason` neben dem
+// englischen `error` - je Operation der Satz, der sie nennt. Die aelteren
+// Gruende ohne Praefix (`out_of_stock`, `insufficient_funds` ...) stehen
+// schon in den Beschreibungen oben.
+const REWARD_GONE = '`rewards_reward_not_found` (404, the reward was deleted)';
+const NOT_PARTICIPATING = '`rewards_not_participating` (400, the person does not take part in rewards)';
+const CASE_REASONS = {
+  '/api/v1/rewards/catalog/{id}': { patch: REWARD_GONE, delete: REWARD_GONE },
+  '/api/v1/rewards/redemptions': {
+    post: '`rewards_reward_not_found` (404, the reward was deleted or switched off), '
+      + `${NOT_PARTICIPATING}, \`rewards_insufficient_points\` (400, the balance does not cover the cost)`,
+  },
+  '/api/v1/rewards/redemptions/{id}': {
+    patch: '`rewards_redemption_not_found` (404, the request does not exist or is not visible), '
+      + '`rewards_redemption_decided` (409, the request was decided already)',
+  },
+  '/api/v1/rewards/bonus': { post: NOT_PARTICIPATING },
+  '/api/v1/rewards/money/accounts/{userId}': { delete: '`rewards_money_account_not_found` (404, there is no account)' },
+  '/api/v1/rewards/money/plans/{userId}': { delete: '`rewards_money_plan_not_found` (404, there is no plan)' },
+};

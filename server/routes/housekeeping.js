@@ -10,6 +10,7 @@ import { createLogger } from '../logger.js';
 import { hashPassword } from '../utils/password.js';
 import * as db from '../db.js';
 import { normalizeAvatarData, syncFamilyMemberArtifacts } from '../auth.js';
+import { birthDateInput, validateYearUnknown } from '../services/birthdays.js';
 import { collectErrors, color, date, datetime, month, num, oneOf, str, id as validateId, MAX_SHORT, MAX_TEXT, MAX_TITLE } from '../middleware/validate.js';
 import { isAdminRequest } from '../middleware/require-admin.js';
 import { minutesBetween, computeHourlyAmount } from '../services/housekeeping-billing.js';
@@ -49,6 +50,7 @@ import {
 import { addMonthsClamped } from '../utils/interval-date.js';
 import { recordLocalColorChoice } from '../services/legacy-color-snapshot.js';
 import { paymentTaskAudience, normalizePaymentTaskAudience } from '../services/payment-task-audience.js';
+import { syncTaskCompletion } from '../services/task-completions.js';
 import {
   byCheckInDesc,
   checkInInstantMs,
@@ -57,6 +59,7 @@ import {
   latestVisit,
   widenedWindow,
 } from '../services/housekeeping-month.js';
+import { personAvatarUrlSql } from '../services/person-avatar.js';
 
 const log = createLogger('Housekeeping');
 const router = express.Router();
@@ -237,6 +240,8 @@ function publicWorker(row, context = localDayContext(), receipts = MASKED_RECEIP
     phone: row.phone ?? null,
     email: row.email ?? null,
     birth_date: row.birth_date ?? null,
+    // Nur Tag und Monat bekannt (#2095): birth_date traegt dann 2000.
+    birth_year_unknown: row.birth_year_unknown === 1,
     // Der Lohn ist eine Betragsangabe wie die am Besuch (R20, `amounts`).
     daily_rate: receipts.amounts === true ? Number(row.daily_rate || 0) : null,
     rate_type: row.rate_type || 'daily',
@@ -398,7 +403,8 @@ function loadWorkers() {
            u.avatar_data,
            c.phone,
            c.email,
-           b.birth_date
+           b.birth_date,
+           b.year_unknown AS birth_year_unknown
     FROM housekeeping_workers hw
     JOIN users u ON u.id = hw.user_id
     LEFT JOIN contacts c ON c.family_user_id = u.id
@@ -599,7 +605,8 @@ function loadWorkerById(workerId) {
            u.avatar_data,
            c.phone,
            c.email,
-           b.birth_date
+           b.birth_date,
+           b.year_unknown AS birth_year_unknown
     FROM housekeeping_workers hw
     JOIN users u ON u.id = hw.user_id
     LEFT JOIN contacts c ON c.family_user_id = u.id
@@ -944,23 +951,25 @@ router.post('/worker', async (req, res) => {
       : { value: null, error: null };
     if (vWorkerId.error) return res.status(400).json({ error: vWorkerId.error, code: 400 });
     const existing = vWorkerId.value ? loadWorkerById(vWorkerId.value) : null;
-    if (vWorkerId.value && !existing) return res.status(404).json({ error: 'Housekeeper not found.', code: 404 });
+    if (vWorkerId.value && !existing) return res.status(404).json({ error: 'Housekeeper not found.', code: 404, reason: 'housekeeping_worker_not_found' });
 
     const vDisplayName = str(req.body.display_name, 'display_name', { max: 128 });
     const vUsername = str(req.body.username, 'username', { max: 64, required: false });
     const vPhone = str(req.body.phone, 'phone', { max: MAX_SHORT, required: false });
     const vEmail = str(req.body.email, 'email', { max: MAX_TITLE, required: false });
-    const vBirthDate = date(req.body.birth_date, 'birth_date');
+    // Ohne Jahr (#2095) weicht das Jahr dem Platzhalter, bevor geprueft wird.
+    const vYearUnknown = validateYearUnknown(req.body.birth_year_unknown, 'birth_year_unknown');
+    const vBirthDate = date(birthDateInput(req.body.birth_date, vYearUnknown.value === true), 'birth_date');
     const vDailyRate = num(req.body.daily_rate, 'daily_rate', { required: true });
     const vSchedule = oneOf(req.body.payment_schedule || 'monthly', PAYMENT_SCHEDULES, 'payment_schedule');
     const vCalendarColor = color(req.body.calendar_color || existing?.calendar_color || NEW_WORKER_COLOR, 'calendar_color');
     const vNotes = str(req.body.notes, 'notes', { max: MAX_TEXT, required: false });
     const vRateType = oneOf(req.body.rate_type || 'daily', ['daily', 'hourly'], 'rate_type');
     const vHourlyRate = num(req.body.hourly_rate, 'hourly_rate');
-    const errors = collectErrors([vDisplayName, vUsername, vPhone, vEmail, vBirthDate, vDailyRate, vSchedule, vCalendarColor, vNotes, vRateType, vHourlyRate]);
+    const errors = collectErrors([vDisplayName, vUsername, vPhone, vEmail, vYearUnknown, vBirthDate, vDailyRate, vSchedule, vCalendarColor, vNotes, vRateType, vHourlyRate]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
     if (vUsername.value && !/^[a-zA-Z0-9._-]{3,64}$/.test(vUsername.value)) {
-      return res.status(400).json({ error: 'Username must be 3-64 characters long and may only contain letters, numbers, dots, hyphens, and underscores.', code: 400 });
+      return res.status(400).json({ error: 'Username must be 3-64 characters long and may only contain letters, numbers, dots, hyphens, and underscores.', code: 400, reason: 'housekeeping_username_invalid' });
     }
     if (vDailyRate.value < 0) {
       return res.status(400).json({ error: 'daily_rate must be greater than or equal to zero.', code: 400 });
@@ -969,6 +978,8 @@ router.post('/worker', async (req, res) => {
       return res.status(400).json({ error: 'hourly_rate must be greater than or equal to zero.', code: 400 });
     }
     const avatarColor = String(req.body.avatar_color || existing?.avatar_color || NEW_WORKER_COLOR).trim();
+    const colorError = color(avatarColor, 'avatar_color').error;
+    if (colorError) return res.status(400).json({ error: colorError, code: 400 });
     const avatarData = req.body.avatar_data !== undefined
       ? normalizeAvatarData(req.body.avatar_data)
       : existing?.avatar_data ?? null;
@@ -1013,6 +1024,7 @@ router.post('/worker', async (req, res) => {
         phone: vPhone.value,
         email: vEmail.value,
         birthDate: vBirthDate.value,
+        birthYearUnknown: vYearUnknown.value,
         avatarData: avatarData ?? null,
         actorUserId: actorId,
       });
@@ -1022,7 +1034,7 @@ router.post('/worker', async (req, res) => {
     res.status(existing ? 200 : 201).json({ data: publicWorker(saved, localDayContext(), receiptAccess(req)) });
   } catch (err) {
     if (err.message?.includes('UNIQUE constraint')) {
-      return res.status(409).json({ error: 'Username is already taken.', code: 409 });
+      return res.status(409).json({ error: 'Username is already taken.', code: 409, reason: 'housekeeping_username_taken' });
     }
     log.error('POST /worker error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -1081,7 +1093,7 @@ router.get('/visits', (req, res) => {
              hw.payment_schedule,
              u.display_name AS worker_name,
              u.avatar_color AS worker_avatar_color,
-             u.avatar_data AS worker_avatar_data,
+             ${personAvatarUrlSql('u')} AS worker_avatar_data,
              t.status AS payment_task_status,
              t.title AS payment_task_title
       FROM housekeeping_work_sessions hws
@@ -1126,14 +1138,14 @@ router.post('/work-sessions/check-in', (req, res) => {
     const vWorkerId = validateId(req.body.worker_id, 'worker_id');
     if (vWorkerId.error) return res.status(400).json({ error: vWorkerId.error, code: 400 });
     const worker = loadWorkerById(vWorkerId.value);
-    if (!worker) return res.status(404).json({ error: 'Housekeeper not found.', code: 404 });
+    if (!worker) return res.status(404).json({ error: 'Housekeeper not found.', code: 404, reason: 'housekeeping_worker_not_found' });
     const workerRateType = worker.rate_type || 'daily';
     const workerHourlyRate = worker.hourly_rate ?? 0;
     // Nur eine OFFENE Sitzung sperrt. Vorher sperrte jede Sitzung des Tages,
     // auch eine laengst abgeschlossene - geteilte Schichten, eine Pause mit
     // Wiederaufnahme und zwei getrennte Besuche am selben Tag waren damit
     // unmoeglich (#1138).
-    if (loadOpenSession(worker.id)) return res.status(409).json({ error: 'This housekeeper is already checked in.', code: 409 });
+    if (loadOpenSession(worker.id)) return res.status(409).json({ error: 'This housekeeper is already checked in.', code: 409, reason: 'housekeeping_already_checked_in' });
 
     // Ohne Betragsrecht (R20) kommt der Satz aus dem Profil und nicht aus dem
     // Body - der Knopf, der ihn schickte, kannte ihn nicht.
@@ -1189,7 +1201,7 @@ router.get('/visits/:id', (req, res) => {
              hw.payment_schedule,
              u.display_name AS worker_name,
              u.avatar_color AS worker_avatar_color,
-             u.avatar_data  AS worker_avatar_data,
+             ${personAvatarUrlSql('u')} AS worker_avatar_data,
              t.status  AS payment_task_status,
              t.title   AS payment_task_title
       FROM housekeeping_work_sessions hws
@@ -1198,7 +1210,7 @@ router.get('/visits/:id', (req, res) => {
       LEFT JOIN tasks t ON t.id = hws.payment_task_id
       WHERE hws.id = ?
     `).get(vId.value);
-    if (!row) return res.status(404).json({ error: 'Visit not found.', code: 404 });
+    if (!row) return res.status(404).json({ error: 'Visit not found.', code: 404, reason: 'housekeeping_visit_not_found' });
     const receipts = receiptAccess(req);
     const visit = {
       ...publicSession(row, receipts),
@@ -1224,7 +1236,7 @@ router.put('/visits/:id', (req, res) => {
     const vId = validateId(req.params.id, 'id');
     if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
     const existing = db.get().prepare('SELECT * FROM housekeeping_work_sessions WHERE id = ?').get(vId.value);
-    if (!existing) return res.status(404).json({ error: 'Visit not found.', code: 404 });
+    if (!existing) return res.status(404).json({ error: 'Visit not found.', code: 404, reason: 'housekeeping_visit_not_found' });
     if (!assertMayTouchSettled(existing, req, res)) return;
 
     // Ohne Betragsrecht (R20) bleiben Satz, Extras und Minuten, wie sie sind;
@@ -1360,7 +1372,7 @@ router.post('/visits/:id/pay', (req, res) => {
     const vId = validateId(req.params.id, 'id');
     if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
     const existing = db.get().prepare('SELECT * FROM housekeeping_work_sessions WHERE id = ?').get(vId.value);
-    if (!existing) return res.status(404).json({ error: 'Visit not found.', code: 404 });
+    if (!existing) return res.status(404).json({ error: 'Visit not found.', code: 404, reason: 'housekeeping_visit_not_found' });
     if (!assertMayTouchSettled(existing, req, res)) return;
     const viewer = receiptAccess(req);
     if (!viewer.amounts) return payment403(res);
@@ -1368,7 +1380,11 @@ router.post('/visits/:id/pay', (req, res) => {
     db.get().transaction(() => {
       db.get().prepare('UPDATE housekeeping_work_sessions SET paid_at = ? WHERE id = ?').run(paidAt, existing.id);
       if (existing.payment_task_id) {
+        const prev = db.get().prepare('SELECT status FROM tasks WHERE id = ?').get(existing.payment_task_id);
         db.get().prepare('UPDATE tasks SET status = ? WHERE id = ?').run('done', existing.payment_task_id);
+        // Derselbe Erledigungseintrag wie beim Abhaken (#1836); abgehakt hat,
+        // wer die Zahlung vermerkt.
+        if (prev) syncTaskCompletion(db.get(), existing.payment_task_id, prev.status, 'done', userId(req));
         normalizePaymentTaskAudience(db.get(), existing.payment_task_id);
       }
     })();
@@ -1383,16 +1399,15 @@ router.post('/visits/:id/pay', (req, res) => {
 // Der Rueckweg zu /pay (#1136), nur fuer Admins: ein bezahlter Besuch ist
 // abgerechnet (assertMayTouchSettled), und wer die Zahlung zuruecknimmt, gibt
 // ihn wieder fuer jedes Mitglied frei. Spiegelbildlich zu /pay wird die
-// verknuepfte Zahlungsaufgabe direkt wieder geoeffnet, ohne Punkte- oder
-// Verlaufsbuchung - sie spiegelt einen Zahlungsstand, niemand hat dort etwas
-// abgehakt (services/task-completions.js). Bliebe sie 'done', setzte
+// verknuepfte Zahlungsaufgabe direkt wieder geoeffnet, ohne Punktebuchung, und
+// ihr Erledigungseintrag geht mit (#1836, services/task-completions.js). Bliebe sie 'done', setzte
 // reconcilePaymentTasks() beim naechsten GET /visits paid_at sofort wieder.
 router.post('/visits/:id/unpay', (req, res) => {
   try {
     const vId = validateId(req.params.id, 'id');
     if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
     const existing = db.get().prepare('SELECT * FROM housekeeping_work_sessions WHERE id = ?').get(vId.value);
-    if (!existing) return res.status(404).json({ error: 'Visit not found.', code: 404 });
+    if (!existing) return res.status(404).json({ error: 'Visit not found.', code: 404, reason: 'housekeeping_visit_not_found' });
     if (!assertAdmin(req, res)) return;
     const viewer = receiptAccess(req);
     if (!viewer.amounts) return payment403(res);
@@ -1400,7 +1415,8 @@ router.post('/visits/:id/unpay', (req, res) => {
       db.get().transaction(() => {
         db.get().prepare('UPDATE housekeeping_work_sessions SET paid_at = NULL WHERE id = ?').run(existing.id);
         if (existing.payment_task_id) {
-          db.get().prepare('UPDATE tasks SET status = ? WHERE id = ? AND status = ?').run('open', existing.payment_task_id, 'done');
+          const reopened = db.get().prepare('UPDATE tasks SET status = ? WHERE id = ? AND status = ?').run('open', existing.payment_task_id, 'done');
+          if (reopened.changes > 0) syncTaskCompletion(db.get(), existing.payment_task_id, 'done', 'open', userId(req));
           normalizePaymentTaskAudience(db.get(), existing.payment_task_id);
         }
       })();
@@ -1418,7 +1434,7 @@ router.delete('/visits/:id', (req, res) => {
     const vId = validateId(req.params.id, 'id');
     if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
     const existing = db.get().prepare('SELECT * FROM housekeeping_work_sessions WHERE id = ?').get(vId.value);
-    if (!existing) return res.status(404).json({ error: 'Visit not found.', code: 404 });
+    if (!existing) return res.status(404).json({ error: 'Visit not found.', code: 404, reason: 'housekeeping_visit_not_found' });
     if (!assertMayTouchSettled(existing, req, res)) return;
     db.get().transaction(() => {
       deleteVisitLinks(db.get(), existing);
@@ -1436,7 +1452,7 @@ router.post('/work-sessions/check-out', (req, res) => {
     const vWorkerId = validateId(req.body.worker_id, 'worker_id');
     if (vWorkerId.error) return res.status(400).json({ error: vWorkerId.error, code: 400 });
     const session = loadOpenSession(vWorkerId.value);
-    if (!session) return res.status(404).json({ error: 'No open work session found.', code: 404 });
+    if (!session) return res.status(404).json({ error: 'No open work session found.', code: 404, reason: 'housekeeping_open_session_not_found' });
 
     // Ohne Betragsrecht (R20) bleiben die Extras der Sitzung stehen.
     const viewer = receiptAccess(req);
@@ -1470,6 +1486,53 @@ router.post('/work-sessions/check-out', (req, res) => {
     res.json({ data: publicSession(row, viewer), summary: monthlySummary(householdMonthOf(row.check_in) ?? currentMonth(), viewer) });
   } catch (err) {
     log.error('POST /work-sessions/check-out error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+/** So lange nach dem Auschecken nimmt "Rueckgaengig" es zurueck (Minuten). */
+const REOPEN_WINDOW_MINUTES = 10;
+
+/*
+ * AUSCHECKEN ZURUECKNEHMEN (Critique R23, D6). Das Auschecken stand ohne
+ * Rueckweg da, und danach bot die Seite "Einchecken" als Primaerknopf an: ein
+ * Fehlgriff wurde zu einem zweiten Einsatz am selben Tag. Jetzt nimmt der
+ * Toast den Check-out am Server zurueck - die Sitzung ist wieder offen, wie
+ * vor dem Tipp: ohne Ende, und bei Stundenlohn ohne die beim Auschecken
+ * gerechnete Dauer und den Betrag daraus (der Check-in schreibt dort 0).
+ * Termin und Zahlungsaufgabe haengen an der Sitzung und bleiben.
+ *
+ * Nur kurz danach, nur unbezahlt und nur, solange die Person nicht schon
+ * wieder eingecheckt ist: sonst stuenden zwei offene Sitzungen da, und die
+ * Seite kennt nur eine.
+ */
+router.post('/work-sessions/:id/reopen', (req, res) => {
+  try {
+    const vId = validateId(req.params.id, 'id');
+    if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
+    const session = db.get().prepare('SELECT * FROM housekeeping_work_sessions WHERE id = ?').get(vId.value);
+    if (!session) return res.status(404).json({ error: 'Visit not found.', code: 404, reason: 'housekeeping_visit_not_found' });
+    if (!session.check_out) return res.status(409).json({ error: 'This visit is still open.', code: 409, reason: 'housekeeping_visit_open' });
+    const outMs = Date.parse(session.check_out);
+    if (session.paid_at || !Number.isFinite(outMs) || Date.now() - outMs > REOPEN_WINDOW_MINUTES * 60_000) {
+      return res.status(409).json({ error: 'This check-out can no longer be taken back.', code: 409, reason: 'housekeeping_reopen_expired' });
+    }
+    if (session.worker_id && loadOpenSession(session.worker_id)) {
+      return res.status(409).json({ error: 'This housekeeper is already checked in.', code: 409, reason: 'housekeeping_already_checked_in' });
+    }
+    const hourly = session.rate_type === 'hourly';
+    db.get().prepare(`
+      UPDATE housekeeping_work_sessions
+      SET check_out = NULL,
+          minutes_worked = CASE WHEN ? THEN NULL ELSE minutes_worked END,
+          daily_rate = CASE WHEN ? THEN 0 ELSE daily_rate END
+      WHERE id = ?
+    `).run(hourly ? 1 : 0, hourly ? 1 : 0, session.id);
+    const viewer = receiptAccess(req);
+    const row = db.get().prepare('SELECT * FROM housekeeping_work_sessions WHERE id = ?').get(session.id);
+    res.json({ data: publicSession(row, viewer), summary: monthlySummary(householdMonthOf(row.check_in) ?? currentMonth(), viewer) });
+  } catch (err) {
+    log.error('POST /work-sessions/:id/reopen error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
@@ -1524,7 +1587,7 @@ router.patch('/decay-tasks/:taskId', (req, res) => {
     const vId = validateId(req.params.taskId, 'taskId');
     if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
     const existing = db.get().prepare('SELECT * FROM housekeeping_decay_tasks WHERE id = ?').get(vId.value);
-    if (!existing) return res.status(404).json({ error: 'Task not found.', code: 404 });
+    if (!existing) return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'housekeeping_task_not_found' });
 
     const vName = req.body.name !== undefined ? str(req.body.name, 'name', { max: MAX_TITLE }) : { value: existing.name, error: null };
     const vArea = req.body.area !== undefined ? str(req.body.area, 'area', { max: MAX_SHORT }) : { value: existing.area, error: null };
@@ -1554,7 +1617,7 @@ router.post('/decay-tasks/:taskId/complete', (req, res) => {
     const vId = validateId(req.params.taskId, 'taskId');
     if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
     const existing = db.get().prepare('SELECT * FROM housekeeping_decay_tasks WHERE id = ?').get(vId.value);
-    if (!existing) return res.status(404).json({ error: 'Task not found.', code: 404 });
+    if (!existing) return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'housekeeping_task_not_found' });
 
     db.get().prepare('UPDATE housekeeping_decay_tasks SET last_completed = ? WHERE id = ?').run(nowIso(), vId.value);
     const row = db.get().prepare('SELECT * FROM housekeeping_decay_tasks WHERE id = ?').get(vId.value);
@@ -1570,7 +1633,7 @@ router.delete('/decay-tasks/:taskId', (req, res) => {
     const vId = validateId(req.params.taskId, 'taskId');
     if (vId.error) return res.status(400).json({ error: vId.error, code: 400 });
     const result = db.get().prepare('DELETE FROM housekeeping_decay_tasks WHERE id = ?').run(vId.value);
-    if (result.changes === 0) return res.status(404).json({ error: 'Task not found.', code: 404 });
+    if (result.changes === 0) return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'housekeeping_task_not_found' });
     res.json({ data: null });
   } catch (err) {
     log.error('DELETE /decay-tasks/:taskId error:', err);

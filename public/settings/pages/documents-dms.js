@@ -1,5 +1,6 @@
 import { api } from '/api.js';
 import { t } from '/i18n.js';
+import { REQUIRED_MARK } from '/utils/html.js';
 import { confirmModal, refocusAfterRender } from '/components/modal.js';
 import {
   createDisclosure,
@@ -8,6 +9,7 @@ import {
   createStatusSummary,
   settingRowHtml,
 } from '/settings/components.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
 
 function showToast(message, tone = 'default') {
   window.yuvomi?.showToast(message, tone);
@@ -31,11 +33,11 @@ function buildAddForm(container) {
         </select>`,
       })}
       ${settingRowHtml({
-        label: t('settings.dmsName'), labelFor: 'dms-name',
+        label: t('settings.dmsName'), labelFor: 'dms-name', labelExtra: REQUIRED_MARK,
         control: `<input class="form-input" type="text" id="dms-name" maxlength="100" required />`,
       })}
       ${settingRowHtml({
-        label: t('settings.dmsBaseUrl'), labelFor: 'dms-url',
+        label: t('settings.dmsBaseUrl'), labelFor: 'dms-url', labelExtra: REQUIRED_MARK,
         control: `<input class="form-input" type="url" id="dms-url" required placeholder="https://..." />`,
       })}
       ${settingRowHtml({
@@ -44,8 +46,8 @@ function buildAddForm(container) {
         control: `<input class="form-input" type="text" id="dms-org-id" maxlength="200" />`,
       })}
       ${settingRowHtml({
-        label: t('settings.dmsToken'), labelFor: 'dms-token',
-        control: `<input class="form-input" type="password" id="dms-token" required autocomplete="current-password" />`,
+        label: t('settings.dmsToken'), labelFor: 'dms-token', labelExtra: REQUIRED_MARK,
+        control: `<input class="form-input" type="password" id="dms-token" required autocomplete="new-password" />`,
       })}
     </div>
     <div id="dms-form-error-host"></div>
@@ -79,7 +81,7 @@ function buildAddForm(container) {
       orgGroup.hidden = true;
       orgInput.required = false;
       showToast(t('settings.dmsConnected'), 'success');
-      await loadDmsAccounts(container);
+      await reloadAfterSave(() => loadDmsAccounts(container));
     } catch (err) {
       errorHost.replaceChildren(createInlineError(err.message ?? t('common.errorGeneric')));
     }

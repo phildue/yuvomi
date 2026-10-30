@@ -1,4 +1,4 @@
-import { op, jsonBody, idParam } from '../helpers.js';
+import { op, jsonBody, idParam, withCaseReasons } from '../helpers.js';
 
 // POST und PUT pruefen ihre Felder und antworten mit 400 (validateReminder()
 // und die Nachbarn in server/routes/birthdays.js); `op()` fuehrt ohne
@@ -14,7 +14,7 @@ function withBadRequest(status, description, extra = {}) {
 }
 
 export function birthdaysPaths() {
-  return {
+  return withCaseReasons('birthdays', CASE_REASONS, {
     '/api/v1/birthdays': {
       get: op({ summary: 'List birthdays', tag: 'Birthdays' }),
       post: op({
@@ -23,13 +23,16 @@ export function birthdaysPaths() {
         tag: 'Birthdays',
         stateChanging: true,
         requestBody: jsonBody('#/components/schemas/BirthdayCreateInput'),
-        responses: withBadRequest(201, 'Birthday created'),
+        responses: withBadRequest(201, 'Birthday created', {
+          403: { $ref: '#/components/responses/Forbidden' },
+          409: { description: 'The contact is already linked to another birthday' },
+        }),
       }),
     },
     '/api/v1/birthdays/upcoming': {
       get: op({
         summary: 'List upcoming birthdays',
-        description: 'Ordered by distance to each person’s next birthday; optional name-day fields do not affect ordering.',
+        description: 'Ordered by distance to each person’s next birthday; optional name-day fields do not affect ordering. A birthday with `year_unknown` sorts by day and month like any other and carries `next_age: null`.',
         tag: 'Birthdays',
       }),
     },
@@ -50,7 +53,7 @@ export function birthdaysPaths() {
       get: op({
         summary: 'List contacts eligible for birthday import',
         tag: 'Birthdays',
-        description: 'Reads the contact book, so it requires read access to the `contacts` module in addition to `calendar` - a credential scoped to the calendar alone is refused with 403.',
+        description: 'Reads the contact book, so it requires read access to the `contacts` module in addition to `calendar` - a credential scoped to the calendar alone is refused with 403. Each candidate with a birthday carries `birthday_year_unknown` (boolean); the import takes it over as `year_unknown`.',
         responses: {
           200: { description: 'Successful response' },
           401: { $ref: '#/components/responses/Unauthorized' },
@@ -85,9 +88,26 @@ export function birthdaysPaths() {
         params: [idParam()],
         stateChanging: true,
         requestBody: jsonBody('#/components/schemas/BirthdayUpdateInput'),
-        responses: withBadRequest(200, 'Birthday updated', { 404: { description: 'Birthday not found' } }),
+        responses: withBadRequest(200, 'Birthday updated', {
+          403: { $ref: '#/components/responses/Forbidden' },
+          404: { description: 'Birthday not found' },
+          409: { description: 'The contact is already linked to another birthday' },
+        }),
       }),
       delete: op({ summary: 'Delete birthday', tag: 'Birthdays', params: [idParam()], stateChanging: true }),
     },
-  };
+  });
 }
+
+// #1909: die Faelle, die ein Nutzer erreicht, tragen einen `reason` neben dem
+// englischen `error` - je Operation der Satz, der sie nennt.
+const BIRTHDAY_GONE = '`birthdays_birthday_not_found` (404, the birthday does not exist - deleted)';
+// D7 (Critique R22): POST und PUT verknuepfen per `contact_id`.
+const CONTACT_LINK = '`birthdays_contact_linked` (409, the contact is already linked to another birthday), `birthdays_selected_contact_not_found` (400, no such contact)';
+const CONTACTS_READ_REQUIRED = '`cross_module_access` (403, importing birthdays reads contacts and needs read access to them - for API tokens a `contacts:read` scope)';
+const CASE_REASONS = {
+  '/api/v1/birthdays': { post: CONTACT_LINK },
+  '/api/v1/birthdays/{id}': { put: `${BIRTHDAY_GONE}, ${CONTACT_LINK}`, delete: BIRTHDAY_GONE },
+  '/api/v1/birthdays/import/candidates': { get: CONTACTS_READ_REQUIRED },
+  '/api/v1/birthdays/import': { post: CONTACTS_READ_REQUIRED },
+};

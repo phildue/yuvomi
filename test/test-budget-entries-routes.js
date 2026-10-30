@@ -126,6 +126,69 @@ test('GET /summary: aggregiert income/expenses/balance + byCategory', async () =
   assert.equal(food.total, 70);
 });
 
+test('GET /summary: Savings has its own chart bar under the stored Financials category', async () => {
+  const id = insertEntry({ amount: -125, category: 'financial_other', subcategory: 'saving', date: '2042-01-10' });
+  insertEntry({ amount: -10, category: 'financial_other', subcategory: '', date: '2042-01-10' });
+  insertEntry({ amount: -50, category: 'financial_other', subcategory: 'saving', date: '2042-01-10', is_pending: 1 });
+  const r = await call('GET', '/summary?month=2042-01');
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.data.byCategory, [
+    { category: '__saving__', income: 0, expenses: -125, total: -125 },
+    { category: 'financial_other', income: 0, expenses: -10, total: -10 },
+  ]);
+  assert.equal(r.body.data.expenses, -135);
+  assert.equal(db.prepare('SELECT category FROM budget_entries WHERE id = ?').get(id).category, 'financial_other');
+});
+
+test('GET /summary: Savings chart grouping preserves hidden category details', async () => {
+  setMode('personal');
+  insertEntry({ amount: -125, category: 'financial_other', subcategory: 'saving', date: '2042-02-10', created_by: B, owner_id: B, visibility: 'shared_amount' });
+  const r = await call('GET', '/summary?month=2042-02&scope=household');
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.data.byCategory, [
+    { category: '__private__', income: 0, expenses: -125, total: -125 },
+  ]);
+});
+
+test('salary and an account transfer keep income, spending, and account balances distinct', async () => {
+  const from = (await call('POST', '/accounts', { body: { name: 'Transfer source', type: 'checking', starting_balance: 0 } })).body.data;
+  const to = (await call('POST', '/accounts', { body: { name: 'Transfer target', type: 'savings', starting_balance: 0 } })).body.data;
+  insertEntry({ title: 'Salary', amount: 1000, category: 'Erwerbseinkommen', date: '2042-03-01', account_id: from.id });
+  const transfer = await call('POST', '/transfers', { body: {
+    title: 'Save', amount: 10, date: '2042-03-01', from_account_id: from.id, to_account_id: to.id,
+  } });
+  assert.equal(transfer.status, 201);
+  const r = await call('GET', '/summary?month=2042-03');
+  assert.equal(r.status, 200);
+  const summary = r.body.data;
+  assert.equal(summary.income, 1000);
+  assert.equal(summary.expenses, 0);
+  assert.equal(summary.balance, 1000);
+  assert.equal(summary.transfers, 10);
+  assert.deepEqual(summary.byCategory.find(c => c.category === '__saving__'),
+    { category: '__saving__', income: 0, expenses: 0, total: 0, transfers: 10 });
+  assert.equal(summary.byCategory.some(c => c.category === 'Geschenke & Transfers'), false);
+  const stats = (await call('GET', '/stats?range=month&anchor=2042-03-01')).body.data;
+  assert.deepEqual(stats.totals, { income: 1000, expenses: 0, balance: 1000 });
+  assert.equal(stats.series.reduce((sum, row) => sum + row.income, 0), 1000);
+  assert.equal(stats.series.reduce((sum, row) => sum + row.expenses, 0), 0);
+  assert.equal(stats.byCategory.some(c => c.category === 'financial_other'), false);
+  const plans = (await call('GET', '/plans?month=2042-03')).body.data;
+  assert.equal(plans.totalActual, 0);
+  const accounts = (await call('GET', '/accounts')).body.data.accounts;
+  assert.equal(accounts.find(a => a.id === from.id).projected_balance, 990);
+  assert.equal(accounts.find(a => a.id === to.id).projected_balance, 10);
+  for (const [account, income, transfers] of [[from, 1000, 10], [to, 0, 0]]) {
+    const filtered = await call('GET', `/summary?month=2042-03&account_id=${account.id}`);
+    assert.equal(filtered.status, 200);
+    assert.equal(filtered.body.data.income, income);
+    assert.equal(filtered.body.data.expenses, 0, 'a transfer is not account spending');
+    assert.equal(filtered.body.data.balance, income, 'a transfer is not account income');
+    assert.equal(filtered.body.data.transfers, transfers, 'only outflows from the selected account count');
+    assert.equal(filtered.body.data.byCategory.reduce((sum, row) => sum + (row.transfers ?? 0), 0), transfers);
+  }
+});
+
 test('GET /summary?account_id: Bilanz und Kategorien folgen dem Kontofilter der Liste', async () => {
   // Re-Critique 2026-10-17: das Hauptbuch zeigte Konto "Visa", die Seitenleiste
   // daneben weiter Saldo und Kategorien des ganzen Haushalts.
@@ -149,6 +212,42 @@ test('GET /summary?account_id: Bilanz und Kategorien folgen dem Kontofilter der 
   assert.equal(alle.body.data.balance, 2905, 'ohne Filter bleibt es der ganze Haushalt');
   const unsinn = await call('GET', '/summary?month=2047-04&account_id=abc');
   assert.equal(unsinn.body.data.balance, 2905, 'ein unbrauchbarer Filter filtert nicht, wie in der Liste');
+});
+
+test('GET /summary?account_id: eingehende Umbuchungen stehen getrennt neben den ausgehenden (#2207)', async () => {
+  // Gefiltert auf das Zielkonto stand eine eingehende Umbuchung in der Liste
+  // und im Kontostand, aber in keiner Karte: `transfers` zaehlt nur Abgaenge.
+  const giro = (await call('POST', '/accounts', { body: { name: 'Giro 2207', type: 'checking', starting_balance: 0 } })).body.data;
+  const spar = (await call('POST', '/accounts', { body: { name: 'Spar 2207', type: 'savings', starting_balance: 0 } })).body.data;
+  insertEntry({ title: 'Gehalt', amount: 2000, category: 'income_salary', date: '2043-05-01', account_id: giro.id });
+  for (const [amount, fromId, toId] of [[500, spar.id, giro.id], [200, giro.id, spar.id]]) {
+    const r = await call('POST', '/transfers', { body: { title: 'Umbuchung', amount, date: '2043-05-02', from_account_id: fromId, to_account_id: toId } });
+    assert.equal(r.status, 201);
+  }
+
+  const g = (await call('GET', `/summary?month=2043-05&account_id=${giro.id}`)).body.data;
+  assert.equal(g.transfers_in, 500, 'die eingehende Umbuchung zaehlt auf dem Zielkonto');
+  assert.equal(g.transfers, 200, 'ausgehend bleibt wie bisher');
+  assert.equal(g.balance, 2000, 'die Bilanz bleibt Einnahmen minus Ausgaben');
+  const s = (await call('GET', `/summary?month=2043-05&account_id=${spar.id}`)).body.data;
+  assert.equal(s.transfers_in, 200);
+  assert.equal(s.transfers, 500);
+  assert.equal(s.balance, 0);
+
+  const alle = (await call('GET', '/summary?month=2043-05')).body.data;
+  assert.equal('transfers_in' in alle, false, 'ohne Kontofilter bleibt die Antwort wie sie war');
+  assert.equal(alle.transfers, 700);
+
+  // Eine private Umbuchung von B auf dasselbe Konto sieht A nicht und zaehlt sie nicht.
+  setMode('personal');
+  const priv = await call('POST', '/transfers', { as: { id: B, role: 'member' }, body: { title: 'Privat', amount: 80, date: '2043-05-03', from_account_id: spar.id, to_account_id: giro.id, visibility: 'private' } });
+  assert.equal(priv.status, 201);
+  for (const scope of ['mine', 'household']) {
+    const gA = (await call('GET', `/summary?month=2043-05&account_id=${giro.id}&scope=${scope}`)).body.data;
+    assert.equal(gA.transfers_in, 500, `fremde private Umbuchungen zaehlen nicht (${scope})`);
+  }
+  const gB = (await call('GET', `/summary?month=2043-05&account_id=${giro.id}&scope=mine`, { as: { id: B, role: 'member' } })).body.data;
+  assert.equal(gB.transfers_in, 80, 'die eigene private Umbuchung zaehlt fuer B');
 });
 
 // ── GET /export ─────────────────────────────────────────────────────────────────

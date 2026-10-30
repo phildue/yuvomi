@@ -152,6 +152,55 @@ test('Indikator: gleitet per transform mit --duration-lg/--ease-out; auch ein Br
   assert.equal(wide.handle.indicator.style.width, '130px', 'die Kapsel steht sofort in der Zielbreite');
 });
 
+// Critique R21 (D11): die Kuechen-Kapsel war mobil ein 58x48-Fast-Kreis mit
+// rund 3px Luft ums Wort - sie trug die Masse der Trefferflaeche. Eine Leiste
+// gibt ihr jetzt per CSS eine eigene Form: `--seg-pill-outset` (waagerecht ueber
+// den Eintrag hinaus) und `--seg-pill-block` (eigene Hoehe, mittig).
+test('Indikator D11: eine Leiste gibt der Kapsel ihre eigene Form - breiter als der Eintrag, niedriger als das Ziel', () => {
+  const prev = global.getComputedStyle;
+  const shape = { '--seg-pill-outset': ' 4px', '--seg-pill-block': ' 40px' };
+  global.getComputedStyle = (el) => ({
+    borderRadius: '9999px',
+    getPropertyValue: (name) => (el?.querySelectorAll ? shape[name] ?? '' : ''),
+  });
+  try {
+    const { handle, activate, animations } = fakeBar([
+      { offsetLeft: 16, offsetTop: 4, offsetWidth: 58, offsetHeight: 48, active: true },
+      { offsetLeft: 74, offsetTop: 4, offsetWidth: 71, offsetHeight: 48 },
+    ]);
+    assert.equal(handle.indicator.style.transform, 'translate(12px, 8px)', 'die Kapsel steht nicht 4px ueber dem Eintrag und mittig im Ziel');
+    assert.equal(handle.indicator.style.width, '66px');
+    assert.equal(handle.indicator.style.height, '40px', 'die Kapsel traegt die Hoehe der Trefferflaeche statt ihrer eigenen');
+    activate(1);
+    handle.place({ glide: true });
+    assert.deepEqual(animations.at(-1).frames.map((f) => f.transform), ['translate(12px, 8px) scale(0.8354, 1)', 'translate(70px, 8px) scale(1, 1)'],
+      'die geformte Kapsel gleitet wie jede andere nur per transform');
+    // Ohne die Eigenschaften misst sie den Eintrag wie bisher.
+    shape['--seg-pill-outset'] = '';
+    shape['--seg-pill-block'] = '';
+    const plain = fakeBar([{ offsetLeft: 16, offsetTop: 4, offsetWidth: 58, offsetHeight: 48, active: true }]);
+    assert.equal(plain.handle.indicator.style.transform, 'translate(16px, 4px)');
+    assert.equal(plain.handle.indicator.style.height, '48px');
+  } finally {
+    global.getComputedStyle = prev;
+  }
+});
+
+test('Kueche mobil D11: Kapsel 36-40px hoch, 12px Luft ums Wort, der Zaehler mit Abstand (Critique R21)', async () => {
+  const { eachRule } = await import('./css-rules.js');
+  const tokens = readSrc('../public/styles/tokens.css');
+  const tok = (name) => Number(tokens.match(new RegExp(`--${name}:\\s*([\\d.]+)px`))?.[1]);
+  const px = (value) => tok(String(value ?? '').match(/^var\(--([\w-]+)\)$/)?.[1]);
+  const narrow = [...eachRule(readSrc('../public/styles/kitchen-tabs.css'))].filter((r) => r.at.some((a) => /\(max-width:\s*639px\)/.test(a)));
+  const decl = (sel, prop) => narrow.filter((r) => r.selector.trim() === sel).map((r) => r.body.match(new RegExp(`(?:^|;)\\s*${prop}:\\s*([^;]+)`))?.[1]?.trim()).filter(Boolean).at(-1);
+  const block = px(decl('.kitchen-tabs-bar', '--seg-pill-block'));
+  assert.ok(block >= 36 && block <= 40, `die aktive Kapsel ist ${block}px hoch - D11 verlangt 36-40`);
+  const air = px(decl('.kitchen-tabs-bar .sub-tab', 'padding-inline')) + px(decl('.kitchen-tabs-bar', '--seg-pill-outset'));
+  assert.equal(air, 12, `${air}px Luft ums Wort in der aktiven Kapsel - D11 verlangt 12`);
+  assert.ok(px(decl('.kitchen-tabs-bar .sub-tab', 'gap')) >= 4, 'der Zaehler klebt am Wort ("Vorrat11")');
+  assert.ok(px(decl('.kitchen-tabs-bar .sub-tab__badge', 'padding-inline')) >= 4, 'der Zaehler hat keine Luft in seiner Marke');
+});
+
 test('Indikator: reduzierte Bewegung springt', () => {
   global.matchMedia = (q) => ({ matches: /reduced-motion/.test(q) });
   try {
@@ -432,4 +481,49 @@ test('Kueche mobil: die Leiste passt bei 375px in allen vier Tabs ohne Scrollen 
   }
   assert.ok(numeric >= badgeMin, 'der Zaehler bleibt eine Pille');
   assert.ok(tabPad >= tok('space-1'), 'die Kapsel des aktiven Tabs laesst dem Wort weiter 4px je Seite');
+});
+
+// --------------------------------------------------------
+// Critique R22 (D1): Kapsel und Koerper wechseln im selben Frame. Die Kapsel
+// glitt seit dem Tipp (Auswahl beim Klick + Beobachter + placeIndicator) und
+// stand am Ziel, bevor der Koerper wechselte. Jetzt bleibt die Auswahl beim
+// Klick stehen, und die naechste Kuechen-Seite zieht sie beim Wiedereinhaengen
+// nach - synchron und ohne Gleiten, im Update-Callback des Seitenwechsels.
+// --------------------------------------------------------
+test('Kueche D1: die Auswahl wechselt erst mit dem Inhalt - nicht beim Tipp, und dann ohne Gleiten', () => {
+  const kitchen = readSrc('../public/utils/kitchen-tabs.js');
+  const subTabs = readSrc('../public/utils/sub-tabs.js');
+  assert.match(kitchen, /markOnNavigate: false,\s*onChange: onTabChosen,/, 'die Kuechen-Leiste markiert den Reiter weiter beim Tipp');
+  const chosen = kitchen.slice(kitchen.indexOf('function onTabChosen('), kitchen.indexOf('export function renderKitchenTabsBar('));
+  assert.doesNotMatch(chosen.replace(/\/\/.*$/gm, ''), /placeIndicator|applyBadges|_activeRoute =/, 'der Tipp bewegt Kapsel oder Zahlen vor dem Inhalt');
+  const reuse = kitchen.slice(kitchen.indexOf('if (_bar && isKitchenRoute(navigationFrom())'), kitchen.indexOf('// Eine frische Leiste'));
+  assert.match(reuse, /selectSubTab\(_bar, activeRoute\);[\s\S]*placeIndicator\(\);/, 'die wiedereingehaengte Leiste zieht die Kapsel nicht synchron nach');
+  assert.doesNotMatch(reuse, /placeIndicator\(\{ glide: true \}\)/, 'im Tausch gleitet die Kapsel noch - sie stuende erst nach dem Inhalt am Ziel');
+  assert.match(subTabs, /if \(isNav && !markOnNavigate\) \{\s*onChange\(tabId\);\s*return;\s*\}/, 'renderSubTabs ehrt markOnNavigate nicht');
+});
+
+// R24 E3 (Ulas 2026-10-28): der aktive Reiter ist in beiden Themes EINE
+// getoente Kapsel im Modulton, ohne Ring - hell war er die weisse
+// Segment-Pille mit grauem Ring auf dem Seitengrund und las sich als
+// Umrandungs-Knopf, dunkel eine graue Platte. Das Segment (Ansichtswahl)
+// behaelt Daumen und Kante; Reiter und Segment bleiben unterscheidbar.
+test('R24 E3: der aktive Reiter ist eine getoente Kapsel ohne Ring, das Segment behaelt den Daumen', async () => {
+  const { eachRule } = await import('./css-rules.js');
+  const rules = [...eachRule(readSrc('../public/styles/sub-tabs.css'))].filter((r) => !r.at.length);
+  const tint = /background-color:\s*color-mix\(in srgb,\s*var\(--active-module-accent, var\(--color-accent\)\) var\(--tint-state\),\s*transparent\)/;
+  for (const selector of ['.sub-tab--active', '.has-seg-indicator:has(> .sub-tab) > .seg-indicator']) {
+    const rule = rules.find((r) => r.selector === selector);
+    assert.ok(rule, `${selector} steht in sub-tabs.css`);
+    assert.match(rule.body, tint, `${selector}: Flaeche = Modulton auf --tint-state`);
+    assert.match(rule.body, /box-shadow:\s*none/, `${selector}: kein Ring, kein Schatten`);
+    assert.doesNotMatch(rule.body, /--seg-active-(?:bg|shadow)/, `${selector}: nicht der Segment-Daumen`);
+  }
+  // Die Listen-Kapseln des Einkaufs sind Reiter (welche Liste) direkt unter
+  // der Kuechen-Leiste: dieselbe Flaeche, sonst zwei Zustandsbilder uebereinander.
+  const list = [...eachRule(readSrc('../public/styles/shopping.css'))].find((r) => !r.at.length && r.selector === '.list-tab--active');
+  assert.match(list.body, /background-color:\s*color-mix\(in srgb,\s*var\(--module-accent, var\(--color-accent\)\) var\(--tint-state\),\s*transparent\)/);
+  assert.match(list.body, /box-shadow:\s*none/, 'Listen-Kapsel ohne Ring');
+  const base = rules.find((r) => r.selector === '.seg-indicator');
+  assert.match(base.body, /background-color:\s*var\(--seg-active-bg\)/, 'das Segment behaelt den Daumen');
+  assert.match(base.body, /box-shadow:\s*var\(--seg-active-shadow\)/, 'und seine 3:1-Kante');
 });

@@ -21,6 +21,7 @@ import * as db from '../db.js';
 import { getAdapter } from './recipe-providers/index.js';
 import { householdDisabledModules } from './household-modules.js';
 import { withPrivateNetworkHint } from './recipe-providers/private-network.js';
+import { classifyProviderFailure } from './recipe-providers/failure.js';
 import { ingredientMatchKey } from '../../public/utils/ingredient-match-key.js';
 
 const log = createLogger('RecipeProviderSync');
@@ -43,6 +44,20 @@ function getAccountById(id) {
  * mehr liefert. Wirft nie - ein Fehler wird als { failed: true } gemeldet,
  * damit ein kaputter Account den Sync-Lauf anderer Accounts nicht abbricht.
  */
+/**
+ * Der gespeicherte Sync-Stand eines Spiegel-Rezepts (#2363): Providers updatedAt,
+ * bei einem Adapter mit `mirrorFormat` mit angehaengter Formatnummer. Spiegelt
+ * ein Adapter nach einem Update mehr Felder (Mealie: Schritte in notes), passt
+ * der alte Stand nicht mehr, und jedes Bestandsrezept wird genau einmal neu
+ * geholt - ohne Migration. Der Wert ist auch die Bildversion (?v=, ETag in
+ * routes/recipes.js); dort ist er nur ein undurchsichtiger Schluessel, der
+ * Wechsel kostet einmal einen frischen Bildabruf.
+ */
+function syncStamp(adapter, updatedAt) {
+  if (!adapter.mirrorFormat || updatedAt == null) return updatedAt;
+  return `${updatedAt}#f${adapter.mirrorFormat}`;
+}
+
 async function syncAccount(account) {
   const adapter = getAdapter(account);
   const conn = db.get();
@@ -55,7 +70,13 @@ async function syncAccount(account) {
     summaries = await adapter.listRecipeSummaries();
   } catch (err) {
     log.error(`Account ${account.id} ("${account.name}"): fetch failed, skipping this pass:`, err.message);
-    return { imported: 0, updated: 0, deleted: 0, failed: true, error: err.message };
+    // Der Fall des Wurfs (#1909) geht mit: die Konto-Karte sagt ihn als Satz
+    // der App, `error` bleibt der rohe Text fuer Log und API.
+    const failure = classifyProviderFailure(err);
+    return {
+      imported: 0, updated: 0, deleted: 0, failed: true, error: err.message,
+      reason: failure?.reason ?? null, ...(failure?.params && { params: failure.params }),
+    };
   }
 
   const existing = conn.prepare(
@@ -79,7 +100,7 @@ async function syncAccount(account) {
     // weiterhin für den Detail-Abruf gebraucht (adapter.getRecipe(ref)).
     seenIds.add(summary.id);
     const current = existingByProviderId.get(summary.id);
-    if (current && current.provider_updated_at === summary.updatedAt) {
+    if (current && current.provider_updated_at === syncStamp(adapter, summary.updatedAt)) {
       // Unverändert beim Provider - den vollen Detail-Abruf sparen, aber
       // recipe_url trotzdem aus den gespeicherten Feldern neu bauen: ein Sync ist
       // der einzige Moment, in dem eine nachträgliche external_url/base_url-
@@ -171,13 +192,13 @@ async function syncAccount(account) {
       const hasImage = detail.hasImage ? 1 : 0;
       let id;
       if (current) {
-        updRecipe.run(detail.title, detail.notes || null, recipeUrl, detail.updatedAt, detail.slug, hasImage, current.id);
+        updRecipe.run(detail.title, detail.notes || null, recipeUrl, syncStamp(adapter, detail.updatedAt), detail.slug, hasImage, current.id);
         id = current.id;
         updated++;
       } else {
         const result = insRecipe.run(
           detail.title, detail.notes || null, recipeUrl,
-          account.created_by, account.id, detail.id, detail.updatedAt, detail.slug, hasImage,
+          account.created_by, account.id, detail.id, syncStamp(adapter, detail.updatedAt), detail.slug, hasImage,
         );
         id = Number(result.lastInsertRowid);
         imported++;
@@ -193,18 +214,57 @@ async function syncAccount(account) {
   return { imported, updated, deleted: stale.length, failed: false };
 }
 
+/**
+ * Schreibt den letzten Fehlschlag auf ein Konto: Text, Fall und Zahlen gehen
+ * immer ZUSAMMEN (#1909, Migration 255). Ein neuer Text ohne Fall raeumt den
+ * alten Fall mit ab, sonst sagte die Karte den Satz eines frueheren
+ * Fehlschlags. Auch der Verbindungstest (routes/recipe-providers.js) schreibt
+ * hierueber.
+ *
+ * @param {number} accountId
+ * @param {{ error: string, reason?: string|null, params?: object|null }} failure
+ */
+export function recordAccountFailure(accountId, { error, reason = null, params = null }) {
+  // Eine Lookup-Ablehnung ("URL resolves to a private IP address") nennt im
+  // Text den Schalter mit (#1053) - fuer Log und API; die Karte sagt den Satz
+  // zum Fall `recipe_providers_private_network`, der ihn ebenso nennt.
+  db.get().prepare(`
+    UPDATE recipe_provider_accounts SET last_error = ?, last_error_reason = ?, last_error_params = ? WHERE id = ?
+  `).run(
+    withPrivateNetworkHint(error) || 'Sync failed.',
+    typeof reason === 'string' ? reason : null,
+    typeof reason === 'string' && params ? JSON.stringify(params) : null,
+    accountId,
+  );
+}
+
 /** Schreibt last_sync/last_error auf den Account nach einem Durchlauf. Gibt zurück, ob er erfolgreich war. */
 function recordAccountResult(account, result) {
   if (result.failed) {
-    // Eine Lookup-Ablehnung ("URL resolves to a private IP address") nennt hier
-    // den Schalter mit (#1053): last_error ist, was die Konto-Karte zeigt.
-    db.get().prepare('UPDATE recipe_provider_accounts SET last_error = ? WHERE id = ?')
-      .run(withPrivateNetworkHint(result.error), account.id);
+    recordAccountFailure(account.id, result);
     return false;
   }
-  db.get().prepare('UPDATE recipe_provider_accounts SET last_sync = ?, last_error = NULL WHERE id = ?')
-    .run(new Date().toISOString(), account.id);
+  // Ein Erfolg leert den Fehlschlag ganz: Text, Fall und Zahlen.
+  db.get().prepare(`
+    UPDATE recipe_provider_accounts
+    SET last_sync = ?, last_error = NULL, last_error_reason = NULL, last_error_params = NULL WHERE id = ?
+  `).run(new Date().toISOString(), account.id);
   return true;
+}
+
+/**
+ * Die Zahlen des letzten Fehlschlags als Objekt, nicht als der JSON-Text, in
+ * dem die Spalte sie haelt (#1909). Ein unlesbarer Wert wird null: die App
+ * sagt dann den allgemeinen Satz statt eines mit Luecke.
+ */
+function parseErrorParams(value) {
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Sync-Durchlauf über alle aktivierten Accounts, egal welchen Providers. */
@@ -304,6 +364,10 @@ export function getStatus() {
     enabled: !!acc.enabled,
     lastSync: acc.last_sync,
     lastError: acc.last_error,
+    // Der Fall dazu (#1909): den Satz baut die App, `lastError` bleibt der
+    // rohe Text fuer Log und API. Ohne Text gibt es keinen Fall.
+    lastErrorReason: acc.last_error ? (acc.last_error_reason ?? null) : null,
+    lastErrorParams: acc.last_error ? parseErrorParams(acc.last_error_params) : null,
     recipeCount: countByAccount.get(acc.id) ?? 0,
   }));
 }

@@ -21,7 +21,7 @@ const {
   rememberFocus,
   __test: modalTest,
   restoreFocusAfterClose, refocusAfterRender, forgetRestore, renderKeepingFocus,
-  reportFieldErrors, reportFieldError, clearFieldError,
+  reportFieldErrors, reportFieldError, clearFieldError, constraintErrors,
 } = await import('../public/components/modal.js');
 
 // matchMedia und document.createElementNS werden von btnSuccess/btnError benötigt
@@ -184,13 +184,23 @@ test('failed confirmation actions keep the dialog open and allow retry', async (
   const panel = confirmationPanel();
   const finished = [];
   let fail = true;
+  let thrown = Object.assign(new Error('Calendar not found.'), {
+    name: 'ApiError', status: 404, data: { error: 'Calendar not found.', code: 404 },
+  });
   modalTest.wireConfirmation(panel, value => finished.push(value), async () => {
-    if (fail) throw new Error('Could not disable export');
+    if (fail) throw thrown;
   });
   await panel.listeners.get('ok')();
   assert.deepEqual(finished, []);
   assert.equal(panel.error.hidden, false);
-  assert.equal(panel.error.textContent, 'Could not disable export');
+  // Der Satz der App, nie der des Servers (#1909) - auch nicht der des Browsers.
+  assert.equal(panel.error.textContent, 'common.errorGeneric');
+  thrown = new Error('Could not disable export');
+  await panel.listeners.get('ok')();
+  assert.equal(panel.error.textContent, 'common.errorGeneric');
+  thrown = Object.assign(new Error('x'), { status: 403, data: { error: 'Forbidden.', reason: 'module_read_only' } });
+  await panel.listeners.get('ok')();
+  assert.equal(panel.error.textContent, 'settings.permReadOnlyBanner', 'eine Absage mit Grund sagt ihren Satz');
   assert.equal(panel.ok.disabled, false);
   assert.equal(panel.cancel.disabled, false);
   fail = false;
@@ -1592,6 +1602,64 @@ test('Erstfokus: ein ausdrueckliches Ziel traegt dieselbe Wache, "none" plant ni
   }
 });
 
+/* R23 (D13): BEARBEITEN HOLT AM FINGER KEINE TASTATUR. Wer eine Mahlzeit oder
+ * eine Buchung antippt, will sie meist ansehen; der Feldfokus fuhr die
+ * Tastatur hoch (Critique G3, Rest S1). `initialFocus: 'edit'` gibt ohne
+ * schwebenden Zeiger dem Titel des Blatts den Fokus, am Zeiger dem ersten Feld. */
+test('Erstfokus "edit": am Finger der Titel (ohne Ring), am Zeiger das erste Feld (R23 D13)', () => {
+  const vorherMM = global.matchMedia;
+  for (const finger of [true, false]) {
+    const lage = erstfokusLage();
+    try {
+      global.matchMedia = (q) => ({ matches: finger && q === '(hover: none)' });
+      const attrs = {};
+      const titel = lage.knoten('modal-title', true);
+      Object.assign(titel, { hasAttribute: (n) => n in attrs, setAttribute: (n, v) => { attrs[n] = v; } });
+      const container = { ...lage.container, querySelector: (sel) => (sel === '.modal-panel__title' ? titel : lage.feld) };
+      global.document.activeElement = lage.knoten('karte-draussen', false);
+      modalTest.applyInitialFocus(container, 'edit');
+      lage.ausloesen();
+      if (finger) {
+        assert.equal(global.document.activeElement, titel, 'am Finger nimmt der Titel den Fokus - keine Tastatur');
+        assert.equal(attrs.tabindex, '-1', 'programmatisch fokussierbar, nicht in der Tab-Folge');
+      } else {
+        assert.equal(global.document.activeElement, lage.feld, 'am Zeiger bleibt es beim ersten Feld');
+      }
+    } finally {
+      lage.aufraeumen();
+      global.matchMedia = vorherMM;
+    }
+  }
+  const meals = readFileSync(new URL('../public/pages/meals.js', import.meta.url), 'utf8');
+  const budget = readFileSync(new URL('../public/pages/budget.js', import.meta.url), 'utf8');
+  assert.match(meals, /initialFocus: isEdit \? 'edit' : 'first-field'/, 'die Mahlzeit-Karte oeffnet das Bearbeiten mit der Regel');
+  assert.match(budget, /initialFocus: isEdit \? 'edit' : 'first-field'/, 'die Buchung ebenso - kein Eigenbau mehr');
+});
+
+/* R24 (Critique G5 P2-4): „Art *" der Aktivitaet ist eine Pflicht-AUSWAHL;
+ * die Regel sucht Tippfelder zuerst, der Fokus landete im Datum und mobil fuhr
+ * die Tastatur hoch. Ein Selektor nennt das Pflichtfeld; verborgen oder
+ * fehlend gilt wieder die Regel. */
+test('Erstfokus per Selektor: die genannte Pflicht-Auswahl, sonst die Regel (R24 G5 P2-4)', () => {
+  for (const [fall, auswahlDa, verborgen] of [['genannt', true, false], ['verborgen', true, true], ['fehlt', false, false]]) {
+    const lage = erstfokusLage();
+    try {
+      const auswahl = lage.knoten('activity-type', true);
+      auswahl.closest = (sel) => (sel === '[hidden], [inert]' && verborgen ? {} : null);
+      const container = { ...lage.container, querySelector: (sel) => (sel === '#activity-type' ? (auswahlDa ? auswahl : null) : lage.feld) };
+      global.document.activeElement = lage.knoten('fab-draussen', false);
+      modalTest.applyInitialFocus(container, '#activity-type');
+      lage.ausloesen();
+      const soll = auswahlDa && !verborgen ? auswahl : lage.feld;
+      assert.equal(global.document.activeElement, soll, `${fall}: ${soll.id}`);
+    } finally {
+      lage.aufraeumen();
+    }
+  }
+  const health = readFileSync(new URL('../public/pages/health.js', import.meta.url), 'utf8');
+  assert.match(health, /initialFocus: dialogInitialFocus\(isEdit, '#activity-type'\)/, 'die Aktivitaet nennt ihre Art');
+});
+
 /* Review zu #1193: der Datepicker oeffnet sein Popover unter document.body und
  * fokussiert synchron hinein - AUSSERHALB des Modal-Containers. Eine Wache, die
  * nur im Modal nachsieht, riss den Fokus aus dem offenen Kalender. */
@@ -1714,7 +1782,7 @@ test('M8: der Loeschen-Knopf im Fuss wird erkannt, bekommt Symbol, Wortspanne un
   global.document.createElement = (tag) => el(tag);
   try {
     const titel = el('input', { attrs: { type: 'text', value: 'Wocheneinkauf' } });
-    const del = withText(el('button', { cls: ['btn', 'btn--danger-ghost'] }), '\n  ', 'Loeschen', '\n');
+    const del = withText(el('button', { cls: ['btn', 'btn--danger-outline'] }), '\n  ', 'Loeschen', '\n');
     const cancel = withText(el('button', { cls: ['btn', 'btn--secondary'] }), 'Abbrechen');
     const save = withText(el('button', { cls: ['btn', 'btn--primary'] }), 'Speichern');
     const footer = el('div', { cls: ['modal-panel__footer'], kids: [del, cancel, save] });
@@ -1727,6 +1795,7 @@ test('M8: der Loeschen-Knopf im Fuss wird erkannt, bekommt Symbol, Wortspanne un
     assert.ok(del.classList.contains('modal-panel__delete'));
     assert.ok(footer.classList.contains('modal-panel__footer--has-delete'));
     assert.ok(footer.classList.contains('modal-panel__footer--one-row'), 'Dreiheit Loeschen/Abbrechen/Primaer steht in einer Zeile');
+    assert.equal(footer.classList.contains('modal-panel__footer--delete-worded'), false, 'in der Dreiheit wird Loeschen mobil der Papierkorb');
     const label = del.childNodes.find((n) => n.nodeType === 1 && n.classList.contains('modal-panel__delete-label'));
     assert.equal(label?.textContent, 'Loeschen', 'das Wort steht in einer eigenen Spanne, die das CSS mobil ausblendet');
     assert.equal(del.childNodes[0].tagName, 'SVG', 'fehlendes Papierkorb-Symbol kommt dazu');
@@ -1764,7 +1833,7 @@ test('M8: data-delete-name und ein vorhandenes aria-label gewinnen; off und die 
     assert.equal(f3.classList.contains('modal-panel__footer--has-delete'), false);
 
     const detail = el('div', { cls: ['modal-panel__footer'], kids: [
-      withText(el('button', { cls: ['btn', 'btn--danger-ghost'] }), 'Loeschen'),
+      withText(el('button', { cls: ['btn', 'btn--danger-outline'] }), 'Loeschen'),
       withText(el('button', { cls: ['btn', 'btn--secondary'] }), 'Erledigen'),
       withText(el('button', { cls: ['btn', 'btn--ghost'] }), 'Starten'),
       withText(el('button', { cls: ['btn', 'btn--ghost'] }), 'Aufgabe archivieren'),
@@ -1785,6 +1854,17 @@ test('M8: data-delete-name und ein vorhandenes aria-label gewinnen; off und die 
     ] });
     decorateFooterDelete(konto);
     assert.ok(konto.classList.contains('modal-panel__footer--one-row'), 'ein Icon-Knopf daneben zaehlt nicht als beschriftete Aktion');
+
+    // R23 (Critique G3/G5): die Leseansicht [Loeschen][Duplizieren-Icon][Bearbeiten]
+    // hat Platz - Loeschen behaelt mobil sein Wort.
+    const lese = el('div', { cls: ['modal-panel__footer'], kids: [
+      withText(el('button', { cls: ['btn', 'btn--danger-outline'] }), 'Loeschen'),
+      el('button', { cls: ['btn', 'btn--ghost', 'btn--icon'] }),
+      withText(el('button', { cls: ['btn', 'btn--primary'] }), 'Bearbeiten'),
+    ] });
+    decorateFooterDelete(lese);
+    assert.ok(lese.classList.contains('modal-panel__footer--delete-worded'), 'eine beschriftete Nachbarin: das Wort bleibt');
+    assert.equal(detail.classList.contains('modal-panel__footer--delete-worded'), false, 'drei Nachbarinnen: Papierkorb');
   } finally {
     global.document.createElement = savedCreate;
     globalThis.window = savedWindow;
@@ -1802,11 +1882,12 @@ test('M8: mobil ist Loeschen ein Icon-Knopf der Zielgroesse, das Wort nur fuer d
   const css = readFileSync(new URL('../public/styles/layout.css', import.meta.url), 'utf8');
   const mobile = [...eachRule(css)].filter((r) => r.at.some((a) => /max-width:\s*639px/.test(a)));
   const rule = (sel) => mobile.find((r) => r.selector.split(',').map((s) => s.trim()).includes(sel))?.body ?? '';
-  const btn = rule('.modal-panel__footer .btn.modal-panel__delete');
+  // R23: die Regeln gelten nur dort, wo das Wort keinen Platz hat (nicht `--delete-worded`).
+  const btn = rule('.modal-panel__footer:not(.modal-panel__footer--delete-worded) .btn.modal-panel__delete');
   assert.match(btn, /width:\s*var\(--target-base\)/, 'Treffflaeche der Geraeteklasse (44 Zeiger / 48 Finger)');
   assert.match(btn, /min-width:\s*var\(--target-base\)/);
   assert.match(btn, /padding:\s*0/);
-  const label = rule('.modal-panel__footer .modal-panel__delete .modal-panel__delete-label');
+  const label = rule('.modal-panel__footer:not(.modal-panel__footer--delete-worded) .modal-panel__delete .modal-panel__delete-label');
   assert.match(label, /position:\s*absolute/, 'das Wort verlaesst das Bild ...');
   assert.match(label, /clip:\s*rect\(0,\s*0,\s*0,\s*0\)/, '... aber nicht den Baum (sr-only, nicht display:none)');
   assert.doesNotMatch(label, /display:\s*none/);
@@ -1850,7 +1931,7 @@ test('F3: in jedem Fuss liegt das Wort des Loeschen-Knopfs in der ausgeblendeten
   try {
     const cases = {
       // Die Form aus detail-view.js: Symbol + .btn__label.
-      detailansicht: () => el('button', { cls: ['btn', 'btn--danger-ghost'], kids: [
+      detailansicht: () => el('button', { cls: ['btn', 'btn--danger-outline'], kids: [
         el('i', { data: { lucide: 'trash-2' } }),
         el('span', { cls: ['btn__label'], text: 'Loeschen' }),
       ] }),
@@ -2207,6 +2288,69 @@ test('reportFieldErrors: meldet jeden Fehler und fokussiert das erste Feld im Bi
     'der Fokus gehoert dem ersten Feld in Dokumentreihenfolge, und nur ihm');
 });
 
+/* DIE REGELN DES MARKUPS, IN DER STIMME DER APP (Critique R21, a5). Die
+ * Gesundheitsformulare tragen jetzt `novalidate`; was `required`, `min`,
+ * `max`, `step` und der Zahltyp verlangen, liest constraintErrors() aus dem
+ * ValidityState und gibt es reportFieldErrors() - statt einer Browser-Blase.
+ * Ein Feld, das nicht gezeichnet ist, zaehlt nicht (sein Wert geht nicht mit);
+ * eines in einem zugeklappten Aufklapper zaehlt, und der Aufklapper geht auf;
+ * die inneren Felder des Datumsfelds prueft das Datumsfeld selbst. */
+function constraintField({ validity = {}, min = '', max = '', step = '', rendered = true, folded = null, inDatepicker = false, willValidate = true } = {}) {
+  return {
+    willValidate,
+    validity: { valid: !Object.values(validity).some(Boolean), ...validity },
+    min, max, step,
+    getClientRects: () => (rendered || (folded && folded.open) ? [{}] : []),
+    closest: (sel) => {
+      if (sel === 'yuvomi-datepicker') return inDatepicker ? {} : null;
+      if (sel === 'details:not([open])') return folded && !folded.open ? folded : null;
+      return null;
+    },
+  };
+}
+
+test('constraintErrors: required, Zahl, min, max, step - am Feld, in der Stimme der App (Critique R21)', () => {
+  const missing = constraintField({ validity: { valueMissing: true } });
+  const bad = constraintField({ validity: { badInput: true } });
+  const low = constraintField({ validity: { rangeUnderflow: true }, min: '0.01' });
+  const high = constraintField({ validity: { rangeOverflow: true }, max: '24' });
+  const whole = constraintField({ validity: { stepMismatch: true }, step: '1' });
+  const step = constraintField({ validity: { stepMismatch: true }, step: '0.5' });
+  const other = constraintField({ validity: { typeMismatch: true } });
+  const fine = constraintField();
+  const form = { elements: [missing, bad, low, high, whole, step, other, fine] };
+  const found = constraintErrors(form);
+  assert.deepEqual(found.map(([el]) => form.elements.indexOf(el)), [0, 1, 2, 3, 4, 5, 6], 'jedes ungueltige Feld, das gueltige nicht');
+  assert.deepEqual(found.map(([, msg]) => msg), [
+    'common.required',
+    'common.fieldNumber',
+    'common.fieldMin{"min":"0,01"}',
+    'common.fieldMax{"max":"24"}',
+    'common.fieldWholeNumber',
+    'common.fieldStep{"step":"0,5"}',
+    'common.fieldInvalid',
+  ], 'die Grenze steht als Zahl der Format-Locale da');
+  assert.deepEqual(constraintErrors(null), [], 'ohne Formular nichts');
+  assert.deepEqual(constraintErrors({}), [], 'ein Panel ohne elements meldet nichts');
+});
+
+test('constraintErrors: Ungezeichnetes zaehlt nicht, Zugeklapptes klappt auf, das Datumsfeld prueft selbst (Critique R21)', () => {
+  const hidden = constraintField({ validity: { valueMissing: true }, rendered: false });
+  const details = { open: false };
+  const folded = constraintField({ validity: { rangeUnderflow: true }, min: '1', rendered: false, folded: details });
+  const inner = constraintField({ validity: { rangeUnderflow: true }, min: '2026-01-01', inDatepicker: true });
+  const disabled = constraintField({ validity: { valueMissing: true }, willValidate: false });
+  const found = constraintErrors({ elements: [hidden, folded, inner, disabled] });
+  assert.deepEqual(found.map(([el]) => el), [folded], 'nur das Feld hinter dem Aufklapper');
+  assert.equal(details.open, true, 'der Aufklapper geht auf, damit die Meldung zu sehen ist');
+
+  const nowhere = { open: false };
+  const stillHidden = constraintField({ validity: { valueMissing: true }, rendered: false, folded: nowhere });
+  stillHidden.getClientRects = () => [];
+  assert.deepEqual(constraintErrors({ elements: [stillHidden] }), [], 'auch aufgeklappt unsichtbar: kein Feld, das jemand sieht');
+  assert.equal(nowhere.open, false, 'und der Aufklapper geht wieder zu');
+});
+
 test('reportFieldErrors: ohne Fehler meldet es nichts und sagt false', () => {
   const field = fakeField('x', 1);
   assert.equal(reportFieldErrors([false, null, [null, 'Feld fehlt'], undefined]), false);
@@ -2332,4 +2476,164 @@ test('clearFieldError: nimmt Rahmen und aria-invalid, die reportFieldError geset
   assert.equal(field.attrs['aria-invalid'], 'false');
   assert.equal(field.classes.has('form-field--error'), false);
   clearFieldError(null);
+});
+
+/* „WEITERE ANGABEN" KLAPPT INS BILD, NICHT UNTER DEN FUSS (Critique R21, a4).
+ * Im Buchungsdialog am Telefon ging der Aufklapper auf, und alles Neue lag
+ * unter der festen Fusszeile (0 von 5 Zeilen sichtbar). Nach dem Tipp rollt
+ * der Scrollbereich so weit, dass das Neue ueber dem Fuss steht - aber nie so
+ * weit, dass die Beschriftung oben hinausrollt. Nur nach einem Tipp: ein
+ * offen geladener Aufklapper verschiebt nichts. */
+test('Weitere Angaben: nach dem Tipp rollt der Dialog das Neue ueber den Fuss, die Beschriftung bleibt im Bild (Critique R21)', async () => {
+  const listeners = {};
+  const rect = (top, bottom) => ({ top, bottom });
+  const scrolled = [];
+  const scroller = {
+    getBoundingClientRect: () => rect(160, 760),
+    scrollBy: (opts) => scrolled.push(opts),
+  };
+  const summary = { getBoundingClientRect: () => rect(720, 760) };
+  const body = { getBoundingClientRect: () => rect(760, 1300) };
+  const details = {
+    open: false,
+    querySelector: (sel) => (sel === '.form-advanced__body' ? body : sel === 'summary' ? summary : null),
+    closest: (sel) => (sel === '.modal-panel__body' ? scroller : null),
+  };
+  summary.parentElement = details;
+  const target = { closest: (sel) => (sel === 'details.form-advanced > summary' ? summary : null) };
+  const footer = { getBoundingClientRect: () => rect(758, 830) };
+  const panel = {
+    addEventListener: (type, fn) => { (listeners[type] ??= []).push(fn); },
+    querySelector: (sel) => (sel === '.modal-panel__footer' ? footer : null),
+  };
+  const prevRaf = globalThis.requestAnimationFrame;
+  const prevGcs = globalThis.getComputedStyle;
+  const prevDoc = globalThis.document;
+  const prevElement = globalThis.Element;
+  globalThis.requestAnimationFrame = (fn) => fn();
+  globalThis.getComputedStyle = () => ({ getPropertyValue: () => '16px' });
+  globalThis.document = { ...(prevDoc ?? {}), documentElement: {} };
+  if (!globalThis.Element) globalThis.Element = class {};
+  Object.setPrototypeOf(target, globalThis.Element.prototype);
+  try {
+    modalInternals.wireAdvancedReveal(panel);
+    // Offen geladen (kein Tipp davor): nichts rollt.
+    details.open = true;
+    for (const fn of listeners.toggle) fn({ target: details });
+    assert.equal(scrolled.length, 0, 'ein offen geladener Aufklapper verschiebt den Dialog nicht');
+
+    // Getippt: der Dialog rollt - so weit, wie die Beschriftung im Bild bleibt.
+    details.open = false;
+    for (const fn of listeners.click) fn({ target });
+    details.open = true;
+    for (const fn of listeners.toggle) fn({ target: details });
+    assert.equal(scrolled.length, 1, 'nach dem Tipp rollt der Scrollbereich');
+    // Gebraucht: 1300 + 16 - 758 = 558; Platz bis zur Beschriftung: 720 - 160 = 560.
+    assert.equal(scrolled[0].top, 558, 'das Neue steht ganz ueber dem Fuss');
+
+    // Ein langer Inhalt: die Beschriftung bleibt oben im Bild.
+    body.getBoundingClientRect = () => rect(760, 2400);
+    details.open = false;
+    for (const fn of listeners.click) fn({ target });
+    details.open = true;
+    for (const fn of listeners.toggle) fn({ target: details });
+    assert.equal(scrolled[1].top, 560, 'nie weiter, als die Beschriftung oben stehen bleibt');
+
+    // Zuklappen rollt nichts.
+    for (const fn of listeners.click) fn({ target });
+    details.open = false;
+    for (const fn of listeners.toggle) fn({ target: details });
+    assert.equal(scrolled.length, 2);
+  } finally {
+    globalThis.requestAnimationFrame = prevRaf;
+    globalThis.getComputedStyle = prevGcs;
+    globalThis.document = prevDoc;
+    if (!prevElement) delete globalThis.Element; else globalThis.Element = prevElement;
+  }
+});
+
+// R21 S7 (Critique a3): der Fokus-Helfer zentrierte JEDES Feld nach 300ms -
+// auch den 300px hohen Notiztext, der oben im Blatt schon im Bild stand: der
+// Koerper rollte 54px, und der Umschalter Lesen/Bearbeiten lag 38 von 48px
+// unter dem Blattkopf (gemessen 390x844, im Browser nachgeprueft: 38 -> 0).
+test('R21 S7: ein Feld, das schon oben im Blatt steht, rollt den Koerper nicht', () => {
+  const src = readFileSync(new URL('../public/components/modal.js', import.meta.url), 'utf8');
+  const fn = src.slice(src.indexOf('function onInputFocus('), src.indexOf("container.addEventListener('focusin', onInputFocus);"));
+  assert.match(fn, /e\.target\.closest\('\.modal-panel__body'\)/, 'gemessen wird am Scrollport des Blatts');
+  assert.match(fn, /if \(top >= box\.top && top < box\.top \+ box\.height \/ 2\) return;/, 'oben im Bild bleibt alles stehen');
+  assert.ok(fn.indexOf('return;') < fn.indexOf('scrollIntoView'), 'erst pruefen, dann rollen');
+});
+
+// Critique R23 (D8): der Erstfokus geht ins erste PFLICHTFELD zum Tippen, dann ins
+// erste Feld zum Tippen, erst dann irgendwohin - nicht auf die Logo-Dateiwahl des
+// Abos, die Typ-Auswahl des Vitalwerts oder einen Schalter.
+test('firstEntryField: Pflichtfeld zum Tippen vor Tippfeld vor Auswahl/Schalter/Datei', async () => {
+  const { firstEntryField } = await import('../public/components/modal.js');
+  assert.equal(typeof firstEntryField, 'function');
+  const asked = [];
+  const root = (answers) => ({
+    querySelectorAll(sel) { asked.push(sel); const hit = answers.find(([re]) => re(sel))?.[1]; return hit ? [].concat(hit) : []; },
+  });
+  const required = { id: 'name' };
+  const typed = { id: 'qty' };
+  const anyField = { id: 'select' };
+  // 1. Gibt es ein Pflichtfeld zum Tippen, gewinnt es - die erste Frage gilt ihm.
+  assert.equal(firstEntryField(root([[(s) => /\[required\]/.test(s), required], [() => true, anyField]])), required);
+  const first = asked[0];
+  assert.match(first, /\[required\]/);
+  for (const type of ['checkbox', 'radio', 'file', 'color', 'hidden']) {
+    assert.match(first, new RegExp(`:not\\(\\[type="${type}"\\]\\)`), `${type} ist kein Feld zum Tippen`);
+  }
+  assert.doesNotMatch(first, /\bselect\b/, 'eine Auswahl ist kein Feld zum Tippen');
+  // 2. Ohne Pflichtfeld das erste Tippfeld, 3. sonst irgendein Feld.
+  asked.length = 0;
+  assert.equal(firstEntryField(root([[(s) => !/\[required\]/.test(s) && /textarea/.test(s) && !/select/.test(s), typed], [(s) => /select/.test(s), anyField]])), typed);
+  asked.length = 0;
+  assert.equal(firstEntryField(root([[(s) => /select/.test(s), anyField]])), anyField);
+  assert.equal(asked.length, 3, 'die Auswahl kommt erst als dritte Frage');
+  // 4. Ein Feld in einer verborgenen Gruppe zaehlt nicht (Entsorgung: Monatsfelder
+  // einer woechentlichen Regel) - sonst liefe der Fokus ins Leere.
+  const hidden = { id: 'month-day', closest: (sel) => (/\[hidden\]/.test(sel) ? {} : null) };
+  const visible = { id: 'interval', closest: () => null };
+  assert.equal(firstEntryField(root([[(s) => !/\[required\]/.test(s) && /textarea/.test(s) && !/select/.test(s), [hidden, visible]]])), visible);
+});
+
+test('firstEntryField traegt jeden Erstfokus des Dialogs (Oeffnen, Einfahrt, Bearbeiten)', () => {
+  const src = readFileSync(fileURLToPath(new URL('../public/components/modal.js', import.meta.url)), 'utf8');
+  // Oeffnen und Einfahrt fragen seit R23 (D13) beide resolveInitialFocus, das
+  // firstEntryField einmal ruft; dazu der Wechsel ins Formular (focusFirstField).
+  assert.equal((src.match(/firstEntryField\((?:container|panel)\)/g) ?? []).length, 2);
+  assert.equal((src.match(/(?<!function )resolveInitialFocus\((?:container|panel), initialFocus\)/g) ?? []).length, 2,
+    'Oeffnen und Einfahrt nehmen denselben Weg');
+  assert.doesNotMatch(src, /querySelector\(FIRST_FIELD\) \?\? \w+\.querySelector\(FOCUSABLE\)/);
+});
+
+// R23 (Critique G4): ohne Feld fiel der Erstfokus aufs X, und nach einem Tipp
+// zeichnete Chromium den Ring daran. Per Zeiger geoeffnet nimmt der Titel den
+// Fokus; per Tastatur (der Ausloeser zeigte seinen Ring) bleibt es beim X.
+test('Erstfokus: ohne Feld nimmt per Zeiger der Titel den Fokus, per Tastatur das X (R23)', () => {
+  for (const keyboard of [false, true]) {
+    const lage = erstfokusLage();
+    try {
+      const attrs = new Map();
+      const titel = { id: 'title', isConnected: true, hasAttribute: (n) => attrs.has(n), setAttribute: (n, v) => attrs.set(n, v), focus() { global.document.activeElement = titel; } };
+      const x = { id: 'close', isConnected: true, matches: (sel) => sel === '.modal-panel__close', focus() { global.document.activeElement = x; } };
+      lage.container.querySelector = (sel) => (sel === '.modal-panel__title' ? titel : null);
+      const ausloeser = lage.knoten('zeile', false);
+      ausloeser.matches = (sel) => sel === ':focus-visible' && keyboard;
+      global.document.activeElement = ausloeser;
+      modalTest.applyInitialFocus(lage.container, x);
+      lage.ausloesen();
+      if (keyboard) {
+        assert.equal(global.document.activeElement, x, 'per Tastatur: das X, mit Ring');
+      } else {
+        assert.equal(global.document.activeElement, titel, 'per Zeiger: der Titel');
+        assert.equal(attrs.get('tabindex'), '-1', 'der Titel wird programmatisch fokussierbar, nicht Teil der Tab-Kette');
+      }
+    } finally {
+      lage.aufraeumen();
+    }
+  }
+  const css = readFileSync(fileURLToPath(new URL('../public/styles/layout.css', import.meta.url)), 'utf8');
+  assert.match(css, /\.modal-panel__title\[tabindex="-1"\]:focus \{\s*outline: none;/, 'kein Ring um den Titel');
 });

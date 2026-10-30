@@ -41,6 +41,35 @@ const GROUP_ROLES = ['owner', 'admin', 'guest'];
 const SPLIT_METHODS = ['equal', 'exact', 'percentage', 'shares'];
 const CATEGORIES = ['groceries', 'rent', 'utilities', 'baby', 'pets', 'school', 'travel', 'shopping', 'subscriptions', 'health', 'home', 'general'];
 const FREQUENCIES = ['weekly', 'monthly', 'yearly'];
+
+/**
+ * DIE KATEGORIE EINER AUSGABE IST EINE BUDGET-KATEGORIE (R24, E12, Migration
+ * 271). `budget_category` ist ein Schluessel aus budget_categories (Typ
+ * Ausgabe) oder NULL ("ohne Kategorie"). Die alte Liste CATEGORIES bleibt nur
+ * fuer das Feld `category` der /api/v1-Oberflaeche (zugesagt), die App liest
+ * es nicht mehr.
+ *
+ * `undefined` heisst "nicht genannt" und gibt `keep` zurueck (ein PUT, das nur
+ * den Betrag korrigiert, laesst die Kategorie stehen - dieselbe Regel wie
+ * #1941 fuer `category`); `null` oder '' leert sie. Ein unbekannter Schluessel
+ * ist ein Fehler am Feld, kein stilles "ohne Kategorie".
+ *
+ * Ausnahme: derselbe Schluessel, den die Zeile schon traegt (`keep`), geht
+ * ungeprueft durch. Der Editor schickt ihn bei jedem Speichern mit, und eine
+ * Kategorie kann weg sein, waehrend Ausgaben sie noch tragen (geloescht, bevor
+ * die Loeschsperre Ausgaben zaehlte, oder per Migration 271 gemappt und danach
+ * geloescht) - sonst lehnte jedes Speichern dieser Ausgabe mit 400 ab (Codex
+ * an #2364). Eine Neuanlage hat kein `keep` und bleibt streng.
+ */
+function parseBudgetCategory(value, keep = null) {
+  if (value === undefined) return keep;
+  if (value === null || value === '') return null;
+  const key = String(value);
+  if (keep !== null && key === keep) return key;
+  const known = db.get().prepare("SELECT 1 FROM budget_categories WHERE key = ? AND type = 'expense'").get(key);
+  if (!known) throw new Refusal(400, 'Unknown budget category.', 'unknown_budget_category');
+  return key;
+}
 const FAMILY_ROLES = ['dad', 'mom', 'parent', 'child', 'grandparent', 'relative', 'other'];
 
 function userId(req) {
@@ -310,13 +339,15 @@ function userFromContact(database, contactId, actorId, groupId, passwordHash, { 
       phone: contact.phone,
       email: contact.email,
       birthDate: contact.birthday,
+      // Kennt der Kontakt nur Tag und Monat, gilt das auch fuer den Geburtstag (#2095).
+      birthYearUnknown: contact.birthday_year_unknown === 1,
       actorUserId: actorId,
     });
   }
   return created.lastInsertRowid;
 }
 
-function syncGuestArtifacts(database, userId, { displayName, phone, email, birthDate, actorUserId }) {
+function syncGuestArtifacts(database, userId, { displayName, phone, email, birthDate, birthYearUnknown = false, actorUserId }) {
   const contact = database.prepare('SELECT id, name FROM contacts WHERE family_user_id = ?').get(userId);
   if (contact) {
     database.prepare(`
@@ -350,12 +381,22 @@ function syncGuestArtifacts(database, userId, { displayName, phone, email, birth
       SET name = ?, birth_date = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE id = ?
     `).run(displayName, birthDate, existing.id);
+    // "Jahr unbekannt" (#2095) folgt dem Datum: ein anderes Datum mit Jahr nimmt
+    // die Marke ab, dasselbe zurueckgeschickte Platzhalterdatum laesst sie stehen.
+    if (birthYearUnknown) {
+      database.prepare('UPDATE birthdays SET year_unknown = 1 WHERE id = ?').run(existing.id);
+    } else if (existing.year_unknown === 1 && birthDate !== existing.birth_date) {
+      database.prepare('UPDATE birthdays SET year_unknown = 0 WHERE id = ?').run(existing.id);
+    }
     birthday = database.prepare('SELECT * FROM birthdays WHERE id = ?').get(existing.id);
   } else {
     const created = database.prepare(`
       INSERT INTO birthdays (name, birth_date, created_by, family_user_id)
       VALUES (?, ?, ?, ?)
     `).run(displayName, birthDate, actorUserId, userId);
+    if (birthYearUnknown) {
+      database.prepare('UPDATE birthdays SET year_unknown = 1 WHERE id = ?').run(created.lastInsertRowid);
+    }
     birthday = database.prepare('SELECT * FROM birthdays WHERE id = ?').get(created.lastInsertRowid);
   }
   syncBirthdayArtifacts(database, birthday);
@@ -779,7 +820,7 @@ router.get('/groups/:id/member-candidates', (req, res) => {
     const people = db.get().prepare(`
       SELECT * FROM (
       SELECT 'user' AS source, u.id AS user_id, NULL AS contact_id, u.display_name, u.username,
-             u.avatar_color, u.family_role, c.phone, c.email, b.birth_date,
+             u.avatar_color, u.family_role, c.phone, c.email, b.birth_date, b.year_unknown AS birth_year_unknown,
              CASE WHEN gm.user_id IS NULL THEN 0 ELSE 1 END AS in_group,
              gm.role AS group_role,
              ${memberPositionSql('u')} AS sort_order
@@ -790,7 +831,7 @@ router.get('/groups/:id/member-candidates', (req, res) => {
       WHERE ${householdMemberSql('u')}
       UNION ALL
       SELECT 'user' AS source, u.id AS user_id, NULL AS contact_id, u.display_name, u.username,
-             u.avatar_color, u.family_role, c.phone, c.email, b.birth_date,
+             u.avatar_color, u.family_role, c.phone, c.email, b.birth_date, b.year_unknown AS birth_year_unknown,
              CASE WHEN gm.user_id IS NULL THEN 0 ELSE 1 END AS in_group,
              gm.role AS group_role,
              ${memberPositionSql('u')} AS sort_order
@@ -806,7 +847,7 @@ router.get('/groups/:id/member-candidates', (req, res) => {
       -- sich so jemand nicht mehr, aber der Editor muss die Mitgliedschaft
       -- zeigen, damit sie sich beenden laesst.
       SELECT 'user' AS source, u.id AS user_id, NULL AS contact_id, u.display_name, u.username,
-             u.avatar_color, u.family_role, c.phone, c.email, b.birth_date,
+             u.avatar_color, u.family_role, c.phone, c.email, b.birth_date, b.year_unknown AS birth_year_unknown,
              1 AS in_group,
              gm.role AS group_role,
              ${memberPositionSql('u')} AS sort_order
@@ -835,15 +876,18 @@ router.get('/groups/:id/member-candidates', (req, res) => {
       phone: readsContacts ? row.phone : null,
       email: readsContacts ? row.email : null,
       birth_date: readsBirthdays ? row.birth_date : null,
+      // Nur Tag und Monat bekannt (#2095): birth_date traegt dann 2000.
+      birth_year_unknown: readsBirthdays && row.birth_year_unknown === 1,
     }));
     const contacts = mayWriteModule(req, 'contacts') ? db.get().prepare(`
       SELECT 'contact' AS source, NULL AS user_id, c.id AS contact_id, c.name AS display_name,
              NULL AS username, '#2563EB' AS avatar_color, 'other' AS family_role,
-             c.phone, c.email, c.birthday AS birth_date, 0 AS in_group, NULL AS group_role
+             c.phone, c.email, c.birthday AS birth_date, c.birthday_year_unknown AS birth_year_unknown,
+             0 AS in_group, NULL AS group_role
       FROM contacts c
       WHERE c.family_user_id IS NULL
       ORDER BY c.name COLLATE NOCASE ASC
-    `).all() : [];
+    `).all().map((row) => ({ ...row, birth_year_unknown: row.birth_year_unknown === 1 })) : [];
     res.json({ data: [...visiblePeople, ...contacts] });
   } catch (err) {
     log.error('GET /groups/:id/member-candidates error:', err);
@@ -1033,14 +1077,46 @@ router.post('/groups/:id/guests', async (req, res) => {
   }
 });
 
+/**
+ * Cursor der Ausgabenliste (#2108): die Sortierschluessel der letzten Zeile
+ * (`expense_date`, `created_at`, `id`), wie sie `pagination.next_cursor`
+ * liefert. Nur alle drei zusammen - ein halber Cursor ist 400, wie beim Verlauf.
+ */
+function expenseCursor(query) {
+  const given = ['before_date', 'before_at', 'before_id'].filter((k) => query[k] != null && query[k] !== '');
+  if (!given.length) return { cursor: null };
+  const beforeId = Number(query.before_id);
+  const text = (v) => typeof v === 'string' && v.length <= 64;
+  if (given.length < 3 || !text(query.before_date) || !text(query.before_at) || !Number.isInteger(beforeId) || beforeId < 1) {
+    return { error: 'before_date, before_at and before_id belong together: take all three from pagination.next_cursor.' };
+  }
+  return { cursor: { beforeDate: query.before_date, beforeAt: query.before_at, beforeId } };
+}
+
 router.get('/groups/:id/expenses', (req, res) => {
   try {
     const groupId = Number(req.params.id);
     if (!requireGroupAccess(groupId, req)) return res.status(404).json({ error: 'Group not found.', code: 404 });
     const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 100);
     const offset = Math.max(Number(req.query.offset) || 0, 0);
+    const { cursor, error } = expenseCursor(req.query);
+    if (error) return res.status(400).json({ error, code: 400 });
+    if (cursor && offset) return res.status(400).json({ error: 'Use either a cursor or offset, not both.', code: 400 });
+    // Hinter dem Cursor statt hinter einer Zeilenzahl: loescht jemand zwischen
+    // zwei Seiten eine Ausgabe weiter oben, ueberspringt `offset` eine
+    // ungesehene, der Cursor nicht.
+    const keyset = cursor
+      ? `AND (e.expense_date < @beforeDate OR (e.expense_date = @beforeDate
+          AND (e.created_at < @beforeAt OR (e.created_at = @beforeAt AND e.id < @beforeId))))`
+      : '';
     const search = String(req.query.q || '').trim();
     const category = CATEGORIES.includes(req.query.category) ? req.query.category : null;
+    // Der Filter der App (R24, E12): ein Budget-Schluessel oder "none" fuer
+    // Ausgaben ohne Kategorie. Ein unbekannter Schluessel filtert nicht still
+    // auf nichts, er wird ignoriert wie ein unbekanntes `category`.
+    const rawBudget = typeof req.query.budget_category === 'string' ? req.query.budget_category : '';
+    const budgetCategory = rawBudget === 'none' ? 'none'
+      : (rawBudget && db.get().prepare('SELECT 1 FROM budget_categories WHERE key = ?').get(rawBudget) ? rawBudget : null);
     const recurringOnly = req.query.recurring === '1';
     const rows = db.get().prepare(`
       SELECT e.*, u.display_name AS payer_name
@@ -1049,12 +1125,24 @@ router.get('/groups/:id/expenses', (req, res) => {
       WHERE e.group_id = @groupId AND e.status = 'active'
         AND (@search = '' OR e.title LIKE '%' || @search || '%' OR e.description LIKE '%' || @search || '%')
         AND (@category IS NULL OR e.category = @category)
+        AND (@budgetCategory IS NULL OR (@budgetCategory = 'none' AND e.budget_category IS NULL) OR e.budget_category = @budgetCategory)
         AND (@recurringOnly = 0 OR e.recurring_rule_id IS NOT NULL)
-      ORDER BY e.expense_date DESC, e.created_at DESC
-      LIMIT @limit OFFSET @offset
-    `).all({ groupId, search, category, recurringOnly: recurringOnly ? 1 : 0, limit, offset });
-    const serialized = serializeExpenseList(rows, documentViewer(req));
-    res.json({ data: serialized, pagination: { limit, offset, has_more: serialized.length === limit } });
+        ${keyset}
+      ORDER BY e.expense_date DESC, e.created_at DESC, e.id DESC
+      LIMIT @fetch OFFSET @offset
+    `).all({ groupId, search, category, budgetCategory, recurringOnly: recurringOnly ? 1 : 0, fetch: limit + 1, offset, ...(cursor || {}) });
+    // `created_at` ist sekundengenau: Ausgaben derselben Sekunde (eine Serie,
+    // die nachholt) haetten ohne `id` keine feste Reihenfolge, und Offset-Seiten
+    // koennten eine doppeln oder auslassen (#2108). Eine Zeile mehr gelesen
+    // macht `has_more` genau - bei genau `limit` Ausgaben keine leere Extraseite.
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const last = page[page.length - 1];
+    const nextCursor = hasMore && last ? { before_date: last.expense_date, before_at: last.created_at, before_id: last.id } : null;
+    const pagination = cursor
+      ? { limit, has_more: hasMore, next_cursor: nextCursor }
+      : { limit, offset, has_more: hasMore, next_cursor: nextCursor };
+    res.json({ data: serializeExpenseList(page, documentViewer(req)), pagination });
   } catch (err) {
     log.error('GET /groups/:id/expenses error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -1069,6 +1157,7 @@ router.post('/groups/:id/expenses', (req, res) => {
     const archived = archivedRefusal(groupId);
     if (archived) return sendRefusal(res, archived);
     const parsed = parseExpenseBody(req.body, group.default_currency);
+    const budgetCategory = parseBudgetCategory(req.body.budget_category);
     const payerId = Number(req.body.payer_id || userId(req));
     const participants = Array.isArray(req.body.participants) ? req.body.participants : [payerId];
     const refusal = membershipRefusal(db.get(), groupId, payerId, participants);
@@ -1083,9 +1172,9 @@ router.post('/groups/:id/expenses', (req, res) => {
     const createdId = db.transaction(() => {
       const result = db.get().prepare(`
         INSERT INTO expenses
-          (group_id, title, description, amount_minor, currency, converted_amount_minor, converted_currency, exchange_snapshot, payer_id, category, split_method, expense_date, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(groupId, parsed.title, parsed.description, parsed.amountMinor, parsed.currency, parsed.convertedAmountMinor, parsed.convertedCurrency, JSON.stringify(req.body.exchange_snapshot || null), payerId, parsed.category, parsed.method, parsed.expenseDate, userId(req));
+          (group_id, title, description, amount_minor, currency, converted_amount_minor, converted_currency, exchange_snapshot, payer_id, category, budget_category, split_method, expense_date, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(groupId, parsed.title, parsed.description, parsed.amountMinor, parsed.currency, parsed.convertedAmountMinor, parsed.convertedCurrency, JSON.stringify(req.body.exchange_snapshot || null), payerId, parsed.category, budgetCategory, parsed.method, parsed.expenseDate, userId(req));
       const expense = db.get().prepare('SELECT * FROM expenses WHERE id = ?').get(result.lastInsertRowid);
       replaceExpenseSplits(db.get(), expense, splits);
       // Belege (#583): nur sichtbare Dokumente, sonst liesse sich über geratene
@@ -1118,6 +1207,11 @@ router.put('/expenses/:id', (req, res) => {
     const archived = archivedRefusal(existing.group_id);
     if (archived) return sendRefusal(res, archived);
     const parsed = parseExpenseBody(req.body, existing.converted_currency);
+    // Die Kategorie (#1941) wie beim Bearbeiten einer Serie: ein Aufruf, der
+    // sie nicht nennt (oder `null` schickt), laesst sie stehen. Sonst setzte
+    // jedes PUT, das nur den Betrag korrigiert, sie still auf `general`.
+    if (req.body.category === undefined || req.body.category === null) parsed.category = existing.category;
+    const budgetCategory = parseBudgetCategory(req.body.budget_category, existing.budget_category ?? null);
     const payerId = Number(req.body.payer_id || existing.payer_id);
     const participants = Array.isArray(req.body.participants) ? req.body.participants : db.get().prepare('SELECT user_id FROM expense_splits WHERE expense_id = ?').all(existing.id).map((r) => r.user_id);
     const refusal = membershipRefusal(db.get(), existing.group_id, payerId, participants);
@@ -1127,9 +1221,9 @@ router.put('/expenses/:id', (req, res) => {
       db.get().prepare(`
         UPDATE expenses
         SET title = ?, description = ?, amount_minor = ?, currency = ?, converted_amount_minor = ?, converted_currency = ?,
-            exchange_snapshot = ?, payer_id = ?, category = ?, split_method = ?, expense_date = ?
+            exchange_snapshot = ?, payer_id = ?, category = ?, budget_category = ?, split_method = ?, expense_date = ?
         WHERE id = ?
-      `).run(parsed.title, parsed.description, parsed.amountMinor, parsed.currency, parsed.convertedAmountMinor, parsed.convertedCurrency, JSON.stringify(req.body.exchange_snapshot || null), payerId, parsed.category, parsed.method, parsed.expenseDate, existing.id);
+      `).run(parsed.title, parsed.description, parsed.amountMinor, parsed.currency, parsed.convertedAmountMinor, parsed.convertedCurrency, JSON.stringify(req.body.exchange_snapshot || null), payerId, parsed.category, budgetCategory, parsed.method, parsed.expenseDate, existing.id);
       const expense = db.get().prepare('SELECT * FROM expenses WHERE id = ?').get(existing.id);
       replaceExpenseSplits(db.get(), expense, splits);
       // Belege nur anfassen, wenn das Feld mitkommt - ein PUT, das nur den
@@ -1235,6 +1329,78 @@ router.post('/expenses/:id/comments', (req, res) => {
   }
 });
 
+/**
+ * Was jede Person in der Gruppe bezahlt hat und was davon ihr eigener Anteil
+ * ist (#1888), je Person und Waehrung, ueber ALLE aktiven Ausgaben - nicht
+ * ueber die geladene Seite der Liste.
+ *
+ * DIE WAEHRUNG DER SALDEN: gezaehlt wird in `converted_currency` und mit
+ * `converted_amount_minor`, denn nur dort stehen Anteile und Ledger. So ist
+ * bezahlt minus Anteil genau der Saldo vor allen Ausgleichen, und die Summen
+ * nennen keine Waehrung, die die Salden nicht kennen. Ausgleiche zaehlen
+ * nicht: eine Zahlung zwischen zwei Personen ist keine Ausgabe.
+ *
+ * Eine Zeile je Person und Waehrung, in der sie bezahlt ODER einen Anteil hat;
+ * wer in einer Waehrung weder das eine noch das andere hat, hat dort keine.
+ * Gaeste und Ehemalige zaehlen wie jede Person, die zahlt oder teilt.
+ */
+function groupMemberTotals(groupId) {
+  return db.get().prepare(`
+    SELECT t.currency, t.user_id, u.display_name,
+           SUM(t.paid_minor) AS paid_minor, SUM(t.share_minor) AS share_minor
+    FROM (
+      SELECT e.converted_currency AS currency, e.payer_id AS user_id,
+             e.converted_amount_minor AS paid_minor, 0 AS share_minor
+      FROM expenses e
+      WHERE e.group_id = @groupId AND e.status = 'active'
+      UNION ALL
+      SELECT s.currency, s.user_id, 0, s.amount_minor
+      FROM expense_splits s
+      JOIN expenses e ON e.id = s.expense_id
+      WHERE e.group_id = @groupId AND e.status = 'active'
+    ) t
+    LEFT JOIN users u ON u.id = t.user_id
+    GROUP BY t.currency, t.user_id
+    HAVING paid_minor != 0 OR share_minor != 0
+    ORDER BY t.currency ASC, ${memberOrderSql('u')}
+  `).all({ groupId }).map((row) => ({
+    ...row,
+    paid: minorToDecimal(row.paid_minor, row.currency),
+    share: minorToDecimal(row.share_minor, row.currency),
+  }));
+}
+
+/**
+ * Wohin das Geld der Gruppe ging (#1941): je Kategorie und Waehrung die Summe
+ * der aktiven Ausgaben, in derselben Waehrung wie die Summen je Person
+ * (`converted_currency`). Je Waehrung die groesste zuerst; eine Kategorie
+ * ohne Ausgaben hat keine Zeile.
+ */
+function groupCategoryTotals(groupId) {
+  return db.get().prepare(`
+    SELECT e.category, e.converted_currency AS currency, SUM(e.converted_amount_minor) AS total_minor
+    FROM expenses e
+    WHERE e.group_id = ? AND e.status = 'active'
+    GROUP BY e.converted_currency, e.category
+    ORDER BY currency ASC, total_minor DESC, e.category ASC
+  `).all(groupId).map((row) => ({ ...row, total: minorToDecimal(row.total_minor, row.currency) }));
+}
+
+/**
+ * Dieselbe Rechnung nach der Budget-Kategorie (R24, E12): die Zeilen, die die
+ * App zeigt. `budget_category` NULL ist "ohne Kategorie" und steht als eigene
+ * Zeile. `category_totals` bleibt fuer die /api/v1-Oberflaeche.
+ */
+function groupBudgetCategoryTotals(groupId) {
+  return db.get().prepare(`
+    SELECT e.budget_category, e.converted_currency AS currency, SUM(e.converted_amount_minor) AS total_minor
+    FROM expenses e
+    WHERE e.group_id = ? AND e.status = 'active'
+    GROUP BY e.converted_currency, e.budget_category
+    ORDER BY currency ASC, total_minor DESC, e.budget_category ASC
+  `).all(groupId).map((row) => ({ ...row, total: minorToDecimal(row.total_minor, row.currency) }));
+}
+
 router.get('/groups/:id/balances', (req, res) => {
   try {
     const groupId = Number(req.params.id);
@@ -1246,6 +1412,9 @@ router.get('/groups/:id/balances', (req, res) => {
       data: {
         balances: rows.map((row) => ({ ...row, net: minorToDecimal(row.net_minor, row.currency) })),
         simplified_debts: simplifyDebts(rows),
+        member_totals: groupMemberTotals(groupId),
+        category_totals: groupCategoryTotals(groupId),
+        budget_category_totals: groupBudgetCategoryTotals(groupId),
       },
     });
   } catch (err) {
@@ -1533,6 +1702,9 @@ const RECURRING_SELECT = `
  *   fortsetzen darf - die Regel der Ausgaben (`mayChangeGroupRecord`). Vom
  *   Server, damit die Oberflaeche sie nicht nachbaut; das Modulrecht fragt sie
  *   selbst.
+ * - `failed_at` (Spalte, #1746): seit wann der Lauf sie unerwartet nicht
+ *   buchen kann, oder null. Sie bleibt dabei unpausiert und wird stuendlich
+ *   neu versucht; die Zeile sagt das.
  * - `missed_count` / `resume_date`: nur an einer pausierten Serie. Wie viele
  *   Termine ein Fortsetzen ohne `missed: "book"` ueberspringt und auf welchem
  *   Termin es landet - dieselbe Rechnung, die die Pause-Route faehrt.
@@ -1602,6 +1774,36 @@ function parseRecurringBody(body, groupId, fallbackCurrency, fallbackPayerId) {
   return { parsed, frequency, payerId, snapshot };
 }
 
+// Was mit den Terminen geschieht, die vor heute liegen: beim Fortsetzen die
+// waehrend der Pause faelligen, beim Anlegen und Verlegen die zwischen dem
+// gesetzten Datum und heute (#1748). `skip` heisst: ab dem ersten Termin, der
+// nicht vor heute liegt; `book`: der Lauf bucht sie nach.
+const MISSED_MODES = ['skip', 'book'];
+
+/**
+ * `missed` aus dem Aufruf, oder null, wenn er es nicht nennt. Beim Anlegen und
+ * Verlegen (#1748) laesst null das Datum stehen wie vor der Frage: der Lauf
+ * bucht dann je Lauf einen versaeumten Termin nach, und ein Client, der die
+ * Frage nicht kennt, verhaelt sich wie bisher.
+ */
+function parseMissed(body) {
+  const missed = body?.missed;
+  if (missed === undefined || missed === null) return null;
+  if (!MISSED_MODES.includes(missed)) throw new Refusal(400, 'missed must be "skip" or "book".', 'invalid_missed');
+  return missed;
+}
+
+/**
+ * Der Termin, auf dem eine angelegte oder verlegte Serie steht (#1748). Mit
+ * `skip` und einem Datum vor heute der erste Termin ab heute, gezaehlt mit der
+ * Rechnung des Laufs und dem Ankertag des gesetzten Datums - derselben, mit der
+ * der Dialog die Frage stellt (public/utils/interval-date.js). Sonst das Datum.
+ */
+function startingRunDate(date, frequency, anchorDay, missed) {
+  if (missed !== 'skip') return date;
+  return nextRunNotBefore(date, frequency, todayKey(db.get()), anchorDay).date;
+}
+
 /** Eine Serie samt Zugang: null, wenn es sie nicht gibt oder die Gruppe dem Aufrufer verschlossen ist. */
 function loadRecurring(id, req) {
   const row = db.get().prepare('SELECT * FROM recurring_expenses WHERE id = ?').get(id);
@@ -1631,18 +1833,23 @@ router.post('/groups/:id/recurring', (req, res) => {
     if (!group) return res.status(404).json({ error: 'Group not found.', code: 404 });
     const archived = archivedRefusal(groupId);
     if (archived) return sendRefusal(res, archived);
+    const missed = parseMissed(req.body);
     const { parsed, frequency, payerId, snapshot } = parseRecurringBody(req.body, groupId, group.default_currency, userId(req));
     // Der Ankertag (#1721): der Tag des ersten Termins ist der Tag, fuer den
     // die Serie gedacht ist. Der Lauf klemmt in kuerzeren Monaten aufs
     // Monatsende und hebt danach wieder auf diesen Tag (31 -> 28/29 -> 31).
     // Gesetzt wird er hier und beim Bearbeiten (PUT /recurring/:id), sobald
     // dort Datum oder Rhythmus wechseln; das Fortsetzen zaehlt nur weiter.
+    // Ein Datum vor heute fragt der Dialog wie das Fortsetzen (#1748): mit
+    // `missed: "skip"` steht die Serie auf ihrem ersten Termin ab heute, der
+    // Anker bleibt der Tag des eingegebenen Datums.
     const anchorDay = Number(parsed.expenseDate.slice(8, 10));
+    const nextRunDate = startingRunDate(parsed.expenseDate, frequency, anchorDay, missed);
     const result = db.get().prepare(`
       INSERT INTO recurring_expenses
-        (group_id, title, description, amount_minor, currency, payer_id, category, split_method, split_snapshot, frequency, next_run_date, anchor_day, created_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(groupId, parsed.title, parsed.description, parsed.amountMinor, parsed.currency, payerId, parsed.category, parsed.method, JSON.stringify(snapshot), frequency, parsed.expenseDate, anchorDay, userId(req));
+        (group_id, title, description, amount_minor, currency, payer_id, category, budget_category, split_method, split_snapshot, frequency, next_run_date, anchor_day, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(groupId, parsed.title, parsed.description, parsed.amountMinor, parsed.currency, payerId, parsed.category, parseBudgetCategory(req.body.budget_category), parsed.method, JSON.stringify(snapshot), frequency, nextRunDate, anchorDay, userId(req));
     activity(groupId, userId(req), 'recurring_created', 'recurring_expense', result.lastInsertRowid, { title: parsed.title, frequency });
     res.status(201).json({ data: recurringResponse(result.lastInsertRowid, req) });
   } catch (err) {
@@ -1682,6 +1889,16 @@ router.post('/groups/:id/recurring', (req, res) => {
  * Serie am 31. steht im Februar auf dem 28., und ein Speichern, das nur den
  * Titel aendert, liesse sie sonst fuer immer auf dem 28. (#1721).
  *
+ * EIN GESETZTER TERMIN VOR HEUTE nimmt `missed` wie das Anlegen (#1748):
+ * `skip` stellt die Serie auf ihren ersten Termin ab heute, `book` und ein
+ * Aufruf ohne `missed` lassen das Datum stehen. Ohne Verlegung zaehlt `missed`
+ * nicht - ein faelliger Termin, den niemand angefasst hat, rueckt nicht still
+ * weiter.
+ *
+ * Ein unerwarteter Fehlschlag des Laufs (`failed_at`, #1746) wird geleert:
+ * wer die Serie bearbeitet hat, hat sie gesehen, und der naechste Lauf misst
+ * neu. Scheitert sie wieder, steht er wieder da.
+ *
  * `paused_at` bleibt: wer eine automatisch pausierte Serie repariert, setzt sie
  * danach selbst fort und entscheidet dabei ueber die versaeumten Termine.
  *
@@ -1694,6 +1911,7 @@ router.put('/recurring/:id', (req, res) => {
     const id = Number(req.params.id);
     const sent = req.body && typeof req.body === 'object' ? req.body : {};
     const given = (key) => sent[key] !== undefined;
+    const missed = parseMissed(sent);
     db.transaction(() => {
       const existing = loadRecurring(id, req);
       if (!existing) throw new Refusal(404, 'Recurring expense not found.');
@@ -1719,6 +1937,7 @@ router.put('/recurring/:id', (req, res) => {
       // Die Kategorie laeuft nicht durch die Rueckfall-Regel des Parsers
       // ("unbekannt = general"), wenn der Aufruf sie gar nicht nennt.
       const category = given('category') && sent.category !== null ? (CATEGORIES.includes(sent.category) ? sent.category : 'general') : existing.category;
+      const budgetCategory = parseBudgetCategory(sent.budget_category, existing.budget_category ?? null);
       const dateMoved = parsed.expenseDate !== existing.next_run_date;
       if (dateMoved) {
         const lastBooked = db.get().prepare('SELECT MAX(expense_date) AS date FROM expenses WHERE recurring_rule_id = ?').get(existing.id)?.date || null;
@@ -1729,12 +1948,15 @@ router.put('/recurring/:id', (req, res) => {
         }
       }
       const anchorDay = dateMoved || frequency !== existing.frequency ? Number(parsed.expenseDate.slice(8, 10)) : existing.anchor_day;
+      // `missed` gilt nur fuer einen Termin, den der Aufruf SETZT: ein
+      // faelliger Termin, den niemand angefasst hat, rueckt nicht still weiter.
+      const nextRunDate = dateMoved ? startingRunDate(parsed.expenseDate, frequency, anchorDay, missed) : parsed.expenseDate;
       db.get().prepare(`
         UPDATE recurring_expenses
-        SET title = ?, description = ?, amount_minor = ?, currency = ?, payer_id = ?, category = ?,
-            split_method = ?, split_snapshot = ?, frequency = ?, next_run_date = ?, anchor_day = ?
+        SET title = ?, description = ?, amount_minor = ?, currency = ?, payer_id = ?, category = ?, budget_category = ?,
+            split_method = ?, split_snapshot = ?, frequency = ?, next_run_date = ?, anchor_day = ?, failed_at = NULL
         WHERE id = ?
-      `).run(parsed.title, parsed.description, parsed.amountMinor, parsed.currency, payerId, category, parsed.method, JSON.stringify(snapshot), frequency, parsed.expenseDate, anchorDay, existing.id);
+      `).run(parsed.title, parsed.description, parsed.amountMinor, parsed.currency, payerId, category, budgetCategory, parsed.method, JSON.stringify(snapshot), frequency, nextRunDate, anchorDay, existing.id);
       activity(existing.group_id, userId(req), 'recurring_edited', 'recurring_expense', existing.id, expenseSnapshot(parsed.title, parsed.amountMinor, parsed.currency));
     });
     res.json({ data: recurringResponse(id, req) });
@@ -1771,10 +1993,6 @@ router.delete('/recurring/:id', (req, res) => {
     res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
-
-// Was beim Fortsetzen mit den Terminen geschieht, die waehrend der Pause
-// faellig gewesen waeren. `skip` ist die Vorgabe.
-const MISSED_MODES = ['skip', 'book'];
 
 router.post('/recurring/:id/pause', (req, res) => {
   try {

@@ -304,7 +304,7 @@ test('Ist die aktive Liste weg, faellt die Seite auf die erste verbliebene - und
   assert.equal(shopping.state.activeListId, 2);
   assert.deepEqual(shopping.state.items.map((i) => i.id), [20]);
   assert.deepEqual(shopping.state.lists.map((l) => l.id), [2]);
-  assert.deepEqual(geschlossen, [{ force: true }]);
+  assert.deepEqual(geschlossen, [{ force: true, context: 'test-modal-context' }]);
 });
 
 test('Ist die letzte Liste weg, zeigt die Seite den Leerzustand', async () => {
@@ -332,7 +332,7 @@ test('Dialog zu einem Artikel, den es nicht mehr gibt: er geht zu', async () => 
   const geschlossen = await mit(stub, () => dialog().submit());
 
   assert.deepEqual(toasts, [['shopping.errorItemGone', 'danger']]);
-  assert.deepEqual(geschlossen, [{ force: true }]);
+  assert.deepEqual(geschlossen, [{ force: true, context: 'test-modal-context' }]);
 });
 
 test('Dialog, dessen Artikel noch da ist (der Laden ist weg): er bleibt mit den Eingaben offen', async () => {
@@ -889,3 +889,221 @@ for (const v of VERWALTER) {
     });
   }
 }
+
+// -------------------------------------------------------------------------
+// #1997: eine spaete Antwort schliesst nur ihren EIGENEN Dialog
+// -------------------------------------------------------------------------
+
+// Kommt die Antwort erst, nachdem der Nutzer den Dialog geschlossen und einen
+// anderen geoeffnet hat, darf das force-Schliessen nur den eigenen treffen. Ob
+// der Slot noch denselben Dialog haelt, entscheidet closeModal({ context }) in
+// components/modal.js (am echten Modul gemessen in test-modal-dead-time.js);
+// hier zaehlt die Verdrahtung: jeder Weg der Seite, der nach einer Anfrage
+// schliesst, reicht den VOR der Anfrage gemerkten Kontext hinein. Gefahren wird
+// je Weg der echte Handler; die Antwort wechselt den Kontext, wie es ein
+// inzwischen geoeffneter Dialog tut.
+
+/** Ein Dialog ueber den Modal-Stub: `felder` belegt querySelector, liefert die Zuhoerer. */
+async function stubDialog(oeffne, felder = {}, stub = {}) {
+  let opts = null;
+  globalThis.__openModal = (o) => { opts = o; };
+  globalThis.__apiStub = stub;
+  try {
+    await oeffne();
+  } finally {
+    delete globalThis.__openModal;
+    delete globalThis.__apiStub;
+  }
+  assert.ok(opts, 'der Dialog wurde geoeffnet');
+  const handlers = {};
+  const element = (selector) => {
+    felder[selector] ??= {};
+    return Object.assign(felder[selector], {
+      addEventListener(type, fn) { handlers[`${selector}:${type}`] = fn; },
+    });
+  };
+  const panel = { querySelector: element, querySelectorAll: () => [] };
+  opts.onSave(panel);
+  return (selector, type = 'click') => handlers[`${selector}:${type}`]({ preventDefault() {}, currentTarget: element(selector) });
+}
+
+const SHOPPING_ERFOLGSWEGE = [
+  ['Artikel speichern', () => dialog().submit, { patch: () => ({ data: item({ name: 'Hafermilch' }) }) }],
+  ['Artikel speichern, er zieht in eine andere Liste', () => dialog(10, { '#item-details-list': { value: '2' } }).submit,
+    { patch: () => ({ data: item({ list_id: 2 }) }) }],
+  ['Artikel speichern, er ist inzwischen nicht mehr geladen', () => dialog().submit, {
+    patch: () => {
+      shopping.state.items = shopping.state.items.filter((i) => i.id !== 10);
+      return { data: item({ name: 'Hafermilch' }) };
+    },
+  }],
+  ['Liste senden', async () => {
+    const klick = await stubDialog(() => shopping.openSendListDialog(nullContainer()),
+      { '#send-list-recipient': { value: '7' } },
+      { get: async () => ({ data: [{ id: 7, display_name: 'Mia' }] }) });
+    return () => klick('#send-list-confirm');
+  }, { post: () => ({ data: {} }) }],
+  ['Liste duplizieren', async () => {
+    const klick = await stubDialog(() => shopping.openDuplicateListDialog(nullContainer()), {
+      '#duplicate-list-name': { value: 'Kopie' }, '#duplicate-reset-checked': { checked: true },
+      '#duplicate-keep-quantities': { checked: true }, '#duplicate-keep-notes': { checked: true },
+    });
+    return () => klick('#duplicate-list-confirm');
+  }, { post: () => ({ data: { id: 2, name: 'Kopie' } }) }],
+  ['In den Vorrat uebernehmen', async () => {
+    shopping.state.items = [item({ is_checked: 1 })];
+    const klick = await stubDialog(() => shopping.openPantryTransfer(nullContainer()),
+      { '#pantry-transfer-clear': { checked: false } },
+      { get: async () => ({ data: [] }) });
+    return () => klick('#pantry-transfer-confirm');
+  }, { post: () => ({ data: { added: 1, merged: 0 } }) }],
+  ['Aus dem Essensplan uebernehmen', async () => {
+    const klick = await stubDialog(() => shopping.openMealPlanImport(nullContainer()), {
+      '#shopping-import-from': { value: '2026-01-05' }, '#shopping-import-to': { value: '2026-01-11' },
+    }, { post: async () => ({ data: { transferred: 2, meals: 1 } }) });
+    return () => klick('#shopping-import-meals-form', 'submit');
+  }, { post: (_path, body) => (body?.preview ? { data: { transferred: 2, meals: 1 } } : { data: { transferred: 2 } }) }],
+];
+
+test('Erfolg nach Dialogwechsel - jeder Weg schliesst nur mit dem Kontext von VOR der Anfrage (#1997)', async () => {
+  for (const [name, vorbereiten, schreiben] of SHOPPING_ERFOLGSWEGE) {
+    zustand();
+    const ausloesen = await vorbereiten();
+    toasts.length = 0;
+    let kontext = 'eigener-dialog';
+    globalThis.__modalContextId = () => kontext;
+    const { stub } = server();
+    let geschrieben = 0;
+    for (const [verb, antwort] of Object.entries(schreiben)) {
+      stub[verb] = async (path, body) => {
+        const ergebnis = antwort(path, body);
+        if (!body?.preview) { geschrieben += 1; kontext = 'ein-anderer-dialog'; }
+        return ergebnis;
+      };
+    }
+    try {
+      const geschlossen = await mit(stub, ausloesen);
+      assert.equal(geschrieben, 1, `${name}: der Weg schreibt`);
+      assert.equal(toasts.some(([, art]) => art === 'danger'), false, `${name}: der Erfolg ist kein Fehler (${JSON.stringify(toasts)})`);
+      assert.equal(geschlossen.length, 1, `${name}: genau ein Schliessen (${JSON.stringify(geschlossen)})`);
+      assert.equal(geschlossen[0].force, true, `${name}: force wie bisher`);
+      assert.equal(geschlossen[0].context, 'eigener-dialog',
+        `${name}: geschlossen wird ohne den Kontext von vor der Anfrage - die spaete Antwort traefe den Dialog, der jetzt offen ist`);
+    } finally {
+      delete globalThis.__modalContextId;
+    }
+  }
+});
+
+for (const [name, serverStand] of [
+  ['der Artikel ist weg', {}],
+  ['die aktive Liste ist weg', { lists: LISTEN().filter((l) => l.id !== 1) }],
+]) {
+  test(`Nachladen nach "gibt es nicht mehr" schliesst den Dialog von damals, nicht einen inzwischen geoeffneten (#1997) - ${name}`, async () => {
+    zustand();
+    let kontext = 'eigener-dialog';
+    globalThis.__modalContextId = () => kontext;
+    try {
+      const d = dialog();
+      const { stub } = server(serverStand);
+      const lese = stub.get;
+      // Waehrend die Seite nachlaedt, oeffnet der Nutzer einen anderen Dialog.
+      stub.get = async (path) => { kontext = 'ein-anderer-dialog'; return lese(path); };
+      stub.patch = async () => { throw fehler(404, 'shopping_item_not_found'); };
+
+      const geschlossen = await mit(stub, () => d.submit());
+
+      assert.equal(kontext, 'ein-anderer-dialog', 'der Wechsel kam waehrend des Nachladens');
+      assert.deepEqual(geschlossen, [{ force: true, context: 'eigener-dialog' }]);
+    } finally {
+      delete globalThis.__modalContextId;
+    }
+  });
+}
+
+/**
+ * R22 (Critique a2 P2 "Einkauf laedt in 3 Runden", D22): DER SEITENAUFBAU
+ * FRAGT IN EINER RUNDE, WENN DIE LISTE SCHON BEKANNT IST. Die Waehrung
+ * (`/preferences`) wartete auf die Laeden, und die Artikel warteten auf alle
+ * drei - bei 400 ms Latenz standen sie erst nach 2,1 s da, die Aufgaben nach
+ * einer Runde. Gemessen wird, welche Anfragen losgehen, BEVOR irgendeine
+ * Antwort da ist: Waehrung immer, die Artikel mit der Id aus `?list=`, aus dem
+ * letzten Besuch oder aus dem Merker des Geraets. Raet der Merker falsch,
+ * zaehlen die Artikel der richtigen Liste, und die falsche Antwort fasst den
+ * Stand nicht an.
+ */
+function langsamerServer({ lists = LISTEN() } = {}) {
+  const gets = [];
+  const offen = [];
+  const antwort = (path) => {
+    if (path === '/shopping') return { data: lists };
+    if (path === '/shopping/categories') return { data: KATEGORIEN() };
+    if (path === '/shopping/stores') return { data: [] };
+    if (path === '/preferences') return { data: { currency: 'CHF' } };
+    const m = /^\/shopping\/(\d+)\/items$/.exec(path);
+    if (m) return { data: [item({ id: 100 + Number(m[1]), list_id: Number(m[1]), name: `Artikel ${m[1]}` })], list: lists.find((l) => l.id === Number(m[1])), version: 3 };
+    throw new Error(`kein Stub fuer GET ${path}`);
+  };
+  const lese = (path) => new Promise((resolve) => { gets.push(path); offen.push(() => resolve(antwort(path))); });
+  return {
+    gets,
+    alleAntworten: async () => { while (offen.length) { offen.shift()(); await new Promise((r) => setImmediate(r)); } },
+    stub: { get: lese, getWithSource: async (path) => ({ data: await lese(path), fromCache: false }) },
+  };
+}
+
+async function seitenaufbau({ search = '', vorher = [], merker = null } = {}) {
+  zustand({ lists: vorher, items: [], activeListId: null, activeList: null, currentUserId: 7 });
+  speicher.delete(shopping.firstListStorageKey(7));
+  if (merker != null) speicher.set(shopping.firstListStorageKey(7), String(merker));
+  const srv = langsamerServer();
+  const window0 = globalThis.window.location;
+  globalThis.window.location = { search };
+  globalThis.__apiStub = srv.stub;
+  try {
+    const lauf = shopping.loadPageData();
+    await new Promise((r) => setImmediate(r));
+    const ersteRunde = [...srv.gets];
+    await srv.alleAntworten();
+    await lauf;
+    await srv.alleAntworten();
+    return { ersteRunde, alle: srv.gets };
+  } finally {
+    delete globalThis.__apiStub;
+    globalThis.window.location = window0;
+  }
+}
+
+test('R22 D22: Waehrung und Laeden laufen nebeneinander, nicht nacheinander', async () => {
+  const { ersteRunde } = await seitenaufbau();
+  assert.ok(ersteRunde.includes('/preferences'), `die Waehrung wartet auf die Laeden: ${ersteRunde.join(', ')}`);
+  assert.equal(shopping.state.currency, 'CHF');
+});
+
+test('R22 D22: mit bekannter Liste laufen die Artikel in der ersten Runde mit', async () => {
+  for (const [fall, opts, id] of [
+    ['?list=2', { search: '?list=2' }, 2],
+    ['letzter Besuch', { vorher: LISTEN() }, 1],
+    ['Merker des Geraets', { merker: 1 }, 1],
+  ]) {
+    const { ersteRunde, alle } = await seitenaufbau(opts);
+    assert.ok(ersteRunde.includes(`/shopping/${id}/items`), `${fall}: die Artikel warten auf die Listen (${ersteRunde.join(', ')})`);
+    assert.equal(alle.filter((p) => p.endsWith('/items')).length, 1, `${fall}: die Artikel werden zweimal geholt`);
+    assert.equal(shopping.state.activeListId, id);
+    assert.deepEqual(shopping.state.items.map((i) => i.id), [100 + id]);
+  }
+  assert.equal(speicher.get(shopping.firstListStorageKey(7)), '1', 'der Merker haelt die erste Liste fuer den naechsten Kaltstart');
+});
+
+test('R22 D22: ohne bekannte Liste zwei Runden; ein falscher Merker zaehlt nicht', async () => {
+  const kalt = await seitenaufbau();
+  assert.ok(!kalt.ersteRunde.some((p) => p.endsWith('/items')), 'ohne Id gibt es nichts vorzuholen');
+  assert.deepEqual(shopping.state.items.map((i) => i.id), [101]);
+
+  const falsch = await seitenaufbau({ merker: 2 });
+  assert.ok(falsch.ersteRunde.includes('/shopping/2/items'), 'der Merker wird vorgeholt');
+  assert.ok(falsch.alle.includes('/shopping/1/items'), 'die gewaehlte (erste) Liste wird danach geholt');
+  assert.equal(shopping.state.activeListId, 1, 'der Merker waehlt keine Liste');
+  assert.deepEqual(shopping.state.items.map((i) => i.id), [101], 'die Artikel der falschen Liste stehen nicht unter der richtigen');
+  assert.equal(shopping.loadsInFlightForTest?.() ?? 0, 0, 'die verworfene Anfrage schliesst ihre Ladenummer ab');
+});

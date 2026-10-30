@@ -136,6 +136,22 @@ test('tasks: the dialog asks when, who and how important before the free-text no
   assert.deepEqual(order, [...order].sort((a, b) => a - b), 'title, due, assignee, priority, note, more settings');
 });
 
+// R22 D17 (Critique 2026-10-22, a2 Klein): `modal-grid--2` fiel unter 480px
+// Modalbreite einspaltig - Faelligkeit und Uhrzeit standen am Telefon in zwei
+// vollen Zeilen. Sie teilen sich eine Zeile, solange zwei 8rem-Spalten passen.
+test('tasks: due date and time share one row that only stacks when two columns no longer fit', () => {
+  setHouseholdSize(2);
+  const html = taskDialog({ task: null, users: [ANNA, CLARA] });
+  const date = html.indexOf('id="task-due-date"');
+  const row = html.lastIndexOf('<div class="', html.lastIndexOf('<div class="form-group">', date) - 1);
+  const cls = html.slice(row, html.indexOf('>', row));
+  assert.match(cls, /\bform-pair\b/, 'the pair measures its columns, not the window');
+  assert.doesNotMatch(cls, /modal-grid--2/, 'no longer the grid that stacks below 480px');
+  const time = html.indexOf('id="task-due-time"');
+  const rowEnd = html.indexOf('task_assigned');
+  assert.ok(time > date && time < rowEnd, 'time follows in the same pair, before the people');
+});
+
 test('tasks: an empty recurrence and an empty reminder wait behind "more settings"', () => {
   setHouseholdSize(2);
   const html = taskDialog({ task: null, users: [ANNA, CLARA] });
@@ -205,11 +221,17 @@ test('tasks: a task that is already done or filed away offers no doer picker', (
 function doerList() {
   const listeners = {};
   const panel = {
-    open: false, shown: 0,
+    open: false, shown: 0, dataset: {}, at: null,
     matches(sel) { return sel === ':popover-open' && this.open; },
-    showPopover() { this.open = true; this.shown += 1; },
+    showPopover() {
+      this.open = true; this.shown += 1;
+      this.at = this.dataset.anchorX == null ? null : [Number(this.dataset.anchorX), Number(this.dataset.anchorY)];
+    },
   };
-  const card = { querySelector: (sel) => (sel.startsWith('.popover-menu') ? panel : null) };
+  const card = {
+    querySelector: (sel) => (sel.startsWith('.popover-menu') ? panel : null),
+    getBoundingClientRect: () => ({ left: 252, top: 336, bottom: 416 }),
+  };
   const target = { closest: (sel) => (sel === '.task-card' ? card : null) };
   const list = {
     addEventListener(type, fn, opts) {
@@ -284,6 +306,35 @@ test('tasks: the context menu (right click, menu key) opens the same doer panel'
   assert.equal(panel.shown, 2);
   assert.equal(fire('click').defaultPrevented, false,
     'ein Rechtsklick hinterlaesst keinen Riegel, der den naechsten echten Klick schluckt');
+});
+
+// R22 S9: der Knopf der Auswahl steht unsichtbar am Zeilenanfang. An ihm
+// gerechnet hing das Menue am Laptop ueber der Seitenleiste neben der Liste -
+// es gehoert dorthin, wo die Zeile angefasst wurde.
+test('tasks: the doer menu opens where the row was pressed, the menu key at the row start', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  tasks.state.bulkSelectMode = false;
+  const { list, panel, fire } = doerList();
+  tasks.wireDoerContextMenu(list);
+
+  fire('contextmenu', { clientX: 452, clientY: 356 });
+  assert.deepEqual(panel.at, [452, 356], 'ein Rechtsklick ohne laufenden Druck: am Zeiger');
+
+  panel.open = false; panel.dataset = {};
+  fire('pointerdown', { pointerType: 'mouse', button: 2, clientX: 500, clientY: 380 });
+  fire('contextmenu', { clientX: 500, clientY: 380 });
+  fire('pointerup', { pointerType: 'mouse', button: 2 }); t.mock.timers.tick(1);
+  assert.deepEqual(panel.at, [500, 380], 'ein Rechtsklick mit Druck: nach dem Loslassen am Zeiger');
+
+  panel.open = false; panel.dataset = {};
+  fire('pointerdown', { clientX: 120, clientY: 300 });
+  t.mock.timers.tick(600);
+  fire('pointerup'); t.mock.timers.tick(1);
+  assert.deepEqual(panel.at, [120, 300], 'ein Long-Press: am Finger');
+
+  panel.open = false; panel.dataset = {};
+  fire('contextmenu', { clientX: 0, clientY: 0 });
+  assert.deepEqual(panel.at, [264, 416], 'die Menue-Taste hat keinen Zeiger: unter dem Zeilenanfang');
 });
 
 test('tasks: in select mode a long press selects, it does not ask for a person', (t) => {
@@ -365,9 +416,10 @@ test('documents: a stored grant for a non-member stays on offer and checked', as
   // ein Kaestchen, das fehlt, entzieht beim Speichern den Zugriff.
   await loadDocumentPeople();
   const html = documents.memberOptions([CLARA.id]);
-  const boxes = [...html.matchAll(/<input type="checkbox" value="(\d+)"\s*(checked)?/g)].map((m) => [Number(m[1]), Boolean(m[2])]);
+  // Seit R24 (D4 people-checkbox) Chips wie renderUserMultiSelect.
+  const boxes = [...html.matchAll(/<input type="checkbox" class="user-ms__checkbox" value="(\d+)" data-ms-input="document-members"\s*(checked)?/g)].map((m) => [Number(m[1]), Boolean(m[2])]);
   assert.deepEqual(boxes, [[ANNA.id, false], [CLARA.id, true]]);
-  assert.match(html, /<span>Clara<\/span>/, 'the grant is shown by name');
+  assert.match(html, /<span class="user-ms__name">Clara<\/span>/, 'the grant is shown by name');
 });
 
 test('budget: the responsible filter chip names a stored non-member responsible', () => {
@@ -399,7 +451,7 @@ test('dashboard: the schedule slice brings the names of every plan owner, and th
   try {
     const slice = await dashboard.loadScheduleSlice('2030-05-01');
     const html = dashboard.renderScheduleWidget(slice, [ANNA], '1x2');
-    assert.match(html, /class="schedule-widget-row__name">Clara</, 'the row of a stored plan owner carries a name');
+    assert.match(html, /class="list-row__name schedule-widget-row__name">Clara</, 'the row of a stored plan owner carries a name');
   } finally {
     delete globalThis.__apiStub;
   }
@@ -484,16 +536,34 @@ test('privacy: with one member, the protective fields stay while another account
 const { __test: icsSettings } = await import('../public/settings/pages/personal-calendar-subscriptions.js');
 
 test('settings: saving a calendar subscription keeps a stored assignee that is not on offer', () => {
-  // Die Optionen laden asynchron nach. Steht die gespeicherte Zuweisung nicht
-  // darunter - die Liste laedt noch, oder das Laden ist fehlgeschlagen -, zeigt
-  // die Auswahl "niemand", und Speichern von Name oder Farbe truege das ein.
-  const select = (value, ...ids) => ({ value, options: [{ value: '' }, ...ids.map((id) => ({ value: String(id) }))] });
-  assert.deepEqual(icsSettings.assigneePatch(select('', ANNA.id), CLARA.id), {},
+  // Die Personen laden im Knopf nach (settings/assignee-menu.js). Bis dahin -
+  // oder wenn das Laden scheitert - traegt der Knopf die gespeicherte Menge,
+  // und solange niemand sie anfasst, bleibt das Feld aus der Anfrage: ein
+  // Speichern von Name oder Farbe traegt nichts ein, was nicht angeboten war.
+  const field = (...ids) => ({ dataset: { assigneeIds: ids.join(',') } });
+  assert.deepEqual(icsSettings.assigneePatch(field(CLARA.id), [CLARA.id]), {},
     'the field stays out of the request, so the server keeps the stored assignee');
-  assert.deepEqual(icsSettings.assigneePatch(select(String(CLARA.id), ANNA.id, CLARA.id), CLARA.id), { default_assignee_user_id: CLARA.id });
-  assert.deepEqual(icsSettings.assigneePatch(select('', ANNA.id, CLARA.id), CLARA.id), { default_assignee_user_id: null },
+  assert.deepEqual(icsSettings.assigneePatch(field(CLARA.id, ANNA.id), [CLARA.id]), { default_assignee_user_ids: [CLARA.id, ANNA.id] },
+    'a person added keeps the order of the choice (#1897)');
+  assert.deepEqual(icsSettings.assigneePatch(field(), [CLARA.id]), { default_assignee_user_ids: [] },
     'removing an assignee who is on offer still works');
-  assert.deepEqual(icsSettings.assigneePatch(select(String(ANNA.id), ANNA.id), null), { default_assignee_user_id: ANNA.id });
+  assert.deepEqual(icsSettings.assigneePatch(field(ANNA.id), []), { default_assignee_user_ids: [ANNA.id] });
+  assert.deepEqual(icsSettings.storedAssigneeIds({ default_assignee_user_id: CLARA.id }), [CLARA.id],
+    'an answer in the earlier form still names its person');
+});
+
+const assigneeMenu = await import('../public/settings/assignee-menu.js');
+
+test('settings: the default-assignee menu keeps the order of the choice and names everyone (#1897)', () => {
+  // Die erste Person wird die primaere Zuweisung eines neuen Termins (ihre
+  // Farbe); wer dazukommt, steht hinten, wer geht, faellt heraus.
+  assert.deepEqual(assigneeMenu.toggleAssignee([], CLARA.id), [CLARA.id]);
+  assert.deepEqual(assigneeMenu.toggleAssignee([CLARA.id], ANNA.id), [CLARA.id, ANNA.id]);
+  assert.deepEqual(assigneeMenu.toggleAssignee([CLARA.id, ANNA.id], CLARA.id), [ANNA.id]);
+  const names = new Map([[ANNA.id, 'Anna'], [CLARA.id, 'Clara']]);
+  assert.equal(assigneeMenu.assigneeSummary([CLARA.id, ANNA.id], names), 'Clara, Anna');
+  assert.equal(assigneeMenu.assigneeIdsOf({ dataset: { assigneeIds: '3,1' } }).join(), '3,1');
+  assert.deepEqual(assigneeMenu.assigneeIdsOf({ dataset: { assigneeIds: '' } }), []);
 });
 
 // --------------------------------------------------------------------------
@@ -614,4 +684,83 @@ test('R19: tragen alle denselben Nachnamen, zeigt der Chip den Vornamen - der vo
   assert.match(mixed, /<span class="user-ms__name">Alex Johnson<\/span>/);
   assert.match(renderUserMultiSelect([{ id: 1, display_name: 'A <b> Johnson' }, { id: 2, display_name: 'B Johnson' }], [], 'x', 'l'),
     /<span class="user-ms__name">A &lt;b&gt;<span class="sr-only"> Johnson<\/span>/, 'escaped');
+});
+
+// "NIEMAND" STEHT NICHT IN DER MEHRFACHWAHL (Critique R21, a5; clarify). In
+// "Darf Gesundheitsdaten eintragen" stand "Niemand" als erster Chip zwischen
+// den Personen - wie eine weitere Person, und neben einer Auswahl von
+// mehreren eine Option, die alle anderen abwaehlt. Wer niemanden waehlt, waehlt
+// keinen Chip. Nur die EINZELWAHL (der Koch einer Mahlzeit) behaelt "Niemand":
+// dort ist es eine der Antworten, nicht das Fehlen einer.
+test('R21: die Mehrfachwahl fuehrt keinen Niemand-Chip, nur die Einzelwahl', async () => {
+  const { readFileSync } = await import('node:fs');
+  const family = [{ id: 1, display_name: 'Alex Johnson' }, { id: 2, display_name: 'Leo Johnson' }];
+  const multi = renderUserMultiSelect(family, [], 'x', 'tasks.assignedLabel');
+  assert.doesNotMatch(multi, /user-ms__none/, 'keine Niemand-Option in der Reihe');
+  assert.equal((multi.match(/class="user-ms__checkbox"/g) || []).length, 2, 'nur die Personen');
+  const single = renderUserMultiSelect(family, [], 'meal_cook', 'meals.cookLabel', 'userMultiSelect.nobody');
+  assert.match(single, /user-ms__option--none/, 'wer einen Schluessel fuer "Niemand" uebergibt, bekommt den Chip');
+  const src = (p) => readFileSync(new URL(p, import.meta.url), 'utf8');
+  assert.match(src('../public/pages/meals.js'), /renderUserMultiSelect\(people, cook \? \[cook\.id\] : \[\], COOK_INPUT, 'meals\.cookLabel', 'userMultiSelect\.nobody'\)/,
+    'der Koch ist eine Einzelwahl und behaelt "Niemand"');
+  assert.doesNotMatch(src('../public/pages/schedule.js'), /overviewClearSelection/, 'der Vergleich leert die Auswahl ohne eigenen Chip');
+});
+
+// --------------------------------------------------------------------------
+// EINE Personenzeile (Critique R24 G2-Quer-P2-1)
+// --------------------------------------------------------------------------
+// Der Personenfilter stand in drei Formen: Aufgaben-Verlauf als Umschalter
+// mit Avatar und Kuerzel (mobil ohne Namen, Desktop "Leo Joh..."), Belohnungen
+// als Chip mit vollem Namen ohne Scheibe, Kalender/Filterblatt als Chip mit
+// Scheibe und Vorname. Kanon ist die letzte, gebaut von personChipsHtml().
+
+test('personChipsHtml: Alle vorn als Text, je Person Scheibe + Vorname, der Nachname nur fuer die Vorlesehilfe', async () => {
+  const { sharedSurname } = await import('../public/components/user-multi-select.js');
+  globalThis.__sharedSurname = sharedSurname;
+  const { personChipsHtml } = await import('../public/utils/filter-sheet.js');
+  try {
+    const html = personChipsHtml({
+      filter: 'who', label: 'Person', className: 'page-chip-row',
+      people: [{ id: 1, display_name: 'Leo Johnson', avatar_color: '#3B82F6' }, { id: 2, display_name: 'Emma Johnson', color: '#EF4444' }],
+      isActive: (p) => p.id === 2,
+      all: { label: 'Alle', active: false },
+    });
+    assert.match(html, /^\s*<div class="page-chip-row" role="group" aria-label="Person" data-person-chips="who">/);
+    const chips = [...html.matchAll(/<button[^>]*data-value="([^"]*)" aria-pressed="(true|false)">([\s\S]*?)<\/button>/g)];
+    assert.deepEqual(chips.map((m) => m[1]), ['', '1', '2'], '"Alle" vorn, dann die Personen');
+    assert.deepEqual(chips.map((m) => m[2]), ['false', 'false', 'true']);
+    assert.doesNotMatch(chips[0][3], /filter-chip__swatch/, '"Alle" ist Text, keine Scheibe');
+    assert.match(chips[1][3], /class="filter-chip__swatch"[^>]*--swatch-color:#3B82F6[^>]*>LJ<\/span><span>Leo<span class="sr-only"> Johnson<\/span>/);
+    assert.match(chips[2][3], /--swatch-color:#EF4444/, 'auch die umbenannte Farbe (`color`) traegt');
+    assert.ok(chips.every((m) => /filter-chip filter-chip--sm/.test(m[0])), 'jeder Chip ist der Kanon-Chip');
+  } finally {
+    delete globalThis.__sharedSurname;
+  }
+});
+
+test('R24: Aufgaben-Verlauf, Filterblatt, Belohnungen und Kalender bauen ihre Personen mit personChipsHtml', async () => {
+  const { readFileSync } = await import('node:fs');
+  const read = (f) => readFileSync(new URL(`../public/${f}`, import.meta.url), 'utf8');
+  const tasksSrc = read('pages/tasks.js');
+  assert.match(tasksSrc, /personChipsHtml\(\{\s*filter: 'history-user'[\s\S]{0,300}className: 'page-chip-row history-people'/, 'Verlauf');
+  assert.match(tasksSrc, /personChipsHtml\(\{\s*filter: 'assigned_to'/, 'Filterblatt');
+  assert.doesNotMatch(tasksSrc, /group-toggle history-people|history-people__mark|data-history-user/, 'kein Umschalter-Dialekt mehr im Verlauf');
+  assert.match(read('pages/rewards.js'), /personChipsHtml\(\{\s*filter: 'ledger-member'/, 'Belohnungen');
+  assert.match(read('pages/calendar.js'), /personChipsHtml\(\{\s*filter: 'person'/, 'Kalender');
+  // S10 (G4-Notizen-P3-2): der Verfasserfilter der Notizen war die vierte
+  // Form - Namen-Chips ohne Scheibe, von Hand gebaut.
+  const notesSrc = read('pages/notes.js');
+  assert.match(notesSrc, /personChipsHtml\(\{\s*filter: 'creator'[\s\S]{0,400}className: 'notes-filter-group'/, 'Notizen');
+  assert.doesNotMatch(notesSrc, /dataset\.creator|\[data-creator\]/, 'kein handgebauter Namen-Chip mehr');
+});
+
+test('settings: the calendar import proposes the colour of the chosen calendar (#2303)', () => {
+  // Bleibt die vorgeschlagene Farbe stehen, erbt der Import die Kalenderfarbe
+  // und folgt dem Umfaerben; der alte feste Vorschlag (#0891B2) wurde zur
+  // Eigenfarbe jedes Termins und hielt ihn auf der alten Farbe fest.
+  const calendars = [{ id: 1, color: '#007AFF', is_default: true }, { id: 7, color: '#2E7D32' }];
+  assert.equal(icsSettings.importTargetColor(calendars, '7'), '#2E7D32');
+  assert.equal(icsSettings.importTargetColor(calendars, '1'), '#007AFF');
+  assert.equal(icsSettings.importTargetColor(calendars, '__new'), null, 'a new calendar takes the chosen colour itself');
+  assert.equal(icsSettings.importTargetColor(calendars, '99'), null);
 });

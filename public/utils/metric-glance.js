@@ -15,7 +15,6 @@
  * aus. Ab 640px bleibt die Kennzahl-Zeile stehen, die Zeile gibt es nicht.
  */
 import { esc } from '/utils/html.js';
-import { leadStep } from '/utils/metric-card.js';
 
 /**
  * OHNE `controls` IST DIE ZEILE EIN ZEICHEN, KEIN KNOPF (R16 Schritt 2b):
@@ -35,9 +34,13 @@ import { leadStep } from '/utils/metric-card.js';
  *        hoechstens zwei Nebenwerte rechts; `amount` optional (z.B. „8 aktiv")
  * @param {boolean} [o.lead]   die Zahl FUEHRT den Bildschirm (R18): Display-Stufe,
  *        die Nebenwerte stehen als ruhige Zeile darunter (`glanceLeadClass`)
+ * @param {boolean} [o.everywhere] die Zeile steht in JEDER Breite, nicht nur unter
+ *        640px (Critique R24, E2 "eine Kennzahlkarte oben"): fuer Flaechen, deren
+ *        Kennzahlen keine Seitenspalte mehr tragen. Nur statisch (ohne `controls`) -
+ *        es gibt dann keine Karten, die sie aufklappen koennte.
  */
-export function metricGlanceHtml({ id, controls, expanded, label, value, tone = 'neutral', flows = [], lead: leads = false }) {
-  const carrier = `row-carrier budget-glance${leads ? ` ${glanceLeadClass(value)}` : ''}`;
+export function metricGlanceHtml({ id, controls, expanded, label, value, tone = 'neutral', flows = [], lead: leads = false, everywhere = false }) {
+  const carrier = `row-carrier budget-glance${leads ? ` ${glanceLeadClass(value)}` : ''}${everywhere && !controls ? ' budget-glance--everywhere' : ''}`;
   const side = flows.filter(Boolean).slice(0, 2);
   const flowsHtml = side.length ? `
         <span class="budget-glance__flows">${side.map((f) => `
@@ -67,14 +70,13 @@ export function metricGlanceHtml({ id, controls, expanded, label, value, tone = 
 /**
  * EINE LEITZAHL JE GELD-BILDSCHIRM (Critique R18, 2026-10-07). Mobil war das
  * groesste Element jedes Budget-Reiters das Wort "Budget" (34px), der Saldo
- * stand in 18px daneben. Mit dieser Klasse traegt die Zahl der Kurzzeile eine
- * Display-Stufe und die Nebenwerte ruecken als ruhige Zeile darunter
- * (panel.css `.budget-glance--lead`). Die Laengenstufe haelt sechsstellige
- * Betraege und lange Waehrungszeichen bei 390px in einer Zeile.
+ * stand in 18px daneben. Mit dieser Klasse traegt die Zahl der Kurzzeile
+ * Title 1 und die Nebenwerte ruecken als ruhige Zeile darunter (panel.css
+ * `.budget-glance--lead`). Seit R23 (D12) eine feste Stufe; zu lange Betraege
+ * verkleinert `fitMetricLeads` (utils/metric-card.js), nicht die Zeichenzahl.
  */
-export function glanceLeadClass(value) {
-  const step = leadStep(value);
-  return `budget-glance--lead${step ? ` budget-glance--lead-${step}` : ''}`;
+export function glanceLeadClass() {
+  return 'budget-glance--lead';
 }
 
 /**
@@ -93,4 +95,61 @@ export function wireMetricGlance(root, id, onChange) {
     button.ownerDocument?.getElementById(button.getAttribute('aria-controls'))?.classList.toggle('is-expanded', expanded);
     onChange?.(expanded);
   });
+}
+
+/**
+ * DER KENNZAHL-SLOT STEHT AB DEM ERSTEN BILD (Critique R22, D4). Abos und
+ * Aufteilung bauten Kurzzeile und Kennzahlkarten erst mit den Daten; bis dahin
+ * war der Slot leer, und die Liste darunter rutschte beim Eintreffen um ihre
+ * Hoehe nach unten - gemessen nach dem Reiterwechsel mobil 0,0996 (Abos) und
+ * 0,060 (Aufteilung), am Laptop 0,025. CLS verschweigt das, weil der Sprung
+ * einer Eingabe folgt (`hadRecentInput`).
+ *
+ * Das Skelett ist dasselbe Markup wie die echte Zeile und die echten Karten,
+ * nur mit Platzhaltertext in `.skeleton-text` (durchsichtig, Schimmer): die
+ * Hoehen kommen aus denselben Regeln, nicht aus nachgerechneten Zahlen.
+ *
+ * @param {object} [o]
+ * @param {boolean} [o.lead]      wie `metricGlanceHtml` - die Zahl fuehrt
+ * @param {boolean} [o.controls]  die echte Zeile klappt auf (Pfeil)
+ * @param {number}  [o.flows]     Zahl der Nebenwerte (0-2)
+ * @param {boolean} [o.everywhere] wie `metricGlanceHtml` - die Zeile steht in jeder Breite (R24, E2)
+ * @returns {string}
+ */
+export function metricGlanceSkeletonHtml({ lead = false, controls = true, flows = 1, everywhere = false } = {}) {
+  const bar = (text) => `<span class="skeleton skeleton-text">${text}</span>`;
+  const side = Math.max(0, Math.min(2, flows));
+  const flowsHtml = side ? `
+        <span class="budget-glance__flows">${Array.from({ length: side }, () => `
+          <span class="budget-glance__flow">${bar('0000000 00,00')}</span>`).join('')}
+        </span>` : '';
+  return `
+    <div class="row-carrier budget-glance${lead ? ` ${glanceLeadClass('000,00')}` : ''}${everywhere && !controls ? ' budget-glance--everywhere' : ''}" aria-hidden="true">
+      <div class="budget-glance__row${controls ? ' budget-glance__balance' : ' budget-glance__row--static'}">
+        <span class="budget-glance__lead">
+          <span class="budget-glance__label">${bar('0000000000')}</span>
+          <span class="budget-glance__value budget-glance__value--neutral">${bar('000,00')}</span>
+        </span>${flowsHtml}${controls ? `
+        <span class="budget-glance__chevron icon-sm"></span>` : ''}
+      </div>
+    </div>`;
+}
+
+/**
+ * Kennzahlkarten als Skelett in ihrer Form (siehe oben): Beschriftung, Wert
+ * und auf Wunsch eine Fussnote je Karte.
+ * @param {number} [count]
+ * @param {object} [o]
+ * @param {boolean} [o.note]  die echten Karten tragen eine Fussnote
+ * @param {string} [o.tag]    Element der echten Karte (`article` oder `div`)
+ * @returns {string}
+ */
+export function metricCardsSkeletonHtml(count = 3, { note = true, tag = 'article' } = {}) {
+  const bar = (text) => `<span class="skeleton skeleton-text">${text}</span>`;
+  return Array.from({ length: Math.max(1, count) }, () => `
+    <${tag} class="metric-card" aria-hidden="true">
+      <div class="metric-card__label">${bar('0000000000')}</div>
+      <div class="metric-card__value">${bar('000,00')}</div>${note ? `
+      <div class="metric-card__note">${bar('0000000000')}</div>` : ''}
+    </${tag}>`).join('');
 }

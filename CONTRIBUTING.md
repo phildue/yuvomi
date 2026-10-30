@@ -114,6 +114,18 @@ and nowhere else. Because suites run side by side, a suite takes a free port
 fixed one. CI runs `npm test`, one suite after the other, and next to it one browser suite,
 `test:fasting-browser`, as a job of its own.
 
+On Windows, check the repository out with LF line endings: Git for Windows turns them
+into CRLF by default, and the guards that read docs and locale files byte for byte then
+fail. Clone with `git clone -c core.autocrlf=false -c core.eol=lf ...`, or set both before
+the checkout. The suites start under `cmd.exe`, npm's default shell there, without extra setup:
+a script that needs an environment variable sets it through `scripts/with-env.mjs`
+(`node scripts/with-env.mjs DB_PATH=:memory: node ...`), never as a shell prefix, which
+`cmd.exe` does not understand. What only POSIX can do is skipped on Windows, with a reason:
+the symbolic link cases without Developer Mode, the file permission cases `chmod` cannot set
+up there, and the `/bin/sh` and process group parts of `test:restore-swap` and
+`test:parallel-runner`; `test:runtime-deps` links its folders as junctions and runs in full.
+`npm run test-parallel` itself is POSIX only. CI and the Docker image run on Linux.
+
 ---
 
 ## Project Structure
@@ -347,7 +359,7 @@ without this repository's private tooling.
 
 - Web Component prefix: `yuvomi-` (one component per file). Not every file in `public/components/` is a Web Component: most are ES modules that export functions, such as `openModal`, `openDetailView` or `renderUserMultiSelect`.
 - All UI text via i18n keys (`t('key')`) - never hardcode text in components. German (`de`) is the reference locale.
-- **Adding a new i18n key:** add it to **all** files in `public/locales/` (26 languages; a
+- **Adding a new i18n key:** add it to **all** files in `public/locales/` (27 languages; a
   non-German value may start as the English text). The JSON files are 4-space indented
   and nested - edit them in place, never reserialize a whole file. A key interpolating a
   numeric `count` needs an `_one` singular variant (`{{count}}` placeholder), otherwise
@@ -481,6 +493,8 @@ npm run test:document-guards > /tmp/dg.log 2>&1; echo $?
 
 A `| tail` reports the status of `tail`, not of the run. That is not a hypothetical: v2.64.0 shipped on 2 September without this handrail because the step lived only in `docs/test-suites.md` and not in the release checklist anyone actually followed.
 
+After a Puppeteer bump, install the Chrome it pins before the run: `npx puppeteer browsers install chrome`. A machine that ran the handrail before only has the previous version in `~/.cache/puppeteer` ([#2155](https://github.com/ulsklyc/yuvomi/issues/2155)). Until then every browser start falls back to an installed system Chrome and logs a warning with both versions; that run is usable, but it is not the browser Puppeteer guarantees. To force a specific Chrome, set `PUPPETEER_EXECUTABLE_PATH=/path/to/chrome`. If that path does not exist, or no Chrome is found at all, the run stops with an error that names the install command.
+
 ---
 
 ## AI Assistance
@@ -495,7 +509,9 @@ That is worth stating plainly rather than leaving to inference. An automated rev
 
 ### What a human guarantees
 
-**Nothing reaches `main` without a human deciding that it should.** Every merge in this repository is performed by the maintainer, including automated dependency updates and contributions from others. There is no path by which an agent merges its own work.
+**Nothing reaches `main` without a human deciding that it should.** Contributions from others and automated dependency updates are merged by the maintainer, by hand.
+
+**For the maintainer's own work, that decision comes earlier.** The maintainer decides what gets built and hands it to an agent; an agent does not merge work nobody asked for. Once that pull request is open, the agent may turn on GitHub's auto-merge, which merges only after the required test runs have passed, and it turns it on only after the automated review has come back without an open finding. Three kinds of change never go in that way and wait for the maintainer to merge them: database migrations, changes that touch something sensitive (see below), and changes with a design question still open. GitHub enforces the test runs; the rest is a rule the agents follow under the maintainer's account, not a technical barrier. Every auto-merge shows up as such in the pull request's history, so the rule can be checked against it.
 
 Beyond that decision, three things are mechanical and hold for every change regardless of who or what wrote it:
 
@@ -503,7 +519,7 @@ Beyond that decision, three things are mechanical and hold for every change rega
 - The [Hard Constraints](#hard-constraints) above are enforced by tests, not by good intentions - a framework import or an `innerHTML` call fails the build.
 - Behaviour that is claimed to be fixed carries a test that fails against the state before the fix. A guard that was never seen red is not evidence.
 
-**On "a human has read and understood every merged line":** for a one-person project shipping several releases a week, that sentence would be a promise nobody could keep, and a promise that cannot be kept is worse than none - it invites exactly the trust it does not earn. What is true instead: the maintainer reviews every change before merging it, decides whether it goes in, and is answerable for it either way. Where a change touches something sensitive - authentication, permissions, storage, anything reaching the network - that review goes line by line.
+**On "a human has read and understood every merged line":** for a one-person project shipping several releases a week, that sentence would be a promise nobody could keep, and a promise that cannot be kept is worse than none - it invites exactly the trust it does not earn. What is true instead: the maintainer decides what gets built and whether it goes in, and is answerable for it either way. Where a change touches something sensitive - authentication, permissions, storage, anything reaching the network - the maintainer reads it line by line and merges it by hand.
 
 ### If you contribute
 

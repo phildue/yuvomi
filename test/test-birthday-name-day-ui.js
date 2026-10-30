@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getSupportedLocales } from '../public/i18n.js';
 import { readdirSync, readFileSync } from 'node:fs';
+import { globalHiddenRule } from './css-rules.js';
 
 const birthdays = await import('../public/pages/birthdays.js');
 const { __test: calendar } = await import('../public/pages/calendar.js');
@@ -64,9 +65,10 @@ test('person list renders the name-day countdown, date and label after the birth
   });
 
   assert.match(html, /birthday-item__meta--with-name-day/);
-  // Plural-`count` statt `days` (Critique 2026-09-26): "in 1 Tagen" brach in
-  // Sprachen mit anderen Pluralformen.
-  assert.match(html, /birthdays\.inDays\{&quot;count&quot;:235\}/);
+  // Seit R23 (D11) der Abstand aus utils/date-format.js: Intl.RelativeTimeFormat
+  // kennt die Pluralformen jeder Sprache, und jenseits eines Monats zaehlt es
+  // grob wie die Uebersicht (235 Tage = "in 8 Monaten").
+  assert.match(html, /in 8 Monaten/);
   assert.match(html, /2027-04-24/);
   assert.match(html, /birthdays\.celebratesNameDay/);
 });
@@ -115,24 +117,19 @@ const nameDayText = (html) => html.match(/<span class="birthday-item__name-day">
 test('name-day countdown says today and tomorrow instead of "in 0/1 days"', () => {
   assert.match(nameDayText(nameDayRow(0)), /^common\.today · /);
   assert.match(nameDayText(nameDayRow(1)), /^common\.tomorrow · /);
-  assert.match(nameDayText(nameDayRow(2)), /^birthdays\.inDays\{&quot;count&quot;:2\} · /);
+  assert.match(nameDayText(nameDayRow(2)), /^in 2 Tagen · /);
 });
 
-test('birthday and name-day countdowns pass a plural count, never a bare days number', () => {
+test('R23/D11: der Abstand spricht wie die Uebersicht ("in 10 Tagen"), kein eigener Schluessel mehr', () => {
   const html = birthdays.birthdayItemHtml({
     id: 9, name: 'Tom', birth_date: '1990-10-06', next_birthday: '2026-10-06', next_age: 36, days_until: 10,
   });
-  assert.match(html, /birthdays\.inDays\{&quot;count&quot;:10\}/);
-  assert.doesNotMatch(html + nameDayRow(5), /&quot;days&quot;/);
-});
-
-test('every locale pluralizes birthdays.inDays on {{count}}', () => {
+  assert.match(html, /in 10 Tagen/);
+  assert.doesNotMatch(html + nameDayRow(5), /birthdays\.inDays/);
   const localeDir = new URL('../public/locales/', import.meta.url);
   for (const file of readdirSync(localeDir).filter((f) => f.endsWith('.json'))) {
     const block = JSON.parse(readFileSync(new URL(file, localeDir), 'utf8')).birthdays;
-    assert.match(block.inDays, /\{\{count\}\}/, `${file}: inDays`);
-    assert.doesNotMatch(block.inDays, /\{\{days\}\}/, `${file}: inDays`);
-    assert.match(block.inDays_one ?? '', /\{\{count\}\}/, `${file}: inDays_one`);
+    assert.equal(block.inDays, undefined, `${file}: birthdays.inDays ist ersetzt`);
   }
 });
 
@@ -157,8 +154,9 @@ test('the remove-photo button exists only while there is a photo', () => {
   assert.match(renderPreview, /removePhoto\.hidden = !photoData/, 'follows the photo state after crop and removal');
   const onRemove = modal.slice(modal.indexOf("removePhoto.addEventListener('click'"));
   assert.match(onRemove.slice(0, 400), /photoEdit\?*\.focus\(\)/, 'removing hides the focused button - focus moves to the edit button');
-  const css = readFileSync(new URL('../public/styles/birthdays.css', import.meta.url), 'utf8');
-  assert.match(css, /\.birthday-modal__photo-action\[hidden\]\s*\{\s*display:\s*none;?\s*\}/, 'display: inline-flex would beat the UA [hidden]');
+  // display: inline-flex would beat the UA [hidden] - since R21 S9a the one
+  // global rule in reset.css (D13) holds it, not one rule per class.
+  assert.ok(globalHiddenRule(), 'display: inline-flex would beat the UA [hidden]');
 });
 
 // ── R10 L5: Geburtstage als Liste + Detail ────────────────────────────────
@@ -192,7 +190,7 @@ test('Liste + Detail: die Spalte nennt wann und wie alt, Datum, Notiz - und fueh
     const head = birthdays.__test.birthdayDetailHead(BD);
     assert.ok(head.subtitle, 'das Datum des naechsten Geburtstags steht als Unterzeile im Kopf');
     assert.ok(head.media, 'der Kopf fuehrt immer ein Bild oder Monogramm');
-    assert.deepEqual(head.facts, ['birthdays.turnsAge{"age":41}', 'birthdays.inDays{"count":36}'], 'dieselben Worte wie die Kachel der Uebersicht: wie alt, wann');
+    assert.deepEqual(head.facts, ['birthdays.turnsAge{"age":41}', 'in 5 Wochen'], 'dieselben Worte wie die Kachel der Uebersicht: wie alt, wann');
     assert.deepEqual(birthdays.__test.birthdayDetailHead({ ...BD, next_age: null, days_until: 0 }).facts, ['', 'common.today'],
       'ohne Geburtsjahr kein Alter; heute heisst heute');
     assert.ok(byLabel['birthdays.birthDateLabel'].value, 'Geburtsdatum');
@@ -215,24 +213,136 @@ test('Liste + Detail: Seite, Markup, Klickweg und die klebende Spalte', () => {
   const block = css.slice(css.indexOf('@container module-surface (min-width: 65rem)'));
   assert.ok(block.length > 0, 'die Spalte gilt ab der Schwelle aus tokens.css');
   assert.match(block, /position: sticky;/);
-  assert.match(block, /height: calc\(var\(--viewport-height\) - var\(--birthdays-detail-top/,
-    'die Hoehe rechnet ab der gemessenen Oberkante - sonst ragt sie in Ruhe unter den Falz');
+  // R21 S7 (D9): HOECHSTENS bis zur Luft ueber dem Fensterrand, nicht immer -
+  // die Spalte endet unter ihrem Inhalt (1920: 528px leer ueber dem Fuss).
+  assert.match(block, /max-height: calc\(var\(--viewport-height\) - var\(--birthdays-detail-top/,
+    'die Obergrenze rechnet ab der gemessenen Oberkante - sonst ragt sie in Ruhe unter den Falz');
+  assert.doesNotMatch(block, /(?:^|[;\s])height: calc\(var\(--viewport-height\)/, 'keine feste Hoehe: die Spalte folgt dem Inhalt');
 });
 
 // R19 (Critique 2026-10-16): Monatsgruppen in der Liste, und der naechste
-// Geburtstag fuehrt im Modulton.
+// Geburtstag fuehrt im Modulton. R21 S9b (Critique a3, "7 Monatskoepfe fuer 8
+// Eintraege"): die Koepfe stehen erst, wenn im Mittel zwei auf einen Monat kommen.
 test('R19: die Liste gruppiert nach Monat und hebt den naechsten hervor', async () => {
   const { installMiniDom } = await import('./mini-dom.js');
   const restore = installMiniDom();
   try {
     const row = (id, next) => ({ id, name: `P${id}`, next_birthday: next, days_until: id * 10, next_age: 30, birth_date: '1990-01-01' });
-    const html = birthdays.__test.birthdayListHtml([row(1, '2026-11-02'), row(2, '2026-11-20'), row(3, '2027-02-08')]);
-    const heads = [...html.matchAll(/<h2 class="list-group__title birthdays-month">([^<]*)<\/h2>/g)].map((m) => m[1]);
-    assert.equal(heads.length, 2, `ein Kopf je Monat: ${heads.join(', ')}`);
-    assert.ok(html.indexOf(heads[1]) > html.indexOf('data-id="2"'), 'der zweite Kopf steht vor dem Februar, nach beiden Novembern');
+    const heads = (h) => [...h.matchAll(/<h2 class="list-group__title birthdays-month">([^<]*)<\/h2>/g)].map((m) => m[1]);
+    const duenn = birthdays.__test.birthdayListHtml([row(1, '2026-11-02'), row(2, '2026-11-20'), row(3, '2027-02-08')]);
+    assert.deepEqual(heads(duenn), [], 'drei Geburtstage in zwei Monaten: kein Register - jeder Kopf wiederholte nur ein Datum');
+    const html = birthdays.__test.birthdayListHtml([row(1, '2026-11-02'), row(2, '2026-11-20'), row(3, '2027-02-08'), row(4, '2027-02-19')]);
+    assert.equal(heads(html).length, 2, `ein Kopf je Monat: ${heads(html).join(', ')}`);
+    assert.ok(html.indexOf(heads(html)[1]) > html.indexOf('data-id="2"'), 'der zweite Kopf steht vor dem Februar, nach beiden Novembern');
     assert.equal((html.match(/birthday-item--next/g) ?? []).length, 1, 'genau einer ist der naechste');
     assert.ok(html.indexOf('birthday-item--next') < html.indexOf('data-id="2"'), 'und zwar der erste');
   } finally { restore(); }
   const css = readFileSync(new URL('../public/styles/birthdays.css', import.meta.url), 'utf8');
   assert.match(css, /\.birthday-item--next \.birthday-chip \{[^}]*--module-accent/, 'der Countdown des naechsten im Modulton');
+});
+
+// --------------------------------------------------------------------------
+// Geburtstag ohne Jahr (#2095): nie ein Jahr, nie ein Alter.
+// --------------------------------------------------------------------------
+const { birthDateText, birthDateShort, birthDateFieldHtml } = await import('../public/utils/birth-date.js');
+
+test('ohne Jahr nennt die Zeile nur den Tag, kein Alter', () => {
+  // Seit R23 (D11) mit kurzem Wochentag vorn (utils/date-format.js dateText) -
+  // seit S12 nur in den naechsten zwei Wochen: weiter weg kappte er bei 390 px
+  // das Alter ("Mo, 08.02.2027 · wird" ohne Zahl).
+  const wd = new Intl.DateTimeFormat('de', { weekday: 'short', timeZone: 'UTC' }).format(new Date('2027-03-15T12:00:00Z'));
+  assert.equal(birthdays.ageMeta({ next_birthday: '2027-03-15', next_age: null, days_until: 9 }), `${wd}, 2027-03-15`);
+  assert.equal(birthdays.ageMeta({ next_birthday: '2027-03-15', next_age: null, days_until: 146 }), '2027-03-15', 'weit weg: kein Wochentag');
+  assert.equal(birthdays.ageMeta({ next_birthday: '2027-03-15', next_age: null }), '2027-03-15');
+  assert.match(birthdays.ageMeta({ next_birthday: '2027-03-15', next_age: 41 }), /turnsAge/);
+  const html = birthdays.birthdayItemHtml({
+    id: 77, name: 'Ohne Jahr', birth_date: '2000-03-15', year_unknown: 1,
+    next_birthday: '2027-03-15', next_age: null, days_until: 146,
+  });
+  assert.doesNotMatch(html, /turnsAge|null/);
+});
+
+test('das Geburtsdatum ohne Jahr steht ausgeschrieben da, nie mit dem Platzhalter', () => {
+  globalThis.__locale = 'de';
+  try {
+    assert.equal(birthDateText('2000-03-15', 1), '15. März');
+    assert.equal(birthDateText('2000-02-29', true), '29. Februar');
+    assert.equal(birthDateText('1990-03-15', 0), '1990-03-15', 'mit Jahr wie bisher (formatDate)');
+    assert.equal(birthDateText(null, 1), '');
+    globalThis.__formatDayMonth = (d) => `TM(${d})`;
+    assert.equal(birthDateShort('2000-03-15', 1), 'TM(2000-03-15)', 'die knappe Form laesst das Jahr weg');
+    assert.equal(birthDateShort('1990-03-15', 0), '1990-03-15');
+  } finally {
+    delete globalThis.__locale;
+    delete globalThis.__formatDayMonth;
+  }
+});
+
+test('der Editor zeigt ohne Jahr Monat und Tag statt des Datumswaehlers', () => {
+  const yearless = birthDateFieldHtml({ id: 'bd-birth-date', label: 'L', value: '2000-02-29', yearUnknown: 1, max: '2026-10-20' });
+  assert.match(yearless, /<yuvomi-datepicker id="bd-birth-date"[^>]* value=""[^>]* hidden>/, 'der Datumswaehler weicht, ohne Platzhalterjahr');
+  assert.match(yearless, /class="birth-date-field__yearless" id="bd-birth-date-yearless" role="group"[^>]*>/);
+  assert.doesNotMatch(yearless, /class="birth-date-field__yearless"[^>]* hidden/);
+  assert.match(yearless, /value="02" selected/);
+  assert.match(yearless, /value="29" selected/, 'der 29.02. ist waehlbar');
+  assert.match(yearless, /id="bd-birth-date-year-unknown" checked/);
+  // R22 D20: "Jahr unbekannt" ist ein Schalter (an/aus), kein Haken in einer Auswahl.
+  assert.match(yearless, /<label class="toggle birth-date-field__toggle">\s*<input type="checkbox" role="switch" id="bd-birth-date-year-unknown" checked>\s*<span class="toggle__track" aria-hidden="true"><\/span>/);
+  assert.doesNotMatch(yearless, /form-check/, 'die native Checkbox ist weg');
+
+  const known = birthDateFieldHtml({ id: 'bd-birth-date', label: 'L', value: '1990-03-15' });
+  assert.match(known, /value="1990-03-15"/);
+  assert.match(known, /class="birth-date-field__yearless"[^>]* hidden/);
+  assert.doesNotMatch(known, /year-unknown" checked/);
+});
+
+test('der Kalendertermin eines Geburtstags ohne Jahr bekommt die Beschreibung ohne Datum', () => {
+  const ev = localizeBirthdayEvent({ birthday_name: 'Ohne Jahr', birthday_date: null, title: 'x' });
+  assert.match(ev.description, /calendarEventDescriptionNoDate/);
+});
+
+// Codex-Befund auf #2111: ein Mitglied, dessen Geburtstag nur Tag und Monat
+// kennt (etwa ein Split-Gast aus einem jahrlosen Kontakt), zeigt in der
+// Mitgliederliste kein Platzhalterjahr, und Profil und Mitglieds-Editor bieten
+// dieselbe Wahl wie der Geburtstags-Editor.
+test('Mitglied ohne Geburtsjahr: Liste ohne 2000, Editoren mit "Jahr unbekannt"', async () => {
+  const { __test: family } = await import('../public/settings/pages/admin-family.js');
+  globalThis.__locale = 'de';
+  try {
+    const row = family.memberHtml({ id: 5, username: 'gast', display_name: 'Gast', role: 'member', family_role: 'other',
+      birth_date: '2000-03-15', birth_year_unknown: true }, 1);
+    // Seit R22 (D13) steht der Geburtstag gar nicht mehr in der Mitgliederzeile -
+    // erst recht kein Platzhalterjahr; Tag und Monat zeigt der Editor.
+    assert.doesNotMatch(row, /2000|15\. März/);
+  } finally {
+    delete globalThis.__locale;
+  }
+  const { birthDateControlHtml } = await import('../public/utils/birth-date.js');
+  const control = birthDateControlHtml({ id: 'profile-birth-date', value: '2000-03-15', yearUnknown: true, describedBy: 'profile-error' });
+  assert.match(control, /id="profile-birth-date-year-unknown" checked/);
+  assert.match(control, /aria-describedby="profile-error"/);
+  const { readFileSync } = await import('node:fs');
+  const hk = readFileSync(new URL('../public/pages/housekeeping.js', import.meta.url), 'utf8');
+  assert.match(hk, /birthDateText\(worker\.birth_date, worker\.birth_year_unknown\)/, 'Hausprofil zeigt kein Platzhalterjahr');
+  assert.match(hk, /yearUnknown: item\.birth_year_unknown/);
+  assert.match(hk, /birth_year_unknown: workerBirth\.yearUnknown/);
+  for (const page of ['personal-account', 'admin-family']) {
+    const src = readFileSync(new URL(`../public/settings/pages/${page}.js`, import.meta.url), 'utf8');
+    assert.match(src, /birthDateControlHtml\(\{[\s\S]{0,200}yearUnknown: (user\?|member)\.birth_year_unknown/, `${page} reicht die Marke an den Editor`);
+    assert.match(src, /birth_year_unknown: birth\.yearUnknown/, `${page} schickt die Marke mit`);
+  }
+});
+
+/* D7 (Critique R21): DER GEBURTSTAG FUEHRT ZU SEINEM KONTAKT. Ein importierter
+ * Eintrag traegt `contact_id` (Migration 90) - die Leseansicht bietet an der
+ * Datumszeile "Kontakt anzeigen" an, wie Apples Kalender am Geburtstag. Ohne
+ * Verknuepfung bleibt die Zeile reiner Text. */
+test('R21 D7: ein importierter Geburtstag fuehrt zu seinem Kontakt', () => {
+  const rows = birthdays.__test.birthdayPaneSections({ id: 1, name: 'Tante', birth_date: '1970-05-04', year_unknown: 0, contact_id: 9 });
+  const row = rows.find((r) => r.icon === 'cake');
+  assert.ok(row?.action, 'die Datumszeile traegt eine Folgeaktion');
+  assert.equal(row.action.label, 'birthdays.showContact');
+  assert.equal(birthdays.__test.contactHref(9), '/contacts?open=9');
+  const own = birthdays.__test.birthdayPaneSections({ id: 2, name: 'Lose', birth_date: '1970-05-04', year_unknown: 0, contact_id: null });
+  assert.equal(own.find((r) => r.icon === 'cake')?.action ?? null, null);
 });

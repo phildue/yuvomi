@@ -226,7 +226,7 @@
  * hidden-Attributs, und der Hinweis stünde auch ohne Vorgabe da. */
 .auth-form__hint {
   margin-top: var(--space-1);
-  font-size: var(--text-sm);
+  font-size: var(--type-caption);
   color: var(--color-text-secondary);
 }
 
@@ -250,10 +250,29 @@
   color: var(--color-warning);
 }
 
-/* Das display:flex oben überschreibt sonst das UA-display:none des
- * hidden-Attributs – Hinweis würde permanent sichtbar sein. */
-.auth-capslock[hidden] {
-  display: none;
+/* Der Rueckweg unter dem Formular ("Zurueck zur Anmeldung", "Passwort
+ * vergessen?"). Er hatte keine Regel (Critique R22, D19): als Fliesstext in
+ * Textfarbe klebte er an der Unterkante des Primaerknopfs und las sich nicht
+ * als Link. Jetzt ein leiser Link in Akzentfarbe, mittig, mit Abstand zum
+ * Knopf und einer Tippflaeche in voller Zielhoehe. */
+.auth-form__forgot {
+  margin-top: var(--space-3);
+  text-align: center;
+  font-size: var(--text-sm);
+}
+
+.auth-form__forgot a {
+  display: inline-flex;
+  align-items: center;
+  min-block-size: var(--target-base);
+  padding-inline: var(--space-2);
+  color: var(--color-accent);
+  text-decoration: none;
+}
+
+.auth-form__forgot a:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
 }
 
 /* Nach falschen Zugangsdaten wird der Recovery-Link betont, damit der Nutzer
@@ -314,52 +333,8 @@
   background-color: var(--color-border);
 }
 
-/* Passwort-Sichtbarkeit-Toggle */
-.input-password-wrapper {
-  position: relative;
-  display: flex;
-  align-items: stretch;
-}
-
-.input-password-wrapper .input {
-  flex: 1;
-  min-width: 0;
-  /* logisch statt physisch, damit der Toggle-Platz in RTL auf der richtigen
-   * Seite reserviert wird (ar/fa) */
-  padding-inline-end: calc(var(--target-lg) + var(--space-1));
-}
-
-.password-toggle {
-  position: absolute;
-  inset-inline-end: 0;
-  top: 0;
-  bottom: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  /* Komfortable Daumen-Trefferfläche (≥44 px) statt der bisherigen 40 px */
-  width: var(--target-lg);
-  padding: 0;
-  background: none;
-  border: none;
-  cursor: pointer;
-  color: var(--color-text-secondary);
-  /* logische Ecken: rundet in RTL automatisch die richtige Seite */
-  border-start-start-radius: 0;
-  border-start-end-radius: var(--radius-md);
-  border-end-end-radius: var(--radius-md);
-  border-end-start-radius: 0;
-  transition: color var(--transition-fast);
-}
-
-.password-toggle:hover {
-  color: var(--color-text-primary);
-}
-
-.password-toggle:focus-visible {
-  outline: var(--focus-ring-width) solid var(--focus-ring-color);
-  outline-offset: var(--focus-ring-offset-inset);
-}
+/* Passwort-Sichtbarkeit-Toggle: seit Critique R24 (G6-Einst-P3-4) in
+   layout.css - das Auge sitzt auch in den Einstellungen im Feld. */
 
 /* Feld-Fehler-Zustand */
 .form-group--error .input {
@@ -377,16 +352,10 @@
   border: 2px solid color-mix(in srgb, currentColor 30%, transparent);
   border-top-color: currentColor;
   border-radius: 50%;
-  animation: auth-spin 0.7s linear infinite;
+  /* Die geteilte Statusdrehung (layout.css); unter reduzierter Bewegung
+   * dreht sie weiter (reset.css, D12). */
+  animation: status-spin var(--spin-period) linear infinite;
   flex-shrink: 0;
-}
-
-@keyframes auth-spin {
-  to { transform: rotate(360deg); }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .auth-spinner { animation: none; opacity: 0.6; }
 }
 
 /* --------------------------------------------------------

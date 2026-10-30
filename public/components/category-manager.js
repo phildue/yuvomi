@@ -52,7 +52,7 @@ import { api } from '/api.js';
 import { t, getLocale } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { makeSortable, isDragActive } from '/utils/sortable.js';
-import { wireTablist } from '/utils/tablist.js';
+import { colorPickerHtml, wireColorPicker } from '/utils/color-picker.js';
 import { rowMenuHtml } from '/utils/row-action.js';
 import { installPopoverMenus } from '/utils/popover-menu.js';
 import { errorSentence, isGone, isAlreadyDeleted } from '/utils/friendly-error.js';
@@ -63,9 +63,6 @@ import { holdUntilStyled, warmStyle } from '/utils/component-style.js';
 // Der Tag-Verwalter (tag-manager.js) traegt dieselben Klassen.
 const CATEGORY_MANAGER_STYLE = '/styles/category-manager.css';
 warmStyle(CATEGORY_MANAGER_STYLE);
-
-/** Platzhalter-Id fuer den Eintrag ohne Ton: eine leere `data-tab-id` waere kein Knopf. */
-const NO_COLOR_ID = '__none__';
 
 /**
  * Die Beschriftungen der Palette, in der Reihenfolge der Toene, die der Server
@@ -176,6 +173,7 @@ class CategoryManagerElement extends HTMLElement {
     this._sortables = [];
     this._onClick = this._onClick.bind(this);
     this._onSubmit = this._onSubmit.bind(this);
+    this._onKeydown = this._onKeydown.bind(this);
   }
 
   configure(opts) {
@@ -216,6 +214,7 @@ class CategoryManagerElement extends HTMLElement {
     this._disposeScopeHelp?.();
     this._root?.removeEventListener('click', this._onClick);
     this._root?.removeEventListener('submit', this._onSubmit);
+    this._root?.removeEventListener('keydown', this._onKeydown);
     this._destroySortables();
   }
 
@@ -236,6 +235,7 @@ class CategoryManagerElement extends HTMLElement {
     this._announceEl = this.querySelector('#cat-manager-announce');
     this._root.addEventListener('click', this._onClick);
     this._root.addEventListener('submit', this._onSubmit);
+    this._root.addEventListener('keydown', this._onKeydown);
     // Die Mehr-Menues der Zeilen (R19): Lage, Schliessen nach der Wahl, Pfeiltasten.
     installPopoverMenus(this._root);
   }
@@ -296,7 +296,7 @@ class CategoryManagerElement extends HTMLElement {
       <section class="cat-group" data-group="${esc(g.key)}">
         ${g.labelKey ? `<h4 class="cat-group__title">${esc(t(g.labelKey))}</h4>` : ''}
         <ul class="cat-list">
-          ${items.map((c, i) => this._rowHtml(c, g, i === 0, i === items.length - 1)).join('')}
+          ${items.map((c, i) => this._rowHtml(c, g, i + 1, items.length)).join('')}
         </ul>
         ${this._unifiedAdd ? '' : `<form class="cat-add-form" data-group="${esc(g.key)}" novalidate autocomplete="off">
           <input class="form-input" type="text" maxlength="${this._addMaxLength}"
@@ -414,9 +414,10 @@ class CategoryManagerElement extends HTMLElement {
     }
   }
 
-  /* Drag ist nie der einzige Weg: die Auf/Ab-Buttons in _rowHtml/_subListHtml
-   * bleiben der tastaturbedienbare Reorder-Pfad und rufen denselben
-   * _persistOrder/_persistSubOrder-Handler wie das Drag-Ende auf.
+  /* Drag ist nie der einzige Weg: die Pfeiltasten am Griff (`_onKeydown`) und
+   * Auf/Ab im Mehr-Menue bleiben der tastatur- und schalterbedienbare
+   * Reorder-Pfad und rufen denselben _persistOrder/_persistSubOrder-Handler
+   * wie das Drag-Ende auf.
    *
    * Scope-fähig: `root` ist beim Voll-Render der Groups-Container, beim
    * Teil-Render nur die neu gebaute Gruppen-Sektion bzw. Parent-Zeile — so
@@ -432,6 +433,8 @@ class CategoryManagerElement extends HTMLElement {
           // Nur der Drag-Pfad hat das DOM schon optimistisch umgestellt (SortableJS
           // verschiebt vor dem PATCH); ein Fehler braucht daher hier einen
           // Rollback-Render. Der Button-Pfad (_move) mutiert das DOM nie vorab.
+          // Speichert gerade ein anderer Zug, wird dieser sofort zurueckgenommen.
+          if (this._reorderBusy) { this._renderGroup(groupKey); return; }
           this._persistOrder(groupKey, orderedKeys, movedKey, { rollbackRender: true });
         },
       }).then((instance) => this._trackSortable(instance, listEl)).catch((err) => this._warnDragUnavailable(err));
@@ -447,6 +450,7 @@ class CategoryManagerElement extends HTMLElement {
           const orderedSubKeys = Array.from(subListEl.children)
             .filter((el) => el.matches('.cat-subrow'))
             .map((el) => el.dataset.subkey);
+          if (this._reorderBusy) { this._renderSublist(parentKey); return; }
           this._persistSubOrder(parentKey, orderedSubKeys, movedSubKey, { rollbackRender: true });
         },
       }).then((instance) => this._trackSortable(instance, subListEl)).catch((err) => this._warnDragUnavailable(err));
@@ -483,7 +487,7 @@ class CategoryManagerElement extends HTMLElement {
   // Button am Listenrand nun deaktiviert, auf die Gegenrichtung ausweichen,
   // sonst auf den Umbenennen-Button (letzter Rückfall, nie <body>). Nur der
   // Button-Pfad ruft das auf — der Drag-Pfad übergibt bewusst keine Fokus-Absicht.
-  _restoreReorderFocus(rowSelector, dir, prefix = '') {
+  _restoreReorderFocus(rowSelector, dir, prefix = '', { fromHandle = false } = {}) {
     const row = this._groupsEl?.querySelector(rowSelector);
     if (!row) return;
     const pick = (action) => {
@@ -493,9 +497,18 @@ class CategoryManagerElement extends HTMLElement {
     // Seit R19 stehen Auf/Ab im Mehr-Menue der Zeile, das nach der Wahl zu
     // ist: der Fokus geht an dessen Knopf (die bewegte Zeile), nie auf <body>.
     const own = (el) => el?.closest('.cat-row, .cat-subrow') === row;
+    // Kam der Schritt vom Griff (Pfeiltaste), bleibt der Fokus auf dem Griff:
+    // so laesst sich eine Zeile mit wiederholtem Druck weiterschieben. Die
+    // Herkunft reist MIT DEM VORGANG (Codex an #2177): ein geteilter Merker
+    // wurde von der ersten Antwort verbraucht, wenn eine zweite Pfeiltaste
+    // waehrend der laufenden Anfrage kam, und die zweite fiel auf Mehr.
+    const handle = fromHandle
+      ? [...row.querySelectorAll('[data-reorder-handle]')].find(own)
+      : null;
     const more = [...row.querySelectorAll('.row-action--more')].find(own);
     const opposite = dir === 'down' ? 'up' : 'down';
-    const target = more
+    const target = handle
+      || more
       || pick(`${prefix}${dir}`)
       || pick(`${prefix}${opposite}`)
       || row.querySelector(`[data-action="${prefix}rename"]`);
@@ -546,17 +559,17 @@ class CategoryManagerElement extends HTMLElement {
     });
   }
 
-  _rowHtml(cat, group, isFirst, isLast) {
+  _rowHtml(cat, group, position, total) {
+    const isFirst = position === 1;
+    const isLast = position === total;
     return `
       <li class="cat-row" data-key="${esc(this._keyOf(cat))}">
-        <span class="cat-row__handle" role="img" aria-label="${esc(t('category.dragHandle'))}" title="${esc(t('category.dragHandle'))}">
-          <i data-lucide="grip-vertical" class="icon-sm" aria-hidden="true"></i>
-        </span>
         ${this._markHtml(cat)}
         <button type="button" class="cat-row__name" data-action="rename"
               title="${esc(t('category.renameHint'))}">${esc(this._labelResolver(cat))}</button>
         <div class="cat-row__actions row-actions">
           ${this._rowActionsHtml(this._labelResolver(cat), { isFirst, isLast })}
+          ${this._handleHtml(this._labelResolver(cat), 'cat-row__handle', position, total)}
         </div>
         ${this._colorStripHtml(cat)}
         ${this._subListHtml(cat, group)}
@@ -601,6 +614,26 @@ class CategoryManagerElement extends HTMLElement {
   }
 
   /**
+   * DER GRIFF STEHT GANZ RECHTS (DESIGN.md D10 Zeilen-Endzone, #2152):
+   * [Mehr-Knopf][Griff], wie im Einkauf und in den Aufgaben. Bis dahin stand er
+   * als `role="img"` VOR der Marke - ein Ziehziel ohne Tastaturweg, das die
+   * Zeile von links her anders anfing als jede andere Liste der App.
+   *
+   * Ein BUTTON wie `.list-row__drag` (list-row.css): die Pfeiltasten am
+   * fokussierten Griff sind der Tastaturpfad (`_onKeydown`), derselbe
+   * Persistenz-Handler wie das Drag-Ende. Auf und Ab bleiben zusaetzlich im
+   * Mehr-Menue - fuer Schalter und Screenreader auf dem Telefon, die keine
+   * Pfeiltaste haben. Das Label nennt Objekt und Position.
+   */
+  _handleHtml(name, cls, position, total) {
+    const label = `${t('shopping.reorderHandle', { name })}, ${t('shopping.reorderPosition', { index: position, total })}`;
+    return `<button type="button" class="row-action list-row__drag ${cls}" data-reorder-handle
+              aria-label="${esc(label)}" title="${esc(t('shopping.reorderHandleHint'))}">
+              <i data-lucide="grip-vertical" class="icon-md" aria-hidden="true"></i>
+            </button>`;
+  }
+
+  /**
    * Das Zeichen der Zeile - als Vollton-Marke, wo eine Palette konfiguriert ist.
    *
    * Die Marke IST die Vorschau: sie zeigt Ton und Glyph genau so, wie die
@@ -637,25 +670,18 @@ class CategoryManagerElement extends HTMLElement {
    */
   _colorStripHtml(cat) {
     if (!this._colors.length) return '';
-    // `data-tab-id` statt eines eigenen Attributs: den Streifen bedient
-    // `wireTablist(mode: 'select')`, und der liefert Pfeiltasten,
-    // Roving-Tabindex und aria-checked - das vorgeschriebene Muster fuer eine
-    // radiogroup. Eine handgeschriebene Tastaturschleife waere hier die zweite
-    // Fassung derselben zwanzig Zeilen (der Kalender hat eine aeltere).
-    const swatch = (value, labelKey) => {
-      const on = (cat.color ?? '') === value;
-      return `<button type="button" role="radio" aria-checked="${on}"
-        class="cat-color-swatch${on ? ' cat-color-swatch--active' : ''}${value ? ' vivid-mark' : ''}"
-        data-tab-id="${esc(value || NO_COLOR_ID)}"
-        tabindex="${on ? '0' : '-1'}"
-        aria-label="${esc(t(labelKey))}" title="${esc(t(labelKey))}"
-        ${value ? `style="--seal-accent:${esc(value)}"` : ''}></button>`;
-    };
+    // EIN FARBWAEHLER (Critique R24, E6; Uebergabe S3): die Kategorietoene
+    // sind kuratierte Token-Werte und gehen OHNE "Eigene" durch denselben
+    // Baustein wie jede Farbreihe der App (utils/color-picker.js) - vorher
+    // eine eigene Swatch-Klasse mit wireTablist. "Keine Farbe" ist der leere
+    // Wert und steht vorn als ruhige Mulde.
+    const options = [
+      { value: '', paint: 'var(--color-fill-well)', label: t('category.colorNone'), title: t('category.colorNone') },
+      ...this._colors.map((c, i) => ({ value: c, label: t(COLOR_LABEL_KEYS[i] ?? 'category.colorPick'), title: t(COLOR_LABEL_KEYS[i] ?? 'category.colorPick') })),
+    ];
     return `
-      <div class="cat-row__colors" role="radiogroup"
-           aria-label="${esc(t('category.colorPick'))}" hidden>
-        ${swatch('', 'category.colorNone')}
-        ${this._colors.map((c, i) => swatch(c, COLOR_LABEL_KEYS[i] ?? 'category.colorPick')).join('')}
+      <div class="cat-row__colors" hidden>
+        ${colorPickerHtml({ value: cat.color ?? '', label: t('category.colorPick'), options, custom: false, inputClass: 'cat-row__color-value' })}
       </div>`;
   }
 
@@ -666,12 +692,10 @@ class CategoryManagerElement extends HTMLElement {
       <ul class="cat-sublist" data-parent="${esc(this._keyOf(cat))}">
         ${subs.map((s, j, arr) => `
           <li class="cat-subrow" data-subkey="${esc(this._keyOf(s))}" data-parent="${esc(this._keyOf(cat))}">
-            <span class="cat-subrow__handle" role="img" aria-label="${esc(t('category.dragHandle'))}" title="${esc(t('category.dragHandle'))}">
-              <i data-lucide="grip-vertical" class="icon-sm" aria-hidden="true"></i>
-            </span>
             <button type="button" class="cat-subrow__name" data-action="sub-rename">${esc(this._labelResolver(s))}</button>
             <div class="cat-row__actions row-actions">
               ${this._rowActionsHtml(this._labelResolver(s), { isFirst: j === 0, isLast: j === arr.length - 1, sub: true })}
+              ${this._handleHtml(this._labelResolver(s), 'cat-subrow__handle', j + 1, arr.length)}
             </div>
           </li>`).join('')}
         <li><form class="cat-subadd-form" data-parent="${esc(this._keyOf(cat))}" novalidate autocomplete="off">
@@ -802,6 +826,26 @@ class CategoryManagerElement extends HTMLElement {
     else if (action === 'delete') await this._delete(key);
   }
 
+  /**
+   * Der Tastaturpfad am Griff (#2152): Pfeil hoch/runter verschiebt die Zeile
+   * um einen Platz, ueber dieselben `_move`/`_subMove` wie das Menue und damit
+   * ueber denselben Persistenz-Pfad wie das Drag-Ende.
+   */
+  async _onKeydown(e) {
+    if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+    const handle = e.target.closest?.('[data-reorder-handle]');
+    if (!handle) return;
+    e.preventDefault();
+    const delta = e.key === 'ArrowUp' ? -1 : 1;
+    const subRow = handle.closest('.cat-subrow');
+    if (subRow) {
+      await this._subMove(subRow.dataset.parent, subRow.dataset.subkey, delta, { fromHandle: true });
+    } else {
+      const row = handle.closest('.cat-row');
+      if (row) await this._move(row.dataset.key, delta, { fromHandle: true });
+    }
+  }
+
   _toggleColors(row) {
     const strip = row.querySelector('.cat-row__colors');
     const btn = row.querySelector('.cat-row__mark');
@@ -812,13 +856,9 @@ class CategoryManagerElement extends HTMLElement {
     // Listener fuer eine Palette, die meistens niemand oeffnet.
     if (open && !strip.dataset.wired) {
       strip.dataset.wired = '1';
-      const cat = this._cats.find((c) => this._keyOf(c) === row.dataset.key);
-      wireTablist(strip, {
-        activeId: cat?.color || NO_COLOR_ID,
-        activeClass: 'cat-color-swatch--active',
-        mode: 'select',
-        onChange: (id) => this._setColor(row.dataset.key, id === NO_COLOR_ID ? '' : id),
-      });
+      wireColorPicker(strip);
+      strip.querySelector('.cat-row__color-value')
+        ?.addEventListener('change', (e) => this._setColor(row.dataset.key, e.target.value));
     }
     // Nur eine Palette gleichzeitig: zwei offene Streifen in einer kurzen
     // Liste lesen sich als Mehrfachauswahl.
@@ -826,7 +866,7 @@ class CategoryManagerElement extends HTMLElement {
     for (const other of this.querySelectorAll('.cat-row__mark')) other.setAttribute('aria-expanded', 'false');
     strip.hidden = !open;
     btn.setAttribute('aria-expanded', String(open));
-    if (open) strip.querySelector('[aria-checked="true"], .cat-color-swatch')?.focus();
+    if (open) strip.querySelector('.color-swatch[aria-checked="true"], .color-swatch')?.focus();
   }
 
   async _setColor(key, color) {
@@ -891,7 +931,13 @@ class CategoryManagerElement extends HTMLElement {
     }
   }
 
-  async _move(key, delta) {
+  async _move(key, delta, { fromHandle = false } = {}) {
+    // EIN ZUG ZUR ZEIT (Codex an #2177): ein zweiter Schritt, waehrend der
+    // erste noch speichert, rechnete auf einem Stand, den der Server noch
+    // nicht bestaetigt hat - scheitert der erste, stuende eine Folge da, die
+    // es nirgends gibt. Der Schritt entfaellt; der naechste Druck nach der
+    // Antwort zaehlt wieder.
+    if (this._reorderBusy) return;
     const cat = this._cats.find((c) => this._keyOf(c) === key);
     if (!cat) return;
     const groupKey = this._groupOf(cat);
@@ -911,6 +957,7 @@ class CategoryManagerElement extends HTMLElement {
     await this._persistOrder(groupKey, group.map((c) => this._keyOf(c)), key, {
       focusKey: key,
       focusDir: delta > 0 ? 'down' : 'up',
+      fromHandle,
     });
   }
 
@@ -924,7 +971,8 @@ class CategoryManagerElement extends HTMLElement {
   // State stellt die servergültige Reihenfolge wieder her. Der Button-Pfad
   // rendert bewusst NICHT (sonst Fokusverlust auf dem gerade geklickten Auf/Ab-
   // Button und Verlust ungespeicherten Texts in offenen Add-Feldern).
-  async _persistOrder(groupKey, orderedKeys, movedKey, { rollbackRender = false, focusKey = null, focusDir = null } = {}) {
+  async _persistOrder(groupKey, orderedKeys, movedKey, { rollbackRender = false, focusKey = null, focusDir = null, fromHandle = false } = {}) {
+    this._reorderBusy = true;
     try {
       const body = { order: orderedKeys };
       if (groupKey) body[this._groupField] = groupKey;
@@ -932,7 +980,7 @@ class CategoryManagerElement extends HTMLElement {
       if (Array.isArray(res?.data)) this._cats = res.data;
       else await this._fetch();
       this._renderGroup(groupKey);
-      if (focusKey) this._restoreReorderFocus(`.cat-row[data-key="${CSS.escape(focusKey)}"]`, focusDir);
+      if (focusKey) this._restoreReorderFocus(`.cat-row[data-key="${CSS.escape(focusKey)}"]`, focusDir, '', { fromHandle });
       if (movedKey) this._announceMove(movedKey, { groupKey });
       this._notifyChanged();
     } catch (err) {
@@ -942,6 +990,8 @@ class CategoryManagerElement extends HTMLElement {
         this._renderGroup(groupKey);
         this._restoreAddInputs(inputs);
       }
+    } finally {
+      this._reorderBusy = false;
     }
   }
 
@@ -1043,7 +1093,8 @@ class CategoryManagerElement extends HTMLElement {
     }
   }
 
-  async _subMove(parent, subKey, delta) {
+  async _subMove(parent, subKey, delta, { fromHandle = false } = {}) {
+    if (this._reorderBusy) return;
     const cat = this._cats.find((c) => this._keyOf(c) === parent);
     if (!cat) return;
     const subs = (cat.subcategories || []).slice();
@@ -1054,13 +1105,15 @@ class CategoryManagerElement extends HTMLElement {
     await this._persistSubOrder(parent, subs.map((s) => this._keyOf(s)), subKey, {
       focusSubKey: subKey,
       focusDir: delta > 0 ? 'down' : 'up',
+      fromHandle,
     });
   }
 
   // Sub-Pendant zu _persistOrder, gleicher Vertrag (Auf/Ab-Buttons + Drag-Ende
   // in _wireSortableIn rufen beide diesen Handler mit der neuen Reihenfolge auf;
   // nur der Drag-Pfad rollt bei Fehlern per rollbackRender zurück).
-  async _persistSubOrder(parent, orderedSubKeys, movedSubKey, { rollbackRender = false, focusSubKey = null, focusDir = null } = {}) {
+  async _persistSubOrder(parent, orderedSubKeys, movedSubKey, { rollbackRender = false, focusSubKey = null, focusDir = null, fromHandle = false } = {}) {
+    this._reorderBusy = true;
     try {
       const res = await api.patch(
         `${this._basePath}/${encodeURIComponent(parent)}/subcategories/reorder`,
@@ -1069,7 +1122,7 @@ class CategoryManagerElement extends HTMLElement {
       if (Array.isArray(res?.data)) this._cats = res.data;
       else await this._fetch();
       this._renderSublist(parent);
-      if (focusSubKey) this._restoreReorderFocus(`.cat-subrow[data-subkey="${CSS.escape(focusSubKey)}"]`, focusDir, 'sub-');
+      if (focusSubKey) this._restoreReorderFocus(`.cat-subrow[data-subkey="${CSS.escape(focusSubKey)}"]`, focusDir, 'sub-', { fromHandle });
       if (movedSubKey) this._announceMove(movedSubKey, { parentKey: parent });
       this._notifyChanged();
     } catch (err) {
@@ -1079,6 +1132,8 @@ class CategoryManagerElement extends HTMLElement {
         this._renderSublist(parent);
         this._restoreAddInputs(inputs);
       }
+    } finally {
+      this._reorderBusy = false;
     }
   }
 

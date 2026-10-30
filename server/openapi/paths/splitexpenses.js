@@ -1,11 +1,13 @@
-import { op, jsonBody, idParam, DOCUMENT_LINKS_READ_NOTE } from '../helpers.js';
+import { op, jsonBody, idParam, DOCUMENT_LINKS_READ_NOTE, withCaseReasons } from '../helpers.js';
 
 // Betraege im Request (#1607): eine Regel fuer Ausgabe, Genau-Anteil und Zahlung,
 // durchgesetzt in parseMoneyToMinor().
+const BUDGET_CATEGORY_NOTE = '`budget_category` is a key from `GET /api/v1/budget/categories` of type `expense`, or `null` for none; an unknown key answers 400. On an update an omitted `budget_category` stays as it is, and so does the key the row already carries even when that category no longer exists. A budget category that split expenses or series still use cannot be deleted. `category` is the older split-expense category and is kept as it was.';
 const AMOUNT_NOTE = 'Amounts are decimal strings with a dot (`"12.50"`, not a number), with at most the currency\'s decimal places, and must be greater than zero: `0`, `-0` and negative values are answered with `400`.';
 const EXACT_SPLIT_NOTE = 'With `split_method: "exact"`, every participant needs a `splits[].amount` under the same rule, and the shares must add up to the expense amount.';
 const RECURRING_SPLIT_NOTE = 'The split is checked when the recurring expense is created, by the same rule as a single expense: `payer_id` and every entry of `participants` must be members of the group, `exact` amounts must add up to the amount, `percentage` values to 100, and `shares` must be positive integers. Anything else is answered with `400` and nothing is stored.';
-const RECURRING_VIEW_NOTE = 'Active ones first, then by `next_run_date`. Besides its columns every recurring expense carries: `payer_name`; `participants` and `splits`, the stored split as input (what `split_snapshot` holds; a legacy snapshot that is a list of finished shares gives its people as `participants`); `blocked_reason`, why the hourly run would pause it on its next date (`split_invalid`: the stored split cannot be booked, `not_a_member`: the payer or a participant is no longer a member of the group) or null, measured against the current state with the run\'s own check; `can_edit`, whether the caller may update, delete, pause and resume it (group owner/admin or whoever created it); and, on a paused one, `missed_count` and `resume_date`: how many dates a resume without `missed: "book"` skips and the date it lands on (0 and null while it is active).';
+const RECURRING_VIEW_NOTE = 'Active ones first, then by `next_run_date`. Besides its columns every recurring expense carries: `payer_name`; `participants` and `splits`, the stored split as input (what `split_snapshot` holds; a legacy snapshot that is a list of finished shares gives its people as `participants`); `blocked_reason`, why the hourly run would pause it on its next date (`split_invalid`: the stored split cannot be booked, `not_a_member`: the payer or a participant is no longer a member of the group) or null, measured against the current state with the run\'s own check; `can_edit`, whether the caller may update, delete, pause and resume it (group owner/admin or whoever created it); `failed_at`, when the hourly run first failed to book it for an unexpected reason (an ISO timestamp, or null): such a recurring expense is not paused and is retried every hour; a booking, an update or a pause for a known reason clears it; and, on a paused one, `missed_count` and `resume_date`: how many dates a resume without `missed: "book"` skips and the date it lands on (0 and null while it is active).';
+const RECURRING_PAST_DATE_NOTE = 'A `next_run_date` before today can be answered with `missed` (#1748), the same choice a resume takes: `skip` stores the first date of the series that is not before today, counted from the given date in whole intervals exactly as the hourly run counts (with the `anchor_day` of the given date), so nothing is booked for the past; `book` keeps the date, and the hourly run then books every missed date, one per run, each with its original date. Without `missed` the date is kept, as before this option existed. "Today" is the day in the household time zone; a date that is today is not missed. On an update `missed` only applies when the call changes `next_run_date`. Anything other than `skip` or `book` is refused with 400 and `reason: "invalid_missed"`, and nothing is stored.';
 const RECURRING_ANCHOR_NOTE = 'Every recurring expense carries `anchor_day`, the day of the month it is meant for (1-31), taken from the first `next_run_date` when it is created and again whenever an update changes `next_run_date` or `frequency`; it cannot be set directly. Monthly and yearly steps clamp to the last day of a shorter month and return to the anchor where the month has it: a series on the 31st books on 28 or 29 February and on 31 March, a yearly one from 29 February books on 28 February and on 29 February again in a leap year. Weekly series step by seven days.';
 
 const apiError = (description) => ({
@@ -42,6 +44,66 @@ const settlementReversalResponse = {
         updated_at: { type: 'string', format: 'date-time' },
         reversed_at: { type: 'string', format: 'date-time' },
         reversed_by: { type: ['integer', 'null'], description: 'Who reversed the payment, from the `payment_reversed` activity; `null` when that account no longer exists. The counter-entries themselves keep the `created_by` of the rows they reverse.' },
+      },
+    },
+  },
+};
+
+// Salden und Summen einer Gruppe (#1888, #1941). Betraege wie ueberall im
+// Modul doppelt: `*_minor` in der kleinsten Einheit, daneben die Dezimalzahl.
+const balancesResponse = {
+  type: 'object',
+  required: ['data'],
+  properties: {
+    data: {
+      type: 'object',
+      required: ['balances', 'simplified_debts', 'member_totals', 'category_totals', 'budget_category_totals'],
+      properties: {
+        balances: { type: 'array', items: { type: 'object', additionalProperties: true }, description: 'Net balance per member and currency (`net_minor`, `net`); members at zero are left out.' },
+        simplified_debts: { type: 'array', items: { type: 'object', additionalProperties: true }, description: 'The fewest payments that settle the balances, per currency.' },
+        member_totals: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['currency', 'user_id', 'display_name', 'paid_minor', 'paid', 'share_minor', 'share'],
+            properties: {
+              currency: { type: 'string', description: 'ISO 4217 code, the `converted_currency` of the expenses.' },
+              user_id: { type: 'integer' },
+              display_name: { type: ['string', 'null'] },
+              paid_minor: { type: 'integer', minimum: 0, description: 'What the member paid, in the minor unit of `currency`.' },
+              paid: { type: 'string', description: 'Decimal amount, e.g. `120.00`.' },
+              share_minor: { type: 'integer', minimum: 0, description: 'The member\'s own share of the expenses, in the minor unit of `currency`.' },
+              share: { type: 'string', description: 'Decimal amount, e.g. `80.00`.' },
+            },
+          },
+        },
+        category_totals: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['category', 'currency', 'total_minor', 'total'],
+            properties: {
+              category: { type: 'string', description: 'One of the categories from `GET /api/v1/split-expenses/meta`.' },
+              currency: { type: 'string', description: 'ISO 4217 code, the `converted_currency` of the expenses.' },
+              total_minor: { type: 'integer', minimum: 1 },
+              total: { type: 'string', description: 'Decimal amount, e.g. `130.00`.' },
+            },
+          },
+        },
+        budget_category_totals: {
+          type: 'array',
+          description: 'The same sums per budget category (`budget_category`, a key from `GET /api/v1/budget/categories` of type `expense`); `null` collects the expenses without one.',
+          items: {
+            type: 'object',
+            required: ['budget_category', 'currency', 'total_minor', 'total'],
+            properties: {
+              budget_category: { type: ['string', 'null'] },
+              currency: { type: 'string', description: 'ISO 4217 code, the `converted_currency` of the expenses.' },
+              total_minor: { type: 'integer', minimum: 1 },
+              total: { type: 'string', description: 'Decimal amount, e.g. `130.00`.' },
+            },
+          },
+        },
       },
     },
   },
@@ -123,7 +185,7 @@ function refuseWhenArchived(paths) {
 }
 
 export function splitexpensesPaths() {
-  return refuseWhenArchived({
+  return withCaseReasons('split-expenses', CASE_REASONS, refuseWhenArchived({
     '/api/v1/split-expenses/meta': { get: op({ summary: 'Get split expenses metadata', tag: 'SplitExpenses' }) },
     '/api/v1/split-expenses/dashboard': { get: op({ summary: 'Get split expenses dashboard summary', tag: 'SplitExpenses' }) },
     '/api/v1/split-expenses/groups': {
@@ -145,7 +207,7 @@ export function splitexpensesPaths() {
       post: op({ summary: 'Add member to group', description: 'Takes a `user_id`, or a `contact_id` that is turned into a guest user when the contact has none yet. A `contact_id` needs read access to the Contacts module (for API tokens `contacts:read`); without it, and for an unknown contact, the answer is the same 404 and nothing is created. A contact without an account is linked to the new guest and needs write access to Contacts (`contacts:write`); without it the answer is 403 and nothing is written. If that contact carries an address that already belongs to another account (split-expense guests excluded), a caller who is not an admin gets 409 with `reason: "email_in_use"` and nothing is created.', tag: 'SplitExpenses', params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
     },
     '/api/v1/split-expenses/groups/{id}/member-candidates': {
-      get: op({ summary: 'List users and contacts that can be added to a group', description: 'Phone and email come only with read access to the Contacts module, a member\'s birthday only with read access to the Calendar module (for API tokens `contacts:read` and `calendar:read`); otherwise they are null. Contacts without an account are offered as candidates only with write access to Contacts (`contacts:write`), because adding one links it to the new guest.', tag: 'SplitExpenses', params: [idParam()] }),
+      get: op({ summary: 'List users and contacts that can be added to a group', description: 'Phone and email come only with read access to the Contacts module, a member\'s birthday only with read access to the Calendar module (for API tokens `contacts:read` and `calendar:read`); otherwise they are null. `birth_year_unknown` (boolean) marks a birthday known by day and month only (#2095). Contacts without an account are offered as candidates only with write access to Contacts (`contacts:write`), because adding one links it to the new guest.', tag: 'SplitExpenses', params: [idParam()] }),
     },
     '/api/v1/split-expenses/groups/{id}/members/{userId}': {
       delete: op({ summary: 'Remove member from group', tag: 'SplitExpenses', params: [idParam(), { name: 'userId', in: 'path', required: true, schema: { type: 'integer' } }], stateChanging: true }),
@@ -154,11 +216,38 @@ export function splitexpensesPaths() {
       post: op({ summary: 'Create a guest user and add them to a group', description: 'An `email` that already belongs to another account (split-expense guests excluded) is refused with 409 and `reason: "email_in_use"` unless the caller is an admin; a guest is never linked to SSO through its address.', tag: 'SplitExpenses', params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
     },
     '/api/v1/split-expenses/groups/{id}/expenses': {
-      get: op({ summary: 'List group expenses', description: `Each expense carries \`attachments\`. ${DOCUMENT_LINKS_READ_NOTE}`, tag: 'SplitExpenses', params: [idParam()] }),
-      post: op({ summary: 'Create expense in group (optional `attachment_document_ids`: receipts from the documents module, filtered by document visibility)', tag: 'SplitExpenses', params: [idParam()], description: `${AMOUNT_NOTE} ${EXACT_SPLIT_NOTE} ${DOCUMENT_LINKS_READ_NOTE}`, stateChanging: true, documentDeleteConflict: true, documentLinkRefusal: true, requestBody: jsonBody(null) }),
+      get: op({
+        summary: 'List group expenses',
+        description: `Active expenses, newest first: \`expense_date\`, then \`created_at\`, then \`id\`, each descending - expenses written in the same second keep a fixed order. Page through every expense with the cursor: pass \`before_date\`, \`before_at\` and \`before_id\` from \`pagination.next_cursor\` of the previous page; an expense added or deleted meanwhile shifts nothing. Without a cursor the endpoint behaves as before (\`limit\`, \`offset\`). \`pagination.has_more\` is exact: false when the page holds the last expense, also when exactly \`limit\` remain; \`pagination.next_cursor\` is null then. A partial cursor, or a cursor together with a non-zero \`offset\`, answers 400. Each expense carries \`attachments\`. ${DOCUMENT_LINKS_READ_NOTE}`,
+        tag: 'SplitExpenses',
+        params: [
+          idParam(),
+          { name: 'limit', in: 'query', required: false, schema: { type: 'integer', minimum: 1, maximum: 100, default: 30 }, description: 'Page size. Values above 100 are capped at 100.' },
+          { name: 'before_date', in: 'query', required: false, schema: { type: 'string', maxLength: 64 }, description: 'Cursor, taken from `pagination.next_cursor.before_date`. Only together with `before_at` and `before_id`.' },
+          { name: 'before_at', in: 'query', required: false, schema: { type: 'string', maxLength: 64 }, description: 'Cursor, taken from `pagination.next_cursor.before_at`.' },
+          { name: 'before_id', in: 'query', required: false, schema: { type: 'integer', minimum: 1 }, description: 'Cursor, taken from `pagination.next_cursor.before_id`, because several expenses can share a second.' },
+          { name: 'offset', in: 'query', required: false, schema: { type: 'integer', minimum: 0, default: 0 }, description: 'Offset paging as before the cursor existed. An expense deleted above the current page while paging makes the next offset page skip one; prefer the cursor.' },
+          { name: 'q', in: 'query', required: false, schema: { type: 'string' }, description: 'Matches title or description.' },
+          { name: 'category', in: 'query', required: false, schema: { type: 'string' }, description: 'Only expenses of this category; an unknown category is ignored.' },
+          { name: 'budget_category', in: 'query', required: false, schema: { type: 'string', maxLength: 200 }, description: 'Only expenses of this budget category; `none` lists the expenses without one. An unknown key is ignored.' },
+          { name: 'recurring', in: 'query', required: false, schema: { type: 'string', enum: ['1'] }, description: '`1` lists only expenses booked from a recurring expense.' },
+        ],
+      }),
+      post: op({ summary: 'Create expense in group (optional `attachment_document_ids`: receipts from the documents module, filtered by document visibility)', tag: 'SplitExpenses', params: [idParam()], description: `${AMOUNT_NOTE} ${BUDGET_CATEGORY_NOTE} ${EXACT_SPLIT_NOTE} ${DOCUMENT_LINKS_READ_NOTE}`, stateChanging: true, documentDeleteConflict: true, documentLinkRefusal: true, requestBody: jsonBody(null) }),
     },
     '/api/v1/split-expenses/groups/{id}/balances': {
-      get: op({ summary: 'Get group balances', tag: 'SplitExpenses', params: [idParam()] }),
+      get: op({
+        summary: 'Get group balances and totals',
+        tag: 'SplitExpenses',
+        description: 'Balances per member and currency, the payments that settle them, and two totals over all active expenses of the group (not one page of the expense list). `member_totals`: per member and currency, what the member paid (`paid`, the full amount of every expense with that member as payer) and the member\'s own share (`share`, the sum of that member\'s splits); a member with neither in a currency has no row there. `category_totals`: per category and currency, the sum of the expenses in that category, largest first within a currency; a category without expenses has no row. Both count in `converted_currency` with `converted_amount_minor` - the currency the splits and the ledger are kept in - so `paid` minus `share` is the member\'s balance before any settlement. Deleted expenses and settlements count in neither total, and there is no conversion between currencies.',
+        params: [idParam()],
+        responses: {
+          200: { description: 'Balances and totals', content: { 'application/json': { schema: balancesResponse } } },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          404: apiError('Group not found or not visible to the caller'),
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
+      }),
     },
     '/api/v1/split-expenses/groups/{id}/settlements': {
       post: op({ summary: 'Record settlement (optional `proof_document_id`: one payment proof, ignored when the document is not visible to the caller)', tag: 'SplitExpenses', params: [idParam()], description: AMOUNT_NOTE + ' The response carries `proof_document_id` only when the caller may read that document (access to the Documents module, for API tokens a `documents:read` scope, and the document\'s own visibility), else `null`.', stateChanging: true, documentDeleteConflict: true, documentLinkRefusal: true, requestBody: jsonBody(null) }),
@@ -209,10 +298,10 @@ export function splitexpensesPaths() {
     },
     '/api/v1/split-expenses/groups/{id}/recurring': {
       get: op({ summary: 'List recurring expenses in group', description: `${RECURRING_VIEW_NOTE} ${RECURRING_ANCHOR_NOTE}`, tag: 'SplitExpenses', params: [idParam()] }),
-      post: op({ summary: 'Create recurring expense in group', description: `${AMOUNT_NOTE} ${EXACT_SPLIT_NOTE} ${RECURRING_SPLIT_NOTE} ${RECURRING_ANCHOR_NOTE}`, tag: 'SplitExpenses', params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
+      post: op({ summary: 'Create recurring expense in group', description: `${AMOUNT_NOTE} ${BUDGET_CATEGORY_NOTE} ${EXACT_SPLIT_NOTE} ${RECURRING_SPLIT_NOTE} ${RECURRING_ANCHOR_NOTE} ${RECURRING_PAST_DATE_NOTE}`, tag: 'SplitExpenses', params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
     },
     '/api/v1/split-expenses/expenses/{id}': {
-      put: op({ summary: 'Update expense (`attachment_document_ids` replaces the receipt links; omit the field to leave them untouched)', tag: 'SplitExpenses', params: [idParam()], description: `${AMOUNT_NOTE} ${EXACT_SPLIT_NOTE} ${DOCUMENT_LINKS_READ_NOTE}`, stateChanging: true, documentDeleteConflict: true, documentLinkRefusal: true, requestBody: jsonBody(null) }),
+      put: op({ summary: 'Update expense (`attachment_document_ids` replaces the receipt links; omit the field to leave them untouched)', tag: 'SplitExpenses', params: [idParam()], description: `${AMOUNT_NOTE} ${BUDGET_CATEGORY_NOTE} ${EXACT_SPLIT_NOTE} Omit \`category\` (or send \`null\`) to keep the stored category; an unknown category is stored as \`general\`, as on creation. ${DOCUMENT_LINKS_READ_NOTE}`, stateChanging: true, documentDeleteConflict: true, documentLinkRefusal: true, requestBody: jsonBody(null) }),
       delete: op({
         summary: 'Delete expense',
         tag: 'SplitExpenses',
@@ -227,7 +316,7 @@ export function splitexpensesPaths() {
     '/api/v1/split-expenses/recurring/{id}': {
       put: op({
         summary: 'Update recurring expense',
-        description: `Allowed for group owners/admins and for whoever created it. A partial update: every field the call omits stays as it is - title, amount, currency, payer, category, description, rhythm, date, split method, participants and \`splits\`. Send \`description\` as \`null\` or \`""\` to clear it. The resulting recurring expense as a whole runs through the same check as creating one, and a refused update changes nothing: changing only the amount of an \`exact\` split is answered with \`400\` because the stored shares no longer add up. ${AMOUNT_NOTE} ${EXACT_SPLIT_NOTE} ${RECURRING_SPLIT_NOTE} Without \`currency\` an \`amount\` is read in the currency of the recurring expense. A date that was already booked cannot be triggered again: a \`next_run_date\` that differs from the stored one must lie after the last date booked from this recurring expense (the latest \`expense_date\` of its expenses, deleted ones included); otherwise the answer is \`400\` with \`reason: "next_run_not_after_last_booking"\` and \`last_booked\`. Clients that show an edit form should send only the fields the user changed, so a form opened before the last run does not send its old date back. Expenses already booked keep their values; the next date is booked with the new ones. \`anchor_day\` follows \`next_run_date\` only when the call changes the date or the frequency, so saving a series from the 31st while it stands on 28 February leaves it on the 31st. \`paused_at\` is not touched: a paused recurring expense stays paused until it is resumed. Writes a \`recurring_edited\` activity entry with title and amount. The response has the shape of the list.`,
+        description: `Allowed for group owners/admins and for whoever created it. A partial update: every field the call omits stays as it is - title, amount, currency, payer, category, description, rhythm, date, split method, participants and \`splits\`. Send \`description\` as \`null\` or \`""\` to clear it. The resulting recurring expense as a whole runs through the same check as creating one, and a refused update changes nothing: changing only the amount of an \`exact\` split is answered with \`400\` because the stored shares no longer add up. ${AMOUNT_NOTE} ${BUDGET_CATEGORY_NOTE} ${EXACT_SPLIT_NOTE} ${RECURRING_SPLIT_NOTE} Without \`currency\` an \`amount\` is read in the currency of the recurring expense. A date that was already booked cannot be triggered again: a \`next_run_date\` that differs from the stored one must lie after the last date booked from this recurring expense (the latest \`expense_date\` of its expenses, deleted ones included); otherwise the answer is \`400\` with \`reason: "next_run_not_after_last_booking"\` and \`last_booked\`. Clients that show an edit form should send only the fields the user changed, so a form opened before the last run does not send its old date back. Expenses already booked keep their values; the next date is booked with the new ones. \`anchor_day\` follows \`next_run_date\` only when the call changes the date or the frequency, so saving a series from the 31st while it stands on 28 February leaves it on the 31st. ${RECURRING_PAST_DATE_NOTE} \`paused_at\` is not touched: a paused recurring expense stays paused until it is resumed. Writes a \`recurring_edited\` activity entry with title and amount. The response has the shape of the list.`,
         tag: 'SplitExpenses',
         params: [idParam()],
         stateChanging: true,
@@ -286,5 +375,12 @@ export function splitexpensesPaths() {
     '/api/v1/split-expenses/search': {
       get: op({ summary: 'Search split-expense groups, expenses, and people', tag: 'SplitExpenses' }),
     },
-  });
+  }));
 }
+
+// #2267: der Grund, den die Route neben `error` sendet.
+const CASE_REASONS = {
+  '/api/v1/split-expenses/groups/{id}/members': {
+    post: '`cross_module_access` (403, adding a person without an account creates a contact and needs write access to contacts - for API tokens a `contacts:write` scope)',
+  },
+};

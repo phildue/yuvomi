@@ -70,9 +70,58 @@
  * `.section-title-link` (layout.css) - derselbe Knopf wie „Agenda >" in der
  * Tagesansicht des Kalenders. */
 
-/* Punktestand in Kurzform (Seitenspalte des Verlaufs): nur Person und Punkte. */
-.rw-standing--compact {
-  grid-template-columns: minmax(0, 1fr);
+/* DER VERLAUF IST EINE EBENE UNTER "PUNKTE" (Critique R24, E8; rewards.js
+ * `renderLedger`). Vorn der Rueckweg wie in iOS: Chevron und der Name der
+ * Ebene darueber, im Akzent, ohne Flaeche; das Zeichen steht an der Kante des
+ * Titels darunter (negativer Rand um die eigene Polsterung). Die Seitenspalte
+ * mit den Punktestaenden ist mit dem Reiter gegangen. */
+.rw-ledger-view {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.rw-ledger-view > .rw-ledger,
+.rw-ledger-view > .rw-chips,
+.rw-ledger-view > .empty-state {
+  align-self: stretch;
+}
+
+.rw-back {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-0h);
+  min-height: var(--target-base);
+  margin-block: calc(-1 * var(--space-2)) calc(-1 * var(--space-2));
+  margin-inline-start: calc(-1 * var(--space-1h));
+  padding: 0 var(--space-2) 0 0;
+  border: 0;
+  background: none;
+  color: var(--color-accent);
+  font: inherit;
+  font-size: var(--type-body);
+  cursor: pointer;
+}
+
+.rw-back > svg {
+  width: var(--icon-lg);
+  height: var(--icon-lg);
+}
+
+.rw-back:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+  border-radius: var(--radius-sm);
+}
+
+/* Gutschrift | Abzug im Bonus-Dialog: das Kanon-Segment ueber die volle
+ * Breite, beide Haelften gleich (Muster `.budget-type-toggle`). */
+.rw-bonus-kind {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(max-content, 1fr);
+  margin-block-end: var(--space-4);
 }
 
 .rw-section__head {
@@ -214,7 +263,7 @@
   color: var(--color-text-primary);
   transition: color var(--transition-fast);
 }
-.rw-standing__points { font-size: var(--text-sm); color: var(--color-text-secondary); }
+.rw-standing__points { color: var(--color-text-secondary); }
 /* Der Punktestand ist die Hauptaussage seiner Zeile und trägt Label-Farbe: der
  * Modulton sagte hier „Belohnungen" auf einer Seite, deren Titel und Siegel das
  * schon beantwortet haben (Herkunfts-Regel). Was die Zahl auszeichnet, ist ihr
@@ -314,7 +363,7 @@
   transform: scaleX(var(--rw-progress, 0));
   transition: transform var(--duration-xl) var(--ease-out);
 }
-.rw-progress__label { margin: 0; font-size: var(--text-xs); color: var(--color-text-secondary); }
+.rw-progress__label { margin: 0; color: var(--color-text-secondary); }
 .rw-progress__label--muted { color: var(--color-text-tertiary); }
 
 /* --------------------------------------------------------
@@ -399,6 +448,27 @@
   justify-content: flex-end;
   gap: var(--space-2);
 }
+
+/* DAS ZIEL BEKOMMT DIE BREITE, NICHT DIE KNOEPFE (R22 S9, Critique a2). Bei
+ * 1280 mit Seitenspalte war die Karte 612px breit, und drei Spalten liessen dem
+ * Ziel 220px: „Eine Stunde zocken" brach auf zwei Zeilen, waehrend rechts zwei
+ * Knoepfe standen (1440: 720px, dasselbe). Unter 48rem Kartenbreite stehen die Handlungen deshalb
+ * unter Stand und Ziel, an der Endkante. Ohne Container-Abfragen (aeltere
+ * Browser) bleiben es drei Spalten wie bisher. */
+.rw-section--own {
+  container: rw-own / inline-size;
+}
+
+@container rw-own (max-width: 48rem) {
+  .rw-own {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .rw-own__actions {
+    grid-column: 1 / -1;
+  }
+}
+
 @media (max-width: 639px) {
   .rw-own {
     grid-template-columns: minmax(0, 1fr);
@@ -455,9 +525,9 @@
 }
 .rw-pending + .rw-pending { border-top: 1px solid var(--color-border-subtle); }
 .rw-pending__text { flex: 1 1 auto; min-width: 0; }
-.rw-pending__title { margin: 0; font-weight: 600; color: var(--color-text-primary); }
-.rw-pending__meta { margin: var(--space-1) 0 0; font-size: var(--text-xs); color: var(--color-text-secondary); }
-.rw-pending__actions { display: flex; gap: var(--space-2); flex: 0 0 auto; }
+.rw-pending__title { margin: 0; color: var(--color-text-primary); }
+.rw-pending__meta { margin: var(--space-1) 0 0; color: var(--color-text-secondary); }
+.rw-pending__actions { display: flex; align-items: center; gap: var(--space-1); flex: 0 0 auto; }
 
 /* --------------------------------------------------------
    Prämien-Katalog
@@ -556,10 +626,12 @@
 /* --------------------------------------------------------
    Verlauf (Ledger)
    -------------------------------------------------------- */
-.rw-chips { display: flex; flex-wrap: wrap; gap: var(--space-2); }
-/* Die Chips selbst sind `.filter-chip filter-chip--sm` (filter-chip.css) -
- * hier stand bis zur Re-Critique 2026-09-28 ein eigener `.rw-chip` mit 31px
- * Hoehe und ohne Zustand fuer den Screenreader. */
+/* Die Personenzeile ist `personChipsHtml` auf `.page-chip-row` (Critique R24
+ * G2-Quer-P2-1): sie scrollt erst bei Ueberlauf. Die Chips selbst sind
+ * `.filter-chip filter-chip--sm` (filter-chip.css) - hier stand bis zur
+ * Re-Critique 2026-09-28 ein eigener `.rw-chip` mit 31px Hoehe und ohne
+ * Zustand fuer den Screenreader. */
+.rw-chips { min-inline-size: 0; }
 
 /* Verlaufsliste: Traeger und Zeile kommen aus list-row.css (`.row-carrier` +
  * `.list-row`) - Flaeche, Radius, Trennlinie, Polster und der Schnitt des
@@ -628,7 +700,7 @@
    Modal-Bausteine
    -------------------------------------------------------- */
 .rw-modal-intro { margin: 0 0 var(--space-4); color: var(--color-text-secondary); font-size: var(--text-sm); }
-.rw-hint { margin: var(--space-1) 0 0; font-size: var(--text-xs); color: var(--color-text-tertiary); }
+.rw-hint { margin: var(--space-1) 0 0; font-size: var(--type-caption); color: var(--color-text-tertiary); }
 .rw-emoji-input { text-align: center; font-size: var(--text-xl); }
 
 .rw-redeem-summary {
@@ -676,9 +748,7 @@
 .rw-detail-hint { margin: var(--space-1) 0 0; font-size: var(--text-sm); color: var(--color-text-secondary); }
 
 /* Toggle-Switch */
-.rw-switch { display: inline-flex; align-items: center; gap: var(--space-2); cursor: pointer; }
-.rw-switch input { accent-color: var(--color-accent); width: 18px; height: 18px; }
-.rw-switch--compact { margin-left: auto; }
+.rw-participant__switch { margin-inline-start: auto; }
 
 /* `.btn--sm` STEHT IN layout.css (2026-09-24), samt seiner Touch-Hoehe.
  * Hier lebte die Variante als „global additiv", aber der Router laedt dieses

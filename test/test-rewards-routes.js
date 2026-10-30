@@ -161,7 +161,9 @@ test('POST /catalog — Validierung + Anlegen', async () => {
 });
 
 test('PATCH /catalog/:id — 404/400/Teil-Update/Deaktivieren', async () => {
-  assert.equal((await call('PATCH', '/catalog/999999', { body: { name: 'X' } })).status, 404);
+  const gone = await call('PATCH', '/catalog/999999', { body: { name: 'X' } });
+  assert.equal(gone.status, 404);
+  assert.equal(gone.body.reason, 'rewards_reward_not_found');
   assert.equal((await call('PATCH', `/catalog/${EIS}`, { body: { name: '   ' } })).status, 400, 'leerer Name');
   assert.equal((await call('PATCH', `/catalog/${EIS}`, { body: { cost: -5 } })).status, 400, 'cost ungültig');
   const upd = await call('PATCH', `/catalog/${EIS}`, { body: { description: 'Lecker' } });
@@ -207,7 +209,9 @@ test('GET /catalog — Nicht-Admin nur aktive, Admin all=1 auch inaktive', async
 
 test('DELETE /catalog/:id — 404 + Löschen', async () => {
   const tmp = (await call('POST', '/catalog', { body: { name: 'Wegwerf', cost: 3 } })).body.data.id;
-  assert.equal((await call('DELETE', '/catalog/999999')).status, 404);
+  const gone = await call('DELETE', '/catalog/999999');
+  assert.equal(gone.status, 404);
+  assert.equal(gone.body.reason, 'rewards_reward_not_found');
   const ok = await call('DELETE', `/catalog/${tmp}`);
   assert.equal(ok.status, 200);
   assert.equal(ok.body.ok, true);
@@ -222,7 +226,9 @@ test('POST /bonus — Validierungs-400s', async () => {
   assert.equal((await call('POST', '/bonus', { body: { delta: 10 } })).status, 400, 'user_id Pflicht');
   assert.equal((await call('POST', '/bonus', { body: { user_id: KID_A.id, delta: 0 } })).status, 400, 'delta != 0');
   assert.equal((await call('POST', '/bonus', { body: { user_id: KID_A.id, delta: 2_000_000 } })).status, 400, 'out of range');
-  assert.equal((await call('POST', '/bonus', { body: { user_id: WORKER, delta: 10 } })).status, 400, 'nicht teilnehmend');
+  const outside = await call('POST', '/bonus', { body: { user_id: WORKER, delta: 10 } });
+  assert.equal(outside.status, 400, 'nicht teilnehmend');
+  assert.equal(outside.body.reason, 'rewards_not_participating');
 });
 
 test('POST /bonus — positiv (bonus) und negativ (adjust) verbuchen', async () => {
@@ -261,12 +267,18 @@ test('GET /ledger — user_id-Filter, Namens-Joins, limit-Clamp', async () => {
 
 test('POST /redemptions — 404/400-Pfade', async () => {
   const kid = freshKid(100);
-  assert.equal((await call('POST', '/redemptions', { actor: kid, body: { catalog_id: 999999 } })).status, 404, 'unbekannte Prämie');
+  const unknown = await call('POST', '/redemptions', { actor: kid, body: { catalog_id: 999999 } });
+  assert.equal(unknown.status, 404, 'unbekannte Prämie');
+  assert.equal(unknown.body.reason, 'rewards_reward_not_found');
   // Nicht teilnehmender Nutzer (roh angelegt, kein reward_participants-Eintrag).
   const outsiderId = db.prepare("INSERT INTO users (username, display_name, password_hash, role, family_role) VALUES ('outsider','Outsider','x','member','child')").run().lastInsertRowid;
-  assert.equal((await call('POST', '/redemptions', { actor: { id: outsiderId, role: 'member' }, body: { catalog_id: EIS } })).status, 400, 'nimmt nicht teil');
+  const outside = await call('POST', '/redemptions', { actor: { id: outsiderId, role: 'member' }, body: { catalog_id: EIS } });
+  assert.equal(outside.status, 400, 'nimmt nicht teil');
+  assert.equal(outside.body.reason, 'rewards_not_participating');
   const poor = freshKid(5);
-  assert.equal((await call('POST', '/redemptions', { actor: poor, body: { catalog_id: KINO } })).status, 400, 'zu wenig Punkte');
+  const short = await call('POST', '/redemptions', { actor: poor, body: { catalog_id: KINO } });
+  assert.equal(short.status, 400, 'zu wenig Punkte');
+  assert.equal(short.body.reason, 'rewards_insufficient_points');
   // Admin mit user_id=0 -> 400 user_id required
   assert.equal((await call('POST', '/redemptions', { actor: ADMIN, body: { catalog_id: EIS, user_id: 0 } })).status, 400);
 });
@@ -326,7 +338,9 @@ async function pendingRedemption(startPoints = 100) {
 }
 
 test('PATCH /redemptions/:id — 404 + 400 ungültige Aktion', async () => {
-  assert.equal((await call('PATCH', '/redemptions/999999', { body: { action: 'fulfill' } })).status, 404);
+  const gone = await call('PATCH', '/redemptions/999999', { body: { action: 'fulfill' } });
+  assert.equal(gone.status, 404);
+  assert.equal(gone.body.reason, 'rewards_redemption_not_found');
   const { id } = await pendingRedemption();
   assert.equal((await call('PATCH', `/redemptions/${id}`, { actor: ADMIN, body: { action: 'nope' } })).status, 400);
 });
@@ -369,7 +383,19 @@ test('PATCH /redemptions/:id — 409 wenn bereits entschieden (Idempotenz)', asy
   const balAfterFulfill = getBalance(db, kid.id); // 90 (reserviert, nicht zurückgebucht)
   const again = await call('PATCH', `/redemptions/${id}`, { actor: ADMIN, body: { action: 'reject' } });
   assert.equal(again.status, 409, 'zweite Entscheidung abgelehnt');
+  assert.equal(again.body.reason, 'rewards_redemption_decided');
   assert.equal(getBalance(db, kid.id), balAfterFulfill, 'kein Doppel-Ledger: der 409-Pfad bucht nichts zurück');
+});
+
+// #1909: Konto und Plan, die es nicht (mehr) gibt, nennen ihren Fall - die
+// Seite nimmt ein zweites Loeschen damit als erledigt.
+test('DELETE /money/accounts|plans/:userId - 404 mit reason', async () => {
+  const account = await call('DELETE', '/money/accounts/999999');
+  assert.equal(account.status, 404);
+  assert.equal(account.body.reason, 'rewards_money_account_not_found');
+  const plan = await call('DELETE', '/money/plans/999999');
+  assert.equal(plan.status, 404);
+  assert.equal(plan.body.reason, 'rewards_money_plan_not_found');
 });
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -628,4 +654,115 @@ test('POST /redemptions - zwei gleichzeitige Anfragen auf die letzte Einheit: nu
     assert.equal(zaehleErfuellt(letztes), 1, 'und genau eine Einheit ist vergeben');
     assert.equal(getBalance(db, a.id) + getBalance(db, b.id), 190, 'nur einmal abgebucht');
   });
+});
+
+// ── R23, D6: eine Entscheidung zuruecknehmen (Rueckgaengig im Toast) ──────────
+// "Freigegeben" stand ohne Rueckweg da, das harmlosere Ablehnen fragte nach.
+// Jetzt fragt keine der beiden, und `reopen` nimmt sie am Server ECHT zurueck.
+
+test('R23 D6: reopen nach Freigabe - Anfrage offen, Punkte bleiben reserviert, Einheit wieder frei', async () => {
+  const kid = freshKid(100);
+  const item = (await call('POST', '/catalog', { body: { name: 'Undo-Kino', cost: 30, quantity: 1 } })).body.data.id;
+  const req = await call('POST', '/redemptions', { actor: kid, body: { catalog_id: item } });
+  assert.equal(req.status, 201);
+  const id = req.body.data.id;
+  assert.equal(getBalance(db, kid.id), 70, 'beim Stellen reserviert');
+  assert.equal((await call('PATCH', `/redemptions/${id}`, { body: { action: 'fulfill' } })).status, 200);
+  const back = await call('PATCH', `/redemptions/${id}`, { body: { action: 'reopen' } });
+  assert.equal(back.status, 200, JSON.stringify(back.body));
+  assert.equal(back.body.data.status, 'pending');
+  assert.equal(back.body.data.decided_by, null);
+  assert.equal(getBalance(db, kid.id), 70, 'die Reservierung steht wie vor der Freigabe');
+  // Die eine Einheit ist wieder frei: dieselbe Anfrage laesst sich erneut freigeben.
+  assert.equal((await call('PATCH', `/redemptions/${id}`, { body: { action: 'fulfill' } })).status, 200);
+  assert.equal((await call('PATCH', `/redemptions/${id}`, { body: { action: 'reopen' } })).status, 200);
+  assert.equal((await call('PATCH', `/redemptions/${id}`, { body: { action: 'reopen' } })).status, 409, 'offen ist nichts zurueckzunehmen');
+});
+
+test('R23 D6: reopen nach Ablehnen nimmt genau die Rueckbuchung zurueck - und nur, solange das Guthaben reicht', async () => {
+  const kid = freshKid(40);
+  const item = (await call('POST', '/catalog', { body: { name: 'Undo-Eis', cost: 25 } })).body.data.id;
+  const id = (await call('POST', '/redemptions', { actor: kid, body: { catalog_id: item } })).body.data.id;
+  assert.equal(getBalance(db, kid.id), 15);
+  await call('PATCH', `/redemptions/${id}`, { body: { action: 'reject' } });
+  assert.equal(getBalance(db, kid.id), 40, 'Ablehnen bucht zurueck');
+  const back = await call('PATCH', `/redemptions/${id}`, { body: { action: 'reopen' } });
+  assert.equal(back.status, 200);
+  assert.equal(getBalance(db, kid.id), 15, 'wieder reserviert, ohne zweite Buchung');
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM reward_ledger WHERE redemption_id = ? AND type = 'reversal'").get(id).n, 0);
+  // Das Guthaben reicht nicht mehr: die Ablehnung bleibt.
+  await call('PATCH', `/redemptions/${id}`, { body: { action: 'reject' } });
+  postLedger(db, { userId: kid.id, delta: -30, type: 'adjust', reason: 'ausgegeben', createdBy: ADMIN.id });
+  const refused = await call('PATCH', `/redemptions/${id}`, { body: { action: 'reopen' } });
+  assert.equal(refused.status, 409);
+  assert.equal(refused.body.reason, 'insufficient_points');
+  assert.equal(db.prepare('SELECT status FROM reward_redemptions WHERE id = ?').get(id).status, 'rejected');
+});
+
+test('R23 D6: reopen nur durch den, der entschied, und nur kurz danach', async () => {
+  const kid = freshKid(50);
+  const item = (await call('POST', '/catalog', { body: { name: 'Undo-Buch', cost: 10 } })).body.data.id;
+  const id = (await call('POST', '/redemptions', { actor: kid, body: { catalog_id: item } })).body.data.id;
+  await call('PATCH', `/redemptions/${id}`, { body: { action: 'fulfill' } });
+  assert.equal((await call('PATCH', `/redemptions/${id}`, { actor: kid, body: { action: 'reopen' } })).status, 403);
+  db.prepare("UPDATE reward_redemptions SET decided_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-11 minutes') WHERE id = ?").run(id);
+  const late = await call('PATCH', `/redemptions/${id}`, { body: { action: 'reopen' } });
+  assert.equal(late.status, 409);
+  assert.equal(late.body.reason, 'rewards_reopen_expired');
+});
+
+test('R23 D6: reopen einer freigegebenen Geld-Einzahlung nimmt die Gutschrift zurueck', async () => {
+  const kid = freshKid(0);
+  assert.equal((await call('POST', '/money/accounts', { body: { user_id: kid.id } })).status, 201);
+  const dep = await call('POST', '/redemptions', { actor: kid, body: { kind: 'deposit', amount: '2.50' } });
+  assert.equal(dep.status, 201, JSON.stringify(dep.body));
+  const money = () => db.prepare("SELECT COALESCE(SUM(delta), 0) AS n FROM reward_ledger WHERE user_id = ? AND unit = 'money'").get(kid.id).n;
+  assert.equal((await call('PATCH', `/redemptions/${dep.body.data.id}`, { body: { action: 'fulfill' } })).status, 200);
+  assert.equal(money(), 250);
+  const back = await call('PATCH', `/redemptions/${dep.body.data.id}`, { body: { action: 'reopen' } });
+  assert.equal(back.status, 200, JSON.stringify(back.body));
+  assert.equal(back.body.data.status, 'pending');
+  assert.equal(money(), 0, 'die Einzahlung ist zurueckgenommen');
+});
+
+test('R23 Sicherheit: eine Auto-Erfuellung laesst sich nicht oeffnen und zurueckziehen (Punkte bleiben weg)', async () => {
+  const kid = freshKid(60);
+  const item = (await call('POST', '/catalog', { body: { name: 'Undo-Auto', cost: 20 } })).body.data.id;
+  db.prepare("INSERT INTO sync_config (key, value) VALUES ('rewards_require_approval','0') ON CONFLICT(key) DO UPDATE SET value='0'").run();
+  try {
+    const req = await call('POST', '/redemptions', { actor: kid, body: { catalog_id: item } });
+    assert.equal(req.status, 201);
+    assert.equal(req.body.data.status, 'fulfilled', 'ohne Freigabepflicht sofort erfuellt');
+    const reopen = await call('PATCH', `/redemptions/${req.body.data.id}`, { actor: kid, body: { action: 'reopen' } });
+    assert.equal(reopen.status, 403);
+    const cancel = await call('PATCH', `/redemptions/${req.body.data.id}`, { actor: kid, body: { action: 'cancel' } });
+    assert.equal(cancel.status, 409, 'erfuellt bleibt erfuellt');
+    assert.equal(getBalance(db, kid.id), 40, 'die Punkte bleiben ausgegeben');
+    // Auch ein Admin, der fuer das Kind ohne Freigabe einloest, oeffnet das nicht.
+    const byAdmin = await call('POST', '/redemptions', { body: { catalog_id: item, user_id: kid.id } });
+    assert.equal(byAdmin.body.data.status, 'fulfilled');
+    assert.equal((await call('PATCH', `/redemptions/${byAdmin.body.data.id}`, { body: { action: 'reopen' } })).status, 403);
+  } finally {
+    db.prepare("DELETE FROM sync_config WHERE key='rewards_require_approval'").run();
+  }
+  // Das eigene Zurueckziehen bleibt umkehrbar - es reserviert nur wieder.
+  const pend = (await call('POST', '/redemptions', { actor: kid, body: { catalog_id: item } })).body.data.id;
+  assert.equal(getBalance(db, kid.id), 0);
+  await call('PATCH', `/redemptions/${pend}`, { actor: kid, body: { action: 'cancel' } });
+  assert.equal(getBalance(db, kid.id), 20);
+  const back = await call('PATCH', `/redemptions/${pend}`, { actor: kid, body: { action: 'reopen' } });
+  assert.equal(back.status, 200);
+  assert.equal(getBalance(db, kid.id), 0, 'wieder reserviert');
+  assert.equal((await call('PATCH', `/redemptions/${pend}`, { actor: kid, body: { action: 'fulfill' } })).status, 403);
+});
+
+test('R23: ein Admin, der fuer ein Kind beantragt und spaeter freigibt, nimmt die Freigabe zurueck', async () => {
+  const kid = freshKid(40);
+  const item = (await call('POST', '/catalog', { body: { name: 'Undo-Stellvertretend', cost: 15 } })).body.data.id;
+  const id = (await call('POST', '/redemptions', { body: { catalog_id: item, user_id: kid.id } })).body.data.id;
+  db.prepare("UPDATE reward_redemptions SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 minutes') WHERE id = ?").run(id);
+  assert.equal((await call('PATCH', `/redemptions/${id}`, { body: { action: 'fulfill' } })).status, 200);
+  const back = await call('PATCH', `/redemptions/${id}`, { body: { action: 'reopen' } });
+  assert.equal(back.status, 200, JSON.stringify(back.body));
+  assert.equal(getBalance(db, kid.id), 25, 'weiter reserviert');
 });

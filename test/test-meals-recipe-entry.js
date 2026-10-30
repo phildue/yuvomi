@@ -182,7 +182,7 @@ test('Spalte: Klick auf den Knopf oeffnet "Mahlzeit hinzufuegen" mit gesetztem R
   const savedMeals = meals.state.meals;
   meals.state.recipes = [PIZZA];
   meals.state.meals = [];
-  meals.state.currentWeek = meals.getMondayOf(todayKey());
+  meals.state.currentWeek = meals.getWeekStartOf(todayKey());
   meals.setContainerForTest({ querySelector: (sel) => (sel === '#recipe-sidebar' ? sidebar : null) });
   let opened = null;
   const zuvor = globalThis.__openModal;
@@ -352,7 +352,7 @@ test('Verschieben: scheitert der Server, kehrt die Karte zurueck UND es gibt ein
   globalThis.__apiStub = { put: async () => { const err = new Error('boom'); err.data = { error: 'Nicht erlaubt' }; throw err; } };
   const toasts = [];
   const prevYuvomi = globalThis.window.yuvomi;
-  globalThis.window.yuvomi = { ...prevYuvomi, showToast: (...args) => toasts.push(args), friendlyError: (err) => err.data?.error };
+  globalThis.window.yuvomi = { ...prevYuvomi, showToast: (...args) => toasts.push(args) };
   let renders = 0;
   try {
     await meals.moveMeal(5, '2026-10-07', 'dinner', { rerender: () => { renders += 1; } });
@@ -362,7 +362,8 @@ test('Verschieben: scheitert der Server, kehrt die Karte zurueck UND es gibt ein
   }
   assert.deepEqual([meal.date, meal.meal_type], ['2026-10-05', 'lunch'], 'der Zustand steht wieder am Ursprung');
   assert.equal(renders, 2, 'einmal optimistisch, einmal zurueck');
-  assert.deepEqual(toasts, [['Nicht erlaubt', 'danger']], 'der Fehler wird gemeldet, nicht verschluckt');
+  // Die App sagt ihren eigenen Satz, nie den des Servers (#1695).
+  assert.deepEqual(toasts, [['common.errorGeneric', 'danger']], 'der Fehler wird gemeldet, nicht verschluckt');
 });
 
 // Zweimal ziehen, bevor der Server geantwortet hat (Review #1673). Jeder Zug
@@ -382,7 +383,7 @@ test('Verschieben: scheitern zwei Zuege derselben Karte, steht sie am letzten BE
   const { calls, put } = gatedPut();
   globalThis.__apiStub = { put };
   const prevYuvomi = globalThis.window.yuvomi;
-  globalThis.window.yuvomi = { ...prevYuvomi, showToast: () => {}, friendlyError: () => 'x' };
+  globalThis.window.yuvomi = { ...prevYuvomi, showToast: () => {} };
   try {
     const first = meals.moveMeal(5, '2026-10-06', 'lunch', { rerender: () => {} });
     const second = meals.moveMeal(5, '2026-10-07', 'dinner', { rerender: () => {} });
@@ -409,7 +410,7 @@ test('Verschieben: gelingt der erste Zug und scheitert der zweite, bleibt das Zi
   const { calls, put } = gatedPut();
   globalThis.__apiStub = { put };
   const prevYuvomi = globalThis.window.yuvomi;
-  globalThis.window.yuvomi = { ...prevYuvomi, showToast: () => {}, friendlyError: () => 'x' };
+  globalThis.window.yuvomi = { ...prevYuvomi, showToast: () => {} };
   try {
     const first = meals.moveMeal(5, '2026-10-06', 'lunch', { rerender: () => {} });
     const second = meals.moveMeal(5, '2026-10-07', 'dinner', { rerender: () => {} });
@@ -432,4 +433,42 @@ test('Speichern: die Quittung nennt das Ergebnis, nicht den Dialogtitel', async 
   // „Mahlzeit hinzufuegen" als Erfolgsmeldung liest sich wie eine Aufforderung.
   assert.doesNotMatch(src, /showToast\([^)]*t\('meals\.(addMealTitle|editMeal)'\)/);
   assert.match(src, /showToast\(mode === 'create' \? t\('meals\.mealSaved'\) : t\('meals\.mealUpdated'\), 'success'\)/);
+});
+
+// #2075: Erster Ladevorgang benutzt den Haushaltswochenstartag.
+// loadPreferences() muss vor getWeekStartOf(today) abgeschlossen sein, weil
+// getWeekStartOf() state.weekStart liest. Laeuft loadPreferences() parallel,
+// steht state.weekStart noch auf dem Standard (Montag) und die erste
+// Wochenanfrage landet auf dem falschen Tag.
+test('Erstladen: loadPreferences() vor loadWeek() setzt den richtigen Wochenbeginn (#2075)', async () => {
+  const zuvorWeekStart   = meals.state.weekStart;
+  const zuvorCurrentWeek = meals.state.currentWeek;
+  const zuvorApiStub     = globalThis.__apiStub;
+
+  try {
+    // Donnerstag 2026-10-22: Sonntag-Haushalt → Woche beginnt 2026-10-18.
+    const thursday       = '2026-10-22';
+    const expectedSunday = '2026-10-18';
+
+    let mealsRequestUrl = null;
+    globalThis.__apiStub = {
+      get: async (url) => {
+        if (url === '/preferences')        return { data: { week_start: 'sunday' } };
+        if (url.startsWith('/meals?week=')) { mealsRequestUrl = url; return { data: [], weekStart: expectedSunday, weekEnd: '2026-10-24' }; }
+        return { data: [] };
+      },
+    };
+
+    meals.state.weekStart = 1; // Standardwert, simuliert den Zustand vor dem Laden
+    await meals.loadPreferences();
+    const weekBegin = meals.getWeekStartOf(thursday);
+    await meals.loadWeek(weekBegin);
+
+    assert.equal(mealsRequestUrl, `/meals?week=${expectedSunday}`, 'erste Wochenanfrage nutzt Sonntag als Wochenbeginn');
+    assert.equal(meals.state.currentWeek, expectedSunday, 'state.currentWeek zeigt auf Sonntag');
+  } finally {
+    meals.state.weekStart   = zuvorWeekStart;
+    meals.state.currentWeek = zuvorCurrentWeek;
+    globalThis.__apiStub    = zuvorApiStub;
+  }
 });

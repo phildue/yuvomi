@@ -59,6 +59,25 @@ test('auth.login: 401 feuert kein auth:expired', async () => {
   assert.equal(expired.length, 0, 'auth:expired darf bei Login-401 nicht gefeuert werden');
 });
 
+// Critique R21: die Uebersicht zeichnet einen eben geladenen Stand beim
+// Zurueckkommen sofort - aber nur, solange niemand etwas geschrieben hat.
+// Dafuer meldet sich jeder GEGLUECKTE Schreibvorgang einmal am window.
+test('api: ein geglueckter Schreibvorgang meldet sich als yuvomi:write, Lesen und Fehler nicht', async () => {
+  setup();
+  const writes = () => dispatchedEvents.filter((e) => e.type === 'yuvomi:write');
+  _mockFetch = () => mockResponse(200, { data: {} });
+  await api.get('/tasks');
+  assert.equal(writes().length, 0, 'ein Lesen meldete sich als Schreibvorgang');
+  for (const call of [() => api.post('/tasks', { title: 'x' }), () => api.patch('/tasks/1', {}), () => api.put('/preferences', {}), () => api.delete('/notes/2')]) {
+    await call();
+  }
+  assert.deepEqual(writes().map((e) => e.detail?.path), ['/tasks', '/tasks/1', '/preferences', '/notes/2'],
+    'nicht jeder Schreibvorgang meldete sich genau einmal');
+  _mockFetch = () => mockResponse(400, { error: 'Nope.' });
+  await assert.rejects(() => api.post('/tasks', {}));
+  assert.equal(writes().length, 4, 'ein abgelehnter Schreibvorgang meldete sich');
+});
+
 test('auth.login: 401 wirft ApiError mit status 401', async () => {
   setup();
   _mockFetch = () => mockResponse(401, { error: 'Invalid credentials.', code: 401 });
@@ -757,7 +776,7 @@ const EXPLAINED_REFUSALS = [
   ['routes/calendar/sync-targets.js', 'Write access to the calendar is required.', 'cross_module_access'],
   // Der Satz steht in der Fehlerklasse; die Antwort baut `sendDocumentLinkRefusal`.
   ['services/document-links.js', 'err.message, code: 403', 'cross_module_access'],
-  ['routes/contacts.js', 'Familienmitglieder können nicht aus der Kontaktliste gelöscht werden.', 'family_member_contact'],
+  ['routes/contacts.js', 'A household member cannot be deleted from the contact list.', 'family_member_contact'],
   ['routes/contacts.js', 'can change the email addresses of a household member.', 'contact_email_protected'],
   ['routes/documents.js', 'Not authorized to delete every document in this folder.', 'FOLDER_DOCUMENTS_NOT_MANAGEABLE'],
 ];
@@ -801,6 +820,9 @@ const publicSource = (rel) => readFileSync(new URL(`../public/${rel}`, import.me
 const REASONS_READ_BY_A_PAGE = new Map([
   ['ATTACHMENT_CHANGE_REFUSED', 'pages/calendar.js'],
   ['ATTACHMENT_UPLOAD_REFUSED', 'pages/calendar.js'],
+  // Ein Mitglied loescht einen Kalender, den ein Admin exportiert (#1909): das
+  // Mitglied sieht den Abo-Link nicht, die Verwaltung sagt es ihm.
+  ['calendar_feed_admin_only', 'pages/calendar.js'],
   ['FOLDER_DOCUMENTS_NOT_MANAGEABLE', 'utils/document-folder-delete.js'],
   // Gravatar-Import (#1791): GRAVATAR_REASON_KEYS auf der Kontoseite. Einen
   // Gast erreicht der Knopf gar nicht (gravatarAvailable), der Satz steht fuer
@@ -827,6 +849,10 @@ const REASONS_WITHOUT_SENTENCE = new Set([
   'display_account', 'display_only', 'display_action', 'acting_person_no_access', 'split_guest_scope',
   // Taschengeld am Wandtablett (#1734): die Seite fragt dort gar nicht erst nach Geld.
   'money_not_on_display',
+  // Rueckgaengig einer Entscheidung (R23, D6): der Toast bietet es nur dem an,
+  // der eben entschieden hat; der Fall (fremde oder Auto-Erfuellung) ist aus der
+  // Oberflaeche nicht erreichbar, der Fehlerweg sagt "keine Berechtigung".
+  'rewards_reopen_not_allowed',
   // Die Oberflaeche bietet das Loeschen dort nicht an; der Servertext ist deutsch.
   'family_member_contact',
   'FASTING_CAPABILITY_REQUIRED', 'FASTING_SUBJECT_FORBIDDEN', 'FASTING_ACK_FORBIDDEN', 'FASTING_SETTINGS_FORBIDDEN',
@@ -851,6 +877,12 @@ const REASONS_PASSED_THROUGH = new Map([
   ['routes/calendar/crud.js: error.code', { sites: 1, at403: [['not_authorized', 'services/calendar-occurrence-overrides.js']],
     why: 'sendCalendarOccurrenceError: 403 nur bei not_authorized, sonst 400/404/409' }],
   ['routes/calendar/crud.js: eligibility.reason', { sites: 1, at403: [], why: 'feste 400' }],
+  // Personen einer Sync-Quelle (#1897, #1221, #1940): validateAssigneeIds
+  // (services/default-assignees.js) liefert den Grund, die Routen senden ihn an
+  // einer festen 400.
+  ['routes/calendar/google.js: checked.reason', { sites: 1, at403: [], why: 'feste 400 (calendar_assignee_*)' }],
+  ['routes/calendar/caldav.js: checked.reason', { sites: 1, at403: [], why: 'feste 400 (calendar_assignee_*)' }],
+  ['routes/calendar/subscriptions.js: assignees.reason', { sites: 3, at403: [], why: 'feste 400 (calendar_assignee_*)' }],
   ['services/calendar-occurrence-overrides.js: eligible ? null : \'ineligible_series\'', { sites: 1, at403: [],
     why: 'keine Antwort; wird zu error.code und reist mit 400' }],
   ['routes/tasks.js: actor.reason', { sites: 1, at403: [['acting_person_no_access', 'services/display-acting.js']],
@@ -874,6 +906,8 @@ const REASONS_PASSED_THROUGH = new Map([
   // Die zweite Stelle ist die Logzeile daneben, keine Antwort.
   ['auth.js: err.reason', { sites: 2, at403: [], why: 'Gravatar-Import: 400/404/413/415/502 oder 500, nie 403' }],
   ['routes/notes.js: result.reason', { sites: 1, at403: [], why: 'feste 409' }],
+  ['routes/calendar/local-calendars.js: withReason.reason', { sites: 1, at403: [],
+    why: 'sendValidationErrors: feste 400 (calendar_name_invalid)' }],
   // SMTP (Re-Critique 2026-10-17): die Absage beim Speichern und der Fall der
   // Testmail. Beides reist an einer festen 400 bzw. in einer 200, nie an 403.
   ['routes/email.js: refusal.reason', { sites: 1, at403: [], why: 'emailConfigRefusal: feste 400' }],
@@ -884,6 +918,13 @@ const REASONS_PASSED_THROUGH = new Map([
   // problemBody (#1909): der Grund einer Abo-Pruefung, nur bei genau einem Befund.
   ['routes/subscriptions.js: items[0].reason', { sites: 1, at403: [], why: 'problemBody: feste 400' }],
   ['routes/tasks.js: result.reason', { sites: 1, at403: [], why: 'feste 409' }],
+  // Inventar (#1909): linkEntry/unlinkEntry/completeTrackedDate geben ihren
+  // Grund an 404/409/400 zurueck, der gewaehlte Ort reist an einer festen 400.
+  ['routes/inventory/items.js: result.reason', { sites: 3, at403: [], why: 'entry-links.js/service-log.js: 404, 409 oder 400' }],
+  ['routes/inventory/items.js: reason (Kurzform)', { sites: 2, at403: [], why: 'validateItemFields: feste 400' }],
+  // Notizen (#1909): NoteCategoryInputError traegt den Grund einer gewaehlten
+  // Kategorie; jeder Wurf dort ist eine 400.
+  ['routes/notes.js: error.reason', { sites: 1, at403: [], why: 'categoryErrorResponse: NoteCategoryInputError, immer 400' }],
   ['routes/backup.js: err.reason', { sites: 1, at403: [], why: 'Restore: 409, 503 oder 400' }],
   // wasteErrorResponse (#1795, #1909): der Grund eines getypten Abfuhr-Fehlers
   // haengt an seinem Zweig - 400 (WasteValidationError), 409 (WasteConflictError:
@@ -907,10 +948,22 @@ const REASONS_PASSED_THROUGH = new Map([
   // Stellen ausgeschrieben, 409 - eine 403 baut sie nie.
   ['routes/budget/helpers.js: first.reason', { sites: 1, at403: [], why: '400 oder 409' }],
   ['routes/budget/loans.js: derived.reason', { sites: 1, at403: [], why: 'Vorschau: 200 mit ok: false' }],
+  ["routes/budget/transfers.js: v.reason ?? 'transfer_invalid'", { sites: 1, at403: [],
+    why: 'guard: feste 400 fuer transfer_account_archived, transfer_currency_mismatch, entry_amount_invalid oder transfer_invalid; Zugriff verweigert access() getrennt mit 403 ohne reason' }],
   ['routes/modules.js: err.reason', { sites: 2, at403: [],
     why: 'sendInstallError: InstallError traegt nur 400-429 und 502/503 (REASON_STATUS in services/module-install.js); '
       + 'PATCH /:id: setModuleEnabled setzt nur busy (409) und not_writable (503); '
       + 'die beiden 403 der Modul-Installation (module_web_install_disabled, module_session_required) schickt die Route als Literal, vor dem Body' }],
+  // Der Fall eines gescheiterten Abgleichs eines Rezeptdienstes (#1909,
+  // Migration 255, services/recipe-providers/failure.js): eine kleine feste
+  // Menge recipe_providers_sync_* plus recipe_providers_private_network. Er wird
+  // am Konto gespeichert und reist im Rumpf einer 200 (POST .../sync mit
+  // failed: true, POST .../test mit ok: false) - nie an einer 403. Der Fall
+  // `auth_failed` meint die 401/403 des ANBIETERS, nicht eine Antwort hier.
+  ['routes/recipe-providers.js: failure?.reason ?? null', { sites: 2, at403: [], why: 'Verbindungstest: gespeichert und in der 200-Antwort' }],
+  ['services/recipe-provider-sync.js: failure?.reason ?? null', { sites: 1, at403: [], why: 'Ergebnis eines Abgleichs: gespeichert und in der 200-Antwort' }],
+  ['services/recipe-providers/failure.js: failure?.reason ?? null', { sites: 1, at403: [], why: 'probeFailure: Feld im Ergebnis des Verbindungstests' }],
+  ['services/recipe-providers/failure.js: probe.reason', { sites: 1, at403: [], why: 'classifyProbe: reicht den Fall des Adapters weiter' }],
   ['services/document-deletion-lock.js: err.reason', { sites: 1, at403: [], why: 'feste 409' }],
   ['middleware/error-handler.js: err.reason', { sites: 1, at403: [], why: 'feste 503' }],
   ['middleware/restore-gate.js: RESTORE_IN_PROGRESS_REASON', { sites: 1, at403: [], why: '503 oder 409' }],
@@ -1096,8 +1149,8 @@ test('die drei Absagen aus #1640 haben ihren Satz, und jeder Satz steht in jeder
 // Saetze ohne Grund: sie sagen nur, DASS die Berechtigung fehlt.
 const PLAIN_REFUSALS = new Set([
   'Admin access required.', 'Not authorized.', 'Permission denied.', 'Forbidden.', 'Not allowed.',
-  'Nicht autorisiert.', 'Keine Berechtigung', 'Keine Berechtigung fuer dieses Ziel.',
-  'Keine Berechtigung, für diese Person einzutragen.',
+  'Nicht autorisiert.', 'Keine Berechtigung', 'You cannot view this target.',
+  'You cannot record entries for this person.',
   'You cannot modify this entry.', 'You cannot modify this loan.', 'You cannot modify this subscription.',
   'You cannot change a receipt you may not see.', 'Household category management is not allowed.',
   // Nur mit API-Token erreichbar, nie aus der App.
@@ -1281,7 +1334,7 @@ test('der Sammelhandler im Router zeigt fuer einen Abbruch keinen Fehler-Toast',
   // Als PROGRAMM gefahren, nicht nur gelesen: der Rumpf laeuft mit Attrappen.
   const run = (reason) => {
     const seen = { toasts: 0, prevented: 0 };
-    const fn = new Function('e', 'isAbortError', 'showToast', 'friendlyError', 'console', handler);
+    const fn = new Function('e', 'isAbortError', 'showToast', 'unhandledErrorSentence', 'console', handler);
     fn({ reason, preventDefault: () => { seen.prevented += 1; } }, isAbortError, () => { seen.toasts += 1; }, (x) => String(x), { error() {} });
     return seen;
   };

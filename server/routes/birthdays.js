@@ -12,6 +12,11 @@ import {
   syncAllBirthdayReminders,
   listBirthdayImportCandidates,
   importBirthdaysFromContacts,
+  placeholderBirthDate,
+  birthDateInput,
+  validateYearUnknown,
+  sameNameKey,
+  contactBirthdayMatch,
 } from '../services/birthdays.js';
 
 const log = createLogger('Birthdays');
@@ -159,6 +164,115 @@ function sortHydrated(rows) {
     .sort((a, b) => a.days_until - b.days_until || a.name.localeCompare(b.name));
 }
 
+/**
+ * DER GEBURTSTAG UND SEIN KONTAKT (Critique R22, D7). Bis hierher entstand die
+ * Verknuepfung (`birthdays.contact_id`, Migration 90) nur ueber den Import -
+ * ein von Hand angelegter Geburtstag blieb fuer immer allein, auch wenn es
+ * denselben Menschen im Adressbuch gab (Seed: "Onkel Mike Johnson" zweimal,
+ * ohne Weg zueinander). POST und PUT nehmen `contact_id` jetzt an.
+ *
+ * Geprueft wird in dieser Reihenfolge:
+ *   - `undefined` = Feld fehlt, nichts aendert sich; `null`/`''` loest die
+ *     Verknuepfung (verraet nichts, braucht also kein Kontakte-Recht);
+ *   - derselbe Wert, der schon gespeichert ist, geht durch (GET, ein Feld
+ *     aendern, PUT - wie bei der Erinnerung);
+ *   - ein MITGLIEDS-Geburtstag (`family_user_id`) haengt am Konto, nicht an
+ *     einem Kontakt: 400;
+ *   - wer Kontakte nicht lesen darf, erfuehre ueber das Ergebnis, welche ids
+ *     es gibt: 403 wie beim Import (`contactsHidden`, Mischstelle);
+ *   - der Kontakt muss sichtbar sein wie in GET /contacts (kein Kontakt einer
+ *     Haushaltshilfe): sonst 400 `birthdays_selected_contact_not_found`;
+ *   - traegt er schon einen anderen Geburtstag (auch den Profil-Geburtstag
+ *     eines Mitglieds, #2214): 409 `birthdays_contact_linked`.
+ *     Der eindeutige Index aus Migration 90 haelt dasselbe in der DB.
+ *
+ * KEIN await zwischen dieser Pruefung und dem Schreiben (CLAUDE.md): der
+ * Treiber ist synchron, also kommt kein anderer Request dazwischen. Faengt der
+ * Index trotzdem einen Doppelgriff (zweiter Prozess), wird daraus dieselbe 409
+ * (`isContactLinkConflict`).
+ *
+ * Das DATUM folgt dem Kontakt NICHT (#2124 bleibt eigenstaendig): die
+ * Verknuepfung ist ein Weg zwischen zwei Eintraegen, keine Synchronisation.
+ */
+function checkContactLink(req, raw, existing = null) {
+  if (raw === undefined) return { value: undefined };
+  if (raw === null || raw === '') return { value: null };
+  const id = wholeNumber(raw);
+  if (id === null || id < 1) return { refused: 'invalid' };
+  if (existing && Number(existing.contact_id) === id) return { value: id };
+  if (existing?.family_user_id) return { refused: 'member' };
+  if (contactsHidden(req)) return { refused: 'hidden' };
+  const contact = db.get().prepare(`
+    SELECT c.id FROM contacts c
+     WHERE c.id = ?
+       AND NOT EXISTS (SELECT 1 FROM housekeeping_workers hw WHERE hw.user_id = c.family_user_id)
+  `).get(id);
+  if (!contact) return { refused: 'unknown' };
+  // Auch der Profil-Geburtstag eines Mitglieds belegt dessen Kontakt (#2214).
+  const taken = db.get().prepare(`
+    SELECT b.id FROM contacts c JOIN birthdays b ON ${contactBirthdayMatch('c')}
+     WHERE c.id = ? AND b.id IS NOT ?
+  `).get(id, existing?.id ?? null);
+  if (taken) return { refused: 'taken' };
+  return { value: id };
+}
+
+/** Jede Absage mit ihrem eigenen, literalen Grund (test:api liest sie). */
+function refuseContactLink(res, refused) {
+  switch (refused) {
+    case 'member':
+      return res.status(400).json({ error: 'The birthday of a household member cannot be linked to a contact.', code: 400, reason: 'birthdays_member_not_linkable' });
+    case 'hidden':
+      return res.status(403).json({ error: 'Contact access is required to link a birthday to a contact.', code: 403, reason: 'cross_module_access' });
+    case 'unknown':
+      return res.status(400).json({ error: 'Contact not found.', code: 400, reason: 'birthdays_selected_contact_not_found' });
+    case 'taken':
+      return res.status(409).json({ error: 'This contact is already linked to another birthday.', code: 409, reason: 'birthdays_contact_linked' });
+    default:
+      return res.status(400).json({ error: 'contact_id must be a contact id or null.', code: 400 });
+  }
+}
+
+/** Der eindeutige Index aus Migration 90 hat einen Doppelgriff gefangen. */
+function isContactLinkConflict(err) {
+  return err?.code === 'SQLITE_CONSTRAINT_UNIQUE' && /birthdays\.contact_id/.test(String(err.message));
+}
+
+/**
+ * DER RUHIGE HINWEIS (D7): ein unverknuepfter Geburtstag, dessen Name genau
+ * EINEM unverknuepften Kontakt gleicht, traegt `suggested_contact_id` - die
+ * Seite bietet dort "Verknuepfen" an. Ein verknuepfter traegt `contact_name`,
+ * damit der Dialog die Auswahl beschriften kann, bevor die Kandidaten geladen
+ * sind. Ein Mitgliedskontakt mit Profil-Geburtstag gilt als verknuepft
+ * (#2214) und wird keinem anderen vorgeschlagen. Beides nur fuer wer
+ * Kontakte lesen darf (sonst verriete es das Adressbuch), nie fuer Mitglieder-Geburtstage, und der Vorschlag nur bei
+ * eindeutigem Namen: zwei gleichnamige Kontakte sind eine Frage, die der
+ * Dialog beantwortet, kein Vorschlag.
+ */
+function withContactLinks(req, birthdays) {
+  if (contactsHidden(req)) return birthdays;
+  const rows = db.get().prepare(`
+    SELECT c.id, c.name,
+           EXISTS (SELECT 1 FROM birthdays b WHERE ${contactBirthdayMatch('c')}) AS linked
+      FROM contacts c
+     WHERE NOT EXISTS (SELECT 1 FROM housekeeping_workers hw WHERE hw.user_id = c.family_user_id)
+  `).all();
+  const names = new Map(rows.map((row) => [row.id, row.name]));
+  const byName = new Map();
+  for (const row of rows) {
+    if (row.linked) continue;
+    // Ein Schluessel fuer beide Seiten (sameNameKey, services/birthdays.js).
+    const key = sameNameKey(row.name);
+    byName.set(key, byName.has(key) ? null : row.id);
+  }
+  return birthdays.map((b) => {
+    if (b.contact_id) return names.has(b.contact_id) ? { ...b, contact_name: names.get(b.contact_id) } : b;
+    if (b.family_user_id) return b;
+    const id = byName.get(sameNameKey(b.name));
+    return id ? { ...b, suggested_contact_id: id } : b;
+  });
+}
+
 router.get('/', (req, res) => {
   try {
     const userId = req.authUserId || req.session.userId;
@@ -176,7 +290,7 @@ router.get('/', (req, res) => {
     sql += ' ORDER BY birthdays.name COLLATE NOCASE ASC';
 
     const rows = db.get().prepare(sql).all(...params);
-    res.json({ data: sortHydrated(rows) });
+    res.json({ data: withContactLinks(req, sortHydrated(rows)) });
   } catch (err) {
     log.error('GET / error:', err);
     res.status(500).json({ error: 'Internal error.', code: 500 });
@@ -199,33 +313,39 @@ router.get('/upcoming', (req, res) => {
 router.post('/', (req, res) => {
   try {
     const vName = str(req.body.name, 'Name', { max: MAX_TITLE });
-    const vBirthDate = validateDate(req.body.birth_date, 'Birth date', true);
+    const vYearUnknown = validateYearUnknown(req.body.year_unknown, 'year_unknown');
+    const vBirthDate = validateDate(birthDateInput(req.body.birth_date, vYearUnknown.value === true), 'Birth date', true);
     const vNotes = str(req.body.notes, 'Notes', { max: MAX_TEXT, required: false });
     const vPhoto = validatePhotoData(req.body.photo_data);
     const vNameDay = validateNameDay(req.body.name_day);
     const vReminder = validateReminder(req.body);
-    const errors = collectErrors([vName, vBirthDate, vNotes, vPhoto, vNameDay, ...Object.values(vReminder)]);
+    const errors = collectErrors([vName, vYearUnknown, vBirthDate, vNotes, vPhoto, vNameDay, ...Object.values(vReminder)]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
+    const link = checkContactLink(req, req.body.contact_id);
+    if (link.refused) return refuseContactLink(res, link.refused);
 
     const result = db.get().prepare(`
-      INSERT INTO birthdays (name, birth_date, name_day, notes, photo_data, created_by, reminder_offset, reminder_custom_amount, reminder_custom_unit)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO birthdays (name, birth_date, year_unknown, name_day, notes, photo_data, created_by, reminder_offset, reminder_custom_amount, reminder_custom_unit, contact_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       vName.value,
       vBirthDate.value,
+      vYearUnknown.value ? 1 : 0,
       vNameDay.value ?? null,
       vNotes.value,
       vPhoto.value ?? null,
       req.authUserId || req.session.userId,
       vReminder.offset.value ?? null,
       vReminder.amount.value ?? null,
-      vReminder.unit.value ?? null
+      vReminder.unit.value ?? null,
+      link.value ?? null,
     );
 
     const birthday = loadBirthday(result.lastInsertRowid);
     const synced = db.transaction(() => syncBirthdayArtifacts(db.get(), birthday));
     res.status(201).json({ data: hydrateBirthday(db.get(), loadBirthday(synced.id)) });
   } catch (err) {
+    if (isContactLinkConflict(err)) return refuseContactLink(res, 'taken');
     log.error('POST / error:', err);
     res.status(500).json({ error: 'Internal error.', code: 500 });
   }
@@ -297,11 +417,22 @@ router.put('/:id', (req, res) => {
     const userId = req.authUserId || req.session.userId;
     const id = parseInt(req.params.id, 10);
     const existing = loadBirthday(id);
-    if (!existing) return res.status(404).json({ error: 'Birthday not found.', code: 404 });
+    if (!existing) return res.status(404).json({ error: 'Birthday not found.', code: 404, reason: 'birthdays_birthday_not_found' });
 
-    const checks = [];
+    // Fehlt `year_unknown`, bleibt die gespeicherte Marke. Wer sie abnimmt, muss
+    // das Jahr mitschicken: sonst wuerde das Platzhalterjahr 2000 still zum
+    // echten Geburtsjahr.
+    const vYearUnknown = validateYearUnknown(req.body.year_unknown, 'year_unknown');
+    const yearUnknown = vYearUnknown.value ?? existing.year_unknown === 1;
+    const birthDate = req.body.birth_date !== undefined
+      ? birthDateInput(req.body.birth_date, yearUnknown)
+      : (yearUnknown && existing.year_unknown !== 1 ? placeholderBirthDate(existing.birth_date) : undefined);
+    const checks = [vYearUnknown];
+    if (vYearUnknown.value === false && existing.year_unknown === 1 && req.body.birth_date === undefined) {
+      checks.push({ value: null, error: 'Birth date with its year is required when year_unknown is turned off.' });
+    }
     if (req.body.name !== undefined) checks.push(str(req.body.name, 'Name', { max: MAX_TITLE, required: false }));
-    if (req.body.birth_date !== undefined) checks.push(validateDate(req.body.birth_date, 'Birth date'));
+    if (birthDate !== undefined) checks.push(validateDate(birthDate, 'Birth date'));
     if (req.body.notes !== undefined) checks.push(str(req.body.notes, 'Notes', { max: MAX_TEXT, required: false }));
     if (req.body.photo_data !== undefined) checks.push(validatePhotoData(req.body.photo_data));
     if (req.body.name_day !== undefined) checks.push(validateNameDay(req.body.name_day));
@@ -309,6 +440,8 @@ router.put('/:id', (req, res) => {
     checks.push(...Object.values(vReminder));
     const errors = collectErrors(checks);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
+    const link = checkContactLink(req, req.body.contact_id, existing);
+    if (link.refused) return refuseContactLink(res, link.refused);
 
     const vPhoto = req.body.photo_data !== undefined ? validatePhotoData(req.body.photo_data) : { value: undefined };
     const vNameDay = req.body.name_day !== undefined ? validateNameDay(req.body.name_day) : { value: undefined };
@@ -317,23 +450,27 @@ router.put('/:id', (req, res) => {
       UPDATE birthdays
       SET name = COALESCE(?, name),
           birth_date = COALESCE(?, birth_date),
+          year_unknown = ?,
           name_day = ?,
           notes = ?,
           photo_data = ?,
           reminder_offset = ?,
           reminder_custom_amount = ?,
           reminder_custom_unit = ?,
+          contact_id = ?,
           updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE id = ?
     `).run(
       req.body.name?.trim() ?? null,
-      req.body.birth_date ?? null,
+      birthDate ?? null,
+      yearUnknown ? 1 : 0,
       req.body.name_day !== undefined ? vNameDay.value : existing.name_day,
       req.body.notes !== undefined ? (req.body.notes?.trim() || null) : existing.notes,
       req.body.photo_data !== undefined ? (vPhoto.value ?? null) : existing.photo_data,
       vReminder.offset.value !== undefined ? vReminder.offset.value : existing.reminder_offset,
       vReminder.amount.value !== undefined ? vReminder.amount.value : existing.reminder_custom_amount,
       vReminder.unit.value !== undefined ? vReminder.unit.value : existing.reminder_custom_unit,
+      link.value !== undefined ? link.value : existing.contact_id,
       id,
     );
 
@@ -341,6 +478,7 @@ router.put('/:id', (req, res) => {
     db.transaction(() => syncBirthdayArtifacts(db.get(), updated));
     res.json({ data: hydrateBirthday(db.get(), loadBirthday(id)) });
   } catch (err) {
+    if (isContactLinkConflict(err)) return refuseContactLink(res, 'taken');
     log.error('PUT /:id error:', err);
     res.status(500).json({ error: 'Internal error.', code: 500 });
   }
@@ -351,7 +489,7 @@ router.delete('/:id', (req, res) => {
     const userId = req.authUserId || req.session.userId;
     const id = parseInt(req.params.id, 10);
     const existing = loadBirthday(id);
-    if (!existing) return res.status(404).json({ error: 'Birthday not found.', code: 404 });
+    if (!existing) return res.status(404).json({ error: 'Birthday not found.', code: 404, reason: 'birthdays_birthday_not_found' });
 
     db.transaction(() => {
       deleteBirthdayArtifacts(db.get(), existing);

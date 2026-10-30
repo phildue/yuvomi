@@ -29,9 +29,25 @@
   color: var(--color-text-secondary);
   /* Benannt statt `all`: der Chip wechselt auf Hover und im Aktivzustand genau
    * diese drei. `all` zieht implizit auch Layout-Properties mit (Critique
-   * 2026-07-30). */
-  transition: background-color var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+   * 2026-07-30). Dazu der Druck (R22): er gibt die kleine Stufe nach. */
+  transition: background-color var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast), transform var(--transition-fast);
   min-height: var(--target-lg);
+}
+
+/* EINE GLYPHE JE CHIP (R22, D8): `--icon-md` wie jede Knopf-Glyphe. Der
+ * Vorrat zeichnete seine Status-Chips mit 12px, Kontakte, Dokumente und
+ * Entsorgung mit 16px - derselbe Chip in zwei Groessen. */
+.filter-chip > svg {
+  width: var(--icon-md);
+  height: var(--icon-md);
+  flex-shrink: 0;
+}
+
+/* Druck wie Reiter und Segment (tokens.css, Druckzustand): hinein schnell,
+ * heraus mit der Dauer der Ruhe-Regel. */
+.filter-chip:active {
+  transform: scale(var(--press-scale-sm));
+  transition-duration: var(--duration-2xs);
 }
 
 .filter-chip:hover:not(.filter-chip--active) {
@@ -290,4 +306,26 @@
   height: var(--space-2);
   border-radius: var(--radius-full);
   background: var(--meal-type-dot, var(--color-text-disabled));
+}
+
+/* FORCED COLORS (Windows-Kontrastmodus): Toenung und Modulfarbe fallen weg,
+ * jeder Chip bekaeme dieselbe Systemfarbe. Der aktive traegt deshalb die
+ * Hervorhebung des Systems. */
+@media (forced-colors: active) {
+  /* `forced-color-adjust: none`: ohne das legt Chrome eine Canvas-Flaeche
+   * hinter den Text, und HighlightText verschwindet darauf. */
+  .filter-chip--active {
+    forced-color-adjust: none;
+    background-color: Highlight;
+    border-color: Highlight;
+    color: HighlightText;
+  }
+
+  /* Mit `forced-color-adjust: none` bildet der Modus auch den Fokusring nicht
+   * mehr ab; er steht deshalb selbst in einer Systemfarbe, mit Abstand auf
+   * Canvas statt auf der Hervorhebung. */
+  .filter-chip--active:focus-visible {
+    outline: var(--focus-ring-width) solid CanvasText;
+    outline-offset: var(--focus-ring-offset);
+  }
 }

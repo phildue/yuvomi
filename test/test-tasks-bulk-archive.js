@@ -135,13 +135,16 @@ test('Mehrfachauswahl: uebersprungene gesperrte Aufgaben stehen im Toast', async
 });
 
 test('Mehrfachauswahl: nach einem Fehler wird trotzdem neu geladen', async () => {
-  const calls = recordApi(() => { throw new Error('Too many requests'); });
+  const calls = recordApi(() => {
+    throw Object.assign(new Error('Too many requests'), { status: 429, data: { error: 'Too many requests', code: 429 } });
+  });
   const { click } = fakeContainer();
   select([31, 32]);
 
   await click('archive');
 
-  assert.deepEqual(toasts, [{ msg: 'Too many requests', type: 'danger' }]);
+  // Der Satz der App, nie der Text des Servers (#1909).
+  assert.deepEqual(toasts, [{ msg: 'common.errorRateLimited', type: 'danger' }]);
   assert.ok(calls.some(([m]) => m === 'get'), 'die Liste darf nicht stehen bleiben, was schon abgelegt ist');
 });
 
@@ -364,7 +367,7 @@ test('Auswahlmodus: Teilaufgaben zeigen ihren Zustand, bieten aber nichts an - d
     assert.deepEqual([...aktionen(html)].filter((a) => !ERLAUBT.has(a)), [],
       'in der Auswahl nur auswaehlen, oeffnen (waehlt dort aus) und auf-/zuklappen');
     assert.equal((html.match(/subtask-item__checkbox--static/g) ?? []).length, 2, 'der Zustand jeder Teilaufgabe bleibt als Zeichen');
-    assert.match(html, /subtask-item__checkbox--done subtask-item__checkbox--static|subtask-item__checkbox--static[^"]*subtask-item__checkbox--done/,
+    assert.match(html, /subtask-item__checkbox--static[^"]*check-ring--done/,
       'die erledigte Teilaufgabe bleibt als erledigt erkennbar');
   } finally {
     tasks.state.user = vorher;

@@ -10,7 +10,7 @@ node tools/installer/install-server.js
 # Open http://localhost:8090
 ```
 
-Requires Node.js 22+ on the host. The browser-based wizard is fully localized (26 languages, auto-detected from your browser), detects your container engine (Docker or Podman) first, then configures your `.env` - including optional reverse-proxy/HTTPS, Single Sign-On (OIDC), and automatic backups - starts the container, and creates your admin account. The engine still runs the app itself.
+Requires Node.js 22+ on the host. The browser-based wizard is fully localized (27 languages, auto-detected from your browser), detects your container engine (Docker or Podman) first, then configures your `.env` - including optional reverse-proxy/HTTPS, Single Sign-On (OIDC), and automatic backups - starts the container, and creates your admin account. The engine still runs the app itself.
 
 ### Option B — CLI Installer (Linux / macOS)
 
@@ -19,7 +19,7 @@ git clone https://github.com/ulsklyc/yuvomi.git && cd yuvomi
 bash install.sh
 ```
 
-The script checks prerequisites, generates security keys, asks for the base URL your household will use, configures optional integrations (weather via Open-Meteo coordinates, calendars, document storage), starts the container (Docker or Podman — auto-detected), and creates your admin account. Like the web installer, it is fully localized in 26 languages and auto-detects yours from the shell environment (`LANG`/`LC_ALL`).
+The script checks prerequisites, generates security keys, asks for the base URL your household will use, configures optional integrations (weather via Open-Meteo coordinates, calendars, document storage), starts the container (Docker or Podman — auto-detected), and creates your admin account. Like the web installer, it is fully localized in 27 languages and auto-detects yours from the shell environment (`LANG`/`LC_ALL`).
 
 Running it again on an existing installation is safe, in two ways:
 
@@ -28,7 +28,7 @@ Running it again on an existing installation is safe, in two ways:
 
 > **Base URL.** The script asks for the absolute origin your household will open (default `http://<host>:<port>`) and writes it as `BASE_URL`. Behind a reverse proxy, enter the public address there — for example `https://yuvomi.example.com`. Without it the server sends no password-reset or invitation emails at all, because it deliberately does not trust the request's `Host` header.
 
-Force a specific language with `--lang` (one of `de en es fr it sv el ru tr zh ja ar hi pt-BR pt uk pl nl cs vi hu ko id fa fil nb`):
+Force a specific language with `--lang` (one of `de en es fr it sv el ru tr zh zh-Hant ja ar hi pt-BR pt uk pl nl cs vi hu ko id fa fil nb`):
 
 ```bash
 bash install.sh --lang de
@@ -197,10 +197,10 @@ which version:
 
 | Feature | Chrome | Firefox | Safari | Without it |
 |---|---|---|---|---|
-| `color-mix()` | 111 | 113 | 16.2 | Tinted surfaces, selected and hover states lose their color; the dialog backdrop loses its tint |
+| `color-mix()` | 111 | 113 | 16.2 | Tinted surfaces and hover states lose their color; the dialog backdrop loses its tint. Where that would lose information, a plain color stands in: primary buttons, the add button, toasts, holidays, selected rows and filters, the search overlay, note and shift colors (as a ring) and empty checklist boxes |
 | `:has()` | 105 | 121 | 15.4 | Layout details: toolbar wrapping, the space kept free above the bottom navigation, full-height split pages |
 | Container queries | 105 | 110 | 16 | Cards and lists keep their narrow layout; split views stay in one column |
-| Popover | 114 | 125 | 17 | The "more actions" menus (shopping lists, contacts, documents, waste, health, recipes) do not open; the date field's calendar does not behave as intended (typing a date works, touch devices get the system picker) |
+| Popover | 114 | 125 | 17 | The menus behind a button are not available and stay hidden: every "more" menu (module tools, list rows, documents), the account menu at the foot of the sidebar, the Overview's New and tools menus, the calendar's view menu. Their buttons do nothing; Log out is also under Settings > Account. The date field's calendar does not open (typing a date works, touch devices get the system picker) |
 | `dvh` | 108 | 101 | 15.4 | Heights fall back to `vh`; on a phone the bottom edge can sit under the browser's toolbar |
 | `Object.hasOwn`, `Array.at()`, `findLastIndex()` | 97 | 104 | 15.4 | Single actions fail: note category filter, notification channel form, document storage settings, folder upload, fasting controls and durations, a birthday's custom reminder |
 | `<dialog>` `showModal()` | 37 | 98 | 15.4 | Icon picker and photo crop do not open |
@@ -251,7 +251,7 @@ node tools/installer/install-server.js
 
 #### 3. Open the Wizard
 
-Open your browser and navigate to **http://localhost:8090**. The wizard detects your browser language (26 languages supported), verifies that a container engine is available (Docker with Compose v2, or Podman with `podman compose` / `podman-compose`), and reports an existing `.env` file as well as a running container before you start. When it finds one, the **simple setup is disabled** and you continue with the advanced setup: the simple path writes fixed values for host, port, `SESSION_SECURE` and `TRUST_PROXY`, which would silently downgrade an installation that already runs behind a reverse proxy. The wizard then guides you through:
+Open your browser and navigate to **http://localhost:8090**. The wizard detects your browser language (27 languages supported), verifies that a container engine is available (Docker with Compose v2, or Podman with `podman compose` / `podman-compose`), and reports an existing `.env` file as well as a running container before you start. When it finds one, the **simple setup is disabled** and you continue with the advanced setup: the simple path writes fixed values for host, port, `SESSION_SECURE` and `TRUST_PROXY`, which would silently downgrade an installation that already runs behind a reverse proxy. The wizard then guides you through:
 
 - Basics - domain/IP, HTTP host port (`OIKOS_HTTP_PORT`), timezone (`TZ`, which pre-sets the household zone; that one is changeable later under Settings → Account → Appearance → Region), how Yuvomi is exposed (`SESSION_SECURE`, `TRUST_PROXY`) and the public address (`BASE_URL`). The exposure choice follows the host you enter, and the wizard rejects an `http://` address combined with enforced secure cookies - nobody could sign in to that combination. A typed public address only counts once it names a full `http://` or `https://` origin; until then the wizard keeps the address it derives from host and port. A timezone the browser does not recognise (`Europe/Berln`) is refused on the spot instead of silently falling back to UTC
 - Security key generation (`SESSION_SECRET`, `DB_ENCRYPTION_KEY`) — on a re-run, keys already present in your `.env` are kept rather than regenerated, so running the wizard again on a live installation cannot lock you out of your encrypted database
@@ -313,9 +313,9 @@ docker compose up -d
 Docker pulls `ghcr.io/ulsklyc/yuvomi:latest` automatically. No build step, no Node.js installation needed.
 
 > **Pinning a version.** Every release is also published under immutable tags:
-> `2.78.0` (exact version), `2.78` (latest patch of that minor), plus a moving `main`
+> `2.83.0` (exact version), `2.83` (latest patch of that minor), plus a moving `main`
 > tag for the current development state. To pin production to a known-good release,
-> set `image: ghcr.io/ulsklyc/yuvomi:2.78.0` in your compose file and bump it
+> set `image: ghcr.io/ulsklyc/yuvomi:2.83.0` in your compose file and bump it
 > deliberately; `latest` always points at the newest release.
 
 > **Verifying what you pull.** Every image the publish workflow builds is signed at build
@@ -324,7 +324,7 @@ Docker pulls `ghcr.io/ulsklyc/yuvomi:latest` automatically. No build step, no No
 > image you are about to run is one GitHub built from a release tag of this repository:
 >
 > ```bash
-> cosign verify ghcr.io/ulsklyc/yuvomi:2.78.0 \
+> cosign verify ghcr.io/ulsklyc/yuvomi:2.83.0 \
 >   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
 >   --certificate-identity-regexp '^https://github.com/ulsklyc/yuvomi/.github/workflows/docker-publish.yml@refs/tags/v'
 > ```
@@ -333,7 +333,7 @@ Docker pulls `ghcr.io/ulsklyc/yuvomi:latest` automatically. No build step, no No
 > anything else means the image is not one this repository released. The `main` tag is
 > signed too, under `refs/heads/main`, which the pattern above deliberately excludes. Tags
 > published before September 2026 carry no signature. Provenance and SBOM travel inside the
-> image: `docker buildx imagetools inspect ghcr.io/ulsklyc/yuvomi:2.78.0 --format '{{ json .Provenance }}'`.
+> image: `docker buildx imagetools inspect ghcr.io/ulsklyc/yuvomi:2.83.0 --format '{{ json .Provenance }}'`.
 
 Continue with [Step 4 — Verify](#4-verify-the-container-is-running).
 
@@ -378,7 +378,7 @@ docker compose logs -f
 You should see output like:
 
 ```
-yuvomi  | [Yuvomi] Server running on port 3000 | Version 2.78.0
+yuvomi  | [Yuvomi] Server running on port 3000 | Version 2.83.0
 yuvomi  | [Yuvomi] Environment: production
 yuvomi  | [Sync] Auto-sync active every 15 minutes.
 ```
@@ -510,6 +510,10 @@ docs/docker-compose.portainer.yml
 
 Add the same environment variables as above. Auto-update then follows `main` on its own.
 
+#### App template
+
+Yuvomi is in the community catalog [Lissy93/portainer-templates](https://github.com/Lissy93/portainer-templates). Under **Settings → App Templates**, set the URL to `https://raw.githubusercontent.com/Lissy93/portainer-templates/main/templates.json`, then pick **Yuvomi** under **App Templates**. The form asks for `SESSION_SECRET` and `DB_ENCRYPTION_KEY` (generated as above), the host port and `BASE_URL`; everything else keeps the default of [`docker-compose.portainer.yml`](docker-compose.portainer.yml), which the template deploys.
+
 > **Do not point a Git stack at the repository's `docker-compose.yml`.** That file is written for a local clone with a generated `.env` beside it, so it passes most of its configuration through `env_file` — and Portainer clones the repository without one. The deploy then fails on the missing file, and even if it did not, the container would start without `SESSION_SECRET` and exit (issues #698, #765).
 
 ---
@@ -550,6 +554,43 @@ Generate a secure `SESSION_SECRET`:
 ```bash
 openssl rand -hex 32
 ```
+
+### Secrets from Files (Optional)
+
+Instead of putting a secret into `.env` or an environment variable, point `<NAME>_FILE` at a file that holds it. The content of the file is used as the value of `<NAME>`, the same convention as the official postgres and mysql images. This fits Docker and Podman secrets, a Vault Agent, or any mounted secret file.
+
+Supported names: `SESSION_SECRET`, `DB_ENCRYPTION_KEY`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_DRIVE_CLIENT_SECRET`, `MS_CLIENT_SECRET`, `OIDC_CLIENT_SECRET`, `APPLE_APP_SPECIFIC_PASSWORD`, `OPENWEATHER_API_KEY`, `FIXER_API_KEY`, `WEBDAV_BACKUP_PASSWORD`, `DOCUMENT_STORAGE_WEBDAV_PASSWORD`, `VAPID_PRIVATE_KEY`, `EMAIL_SMTP_PASS` and `IMMICH_API_KEY`. Each takes a `_FILE` variant, for example `SESSION_SECRET_FILE`.
+
+```yaml
+services:
+  yuvomi:
+    environment:
+      SESSION_SECRET_FILE: /run/secrets/session_secret
+      DB_ENCRYPTION_KEY_FILE: /run/secrets/db_encryption_key
+    secrets: [session_secret, db_encryption_key]
+
+secrets:
+  session_secret:
+    file: ./secrets/session_secret
+  db_encryption_key:
+    file: ./secrets/db_encryption_key
+```
+
+- Set either `<NAME>` or `<NAME>_FILE`, not both: the start stops with a message naming the variable.
+- A missing, unreadable or empty file stops the start. There is no silent fallback, because for `DB_ENCRYPTION_KEY` that would start on a new, unencrypted database.
+- Line breaks at the end of the file are ignored; everything else, spaces included, belongs to the value. Keep a copy of the database key elsewhere: it cannot be recovered or changed on an existing database.
+- Remove the matching `<NAME>=` lines from `.env`.
+- This is for setups where you write the compose file yourself (Docker Compose, Podman, Quadlet). The TrueNAS, Umbrel, Unraid and Portainer templates always set `SESSION_SECRET` themselves, so adding `SESSION_SECRET_FILE` there stops the start.
+
+**File permissions.** The file is read by the user the app runs as, not by root: the image's entrypoint switches to `node` (uid 1000) before the server starts, and TrueNAS starts the container as uid 568 from the outset. This differs from the postgres image, which reads its secret files as root. A file that belongs to root with mode `600` therefore stops the start with `EACCES`. With Docker Compose the secret is a bind mount that keeps the owner and mode from the host, so create the file under `umask 077` and hand it to that uid:
+
+```bash
+mkdir -p secrets
+(umask 077; printf '%s' "$(openssl rand -hex 32)" > secrets/db_encryption_key)
+sudo chown 1000:1000 secrets/db_encryption_key   # 568:568 on TrueNAS
+```
+
+Without `umask 077`, a plain `printf ... >` creates a file every user on the host can read; the start then logs a warning naming the variable, the path and the mode. Podman and Docker Swarm mount their secrets read-only and readable (`0444`) inside the container, so there is nothing to change there and no warning. Kubernetes secret volumes default to `0644` and do get the warning: set `defaultMode: 0440` together with `fsGroup: 1000` on the pod.
 
 ### Web Push (Optional)
 
@@ -642,7 +683,7 @@ makes exactly that field read-only in the settings UI; empty values fall back to
 |----------|-------------|---------|----------|
 | `EMAIL_SMTP_HOST` | SMTP server hostname. | - | No |
 | `EMAIL_SMTP_PORT` | SMTP server port. | `587` (`465` with `ssl`) | No |
-| `EMAIL_SMTP_SECURE` | Connection security: `ssl`, `starttls`, or `none`. | `starttls` | No |
+| `EMAIL_SMTP_SECURE` | Connection security: `ssl`, `starttls`, or `none`. `none` sends unencrypted and never switches to STARTTLS, even when the server offers it (for an internal relay on port 25). | `starttls` | No |
 | `EMAIL_SMTP_USER` | SMTP auth username. | - | No |
 | `EMAIL_SMTP_PASS` | SMTP auth password. | - | No |
 | `EMAIL_FROM_ADDRESS` | Sender email address. | - | No |
@@ -790,7 +831,11 @@ environment:
 > points at a path nobody mounted, uploads still succeed: the folder is created inside the container
 > layer and the files are gone on the next `pull && up -d`, while the database keeps referencing them.
 > Since v2.9.0 the server checks this at startup and warns when the folder is missing or not writable,
-> naming the path it looked for. A silent start means the mount is where the app expects it.
+> naming the path it looked for. The image ships an empty `/documents` folder, though, so on the
+> default path the folder exists even with nothing mounted on it; inside a container the check
+> therefore also warns when the path is not on a volume or bind mount, using the same rule as the
+> modules folder (see [MODULES.md](../MODULES.md)). Where the mount table cannot be read, the check
+> stays quiet, so a silent start there proves nothing about the mount.
 
 ### WebDAV Document Storage (Optional)
 
@@ -913,7 +958,13 @@ the same kind, listed in the same table.
 | `GOOGLE_REDIRECT_URI` | OAuth callback URL, `https://<YOUR-DOMAIN>/api/v1/calendar/google/callback`. Yuvomi does not derive it, so it has to be set | - | Yes when Google sync is used |
 
 The three variables belong together. As long as one of them is empty, the settings page shows
-"Not configured (missing .env variables)" instead of the connect button.
+"Not configured (missing .env variables)" instead of the connect button, and for an admin the
+Google card under **Settings → Modules → Calendar sync → More providers** turns into a short setup
+guide: which of the three variables are still missing (names only, never values), the redirect URI
+to register at Google with a copy button (the value of `GOOGLE_REDIRECT_URI` when it is set,
+otherwise the address the admin is using, with a warning when Google would refuse it), the steps
+below in short, and the ways to get a Google calendar in without any Google setup: subscribe to its
+secret address in iCal format (read only) or import it once as an `.ics` file.
 
 **Setting it up at Google.** Google renames the pages of its console from time to time, so the steps
 below say what has to exist rather than where to click; the current click path is in Google's own
@@ -1004,7 +1055,7 @@ One-way push **Yuvomi → Outlook.com** for personal Microsoft accounts (outlook
 |----------|-------------|---------|----------|
 | `APPLE_CALDAV_URL` | CalDAV server URL | `https://caldav.icloud.com` | No |
 | `APPLE_USERNAME` | Apple ID email | - | No |
-| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password (generate at [appleid.apple.com](https://appleid.apple.com/)) | - | No |
+| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password (generate at [account.apple.com](https://account.apple.com/) > Sign-In and Security > App-Specific Passwords) | - | No |
 
 ### Sync
 
@@ -1061,6 +1112,7 @@ Pocket ID documents Yuvomi as one of its [client examples](https://pocket-id.org
 | `OIDC_CLIENT_SECRET` | Client secret for the registered application | - | No |
 | `OIDC_REDIRECT_URI` | OAuth callback URL — must be registered with the provider (e.g. `https://yuvomi.example.com/api/v1/auth/oidc/callback`) | - | No |
 | `OIDC_TRUST_EMAIL_WITHOUT_VERIFIED_CLAIM` | Set to `true` to allow account linking when the IdP omits the `email_verified` claim entirely. It does not cover a provider that sends `email_verified: false` - such an address is never linked, with or without this setting. Only enable for IdPs fully under your control that never issue unverified addresses. | - | No |
+| `OIDC_TOKEN_AUTH_METHOD` | How Yuvomi authenticates at the provider's token endpoint: `client_secret_basic` (HTTP Basic header) or `client_secret_post` (request body). Unset picks automatically: `client_secret_basic`, unless the provider's discovery document offers `client_secret_post` only. Set it only when the sign-in fails with `invalid_client` although client ID and secret are right. Any other value fails the SSO start with a message naming the variable. | automatic | No |
 | `OIDC_ALLOW_SIGNUP` | Set to `false` so an SSO sign-in never provisions a new account. Sign-in and account linking are unaffected, so the admin creates the account and the user signs in with SSO. Use this when your identity provider serves more people than this household. | `true` | No |
 | `AUTH_ALLOW_PASSWORD_LOGIN` | Set to `false` to make SSO the only way in: the login form, password login and password reset are all switched off. Ignored until all four OIDC variables are set **and** at least one administrator account is linked to the provider, so a typo - or a fresh install - can never lock everyone out. | `true` | No |
 

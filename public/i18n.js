@@ -11,7 +11,7 @@
 import { zonedFields } from './utils/timezone.js';
 import { resolveKoreanParticles } from './utils/korean-particles.js';
 
-const SUPPORTED_LOCALES = ['de', 'en', 'es', 'fr', 'it', 'sv', 'el', 'ru', 'tr', 'zh', 'ja', 'ar', 'hi', 'pt-BR', 'pt', 'uk', 'pl', 'nl', 'cs', 'vi', 'hu', 'ko', 'id', 'fa', 'fil', 'nb'];
+const SUPPORTED_LOCALES = ['de', 'en', 'es', 'fr', 'it', 'sv', 'el', 'ru', 'tr', 'zh', 'zh-Hant', 'ja', 'ar', 'hi', 'pt-BR', 'pt', 'uk', 'pl', 'nl', 'cs', 'vi', 'hu', 'ko', 'id', 'fa', 'fil', 'nb'];
 const RTL_LOCALES = new Set(['ar', 'fa']);
 // Form eines Regions-Tags: Sprache, optional Schrift, dann die Region -
 // `de-DE`, `fil-PH`, `zh-Hant-TW`. Eigene Konstante und kein Import aus
@@ -304,9 +304,13 @@ export function t(key, params = {}) {
       ?? resolve(fallbackTranslations, key)
       ?? key;
   }
-  const fill = (text) => text.replace(/\{\{(\w+)\}\}/g, (placeholder, name) => (
-    Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : placeholder
-  ));
+  // Endet der eingesetzte Wert auf einen Punkt und der Satz auch ("am
+  // {{date}}." mit "30.09."), verschmelzen beide zu einem: "30.09..".
+  const fill = (text) => text.replace(/\{\{(\w+)\}\}(\.?)/g, (placeholder, name, dot) => {
+    if (!Object.prototype.hasOwnProperty.call(params, name)) return placeholder;
+    const value = String(params[name]);
+    return dot && value.endsWith('.') ? value : value + dot;
+  });
   // Koreanisch schreibt hinter einen Platzhalter beide Formen der Partikel
   // (`{{name}}이(가)`), weil die richtige am eingesetzten Wort haengt (#1607).
   // Die Regel steht in utils/korean-particles.js; jede andere Sprache zahlt

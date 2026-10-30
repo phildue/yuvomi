@@ -260,14 +260,18 @@ test('POST /pantry/import-shopping: nur abgehakte Artikel, gleiche Charge addier
     ],
   });
   assert.equal(first.status, 200);
-  assert.deepEqual(first.body.data, { added: 2, merged: 0, skipped: 1 });
+  const { changes: firstChanges, ...firstCounts } = first.body.data;
+  assert.deepEqual(firstCounts, { added: 2, merged: 0, skipped: 1 });
+  assert.deepEqual(firstChanges.map((c) => c.kind), ['added', 'added']);
 
   // Zweiter Lauf mit identischer Charge (Name/Einheit/Ort/MHD) addiert auf.
   const second = await call('POST', '/pantry/import-shopping', {
     list_id: listId,
     items: [{ shopping_item_id: milk.body.data.id, quantity: 1, unit: 'l' }],
   });
-  assert.deepEqual(second.body.data, { added: 0, merged: 1, skipped: 0 });
+  const { changes: secondChanges, ...secondCounts } = second.body.data;
+  assert.deepEqual(secondCounts, { added: 0, merged: 1, skipped: 0 });
+  assert.deepEqual(secondChanges, [{ pantry_item_id: firstChanges[0].pantry_item_id, kind: 'merged', quantity_added: 1, expires_set: false }]);
 
   const rows = db.prepare(`SELECT quantity FROM pantry_items WHERE name = 'Milch'`).all();
   assert.equal(rows.length, 1);
@@ -295,6 +299,112 @@ test('POST /pantry/import-shopping: abweichendes MHD ist eine eigene Charge', as
   assert.deepEqual(rows.map((r) => r.expires_on), ['2026-08-10', '2026-08-24']);
 });
 
+// --------------------------------------------------------------------------
+// R23 (D3): Zusammenfuehren in bestehende Chargen + Rueckgaengig
+//
+// Gemessen vor R23 (Critique G3, P1): 6 Dubletten aus 10 uebernommenen
+// Artikeln - der Abgleich verlangte Name, Einheit, Ort und MHD exakt gleich.
+// --------------------------------------------------------------------------
+async function checkedOn(listId, name) {
+  const item = await call('POST', `/shopping/${listId}/items`, { name });
+  await call('PATCH', `/shopping/items/${item.body.data.id}`, { is_checked: 1 });
+  return item.body.data.id;
+}
+const fridgeId = () => db.prepare("SELECT id FROM pantry_locations WHERE name = 'Kühlschrank'").get().id;
+const shelfId = () => db.prepare("SELECT id FROM pantry_locations WHERE name = 'Vorratsschrank'").get().id;
+
+test('D3 import-shopping: g/kg und ml/l rechnen in die Einheit der Charge, Name normalisiert', async () => {
+  db.prepare('DELETE FROM pantry_items').run();
+  const flour = await call('POST', '/pantry', { name: 'Mehl', quantity: 1, unit: 'kg', location_id: shelfId() });
+  const milk = await call('POST', '/pantry', { name: 'Hafermilch', quantity: 1, unit: 'l', location_id: fridgeId() });
+  const list = (await call('POST', '/shopping', { name: 'D3-Einheiten' })).body.data.id;
+  const a = await checkedOn(list, ' mehl ');
+  const b = await checkedOn(list, 'HAFERMILCH');
+
+  const r = await call('POST', '/pantry/import-shopping', {
+    list_id: list,
+    items: [
+      { shopping_item_id: a, quantity: 500, unit: 'g', location_id: shelfId() },
+      { shopping_item_id: b, quantity: 500, unit: 'ml', location_id: fridgeId() },
+    ],
+  });
+  assert.equal(r.body.data.merged, 2);
+  assert.equal(r.body.data.added, 0);
+  assert.equal(itemRow(flour.body.data.id).quantity, 1.5, '500 g zu 1 kg = 1,5 kg');
+  assert.equal(itemRow(milk.body.data.id).quantity, 1.5);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM pantry_items').get().n, 2, 'keine Dublette');
+});
+
+test('D3 import-shopping: anderer Ort oder unvertraegliche Einheit ist eine eigene Zeile', async () => {
+  db.prepare('DELETE FROM pantry_items').run();
+  await call('POST', '/pantry', { name: 'Tomaten', quantity: 2, unit: 'can', location_id: shelfId() });
+  const list = (await call('POST', '/shopping', { name: 'D3-Getrennt' })).body.data.id;
+  const a = await checkedOn(list, 'Tomaten');
+  const b = await checkedOn(list, 'Tomaten');
+  const r = await call('POST', '/pantry/import-shopping', {
+    list_id: list,
+    items: [
+      { shopping_item_id: a, quantity: 500, unit: 'g', location_id: shelfId() }, // Dose vs. Gramm
+      { shopping_item_id: b, quantity: 1, unit: 'can', location_id: fridgeId() }, // anderer Ort
+    ],
+  });
+  assert.equal(r.body.data.added, 2);
+  assert.equal(r.body.data.merged, 0);
+});
+
+test('D3 import-shopping: MHD gleich oder eins leer fuehrt zusammen, zwei verschiedene nicht', async () => {
+  db.prepare('DELETE FROM pantry_items').run();
+  const butter = await call('POST', '/pantry', { name: 'Butter', quantity: 1, unit: 'pcs', location_id: fridgeId() });
+  const list = (await call('POST', '/shopping', { name: 'D3-MHD' })).body.data.id;
+  const a = await checkedOn(list, 'Butter');
+  const r = await call('POST', '/pantry/import-shopping', {
+    list_id: list, items: [{ shopping_item_id: a, quantity: 1, unit: 'pcs', location_id: fridgeId(), expires_on: '2027-05-01' }],
+  });
+  assert.equal(r.body.data.merged, 1);
+  assert.equal(itemRow(butter.body.data.id).expires_on, '2027-05-01', 'das gesetzte MHD gilt');
+  assert.equal(r.body.data.changes[0].expires_set, true);
+
+  const b = await checkedOn(list, 'Butter');
+  const r2 = await call('POST', '/pantry/import-shopping', {
+    list_id: list, items: [{ shopping_item_id: b, quantity: 1, unit: 'pcs', location_id: fridgeId(), expires_on: '2027-06-01' }],
+  });
+  assert.equal(r2.body.data.added, 1, 'ein anderes MHD ist eine neue Charge');
+});
+
+test('D3 import-shopping/undo: stellt den Vorrat genau wieder her', async () => {
+  db.prepare('DELETE FROM pantry_items').run();
+  const rice = await call('POST', '/pantry', { name: 'Reis', quantity: 1, unit: 'kg', location_id: shelfId() });
+  const before = db.prepare('SELECT id, name, quantity, unit, location_id, expires_on FROM pantry_items ORDER BY id').all();
+  const list = (await call('POST', '/shopping', { name: 'D3-Undo' })).body.data.id;
+  const a = await checkedOn(list, 'Reis');
+  const b = await checkedOn(list, 'Linsen');
+  const r = await call('POST', '/pantry/import-shopping', {
+    list_id: list,
+    items: [
+      { shopping_item_id: a, quantity: 250, unit: 'g', location_id: shelfId(), expires_on: '2027-09-01' },
+      { shopping_item_id: b, quantity: 2, unit: 'pkg', location_id: shelfId() },
+    ],
+  });
+  assert.equal(r.body.data.merged, 1);
+  assert.equal(r.body.data.added, 1);
+  assert.equal(itemRow(rice.body.data.id).quantity, 1.25);
+
+  // Im Undo-Fenster nimmt jemand 0,25 kg heraus - das bleibt nach der Ruecknahme.
+  await call('PATCH', `/pantry/${rice.body.data.id}`, { quantity: 1 });
+  const undo = await call('POST', '/pantry/import-shopping/undo', { changes: r.body.data.changes });
+  assert.equal(undo.status, 200);
+  assert.deepEqual(undo.body.data, { removed: 1, reduced: 1 });
+  const after = db.prepare('SELECT id, name, quantity, unit, location_id, expires_on FROM pantry_items ORDER BY id').all();
+  assert.deepEqual(after, [{ ...before[0], quantity: 0.75 }],
+    'Linsen weg, Reis um genau seinen Zuwachs verringert, das erst gesetzte MHD wieder leer');
+
+  const added = r.body.data.changes.filter((c) => c.kind === 'added');
+  const again = await call('POST', '/pantry/import-shopping/undo', { changes: added });
+  assert.deepEqual(again.body.data, { removed: 0, reduced: 0 }, 'eine geloeschte Charge wird still uebergangen');
+  const junk = await call('POST', '/pantry/import-shopping/undo', { changes: [{ pantry_item_id: 'x', kind: 'added' }, { kind: 'nope' }] });
+  assert.deepEqual(junk.body.data, { removed: 0, reduced: 0 });
+});
+
 test('POST /pantry/import-shopping: räumt die Einkaufsliste bewusst NICHT ab', async () => {
   const list = await call('POST', '/shopping', { name: 'Bleibt stehen' });
   const listId = list.body.data.id;
@@ -315,7 +425,7 @@ test('POST /pantry/import-shopping: unbekannte Liste → 404, leere Auswahl → 
   assert.equal((await call('POST', '/pantry/import-shopping', { list_id: 999999, items: [] })).status, 404);
   const list = await call('POST', '/shopping', { name: 'Leer' });
   const r = await call('POST', '/pantry/import-shopping', { list_id: list.body.data.id, items: [] });
-  assert.deepEqual(r.body.data, { added: 0, merged: 0, skipped: 0 });
+  assert.deepEqual(r.body.data, { added: 0, merged: 0, skipped: 0, changes: [] });
 });
 
 // --------------------------------------------------------------------------
@@ -356,6 +466,17 @@ test('POST /shopping/:listId/import-pantry: gleicher Name unabgehakt → übersp
   });
   assert.deepEqual(r.body.data, { added: 0, skipped: 1, added_ids: [] });
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM shopping_items WHERE list_id = ?').get(listId).n, 1);
+});
+
+// R23 (D2): die Regel der ganzen Kueche statt SQLites NOCASE, das nur ASCII
+// kennt - "Öl" auf der Liste und "öl" im Vorrat waren zwei Artikel.
+test('POST /shopping/:listId/import-pantry: "Öl" deckt "öl" (D2)', async () => {
+  const list = await call('POST', '/shopping', { name: 'Unicode-Dublette' });
+  const listId = list.body.data.id;
+  await call('POST', `/shopping/${listId}/items`, { name: 'Öl' });
+  const oil = await call('POST', '/pantry', { name: 'öl', quantity: 0 });
+  const r = await call('POST', `/shopping/${listId}/import-pantry`, { items: [{ pantry_item_id: oil.body.data.id }] });
+  assert.deepEqual(r.body.data, { added: 0, skipped: 1, added_ids: [] });
 });
 
 test('POST /shopping/:listId/import-pantry: unbekannter Vorratsartikel → skipped, unbekannte Liste → 404', async () => {
@@ -403,4 +524,151 @@ test('undo-transfer: unbekannte IDs werden uebergangen, leerer Body ist kein Feh
   const r = await call('POST', '/shopping/items/undo-transfer', { ids: [added.body.data.id, 999999, 'x'] });
   assert.equal(r.body.data.removed, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM shopping_items WHERE list_id = ?').get(list.body.data.id).n, 0);
+});
+
+// --------------------------------------------------------------------------
+// Products in GET /pantry and the handover of a product without batches (#1448, step 2)
+// --------------------------------------------------------------------------
+test('GET /pantry: products names every household product with its batch count, also the one without batches', async () => {
+  db.prepare('DELETE FROM pantry_items').run();
+  db.prepare('DELETE FROM pantry_products').run();
+  const cellar = db.prepare("SELECT id FROM pantry_locations WHERE name = 'Keller'").get().id;
+  const fridge = db.prepare("SELECT id FROM pantry_locations WHERE name = 'Kühlschrank'").get().id;
+  await call('POST', '/pantry', { name: 'Milch', quantity: 2, unit: 'l', location_id: cellar, category: 'Milchprodukte' });
+  await call('POST', '/pantry', { name: 'milch ', quantity: 1, unit: 'l', location_id: fridge, category: 'Milchprodukte' });
+  const tooth = await call('POST', '/pantry', { name: 'Zahnpasta', quantity: 1, category: 'Drogerie' });
+  await call('DELETE', `/pantry/${tooth.body.data.id}`);
+
+  const r = await call('GET', '/pantry');
+  assert.equal(r.status, 200);
+  // Additive: the batches, places and categories are still there.
+  assert.equal(r.body.data.length, 2);
+  assert.ok(Array.isArray(r.body.locations) && Array.isArray(r.body.categories));
+  assert.deepEqual(
+    r.body.products.map(({ name, unit, category, batch_count }) => ({ name, unit, category, batch_count })),
+    [
+      { name: 'Milch', unit: 'l', category: 'Milchprodukte', batch_count: 2 },
+      { name: 'Zahnpasta', unit: 'pcs', category: 'Drogerie', batch_count: 0 },
+    ],
+  );
+  const milk = r.body.products.find((p) => p.name === 'Milch');
+  assert.ok(r.body.data.every((i) => i.product_id === milk.id), 'both batches point at the product listed');
+});
+
+test('import-pantry: a product without batches goes over by pantry_product_id, with its name and category and no quantity', async () => {
+  const list = await call('POST', '/shopping', { name: 'Drogerie' });
+  const listId = list.body.data.id;
+  const tooth = db.prepare("SELECT id FROM pantry_products WHERE name = 'Zahnpasta'").get();
+  const r = await call('POST', `/shopping/${listId}/import-pantry`, {
+    // A quantity sent along is not taken: there is no stock to measure it against.
+    items: [{ pantry_product_id: tooth.id, quantity: '3' }, { pantry_product_id: 999999 }],
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.data.added, 1);
+  assert.equal(r.body.data.skipped, 1, 'an unknown product is skipped like an unknown batch');
+  const row = db.prepare('SELECT id, name, quantity, category FROM shopping_items WHERE list_id = ?').get(listId);
+  assert.deepEqual({ name: row.name, quantity: row.quantity, category: row.category },
+    { name: 'Zahnpasta', quantity: null, category: 'Drogerie' });
+  assert.deepEqual(r.body.data.added_ids, [row.id]);
+
+  // Same name unchecked on the list: skipped, as for a batch.
+  const again = await call('POST', `/shopping/${listId}/import-pantry`, { items: [{ pantry_product_id: tooth.id }] });
+  assert.deepEqual(again.body.data, { added: 0, skipped: 1, added_ids: [] });
+
+  // pantry_item_id wins when both are sent: a batch entry keeps meaning the batch.
+  const milkBatch = db.prepare("SELECT id FROM pantry_items WHERE location_id IS NOT NULL ORDER BY id LIMIT 1").get();
+  const both = await call('POST', `/shopping/${listId}/import-pantry`, {
+    items: [{ pantry_item_id: milkBatch.id, pantry_product_id: tooth.id, quantity: '1 l' }],
+  });
+  assert.equal(both.body.data.added, 1);
+  assert.equal(db.prepare('SELECT quantity FROM shopping_items WHERE id = ?').get(both.body.data.added_ids[0]).quantity, '1 l');
+  assert.equal(db.prepare('SELECT name FROM shopping_items WHERE id = ?').get(both.body.data.added_ids[0]).name, 'Milch');
+});
+
+// --------------------------------------------------------------------------
+// Deleting a product without batches (#1448, brought forward from step 5;
+// review of #2085, point 1)
+// --------------------------------------------------------------------------
+const productRow = (id) => db.prepare('SELECT id FROM pantry_products WHERE id = ?').get(id);
+const batchesOf = (id) => db.prepare('SELECT COUNT(*) AS n FROM pantry_items WHERE product_id = ?').get(id).n;
+
+test('DELETE /pantry/products/:id: a product without batches goes, 204', async () => {
+  const made = await call('POST', '/pantry', { name: 'Seife', quantity: 1 });
+  const productId = made.body.data.product_id;
+  await call('DELETE', `/pantry/${made.body.data.id}`);
+  assert.ok(productRow(productId), 'the product outlives its last batch');
+
+  const r = await call('DELETE', `/pantry/products/${productId}`);
+  assert.equal(r.status, 204);
+  assert.equal(productRow(productId), undefined, 'the product is gone');
+  const list = await call('GET', '/pantry');
+  assert.equal(list.body.products.some((p) => p.id === productId), false, 'and no longer listed');
+
+  // Gone already: 404; not an id: 400.
+  assert.equal((await call('DELETE', `/pantry/products/${productId}`)).status, 404);
+  assert.equal((await call('DELETE', '/pantry/products/0')).status, 400);
+  assert.equal((await call('DELETE', '/pantry/products/abc')).status, 400);
+});
+
+test('DELETE /pantry/products/:id: a product with batches is refused with 409 and a reason, nothing is deleted', async () => {
+  const first = await call('POST', '/pantry', { name: 'Linsen', quantity: 2, unit: 'kg' });
+  await call('POST', '/pantry', { name: 'linsen', quantity: 1, unit: 'kg', expires_on: '2027-01-01' });
+  const productId = first.body.data.product_id;
+  assert.equal(batchesOf(productId), 2);
+
+  const r = await call('DELETE', `/pantry/products/${productId}`);
+  assert.equal(r.status, 409);
+  assert.equal(r.body.reason, 'pantry_product_has_batches', 'a stable reason for the client');
+  assert.equal(r.body.count, 2);
+  assert.ok(productRow(productId), 'the product stays');
+  assert.equal(batchesOf(productId), 2, 'the ON DELETE CASCADE never takes the stock with it');
+});
+
+test('DELETE /pantry/products/:id: behind the pantry write permission, like the delete of a batch', async () => {
+  const { sessionModuleAccessRequirement, tokenAccessRequirement } = await import('../server/scopes.js');
+  const { moduleAccessVerdict, MODULE_ACCESS_READ_ONLY, MODULE_ACCESS_DENIED } = await import('../server/permissions.js');
+  // Both gates in server/index.js ask these two functions, at the path below /api/v1.
+  for (const ask of [sessionModuleAccessRequirement, tokenAccessRequirement]) {
+    assert.deepEqual(ask('/pantry/products/5', 'DELETE'), ask('/pantry/5', 'DELETE'), 'the same requirement as a batch');
+    assert.deepEqual(ask('/pantry/products/5', 'DELETE'), { moduleKey: 'pantry', access: 'write' });
+  }
+
+  // The session gate of server/index.js in front of the real router.
+  let level = 'read';
+  const gated = express();
+  gated.use((req, res, next) => {
+    req.authUserId = USER;
+    req.session = { userId: USER, role: 'member' };
+    const { moduleKey, access } = sessionModuleAccessRequirement(req.path, req.method);
+    const verdict = moduleAccessVerdict({ pantry: level }, moduleKey, access);
+    if (verdict === MODULE_ACCESS_DENIED) return res.status(403).json({ code: 403, reason: 'module_access_denied' });
+    if (verdict === MODULE_ACCESS_READ_ONLY) return res.status(403).json({ code: 403, reason: 'module_read_only' });
+    return next();
+  });
+  gated.use('/pantry', pantryRouter);
+  const gatedServer = gated.listen(0, '127.0.0.1');
+  await new Promise((r) => gatedServer.on('listening', r));
+  try {
+    const made = await call('POST', '/pantry', { name: 'Kerzen', quantity: 1 });
+    const productId = made.body.data.product_id;
+    await call('DELETE', `/pantry/${made.body.data.id}`);
+    const url = `http://127.0.0.1:${gatedServer.address().port}/pantry/products/${productId}`;
+
+    let r = await fetch(url, { method: 'DELETE' });
+    assert.equal(r.status, 403);
+    assert.equal((await r.json()).reason, 'module_read_only');
+    assert.ok(productRow(productId), 'pantry: read deletes nothing');
+
+    level = 'none';
+    r = await fetch(url, { method: 'DELETE' });
+    assert.equal(r.status, 403);
+    assert.ok(productRow(productId));
+
+    level = 'write';
+    r = await fetch(url, { method: 'DELETE' });
+    assert.equal(r.status, 204, 'with write access it goes');
+    assert.equal(productRow(productId), undefined);
+  } finally {
+    gatedServer.close();
+  }
 });

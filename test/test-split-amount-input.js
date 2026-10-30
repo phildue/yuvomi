@@ -105,13 +105,13 @@ function unter(locale, fn) {
  * Oeffnet einen Dialog, verdrahtet ihn mit `panel` und schickt das Formular ab.
  * Liefert, was gesendet und was am Feld gemeldet wurde.
  */
-async function speichern(oeffnen, panel, { currency = 'EUR' } = {}) {
+async function speichern(oeffnen, panel, { currency = 'EUR', beimSchreiben = () => {} } = {}) {
   const vorherState = { ...split.state };
   Object.assign(split.state, {
     activeGroupId: 2, groups: [{ id: 2, name: 'Reise', default_currency: currency }],
     groupMembers: [{ id: 1, display_name: 'Alex' }, { id: 3, display_name: 'Emma' }],
     balances: { simplified_debts: [] }, user: { id: 1 },
-    meta: { currencies: ['EUR', 'KRW', 'JPY'], default_currency: currency },
+    meta: { currencies: ['EUR', 'KRW', 'JPY'], default_currency: currency, group_types: ['trip'] },
   });
   const gesendet = [];
   const gemeldet = [];
@@ -120,13 +120,14 @@ async function speichern(oeffnen, panel, { currency = 'EUR' } = {}) {
   globalThis.__reportFieldError = (input, text) => { gemeldet.push({ input, text }); };
   // Nur das Schreiben zaehlt; das Nachladen danach darf ins Leere laufen.
   globalThis.__apiStub = {
-    post: async (pfad, daten) => { gesendet.push({ pfad, daten }); return { data: {} }; },
-    put: async (pfad, daten) => { gesendet.push({ pfad, daten }); return { data: {} }; },
+    post: async (pfad, daten) => { gesendet.push({ pfad, daten }); beimSchreiben(); return { data: {} }; },
+    put: async (pfad, daten) => { gesendet.push({ pfad, daten }); beimSchreiben(); return { data: {} }; },
+    patch: async (pfad, daten) => { gesendet.push({ pfad, daten }); beimSchreiben(); return { data: {} }; },
     get: async () => ({ data: [] }),
   };
   setPermissions({ admin: false, modules: { budget: 'write' }, widgets: {}, capabilities: {} });
   try {
-    oeffnen();
+    await oeffnen();
     assert.ok(optionen, 'der Dialog geht auf');
     optionen.onSave(panel);
     try { await panel.feuere('submit'); } catch { /* Neuzeichnen ohne Seitencontainer */ }
@@ -141,6 +142,17 @@ async function speichern(oeffnen, panel, { currency = 'EUR' } = {}) {
 }
 
 const neueAusgabe = () => split.openExpenseModal(null);
+
+test('en-US keyboard commas reach the shared-expense API as exact decimal strings (#2170)', async () => {
+  await unter('en-US', async () => {
+    const { panel } = formular({ amount: '12,50', method: 'exact', teilnehmer: { 1: '6,20', 3: '6,30' } });
+    const { gesendet, gemeldet } = await speichern(neueAusgabe, panel);
+    assert.deepEqual(gemeldet, []);
+    assert.equal(gesendet.length, 1);
+    assert.equal(gesendet[0].daten.amount, '12.50');
+    assert.deepEqual(gesendet[0].daten.splits, [{ user_id: 1, amount: '6.20' }, { user_id: 3, amount: '6.30' }]);
+  });
+});
 
 test('Gegenprobe: ein gueltiger Betrag wird gesendet, in der Schreibweise des Servers', async () => {
   await unter('de', async () => {
@@ -180,7 +192,9 @@ test('P2b: Nachkommastellen, die die Waehrung nicht kennt, bleiben am Feld und g
     const { panel } = formular({ amount: '12,500', currency: 'EUR' });
     const { gesendet, gemeldet } = await speichern(neueAusgabe, panel);
     assert.deepEqual(gesendet, []);
-    assert.match(gemeldet[0]?.text ?? '', /^common\.amountPrecisionRequired\{"currency":"EUR","step":"0\.01"\}/);
+    // Die kleinste Einheit in der Schreibweise der Region (Critique R23): unter
+    // de "0,01" wie der Platzhalter "0,00", nicht "0.01".
+    assert.match(gemeldet[0]?.text ?? '', /^common\.amountPrecisionRequired\{"currency":"EUR","step":"0,01"\}/);
   });
 });
 
@@ -219,11 +233,11 @@ function grundNach(eingabe, currency = 'KRW') {
   return { gueltig, gesperrt: felder['#split-save-expense'].disabled, text: grund.hidden ? '' : grund.textContent, felder, panel };
 }
 
-test('P2c: 0, negativ und gruppiert sperren das Speichern MIT Grund', () => {
+test('P2c / R24: 0, negativ und gruppiert halten das Absenden auf MIT Grund - der Primaerknopf bleibt bedienbar', () => {
   unter('ko-KR', () => {
     const ok = grundNach('10000');
     assert.equal(ok.gueltig, true);
-    assert.equal(ok.gesperrt, false);
+    assert.notEqual(ok.gesperrt, true);
     assert.equal(ok.text, '', 'ein gueltiger Betrag traegt keinen Grund');
 
     for (const [eingabe, grund] of [
@@ -233,7 +247,8 @@ test('P2c: 0, negativ und gruppiert sperren das Speichern MIT Grund', () => {
       ['abc', /^common\.amountInvalid\{"example":"1250"\}$/],
     ]) {
       const r = grundNach(eingabe);
-      assert.equal(r.gesperrt, true, `"${eingabe}" sperrt`);
+      assert.equal(r.gueltig, false, `"${eingabe}" haelt auf`);
+      assert.notEqual(r.gesperrt, true, `"${eingabe}" sperrt den Knopf nicht (R24, D4)`);
       assert.match(r.text, grund, `"${eingabe}" nennt den Grund`);
       assert.equal(r.felder['[name="amount"]'].getAttribute('aria-invalid'), 'true');
     }
@@ -250,8 +265,8 @@ test('P2c: der Grund erscheint erst nach dem Verlassen des Feldes und geht beim 
     const { panel, felder } = formular({ amount: '0', currency: 'KRW' });
     const grund = felder['#split-amount-reason'];
     // Beim Tippen: "0" ist der Anfang von "0.5" - gesperrt, aber noch still.
-    split.validateSplitForm(panel);
-    assert.equal(felder['#split-save-expense'].disabled, true);
+    assert.equal(split.validateSplitForm(panel), false);
+    assert.notEqual(felder['#split-save-expense'].disabled, true, 'der Primaerknopf bleibt bedienbar (R24, D4)');
     assert.equal(grund.hidden, true, 'waehrend des Tippens kein Fehlertext');
     split.validateSplitForm(panel, { reveal: true });
     assert.equal(grund.hidden, false);
@@ -267,11 +282,19 @@ test('P2c: der Grund erscheint erst nach dem Verlassen des Feldes und geht beim 
   });
 });
 
-test('P2c: der Dialog verdrahtet das Verlassen des Betragsfeldes', async () => {
+test('P2c / R24: das Absenden nennt den Grund unter dem Betrag, das Verlassen des Feldes ebenso', async () => {
   await unter('ko-KR', async () => {
     const { panel, felder } = formular({ amount: '10,000', currency: 'KRW' });
+    const { gesendet, gemeldet } = await speichern(neueAusgabe, panel, { currency: 'KRW' });
+    assert.deepEqual(gesendet, [], 'nichts geht an den Server');
+    assert.equal(felder['#split-amount-reason'].hidden, false, 'der Tipp auf den Primaerknopf zeigt den Grund');
+    assert.match(felder['#split-amount-reason'].textContent, /^common\.amountGrouped/);
+    assert.equal(gemeldet.length, 0, 'kein zweiter Satz am selben Feld');
+  });
+  await unter('ko-KR', async () => {
+    const { panel, felder } = formular({ amount: '10000', currency: 'KRW' });
     await speichern(neueAusgabe, panel, { currency: 'KRW' });
-    assert.equal(felder['#split-amount-reason'].hidden, true, 'beim Oeffnen still');
+    felder['[name="amount"]'].value = '10,000';
     await felder['[name="amount"]'].feuere('change');
     assert.equal(felder['#split-amount-reason'].hidden, false);
     assert.match(felder['#split-amount-reason'].textContent, /^common\.amountGrouped/);
@@ -513,5 +536,66 @@ test('Hin- und Rueckweg am Rand des Zahlenraums: unveraendert speichern zieht ke
       assert.deepEqual(gemeldet, [], `${locale}: "${feld}"`);
       assert.equal(gesendet[0]?.daten.amount, '90071992547409.91', `${locale}: "${feld}"`);
     });
+  }
+});
+
+// --- #1997: eine spaete Erfolgsantwort schliesst nur ihren EIGENEN Dialog -----
+
+// Kommt die Antwort erst, nachdem der Nutzer den Dialog geschlossen und einen
+// anderen geoeffnet hat, darf das force-Schliessen nur den eigenen treffen. Ob
+// der Slot noch denselben Dialog haelt, entscheidet closeModal({ context }) in
+// components/modal.js (am echten Modul gemessen in test-modal-dead-time.js);
+// hier zaehlt die Verdrahtung: jeder Speicherweg der Seite reicht den Kontext
+// von VOR der Anfrage hinein, und den Fokus traegt er nur zurueck, wenn es sein
+// Dialog war, der zuging. Gefahren wird je Weg der echte submit-Lauscher; die
+// schreibende Anfrage wechselt den Kontext.
+test('#1997: Erfolg nach Dialogwechsel - jeder Speicherweg schliesst nur mit dem Kontext von VOR der Anfrage', async () => {
+  const { installMiniDom } = await import('./mini-dom.js');
+  const WEGE = [
+    ['Gruppe anlegen', () => split.openGroupModal(null), '#split-group-form'],
+    ['Ausgabe anlegen', neueAusgabe, '#split-expense-form', { amount: '12,50' }],
+    ['Zahlung erfassen', split.openSettlementModal, '#split-settlement-form', { amount: '12,50' }],
+    ['Mitglied hinzufuegen', split.openMemberModal, '#split-member-form'],
+    ['Gast anlegen', split.openGuestModal, '#split-guest-form'],
+  ];
+  for (const [name, oeffnen, formId, felder = {}] of WEGE) {
+    for (const eigenerOffen of [true, false]) {
+      let kontext = 'eigener-dialog';
+      const geschlossen = [];
+      let fokus = 0;
+      globalThis.__modalContextId = () => kontext;
+      globalThis.__isOwnModalOpen = (ctx) => eigenerOffen && ctx === 'eigener-dialog';
+      globalThis.__closeModal = (opts) => { geschlossen.push(opts ?? {}); return true; };
+      globalThis.__refocusAfterRender = () => { fokus += 1; };
+      // Der Seitentraeger, in den nach dem Speichern gezeichnet wird: jede
+      // Stelle ein leerer Knoten, damit das Neuzeichnen bis zum Fokus durchlaeuft.
+      const leer = {
+        hidden: false, removeAttribute() {}, setAttribute() {}, replaceChildren() {}, insertAdjacentHTML() {},
+        querySelector: () => null, querySelectorAll: () => [], addEventListener() {},
+      };
+      split.setContainerForTest({ querySelector: () => leer, querySelectorAll: () => [], isConnected: true });
+      // Das Neuzeichnen sucht den FAB im Dokument und baut Leerzustaende als Knoten.
+      const miniDomAbraeumen = installMiniDom();
+      try {
+        const { gesendet } = await speichern(oeffnen, formular({ formId, ...felder }).panel, {
+          beimSchreiben: () => { if (!eigenerOffen) kontext = 'ein-anderer-dialog'; },
+        });
+        const label = `${name}${eigenerOffen ? '' : ', inzwischen ein anderer Dialog offen'}`;
+        assert.equal(gesendet.length, 1, `${label}: der Weg schreibt (${JSON.stringify(gesendet)})`);
+        assert.equal(geschlossen.length, 1, `${label}: genau ein Schliessen (${JSON.stringify(geschlossen)})`);
+        assert.equal(geschlossen[0].force, true, `${label}: force wie bisher`);
+        assert.equal(geschlossen[0].context, 'eigener-dialog',
+          `${label}: geschlossen wird ohne den Kontext von vor der Anfrage - die spaete Antwort traefe den Dialog, der jetzt offen ist`);
+        assert.equal(fokus, eigenerOffen ? 1 : 0,
+          `${label}: den Fokus traegt nur zurueck, wessen Dialog eben zuging - sonst gehoert er dem anderen Dialog`);
+      } finally {
+        miniDomAbraeumen();
+        split.setContainerForTest(null);
+        delete globalThis.__modalContextId;
+        delete globalThis.__isOwnModalOpen;
+        delete globalThis.__closeModal;
+        delete globalThis.__refocusAfterRender;
+      }
+    }
   }
 });

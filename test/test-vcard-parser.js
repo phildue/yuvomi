@@ -90,15 +90,53 @@ test('parseVCard nutzt resolveCategory, sonst fallbackCategory', () => {
 });
 
 test('parseBirthdayValue normalisiert diverse Formate auf ISO', () => {
-  assert.equal(parseBirthdayValue('1990-07-18'), '1990-07-18');
-  assert.equal(parseBirthdayValue('19900718'), '1990-07-18');
-  assert.equal(parseBirthdayValue('1990'), '1990-01-01');
-  // Zeitanteil wird nicht unterstuetzt (identisch zu CardDAV parseBirthday):
-  // die Bereinigung laesst "1990-07-1800000000" -> kein Muster -> null.
-  assert.equal(parseBirthdayValue('1990-07-18T00:00:00Z'), null);
-  assert.equal(parseBirthdayValue('--0718'), null); // jahrlos: bewusst nicht unterstuetzt (wie CardDAV)
+  const known = (date) => ({ date, yearUnknown: false });
+  assert.deepEqual(parseBirthdayValue('1990-07-18'), known('1990-07-18'));
+  assert.deepEqual(parseBirthdayValue('19900718'), known('1990-07-18'));
+  assert.deepEqual(parseBirthdayValue('1990'), known('1990-01-01'));
   assert.equal(parseBirthdayValue(''), null);
   assert.equal(parseBirthdayValue(null), null);
+});
+
+// Mit Uhrzeit war das hier `null`: die Bereinigung haengte die Ziffern der
+// Uhrzeit an das Datum. Beide Standards erlauben sie (RFC 2426 3.1.5,
+// RFC 6350 6.2.5); der Kontakt landete trotzdem unter "ohne Geburtstag".
+test('parseBirthdayValue liest das Datum eines BDAY mit Uhrzeit', () => {
+  const known = (date) => ({ date, yearUnknown: false });
+  assert.deepEqual(parseBirthdayValue('1953-10-15T23:10:00Z'), known('1953-10-15'), 'Beispiel aus RFC 2426');
+  assert.deepEqual(parseBirthdayValue('19531015T231000Z'), known('1953-10-15'), 'Beispiel aus RFC 6350');
+  assert.deepEqual(parseBirthdayValue('1990-07-18T00:00:00'), known('1990-07-18'), 'ohne Zone');
+  // Keine Umrechnung: in UTC waere das der 17. bzw. der 19.
+  assert.deepEqual(parseBirthdayValue('1990-07-18T00:00:00+02:00'), known('1990-07-18'));
+  assert.deepEqual(parseBirthdayValue('1987-09-27T23:30:00-06:00', 'VALUE=date-time'), known('1987-09-27'));
+  assert.deepEqual(parseBirthdayValue('--0718T1200'), { date: '2000-07-18', yearUnknown: true }, 'ohne Jahr, mit Uhrzeit');
+  assert.deepEqual(parseBirthdayValue('1604-07-18T00:00:00Z', 'X-APPLE-OMIT-YEAR=1604'), { date: '2000-07-18', yearUnknown: true });
+  assert.equal(parseBirthdayValue('T102200Z'), null, 'nur eine Uhrzeit ist kein Geburtstag');
+});
+
+// #2095: jahrlos war hier bis v2.78 "bewusst nicht unterstuetzt" (`--0718` ->
+// null), und Apples 1604 lief ungesehen als echtes Jahr durch. Beides ergibt
+// jetzt Tag und Monat mit dem Platzhalterjahr 2000 und der Marke.
+test('parseBirthdayValue erkennt einen Geburtstag ohne Jahr (#2095)', () => {
+  const yearless = (date) => ({ date, yearUnknown: true });
+  assert.deepEqual(parseBirthdayValue('--0718'), yearless('2000-07-18'));
+  assert.deepEqual(parseBirthdayValue('--07-18'), yearless('2000-07-18'));
+  assert.deepEqual(parseBirthdayValue('1604-07-18', 'X-APPLE-OMIT-YEAR=1604'), yearless('2000-07-18'));
+  assert.deepEqual(parseBirthdayValue('1604-02-29', 'VALUE=date;X-APPLE-OMIT-YEAR=1604'), yearless('2000-02-29'));
+  assert.deepEqual(parseBirthdayValue('1604-07-18'), yearless('2000-07-18'), '1604 ohne Marke');
+  assert.deepEqual(parseBirthdayValue('1990-07-18', 'X-APPLE-OMIT-YEAR=1604'), { date: '1990-07-18', yearUnknown: false });
+  assert.equal(parseBirthdayValue('--0230'), null);
+});
+
+test('parseVCard traegt die Marke "Jahr unbekannt" aus BDAY-Parametern (#2095)', () => {
+  const apple = parseVCard('BEGIN:VCARD\r\nFN:A\r\nBDAY;X-APPLE-OMIT-YEAR=1604:1604-03-15\r\nEND:VCARD');
+  assert.equal(apple.birthday, '2000-03-15');
+  assert.equal(apple.birthdayYearUnknown, true);
+  const v4 = parseVCard('BEGIN:VCARD\r\nVERSION:4.0\r\nFN:B\r\nBDAY:--0315\r\nEND:VCARD');
+  assert.equal(v4.birthday, '2000-03-15');
+  assert.equal(v4.birthdayYearUnknown, true);
+  const known = parseVCard('BEGIN:VCARD\r\nFN:C\r\nBDAY:1985-03-09\r\nEND:VCARD');
+  assert.equal(known.birthdayYearUnknown, false);
 });
 
 test('parseVCard extrahiert BDAY nach birthday (ISO)', () => {

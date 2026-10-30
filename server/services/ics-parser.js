@@ -9,7 +9,8 @@ import {
   nextOccurrence, matchesRRuleByday, rruleLine, parseRRule, untilInstantMs,
 } from './recurrence.js';
 import { resolveIcalColor } from '../utils/ical-color.js';
-import { hasExplicitZone, localToUTC, utcToWall } from '../utils/timezone.js';
+import { hasExplicitZone, localToUTC, localToUTCOccurrence, utcToWall } from '../utils/timezone.js';
+import { instantKey, rawOccurrenceKey } from './imported-occurrence-key.js';
 
 function unfoldLines(ics) {
   return ics.replace(/\r?\n[ \t]/g, '');
@@ -112,6 +113,26 @@ function parseRelations(block) {
   return { parentUid, childUids };
 }
 
+// Wert einer Property im Block. Der Doppelpunkt vor dem Wert ist der erste
+// ausserhalb eines gequoteten Parameters: ALTREP="data:text/html,..." enthaelt
+// selbst Doppelpunkte und darf den Wert nicht abschneiden (#2189).
+function propertyValue(block, prop) {
+  const lines  = block.split(/\r?\n/);
+  const needle = prop.toUpperCase();
+  for (const line of lines) {
+    if (!line.toUpperCase().startsWith(needle)) continue;
+    const after = line[needle.length];
+    if (after !== ':' && after !== ';') continue;
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') inQuotes = !inQuotes;
+      if (ch === ':' && !inQuotes) return line.slice(i + 1).trim();
+    }
+  }
+  return null;
+}
+
 /**
  * @param {string} ics
  * @param {{onSkip?: (info: {uid: string|null, reason: string, summary: string|null}) => void, allowMissingUid?: boolean}} [opts]
@@ -134,11 +155,7 @@ function parseICS(ics, { onSkip, allowMissingUid = false } = {}) {
   let match;
   while ((match = vEventRe.exec(unfolded)) !== null) {
     const block = match[1];
-    const get   = (prop) => {
-      const re = new RegExp(`^${prop}(?:;[^:]*)?:(.*)$`, 'im');
-      const m  = re.exec(block);
-      return m ? m[1].trim() : null;
-    };
+    const get = (prop) => propertyValue(block, prop);
     const uid         = get('UID');
     const summary     = unescapeICSText(get('SUMMARY') || '(kein Titel)');
     const description = unescapeICSText(get('DESCRIPTION')) || null;
@@ -175,7 +192,14 @@ function parseICS(ics, { onSkip, allowMissingUid = false } = {}) {
     // EXDATE-Zeilen und komma-separierte Werte sind erlaubt; TZID/VALUE=DATE
     // werden wie DTSTART aufgelöst und auf das Instanz-Datum (YYYY-MM-DD)
     // reduziert – so matcht die date-basierte Recurrence-Engine (#513/#489).
+    //
+    // Seit #2034 Schritt 5 kommt der ROHWERT mit (`exdateRaws`): der UTC-Tag
+    // in `exdates` sagt nicht, welches Vorkommen gemeint ist, sobald Ortstag
+    // und UTC-Tag auseinandergehen (#2000). Den Schluessel daraus macht
+    // services/imported-occurrence-key.js; `exdates` bleibt die alte Form, an
+    // der das Heilen die Zeile von frueher erkennt.
     const exdates = [];
+    const exdateRaws = [];
     const exRe = /^EXDATE((?:;[^:;]*)*):(.*)$/gim;
     let exMatch;
     while ((exMatch = exRe.exec(block)) !== null) {
@@ -187,7 +211,10 @@ function parseICS(ics, { onSkip, allowMissingUid = false } = {}) {
         const v = rawVal.trim();
         if (!v) continue;
         const conv = formatICSDate(v, isDate, exTz);
-        if (conv) exdates.push(conv.slice(0, 10));
+        if (conv) {
+          exdates.push(conv.slice(0, 10));
+          exdateRaws.push({ value: v, tzid: exTz, isDate, legacy: conv.slice(0, 10) });
+        }
       }
     }
     // RECURRENCE-ID (RFC 5545 §3.8.4.4): markiert diesen VEVENT als geändertes
@@ -196,10 +223,17 @@ function parseICS(ics, { onSkip, allowMissingUid = false } = {}) {
     // date-basierte Recurrence-Engine matcht (#549).
     const recIdLine = parseDTLine('RECURRENCE-ID');
     let recurrenceId = null;
+    let recurrenceIdRaw = null;
     if (recIdLine.value) {
       const recIsDate = /^\d{8}$/.test(recIdLine.value);
       const conv = formatICSDate(recIdLine.value, recIsDate, recIdLine.tzid);
       recurrenceId = conv ? conv.slice(0, 10) : null;
+      // Der Rohwert fuer den Schluessel der Ausnahme am Master (#2034 Schritt
+      // 5). Die UID des Einzelvorkommens (`${uid}::${recurrenceId}`) bleibt
+      // in der alten Form: an ihr haengen gespiegelte Zeilen und Auftraege.
+      if (recurrenceId) {
+        recurrenceIdRaw = { value: recIdLine.value, tzid: recIdLine.tzid, isDate: recIsDate, legacy: recurrenceId };
+      }
     }
     if ((!uid && !allowMissingUid) || !dtstart) {
       onSkip?.({ uid, summary: uid ? summary : null, reason: !uid ? 'missing UID' : 'missing or unparsable DTSTART' });
@@ -227,7 +261,7 @@ function parseICS(ics, { onSkip, allowMissingUid = false } = {}) {
     // braucht den Unterschied - eine vorhandene Zeile heisst, der Server
     // spricht ueber DIESEN Termin.
     const hasColor = get('COLOR') !== null;
-    events.push({ uid, summary, description, location, dtstart, dtend, rrule, allDay, color, hasColor, exdates, recurrenceId, tzid, categories, status, hasRDate });
+    events.push({ uid, summary, description, location, dtstart, dtend, rrule, allDay, color, hasColor, exdates, exdateRaws, recurrenceId, recurrenceIdRaw, tzid, categories, status, hasRDate });
   }
   return events;
 }
@@ -267,18 +301,49 @@ function normalizeRecurrenceOverrides(events) {
     const { master, overrides } = groups.get(uid);
     if (master) {
       const exSet = new Set(master.exdates || []);
+      // Dieselben Ausnahmen mit Rohwert (#2034 Schritt 5): ein ersetztes
+      // Vorkommen traegt seine RECURRENCE-ID; ein zweiter VEVENT ohne sie
+      // nur den alten Tag, und der wirkt wie bisher.
+      const exRaws = [...(master.exdateRaws
+        ?? (master.exdates || []).map((legacy) => ({ value: null, legacy })))];
       for (const ov of overrides) {
         const key = ov.recurrenceId || ov.dtstart?.slice(0, 10);
-        if (key) exSet.add(key);
+        if (key) {
+          exSet.add(key);
+          exRaws.push(ov.recurrenceIdRaw ?? { value: null, legacy: key });
+        }
       }
-      out.push({ ...master, exdates: [...exSet] });
+      out.push({ ...master, exdates: [...exSet], exdateRaws: exRaws });
     }
     for (const ov of overrides) {
       const key = ov.recurrenceId || ov.dtstart?.slice(0, 10);
-      out.push({ ...ov, uid: `${uid}::${key}`, rrule: null, exdates: [] });
+      // `seriesUid`: der Sync findet darüber die Serie, deren Zuweisung eine
+      // neu angelegte Ausnahme erbt (#2202). Nur gesetzt, wenn das Objekt die
+      // Serie selbst mitliefert - eine losgelöste Instanz hat keine.
+      out.push({ ...ov, uid: `${uid}::${key}`, rrule: null, exdates: [], exdateRaws: [], seriesUid: master ? uid : null });
     }
   }
   return out;
+}
+
+/**
+ * COMPLETED eines VTODO als ISO-Zeitpunkt (`YYYY-MM-DDTHH:MM:SSZ`), oder null.
+ *
+ * RFC 5545 schreibt für COMPLETED UTC vor (3.8.2.1). Nur diese Form wird
+ * übernommen: eine Wanduhrzeit ohne Zone wäre ein geratener Zeitpunkt, und für
+ * den Verlauf ist "beim Sync bemerkt" (null, der Aufrufer nimmt jetzt) die
+ * ehrlichere Antwort als ein um den Zonenversatz verschobener Haken (#1836).
+ */
+function completedInstant(raw) {
+  const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/i.exec(String(raw || '').trim());
+  if (!m) return null;
+  const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`;
+  // Rundreise statt Date.parse allein: der 30. Februar oder Stunde 24 werden
+  // dort still zu einem anderen Tag, gespeichert waere aber der Rohtext - und
+  // den vergleicht SQL als Text (Verlauf, "heute erledigt").
+  const at = Date.parse(iso);
+  if (Number.isNaN(at)) return null;
+  return new Date(at).toISOString().replace(/\.\d{3}Z$/, 'Z') === iso ? iso : null;
 }
 
 function parseVTODO(ics) {
@@ -288,11 +353,7 @@ function parseVTODO(ics) {
   let match;
   while ((match = vTodoRe.exec(unfolded)) !== null) {
     const block = match[1];
-    const get   = (prop) => {
-      const re = new RegExp(`^${prop}(?:;[^:]*)?:(.*)$`, 'im');
-      const m  = re.exec(block);
-      return m ? m[1].trim() : null;
-    };
+    const get = (prop) => propertyValue(block, prop);
     const uid = get('UID');
     if (!uid) continue;
     const summary     = unescapeICSText(get('SUMMARY') || '(kein Titel)');
@@ -318,7 +379,10 @@ function parseVTODO(ics) {
     if (priority === 0 || Number.isNaN(priority)) priority = null;
     const tags = parseCategories(block);
     const { parentUid, childUids } = parseRelations(block);
-    todos.push({ uid, summary, description, completed, status, due, priority, tags, parentUid, childUids });
+    todos.push({
+      uid, summary, description, completed, completedAt: completedInstant(completedAt),
+      status, due, priority, tags, parentUid, childUids,
+    });
   }
   return todos;
 }
@@ -368,9 +432,6 @@ function expandRRULE(vevent, windowStart, windowEnd) {
   }
   const countMatch = /;COUNT=(\d+)/i.exec(vevent.rrule);
   const maxCount   = countMatch ? parseInt(countMatch[1], 10) : null;
-  // EXDATE zählt für COUNT mit (RFC 5545: COUNT vor Exclusion), erzeugt aber
-  // keine Instanz – daher innerhalb der Schleife filtern, nicht die Zählung (#513).
-  const exdateSet  = new Set(vevent.exdates || []);
   // DST-korrekte Expansion: bei bekannter TZID pro Vorkommen die lokale Wanduhrzeit
   // des Masters neu nach UTC rechnen, statt den festen UTC-Suffix zu wiederholen
   // (sonst driftet die Uhrzeit über die Sommer-/Winterzeit, #549). Nur für
@@ -378,11 +439,39 @@ function expandRRULE(vevent, windowStart, windowEnd) {
   const wall = vevent.tzid ? utcToWall(vevent.dtstart, vevent.tzid) : null;
   const tzAware = wall && wall.date === startDate;
   const zonenUnsicher = !!vevent.tzid && !tzAware;
+  // EXDATE zählt für COUNT mit (RFC 5545: COUNT vor Exclusion), erzeugt aber
+  // keine Instanz – daher innerhalb der Schleife filtern, nicht die Zählung (#513).
+  //
+  // WELCHES VORKOMMEN EINE ABSAGE MEINT (#2000, #2034 Schritt 5). Die Schleife
+  // laeuft bei `tzAware` auf ORTSTAGEN, der alte Schluessel einer Absage ist
+  // ihr UTC-Tag: New York 19:30 im Winter liegt auf dem UTC-Folgetag, Berlin
+  // 01:30 nach der Umstellung auf dem UTC-Vortag - die Absage traf nichts oder
+  // den Nachbarn. Dort zaehlt deshalb der Originalstart (`exactKeys`). Sonst
+  // laeuft die Schleife auf denselben Tagen, die der alte Schluessel nennt
+  // (UTC-Tag, Wanduhr ohne Zone, ganztaegig), und es bleibt beim Tag.
+  const exactKeys = new Set();
+  const exdateSet = new Set();
+  const exRaws = Array.isArray(vevent.exdateRaws)
+    ? vevent.exdateRaws
+    : (vevent.exdates || []).map((legacy) => ({ value: null, legacy }));
+  // Ein Originalstart zaehlt nur, wenn die Schleife ihn an seinem Ortstag selbst
+  // erzeugt (Review zu #2300): faellt DTSTART in eine Umstellung, liest
+  // `formatICSDate` den Start mit der alten Uhr, die Vorkommen stehen dann eine
+  // Stunde neben der Absage - dort bleibt es beim alten Tag, wie auf main.
+  const loopMakes = (key) => {
+    const day = utcToWall(key, vevent.tzid)?.date;
+    return !!day && instantKey(localToUTCOccurrence(`${day}T${wall.time}`, vevent.tzid)) === key;
+  };
+  for (const raw of exRaws) {
+    const key = (tzAware && !vevent.allDay && raw.value) ? rawOccurrenceKey(raw, vevent.tzid) : null;
+    if (key && key.length > 10 && loopMakes(key)) exactKeys.add(key);
+    else if (raw.legacy) exdateSet.add(raw.legacy);
+  }
   // UNTIL ALS ZEITPUNKT, WO ES EINER IST (#1269) - dieselbe Unterscheidung wie
   // in services/calendar-events.js und aus demselben Grund: ein Serienende
   // mitten am Schnitttag darf dessen Vorkommen nicht mehr durchlassen. Der
   // Abonnement-Pfad liest dieselben fremden Kalender wie der CalDAV-Sync.
-  const untilMs = untilInstantMs(parseRRule(vevent.rrule), { tzid: vevent.tzid, toUTC: localToUTC });
+  const untilMs = untilInstantMs(parseRRule(vevent.rrule), { tzid: vevent.tzid, toUTC: localToUTCOccurrence });
   let current = startDate, iterations = 0;
   const MAX_ITER = 1500;
   let occurrence = 0;
@@ -407,15 +496,16 @@ function expandRRULE(vevent, windowStart, windowEnd) {
     // vergleichen; ganztaegig oder zonenlos bleibt es beim Tag (#1269).
     const occStartAt = untilMs === null
       ? null
-      : (tzAware ? localToUTC(`${current}T${wall.time}`, vevent.tzid) : current + timeSuffix);
+      : (tzAware ? localToUTCOccurrence(`${current}T${wall.time}`, vevent.tzid) : current + timeSuffix);
     if (occStartAt !== null && hasExplicitZone(occStartAt) && Date.parse(occStartAt) > untilMs) break;
 
     if (maxCount !== null && occurrence >= maxCount) break;
     occurrence++;
 
-    if (current >= windowStart && !exdateSet.has(current)) {
-      const occStart = occStartAt
-        ?? (tzAware ? localToUTC(`${current}T${wall.time}`, vevent.tzid) : current + timeSuffix);
+    const occStart = current >= windowStart && !exdateSet.has(current)
+      ? (occStartAt ?? (tzAware ? localToUTCOccurrence(`${current}T${wall.time}`, vevent.tzid) : current + timeSuffix))
+      : null;
+    if (occStart !== null && !(exactKeys.size && exactKeys.has(instantKey(occStart)))) {
       let occEnd = null;
       if (durationMs !== null) {
         if (vevent.allDay) {

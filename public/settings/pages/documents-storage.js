@@ -1,5 +1,7 @@
+import { wirePasswordToggle } from "/utils/auth-ui.js";
 import { api } from "/api.js";
-import { formatDate, formatTime, t } from "/i18n.js";
+import { dateTimeText } from '/utils/date-format.js';
+import { t } from "/i18n.js";
 import { confirmModal, refocusAfterRender } from "/components/modal.js";
 import {
   createDisclosure,
@@ -10,12 +12,13 @@ import {
   settingRowHtml,
   settingSwitchRowHtml
 } from "/settings/components.js";
+import { reloadAfterSave } from '/utils/reload-after-save.js';
 
 function formatSyncTime(value) {
   if (!value) return null;
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
-  return `${formatDate(date)} ${formatTime(date)}`.trim();
+  return dateTimeText(date);
 }
 
 function showToast(message, tone = "default") {
@@ -113,14 +116,9 @@ function buildConnectionForm() {
       })}
       ${settingRowHtml({
         label: t("settings.documentStoragePassword"), labelFor: "document-storage-password",
-        control: `<div class="settings-webdav-pw-wrap">
-          <input class="form-input" type="password" id="document-storage-password" name="password"
-            autocomplete="current-password" placeholder="${t("settings.documentStoragePasswordPlaceholder")}" />
-          <button type="button" class="btn btn--icon btn--ghost settings-webdav-reveal-btn"
-            data-reveal-target="document-storage-password" aria-label="${t("common.togglePasswordVisibility")}">
-            <i data-lucide="eye" aria-hidden="true"></i>
-          </button>
-        </div>`,
+        // Das Auge sitzt IM Feld (wirePasswordToggle), wie bei der Sicherung.
+        control: `<input class="form-input" type="password" id="document-storage-password" name="password"
+            autocomplete="new-password" placeholder="${t("settings.documentStoragePasswordPlaceholder")}" />`,
         extra: `<span class="form-hint" data-env-hint="password" hidden>${t("settings.documentStorageEnvHint")}</span>`,
       })}
       ${settingRowHtml({
@@ -243,16 +241,7 @@ function bindConnectionForm(container, form, reload) {
     syncBackupWarning(event.currentTarget.checked);
   });
 
-  form.querySelector("[data-reveal-target]")?.addEventListener("click", (event) => {
-    const button = event.currentTarget;
-    const input = form.querySelector(`#${button.dataset.revealTarget}`);
-    if (!input) return;
-    const reveal = input.type === "password";
-    input.type = reveal ? "text" : "password";
-    const icon = button.querySelector("[data-lucide]");
-    if (icon) icon.dataset.lucide = reveal ? "eye-off" : "eye";
-    window.lucide?.createIcons({ el: button });
-  });
+  wirePasswordToggle(form.querySelector("#document-storage-password"), { show: t("login.showPassword"), hide: t("login.hidePassword") });
 
   const testBtn = form.querySelector("#document-storage-test-btn");
   const result = form.querySelector("#document-storage-test-result");
@@ -269,7 +258,7 @@ function bindConnectionForm(container, form, reload) {
         result.textContent = t("settings.documentStorageTestSuccess");
         result.className = "form-hint settings-document-storage-success";
       }
-      await reload();
+      await reloadAfterSave(() => reload());
     } catch (err) {
       if (result) {
         result.textContent = t("settings.documentStorageTestFailed", { error: err.message });
@@ -299,7 +288,7 @@ function bindConnectionForm(container, form, reload) {
     try {
       await api.put("/documents/storage/config", payload);
       showToast(t("settings.documentStorageSaved"), "success");
-      await reload();
+      await reloadAfterSave(() => reload());
       // Nur nach der Rueckfrage: ohne sie schliesst auf diesem Weg kein Dialog,
       // und das Nachfassen griffe auf den Merker eines frueheren zurueck (#1083).
       if (gefragt) refocusAfterRender();
@@ -359,7 +348,7 @@ function buildDestinationForm(data, reload) {
     try {
       await api.put("/documents/storage/config", { selected_upload_backend: select.value });
       showToast(t("settings.documentStorageSaved"), "success");
-      await reload();
+      await reloadAfterSave(() => reload());
     } catch (error) {
       showToast(error.message ?? t("common.errorGeneric"), "danger");
     } finally {
@@ -503,7 +492,7 @@ function buildGoogleDriveProvider(data, reload) {
       try {
         await api.post("/documents/storage/google-drive/test", {});
         showToast(t("settings.documentStorageTestSuccess"), "success");
-        await reload();
+        await reloadAfterSave(() => reload());
       } catch (error) {
         showToast(error.message ?? t("common.errorGeneric"), "danger");
       } finally {

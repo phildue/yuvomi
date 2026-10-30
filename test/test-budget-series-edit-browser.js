@@ -26,6 +26,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
 import puppeteer from 'puppeteer';
+import { launchBrowser } from '../scripts/lib/chrome-executable.js';
 import { fileURLToPath } from 'node:url';
 
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'test-secret';
@@ -71,7 +72,7 @@ before(async () => {
   server = app.listen(0, '127.0.0.1');
   await new Promise((resolve) => server.on('listening', resolve));
   baseUrl = `http://127.0.0.1:${server.address().port}`;
-  browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  browser = await launchBrowser(puppeteer, { headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
 });
 
 after(async () => {
@@ -119,6 +120,9 @@ async function editOccurrenceForAllFuture(seriesFields) {
     await page.waitForFunction(() => window.__ready === true, { timeout: 20000 });
     await page.waitForSelector(`.budget-entry[data-id="${occurrence.id}"]`, { timeout: 10000 });
     await page.click(`.budget-entry[data-id="${occurrence.id}"]`);
+    // R24 E1: der Tipp zeigt die Buchung zuerst; Bearbeiten fuehrt in den Editor.
+    await page.waitForSelector('#budget-read-edit', { timeout: 5000 });
+    await page.click('#budget-read-edit');
     await page.waitForSelector('#bm-title', { timeout: 5000 });
     const recurringVisible = await page.$eval('#bm-recurring', (el) => el.closest('.form-group').hidden === false);
     await page.$eval('#bm-title', (el) => { el.value = 'Miete neu'; });
@@ -204,6 +208,9 @@ async function editAnchor(seriesFields, edit, { choice = 'series', prepare } = {
     await page.click('#budget-prev');
     await page.waitForSelector(`.budget-entry[data-id="${anchor}"]`, { timeout: 10000 });
     await page.click(`.budget-entry[data-id="${anchor}"]`);
+    // R24 E1: der Tipp zeigt die Buchung zuerst; Bearbeiten fuehrt in den Editor.
+    await page.waitForSelector('#budget-read-edit', { timeout: 5000 });
+    await page.click('#budget-read-edit');
     await page.waitForSelector('#bm-title', { timeout: 5000 });
     await page.evaluate(edit);
     await page.click('#bm-save');

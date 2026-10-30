@@ -72,8 +72,12 @@ export function chartScales(geo = CHART) {
  *        Nachkommastellen Pseudo-Präzision („125,9 mmHg", Audit A2-21), bei
  *        kleinen Spannen (Laborwerte 0,5-1,2) sind sie die eigentliche Auskunft.
  * @param {number} [steps=4]  Zahl der Schritte, `niceDomain().steps`
+ * @param {{ unit?: string }} [opts]  `unit`: die Einheit steht am OBERSTEN Wert
+ *        der Achse ("140 mmHg", R21 D6) - einmal, nicht an jeder Linie. Sie ist
+ *        ein eigenes `<tspan>`, damit die Zahl ihr Textknoten bleibt; die
+ *        Gutterbreite (`fitChartGutter`) misst den ganzen Wert mit.
  */
-export function chartGridMarkup(min, max, formatTick, geo = CHART, steps = 4) {
+export function chartGridMarkup(min, max, formatTick, geo = CHART, steps = 4, { unit = '' } = {}) {
   const { W, PAD_L, PAD_R } = geo;
   const { top, bottom } = chartScales(geo);
   const out = [];
@@ -99,7 +103,8 @@ export function chartGridMarkup(min, max, formatTick, geo = CHART, steps = 4) {
     // Datum darunter. Gilt fuer jedes Diagramm dieser Geometrie (Budget-Verlauf
     // und die Kurven der Gesundheit).
     const base = k === steps ? ' dy="-0.6em"' : '';
-    out.push(`<text x="${PAD_L - AXIS_GAP}" y="${gy.toFixed(1)}" class="chart__axis chart__axis--y" text-anchor="end"${base}>${esc(formatTick(val, wholeTicks))}</text>`);
+    const unitSpan = k === 0 && unit ? `<tspan class="chart__axis-unit"> ${esc(unit)}</tspan>` : '';
+    out.push(`<text x="${PAD_L - AXIS_GAP}" y="${gy.toFixed(1)}" class="chart__axis chart__axis--y" text-anchor="end"${base}>${esc(formatTick(val, wholeTicks))}${unitSpan}</text>`);
   }
   return out.join('');
 }
@@ -410,9 +415,9 @@ export function chartTimePositions(dateKeys, geo = CHART) {
  * Zeitachse steht sie genau dort, wo sie hingehoert.
  * @param {string} fromKey
  * @param {string} toKey
- * @param {(dateKey: string) => string} formatDate
+ * @param {(dateKey: string) => string} labelOf
  */
-export function chartTimeLabelsMarkup(fromKey, toKey, formatDate, geo = CHART) {
+export function chartTimeLabelsMarkup(fromKey, toKey, labelOf, geo = CHART) {
   const { H } = geo;
   const y = H - 7;
   const a = dayNumber(fromKey);
@@ -426,6 +431,6 @@ export function chartTimeLabelsMarkup(fromKey, toKey, formatDate, geo = CHART) {
   return keys.map((key, idx) => {
     const anchor = idx === 0 ? 'start' : idx === keys.length - 1 ? 'end' : 'middle';
     const px = chartTimeX(key, fromKey, toKey, geo);
-    return `<text x="${px.toFixed(1)}" y="${y}" class="chart__axis" text-anchor="${anchor}">${esc(formatDate(key))}</text>`;
+    return `<text x="${px.toFixed(1)}" y="${y}" class="chart__axis" text-anchor="${anchor}">${esc(labelOf(key))}</text>`;
   }).join('');
 }

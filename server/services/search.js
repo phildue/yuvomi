@@ -6,7 +6,7 @@
  * Abhaengigkeiten: server/services/visibility.js, document-access.js und
  *        budget-visibility.js (reine SQL-Bausteine, kein db.js)
  */
-import { icsSubscriptionVisibleWhere, visibilityWhere } from './visibility.js';
+import { icsSubscriptionVisibleWhere, noteVisibleWhere, visibilityWhere } from './visibility.js';
 import { documentVisibleSql } from './document-access.js';
 import { budgetDetailsVisibleWhere, resolveBudgetMode } from './budget-visibility.js';
 
@@ -15,7 +15,7 @@ import {
 } from './calendar-events.js';
 import { eventProjectionSql, resolveProjectedEventRows } from './calendar-event-reader.js';
 import { notBirthdayEventSql } from './household-modules.js';
-import { shiftDateKey, todayKey } from '../utils/timezone.js';
+import { householdTimeZone, shiftDateKey, storedToInstantMs, todayKey } from '../utils/timezone.js';
 
 export const SEARCH_LIMIT = 5;
 // Wie viele Termin-Treffer AUFGELOEST werden, bevor die fuenf fruehesten
@@ -26,6 +26,9 @@ export const SEARCH_LIMIT = 5;
 // die Expansion klein; die Kalendersuche loest mit derselben Funktion hundert
 // Zeilen auf.
 const EVENT_SEARCH_CANDIDATES = 50;
+// Ein Einzeltermin, dessen Tag vor heute liegt (Kandidatenfolge der globalen
+// Suche; Serien zaehlen nie dazu - ihr naechster Termin kann kommen).
+const PAST_SINGLE_EVENT_SQL = "(e.recurrence_rule IS NULL AND substr(e.start_datetime, 1, 10) < @from)";
 
 /**
  * Erzeugt die ß↔ss-Schreibvarianten eines Tokens. Der FTS-Tokenizer faltet
@@ -329,6 +332,9 @@ export function resolveEventSearchRows(database, rows, from = null, to = null, o
   // Einmal je Aufruf, nicht je Treffer - und nur, wenn ein Treffer sie braucht
   // (zonenlose Ziffern neben einer `tzid`, #1993).
   const householdZone = rows.reduce((zone, row) => zone ?? seriesReadingZone(database, row), null);
+  // Das Fenster ist ein Haushaltsfenster (`eventSearchWindow`, ab `todayKey()`):
+  // eine Serie mit eigener Zone wird an ihrem Haushaltstag gemessen (#1999).
+  const windowZone = from && to ? householdTimeZone(database) : null;
   const displayRows = rows.map((row) => {
     if (!row.recurrence_rule || !from || !to) return row;
     return expandRecurringEvents(
@@ -336,11 +342,71 @@ export function resolveEventSearchRows(database, rows, from = null, to = null, o
       from,
       to,
       exceptions,
-      { includeRecurrenceIdentity: true, householdZone },
+      { includeRecurrenceIdentity: true, householdZone, windowZone },
     )[0] || row;
   });
   return resolveProjectedEventRows(database, displayRows, options)
     .sort((a, b) => String(a.start_datetime).localeCompare(String(b.start_datetime)));
+}
+
+/**
+ * KOMMENDES ZUERST, VERGANGENES DAHINTER (Critique R21, Palette). Die globale
+ * Suche reihte Termine aufsteigend nach Start - wer "Zahnarzt" tippte, sah den
+ * Termin vom letzten Jahr vor dem naechste Woche. Jetzt stehen die Termine ab
+ * heute (Haushaltstag, `eventSearchWindow`) aufsteigend vorn, die vergangenen
+ * danach, der juengste zuerst. Gemessen wird der Zeitpunkt in der
+ * Haushaltszone (`storedToInstantMs`), nie der Datumsteil des Texts: ein Wert
+ * mit `Z` kurz vor Mitternacht laege sonst am falschen Tag.
+ * @param {Array<{start_datetime: string}>} rows  aufsteigend nach Start
+ * @param {number} fromMs  Beginn des heutigen Haushaltstags
+ * @param {string} zone    Haushaltszone
+ */
+export function upcomingEventsFirst(rows, fromMs, zone) {
+  const upcoming = [];
+  const past = [];
+  for (const row of rows) {
+    const ms = storedToInstantMs(row.start_datetime, zone);
+    if (ms !== null && fromMs !== null && ms < fromMs) past.push(row);
+    else upcoming.push(row);
+  }
+  return [...upcoming, ...past.reverse()];
+}
+
+/**
+ * DER GEBURTSTAGSTERMIN TRAEGT SEINEN NAMEN (R24, Critique G0 P1-1). Der Termin
+ * steht mit dem sprachneutralen Titel "Birthday: <Name>" in calendar_events
+ * (#524); Kalender und Uebersicht uebersetzen ihn ueber `birthday_name`
+ * (public/utils/birthday-event.js). Die globale Suche lieferte das Feld nicht,
+ * und Palette wie mobile Suche zeigten "Birthday: Emma" auf Deutsch. Dieselben
+ * Felder wie `serializeEvent()` (routes/calendar/helpers.js), mit derselben
+ * Regel fuer das unbekannte Geburtsjahr. Eine Abfrage fuer die (hoechstens
+ * SEARCH_LIMIT) Treffer, nicht ein Join in der FTS-Abfrage.
+ * @returns {Map<number, object>} Termin-ID -> Geburtstagsfelder
+ */
+function birthdayFieldsByEvent(database, events) {
+  const out = new Map();
+  if (!events.length) return out;
+  const ids = events.map((event) => Number(event.id));
+  const marks = ids.map(() => '?').join(', ');
+  const rows = database.prepare(`
+    SELECT calendar_event_id, name_day_calendar_event_id, name,
+           CASE WHEN year_unknown = 1 THEN NULL ELSE birth_date END AS birth_date
+    FROM birthdays
+    WHERE calendar_event_id IN (${marks}) OR name_day_calendar_event_id IN (${marks})
+  `).all(...ids, ...ids);
+  for (const row of rows) {
+    if (row.calendar_event_id != null && ids.includes(Number(row.calendar_event_id))) {
+      out.set(Number(row.calendar_event_id), {
+        birthday_name: row.name, birthday_date: row.birth_date ?? null, birthday_event_kind: 'birthday',
+      });
+    }
+    if (row.name_day_calendar_event_id != null && ids.includes(Number(row.name_day_calendar_event_id))) {
+      out.set(Number(row.name_day_calendar_event_id), {
+        birthday_name: row.name, birthday_date: null, birthday_event_kind: 'name_day',
+      });
+    }
+  }
+  return out;
 }
 
 /**
@@ -404,7 +470,7 @@ export function runSearch(database, q, userId, { hiddenModules = null, disabledN
   if (allows('events')) {
     // Serien stehen an ihrem naechsten Termin, wie in der Kalendersuche (#1607).
     const window = eventSearchWindow(database);
-    const eventRows = resolveEventSearchRows(database, database.prepare(`
+    const eventCandidates = resolveEventSearchRows(database, database.prepare(`
       SELECT ${eventProjectionSql(database)}
       FROM search_index s
       JOIN calendar_events e ON e.id = s.entity_id
@@ -414,19 +480,29 @@ export function runSearch(database, q, userId, { hiddenModules = null, disabledN
           // Geburtstagstermine stehen in dieser Trefferart, gehoeren aber dem
           // Schalter `birthdays` - wie in der Kalendersuche (#1660).
           disabledNav?.has('birthdays') ? ` AND ${notBirthdayEventSql('e')}` : ''}
-      ORDER BY e.start_datetime ASC
+      ORDER BY ${PAST_SINGLE_EVENT_SQL} ASC,
+               CASE WHEN ${PAST_SINGLE_EVENT_SQL} THEN NULL ELSE e.start_datetime END ASC,
+               e.start_datetime DESC
       LIMIT @limit
-    `).all({ match, userId, limit: EVENT_SEARCH_CANDIDATES }), window.from, window.to, { lightweight: true })
-      // resolveEventSearchRows sortiert nach dem AUFGELOESTEN Start.
+    `).all({ match, userId, from: window.from, limit: EVENT_SEARCH_CANDIDATES }), window.from, window.to, { lightweight: true });
+    // resolveEventSearchRows sortiert nach dem AUFGELOESTEN Start; vorn steht,
+    // was ab heute kommt, danach das Vergangene (upcomingEventsFirst). Die
+    // Kandidaten holt die Abfrage schon in dieser Folge, damit fuenfzig alte
+    // Einzeltermine den kommenden nicht aus dem Fenster draengen - dort genuegt
+    // der Datumsteil, die genaue Grenze zieht upcomingEventsFirst.
+    const zone = householdTimeZone(database);
+    const eventRows = upcomingEventsFirst(eventCandidates, storedToInstantMs(window.from, zone), zone)
       .slice(0, limit);
     // Preserve the compact global-search payload. The resolver-capable
     // projection supplies linked inheritance without loading attachment bodies
     // or unrelated sync metadata into this result bucket.
+    const birthdays = birthdayFieldsByEvent(database, eventRows);
     results.events = eventRows.map((event) => withExcerpt({
       id: event.id,
       title: event.title,
       start_datetime: event.start_datetime,
       all_day: event.all_day,
+      ...(birthdays.get(Number(event.id)) || {}),
       ...(event.is_occurrence_override ? {
         series_id: event.series_id,
         recurrence_id: event.recurrence_id,
@@ -445,6 +521,10 @@ export function runSearch(database, q, userId, { hiddenModules = null, disabledN
     JOIN notes n ON n.id = s.entity_id
     WHERE s.entity = 'note' AND s.search_index MATCH @match
       AND n.created_by = @userId
+      -- Die Sichtbarkeitsregel (#1514) steht auch hier, obwohl die Suche heute
+      -- nur eigene Notizen findet: wer die engere Klausel loest, soll die
+      -- private Notiz eines anderen nicht mit freigeben.
+      AND ${noteVisibleWhere('n', '@userId')}
     ORDER BY n.pinned DESC, n.updated_at DESC
     LIMIT @limit
   `).all({ match, userId, limit }).map((row) => withExcerpt(row, q, [row.content]));
@@ -599,11 +679,12 @@ export function runTableSearch(database, q, userId, { hiddenModules = null, disa
   // Geburtstage: Haushaltsbesitz, Rechte-Modul `calendar` (siehe BUCKET_MODULE).
   if (allows('birthdays')) {
     results.birthdays = firstMatches(database.prepare(`
-      SELECT b.id, b.name AS title, b.birth_date, b.notes
+      SELECT b.id, b.name AS title, b.birth_date, b.notes, b.year_unknown
       FROM birthdays b
       ORDER BY b.name COLLATE NOCASE ASC, b.id ASC
     `).all(), matches, (b) => [b.title, b.notes], limit)
-      .map((b) => withExcerpt(pick(b, ['id', 'title', 'birth_date']), q, [b.notes]));
+      // `year_unknown` (#2095): birth_date traegt dann das Platzhalterjahr.
+      .map((b) => withExcerpt({ ...pick(b, ['id', 'title', 'birth_date']), year_unknown: b.year_unknown === 1 }, q, [b.notes]));
   }
 
   // Budget: gesucht wird im TITEL, also nur dort, wo der Betrachter den Titel

@@ -439,3 +439,80 @@ test('POST/PUT /accounts weisen einen negativen Kreditrahmen ab (#541)', async (
     assert.equal(unchanged.credit_limit, 500, 'abgewiesenes Update darf nichts verändern');
   } finally { await h.close(); }
 });
+
+// Critique R23 (Rest aus S4, Sicherheitspruefung): ein Konto zu loeschen nimmt
+// seinen Buchungen die Zuordnung. Im personal-Modus kann daran eine private
+// Buchung eines anderen Mitglieds haengen, die der Loeschende weder sieht noch
+// zaehlt - der Server nahm ihr still Konto und Saldo. Jede eigene Antwort darauf
+// (409, ein Feld in der Liste) waere ein Orakel. Jetzt loest der Loeschende nur,
+// was er sieht; der Rest haelt das Konto als Huelle, die nur der Besitzer sieht
+// (archiviert), und fuer den Loeschenden ist alles wie bei einem echten Loeschen.
+test('DELETE /accounts/:id: fremde private Buchungen behalten ihr Konto, und der Loeschende merkt nichts (personal)', async () => {
+  cleanup();
+  const setMode = (mode) => suiteDatabase.prepare(`INSERT INTO sync_config (key, value) VALUES ('budget_mode', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(mode);
+  const otherId = Number(suiteDatabase.prepare(`
+    INSERT INTO users (username, display_name, password_hash, role)
+    VALUES ('member-b', 'B', 'x', 'member')
+  `).run().lastInsertRowid);
+  setMode('personal');
+  const a = createHarness();
+  const b = createHarness({ userId: otherId, role: 'member' });
+  const listA = async () => (await a.call('GET', '/accounts?include_archived=1')).body.data;
+  try {
+    const plain = (await a.call('POST', '/accounts', { name: 'Leer', starting_balance: 0 })).body.data;
+    const shared = (await a.call('POST', '/accounts', { name: 'Gemeinsam', starting_balance: 0 })).body.data;
+    const foreign = await b.call('POST', '', {
+      title: 'Privat B', amount: -40, category: EXPENSE_CAT, date: PAST, account_id: shared.id, visibility: 'private',
+    });
+    assert.equal(foreign.status, 201, JSON.stringify(foreign.body));
+    // Zeitstempel gehoeren nicht zum Vergleich: die beiden Konten entstehen
+    // nacheinander, und faellt eine Sekundengrenze dazwischen, unterschieden
+    // sie sich nur darin (CI-Flake an #2208). Verglichen wird, was eine fremde
+    // private Buchung verraten koennte - Salden, Zaehler, Rahmen.
+    const strip = ({ id, name, sort_order, created_at, updated_at, ...rest }) => rest;
+    assert.deepEqual(strip((await listA()).accounts.find((x) => x.id === shared.id)),
+      strip((await listA()).accounts.find((x) => x.id === plain.id)), 'vorher: beide Konten sehen fuer A gleich aus');
+
+    const delPlain = await a.call('DELETE', `/accounts/${plain.id}`);
+    const delShared = await a.call('DELETE', `/accounts/${shared.id}`);
+    assert.deepEqual(delShared, delPlain, 'gleicher Status, gleicher Body');
+    assert.equal(delShared.status, 204);
+    const after = await listA();
+    assert.deepEqual(after.accounts, [], 'fuer A sind beide weg');
+    assert.equal(after.net_worth, 0);
+
+    // Auch danach antwortet die Huelle A wie ein geloeschtes Konto.
+    assert.deepEqual(await a.call('PUT', `/accounts/${shared.id}`, { name: 'x' }), await a.call('PUT', `/accounts/${plain.id}`, { name: 'x' }));
+    assert.deepEqual(await a.call('DELETE', `/accounts/${shared.id}`), await a.call('DELETE', `/accounts/${plain.id}`));
+    const viaEntry = (accountId) => a.call('POST', '', { title: 'y', amount: -1, category: EXPENSE_CAT, date: PAST, account_id: accountId });
+    assert.deepEqual(await viaEntry(shared.id), await viaEntry(plain.id), 'als Kontowahl einer Buchung: nicht gefunden');
+
+    // Die fremde Buchung behaelt ihr Konto, ihr Besitzer sieht es archiviert.
+    const row = suiteDatabase.prepare('SELECT account_id FROM budget_entries WHERE id = ?').get(foreign.body.data.id);
+    assert.equal(row.account_id, shared.id, 'die fremde Buchung behaelt ihr Konto');
+    const seenByB = (await b.call('GET', '/accounts?include_archived=1')).body.data.accounts;
+    assert.deepEqual(seenByB.map((x) => [x.id, x.archived, x.entry_count, x.current_balance]), [[shared.id, 1, 1, -40]]);
+    assert.equal((await b.call('GET', '/accounts')).body.data.accounts.length, 0, 'in der aktiven Liste steht es nicht');
+
+    // Die Huelle verraet sich auch nicht ueber die Position des naechsten Kontos:
+    // nach zwei echten Loeschungen begaenne die Reihe wieder bei 0.
+    const next = (await a.call('POST', '/accounts', { name: 'Neu', starting_balance: 0 })).body.data;
+    assert.equal(next.sort_order, 0, 'die Huelle zaehlt bei der Position nicht mit');
+    assert.equal((await a.call('DELETE', `/accounts/${next.id}`)).status, 204);
+
+    // Auch ihr Rest-Besitzer holt sie nicht ins Aktive zurueck - A saehe sonst
+    // das geloeschte Konto wieder.
+    assert.equal((await b.call('PUT', `/accounts/${shared.id}`, { archived: false, name: 'Wieder da' })).status, 200);
+    assert.deepEqual((await listA()).accounts, [], 'fuer A bleibt es weg');
+    assert.equal(suiteDatabase.prepare('SELECT archived FROM budget_accounts WHERE id = ?').get(shared.id).archived, 2);
+
+    // Loescht B es, ist nichts Fremdes mehr daran: echt geloescht.
+    assert.equal((await b.call('DELETE', `/accounts/${shared.id}`)).status, 204);
+    assert.equal(suiteDatabase.prepare('SELECT 1 FROM budget_accounts WHERE id = ?').get(shared.id), undefined);
+  } finally {
+    setMode('shared');
+    await a.close();
+    await b.close();
+  }
+});

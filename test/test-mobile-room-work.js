@@ -123,6 +123,13 @@ test('M1: die Metazeile endet mit Ellipse statt mit einem Schnitt', () => {
   assert.equal(label['white-space'], 'nowrap');
   const due = declarations(tasksCss, '.task-card__meta > .due-date');
   assert.equal(due['min-width'], '0', 'ohne min-width 0 schrumpft der Flex-Chip nie und die Zeile klippt');
+  // Summe der Schrumpffaktoren unter 1 verteilt nur diesen Bruchteil des
+  // Ueberlaufs: mit 0.01 nahm die Faelligkeit allein 1 % auf, der Rest schnitt
+  // die Bueroklammer ab (R22-Sichtpruefung, 184px Inhalt in 178px).
+  assert.ok(Number(due['flex-shrink']) >= 1, `die Faelligkeit muss den Ueberlauf allein aufnehmen koennen (flex-shrink ${due['flex-shrink']})`);
+  assert.equal(declarations(tasksCss, '.task-card__meta > .task-card__docs')['flex-shrink'], '0', 'die Bueroklammer schrumpft nie');
+  const tagShrink = Number(declarations(tasksCss, '.task-card__meta > .task-tag').flex?.split(/\s+/)[1]);
+  assert.ok(tagShrink > Number(due['flex-shrink']), 'das Etikett gibt zuerst nach, dann die Faelligkeit');
 });
 
 // --------------------------------------------------------------------------
@@ -147,16 +154,21 @@ test('M2: die Karte ist mobil so flach wie eine Zeile - Avatar und Status in der
   assert.equal(declarations(tasksCss, '.kanban-card__status-btn', { media: MOBILE })['grid-row'], '1 / span 2');
 });
 
-test('M2: je Spalte ein Punkt, benannt nach der Spalte, der erste ist aktuell', () => {
+// R24 (G2-Aufgaben-P3-4): aus den Punkten sind Text-Reiter geworden - der
+// Name der Spalte steht SICHTBAR da, mit ihrer Zahl, nicht nur im aria-label.
+test('M2: je Spalte ein Reiter mit sichtbarem Namen und Zahl, der erste ist aktuell', () => {
   const cols = tasks.KANBAN_COLS();
-  const html = tasks.kanbanPagerHtml(cols);
-  const dots = [...html.matchAll(/data-kanban-page="([\w_]+)"\s+aria-label="([^"]*)"(\s+aria-current="true")?/g)];
-  assert.deepEqual(dots.map((m) => m[1]), cols.map((c) => c.status), 'ein Punkt je Spalte, in Brettreihenfolge');
-  assert.deepEqual(dots.map((m) => m[2]), cols.map((c) => c.label), 'jeder Punkt nennt seine Spalte');
-  assert.deepEqual(dots.map((m) => Boolean(m[3])), cols.map((_, i) => i === 0), 'genau einer ist aktuell');
+  const grouped = { open: [1, 2, 3], in_progress: [4], done: [], archived: [] };
+  const html = tasks.kanbanPagerHtml(cols, grouped);
+  const tabs = [...html.matchAll(/<button[^>]*class="kanban-pager__tab"[^>]*data-kanban-page="([\w_]+)"([^>]*)>\s*<span>([^<]*)<\/span><span class="kanban-pager__count">(\d+)<\/span>/g)];
+  assert.deepEqual(tabs.map((m) => m[1]), cols.map((c) => c.status), 'ein Reiter je Spalte, in Brettreihenfolge');
+  assert.deepEqual(tabs.map((m) => m[3]), cols.map((c) => c.label), 'jeder Reiter nennt seine Spalte sichtbar');
+  assert.deepEqual(tabs.map((m) => m[4]), ['3', '1', '0', '0'], 'und ihre Zahl');
+  assert.deepEqual(tabs.map((m) => /aria-current="true"/.test(m[2])), cols.map((_, i) => i === 0), 'genau einer ist aktuell');
+  assert.doesNotMatch(html, /kanban-pager__dot/, 'keine Punkte mehr');
 });
 
-test('M2: ein Tipp auf einen Punkt blaettert zu dessen Spalte und markiert ihn', () => {
+test('M2: ein Tipp auf einen Reiter blaettert zu dessen Spalte und markiert ihn', () => {
   const cols = tasks.KANBAN_COLS();
   const listeners = {};
   const left = { open: 16, in_progress: 386, done: 756, archived: 1126 };
@@ -177,7 +189,10 @@ test('M2: ein Tipp auf einen Punkt blaettert zu dessen Spalte und markiert ihn',
     getBoundingClientRect: () => ({ left: 16 }),
     querySelector: (sel) => colEls[/data-status="([\w_]+)"/.exec(sel)?.[1]] ?? null,
     querySelectorAll: () => Object.values(colEls),
-    scrollBy: (opts) => scrolled.push(opts),
+    scrollLeft: 0,
+    // scrollTo auf die Ziellage, nicht scrollBy (R24): mit snap-stop: always
+    // hielt ein weiches scrollBy an der naechsten Spalte an.
+    scrollTo: (opts) => scrolled.push(opts),
     addEventListener() {},
   };
   const pager = {
@@ -297,6 +312,21 @@ test('M13: mobil ist die Karte kompakt - drei Zeilen Vorschau, Fusszeile ohne Kr
   const more = declarations(notesCss, '.note-card__more', { media: MOBILE });
   assert.match(more['margin-block'] ?? '', /var\(--target-base\)/,
     'der Mehr-Knopf haengt seine volle Trefflaeche in die Polsterung statt die Zeile zu strecken');
+});
+
+// Critique R22-F (F2.3): mobil standen bei 390x844 drei Notizen ganz im ersten
+// Bild (Karte 158px: Titel plus drei Zeilen Vorschau), die vierte lief unter
+// die Tab-Leiste. Eine Karte zeigt mobil drei TEXTzeilen: mit Titel zwei
+// Zeilen Vorschau, ohne Titel drei - 133px, vier Notizen ganz im Bild.
+test('R22-F F2.3: mobil drei Textzeilen je Karte - mit Titel zwei Zeilen Vorschau', () => {
+  const titled = declarations(notesCss, '.note-card__title + .note-card__content', { media: MOBILE });
+  assert.equal(titled['-webkit-line-clamp'], '2', 'mit Titel: zwei Zeilen Vorschau');
+  assert.equal(titled['line-clamp'], '2');
+  assert.equal(declarations(notesCss, '.note-card__content', { media: MOBILE })['-webkit-line-clamp'], '3', 'ohne Titel bleibt es bei drei');
+  assert.equal(declarations(notesCss, '.note-card__title + .note-card__content')['-webkit-line-clamp'], undefined, 'nur mobil');
+  // Die Regel greift nur, wenn der Inhalt dem Titel unmittelbar folgt.
+  const html = notes.renderNoteCard({ id: 6, title: 'Einkauf', content: 'Milch', color: '#ffcc00', pinned: 0 });
+  assert.match(html, /<\/h2>\s*<div class="note-card__content">/, 'zwischen Titel und Vorschau steht nichts');
 });
 
 // Re-Critique 2026-09-28 (P8 / A3 P3-2): mobil brach der Detail-Fuss einer

@@ -14,10 +14,17 @@
  * DIE REGEL
  *
  * 1. Mehrere Woerter: das erste Zeichen des ERSTEN und des LETZTEN Worts,
- *    gross ("Anna Maria Schmidt" -> "AS", "Dr. Hans Müller" -> "DM"). Ein
- *    Bindestrich trennt nicht ("Anna-Lena Vogt" -> "AV"). Die ersten zwei
- *    Woerter - die Regel von dreizehn der vierzehn Kopien - machten aus einem
- *    Zweitnamen oder Titel den Familiennamen; das letzte Wort ist er.
+ *    gross ("Anna Maria Schmidt" -> "AS"). Ein Bindestrich trennt nicht
+ *    ("Anna-Lena Vogt" -> "AV"). Die ersten zwei Woerter - die Regel von
+ *    dreizehn der vierzehn Kopien - machten aus einem Zweitnamen oder Titel
+ *    den Familiennamen; das letzte Wort ist er.
+ *    EINE ANREDE VORN ZAEHLT NICHT (R23, Critique G5 P3): ein Wort aus
+ *    mindestens zwei Buchstaben mit Punkt am Ende ("Dr.", "Prof.", "med.")
+ *    ist ein Titel, kein Vorname - "Dr. Hans Müller" -> "HM", nicht "DM",
+ *    und die Aerztinnen einer Kontaktliste trugen nicht alle ein D. Er weicht
+ *    nur, solange danach noch zwei Woerter stehen ("Dr. Müller" bleibt "DM");
+ *    ein einzelner Buchstabe mit Punkt ist eine Initiale ("J. R. Smith" ->
+ *    "JS").
  * 2. Name OHNE Leerraum, ganz in Hangul, Han oder Kana: die LETZTEN ZWEI
  *    Zeichen, also der Rufname (김민수 -> 민수, 田中太郎 -> 太郎); bei einem
  *    oder zwei Zeichen der ganze Name. Das erste Zeichen ist dort der
@@ -223,6 +230,10 @@ function parse(name) {
   // Ein Name NUR aus Satzzeichen: dann sein erstes Zeichen, wie bisher - eine
   // leere Scheibe sagte noch weniger.
   const words = said.length ? said : raw;
+  // Regel 1, Anrede: Titel vorn weichen, solange zwei Woerter bleiben.
+  const isTitle = (chars) => chars.length >= 3 && chars[chars.length - 1] === '.'
+    && chars.slice(0, -1).every((char) => /^\p{L}/u.test(char));
+  while (words.length > 2 && isTitle(words[0])) words.shift();
   const cjk = words.length <= 2 && words.every((chars) => chars.every((char) => CJK.test(char)));
   return { cjk, words };
 }
@@ -422,4 +433,23 @@ export function compactInitials(name, fallback = '') {
   if (!isWidePair(chars)) return full;
   // In einer Kollisionsgruppe das Zeichen, das dort unterscheidet (compactGroup).
   return compactRoster?.get(keyOf(name)) ?? chars[1];
+}
+
+/**
+ * DER GETEILTE NACHNAME STEHT NICHT IN JEDEM CHIP (R19, Critique 2026-10-16:
+ * Termin-Dialog mobil 1,6 Bildschirme). "Alex Johnson, Emma Johnson, Leo
+ * Johnson, Linda Johnson" brauchten bei 390px drei Chip-Zeilen, und das
+ * vierfache "Johnson" unterscheidet niemanden. Tragen ALLE Personen der Wahl
+ * denselben Nachnamen, zeigt der Chip den Vornamen; der volle Name bleibt sein
+ * zugaenglicher Name (`.sr-only`). Ein Konto mit anderem Nachnamen (Hilfe,
+ * Grosseltern) laesst alle Namen voll stehen - dann unterscheidet er.
+ * @param {Array<{display_name?: string}>} users
+ * @returns {string} der geteilte Nachname, sonst ''
+ */
+export function sharedSurname(users) {
+  if (!Array.isArray(users) || users.length < 2) return '';
+  const lasts = users.map((u) => String(u?.display_name ?? '').trim().split(/\s+/))
+    .map((parts) => (parts.length >= 2 ? parts[parts.length - 1] : ''));
+  const [first] = lasts;
+  return first && lasts.every((l) => l === first) ? first : '';
 }

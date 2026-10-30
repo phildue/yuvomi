@@ -368,7 +368,11 @@ function tileEvents(count, { ended = 0 } = {}) {
   }
   return list;
 }
-const rowTitles = (html) => [...html.matchAll(/event-item__title">([^<]*)</g)].map((m) => m[1]);
+// Was ohne Streckung steht: Zusatzzeilen (U14, `data-fill-row`) zeigt erst
+// applyRowFill, wenn die Packung der Kachel die Hoehe dafuer zuteilt.
+const rowTitles = (html) => html.split('<div class="list-row event-item').slice(1)
+  .filter((row) => !/^[^>]*data-fill-row/.test(row))
+  .map((row) => /event-item__title">([^<]*)</.exec(row)?.[1]).filter((title) => title !== undefined);
 const aheadRows = (html) => rowTitles(html).filter((title) => title.startsWith('Kommt'));
 
 /** Den Dialog oeffnen, ohne DOM: der Stub faengt Inhalt und Speichern-Handler. */
@@ -386,11 +390,12 @@ async function openCalendarDialog(current, picked) {
   };
   globalThis.__openModal = (config) => {
     content = config.content;
-    config.onSave({ querySelector: field });
+    config.onSave({ querySelector: field, querySelectorAll: () => [] });
   };
   globalThis.__closeModal = () => true;
   try {
-    const result = dash.openWidgetOptions('calendar', current);
+    // Ohne Kalender-Katalog (#2062): die Stufe ist hier die Frage, nicht die Auswahl.
+    const result = dash.openWidgetOptions('calendar', current, { loadCalendars: async () => [] });
     // openWidgetOptions ist async: der Dialog steht erst nach einem Takt.
     await Promise.resolve();
     await Promise.resolve();
@@ -437,17 +442,41 @@ for (const [limit, expected] of [[undefined, 5], [5, 5], [8, 8], [12, 12], [7, 5
   }));
 }
 
-test('Kachel: jede Listengroesse traegt die gewaehlte Zahl, 2x1 bleibt der Wochenstreifen', inBrowser(THU_14_BERLIN, 'Europe/Berlin', () => {
+/* #2087: die Kachel folgt ihrer Groesse wie jede Liste (`listRowCap`). Vorher
+ * zeigte eine 1x1-Kachel ihre Stufe - acht oder zwoelf Zeilen in einer
+ * Rasterzeile, die die Nachbarn mitstreckte. */
+const aheadMore = (html) => /widget-list-more"[^>]*>dashboard\.eventsMoreAhead</.test(html);
+
+test('Kachel: 1x1 zeigt drei wie jede Liste, hoch die Stufe, 2x1 bleibt der Wochenstreifen (#2087)', inBrowser(THU_14_BERLIN, 'Europe/Berlin', () => {
   const data = { upcomingEvents: tileEvents(14), weekEvents: [] };
-  for (const size of ['1x1', '1x2', '2x2']) {
-    for (const limit of [8, 12]) {
-      assert.equal(aheadRows(dash.renderCalendarWidget(data, size, { limit })).length, limit, `${size} mit ${limit}`);
+  for (const limit of [undefined, 8, 12]) {
+    const options = limit === undefined ? {} : { limit };
+    const small = dash.renderCalendarWidget(data, '1x1', options);
+    assert.deepEqual(aheadRows(small), firstAhead(3), `1x1 mit ${limit ?? 5}`);
+    assert.ok(aheadMore(small), `1x1 mit ${limit ?? 5}: was nicht passt, nennt die Fusszeile`);
+    for (const size of ['1x2', '2x2']) {
+      const tall = dash.renderCalendarWidget(data, size, options);
+      assert.deepEqual(aheadRows(tall), firstAhead(limit ?? 5), `${size} mit ${limit ?? 5}`);
+      assert.ok(!aheadMore(tall), `${size}: die Stufe ist ganz zu sehen, keine Fusszeile`);
     }
   }
+  assert.equal(dash.calendarRowCap('1x1', 12), dash.listRowCap('1x1'), 'dieselbe Regel wie jede Liste');
   const strip = dash.renderCalendarWidget(data, '2x1', { limit: 12 });
   assert.match(strip, /week-strip/, '2x1 ist die Woche');
   assert.equal(rowTitles(strip).length, 0, 'und zeigt keine Liste, was immer gewaehlt ist');
 }));
+
+test('Kachel: 1x1 ohne Ueberhang traegt keine Fusszeile, und sie traegt keine Zahl', inBrowser(THU_14_BERLIN, 'Europe/Berlin', () => {
+  assert.ok(!aheadMore(dash.renderCalendarWidget({ upcomingEvents: tileEvents(3) }, '1x1', {})), 'drei von drei: nichts weiter');
+  const four = dash.renderCalendarWidget({ upcomingEvents: tileEvents(4) }, '1x1', {});
+  assert.ok(aheadMore(four));
+  // Die Liste ist nach vorn offen: „+1 weitere" hiesse nur „einer mehr geladen".
+  assert.doesNotMatch(four, /eventsMoreAhead\{/, 'die Fusszeile nennt keine Zahl');
+}));
+
+test('Kachel: 1x1 auf dem Telefon zeigt ebenfalls drei', inBrowser(THU_14_BERLIN, 'Europe/Berlin', () => {
+  assert.deepEqual(aheadRows(dash.renderCalendarWidget({ upcomingEvents: tileEvents(14) }, '1x1', { limit: 12 })), firstAhead(3));
+}, { phone: true }));
 
 test('Kachel: auf dem Telefon gilt dieselbe Zahl', inBrowser(THU_14_BERLIN, 'Europe/Berlin', () => {
   const data = { upcomingEvents: tileEvents(14) };
@@ -456,13 +485,139 @@ test('Kachel: auf dem Telefon gilt dieselbe Zahl', inBrowser(THU_14_BERLIN, 'Eur
   assert.equal(aheadRows(dash.renderCalendarWidget(data, '1x2', {})).length, 5);
 }, { phone: true }));
 
-test('Kachel: beendete von heute stehen darueber und verbrauchen die Stufe nicht', inBrowser(THU_14_BERLIN, 'Europe/Berlin', () => {
-  const html = dash.renderCalendarWidget({ upcomingEvents: tileEvents(14, { ended: 3 }) }, '1x2', { limit: 8 });
-  assert.deepEqual(aheadRows(html), firstAhead(8));
-  assert.deepEqual(rowTitles(html).filter((title) => title.startsWith('Vorbei')), ['Vorbei 09', 'Vorbei 10'], 'die zwei juengsten beendeten');
-  assert.equal((html.match(/event-item--ended/g) ?? []).length, 2);
-  assert.match(html, /event-list__earlier/, 'der dritte faltet sich in die Zeile darueber');
+/* Beendete zaehlen innerhalb der Zeilen, nach dem Kommenden (#2087): zwei
+ * obendrauf machten aus drei Zeilen fuenf. Ein Vergangenes verdraengt aber nie
+ * ein Kommendes (#1449) - es nimmt nur, was frei bleibt. */
+const endedRows = (html) => rowTitles(html).filter((title) => title.startsWith('Vorbei'));
+
+test('Kachel: beendete von heute nehmen nur freie Zeilen und verdraengen nie ein Kommendes', inBrowser(THU_14_BERLIN, 'Europe/Berlin', () => {
+  const full = dash.renderCalendarWidget({ upcomingEvents: tileEvents(14, { ended: 3 }) }, '1x2', { limit: 8 });
+  assert.deepEqual(aheadRows(full), firstAhead(8), 'die Stufe gehoert dem Kommenden');
+  assert.deepEqual(endedRows(full), [], 'eine volle Stufe laesst keinen Platz');
+  assert.match(full, /dashboard\.eventsEndedMore\{&quot;count&quot;:3\}/, 'alle drei falten sich in die Zeile darueber');
+
+  const evening = dash.renderCalendarWidget({ upcomingEvents: tileEvents(3, { ended: 3 }) }, '1x2', { limit: 8 });
+  assert.deepEqual(aheadRows(evening), firstAhead(3));
+  assert.deepEqual(endedRows(evening), ['Vorbei 09', 'Vorbei 10'], 'die zwei juengsten beendeten, zurueckgetreten darueber');
+  assert.equal((evening.match(/event-item--ended/g) ?? []).length, 2);
+  assert.match(evening, /event-list__earlier/, 'der dritte faltet sich in die Zeile darueber');
+
+  const small = dash.renderCalendarWidget({ upcomingEvents: tileEvents(1, { ended: 3 }) }, '1x1', { limit: 12 });
+  assert.equal(rowTitles(small).length, 3, '1x1: drei Zeilen insgesamt');
+  assert.deepEqual(aheadRows(small), firstAhead(1));
+  assert.deepEqual(endedRows(small), ['Vorbei 09', 'Vorbei 10']);
+
+  const busy = dash.renderCalendarWidget({ upcomingEvents: tileEvents(5, { ended: 2 }) }, '1x1', {});
+  assert.deepEqual(aheadRows(busy), firstAhead(3), '1x1 an einem vollen Tag: das Kommende zuerst');
+  assert.deepEqual(endedRows(busy), []);
+  assert.match(busy, /dashboard\.eventsEndedMore\{&quot;count&quot;:2\}/);
+  assert.doesNotMatch(busy, /event-list__earlier/, 'die frueheren stehen in der Fusszeile, nicht in einer eigenen Zeile');
 }));
+
+/* Codex-Review zu PR #2117: eine volle 1x1-Kachel mit beendeten von heute trug
+ * drei Zeilen, die Faltzeile „+N fruehere heute" UND die Fusszeile - eine
+ * Zeile mehr als jede 1x1-Liste (drei Zeilen plus „+N weitere"), und damit
+ * wieder eine gestreckte Nachbarzeile. Eine Kachel traegt hoechstens EINE
+ * Zusatzzeile; stehen beide an, teilen sie sich die Fusszeile. */
+const auxLines = (html) => (html.match(/class="(event-list__earlier|widget-list-more)"/g) ?? []).length;
+
+test('Kachel: 1x1 voll und mit beendeten von heute traegt nur eine Zusatzzeile (Review #2117)', inBrowser(THU_14_BERLIN, 'Europe/Berlin', () => {
+  for (const ended of [1, 3]) {
+    const html = dash.renderCalendarWidget({ upcomingEvents: tileEvents(5, { ended }) }, '1x1', {});
+    assert.equal(rowTitles(html).length, 3, `${ended} beendet: drei Terminzeilen`);
+    assert.equal(auxLines(html), 1, `${ended} beendet: eine Zusatzzeile wie jede 1x1-Liste`);
+    const foot = /<p class="widget-list-more"[^>]*>([^<]*)<\/p>/.exec(html)?.[1] ?? '';
+    assert.match(foot, new RegExp(`eventsEndedMore\\{&quot;count&quot;:${ended}\\}`), 'die Fusszeile nennt die frueheren');
+    assert.match(foot, /eventsMoreAhead/, 'und dass weitere kommen');
+  }
+  // Ohne weitere Kommende bleibt die Faltzeile, wo sie war: ueber dem Kommenden.
+  const rest = dash.renderCalendarWidget({ upcomingEvents: tileEvents(3, { ended: 3 }) }, '1x1', {});
+  assert.equal(auxLines(rest), 1);
+  assert.match(rest, /event-list__earlier/);
+}));
+
+/* Die Stufe ist in den hohen Groessen die Obergrenze der Liste (#2087), und
+ * seit U1 b (DW-P1-3) ist die Kachel so hoch wie ihre Zeilen: 5/8/12 Termine
+ * sind 5/8/12 Zeilen hoch - nicht 2/3/4 Rasterzeilen, die weniger Termine mit
+ * Leere auffuellten. Darstellung, nicht Groesse: die Klasse bleibt. */
+const wrapperOf = (html) => /<div class="widget-wrapper [^"]*"[^>]*data-widget-id="calendar"[^>]*>/.exec(html)?.[0] ?? '';
+const tileAt = (size, options) => [{ id: 'calendar', visible: true, order: 0, size, ...(options ? { options } : {}) }];
+const spurenOf = (html) => Number(/data-span-rows="(\d+)"/.exec(html)?.[1]);
+
+test('Raster: die hohe Kalenderkachel ist so hoch wie ihre Termine, die Groesse bleibt (#2087, U1 b)', inBrowser(THU_14_BERLIN, 'Europe/Berlin', () => {
+  const data = { upcomingEvents: tileEvents(14), weekEvents: [] };
+  const wrap = (size, options) => wrapperOf(dash.renderDashboardLayout(tileAt(size, options), data, null, 'EUR'));
+  const fuenf = spurenOf(wrap('1x2'));
+  const acht = spurenOf(wrap('1x2', { limit: 8 }));
+  const zwoelf = spurenOf(wrap('2x2', { limit: 12 }));
+  assert.ok(fuenf > 0 && acht > fuenf && zwoelf > acht, `mehr Termine, hoehere Kachel: ${fuenf} / ${acht} / ${zwoelf}`);
+  // Drei Zeilen mehr sind drei Zeilenhoehen mehr - nicht eine ganze Rasterzeile.
+  const g = widgets.TILE_GEOMETRY;
+  assert.ok(Math.abs((acht - fuenf) * g.unit - 3 * g.row) < g.unit, `8 statt 5: drei Zeilen mehr (${(acht - fuenf) * g.unit}px)`);
+  assert.equal(spurenOf(wrap('1x2', { limit: 500 })), fuenf, 'ein Fremdwert geht durch die Klemme');
+  for (const options of [{ limit: 8 }, { limit: 12 }]) {
+    assert.match(wrap('1x2', options), /widget-size--1x2/, 'die gespeicherte Groesse bleibt die Klasse');
+  }
+  assert.doesNotMatch(wrap('1x2', { limit: 8 }), /data-list-rows/, 'die eigene Stufe-Spanne ist mit U1 b gegangen');
+  // Weniger Termine als die Stufe: die Kachel ist kuerzer, nicht leerer.
+  const wenige = spurenOf(wrapperOf(dash.renderDashboardLayout(tileAt('1x2', { limit: 12 }), { upcomingEvents: tileEvents(2), weekEvents: [] }, null, 'EUR')));
+  assert.ok(wenige < fuenf, `zwei Termine bei Stufe 12 sind zwei Zeilen hoch (${wenige} < ${fuenf})`);
+}));
+
+/* Codex-Review zu PR #2117, neu gefasst mit U1 b: das Skelett sagt das Raster
+ * voraus, das gleich kommt - auch die Hoehen. Kannte der Layout-Hinweis nur die
+ * Groesse, stand die Kalenderkachel mit zwoelf Terminen im Skelett zu kurz und
+ * wuchs beim Laden - die Nachbarn sprangen. Jetzt merkt er sich die Spuren,
+ * die jede Kachel zuletzt belegt hat. */
+const hintLayouts = await import('../public/utils/dashboard-layout-hint.js');
+function withStorage(fn) {
+  const store = new Map();
+  const prev = globalThis.localStorage;
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => { store.set(k, String(v)); },
+    removeItem: (k) => { store.delete(k); },
+  };
+  try {
+    return fn(store);
+  } finally {
+    globalThis.localStorage = prev;
+  }
+}
+const skeletonTiles = (html) => [...html.matchAll(/<div class="widget-wrapper (widget-size--[0-9x]+)"([^>]*)>/g)].map((m) => `${m[1]}${m[2]}`);
+
+test('Skelett: jede Kachel steht schon in ihrer gezeichneten Hoehe da (Review #2117, U1 b)', inBrowser(THU_14_BERLIN, 'Europe/Berlin', () => withStorage((store) => {
+  const cfg = [
+    { id: 'calendar', visible: true, order: 0, size: '1x2', options: { limit: 12 } },
+    { id: 'tasks', visible: true, order: 1, size: '1x1' },
+    { id: 'notes', visible: false, order: 2, size: '1x2' },
+  ];
+  const spans = { calendar: 182, tasks: 66 };
+  hintLayouts.rememberLayoutHint(cfg, '/dashboard?events_limit=12', (w) => spans[w.id] ?? null);
+  assert.deepEqual(skeletonTiles(dash.renderDashboardSkeleton()), ['widget-size--1x2 style="--tile-rows: 182"', 'widget-size--1x1 style="--tile-rows: 66"']);
+  // Der Aufbau merkt sich, was er gezeichnet hat (drawnSpanOf in rememberGridHint).
+  const src = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
+  assert.match(src, /rememberLayoutHint\(drawn, dashboardQuery\(cfg\), drawnSpanOf\)/);
+
+  // Alte Eintraege (vor U1 b, auch die Array-Form und die Listenstufe aus #2087)
+  // sagen weiter die Groessen voraus - die Hoehe kommt dann aus der Groesse.
+  store.set('yuvomi-dash-layout-hint', JSON.stringify({ sizes: ['1x2', '2x1'], query: '/dashboard', listRows: [12, 0] }));
+  assert.deepEqual(skeletonTiles(dash.renderDashboardSkeleton()), ['widget-size--1x2', 'widget-size--2x1']);
+  store.set('yuvomi-dash-layout-hint', JSON.stringify(['2x2']));
+  assert.deepEqual(skeletonTiles(dash.renderDashboardSkeleton()), ['widget-size--2x2']);
+  // Der Eintrag ist von der Seite aus beschreibbar: nur eine ganze Zahl in Grenzen wird zum Stil.
+  store.set('yuvomi-dash-layout-hint', JSON.stringify({ sizes: ['1x2', '1x2', '1x2', '1x2'], spans: ['"><b>', 7.5, 5000, 40] }));
+  assert.deepEqual(skeletonTiles(dash.renderDashboardSkeleton()), ['widget-size--1x2', 'widget-size--1x2', 'widget-size--1x2', 'widget-size--1x2 style="--tile-rows: 40"']);
+  store.set('yuvomi-dash-layout-hint', JSON.stringify({ sizes: ['1x2'], spans: [12, 8] }));
+  assert.deepEqual(skeletonTiles(dash.renderDashboardSkeleton()), ['widget-size--1x2'], 'Hoehen nur passend zu den Groessen');
+})));
+
+test('Raster: dashboard.css kennt keine Stufen-Spannen mehr - die Hoehe kommt aus --tile-rows (U1 b)', () => {
+  const css = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
+  assert.doesNotMatch(css.replace(/\/\*[\s\S]*?\*\//g, ''), /\[data-list-rows=/, 'keine Regel liest mehr die Listenstufe');
+  assert.match(css, /grid-row-end:\s*span calc\(var\(--tile-rows, var\(--tile-size-rows\)\) \+ var\(--tile-gap-rows\)\)/,
+    'die Spanne jeder Kachel kommt aus ihren Daten');
+});
 
 test('Kachel: weniger Termine als die Stufe - keine Luecke, kein Badge, Leerzustand bleibt', inBrowser(THU_14_BERLIN, 'Europe/Berlin', () => {
   const some = dash.renderCalendarWidget({ upcomingEvents: tileEvents(3) }, '1x2', { limit: 12 });
@@ -498,6 +653,33 @@ test('Heute-Blatt und Wand behalten ihren Deckel, auch mit zwoelf Terminen in de
   assert.equal(wall(today).rows.length, wall(five).rows.length, 'und nicht mehr Zeilen als mit fuenf');
   assert.equal(sheet(today).overflow, 12 - dash.PROGRAM_ROW_CAP, 'der Rest steht hinter „+N weitere"');
 }));
+
+/* Die Wand hat ihren eigenen Deckel und liest weder Groesse noch Stufe noch
+ * die Telefon-Buehne (#2087 laesst sie unberuehrt). */
+test('Wand: vier Zeilen, mit und ohne Telefon-Buehne dieselbe Flaeche (#2087)', async () => {
+  const today = Array.from({ length: 12 }, (_, i) => ev(i + 1, `Heute ${pad(i + 8)}`, `2026-09-24T${pad(i + 8)}:00`, `2026-09-24T${pad(i + 8)}:30`));
+  const tasks = Array.from({ length: 5 }, (_, i) => ({ id: 50 + i, title: `Aufgabe ${i}`, priority: 'high', status: 'open', due_date: '2026-09-24', assigned_users: [] }));
+  const data = { upcomingEvents: today, urgentTasks: tasks, openTaskCount: 12, users: [] };
+  let wide;
+  let narrow;
+  await inBrowser('2026-09-24T04:00:00Z', 'Europe/Berlin', () => {
+    assert.equal(dash.WALL_ROW_CAP, 4, 'der Deckel der Wand');
+    assert.equal(dash.buildTodayCockpitModel(data, [], { cap: dash.WALL_ROW_CAP, groupOverdue: false }).rows.length, 4);
+    wide = dash.renderWallSurface(data, null, { now: new Date() });
+  })();
+  await inBrowser('2026-09-24T04:00:00Z', 'Europe/Berlin', () => {
+    assert.equal(dash.listRowCap('1x2'), 3, 'Vorbedingung: die Telefon-Buehne ist aktiv');
+    narrow = dash.renderWallSurface(data, null, { now: new Date() });
+  }, { phone: true })();
+  assert.match(wide, /wall__program/, 'Reichweite: die Wand ist gebaut');
+  // Seit R24 fuehrt auf der Wand die Leiste wie im Cockpit (wallTimelineOptions):
+  // die vier Zeilen sind die ersten Termine des Tages, die Aufgaben stehen
+  // dahinter in „+N weitere".
+  const rows = [...wide.matchAll(/<li class="wall-row wall-row--(\w+)"[\s\S]*?wall-row__title">([^<]*)</g)]
+    .filter(([, tone]) => tone !== 'shopping' && tone !== 'state').map(([, , title]) => title);
+  assert.deepEqual(rows, ['Heute 08', 'Heute 09', 'Heute 10', 'Heute 11'], 'die Wand zeigt vier Zeilen, nicht drei und nicht fuenf');
+  assert.equal(narrow, wide, 'die Telefon-Buehne aendert an der Wand nichts');
+});
 
 // --------------------------------------------------------------------------
 // 4. Die Stufe ist kein Filter, und Veroeffentlichen holt die Antwort neu

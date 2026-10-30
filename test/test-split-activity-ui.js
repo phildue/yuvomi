@@ -287,6 +287,224 @@ test('Neuladen in derselben Gruppe blaettert nach, bis der bisher letzte Eintrag
   } finally { b.abbauen(); }
 });
 
+// --------------------------------------------------------------------------
+// Ausgabenliste seitenweise (#2108). Die Route paginiert (30 je Seite), die
+// Seite fragte einmal ohne limit/offset und las `pagination` nie: eine Gruppe
+// zeigte ihre 30 juengsten Ausgaben, die 31. liess sich weder oeffnen noch
+// bearbeiten. Jetzt dasselbe "Mehr laden" wie im Verlauf, und ein Neuladen
+// (nach Bearbeiten/Loeschen) behaelt die geladene Tiefe.
+// --------------------------------------------------------------------------
+
+// Alle am selben Tag in derselben Sekunde - die Reihenfolge der Route ist dann
+// id absteigend (wie seit #2108 auf dem Server).
+function ausgabe(id, extra = {}) {
+  return { id, title: `Ausgabe ${id}`, amount: '5.00', currency: 'EUR', payer_name: 'Alex', category: 'other', expense_date: '2026-09-01', created_at: '2026-09-01 10:00:00', ...extra };
+}
+
+/** Liegt `e` in der Reihenfolge der Route hinter dem Cursor? (Datum, Anlage, id - je absteigend) */
+function hinterCursor(e, q) {
+  if (e.expense_date !== q.get('before_date')) return e.expense_date < q.get('before_date');
+  if (e.created_at !== q.get('before_at')) return e.created_at < q.get('before_at');
+  return e.id < Number(q.get('before_id'));
+}
+
+/**
+ * Buehne fuer die Ausgabenliste: `#split-expense-list` ist der Kasten, den
+ * renderExpenseBox neu zeichnet. Der Server-Doppel beantwortet limit, offset
+ * und den Cursor wie die Route (has_more genau, next_cursor aus der letzten
+ * Zeile), je Gruppe aus `server[groupId]`.
+ */
+function ausgabenBuehne({ server, antwort = null, groupId = 2, modus = 'write', geladen = null }) {
+  const gets = [];
+  const box = {
+    html: '',
+    replaceChildren() { this.html = ''; },
+    insertAdjacentHTML(_p, m) { this.html += m; },
+    querySelector: () => ({ focus() {} }),
+  };
+  const leer = {
+    hidden: false, removeAttribute() {}, replaceChildren() {}, insertAdjacentHTML() {},
+    querySelector: () => null, querySelectorAll: () => [], addEventListener() {},
+  };
+  const vorher = { ...split.state };
+  Object.assign(split.state, {
+    activeGroupId: groupId, groupStatus: 'active', user: null, category: '',
+    groups: [{ id: groupId, name: 'Urlaub Ostsee', type: 'trip', description: '' }, { id: 5, name: 'WG', type: 'household', description: '' }],
+    expenses: [], expensesCursor: null, expensesKey: null, expensesLoadingMore: false,
+    balances: { balances: [], simplified_debts: [] }, activity: [], activityCursor: null, activityGroupId: null,
+    meta: { currencies: ['EUR'], default_currency: 'EUR' },
+    ...(geladen || {}),
+  });
+  split.renderMainForTest({ querySelector: (sel) => (sel === '#split-expense-list' ? box : leer) });
+  const routeAntwort = (path) => {
+    const m = path.match(/\/groups\/(\d+)\/expenses\?/);
+    if (!m) return { data: [] };
+    const q = new URL(path, 'http://x').searchParams;
+    const liste = (server[m[1]] || []).filter((e) => !q.get('category') || e.category === q.get('category'));
+    const limit = Number(q.get('limit') || 30);
+    const offset = Number(q.get('offset') || 0);
+    const rest = (q.get('before_id') ? liste.filter((e) => hinterCursor(e, q)) : liste).slice(offset);
+    const data = rest.slice(0, limit);
+    const mehr = rest.length > limit;
+    const last = data.at(-1);
+    return { data, pagination: { limit, has_more: mehr, next_cursor: mehr ? { before_date: last.expense_date, before_at: last.created_at, before_id: last.id } : null } };
+  };
+  globalThis.__apiStub = {
+    get: async (path) => { gets.push(path); return (antwort && antwort(path)) ?? routeAntwort(path); },
+  };
+  setPermissions({ admin: false, modules: { budget: modus }, widgets: {}, capabilities: {} });
+  const zeichne = () => {
+    box.replaceChildren();
+    box.insertAdjacentHTML('beforeend', split.renderExpenses(split.state.groupStatus === 'archived' || modus === 'read'));
+    return box.html;
+  };
+  return {
+    box, gets, zeichne,
+    ausgabenGets: () => gets.filter((p) => p.includes('/expenses')),
+    abbauen() {
+      clearPermissions();
+      delete globalThis.__apiStub;
+      Object.assign(split.state, vorher);
+    },
+  };
+}
+
+const einunddreissig = () => Array.from({ length: 31 }, (_, i) => ausgabe(131 - i));
+
+/** Die Abfrage eines GET-Pfads als Objekt - der Cursor ist dort lesbar. */
+const abfrage = (path) => Object.fromEntries(new URL(path, 'http://x').searchParams);
+const CURSOR_102 = { before_date: '2026-09-01', before_at: '2026-09-01 10:00:00', before_id: '102' };
+
+test('Ausgaben (#2108): 31 Ausgaben zeigen "Mehr laden", der Klick holt die 31. - bei jedem Recht und im Archiv', async () => {
+  for (const modus of ['write', 'read']) {
+    for (const archiviert of [false, true]) {
+      const b = ausgabenBuehne({ server: { 2: einunddreissig() }, modus });
+      try {
+        split.state.groupStatus = archiviert ? 'archived' : 'active';
+        await split.loadGroupData();
+        assert.deepEqual(b.ausgabenGets(), ['/split-expenses/groups/2/expenses?limit=30'], 'erste Seite mit der Seitengroesse der Route');
+        assert.equal(split.state.expenses.length, 30);
+        const html = b.zeichne();
+        assert.match(html, /<button type="button" class="btn btn--secondary split-expenses-more" data-expenses-more>splitExpenses\.loadMoreActivity<\/button>/, `${modus} archiv=${archiviert}`);
+        assert.doesNotMatch(html, /data-expense-(?:id|view)="101"/, 'die 31. steht noch nicht da');
+        await split.onExpenseListClick(klickAus(html, 'data-expenses-more'));
+        assert.equal(b.ausgabenGets().length, 2);
+        assert.deepEqual(abfrage(b.ausgabenGets()[1]), { limit: '30', ...CURSOR_102 }, 'hinter dem Cursor der letzten Zeile, kein offset');
+        assert.equal(split.state.expenses.length, 31);
+        assert.match(b.box.html, /data-expense-(?:id|view)="101"/, 'die 31. steht im Kasten und laesst sich oeffnen');
+        assert.doesNotMatch(b.box.html, /data-expenses-more/, 'alles geladen: kein Knopf mehr');
+      } finally { b.abbauen(); }
+    }
+  }
+});
+
+test('Ausgaben (#2108): genau 30 Ausgaben - kein "Mehr laden"', async () => {
+  const b = ausgabenBuehne({ server: { 2: einunddreissig().slice(0, 30) } });
+  try {
+    await split.loadGroupData();
+    assert.equal(split.state.expenses.length, 30);
+    assert.equal(split.state.expensesCursor, null);
+    assert.doesNotMatch(b.zeichne(), /data-expenses-more/);
+  } finally { b.abbauen(); }
+});
+
+test('Ausgaben (#2108): nach Bearbeiten und Loeschen bleibt die geladene Tiefe', async () => {
+  const server = { 2: einunddreissig() };
+  const b = ausgabenBuehne({ server });
+  try {
+    await split.loadGroupData();
+    await split.onExpenseListClick(klickAus(b.zeichne(), 'data-expenses-more'));
+    assert.equal(split.state.expenses.length, 31);
+    // Bearbeiten der 31. - der Speicherweg laedt danach loadGroupData().
+    server[2] = server[2].map((e) => (e.id === 101 ? { ...e, title: 'Fähre zurück' } : e));
+    await split.loadGroupData();
+    assert.equal(split.state.expenses.length, 31, 'nicht auf 30 zurueckgefallen');
+    assert.equal(split.state.expenses.find((e) => e.id === 101)?.title, 'Fähre zurück', 'die bearbeitete Ausgabe steht mit neuem Titel da');
+    assert.equal(new URL(b.ausgabenGets().at(-1), 'http://x').searchParams.get('limit'), '32', 'die bisherige Tiefe in einer Abfrage');
+    // Loeschen weiter oben: die 31. bleibt in der Liste.
+    server[2] = server[2].filter((e) => e.id !== 120);
+    await split.loadGroupData();
+    assert.deepEqual(split.state.expenses.map((e) => e.id), server[2].map((e) => e.id), 'alle verbliebenen, keine Dublette');
+    assert.ok(split.state.expenses.some((e) => e.id === 101));
+    assert.equal(split.state.expensesCursor, null);
+  } finally { b.abbauen(); }
+});
+
+test('Ausgaben (#2108): Neuladen blaettert nach, bis die bisher letzte Ausgabe wieder da ist', async () => {
+  // 150 Ausgaben, 130 geladen: mehr als eine Abfrage (Obergrenze 100) - der
+  // Rest muss per Cursor nachkommen, sonst schrumpft die Liste.
+  const liste = Array.from({ length: 150 }, (_, i) => ausgabe(1000 - i));
+  const b = ausgabenBuehne({
+    server: { 2: liste },
+    geladen: { expenses: liste.slice(0, 130), expensesCursor: { before_date: '2026-09-01', before_at: '2026-09-01 10:00:00', before_id: 871 }, expensesKey: '2|' },
+  });
+  try {
+    await split.loadGroupData();
+    assert.deepEqual(b.ausgabenGets().map(abfrage), [
+      { limit: '100' },
+      { limit: '100', before_date: '2026-09-01', before_at: '2026-09-01 10:00:00', before_id: '901' },
+    ]);
+    assert.ok(split.state.expenses.some((e) => e.id === 871), 'die bisher letzte Ausgabe ist wieder geladen');
+    assert.equal(split.state.expensesCursor, null);
+  } finally { b.abbauen(); }
+});
+
+test('Ausgaben (#2108): Gruppenwechsel und Kategoriewechsel beginnen bei Seite 1', async () => {
+  const b = ausgabenBuehne({ server: { 2: einunddreissig(), 5: [ausgabe(500)] } });
+  try {
+    await split.loadGroupData();
+    await split.onExpenseListClick(klickAus(b.zeichne(), 'data-expenses-more'));
+    split.state.activeGroupId = 5;
+    await split.loadGroupData();
+    assert.equal(b.ausgabenGets().at(-1), '/split-expenses/groups/5/expenses?limit=30');
+    assert.deepEqual(split.state.expenses.map((e) => e.id), [500]);
+    split.state.activeGroupId = 2;
+    await split.loadGroupData();
+    await split.onExpenseListClick(klickAus(b.zeichne(), 'data-expenses-more'));
+    assert.equal(split.state.expenses.length, 31);
+    split.state.category = 'travel';
+    await split.loadGroupData();
+    assert.equal(b.ausgabenGets().at(-1), '/split-expenses/groups/2/expenses?limit=30&budget_category=travel', 'ein neuer Filter fragt neu, ohne die alte Tiefe');
+  } finally { b.abbauen(); }
+});
+
+test('Ausgaben (#2108): loescht jemand zwischen zwei Seiten eine Ausgabe weiter oben, fehlt keine', async () => {
+  // Mit `offset = geladene Zahl` rutschte die 31. nach dem Loeschen der 1. auf
+  // Platz 30, die Abfrage ab 30 begann hinter ihr - sie fehlte, und der Knopf
+  // verschwand trotzdem (Codex-Befund auf #2112). Der Cursor haengt an der
+  // letzten gesehenen Zeile, nicht an einer Zeilenzahl.
+  const server = { 2: einunddreissig() };
+  const b = ausgabenBuehne({ server });
+  try {
+    await split.loadGroupData();
+    server[2] = server[2].filter((e) => e.id !== 131);
+    await split.onExpenseListClick(klickAus(b.zeichne(), 'data-expenses-more'));
+    assert.ok(split.state.expenses.some((e) => e.id === 101), 'die bisher ungesehene 31. ist angehaengt');
+    assert.equal(split.state.expensesCursor, null);
+  } finally { b.abbauen(); }
+});
+
+test('Ausgaben (#2108): ein zweiter Klick waehrend der Ladung laedt nicht doppelt, eine Antwort nach dem Gruppenwechsel wird verworfen', async () => {
+  const seite = offen();
+  const b = ausgabenBuehne({
+    server: { 2: einunddreissig(), 5: [ausgabe(500)] },
+    antwort: (path) => (path.includes('/groups/2/expenses?') && path.includes('before_id=102') ? seite.promise : null),
+  });
+  try {
+    await split.loadGroupData();
+    const klick = klickAus(b.zeichne(), 'data-expenses-more');
+    const erster = split.onExpenseListClick(klick);
+    const zweiter = split.onExpenseListClick(klick);
+    assert.match(b.box.html, /data-expenses-more aria-disabled="true" aria-busy="true"/, 'der Knopf ist gesperrt');
+    split.state.activeGroupId = 5;
+    await split.loadGroupData();
+    seite.resolve({ data: [ausgabe(101)], pagination: { limit: 30, has_more: false, next_cursor: null } });
+    await Promise.all([erster, zweiter]);
+    assert.equal(b.ausgabenGets().filter((p) => p.includes('before_id=102')).length, 1, 'eine Anfrage');
+    assert.deepEqual(split.state.expenses.map((e) => e.id), [500], 'die alte Seite haengt nichts an die neue Gruppe');
+  } finally { b.abbauen(); }
+});
+
 test('Datum: der Tag in der Haushaltszone, nicht der UTC-Tag', () => {
   const vorher = { ...split.state };
   try {
@@ -506,14 +724,30 @@ test('die Gruppenzahl steht am Kopf der Liste, die Kennzahlen nennen ihre Gruppe
     render();
     assert.equal(zaehler.textContent, '2', 'der Kopf „Gruppen" traegt die Zahl');
     assert.doesNotMatch(summary.html, /split-summary-groups|splitExpenses\.activeGroups/, 'keine Kachel ueber alle Gruppen neben denen der gewaehlten');
-    assert.equal((summary.html.match(/class="metric-card[ "]/g) ?? []).length, 2, 'zwei Kacheln: bekommen und schulden');
-    assert.match(summary.html, /metric-card__label">splitExpenses\.youAreOwedInGroup\{&quot;group&quot;:&quot;Haus &lt;&amp;&gt;&quot;\}</, 'der Name der Gruppe steht escaped im Label');
-    assert.match(summary.html, /metric-card__label">splitExpenses\.youOweInGroup\{&quot;group&quot;:&quot;Haus &lt;&amp;&gt;&quot;\}</);
+    // R22 D9: EINE Saldo-Aussage - die Richtung, die nicht null ist. Bis dahin
+    // "Du bekommst 0,00 €" gross und "Du schuldest 24,14 €" klein daneben.
+    assert.equal((summary.html.match(/class="metric-card[ "]/g) ?? []).length, 1, 'eine Kachel: die Schuld');
+    assert.match(summary.html, /metric-card__label">splitExpenses\.youOweInGroup\{&quot;group&quot;:&quot;Haus &lt;&amp;&gt;&quot;\}</, 'der Name der Gruppe steht escaped im Label');
+    assert.doesNotMatch(summary.html, /youAreOwed/, 'keine Null-Kachel "Du bekommst"');
     // R19: die Kurzzeile (nur schmal, direkt ueber der Gruppenwahl) nennt die
     // Gruppe NICHT - mit ihr brach "Du bekommst in Haushalt" bei 390px um.
-    assert.match(glance.html, /budget-glance__label">splitExpenses\.youAreOwed</, 'die Kurzzeile sagt nur die Richtung');
-    assert.match(glance.html, /budget-glance__flow[^"]*">splitExpenses\.youOwe </);
+    assert.match(glance.html, /budget-glance__label">splitExpenses\.youOwe</, 'die Kurzzeile sagt die Richtung, die gilt');
+    assert.match(glance.html, /budget-glance__value[^"]*">24,14/);
+    assert.doesNotMatch(glance.html, /budget-glance__flow|aria-expanded/, 'eine Zahl: kein Nebenwert, kein Aufklapper');
     assert.doesNotMatch(glance.html, /InGroup/, 'kein Gruppenname in der Kurzzeile');
+    // Ohne Saldo: "Ausgeglichen", nicht "Du bekommst 0,00 €".
+    render({ balances: { balances: [] } });
+    assert.match(glance.html, /budget-glance__label">splitExpenses\.balanced</);
+    assert.match(summary.html, /metric-card__label">splitExpenses\.balancedInGroup\{/);
+    assert.doesNotMatch(summary.html, /metric-card--positive/, 'null ist kein Gewinn');
+    // Man bekommt etwas: gruen, eine Kachel.
+    render({ balances: { balances: [{ user_id: 7, net: '12.00', net_minor: 1200, currency: 'EUR' }] } });
+    assert.match(summary.html, /class="metric-card metric-card--positive">\s*<div class="metric-card__label">splitExpenses\.youAreOwedInGroup/);
+    assert.equal((summary.html.match(/class="metric-card[ "]/g) ?? []).length, 1);
+    // Beide Richtungen (zwei Waehrungen): beide Kacheln, die Kurzzeile klappt auf.
+    render({ balances: { balances: [{ user_id: 7, net: '12.00', net_minor: 1200, currency: 'EUR' }, { user_id: 7, net: '-5.00', net_minor: -500, currency: 'USD' }] } });
+    assert.equal((summary.html.match(/class="metric-card[ "]/g) ?? []).length, 2);
+    assert.match(glance.html, /aria-controls="split-summary"/);
     render({ activeGroupId: null, groups: [] });
     assert.match(summary.html, /metric-card__label">splitExpenses\.youOwe</, 'ohne Gruppe das schlichte Label');
   } finally {
@@ -525,6 +759,44 @@ test('die Gruppenzahl steht am Kopf der Liste, die Kennzahlen nennen ihre Gruppe
   assert.ok(![...eachRule(css)].some((r) => r.selector.includes('.split-summary-groups')), 'keine Regel fuer eine Karte, die es nicht mehr gibt');
   const src = readFileSync(new URL('../public/pages/split-expenses.js', import.meta.url), 'utf8');
   assert.match(src, /class="split-panel-title u-section-title">\$\{t\('splitExpenses\.groups'\)\}<span class="list-group__count split-panel-count" id="split-group-count">/);
+});
+
+// Critique R23 P1: eine Gruppensuche ohne Treffer zeigte "Ausgeglichen 0,00 €"
+// und zweimal "Noch keine Ausgabengruppen" - falsch, es gibt Gruppen, nur
+// keine Treffer. Jetzt: EIN Such-Leerzustand an der Liste, die Kennzahl aus
+// allen Gruppen, der Hauptbereich leer.
+test('Gruppensuche ohne Treffer: Such-Leerzustand einmal, Kennzahl aus allen Gruppen', () => {
+  const vorher = { ...split.state };
+  const box = () => ({
+    html: '', hidden: false,
+    replaceChildren() { this.html = ''; }, insertAdjacentHTML(_p, h) { this.html += h; },
+    querySelector: () => null, querySelectorAll: () => [], removeAttribute() {}, setAttribute() {},
+  });
+  const boxen = { '#split-groups': box(), '#split-main': box(), '#split-glance': box(), '#split-summary': box(), '#split-groups-total': box() };
+  const root = { querySelector: (sel) => boxen[sel] ?? null };
+  try {
+    Object.assign(split.state, {
+      groupStatus: 'active', groups: [], activeGroupId: null, query: 'urlaub', user: { id: 7 },
+      balances: { balances: [] },
+      dashboard: { total_owed: [], total_owing: [{ amount: '196.14', currency: 'EUR' }] },
+      meta: { currencies: ['EUR'], default_currency: 'EUR' },
+    });
+    split.renderGroupsForTest(root);
+    const liste = boxen['#split-groups'].html;
+    assert.match(liste, /common\.searchNoResultsTitle/, 'die Liste sagt "keine Treffer"');
+    assert.match(liste, /urlaub/, 'mit dem Suchbegriff');
+    assert.match(liste, /data-split-reset-search/, 'mit dem Weg zurueck');
+    assert.doesNotMatch(liste, /emptyGroupsTitle/, 'nicht "Noch keine Gruppen"');
+    boxen['#split-main'].html = 'alt';
+    split.renderMainForTest(root);
+    assert.equal(boxen['#split-main'].html, '', 'kein zweiter Leerzustand im Hauptbereich');
+    split.renderSummaryForTest(root);
+    const glance = boxen['#split-glance'].html;
+    assert.match(glance, /196,14/, 'die Kennzahl gilt allen Gruppen');
+    assert.doesNotMatch(glance, /splitExpenses\.balanced/, 'nicht "Ausgeglichen"');
+  } finally {
+    Object.assign(split.state, vorher);
+  }
 });
 
 // Review an #1767: die Kurzzeile liest seit R17 (E5) aus `state.balances`. Der
@@ -563,5 +835,34 @@ test('R20: der eigene Saldo heisst "Du schuldest ..." bzw. "... schuldet dir", f
     for (const key of ['youOweInGroup', 'youAreOwedInGroup']) {
       assert.match(s[key], /^\{\{group\}\}\s?[:：]/, `${file}: ${key} fuehrt mit dem Gruppennamen (${s[key]})`);
     }
+  }
+});
+
+// Critique R22 (D9, a4 P2): die Gruppe "Haushalt" vom Typ Haushalt stand als
+// "Haushalt / Haushalt" im Kopf und "Haushalt · Haushalt · 2 Mitglieder" in der Wahl.
+test('R22 D9: der Gruppentyp faellt weg, wo er den Namen wiederholt', () => {
+  assert.equal(split.groupTypeLabel({ name: 'splitExpenses.groupType.household', type: 'household' }), '', 'gleich dem Namen: kein Typ');
+  assert.equal(split.groupTypeLabel({ name: ' SPLITEXPENSES.GROUPTYPE.HOUSEHOLD ', type: 'household' }), '', 'Gross/klein und Rand zaehlen nicht');
+  assert.equal(split.groupTypeLabel({ name: 'Italienurlaub 2026', type: 'travel' }), 'splitExpenses.groupType.travel');
+});
+
+test('R22 D9: die Summe aller Gruppen nennt nur die Richtung, die nicht null ist', () => {
+  const total = { html: '', hidden: true, replaceChildren() { this.html = ''; }, insertAdjacentHTML(_p, h) { this.html += h; } };
+  const box = () => ({ html: '', replaceChildren() {}, insertAdjacentHTML() {}, querySelector: () => null });
+  const vorher = { ...split.state };
+  const run = (dashboard) => {
+    total.html = '';
+    Object.assign(split.state, { groupStatus: 'active', groups: [{ id: 1, name: 'A' }], activeGroupId: 1, user: { id: 7 },
+      balances: { balances: [] }, dashboard, meta: { currencies: ['EUR'], default_currency: 'EUR' } });
+    split.renderSummaryForTest({ querySelector: (sel) => (sel === '#split-groups-total' ? total : sel === '#split-group-count' ? { textContent: '' } : box()) });
+    return total.html;
+  };
+  try {
+    const owing = run({ total_owed: [], total_owing: [{ amount: '196.14', currency: 'EUR' }] });
+    assert.match(owing, /splitExpenses\.youOwe <strong>196,14/);
+    assert.doesNotMatch(owing, /youAreOwed/, 'keine Null in Gegenrichtung');
+    assert.match(run({ total_owed: [], total_owing: [] }), /split-groups-total__part">splitExpenses\.balanced</);
+  } finally {
+    Object.assign(split.state, vorher);
   }
 });

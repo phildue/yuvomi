@@ -5,26 +5,30 @@
  */
 
 import { api } from '/api.js';
-import { openModal as openSharedModal, closeModal, advancedSection, refocusAfterRender } from '/components/modal.js';
-import { openDetailView } from '/components/detail-view.js';
+import { openModal as openSharedModal, closeModal, advancedSection, refocusAfterRender, captureModalContext, captureOpenContext, isModalContextCurrent, reportFieldErrors } from '/components/modal.js';
+import { errorSentence, isAlreadyDeleted, loadErrorSentence } from '/utils/friendly-error.js';
+import { openDetailView, leaveDetailTo } from '/components/detail-view.js';
 import { stagger, vibrate, wireScrollFade, scheduleUndoableDelete } from '/utils/ux.js';
-import { t, formatDate } from '/i18n.js';
-import { esc, REQUIRED_MARK } from '/utils/html.js';
+import { t } from '/i18n.js';
+import { esc, REQUIRED_MARK, externalHref } from '/utils/html.js';
 import { initials } from '/utils/initials.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
 import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
 import { pageToolsMenuHtml, pageToolsActionEl, popoverMenuHtml, installPopoverMenus } from '/utils/popover-menu.js';
 import { parseVCards } from '/utils/vcard.js';
+import { birthDateText, birthDateFieldHtml, wireBirthDateField } from '/utils/birth-date.js';
 import { getReadableTextColor, AVATAR_FALLBACK_COLOR } from '/utils/color.js';
 import { composeDisplayName, contactSortKey, splitDisplayName } from '/utils/contact-name.js';
+import { CONTACT_PHONE_MAX_LENGTH } from '/utils/contact-limits.js';
 import { getPhoneFormatter, createAsYouType, countryFromRegion } from '/utils/phone.js';
 import { emptyStateHTML, searchEmptyHTML } from '/utils/empty-state.js';
 import { splitViewDetailHtml, mountMasterDetail, setSelectionBulk } from '/utils/master-detail.js';
 import { redrawList, collapseRow } from '/utils/list-motion.js';
 import '/components/category-manager.js';
 import { findPageFab } from '/utils/fab.js';
+import { filterButtonHtml, syncFilterButton, openFilterSheet, filterChipHtml } from '/utils/filter-sheet.js';
 import { isNavModuleReadOnly } from '/permissions.js';
-import { mayWritePath } from '/utils/module-access.js';
+import { mayWritePath, pathAccess } from '/utils/module-access.js';
 
 // --------------------------------------------------------
 // Konstanten
@@ -265,8 +269,8 @@ export async function render(container, { user, signal } = {}) {
       </div>
       <div id="contacts-status" class="sr-only" role="status" aria-live="polite"></div>
       <div class="split-view contacts-split">
-        <div id="contacts-list" class="contacts-list page-scrollport split-view__list" aria-busy="true">
-          <div class="contacts-filters page-chip-row" id="contacts-filters" role="group" aria-label="${t('contacts.categoryLabel')}"></div>
+        <div id="contacts-list" class="contacts-list page-scrollport split-view__list" data-scroll-port="contacts" aria-busy="true">
+          <div class="contacts-filters page-chip-row" id="contacts-filters" role="group" aria-label="${t('contacts.categoryLabel')}" data-pending></div>
           <div id="contacts-rows" class="contacts-rows">${renderSkeletonList({ rows: 6, lines: 2 })}</div>
         </div>
         ${splitViewDetailHtml({
@@ -413,7 +417,9 @@ export async function render(container, { user, signal } = {}) {
   // Kategorie-Filter: Rand-Fade-Affordanz für die scrollende Chipzeile
   // (geteilte has-fade-*-Konvention, Audit F-06 — Scrollbalken ist versteckt).
   wireScrollFade(_container.querySelector('#contacts-filters'));
+  wireWheelToRow(_container.querySelector('#contacts-filters'));
   _container.querySelector('#contacts-filters').addEventListener('click', (e) => {
+    if (e.target.closest('#contacts-category-filter')) { openContactCategoryFilter(); return; }
     const chip = e.target.closest('[data-cat]');
     if (!chip) return;
     _container.querySelectorAll('.contact-filter-chip').forEach((c) => {
@@ -446,8 +452,10 @@ export async function render(container, { user, signal } = {}) {
     let text;
     try {
       text = await file.text();
-    } catch (err) {
-      window.yuvomi?.showToast(t('contacts.importError', { error: err.message }), 'danger');
+    } catch {
+      // Die Datei liess sich nicht lesen: der Satz des Browsers ist nicht
+      // uebersetzt, also der allgemeine (#1909).
+      window.yuvomi?.showToast(t('contacts.importError', { error: t('common.errorGeneric') }), 'danger');
       return;
     }
     const parsed  = parseVCards(text, {
@@ -504,15 +512,87 @@ function filterCategoryKeys() {
   return keys.length < 2 && !state.activeCategory ? [] : keys;
 }
 
+/**
+ * PASST DIE REIHE NICHT, STEHT EIN FILTERKNOPF (R24, Critique G5 Kontakte-P3-2).
+ * Die Chipreihe lief am Desktop in der 424px-Spalte aus dem Bild
+ * („Dienstleistungen" nur per Querscroll), am Telefon schon ab „Familie".
+ * Solange alle Chips in die Reihe passen und es hoechstens vier Kategorien
+ * sind, bleibt sie die schnelle Facette im Scrollport (Kopfregel „wenige
+ * Facetten"); sonst steht an ihrer Stelle EIN Filterknopf mit Zaehler, die
+ * Kategorien als Chips im Blatt bzw. am Desktop als Popover - derselbe
+ * Baustein wie die Aufteilung. Gemessen wird die Reihe selbst: schneidet sie,
+ * merkt sie sich ihre Breite und versucht die Chips erst wieder, wenn sie
+ * breiter geworden ist.
+ */
+const CONTACT_CHIP_MAX = 4;
+let _chipOverflowWidth = null;
+let _chipRowObserver = null;
+let _chipRowObserved = null;
+
+function watchChipRow(bar) {
+  if (typeof ResizeObserver !== 'function' || _chipRowObserved === bar) return;
+  _chipRowObserver?.disconnect();
+  _chipOverflowWidth = null;
+  _chipRowObserved = bar;
+  _chipRowObserver = new ResizeObserver(() => {
+    if (!bar.isConnected) { _chipRowObserver?.disconnect(); _chipRowObserver = null; _chipRowObserved = null; return; }
+    const width = bar.clientWidth;
+    if (_chipOverflowWidth != null && width > _chipOverflowWidth) { _chipOverflowWidth = null; renderCategoryFilters(); }
+    else if (_chipOverflowWidth == null && bar.querySelector('[data-cat]') && bar.scrollWidth > width + 1) renderCategoryFilters();
+  });
+  _chipRowObserver.observe(bar);
+}
+
+function openContactCategoryFilter() {
+  const keys = filterCategoryKeys();
+  const active = state.activeCategory || '';
+  const chips = [
+    filterChipHtml({ filter: 'contacts-category', value: '', label: t('contacts.filterAll'), active: !active }),
+    ...state.categories.filter((c) => keys.includes(c.key))
+      .map((c) => filterChipHtml({ filter: 'contacts-category', value: c.key, label: catLabel(c.key), active: c.key === active })),
+  ].join('');
+  const panel = openFilterSheet({
+    groups: [{ heading: t('contacts.categoryLabel'), html: `<div class="filter-panel__chips" role="group" aria-label="${esc(t('contacts.categoryLabel'))}">${chips}</div>` }],
+    anchor: () => _container?.querySelector('#contacts-category-filter'),
+    onReset: () => { state.activeCategory = null; renderList(); },
+  });
+  panel?.addEventListener('click', (e) => {
+    const chip = e.target.closest('.filter-chip[data-filter="contacts-category"]');
+    if (!chip) return;
+    panel.querySelectorAll('.filter-chip[data-filter="contacts-category"]').forEach((el) => {
+      const on = el === chip;
+      el.classList.toggle('filter-chip--active', on);
+      el.setAttribute('aria-pressed', String(on));
+    });
+    state.activeCategory = chip.dataset.value || null;
+    renderList();
+  });
+}
+
 function renderCategoryFilters() {
   const bar = _container?.querySelector('#contacts-filters');
   if (!bar) return;
+  // Die Reihe haelt ihren Platz, bis die Daten da sind (contacts.css, R23):
+  // gerufen wird hier erst mit ihnen.
+  bar.removeAttribute('data-pending');
   const active = state.activeCategory;
   const keys = filterCategoryKeys();
+  watchChipRow(bar);
+  const asButton = keys.length > CONTACT_CHIP_MAX || _chipOverflowWidth != null;
+  bar.classList.toggle('contacts-filters--button', asButton);
   // Nur neu bauen, wenn sich die Menge der Chips geaendert hat: renderList()
   // ruft hier bei jedem Tastendruck der Suche, und ein Neubau naehme einem
   // gerade fokussierten Chip den Fokus.
-  const signature = keys.join(',');
+  const signature = `${asButton ? 'button:' : ''}${keys.join(',')}`;
+  if (asButton) {
+    const button = bar.querySelector('#contacts-category-filter');
+    if (bar.dataset.chips === signature && button) { syncFilterButton(button, active ? 1 : 0); return; }
+    bar.dataset.chips = signature;
+    bar.replaceChildren();
+    bar.insertAdjacentHTML('beforeend', filterButtonHtml({ id: 'contacts-category-filter', count: active ? 1 : 0, showLabel: true }));
+    if (window.lucide) lucide.createIcons({ el: bar });
+    return;
+  }
   const chips = () => bar.querySelectorAll('[data-cat]');
   if (bar.dataset.chips === signature && (chips().length > 0) === (keys.length > 0)) {
     for (const chip of chips()) {
@@ -535,6 +615,13 @@ function renderCategoryFilters() {
   bar.replaceChildren();
   bar.insertAdjacentHTML('beforeend', allChip + catChips);
   if (window.lucide) lucide.createIcons({ el: bar });
+  // Schneidet die Reihe, wird sie zum Knopf (siehe oben). Ohne Layout (Sonden,
+  // verborgene Spalte) ist clientWidth 0 - dann bleibt es bei den Chips.
+  if (bar.clientWidth > 0 && bar.scrollWidth > bar.clientWidth + 1) {
+    _chipOverflowWidth = bar.clientWidth;
+    renderCategoryFilters();
+    return;
+  }
   if (focusedCat !== undefined) bar.querySelector(`[data-cat="${CSS.escape(focusedCat)}"]`)?.focus();
 }
 
@@ -563,7 +650,8 @@ function openContactCategoryManager() {
       // ankommt, ist immer ein Fehler DIESER Auffrischung - und der erklaert als
       // einziger, warum die Seite den alten Stand behaelt.
       console.error('[Contacts] Auffrischen nach Kategorie-Aenderung fehlgeschlagen:', err);
-      window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+      // Ein Ladefehler: sein Satz, nie der Text des Servers (#1909).
+      window.yuvomi?.showToast(loadErrorSentence(err) ?? t('common.errorGeneric'), 'danger');
     }
   };
   openSharedModal({
@@ -657,6 +745,7 @@ function contactsEmptyStateHtml(filtered) {
     description: ro ? '' : t('contacts.emptyDescription'),
     hint: ro ? '' : t('emptyHint.contacts'),
     action: ro ? null : {
+      tone: 'secondary',
       label: t('contacts.emptyAction'),
       icon: 'plus',
       attrs: { 'data-action': 'empty-cta' },
@@ -755,15 +844,19 @@ async function enhancePhones(root) {
   for (const el of els) {
     const raw = el.dataset.phoneRaw;
     if (el.tagName === 'A') {
-      // href aktualisieren; textContent (Icon) bleibt unangetastet.
+      // href aktualisieren. Ein Aktionslink ("Anrufen", Icon) behaelt sein Wort.
       el.href = fmt.tel(raw, country);
-    } else {
-      const display = fmt.display(raw, country);
-      // Nummer ist immer LTR - in RTL-Locales (ar/fa) sonst Bidi-Umbruch bei '+'.
-      el.setAttribute('dir', 'ltr');
-      // Nur den ANZEIGETEXT setzen - der Rohwert lebt weiter in data-phone-raw.
-      if (display !== raw) el.textContent = display;
+      // TRAEGT DER LINK DIE NUMMER SELBST (Zeile der Detailansicht), bekommt er
+      // dieselbe Anzeige wie die Listenzeile (Critique R21, a3): vorher stand
+      // in der Liste "+49 231 4452210", im Detail derselbe Kontakt als
+      // "+49 231 445 2210" - der Zweig hier setzte nur das Ziel.
+      if (el.textContent.trim() !== raw.trim()) continue;
     }
+    const display = fmt.display(raw, country);
+    // Nummer ist immer LTR - in RTL-Locales (ar/fa) sonst Bidi-Umbruch bei '+'.
+    el.setAttribute('dir', 'ltr');
+    // Nur den ANZEIGETEXT setzen - der Rohwert lebt weiter in data-phone-raw.
+    if (display !== raw) el.textContent = display;
   }
 }
 
@@ -881,10 +974,12 @@ function renderContactItem(c) {
   }
 
   // Primäre, stets sichtbare Zeilenaktion: Anrufen (falls Telefon vorhanden).
+  // Neutral wie jede Zeilenaktion (R23, Ulas 25.10.; bis dahin gruen nach
+  // Audit F1) - die Modulfarbe traegt "Anrufen" in der Leseansicht.
   // Der Name nennt die Person: zwoelf Zeilen, die alle "Anrufen" heissen, sind
   // fuer einen Screenreader eine Zeile.
   const callBtn = c.phone
-    ? `<a href="tel:${esc(c.phone)}" data-phone-raw="${esc(c.phone)}" class="row-action row-action--success" aria-label="${esc(t('contacts.callNamed', { name: c.name }))}">
+    ? `<a href="tel:${esc(c.phone)}" data-phone-raw="${esc(c.phone)}" class="row-action" aria-label="${esc(t('contacts.callNamed', { name: c.name }))}">
          <i data-lucide="phone" aria-hidden="true"></i>
        </a>`
     : '';
@@ -991,14 +1086,18 @@ function contactLinksNode(entries) {
     const line = document.createElement('div');
     line.className = 'contact-detail__value';
 
-    const a = document.createElement('a');
-    a.className = 'contact-detail__link';
-    a.href = href;
+    // Ohne sicheres Ziel (eine Website ohne http(s), etwa aus einer vCard)
+    // steht der Wert als Text da statt als Link.
+    const a = document.createElement(href ? 'a' : 'span');
+    if (href) {
+      a.className = 'contact-detail__link';
+      a.href = href;
+    }
     a.textContent = text;
     // enhancePhones() ersetzt danach nur den Anzeigetext; der Rohwert im href
     // und im data-Attribut bleibt unberührt.
     if (phoneRaw) a.dataset.phoneRaw = phoneRaw;
-    if (external) { a.target = '_blank'; a.rel = 'noopener'; }
+    if (external && href) { a.target = '_blank'; a.rel = 'noopener'; }
     line.appendChild(a);
 
     if (sub) {
@@ -1038,7 +1137,7 @@ const mvSubLabel = (label) => (!label || label === 'other' ? '' : label);
  * hatten in der App bislang überhaupt keine Anzeige - das Formular führt sie
  * nicht. Sie stehen hier als reine Leseinformation.
  */
-function renderContactDetail(contact) {
+function renderContactDetail(contact, { onBirthdayLinked = null } = {}) {
   // Solange der Einzelabruf läuft, speist der Legacy-Einzelwert die Gruppe -
   // besser eine Nummer sofort als drei nach dem Roundtrip.
   const phones = contact.phones?.length
@@ -1089,13 +1188,23 @@ function renderContactDetail(contact) {
     {
       icon: 'cake',
       label: t('contacts.birthdayLabel'),
-      value: contact.birthday ? formatDate(contact.birthday) : '',
+      // Ohne eigenes Datum zeigt die Zeile das des verknuepften Geburtstags
+      // (R22, D7: der Geburtstag-Dialog verknuepft auch Kontakte ohne Datum) -
+      // sonst fiele die Zeile weg und mit ihr der Weg dorthin.
+      value: contact.birthday
+        ? birthDateText(contact.birthday, contact.birthday_year_unknown)
+        : birthDateText(contact.birthday_link_date, contact.birthday_link_year_unknown),
+      // DER WEG ZUM GEBURTSTAG (Critique R21, D7; #2149): verknuepft fuehrt
+      // die Zeile dorthin, unverknuepft legt sie den Eintrag an - in derselben
+      // Folgeaktion, siehe birthdayRowAction().
+      action: birthdayRowAction(contact, onBirthdayLinked),
     },
+    birthdaySuggestionRow(contact, onBirthdayLinked),
     {
       icon: 'globe',
       label: t('contacts.websiteLabel'),
       node: contactLinksNode(contact.website
-        ? [{ href: contact.website, text: contact.website, external: true }]
+        ? [{ href: externalHref(contact.website), text: contact.website, external: true }]
         : []),
     },
     { icon: 'quote',      label: t('contacts.nicknameLabel'), value: contact.nickname || '' },
@@ -1132,9 +1241,19 @@ function openContactDetail(contact, { inPane = null } = {}) {
   // damit die Reihenfolge nicht stillschweigend zur Voraussetzung wird.
   let view = null;
   let card = null;
-  const ready = fetchFullContact(contact).then((loaded) => {
+  // #2149: ist der Geburtstag angelegt, zeigt dieselbe Zeile "Anzeigen" und
+  // bekommt den Fokus, den der ersetzte Knopf mitnahm.
+  const detailOptions = {
+    onBirthdayLinked: (loaded) => {
+      if (!refresh(loaded)) return;
+      const root = inPane ?? document;
+      root.querySelector?.('#contact-detail-birthday')?.focus();
+    },
+  };
+  const ready = fetchFullContact(contact).then((loaded) => { refresh(loaded); });
+  function refresh(loaded) {
     full = loaded;
-    if (!view?.update(renderContactDetail(full))) return;
+    if (!view?.update(renderContactDetail(full, detailOptions))) return false;
     // Organisation und Zweitnummern kennt erst der Einzelabruf. In der Spalte
     // steht die Karte ausserhalb der Zeilen und wird getauscht; im Blatt lag
     // sie in dem Bereich, den update() gerade neu gefuellt hat, und kommt neu.
@@ -1147,13 +1266,15 @@ function openContactDetail(contact, { inPane = null } = {}) {
       card = mountContactCard(full, null);
     }
     enhanceDetailPhones(inPane);
-  });
+    return true;
+  }
 
   const actions = [{
     id: 'contact-detail-export',
     label: t('contacts.exportLabel'),
-    variant: 'ghost',
     icon: 'download',
+    // Selten gesucht, darum im Mehr-Menue des Fusses mit Wort (R24).
+    more: true,
     onClick: () => window.open(`/api/v1/contacts/${contact.id}/vcard`, '_blank', 'noopener'),
   }];
 
@@ -1166,7 +1287,7 @@ function openContactDetail(contact, { inPane = null } = {}) {
     actions.unshift({
       id: 'contact-detail-delete',
       label: t('common.delete'),
-      variant: 'danger-ghost',
+      variant: 'danger-outline',
       icon: 'trash-2',
       align: 'start',
       // force + await wie überall in dieser Grammatik: Löschen entscheidet über
@@ -1196,7 +1317,7 @@ function openContactDetail(contact, { inPane = null } = {}) {
     key: `contact:${contact.id}`,
     size: 'md',
     pane: inPane ?? undefined,
-    sections: renderContactDetail(full),
+    sections: renderContactDetail(full, detailOptions),
     actions,
     // OHNE SCHREIBRECHT KEIN „BEARBEITEN" IM KOPF. `openDetailView` setzt die
     // Kopf-Aktion genau dann, wenn dieser Schluessel steht (detail-view.js) -
@@ -1358,9 +1479,14 @@ async function fetchFullContact(contact) {
 
 async function openContactModal({ mode, contact = null }) {
   if (readOnly()) return;
+  // Kommt der volle Kontakt erst, nachdem der Nutzer einen anderen Dialog
+  // geoeffnet oder die Seite verlassen hat, geht das Formular nicht mehr auf (#1997).
+  const context = captureOpenContext();
   if (mode === 'edit') contact = await fetchFullContact(contact);
+  if (!isModalContextCurrent(context)) return;
   const form = buildContactForm({ mode, contact });
-  openSharedModal({ title: form.title, content: form.content, size: 'md', onSave: form.wire });
+  // Anlegen: Buehne zuerst, Felder nach dem ersten Bild (modal.js `staged`, R21 a6).
+  openSharedModal({ title: form.title, content: form.content, size: 'md', onSave: form.wire, staged: mode === 'create' });
 }
 
 /**
@@ -1394,7 +1520,7 @@ function buildContactForm({ mode, contact = null }) {
   const mvRow = (kind, row, isFirst) => `
     <div class="contact-mv-row" data-mv-row>
       <input type="${kind === 'phone' ? 'tel' : 'email'}" class="form-input" data-mv-value
-             ${isFirst ? `id="cm-${kind}"` : ''} value="${esc(row.value)}"
+             ${isFirst ? `id="cm-${kind}"` : ''} value="${esc(row.value)}"${kind === 'phone' ? ` maxlength="${CONTACT_PHONE_MAX_LENGTH}"` : ''}
              placeholder="${t(kind === 'phone' ? 'contacts.phonePlaceholder' : 'contacts.emailPlaceholder')}"
              autocomplete="${kind === 'phone' ? 'tel' : 'email'}"${mvLocked(kind) ? ' readonly aria-describedby="cm-email-locked"' : ''}>
       <input type="text" class="form-input contact-mv-row__label" data-mv-label maxlength="50"
@@ -1412,7 +1538,7 @@ function buildContactForm({ mode, contact = null }) {
       <div class="contact-mv-list" data-mv-list>${rows.map((r, i) => mvRow(kind, r, i === 0)).join('')}</div>
       ${mvLocked(kind)
         ? `<p class="form-hint" id="cm-email-locked">${t('contacts.emailLockedHint')}</p>`
-        : `<button type="button" class="btn btn--ghost contact-mv-add" data-mv-add>
+        : `<button type="button" class="btn btn--ghost btn--sm contact-mv-add" data-mv-add>
         <i data-lucide="plus" class="icon-sm" aria-hidden="true"></i>${t(addKey)}
       </button>`}
       ${kind === 'phone'
@@ -1473,11 +1599,13 @@ function buildContactForm({ mode, contact = null }) {
       <label class="form-label" for="cm-address">${t('contacts.addressLabel')}</label>
       <input type="text" class="form-input" id="cm-address" placeholder="${t('contacts.addressPlaceholder')}" value="${v('address')}" autocomplete="street-address">
     </div>
-    <div class="form-group">
-      <label class="form-label" for="cm-birthday">${t('contacts.birthdayLabel')}</label>
-      <yuvomi-datepicker id="cm-birthday" type="date" value="${v('birthday')}"></yuvomi-datepicker>
-      <p class="form-hint">${t('contacts.birthdayHint')}</p>
-    </div>
+    ${birthDateFieldHtml({
+      id: 'cm-birthday',
+      label: t('contacts.birthdayLabel'),
+      value: isEdit ? contact.birthday : '',
+      yearUnknown: isEdit ? contact.birthday_year_unknown : false,
+      hint: t('contacts.birthdayHint'),
+    })}
     <div class="form-group">
       <label class="form-label" for="cm-notes">${t('contacts.notesLabel')}</label>
       <textarea class="form-input" id="cm-notes" rows="2" placeholder="${t('contacts.notesPlaceholder')}">${v('notes')}</textarea>
@@ -1507,14 +1635,18 @@ function buildContactForm({ mode, contact = null }) {
     ${mvSection('phone', phoneRows, 'contacts.phoneLabel', 'contacts.mvAddPhone')}
     ${mvSection('email', emailRows, 'contacts.emailLabel', 'contacts.mvAddEmail')}
 
-    ${advancedSection(advancedFieldsHtml, { open: advancedOpen })}
+    ${advancedSection(advancedFieldsHtml, {
+      open: advancedOpen,
+      // Was dahinter liegt, nennt die Zeile (R24 D4, Inventar-Muster).
+      hint: [t('contacts.addressLabel'), t('contacts.birthdayLabel'), t('contacts.notesLabel')].join(', '),
+    })}
 
     <div class="modal-panel__footer contact-modal__footer">
-      ${isEdit && !contact.family_user_id ? `<button type="button" class="btn btn--danger-outline" id="cm-delete" style="margin-inline-end:auto">
+      ${isEdit && !contact.family_user_id ? `<button type="button" class="btn btn--danger-outline" id="cm-delete">
         <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${t('common.delete')}
       </button>` : '<div></div>'}
       <div class="contact-modal__footer-actions">
-        <button class="btn btn--secondary" id="cm-cancel">${t('common.cancel')}</button>
+        <button type="button" class="btn btn--secondary" id="cm-cancel" data-action="close-modal">${t('common.cancel')}</button>
         <button class="btn btn--primary" id="cm-save">${isEdit ? t('common.save') : t('common.add')}</button>
       </div>
     </div>`;
@@ -1523,6 +1655,12 @@ function buildContactForm({ mode, contact = null }) {
     title: isEdit ? t('contacts.editContact') : t('contacts.newContact'),
     content,
     wire(panel) {
+      // EIN RUECKWEG IM BEARBEITEN (R23 S11b, Critique G5 P3; Kanon R19 in
+      // detail-view.js): mit `data-action="close-modal"` erkennt die
+      // Detailansicht das Abbrechen als den Weg zurueck in die Leseansicht und
+      // nimmt ihr Kopf-"Zurueck" weg. Vorher standen mobil drei Ausgaenge da
+      // (Zurueck, x, Abbrechen), und Abbrechen schloss das ganze Blatt. Der
+      // eigene Listener bleibt fuer den Anlege-Dialog ohne Leseansicht.
       panel.querySelector('#cm-cancel').addEventListener('click', closeModal);
 
       // Mehrwert-Gruppen: Zeile ergänzen/entfernen (Telefon + E-Mail).
@@ -1554,6 +1692,32 @@ function buildContactForm({ mode, contact = null }) {
         if (window.lucide) lucide.createIcons({ el: catIcon });
       });
 
+      // Die gewaehlte Kategorie wurde inzwischen geloescht (#1909): das
+      // Formular bleibt offen, die Kategorien kommen frisch, und die Auswahl
+      // faellt auf eine, die es gibt - die Eingaben bleiben stehen.
+      async function offerCurrentCategories(owner) {
+        try {
+          const res = await api.get('/contacts/categories');
+          state.categories = res.data ?? [];
+        } catch {
+          return;
+        }
+        if (_container === owner) renderCategoryFilters();
+        if (!catSel?.isConnected) return;
+        const chosen = catSel.value;
+        const known = new Set(state.categories.map((c) => c.key));
+        catSel.replaceChildren();
+        catSel.insertAdjacentHTML('beforeend', [
+          ...(orphanCat ? [`<option value="${esc(orphanCat)}">${esc(orphanCat)}</option>`] : []),
+          ...state.categories.map((c) => `<option value="${esc(c.key)}">${esc(catLabel(c.key))}</option>`),
+        ].join(''));
+        catSel.value = known.has(chosen) || chosen === orphanCat ? chosen
+          : known.has(FALLBACK_CATEGORY) ? FALLBACK_CATEGORY
+            : (state.categories[0]?.key ?? '');
+        catSel.dispatchEvent(new Event('change'));
+        catSel.focus();
+      }
+
       panel.querySelector('#cm-delete')?.addEventListener('click', async () => {
         closeModal({ force: true });
         await deleteContact(contact.id);
@@ -1565,6 +1729,8 @@ function buildContactForm({ mode, contact = null }) {
       // Nutzer sie bestätigt hat - sonst bekäme "AutoHaus König" beim Ändern
       // einer Telefonnummer stillschweigend den Nachnamen "König" und würde in
       // der Liste umsortiert (#535).
+      const birthdayField = wireBirthDateField(panel, 'cm-birthday');
+
       let nameTouched = false;
       panel.querySelectorAll('#cm-first-name, #cm-last-name').forEach((input) => {
         input.addEventListener('input', () => { nameTouched = true; });
@@ -1595,21 +1761,29 @@ function buildContactForm({ mode, contact = null }) {
         const phone    = phoneEntries[0]?.value || null;
         const email    = emailEntries[0]?.value || null;
         const address  = panel.querySelector('#cm-address').value.trim() || null;
-        const birthday = panel.querySelector('#cm-birthday')?.value || null;
+        // Ohne Jahr kommen Monat und Tag mit dem Platzhalterjahr (#2095).
+        const birth    = birthdayField.read();
+        const birthday = birth.date;
         const notes    = panel.querySelector('#cm-notes').value.trim() || null;
-
-        if (!name) {
-          window.yuvomi?.showToast(t('contacts.nameRequiredHint'), 'danger');
-          panel.querySelector('#cm-first-name').focus();
+        if (birth.yearUnknown && !birth.complete) {
+          window.yuvomi?.showToast(t('birthdays.yearlessIncomplete'), 'warning');
           return;
         }
 
+        // DER FEHLER STEHT AM FELD (R23, Critique G5 P3; D8 wie Geburtstage):
+        // vorher ein Toast, der das Feld nicht nannte - jetzt die Meldung am
+        // Vornamen (aria-invalid, aria-describedby), der Fokus darin.
+        if (!name && reportFieldErrors([[panel.querySelector('#cm-first-name'), t('contacts.nameRequiredHint')]])) return;
+
         saveBtn.disabled    = true;
         saveBtn.textContent = '…';
+        const owner = _container;
+        const dialog = captureModalContext();
 
         try {
           // firstName/lastName sind führend; der Server leitet `name` daraus ab (#535).
-          const body = { name, category, phone, email, address, notes, birthday };
+          const body = { name, category, phone, email, address, notes, birthday,
+            birthday_year_unknown: !!birthday && birth.yearUnknown };
           // Replace-Set: das Formular hält alle Werte, Label-Pflicht des Servers
           // deckt 'other' als neutrales Default ab.
           body.phones = phoneEntries.map((r, i) => ({ label: r.label || 'other', value: r.value, isPrimary: i === 0 }));
@@ -1634,7 +1808,9 @@ function buildContactForm({ mode, contact = null }) {
             const idx = state.contacts.findIndex((c) => c.id === contact.id);
             if (idx !== -1) state.contacts[idx] = res.data;
           }
-          closeModal({ force: true });
+          // Nur dieser Dialog, nicht einer, der waehrend der Anfrage
+          // aufgegangen ist (#1997).
+          closeModal({ force: true, context: dialog });
           renderList({ motion: true });
           // In der Spalte: das Gespeicherte steht rechts - das Bearbeitete neu
           // gezeichnet, das Neue ausgewaehlt (wie in Apples Kontakten), sofern
@@ -1648,9 +1824,17 @@ function buildContactForm({ mode, contact = null }) {
         } catch (err) {
           window.yuvomi?.showToast(err.data?.reason === 'email_in_use'
             ? t('common.emailInUse')
-            : (err.data?.error ?? t('common.unknownError')), 'danger');
+            : errorSentence(err), 'danger');
           saveBtn.disabled    = false;
           saveBtn.textContent = isEdit ? t('common.save') : t('common.add');
+          // Den Kontakt gibt es nicht mehr (#1909): das Formular geht zu,
+          // solange es das offene ist, und der Kontakt faellt aus der Liste.
+          if (isEdit && isAlreadyDeleted(err, 'contacts_contact_not_found')) {
+            closeModal({ force: true, context: dialog });
+            dropGoneContacts([contact.id], owner);
+          } else if (err?.data?.reason === 'contacts_selected_category_not_found') {
+            await offerCurrentCategories(owner);
+          }
         }
       });
     },
@@ -1701,8 +1885,10 @@ function exitSelectMode() {
   // Menue-Knopf, ueber den man hineingekommen ist - sonst faellt er auf <body>.
   const refocus = _container.querySelector('#contacts-select-cancel')?.contains(document.activeElement);
   syncSelectChrome();
-  if (refocus) _container.querySelector('.contacts-toolbar .page-tools-btn')?.focus();
+  // ERST die Klasse, DANN der Fokus: im Auswahlmodus ist das Menue
+  // ausgeblendet (contacts.css, R23) und nimmt keinen Fokus an.
   _container.querySelector('.contacts-page')?.classList.remove('is-selecting');
+  if (refocus) _container.querySelector('.contacts-toolbar .page-tools-btn')?.focus();
   setSelectionBulk(md, null);
   renderList();
 }
@@ -1777,11 +1963,12 @@ async function deleteSelected() {
 
   scheduleUndoableDelete({
     message: t('contacts.bulkDeletedToast', { count: ids.length }),
-    commit: ({ keepalive }) => Promise.all(ids.map((id) => api.delete(`/contacts/${id}`, { keepalive }))),
+    // Je Kontakt: schon geloescht ist ein Erfolg (#1909).
+    commit: ({ keepalive }) => Promise.all(ids.map((id) => deleteOnServer(id, { keepalive }))),
     restore: (err) => {
       state.contacts = [...state.contacts, ...removed].sort(byName);
       renderList();
-      if (err) window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+      if (err) window.yuvomi?.showToast(errorSentence(err), 'danger');
     },
   });
 }
@@ -1802,15 +1989,38 @@ async function deleteContact(id) {
 
   scheduleUndoableDelete({
     message: t('contacts.deletedToast'),
-    commit: ({ keepalive }) => api.delete(`/contacts/${id}`, { keepalive }),
+    commit: ({ keepalive }) => deleteOnServer(id, { keepalive }),
     restore: (err) => {
       if (contact) {
         state.contacts = [...state.contacts, contact].sort(byName);
         if (_container === owner) renderList({ motion: true });
       }
-      if (err) window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+      if (err) window.yuvomi?.showToast(errorSentence(err), 'danger');
     },
   });
+}
+
+/**
+ * Einen Kontakt am Server loeschen. SCHON GELOESCHT IST EIN ERFOLG (#1909):
+ * ein anderes Haushaltsmitglied war schneller. Kontakte haben keine
+ * Sichtbarkeit - die 404 heisst nur "gibt es nicht mehr". Alles andere bleibt
+ * ein Fehler, und die Zeile kommt zurueck.
+ */
+async function deleteOnServer(id, { keepalive } = {}) {
+  try {
+    await api.delete(`/contacts/${id}`, { keepalive });
+  } catch (err) {
+    if (!isAlreadyDeleted(err, 'contacts_contact_not_found')) throw err;
+  }
+}
+
+/** Kontakte, die es nicht mehr gibt, aus dem Stand nehmen - gezeichnet nur auf der Seite, von der die Anfrage kam. */
+function dropGoneContacts(ids, owner) {
+  const gone = new Set(ids);
+  state.contacts = state.contacts.filter((c) => !gone.has(c.id));
+  if (!owner || _container !== owner) return;
+  renderList();
+  md?.refresh({ repaint: true });
 }
 
 // --------------------------------------------------------
@@ -1872,7 +2082,7 @@ function importSelectionRowHtml(contact, index) {
       <span class="vcard-import-row__name">${esc(contact.name)}</span>
       ${detail ? `<span class="vcard-import-row__detail">${esc(detail)}</span>` : ''}
       ${contact.birthday
-        ? `<span class="vcard-import-row__bday" title="${esc(formatDate(contact.birthday))}"><i data-lucide="cake" aria-hidden="true"></i></span>`
+        ? `<span class="vcard-import-row__bday" title="${esc(birthDateText(contact.birthday, contact.birthdayYearUnknown))}"><i data-lucide="cake" aria-hidden="true"></i></span>`
         : ''}
       ${exists ? `<span class="vcard-import-row__badge">${t('contacts.importExistsBadge')}</span>` : ''}
     </label>`;
@@ -1896,6 +2106,7 @@ function openImportSelectionModal(named, skipped) {
         </div>
         <div class="vcard-import__list">${named.map(importSelectionRowHtml).join('')}</div>
         ${skippedHtml}
+        <p class="form-hint form-hint--danger vcard-import__reason" data-import-reason role="status" hidden></p>
         <div class="modal-panel__footer modal-panel__footer--plain">
           <button class="btn btn--secondary" type="button" id="vcard-import-cancel">${t('common.cancel')}</button>
           <button class="btn btn--primary" type="button" id="vcard-import-submit">${t('contacts.importSubmit', { count: 0 })}</button>
@@ -1907,13 +2118,16 @@ function openImportSelectionModal(named, skipped) {
       const toggleBtn = panel.querySelector('#vcard-import-toggle');
       const status    = panel.querySelector('#vcard-import-status');
       const boxes     = [...panel.querySelectorAll('.vcard-import__list input[type="checkbox"]')];
+      const reasonEl  = panel.querySelector('[data-import-reason]');
 
       const selectedIndices = () => boxes.filter((b) => b.checked).map((b) => Number(b.value));
 
       const refresh = (announce = false) => {
         const n = selectedIndices().length;
         submitBtn.textContent = t('contacts.importSubmit', { count: n });
-        submitBtn.disabled = n === 0;
+        // DER PRIMAERKNOPF IST NIE GESPERRT (R24, D4): ohne Wahl sagt er beim
+        // Tippen, was fehlt (unten), statt grau dazustehen.
+        if (n > 0) reasonEl.hidden = true;
         toggleBtn.textContent = boxes.every((b) => b.checked)
           ? t('contacts.importDeselectAll')
           : t('contacts.importSelectAll');
@@ -1932,15 +2146,188 @@ function openImportSelectionModal(named, skipped) {
 
       submitBtn.addEventListener('click', async () => {
         const chosen = selectedIndices().map((i) => named[i]);
-        if (chosen.length === 0) return;
+        if (chosen.length === 0) {
+          // Derselbe Satz wie im Geburtstags-Import (dieselbe Lage: Kontakte waehlen).
+          reasonEl.textContent = t('birthdays.importNothingSelected');
+          reasonEl.hidden = false;
+          boxes[0]?.focus();
+          return;
+        }
+        // Geschlossen wird nur dieser Dialog, nicht einer, der waehrend des
+        // Imports aufgegangen ist (#1997).
+        const dialog = captureModalContext();
         submitBtn.disabled = true;
         toggleBtn.disabled = true;
         submitBtn.textContent = t('contacts.importImporting');
         await importParsedContacts(chosen);
-        closeModal({ force: true });
+        closeModal({ force: true, context: dialog });
       });
     },
   });
+}
+
+/**
+ * DIE CHIPREIHE BLEIBT EINE REIHE, AUCH AM DESKTOP (Critique R22, D20). Bis
+ * dahin brach sie am Zeigergeraet in zwei Reihen um (R10 L8: "eine Maus hat
+ * keine waagerechte Geste") und kostete 1280/1440 rund 48px Hoehe ueber der
+ * Liste. Jetzt scrollt sie wie mobil mit Fade an der Kante (`wireScrollFade`),
+ * und das Mausrad, das nur senkrecht dreht, bewegt sie waagerecht - solange
+ * es in seiner Richtung noch etwas zu zeigen gibt. Am Ende der Reihe (und
+ * mit Strg zum Zoomen, oder einer echten Waagerecht-Geste vom Trackpad) geht
+ * das Rad an die Seite weiter; die Seite scrollt also nie fest.
+ * @param {HTMLElement|null} row
+ */
+function wireWheelToRow(row) {
+  row?.addEventListener('wheel', (e) => {
+    if (e.ctrlKey || e.deltaX !== 0 || e.deltaY === 0 || row.scrollWidth <= row.clientWidth) return;
+    const before = row.scrollLeft;
+    row.scrollLeft = before + e.deltaY;
+    if (row.scrollLeft !== before) e.preventDefault();
+  }, { passive: false });
+}
+
+/** Die Adresse eines Geburtstags: dieselbe wie aus der Suche (`?open=`). */
+function birthdayHref(id) {
+  return `/birthdays?open=${encodeURIComponent(String(id))}`;
+}
+
+/**
+ * Die Folgeaktion der Geburtstagszeile (Critique R21 D7, #2149): EIN Platz,
+ * zwei Zustaende. Verknuepft fuehrt sie zum Eintrag, unverknuepft legt sie
+ * ihn an - genau den, den der Import aus diesem Kontakt anlegen wuerde
+ * (`POST /birthdays/import` mit einer id, server/services/birthdays.js). Nach
+ * dem Anlegen wird aus "Hinzufuegen" an derselben Stelle "Anzeigen"; eine
+ * zweite Stelle (Fuss, Karte) haette zwei Wege fuer einen Wert gebaut.
+ *
+ * Ohne Geburtsdatum gibt es keine Zeile (detailRowEl wirft sie weg) und
+ * nichts zu importieren. Angeboten wird nur, was der Server annimmt: die
+ * Frage stellt `mayOpenBirthdayImport()` mit dem Pfad, den der Knopf
+ * schreibt (`calendar: write`, Modul nicht abgeschaltet). Kontakte-Leserecht
+ * verlangt der Import auch - wer diese Ansicht sieht, hat es.
+ *
+ * @param {object} contact
+ * @param {((loaded: object) => void)|null} onLinked  bekommt den neu geladenen Kontakt
+ */
+function birthdayRowAction(contact, onLinked = null) {
+  if (contact.birthday_id) {
+    return mayOpenBirthdays() ? {
+      id: 'contact-detail-birthday',
+      label: t('contacts.showBirthday'),
+      icon: 'cake',
+      onClick: () => leaveDetailTo(birthdayHref(contact.birthday_id)),
+    } : null;
+  }
+  // Heisst schon ein Geburtstag so (Hinweis unten), legte "Hinzufuegen" einen
+  // zweiten fuer denselben Menschen an - dann ist "Verknuepfen" der Weg.
+  if (!contact.birthday || contact.suggested_birthday_id || !mayOpenBirthdayImport()) return null;
+  return {
+    id: 'contact-detail-birthday-add',
+    label: t('contacts.addToBirthdays'),
+    icon: 'calendar-plus',
+    onClick: ({ button } = {}) => addContactToBirthdays(contact, { button, onLinked }),
+  };
+}
+
+/**
+ * Der ruhige Hinweis auch im Kontakt (Critique R22, D7): der Geburtstag zeigt
+ * "Ein Kontakt heisst genauso" (birthdays.js, contactSuggestionRow), und
+ * dasselbe Paar steht jetzt auch hier - `suggested_birthday_id` liefert der
+ * Server nur mit Kalender-Leserecht und nur fuer genau einen unverknuepften
+ * Geburtstag dieses Namens. Eine Zeile wie jede andere der Ansicht, mit
+ * "Verknuepfen" als Folgeaktion (dieselben Worte wie dort). Ohne das Recht,
+ * den Geburtstag zu schreiben, gibt es nichts zu tun, also auch keine Zeile.
+ *
+ * @param {object} contact
+ * @param {((loaded: object) => void)|null} onLinked
+ */
+function birthdaySuggestionRow(contact, onLinked = null) {
+  if (!contact.suggested_birthday_id || contact.birthday_id || !mayLinkBirthday()) return null;
+  return {
+    icon: 'cake',
+    label: t('nav.birthdays'),
+    // Gleicher Tag, anderer Name (R23): der Satz nennt den Geburtstag, weil
+    // der Leser ihn sonst nicht wiedererkennt.
+    value: contact.suggested_birthday_name
+      ? t('contacts.birthdaySuggestSameDate', { name: contact.suggested_birthday_name })
+      : t('contacts.birthdaySuggestValue'),
+    action: {
+      id: 'contact-detail-birthday-link',
+      label: t('birthdays.linkContact'),
+      icon: 'link',
+      onClick: ({ button } = {}) => linkContactToBirthday(contact, contact.suggested_birthday_id, { button, onLinked }),
+    },
+  };
+}
+
+/** Darf der Hinweis verknuepfen? `PUT /birthdays/:id` gehoert `calendar`. */
+function mayLinkBirthday() {
+  return !globalThis.window?.yuvomi?.isModuleDisabled?.('birthdays') && mayWritePath('/birthdays');
+}
+
+/**
+ * Verknuepft den gleichnamigen Geburtstag mit diesem Kontakt und laedt den
+ * Kontakt neu - danach traegt die Geburtstagszeile "In Geburtstagen anzeigen"
+ * (samt Datum des Eintrags, wo der Kontakt keins hat), und der Hinweis ist weg.
+ * Wie beim Anlegen zaehlt der neu gelesene Kontakt, nicht die Antwort.
+ *
+ * @returns {Promise<object|null>} der neu geladene Kontakt, oder null
+ */
+async function linkContactToBirthday(contact, birthdayId, { button = null, onLinked = null } = {}) {
+  if (!mayLinkBirthday()) return null;
+  if (button) button.disabled = true;
+  try {
+    await api.put(`/birthdays/${birthdayId}`, { contact_id: contact.id });
+    const loaded = (await api.get(`/contacts/${contact.id}`)).data;
+    if (!loaded?.birthday_id) throw new Error('birthday not linked');
+    const i = state.contacts.findIndex((c) => c.id === contact.id);
+    if (i !== -1) state.contacts[i] = { ...state.contacts[i], birthday_id: loaded.birthday_id };
+    window.yuvomi?.showToast(t('contacts.linkedToBirthday'), 'success');
+    onLinked?.(loaded);
+    return loaded;
+  } catch (err) {
+    if (button?.isConnected) button.disabled = false;
+    window.yuvomi?.showToast(errorSentence(err), 'danger');
+    return null;
+  }
+}
+
+/**
+ * Legt den verknuepften Geburtstag an und laedt den Kontakt neu.
+ *
+ * Gelesen wird danach der KONTAKT, nicht die Antwort des Imports: die meldet
+ * nur Zahlen, und ein `skipped` heisst auch "jemand war schneller" - dann
+ * traegt der Kontakt die `birthday_id` trotzdem, und das ist ein Erfolg. Nur
+ * ein Kontakt, der danach immer noch keinen Eintrag hat, ist ein Fehlschlag.
+ *
+ * @returns {Promise<object|null>} der neu geladene Kontakt, oder null
+ */
+async function addContactToBirthdays(contact, { button = null, onLinked = null } = {}) {
+  if (!mayOpenBirthdayImport()) return null;
+  if (button) button.disabled = true;
+  try {
+    await api.post('/birthdays/import', { contact_ids: [contact.id] });
+    const loaded = (await api.get(`/contacts/${contact.id}`)).data;
+    if (!loaded?.birthday_id) throw new Error('birthday not linked');
+    const i = state.contacts.findIndex((c) => c.id === contact.id);
+    if (i !== -1) state.contacts[i] = { ...state.contacts[i], birthday_id: loaded.birthday_id };
+    window.yuvomi?.showToast(t('contacts.addedToBirthdays'), 'success');
+    onLinked?.(loaded);
+    return loaded;
+  } catch (err) {
+    if (button?.isConnected) button.disabled = false;
+    window.yuvomi?.showToast(errorSentence(err), 'danger');
+    return null;
+  }
+}
+
+/**
+ * Darf die Leseansicht zum Geburtstag springen? (Critique R21, D7) Dieselbe
+ * Paarung wie beim Import unten: `/birthdays` gehoert `calendar`, und ein
+ * haushaltweit abgeschaltetes Modul leitet der Router um - beides waere eine
+ * Sackgasse hinter dem Knopf.
+ */
+function mayOpenBirthdays() {
+  return !globalThis.window?.yuvomi?.isModuleDisabled?.('birthdays') && pathAccess('/birthdays') !== 'none';
 }
 
 /**
@@ -1992,7 +2379,9 @@ async function importParsedContacts(list) {
   const failedList = [];
   for (const contact of list) {
     try {
-      const res = await api.post('/contacts', contact);
+      // Der Parser spricht camelCase, die API `birthday_year_unknown` (#2095).
+      const { birthdayYearUnknown, ...fields } = contact;
+      const res = await api.post('/contacts', { ...fields, birthday_year_unknown: !!fields.birthday && birthdayYearUnknown });
       state.contacts.push(res.data);
       imported++;
       if (res.data.birthday) withBirthday++;
@@ -2041,8 +2430,9 @@ function showImportResult({ imported, withBirthday, failedList, lastName, lastEr
   let type;
   if (imported === 0) {
     // Alles fehlgeschlagen: konkrete Ursache nennen (Recovery), Retry via Aktion.
-    const reason = window.yuvomi?.friendlyError?.(lastError) || lastError?.message || '';
-    message = t('contacts.importError', { error: reason });
+    // Ein abgewiesenes Feld nennt der Server als `reason` (#1909), der Satz
+    // dazu nennt das Feld und seine Grenze - nie der Text des Servers.
+    message = t('contacts.importError', { error: errorSentence(lastError) });
     type = 'danger';
   } else if (imported === 1 && details.length === 0) {
     // Persönlicher Einzel-Import: Name statt Zähler (Prinzip „persönlich").
@@ -2073,6 +2463,12 @@ export const __test = {
   // R8 H14: der Auswahlkreis als Programm.
   toggleContactSelection,
   openContactDetail, readOnly, state, buildContactForm,
+  // R21 D7: der Weg zum Geburtstag (die Zeilen stehen unten).
+  birthdayHref,
+  // #2149: unverknuepft legt dieselbe Zeile den Geburtstag an.
+  addContactToBirthdays,
+  // R22 D7: der Hinweis "Ein Geburtstag heisst genauso" und sein Verknuepfen.
+  linkContactToBirthday,
   // Der Import-Toast und sein Sprung (#1348): die Aussage ist ein Aufruf von
   // `showToast` und ein Flag in der sessionStorage, kein Markup.
   showImportResult, openBirthdayImport,
@@ -2084,4 +2480,13 @@ export const __test = {
   dropFiltersForDeepLink,
   // R10 L8: nur belegte Kategorien bekommen einen Chip.
   filterCategoryKeys,
+  // #1909: Speichern und Loeschen eines Kontakts, den es nicht mehr gibt.
+  openContactModal, deleteContact, deleteSelected,
+  // #1997: der vCard-Import schliesst nur seinen eigenen Dialog.
+  openImportSelectionModal,
+  setContainerForTest(container) { _container = container; },
+  // R21 S9b: Liste und Detail zeigen eine Nummer gleich.
+  enhancePhones,
+  // R22 D20: die Chipreihe und das Mausrad.
+  wireWheelToRow,
 };

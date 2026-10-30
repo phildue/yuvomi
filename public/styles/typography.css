@@ -98,6 +98,26 @@
   }
 }
 
+/* DER ZEITRAUM ALS TITEL (#1797, Shell-Variante `page-toolbar--period-as-title`,
+ * layout.css). Ab 1024px traegt der Zeitraum den Inline-Schnitt der
+ * Canonical-Page-Head-Rolle - er ist dort der sichtbare Titel, die groesste
+ * Schrift des Kopfs. Das Jahr steht in der Sekundaerfarbe, wie Apples
+ * Kalender „Oktober 2026" setzt; Ziffern tabellarisch, damit die gemessene
+ * Titelbreite fuer jeden Tag einer Ansicht gilt. */
+@media (min-width: 1024px) {
+  .page-toolbar--period-as-title .page-toolbar__period-title {
+    font-size: var(--type-toolbar-title);
+    font-weight: var(--font-weight-bold);
+    line-height: var(--line-height-tight);
+    letter-spacing: var(--tracking-tight);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .page-toolbar--period-as-title .page-toolbar__period-year {
+    color: var(--color-text-secondary);
+  }
+}
+
 /* DAS EINSTELLUNGS-BLATT MOBIL: EINE EBENE TIEFER, EINE GRAMMATIK (R14,
  * A8 P2-4). Unter 768px steht ueber dem Blatt die Zurueck-Leiste, der Titel
  * steht im Inhalt - bisher im Inline-Schnitt (22px), direkt ueber einem
@@ -146,15 +166,23 @@
 .loan-report__title,
 .day-view__date-label,
 .today-cockpit__header h2,
+/* EIN ABSCHNITT IST IMMER 20 (R24, Critique G6-Einst-P2-2). Bis R24 trat er
+ * unter einer Reichweite ("Fuer mich" / "Fuer den Haushalt") auf 17 zurueck -
+ * dieselbe Ueberschrift "Termin-Vorgaben" stand fuer Linda in 17, fuer Emma
+ * (ohne Haushalts-Reichweite) in 20. Die Reichweite ist jetzt ein
+ * Gruppenlabel (Block "Navigations-Gruppierungslabel"), keine Stufe ueber dem
+ * Abschnitt; damit haengt die Groesse eines Abschnitts nicht mehr davon ab,
+ * wer das Blatt oeffnet. */
 .settings-section__title,
-/* Die Reichweite eines Einstellungsblatts ("Fuer mich" / "Fuer den Haushalt")
- * gliedert Abschnitte, also traegt sie deren Stufe - siehe die Stufenleiter
- * weiter unten (R16). */
-/* Der Titel des Lese-Popovers traegt die Stufe des Blatts und der
- * Detailspalte (`.modal-panel__title`, Title 3): derselbe Termin stand im
- * Popover in 17px und im Blatt in 20px (Critique R18). */
+/* Der Titel des Lese-Popovers traegt die Stufe des Blatts (`.modal-panel__title`,
+ * Title 3): derselbe Termin stand im Popover in 17px und im Blatt in 20px
+ * (Critique R18). Die DETAILSPALTE hat seit R24 ihre eigene Rolle
+ * (Detailtitel, unten). */
 .detail-popover__title,
-.settings-scope__title,
+/* Der Kopf einer Listenspalte benennt die Spalte, wie "Alle Bereiche" der
+ * Gesundheit (`.health-areas__title`, u-section-title): "Ordner" stand dort in
+ * 14/600 sekundaer, eine Stufe ausserhalb jeder Rolle (R24, G0-Shell-P2-4). */
+.documents-folder-browser__title,
 .settings-navigation-panel__title,
 .split-group-name,
 .subscriptions-section-head h2,
@@ -232,10 +260,25 @@
  * und Filter-Labels): ganze Phrasen wie "Überfällig" oder Kategorienamen
  * ("Haushalt", "Schule") lasen in Versal + Tracking geschrien (Critique P2).
  * ------------------------------------------------------------------------ */
+/* DIE GRUPPE IN DEN EINSTELLUNGEN IST EINE ROLLE (R24, Critique G6-Einst-P2-2).
+ * Dieselben Gruppen standen in drei Groessen: die Spalte 12/600, die mobile
+ * Uebersicht 16/600 mit Glyphe (18 am Desktop), "Aktive Module"/"Navigation"
+ * 15/600 mit Haarlinie - und die Reichweite eines Blatts ("Fuer mich" / "Fuer
+ * den Haushalt") stand als 20er-Ueberschrift UEBER ihren Abschnitten, die
+ * deshalb auf 17 zurueckwichen. Alle vier gruppieren, keiner benennt einen
+ * Bereich: sie nehmen das Gruppierungslabel der Seitenleiste (Satzschreibung,
+ * Sekundaerton aus dem Modulblatt), und der Abschnitt darunter bleibt 20. */
 .nav-section-label,
 .more-sheet__section-label,
 .settings-shell__navigation-heading,
-.kanban-col__title {
+.settings-overview__heading,
+.settings-navigation-group__title,
+.settings-scope__title,
+.kanban-col__title,
+/* Die Gruppen der Schichtarten („Mit Uhrzeit", „Ganztaegig") gliedern EINEN
+ * Abschnitt - neben dem Abschnittstitel „Eigene Felder" (20) standen sie in
+ * 15/600 wie eine zweite Stufe (R24, Critique G1-Schichtplan-P3-2). */
+.schedule-type-group__title {
   font-size: var(--text-xs);
   font-weight: var(--font-weight-semibold);
   line-height: var(--line-height-tight);
@@ -246,20 +289,19 @@
  * Card-/Item-Titel
  * ------------------------------------------------------------------------ */
 .u-card-title,
-.budget-loan-card__title,
 .document-card__title,
 .document-row__title,
 .document-viewer__unsupported-title,
 .recipe-card__title,
 .settings-card__title,
-/* EINE STUFENLEITER IM EINSTELLUNGSBLATT (Critique 2026-10-05, R16). Gemessen
- * im Kalender-Blatt: Blatt 22px, Reichweite 16px, Abschnitt 20px, Karte 17px -
- * die Reichweite, die alles darunter gliedert, war die KLEINSTE Stufe. Jetzt
- * folgt die Groesse der Tiefe: Blatt 22, Reichweite 20, Abschnitt 17, Karte 16.
- * Ein Blatt ohne Reichweite hat eine Stufe weniger (22 / 20 / 17) - dieselbe
- * Leiter, nur kuerzer. Die Ebene im Baum zieht shell.js nach (`aria-level`). */
-.settings-scope .settings-section__title,
-.settings-member__name,
+/* DIE LEITER IM EINSTELLUNGSBLATT (R16, seit R24 ohne Sonderstufe): Blatt 22,
+ * Abschnitt 20, Karte 17 - gleich, ob das Blatt Reichweiten hat. R16 hatte die
+ * Reichweite zur 20er-Stufe gemacht und Abschnitt (17) und Karte (16) darunter
+ * geschoben; die Groesse eines Abschnitts hing damit an der Rolle dessen, der
+ * das Blatt oeffnet. Die Reichweite ist jetzt ein Gruppenlabel (oben), die
+ * Ebene im Baum zieht shell.js weiter nach (`aria-level`). Die
+ * Zusammenfassung eines Status ("Lokal", Dokumentablage) ist ein Kartentitel. */
+.settings-status-summary__title,
 .settings-provider__name,
 .settings-sync-info__name,
 /* Dashboard-Widget-Titel eine Stufe über den Zeilen-Titeln (17px vs. 15px, die
@@ -267,6 +309,11 @@
  * und Inhalt (Critique P3). Hier stand „16px vs. 14px" - die Zahlen der Skala
  * VOR der Apple-Umstellung, während die Regel darunter längst --type-card-title
  * liest. */
+/* Gesundheit: der Titel eines Diagramms ("Blutdruck") und der Kopf der
+ * letzten Messungen sind Untertitel unter dem Abschnitt - Headline, nicht 18
+ * (ausserhalb der Skala) und nicht 14 sekundaer (R24, G5-Gesundheit-P2-2/P3-2). */
+.health-chart-section__title,
+.health-recent__title,
 .widget__title {
   font-size: var(--type-card-title);
   font-weight: var(--font-weight-semibold);
@@ -285,16 +332,9 @@
 .documents-folder-item__name,
 .document-dropzone__title,
 .dms-result__title,
-.meal-card__title,
 .housekeeping-section-heading span,
-.reminder-section__title,
 .cat-row__name,
-.cat-subrow__name,
-/* Gruppentitel über den Modul-Listen ("Übersicht", "Planen"). Sie standen in
- * der Section-Rolle (18px) und wurden in settings.css auf 14px übersteuert -
- * die Registrierung behauptete das eine, die Datei tat das andere, und im
- * Ergebnis rendert dasselbe h3-Element zwei Größen (Critique 2026-07-27). */
-.settings-navigation-group__title {
+.cat-subrow__name {
   font-size: var(--type-secondary);
   font-weight: var(--font-weight-semibold);
   line-height: var(--line-height-snug);
@@ -311,10 +351,13 @@
  * Registrierung darueber, obwohl sie Zeilen sind). Kanon ist der haeufigste:
  * 16px, medium.
  *
- * DIE GRENZE ZUR HEADLINE: ein KARTEN-Titel (Rezeptkarte, Darlehen, Widget,
- * Kanban-Karte, Notizkarte) bleibt Headline bzw. ihre Dichte-Variante - eine
- * Karte ist ein Objekt mit eigener Flaeche und fuehrt ihren Titel als
- * Ueberschrift. Eine ZEILE steht in einem Traeger neben ihresgleichen; ihr
+ * DIE GRENZE ZUR HEADLINE: ein KARTEN-Titel (Rezeptkarte, Widget, Notizkarte)
+ * bleibt Headline bzw. ihre Dichte-Variante - eine Karte ist ein Objekt mit
+ * eigener Flaeche und fuehrt ihren Titel als Ueberschrift. KANBAN-KARTE,
+ * MAHLZEIT UND DARLEHEN NICHT MEHR (R23, N2): ihre Karten stehen gestapelt
+ * neben ihresgleichen wie Zeilen und tragen denselben Gegenstand wie die
+ * Zeile der Nachbaransicht (Aufgabe in Liste und Kanban, Mahlzeit in Woche und
+ * Tag) - 15/600 dort neben 16/500 hier hiess: eine Aufgabe, zwei Stimmen. Eine ZEILE steht in einem Traeger neben ihresgleichen; ihr
  * Name ist Lesetext mit Betonung, keine Ueberschrift. Wer `.list-row` traegt,
  * nimmt diese Rolle - ueber `.list-row__name` am Namen oder, wo der Name ein
  * eigenes Element mit eigener Geometrie ist, ueber die Registrierung hier.
@@ -328,15 +371,58 @@
  * (list-row.css), und zwei Zeilen Lesetext stehen im Body-Abstand.
  * Guard: test-typography.js, "der Zeilentitel ist eine Rolle".
  * ------------------------------------------------------------------------ */
+/* Die offene Anfrage der Belohnungen ist eine Zeile ihrer Liste und stand mit
+ * einem Literal-Gewicht in 16/600 (R24, G0-Inv-4). Der Modulname in Aktive
+ * Module und Navigation stand als nacktes `<strong>` in 16/700 (R24, S4-Rest). */
 .u-row-title,
-.settings-scope .settings-card__title,
+.rw-pending__title,
+.settings-module-row__name,
 .list-row__name,
+.budget-loan-card__title,
+.meal-card__title,
 .agenda-event__title,
 .contact-item__name,
 .subscription-card__name,
+.settings-member__name,
 .rw-standing__name {
   font-size: var(--text-base);
   font-weight: var(--font-weight-medium);
+}
+
+/* --------------------------------------------------------------------------
+ * Detailtitel: der Name des Objekts im Kopf einer Detailspalte (R24)
+ *
+ * Title 2, semibold. Die Spalte rechts neben der Liste (`.split-view__detail-
+ * title`, master-detail.js: Aufgaben, Kontakte, Rezepte, Inventar, Gesundheit)
+ * trug 18px - eine Stufe, die es in der Skala nicht gibt, und kleiner als der
+ * 20er-Abschnitt, der in der Gesundheit direkt darunter beginnt (Critique
+ * G0-Shell-P2-4, G5-Gesundheit-P2-2). Bold bleibt dem Modulkopf (Title 2 bold
+ * eine Ebene darueber); der Detailtitel tritt ueber das Gewicht zurueck, nicht
+ * ueber die Groesse.
+ * Guard: test-typography.js, "R24: die Titelleiter".
+ * ------------------------------------------------------------------------ */
+.split-view__detail-title {
+  font-size: var(--text-2xl);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  letter-spacing: var(--tracking-tight);
+}
+
+/* --------------------------------------------------------------------------
+ * Blocktitel im Zeitraster: der Name eines Blocks in Woche und Tag (R24)
+ *
+ * Caption 1, semibold - die Groesse des Rasters (der Block ist Mikrotext, seine
+ * Hoehe ist die Dauer). Der Schichtblock stand im Tag in 16/400 neben dem
+ * Termin in 12/600, in der Woche in 12/500 (Critique G1-Kalender-P3-3): drei
+ * Schnitte fuer dieselbe Stelle. Die Zeitzeile darunter bleibt im Modulblatt
+ * (calendar.css) und tritt ueber das Gewicht zurueck.
+ * ------------------------------------------------------------------------ */
+.week-event__title,
+.day-event__title,
+.schedule-time-block__title {
+  font-size: var(--text-xs);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
 }
 
 /* --------------------------------------------------------------------------
@@ -371,6 +457,164 @@
 }
 
 /* --------------------------------------------------------------------------
+ * DIE ENDZONE EINER ZEILE: Footnote 13, halbfett, gleich breite Ziffern
+ * (Critique DW 2026-10-26, DW-P1-4)
+ *
+ * Die eine Angabe am Ende einer Zeile (`.list-row__end`, list-row.css):
+ * "wird 41", "Noch 2 Tage", "120 Punkte", "3/26". Sie steht eine Stufe unter
+ * dem Namen und eine Gewichtsstufe ueber der Metazeile - sie ist der Grund,
+ * warum man auf die Zeile schaut, aber nicht ihr Name. Auf der Uebersicht
+ * standen dafuer vier Formen (Pille 13/600 auf Mulde, 15/700, 12/500, 15/600).
+ * ------------------------------------------------------------------------ */
+.list-row__end {
+  font-size: var(--type-caption);
+  font-weight: var(--font-weight-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------------------------------
+ * DIE METAZEILE: Footnote 13, regular (R21, Critique 2026-10-21, D4)
+ *
+ * EINE ZEILE IST TITEL 16 + METAZEILE 13. Was unter dem Namen einer Zeile,
+ * einer Karte oder einer Kachel steht und sie beschreibt - Datum, Ort, Anzahl,
+ * Betrag, Kategorie, Stand, Veraenderung -, ist die Metazeile. Gemessen stand
+ * dieselbe Stelle in drei Groessen: Aufgaben 12 (`.due-date`,
+ * `.priority-badge`), Budget, Inventar, Kontakte und Agenda 14
+ * (`.list-row__meta` und Verwandte), das Dashboard 12 neben seiner eigenen
+ * 13er Cockpitzeile. 14 gehoert Bedienelementen, 12 Badges, Nav-Labels und
+ * Mikrotext (DESIGN.md, Typography) - fuer Lesetext unter einem Namen war
+ * beides die falsche Stufe.
+ *
+ * Groesse und Grundgewicht stehen HIER, Farbe, Layout und Hervorhebung
+ * (Ueberfaellig halbfett, Planstand im Ton) im Modulblatt. Ein Chip oder Badge
+ * IN der Zeile (`.task-tag`, `.list-row__tag`, `.doc-badge`) ist ein Etikett
+ * und bleibt Caption 1. Die Zeilenhoehe erbt die Zeile.
+ *
+ * Guard: test-typography.js, "R21: die Metazeile ist eine Rolle" - er liest
+ * jede `__meta`-Klasse aus Stylesheets und Markup und verlangt sie hier oder
+ * als benannte Ausnahme dort; kein anderes Blatt setzt an diesen Subjekten
+ * eine Groesse.
+ * ------------------------------------------------------------------------ */
+.list-row__meta,
+/* Aufgaben: die Zeile und ihre Teile, die vorher je 12px trugen */
+.task-card__meta,
+.kanban-card__meta,
+.due-date,
+.priority-badge,
+/* Kueche (R24): die Metazeile des Vorrats (Menge, Status, MHD, Ort) und die
+   Zutatenzahl der Rezeptkachel unter dem Essensplan */
+.pantry-row__meta,
+.recipe-sidebar__card-meta,
+/* Kalender, Kontakte, Geburtstage */
+.agenda-event__meta,
+.contact-item__meta,
+.birthday-item__meta,
+/* Budget, Darlehen, Statistik, Plan */
+.budget-entry__meta,
+.budget-account__meta,
+.budget-loan-card__meta,
+.budget-loan-card__dates > span,
+.budget-loan-card__amounts span,
+.budget-bar-row__share,
+.budget-bar-row__of,
+.budget-plan-row__foot,
+.budget-chart-head__income,
+.budget-stats__readout,
+.budget-stats__legend,
+.split-group-meta,
+.split-group__meta,
+.split-expense__body span,
+.split-activity-item span,
+.subscription-card__meta,
+/* Kennzahl-Karten: Veraenderung, Notiz und Zusatz unter dem Wert; dazu die
+   Nebenwerte der mobilen Kurzzeile (Ein/Aus neben dem Saldo, bis S9b 14) */
+.metric-card__meta,
+.budget-glance__flows,
+.metric-card__trend,
+.metric-card__note,
+/* Dokumente und Inventar */
+.document-row__meta,
+.document-card__meta,
+.document-card__date,
+.document-viewer__meta,
+.document-upload-meta,
+.doc-attach-picker__item-meta,
+.inventory-booking-picker__item-meta,
+.dms-result__sub,
+.inventory-detail-list__sub,
+.inventory-history-entry__sub,
+/* Kueche, Belohnungen, Haushalt */
+.item-meta,
+.meal-card__meta,
+.meal-card__ingredients-count,
+.day-header__date,
+.rw-ledger-row__meta,
+.rw-pending__meta,
+.rw-progress__label,
+.rw-standing__points,
+.schedule-today__meta,
+.schedule-today__empty,
+.waste-source-detail__meta,
+/* Gesundheit */
+.health-area-row__status,
+.health-overview__stat-label,
+.health-dose__status,
+.health-med-card__sub,
+.health-recent__date,
+.health-prevention-due-row__date,
+.health-lab-rows__meta,
+.health-prevention-row__meta,
+.health-nutrition-row__meta,
+.health-activity-row__meta,
+.cycle-history__meta,
+.cycle-preg__meta,
+.fasting-hero__meta,
+/* Uebersicht: jede Kachelzeile unter einem Namen */
+.dashboard-overview__weather,
+.today-cockpit-card__sub,
+.today-cockpit-card__time,
+.task-item__meta,
+.birthday-widget-item__meta,
+.countdown-item__meta,
+.pantry-widget-row__meta,
+.weather-widget__meta,
+.fasting-widget__meta,
+.housekeeping-widget__sub,
+.waste-widget-row__date,
+.cycle-widget__date,
+/* ... und was dort bis R21 noch 12 oder 14 trug (S5, D5): Zaehler, Restzeit,
+   Menge und die Fussnote "+N weitere" jeder Listenkachel */
+.health-widget__count,
+.cycle-widget__next-label,
+.cycle-widget__countdown,
+.pantry-widget-row__days,
+.shopping-widget-item__qty,
+.widget-list-more,
+.countdown-more,
+.week-strip__more,
+.waste-widget-more,
+.pantry-widget-more,
+.health-widget__status,
+.countdown-item__days,
+.schedule-widget-row__shift,
+.fasting-widget__remaining,
+.nutrition-widget__value,
+.nutrition-widget__count,
+.event-item__cal,
+/* Shell und Einstellungen */
+.search-result__meta,
+.settings-overview__row-description,
+.settings-setting-row__description,
+.settings-member__meta,
+.weather-place__meta,
+.backfill-moved__meta,
+.backfill-moved__change,
+.dms-account-meta {
+  font-size: var(--type-caption);
+  font-weight: var(--font-weight-regular);
+}
+
+/* --------------------------------------------------------------------------
  * Generische Rollen für neuen Code (Markup trägt u-* direkt)
  * ------------------------------------------------------------------------ */
 .u-body {
@@ -378,7 +622,19 @@
   font-weight: var(--font-weight-regular);
   line-height: var(--line-height-base);
 }
-.u-meta {
+/* SEKUNDAERTEXT: Subheadline 15 (R21, D4). Freistehender Lesetext neben dem
+ * Hauptinhalt - die Erklaerung eines Leerzustands, die Beschreibung einer
+ * Karte, der Untertitel eines Kontaktkopfs. Er stand bei 14, der Stufe der
+ * Bedienelemente; Apple setzt ihn auf 15. Was unter dem NAMEN einer Zeile
+ * steht, ist dagegen die Metazeile (13, Block oben). `.u-meta` heisst aus
+ * Zeiten vor den Rollen so und ist genau diese Rolle.
+ * Guard: test-typography.js, "R21: Sekundaertext ist Subheadline 15". */
+.u-meta,
+.empty-state__description,
+.document-card__description,
+.settings-card-description,
+.contact-card__sub,
+.task-comments__status {
   font-size: var(--type-secondary);
   font-weight: var(--font-weight-regular);
   line-height: var(--line-height-base);
@@ -459,7 +715,12 @@
   width: 1em;
   height: 1em;
   border: 1.5px solid color-mix(in srgb, currentColor 50%, transparent);
-  border-radius: var(--radius-xs);
+  /* DER RING DER AUFGABEN (R23, D7), nicht das Kaestchen: eine Checkliste in
+   * Notiz oder Aufgabenbeschreibung ist dieselbe Geste wie das Abhaken einer
+   * Teilaufgabe. In em, weil sie mit dem Text der Karte skaliert, und im Ton
+   * der Karte (`currentColor`), weil Notizen eigene Flaechenfarben tragen;
+   * erledigt in Erfolgsfarbe wie jeder Ring. */
+  border-radius: var(--radius-full);
 }
 /* Antippbares Kaestchen (#704). Ein <button role="checkbox"> statt des
    dekorativen <span>: sichtbar ist es dasselbe Quadrat, es tilgt nur die
@@ -500,8 +761,8 @@ button.note-md-box:focus-visible {
   opacity: 0.65;
 }
 .note-md-check.is-checked .note-md-box {
-  background: color-mix(in srgb, currentColor 70%, transparent);
-  border-color: color-mix(in srgb, currentColor 70%, transparent);
+  background: var(--color-success);
+  border-color: var(--color-success);
   /* Die Quittung des Tipps (#704) startet der Handler (acknowledgeCheck in
    * utils/ux.js), nicht diese Zustandsregel: hier lief sie bei jedem Zeichnen
    * einer Notiz an jedem schon gesetzten Haken (R18, Guard test:motion). */
@@ -509,11 +770,11 @@ button.note-md-box:focus-visible {
 .note-md-check.is-checked .note-md-box::after {
   content: '';
   position: absolute;
-  inset-inline-start: 0.28em;
-  top: 0.02em;
-  width: 0.3em;
-  height: 0.6em;
-  border: solid var(--color-surface);
+  inset-inline-start: 0.3em;
+  top: 0.1em;
+  width: 0.25em;
+  height: 0.5em;
+  border: solid var(--color-ink-on-vivid);
   border-width: 0 2px 2px 0;
   transform: rotate(45deg);
 }

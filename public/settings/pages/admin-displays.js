@@ -12,16 +12,18 @@
  */
 
 import { api, auth } from '/api.js';
-import { formatDate, formatTime, getLocale, t } from '/i18n.js';
+import { getLocale, t } from '/i18n.js';
+import { dateTimeText } from '/utils/date-format.js';
 import { esc } from '/utils/html.js';
-import { confirmModal, refocusAfterRender } from '/components/modal.js';
-import { settingRowHtml, settingSwitchRowHtml } from '/settings/components.js';
+import { confirmModal, refocusAfterRender, reportFieldErrors, constraintErrors } from '/components/modal.js';
+import { hintFoldHtml, settingRowHtml, settingSwitchRowHtml } from '/settings/components.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
 
 function formatSeen(value) {
   if (!value) return null;
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
-  return `${formatDate(date)} ${formatTime(date)}`.trim();
+  return dateTimeText(date);
 }
 
 function showError(element, message) {
@@ -147,16 +149,33 @@ function renderPage(container) {
            (test:typography haelt das fest). settings.displaysTitle traegt
            weiterhin den Namen in der Navigation. -->
       <div class="settings-card">
-        <div style="margin-bottom:var(--space-3)">
-        <p class="form-hint">${esc(t('settings.displaysHint'))}</p>
-        <!-- Zweiter Absatz desselben Hinweises (#1808). Er kommt mit der Liste:
-             WELCHE Bereiche ein Tablett zeigt, weiss nur der Server
-             (DISPLAY_SCOPES), und eine zweite Handliste hier bliebe beim
-             naechsten Scope stehen. Bis dahin leer und versteckt. -->
-        <p class="form-hint" id="display-areas-hint" style="margin-top:var(--space-2)" hidden></p>
-        </div>
+        ${/* Kern vorn, der Rest aufklappbar (R22, D13). Der Absatz zu den
+             Bereichen (#1808) kommt mit der Liste: WELCHE Bereiche ein Tablett
+             zeigt, weiss nur der Server (DISPLAY_SCOPES), und eine zweite
+             Handliste hier bliebe beim naechsten Scope stehen. Bis dahin
+             leer und versteckt. Der Weg zum Wand-Modus dieses Geraets
+             steht am Ende (D13: Wand an zwei Orten, gegenseitig verwiesen). */ ''}
+        ${hintFoldHtml({
+          lead: t('settings.displaysLead'),
+          moreHtml: `<p class="form-hint">${esc(t('settings.displaysMore'))}</p>
+            <p class="form-hint" id="display-areas-hint" hidden></p>
+            <p class="form-hint" id="display-wall-mode">${esc(t('settings.displaysWallModeLinkHint'))}
+              <a href="/settings/personal/device" id="display-wall-mode-link">${esc(t('settings.pageDevice'))}</a></p>`,
+        })}
+        ${/* Der Weg des Tabletts, bevor es einen Code gibt (#2294). Es koppelt
+             unter /pair, einer oeffentlichen Route, nicht ueber die
+             Anmeldeseite - bei reinem OIDC-Login gaebe es dort nicht einmal
+             ein Passwortfeld. Deshalb steht die Adresse mit dem eigenen
+             Ursprung sichtbar vor der Liste, nicht im Aufklapper und nicht
+             erst neben einem frischen Code. Dieselbe Ziffernliste wie die
+             Google-Einrichtung (settings-provider__steps). */ ''}
+        <ol class="settings-provider__steps" id="display-pair-steps">
+          <li>${esc(t('settings.displayPairStepCode'))}</li>
+          <li>${esc(t('settings.displayPairStepOpen'))}
+            <code id="display-pair-address" dir="ltr">${esc(`${window.location.origin}/pair`)}</code></li>
+        </ol>
         <ul class="settings-cards" id="display-list"></ul>
-        <form id="display-form" class="settings-form" autocomplete="off">
+        <form id="display-form" class="settings-form" autocomplete="off" novalidate>
           ${/* displayDeviceNameLabel, NICHT displayNameLabel: der zweite heisst
                "Anzeigename" - der Name eines MENSCHEN (admin-family.js,
                personal-account.js). Eine Zeile der Gruppe (R19, B7). */ ''}
@@ -255,6 +274,8 @@ function bindEvents(container) {
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     clearError(errorEl);
+    // KEINE BROWSER-BLASEN (Critique R21): `novalidate`, die Regeln des Markups melden sich am Feld (constraintErrors, components/modal.js).
+    if (reportFieldErrors(constraintErrors(form))) return;
     const input = container.querySelector('#display-name');
     const name = input.value.trim();
     if (!name) return;
@@ -272,7 +293,7 @@ function bindEvents(container) {
       // demselben Grund nach (admin-permissions.js).
       await auth.me().catch(() => {});
       input.value = '';
-      await reload(container);
+      await reloadAfterSave(() => reload(container));
     } catch (err) {
       showError(errorEl, err.message);
     } finally {
@@ -330,7 +351,7 @@ function bindEvents(container) {
       clearError(errorEl);
       try {
         await api.post(`/displays/${revoke.dataset.displayRevoke}/devices/${revoke.dataset.device}/revoke`, {});
-        await reload(container);
+        await reloadAfterSave(() => reload(container));
         // Der Dialog hat den Fokus gehalten, und `reload()` ersetzt die Liste
         // darunter - ohne das hier landet der Fokus nach dem Schliessen am
         // Dokumentanfang statt an der Stelle, an der gerade gearbeitet wurde.

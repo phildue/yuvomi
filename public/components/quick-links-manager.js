@@ -21,12 +21,17 @@ import { api } from '/api.js';
 import { t } from '/i18n.js';
 import { esc } from '/utils/html.js';
 import { rowActionHtml } from '/utils/row-action.js';
-import { AVATAR_COLORS } from '/utils/color.js';
+import { USER_COLOR_DEFAULT } from '/utils/color.js';
+import { colorPickerHtml, wireColorPicker } from '/utils/color-picker.js';
 import { prefersInkText } from '/utils/contrast.js';
-import { openModal, closeModal, confirmOverModal, reportFieldError, btnError, refocusAfterRender } from '/components/modal.js';
+import { openModal, closeModal, captureModalContext, captureOpenContext, isModalContextCurrent, confirmOverModal, reportFieldError, btnError, refocusAfterRender, dialogInitialFocus } from '/components/modal.js';
 import { normalizeQuickLinkUrl, quickLinkHost } from '/utils/quick-link-url.js';
 import { iconElement } from '/utils/lucide-icons.js';
-import { makeSortable } from '/utils/sortable.js';
+import { sortableSet, restoreOrder } from '/utils/sortable.js';
+
+/** Die Sortable-Instanz der Verwaltung: frei beim Neuaufbau und beim Schliessen (Codex an #2177). */
+const manageSortables = sortableSet();
+import { errorSentence, isGone, isAlreadyDeleted } from '/utils/friendly-error.js';
 
 /** Dieselben Werte wie in server/routes/quick-links.js. */
 const VISIBILITY_VALUES = ['all', 'private'];
@@ -58,11 +63,16 @@ const URL_ERROR_KEYS = {
 };
 
 /**
- * Die Farben, aus denen eine Kachel ohne Bild ihren Grund bekommt. Es sind die
- * Farben, aus denen auch ein Mitglied ohne Foto seine bekommt (utils/color.js):
- * eine Kachel neben einem Mitgliedsbild soll aus derselben Palette sprechen.
+ * Die Farbe einer Kachel ohne Bild waehlt der geteilte Farbwaehler
+ * (utils/color-picker.js, Critique R24 E6): dieselben Familientoene, aus
+ * denen auch ein Mitglied seine Farbe waehlt - eine Kachel neben einem
+ * Mitgliedsbild spricht aus derselben Palette. Bis R24 hiessen die sechs
+ * Swatches hier nach ihrem Hex-Wert ("Farbe #007AFF").
+ *
+ * Der Rueckfall fuer eine Kachel ohne gespeicherte Farbe bleibt das Blau der
+ * alten Palette: Bestandskacheln aendern ihr Gesicht nicht.
  */
-const TILE_COLORS = AVATAR_COLORS;
+const TILE_FALLBACK_COLOR = '#007AFF';
 
 function monogram(name) {
   // Der erste BUCHSTABE, nicht das erste Zeichen: ein Name wie "🎬 Jellyfin"
@@ -141,18 +151,25 @@ async function readIconAsDataUrl(file) {
   });
 }
 
+/* DER SATZ DER APP, NIE DER DES SERVERS (#1909). Bis dahin zeigte ein
+ * gescheitertes Speichern oder Loeschen hier `err.data.error` - den Text des
+ * Servers ("Schnellzugriff nicht gefunden", "At most 24 quick links ...") in
+ * jeder Sprache. Jetzt nennt der Server den Fall (`reason`), und der Satz
+ * kommt aus utils/friendly-error.js. */
+/** Loeschen, das schon erledigt ist, ist kein Fehler. */
+async function deleteUnlessGone(path) {
+  try {
+    await api.delete(path);
+  } catch (err) {
+    if (!isAlreadyDeleted(err, 'quick_links_link_not_found')) throw err;
+  }
+}
+
 // --------------------------------------------------------
 // Formular für eine Kachel
 // --------------------------------------------------------
 
 function formHtml(state, isEdit) {
-  const swatches = TILE_COLORS.map((c) => `
-    <button type="button" class="quick-link-swatch ${state.color === c ? 'quick-link-swatch--active' : ''}"
-            data-color="${esc(c)}" style="--swatch:${esc(c)}"
-            role="radio" aria-checked="${state.color === c ? 'true' : 'false'}"
-            tabindex="${state.color === c ? '0' : '-1'}"
-            aria-label="${esc(t('quickLinks.colorOption', { color: c }))}"></button>`).join('');
-
   return `
     <div class="quick-link-form">
       <div class="quick-link-form__face">
@@ -190,7 +207,7 @@ function formHtml(state, isEdit) {
 
       <div class="form-group">
         <span class="form-label" id="quick-link-color-label">${esc(t('quickLinks.colorLabel'))}</span>
-        <div class="quick-link-swatches" role="radiogroup" aria-labelledby="quick-link-color-label">${swatches}</div>
+        ${colorPickerHtml({ id: 'quick-link-color', value: state.color, labelledBy: 'quick-link-color-label' })}
       </div>
 
       <div class="form-group">
@@ -204,7 +221,7 @@ function formHtml(state, isEdit) {
     </div>
     <div class="modal-panel__footer modal-panel__footer--plain">
       ${isEdit
-    ? `<button type="button" class="btn btn--danger-outline" id="quick-link-delete" style="margin-inline-end:auto">${esc(t('common.delete'))}</button>`
+    ? `<button type="button" class="btn btn--danger-outline" id="quick-link-delete">${esc(t('common.delete'))}</button>`
     : ''}
       <button type="button" class="btn btn--secondary" id="quick-link-cancel">${esc(t('common.cancel'))}</button>
       <button type="button" class="btn btn--primary" id="quick-link-save">${esc(isEdit ? t('common.save') : t('common.add'))}</button>
@@ -223,12 +240,14 @@ function openQuickLinkForm(link, onDone) {
     url: link?.url ?? '',
     iconData: link?.icon_data ?? null,
     iconName: link?.icon_name ?? null,
-    color: link?.color ?? TILE_COLORS[0],
+    color: link?.color ?? USER_COLOR_DEFAULT,
     visibility: VISIBILITY_VALUES.includes(link?.visibility) ? link.visibility : 'all',
   };
 
   openModal({
     title: isEdit ? t('quickLinks.editTitle') : t('quickLinks.addTitle'),
+    // Anlegen: erstes Pflichtfeld; Bearbeiten: am Finger der Titel (R24 D4).
+    initialFocus: dialogInitialFocus(isEdit),
     size: 'sm',
     content: formHtml(state, isEdit),
     onSave(panel) {
@@ -289,7 +308,9 @@ function openQuickLinkForm(link, onDone) {
           state.iconName = null;
           repaintFace();
         } catch (err) {
-          window.yuvomi?.showToast(err.message, 'danger');
+          // Die Pruefung des Bildes sagt ihren eigenen Satz (ImageProblem);
+          // jeder andere Wurf den allgemeinen, nie seinen eigenen Text (#1909).
+          window.yuvomi?.showToast(err?.name === 'ImageProblem' && err.sentence ? err.sentence : t('common.errorGeneric'), 'danger');
         }
       });
 
@@ -299,35 +320,11 @@ function openQuickLinkForm(link, onDone) {
         repaintFace();
       });
 
-      // Farbwahl mit Roving Tabindex - dasselbe Muster wie die Notizfarben.
-      const swatches = [...panel.querySelectorAll('.quick-link-swatch')];
-      const selectSwatch = (target) => {
-        swatches.forEach((s) => {
-          const active = s === target;
-          s.classList.toggle('quick-link-swatch--active', active);
-          s.setAttribute('aria-checked', active ? 'true' : 'false');
-          s.setAttribute('tabindex', active ? '0' : '-1');
-        });
-        state.color = target.dataset.color;
+      // Die Farbe ist der geteilte Waehler; die Kachel oben malt jede Wahl mit.
+      wireColorPicker(panel);
+      panel.querySelector('#quick-link-color')?.addEventListener('change', (e) => {
+        state.color = e.target.value;
         repaintFace();
-      };
-      swatches.forEach((sw) => {
-        sw.addEventListener('click', () => { selectSwatch(sw); sw.focus(); });
-        sw.addEventListener('keydown', (e) => {
-          const idx = swatches.indexOf(sw);
-          if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
-            e.preventDefault();
-            const next = swatches[(idx + 1) % swatches.length];
-            selectSwatch(next); next.focus();
-          } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
-            e.preventDefault();
-            const prev = swatches[(idx - 1 + swatches.length) % swatches.length];
-            selectSwatch(prev); prev.focus();
-          } else if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            selectSwatch(sw);
-          }
-        });
       });
 
       panel.querySelector('#quick-link-cancel').addEventListener('click', () => closeModal());
@@ -345,12 +342,13 @@ function openQuickLinkForm(link, onDone) {
         const ok = await confirmOverModal(t('quickLinks.deleteConfirm', { name: link.name }));
         if (!ok) return;
         try {
-          await api.delete(`/quick-links/${link.id}`);
+          // Schon geloescht (eine andere Person war schneller) ist erledigt (#1909).
+          await deleteUnlessGone(`/quick-links/${link.id}`);
           window.yuvomi?.showToast(t('quickLinks.deleted'), 'success');
           await onDone();
           refocusAfterRender();
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+          window.yuvomi?.showToast(errorSentence(err, 'quickLinks.deleteError'), 'danger');
         }
       });
 
@@ -375,17 +373,28 @@ function openQuickLinkForm(link, onDone) {
         };
 
         const label = saveBtn.textContent;
+        // Geschlossen wird nur dieser Dialog, nicht einer, der waehrend der
+        // Anfrage aufgegangen ist (#1997).
+        const modalContext = captureModalContext();
         saveBtn.disabled = true;
         saveBtn.textContent = '…';
         try {
           if (isEdit) await api.put(`/quick-links/${link.id}`, body);
           else await api.post('/quick-links', body);
-          closeModal({ force: true });
+          closeModal({ force: true, context: modalContext });
           window.yuvomi?.showToast(isEdit ? t('quickLinks.saved') : t('quickLinks.added'), 'success');
           await onDone();
           refocusAfterRender();
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+          window.yuvomi?.showToast(errorSentence(err, 'quickLinks.saveError'), 'danger');
+          // Die Kachel gibt es nicht mehr: der Dialog hat nichts mehr zu
+          // speichern, die Verwaltung kommt mit dem aktuellen Stand (#1909).
+          if (isGone(err)) {
+            closeModal({ force: true, context: modalContext });
+            await onDone();
+            refocusAfterRender();
+            return;
+          }
           btnError(saveBtn);
           saveBtn.disabled = false;
           saveBtn.textContent = label;
@@ -416,14 +425,34 @@ function paintFaces(scope, items) {
   });
 }
 
-function listRowHtml(s, canEdit) {
+/**
+ * Das Label des Griffs: Objekt und Position (wie im Einkauf). Nach einem
+ * Schritt per Pfeiltaste zieht `refreshHandleLabels` es nach.
+ */
+function handleLabel(name, index, total) {
+  return `${t('shopping.reorderHandle', { name })}, ${t('shopping.reorderPosition', { index, total })}`;
+}
+
+/**
+ * D10 ZEILEN-ENDZONE (#2152): [Bearbeiten][Griff], der Griff ganz rechts.
+ * Bis dahin stand er als `aria-hidden`-Span VOR dem Symbol - ein Ziehziel
+ * ohne Tastaturweg: wer ohne Maus und Finger sortieren wollte, konnte es
+ * nicht. Jetzt ein Button wie `.list-row__drag` im Einkauf, die Pfeiltasten
+ * bei Fokus sind der Tastaturpfad. Eine Kachel allein hat keine Reihenfolge.
+ */
+function handleHtml(name, index, total) {
+  return `
+      <button type="button" class="row-action list-row__drag quick-link-manage-row__handle" data-sortable-handle
+              aria-label="${esc(handleLabel(name, index, total))}" title="${esc(t('shopping.reorderHandleHint'))}">
+        <i data-lucide="grip-vertical" class="icon-md" aria-hidden="true"></i>
+      </button>`;
+}
+
+function listRowHtml(s, canEdit, index = 1, total = 1) {
   const host = quickLinkHost(s.url);
   return `
-    <li class="quick-link-manage-row" data-id="${s.id}">
-      <span class="quick-link-manage-row__handle" data-sortable-handle aria-hidden="true">
-        <i data-lucide="grip-vertical"></i>
-      </span>
-      <span class="quick-link-face${faceInk(s.color || TILE_COLORS[0])}" style="--quick-link-color:${esc(s.color || TILE_COLORS[0])}" data-face></span>
+    <li class="quick-link-manage-row" data-id="${s.id}" data-name="${esc(s.name)}">
+      <span class="quick-link-face${faceInk(s.color || TILE_FALLBACK_COLOR)}" style="--quick-link-color:${esc(s.color || TILE_FALLBACK_COLOR)}" data-face></span>
       <span class="quick-link-manage-row__body">
         <span class="quick-link-manage-row__name">${esc(s.name)}</span>
         <span class="quick-link-manage-row__host">${esc(host)}</span>
@@ -436,8 +465,16 @@ function listRowHtml(s, canEdit) {
     // EINE FREMDE KACHEL IST SICHTBAR, ABER NICHT BEARBEITBAR, und das steht
     // hier auch so da. Ein Knopf, den der Server mit 403 beantwortet, wäre die
     // schlechtere Auskunft als gar keiner.
-    : `<span class="quick-link-manage-row__locked">${esc(t('quickLinks.notYours'))}</span>`}
+    : `<span class="quick-link-manage-row__locked">${esc(t('quickLinks.notYours'))}</span>`}${total > 1 ? handleHtml(s.name, index, total) : ''}
     </li>`;
+}
+
+function refreshHandleLabels(list) {
+  const rows = [...list.querySelectorAll('.quick-link-manage-row')];
+  rows.forEach((row, i) => {
+    row.querySelector('[data-sortable-handle]')
+      ?.setAttribute('aria-label', handleLabel(row.dataset.name ?? '', i + 1, rows.length));
+  });
 }
 
 /**
@@ -446,6 +483,9 @@ function listRowHtml(s, canEdit) {
  * @param {Function} opts.onChange  nach jeder Änderung (Übersicht neu laden)
  */
 export async function openQuickLinksManager({ onChange = () => {} } = {}) {
+  // Kommt die Liste erst, nachdem der Nutzer einen anderen Dialog geoeffnet
+  // oder die Seite verlassen hat, geht die Verwaltung nicht mehr auf (#1997).
+  const context = captureOpenContext();
   let items = [];
   try {
     items = (await api.get('/quick-links'))?.data ?? [];
@@ -453,6 +493,7 @@ export async function openQuickLinksManager({ onChange = () => {} } = {}) {
     window.yuvomi?.showToast(t('quickLinks.loadError'), 'danger');
     return;
   }
+  if (!isModalContextCurrent(context)) return;
 
   // Nach einer Änderung zeigt die Verwaltung wieder den neuen Stand - sonst
   // stünde die Liste, aus der man gerade gelöscht hat, unverändert da.
@@ -462,12 +503,13 @@ export async function openQuickLinksManager({ onChange = () => {} } = {}) {
   };
 
   const body = items.length
-    ? `<ul class="quick-link-manage-list" id="quick-link-manage-list">${items.map((s) => listRowHtml(s, s.can_edit)).join('')}</ul>`
+    ? `<ul class="quick-link-manage-list" id="quick-link-manage-list">${items.map((s, i) => listRowHtml(s, s.can_edit, i + 1, items.length)).join('')}</ul>`
     : `<p class="quick-link-manage-empty">${esc(t('quickLinks.emptyManage'))}</p>`;
 
   openModal({
     title: t('quickLinks.manageTitle'),
     size: 'sm',
+    onClose: () => manageSortables.clear(),
     content: `
       ${body}
       <button type="button" class="btn btn--secondary quick-link-manage-add" id="quick-link-add">
@@ -491,10 +533,16 @@ export async function openQuickLinksManager({ onChange = () => {} } = {}) {
 
       const list = panel.querySelector('#quick-link-manage-list');
       if (!list) return;
-      makeSortable(list, {
-        handle: '[data-sortable-handle]',
-        draggable: '.quick-link-manage-row',
-        onEnd: async () => {
+      // Ein Weg fuer Ziehen und Pfeiltaste: die Liste im DOM ist die Wahrheit.
+      // `savedIds` ist der Stand des Servers - dorthin geht es zurueck, wenn
+      // ein Zug nicht gespeichert werden kann (Codex an #2177).
+      let savedIds = items.map((s) => s.id);
+      // EIN ZUG ZUR ZEIT (Codex an #2177): die Folge, die gerade speichert,
+      // sonst null. Ein zweiter Schritt waehrend der Anfrage entfaellt, ein
+      // gezogener wird zurueckgenommen - sonst rechnete die Ruecknahme eines
+      // gescheiterten ersten Zugs einen zweiten, schon gespeicherten weg.
+      let inflight = null;
+      const persistOrder = async () => {
           // Die Reihenfolge gilt für den ganzen Haushalt, nicht pro Person: es
           // ist EINE Reihe, und zwei Mitglieder, die sie verschieden sortieren,
           // hätten zwei Wahrheiten über dieselben Kacheln. Wer eine eigene
@@ -506,14 +554,52 @@ export async function openQuickLinksManager({ onChange = () => {} } = {}) {
           const ids = [...list.querySelectorAll('.quick-link-manage-row')]
             .map((li) => Number(li.dataset.id))
             .filter(Number.isInteger);
+          if (inflight) {
+            restoreOrder(list, inflight, (li) => li.dataset.id);
+            refreshHandleLabels(list);
+            return;
+          }
+          inflight = ids;
+          refreshHandleLabels(list);
           try {
             await api.put('/quick-links/order', { ids });
-            await onChange();
           } catch {
             window.yuvomi?.showToast(t('quickLinks.orderError'), 'danger');
+            restoreOrder(list, savedIds, (li) => li.dataset.id);
+            refreshHandleLabels(list);
+            return;
+          } finally {
+            inflight = null;
           }
-        },
+          savedIds = ids;
+          await onChange();
+      };
+      // Der Tastaturpfad am Griff (#2152): Pfeil hoch/runter verschiebt die
+      // Zeile um einen Platz, der Fokus bleibt auf dem Griff - die Zeile wird
+      // verschoben, nicht neu gezeichnet.
+      list.addEventListener('keydown', (event) => {
+        if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+        const handle = event.target.closest?.('[data-sortable-handle]');
+        if (!handle) return;
+        event.preventDefault();
+        if (inflight) return;
+        const row = handle.closest('.quick-link-manage-row');
+        const sibling = event.key === 'ArrowUp' ? row.previousElementSibling : row.nextElementSibling;
+        if (!sibling) return;
+        if (event.key === 'ArrowUp') list.insertBefore(row, sibling);
+        else list.insertBefore(sibling, row);
+        handle.focus();
+        persistOrder();
       });
+      manageSortables.clear();
+      manageSortables.add(list, {
+        handle: '[data-sortable-handle]',
+        draggable: '.quick-link-manage-row',
+        onEnd: persistOrder,
+      }).catch(() => { /* ohne SortableJS bleibt der Tastaturpfad */ });
     },
   });
 }
+
+// #1997: das Formular einer Kachel, bis in seinen Speichern-Weg.
+export const __test = { openQuickLinkForm, listRowHtml };

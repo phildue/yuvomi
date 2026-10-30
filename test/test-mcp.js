@@ -48,9 +48,11 @@ db.exec(`
     name TEXT NOT NULL,
     color TEXT
   );
+  CREATE TABLE external_calendar_assignees (calendar_id INTEGER NOT NULL, user_id INTEGER NOT NULL, position INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (calendar_id, user_id));
 `);
 db.exec(MIGRATIONS_SQL[85]);  // calendar_event_exceptions
 db.exec(MIGRATIONS_SQL[174]); // generated birthday/name-day joins
+db.exec(MIGRATIONS_SQL[254]); // birthday without a year, read by the calendar join
 db.exec(MIGRATIONS_SQL[44]); // search index rebuilt by migration 194
 db.exec(MIGRATIONS_SQL[245]);
 // Migration 246 (#1935) hat ein Funktions-up und steht nicht im Spiegel.
@@ -956,6 +958,59 @@ test('call_api_operation POST: string-serialisiertes Payload wird nicht doppelt 
     assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
     assert.equal(calls[0].options.headers['Content-Type'], 'application/json');
     assert.deepEqual(JSON.parse(calls[0].options.body), { title: 'Neu' });
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+// #2197: die Felder neben `operation_key` statt in `payload` - vorher ging der
+// POST ohne Body raus, die Felder fielen still weg, die Route antwortete 500.
+test('call_api_operation POST: Body-Felder auf oberster Ebene → isError mit Hinweis auf payload (kein fetch)', async () => {
+  const calls = installFetchMock(() => jsonResponse({}));
+  try {
+    const res = await toolCallWithHeaders(
+      'call_api_operation',
+      { operation_key: 'post_recipes', title: 'error-probe' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /Unknown argument\(s\) title/);
+    assert.match(res.result.content[0].text, /"payload"/);
+    assert.equal(calls.length, 0, 'ohne payload darf kein Request ohne Body abgehen');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('call_api_operation POST: Pflicht-Body ohne payload geht als {} raus, mit JSON-Content-Type (#2197)', async () => {
+  const calls = installFetchMock(() => jsonResponse({ error: 'Titel is required.' }, { ok: false, status: 400 }));
+  try {
+    const res = await toolCallWithHeaders(
+      'call_api_operation',
+      { operation_key: 'post_recipes' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /Titel is required/);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].options.headers['Content-Type'], 'application/json');
+    assert.equal(calls[0].options.body, '{}');
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('call_api_operation GET: fremde Schluessel bleiben ohne Wirkung (kein Body-Hinweis)', async () => {
+  const calls = installFetchMock(() => jsonResponse({ data: [] }));
+  try {
+    const res = await toolCallWithHeaders(
+      'call_api_operation',
+      { operation_key: 'get_recipes', title: 'egal' },
+      { authorization: 'Bearer test-token' },
+    );
+    assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].options.body, undefined);
   } finally {
     global.fetch = realFetch;
   }

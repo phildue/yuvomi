@@ -114,11 +114,17 @@
   font-weight: var(--font-weight-medium);
   white-space: nowrap;
   cursor: pointer;
-  transition: background-color var(--transition-fast), color var(--transition-fast);
+  transition: background-color var(--transition-fast), color var(--transition-fast), transform var(--transition-fast);
 }
 
 .segmented__item:hover:not(.is-active) {
   color: var(--color-text-primary);
+}
+
+/* Druck wie der Reiter (sub-tabs.css): die kleine Stufe, hinein schnell. */
+.segmented__item:active {
+  transform: scale(var(--press-scale-sm));
+  transition-duration: var(--duration-2xs);
 }
 
 /* Aktiv = erhabene Surface-Pille im Well, Modulton nur in der Tinte - die eine
@@ -147,25 +153,39 @@
  * misst AUSSEN dieselben 40px - Naht 1px, Rand 1px, Segmente 36px. Mit der
  * Basis-Hoehe und 2px Naht stand es als 50px-Well in der Zeile und hob die
  * Titelzeile um 6px an. Am Finger gilt dieselbe Rechnung gegen --target-base
- * (aussen 48px wie Lupe und Filter, statt 54px auf dem Tablet). */
-.page-toolbar .segmented {
+ * (aussen 48px wie Lupe und Filter, statt 54px auf dem Tablet).
+ *
+ * DIESELBE RECHNUNG NEBEN CHIPS (R22, D8): der Status der Dokumente
+ * (Aktiv/Archiviert) steht in einer Zeile mit den kleinen Filter-Chips
+ * (`.filter-chip--sm`: 40px am Zeiger, 48px am Finger) und mass als freies
+ * Segment 50 bzw. 54px. Er nimmt die Kopf-Rechnung und misst aussen wie sie. */
+.page-toolbar .segmented,
+.segmented.documents-status {
   padding: var(--space-px);
 }
 
-.page-toolbar .segmented__item {
+.page-toolbar .segmented__item,
+.documents-status .segmented__item {
   min-height: calc(var(--target-base) - 4 * var(--space-px));
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .page-toolbar .segmented__item {
+  .page-toolbar .segmented__item,
+  .documents-status .segmented__item {
     min-height: calc(var(--target-md) - 4 * var(--space-px));
   }
 }
 
 /* Die Icon-Variante (Aufgaben Liste/Brett, Dokumente Liste/Raster): ein
- * quadratisches Segment je Ansicht, der Name steht im aria-label und title. */
+ * quadratisches Segment je Ansicht, der Name steht im aria-label und title.
+ *
+ * MINDESTENS SO BREIT WIE HOCH (R24, Critique G0 P3-2 / P2-1). Mit 8px
+ * Polster um ein 16px-Zeichen mass das Segment 32px breit neben 40px-Knoepfen
+ * - unter der Zielgroesse, die jeder Kopfknopf haelt. Jetzt `--target-md` als
+ * Mindestbreite: am Zeiger 40x36, nie schmaler als ein Kopfknopf. */
 .segmented--icons .segmented__item {
   padding-inline: var(--space-2);
+  min-inline-size: var(--target-md);
 }
 
 /* --------------------------------------------------------
@@ -268,18 +288,15 @@
  *
  * Der Druckzustand steigt eine Sprosse der Toenungsskala statt den eigenen
  * Inhalt per opacity abzudunkeln. */
-/* MITTIG, NICHT OBEN UND NICHT AUSEINANDERGEZOGEN. Die Kachel fuellt ihre
- * Rasterzelle, und die ist auf dem Desktop rund 137px hoch bei ~70px Inhalt.
- * Oben ausgerichtet blieb das Label allein am Kartenrand haengen; mit einem
- * `margin-block-start:auto` am Wert klaffte dazwischen ein 60px-Loch. Zentriert
- * liest sich derselbe Block auf beiden Groessen als eine Einheit, und zwei
- * Kacheln nebeneinander zeigen ihre Werte weiter auf einer Linie, solange die
- * Labels gleich viele Zeilen brauchen. */
+/* DIE ANORDNUNG IN DER KACHEL STEHT IN dashboard.css (`.metric-tiles`, DW-P2-7):
+ * die Kacheln einer Reihe teilen dort per Subgrid ihre Kopf-, Wert- und
+ * Fusszeile, damit die Werte auch bei umbrechendem Modulnamen auf einer Linie
+ * stehen - das leistete das Zentrieren hier nur, solange alle Labels gleich
+ * viele Zeilen brauchten. */
 .metric-card--tile {
   text-decoration: none;
   color: var(--color-text-primary);
   gap: var(--space-1);
-  justify-content: center;
   transition: background-color var(--transition-fast), transform var(--duration-xs) var(--ease-out);
 }
 
@@ -290,7 +307,7 @@
 }
 
 .metric-card--tile:active {
-  transform: scale(0.98);
+  transform: scale(var(--press-scale-lg));
 }
 
 .metric-card__tile-head {
@@ -362,12 +379,19 @@
  * Der Wert bleibt in der schmalsten Spalte lesbar, weil er nicht umbrechen
  * DARF: `--text-3xl` mit dem Tracking von Title 1, und lange Beträge klemmen
  * sich über die Container-Query weiter unten auf Title 2 herunter statt in
- * zwei Zeilen zu fallen. Ein Betrag über zwei Zeilen ist keine Kennzahl mehr. */
+ * zwei Zeilen zu fallen. Ein Betrag über zwei Zeilen ist keine Kennzahl mehr.
+ *
+ * SEMIBOLD, NICHT FETT (Entscheidung 2026-10-26, DW-P2-7 Nachtrag). Seit R23
+ * D12 standen Leitzahl und ruhige Werte auf 600, alle anderen Kennzahlen auf
+ * 700 - eine Rolle in zwei Gewichten, je nachdem, ob die Reihe fuehrt. Die
+ * Kennzahl hebt sich durch ihre GROESSE ab, wie bei Apple (Health, Wallet);
+ * ein Betrag in einer Zeile ist ebenfalls semibold und eine Stufe kleiner.
+ * Guard: test:typography "Title 1 traegt semibold". */
 .metric-card__value {
   /* `--metric-value-size` ist die Zusage einer SEITENSPALTE (siehe unten,
    * "Eine Karte je Zeile traegt Title 1"); ohne sie gilt die Stufenleiter. */
   font-size: var(--metric-value-size, var(--text-3xl));
-  font-weight: var(--font-weight-bold);
+  font-weight: var(--font-weight-semibold);
   line-height: var(--line-height-tight);
   letter-spacing: var(--tracking-tight);
   font-variant-numeric: tabular-nums;
@@ -427,82 +451,63 @@
  * Zahl die Aussage des Reiters ist; mobil war das groesste Element jedes
  * Geld-Bildschirms das Wort "Budget". Je Reiter traegt jetzt EINE Karte
  * `.metric-card--lead` (Saldo, Nettovermoegen, Restschuld, Monatskosten), und
- * ihre Reihe `.metric-grid--led`:
+ * ihre Reihe `.metric-grid--led`: in einer REIHE treten die uebrigen eine Stufe
+ * zurueck (eine Groessenstufe; das Gewicht ist seit 2026-10-26 ohnehin fuer
+ * jede Kennzahl semibold) - die Fuehrung entsteht durch Ruhe daneben.
  *
- *   - In einer SEITENSPALTE (eine Karte je Zeile, `--metric-value-size`
- *     gesetzt) steigt die Leitzahl auf eine Display-Stufe. Die Stufe misst an
- *     der Spalte (cqi gegen `.metric-grid`), nicht am Viewport: 13cqi sind in
- *     der schmalsten Spalte (300px) 39px, "2.503,89 €" laeuft dort 226px von
- *     276px. Laengere Werte nennen ihre Stufe als Klasse
- *     (`leadStep()` in utils/metric-card.js): "175.444,93 €" bei 11cqi = 33px
- *     -> 247px, "CHF 175'444.93" bei 9cqi = 27px -> 232px.
- *   - In einer REIHE mit mehreren Karten kann die Leitzahl nicht wachsen (die
- *     Stufenleiter oben ist an der Kartenbreite gemessen). Dort treten die
- *     uebrigen eine Stufe zurueck und verlieren das Fett - die Fuehrung
- *     entsteht durch Ruhe daneben, nicht durch Lautstaerke.
+ * EINE FESTE STUFE JE ORT (R23, D12). Bis R23 waehlte die Leitzahl ihre Stufe
+ * nach ihrer LAENGE (`leadStep`, 13/11/9cqi, 18-48px) - der Saldo stand in
+ * 48px, die Restschuld daneben in 33px, dieselbe Rolle in sechs Groessen. Jetzt:
+ * in einer SEITENSPALTE Large Title (34px), in einer Reihe und in der mobilen
+ * Kurzzeile Title 1 (28px), beides semibold. KLEINER WIRD SIE NUR, WENN SIE
+ * NICHT PASST: `fitMetricLeads()` (utils/metric-card.js) misst die Karte und
+ * setzt `data-fit` (1 = Title 2, 2 = Title 3) - eine Stufe, die man sieht,
+ * statt einer, die aus der Zeichenzahl geraten wird.
  *
  * WER EINE SEITENSPALTE IST, SAGT ES MIT `--metric-rail: ;` - einem leeren
  * Wert, neben `--metric-value-size` (siehe "Eine Karte je Zeile"). Die Regel
- * der Leitzahl setzt ihn vor ihre Stufe: ist er leer, gilt die Stufe; ist er
- * nicht gesetzt, ist die ganze Zeile ungueltig und der Rueckfall dahinter
- * greift - die Stufenleiter der Reihe. So entscheidet EINE Regel hier, und
- * kein Modul-Stylesheet setzt einen eigenen Wert-Grad (Guard R16 in
- * test-frontend-audit). Ohne Container-Einheiten (Chrome < 105, Safari < 16)
- * gilt die Regel nicht, die Leitzahl bleibt dort auf der Stufenleiter. */
+ * der Leitzahl setzt ihn vor ihre Stufe: ist er leer, gilt Large Title; ist er
+ * nicht gesetzt, ist die Zeile ungueltig und Title 1 der Reihe greift. So
+ * entscheidet EINE Regel hier, und kein Modul-Stylesheet setzt einen eigenen
+ * Wert-Grad (Guard R16 in test-frontend-audit). */
 .metric-card--lead {
-  --metric-lead-size: clamp(var(--text-3xl), 13cqi, var(--text-5xl));
-}
-
-.metric-card--lead-long {
-  --metric-lead-size: clamp(var(--text-3xl), 11cqi, var(--text-4xl));
-}
-
-.metric-card--lead-xlong {
-  --metric-lead-size: clamp(var(--text-2xl), 9cqi, var(--text-3xl));
-}
-
-.metric-card--lead-xxlong {
-  --metric-lead-size: var(--text-2xl);
+  --metric-lead-size: var(--text-4xl);
 }
 
 .metric-grid--rail {
   --metric-rail: ;
 }
 
-@supports (width: 1cqi) {
-  .metric-card--lead > .metric-card__value {
-    --_metric-lead: var(--metric-rail) var(--metric-lead-size);
-    font-size: var(--_metric-lead, var(--metric-value-size, var(--text-3xl)));
-  }
-
-  @container metric-grid (max-width: 600px) {
-    .metric-card--lead > .metric-card__value {
-      font-size: var(--_metric-lead, var(--metric-value-size, var(--text-2xl)));
-    }
-  }
-
-  @container metric-grid (max-width: 400px) {
-    .metric-card--lead > .metric-card__value {
-      font-size: var(--_metric-lead, var(--metric-value-size, var(--text-xl)));
-    }
-  }
-}
-
-.metric-grid--led > .metric-card:not(.metric-card--lead) > .metric-card__value {
-  font-size: var(--metric-quiet-size, var(--text-2xl));
+.metric-card--lead > .metric-card__value {
+  --_metric-lead: var(--metric-rail) var(--metric-lead-size);
+  font-size: var(--_metric-lead, var(--text-3xl));
   font-weight: var(--font-weight-semibold);
 }
 
-@container metric-grid (max-width: 600px) {
-  .metric-grid--led > .metric-card:not(.metric-card--lead) > .metric-card__value {
-    font-size: var(--metric-quiet-size, var(--text-xl));
-  }
+/* Verkleinern nur bei Ueberlauf (fitMetricLeads). Spezifischer als jede Stufe
+ * oben und in den Container-Stufen. */
+.metric-card .metric-card__value[data-fit="1"] {
+  font-size: var(--text-2xl);
 }
 
-@container metric-grid (max-width: 400px) {
-  .metric-grid--led > .metric-card:not(.metric-card--lead) > .metric-card__value {
-    font-size: var(--metric-quiet-size, var(--text-lg));
-  }
+.metric-card .metric-card__value[data-fit="2"] {
+  font-size: var(--text-xl);
+}
+
+/* DIE NEBENZAHL: Headline 17, semibold, an jedem Ort (R24, Critique
+ * G4-Budget-P2-2). Neben der Leitzahl standen die uebrigen Werte je nach Ort
+ * in 22 (Seitenspalte, per `--metric-quiet-size` aus drei Modulblaettern), 20
+ * oder 18 (Container-Stufen der Reihe) - vier Grade fuer dieselbe Rolle, und
+ * in der Seitenspalte 22 unter 34: zwei Zahlen, die beide wie Kennzahlen
+ * aussahen. Jetzt fuehrt EINE Zahl (34 bzw. 28), und was neben ihr steht, ist
+ * eine Nebenzahl in Headline - dieselbe Stufe wie der Wert der mobilen
+ * Kurzzeile (`.budget-glance__value`). Eine feste Stufe braucht keine
+ * Container-Abfrage: 17px fassen "174.644,93 EUR" in jeder Karte, die eine
+ * Reihe hergibt. */
+.metric-grid--led > .metric-card:not(.metric-card--lead) > .metric-card__value {
+  font-size: var(--type-card-title);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: var(--tracking-normal);
 }
 
 /* UND DIE REIHE BRICHT, STATT IHRE KARTEN ZU ZERQUETSCHEN.
@@ -553,7 +558,6 @@
 /* Fußnote unter dem Betrag: „7 aktiv", „121% des Budgets genutzt", „EUR".
  * Löst die frühere <small>-Sonderbehandlung in subscriptions.css ab. */
 .metric-card__note {
-  font-size: var(--text-xs);
   color: var(--color-text-secondary);
   min-width: 0;
   hyphens: auto;
@@ -609,8 +613,7 @@
 
 /* Dieselben Stufen wie der Budgetplan (budget-plans.js `toneForRatio`): ab
  * 85 % der Warnton, ueber 100 % Danger - eine Ueberschreitung ist eine
- * Tatsache, kein Hinweis. `.metric-card--over` traegt dieselbe Stimme an der
- * Karte daneben. */
+ * Tatsache, kein Hinweis - und sie steht einmal: am Balken (R21 S7). */
 .metric-card__progress--near > span { background: var(--color-warning); }
 .metric-card__progress--over > span { background: var(--color-danger); }
 
@@ -645,16 +648,11 @@
   color: var(--color-warning);
 }
 
-/* Eine tatsaechliche Ueberschreitung (Abo-Budget): derselbe Danger-Ton wie die
- * ueberzogene Plan-Kategorie (budget.css `--tone-over`). Das Label nennt den
- * Zustand samt Symbol - die Farbe ist nicht der einzige Traeger. */
-.metric-card--over {
-  border-color: color-mix(in oklch, var(--color-danger) 40%, transparent);
-}
-
-.metric-card--over .metric-card__value {
-  color: var(--color-danger);
-}
+/* `.metric-card--over` ist entfallen (R21 S7): die Ueberschreitung des
+ * Abo-Budgets stand zweimal rot - am Balken der Kostenkarte und als eigene
+ * rote Karte daneben. Das Rot traegt jetzt nur der Balken
+ * (`.metric-card__progress--over`, wie im Plan); die Karte nennt die Tatsache
+ * in Worten samt Symbol. */
 .metric-card--balance-negative .metric-card__value { color: var(--color-danger);  }
 /* Reines Ausgaben-Tracking (keine Einnahmen im Monat): Saldo = -Ausgaben ist eine
    Tautologie, die rote Zahl wird als „im Minus" fehlgelesen (#504). Neutral statt rot. */
@@ -664,7 +662,6 @@
 .metric-card--forecast .metric-card__value { color: var(--color-text-secondary); }
 
 .metric-card__trend {
-  font-size: var(--text-xs);
   /* Icon und Text bilden eine Zeile an der Fluchtlinie von Label und Betrag. */
   display: flex;
   align-items: center;
@@ -984,11 +981,19 @@ svg.chart {
  *     Ohne Modulton (Karte ausserhalb eines Moduls) bleibt Sekundärtext.
  * Der Endpunkt trägt die Label-Farbe mit einem Ring in Kartenfläche: er
  * markiert den aktuellen Wert, nicht den Verlauf dorthin. */
+/* `fill: none` AM WURZELKNOTEN (R24 S15). Ein SVG ohne Fuellangabe fuellt
+ * schwarz (Anfangswert von `fill`); gemalt hat das nie, weil Flaeche, Linie
+ * und Endpunkt ihre Farbe selbst tragen - aber jede kuenftige Form ohne
+ * eigene Angabe kaeme schwarz, im Dark 1,68:1 auf der Kachel. Wie bei jedem
+ * Lucide-Zeichen sagt die Wurzel: hier fuellt nichts, die Tinte ist
+ * `currentColor`. Die Flaeche behaelt ihren Verlauf (Praesentationsattribut
+ * schlaegt Vererbung). */
 .metric-card__spark {
   width: 100%;
   height: 22px;
   display: block;
   overflow: visible;
+  fill: none;
   color: var(--module-accent, var(--color-text-secondary));
 }
 
@@ -1012,7 +1017,6 @@ svg.chart {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-  font-size: var(--text-xs);
   color: var(--color-text-secondary);
 }
 
@@ -1112,6 +1116,16 @@ svg.chart {
   display: none;
 }
 
+/* IN JEDER BREITE (Critique R24, E2; `metricGlanceHtml({ everywhere })`): die
+ * Kennzahl einer Flaeche ohne Seitenspalte steht als EINE Zeile oben in der
+ * Bahn - dieselbe Kurzzeile wie mobil, keine zweite Bauart fuer den Desktop.
+ * Den Abstand zur Liste darunter traegt die Spalte (`.page-columns__main`,
+ * gap), kein eigener Rand - mit beidem standen 32px zwischen Zahl und Liste. */
+.budget-glance.budget-glance--everywhere {
+  display: block;
+  margin-block-end: 0;
+}
+
 @media (max-width: 639px) {
   .budget-glance {
     display: block;
@@ -1182,7 +1196,9 @@ svg.chart {
  * Kennzahl-Karte: Title 3 waere groesser als der Titel „Transaktionen"
  * darunter. Die Toene sind die der Saldo-Karte (panel.css). */
 .budget-glance__value {
-  font-size: var(--text-lg);
+  /* Headline wie die Nebenzahl einer Reihe (R24); bis dahin 18px, eine Stufe
+   * ausserhalb der Skala. */
+  font-size: var(--type-card-title);
   font-weight: var(--font-weight-semibold);
   line-height: var(--line-height-tight);
   font-variant-numeric: tabular-nums;
@@ -1201,7 +1217,6 @@ svg.chart {
   gap: var(--space-0h);
   min-width: 0;
   margin-inline-start: auto;
-  font-size: var(--text-sm);
   line-height: var(--line-height-tight);
   color: var(--color-text-secondary);
 }
@@ -1221,21 +1236,17 @@ svg.chart {
   color: var(--color-danger);
 }
 
-/* DIE KURZZEILE MIT LEITZAHL (Critique R18, 2026-10-07; `glanceLeadClass()`
- * in utils/metric-glance.js). Die Zahl steigt von 18px auf eine Display-Stufe
- * und steht allein in ihrer Zeile; die Nebenwerte ruecken als EINE ruhige
- * Zeile darunter (sie stehen im Markup vor dem Pfeil, `order` haelt den Pfeil
- * in der ersten Zeile). Neben der Zahl ist dafuer kein Platz: bei 390px
+/* DIE KURZZEILE MIT LEITZAHL (Critique R18, 2026-10-07;
+ * `glanceLeadClass()` in utils/metric-glance.js). Die Zahl steigt von 18px auf
+ * Title 1 und steht allein in ihrer Zeile; die Nebenwerte ruecken als EINE
+ * ruhige Zeile darunter (sie stehen im Markup vor dem Pfeil, `order` haelt den
+ * Pfeil in der ersten Zeile). Neben der Zahl ist dafuer kein Platz: bei 390px
  * bleiben nach Polster und Pfeil 298px, "Einnahmen 5.550,00 €" braucht 150.
  *
- * Stufen gegen den Viewport, weil die Zeile nur unter 640px existiert und dort
- * immer die volle Breite traegt (Breite minus 2 x 16px Rand, 2 x 16px Polster,
- * 28px Pfeil). Fette Systemziffern laufen rund 0,6em je Zeichen:
- *   kurz  (<= 10 Zeichen, "2.503,89 €")      11vw: 390 -> 43px = 249 von 298px
- *   long  (<= 13, "175.444,93 €")             9vw: 390 -> 34px = 240px
- *   xlong (<= 17, "CHF 175'444.93")         7,5vw: 390 -> 28px = 241px
- *   320px: 35px = 204, 29px = 204, 24px = 206 von 228px.
- * Im Browser nachgemessen, Guard: test-budget-ui.js. */
+ * FESTE STUFE, MOBIL 28px (R23, D12): bis R23 eine Leiter nach Zeichenzahl
+ * (11/9/7,5vw, 24-48px). Jetzt Title 1 semibold, wie die Leitzahl einer Reihe;
+ * passt sie nicht (sechsstellige Betraege bei 320px), setzt fitMetricLeads()
+ * `data-fit` und sie tritt eine oder zwei Stufen zurueck. */
 .budget-glance--lead .budget-glance__row {
   flex-wrap: wrap;
   row-gap: var(--space-0h);
@@ -1246,21 +1257,17 @@ svg.chart {
 }
 
 .budget-glance--lead .budget-glance__value {
-  font-size: clamp(var(--text-3xl), 11vw, var(--text-5xl));
-  font-weight: var(--font-weight-bold);
+  font-size: var(--text-3xl);
+  font-weight: var(--font-weight-semibold);
   letter-spacing: var(--tracking-tight);
 }
 
-.budget-glance--lead-long .budget-glance__value {
-  font-size: clamp(var(--text-3xl), 9vw, var(--text-4xl));
-}
-
-.budget-glance--lead-xlong .budget-glance__value {
-  font-size: clamp(var(--text-2xl), 7.5vw, var(--text-3xl));
-}
-
-.budget-glance--lead-xxlong .budget-glance__value {
+.budget-glance .budget-glance__row .budget-glance__value[data-fit="1"] {
   font-size: var(--text-2xl);
+}
+
+.budget-glance .budget-glance__row .budget-glance__value[data-fit="2"] {
+  font-size: var(--text-xl);
 }
 
 .budget-glance--lead .budget-glance__chevron {
@@ -1283,32 +1290,26 @@ svg.chart {
  * `balanceGlanceHtml`). Die Budget-Uebersicht stellte Saldo, Ein/Aus und
  * „Alle Kategorien" in drei Zeilen vor die erste Buchung (y=354). Eingeklappt
  * stehen jetzt Etikett und Saldo in EINER Zeile, auf der Grundlinie; Ein/Aus
- * und die Kategorien-Zeile kommen mit dem Aufklappen. Die Zahl fuehrt weiter
- * (Title 1 statt Display), damit sie neben dem Etikett in die Zeile passt -
- * die Stufen der Leiter gelten wie oben, nur eine Stufe tiefer. */
+ * und die Kategorien-Zeile kommen mit dem Aufklappen. Die Zahl fuehrt in
+ * derselben Stufe wie jede Kurzzeile (Title 1, R23). */
 .budget-glance--fold.budget-glance--lead .budget-glance__lead {
   flex-direction: row;
   align-items: baseline;
   gap: var(--space-2);
 }
 
+/* Das Etikett neben der Zahl ist ein Feldlabel (Footnote 13), keine 14 der
+ * Bedienelemente (R21 S9b, D4). */
 .budget-glance--fold.budget-glance--lead .budget-glance__label {
-  font-size: var(--text-sm);
+  font-size: var(--type-caption);
 }
 
-.budget-glance--fold.budget-glance--lead .budget-glance__value {
-  font-size: var(--text-3xl);
+.budget-glance--fold .budget-glance__balance[aria-expanded="false"] .budget-glance__flows {
+  display: none;
 }
 
-.budget-glance--fold.budget-glance--lead-xlong .budget-glance__value {
-  font-size: var(--text-2xl);
-}
-
-.budget-glance--fold.budget-glance--lead-xxlong .budget-glance__value {
-  font-size: var(--text-xl);
-}
-
-.budget-glance--fold .budget-glance__balance[aria-expanded="false"] .budget-glance__flows,
+/* Eigene Regel: ein `:has()` in einer Selektorliste verwirft ohne
+ * `:has()`-Unterstuetzung die ganze Liste (F4.2). */
 .budget-glance--fold:has(.budget-glance__balance[aria-expanded="false"]) .budget-glance__categories {
   display: none;
 }

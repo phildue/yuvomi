@@ -28,7 +28,8 @@
  *
  * 3. NACHTABSENKUNG NACH UHRZEIT. Das Tablet haengt im Flur und leuchtet um
  *    drei. Das Problem ist die Leuchtdichte, nicht der Farbmodus: ein dunkles
- *    Theme leuchtet immer noch. Zwischen 22 und 6 Uhr traegt die Wurzel deshalb
+ *    Theme leuchtet immer noch. In den Nachtstunden des Geraets (Vorgabe 22
+ *    bis 6 Uhr, utils/night-hours.js) traegt die Wurzel deshalb
  *    `data-wall-night`, und der dunkle Grund wird ERZWUNGEN, auch wenn das
  *    Theme hell steht. Erzwungen heisst hier nicht gespeichert: die Wahl des
  *    Nutzers in `yuvomi-theme` bleibt unberuehrt, sie ist die Quelle, aus der
@@ -71,15 +72,10 @@
  * zwei Wege.
  */
 
-import { nowFields } from './timezone.js';
+import { isNightHours } from './night-hours.js';
 
 const WALL_KEY = 'yuvomi-wall-mode';
 const THEME_KEY = 'yuvomi-theme';
-
-/** Ab dieser Stunde (einschliesslich) ist Nacht. */
-export const WALL_NIGHT_FROM = 22;
-/** Ab dieser Stunde (einschliesslich) ist wieder Tag. */
-export const WALL_NIGHT_TO = 6;
 
 function safeGet(key) {
   try {
@@ -104,6 +100,17 @@ function safeRemove(key) {
   } catch {
     // Siehe safeGet.
   }
+}
+
+/**
+ * Callback, der bei jeder Aenderung des Wand-Aktivzustands aufgerufen wird.
+ * Wird einmal von router.js mit `reportWallPauseState` aus push.js belegt.
+ */
+let _wallActiveChangeHook = null;
+
+/** Registriert einen Callback fuer Aenderungen des Wand-Zustands (#1904). */
+export function onWallActiveChange(cb) {
+  _wallActiveChangeHook = cb;
 }
 
 /** Ist der Modus auf DIESEM Geraet eingeschaltet? */
@@ -140,15 +147,12 @@ export function wallShowsOn(path = location.pathname) {
 }
 
 /**
- * Nachtfenster. Ueber Mitternacht hinweg, deshalb ODER statt UND - dieselbe
- * Falle, die das Tagesprogramm beim Mitternachts-Ausblick schon einmal hatte.
+ * Nachtfenster: die Nachtstunden DIESES Geraets (#2234), auf der Uhr des
+ * Haushalts (#829 Teil 3). Dieselbe Funktion fragt theme-init.js fuer das
+ * erste Bild und der Bildschirmschoner (#1901) - utils/night-hours.js.
  */
 export function isWallNight(now = new Date()) {
-  // Die Uhr des Haushalts, nicht die des Geraets: ein Wandbildschirm, dessen
-  // Browser in einer anderen Zone steht, ginge sonst zur falschen Stunde in den
-  // Nachtmodus (#829 Teil 3).
-  const hour = nowFields(now).hour;
-  return hour >= WALL_NIGHT_FROM || hour < WALL_NIGHT_TO;
+  return isNightHours(now);
 }
 
 /** Laeuft die Flaeche gerade als Wand? Liest den Zustand, den `syncWallMode` setzt. */
@@ -187,6 +191,7 @@ function restoreUserTheme() {
  */
 export function syncWallMode(path = location.pathname) {
   const root = document.documentElement;
+  const wasActive = root.hasAttribute('data-wall-mode');
   const active = wallShowsOn(path);
   const night = active && isWallNight();
   const wasNight = root.hasAttribute('data-wall-night');
@@ -217,6 +222,8 @@ export function syncWallMode(path = location.pathname) {
   if (night !== wasNight || root.getAttribute('data-theme') !== themeBefore) {
     window.yuvomi?.restoreThemeColor?.();
   }
+
+  if (active !== wasActive && _wallActiveChangeHook) _wallActiveChangeHook(active);
 
   return active;
 }

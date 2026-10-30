@@ -6,6 +6,7 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { linkTransfer } from '../../services/budget-transfers.js';
 import path from 'path';
 import * as db from '../../db.js';
 import {
@@ -14,8 +15,11 @@ import {
 } from '../../services/budget-visibility.js';
 import { computeLoanSchedule, remainingPrincipalFromPayments, remainingInstallmentsForBalance, rateForInstallment } from '../../services/loan-amortization.js';
 import { todayKey } from '../../utils/timezone.js';
+import { cachedRate, cachedRateInfo } from '../../services/subscription-rates.js';
 import { DEFAULT_LOCALE, resolveHouseholdLocale, supportedLocaleFor } from '../../utils/i18n.js';
 import { newNonMembers } from '../../services/household-members.js';
+import { MAX_INTERVAL_COUNT } from '../../../public/utils/budget-recurrence.js';
+import { SAVINGS_CHART_CATEGORY } from '../../../public/utils/budget-chart-category.js';
 
 // --------------------------------------------------------
 // Persönlich/geteilt (#476/#505): Haushalts-Modus + Sichtbarkeits-Enforcement.
@@ -102,12 +106,12 @@ export function expectedSubscriptionFilter(req) {
  *
  * @returns {{ expr: string, params: number[] }}
  */
-export function budgetCategoryExpr(req, alias) {
+export function budgetCategoryExpr(req, alias, category = `${alias}.category`) {
   const mode = getBudgetMode();
-  if (mode !== 'personal') return { expr: `${alias}.category`, params: [] };
+  if (mode !== 'personal') return { expr: category, params: [] };
   return {
     expr: `CASE WHEN ${budgetDetailsHiddenWhere(alias, '?', { mode })}`
-        + ` THEN '${BUDGET_MASKED_CATEGORY}' ELSE ${alias}.category END`,
+        + ` THEN '${BUDGET_MASKED_CATEGORY}' ELSE ${category} END`,
     params: [viewerId(req)],
   };
 }
@@ -167,6 +171,7 @@ const CATEGORY_LABEL_KEYS = {
   'Sonstiges Einkommen': 'catOtherIncome',
 };
 const SUBCATEGORY_LABEL_KEYS = {
+  saving: 'catSaving',
   rent_mortgage: 'subcatRentMortgage',
   condominium: 'subcatCondominium',
   utilities: 'subcatUtilities',
@@ -278,7 +283,7 @@ export const RECURRENCE_INTERVAL_KEYS = ['weekly', 'monthly', 'yearly'];
 
 // Obergrenze wie im RRULE-Formular der Aufgaben/Termine: dieselbe Zahl im
 // Eingabefeld, damit "alle N" überall dasselbe Höchstmaß hat.
-export const MAX_INTERVAL_COUNT = 99;
+export { MAX_INTERVAL_COUNT };
 
 /** Anzahl auf eine ganze Zahl in [1, MAX_INTERVAL_COUNT] bringen. */
 export function normalizeIntervalCount(value) {
@@ -377,7 +382,7 @@ export function occurrenceDatesInMonth(startDate, interval, count, month) {
  * #1035 nur "von Hand erfasst" heisst.
  */
 const SERIES_SELECT = `
-    SELECT a.id, COALESCE(s.start_date, a.date) AS start_date, a.created_by, a.owner_id,
+    SELECT a.id, a.transfer_entry_id, COALESCE(s.start_date, a.date) AS start_date, a.created_by, a.owner_id,
            a.recurrence_interval, a.recurrence_interval_count,
            a.recurrence_virtual, a.recurrence_confirm,
            s.title, s.amount, s.category, s.subcategory, s.account_id, s.visibility,
@@ -414,7 +419,25 @@ function occurrenceWriter(database) {
     SELECT ?, user_id FROM budget_series_responsibles WHERE anchor_id = ?
   `);
 
-  return (orig, date) => {
+  const write = (orig, date) => {
+    if (orig.transfer_entry_id) {
+      const partner = database.prepare(`${SERIES_SELECT} AND a.id = ?`).get(orig.transfer_entry_id);
+      if (!partner) throw new Error('Transfer series partner missing');
+      return database.transaction(() => {
+        if ((orig.grid_from && date < orig.grid_from) || (partner.grid_from && date < partner.grid_from)) return false;
+        if (skipStmt.get(orig.id, date) || skipStmt.get(partner.id, date)) return false;
+        const first = existsStmt.get(orig.id, date);
+        const second = existsStmt.get(partner.id, date);
+        if (first && second) return false;
+        if (first || second) throw new Error('Unpaired transfer occurrence');
+        write({ ...orig, transfer_entry_id: null }, date);
+        write({ ...partner, transfer_entry_id: null }, date);
+        const firstId = existsStmt.get(orig.id, date).id;
+        const secondId = existsStmt.get(partner.id, date).id;
+        linkTransfer(database, firstId, secondId);
+        return true;
+      })();
+    }
     // VOR DER LETZTEN RASTERAENDERUNG ENTSTEHT NICHTS (#1545, Review-Befund in
     // #1585). Hat eine Serien-Aenderung den Starttag oder den Rhythmus
     // verschoben, stehen die Buchungen davor auf dem ALTEN Raster - ein
@@ -465,6 +488,7 @@ function occurrenceWriter(database) {
     copyResponsiblesStmt.run(created.lastInsertRowid, orig.id);
     return true;
   };
+  return write;
 }
 
 /**
@@ -683,8 +707,18 @@ export function uniqueKey(table, base) {
   return key;
 }
 
+/**
+ * Wer eine Kategorie traegt: Buchungen, und seit Migration 271 auch Ausgaben
+ * und Serien der Aufteilung (`budget_category`). Zaehlte bis Codex an #2364
+ * nur Buchungen - eine Kategorie, die nur Aufteilungs-Ausgaben trugen, liess
+ * sich loeschen, und danach scheiterte jedes Speichern dieser Ausgaben.
+ */
 export function categoryInUseCount(database, key) {
-  return database.prepare('SELECT COUNT(*) AS n FROM budget_entries WHERE category = ?').get(key).n;
+  return database.prepare(`
+    SELECT (SELECT COUNT(*) FROM budget_entries WHERE category = @key)
+         + (SELECT COUNT(*) FROM expenses WHERE budget_category = @key)
+         + (SELECT COUNT(*) FROM recurring_expenses WHERE budget_category = @key) AS n
+  `).get({ key }).n;
 }
 
 export function subcategoryInUseCount(database, key) {
@@ -840,6 +874,39 @@ export function budgetCurrency() {
   return db.get().prepare("SELECT value FROM sync_config WHERE key = 'currency'").get()?.value || 'EUR';
 }
 
+export function budgetChartCategorySql(alias) {
+  return `CASE WHEN ${alias}.category = 'financial_other' AND ${alias}.subcategory = 'saving'
+    THEN '${SAVINGS_CHART_CATEGORY}' ELSE ${alias}.category END`;
+}
+
+/** Transfers carry one amount, so both accounts must use the same effective currency. */
+export function transferCurrenciesMatch(firstId, secondId) {
+  const currency = budgetCurrency();
+  const account = db.get().prepare('SELECT currency FROM budget_accounts WHERE id = ?');
+  const first = account.get(firstId);
+  const second = account.get(secondId);
+  return Boolean(first && second && (first.currency || currency) === (second.currency || currency));
+}
+
+export function isArchivedBudgetAccount(id) {
+  return Boolean(db.get().prepare('SELECT archived FROM budget_accounts WHERE id = ?').get(id)?.archived);
+}
+
+export function budgetAccountCurrency(id) {
+  return db.get().prepare('SELECT currency FROM budget_accounts WHERE id = ?').get(id)?.currency || budgetCurrency();
+}
+
+function accountFractionDigits(currency) {
+  try { return new Intl.NumberFormat('en', { style: 'currency', currency }).resolvedOptions().minimumFractionDigits; }
+  catch { return 2; }
+}
+
+export function transferAmountFitsCurrency(amount, accountId) {
+  const value = Number(amount);
+  return Number.isFinite(value) && value !== 0
+    && Number(value.toFixed(accountFractionDigits(budgetAccountCurrency(accountId)))) === value;
+}
+
 /**
  * Fester Umrechnungskurs eines Darlehens in die Budget-Währung (#582).
  * Semantik: 1 Einheit Darlehenswährung = rate Einheiten Budget-Währung.
@@ -856,9 +923,62 @@ export function toBudgetAmount(amount, loan) {
   return cents(Number(amount || 0) * loanRate(loan));
 }
 
-/** Gegenrichtung zu toBudgetAmount: Budget-Betrag zurück in die Darlehenswährung (#582). */
-export function fromBudgetAmount(amount, loan) {
-  return cents(Number(amount || 0) / loanRate(loan));
+/**
+ * Kurs von der Darlehenswaehrung in die Waehrung der Buchung einer Rate
+ * (#2302): eine Buchung steht in der Waehrung ihres Kontos, ohne Konto in der
+ * Budget-Waehrung. Traegt das Konto die Darlehenswaehrung, bucht die Rate
+ * ohne Umrechnung; traegt es die Budget-Waehrung, gilt der feste Kurs des
+ * Darlehens (#582). Eine dritte Waehrung geht ueber den festen Kurs bis zur
+ * Budget-Waehrung und von dort ueber den Kurs-Cache - null, wenn der keinen
+ * kennt: dann gibt es keine richtige Zahl, und der Aufrufer lehnt ab.
+ */
+export function loanEntryRate(loan, accountId, { bookedRate = null } = {}) {
+  const base = budgetCurrency();
+  const target = accountId != null ? budgetAccountCurrency(accountId) : base;
+  if (target === (loan?.currency || base)) return 1;
+  if (target === base) return loanRate(loan);
+  // Eine schon gebuchte Rate behaelt ihren Kurs: der Cache aendert sich, die
+  // Buchung nicht (Codex zu #2302).
+  if (bookedRate > 0 && Number.isFinite(bookedRate)) return bookedRate;
+  const onward = cachedRate(base, target);
+  return onward == null ? null : loanRate(loan) * onward;
+}
+
+/**
+ * Das Nettovermoegen der aktiven Konten (#2302). Jedes Konto fuehrt seinen
+ * Saldo in seiner Waehrung; eine Rohsumme ueber Dollar und Euro waere eine
+ * falsche Zahl. Stehen alle in der Budget-Waehrung, bleibt es die Summe. Sonst
+ * rechnet der Kurs-Cache in die Budget-Waehrung um, und die Antwort sagt, dass
+ * es eine Naeherung ist und von wann ihr aeltester Kurs stammt. Fehlt ein Kurs,
+ * ist `net_worth` null, und `net_worth_by_currency` traegt die Summe je Waehrung -
+ * keine Zahl ist besser als eine falsche.
+ */
+export function netWorthSummary(accounts) {
+  const base = budgetCurrency();
+  const totals = new Map();
+  for (const a of accounts) {
+    if (a.archived) continue;
+    const currency = a.currency || base;
+    totals.set(currency, (totals.get(currency) ?? 0) + Number(a.current_balance || 0));
+  }
+  // Jede Teilsumme in den Stellen IHRER Waehrung (KWD drei, JPY keine) -
+  // gerundet wird erst die umgerechnete Summe (Codex zu #2335).
+  const inDigits = (amount, currency) => {
+    const f = 10 ** accountFractionDigits(currency);
+    return Math.round(amount * f) / f;
+  };
+  const byCurrency = [...totals].map(([currency, amount]) => ({ currency, amount: inDigits(amount, currency) }))
+    .sort((x, y) => (x.currency === base ? -1 : y.currency === base ? 1 : x.currency.localeCompare(y.currency)));
+  if (byCurrency.every((p) => p.currency === base)) return { net_worth: byCurrency[0]?.amount ?? 0 };
+  let sum = 0;
+  let ratesAt = null;
+  for (const part of byCurrency) {
+    const info = cachedRateInfo(part.currency, base);
+    if (!info) return { net_worth: null, net_worth_by_currency: byCurrency };
+    sum += part.amount * info.rate;
+    if (info.fetchedAt && (!ratesAt || info.fetchedAt < ratesAt)) ratesAt = info.fetchedAt;
+  }
+  return { net_worth: cents(sum), net_worth_approx: true, net_worth_rates_at: ratesAt, net_worth_by_currency: byCurrency };
 }
 
 // --------------------------------------------------------
@@ -1270,12 +1390,14 @@ export function refuse(res, errors, status = 400) {
  * Prüft eine optionale Konto-Zuordnung aus dem Request.
  * @returns {{ value: number|null }|{ error: string }} value=null ⇒ keinem Konto zugeordnet.
  */
-export function validateAccountRef(raw) {
+export function validateAccountRef(raw, filter) {
   if (raw === undefined || raw === null || raw === '') return { value: null };
   const id = Number(raw);
   if (!Number.isInteger(id) || id <= 0) return { error: 'account_id must be a valid account id.' };
-  const row = db.get().prepare('SELECT id FROM budget_accounts WHERE id = ?').get(id);
-  if (!row) return { error: 'Account not found.' };
+  const row = db.get().prepare('SELECT id, archived FROM budget_accounts WHERE id = ?').get(id);
+  // Eine Huelle (ACCOUNT_SHELL) ist fuer wen sie nichts traegt "nicht gefunden",
+  // wie ein geloeschtes Konto. Ohne Filter (alte Aufrufer) zaehlt nur das Dasein.
+  if (!row || (filter && accountGoneFor(row, filter))) return { error: 'Account not found.' };
   return { value: id };
 }
 
@@ -1306,25 +1428,59 @@ export function listAccounts(includeArchived = false, filter = { clause: '', par
     WHERE ? = 1 OR a.archived = 0
     ORDER BY a.sort_order ASC, a.name COLLATE NOCASE ASC
   `).all(today, ...f.params, ...f.params, ...f.params, includeArchived ? 1 : 0);
-  return rows.map((a) => {
-    const currentBalance = cents(a.current_balance);
+  // Eine Kontohuelle (archived = ACCOUNT_SHELL, siehe DELETE /accounts/:id)
+  // sieht nur, wer noch Buchungen daran sieht - fuer alle anderen ist das
+  // Konto geloescht, ununterscheidbar von einem echt geloeschten.
+  return rows.filter((a) => a.archived !== ACCOUNT_SHELL || a.entry_count > 0).map((a) => {
+    // Preserve three-decimal account currencies, including linked transfers.
+    // Keep existing fractional values on zero-decimal accounts as before.
+    const digits = Math.max(2, accountFractionDigits(a.currency || budgetCurrency()));
+    const round = value => Number(Number(value).toFixed(digits));
+    const currentBalance = round(a.current_balance);
     // Verfügbarer Rahmen nur für Kreditkarten mit gepflegtem Limit. Ein negativer
     // Saldo ist die offene Schuld; ein positiver (Guthaben auf der Karte) vergrößert
     // den Rahmen nicht, deshalb der Clamp auf 0.
     const availableLimit = a.type === 'credit' && a.credit_limit != null
-      ? Math.max(0, cents(a.credit_limit) - Math.max(0, -currentBalance))
+      ? Math.max(0, round(a.credit_limit) - Math.max(0, -currentBalance))
       : null;
     return {
       ...a,
-      starting_balance:  cents(a.starting_balance),
+      archived:          a.archived ? 1 : 0, // die Huelle zeigt sich ihrem Rest-Besitzer als archiviert
+      starting_balance:  round(a.starting_balance),
       current_balance:   currentBalance,
-      projected_balance: cents(a.projected_balance),
+      projected_balance: round(a.projected_balance),
       available_limit:   availableLimit,
     };
   });
 }
 
+/**
+ * DIE KONTOHUELLE (Critique R23, Sicherheitspruefung). Ein Konto zu loeschen
+ * nimmt seinen Buchungen die Zuordnung. Im personal-Modus koennen daran
+ * private Buchungen anderer haengen, die der Loeschende nicht sieht - ueber die
+ * entscheidet er nicht mit. Jede eigene Antwort darauf (409, ein Bit in der
+ * Liste) waere ein Orakel: wer ein scheinbar leeres Konto loescht, wuesste,
+ * dass dort Fremdes liegt. Deshalb loest der Loeschende nur, was er sieht, und
+ * bleibt danach Fremdes am Konto, steht es als HUELLE weiter (archived = 2):
+ * fuer ihn und jeden ohne sichtbare Buchung daran ist es geloescht (Liste,
+ * PUT, DELETE, Kontowahl antworten wie bei einem echt geloeschten), der
+ * Besitzer der privaten Buchungen sieht es als archiviert.
+ */
+export const ACCOUNT_SHELL = 2;
+
+/** Ist Konto `row` fuer diesen Betrachter weg - nicht da, oder eine Huelle ohne sichtbare Buchung? */
+export function accountGoneFor(row, filter = { clause: '', params: [] }) {
+  if (!row) return true;
+  if (row.archived !== ACCOUNT_SHELL) return false;
+  const f = filter && filter.clause ? filter : { clause: '', params: [] };
+  return !db.get().prepare(`SELECT 1 FROM budget_entries e WHERE e.account_id = ?${f.clause} LIMIT 1`)
+    .get(row.id, ...f.params);
+}
+
 export function nextAccountSortOrder() {
-  const row = db.get().prepare('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM budget_accounts').get();
+  // Huellen zaehlen nicht: sonst verriete die naechste Position eines neuen
+  // Kontos, dass hinter einem geloeschten noch eine Huelle steht.
+  const row = db.get().prepare('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM budget_accounts WHERE archived <> ?')
+    .get(ACCOUNT_SHELL);
   return row.next;
 }

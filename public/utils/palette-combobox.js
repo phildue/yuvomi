@@ -34,8 +34,10 @@
  * echten Handler mit einem kleinen Stub faehrt.
  */
 
-const OPTION_SELECTOR = '.search-result, .search-scope';
-const GROUP_SELECTOR = '.search-section, .search-scopes';
+// Seit R22 (D16) traegt auch der Leerzustand nur Zeilen (`.search-result`) in
+// Gruppen (`.search-section`) - die Kacheln (`.search-scope`) sind entfallen.
+const OPTION_SELECTOR = '.search-result';
+const GROUP_SELECTOR = '.search-section';
 const HEADING_SELECTOR = '.search-section__heading';
 
 let idCounter = 0;
@@ -118,8 +120,10 @@ export function wirePaletteCombobox({ input, listbox }) {
   }
 
   input.addEventListener('keydown', (e) => {
-    // Waehrend einer IME-Eingabe gehoert Enter der Komposition.
-    if (e.isComposing) return;
+    // Waehrend einer IME-Eingabe gehoert Enter der Komposition. keyCode 229
+    // faengt Safari (wie isImeComposing() in utils/ux.js - dieses Modul bleibt
+    // ohne Import, test:search-palette laedt es ohne Browser-Loader).
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       if (!options.length) return;
       e.preventDefault();

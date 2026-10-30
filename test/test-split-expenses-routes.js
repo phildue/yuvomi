@@ -410,6 +410,104 @@ test('GET /groups/:id/expenses: category-Filter + limit/offset-Pagination', asyn
   assert.equal(rec.body.data.length, 0, 'keine Ausgabe hat eine Wiederholungsregel');
 });
 
+// #2108: Offset-Seiten ueber Ausgaben DERSELBEN Sekunde. `created_at` ist
+// sekundengenau; ohne `id` als letzten Schluessel ist die Reihenfolge dort
+// unbestimmt, und eine Seite kann eine Ausgabe doppeln oder auslassen. Die
+// Zeitstempel werden per SQL gleichgezogen - so schreibt eine nachholende
+// Serie oder ein Import.
+test('GET /groups/:id/expenses: Seiten ueber dieselbe Sekunde ohne Doppel und Luecke, Reihenfolge id absteigend', async () => {
+  const owner = { id: OWNER, role: 'member' };
+  const created = await call('POST', '/groups', { actor: owner, body: { name: 'Seiten-Kasse', type: 'household', default_currency: 'EUR' } });
+  const gid = created.body.data.id;
+  const ids = [];
+  for (let i = 0; i < 7; i += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const e = await call('POST', `/groups/${gid}/expenses`, {
+      actor: owner,
+      body: { title: `Gleiche Sekunde ${i}`, amount: '5.00', split_method: 'equal', category: 'other', payer_id: OWNER, participants: [OWNER], expense_date: '2026-04-02' },
+    });
+    assert.equal(e.status, 201, JSON.stringify(e.body));
+    ids.push(e.body.data.id);
+  }
+  db.prepare("UPDATE expenses SET created_at = '2026-04-02 08:00:00' WHERE group_id = ?").run(gid);
+
+  const seiten = [];
+  for (let offset = 0; offset < 7; offset += 3) {
+    // eslint-disable-next-line no-await-in-loop
+    const r = await call('GET', `/groups/${gid}/expenses?limit=3&offset=${offset}`, { actor: owner });
+    assert.equal(r.status, 200);
+    seiten.push(r.body);
+  }
+  const gesehen = seiten.flatMap((seite) => seite.data.map((e) => e.id));
+  assert.equal(new Set(gesehen).size, gesehen.length, 'keine Ausgabe auf zwei Seiten');
+  assert.deepEqual(gesehen, [...ids].sort((a, b) => b - a), 'alle sieben, innerhalb der Sekunde die juengste id zuerst');
+  assert.deepEqual(seiten.map((seite) => seite.pagination.has_more), [true, true, false]);
+});
+
+test('GET /groups/:id/expenses: Cursor blaettert ohne Luecke, auch wenn zwischen zwei Seiten oben geloescht wird', async () => {
+  const owner = { id: OWNER, role: 'member' };
+  const created = await call('POST', '/groups', { actor: owner, body: { name: 'Cursor-Kasse', type: 'household', default_currency: 'EUR' } });
+  const gid = created.body.data.id;
+  const ids = [];
+  for (let i = 0; i < 7; i += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const e = await call('POST', `/groups/${gid}/expenses`, {
+      actor: owner,
+      body: { title: `Cursor ${i}`, amount: '2.00', split_method: 'equal', category: 'other', payer_id: OWNER, participants: [OWNER], expense_date: '2026-04-04' },
+    });
+    ids.push(e.body.data.id);
+  }
+  db.prepare("UPDATE expenses SET created_at = '2026-04-04T08:00:00Z' WHERE group_id = ?").run(gid);
+  const absteigend = [...ids].sort((a, b) => b - a);
+
+  const erste = await call('GET', `/groups/${gid}/expenses?limit=3`, { actor: owner });
+  assert.deepEqual(erste.body.data.map((e) => e.id), absteigend.slice(0, 3));
+  assert.deepEqual(erste.body.pagination.next_cursor, { before_date: '2026-04-04', before_at: '2026-04-04T08:00:00Z', before_id: absteigend[2] });
+  // Zwischen den Seiten loescht jemand die oberste Ausgabe. Mit offset=3 begaenne
+  // die naechste Seite eine Zeile zu spaet und liesse absteigend[3] aus.
+  const weg = await call('DELETE', `/expenses/${absteigend[0]}`, { actor: owner });
+  assert.equal(weg.status, 200);
+  const gesehen = erste.body.data.map((e) => e.id);
+  let cursor = erste.body.pagination.next_cursor;
+  while (cursor) {
+    const q = new URLSearchParams({ limit: '3', before_date: cursor.before_date, before_at: cursor.before_at, before_id: String(cursor.before_id) });
+    // eslint-disable-next-line no-await-in-loop
+    const r = await call('GET', `/groups/${gid}/expenses?${q}`, { actor: owner });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.pagination.offset, undefined, 'mit Cursor kein offset in der Antwort');
+    gesehen.push(...r.body.data.map((e) => e.id));
+    cursor = r.body.pagination.next_cursor;
+  }
+  assert.deepEqual(gesehen, absteigend, 'alle sieben genau einmal - die geloeschte nur von der ersten Seite');
+
+  const halb = await call('GET', `/groups/${gid}/expenses?before_id=${absteigend[2]}`, { actor: owner });
+  assert.equal(halb.status, 400, 'ein halber Cursor ist 400');
+  const beides = await call('GET', `/groups/${gid}/expenses?offset=3&before_date=2026-04-04&before_at=2026-04-04T08:00:00Z&before_id=${absteigend[2]}`, { actor: owner });
+  assert.equal(beides.status, 400, 'Cursor und offset zusammen sind 400');
+  const ohne = await call('GET', `/groups/${gid}/expenses?limit=3&offset=3`, { actor: owner });
+  assert.equal(ohne.body.pagination.offset, 3, 'offset bleibt fuer /api/v1 erhalten');
+});
+
+test('GET /groups/:id/expenses: has_more ist bei genau `limit` Ausgaben false (keine leere Extraseite)', async () => {
+  const owner = { id: OWNER, role: 'member' };
+  const created = await call('POST', '/groups', { actor: owner, body: { name: 'Genau-Kasse', type: 'household', default_currency: 'EUR' } });
+  const gid = created.body.data.id;
+  for (let i = 0; i < 3; i += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const e = await call('POST', `/groups/${gid}/expenses`, {
+      actor: owner,
+      body: { title: `Genau ${i}`, amount: '1.00', split_method: 'equal', category: 'other', payer_id: OWNER, participants: [OWNER], expense_date: '2026-04-03' },
+    });
+    assert.equal(e.status, 201);
+  }
+  const genau = await call('GET', `/groups/${gid}/expenses?limit=3`, { actor: owner });
+  assert.equal(genau.body.data.length, 3);
+  assert.equal(genau.body.pagination.has_more, false, 'drei von drei: nichts mehr dahinter');
+  const knapp = await call('GET', `/groups/${gid}/expenses?limit=2`, { actor: owner });
+  assert.equal(knapp.body.data.length, 2, 'die Zusatzzeile fuer has_more geht nicht mit in die Antwort');
+  assert.equal(knapp.body.pagination.has_more, true);
+});
+
 test('member-candidates: Owner 200, Gast 403, Aussenstehender 404', async () => {
   const ok = await call('GET', `/groups/${OPS}/member-candidates`, { actor: { id: OWNER, role: 'member' } });
   assert.equal(ok.status, 200);
@@ -550,6 +648,21 @@ test('POST members via contact_id mit Geburtstag: erzeugt Nutzer + Geburtstags-A
   const bday = db.prepare('SELECT birth_date FROM birthdays WHERE family_user_id = ?').get(r.body.data.user_id);
   assert.ok(bday, 'Geburtstag aus Kontakt übernommen');
   assert.equal(bday.birth_date, '1992-07-07');
+});
+
+// #2095: ein Kontakt ohne Jahr bleibt ohne Jahr, wenn er Gast wird, und die
+// Kandidatenliste traegt die Marke als Boolean (Codex-Befund auf #2111).
+test('POST members via contact_id ohne Jahr: der Gast-Geburtstag bleibt ohne Jahr', async () => {
+  const contactId = db.prepare(`INSERT INTO contacts (name, category, birthday, birthday_year_unknown) VALUES ('Jahrlos Kontakt', 'Sonstiges', '2000-08-09', 1)`).run().lastInsertRowid;
+  const candidates = await call('GET', `/groups/${OPS}/member-candidates`, { actor: { id: OWNER, role: 'member' } });
+  const candidate = candidates.body.data.find((row) => row.source === 'contact' && row.contact_id === contactId);
+  assert.equal(candidate.birth_year_unknown, true);
+  assert.equal(candidates.body.data.filter((row) => row.source === 'user').every((row) => typeof row.birth_year_unknown === 'boolean'), true);
+
+  const r = await call('POST', `/groups/${OPS}/members`, { actor: { id: OWNER, role: 'member' }, body: { contact_id: contactId, role: 'guest' } });
+  assert.equal(r.status, 201);
+  const bday = db.prepare('SELECT birth_date, year_unknown FROM birthdays WHERE family_user_id = ?').get(r.body.data.user_id);
+  assert.deepEqual({ ...bday }, { birth_date: '2000-08-09', year_unknown: 1 });
 });
 
 // Der Kontakt ist Quelldatum aus `contacts`: ohne dessen Leserecht (Mitglied
@@ -2029,6 +2142,326 @@ test('archivierte Gruppe: Mitglied und Gast antworten 409 noch vor der Body-Prue
     assert.equal(r.body.reason, 'group_archived', name);
   }
   assert.equal(gruppenStand(gid), vorher);
+});
+
+// --------------------------------------------------------------------------
+// Summen einer Gruppe (#1888 je Person, #1941 je Kategorie) und die Kategorie
+// beim Bearbeiten. Zwei Waehrungen, eine Fremdwaehrungs-Ausgabe (gezaehlt in
+// `converted_currency`, der Waehrung der Salden), eine geloeschte Ausgabe,
+// ein Ausgleich und mehr Ausgaben als eine Seite der Liste (30).
+// --------------------------------------------------------------------------
+const OWNER_A = { id: OWNER, role: 'member' };
+let SUM_GROUP;
+async function summen(viewer = OWNER_A) {
+  const r = await call('GET', `/groups/${SUM_GROUP}/balances`, { actor: viewer });
+  assert.equal(r.status, 200);
+  return r.body.data;
+}
+
+test('setup Summen: Gruppe mit zwei Waehrungen, geloeschter Ausgabe, Ausgleich und 31 Kleinbetraegen', async () => {
+  const g = await call('POST', '/groups', { actor: OWNER_A, body: { name: 'Reise-Kasse', type: 'trip', default_currency: 'EUR' } });
+  SUM_GROUP = g.body.data.id;
+  await call('POST', `/groups/${SUM_GROUP}/members`, { actor: OWNER_A, body: { user_id: MGR, role: 'admin' } });
+  await call('POST', `/groups/${SUM_GROUP}/members`, { actor: OWNER_A, body: { user_id: MEM, role: 'guest' } });
+  const ausgabe = async (body) => {
+    const r = await call('POST', `/groups/${SUM_GROUP}/expenses`, { actor: OWNER_A, body: { split_method: 'equal', expense_date: '2026-07-01', ...body } });
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    return r.body.data.id;
+  };
+  await ausgabe({ title: 'Faehre', amount: '30.00', currency: 'EUR', category: 'travel', payer_id: OWNER, participants: [OWNER, MGR, MEM] });
+  await ausgabe({ title: 'Hotel', amount: '110.00', currency: 'USD', converted_amount: '100.00', converted_currency: 'EUR', category: 'travel', payer_id: MGR, participants: [OWNER, MGR] });
+  await ausgabe({ title: 'Migros', amount: '60.00', currency: 'CHF', category: 'groceries', payer_id: MGR, participants: [OWNER, MGR] });
+  await ausgabe({ title: 'Bergbahn', amount: '20.00', currency: 'CHF', category: 'travel', payer_id: OWNER, participants: [OWNER, MGR] });
+  const weg = await ausgabe({ title: 'Doppelt erfasst', amount: '50.00', currency: 'EUR', category: 'groceries', payer_id: MEM, participants: [OWNER, MGR, MEM] });
+  assert.equal((await call('DELETE', `/expenses/${weg}`, { actor: OWNER_A })).status, 200);
+  for (let i = 0; i < 31; i += 1) {
+    await ausgabe({ title: `Kaffee ${i}`, amount: '1.00', currency: 'EUR', category: 'groceries', payer_id: MEM, participants: [MEM] });
+  }
+  const s = await call('POST', `/groups/${SUM_GROUP}/settlements`, { actor: OWNER_A, body: { payer_id: MGR, payee_id: OWNER, amount: '5.00', currency: 'EUR' } });
+  assert.equal(s.status, 201, JSON.stringify(s.body));
+});
+
+test('#1888: je Person und Waehrung, was sie bezahlt hat und ihr eigener Anteil - vollstaendig ueber mehr als eine Seite', async () => {
+  const { member_totals: rows } = await summen();
+  assert.ok(Array.isArray(rows), 'member_totals fehlt in der Antwort');
+  const kurz = rows.map((r) => [r.currency, r.user_id, r.paid_minor, r.share_minor]);
+  assert.deepEqual(kurz, [
+    ['CHF', MGR, 6000, 4000],
+    ['CHF', OWNER, 2000, 4000],
+    ['EUR', MEM, 3100, 4100],
+    ['EUR', MGR, 10000, 6000],
+    ['EUR', OWNER, 3000, 6000],
+  ], 'Fremdwaehrung in converted_currency, geloeschte Ausgabe und Ausgleich zaehlen nicht, keine Zeile ohne Betrag');
+  const mgrEur = rows.find((r) => r.currency === 'EUR' && r.user_id === MGR);
+  assert.equal(mgrEur.paid, '100.00');
+  assert.equal(mgrEur.share, '60.00');
+  assert.equal(mgrEur.display_name, 'MGR');
+});
+
+test('#1888: bezahlt minus Anteil ist der Saldo vor allen Ausgleichen', async () => {
+  const { member_totals: rows } = await summen();
+  const vorAusgleich = new Map(db.prepare(`
+    SELECT currency || ':' || user_id AS k, SUM(amount_minor) AS net
+    FROM expense_ledger_entries
+    WHERE group_id = ? AND source_type IN ('expense', 'expense_reversal')
+    GROUP BY currency, user_id
+  `).all(SUM_GROUP).map((r) => [r.k, r.net]));
+  for (const r of rows) {
+    assert.equal(r.paid_minor - r.share_minor, vorAusgleich.get(`${r.currency}:${r.user_id}`) ?? 0, `${r.currency} ${r.user_id}`);
+  }
+});
+
+test('#1941: je Kategorie und Waehrung die Summe der aktiven Ausgaben, die groesste zuerst', async () => {
+  const { category_totals: rows } = await summen();
+  assert.ok(Array.isArray(rows), 'category_totals fehlt in der Antwort');
+  assert.deepEqual(rows.map((r) => [r.currency, r.category, r.total_minor, r.total]), [
+    ['CHF', 'groceries', 6000, '60.00'],
+    ['CHF', 'travel', 2000, '20.00'],
+    ['EUR', 'travel', 13000, '130.00'],
+    ['EUR', 'groceries', 3100, '31.00'],
+  ]);
+});
+
+test('#1941: wer das Modul nur lesen darf, bekommt dieselben Summen', async () => {
+  const lesend = await summen({ id: MEM, role: 'member', moduleAccess: { budget: 'read' } });
+  const voll = await summen();
+  assert.deepEqual(lesend.member_totals, voll.member_totals);
+  assert.deepEqual(lesend.category_totals, voll.category_totals);
+});
+
+test('#1941: eine Gruppe ohne Ausgaben hat keine Summen', async () => {
+  const g = await call('POST', '/groups', { actor: OWNER_A, body: { name: 'Leer-Kasse', type: 'trip', default_currency: 'EUR' } });
+  const r = await call('GET', `/groups/${g.body.data.id}/balances`, { actor: OWNER_A });
+  assert.deepEqual(r.body.data.member_totals, []);
+  assert.deepEqual(r.body.data.category_totals, []);
+});
+
+test('#1941: der Kategoriefilter liefert ueber alle Seiten genau die Ausgaben der Kategorie', async () => {
+  const r = await call('GET', `/groups/${SUM_GROUP}/expenses?category=groceries&limit=100`, { actor: OWNER_A });
+  assert.equal(r.body.data.length, 32, 'Migros + 31 Kaffee, ohne die geloeschte');
+  assert.ok(r.body.data.every((e) => e.category === 'groceries'));
+});
+
+test('#1941: PUT ohne `category` laesst die Kategorie stehen, eine unbekannte faellt wie bisher auf general', async () => {
+  const created = await call('POST', `/groups/${SUM_GROUP}/expenses`, {
+    actor: OWNER_A,
+    body: { title: 'Zug', amount: '12.00', currency: 'EUR', category: 'travel', split_method: 'equal', payer_id: OWNER, participants: [OWNER, MGR], expense_date: '2026-07-02' },
+  });
+  assert.equal(created.body.data.category, 'travel');
+  const id = created.body.data.id;
+  const nurBetrag = await call('PUT', `/expenses/${id}`, { actor: OWNER_A, body: { title: 'Zug', amount: '14.00', currency: 'EUR', split_method: 'equal' } });
+  assert.equal(nurBetrag.status, 200, JSON.stringify(nurBetrag.body));
+  assert.equal(nurBetrag.body.data.amount_minor, 1400);
+  assert.equal(nurBetrag.body.data.category, 'travel', 'ein PUT ohne Kategorie setzte sie auf general zurueck');
+  const mitNull = await call('PUT', `/expenses/${id}`, { actor: OWNER_A, body: { title: 'Zug', amount: '14.00', currency: 'EUR', category: null } });
+  assert.equal(mitNull.body.data.category, 'travel', 'null heisst: nicht genannt');
+  const gewechselt = await call('PUT', `/expenses/${id}`, { actor: OWNER_A, body: { title: 'Zug', amount: '14.00', currency: 'EUR', category: 'shopping' } });
+  assert.equal(gewechselt.body.data.category, 'shopping');
+  const unbekannt = await call('PUT', `/expenses/${id}`, { actor: OWNER_A, body: { title: 'Zug', amount: '14.00', currency: 'EUR', category: 'casino' } });
+  assert.equal(unbekannt.status, 200);
+  assert.equal(unbekannt.body.data.category, 'general', 'unbekannt faellt wie beim Anlegen auf general');
+  assert.equal((await call('DELETE', `/expenses/${id}`, { actor: OWNER_A })).status, 200);
+});
+
+// --------------------------------------------------------------------------
+// Budget-Kategorien in der Aufteilung (R24, E12): Migration 271 + Routen
+// --------------------------------------------------------------------------
+test('Migration 271: eine frische Datenbank traegt budget_category an Ausgaben und Serien, NULL als Standard', () => {
+  for (const table of ['expenses', 'recurring_expenses']) {
+    const col = db.prepare(`PRAGMA table_info(${table})`).all().find((c) => c.name === 'budget_category');
+    assert.ok(col, `${table}.budget_category vorhanden`);
+    assert.equal(col.notnull, 0);
+    assert.equal(col.dflt_value, null);
+  }
+});
+
+test('Migration 271: eine Bestandsdatenbank mit altem Schema behaelt ihre Ausgaben, die Kategorie wird uebertragen', async () => {
+  const { default: Database } = await import('better-sqlite3-multiple-ciphers');
+  const old = new Database(':memory:');
+  // Das Schema vor 271: Ausgaben und Serien mit der eigenen Kategorie-Liste,
+  // dazu die Budget-Kategorien aus Migration 16 (eine davon hat der Haushalt
+  // geloescht: 'education').
+  old.exec(`
+    CREATE TABLE budget_categories (key TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0);
+    INSERT INTO budget_categories (key, name, type) VALUES
+      ('housing', 'Housing / Home', 'expense'), ('food', 'Food', 'expense'), ('leisure', 'Leisure', 'expense'),
+      ('shopping_clothing', 'Shopping', 'expense'), ('personal_health', 'Health', 'expense');
+    CREATE TABLE expenses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER NOT NULL, title TEXT NOT NULL, amount_minor INTEGER NOT NULL,
+      currency TEXT NOT NULL, payer_id INTEGER NOT NULL, category TEXT NOT NULL DEFAULT 'general'
+    );
+    CREATE TABLE recurring_expenses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER NOT NULL, title TEXT NOT NULL, amount_minor INTEGER NOT NULL,
+      currency TEXT NOT NULL, payer_id INTEGER NOT NULL, category TEXT NOT NULL DEFAULT 'general'
+    );
+    INSERT INTO expenses (group_id, title, amount_minor, currency, payer_id, category) VALUES
+      (1, 'REWE', 3000, 'EUR', 1, 'groceries'), (1, 'Miete', 90000, 'EUR', 1, 'rent'), (1, 'Futter', 2000, 'EUR', 1, 'pets'),
+      (1, 'Hefte', 500, 'EUR', 1, 'school'), (1, 'Sonstwas', 100, 'EUR', 1, 'general');
+    INSERT INTO recurring_expenses (group_id, title, amount_minor, currency, payer_id, category) VALUES (1, 'Strom', 7800, 'EUR', 1, 'utilities');
+  `);
+  const migration = dbmod.MIGRATIONS.find((m) => m.version === 271);
+  assert.ok(migration, 'Migration 271 vorhanden');
+  migration.up(old);
+  assert.deepEqual(
+    old.prepare('SELECT title, amount_minor, category, budget_category FROM expenses ORDER BY id').all().map((r) => ({ ...r })),
+    [
+      { title: 'REWE', amount_minor: 3000, category: 'groceries', budget_category: 'food' },
+      { title: 'Miete', amount_minor: 90000, category: 'rent', budget_category: 'housing' },
+      { title: 'Futter', amount_minor: 2000, category: 'pets', budget_category: null },
+      { title: 'Hefte', amount_minor: 500, category: 'school', budget_category: null },
+      { title: 'Sonstwas', amount_minor: 100, category: 'general', budget_category: null },
+    ],
+    'alte Kategorie bleibt, die Budget-Kategorie nur, wo der Schluessel existiert',
+  );
+  assert.equal(old.prepare('SELECT budget_category FROM recurring_expenses').get().budget_category, 'housing');
+  // Ein zweiter Lauf (gedriftete Datenbank) scheitert nicht und ueberschreibt keine spaetere Wahl.
+  old.prepare("UPDATE expenses SET budget_category = 'leisure' WHERE title = 'REWE'").run();
+  migration.up(old);
+  assert.equal(old.prepare("SELECT budget_category FROM expenses WHERE title = 'REWE'").get().budget_category, 'leisure');
+  old.close();
+});
+
+test('POST/PUT /expenses: budget_category wird gespeichert, ein PUT ohne sie laesst sie stehen, null leert sie, unbekannt -> 400', async () => {
+  const g = await call('POST', '/groups', { actor: OWNER_A, body: { name: 'Budget-Kategorien', type: 'general', default_currency: 'EUR' } });
+  const gid = g.body.data.id;
+  const base = { title: 'Bäcker', amount: '6.00', currency: 'EUR', split_method: 'equal', payer_id: OWNER, participants: [OWNER] };
+  const created = await call('POST', `/groups/${gid}/expenses`, { actor: OWNER_A, body: { ...base, budget_category: 'food' } });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  assert.equal(created.body.data.budget_category, 'food');
+  const id = created.body.data.id;
+  const kept = await call('PUT', `/expenses/${id}`, { actor: OWNER_A, body: { ...base, amount: '7.00' } });
+  assert.equal(kept.status, 200);
+  assert.equal(kept.body.data.budget_category, 'food', 'nicht genannt heisst: bleibt');
+  const moved = await call('PUT', `/expenses/${id}`, { actor: OWNER_A, body: { ...base, budget_category: 'leisure' } });
+  assert.equal(moved.body.data.budget_category, 'leisure');
+  const cleared = await call('PUT', `/expenses/${id}`, { actor: OWNER_A, body: { ...base, budget_category: null } });
+  assert.equal(cleared.body.data.budget_category, null);
+  const income = await call('PUT', `/expenses/${id}`, { actor: OWNER_A, body: { ...base, budget_category: 'Erwerbseinkommen' } });
+  assert.equal(income.status, 400, 'eine Einnahme-Kategorie ist keine Ausgabe-Kategorie');
+  const unknown = await call('POST', `/groups/${gid}/expenses`, { actor: OWNER_A, body: { ...base, title: 'Falsch', budget_category: 'casino' } });
+  assert.equal(unknown.status, 400);
+  assert.match(unknown.body.error, /budget category/i);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM expenses WHERE group_id = ? AND title = 'Falsch'").get(gid).n, 0);
+  assert.equal(db.prepare('SELECT budget_category FROM expenses WHERE id = ?').get(id).budget_category, null, 'die abgelehnten Aufrufe schrieben nichts');
+});
+
+test('GET /expenses?budget_category und /balances: Filter nach Budget-Kategorie, "none" fuer ohne, Summen je Budget-Kategorie', async () => {
+  const g = await call('POST', '/groups', { actor: OWNER_A, body: { name: 'Budget-Filter', type: 'general', default_currency: 'EUR' } });
+  const gid = g.body.data.id;
+  const add = (title, amount, budget_category) => call('POST', `/groups/${gid}/expenses`, {
+    actor: OWNER_A, body: { title, amount, currency: 'EUR', split_method: 'equal', payer_id: OWNER, participants: [OWNER], budget_category },
+  });
+  await add('Brot', '4.00', 'food');
+  await add('Kaese', '6.00', 'food');
+  await add('Kino', '20.00', 'leisure');
+  await add('Ohne', '1.00', null);
+  const food = await call('GET', `/groups/${gid}/expenses?budget_category=food`, { actor: OWNER_A });
+  assert.deepEqual(food.body.data.map((e) => e.title).sort(), ['Brot', 'Kaese']);
+  const none = await call('GET', `/groups/${gid}/expenses?budget_category=none`, { actor: OWNER_A });
+  assert.deepEqual(none.body.data.map((e) => e.title), ['Ohne']);
+  const unknown = await call('GET', `/groups/${gid}/expenses?budget_category=casino`, { actor: OWNER_A });
+  assert.equal(unknown.body.data.length, 4, 'ein unbekannter Schluessel filtert nicht still auf nichts');
+  const balances = await call('GET', `/groups/${gid}/balances`, { actor: OWNER_A });
+  assert.deepEqual(
+    balances.body.data.budget_category_totals.map((r) => [r.budget_category, r.total]),
+    [['leisure', '20.00'], ['food', '10.00'], [null, '1.00']],
+  );
+  assert.ok(Array.isArray(balances.body.data.category_totals), 'die alte Summe bleibt fuer die API');
+});
+
+test('Serie: budget_category wird gespeichert, ein PUT ohne sie laesst sie stehen, der Lauf bucht sie an die Ausgabe', async () => {
+  const g = await call('POST', '/groups', { actor: OWNER_A, body: { name: 'Budget-Serie', type: 'general', default_currency: 'EUR' } });
+  const gid = g.body.data.id;
+  const created = await call('POST', `/groups/${gid}/recurring`, {
+    actor: OWNER_A,
+    body: { title: 'Miete', amount: '900.00', currency: 'EUR', frequency: 'monthly', next_run_date: '2099-01-05', payer_id: OWNER, participants: [OWNER], split_method: 'equal', budget_category: 'housing' },
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const id = created.body.data.id;
+  assert.equal(db.prepare('SELECT budget_category FROM recurring_expenses WHERE id = ?').get(id).budget_category, 'housing');
+  const kept = await call('PUT', `/recurring/${id}`, { actor: OWNER_A, body: { amount: '950.00' } });
+  assert.equal(kept.status, 200, JSON.stringify(kept.body));
+  assert.equal(db.prepare('SELECT budget_category FROM recurring_expenses WHERE id = ?').get(id).budget_category, 'housing');
+  const { generateRecurringExpense } = await import('../server/services/split-expenses-scheduler.js');
+  const rule = db.prepare('SELECT * FROM recurring_expenses WHERE id = ?').get(id);
+  db.transaction(() => generateRecurringExpense(db, rule))();
+  assert.equal(db.prepare('SELECT budget_category FROM expenses WHERE recurring_rule_id = ?').get(id).budget_category, 'housing');
+});
+
+// ── Codex an #2364 (P2): eine Kategorie, die nur Aufteilungs-Ausgaben tragen ──
+//
+// Die Loeschsperre zaehlte nur Buchungen (`budget_entries`). Eine Kategorie,
+// die nur eine Ausgabe der Aufteilung trug, liess sich loeschen - und danach
+// lehnte jedes Speichern der Ausgabe mit 400 ab, weil der Editor die alte
+// Kategorie mitschickt.
+test('eine Budget-Kategorie, die nur Aufteilungs-Ausgaben oder Serien tragen, ist in Benutzung und laesst sich nicht loeschen', async () => {
+  const { categoryInUseCount } = await import('../server/routes/budget/helpers.js');
+  const { default: catRouter } = await import('../server/routes/budget/categories.js');
+  const insertCategory = db.prepare("INSERT INTO budget_categories (key, name, type, sort_order) VALUES (?, ?, 'expense', 900)");
+  insertCategory.run('split_only_expense', 'Nur Aufteilung');
+  insertCategory.run('split_only_series', 'Nur Serie');
+  const g = await call('POST', '/groups', { actor: OWNER_A, body: { name: 'Loeschsperre', type: 'general', default_currency: 'EUR' } });
+  const gid = g.body.data.id;
+  const expense = await call('POST', `/groups/${gid}/expenses`, {
+    actor: OWNER_A,
+    body: { title: 'Kino', amount: '12.00', currency: 'EUR', split_method: 'equal', payer_id: OWNER, participants: [OWNER], budget_category: 'split_only_expense' },
+  });
+  assert.equal(expense.status, 201, JSON.stringify(expense.body));
+  const series = await call('POST', `/groups/${gid}/recurring`, {
+    actor: OWNER_A,
+    body: { title: 'Abo', amount: '9.00', currency: 'EUR', frequency: 'monthly', next_run_date: '2099-01-01', payer_id: OWNER, participants: [OWNER], budget_category: 'split_only_series' },
+  });
+  assert.equal(series.status, 201, JSON.stringify(series.body));
+  assert.equal(categoryInUseCount(db, 'split_only_expense'), 1, 'die Ausgabe zaehlt');
+  assert.equal(categoryInUseCount(db, 'split_only_series'), 1, 'die Serie zaehlt');
+
+  const budgetApp = express();
+  budgetApp.use(express.json());
+  budgetApp.use((req, _res, next) => { req.authUserId = OWNER; req.authRole = 'member'; req.session = { userId: OWNER, role: 'member' }; next(); });
+  budgetApp.use('/', catRouter);
+  const budgetServer = budgetApp.listen(0, '127.0.0.1');
+  await new Promise((r) => budgetServer.on('listening', r));
+  try {
+    for (const key of ['split_only_expense', 'split_only_series']) {
+      const res = await fetch(`http://127.0.0.1:${budgetServer.address().port}/categories/${key}`, { method: 'DELETE' });
+      assert.equal(res.status, 409, `${key} ist in Benutzung`);
+      assert.equal((await res.json()).reason, 'category_in_use');
+      assert.ok(db.prepare('SELECT 1 FROM budget_categories WHERE key = ?').get(key), `${key} steht noch`);
+    }
+  } finally {
+    await new Promise((r) => budgetServer.close(r));
+  }
+});
+
+// Altbestand: geloescht vor der Sperre, oder per Migration 271 gemappt und
+// spaeter geloescht. Der Editor schickt den Schluessel unveraendert mit - das
+// darf das Speichern nicht brechen; eine NEUE Wahl bleibt streng.
+test('ein unveraenderter, inzwischen geloeschter Kategorie-Schluessel bricht das Speichern einer Ausgabe oder Serie nicht', async () => {
+  db.prepare("INSERT INTO budget_categories (key, name, type, sort_order) VALUES ('split_gone', 'Weg', 'expense', 901)").run();
+  const g = await call('POST', '/groups', { actor: OWNER_A, body: { name: 'Altbestand', type: 'general', default_currency: 'EUR' } });
+  const gid = g.body.data.id;
+  const base = { title: 'Bus', amount: '3.00', currency: 'EUR', split_method: 'equal', payer_id: OWNER, participants: [OWNER] };
+  const expense = await call('POST', `/groups/${gid}/expenses`, { actor: OWNER_A, body: { ...base, budget_category: 'split_gone' } });
+  assert.equal(expense.status, 201, JSON.stringify(expense.body));
+  const seriesBase = { title: 'Abo', amount: '9.00', currency: 'EUR', frequency: 'monthly', next_run_date: '2099-01-01', payer_id: OWNER, participants: [OWNER] };
+  const series = await call('POST', `/groups/${gid}/recurring`, { actor: OWNER_A, body: { ...seriesBase, budget_category: 'split_gone' } });
+  assert.equal(series.status, 201, JSON.stringify(series.body));
+  // Wie vor der Sperre (oder nach Migration 271): die Kategorie ist weg, die Ausgaben tragen sie noch.
+  db.prepare("DELETE FROM budget_categories WHERE key = 'split_gone'").run();
+
+  const edited = await call('PUT', `/expenses/${expense.body.data.id}`, { actor: OWNER_A, body: { ...base, amount: '4.00', budget_category: 'split_gone' } });
+  assert.equal(edited.status, 200, JSON.stringify(edited.body));
+  assert.equal(edited.body.data.budget_category, 'split_gone', 'der Schluessel bleibt, wie er war');
+  const editedSeries = await call('PUT', `/recurring/${series.body.data.id}`, { actor: OWNER_A, body: { ...seriesBase, amount: '10.00', budget_category: 'split_gone' } });
+  assert.equal(editedSeries.status, 200, JSON.stringify(editedSeries.body));
+
+  const fresh = await call('POST', `/groups/${gid}/expenses`, { actor: OWNER_A, body: { ...base, title: 'Neu', budget_category: 'split_gone' } });
+  assert.equal(fresh.status, 400, 'eine neue Ausgabe nimmt keinen unbekannten Schluessel');
+  const freshSeries = await call('POST', `/groups/${gid}/recurring`, { actor: OWNER_A, body: { ...seriesBase, title: 'Neu', budget_category: 'split_gone' } });
+  assert.equal(freshSeries.status, 400, 'eine neue Serie auch nicht');
+  const other = await call('POST', `/groups/${gid}/expenses`, { actor: OWNER_A, body: { ...base, title: 'Zweite', budget_category: 'food' } });
+  const moved = await call('PUT', `/expenses/${other.body.data.id}`, { actor: OWNER_A, body: { ...base, budget_category: 'split_gone' } });
+  assert.equal(moved.status, 400, 'den geloeschten Schluessel neu waehlen bleibt verboten');
 });
 
 test('teardown: Server schließen', async () => {

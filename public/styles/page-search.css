@@ -159,8 +159,6 @@
   color: var(--color-text-primary);
 }
 
-.page-search__clear[hidden] { display: none; }
-
 /* --------------------------------------------------------
  * EINE BREITE, EINE STELLE (Re-Critique 2026-09-27, A8 P3-2 / A1 P2-5)
  *
@@ -210,7 +208,16 @@
 }
 
 @media (min-width: 1024px) {
-  .page-toolbar > label.page-search,
+  .page-toolbar > label.page-search {
+    flex: 0 1 var(--page-search-width);
+    min-width: 0;
+    max-width: var(--page-search-width);
+    max-inline-size: var(--page-search-width);
+    margin-inline-start: 0;
+  }
+
+  /* Eigene Regel: ein `:has()` in einer Selektorliste verwirft ohne
+   * `:has()`-Unterstuetzung die ganze Liste (F4.2). */
   .page-toolbar > .page-toolbar__center:has(> label.page-search:only-child) {
     flex: 0 1 var(--page-search-width);
     min-width: 0;

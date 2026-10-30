@@ -47,12 +47,14 @@
  */
 
 import { api } from '/api.js';
-import { t, formatDate } from '/i18n.js';
+import { t } from '/i18n.js';
+import { dateText } from '/utils/date-format.js';
 import { esc } from '/utils/html.js';
 import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
 import { isPreviewable } from '/utils/document-preview.js';
 import { maxUploadBytes, maxUploadMb } from '/utils/upload-limit.js';
 import { attachOverlay } from '/utils/overlay-history.js';
+import { inertOutside } from '/utils/background-inert.js';
 import { pathAccess, mayWritePath } from '/utils/module-access.js';
 import { holdUntilStyled, warmStyle } from '/utils/component-style.js';
 
@@ -453,27 +455,35 @@ function openDocumentPicker(panel, { excludeIds = new Set(), single = false } = 
         <div class="doc-attach-picker__list" data-picker-list>
           <p class="doc-attach-picker__status">${esc(t('common.loading'))}</p>
         </div>
+        <p class="form-hint form-hint--danger doc-attach-picker__reason" data-picker-reason role="status" hidden></p>
         <div class="doc-attach-picker__footer" data-dialog-actions>
           <button class="btn btn--secondary" type="button" data-picker-close>${esc(t('common.cancel'))}</button>
-          <button class="btn btn--primary" type="button" data-picker-confirm disabled>
+          <button class="btn btn--primary" type="button" data-picker-confirm>
             ${esc(t('documentAttach.confirmSelection'))}
           </button>
         </div>
       </div>`);
     panel.append(overlay);
     if (window.lucide) window.lucide.createIcons({ el: overlay });
-
     const listEl = overlay.querySelector('[data-picker-list]');
     const searchEl = overlay.querySelector('#doc-attach-picker-search');
     const confirmEl = overlay.querySelector('[data-picker-confirm]');
+    const reasonEl = overlay.querySelector('[data-picker-reason]');
     // Der Auslöser bekommt den Fokus zurück - das Overlay liegt über einem
     // offenen Modal, sonst fiele der Fokus auf <body>.
     const opener = document.activeElement;
+    // Das Formular darunter ist gesperrt, solange der Picker offen ist
+    // (utils/background-inert.js). ERST den Ausloeser merken: wird sein
+    // Vorfahr inert, gibt der Browser den Fokus ab, und `activeElement` waere
+    // danach body. Die Freigabe kommt VOR der Fokus-Rueckgabe, auf ein inertes
+    // Element ginge der Fokus nicht.
+    const releaseBackground = inertOutside(overlay);
     const selected = new Set();
     let documents = [];
 
     const close = (result) => {
       overlay.remove();
+      releaseBackground();
       if (opener?.isConnected) opener.focus();
       resolve(result);
     };
@@ -520,7 +530,7 @@ function openDocumentPicker(panel, { excludeIds = new Set(), single = false } = 
         }
       }
       if (box.checked) selected.add(id); else selected.delete(id);
-      confirmEl.disabled = selected.size === 0;
+      if (selected.size) reasonEl.hidden = true;
     });
 
     wirePageSearch(overlay, { id: 'doc-attach-picker-search', delay: 0, onQuery: renderList });
@@ -528,6 +538,14 @@ function openDocumentPicker(panel, { excludeIds = new Set(), single = false } = 
       button.addEventListener('click', () => close([]));
     });
     confirmEl.addEventListener('click', () => {
+      // DER PRIMAERKNOPF IST NIE GESPERRT (Critique R24, D4): ohne Wahl sagt
+      // er, was fehlt, und bleibt im Bild - vorher stand er grau da.
+      if (!selected.size) {
+        reasonEl.textContent = t('documentAttach.pickNone');
+        reasonEl.hidden = false;
+        listEl.querySelector('input[type="checkbox"]')?.focus();
+        return;
+      }
       close(documents.filter((doc) => selected.has(doc.id)));
     });
     overlay.addEventListener('mousedown', (event) => {
@@ -561,7 +579,7 @@ function openDocumentPicker(panel, { excludeIds = new Set(), single = false } = 
 
 /** Zweitzeile eines Picker-Eintrags: Ordner und Datum, soweit vorhanden. */
 function pickerMeta(doc) {
-  return [doc.folder_name, doc.created_at ? formatDate(doc.created_at) : '']
+  return [doc.folder_name, doc.created_at ? dateText(doc.created_at) : '']
     .filter(Boolean)
     .join(' · ');
 }

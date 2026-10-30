@@ -468,8 +468,16 @@ test('die Host-Sperre prüft bei jeder Methode die Adresse, an die gesendet wird
   const bases = ['https://a.example/dav/', 'https://a.example/cal/family/', 'https://a.example/cal/work/'];
   const sent = [];
   const stub = {
-    // genau wie tsdav 2.3.4: der Dateiname wird gegen die Collection aufgelöst.
-    createCalendarObject: async ({ calendar, filename }) => { sent.push(new URL(String(filename), String(calendar.url)).href); return { ok: true }; },
+    // genau wie tsdav 2.5.0 (`getObjectUrl`): der Dateiname ist ein Pfadsegment
+    // der Collection; einen Namen mit `/`, `.` oder `..` lehnt tsdav ab.
+    createCalendarObject: async ({ calendar, filename }) => {
+      const name = String(filename);
+      if (!name || name.includes('/') || /^(?:\.|%2e){1,2}$/i.test(name)) throw new Error(`Invalid object filename "${name}"`);
+      const segment = name.replace(/%(?![\da-f]{2})|[?#\\\x00-\x20\x7f]/gi,
+        (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`);
+      sent.push(new URL(`./${segment}`, String(calendar.url).replace(/\/?$/, '/')).href);
+      return { ok: true };
+    },
     updateCalendarObject: async ({ calendarObject }) => { sent.push(calendarObject.url); return { ok: true }; },
     deleteCalendarObject: async ({ calendarObject }) => { sent.push(calendarObject.url); return { ok: true }; },
     fetchCalendarObjects: async ({ calendar }) => { sent.push(calendar.url); return []; },
@@ -486,10 +494,15 @@ test('die Host-Sperre prüft bei jeder Methode die Adresse, an die gesendet wird
     assert.deepEqual(sent, [expected], label);
   };
 
-  // createCalendarObject: ein Dateiname, der zu einer Adresse ausserhalb des
-  // Servers aufloest, wird abgewiesen - der Name allein sagt noch nichts.
-  await refused('create: Name loest off-host auf',
-    () => client.createCalendarObject({ calendar: { url: 'https://a.example/cal/work/' }, filename: 'http:elsewhere.example.ics', iCalString: 'x' }));
+  // createCalendarObject: geprueft wird die Adresse, die tsdav aus dem Namen
+  // macht. Seit tsdav 2.5.0 bleibt ein Name mit Doppelpunkt ein Pfadsegment im
+  // Kalender; die Sperre darf ihn nicht als eigene URL lesen und abweisen.
+  await allowed('create: Name mit Doppelpunkt bleibt im Kalender',
+    () => client.createCalendarObject({ calendar: { url: 'https://a.example/cal/work/' }, filename: 'urn:uuid:1.ics', iCalString: 'x' }),
+    'https://a.example/cal/work/urn:uuid:1.ics');
+  await allowed('create: ein Schema-Praefix im Namen fuehrt nicht vom Server weg',
+    () => client.createCalendarObject({ calendar: { url: 'https://a.example/cal/work/' }, filename: 'http:elsewhere.example.ics', iCalString: 'x' }),
+    'https://a.example/cal/work/http:elsewhere.example.ics');
   await allowed('create: gewoehnlicher Name im eigenen Kalender',
     () => client.createCalendarObject({ calendar: { url: 'https://a.example/cal/work/' }, filename: 'uid.ics', iCalString: 'x' }),
     'https://a.example/cal/work/uid.ics');
@@ -941,7 +954,9 @@ test('Umzug, die Quelle lehnt das Löschen ab: der Auftrag gehört dem Konto der
   const { a, b, workUrl } = accountWithTwoCalendars();
   const id = mirror(a, { title: 'Zieht um' });
   db.prepare('UPDATE calendar_events SET outbound_move_to = ? WHERE id = ?').run(workUrl, id);
-  a.dav.refuse({ method: 'DELETE', status: 403, when: (req) => req.path.startsWith('/cal/family/') });
+  // 409: eine Absage am Eintrag, die als Versuch zählt (eine kontoweite wie
+  // 403 zählt nicht, #1863).
+  a.dav.refuse({ method: 'DELETE', status: 409, when: (req) => req.path.startsWith('/cal/family/') });
 
   await caldavSync.sync();
 
@@ -1045,7 +1060,8 @@ test('Umzug abgelehnt, und für das Objekt steht schon der Auftrag eines ANDEREN
   db.prepare("UPDATE calendar_pending_deletions SET attempts = 3, last_error = 'von B' WHERE id = ?").run(theirs);
   const id = mirror(accounts.a, { title: 'Zieht um' });
   db.prepare('UPDATE calendar_events SET outbound_move_to = ? WHERE id = ?').run(workUrl, id);
-  accounts.a.dav.refuse({ method: 'DELETE', status: 403, when: (req) => req.path.startsWith('/cal/family/') });
+  // 409, damit die Absage als Versuch zählt (#1863).
+  accounts.a.dav.refuse({ method: 'DELETE', status: 409, when: (req) => req.path.startsWith('/cal/family/') });
 
   const lines = await logged(t, () => caldavSync.flushOutbound());
 
@@ -1061,4 +1077,25 @@ test('Umzug abgelehnt, und für das Objekt steht schon der Auftrag eines ANDEREN
   assert.equal(row(id).calendar_ref_id, calendarRef(accounts.a.url));
   assert.equal(lines.filter((l) => l.level === 'warn' && /another account/.test(l.text)).length, 1, 'der Fall wurde nicht gemeldet');
   assert.deepEqual(accounts.a.dav.seen('DELETE').map(describe), ['DELETE /cal/family/shared.ics (user-a)'], 'der Auftrag des anderen Kontos wurde angestossen');
+});
+
+test('das Zielkonto eines lokalen Termins wird gelöscht: das Ziel fällt mit, der Termin bleibt lokal (#1885)', async () => {
+  const { localCalendarIdSql } = await import('../server/services/local-calendars.js');
+  const accounts = twoAccounts();
+  const id = Number(db.prepare(`
+    INSERT INTO calendar_events
+      (title, start_datetime, end_datetime, all_day, created_by, target_caldav_account_id, target_caldav_calendar_url)
+    VALUES ('Soll zu A', '2035-03-10T10:00', '2035-03-10T11:00', 0, ?, ?, ?)
+  `).run(userId, accounts.a.accountId, accounts.a.url).lastInsertRowid);
+
+  caldavSync.deleteAccount(accounts.a.accountId);
+
+  assert.equal(row(id).title, 'Soll zu A', 'der Termin ging mit dem Konto verloren');
+  assert.equal(row(id).external_source, 'local');
+  assert.equal(row(id).target_caldav_account_id, null, 'das Ziel zeigt auf ein gelöschtes Konto');
+  assert.equal(row(id).target_caldav_calendar_url, null, 'die Kalenderadresse des gelöschten Kontos steht noch');
+  // Ohne Ziel gehört der Termin wieder in den lokalen Standardkalender, statt
+  // in keinem Kalender zu stehen.
+  const membership = db.prepare(`SELECT ${localCalendarIdSql()} AS id FROM calendar_events e WHERE e.id = ?`).get(id).id;
+  assert.equal(membership, db.prepare('SELECT id FROM local_calendars WHERE is_default = 1').get().id);
 });

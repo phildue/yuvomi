@@ -20,8 +20,12 @@ import {
   settingsSheetSections,
   migrateLegacySettingsTab,
   readStoredSettingsDestination,
+  settingsOverviewShown,
+  withSettingsOverviewMark,
+  markSettingsOverviewEntry,
   resolveSettingsDestination,
   searchSettings,
+  orderSettingsHits,
   settingsOptionUrl,
   settingsOverviewUrl,
 } from '../public/settings/registry.js';
@@ -224,7 +228,8 @@ test('die Blaetter verteilen sich wie beschlossen auf drei Bereiche, je Modul ei
   // Dazu "Eigenes Modul hinzufuegen" (modules-install): Drittmodule zu
   // installieren ist eine Handlung im Modul-Bereich, kein Modul - deshalb ein
   // Blatt ohne `module`, aber in derselben Domaene.
-  assert.deepEqual(perDomain, { personal: 5, admin: 8, modules: 16 });
+  // R23 D14: die Kalender-Synchronisation ist ein eigenes Blatt (vorher 16).
+  assert.deepEqual(perDomain, { personal: 5, admin: 8, modules: 17 });
   assert.deepEqual(SETTINGS_DOMAINS.map((domain) => domain.id), ['personal', 'admin', 'modules']);
   // Jedes Blatt haengt an einem existierenden Bereich, jeder Abschnitt an
   // einem existierenden Blatt, und kein Blatt ist leer.
@@ -239,8 +244,10 @@ test('die Blaetter verteilen sich wie beschlossen auf drei Bereiche, je Modul ei
     assert.ok(SETTINGS_SCOPES.includes(section.scope), `${section.id}: unbekannte Reichweite "${section.scope}"`);
   }
   assert.equal(new Set(SETTINGS_SECTIONS.map((section) => section.id)).size, SETTINGS_SECTIONS.length);
-  // Je Modul hoechstens EIN Blatt.
-  const modules = SETTINGS_LEAVES.filter((leaf) => leaf.module).map((leaf) => leaf.module);
+  // Je Modul hoechstens EIN Blatt - mit EINER benannten Ausnahme (R23 D14,
+  // Ulas 2026-10-24): die Kalender-Synchronisation (Konten, Anbieter,
+  // Nachtrag) steht neben dem Kalender, das Blatt hatte 12 Karten und 3473px.
+  const modules = SETTINGS_LEAVES.filter((leaf) => leaf.module && leaf.id !== 'module-calendar-sync').map((leaf) => leaf.module);
   assert.equal(new Set(modules).size, modules.length, 'ein Modul hat zwei Blaetter');
   // Die Sammelschublade ist aufgeloest: kein Blatt heisst mehr Modul-Optionen.
   assert.equal(SETTINGS_LEAVES.some((leaf) => leaf.labelKey === 'settings.pageModuleOptions'), false);
@@ -309,7 +316,6 @@ test('Gravatar: der Knopf steht im Bild-Editor, gesperrt ohne gespeicherte Adres
   const locked = buttonOf(avatarEditorHtml({ display_name: 'Ada', email: null }, on));
   assert.ok(locked, 'der Knopf existiert');
   assert.match(locked, /aria-disabled="true"/);
-  assert.match(locked, /aria-label="settings\.gravatarUse"/);
   assert.match(locked, /aria-describedby="profile-gravatar-hint"/);
   assert.doesNotMatch(locked, /\sdisabled[\s>]/, 'aria-disabled statt disabled: erreichbar bleiben');
   assert.equal(gravatarHintText({ email: null }), 'settings.gravatarNeedsEmail');
@@ -326,9 +332,16 @@ test('Gravatar: der Knopf steht im Bild-Editor, gesperrt ohne gespeicherte Adres
   assert.equal(gravatarHintText({ email: ' ada@example.org ' }), 'settings.gravatarHintUnnamed{"email":"ada@example.org"}');
   assert.equal(gravatarHintText({ email: null }, 'gravatar.com'), 'settings.gravatarNeedsEmail');
 
-  // Dieselbe Familie wie Hochladen und Entfernen daneben, mit Icon.
-  assert.match(free, /class="settings-avatar-action"/);
-  assert.match(avatarEditorHtml({ email: 'ada@example.org' }, on), /id="profile-avatar-gravatar"[^]*?data-lucide="cloud-download"/);
+  // R24 (`.media-picker`): Gravatar ist ein kleiner Textknopf mit Symbol und
+  // Wort; die Scheibe ist die Bildwahl (Abzeichen), Entfernen steht als Text
+  // nur mit Bild, kein Stift und kein nackter Papierkorb mehr daneben.
+  assert.match(free, /class="btn btn--secondary btn--sm"/);
+  const editor = avatarEditorHtml({ email: 'ada@example.org' }, on);
+  assert.match(editor, /id="profile-avatar-gravatar"[^]*?data-lucide="cloud-download"[^]*?settings\.gravatarUse/);
+  assert.match(editor, /<span class="media-picker">\s*<button type="button" class="settings-avatar-button" id="profile-avatar-preview"[^]*?<\/button>\s*<span class="media-picker__badge"/);
+  assert.doesNotMatch(editor, /profile-avatar-edit|settings-avatar-action(?!s)/);
+  assert.match(editor, /id="profile-avatar-remove" hidden>/, 'ohne Bild kein Entfernen');
+  assert.doesNotMatch(avatarEditorHtml({ email: 'ada@example.org', avatar_data: 'data:image/png;base64,AA' }, on), /id="profile-avatar-remove" hidden/);
 });
 
 test('Gravatar: die Hinweiszeile kommt leer aus dem HTML und wird als Text gefuellt - die Adresse steht woertlich da', async () => {
@@ -664,8 +677,9 @@ test('Mitglieder erreichen ihre eigenen Termin-Vorgaben', () => {
   assert.deepEqual(settingsSheetSections(sheet, member).map((entry) => entry.id),
     ['personal-calendar', 'personal-calendar-subscriptions', 'personal-feeds', 'feed-birthdays']);
   // Der haushaltweite Teil bleibt adminOnly.
+  // Seit R23 D14 steht die Synchronisation in einem eigenen Blatt.
   assert.deepEqual(settingsSheetSections(sheet, admin).filter((entry) => entry.adminOnly).map((entry) => entry.id),
-    ['modules-calendar', 'sync-calendar']);
+    ['modules-calendar']);
 });
 
 test('Mitglieder erreichen ihr eigenes Zyklus-Opt-out (#760)', () => {
@@ -727,7 +741,7 @@ test('/settings/modules/health ist das Blatt Gesundheit samt Vorsorge-Typregiste
 test('legacy settings tabs migrate to their new destinations', () => {
   assert.equal(migrateLegacySettingsTab('general'), '/settings/personal/appearance');
   assert.equal(migrateLegacySettingsTab('shopping'), '/shopping?manage=categories');
-  assert.equal(migrateLegacySettingsTab('sync'), '/settings/modules/calendar');
+  assert.equal(migrateLegacySettingsTab('sync'), '/settings/modules/calendar-sync');
   assert.equal(migrateLegacySettingsTab('backup'), '/settings/admin/backup');
   // Ein Alt-Tab muss am heutigen Blatt ankommen, nicht an einem Zwischenstand.
   assert.equal(migrateLegacySettingsTab('budget'), '/settings/modules/budget');
@@ -745,7 +759,7 @@ test('legacy settings migration covers every previous tab', () => {
       budget: '/settings/modules/budget',
       shopping: '/shopping?manage=categories',
       calendar: '/settings/modules/calendar',
-      sync: '/settings/modules/calendar',
+      sync: '/settings/modules/calendar-sync',
       account: '/settings/personal/account',
       family: '/settings/admin/family',
       'api-tokens': '/settings/admin/api',
@@ -876,6 +890,43 @@ test('der Settings-Controller rendert ohne gespeichertes Ziel die Uebersicht', a
   assert.doesNotMatch(source, /await redirectTo\(readStoredSettingsDestination/);
 });
 
+/* ZURUECK AUS EINEM BLATT FUEHRT AUF DIE UEBERSICHT (Critique R22, D2, a5 P1).
+ * Uebersicht -> Darstellung -> Zurueck blieb mobil auf dem Blatt: update()
+ * gab fuer ein nacktes `/settings` false zurueck, das volle Rendern stellte das
+ * zuletzt besuchte Blatt wieder her und ersetzte den Eintrag. Jetzt folgt
+ * `/settings` innerhalb der Sektion der Adresse, und ein Eintrag, der die
+ * Uebersicht zeigte, traegt einen Merker im History-State - auch ein Zurueck
+ * von aussen zeigt dort die Uebersicht. Wiederhergestellt wird nur ein frischer
+ * Einstieg. Gemessen im Browser (s1/probes/settings.mjs): vorher C =
+ * /settings/personal/appearance, nachher /settings mit Liste. */
+test('Zurueck aus einem Einstellungsblatt fuehrt auf die Uebersicht, nicht zurueck ins Blatt', async () => {
+  const source = await readFile(new URL('../public/pages/settings.js', import.meta.url), 'utf8');
+  const update = source.slice(source.indexOf('export async function update('));
+  const root = update.slice(update.indexOf('if (path === SETTINGS_ROOT) {'), update.indexOf('const leaf = findSettingsLeaf'));
+  assert.match(root, /if \(hasOAuthResult\) return false;/, 'nur das OAuth-Ergebnis braucht den vollen Weg');
+  assert.doesNotMatch(root, /!OVERVIEW_VIEWS\.has\(view\)\) return false/,
+    'ein nacktes /settings innerhalb der Sektion darf nicht ins volle Rendern samt Wiederherstellung fallen');
+  assert.match(root, /markSettingsOverviewEntry\(\);\s*return true;/, 'die weiche Uebersicht merkt ihren Eintrag');
+  assert.match(source, /const destination = OVERVIEW_VIEWS\.has\(view\) \|\| settingsOverviewShown\(history\.state\)/,
+    'ein Eintrag, der die Uebersicht zeigte, stellt kein Blatt wieder her');
+  assert.match(source, /view: known \? 'domain' : 'domains',[\s\S]{0,120}\}\);\s*markSettingsOverviewEntry\(\);/,
+    'die volle Uebersicht merkt ihren Eintrag');
+  const writes = [];
+  const hist = { state: { path: '/settings', scrollKey: 'k1' }, replaceState(st, title, url) { writes.push([st, url]); this.state = st; } };
+  markSettingsOverviewEntry(hist, { pathname: '/settings' });
+  assert.deepEqual(writes, [[{ path: '/settings', scrollKey: 'k1', settingsOverview: true }, undefined]],
+    'der Merker ergaenzt den State, die Adresse bleibt');
+  markSettingsOverviewEntry(hist, { pathname: '/settings' });
+  markSettingsOverviewEntry({ state: null, replaceState() { writes.push('blatt'); } }, { pathname: '/settings/personal/account' });
+  assert.equal(writes.length, 1, 'einmal je Eintrag, und nie auf einem Blatt (Desktop-Vorwahl)');
+  const marked = withSettingsOverviewMark({ path: '/settings', scrollKey: 'k1' });
+  assert.deepEqual(marked, { path: '/settings', scrollKey: 'k1', settingsOverview: true },
+    'path und scrollKey bleiben stehen');
+  assert.equal(settingsOverviewShown(marked), true);
+  assert.equal(settingsOverviewShown(null), false);
+  assert.equal(settingsOverviewShown({ path: '/settings' }), false);
+});
+
 test('every approved settings leaf is registered as an exact SPA route', async () => {
   const source = await readFile(
     new URL('../public/router.js', import.meta.url),
@@ -969,7 +1020,12 @@ function guardFakes() {
   };
   const form = {
     isConnected: true,
-    querySelector: (sel) => (/type="submit"/.test(sel) ? {} : null),
+    invalid: false,
+    querySelector(sel) {
+      if (/type="submit"/.test(sel)) return {};
+      if (/aria-invalid="true"/.test(sel)) return this.invalid ? {} : null;
+      return null;
+    },
   };
   const field = (instant = false) => ({
     closest: (sel) => (sel === 'form' ? form : (sel === '[data-instant-save]' && instant ? {} : null)),
@@ -982,14 +1038,22 @@ function guardFakes() {
 
 async function withGuardEnv(fn) {
   const prev = { window: globalThis.window, confirm: globalThis.__confirmModal };
-  globalThis.window = { ...(prev.window ?? {}), addEventListener() {}, removeEventListener() {} };
+  // Ein eigenes window je Lauf, das seine Zuhoerer kennt: der Guard gibt ein
+  // abgeschicktes Formular erst mit `yuvomi:write` frei (Critique R21).
+  const zuhoerer = {};
+  globalThis.window = {
+    ...(prev.window ?? {}),
+    addEventListener(type, fn) { (zuhoerer[type] ??= []).push(fn); },
+    removeEventListener() {},
+  };
+  const geschrieben = () => { for (const fn of zuhoerer['yuvomi:write'] ?? []) fn({ type: 'yuvomi:write' }); };
   const gefragt = [];
   let antwort = false;
   globalThis.__confirmModal = async (title, options) => { gefragt.push({ title, options }); return antwort; };
   const guard = await import('/settings/dirty-guard.js');
   const leave = await import('/utils/leave-guard.js');
   try {
-    await fn({ guard, leave, gefragt, antworte: (a) => { antwort = a; } });
+    await fn({ guard, leave, gefragt, geschrieben, antworte: (a) => { antwort = a; } });
   } finally {
     guard.clearLeafEdits?.();
     globalThis.window = prev.window;
@@ -998,7 +1062,7 @@ async function withGuardEnv(fn) {
 }
 
 test('Einstellungen: ein offenes Formular fragt vor JEDEM Wechsel ueber den Router - nur solange etwas offen ist (R15 A7 P1-1)', async () => {
-  await withGuardEnv(async ({ guard, leave, gefragt, antworte }) => {
+  await withGuardEnv(async ({ guard, leave, gefragt, geschrieben, antworte }) => {
     const { container, form, field, fire } = guardFakes();
     guard.watchLeafForms(container);
     assert.equal(leave.hasLeaveGuard(), false, 'sauberes Blatt: kein Waechter, die Navigation bleibt ohne await');
@@ -1023,6 +1087,8 @@ test('Einstellungen: ein offenes Formular fragt vor JEDEM Wechsel ueber den Rout
     fire('change', field());
     assert.equal(leave.hasLeaveGuard(), true);
     fire('submit', field());
+    assert.equal(leave.hasLeaveGuard(), true, 'abgeschickt ist noch nicht gespeichert (Critique R21)');
+    geschrieben();
     assert.equal(leave.hasLeaveGuard(), false, 'gespeichert = sauber, der Waechter geht');
 
     fire('change', field());
@@ -1030,6 +1096,54 @@ test('Einstellungen: ein offenes Formular fragt vor JEDEM Wechsel ueber den Rout
     const vorher = gefragt.length;
     assert.equal(await leave.mayLeave('/tasks'), true, 'ein abgehaengtes Formular haelt niemanden');
     assert.equal(gefragt.length, vorher, 'und fragt auch nicht');
+  });
+});
+
+/* ABGESCHICKT IST NICHT GESPEICHERT (Critique R21, a5). Der Guard gab ein
+ * Formular schon beim `submit` frei - in der Capture-Phase, VOR dem Handler
+ * des Blatts. Scheiterte dessen Pruefung am Feld oder lehnte der Server ab,
+ * fragte der naechste Wechsel nicht mehr, und die Eingabe war weg
+ * (nachgestellt im Konto-Blatt). Frei wird es jetzt erst mit einem
+ * geglueckten Schreibvorgang (api.js meldet nur Erfolge als `yuvomi:write`). */
+test('Einstellungen: ein gescheitertes Speichern laesst das Formular offen - frei erst nach dem Erfolg (Critique R21)', async () => {
+  await withGuardEnv(async ({ guard, leave, gefragt, geschrieben, antworte }) => {
+    const { container, form, field, fire } = guardFakes();
+    guard.watchLeafForms(container);
+
+    // 1. Der Server lehnt ab: kein `yuvomi:write`, das Blatt bleibt offen.
+    fire('input', field());
+    fire('submit', field());
+    assert.equal(leave.hasLeaveGuard(), true, 'abgeschickt, aber nicht gespeichert: der Waechter bleibt');
+    antworte(false);
+    assert.equal(await leave.mayLeave('/tasks'), false, 'und der Wechsel fragt nach');
+    assert.equal(gefragt.length, 1);
+
+    // 2. Die Pruefung am Feld scheitert, danach glueckt ein ANDERER
+    //    Schreibvorgang (ein Sofort-Schalter): das Formular bleibt offen.
+    form.invalid = true;
+    fire('submit', field());
+    geschrieben();
+    assert.equal(leave.hasLeaveGuard(), true, 'ein Feldfehler heisst: dieses Absenden hat nichts geschrieben');
+
+    // 3. Korrigiert und gespeichert: jetzt ist es sauber.
+    form.invalid = false;
+    fire('input', field());
+    fire('submit', field());
+    geschrieben();
+    assert.equal(leave.hasLeaveGuard(), false, 'geglueckt gespeichert: der Waechter geht');
+
+    // 4. Nach dem Absenden weitergetippt: der spaete Erfolg gilt dem alten Stand.
+    fire('input', field());
+    fire('submit', field());
+    fire('input', field());
+    geschrieben();
+    assert.equal(leave.hasLeaveGuard(), true, 'was nach dem Absenden getippt wurde, ist nicht gespeichert');
+
+    // 5. Ein Erfolg ohne vorheriges Absenden gibt nichts frei.
+    guard.clearLeafEdits();
+    fire('input', field());
+    geschrieben();
+    assert.equal(leave.hasLeaveGuard(), true, 'ein Schreibvorgang ohne Absenden gehoert nicht diesem Formular');
   });
 });
 
@@ -1044,30 +1158,17 @@ test('Einstellungen: ein Sofort-Schalter im Formular hinterlaesst keinen offenen
   });
 });
 
-test('Einstellungen: ein Blatt ohne Formular (Rechte-Matrix) meldet seinen Entwurf selbst an (R15 A7 P1-1)', async () => {
-  await withGuardEnv(async ({ guard, leave, gefragt }) => {
-    const { container } = guardFakes();
-    guard.watchLeafForms(container);
-    let dirty = false;
-    const knoten = { isConnected: true };
-    const abmelden = guard.trackLeafEdits(knoten, () => dirty);
-    assert.equal(leave.hasLeaveGuard(), false, 'sauberer Entwurf: kein Waechter');
-    dirty = true;
-    guard.syncLeafEdits();
-    assert.equal(leave.hasLeaveGuard(), true, 'offener Entwurf: angemeldet');
-    assert.equal(await leave.mayLeave('/calendar'), false, 'und gefragt');
-    assert.equal(gefragt.length, 1);
-    guard.watchLeafForms(container);
-    assert.equal(leave.hasLeaveGuard(), true, 'ein Neuaufbau der Formularwache wirft die Quelle des Blatts nicht weg');
-    dirty = false;
-    guard.syncLeafEdits();
-    assert.equal(leave.hasLeaveGuard(), false, 'gespeichert: abgemeldet');
-    abmelden();
-  });
+// R24 (E11): die Rechte-Matrix speichert jede Wahl sofort und hat keinen
+// Entwurf mehr - sie meldet nichts an, und es gibt nichts zu verlieren. Der
+// Weg fuer Blaetter ohne Formular (`trackLeafEdits`, R15 A7 P1-1) hatte damit
+// keinen Nutzer und ist seit R24 S12 entfallen: offen ist nur ein Formular
+// mit eigenem Absenden (die Tests darueber).
+test('Einstellungen: kein Blatt meldet einen Entwurf ohne Formular an - die Rechte-Matrix speichert sofort (R24 E11, S12)', async () => {
+  const guard = await import('/settings/dirty-guard.js');
+  assert.equal('trackLeafEdits' in guard, false, 'der Anmeldeweg ohne Formular ist entfallen');
   const src = await readFile(new URL('../public/settings/pages/admin-permissions.js', import.meta.url), 'utf8');
-  assert.match(src, /trackLeafEdits\(container, \(\) => state\.dirty\)/, 'die Matrix meldet ihren Entwurf an');
-  const update = src.slice(src.indexOf('function updateSaveState('), src.indexOf('\n}\n', src.indexOf('function updateSaveState(')));
-  assert.match(update, /syncLeafEdits\(\)/, 'jede Aenderung des Entwurfs gleicht die Anmeldung ab');
+  assert.doesNotMatch(src, /trackLeafEdits|state\.dirty/, 'kein Entwurf, keine Anmeldung');
+  assert.match(src, /matrix\?\.addEventListener\('change'/, 'die Wahl wirkt beim Aendern');
 });
 
 test('Feiertage: die Ebenen-Schalter speichern sofort, ein Fehler legt zurueck (R15 A7 P1-1)', async () => {
@@ -1184,8 +1285,46 @@ test('die Navigation laesst sich ueber alle Blaetter durchsuchen', async () => {
   assert.match(registry, /descriptionKey/, 'gefiltert wird ueber Label UND Beschreibung');
   assert.match(registry, /normalize\('NFD'\)/, 'die Suche muss Gross-/Kleinschreibung und Diakritika ignorieren');
   assert.match(navSearch, /setAttribute\('role',\s*'status'\)/, 'die Trefferzahl gehoert in eine Live-Region');
-  // Ohne Treffer greift der bestehende Leerzustand, statt stumm zu bleiben.
-  assert.match(navSearch, /t\('search\.noResults'\)/);
+  // Ohne Treffer der Leerzustand der App (R24, G6-Einst-P3-5): Begriff als
+  // Chip und "Suche zuruecksetzen" - nicht mehr der nackte Satz
+  // "Keine Ergebnisse gefunden.". Seitenleiste UND Wurzel.
+  assert.doesNotMatch(source, /t\('search\.noResults'\)/, 'kein nackter Satz mehr');
+  assert.match(navSearch, /searchEmptyEl\(\{\s*query,/);
+  const overview = source.slice(source.indexOf('function filterOverview('), source.indexOf('function emptyOf('));
+  assert.match(overview, /searchEmptyEl\(\{\s*query,/);
+  assert.match(source, /function resetSearchField\(input\) \{[\s\S]{0,200}dispatchEvent\(new Event\('input'/, 'Zuruecksetzen wie das X des Felds');
+  // Die Reihenfolge der Treffer kommt aus EINER Funktion, an beiden Orten.
+  assert.match(navSearch, /orderSettingsHits\(hits, query, t\)/);
+  assert.match(overview, /orderSettingsHits\(hits, query, t\)/);
+});
+
+/* "GERADE ENGLISCH" (Critique R24, G6-Einst-P3-6): neben deutscher Oberflaeche las
+ * sich das Automatik-Ergebnis der Datensprache wie "sogar Englisch". Der Wert
+ * steht wie in jeder anderen Sprache als "Zurzeit: <Wert>." vorn im Hinweis. */
+test('R24: die Hinweiszeile nennt den geltenden Wert als "Zurzeit:", nicht "Gerade"', async () => {
+  const de = JSON.parse(await readFile(new URL('../public/locales/de.json', import.meta.url), 'utf8'));
+  assert.equal(de.settings.hintWithCurrent, 'Zurzeit: {{value}}. {{hint}}');
+});
+
+/* DER TREFFER, DER SO HEISST, STEHT VORN (Critique R24, G6-Einst-P3-5): "passwort"
+ * reihte die Option "Passwort aendern" HINTER die Blaetter Konto und E-Mail
+ * (SMTP), die nur ihre Beschreibung traf (gemessen 1440 und 390). */
+test('R24: die Einstellungssuche stellt den Treffer mit dem gesuchten Namen vor die Beschreibungs-Treffer', async () => {
+  const de = JSON.parse(await readFile(new URL('../public/locales/de.json', import.meta.url), 'utf8'));
+  const translate = (key) => key.split('.').reduce((value, segment) => value?.[segment], de) ?? key;
+  const admin = { role: 'admin' };
+  const order = (query) => orderSettingsHits(searchSettings(query, { user: admin, translate }), query, translate);
+  const passwort = order('passwort');
+  assert.equal(passwort[0].label, 'Passwort ändern', 'die Option, die so heisst, zuerst');
+  assert.equal(passwort[0].kind, 'option');
+  assert.ok(passwort.slice(1).some((hit) => hit.kind === 'leaf' && hit.leaf.id === 'personal-account'), 'Konto bleibt Treffer, dahinter');
+  // Ein Blatt, das so heisst, bleibt vorn.
+  const wetter = order('Wetter');
+  assert.equal(wetter[0].kind, 'leaf');
+  assert.equal(wetter[0].leaf.id, 'personal-weather');
+  // Gleicher Rang: die Reihenfolge der Suche bleibt (Blatt, Abschnitt, Option).
+  const ranks = order('kalender').map((hit) => hit.rank);
+  assert.deepEqual(ranks, [...ranks].sort((a, b) => a - b), 'aufsteigend nach Rang');
 });
 
 /**
@@ -1268,7 +1407,7 @@ test('der Blattwechsel zeigt einen Ladezustand statt eines leeren Kastens', asyn
   const body = source.slice(source.indexOf('async function renderLeafContent'), source.indexOf('function isSplit('));
   // Seit 2026-09-28 wartet die Shell hoechstens SECTION_WAIT_MS (A7 P1-2); das
   // Fertig-Stueck `finishLeaf` laeuft trotzdem genau einmal nach ALLEN.
-  assert.match(body, /await awaitSections\(\s*hosts\.map\(\(\[host, section\]\) => renderSheetSection\([^)]*\)\),\s*finishLeaf,\s*\)/,
+  assert.match(body, /await awaitSections\(\s*hosts\.map\(\(\[host, section\]\) => renderSheetSection\([^)]*\)(?:\.finally\(\(\) => reveal\.done\(host\)\))?\),\s*finishLeaf,\s*\)/,
     'die Abschnitte laufen durch awaitSections, das Fertig-Stueck haengt daran');
   assert.match(body, /const finishLeaf = \(\) => \{\s*clearTimeout\(skeletonTimer\);[\s\S]*?leafContainer\.removeAttribute\('aria-busy'\);/,
     'aria-busy muss nach allen Abschnitten entfernt werden, auch wenn einer scheitert');
@@ -1442,6 +1581,17 @@ test('navigation sections match the grouped desktop information architecture', (
 // Kopf - "Finanzen" stand ueber Budget allein. Die Kueche zaehlt als ein
 // Eintrag, die Uebersicht hat nie einen Kopf. Seitenleiste und Mehr-Blatt
 // lesen dieselbe Regel.
+// R22 D14 hatte dem Mehr-Blatt jede Sektion benannt (`standalone`). R23 (D13,
+// Critique G0 S-P2-3): der Kopf "Finanzen" ueber Budget allein schob die Zeile
+// bei 390x844 unter die Falz. Das Blatt liest jetzt dieselbe Regel wie die
+// Seitenleiste, gezaehlt an SEINER Liste.
+test('R23 D13: auch im Mehr-Blatt bekommt eine Sektion erst ab zwei Eintraegen einen Kopf', async () => {
+  const { navSectionLabelKey } = await import('../public/settings/module-order.js');
+  assert.equal(navSectionLabelKey(NAV_SECTION.finance, 1, { standalone: true }), null,
+    'kein Sonderweg mehr: Budget allein steht auch im Blatt ohne "Finanzen"');
+  assert.equal(navSectionLabelKey.length, 2, 'die Regel kennt keine Option mehr');
+});
+
 test('R19: eine Sektion mit nur einem Eintrag hat keinen Namen in der Navigation', async () => {
   const { navSectionLabelKey, navSectionEntryCounts } = await import('../public/settings/module-order.js');
   assert.equal(navSectionLabelKey(NAV_SECTION.finance, 1), null, 'Budget allein: kein "Finanzen"');
@@ -1462,9 +1612,11 @@ test('R19: eine Sektion mit nur einem Eintrag hat keinen Namen in der Navigation
   assert.match(sidebar, /navSectionLabelKey\(section, entryCounts\.get\(section\)\)/, 'die Seitenleiste fragt die Regel');
   assert.doesNotMatch(router, /const NAV_SECTION_LABEL_KEYS = /, 'keine Abschrift der Namen-Tabelle im Router');
   const sheet = router.slice(router.indexOf('function moreSheetSections('), router.indexOf('function buildMoreSheetBody()'));
-  assert.match(sheet, /navSectionLabelKey\(section, labelCounts\.get\(section\)\)/, 'das Mehr-Blatt fragt dieselbe Regel');
+  assert.match(sheet, /navSectionLabelKey\(section, labelCounts\.get\(section\)\)/,
+    'das Mehr-Blatt fragt dieselbe Regel wie die Seitenleiste (R23 D13)');
   const body = router.slice(router.indexOf('function buildMoreSheetBody()'), router.indexOf('function renderPage('));
-  assert.match(body, /navSectionEntryCounts\(navItems\(\)/, 'gezaehlt wird in der Seitenleiste, nicht im Blatt ohne Favoriten');
+  assert.match(body, /const labelCounts = navSectionEntryCounts\(modules\);/,
+    'gezaehlt wird im Blatt selbst: ein Kopf gliedert erst ab zwei Eintraegen DIESER Liste');
 });
 
 test('desktop navigation order is applied only inside each section', () => {
@@ -2210,7 +2362,9 @@ test('der Sitzungs-Teardown vergisst jeden per-Nutzer-Zustand, den die Navigatio
   assert.equal(/_disabledModules\s*=/.test(body), false,
     '_disabledModules ist haushaltweit - es zurueckzusetzen oeffnet die Route, die der Haushalt abgeschaltet hat');
 
-  assert.match(source, /auth:expired[\s\S]{0,200}forgetSessionState\(\)/,
+  // Der Listener auf `auth:expired` steht seit #1945 in utils/router-navigate.js
+  // und ruft die Funktion, die ihm der Router mitgibt (test:session-expiry misst ihn).
+  assert.match(source, /createNavigate\(routerState, \{[^}]*\bforgetSessionState\b[^}]*\}\)/,
     'der Sitzungsablauf raeumt nicht auf');
   assert.match(source, /clearSession: \(\) => \{\s*forgetSessionState\(\)/,
     'der bewusste Logout raeumt nicht ueber dieselbe Funktion auf');
@@ -2338,7 +2492,8 @@ test('die Wurzel sucht ueber das Such-Icon im geteilten Kopf, in jeder Breite', 
   // Dieselbe Suche wie in der Seitenleiste (searchSettings); ein Abschnitt ohne
   // Treffer faellt weg, und fruehere Blaetter und Optionen bekommen einen
   // eigenen Abschnitt.
-  assert.match(shell, /function filterOverview[\s\S]*?searchSettings\(query[\s\S]*?section\.hidden = visible === 0[\s\S]*?hits\.sections\.map[\s\S]*?hits\.options\.map[\s\S]*?extra\.map\(createOptionRow\)/);
+  // Seit R24 in der Rangfolge von orderSettingsHits (Abschnitte und Optionen aus EINER Liste).
+  assert.match(shell, /function filterOverview[\s\S]*?searchSettings\(query[\s\S]*?section\.hidden = visible === 0[\s\S]*?orderSettingsHits\(hits, query, t\)[\s\S]*?kind === 'section' \? settingsSectionUrl[\s\S]*?settingsOptionUrl[\s\S]*?extra\.map\(createOptionRow\)/);
 });
 
 /**
@@ -2589,7 +2744,9 @@ async function withTasksDefaults({ preferences = {}, syncTargets }, run) {
   const { resetPreferencesCache } = await import('/settings/preferences-cache.js');
   const prev = { window: globalThis.window, document: globalThis.document, error: console.error };
   const navigations = [];
-  globalThis.window = { yuvomi: { showToast() {}, navigate: (href) => navigations.push(href) } };
+  const puts = [];
+  const toasts = [];
+  globalThis.window = { yuvomi: { showToast: (...args) => toasts.push(args), navigate: (href) => navigations.push(href) } };
   globalThis.document = fakeDocument();
   console.error = () => {};
   const state = { syncTargets };
@@ -2602,10 +2759,11 @@ async function withTasksDefaults({ preferences = {}, syncTargets }, run) {
       }
       return { data: null };
     },
+    put: async (url, body) => { puts.push([url, body]); return { data: body }; },
   };
   resetPreferencesCache();
   try {
-    await run({ render, state, navigations });
+    await run({ render, state, navigations, puts, toasts });
   } finally {
     delete globalThis.__apiStub;
     globalThis.window = prev.window;
@@ -2677,6 +2835,71 @@ test('Standard-Erinnerungsliste: eine gescheiterte Abfrage ist ein Fehler mit Au
     assert.match(host.html, /id="tasks-default-target"/, 'Erneut versuchen laedt die Listen und zeigt das Feld');
     assert.equal(walkNodes(host.appended).some((node) => node.getAttribute?.('role') === 'alert'), false, 'der Fehler ist weg');
   });
+});
+
+test('Aufgaben-Standardwerte: Sichtbarkeit und Sperre erscheinen immer, gespeicherter Wert wird vorbelegt (#2125)', async () => {
+  await withTasksDefaults({
+    preferences: { tasks_default_visibility: 'assignees', tasks_default_locked: true },
+    syncTargets: [],
+  }, async ({ render }) => {
+    const host = tasksDefaultsSheet();
+    await render(host, { user: { role: 'member' } });
+    assert.match(host.html, /id="tasks-default-visibility"/, 'Sichtbarkeitsfeld fehlt');
+    assert.match(host.html, /id="tasks-default-locked"/, 'Sperrfeld fehlt');
+    assert.match(host.html, /value="assignees" selected/, 'gespeicherter Wert "assignees" ist nicht vorbelegt');
+    assert.match(host.html, / checked/, 'gespeicherter Wert "locked" ist nicht angehakt');
+  });
+});
+
+test('Aufgaben-Standardwerte: Aenderung der Sichtbarkeit speichert per PUT /preferences (#2125)', async () => {
+  await withTasksDefaults({ preferences: { tasks_default_visibility: 'all' }, syncTargets: [] }, async ({ render, puts, toasts }) => {
+    const host = tasksDefaultsSheet();
+    await render(host, { user: { role: 'member' } });
+    const select = host.querySelector('#tasks-default-visibility');
+    assert.ok(select, 'Sichtbarkeitsfeld nicht gefunden');
+    select.value = 'private';
+    await select.fire('change');
+    assert.deepEqual(puts, [['/preferences', { tasks_default_visibility: 'private' }]], 'Wert nicht gespeichert');
+    assert.equal(toasts.length, 1, 'kein Toast nach Speichern');
+  });
+});
+
+test('Aufgaben-Standardwerte: Aenderung der Sperre speichert per PUT /preferences (#2125)', async () => {
+  await withTasksDefaults({ preferences: { tasks_default_locked: false }, syncTargets: [] }, async ({ render, puts, toasts }) => {
+    const host = tasksDefaultsSheet();
+    await render(host, { user: { role: 'member' } });
+    const toggle = host.querySelector('#tasks-default-locked');
+    assert.ok(toggle, 'Sperrfeld nicht gefunden');
+    toggle.checked = true;
+    await toggle.fire('change');
+    assert.deepEqual(puts, [['/preferences', { tasks_default_locked: true }]], 'Wert nicht gespeichert');
+    assert.equal(toasts.length, 1, 'kein Toast nach Speichern');
+  });
+});
+
+test('Aufgaben-Standardwerte: neue Aufgabe belegt Sichtbarkeit und Sperre aus den Einstellungen vor (#2125)', async () => {
+  globalThis.HTMLElement    ??= class {};
+  globalThis.customElements ??= { define() {}, get() {} };
+  const { __test: tasks } = await import('../public/pages/tasks.js');
+  const prevVisibility = tasks.state.defaultVisibility;
+  const prevLocked    = tasks.state.defaultLocked;
+  try {
+    // Neue Aufgabe: gespeicherte Einstellungen vorbelegen.
+    tasks.state.defaultVisibility = 'private';
+    tasks.state.defaultLocked     = true;
+    const htmlNew = tasks.renderModalContent({ task: null, users: [], reminder: null });
+    assert.match(htmlNew, /value="private"\s+selected/, 'neue Aufgabe: gespeicherte Sichtbarkeit "private" ist nicht vorbelegt');
+    assert.match(htmlNew, /id="task-locked"[^>]*checked/, 'neue Aufgabe: gespeicherter Sperr-Wert ist nicht angehakt');
+
+    // Bestehende Aufgabe: eigener Wert der Aufgabe, nicht die Einstellung.
+    const task = { id: 1, title: 'T', visibility: 'assignees', locked: 0 };
+    const htmlEdit = tasks.renderModalContent({ task, users: [], reminder: null });
+    assert.match(htmlEdit, /value="assignees"\s+selected/, 'bearbeitete Aufgabe: Sichtbarkeit aus der Aufgabe, nicht aus der Einstellung');
+    assert.doesNotMatch(htmlEdit, /id="task-locked"[^>]*checked/, 'bearbeitete Aufgabe: locked=0 darf kein checked setzen');
+  } finally {
+    tasks.state.defaultVisibility = prevVisibility;
+    tasks.state.defaultLocked     = prevLocked;
+  }
 });
 
 /* ==========================================================================
@@ -2807,13 +3030,13 @@ test('S2: der Controller leitet Alt-Adressen samt Abschnitt und Parametern um', 
   // Am Programm statt an der Schreibweise: der Controller fuehrt die Adresse
   // samt Parametern ueber movedSettingsUrl weiter.
   assert.deepEqual((await runSettingsController('/settings/sync/calendar', '?sync_ok=google')).replaced,
-    ['/settings/modules/calendar?section=sync-calendar&sync_ok=google']);
+    ['/settings/modules/calendar-sync?section=sync-calendar&sync_ok=google']);
   // Das OAuth-Ergebnis (?sync_ok) gehoert an den Abschnitt Kalender-Synchronisation.
-  assert.match(source, /const SYNC_CALENDAR_LEAF = '\/settings\/modules\/calendar';/);
+  assert.match(source, /const SYNC_CALENDAR_LEAF = '\/settings\/modules\/calendar-sync';/);
   assert.match(source, /`\$\{SYNC_CALENDAR_LEAF\}\?section=\$\{SYNC_CALENDAR_SECTION\}&\$\{query\.toString\(\)\}`/);
   // Parameter reisen mit, ein alter `?section=` nicht doppelt.
   const { sheet, section, params } = landing('/settings/sync/calendar', 'sync_ok=google&section=alt');
-  assert.equal(sheet.id, 'module-calendar');
+  assert.equal(sheet.id, 'module-calendar-sync');
   assert.equal(section, 'sync-calendar');
   assert.equal(params.get('sync_ok'), 'google');
   assert.equal(params.getAll('section').length, 1);
@@ -3202,7 +3425,8 @@ test('R14: Modulblaetter stehen in der Reihenfolge der Seitenleiste', async () =
   const mods = plain.slice(2, -1);
   // R19 (Ulas 2026-10-16): Planen = Kalender, Aufgaben, Belohnungen, Notizen,
   // Schichtplan. Notizen haben kein eigenes Modulblatt.
-  assert.deepEqual(mods, ['dashboard', 'calendar', 'tasks', 'rewards', 'schedule', 'kitchen', 'housekeeping', 'waste', 'documents',
+  // R23 D14: die Kalender-Synchronisation steht als zweites Blatt des Kalenders direkt dahinter.
+  assert.deepEqual(mods, ['dashboard', 'calendar', 'calendar', 'tasks', 'rewards', 'schedule', 'kitchen', 'housekeeping', 'waste', 'documents',
     'inventory', 'contacts', 'health', 'budget'], 'ohne eigene Anordnung genau wie die Seitenleiste (gemessen 1440)');
   const pos = (id) => mods.indexOf(id);
   assert.equal(mods[0], 'dashboard', 'die Uebersicht fuehrt wie in der Seitenleiste');
@@ -3446,9 +3670,9 @@ test('R16: ein Blatt mit mehr als drei Abschnitten fuehrt Sprungmarken auf seine
 
   const calendar = settingsSheetJumpTargets(sheet('module-calendar'), admin);
   assert.deepEqual(calendar.map((target) => target.id),
-    ['personal-calendar', 'personal-calendar-subscriptions', 'personal-feeds', 'feed-birthdays', 'modules-calendar', 'sync-calendar'],
+    ['personal-calendar', 'personal-calendar-subscriptions', 'personal-feeds', 'feed-birthdays', 'modules-calendar'],
     'in der Reihenfolge des Blatts: erst "Fuer mich", dann der Haushalt');
-  assert.equal(calendar[5].url, '/settings/modules/calendar?section=sync-calendar', 'dasselbe Ziel wie die Umleitungen');
+  assert.equal(calendar[4].url, '/settings/modules/calendar?section=modules-calendar', 'dasselbe Ziel wie die Umleitungen');
   assert.equal(calendar[0].labelKey, 'settings.pageCalendarDefaults', 'die Marke heisst wie der Abschnitt in der Registry');
 
   // Drei Abschnitte sind ein Blick, keine Navigation.
@@ -3477,9 +3701,14 @@ test('R16: die Sprungmarken sind Links im Blatt, eine scrollende Zeile, und spri
   const row = rules.find((r) => r.selector.trim() === '.settings-sheet-jump__list' && !r.at.length);
   assert.match(row?.body ?? '', /overflow-x:\s*auto/);
   assert.match(row?.body ?? '', /flex-wrap:\s*nowrap/, 'eine Zeile: umgebrochen kosteten fuenf Marken mobil drei Reihen vor dem ersten Schalter');
-  // R20: am Desktop schnitt die Zeile im Kalender-Blatt zwei Marken ab (999px in 660px).
-  const wide = rules.find((r) => r.selector.trim() === '.settings-sheet-jump__list' && r.at.some((a) => /min-width:\s*768px/.test(a)));
-  assert.match(wide?.body ?? '', /flex-wrap:\s*wrap/, 'ab 768px brechen die Marken um, statt an der Kante zu enden');
+  // R20 brach die Zeile ab 768px um (am Desktop schnitt sie im Kalender-Blatt
+  // zwei Marken ohne Anriss ab). R24 (G6-Einst-P3-6): der Umbruch liess
+  // „Termine" allein in Reihe zwei stehen; seit R22 D13 traegt die Zeile den
+  // Anriss, also bleibt sie in jeder Breite eine Zeile.
+  const wide = rules.filter((r) => r.selector.trim() === '.settings-sheet-jump__list' && r.at.length);
+  assert.ok(wide.every((r) => !/flex-wrap:\s*wrap/.test(r.body)), 'keine Breite bricht die Marken um');
+  assert.match(shell.slice(shell.indexOf('function createSheetJump('), shell.indexOf('function syncJumpLabels(')), /wireScrollFade\(list\)/,
+    'der Anriss zeigt in jeder Breite, dass es weitergeht');
 });
 
 test('R16/R20: mobil ist die Blattbeschreibung hoechstens drei Zeilen lang', async () => {
@@ -3805,8 +4034,11 @@ test('R17: die gruppierte Zeile - Label links, Bedienelement rechts, der Hinweis
   const base = rules.find((r) => r.selector.trim() === '.settings-group > .settings-setting-row' && !r.at.length);
   assert.match(base?.body ?? '', /grid-template-columns:\s*minmax\(0, 1fr\) auto/);
   assert.match(base?.body ?? '', /min-height:\s*var\(--target-lg\)/, 'die Zeile ist mobil ein Fingerziel hoch');
+  // R23 S10: die EINE benannte Ausnahme stapelt nur eine Zeile, deren
+  // Bedienelement ein Textfeld ist (Konto mobil 50/50) - nie eine Auswahl.
   const narrowed = rules.filter((r) => r.at.length && /\.settings-group\b[^,{]*\.settings-setting-row\b/.test(r.selector)
-    && /grid-template-columns/.test(r.body));
+    && /grid-template-columns/.test(r.body)
+    && !/:has\(> \.settings-setting-row__control > input\.form-input:only-child:is\(\[type="text"\]/.test(r.selector));
   assert.deepEqual(narrowed.map((r) => r.selector), [],
     'keine Breitenabfrage stapelt die Zeile wieder: gestapelt war ein Auswahlfeld mit "5 Minuten" mobil vollbreit');
   const control = rules.find((r) => r.selector.trim() === '.settings-group .settings-setting-row__control' && !r.at.length);
@@ -3986,8 +4218,10 @@ test('R19: Wand-Modus und Bildschirmschoner stehen im Blatt "Dieses Geraet"', as
   assert.equal(section.sheetId, 'personal-device');
   assert.equal(section.props?.part, 'device');
   for (const key of ['settings.wallModeLabel', 'settings.screensaverIdleLabel', 'settings.screensaverClockLabel', 'settings.screensaverCoverLabel']) {
-    assert.ok(section.options.includes(key), `${key} im Geraete-Abschnitt`);
-    assert.ok(!SETTINGS_SECTIONS.find((s) => s.id === 'personal-appearance').options.includes(key), `${key} nicht mehr unter Darstellung`);
+    // Eine Option ist ein Schluessel oder ein Objekt mit `key` (R23: `synonyms`).
+    const keyOf = (o) => (typeof o === 'string' ? o : o.key);
+    assert.ok(section.options.map(keyOf).includes(key), `${key} im Geraete-Abschnitt`);
+    assert.ok(!SETTINGS_SECTIONS.find((s) => s.id === 'personal-appearance').options.map(keyOf).includes(key), `${key} nicht mehr unter Darstellung`);
   }
   const src = await readFile(new URL('../public/settings/pages/personal-appearance.js', import.meta.url), 'utf8');
   assert.match(src, /if \(container\.dataset\?\.part === 'device'\) \{[\s\S]{0,400}?renderDeviceDisplay\(container, \{ screensaverOn, isAdmin[^}]*\}\);\s*return;/);
@@ -4012,9 +4246,12 @@ test('R19: umgestellte Blaetter sprechen den Zeilen-Dialekt', async () => {
   const account = await readFile(new URL('../public/settings/pages/personal-account.js', import.meta.url), 'utf8');
   // Re-Kritik 2026-10-17: auch Anzeigename und Farbe neben dem Bild (vorher
   // Felder unter Etiketten, zwei Dialekte in einer Karte).
-  for (const id of ['profile-display-name', 'profile-avatar-color', 'profile-phone', 'profile-email', 'profile-birth-date', 'current-password', 'new-password', 'confirm-password']) {
+  for (const id of ['profile-display-name', 'profile-phone', 'profile-email', 'profile-birth-date', 'current-password', 'new-password', 'confirm-password']) {
     assert.match(account, new RegExp(`settingRowHtml\\(\\{\\s*label: t\\('settings\\.[a-zA-Z]+'\\), labelFor: '${id}'`), `Konto: ${id} als Zeile`);
   }
+  // Die Farbe ist eine Gruppe (Farbwaehler, Critique R24 E6): Zeile mit
+  // Etikett-id, die Reihe darunter.
+  assert.match(account, /label: t\('settings\.colorLabel'\), labelId: 'profile-avatar-color-label', stacked: true,\s*control: colorPickerHtml\(\{ id: 'profile-avatar-color'/, 'Konto: Farbe als Zeile mit Farbwaehler');
   const profile = account.slice(account.indexOf('<div class="settings-profile-editor">'), account.indexOf('id="profile-error"'));
   assert.ok(profile.length > 0, 'Vorbedingung: das Profil steht im Konto-Blatt');
   assert.doesNotMatch(profile, /class="form-group/, 'Konto: das Profil fuehrt keine gestapelten Felder mehr');
@@ -4025,7 +4262,9 @@ test('R19: umgestellte Blaetter sprechen den Zeilen-Dialekt', async () => {
   // Ein Textfeld in der Zeile fuellt die Bedienspalte (gemessen: E-Mail am
   // Desktop 201px in einer 680px-Zeile).
   const wide = [...eachRule(css)].find((r) => !r.at.length && /\.settings-group \.settings-setting-row__control > input\.form-input:only-child:is\(/.test(r.selector));
-  assert.match(wide?.body ?? '', /inline-size:\s*50cqi/, 'Textfelder nehmen die halbe Zeile');
+  // Seit R21 S7 hoechstens --layout-field-max, damit die Felder einer Seite an
+  // EINER Kante beginnen (Test "R21 S7" unten).
+  assert.match(wide?.body ?? '', /inline-size:\s*min\(50cqi, var\(--layout-field-max\)\)/, 'Textfelder nehmen die halbe Zeile, hoechstens die Feldbreite');
   assert.match(wide?.selector ?? '', /\[type="email"\]/, 'auch E-Mail');
 
   // Schritt 5b (B7 abgeschlossen): die uebrigen Blaetter mit Feldern unter
@@ -4057,8 +4296,11 @@ test('R19: umgestellte Blaetter sprechen den Zeilen-Dialekt', async () => {
   // verborgen werden, und Schalterzeilen fluchten in der Karte.
   assert.doesNotMatch(css, /\.settings-webdav-toggle-row/, 'die eigene Schalterleiste ist entfallen');
   assert.match(css, /\.settings-card \.settings-group > \.settings-setting-row--switch > \.toggle-row,/, 'Schalterzeile fluchtet in der Karte');
+  // Seit D13 (Critique R21) haelt EINE Regel in reset.css jedes `[hidden]`,
+  // auch `.form-row` und `.row-carrier` - die Liste in layout.css ist gegangen.
   const layout = await readFile(new URL('../public/styles/layout.css', import.meta.url), 'utf8');
-  assert.match(layout, /\.form-row\[hidden\],\s*\.row-carrier\[hidden\],/, 'eine verborgene Zeile bleibt verborgen');
+  const reset = await readFile(new URL('../public/styles/reset.css', import.meta.url), 'utf8');
+  assert.match(reset, /\[hidden\]:not\(\[hidden="until-found"\]\) \{\s*display: none !important;/, 'eine verborgene Zeile bleibt verborgen');
 
   // Re-Kritik 2026-10-17: in der Gesundheit sprach nur der Messwert-Dialog
   // Zeilen; Aktivitaet und Naehrwerte stapelten Felder in Rastern, die
@@ -4162,7 +4404,8 @@ test('Eigenes Modul hinzufuegen: adminOnly, am Ende, Fehler je reason lokalisier
     assert.equal(deleteErrorText({ status: 400, data: { reason, error: 'English' } }),
       installErrorText({ status: 400, data: { reason, error: 'English' } }), `${reason}: sonst dieselbe Abbildung`);
   }
-  assert.equal(deleteErrorText({ status: 400, data: { reason: 'new_thing', error: 'Server says' } }), 'Server says');
+  // Ein unbekannter Grund: der allgemeine Satz, nie der Text des Servers (#1909).
+  assert.equal(deleteErrorText({ status: 400, data: { reason: 'new_thing', error: 'Server says' } }), 'settings.installModuleErrorGeneric');
   // Der Loeschen-Toast in Aktive Module nutzt die Loeschen-Abbildung, der
   // Schalter-Toast die Install-Abbildung (PATCH enabled:true kann 409 busy und
   // 503 not_writable nennen, Review Runde 4).
@@ -4170,9 +4413,18 @@ test('Eigenes Modul hinzufuegen: adminOnly, am Ende, Fehler je reason lokalisier
   assert.match(activeSrc, /import \{ deleteErrorText, installErrorText \} from '\/settings\/module-install-errors\.js'/);
   assert.match(activeSrc, /showToast\(error\?\.data\?\.reason \? deleteErrorText\(error\)/, 'Loeschen-Toast');
   assert.match(activeSrc, /showToast\(error\?\.data\?\.reason \? installErrorText\(error\)/, 'Schalter-Toast');
-  assert.equal(installErrorText({ status: 400, data: { reason: 'new_thing', error: 'Server says' } }), 'Server says',
-    'ein unbekannter reason faellt auf den Servertext zurueck');
+  assert.equal(installErrorText({ status: 400, data: { reason: 'new_thing', error: 'Server says' }, message: 'Server says' }),
+    'settings.installModuleErrorGeneric', 'ein unbekannter reason bekommt den allgemeinen Satz, nie den Text des Servers (#1909)');
+  assert.equal(installErrorText(Object.assign(new Error('Failed to fetch'), { status: 0 })), 'common.errorOfflineMutation',
+    'ohne Netz der Satz dafuer, nicht der des Browsers');
+  assert.equal(installErrorText({ status: 403, data: { error: 'Forbidden.' } }), 'common.errorNoPermission');
   assert.equal(installErrorText({}), 'settings.installModuleErrorGeneric');
+  // `bad_manifest` behaelt die Angabe des Loaders - eingesetzt in den eigenen Satz.
+  assert.match(installErrorText({ status: 400, data: { reason: 'bad_manifest', error: 'module.json is not a valid JSON object.' } }),
+    /^settings\.installModuleErrorBadManifest\{"detail":"module\.json is not a valid JSON object\."\}$/);
+  // Aktive Module: ohne reason der Satz der App statt `error.message`.
+  assert.doesNotMatch(activeSrc, /showToast\(error\?\.data\?\.reason \? (?:install|delete)ErrorText\(error\) : \(error\?\.message/);
+  assert.match(activeSrc, /showToast\(error\?\.data\?\.reason \? deleteErrorText\(error\) : errorSentence\(error\)/);
 
   assert.equal(zipFileProblem({ name: 'm.ZIP', size: 1024 }, 20), null);
   assert.equal(zipFileProblem({ name: 'm.tar.gz', size: 1024 }, 20), 'settings.installModuleFileNotZip');
@@ -4443,4 +4695,1131 @@ test('R19: das Kuechenblatt spricht den Zeilen-Dialekt der Einstellungen', async
   assert.match(meals, /settingRowHtml\(\{\s*label: builtInMealTypeLabel\(mealType\),\s*labelFor: `meal-name-\$\{mealType\}`/, 'Etikett links, Feld rechts');
   assert.doesNotMatch(meals, /class="settings-card"|class="form-field"|class="form-label"/, 'keine Karte und kein gestapeltes Feld mehr');
   assert.match(meals, /settings-group__footer">\$\{t\('settings\.mealTypesHint'\)\}/, 'der Hinweis als Gruppenfuss');
+});
+
+// -------------------------------------------------------------------------
+// #1997: eine spaete Erfolgsantwort schliesst nur ihren EIGENEN Dialog
+// -------------------------------------------------------------------------
+
+// Kommt die Antwort erst, nachdem der Nutzer den Dialog geschlossen und einen
+// anderen geoeffnet hat, darf das force-Schliessen nur den eigenen treffen. Ob
+// der Slot noch denselben Dialog haelt, entscheidet closeModal({ context }) in
+// components/modal.js (am echten Modul gemessen in test-modal-dead-time.js);
+// hier zaehlt die Verdrahtung: beide Dialoge der Rezeptquellen reichen den
+// Kontext von VOR der Anfrage hinein. Gefahren wird je Weg der echte
+// Submit-Handler an einem Attrappen-Panel; die Anfrage wechselt den Kontext.
+test('#1997: Rezeptquellen - Konto anlegen und Link aendern schliessen nur mit dem Kontext von VOR der Anfrage', async () => {
+  const { __test: kitchen } = await import('../public/settings/pages/modules-kitchen.js');
+  const { recipeProviders } = await import('/api.js');
+  const vorher = { createAccount: recipeProviders.createAccount, updateAccount: recipeProviders.updateAccount, window: globalThis.window };
+  const toasts = [];
+  globalThis.window = { ...(vorher.window ?? {}), yuvomi: { showToast: (text, kind) => toasts.push([text, kind]) } };
+
+  /** Oeffnet den Dialog ueber den Modal-Stub; liefert den Submit von `formSel`. */
+  const dialog = async (oeffne, formSel, werte) => {
+    let opts = null;
+    globalThis.__openModal = (o) => { opts = o; };
+    try { await oeffne(); } finally { delete globalThis.__openModal; }
+    assert.ok(opts, 'der Dialog wurde geoeffnet');
+    const handlers = {};
+    const els = {};
+    const el = (sel) => {
+      els[sel] ??= {
+        value: '', hidden: false, textContent: '',
+        addEventListener(type, fn) { handlers[`${sel}:${type}`] = fn; },
+        ...werte[sel],
+      };
+      return els[sel];
+    };
+    opts.onSave({ querySelector: el, querySelectorAll: () => [], addEventListener() {} });
+    return () => handlers[`${formSel}:submit`]({ preventDefault() {} });
+  };
+  const klicks = {};
+  const container = {
+    querySelector: (sel) => (sel === '#recipe-provider-add-account-btn'
+      ? { addEventListener(type, fn) { klicks[type] = fn; } }
+      : null),
+    querySelectorAll: () => [],
+  };
+  const WEGE = [
+    ['Konto anlegen', () => dialog(() => { kitchen.bindProviderAddButton(container); klicks.click(); }, '#recipe-provider-add-form', {
+      '#recipe-provider-select': { value: 'mealie' }, '#recipe-provider-name': { value: 'Kueche' },
+      '#recipe-provider-url': { value: 'https://mealie.example' }, '#recipe-provider-external-url': { value: '' },
+      '#recipe-provider-token': { value: 'test-token' },
+    })],
+    ['Link aendern', () => dialog(() => kitchen.openProviderLinkModal({ id: 4, provider: 'mealie', externalUrl: '' }, async () => {}),
+      '#recipe-provider-link-form', { '#recipe-provider-link-external-url': { value: 'https://cook.example' } })],
+  ];
+  try {
+    for (const [name, vorbereiten] of WEGE) {
+      const ausloesen = await vorbereiten();
+      toasts.length = 0;
+      let kontext = 'eigener-dialog';
+      const geschlossen = [];
+      const geschrieben = [];
+      globalThis.__modalContextId = () => kontext;
+      globalThis.__closeModal = (opts) => { geschlossen.push(opts); };
+      const schreibe = (verb) => async () => { geschrieben.push(verb); kontext = 'ein-anderer-dialog'; return { data: {} }; };
+      recipeProviders.createAccount = schreibe('createAccount');
+      recipeProviders.updateAccount = schreibe('updateAccount');
+      try {
+        await ausloesen();
+        assert.equal(geschrieben.length, 1, `${name}: der Weg schreibt`);
+        assert.equal(toasts.some(([, art]) => art === 'danger'), false, `${name}: der Erfolg ist kein Fehler (${JSON.stringify(toasts)})`);
+        assert.equal(geschlossen.length, 1, `${name}: genau ein Schliessen (${JSON.stringify(geschlossen)})`);
+        assert.equal(geschlossen[0].force, true, `${name}: force wie bisher`);
+        assert.equal(geschlossen[0].context, 'eigener-dialog',
+          `${name}: geschlossen wird ohne den Kontext von vor der Anfrage - die spaete Antwort traefe den Dialog, der jetzt offen ist`);
+      } finally {
+        delete globalThis.__modalContextId;
+        delete globalThis.__closeModal;
+      }
+    }
+  } finally {
+    recipeProviders.createAccount = vorher.createAccount;
+    recipeProviders.updateAccount = vorher.updateAccount;
+    globalThis.window = vorher.window;
+  }
+});
+
+// -------------------------------------------------------------------------
+// #1909: die Rezeptdienste sagen den Satz der App, nie den des Servers
+// -------------------------------------------------------------------------
+
+// Bis dahin zeigte jeder gescheiterte Weg des Kuechenblatts `err.message` -
+// den englischen Text des Servers ("Base URL must start with http(s)://")
+// oder den des Browsers. Gefahren werden die ECHTEN Handler bis in ihr catch:
+// ein Fall mit `reason` wird sein Satz, alles andere der allgemeine Satz der
+// Stelle. Ein Konto, das ein anderer Admin inzwischen entfernt hat, laesst die
+// Liste frisch kommen, und sein Loeschen gilt als erledigt.
+const SERVER_SATZ = 'English text of the server';
+const absage = (status, reason) => Object.assign(new Error(SERVER_SATZ), {
+  status, data: reason ? { error: SERVER_SATZ, code: status, reason } : { error: SERVER_SATZ, code: status },
+});
+const KONTO_WEG = () => absage(404, 'recipe_providers_account_not_found');
+
+test('#1909: Rezeptdienst anlegen und Link aendern - der Satz zum Fall, sonst der allgemeine, nie der Servertext', async () => {
+  const { __test: kitchen } = await import('../public/settings/pages/modules-kitchen.js');
+  const { recipeProviders } = await import('/api.js');
+  const vorher = { createAccount: recipeProviders.createAccount, updateAccount: recipeProviders.updateAccount, window: globalThis.window };
+  const toasts = [];
+  globalThis.window = { ...(vorher.window ?? {}), yuvomi: { showToast: (text, kind) => toasts.push([text, kind]) } };
+
+  const dialog = async (oeffne, formSel, fehlerSel, werte) => {
+    let opts = null;
+    globalThis.__openModal = (o) => { opts = o; };
+    try { await oeffne(); } finally { delete globalThis.__openModal; }
+    const handlers = {};
+    const els = {};
+    const el = (sel) => {
+      els[sel] ??= { value: '', hidden: true, textContent: '', addEventListener(type, fn) { handlers[`${sel}:${type}`] = fn; }, ...werte[sel] };
+      return els[sel];
+    };
+    opts.onSave({ querySelector: el, querySelectorAll: () => [], addEventListener() {} });
+    return { senden: () => handlers[`${formSel}:submit`]({ preventDefault() {} }), fehler: el(fehlerSel) };
+  };
+  const klicks = {};
+  const container = {
+    querySelector: (sel) => (sel === '#recipe-provider-add-account-btn' ? { addEventListener(type, fn) { klicks[type] = fn; } } : null),
+    querySelectorAll: () => [],
+  };
+  let nachgeladen = 0;
+  const anlegen = () => dialog(() => { kitchen.bindProviderAddButton(container); klicks.click(); }, '#recipe-provider-add-form', '#recipe-provider-add-error', {
+    '#recipe-provider-select': { value: 'mealie' }, '#recipe-provider-name': { value: 'Kueche' },
+    '#recipe-provider-url': { value: 'https://mealie.example' }, '#recipe-provider-external-url': { value: '' },
+    '#recipe-provider-token': { value: 'test-token' },
+  });
+  const link = () => dialog(() => kitchen.openProviderLinkModal({ id: 4, provider: 'mealie', externalUrl: '' }, async () => { nachgeladen += 1; }),
+    '#recipe-provider-link-form', '#recipe-provider-link-error', { '#recipe-provider-link-external-url': { value: 'cook.example' } });
+
+  const FAELLE = [
+    [anlegen, absage(400, 'recipe_providers_url_invalid'), 'settings.recipeProviderErrorUrlInvalid'],
+    [anlegen, absage(400, 'recipe_providers_external_url_invalid'), 'settings.recipeProviderErrorExternalUrlInvalid'],
+    [anlegen, absage(400, 'recipe_providers_private_network'), 'settings.recipeProviderErrorPrivateNetwork'],
+    [anlegen, absage(502, 'recipe_providers_connection_failed'), 'settings.recipeProviderErrorConnectionFailed'],
+    [anlegen, absage(409, 'recipe_providers_account_exists'), 'settings.recipeProviderErrorAccountExists'],
+    [anlegen, absage(400), 'common.errorGeneric'],
+    [anlegen, new TypeError('Failed to fetch'), 'common.errorGeneric'],
+    [link, absage(400, 'recipe_providers_external_url_invalid'), 'settings.recipeProviderErrorExternalUrlInvalid'],
+    [link, absage(400), 'common.errorGeneric'],
+    [link, new TypeError('Failed to fetch'), 'common.errorGeneric'],
+  ];
+  try {
+    for (const [weg, fehler, satz] of FAELLE) {
+      const { senden, fehler: zeile } = await weg();
+      const wurf = async () => { throw fehler; };
+      recipeProviders.createAccount = wurf;
+      recipeProviders.updateAccount = wurf;
+      const geschlossen = [];
+      globalThis.__closeModal = (o) => { geschlossen.push(o); };
+      try {
+        await senden();
+      } finally {
+        delete globalThis.__closeModal;
+      }
+      const name = `${weg === anlegen ? 'Anlegen' : 'Link'} / ${fehler.data?.reason ?? fehler.message}`;
+      assert.equal(zeile.textContent, satz, `${name}: die Fehlerzeile sagt den Satz der App`);
+      assert.equal(zeile.hidden, false, `${name}: die Fehlerzeile steht`);
+      assert.equal(geschlossen.length, 0, `${name}: der Dialog bleibt offen`);
+    }
+
+    // Das Konto ist weg, waehrend sein Link-Dialog offen war: an ihm ist nichts
+    // mehr zu aendern. Der Dialog geht zu (mit seinem Kontext), der Toast sagt
+    // warum, die Liste kommt frisch.
+    const { senden, fehler: zeile } = await link();
+    recipeProviders.updateAccount = async () => { throw KONTO_WEG(); };
+    toasts.length = 0;
+    nachgeladen = 0;
+    const geschlossen = [];
+    globalThis.__modalContextId = () => 'link-dialog';
+    globalThis.__closeModal = (o) => { geschlossen.push(o); };
+    try {
+      await senden();
+    } finally {
+      delete globalThis.__closeModal;
+      delete globalThis.__modalContextId;
+    }
+    assert.deepEqual(toasts, [['settings.recipeProviderErrorAccountGone', 'danger']]);
+    assert.equal(nachgeladen, 1, 'die Liste kommt frisch');
+    assert.equal(geschlossen.length, 1, 'der Dialog geht zu');
+    assert.equal(geschlossen[0].context, 'link-dialog', 'mit dem Kontext von vor der Anfrage (#1997)');
+    assert.equal(zeile.hidden, true, 'keine Fehlerzeile in einem Dialog, der zugeht');
+  } finally {
+    recipeProviders.createAccount = vorher.createAccount;
+    recipeProviders.updateAccount = vorher.updateAccount;
+    globalThis.window = vorher.window;
+  }
+});
+
+test('#1909: die Karte eines Rezeptdienstes - Sync, Aktivieren und Loeschen sagen den Satz der App', async () => {
+  const { __test: kitchen } = await import('../public/settings/pages/modules-kitchen.js');
+  const { recipeProviders } = await import('/api.js');
+  const { installMiniDom, MiniElement } = await import('./mini-dom.js');
+  const vorher = {
+    syncAccount: recipeProviders.syncAccount, updateAccount: recipeProviders.updateAccount,
+    deleteAccount: recipeProviders.deleteAccount, window: globalThis.window,
+    addEventListener: MiniElement.prototype.addEventListener,
+  };
+  const deinstalliere = installMiniDom();
+  const toasts = [];
+  globalThis.window = { ...(globalThis.window ?? {}), yuvomi: { showToast: (text, kind) => toasts.push([text, kind]) } };
+  // Der Mini-DOM merkt sich nur, DASS ein Listener haengt - hier braucht der
+  // Test den Handler selbst, um ihn zu fahren.
+  MiniElement.prototype.addEventListener = function merke(typ, fn) { this.listener = typ; (this.handlers ??= {})[typ] = fn; };
+
+  /** Baut die Karte und liefert die Knoepfe nach ihrer Beschriftung. Gesammelt
+   *  wird beim Erzeugen: der Mini-DOM haengt den Sync-Knopf (ohne nodeType) nicht
+   *  in die Zusammenfassung, sein Handler haengt trotzdem daran. */
+  const karte = (refresh) => {
+    const gebaut = [];
+    const erzeuge = globalThis.document.createElement;
+    globalThis.document.createElement = (tag) => { const el = erzeuge(tag); gebaut.push(el); return el; };
+    try {
+      kitchen.renderProviderAccount(new MiniElement('div'), {
+        id: 7, provider: 'mealie', name: 'Kueche', baseUrl: 'https://mealie.example', enabled: 1, lastSync: null, lastError: null, recipeCount: 3,
+      }, refresh);
+    } finally {
+      globalThis.document.createElement = erzeuge;
+    }
+    const knoepfe = Object.fromEntries(gebaut.filter((el) => el.tagName === 'button').map((el) => [el.textContent, el]));
+    for (const name of ['settings.syncNow', 'settings.recipeProviderDisable', 'common.delete']) assert.ok(knoepfe[name], `Knopf ${name} gebaut`);
+    return knoepfe;
+  };
+  const klick = (knopf) => knopf.handlers.click();
+
+  try {
+    for (const [knopf, setze, allgemein] of [
+      ['settings.syncNow', (f) => { recipeProviders.syncAccount = f; }, 'settings.recipeProviderSyncFailed'],
+      ['settings.recipeProviderDisable', (f) => { recipeProviders.updateAccount = f; }, 'common.errorGeneric'],
+    ]) {
+      // Ein Fehler ohne bekannten Fall: der allgemeine Satz der Stelle, der Knopf geht wieder.
+      let nachgeladen = 0;
+      let knoepfe = karte(async () => { nachgeladen += 1; });
+      setze(async () => { throw absage(500); });
+      toasts.length = 0;
+      await klick(knoepfe[knopf]);
+      assert.deepEqual(toasts, [[allgemein, 'danger']], `${knopf}: allgemeiner Satz statt Servertext`);
+      assert.equal(knoepfe[knopf].disabled, false, `${knopf}: der Knopf geht wieder`);
+      assert.equal(nachgeladen, 0, `${knopf}: kein Nachladen ohne Grund`);
+
+      // Das Konto ist weg: sein Satz, und die Liste kommt frisch.
+      knoepfe = karte(async () => { nachgeladen += 1; });
+      setze(async () => { throw KONTO_WEG(); });
+      toasts.length = 0;
+      await klick(knoepfe[knopf]);
+      assert.deepEqual(toasts, [['settings.recipeProviderErrorAccountGone', 'danger']], `${knopf}: der Satz zum Fall`);
+      assert.equal(nachgeladen, 1, `${knopf}: die Liste kommt frisch`);
+    }
+
+    // Loeschen, das ein anderer Admin schon erledigt hat, ist erledigt.
+    let nachgeladen = 0;
+    let knoepfe = karte(async () => { nachgeladen += 1; });
+    recipeProviders.deleteAccount = async () => { throw KONTO_WEG(); };
+    toasts.length = 0;
+    await klick(knoepfe['common.delete']);
+    assert.deepEqual(toasts, [['settings.recipeProviderAccountDeleted', 'success']], 'schon geloescht ist kein Fehler');
+    assert.equal(nachgeladen, 1);
+
+    // Jeder andere Fehler beim Loeschen bleibt einer - mit dem allgemeinen Satz.
+    knoepfe = karte(async () => { nachgeladen += 1; });
+    recipeProviders.deleteAccount = async () => { throw absage(500); };
+    toasts.length = 0;
+    await klick(knoepfe['common.delete']);
+    assert.deepEqual(toasts, [['common.errorGeneric', 'danger']]);
+  } finally {
+    MiniElement.prototype.addEventListener = vorher.addEventListener;
+    recipeProviders.syncAccount = vorher.syncAccount;
+    recipeProviders.updateAccount = vorher.updateAccount;
+    recipeProviders.deleteAccount = vorher.deleteAccount;
+    deinstalliere();
+    globalThis.window = vorher.window;
+  }
+});
+
+test('#1909: die Karte eines Rezeptdienstes sagt die Ursache des letzten Fehlschlags als Satz der App, nie den rohen Text', async () => {
+  const { __test: kitchen } = await import('../public/settings/pages/modules-kitchen.js');
+  const { installMiniDom, MiniElement } = await import('./mini-dom.js');
+  const deinstalliere = installMiniDom();
+  // Der rohe Text, wie Adapter und Netz ihn liefern - er darf nie auf die Karte.
+  const ROH = 'getaddrinfo ENOTFOUND mealie.internal';
+  const karte = (felder) => {
+    const container = new MiniElement('div');
+    kitchen.renderProviderAccount(container, {
+      id: 7, provider: 'mealie', name: 'Kueche', baseUrl: 'https://mealie.example', enabled: 1,
+      lastSync: '2026-10-19T08:00:00Z', recipeCount: 3, lastError: ROH, ...felder,
+    }, async () => {});
+    return container.textContent;
+  };
+  const zeile = (message) => `settings.recipeProviderLastError${JSON.stringify({ message })}`;
+  try {
+    for (const [felder, satz] of [
+      [{ lastErrorReason: 'recipe_providers_sync_auth_failed' }, 'settings.recipeProviderErrorSyncAuth'],
+      [{ lastErrorReason: 'recipe_providers_sync_wrong_url' }, 'settings.recipeProviderErrorSyncWrongUrl'],
+      [{ lastErrorReason: 'recipe_providers_sync_http_status', lastErrorParams: { status: 502 } },
+        `settings.recipeProviderErrorSyncStatus${JSON.stringify({ status: 502 })}`],
+      [{ lastErrorReason: 'recipe_providers_sync_timeout' }, 'settings.recipeProviderErrorSyncTimeout'],
+      [{ lastErrorReason: 'recipe_providers_sync_unreachable' }, 'settings.recipeProviderErrorSyncUnreachable'],
+      [{ lastErrorReason: 'recipe_providers_sync_certificate' }, 'settings.recipeProviderErrorSyncCertificate'],
+      [{ lastErrorReason: 'recipe_providers_sync_bad_response' }, 'settings.recipeProviderErrorSyncBadResponse'],
+      // Derselbe Fall wie beim Anlegen, derselbe Satz mit dem Schalter.
+      [{ lastErrorReason: 'recipe_providers_private_network' }, 'settings.recipeProviderErrorPrivateNetwork'],
+      // Ohne gespeicherten Fall (Bestand vor Migration 255, ein Wurf ohne
+      // Klasse), mit unbekanntem Fall oder ohne die Zahl: der allgemeine Satz.
+      [{}, 'settings.recipeProviderErrorSyncUnknown'],
+      [{ lastErrorReason: null, lastErrorParams: null }, 'settings.recipeProviderErrorSyncUnknown'],
+      [{ lastErrorReason: 'recipe_providers_sync_mystery' }, 'settings.recipeProviderErrorSyncUnknown'],
+      [{ lastErrorReason: 'recipe_providers_sync_http_status' }, 'settings.recipeProviderErrorSyncUnknown'],
+      [{ lastErrorReason: 'recipe_providers_sync_http_status', lastErrorParams: { status: '502' } }, 'settings.recipeProviderErrorSyncUnknown'],
+    ]) {
+      const text = karte(felder);
+      const name = JSON.stringify(felder);
+      assert.ok(text.includes(zeile(satz)), `${name}: die Karte sagt ${satz}, sah: ${text}`);
+      assert.equal(text.includes(ROH), false, `${name}: der rohe Text steht nicht auf der Karte`);
+      assert.ok(text.includes('settings.notConnected'), `${name}: der Zustand bleibt "nicht verbunden"`);
+    }
+    // Gegenrichtung: ohne Fehlschlag gibt es keine Fehlerzeile.
+    const gesund = karte({ lastError: null, lastErrorReason: null });
+    assert.equal(gesund.includes('settings.recipeProviderLastError'), false);
+    assert.ok(gesund.includes('settings.connected'));
+  } finally {
+    deinstalliere();
+  }
+});
+
+// Dieselbe Regel fuer die Konten der Synchronisation, die Kalender-Abos und
+// die Schnellzugriffe der Uebersicht (#1997). Gefahren wird je Weg der echte
+// Submit- oder Klick-Handler an einem Attrappen-Panel, in dem jedes Element
+// jeden Aufruf schluckt; die schreibende Anfrage wechselt den Kontext.
+test('#1997: Synchronisation, Kalender-Abo und Schnellzugriff schliessen nur mit dem Kontext von VOR der Anfrage', async () => {
+  const { __test: syncCalendar } = await import('../public/settings/pages/sync-calendar.js');
+  const { __test: syncContacts } = await import('../public/settings/pages/sync-contacts.js');
+  const { __test: icsSubs } = await import('../public/settings/pages/personal-calendar-subscriptions.js');
+  const { __test: quickLinks } = await import('../public/components/quick-links-manager.js');
+  const vorher = { window: globalThis.window, document: globalThis.document };
+  const toasts = [];
+  globalThis.window = { ...(vorher.window ?? {}), yuvomi: { showToast: (text, kind) => toasts.push([text, kind]) } };
+  const { installMiniDom } = await import('./mini-dom.js');
+  const deinstalliere = installMiniDom();
+
+  /** Ein Element, das jeden Aufruf schluckt und seine Handler merkt. */
+  const element = (handlers, sel, werte) => {
+    const el = {
+      value: '', checked: false, hidden: false, disabled: false, textContent: '', dataset: {}, style: { setProperty() {} }, options: [],
+      classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+      addEventListener(type, fn) { handlers[`${sel}:${type}`] = fn; },
+      querySelector: () => null, querySelectorAll: () => [],
+      ...werte[sel],
+    };
+    return new Proxy(el, {
+      get: (target, prop) => (prop in target || typeof prop === 'symbol' || prop === 'then' ? target[prop] : () => {}),
+    });
+  };
+  /** Oeffnet den Dialog ueber den Modal-Stub; liefert das Ausloesen von `ziel` (`selektor:typ`). */
+  const dialog = async (oeffne, ziel, werte = {}) => {
+    let opts = null;
+    globalThis.__openModal = (o) => { opts = o; };
+    try { await oeffne(); } finally { delete globalThis.__openModal; }
+    assert.ok(opts, 'der Dialog wurde geoeffnet');
+    const handlers = {};
+    const els = {};
+    const el = (sel) => { els[sel] ??= element(handlers, sel, werte); return els[sel]; };
+    opts.onSave({ querySelector: el, querySelectorAll: () => [], addEventListener() {} });
+    return () => {
+      const fn = handlers[ziel];
+      assert.equal(typeof fn, 'function', `${ziel} ist verdrahtet`);
+      return fn({ preventDefault() {}, target: el(ziel.split(':')[0]) });
+    };
+  };
+  const klicks = {};
+  const container = {
+    querySelector: (sel) => (sel === '#caldav-add-account-btn' ? { addEventListener(type, fn) { klicks[type] = fn; } } : null),
+    querySelectorAll: () => [], replaceChildren() {}, insertAdjacentHTML() {}, appendChild() {},
+  };
+  const KONTO = { id: 3, name: 'Nextcloud', cardav_url: 'https://dav.example', username: 'ada' };
+  const CARDDAV = {
+    '#cardav-name': { value: 'Nextcloud' }, '#cardav-url': { value: 'https://dav.example' },
+    '#cardav-username': { value: 'ada' }, '#cardav-password': { value: 'test-passwort' },
+  };
+  const LINK = { id: 9, name: 'Wiki', url: 'https://wiki.example', color: null, visibility: 'all' };
+  const QUICK = { '#quick-link-name': { value: 'Wiki' }, '#quick-link-url': { value: 'https://wiki.example' }, '#quick-link-visibility': { value: 'all' } };
+  const ABO = { id: 4, name: 'Feiertage', color: '#123456', shared: 0, default_assignee_user_id: null };
+  const WEGE = [
+    ['CalDAV-Konto anlegen', () => dialog(() => { syncCalendar.bindCalDAVAddButton(container, { role: 'admin' }); klicks.click(); }, '#caldav-add-form:submit', {
+      '#caldav-name': { value: 'Kalender' }, '#caldav-url': { value: 'https://dav.example' },
+      '#caldav-username': { value: 'ada' }, '#caldav-password': { value: 'test-passwort' },
+    })],
+    ['CardDAV-Konto anlegen', () => dialog(() => syncContacts.openAccountModal(null, async () => {}), '#cardav-account-form:submit', CARDDAV)],
+    ['CardDAV-Konto aendern', () => dialog(() => syncContacts.openAccountModal(KONTO, async () => {}), '#cardav-account-form:submit', CARDDAV)],
+    ['Kalender-Abo aendern', () => dialog(() => icsSubs.openIcsEditModal(container, ABO, [ABO], { id: 1 }), '#ics-edit-form:submit', {
+      '#ics-edit-name': { value: 'Feiertage' }, '#ics-edit-color': { value: '#123456' },
+    })],
+    ['Schnellzugriff anlegen', () => dialog(() => quickLinks.openQuickLinkForm(null, async () => {}), '#quick-link-save:click', QUICK)],
+    ['Schnellzugriff aendern', () => dialog(() => quickLinks.openQuickLinkForm(LINK, async () => {}), '#quick-link-save:click', QUICK)],
+  ];
+  try {
+    for (const [name, vorbereiten] of WEGE) {
+      globalThis.__apiStub = { get: async () => ({ data: [] }) };
+      const ausloesen = await vorbereiten();
+      toasts.length = 0;
+      let kontext = 'eigener-dialog';
+      const geschlossen = [];
+      const geschrieben = [];
+      globalThis.__modalContextId = () => kontext;
+      globalThis.__closeModal = (opts) => { geschlossen.push(opts); };
+      const schreibe = (verb) => async (path) => { geschrieben.push(`${verb} ${path}`); kontext = 'ein-anderer-dialog'; return { data: { ...ABO } }; };
+      globalThis.__apiStub = {
+        get: async () => ({ data: [] }), post: schreibe('POST'), put: schreibe('PUT'), patch: schreibe('PATCH'),
+      };
+      try {
+        await ausloesen();
+        for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(geschrieben.length, 1, `${name}: der Weg schreibt (${JSON.stringify(geschrieben)})`);
+        assert.equal(toasts.some(([, art]) => art === 'danger'), false, `${name}: der Erfolg ist kein Fehler (${JSON.stringify(toasts)})`);
+        assert.equal(geschlossen.length, 1, `${name}: genau ein Schliessen (${JSON.stringify(geschlossen)})`);
+        assert.equal(geschlossen[0].force, true, `${name}: force wie bisher`);
+        assert.equal(geschlossen[0].context, 'eigener-dialog',
+          `${name}: geschlossen wird ohne den Kontext von vor der Anfrage - die spaete Antwort traefe den Dialog, der jetzt offen ist`);
+      } finally {
+        delete globalThis.__modalContextId;
+        delete globalThis.__closeModal;
+        delete globalThis.__apiStub;
+      }
+    }
+  } finally {
+    deinstalliere();
+    globalThis.window = vorher.window;
+    globalThis.document = vorher.document;
+  }
+});
+
+/* SPRUNGMARKEN SIND LINKS, KEINE AUSWAHL (Critique R21, a5 P3; clarify). Die
+ * Marken am Blattanfang trugen die Optik der Filter-Chips - im Kalender-Blatt
+ * standen sie direkt ueber den Erinnerungs-Chips, die etwas AUSWAEHLEN, und
+ * sahen genauso aus. Eine Marke springt; sie steht jetzt als Textlink im
+ * App-Akzent, ohne Kapsel, mit Unterstreichung bei Zeiger und Fokus. */
+test('R21: die Sprungmarken sind Textlinks, nicht in der Optik der Auswahl-Chips', async () => {
+  const shell = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  const jump = shell.slice(shell.indexOf('function createSheetJump('), shell.indexOf('function syncJumpLabels('));
+  assert.match(jump, /link\.className = 'settings-sheet-jump__link';/, 'die Marke traegt nur ihre eigene Klasse');
+  assert.doesNotMatch(jump, /filter-chip/, 'keine Chip-Klassen an einem Link');
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const link = [...eachRule(css)].filter((r) => r.selector.trim() === '.settings-sheet-jump__link' && !r.at.length).map((r) => r.body).join(';');
+  assert.match(link, /color:\s*var\(--color-accent\)/, 'die Farbe der Handlung');
+  assert.match(link, /font-size:\s*var\(--type-secondary\)/, 'Sekundaertext, nicht die Chip-Schrift');
+  assert.doesNotMatch(link, /border|background/, 'keine Kapsel');
+});
+
+/* D7 (Critique R21, a5 P2): ZYKLUSVORGABEN SIND IN DER SUCHE. "zyklus" fand
+ * drei Schalter, aber nicht die Zyklus-Einstellungen selbst (Laenge,
+ * Verhuetung, Erinnerungen, Schwangerschaft) - die stehen im Dialog der
+ * Zyklusseite, eine zweite Heimat ohne Weg dorthin. Das Gesundheitsblatt
+ * fuehrt jetzt "Zyklus-Einstellungen" als Link in die Zyklusseite, die den
+ * Dialog oeffnet, und die Suche findet ihn ueber jede seiner Vorgaben. */
+test('R21 D7: die Suche findet die Zyklusvorgaben, das Blatt fuehrt in den Dialog', async () => {
+  const de = JSON.parse(await readFile(new URL('../public/locales/de.json', import.meta.url), 'utf8'));
+  const translate = (key) => key.split('.').reduce((value, segment) => value?.[segment], de) ?? key;
+  const hit = (query) => searchSettings(query, { user: member, translate })
+    .options.find((h) => h.key === 'health.cycle.settings.title');
+  for (const q of ['Zyklus', 'Zykluslänge', 'Verhütung', 'Schwangerschaft', 'Erinnerungen']) {
+    assert.ok(hit(q), `"${q}" findet die Zyklus-Einstellungen`);
+    assert.equal(hit(q).section.id, 'personal-health');
+  }
+  const page = await readFile(new URL('../public/settings/pages/personal-health.js', import.meta.url), 'utf8');
+  assert.match(page, /const CYCLE_SETTINGS_HREF = '\/health\/cycle\?open=settings';/, 'der Link oeffnet den Dialog auf der Zyklusseite');
+  assert.match(page, /<a href="\$\{CYCLE_SETTINGS_HREF\}" id="health-cycle-settings-link">/);
+  assert.match(page, /\$\{esc\(t\('health\.cycle\.settings\.title'\)\)\}/, 'er heisst wie der Dialog (Beschriftung = Suchschluessel)');
+});
+
+// R21 S7 (Critique a5): die Felder der Konto-Seite begannen bei 1280 an drei
+// Kanten (972 / 922 / 999px) - die Bedienspalte ist die halbe Zeile, und
+// Profil, Kontaktdaten und Datum haben verschieden breite Zeilen.
+test('R21 S7: Textfelder und Datumsfeld einer Einstellungsseite teilen eine Kante', async () => {
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const tokens = await readFile(new URL('../public/styles/tokens.css', import.meta.url), 'utf8');
+  const rule = [...eachRule(css)].find((r) => r.selector.includes('.settings-setting-row__control > .birth-date-field')
+    && r.selector.includes('input.form-input:only-child'));
+  assert.ok(rule, 'Textfeld und Datumsfeld stehen in derselben Breitenregel');
+  assert.match(rule.body, /inline-size:\s*min\(50cqi, var\(--layout-field-max\)\)/, 'halbe Zeile, hoechstens die Feldbreite');
+  assert.match(tokens, /--layout-field-max:\s*16rem;/, 'die Feldbreite ist ein Token');
+});
+
+// R21 S9c (Critique 2026-10-21, Entscheidung Ulas: Option 3): bei 390 px waren
+// auf "Darstellung" 3 von 5 Auswahlwerten gekappt - "Automatisch (Engl…",
+// "Deutsch (Deutsch…", "Automatisch (Eur…". Die geschlossene Auswahl hat dort
+// 179 px (davon rund 22 Polster und Pfeil), und das Abgeschnittene war genau
+// das Detail, das sagt, was gilt. Jetzt ist der Wert kurz ("Automatisch",
+// "Deutschland") und das Detail steht vorn in der Hinweiszeile ("Gerade
+// Englisch."). Die R17-Zeile (zweispaltig, Bedienspalte 50cqi) bleibt, wie sie
+// ist - geloest wird es im Text, nicht im Raster.
+const APPEARANCE_PREFS = {
+  currency: 'EUR', date_format: 'dmy', time_format: '24h', region: 'de-DE',
+  language: null, language_auto: 'en', timezone: null, timezone_effective: 'Europe/Berlin',
+};
+
+/** Rendert das Blatt Darstellung mit diesen Preferences und liefert das Markup. */
+async function renderAppearance(preferences, role = 'admin') {
+  const { render } = await import('/settings/pages/personal-appearance.js');
+  const { resetPreferencesCache } = await import('/settings/preferences-cache.js');
+  const prev = { window: globalThis.window, document: globalThis.document, api: globalThis.__apiStub };
+  globalThis.window = { yuvomi: { showToast() {} }, addEventListener() {}, localStorage: { getItem: () => null, setItem() {}, removeItem() {} } };
+  globalThis.document = fakeDocument();
+  globalThis.__apiStub = { get: async () => ({ data: preferences }) };
+  resetPreferencesCache();
+  const host = sheetProbeContainer();
+  try {
+    await render(host, { user: { id: 1, role } });
+  } finally {
+    globalThis.window = prev.window;
+    globalThis.document = prev.document;
+    globalThis.__apiStub = prev.api;
+    resetPreferencesCache();
+  }
+  return stripHtmlComments(host.html);
+}
+
+const unescapeHtml = (text) => text.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+/** Text der gewaehlten Option der Auswahl `id` (das, was die geschlossene Auswahl zeigt). */
+function selectedOptionText(html, id) {
+  const select = html.match(new RegExp(`<select\\b[^>]*\\bid="${id}"[^>]*>([\\s\\S]*?)</select>`));
+  assert.ok(select, `#${id} fehlt im Markup`);
+  const option = select[1].match(/<option\b[^>]*\bselected[^>]*>([^<]*)<\/option>/);
+  assert.ok(option, `#${id}: keine gewaehlte Option`);
+  return unescapeHtml(option[1]);
+}
+/** Text eines Elements per id (Hinweiszeile, Wert-Span). */
+function textById(html, id, tag = 'p') {
+  const m = html.match(new RegExp(`<${tag}\\b[^>]*\\bid="${id}"[^>]*>([^<]*)</${tag}>`));
+  assert.ok(m, `#${id} fehlt im Markup`);
+  return unescapeHtml(m[1]);
+}
+// Der Stub von t() haengt die Werte als JSON an den Schluessel: ein Wert ohne
+// Anhang ist der kurze, ein Hinweis mit Anhang traegt das Detail.
+const withValues = (key, values) => key + JSON.stringify(values);
+
+test('R21 S9c: Darstellung - der Auswahlwert ist kurz, das Detail steht vorn in der Hinweiszeile', async () => {
+  const html = await renderAppearance(APPEARANCE_PREFS);
+  assert.equal(selectedOptionText(html, 'data-language-select'), 'settings.dataLanguageAuto',
+    'der Wert sagt nur "Automatisch" - die Sprache in Klammern wurde mobil gekappt');
+  assert.equal(selectedOptionText(html, 'timezone-select'), 'settings.timezoneAuto', 'ebenso die Zone');
+  assert.equal(selectedOptionText(html, 'region-select'), new Intl.DisplayNames(['de'], { type: 'region' }).of('DE'),
+    'die Region heisst nach ihrem Land ("Deutschland", nicht "Deutsch (Deutschland)")');
+
+  const english = new Intl.DisplayNames(['de'], { type: 'language' }).of('en');
+  assert.equal(textById(html, 'data-language-hint'),
+    withValues('settings.hintWithCurrent', { value: english, hint: 'settings.dataLanguageHint' }),
+    'die Hinweiszeile beginnt mit der Sprache, die gerade gilt');
+  assert.equal(textById(html, 'timezone-hint'),
+    withValues('settings.hintWithCurrent', { value: 'Europe/Berlin', hint: 'settings.timezoneHint' }),
+    'und mit der Zone, die gerade gilt');
+
+  // Ausdruecklich gewaehlt: der Wert steht vollstaendig in der Auswahl, die
+  // Hinweiszeile wiederholt ihn nicht.
+  const chosen = await renderAppearance({ ...APPEARANCE_PREFS, language: 'en', timezone: 'Europe/Paris' });
+  assert.equal(selectedOptionText(chosen, 'data-language-select'), english);
+  assert.equal(selectedOptionText(chosen, 'timezone-select'), 'Paris');
+  assert.equal(textById(chosen, 'data-language-hint'), 'settings.dataLanguageHint');
+  assert.equal(textById(chosen, 'timezone-hint'), 'settings.timezoneHint');
+
+  // Ein Mitglied sieht die Zone als Wert: dieselbe Aufteilung - und eine
+  // gesetzte Zone heisst nicht mehr "Automatisch (...)".
+  const member = await renderAppearance(APPEARANCE_PREFS, 'member');
+  assert.match(member, /<span class="settings-setting-row__value">settings\.timezoneAuto<\/span>/);
+  assert.match(member, /<p class="settings-setting-row__description form-row__description">settings\.hintWithCurrent\{&quot;value&quot;:&quot;Europe\/Berlin&quot;,&quot;hint&quot;:&quot;settings\.timezoneAdminOnly&quot;\}<\/p>/);
+  const memberSet = await renderAppearance({ ...APPEARANCE_PREFS, timezone: 'America/New_York' }, 'member');
+  assert.match(memberSet, /<span class="settings-setting-row__value">America\/New York<\/span>/);
+  assert.match(memberSet, /<p class="settings-setting-row__description form-row__description">settings\.timezoneAdminOnly<\/p>/);
+});
+
+test('R21 S9c: die Hinweiszeile folgt der Auswahl und der Automatik', async () => {
+  const { refreshDataLanguageOptions, refreshTimezone } = await import('/settings/pages/personal-appearance.js');
+  const { resetPreferencesCache } = await import('/settings/preferences-cache.js');
+  const el = () => ({ html: '', textContent: '', replaceChildren() { this.html = ''; }, insertAdjacentHTML(_p, h) { this.html += h; } });
+  const nodes = { '#data-language-select': el(), '#data-language-hint': el(), '#timezone-select': el(), '#timezone-hint': el() };
+  const container = { querySelector: (sel) => nodes[sel] ?? null };
+  const prevApi = globalThis.__apiStub;
+  const names = new Intl.DisplayNames(['de'], { type: 'language' });
+  try {
+    // Regionswechsel: die Automatik ergibt jetzt Deutsch - der Wert bleibt
+    // "Automatisch", die Hinweiszeile nennt die neue Sprache.
+    globalThis.__apiStub = { get: async () => ({ data: { ...APPEARANCE_PREFS, region: 'de-CH', language_auto: 'de' } }) };
+    resetPreferencesCache();
+    await refreshDataLanguageOptions(container);
+    assert.match(nodes['#data-language-select'].html, /<option value="" selected>settings\.dataLanguageAuto<\/option>/);
+    assert.equal(nodes['#data-language-hint'].textContent,
+      withValues('settings.hintWithCurrent', { value: names.of('de'), hint: 'settings.dataLanguageHint' }));
+    // Ausdruecklich gewaehlt: der Vorsatz faellt.
+    globalThis.__apiStub = { get: async () => ({ data: { ...APPEARANCE_PREFS, language: 'en' } }) };
+    resetPreferencesCache();
+    await refreshDataLanguageOptions(container);
+    assert.equal(nodes['#data-language-hint'].textContent, 'settings.dataLanguageHint');
+
+    // Zone: gesetzt (PUT-Antwort oder "Uebernehmen") ohne Vorsatz, zurueck auf
+    // Automatisch mit der Zone, die dann gilt.
+    refreshTimezone(container, { timezone: 'Europe/Paris', timezone_effective: 'Europe/Paris' });
+    assert.match(nodes['#timezone-select'].html, /<option value="Europe\/Paris" selected>Paris<\/option>/);
+    assert.equal(nodes['#timezone-hint'].textContent, 'settings.timezoneHint');
+    refreshTimezone(container, { timezone: null, timezone_effective: 'Asia/Tokyo' });
+    assert.match(nodes['#timezone-select'].html, /<option value="" selected>settings\.timezoneAuto<\/option>/);
+    assert.equal(nodes['#timezone-hint'].textContent,
+      withValues('settings.hintWithCurrent', { value: 'Asia/Tokyo', hint: 'settings.timezoneHint' }));
+  } finally {
+    globalThis.__apiStub = prevApi;
+    resetPreferencesCache();
+  }
+  // Der echte Aufrufer: "Uebernehmen" im Zonen-Hinweis zieht Auswahl und Hinweis nach.
+  const page = await readFile(new URL('../public/settings/pages/personal-appearance.js', import.meta.url), 'utf8');
+  assert.match(page, /const result = await adoptZone\([\s\S]{0,400}if \(result\.timezone\) refreshTimezone\(container, \{ timezone: result\.timezone/,
+    'nach dem Uebernehmen zeigte die Auswahl bis R21 weiter "Automatisch"');
+  assert.match(page, /const saved = await savePreferences\(\{ timezone: timezoneSelect\.value \|\| null \}\);\s*(?:\/\/[^\n]*\n\s*)*refreshTimezone\(container, saved\?\.data\);/);
+});
+
+test('R21 S9c: in jeder Sprache ist "Automatisch" ein Wort, das in die Zeile passt, und das Detail steht vorn', async () => {
+  // 179 px Auswahl bei 390, davon rund 157 px Text bei 17 px Schrift; die
+  // breiteste gemessene Schrift (Kyrillisch) braucht rund 10 px je Zeichen.
+  const MAX_CHARS = 15;
+  const dir = new URL('../public/locales/', import.meta.url);
+  const files = (await readdir(dir)).filter((f) => f.endsWith('.json'));
+  assert.ok(files.length >= 20, 'die Locales sind da');
+  const offenders = [];
+  for (const file of files) {
+    const { settings } = JSON.parse(await readFile(new URL(file, dir), 'utf8'));
+    for (const key of ['dataLanguageAuto', 'timezoneAuto']) {
+      const value = settings[key];
+      if (/\{\{/.test(value)) offenders.push(`${file} ${key}: traegt wieder ein Detail ("${value}")`);
+      if ([...value].length > MAX_CHARS) offenders.push(`${file} ${key}: "${value}" ist laenger als ${MAX_CHARS} Zeichen`);
+    }
+    const hint = settings.hintWithCurrent ?? '';
+    const v = hint.indexOf('{{value}}');
+    const h = hint.indexOf('{{hint}}');
+    if (v < 0 || h < 0 || v > h) offenders.push(`${file} hintWithCurrent: das Detail steht nicht vor dem Hinweis ("${hint}")`);
+  }
+  assert.deepEqual(offenders, []);
+});
+
+test('R21 S9c: Regionen heissen nach ihrem Land, mehrsprachige mit Sprache - und keine zwei gleich', async () => {
+  const { REGION_CODES, regionLabel, regionKeepsLanguage } = await import('../public/settings/region-presets.js');
+  const keeps = REGION_CODES.filter(regionKeepsLanguage).sort();
+  assert.deepEqual(keeps, ['de-CH', 'en-CA', 'en-PH', 'fil-PH', 'fr-CA'],
+    'Laender mit mehreren Voreinstellungen und die Schweiz behalten ihre Sprache');
+  const dir = new URL('../public/locales/', import.meta.url);
+  const locales = (await readdir(dir)).filter((f) => f.endsWith('.json')).map((f) => f.replace(/\.json$/, ''));
+  for (const locale of locales) {
+    const labels = REGION_CODES.map((code) => regionLabel(code, locale));
+    assert.equal(new Set(labels).size, labels.length, `${locale}: zwei Regionen heissen gleich`);
+    const country = new Intl.DisplayNames([locale], { type: 'region' }).of('DE');
+    assert.equal(regionLabel('de-DE', locale), country, `${locale}: Deutschland heisst nach dem Land`);
+  }
+  const withLanguage = (region, language) => `${region} / ${language}`;
+  assert.equal(regionLabel('de-CH', 'de', withLanguage), 'Schweiz / Deutsch', 'die Langform setzt die Seite (t())');
+  assert.equal(regionLabel('fr-CA', 'de'), 'Kanada (Französisch)');
+});
+
+// #2151 (Rest aus R21): auch nach S9c waren am Telefon Werte gekappt - eine
+// ausdruecklich gewaehlte Region mit langem Landesnamen ("Vereinigte Arabis…",
+// 9 von 72 in de, 4 in en, 8 in uk) und die Datensprachen Portugiesisch
+// (Brasilien) und Norwegisch (Bokmål). Dasselbe Muster wie S9c: der Wert ist
+// kurz ("VAE", "Kanada (FR)", "Portugiesisch (BR)", "Norwegisch"), der volle
+// Name steht vorn in der Hinweiszeile. Die R17-Zeile bleibt, wie sie ist.
+//
+// Das Budget ist eine Messung, kein Wunsch: bei 390 px hat die gedeckelte
+// Auswahl (50cqi = 179 px) 145 px Text. Gemessen in Chrome an allen 26
+// Sprachen, 2839 Regions- und Sprachnamen vor und nach #2151: in
+// Lateinschrift kappte nichts bis 18 Zeichen ("Švýcarsko (němčina)", 19, war
+// gekappt), in Kyrillisch/Griechisch bis 16 ("Саудовская Аравия", 17), in
+// Arabisch/Devanagari bis 22. In Japanisch, Chinesisch und Koreanisch zaehlt
+// ein breites Zeichen voll und ein lateinisches halb - "カナダ（フランス語）"
+// (10) war gekappt, "フィリピン（FIL）" (8,5) nicht. Mit diesen Grenzen rutschte
+// kein gekappter Name durch; einige passende fallen darueber und tragen
+// deshalb ebenfalls eine Kurzform ("Тринідад").
+const WIDE_CHAR = /[ᄀ-ᇿ⺀-鿿가-힯豈-﫿＀-￯]/;
+function selectBudget(text) {
+  if (WIDE_CHAR.test(text)) return 8.5;
+  if (/\p{Script=Cyrillic}|\p{Script=Greek}/u.test(text)) return 16;
+  if (/\p{Script=Arabic}|\p{Script=Devanagari}/u.test(text)) return 22;
+  return 18;
+}
+function selectUnits(text) {
+  if (!WIDE_CHAR.test(text)) return [...text].length;
+  return [...text].reduce((sum, c) => sum + (WIDE_CHAR.test(c) ? 1 : 0.5), 0);
+}
+const fillPlaceholders = (template, values) => template.replace(/\{\{(\w+)\}\}/g, (m, name) => values[name] ?? m);
+
+test('#2151: jede Region und jede Sprache passt in jeder Sprache in die geschlossene Auswahl - und keine zwei heissen gleich', async () => {
+  const {
+    REGION_CODES, SHORT_NAME_COUNTRIES, SHORT_NAME_LANGUAGES, regionShortLabel, languageShortLabel, languageShortKey,
+  } = await import('../public/settings/region-presets.js');
+  const dir = new URL('../public/locales/', import.meta.url);
+  const files = (await readdir(dir)).filter((f) => f.endsWith('.json'));
+  const locales = files.map((f) => f.replace(/\.json$/, ''));
+  assert.ok(locales.length >= 20, 'die Locales sind da');
+  const offenders = [];
+  for (const locale of locales) {
+    const { settings } = JSON.parse(await readFile(new URL(`${locale}.json`, dir), 'utf8'));
+    for (const country of SHORT_NAME_COUNTRIES) {
+      const value = settings.regionShort?.[country];
+      if (typeof value !== 'string' || !value.trim()) offenders.push(`${locale}: settings.regionShort.${country} fehlt`);
+    }
+    for (const tag of SHORT_NAME_LANGUAGES) {
+      const value = settings.languageShort?.[languageShortKey(tag)];
+      if (typeof value !== 'string' || !value.trim()) offenders.push(`${locale}: settings.languageShort.${languageShortKey(tag)} fehlt`);
+    }
+    const regions = REGION_CODES.map((code) => regionShortLabel(code, locale, {
+      countryName: (country) => (SHORT_NAME_COUNTRIES.includes(country) ? settings.regionShort?.[country] : null),
+      withLanguage: (region, language) => fillPlaceholders(settings.regionWithLanguage, { region, language }),
+    }));
+    const languages = locales.map((tag) => languageShortLabel(tag, locale,
+      (t) => (SHORT_NAME_LANGUAGES.includes(t) ? settings.languageShort?.[languageShortKey(t)] : null)));
+    for (const label of [...regions, ...languages]) {
+      if (selectUnits(label) > selectBudget(label)) offenders.push(`${locale}: "${label}" hat ${selectUnits(label)} Zeichen, Budget ${selectBudget(label)}`);
+    }
+    if (new Set(regions).size !== regions.length) offenders.push(`${locale}: zwei Regionen heissen gleich (${regions.filter((r, i) => regions.indexOf(r) !== i).join(', ')})`);
+    if (new Set(languages).size !== languages.length) offenders.push(`${locale}: zwei Sprachen heissen gleich`);
+  }
+  assert.deepEqual(offenders, []);
+});
+
+// D#1320: `zh` ist Vereinfacht, heisst im CLDR aber nur "Chinesisch". Neben
+// "Chinesisch (traditionell)" las sich der unmarkierte Eintrag wie der Standard.
+// Der volle Name (Hinweiszeile) nennt die Schrift, und in jeder Sprache heissen
+// die beiden Chinesisch voll wie kurz verschieden.
+test('D#1320: beide Chinesisch nennen ihre Schrift, voll und kurz, in jeder Sprache', async () => {
+  const { languageLabel, languageShortLabel, languageShortKey } = await import('../public/settings/region-presets.js');
+  assert.equal(languageLabel('zh', 'en'), 'Simplified Chinese');
+  assert.equal(languageLabel('zh-Hant', 'en'), 'Traditional Chinese');
+  assert.equal(languageLabel('zh', 'de'), 'Chinesisch (vereinfacht)');
+  assert.equal(languageLabel('de', 'en'), 'German', 'andere Sprachen bleiben beim CLDR-Namen ihres Codes');
+  const dir = new URL('../public/locales/', import.meta.url);
+  const locales = (await readdir(dir)).filter((f) => f.endsWith('.json')).map((f) => f.replace(/\.json$/, ''));
+  const offenders = [];
+  for (const locale of locales) {
+    const { settings } = JSON.parse(await readFile(new URL(`${locale}.json`, dir), 'utf8'));
+    const short = (tag) => languageShortLabel(tag, locale, (x) => settings.languageShort?.[languageShortKey(x)] ?? null);
+    if (languageLabel('zh', locale) === languageLabel('zh-Hant', locale)) offenders.push(`${locale}: voll gleich`);
+    if (short('zh') === short('zh-Hant')) offenders.push(`${locale}: kurz gleich ("${short('zh')}")`);
+  }
+  assert.deepEqual(offenders, []);
+});
+
+test('#2151: Darstellung - Region und Datensprache stehen kurz in der Auswahl, voll vorn in der Hinweiszeile', async (t) => {
+  const de = (type, code) => new Intl.DisplayNames(['de'], { type }).of(code);
+  globalThis.__supportedLocales = ['de', 'en', 'nb', 'pt', 'pt-BR'];
+  t.after(() => { delete globalThis.__supportedLocales; });
+  const emirates = await renderAppearance({
+    ...APPEARANCE_PREFS, currency: 'AED', date_format: 'dmy_slash', time_format: '12h', region: 'ar-AE', language: 'pt-BR',
+  });
+  assert.equal(selectedOptionText(emirates, 'region-select'), 'settings.regionShort.AE', 'die Region steht in ihrer Kurzform');
+  assert.equal(textById(emirates, 'region-hint'),
+    withValues('settings.hintWithCurrent', { value: de('region', 'AE'), hint: 'settings.regionHint' }),
+    'der volle Name steht vorn in der Hinweiszeile');
+  assert.equal(selectedOptionText(emirates, 'data-language-select'), 'settings.languageShort.ptBR',
+    'Portugiesisch (Brasilien) steht in der Kurzform');
+  assert.equal(textById(emirates, 'data-language-hint'),
+    withValues('settings.hintWithCurrent', { value: de('language', 'pt-BR'), hint: 'settings.dataLanguageHint' }));
+
+  const canada = await renderAppearance({ ...APPEARANCE_PREFS, currency: 'CAD', date_format: 'ymd', time_format: '24h', region: 'fr-CA', language: 'nb' });
+  assert.equal(selectedOptionText(canada, 'region-select'),
+    withValues('settings.regionWithLanguage', { region: de('region', 'CA'), language: 'FR' }), 'die Sprache einer Region steht als Kuerzel');
+  assert.equal(textById(canada, 'region-hint'), withValues('settings.hintWithCurrent', {
+    value: withValues('settings.regionWithLanguage', { region: de('region', 'CA'), language: de('language', 'fr') }), hint: 'settings.regionHint',
+  }));
+  assert.equal(selectedOptionText(canada, 'data-language-select'), 'settings.languageShort.nb', 'Bokmål in der Kurzform');
+  assert.equal(textById(canada, 'data-language-hint'),
+    withValues('settings.hintWithCurrent', { value: de('language', 'nb'), hint: 'settings.dataLanguageHint' }));
+
+  // Passt der Name, wiederholt der Hinweis ihn nicht.
+  const germany = await renderAppearance(APPEARANCE_PREFS);
+  assert.equal(textById(germany, 'region-hint'), 'settings.regionHint');
+
+  // Die Hinweiszeile folgt der Auswahl: beim Wechsel sofort und wenn die
+  // Region aus den Einzelfeldern hergeleitet wird.
+  const page = await readFile(new URL('../public/settings/pages/personal-appearance.js', import.meta.url), 'utf8');
+  assert.match(page, /regionSelect\?\.addEventListener\('change', async \(\) => \{\s*(?:\/\/[^\n]*\n\s*)*setHint\(container, 'region-hint', regionHintText\(regionSelect\.value\)\);/);
+  assert.match(page, /function syncRegionSelect\([\s\S]{0,700}setHint\(container, 'region-hint', regionHintText\(regionSelect\.value\)\);/);
+});
+
+// Critique R22 (D4, a5 P1): die Traeger eines Blatts standen leer und fuellten
+// sich in der Reihenfolge ihrer Daten - jeder fertige Abschnitt schob die
+// darunter weg. Kaltstart gemessen: mobil Mitglieder CLS 0,25, Kalender 0,53,
+// Gesundheit 0,20; Desktop Kalender 0,13, Gesundheit 0,10. Jetzt erscheint ein
+// Abschnitt erst, wenn er fertig ist UND alle darueber stehen; bis dahin liegt
+// er ausserhalb des Flusses, und das Skelett steht an der Kante.
+test('R22 D4: Abschnitte erscheinen ganz und in der Reihenfolge des Blatts - nichts Sichtbares rueckt', async () => {
+  const { __test } = await import('/settings/shell.js');
+  const leafContainer = { dataset: {} };
+  const group = { dataset: { pending: '' }, parentElement: leafContainer };
+  const placed = [];
+  const fake = (parentElement) => ({
+    dataset: { pending: '' },
+    parentElement,
+    insertAdjacentHTML(position, html) {
+      assert.equal(position, 'beforebegin');
+      const node = { html, removed: false, remove() { this.removed = true; } };
+      placed.push(node);
+      this.previousElementSibling = node;
+    },
+  });
+  const [a, b, c] = [fake(leafContainer), fake(group), fake(group)];
+  group.insertAdjacentHTML = a.insertAdjacentHTML;
+  const reveal = __test.revealSectionsInOrder([a, b, c], leafContainer);
+  const pending = () => [a, b, c].map((h) => 'pending' in h.dataset);
+
+  reveal.done(b);
+  assert.deepEqual(pending(), [true, true, true], 'ein Abschnitt unter einem wartenden erschien zuerst - der darueber schoebe ihn spaeter weg');
+  assert.ok('pending' in group.dataset, 'der Reichweitenblock steht vor seinem ersten Traeger');
+  reveal.placeSkeleton();
+  assert.equal(placed.length, 1, 'kein Skelett an der Kante');
+  reveal.done(a);
+  assert.deepEqual(pending(), [false, false, true], 'fertige Abschnitte in Reihenfolge erscheinen gemeinsam');
+  assert.ok(!('pending' in group.dataset), 'der Block erscheint mit seinem ersten Traeger');
+  assert.equal(placed[0].removed, true, 'das alte Skelett rueckte mit, statt zu gehen');
+  assert.equal(placed.length, 2, 'die Kante zum naechsten wartenden Traeger traegt ein NEUES Skelett');
+  reveal.all();
+  assert.deepEqual(pending(), [false, false, false], 'nach dem Ende steht jeder Abschnitt im Fluss');
+  assert.equal(placed[1].removed, true, 'ein Skelett blieb stehen');
+
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const { eachRule } = await import('./css-rules.js');
+  const pendingRule = [...eachRule(css)].find((r) => !r.at.length && /\.settings-sheet-section\[data-pending\]/.test(r.selector));
+  assert.ok(pendingRule, 'keine Regel nimmt den wartenden Traeger aus dem Fluss');
+  assert.match(pendingRule.selector, /\.settings-scope\[data-pending\]/, 'der Reichweitenblock wartet nicht mit');
+  for (const decl of [/position:\s*absolute/, /visibility:\s*hidden/, /inset-inline:\s*0/]) assert.match(pendingRule.body, decl);
+});
+
+// ── R22 S8 (Critique a5, D13): Einstellungen ───────────────────────────────
+
+test('R22 D13: lange Erklaerungen vor dem ersten Feld - Kern vorn, der Rest hinter "Mehr dazu"', async () => {
+  const { hintFoldHtml } = await import('../public/settings/components.js');
+  const html = hintFoldHtml({ lead: 'Kern <b>', moreHtml: '<p class="form-hint">Rest</p>' });
+  assert.match(html, /<p class="form-hint">Kern &lt;b&gt;<\/p>/, 'der Kern steht als Hinweis da, escapt');
+  assert.match(html, /<details class="settings-hint-fold__more">\s*<summary class="settings-hint-fold__summary">[^<]+<i data-lucide="chevron-down"/,
+    'der Rest liegt in einem nativen details, der summary zuerst, mit Richtungspfeil');
+  assert.match(html, /<div class="settings-hint-fold__body"><p class="form-hint">Rest<\/p><\/div>/);
+
+  const displays = await readFile(new URL('../public/settings/pages/admin-displays.js', import.meta.url), 'utf8');
+  assert.match(displays, /hintFoldHtml\(\{\s*lead: t\('settings\.displaysLead'\),\s*moreHtml: `<p class="form-hint">\$\{esc\(t\('settings\.displaysMore'\)\)\}<\/p>\s*<p class="form-hint" id="display-areas-hint" hidden><\/p>/,
+    'Wandtabletts: zwei Saetze vorn, Uebersicht/Wand-Modus und die Bereiche im Aufklapper');
+  assert.doesNotMatch(displays, /displaysHint|style="margin/, 'kein Sieben-Zeilen-Absatz und keine Inline-Abstaende mehr');
+  const api = await readFile(new URL('../public/settings/pages/admin-api.js', import.meta.url), 'utf8');
+  assert.match(api, /hintFoldHtml\(\{\s*lead: t\('settings\.apiTokensHint'\),\s*moreHtml: `<p class="form-hint">\$\{esc\(t\('settings\.apiTokensMcpHint'\)\)\}<\/p>`/,
+    'API-Zugriff: der MCP-Absatz liegt im Aufklapper');
+  assert.doesNotMatch(api, /form-hint" style=/);
+
+  const de = JSON.parse(await readFile(new URL('../public/locales/de.json', import.meta.url), 'utf8'));
+  for (const key of ['displaysLead', 'apiTokensHint']) {
+    const sentences = de.settings[key].split(/(?<=[.!?])\s+/).length;
+    assert.ok(sentences <= 2, `${key}: ${sentences} Saetze vor dem ersten Feld`);
+  }
+  // Seit R24 ein geteilter Baustein (utils/hint-fold.js), die Regeln in layout.css.
+  const css = await readFile(new URL('../public/styles/layout.css', import.meta.url), 'utf8');
+  const summary = [...eachRule(css)].find((r) => r.selector.trim() === '.settings-hint-fold__summary');
+  assert.ok(summary, 'der Ausloeser hat eine Regel');
+  assert.match(summary.body, /min-block-size:\s*var\(--target-base\)/, 'Zielgroesse der Geraetewelt');
+  assert.match(summary.body, /list-style:\s*none/);
+});
+
+test('R22 D13: Wetter und Wand verweisen gegenseitig auf ihren zweiten Ort (nur Wege, kein Zusammenlegen)', async () => {
+  const read = (p) => readFile(new URL(`../public/settings/pages/${p}`, import.meta.url), 'utf8');
+  const personalWeather = await read('personal-weather.js');
+  assert.match(personalWeather, /\$\{admin \? `<p class="form-hint settings-group__footer" id="pweather-household">\s*\$\{esc\(t\('settings\.weatherHouseholdLinkHint'\)\)\}\s*<a href="\/settings\/admin\/integrations\?section=admin-weather" id="pweather-household-link">\$\{esc\(t\('settings\.pageIntegrations'\)\)\}<\/a>/,
+    'Mein Wetter -> Fotos und Wetter (Abschnitt Wetter), nur fuer Admins');
+  assert.match(personalWeather, /renderPage\(container, prefs, \{ admin: user\?\.role === 'admin' \}\)/);
+  const adminWeather = await read('admin-weather.js');
+  assert.match(adminWeather, /<a href="\/settings\/personal\/weather" id="weather-personal-link">\$\{esc\(t\('settings\.pageWeather'\)\)\}<\/a>/,
+    'Fotos und Wetter -> Mein Wetter');
+  const appearance = await read('personal-appearance.js');
+  assert.match(appearance, /\$\{options\.isAdmin \? `<p class="form-hint settings-group__footer" id="wall-displays">\s*\$\{esc\(t\('settings\.wallDisplaysLinkHint'\)\)\}\s*<a href="\/settings\/admin\/displays" id="wall-displays-link">/,
+    'Dieses Geraet (Wand-Modus) -> Wandtabletts, nur fuer Admins');
+  const displays = await read('admin-displays.js');
+  assert.match(displays, /<a href="\/settings\/personal\/device" id="display-wall-mode-link">\$\{esc\(t\('settings\.pageDevice'\)\)\}<\/a>/,
+    'Wandtabletts -> Dieses Geraet (Wand-Modus)');
+  // Die Ziele sind echte Blaetter bzw. ein echter Abschnitt.
+  const integrations = findSettingsLeaf('/settings/admin/integrations', { role: 'admin' });
+  assert.ok(settingsSheetSections(integrations, { role: 'admin' }).some((s) => s.id === 'admin-weather'));
+  for (const path of ['/settings/personal/weather', '/settings/personal/device', '/settings/admin/displays']) {
+    assert.ok(findSettingsLeaf(path, { role: 'admin' }), path);
+  }
+  // Ein Weg im Hinweis ist als Weg zu sehen: reset.css nimmt Links Farbe und Unterstrich.
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const link = [...eachRule(css)].find((r) => !r.at.length && r.selector.trim() === ".settings-page :is(.form-hint, .settings-card-description) a:not([class*='btn'])");
+  assert.match(link?.body ?? '', /color:\s*var\(--color-accent\)/, 'der Verweis steht in Akzenttinte, nicht grau im Satz');
+});
+
+test('R22 D13: das Siegel steht am Blatt-Titel, nicht neben "< Einstellungen"', async () => {
+  const shell = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  assert.match(shell, /seal\.className = 'module-seal settings-leaf-header__seal';\s*seal\.setAttribute\('aria-hidden', 'true'\);\s*seal\.insertAdjacentHTML\('beforeend', moduleIconHTML\(MODULE_ICON\.settings\)\);\s*heading\.append\(seal, settingsLeafLabel\(leaf, t\)\);/);
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const rules = [...eachRule(css)];
+  const below = (sel) => rules.find((r) => r.at.some((a) => /\(max-width:\s*1023px\)/.test(a)) && r.selector.trim() === sel);
+  assert.match(below(".settings-shell-header[data-mode='leaf'] > .module-seal--head")?.body ?? '', /display:\s*none/,
+    'unter 1024px traegt der Kopf eines Blatts kein Siegel mehr');
+  assert.match(below('.settings-leaf-header__seal')?.body ?? '', /width:\s*var\(--target-sm\)/, 'Large-Title-Rang wie im Gesundheitsbereich');
+  assert.match(below('.settings-leaf-header__seal')?.body ?? '', /--seal-accent:\s*var\(--module-settings\)/, 'das Siegel nennt seine Herkunft (die Kopfrolle baut nur die Shell)');
+  const wide = rules.find((r) => r.at.some((a) => /\(min-width:\s*1024px\)/.test(a)) && r.selector.trim() === '.settings-leaf-header__seal');
+  assert.match(wide?.body ?? '', /display:\s*none/, 'ab 1024px traegt der Kopf das Siegel mit dem Modulnamen');
+});
+
+test('R22 D13: die Sprungmarken zeigen den Ueberlauf mit dem geteilten Anriss', async () => {
+  const shell = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  const fn = shell.slice(shell.indexOf('function createSheetJump('), shell.indexOf('function syncJumpLabels('));
+  assert.match(fn, /nav\.appendChild\(list\);[\s\S]*wireScrollFade\(list\);\s*return nav;/);
+  assert.match(shell, /import \{ wireScrollFade \} from '\/utils\/ux\.js';/);
+});
+
+test('R22 D13: die Seitenleiste zeigt ihre Gruppen als Weg, solange sie ueberlaeuft', async () => {
+  const shell = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  assert.match(shell, /navigation\.appendChild\(createNavigationIndex\(navigation, domains\)\);/);
+  const fn = shell.slice(shell.indexOf('function createNavigationIndex('), shell.indexOf('function revealActiveNavigationLink('));
+  assert.match(fn, /index\.setAttribute\('role', 'group'\)/);
+  assert.match(fn, /button\.type = 'button';/, 'Knoepfe, keine Hash-Links (die Adresse bleibt beim Blatt)');
+  assert.match(fn, /settings-shell__navigation--overflowing', now\)/);
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const rules = [...eachRule(css)];
+  const shown = rules.find((r) => r.selector.trim() === '.settings-shell__navigation--overflowing .settings-shell__navigation-index');
+  assert.match(shown?.body ?? '', /position:\s*sticky/);
+  assert.match(shown?.body ?? '', /bottom:\s*calc\(-1 \* var\(--space-3\)\)/);
+  const hidden = rules.find((r) => r.selector.trim() === '.settings-shell__navigation-index');
+  assert.match(hidden?.body ?? '', /display:\s*none/, 'ohne Ueberlauf keine Zeile');
+  assert.ok(rules.some((r) => /navigation-results:not\(\[hidden\]\)\) \.settings-shell__navigation-index/.test(r.selector)), 'beim Suchen keine Zeile');
+  const item = rules.find((r) => r.selector.trim() === '.settings-shell__navigation-index-item');
+  assert.match(item?.body ?? '', /min-block-size:\s*var\(--target-md\)/);
+});
+
+test('R22 D13: der aktive Eintrag bleibt ueber der Bereichszeile sichtbar', async () => {
+  const { __test } = await import('/settings/shell.js');
+  const rect = (top, bottom) => ({ top, bottom, height: bottom - top });
+  const link = { getBoundingClientRect: () => rect(660, 694) };
+  const index = { getClientRects: () => [1], getBoundingClientRect: () => rect(650, 700) };
+  const navigation = {
+    scrollHeight: 1400, clientHeight: 600, offsetHeight: 600, scrollTop: 0,
+    getBoundingClientRect: () => rect(100, 700),
+    querySelector: (sel) => (sel.includes('--active') ? link : sel.includes('navigation-index') ? index : null),
+  };
+  __test.revealActiveNavigationLink(navigation);
+  assert.equal(navigation.scrollTop, 44, 'der Eintrag rueckt ueber die klebende Zeile (694 - 650)');
+});
+
+// R23 D14 (Critique G6 P2: Kalender-Blatt 3473px mit 12 Karten): die
+// Kalender-Synchronisation ist ein eigenes Blatt direkt hinter dem Kalender,
+// ohne zweite Statuszeile; lange Erklaerungen stehen hinter "Mehr dazu".
+test('R23: Kalender-Synchronisation als eigenes Blatt, Prosa hoechstens ein bis zwei Saetze vor dem Feld', async () => {
+  const sync = SETTINGS_LEAVES.find((leaf) => leaf.id === 'module-calendar-sync');
+  assert.equal(sync?.path, '/settings/modules/calendar-sync');
+  assert.equal(sync.moduleStatus, false, 'keine zweite Zeile "Kalender ist eingeschaltet"');
+  assert.deepEqual(settingsSheetSections(sync, admin).map((s) => s.id), ['sync-calendar']);
+  const shell = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  assert.match(shell, /if \(leaf\.moduleStatus === false\) return null;/);
+  for (const [file, key] of [['modules-active.js', 'activeModulesHint'], ['admin-permissions.js', 'permIntro'], ['sync-calendar.js', 'sync.backfillDescription']]) {
+    const src = await readFile(new URL(`../public/settings/pages/${file}`, import.meta.url), 'utf8');
+    assert.match(src, new RegExp(`hintFoldHtml\\(\\{ lead: t\\('settings\\.${key.replace('.', '\\.')}'\\), moreHtml: \`<p>\\$\\{esc\\(t\\('settings\\.${key.replace('.', '\\.')}More'\\)\\)\\}</p>\``), `${file}: der Rest steht hinter "Mehr dazu"`);
+  }
+});
+
+// R23 S10 (Critique G6 P3 "Index-Zeile markiert falsch"): markiert ist die
+// Gruppe des offenen Blatts, bis die Leiste von Hand bewegt wird; danach die
+// Gruppe ueber dem oberen Drittel, ganz oben die erste, am Ende die letzte.
+test('R23: die Bereichszeile markiert, was man sieht', async () => {
+  const shell = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  const fn = shell.slice(shell.indexOf('function createNavigationIndex('), shell.indexOf('function createSheetSkipLink('));
+  assert.match(fn, /const active = !userScrolled && navigation\.querySelector\('\.settings-shell__navigation-link--active'\);/);
+  assert.match(fn, /const line = edge \+ \(bottom - edge\) \/ 3;/);
+  assert.match(fn, /if \(top <= line \|\| !current \|\| \(atEnd && top < bottom\)\) current = group\.dataset\.domainId;/);
+  assert.match(fn, /if \(navigation\.scrollTop <= 0\) current = /);
+  assert.match(fn, /for \(const type of \['wheel', 'touchmove', 'keydown', 'pointerdown'\]\) navigation\.addEventListener\(type, byUser/);
+});
+
+// R23 S10 (Critique G6 P3 "Konto mobil 50/50", "Wochenstart-Vorschau wirkt bedienbar").
+test('R23: Textfelder stapeln am Telefon unter ihrem Label; die Wochenstart-Vorschau ist ein Kopf, keine Knoepfe', async () => {
+  const { eachRule } = await import('./css-rules.js');
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const rules = [...eachRule(css)];
+  const stacked = rules.find((r) => r.at.some((a) => /max-width:\s*639px/.test(a))
+    && /settings-setting-row:has\(> \.settings-setting-row__control > input\.form-input:only-child/.test(r.selector)
+    && !/__control/.test(r.selector.split(':has(')[0].slice(-30)) && /grid-template-columns:\s*minmax\(0, 1fr\)/.test(r.body));
+  assert.ok(stacked, 'am Telefon eine Spalte fuer eine Zeile mit einem Textfeld');
+  const cell = rules.find((r) => r.selector.trim() === '.week-start-preview__cell' && !r.at.length);
+  assert.doesNotMatch(cell.body, /border:/, 'keine Kaestchen');
+  const start = rules.find((r) => r.selector.trim() === '.week-start-preview__cell--start' && !r.at.length);
+  assert.doesNotMatch(start.body, /background:/, 'keine Fuellung wie ein gewaehlter Knopf');
+});
+
+// R23 S10 (Critique G6 P3 "Suche ohne Synonyme"): die Einstellungssuche kennt
+// die Woerter, die Menschen in ihrer Sprache tippen.
+test('R23: die Einstellungssuche findet Synonyme ("Dark Mode", "Kennwort", "Kiosk")', async () => {
+  const de = JSON.parse(await readFile(new URL('../public/locales/de.json', import.meta.url), 'utf8'));
+  const translate = (key) => key.split('.').reduce((o, k) => o?.[k], de) ?? key;
+  const found = (q) => searchSettings(q, { user: admin, translate }).options.map((o) => o.key);
+  assert.ok(found('dark mode').includes('settings.sectionDesign'));
+  assert.ok(found('kennwort').includes('settings.changePassword'));
+  assert.ok(found('kiosk').includes('settings.wallModeLabel'));
+  assert.ok(found('24 stunden').includes('settings.timeFormatLabel'));
+});
+
+// R23 S11 (optimize): zwei Load-Shifts im Rechte-Blatt.
+test('R23: das Rechte-Blatt rutscht nicht und rechnet nur die Gruppen in Sicht', async () => {
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const rules = [...eachRule(css)];
+  // Der -8px-Rand der Einleitung kollabierte erst mit dem Kopfrand, wenn das
+  // Skelett wich: das ganze Blatt rutschte 8px hoch (0,0068 mobil).
+  const intro = rules.filter((r) => r.selector.trim() === '.settings-section__intro');
+  assert.ok(intro.length > 0);
+  for (const r of intro) assert.doesNotMatch(r.body, /margin[^;]*-1|margin[^;]*calc\([^)]*\*\s*-1/, `kein negativer Rand: ${r.body}`);
+  // 16 Gruppen, 3600px: ausser Sicht ueberspringt der Browser sie.
+  const cv = rules.find((r) => r.selector.trim() === '.perm-modgroup + .perm-modgroup' && /content-visibility/.test(r.body));
+  assert.match(cv?.body ?? '', /content-visibility:\s*auto/);
+  assert.match(cv?.body ?? '', /contain-intrinsic-size:\s*auto none auto/);
+  assert.match(cv?.body ?? '', /overflow-clip-margin/, 'der Fokusring darf ueber die Gruppenkante');
+});
+
+// #2166 (Rest aus #2151): auf "Darstellung" waren bei 390 px noch zwei
+// Auswahlen gekappt - die Waehrung ("AED - United Arab Emirates Dirham", im
+// gemessenen Fall in 17 von 26 Sprachen) und fuenf Zeitzonen ("North
+// Dakota/New Salem"). Dasselbe Muster wie #2151: der Wert ist kurz, der volle
+// Name steht vorn in der Hinweiszeile, die R17-Zeile bleibt, wie sie ist.
+// Gemessen wird das, was das Blatt rendert, je Sprache, mit dem Zeichenbudget
+// aus #2151 (selectBudget/selectUnits oben).
+function optionTexts(html, id) {
+  const select = html.match(new RegExp(`<select\\b[^>]*\\bid="${id}"[^>]*>([\\s\\S]*?)</select>`));
+  assert.ok(select, `#${id} fehlt im Markup`);
+  const groups = [];
+  const body = select[1].replace(/<optgroup\b[^>]*>([\s\S]*?)<\/optgroup>/g, (_m, inner) => { groups.push(inner); return ''; });
+  const texts = (part) => [...part.matchAll(/<option\b[^>]*>([^<]*)<\/option>/g)].map((m) => unescapeHtml(m[1]));
+  return [texts(body), ...groups.map(texts)];
+}
+
+test('#2166: Waehrung und Zeitzone passen in jeder Sprache in die geschlossene Auswahl - und keine zwei heissen gleich', async (t) => {
+  const dir = new URL('../public/locales/', import.meta.url);
+  const locales = (await readdir(dir)).filter((f) => f.endsWith('.json')).map((f) => f.replace(/\.json$/, ''));
+  assert.ok(locales.length >= 20, 'die Locales sind da');
+  t.after(() => { delete globalThis.__locale; });
+  const offenders = [];
+  for (const locale of locales) {
+    globalThis.__locale = locale;
+    const html = await renderAppearance({ ...APPEARANCE_PREFS, currency: 'AED', region: 'ar-AE' });
+    const [currencies] = optionTexts(html, 'currency-select');
+    if (currencies.length !== CURRENCY_CODES.length) offenders.push(`${locale}: ${currencies.length} statt ${CURRENCY_CODES.length} Waehrungen im Markup`);
+    const zoneGroups = optionTexts(html, 'timezone-select');
+    assert.ok(zoneGroups.flat().length > 300, `${locale}: die Zonen sind da`);
+    for (const label of [...currencies, ...zoneGroups.flat()]) {
+      if (label.startsWith('settings.')) continue; // "Automatisch" haelt R21 S9c
+      if (selectUnits(label) > selectBudget(label)) offenders.push(`${locale}: "${label}" hat ${selectUnits(label)} Zeichen, Budget ${selectBudget(label)}`);
+    }
+    if (new Set(currencies).size !== currencies.length) offenders.push(`${locale}: zwei Waehrungen heissen gleich`);
+    for (const group of zoneGroups) {
+      const dupes = group.filter((z, i) => group.indexOf(z) !== i);
+      if (dupes.length) offenders.push(`${locale}: zwei Zonen einer Gruppe heissen gleich (${dupes.join(', ')})`);
+    }
+  }
+  assert.deepEqual([...new Set(offenders)], []);
+});
+
+test('#2166: Darstellung - Waehrung und Zone stehen kurz in der Auswahl, voll vorn in der Hinweiszeile', async (t) => {
+  t.after(() => { delete globalThis.__locale; });
+  globalThis.__locale = 'de';
+  const symbol = (locale, code) => new Intl.NumberFormat(locale, { style: 'currency', currency: code, currencyDisplay: 'narrowSymbol' })
+    .formatToParts(0).find((p) => p.type === 'currency').value;
+  const name = (locale, code) => new Intl.DisplayNames([locale], { type: 'currency' }).of(code);
+  const html = await renderAppearance({
+    ...APPEARANCE_PREFS, currency: 'GBP', region: 'en-GB', timezone: 'America/North_Dakota/New_Salem',
+  });
+  assert.equal(selectedOptionText(html, 'currency-select'), `GBP ${symbol('de', 'GBP')}`, 'Code und Symbol, kein Name');
+  assert.equal(textById(html, 'currency-hint'),
+    withValues('settings.hintWithCurrent', { value: name('de', 'GBP'), hint: 'settings.currencyHint' }),
+    'der volle Name steht vorn in der Hinweiszeile');
+  assert.equal(selectedOptionText(html, 'timezone-select'), 'New Salem', 'die Zone heisst nach ihrer Stadt');
+  assert.equal(textById(html, 'timezone-hint'),
+    withValues('settings.hintWithCurrent', { value: 'America/North Dakota/New Salem', hint: 'settings.timezoneHint' }));
+
+  // Ein Code ohne eigenes Symbol steht allein, nicht doppelt ("AED AED").
+  globalThis.__locale = 'en';
+  const aed = await renderAppearance({ ...APPEARANCE_PREFS, currency: 'AED', region: 'ar-AE' });
+  assert.equal(selectedOptionText(aed, 'currency-select'), 'AED');
+  assert.equal(textById(aed, 'currency-hint'),
+    withValues('settings.hintWithCurrent', { value: name('en', 'AED'), hint: 'settings.currencyHint' }));
+
+  // Der Kreditdialog im Budget hat die volle Breite und behaelt "Code - Name".
+  const { appendCurrencyOptions } = await import('../public/settings/currency.js');
+  const select = { children: [], appendChild(c) { this.children.push(c); } };
+  const prevDoc = globalThis.document;
+  globalThis.document = fakeDocument();
+  try { appendCurrencyOptions(select, 'AED'); } finally { globalThis.document = prevDoc; }
+  assert.equal(select.children.find((o) => o.value === 'AED').textContent, `AED - ${name('en', 'AED')}`);
+
+  // Die Hinweiszeile folgt der Auswahl: beim Wechsel sofort, beim
+  // Zuruecksetzen nach einem Fehler und wenn die Region die Waehrung setzt.
+  const page = await readFile(new URL('../public/settings/pages/personal-appearance.js', import.meta.url), 'utf8');
+  assert.match(page, /currencySelect\?\.addEventListener\('change', async \(\) => \{\s*if \(currencySelect\.disabled\) return;\s*(?:\/\/[^\n]*\n\s*)*syncCurrencyHint\(container\);/);
+  assert.match(page, /\} catch \(error\) \{\s*syncCurrencyHint\(container\);\s*showError\(errorElement, errorSentence\(error, 'settings\.preferenceSaveFailed'\)\);/);
+  assert.match(page, /if \(currencySelect\) currencySelect\.value = preset\.currency;\s*syncCurrencyHint\(container\);/);
+});
+
+// R24 E4 (Ulas 2026-10-28; Critique G6-Einst-P2-3): mobil traegt EINE Leiste
+// den Rueckweg, das Zeichen des Blatts und seinen Namen im Large Title. Vorher
+// stand „< Einstellungen" allein in einer Zeile, darunter Zahnrad, Large Title
+// und Beschreibung - erste Karte y180 (gemessen 390px), danach y81.
+test('R24 E4: das Blatt nennt sich mobil in der Leiste, mit seinem Zeichen, ohne Beschreibung', async () => {
+  const shell = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  const leaf = shell.match(/if \(activeLeaf && domain\) \{[\s\S]*?\n    return;\n  \}/)?.[0] ?? '';
+  assert.match(leaf, /toolbar\.classList\.add\('page-toolbar--title-tools'\)/, 'eine Zeile (Kopfregel 1a)');
+  assert.match(leaf, /leafName\.setAttribute\('aria-hidden', 'true'\)/, 'Bild, die Ueberschrift bleibt das h1 des Blatts');
+  assert.match(leaf, /createLeafMark\(activeLeaf, 'settings-toolbar__leaf-seal'\)/, 'das Zeichen des Blatts, nicht das Zahnrad');
+  assert.match(leaf, /settingsLeafLabel\(activeLeaf, t\)/);
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const phone = [...eachRule(css)].filter((r) => r.at.some((a) => /\(max-width:\s*767px\)/.test(a)));
+  const header = phone.find((r) => r.selector.trim() === '.settings-leaf-header');
+  assert.match(header?.body ?? '', /clip:\s*rect\(0, 0, 0, 0\)/, 'Kopf im Inhalt nur im Baum (Titel + Beschreibung)');
+  assert.ok(phone.some((r) => r.selector.includes(".settings-toolbar__leaf-name") && /display:\s*flex/.test(r.body)), 'der Blattname steht mobil in der Leiste');
+  assert.ok(phone.some((r) => r.selector.includes('.settings-toolbar__back-label') && /display:\s*none/.test(r.body)), 'der Rueckweg ist neben dem Titel ein Zeichen');
+});
+
+// R24 (Critique G6-Einst-P3-2): die drei Mobil-Plaetze sind EINE Karte mit drei
+// Optionszeilen (Label links, randlose Auswahl rechts) - vorher je Platz eine
+// Karte mit vollbreitem Feld (rund 450px fuer drei Werte).
+test('R24: die Mobil-Plaetze stehen als Optionszeilen in einem Traeger', async () => {
+  const src = await readFile(new URL('../public/settings/pages/modules-navigation.js', import.meta.url), 'utf8');
+  const slot = src.slice(src.indexOf('function mobileSlotHtml('), src.indexOf('function desktopGroupHtml('));
+  assert.match(slot, /return settingRowHtml\(\{/, 'die Zeile der Einstellungen');
+  assert.match(slot, /labelFor: id/, 'das Label benennt die Auswahl (kein aria-label-Ersatz)');
+  assert.match(src, /<div class="row-carrier settings-group settings-mobile-nav-slots">/, 'ein Traeger fuer alle drei');
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  assert.ok(![...eachRule(css)].some((r) => r.selector.trim() === '.settings-mobile-nav-slot'), 'keine eigene Karte je Platz');
 });

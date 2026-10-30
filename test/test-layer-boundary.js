@@ -33,6 +33,10 @@ const SERVER_DIR = path.join(ROOT, 'server');
  * aus `public/` importieren darf. Reine Funktionen, front- und backend-identisch.
  */
 const SHARED_ISOMORPHIC = new Set([
+  // The Savings chart bucket must identify the same stored category/subcategory in API and UI.
+  'public/utils/budget-chart-category.js',
+  // One recurrence maximum for the API validation and both budget dialogs; pure constant only.
+  'public/utils/budget-recurrence.js',
   // Notes category identity must match in the API and duplicate-name picker.
   // This pure Unicode normalization has no browser or server dependencies.
   'public/utils/note-category-name.js',
@@ -52,6 +56,17 @@ const SHARED_ISOMORPHIC = new Set([
   // Fehler. Rein: trim, Leerraum, toLowerCase, kein DOM und kein Node.
   'public/utils/ingredient-match-key.js',
   'public/utils/contact-name.js',
+  // #1748: der Schritt einer Serie (`addInterval`, `nextRunNotBefore`). Der
+  // Dialog der geteilten Ausgaben nennt vor dem Speichern, wie viele Termine
+  // der Server bei `missed: skip` ueberspringt und auf welchem er landet; eine
+  // zweite Rechnung daneben laege an einem 31. oder 29.02. daneben. Rein:
+  // Datumsrechnung in UTC, kein DOM und kein Node.
+  'public/utils/interval-date.js',
+  // #1909: Wie lang eine Telefonnummer sein darf. Die Route prueft das Einzelfeld
+  // `phone` und die Liste `phones` dagegen, das Formular setzt damit `maxlength`.
+  // Zwei Zahlen liefen schon einmal auseinander (100 und 50), und das Formular
+  // nannte nacheinander beide. Rein: eine Konstante, kein DOM und kein Node.
+  'public/utils/contact-limits.js',
   'public/utils/pantry-units.js',
   // #1680: Wie viele Termine die Kalender-Kachel listet - 5, 8 oder 12. Die
   // Route klemmt den Parameter mit derselben Allowlist, mit der die Kachel
@@ -114,6 +129,11 @@ const SHARED_ISOMORPHIC = new Set([
   // 409 abgewiesen - oder, schlimmer, eine Zeile ohne Kaestchen laesst sich
   // ueber die Route umschreiben. Reine Textfunktionen, kein DOM, kein Node.
   'public/utils/markdown-checklist.js',
+  // #1514, #1602: Wer eine Notiz sieht und wer sie aendert. Die Karte nimmt
+  // damit Nadel, Loeschen und Kaestchen weg, die Route weist damit ab - zwei
+  // Fassungen hiessen ein Kaestchen, das antippbar aussieht und mit 403
+  // zurueckspringt. Reine Funktionen ueber eine Notizzeile, kein DOM, kein Node.
+  'public/utils/note-access.js',
   // #785: Was ein Ordnerbaum bedeutet - was liegt unter einem Ordner, wo liegt
   // er selbst, und darf er dorthin. Die Seitenleiste zaehlt damit ihre
   // Dokumente je Ordner, die Route filtert damit ihre Abfrage. Zwei Fassungen

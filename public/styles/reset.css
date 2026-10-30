@@ -92,11 +92,173 @@ img, svg, video {
   max-width: 100%;
 }
 
-/* `display: block` oben ist eine Autorenregel und schlaegt das UA-`[hidden]` -
- * jedes `<img hidden>` der App stand damit sichtbar da, etwa das noch nicht
- * geladene Dokument-Thumbnail ueber seinem Glyph (#1340, test:hidden-cascade). */
-img[hidden], svg[hidden], video[hidden] {
-  display: none;
+/* `hidden` HEISST WEG - UEBERALL (D13, Critique R21).
+ *
+ * Das UA-Blatt traegt `[hidden] { display: none }` auf der untersten Ebene,
+ * und JEDE Autorenregel mit `display` schlaegt es. Bis hier hielt das eine
+ * Rettungsregel je Klasse zusammen (`.x[hidden] { display: none }`, rund 60
+ * Stueck, test:hidden-cascade) - und die naechste Klasse ohne Rettung stand
+ * wieder sichtbar da: zuletzt der Glyph der Dokument-Vorschau als
+ * 3x32-px-Splitter neben jedem Bild, weil `.document-thumb__glyph` ein
+ * `inline-flex` traegt und die Stelle das Attribut per `setAttribute` setzt.
+ *
+ * `!important` ist hier der Sinn der Regel und kein Notbehelf: nur so gewinnt
+ * sie gegen jede Klasse, gleich welcher Spezifitaet und Reihenfolge. Was sie
+ * schlagen koennte - ein `display` ungleich `none` mit `!important` - verbietet
+ * test:hidden-cascade. Ausgenommen ist `hidden="until-found"`: das Element
+ * bleibt fuer die Seitensuche im Fluss (content-visibility), dafuer ist es da.
+ * Die einzelnen Rettungsregeln der Modulblaetter (55, dazu die fuer img, svg
+ * und video) sind seit R21 S9a entfernt - sie doppelten diese Regel nur; eine
+ * neue haelt test:hidden-cascade auf, die mit `!important` die Sperrklinke in
+ * test:frontend-audit. */
+[hidden]:not([hidden="until-found"]) {
+  display: none !important;
+}
+
+/* OHNE POPOVER-API BLEIBT EIN POPOVER ZU (#2107).
+ *
+ * Jedes Menue, das am `popover`-Attribut haengt (`.popover-menu` und die
+ * Werkzeugmenues, das Kontextmenue der Dokumente, die Tooltips der
+ * Notizkategorien, das Kalenderblatt des Datumsfelds), verlaesst sich fuer
+ * den geschlossenen Zustand auf das UA-Blatt: `[popover] { display: none }`.
+ * Ein Browser ohne die API (Chrome < 114, Firefox < 125, Safari < 17) hat
+ * diese Regel nicht und verwirft jede Autorenregel mit `:popover-open` - auch
+ * `.popover-menu:not(:popover-open)`, die einzige, die ein geschlossenes
+ * Menue unsichtbar macht. Ergebnis: jedes Panel der Seite stand offen und fing
+ * die Klicks darunter ab.
+ *
+ * Hier wird die UA-Regel genau dort nachgereicht, wo sie fehlt. Die Menues
+ * sind in diesen Browsern NICHT verfuegbar, statt offen zu stehen
+ * (docs/installation.md, "Browser Support"); einen Polyfill gibt es bewusst
+ * nicht. `@supports selector()` kennt schon die Mindestversion der App.
+ *
+ * `[popover]` hat die Spezifitaet einer Klasse und steht im ersten Blatt nach
+ * den Tokens: eine spaetere Regel, die `display` an einer Popover-Klasse setzt,
+ * schluege sie. `display` an einem Popover gehoert deshalb nur unter
+ * `:popover-open` (das in diesen Browsern mit der ganzen Regel wegfaellt) -
+ * test:old-browser-fallbacks haelt beides fest. */
+@supports not selector(:popover-open) {
+  [popover] {
+    display: none;
+  }
+}
+
+/* OHNE COLOR-MIX() BLEIBT LESBAR, WAS NUR AN DER TONUNG HING (#2184).
+ *
+ * Chrome < 111, Firefox < 113 und Safari < 16.2 kennen color-mix() nicht -
+ * darunter Wandrahmen mit einer WebView, die sich nicht aktualisieren laesst.
+ * Fast jede der rund 270 Stellen traegt ein var(): die Deklaration gilt beim
+ * Parsen als gueltig, gewinnt die Kaskade und faellt erst beim Berechnen auf
+ * ihren Anfangswert. Eine Flaeche wird durchsichtig, ein `border` verschwindet
+ * ganz; ein Zwilling davor (das dvh-Muster) wirkt deshalb nicht.
+ *
+ * GEZIELT, NICHT VOLLSTAENDIG (Entscheidung 25.10.2026). Die meisten Stellen
+ * kosten dort nur Tonung - das ist die Zusage "startet, schlichter" der
+ * Browser-Tabelle (docs/installation.md). Hier steht nur, was Information
+ * verliert: Schrift, die ohne ihre Flaeche unlesbar wird, eine Auswahl, die
+ * nur an der Tonung hing, eine Flaeche, die Inhalt verdecken muss, eine vom
+ * Nutzer gewaehlte Farbe ohne andere Spur, eine leere Checkbox ohne Rand.
+ * Kalendertermine behalten ihre farbige Kante, Segmente und Reiter ihre eigene
+ * Flaeche - die stehen bewusst nicht hier.
+ *
+ * Nur Token-Werte, keine neue Farbe: Vollton statt Abdunklung, die Tints
+ * --color-accent-subtle/-light statt der Modultonung (wie unter
+ * prefers-reduced-transparency in glass.css), ein Ring in der Nutzerfarbe
+ * statt ihrer Tonung. `:root ` davor, weil die Modulblaetter spaeter laden und
+ * ihre color-mix-Regel bei gleicher Spezifitaet gewaenne. Wer color-mix()
+ * kennt, sieht den Block nicht. Liste und Wirkung haelt
+ * test:old-browser-fallbacks (COLOR_MIX_FALLBACKS). */
+@supports not (color: color-mix(in srgb, red, red)) {
+  /* Schrift auf einer Fuellung. Den Primaerknopf traegt sein Token
+   * (--btn-primary-fill, tokens.css). */
+  :root .page-fab:not(.page-fab--docked) {
+    background-color: var(--color-accent);
+  }
+
+  :root .toast:not(.toast--danger):not(.toast--warning),
+  :root .list-bulkbar {
+    background-color: var(--toast-bg);
+  }
+
+  :root .month-day__holiday,
+  :root .allday-holiday {
+    background: var(--holi-color);
+  }
+
+  :root .dms-result__open {
+    background: var(--color-text-secondary);
+  }
+
+  :root .document-viewer__pdf-indicator {
+    background: var(--color-surface-2);
+  }
+
+  /* Flaechen, die Inhalt verdecken. */
+  :root .search-overlay {
+    background-color: var(--color-bg);
+  }
+
+  @media (min-width: 768px) {
+    :root .search-overlay {
+      background-color: var(--color-overlay-glass);
+    }
+  }
+
+  /* Auswahl, die nur an der Tonung hing. */
+  :root .search-result[aria-selected="true"],
+  :root .tasks-page .task-card--selected > .task-card__main,
+  :root .contact-item--selected,
+  :root .document-row.is-selected,
+  :root .split-group--active,
+  :root .budget-bar-row.is-category-selected {
+    background-color: var(--color-accent-subtle);
+  }
+
+  @container module-surface (min-width: 65rem) {
+    :root .split-view [data-md-id].is-selected {
+      background-color: var(--color-accent-subtle);
+    }
+  }
+
+  :root .filter-chip--active {
+    background-color: var(--color-accent-light);
+    border-color: var(--color-accent);
+  }
+
+  @media (max-width: 1023px) {
+    :root .documents-folder-chip[data-folder-active] {
+      background-color: var(--color-accent-light);
+      border-color: var(--color-accent);
+    }
+  }
+
+  @media (max-width: 767px) {
+    :root .documents-folder-chip[data-category-active] {
+      background-color: var(--color-accent-light);
+      border-color: var(--color-accent);
+    }
+  }
+
+  /* Die Farbe, die jemand gewaehlt hat: als Ring statt als Tonung. */
+  :root .note-card {
+    background: var(--color-surface);
+    box-shadow: var(--shadow-sm), inset 0 0 0 1.5px var(--note-color, transparent);
+  }
+
+  :root .dashboard .note-item {
+    background-color: var(--color-fill-well);
+    box-shadow: inset 0 0 0 1.5px var(--note-color, var(--module-notes));
+  }
+
+  :root .schedule-overview__block {
+    background: var(--color-surface-work);
+    box-shadow: inset 0 0 0 1.5px var(--schedule-color);
+  }
+
+  /* Die offene Checkbox einer Notiz-Checkliste. */
+  :root .note-md-box {
+    border: 1px solid var(--color-border-control);
+  }
 }
 
 /* `color: inherit` ist hier die WICHTIGSTE Zeile, und sie hat gefehlt: `a` und
@@ -198,6 +360,44 @@ h1, h2, h3, h4, h5, h6 {
    * Animation des Elements. */
   .page-toolbar--capped > .page-toolbar__title {
     --motion-blend: var(--duration-sm);
+  }
+
+  /* Der Zeitraum-Wisch (R21, D2): kein Zug, aber der neue Zeitraum blendet ein
+   * (`period-swipe-fade`, layout.css) - reine Deckkraft, keine Wegstrecke. */
+  .period-swipe-in--fade {
+    --motion-blend: var(--duration-sm);
+  }
+
+  /* STATUSBEWEGUNG BLEIBT (Critique R21, D12). Ein Spinner sagt "es laeuft
+   * noch"; stand er still, sah ein laufender Vorgang wie ein haengender aus -
+   * die Sperre oben setzte ihn auf 0s. Er dreht auf der Stelle, ohne
+   * Wegstrecke, und behaelt deshalb sein Tempo - ueber dieselbe Abmeldung wie
+   * die Blenden oben, nur mit dem Tempo der Drehung. Nur reine
+   * Statusdrehungen (`status-spin`) stehen hier. */
+  .btn--loading::after,
+  .auth-spinner,
+  .document-viewer__spinner {
+    --motion-blend: var(--spin-period);
+  }
+}
+
+/* WAS DER ZEIGER TUT, TUT DER FINGER ANDERS (Critique R21, a4). "Datei hier
+ * ablegen" stand auch auf dem Telefon, wo nichts abzulegen ist - dort tippt
+ * man. Zwei Fassungen desselben Satzes, die eine fuer Zeigergeraete, die andere
+ * fuer Touch; das Kriterium ist `hover: none` wie bei den Zielgroessen, nicht
+ * die Breite. `display: none` nimmt die jeweils andere auch aus dem
+ * Barrierebaum, gelesen wird nur die, die zu sehen ist. */
+.u-touch-only {
+  display: none;
+}
+
+@media (hover: none) {
+  .u-pointer-only {
+    display: none;
+  }
+
+  .u-touch-only {
+    display: inline;
   }
 }
 

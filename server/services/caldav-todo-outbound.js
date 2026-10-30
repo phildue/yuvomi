@@ -46,10 +46,11 @@
 
 import { createLogger } from '../logger.js';
 import * as db from '../db.js';
-import { outboundFailureAction, MAX_OUTBOUND_ATTEMPTS } from './calendar-outbound.js';
-import { patchICSTodo } from '../utils/ics-patch.js';
+import { davFailureAction, createRefusalStop, MAX_OUTBOUND_ATTEMPTS } from './calendar-outbound.js';
+import { patchICSTodo, unfoldICS } from '../utils/ics-patch.js';
 import {
   createCalDAVClient, collectionUrlOf, createUploadGate, sameObjectAddress, withAccountOrigin, isOriginRefusal,
+  isAccountWideRefusal, acceptsNewEntries,
 } from '../utils/caldav-client.js';
 import {
   ownUid, isOwnUidOfRow, ownUploadRowId, parseOwnUid, findObjectWithUid, inspectObjectAt,
@@ -59,8 +60,11 @@ import {
   hasUploadAttempt, removeLeftoverUploads,
 } from './caldav-upload-attempts.js';
 import { householdTimeZone, localToUTC } from '../utils/timezone.js';
+import { timedSeriesUntil } from '../utils/rrule-until.js';
+import { rruleValue } from './recurrence.js';
 import { loadTags, tagsKey } from '../utils/task-tags.js';
 import { runSerialized } from '../utils/sync-lock.js';
+import { noteMoveTakenBack } from './shopping-move-notices.js';
 
 const log = createLogger('CalDAV-Todo-Outbound');
 
@@ -106,7 +110,11 @@ export const MODULES = {
     // Feldvergleich sieht aber nur die Zeile. Der Aufrufer hängt den
     // kanonischen Schlüssel (utils/task-tags.js: tagsKey) an beide Seiten,
     // sonst bliebe eine reine Tag-Änderung unbemerkt (#586).
-    mirrored: ['title', 'description', 'priority', 'status', 'due_date', 'due_time', 'tags_key'],
+    // `is_recurring`/`recurrence_rule` reisen als RRULE (#2350).
+    mirrored: [
+      'title', 'description', 'priority', 'status', 'due_date', 'due_time', 'tags_key',
+      'is_recurring', 'recurrence_rule',
+    ],
     icsFields: icsFieldsForTask,
     labelOf: (row) => row.title,
   },
@@ -197,7 +205,7 @@ function completionFields(done, inProgress, hadCompleted) {
  * der eine rohe Zeile aus `SELECT *` durchreicht, die Tags des Servers
  * stillschweigend löschen - `reloadRow` hängt sie deshalb an.
  */
-export function icsFieldsForTask(task, hadCompleted = false, tz = householdTimeZone(null)) {
+export function icsFieldsForTask(task, hadCompleted = false, tz = householdTimeZone(null), serverIcs = null) {
   const fields = {
     SUMMARY:     task.title,
     DESCRIPTION: task.description || null,
@@ -206,7 +214,124 @@ export function icsFieldsForTask(task, hadCompleted = false, tz = householdTimeZ
     ...completionFields(task.status === 'done', task.status === 'in_progress', hadCompleted),
   };
   if (Array.isArray(task.tags)) fields.CATEGORIES = task.tags;
+  Object.assign(fields, recurrenceFields(task, fields.DUE, tz, serverIcs));
   return fields;
+}
+
+/** Marke an einem fremden Objekt: die RRULE, die Yuvomi dort geschrieben hat. */
+const YUVOMI_RRULE = 'X-YUVOMI-RRULE';
+
+/**
+ * RRULE, DTSTART und Marke einer Aufgabe - nur die Felder, die der Push
+ * anfassen darf (#2350). Ein fehlendes Feld laesst die Property auf dem Server
+ * stehen, null entfernt sie.
+ *
+ * DTSTART: RFC 5545 §3.8.2.4 verlangt es in jeder Komponente mit RRULE; DUE
+ * ersetzt den Anker nicht. Es traegt Wert und Typ von DUE, so beginnt die Serie
+ * an der Faelligkeit, und es zieht mit, wenn sie sich verschiebt. Der Inbound
+ * liest DTSTART eines VTODO nicht ein.
+ *
+ * Ein eigenes Objekt (von Yuvomi angelegt) fuehrt Yuvomi ganz: ohne Regel
+ * verschwinden RRULE und DTSTART. An einem fremden Objekt bleibt eine Regel
+ * stehen, die Yuvomi nicht kennt - der Inbound liest VTODO-Wiederholungen nicht
+ * ein, eine dort angelegte Serie ist hier also nicht wiederkehrend. Was Yuvomi
+ * dort selbst schreibt, traegt deshalb die Marke X-YUVOMI-RRULE mit derselben
+ * Regel; wird die Wiederholung hier abgeschaltet, nimmt der Push die RRULE nur
+ * weg, solange sie noch genau dieser Marke entspricht. Hat die andere App sie
+ * inzwischen geaendert oder die Marke verworfen, gehoert sie ihr und bleibt.
+ * DTSTART bleibt dabei stehen: an einem fremden Objekt kann es auch vorher ein
+ * Beginn gewesen sein.
+ */
+function recurrenceFields(task, due, tz, serverIcs) {
+  const rrule = vtodoRecurrence(task, tz);
+  const own = ownsRecurrence(task);
+  if (rrule) return { RRULE: rrule, DTSTART: due, [YUVOMI_RRULE]: own ? null : rrule };
+  if (own) return { RRULE: null, DTSTART: null, [YUVOMI_RRULE]: null };
+  // Fremd und erledigt oder ohne Faelligkeit: nichts anfassen. Nur die hier
+  // abgeschaltete Wiederholung nimmt Yuvomis eigene Regel zurueck.
+  if (task.is_recurring && task.recurrence_rule) return {};
+  const mark = todoPropertyValue(serverIcs, task.external_uid, YUVOMI_RRULE);
+  if (!mark) return {};
+  const current = todoPropertyValue(serverIcs, task.external_uid, 'RRULE');
+  if (current && sameRule(current, unescapeText(mark))) return { RRULE: null, [YUVOMI_RRULE]: null };
+  return { [YUVOMI_RRULE]: null };
+}
+
+/**
+ * Rohwert der Property `name` im VTODO mit `uid` ohne RECURRENCE-ID - oder null.
+ * Dieselbe Komponente, die der Patcher anfasst: eine VTIMEZONE davor traegt in
+ * STANDARD/DAYLIGHT eigene RRULEs, und die erste Fundstelle im ganzen Objekt
+ * waere deren Regel statt der der Aufgabe.
+ */
+function todoPropertyValue(icsText, uid, name) {
+  if (!icsText || !uid) return null;
+  const lines = unfoldICS(icsText).split('\n').map((l) => l.replace(/\r$/, ''));
+  const nameOf = (line) => { const cut = line.search(/[;:]/); return (cut === -1 ? line : line.slice(0, cut)).toUpperCase(); };
+  const valueOf = (line) => line.slice(line.indexOf(':') + 1).trim();
+  let block = null;
+  let depth = 0;
+  for (const line of lines) {
+    const upper = line.trim().toUpperCase();
+    if (!block) {
+      if (upper === 'BEGIN:VTODO') { block = { props: [], uid: null, override: false }; depth = 0; }
+      continue;
+    }
+    if (upper.startsWith('BEGIN:')) { depth++; continue; }
+    if (upper === 'END:VTODO' && depth === 0) {
+      if (block.uid === uid && !block.override) {
+        const hit = block.props.find((l) => nameOf(l) === name);
+        return hit ? valueOf(hit) : null;
+      }
+      block = null;
+      continue;
+    }
+    if (upper.startsWith('END:')) { depth--; continue; }
+    if (depth > 0) continue; // VALARM & Co.
+    const prop = nameOf(line);
+    if (prop === 'UID') block.uid = valueOf(line);
+    if (prop === 'RECURRENCE-ID') block.override = true;
+    block.props.push(line);
+  }
+  return null;
+}
+
+function unescapeText(value) {
+  return String(value).replace(/\\([\\;,nN])/g, (_, c) => (c === 'n' || c === 'N' ? '\n' : c));
+}
+
+function sameRule(a, b) {
+  const norm = (r) => rruleValue(r).trim().toUpperCase().split(';').filter(Boolean).sort().join(';');
+  return norm(a) === norm(b);
+}
+
+/**
+ * Die Wiederholung einer Aufgabe als RRULE-Wert (ohne Praefix) - oder null (#2350).
+ *
+ * Keine Regel ohne DUE: DTSTART, der Anker der Serie, steht auf DUE (siehe
+ * recurrenceFields), und eine Aufgabe, die ab Erledigung zaehlt, kann ganz ohne
+ * Faelligkeit wiederkehren. Keine Regel an einer erledigten Aufgabe: das
+ * Abhaken legt in Yuvomi eine Folgeinstanz als eigene Zeile und eigenes VTODO
+ * an; behielte das erledigte Objekt seine Regel, zeigte ein Client die Serie
+ * zweimal. Der Anker "ab Erledigung" (#658) reist nicht mit, RFC 5545 kennt ihn
+ * nicht.
+ *
+ * UNTIL hat nach RFC 5545 den Werttyp des Ankers: an einem reinen Datum ein
+ * Datum (ein altes `T235959Z` aus dem frueheren Formular wird darauf
+ * zurueckgeschnitten), an einer Uhrzeit das Ende des Ortstags in UTC (#1974,
+ * utils/rrule-until.js) - DUE steht dann ebenfalls in UTC. COUNT bleibt, wie es
+ * gespeichert ist.
+ */
+function vtodoRecurrence(task, tz) {
+  if (!task.is_recurring || !task.recurrence_rule || !task.due_date || task.status === 'done') return null;
+  const rule = rruleValue(task.recurrence_rule).trim();
+  if (!rule) return null;
+  const dated = rule.split(';').map((part) => part.replace(/^(\s*UNTIL\s*=\s*)(\d{8})T\d{6}Z?\s*$/i, '$1$2')).join(';');
+  return task.due_time ? timedSeriesUntil(dated, tz) : dated;
+}
+
+/** Hat Yuvomi dieses Objekt selbst angelegt (oder liegt es noch gar nicht oben)? */
+function ownsRecurrence(task) {
+  return task.external_source !== 'caldav' || isOwnUidOfRow(task.external_uid, 'task', task.id);
 }
 
 /** VTODO-Properties eines lokalen Einkaufspostens. */
@@ -252,29 +377,39 @@ function isMirrored(row) {
 
 /**
  * Löst die gespiegelten Zeilen eines Kontos von ihm ab - zu rufen, bevor das
- * Konto verschwindet. Was hier steht, sind Nutzerdaten und bleibt; nur die
- * Verbindung zum Server geht. Danach ist es eine gewöhnliche Aufgabe bzw. ein
- * gewöhnlicher Einkaufsposten: kein Tombstone, kein Push, und der Prune-Lauf
- * eines anderen Kontos fasst sie nicht an.
+ * Konto verschwindet. Dieselbe Regel wie bei Terminen (#1885, #1906): die
+ * Zeile bleibt Spiegel ihrer UID, verliert nur ihr Konto, und das nächste
+ * Konto, das die UID liefert, übernimmt sie - statt dass es neben ihr eine
+ * zweite anlegt. Kein Tombstone und kein Push ohne Konto, und der Prune-Lauf
+ * eines anderen Kontos fasst sie nicht an. Der Trigger
+ * `trg_caldav_accounts_release_rows` (v268) tut dasselbe für jeden anderen
+ * Weg, auf dem ein Konto verschwindet.
  *
- * @returns {number} Anzahl entkoppelter Zeilen
+ * @returns {number} Anzahl abgelöster Zeilen
  */
 export function detachAccountRows(accountId) {
   let detached = 0;
   for (const def of Object.values(MODULES)) {
     detached += db.get().prepare(`
       UPDATE ${def.table}
-         SET external_source     = 'local',
-             external_uid        = NULL,
-             external_account_id = NULL,
-             external_object_url = NULL,${def.table === 'shopping_items' ? `
+         SET external_account_id = NULL,${def.table === 'shopping_items' ? `
              outbound_move          = 0,
-             outbound_move_attempts = 0,` : ''}
+             outbound_move_attempts = 0,
+             outbound_move_since    = NULL,
+             outbound_move_by       = NULL,` : ''}
              outbound_dirty      = 0,
              outbound_attempts   = 0
        WHERE external_source = 'caldav' AND external_account_id = ?
     `).run(accountId).changes;
   }
+  // Das Upload-Ziel lokaler Aufgaben trägt ebenso keinen Fremdschlüssel
+  // (#1885). Ohne Ziel bleibt die Aufgabe lokal und wird nie gesendet - wie
+  // jede Zeile ohne Konto. Einkaufsposten tragen kein eigenes Ziel: sie erben
+  // es von der Listenzuordnung, und die fällt per CASCADE mit dem Konto.
+  db.get().prepare(`
+    UPDATE tasks SET target_caldav_account_id = NULL, target_caldav_list_url = NULL
+     WHERE target_caldav_account_id = ?
+  `).run(accountId);
   return detached;
 }
 
@@ -330,7 +465,9 @@ export function releaseShoppingMirror(row) {
            outbound_dirty         = 0,
            outbound_attempts      = 0,
            outbound_move          = 0,
-           outbound_move_attempts = 0
+           outbound_move_attempts = 0,
+           outbound_move_since    = NULL,
+           outbound_move_by       = NULL
      WHERE id = ?
   `).run(row.id);
   return queued;
@@ -368,7 +505,7 @@ function shoppingMappingsOf(listId) {
  *
  * @returns {'none'|'carry'|'home'|'released'}
  */
-export function moveShoppingMirror(row, targetListId) {
+export function moveShoppingMirror(row, targetListId, movedBy = null) {
   if (!row || row.external_source !== 'caldav') return 'none';
   const from = collectionUrlOf(row.external_object_url);
   const mappings = isMirrored(row) ? shoppingMappingsOf(targetListId) : [];
@@ -379,9 +516,16 @@ export function moveShoppingMirror(row, targetListId) {
   const home = !!from && mappings.some(
     (sel) => sel.account_id === row.external_account_id && sameCollection(sel.list_url, from)
   );
-  db.get().prepare(
-    'UPDATE shopping_items SET outbound_move = ?, outbound_move_attempts = 0 WHERE id = ?'
-  ).run(home ? 0 : 1, row.id);
+  // Der Beginn zählt für die Frist eines wartenden Umzugs (#1911); ein neuer
+  // Umzug beginnt sie neu. Wer verschoben hat, bekommt die Meldung, falls der
+  // Umzug zurückgeht (#1912).
+  db.get().prepare(`
+    UPDATE shopping_items
+       SET outbound_move = ?, outbound_move_attempts = 0,
+           outbound_move_since = CASE WHEN ? THEN NULL ELSE datetime('now') END,
+           outbound_move_by = ?
+     WHERE id = ?
+  `).run(home ? 0 : 1, home ? 1 : 0, home ? null : (movedBy ?? null), row.id);
   return home ? 'home' : 'carry';
 }
 
@@ -492,10 +636,10 @@ export function dropDeletionsOfMissingLists(accountId, listedUrls) {
   return dropped;
 }
 
-function failDeletion(id, err) {
+function failDeletion(id, err, { counts = true } = {}) {
   db.get().prepare(
-    'UPDATE caldav_todo_pending_deletions SET attempts = attempts + 1, last_error = ? WHERE id = ?'
-  ).run(String(err?.message || err).slice(0, 500), id);
+    'UPDATE caldav_todo_pending_deletions SET attempts = attempts + ?, last_error = ? WHERE id = ?'
+  ).run(counts ? 1 : 0, String(err?.message || err).slice(0, 500), id);
 }
 
 // --------------------------------------------------------
@@ -699,7 +843,9 @@ export function adoptOwnUpload(module, uid, accountId, objectUrl, { listUrl, tar
            target_caldav_account_id = NULL,
            target_caldav_list_url   = NULL,` : ''}
            outbound_dirty      = 1,
-           outbound_attempts   = 0
+           outbound_attempts   = 0,
+           -- Der Abruf hat das Objekt gerade gefunden (#1839).
+           seen_on_server      = 1
      WHERE id = ? AND external_source = 'local'
   `).run(uid, accountId, objectUrl, rowId).changes > 0;
   if (adopted) {
@@ -841,6 +987,31 @@ export function recurrenceFollowupTarget(task) {
  * @param {number} listId
  * @param {number|null} [accountId] das Konto, das hochladen würde
  */
+/**
+ * Wie viele Einträge warten auf ihren Upload in diese Liste (#1840)? Für eine
+ * Aufgabenliste die Aufgaben mit ihr als Ziel, für eine Einkaufszuordnung die
+ * lokalen Artikel der zugeordneten Liste. Die Einstellungen nennen die Zahl
+ * neben einer Liste, die keine neuen Einträge annimmt.
+ */
+export function countWaitingTodoUploads(accountId, listUrl) {
+  const sel = db.get().prepare(`
+    SELECT target_module, target_list_id, enabled FROM caldav_reminder_selection
+     WHERE account_id = ? AND list_url = ?
+  `).get(accountId, listUrl);
+  if (!sel) return 0;
+  if (sel.target_module === 'shopping') {
+    if (!sel.enabled || !sel.target_list_id) return 0;
+    return db.get().prepare(`
+      SELECT COUNT(*) AS n FROM shopping_items WHERE external_source = 'local' AND list_id = ?
+    `).get(sel.target_list_id).n;
+  }
+  return db.get().prepare(`
+    SELECT COUNT(*) AS n FROM tasks
+     WHERE external_source = 'local' AND target_caldav_account_id = ?
+       AND target_caldav_list_url = ? AND parent_task_id IS NULL
+  `).get(accountId, listUrl).n;
+}
+
 export function pendingShoppingCreations(listId, accountId = null) {
   const rows = db.get().prepare(`
     SELECT * FROM shopping_items
@@ -1048,7 +1219,9 @@ function bookTodoUpload(module, sent, { uid, objectUrl, accountId, collectionUrl
            target_caldav_account_id = NULL,
            target_caldav_list_url   = NULL,` : ''}
            outbound_dirty      = ?,
-           outbound_attempts   = 0
+           outbound_attempts   = 0,
+           -- Ein Upload belegt nichts (#1839): gesehen setzt nur der Abruf.
+           seen_on_server      = 0
      WHERE id = ? AND external_source = 'local'
   `).run(uid, accountId, objectUrl, adopted || edited ? 1 : 0, sent.id).changes > 0;
   if (!mirrored) return 'unchanged';
@@ -1207,17 +1380,18 @@ export function leftoverHoldsCarriedItem(uid, listUrl) {
  *
  * @param {object} client
  * @param {number} accountId
- * @param {{clientFor?: (accountId: number) => Promise<object|null>}} [opts]
- *        Client eines anderen Kontos - die Kopie kann dort liegen
+ * @param {{clientFor?: (accountId: number) => Promise<object|null>, stop?: object}} [opts]
+ *        Client eines anderen Kontos - die Kopie kann dort liegen; Stoppsignal
+ *        des Durchgangs (#2135)
  * @returns {Promise<number>} entfernte Objekte
  */
-export function releaseLeftoverTodoUploads(client, accountId, { clientFor = null } = {}) {
+export function releaseLeftoverTodoUploads(client, accountId, { clientFor = null, stop = null } = {}) {
   // Nur in Listen, die für dieses Konto eingeschaltet sind.
   const enabled = db.get().prepare(
     'SELECT list_url FROM caldav_reminder_selection WHERE account_id = ? AND enabled = 1'
   ).all(accountId).map((r) => r.list_url);
   return removeLeftoverUploads(client, {
-    source: 'caldav', accountId, kinds: ['task', 'item'],
+    source: 'caldav', accountId, kinds: ['task', 'item'], stop,
     stateOf: (attempt) => todoAttemptState(attempt.kind === 'item' ? 'shopping' : 'tasks', attempt),
     inScope: (url) => enabled.some((known) => sameCollection(known, url)),
     beforeRemove: (attempt) => confirmCarriedCopy(attempt, client, accountId, clientFor),
@@ -1321,6 +1495,14 @@ function keepOwnUpload(module, uid, objectUrl) {
 }
 
 /** EINE Zeile je Liste, die in diesem Lauf abgelehnt hat - mit der Anzahl. */
+/** EINE Zeile je nur lesbarer Liste, in die etwas wartet (#1840). */
+function reportReadOnlyLists(readOnly, what) {
+  for (const [listUrl, waiting] of readOnly) {
+    log.warn(`Reminder list ${listUrl} is read-only for this account; `
+      + `${waiting} ${what} stay local until it accepts new entries.`);
+  }
+}
+
 function reportClosedLists(gate, what) {
   gate.report((listUrl, err, waiting) => log.warn(
     `Reminder list ${listUrl} is not accepting uploads (${err.message}); `
@@ -1335,13 +1517,17 @@ function reportClosedLists(gate, what) {
  * @param {number} accountId
  * @param {string} module
  * @param {Map}    listsByUrl   Listen-URL → Collection des Servers
+ * @param {{stop?: object}} [opts]  Stoppsignal des Durchgangs (#2135)
  * @returns {Promise<number>} erfolgreich hochgeladene Einträge
  */
-export async function processPendingCreations(client, accountId, module, listsByUrl) {
+export async function processPendingCreations(client, accountId, module, listsByUrl, { stop = null } = {}) {
   const rows = pendingCreations(accountId, module);
   if (rows.length === 0) return 0;
 
-  const gate = createUploadGate();
+  // Das Stoppsignal des Durchgangs (#2135): nach einer kontoweiten Absage einer
+  // früheren Phase geht auch kein Upload mehr hinaus.
+  const gate = createUploadGate(stop);
+  const readOnly = new Map();
   let done = 0;
   for (const listed of rows) {
     // Frisch lesen, durch dieselbe Auswahl (#1881): die Liste stammt von vor
@@ -1383,6 +1569,14 @@ export async function processPendingCreations(client, accountId, module, listsBy
     // Aufgabe dieselbe Absage abholen.
     if (gate.isClosed(collection.url)) continue;
 
+    // Nimmt die Liste laut ihren Rechten keine neuen Einträge an (#1840),
+    // geht keine Anfrage hinaus, und das Ziel bleibt stehen: die Aufgabe
+    // wartet, die Einstellungen nennen sie neben der Liste.
+    if (!acceptsNewEntries(collection)) {
+      readOnly.set(collection.url, (readOnly.get(collection.url) || 0) + 1);
+      continue;
+    }
+
     try {
       // Das Ziel räumt die Buchung selbst ab, wenn die Aufgabe Spiegel wird
       // (`bookTodoUpload`) - nicht hier, nach dem await: dann stünde dort
@@ -1403,6 +1597,7 @@ export async function processPendingCreations(client, accountId, module, listsBy
       }
     }
   }
+  reportReadOnlyLists(readOnly, 'task(s)');
   reportClosedLists(gate, 'task(s)');
   return done;
 }
@@ -1426,15 +1621,23 @@ export async function processPendingCreations(client, accountId, module, listsBy
  * @param {number} accountId
  * @param {Array<{listUrl: string, targetListId: number}>} targets  aktive Zuordnungen
  * @param {Map}    listsByUrl  Listen-URL → Collection des Servers
+ * @param {{stop?: object}} [opts]  Stoppsignal des Durchgangs (#2135)
  * @returns {Promise<number>} erfolgreich hochgeladene Artikel
  */
-export async function processPendingShoppingCreations(client, accountId, targets, listsByUrl) {
-  const gate = createUploadGate();
+export async function processPendingShoppingCreations(client, accountId, targets, listsByUrl, { stop = null } = {}) {
+  const gate = createUploadGate(stop);
+  const readOnly = new Map();
   let done = 0;
   for (const { listUrl, targetListId } of targets) {
     if (!targetListId) continue;
     const collection = listsByUrl.get(listUrl);
     if (!collection) continue;
+    // Nur lesbar (#1840): die Artikel bleiben lokal und warten, siehe oben.
+    if (!acceptsNewEntries(collection)) {
+      const waiting = pendingShoppingCreations(targetListId, accountId).length;
+      if (waiting) readOnly.set(collection.url, waiting);
+      continue;
+    }
 
     for (const row of pendingShoppingCreations(targetListId, accountId)) {
       if (gate.isClosed(collection.url)) continue;
@@ -1455,6 +1658,7 @@ export async function processPendingShoppingCreations(client, accountId, targets
       }
     }
   }
+  reportReadOnlyLists(readOnly, 'shopping item(s)');
   reportClosedLists(gate, 'shopping item(s)');
   return done;
 }
@@ -1552,7 +1756,7 @@ export function returnMovesIntoMissingLists(accountId, listedUrls) {
     const mappings = shoppingMappingsOf(listId);
     if (!mappings.length || !mappings.every(missing)) continue;
     for (const row of pendingShoppingMoves(listId)) {
-      const back = returnShoppingMove(row);
+      const back = returnShoppingMove(row, 'refused');
       returned++;
       log.warn(
         `The reminder list that shopping item "${row.name}" (${row.id}) was moved to no longer exists on the server. `
@@ -1600,6 +1804,84 @@ export function movesWaitingForSelection(accountId) {
 }
 
 /**
+ * So viele Tage wartet ein Umzug auf die Server-Liste seines Objekts, solange
+ * sie nicht eingeschaltet ist (#1911). Danach geht der Artikel zurück
+ * (`endWaitingShoppingMoves`).
+ */
+export const SHOPPING_MOVE_WAIT_DAYS = 7;
+
+/**
+ * Umzüge, deren Objekt in einer Server-Liste DIESES Kontos liegt. Ein Konto
+ * ohne eingeschaltete Liste fragt der Lauf trotzdem, solange es solche gibt
+ * (#1911): sonst kämen das Ende des Wartens und `releaseStrandedShoppingMoves`
+ * dort nie an.
+ */
+export function movesFromAccount(accountId) {
+  return db.get().prepare(`
+    SELECT COUNT(*) AS n FROM shopping_items
+     WHERE external_source = 'caldav' AND external_account_id = ? AND outbound_move = 1
+  `).get(accountId).n;
+}
+
+/**
+ * Ein Umzug, der auf die Quelle wartet, bekommt ein Ende (#1911). Für die
+ * Umzüge, deren Objekt in einer Server-Liste dieses Kontos liegt:
+ *
+ *   - Die Auflistung des Servers nennt die Quelle nicht mehr: mit der Liste
+ *     ist ihr Eintrag fort, es gibt nichts mehr mitzunehmen. Der Artikel
+ *     bleibt, wo der Nutzer ihn hingestellt hat, und wird dort als neuer
+ *     Eintrag angelegt (`releaseShoppingMirror`, dann der Upload des Laufs).
+ *     Zurück auf die alte Liste ginge er nicht: deren Objekt fehlt, und der
+ *     Prune nähme die Zeile fort. Sofort, wie bei den Löschaufträgen
+ *     (`dropDeletionsOfMissingLists`); der Auftrag für das alte Objekt fällt
+ *     dort im nächsten Lauf, nennt der Server die Liste dann wieder, löscht er
+ *     es - der Artikel ist umgezogen.
+ *   - Die Quelle ist nicht (als Einkaufsliste) eingeschaltet, und der Umzug
+ *     wartet länger als `SHOPPING_MOVE_WAIT_DAYS`: der Artikel geht auf die
+ *     Liste seines Objekts zurück (`returnShoppingMove`), wie nach der
+ *     fünften Absage des Ziels. Der Eintrag bleibt, wo der Server ihn führt.
+ *
+ * `listedUrls` ist die Auflistung DIESES Laufs für dieses Konto; leer heisst
+ * "nichts gesagt" (#508), dann gilt nur die Frist.
+ *
+ * Synchron, vor dem Abruf des Kontos.
+ *
+ * @returns {{released: number, returned: number}}
+ */
+export function endWaitingShoppingMoves(accountId, listedUrls) {
+  const listed = [...(listedUrls || [])];
+  const rows = db.get().prepare(`
+    SELECT *, outbound_move_since <= datetime('now', ?) AS overdue FROM shopping_items
+     WHERE external_source = 'caldav' AND external_account_id = ? AND outbound_move = 1
+     ORDER BY id
+  `).all(`-${SHOPPING_MOVE_WAIT_DAYS} days`, accountId);
+  let released = 0;
+  let returned = 0;
+  for (const { overdue, ...row } of rows) {
+    const from = collectionUrlOf(row.external_object_url);
+    if (!from) continue;
+    if (listed.length > 0 && !listed.some((url) => sameCollection(url, from))) {
+      db.get().transaction(() => releaseShoppingMirror(row))();
+      released++;
+      log.warn(
+        `The reminder list that shopping item "${row.name}" (${row.id}) was moved away from no longer exists on the server. `
+        + 'The item stays on the list it was moved to and is added there as a new entry.'
+      );
+      continue;
+    }
+    if (overdue !== 1 || listIsSelected(accountId, from)) continue;
+    const back = returnShoppingMove(row, 'waited');
+    returned++;
+    log.warn(
+      `Shopping item "${row.name}" (${row.id}) waited more than ${SHOPPING_MOVE_WAIT_DAYS} days for its reminder list ${from}, which is not selected. `
+      + 'Its entry on the server was not touched'
+      + (back ? `, and the item is back on the list it came from (${back}).` : '.')
+    );
+  }
+  return { released, returned };
+}
+
+/**
  * Soll das Objekt dieser Zeile JETZT an genau diesen Platz mitgenommen werden?
  * Die Zeile ist Spiegel, trägt die Vormerkung, und die Liste, in der sie steht,
  * ist dieser Server-Liste dieses Kontos zugeordnet und eingeschaltet.
@@ -1609,11 +1891,16 @@ function waitsForCarryHere(now, accountId, collectionUrl) {
     && waitsForUploadHere('shopping', now, accountId, collectionUrl);
 }
 
-/** Ist diese Server-Liste für das Konto eingeschaltet? */
+/**
+ * Ist diese Server-Liste für das Konto als EINKAUFSLISTE eingeschaltet? Eine
+ * inzwischen den Aufgaben zugeordnete zählt nicht (#1911): ihr Objekt gehört
+ * dann einer Aufgabe, und der Umzug darf es dort weder lesen noch entfernen.
+ */
 function listIsSelected(accountId, listUrl) {
-  return db.get().prepare(
-    'SELECT list_url FROM caldav_reminder_selection WHERE account_id = ? AND enabled = 1'
-  ).all(accountId).some((sel) => sameCollection(sel.list_url, listUrl));
+  return db.get().prepare(`
+    SELECT list_url FROM caldav_reminder_selection
+     WHERE account_id = ? AND enabled = 1 AND target_module = 'shopping'
+  `).all(accountId).some((sel) => sameCollection(sel.list_url, listUrl));
 }
 
 /** Der Name des Objekts in seiner Collection, wie die Adresse ihn schreibt. */
@@ -1625,7 +1912,7 @@ function objectNameOf(objectUrl) {
 
 function clearShoppingMove(id) {
   db.get().prepare(
-    'UPDATE shopping_items SET outbound_move = 0, outbound_move_attempts = 0 WHERE id = ?'
+    'UPDATE shopping_items SET outbound_move = 0, outbound_move_attempts = 0, outbound_move_since = NULL, outbound_move_by = NULL WHERE id = ?'
   ).run(id);
 }
 
@@ -1637,9 +1924,13 @@ function clearShoppingMove(id) {
  * Server führt. Gibt es die Zuordnung dieser Server-Liste nicht mehr, fällt
  * nur die Vormerkung; der nächste Abruf ordnet die Zeile wie jede andere.
  *
+ * Geht die Zeile auf eine andere Liste zurück, bekommt die Person, die
+ * verschoben hat, eine Meldung an der Glocke (#1912, `noteMoveTakenBack`).
+ *
+ * @param {'refused'|'waited'} reason  warum der Umzug zurückgeht
  * @returns {number|null} die Liste, auf die die Zeile zurückging
  */
-function returnShoppingMove(row) {
+function returnShoppingMove(row, reason) {
   const from = collectionUrlOf(row.external_object_url);
   const home = from ? db.get().prepare(`
     SELECT sel.list_url, sel.target_list_id FROM caldav_reminder_selection sel
@@ -1651,8 +1942,11 @@ function returnShoppingMove(row) {
   // hier liegt kein await.
   const now = row;
   return db.get().transaction(() => {
+    // Frisch gelesen: der Aufrufer kann eine Zeile ohne die Spalte halten.
+    const movedBy = db.get().prepare('SELECT outbound_move_by FROM shopping_items WHERE id = ?').get(now.id)?.outbound_move_by ?? null;
     clearShoppingMove(now.id);
     if (!home || home.target_list_id === now.list_id) return null;
+    noteMoveTakenBack(db.get(), { movedBy, itemId: now.id, itemName: now.name, backListId: home.target_list_id, targetListId: now.list_id, reason });
     // Ans Ende der Kategorie dort, wie bei jedem Listenwechsel (Route).
     db.get().prepare(`
       UPDATE shopping_items SET list_id = ?, sort_order = COALESCE((
@@ -1720,6 +2014,7 @@ function bookShoppingCarry(sent, { accountId, collectionUrl, objectUrl }) {
              external_object_url    = ?,
              outbound_move          = 0,
              outbound_move_attempts = 0,
+             outbound_move_since    = NULL,
              outbound_dirty         = ?,
              outbound_attempts      = 0
        WHERE id = ?
@@ -1776,13 +2071,21 @@ async function removeCarriedOriginal(source, target, { row, original, from, obje
     // Nach den awaits: nur für die Zeile, die weiter an diesem Objekt hängt.
     const now = reloadRow('shopping', row.id);
     if (!there.own || !now || now.external_source !== 'caldav' || now.external_object_url !== objectUrl) return;
-    await target.updateCalendarObject({
-      calendarObject: {
-        url: objectUrl,
-        etag: there.own.etag,
-        data: carriedContent({ ...now, outbound_dirty: workedIn || now.outbound_dirty ? 1 : 0 }, again.own.data),
-      },
-    });
+    try {
+      await target.updateCalendarObject({
+        calendarObject: {
+          url: objectUrl,
+          etag: there.own.etag,
+          data: carriedContent({ ...now, outbound_dirty: workedIn || now.outbound_dirty ? 1 : 0 }, again.own.data),
+        },
+      });
+    } catch (err) {
+      // Ein Fehler am NEUEN Platz sagt nichts über den alten (#1911): auch
+      // ein 404 dort lässt die Notiz des alten stehen, sein Objekt ist dann
+      // womöglich das letzte (`confirmCarriedCopy`).
+      log.warn(`Shopping item ${row.id}: its old object changed while it was carried over, and the copy at ${objectUrl} could not be updated (${err.message}); tried again on the next run.`);
+      return;
+    }
     await source.deleteCalendarObject({ calendarObject: { url: row.external_object_url, etag: again.own.etag } });
     settleUploadAttempt(place);
     log.info(`Shopping item ${row.id}: its old object was changed while it was carried over, carried the change along.`);
@@ -1848,10 +2151,13 @@ async function carryShoppingItem(client, accountId, collection, rowId, clientFor
   }
 
   // Nach den awaits: die Zeile von jetzt.
+  // Auch die Quelle von jetzt: wurde sie während des Lesens abgeschaltet,
+  // wartet der Umzug wie vorher (#1911).
   const sent = reloadRow('shopping', rowId);
   if (!waitsForCarryHere(sent, accountId, collection.url)
       || sent.external_object_url !== listed.external_object_url
-      || sent.external_account_id !== listed.external_account_id) return 'waiting';
+      || sent.external_account_id !== listed.external_account_id
+      || !listIsSelected(sent.external_account_id, from)) return 'waiting';
 
   if (!original) {
     // Am alten Platz liegt das Objekt nicht (mehr): es gibt nichts mitzunehmen,
@@ -1869,8 +2175,10 @@ async function carryShoppingItem(client, accountId, collection, rowId, clientFor
     collectionUrl: collection.url, uid: sent.external_uid, objectUrl,
   });
   try {
-    // `./`: ein Name mit Doppelpunkt würde sonst als eigene URL gelesen.
-    await client.createCalendarObject({ calendar: collection, filename: `./${name}`, iCalString: data });
+    // Der Name geht als ein Pfadsegment hinaus: tsdav (ab 2.5.0) setzt das
+    // `./` selbst davor, damit ein Name mit Doppelpunkt nicht als eigene URL
+    // gelesen wird, und lehnt einen Namen mit `/` ab.
+    await client.createCalendarObject({ calendar: collection, filename: name, iCalString: data });
   } catch (err) {
     if (err?.status !== 412) throw err;
     const there = await findObjectWithUid(client, collection.url, objectUrl, sent.external_uid);
@@ -1879,7 +2187,10 @@ async function carryShoppingItem(client, accountId, collection, rowId, clientFor
   }
 
   const booked = bookShoppingCarry(sent, { accountId, collectionUrl: collection.url, objectUrl });
-  if (booked === 'carried') {
+  // Ist die Quelle inzwischen abgeschaltet, wird dort nichts entfernt: die
+  // Notiz des alten Platzes bleibt, und der Rest fällt, sobald sie wieder an
+  // ist (`releaseLeftoverTodoUploads`, #1911).
+  if (booked === 'carried' && listIsSelected(sent.external_account_id, from)) {
     await removeCarriedOriginal(source, client, {
       row: sent, original, from, objectUrl, collectionUrl: collection.url,
     });
@@ -1898,17 +2209,24 @@ async function carryShoppingItem(client, accountId, collection, rowId, clientFor
  * weiterlebt und dort von anderen Apps gesehen und geändert wird - der
  * Zwischenzustand darf nicht für immer stehen. Nach der fünften Absage steht
  * die Zeile wieder auf der Liste ihres Objekts (`returnShoppingMove`), wie ein
- * Termin, dessen Umzug der Server nicht annimmt. Gezählt wird nur, was der
- * Server beantwortet hat; ein unerreichbarer Server ist keine Absage.
+ * Termin, dessen Umzug der Server nicht annimmt.
+ *
+ * Gezählt wird nur, was über den EINTRAG selbst sagt (#2137): 400, 403, 409,
+ * 412, 422, 423. Eine Absage, die das Konto oder den Server als Ganzes
+ * betrifft (401, 429, 5xx), und ein Fehler ohne Status (Netzfehler) zählen
+ * nicht - der Umzug bleibt stehen und verbraucht keinen Versuch, und der
+ * Durchgang sendet für dieses Konto nichts mehr (`createRefusalStop`). Ein
+ * 403 zählt trotzdem: ein nur lesbares Ziel ist genau der Fall, den
+ * `returnShoppingMove` bewältigt, und einen Umzug gibt es zurück.
  *
  * @param {object} client      tsdav-Client des Zielkontos
  * @param {number} accountId
  * @param {Array<{listUrl: string, targetListId: number}>} targets  aktive Zuordnungen
  * @param {Map}    listsByUrl  Listen-URL → Collection des Servers
- * @param {{clientFor?: (accountId: number) => Promise<object|null>}} [opts]
+ * @param {{clientFor?: (accountId: number) => Promise<object|null>, stop?: ReturnType<typeof createRefusalStop>}} [opts]
  * @returns {Promise<number>} mitgenommene Objekte
  */
-export async function processPendingShoppingMoves(client, accountId, targets, listsByUrl, { clientFor } = {}) {
+export async function processPendingShoppingMoves(client, accountId, targets, listsByUrl, { clientFor, stop = createRefusalStop() } = {}) {
   const sourceFor = clientFor || (async () => null);
   let done = 0;
   for (const { listUrl, targetListId } of targets) {
@@ -1916,18 +2234,42 @@ export async function processPendingShoppingMoves(client, accountId, targets, li
     const collection = listsByUrl.get(listUrl);
     if (!collection) continue;
 
+    // Nach einer kontoweiten Absage in diesem Durchgang: keine weitere
+    // Anfrage an das Konto (#1863, #2137).
+    if (stop.blocks(collection.url)) continue;
+
     for (const listed of pendingShoppingMoves(targetListId)) {
+      // Nach einer kontoweiten Absage in diesem Durchgang: keine weitere
+      // Anfrage an das Konto (#2143).
+      if (stop.blocks(collection.url)) break;
       try {
         if (await carryShoppingItem(client, accountId, collection, listed.id, sourceFor) === 'carried') done++;
       } catch (err) {
         const now = reloadRow('shopping', listed.id);
         if (!waitsForCarryHere(now, accountId, collection.url)) continue;
+
+        // Ein unerreichbarer Server ist keine Absage: er hat nicht geantwortet.
+        // Aber er ist nicht erreichbar - für weitere Artikel in diesem Durchgang
+        // auch nicht (#2143).
         if (typeof err?.status !== 'number') {
+          stop.trip(err, collection.url);
           log.warn(`Could not carry shopping item ${now.id} to ${listUrl}: ${err.message}`);
           continue;
         }
+
+        // Eine kontoweite Absage (401, 429, 5xx) sagt nichts über den Eintrag
+        // selbst (#2137): der Umzug bleibt stehen, verbraucht keinen Versuch,
+        // und der Durchgang sendet für dieses Konto nichts mehr. Ein 403 zählt
+        // trotzdem - ein nur lesbares Ziel ist genau der Fall, den
+        // `returnShoppingMove` bewältigt, und einen Umzug gibt es zurück.
+        if (isAccountWideRefusal(err) && err.status !== 403) {
+          stop.trip(err, collection.url);
+          log.warn(`Reminder list ${listUrl} refused shopping item ${now.id} for the whole account, its move waits without using up an attempt: ${err.message}`);
+          continue;
+        }
+
         if (now.outbound_move_attempts + 1 >= MAX_OUTBOUND_ATTEMPTS) {
-          const back = returnShoppingMove(now);
+          const back = returnShoppingMove(now, 'refused');
           log.error(
             `Giving up on moving shopping item "${now.name}" (${now.id}) to reminder list ${listUrl} after `
             + `${now.outbound_move_attempts + 1} refusal(s): ${err.message}. Its entry on the server was not touched`
@@ -1970,9 +2312,14 @@ export async function processPendingShoppingMoves(client, accountId, targets, li
  * oder das Konto gelöscht wird. Führt der Abruf das Objekt inzwischen in einer
  * EINGESCHALTETEN Liste (auf einem anderen Gerät verschoben), wird es dort
  * gelöscht.
+ *
+ * `stop` (#1863): das Stoppsignal des Durchgangs (`createRefusalStop`). Nach
+ * einer kontoweiten Absage geht keine weitere Anfrage an das Konto, die
+ * Aufträge bleiben ohne Versuch. Der Aufrufer teilt es mit
+ * `processPendingUpdates` und über die Module hinweg.
  * @returns {Promise<number>} erledigte Tombstones
  */
-export async function processPendingDeletions(client, accountId, module, objectIndex, complete = false) {
+export async function processPendingDeletions(client, accountId, module, objectIndex, complete = false, { stop = createRefusalStop() } = {}) {
   const rows = pendingDeletions(accountId, module);
   if (rows.length === 0) return 0;
 
@@ -1996,6 +2343,9 @@ export async function processPendingDeletions(client, accountId, module, objectI
       continue;
     }
 
+    // Nach einer kontoweiten Absage in diesem Durchgang: nichts senden (#1863).
+    if (stop.blocks(collectionUrlOf(url))) continue;
+
     try {
       await client.deleteCalendarObject({ calendarObject: { url, etag: known?.etag } });
       dropDeletion(row.id);
@@ -2014,10 +2364,17 @@ export async function processPendingDeletions(client, accountId, module, objectI
         }
         continue;
       }
-      const action = outboundFailureAction(err, row.attempts);
+      // Eine kontoweite Absage verbraucht keinen Versuch (#1863).
+      const action = davFailureAction(err, row.attempts);
       if (action === 'settled') {
         dropDeletion(row.id);
         done++;
+        continue;
+      }
+      if (action === 'wait') {
+        stop.trip(err, collectionUrlOf(url));
+        failDeletion(row.id, err, { counts: false });
+        log.warn(`Remote deletion of VTODO ${row.uid} was refused for the whole account, it waits without using up an attempt:`, err.message);
         continue;
       }
       failDeletion(row.id, err);
@@ -2042,7 +2399,7 @@ export async function processPendingDeletions(client, accountId, module, objectI
  *
  * @returns {Promise<number>} erfolgreich verarbeitete Einträge
  */
-export async function processPendingUpdates(client, accountId, module, objectIndex) {
+export async function processPendingUpdates(client, accountId, module, objectIndex, { stop = createRefusalStop() } = {}) {
   const def  = moduleDef(module);
   const rows = pendingUpdates(accountId, module);
   if (rows.length === 0) return 0;
@@ -2067,13 +2424,15 @@ export async function processPendingUpdates(client, accountId, module, objectInd
     if (!fresh) continue; // parallel gelöscht - der Tombstone-Pfad übernimmt
 
     const patched = patchICSTodo(
-      known.data, row.external_uid, def.icsFields(fresh, hasCompleted(known.data), householdTimeZone(db.get()))
+      known.data, row.external_uid, def.icsFields(fresh, hasCompleted(known.data), householdTimeZone(db.get()), known.data)
     );
     if (!patched) {
       log.warn(`VTODO ${row.external_uid} has no editable component in its calendar object, dropping its update.`);
       clearOutbound(module, row.id);
       continue;
     }
+
+    if (stop.blocks(collectionUrlOf(url))) continue;
 
     try {
       await client.updateCalendarObject({ calendarObject: { url, etag: known.etag, data: patched } });
@@ -2087,10 +2446,15 @@ export async function processPendingUpdates(client, accountId, module, objectInd
         log.warn(`The stored address of VTODO ${row.external_uid} is not on the server of its account, its update waits.`);
         continue;
       }
-      const action = outboundFailureAction(err, row.outbound_attempts);
+      const action = davFailureAction(err, row.outbound_attempts);
       if (action === 'settled') {
         log.warn(`VTODO ${row.external_uid} no longer exists on the server, dropping its update.`);
         clearOutbound(module, row.id);
+        continue;
+      }
+      if (action === 'wait') {
+        stop.trip(err, collectionUrlOf(url));
+        log.warn(`Outbound update of "${def.labelOf(row)}" was refused for the whole account, it waits without using up an attempt:`, err.message);
         continue;
       }
       if (action === 'give-up') {
@@ -2271,11 +2635,18 @@ async function runFlushOutbound({ createClient } = {}) {
     try {
       const client = await createTodoClient(account, makeClient);
 
+      // Ein Stoppsignal für jede schreibende Phase aller Module dieses
+      // Kontos (#1863, #2137, #2135): Aufräumen, Löschen, Ändern, Uploads und
+      // Mitnahmen. Nach einer kontoweiten Absage geht keine Anfrage mehr an
+      // das Konto, auch kein Abruf, der nur einer späteren Phase diente.
+      const stop = createRefusalStop();
+
       // Vor allem anderen: die Reste nie bestätigter Uploads entfernen
       // (#1882), damit eine Zeile mit neuem Ziel nicht neben ihren Rest geht.
-      await releaseLeftoverTodoUploads(client, accountId, { clientFor });
+      await releaseLeftoverTodoUploads(client, accountId, { clientFor, stop });
 
       for (const module of modules) {
+        if (stop.blocks()) break;
         const wanted = [
           ...pendingDeletions(accountId, module)
             .filter((r) => r.object_url && !inUnselectedList(accountId, r.object_url))
@@ -2290,15 +2661,16 @@ async function runFlushOutbound({ createClient } = {}) {
         // complete = false: ohne vollen Listenabruf ist "der Server führt das
         // Objekt nicht mehr" nicht belegbar; ein Tombstone ohne bekannte URL
         // bleibt für den Sync liegen.
-        total.deleted += await processPendingDeletions(client, accountId, module, objectIndex, false);
-        total.updated += await processPendingUpdates(client, accountId, module, objectIndex);
+        total.deleted += await processPendingDeletions(client, accountId, module, objectIndex, false, { stop });
+        total.updated += await processPendingUpdates(client, accountId, module, objectIndex, { stop });
 
         // Uploads brauchen die Collection selbst, nicht einzelne Objekte - und
         // damit den einzigen Listenabruf in diesem Pfad. Er läuft deshalb nur,
         // wenn wirklich etwas wartet.
+        if (stop.blocks()) break;
         if (module === 'tasks' && pendingCreations(accountId, module).length) {
           total.created += await processPendingCreations(
-            client, accountId, module, await taskListsOf(client, accountId)
+            client, accountId, module, await taskListsOf(client, accountId), { stop }
           );
         }
         if (module === 'shopping') {
@@ -2311,11 +2683,12 @@ async function runFlushOutbound({ createClient } = {}) {
           if (targets.length || moves.length) {
             const collections = await collectionsForTargets(client, [...targets, ...moves]);
             if (targets.length) {
-              total.created += await processPendingShoppingCreations(client, accountId, targets, collections);
+              total.created += await processPendingShoppingCreations(client, accountId, targets, collections, { stop });
             }
             if (moves.length) {
               // Als `updated` gezählt: das Objekt ist dasselbe, nur sein Platz nicht.
-              total.updated += await processPendingShoppingMoves(client, accountId, moves, collections, { clientFor });
+              // Dasselbe Stoppsignal wie Löschen und Ändern (#1863, #2137).
+              total.updated += await processPendingShoppingMoves(client, accountId, moves, collections, { clientFor, stop });
             }
           }
         }

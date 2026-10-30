@@ -5,12 +5,17 @@
  */
 
 import { api } from '/api.js';
-import { openModal as openSharedModal, closeModal, btnError, advancedSection, reportFieldError } from '/components/modal.js';
-import { wireCategoryScopeHelp } from '/components/category-manager.js';
-import { stagger, vibrate, scheduleUndoableDelete, wireScrollFade, acknowledgeCheck } from '/utils/ux.js';
+import { colorPickerHtml, wireColorPicker } from '/utils/color-picker.js';
+import { openModal as openSharedModal, closeModal, btnError, advancedSection, reportFieldError, captureModalContext, decorateFooterDelete, dialogInitialFocus } from '/components/modal.js';
+// Der Kategorie-Verwalter (`<yuvomi-category-manager>`, unten) registriert
+// sich beim Import.
+import '/components/category-manager.js';
+import { hintFoldHtml } from '/utils/hint-fold.js';
+import { stagger, vibrate, scheduleUndoableDelete, wireScrollFade, acknowledgeCheck, isImeComposing } from '/utils/ux.js';
 import { redrawList } from '/utils/list-motion.js';
 import { t } from '/i18n.js';
 import { esc, renderMarkdownLight } from '/utils/html.js';
+import { formSwitchRowHtml } from '/settings/components.js';
 import { rowMenuHtml } from '/utils/row-action.js';
 import { splitKeepingLineEndings } from '/utils/markdown-checklist.js';
 import { renderMarkdownToolbar, wireMarkdownToolbar } from '/utils/markdown-toolbar.js';
@@ -18,9 +23,11 @@ import { renderSkeletonList } from '/utils/skeleton.js';
 import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
 import { pageToolsMenuHtml, pageToolsActionEl, installPopoverMenus } from '/utils/popover-menu.js';
 import { findPageFab } from '/utils/fab.js';
+import { lendPageStyle } from '/utils/component-style.js';
 import { attachSegmentIndicator } from '/utils/segment-indicator.js';
 import { emptyStateHTML, searchEmptyHTML } from '/utils/empty-state.js';
 import { AVATAR_FALLBACK_COLOR } from '/utils/color.js';
+import { personChipsHtml } from '/utils/filter-sheet.js';
 import {
   noteMatchesCategories,
   occupiedNoteCategoryIds,
@@ -35,7 +42,10 @@ import {
   moveCategoryPickerOption,
 } from '/utils/note-category-picker.js';
 import { NOTE_CATEGORY_NAME_MAX_LENGTH } from '/utils/note-category-name.js';
-import { isNavModuleReadOnly } from '/permissions.js';
+import { canChangeRecord, isNavModuleReadOnly } from '/permissions.js';
+import { errorSentence, isAlreadyDeleted } from '/utils/friendly-error.js';
+import { mayChangeNoteLock, mayChangeNoteVisibility, noteLockedFor } from '/utils/note-access.js';
+import { hidesPrivacyControls } from '/utils/household.js';
 
 // --------------------------------------------------------
 // Konstanten
@@ -78,6 +88,14 @@ let state = {
   filterCategoryIds: [],
 };
 let _container = null;
+
+/** Steht die Notizenseite gerade im Dokument? Sonst ist der Editor ueber einer fremden Seite offen (openNewNote). */
+function hostedHere() {
+  return Boolean(_container?.isConnected);
+}
+
+/** Wer nach dem Speichern ueber einer fremden Seite auffrischt (openNewNote). */
+let _awayChanged = null;
 /** Das Suchfeld (wirePageSearch) - der Leerzustand einer leeren Suche leert es. */
 let _search = null;
 
@@ -106,6 +124,35 @@ function readOnly() {
 }
 
 /**
+ * Darf ich DIESE Notiz aendern (R23, D5)? Ohne `notes_edit_others` nur meine
+ * eigenen: fremde gehen als Leseansicht auf, Nadel und Mehr-Menue fehlen an
+ * ihrer Karte. Das Abhaken einer Checkliste bleibt allen offen, die schreiben
+ * duerfen - es ist Benutzen, nicht Umschreiben (server/routes/notes.js).
+ */
+function mayChange(note) {
+  if (readOnly() || !note) return false;
+  if (noteLockedFor(note, viewer())) return false;
+  return canChangeRecord('notes', Number(note.created_by) === Number(state.user?.id));
+}
+
+/** Wer hier fragt - fuer die Regeln aus utils/note-access.js (#1514, #1602). */
+function viewer() {
+  return { userId: state.user?.id ?? null, isAdmin: state.user?.role === 'admin' };
+}
+
+/**
+ * Darf ich in DIESER Notiz abhaken? Allen offen, die schreiben duerfen - ausser
+ * die Notiz ist gesperrt (#1602): die Sperre gilt ganz, auch fuer die Haken.
+ */
+function mayCheck(note) {
+  return !readOnly() && Boolean(note) && !noteLockedFor(note, viewer());
+}
+
+function noteById(id) {
+  return state.notes.find((n) => n.id === Number(id));
+}
+
+/**
  * Die Stecknadel einer Karte - Bedienelement, Zeichen oder nichts.
  *
  * DIE ANTWORT FOLGT DEM DATENSATZ, nicht dem Zugriff (#1252): eine angepinnte
@@ -125,7 +172,7 @@ function readOnly() {
 // angepinnt (notes.css), offen in Tertiaerfarbe heisst nicht; die Beschriftung
 // nennt weiter die Handlung.
 function pinMarkup(note) {
-  if (!readOnly()) {
+  if (mayChange(note)) {
     return `<button class="note-card__pin" data-action="pin" data-id="${note.id}"
               aria-label="${note.pinned ? t('notes.unpinAction') : t('notes.pinAction')}">
         <i data-lucide="pin" aria-hidden="true"></i>
@@ -151,7 +198,9 @@ function pinMarkup(note) {
 // ein `span role="img"`, dessen Beschriftung den Zustand nennt. Die
 // dekorative Form waere hier zu wenig - sie ist `aria-hidden` und nimmt einem
 // Nur-lesen-Nutzer genau die Auskunft, die die Zeile traegt.
-const CHECKLIST_OPTS = () => (readOnly()
+// Seit #1602 fragt das die Notiz: in einer gesperrten fremden sind die
+// Kaestchen ebenso Zeichen wie bei Nur-lesen.
+const CHECKLIST_OPTS = (note = null) => (!(note ? mayCheck(note) : !readOnly())
   ? { checklist: { stateLabels: { checked: t('notes.checklistDone'), unchecked: t('notes.checklistOpen') } } }
   : { checklist: { interactive: true, toggleLabel: t('notes.checklistToggle') } });
 
@@ -191,7 +240,7 @@ async function toggleCheck(noteId, box) {
   // Render oder aus den Devtools findet ihn trotzdem.
   if (readOnly()) return;
   const note = state.notes.find((n) => n.id === noteId);
-  if (!note) return;
+  if (!note || !mayCheck(note)) return;
 
   const line    = parseInt(box.dataset.mdLine, 10);
   const checked = box.dataset.mdChecked !== '1';
@@ -219,9 +268,25 @@ async function toggleCheck(noteId, box) {
     if (err.status === 409) {
       await handleCheckConflict();
     } else {
-      window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+      window.yuvomi?.showToast(errorSentence(err), 'danger');
+      dropGoneNote(err, noteId);
     }
   }
+}
+
+/**
+ * "GIBT ES NICHT MEHR" (#1909): ein anderes Haushaltsmitglied hat die Notiz
+ * geloescht - oder, seit #1514, auf "Nur ich" gestellt. Fuer diese Person ist
+ * beides dasselbe: es gibt sie nicht mehr. Sie faellt aus dem Stand, ohne die
+ * Pinnwand neu zu holen - und zwar nur bei genau diesem Grund. Gibt true
+ * zurueck, wenn sie gefallen ist.
+ */
+function dropGoneNote(err, noteId) {
+  if (!isAlreadyDeleted(err, 'notes_note_not_found')) return false;
+  const before = state.notes.length;
+  state.notes = state.notes.filter((n) => n.id !== noteId);
+  if (state.notes.length !== before && _container) renderNotesAndFilters();
+  return true;
 }
 
 async function handleCheckConflict() {
@@ -270,7 +335,7 @@ export async function render(container, { user, signal }) {
           </div>`}
         </div>
       </div>
-      <div class="notes-scroll page-scrollport">
+      <div class="notes-scroll page-scrollport" data-scroll-port="notes">
         <!-- DIE CHIPREIHE IST DAS ERSTE KIND DES PORTS (Kopfregel mobil,
              2026-09-26). Zwischen Kopf und Port kostete sie dauerhaft 65px
              (Port ab y=179 statt 114), die auch der Kopf-Kollaps nicht
@@ -313,6 +378,8 @@ export async function render(container, { user, signal }) {
     // steht unter dem Riegel.
     const schreibweg = e.target.closest('[data-action="pin"], [data-action="delete"], .note-md-box[data-md-line]');
     if (schreibweg && readOnly()) { e.stopPropagation(); return; }
+    const notenweg = e.target.closest('[data-action="pin"], [data-action="delete"]');
+    if (notenweg && !mayChange(noteById(notenweg.dataset.id))) { e.stopPropagation(); return; }
 
     const pinBtn = e.target.closest('[data-action="pin"]');
     if (pinBtn) { e.stopPropagation(); await togglePin(parseInt(pinBtn.dataset.id, 10)); return; }
@@ -394,6 +461,8 @@ function renderNotesAndFilters({ motion = false } = {}) {
  * Button-Chips wie Dokumente/Aufgaben (Tastatur + aria-pressed).
  */
 function renderFilters() {
+  // Ueber einer fremden Seite gibt es keine Reihe (openNewNote).
+  if (!hostedHere()) return;
   const row = _container.querySelector('#notes-filters');
   if (!row) return;
 
@@ -413,31 +482,30 @@ function renderFilters() {
   row.removeAttribute('aria-hidden');
   delete row.dataset.pending;
   const focused = row.contains(document.activeElement) ? document.activeElement : null;
-  const focusKey = ['creator', 'categoryId', 'clearCategories'].find((key) => focused && Object.hasOwn(focused.dataset, key));
+  const focusKey = ['value', 'categoryId', 'clearCategories'].find((key) => focused && Object.hasOwn(focused.dataset, key));
   const focusValue = focusKey ? focused.dataset[focusKey] : null;
   const scrollLeft = row.scrollLeft;
   row.replaceChildren();
   if (row.hidden) return;
 
-  const makeChip = (label, value) => {
-    const active = state.filterCreator === value;
-    const chip = document.createElement('button');
-    chip.type = 'button';
-    chip.className = `filter-chip filter-chip--sm${active ? ' filter-chip--active' : ''}`;
-    chip.dataset.creator = value;
-    chip.setAttribute('aria-pressed', String(active));
-    chip.textContent = label;
-    return chip;
-  };
-
+  /* DIE PERSONEN WIE UEBERALL (Critique R24 G4-Notizen-P3-2): der Baustein
+   * der Personenzeile (`personChipsHtml`, S3) - Scheibe in der Farbe der
+   * Person mit Initialen, der Vorname, solange alle denselben Nachnamen
+   * tragen. Hier standen Namen-Chips ohne Scheibe, die vierte Form derselben
+   * Zeile. Der Wert ist der Name, nach dem `visibleNotes()` filtert. */
   if (creators.length >= 2) {
-    const group = document.createElement('div');
-    group.className = 'notes-filter-group';
-    group.setAttribute('role', 'group');
-    group.setAttribute('aria-label', t('notes.filterCreatorLabel'));
-    group.appendChild(makeChip(t('common.all'), ''));
-    creators.forEach((n) => group.appendChild(makeChip(n.creator_name, n.creator_name)));
-    row.appendChild(group);
+    row.insertAdjacentHTML('beforeend', personChipsHtml({
+      filter: 'creator',
+      label: t('notes.filterCreatorLabel'),
+      people: creators.map((n) => ({
+        id: n.creator_name,
+        display_name: n.creator_name,
+        avatar_color: n.creator_color || AVATAR_FALLBACK_COLOR,
+      })),
+      isActive: (person) => state.filterCreator === person.id,
+      all: { label: t('common.all'), active: !state.filterCreator },
+      className: 'notes-filter-group',
+    }));
   }
 
   if (filterCategories.length) {
@@ -465,10 +533,10 @@ function renderFilters() {
     row.appendChild(group);
   }
 
-  row.querySelectorAll('[data-creator]').forEach((chip) => {
+  row.querySelectorAll('[data-filter="creator"]').forEach((chip) => {
     chip.addEventListener('click', () => {
       // Erneuter Klick auf den aktiven Chip hebt den Filter auf.
-      state.filterCreator = state.filterCreator === chip.dataset.creator ? '' : chip.dataset.creator;
+      state.filterCreator = state.filterCreator === chip.dataset.value ? '' : chip.dataset.value;
       renderNotesAndFilters();
     });
   });
@@ -514,6 +582,7 @@ const NOTE_CARD = '.note-card[data-id]';
  * Filter und Suche zeichnen ohne Bewegung neu - dort wechselt die Frage,
  * nicht die Liste. */
 function renderGrid({ motion = false } = {}) {
+  if (!hostedHere()) return;
   const grid = _container.querySelector('#notes-grid');
   if (!grid) return;
   if (motion) {
@@ -622,7 +691,7 @@ function notesEmptyStateHtml(isFiltered) {
     title: t('notes.emptyTitle'),
     description: ro ? '' : t('notes.emptyDescription'),
     hint: ro ? '' : t('emptyHint.notes'),
-    action: ro ? null : { label: t('notes.emptyAction'), icon: 'plus', attrs: { id: 'empty-cta-notes' } },
+    action: ro ? null : { tone: 'secondary', label: t('notes.emptyAction'), icon: 'plus', attrs: { id: 'empty-cta-notes' } },
   });
 }
 
@@ -674,7 +743,7 @@ function renderNoteCard(note, { headingLevel = 2 } = {}) {
           * Die Optik traegt allein die Klasse (typography.css, notes.css);
           * `reset.css` nimmt den UA-Rand, die Groesse setzt die Rolle. */ ''}
       ${note.title ? `<h${headingLevel === 3 ? 3 : 2} class="note-card__title">${esc(note.title)}</h${headingLevel === 3 ? 3 : 2}>` : ''}
-      <div class="note-card__content">${renderMarkdownLight(note.content, CHECKLIST_OPTS())}</div>
+      <div class="note-card__content">${renderMarkdownLight(note.content, CHECKLIST_OPTS(note))}</div>
       ${(note.categories || []).length ? `<div class="note-card__categories" role="group" aria-label="${t('noteCategories.categories')}">
         ${note.categories.map(renderCategoryBadge).join('')}
       </div>` : ''}
@@ -687,12 +756,13 @@ function renderNoteCard(note, { headingLevel = 2 } = {}) {
               : ''}
           </span>
           <span>${esc(note.creator_name || '')}</span>
+          ${renderAccessMarks(note)}
         </div>
         <div class="note-card__actions">
           ${/* LOESCHEN IM MEHR-KNOPF (R18, D6, Critique 2026-10-16): der
               * Papierkorb stand offen auf jeder Karte - die lauteste Farbe
               * der Wand gehoerte der seltensten Handlung. */ ''}
-          ${readOnly() ? '' : rowMenuHtml({
+          ${!mayChange(note) ? '' : rowMenuHtml({
     id: `note-menu-${note.id}`,
     label: t('common.moreActionsNamed', { name: noteName(note) }),
     className: 'note-card__more',
@@ -702,6 +772,68 @@ function renderNoteCard(note, { headingLevel = 2 } = {}) {
       </div>
     </div>
   `;
+}
+
+/**
+ * Die zwei leisen Zeichen neben dem Namen (#1514, #1602): Schloss fuer
+ * gesperrt - dasselbe Zeichen wie an der gesperrten Aufgabe -, durchgestrichenes
+ * Auge fuer "Nur ich". Das zweite sieht nur die Autorin; fuer alle anderen gibt
+ * es die Notiz nicht. `role="img"`, damit die Beschriftung gilt.
+ */
+function renderAccessMarks(note) {
+  const mark = (icon, label) => `<span class="note-card__mark" role="img" aria-label="${esc(label)}" title="${esc(label)}">
+            <i data-lucide="${icon}" aria-hidden="true"></i>
+          </span>`;
+  return [
+    note.visibility === 'private' ? mark('eye-off', t('common.visibility.private')) : '',
+    note.locked ? mark('lock', t('notes.lockedBadge')) : '',
+  ].join('');
+}
+
+/**
+ * Sichtbarkeit und Sperre im Editor (#1514, #1602) - neben Farbe und Nadel,
+ * wie bei den Aufgaben nebeneinander: beide beantworten, wer hier was darf.
+ *
+ * GEZEIGT WIRD NUR, WAS DIESE PERSON STELLEN DARF: die Sichtbarkeit die
+ * Autorin, die Sperre Autorin und Admins. Ein Feld, das fehlt, geht auch nicht
+ * in den Rumpf - der Server laesst den Bestand stehen.
+ *
+ * Im Ein-Personen-Haushalt VERBORGEN, NICHT ENTFERNT (dieselbe Regel wie bei
+ * den Aufgaben): der Absende-Pfad liest die Knoten, und ein fehlender schriebe
+ * den gespeicherten Wert nicht mit.
+ */
+function renderAccessFields(note) {
+  const v = viewer();
+  const showVisibility = !note || mayChangeNoteVisibility(note, v);
+  const showLock = !note || mayChangeNoteLock(note, v);
+  if (!showVisibility && !showLock) return '';
+  const hidden = hidesPrivacyControls('notes') ? ' hidden' : '';
+  const visibility = note?.visibility === 'private' ? 'private' : 'all';
+  return `${showVisibility ? `
+      <div class="form-group"${hidden}>
+        <label class="form-label" for="note-visibility">${t('common.visibility.label')}</label>
+        <select class="form-input" id="note-visibility" aria-describedby="note-visibility-hint">
+          <option value="all"${visibility === 'all' ? ' selected' : ''}>${t('common.visibility.all')}</option>
+          <option value="private"${visibility === 'private' ? ' selected' : ''}>${t('common.visibility.private')}</option>
+        </select>
+        <p class="form-hint" id="note-visibility-hint">${t('common.visibility.hint')}</p>
+      </div>` : ''}${showLock ? `
+      <div class="form-group"${hidden}>
+        ${formSwitchRowHtml({
+          label: t('notes.lockedToggle'), checked: Boolean(note?.locked),
+          hint: t('notes.lockedHint'), hintId: 'note-locked-hint', attrs: { id: 'note-locked' },
+        })}
+      </div>` : ''}`;
+}
+
+/** Was die Felder oben in den Rumpf geben - nur die, die es gibt. */
+function readAccessFields(panel) {
+  const out = {};
+  const visibility = panel.querySelector('#note-visibility');
+  if (visibility) out.visibility = visibility.value === 'private' ? 'private' : 'all';
+  const locked = panel.querySelector('#note-locked');
+  if (locked) out.locked = locked.checked ? 1 : 0;
+  return out;
 }
 
 // --------------------------------------------------------
@@ -723,15 +855,15 @@ function categoryScopeLabel(category) {
 }
 
 function renderCategoryBadge(category) {
-  return `<span class="note-category-badge note-category-badge--${category.scope} u-badge">
+  return `<span class="tag note-category-badge note-category-badge--${category.scope}">
     <i data-lucide="${category.scope === 'personal' ? 'user' : 'home'}" aria-hidden="true"></i><span class="note-category-badge__name">${esc(category.name)}</span>
     <span class="sr-only"> (${esc(categoryScopeLabel(category))})</span>
   </span>`;
 }
 
-function renderNoteReadHtml(content, { live = false, categories = [] } = {}) {
+function renderNoteReadHtml(content, { live = false, categories = [], note = null } = {}) {
   const body = (content || '').trim()
-    ? renderMarkdownLight(content, live ? CHECKLIST_OPTS() : {})
+    ? renderMarkdownLight(content, live ? CHECKLIST_OPTS(note) : {})
     : `<p class="note-read__empty">${t('notes.readEmpty')}</p>`;
   return `${categories.length ? `<div class="note-read__categories" role="group" aria-label="${t('noteCategories.categories')}">
     ${categories.map(renderCategoryBadge).join('')}
@@ -767,16 +899,17 @@ function renderSelectedCategories(selectedIds) {
 
 function renderCategoryScopeControl() {
   if (!state.canManageHousehold) return '';
-  return `<div class="note-category-editor__scope">
-    <select class="form-input" id="note-category-new-scope" aria-label="${esc(t('noteCategories.scopeLabel'))}"
-            aria-describedby="note-category-scope-help">
+  /* DIE WAHL TRAEGT IHR LABEL (Critique R24 G4-Notizen-P3-1): "Persoenlich"
+   * stand als Auswahl ohne sichtbaren Namen, die Erklaerung hinter einem
+   * Info-Zeichen als Tooltip. Jetzt "Kategorietyp" als Label ueber der Wahl,
+   * die Erklaerung hinter "Mehr dazu" wie jede Hilfe eines Formulars. */
+  return `<div class="form-field note-category-editor__scope">
+    <label class="form-label" for="note-category-new-scope">${esc(t('noteCategories.scopeLabel'))}</label>
+    <select class="form-input" id="note-category-new-scope">
       <option value="personal">${t('noteCategories.personal')}</option>
       <option value="household">${t('noteCategories.household')}</option>
     </select>
-    <button type="button" class="category-scope-help" aria-expanded="false" aria-label="${esc(t('noteCategories.scopeHelp'))}">
-      <i data-lucide="info" aria-hidden="true"></i>
-      <span class="category-scope-help__tooltip u-meta" id="note-category-scope-help" role="tooltip">${esc(t('noteCategories.scopeHelp'))}</span>
-    </button>
+    ${hintFoldHtml({ moreHtml: `<p class="form-hint">${esc(t('noteCategories.scopeHelp'))}</p>` })}
   </div>`;
 }
 
@@ -854,13 +987,19 @@ function openNoteFromQuery(loc = window.location, hist = window.history) {
  * mitgehen, welche es sind, entscheidet das Recht.
  */
 function openNoteReadModal(note) {
+  // Fremde Notiz ohne Recht (R23, D5): der Grund steht im Dialog, statt dass
+  // der Bearbeiten-Reiter still fehlt.
+  const foreign = !readOnly() && note.creator_name
+    ? `<p class="form-hint note-read__owner">${esc(t('common.foreignReadOnlyHint', { name: note.creator_name }))}</p>`
+    : '';
   openSharedModal({
     title: note.title && note.title.trim() ? note.title : t('notes.viewNote'),
     size: 'lg',
     content: `
     <div class="note-modal" data-view="read" data-note-id="${note.id}" style="--note-color:${esc(note.color)};">
       <div class="note-read-view" data-pane="read" tabindex="-1">
-        ${renderNoteReadHtml(note.content, { live: true, categories: note.categories || [] })}
+        ${foreign}
+        ${renderNoteReadHtml(note.content, { live: true, categories: note.categories || [], note })}
       </div>
     </div>`,
     onSave(panel) {
@@ -869,44 +1008,74 @@ function openNoteReadModal(note) {
   });
 }
 
+/**
+ * EINE NEUE NOTIZ UEBER EINER FREMDEN SEITE (DW, Ulas U2). "+ Neu > Notiz"
+ * auf der Uebersicht wechselte hierher und klickte den FAB; jetzt geht
+ * derselbe Editor ueber der aufrufenden Seite auf, und nach dem Speichern
+ * frischt `onChanged` sie auf (angepinnt steht die Notiz dort in ihrer
+ * Kachel). Der Editor braucht die Kategorien des Haushalts und notes.css
+ * (Schreibflaeche, Farbwahl) - geliehen fuer die Lebenszeit der Seite
+ * darunter (`signal`, lendPageStyle). Scheitert das Laden, wirft der Aufruf,
+ * und der Aufrufer nimmt den Weg ins Modul.
+ * @param {{ user?: object|null, onChanged?: () => (void|Promise<void>), signal?: AbortSignal|null }} [options]
+ */
+export async function openNewNote({ user = null, onChanged = null, signal = null } = {}) {
+  if (readOnly() || signal?.aborted) return;
+  const [categoriesRes] = await Promise.all([api.get('/notes/categories'), lendPageStyle('/styles/notes.css', signal)]);
+  // DIE SEITE DARUNTER IST GEGANGEN, waehrend geladen wurde (Review p11):
+  // der Editor ginge sonst ueber der neuen Seite auf, mit `onChanged` der
+  // alten. Geprueft VOR dem ersten Schreiben in `state` - steht inzwischen die
+  // Notizenseite selbst, gehoert er ihr.
+  if (signal?.aborted) return;
+  state.categories = categoriesRes?.data || [];
+  state.canManageHousehold = !!categoriesRes?.meta?.can_manage_household;
+  if (user) state.user = user;
+  _awayChanged = onChanged;
+  openNoteModal({ mode: 'create' });
+}
+
+async function notifyAwayChanged() {
+  if (hostedHere() || !_awayChanged) return;
+  try { await _awayChanged(); } catch (err) { console.warn('[Notes] Seite unter dem Editor nicht aufgefrischt:', err); }
+}
+
 function openNoteModal({ mode, note = null }) {
   // Der Riegel steht VOR jeder Vorbereitung: der Anlegeweg entfaellt ganz, ein
   // bestehender Zettel geht als Leseansicht auf.
-  if (readOnly()) {
+  if (readOnly() || (mode === 'edit' && note && !mayChange(note))) {
     if (mode === 'edit' && note) openNoteReadModal(note);
     return;
   }
   const isEdit      = mode === 'edit';
   const selColor    = (isEdit ? note.color : null) || NOTE_COLORS[0];
   // Bestehende Notizen können Farben außerhalb der Palette tragen (Alt-Daten,
-  // frühere Paletten). Die aktuelle Farbe wird dann als eigener Swatch
-  // vorangestellt: sonst wäre nichts selektiert und die Radio-Gruppe hätte
-  // keinen Tastatur-Einstieg (kein tabindex="0" im Roving-Muster).
-  const swatchColors = NOTE_COLORS.includes(selColor) ? NOTE_COLORS : [selColor, ...NOTE_COLORS];
+  // frühere Paletten): der Farbwaehler zeigt sie als eigenen, gewaehlten
+  // Swatch (colorPickerHtml), statt sie still zu ersetzen.
   // Bestehende Notizen öffnen im Lese-Modus (#507); neue direkt im Editor.
   const initialView = isEdit ? 'read' : 'edit';
   let editorClosed = false;
 
   const content = `
     <div class="note-modal" data-view="${initialView}"${isEdit ? ` data-note-id="${note.id}"` : ''} style="--note-color:${esc(selColor)};">
+      ${/* LESEN | BEARBEITEN ALS TEXT (Critique R24 G4-Notizen-P3-1, D3):
+           Reiter tragen ihr Wort, kein Zeichen davor - das Buch und der Stift
+           wiederholten nur, was das Wort sagt. */ ''}
       <div class="note-mode-switch" role="tablist" aria-label="${t('notes.modeSwitchLabel')}">
         <button type="button" id="note-tab-read" class="sub-tab${initialView === 'read' ? ' sub-tab--active' : ''}"
                 role="tab" aria-selected="${initialView === 'read' ? 'true' : 'false'}"
                 aria-controls="note-pane-read" tabindex="${initialView === 'read' ? '0' : '-1'}" data-view="read">
-          <i data-lucide="book-open" class="sub-tab__icon" aria-hidden="true"></i>
           <span class="sub-tab__label">${t('notes.modeRead')}</span>
         </button>
         <button type="button" id="note-tab-edit" class="sub-tab${initialView === 'edit' ? ' sub-tab--active' : ''}"
                 role="tab" aria-selected="${initialView === 'edit' ? 'true' : 'false'}"
                 aria-controls="note-pane-edit" tabindex="${initialView === 'edit' ? '0' : '-1'}" data-view="edit">
-          <i data-lucide="pencil" class="sub-tab__icon" aria-hidden="true"></i>
           <span class="sub-tab__label">${t('notes.modeEdit')}</span>
         </button>
       </div>
 
       <div class="note-read-view" id="note-pane-read" data-pane="read" role="tabpanel"
            aria-labelledby="note-tab-read" tabindex="-1"${initialView === 'read' ? '' : ' hidden'}>
-        ${isEdit ? renderNoteReadHtml(note.content, { live: true, categories: note.categories || [] }) : ''}
+        ${isEdit ? renderNoteReadHtml(note.content, { live: true, categories: note.categories || [], note }) : ''}
       </div>
 
       <div class="note-edit-view" id="note-pane-edit" data-pane="edit" role="tabpanel"
@@ -932,42 +1101,37 @@ function openNoteModal({ mode, note = null }) {
     ${renderCategoryEditor(isEdit ? (note.categories || []).map((category) => category.id) : [])}
     ${advancedSection(`
       <div class="form-group">
-        <label class="form-label" id="note-color-label">${t('notes.colorLabel')}</label>
-        <div class="note-color-picker" role="radiogroup" aria-labelledby="note-color-label">
-          ${swatchColors.map((c) => `
-            <div class="note-color-swatch ${c === selColor ? 'note-color-swatch--active' : ''}"
-                 data-color="${esc(c)}"
-                 style="background-color:${esc(c)};border:2px solid ${c === NOTE_COLORS[7] ? 'var(--color-border)' : esc(c)};"
-                 role="radio"
-                 tabindex="${c === selColor ? '0' : '-1'}"
-                 aria-checked="${c === selColor ? 'true' : 'false'}"
-                 aria-label="${esc(NOTE_COLOR_NAMES()[c] ?? t('notes.colorCurrent'))}"></div>
-          `).join('')}
-        </div>
+        <span class="form-label" id="note-color-label">${t('notes.colorLabel')}</span>
+        ${colorPickerHtml({ id: 'note-color', value: selColor, labelledBy: 'note-color-label', custom: false,
+          options: NOTE_COLORS.map((c) => ({ value: c, label: NOTE_COLOR_NAMES()[c] })) })}
       </div>
       <div class="form-group">
-        <label class="toggle">
-          <input type="checkbox" id="note-pinned" ${isEdit && note.pinned ? 'checked' : ''}>
-          <span class="toggle__track"></span>
-          <span>${t('notes.pinnedLabel')}</span>
-        </label>
-      </div>`,
-      { open: isEdit && (!!note.pinned || (!!note.color && note.color !== NOTE_COLORS[0])) })}
+        ${formSwitchRowHtml({ label: t('notes.pinnedLabel'), checked: Boolean(isEdit && note.pinned), attrs: { id: 'note-pinned' } })}
+      </div>
+      ${renderAccessFields(isEdit ? note : null)}`,
+      { open: isEdit && (!!note.pinned || (!!note.color && note.color !== NOTE_COLORS[0])
+        || note.visibility === 'private' || !!note.locked) })}
       </div>
 
       <div class="modal-panel__footer modal-panel__footer--plain note-modal__footer">
-        ${isEdit ? `<button type="button" class="btn btn--danger-outline" id="note-modal-delete" style="margin-inline-end:auto">
+        ${isEdit ? `<button type="button" class="btn btn--danger-outline" id="note-modal-delete">
           <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${t('common.delete')}
         </button>` : ''}
         <button type="button" class="btn btn--secondary" id="note-modal-cancel" data-editor-only>${t('common.cancel')}</button>
         <button type="button" class="btn btn--primary" id="note-modal-save" data-editor-only>${isEdit ? t('common.save') : t('common.add')}</button>
-        ${isEdit ? `<button type="button" class="btn btn--primary" id="note-modal-edit" data-reader-only>${t('common.edit')}</button>` : ''}
+        ${isEdit ? `<button type="button" class="btn btn--primary" id="note-modal-edit" data-reader-only>
+          <i data-lucide="pencil" class="icon-md" aria-hidden="true"></i><span class="btn__label">${t('common.edit')}</span>
+        </button>` : ''}
       </div>
     </div>`;
 
   openSharedModal({
+    staged: !isEdit, // Buehne zuerst, Felder nach dem ersten Bild (modal.js, R21 a6)
     title: isEdit && note.title && note.title.trim() ? note.title : (isEdit ? t('notes.viewNote') : t('notes.newNote')),
     content,
+    // Eine bestehende Notiz oeffnet lesend: am Finger nimmt der Titel den
+    // Fokus, keine Tastatur ueber dem Text (D4, R23 D13).
+    initialFocus: dialogInitialFocus(isEdit),
     // 'lg' statt 'md' (#826): eine Notiz ist fast nur Textflaeche und bekam
     // dieselbe Breite wie ein Formular aus vier kurzen Feldern. Das ist der
     // Dialog, der einheitlich ist, wo er es nicht sein sollte. 'lg' (680px) ist
@@ -980,7 +1144,6 @@ function openNoteModal({ mode, note = null }) {
       editorClosed = true;
     },
     onSave(panel) {
-      wireCategoryScopeHelp(panel);
       // Reader/Editor-Umschalter (#507): beide Panes bleiben im DOM, damit
       // Dirty-Check und Feld-Verdrahtung intakt bleiben und der Toggle nichts
       // verwirft. Die Leseansicht wird bei jedem Wechsel aus den Live-Feldern
@@ -1000,9 +1163,19 @@ function openNoteModal({ mode, note = null }) {
       const viewContent = panel.querySelector('#note-content');
       const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+      // DER FUSS FOLGT DEM DETAIL-FUSS-KANON (Critique R22, D20): in der
+      // Leseansicht wie das Leseblatt der Kontakte - Loeschen am Anfang,
+      // Bearbeiten gefuellt mit Stift am Ende; im Editor wie jeder Dialogfuss -
+      // Loeschen, Abbrechen, Speichern. Loeschen ist in beiden Ansichten
+      // derselbe umrandete Knopf mit Wort (R24, G0-Shell-P3-1: EINE
+      // Loeschen-Form app-weit, `danger-ghost` ist entfallen).
+      const deleteBtn = panel.querySelector('#note-modal-delete');
       function syncFooter(view) {
         editorOnly.forEach((el) => { el.style.display = view === 'read' ? 'none' : ''; });
         readerOnly.forEach((el) => { el.style.display = view === 'read' ? '' : 'none'; });
+        // Lesend steht Loeschen mobil mit Wort, im Editor als Papierkorb neben
+        // Abbrechen/Speichern (R23, modal.js `--delete-worded`).
+        decorateFooterDelete(deleteBtn?.closest('.modal-panel__footer') ?? null);
       }
 
       function animatePane(pane) {
@@ -1046,7 +1219,7 @@ function openNoteModal({ mode, note = null }) {
         if (view === 'read') {
           // Live-Spiegelung: Farbe aus dem aktiven Swatch, Inhalt frisch gerendert
           // — Lesemodus zeigt ungespeicherte Änderungen.
-          const c = panel.querySelector('.note-color-swatch--active')?.dataset.color;
+          const c = panel.querySelector('#note-color')?.value;
           if (c) noteModal.style.setProperty('--note-color', c);
           syncHeaderTitle();
           readPane.replaceChildren();
@@ -1055,6 +1228,7 @@ function openNoteModal({ mode, note = null }) {
           // anders als die der Notiz auf dem Server (#704).
           readPane.insertAdjacentHTML('beforeend', renderNoteReadHtml(viewContent.value, {
             live: isEdit && viewContent.value === note.content,
+            note,
             categories: [...panel.querySelectorAll('input[name="note-category"]:checked')]
               .map((input) => state.categories.find((category) => Number(category.id) === Number(input.value)))
               .filter(Boolean),
@@ -1122,36 +1296,10 @@ function openNoteModal({ mode, note = null }) {
         setTimeout(() => panel.querySelector('.note-mode-switch .sub-tab--active')?.focus(), 80);
       }
 
-      // Farb-Swatch: Auswahl + ARIA + Keyboard (Roving Tabindex)
-      function selectSwatch(target) {
-        panel.querySelectorAll('.note-color-swatch').forEach((s) => {
-          s.classList.remove('note-color-swatch--active');
-          s.setAttribute('aria-checked', 'false');
-          s.setAttribute('tabindex', '-1');
-        });
-        target.classList.add('note-color-swatch--active');
-        target.setAttribute('aria-checked', 'true');
-        target.setAttribute('tabindex', '0');
-      }
-      panel.querySelectorAll('.note-color-swatch').forEach((sw) => {
-        sw.addEventListener('click', () => { selectSwatch(sw); sw.focus(); });
-        sw.addEventListener('keydown', (e) => {
-          const swatches = [...panel.querySelectorAll('.note-color-swatch')];
-          const idx = swatches.indexOf(sw);
-          if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
-            e.preventDefault();
-            const next = swatches[(idx + 1) % swatches.length];
-            selectSwatch(next); next.focus();
-          } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
-            e.preventDefault();
-            const prev = swatches[(idx - 1 + swatches.length) % swatches.length];
-            selectSwatch(prev); prev.focus();
-          } else if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            selectSwatch(sw);
-          }
-        });
-      });
+      // Die Notizfarbe ist der geteilte Waehler (utils/color-picker.js,
+      // Critique R24 E6) - kuratierte Pastelltoene als Kartengrund, deshalb
+      // ohne "Eigene": auf einem frei gewaehlten Grund gibt es keine Tinte.
+      wireColorPicker(panel);
 
       // Formatierungs-Toolbar (geteilt mit den Aufgaben-Notizen, #731)
       const textarea = panel.querySelector('#note-content');
@@ -1303,7 +1451,7 @@ function openNoteModal({ mode, note = null }) {
             direction,
           });
           activeCategoryOption = movement.activeIndex;
-        } else if (event.key === 'Enter') {
+        } else if (event.key === 'Enter' && !isImeComposing(event)) {
           event.preventDefault();
           const options = [...categoryList.querySelectorAll('[role="option"]')];
           const active = options[activeCategoryOption];
@@ -1377,7 +1525,7 @@ function openNoteModal({ mode, note = null }) {
           renderFilters();
         } catch (err) {
           if (editorIsCurrent()) {
-            window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+            window.yuvomi?.showToast(errorSentence(err), 'danger');
           }
         } finally {
           if (pendingCategoryCreate === createRequest) pendingCategoryCreate = null;
@@ -1388,6 +1536,24 @@ function openNoteModal({ mode, note = null }) {
         }
       });
 
+      async function offerCurrentCategories() {
+        try {
+          const res = await api.get('/notes/categories');
+          state.categories = res.data ?? [];
+          state.canManageHousehold = !!res.meta?.can_manage_household;
+        } catch {
+          return;
+        }
+        if (!editorIsCurrent()) return;
+        const known = new Set(state.categories.map((category) => Number(category.id)));
+        for (const chip of [...categoryChoices.querySelectorAll('[data-selected-category-id]')]) {
+          if (!known.has(Number(chip.dataset.selectedCategoryId))) chip.remove();
+        }
+        renderCategorySuggestions({ open: false });
+        renderFilters();
+        categorySearch.focus();
+      }
+
       panel.querySelector('#note-modal-cancel').addEventListener('click', closeModal);
 
       panel.querySelector('#note-modal-save').addEventListener('click', async () => {
@@ -1395,7 +1561,7 @@ function openNoteModal({ mode, note = null }) {
         const saveBtn = saveButton;
         const title   = panel.querySelector('#note-title').value.trim() || null;
         const cnt     = panel.querySelector('#note-content').value.trim();
-        const color   = panel.querySelector('.note-color-swatch--active')?.dataset.color || NOTE_COLORS[0];
+        const color   = panel.querySelector('#note-color')?.value || NOTE_COLORS[0];
         const pinned  = panel.querySelector('#note-pinned').checked ? 1 : 0;
         const category_ids = [...panel.querySelectorAll('input[name="note-category"]:checked')]
           .map((input) => Number(input.value));
@@ -1407,16 +1573,17 @@ function openNoteModal({ mode, note = null }) {
         }
 
         noteSavePending = true;
+        const dialog = captureModalContext();
         categoryCreateButton.disabled = true;
         saveBtn.disabled    = true;
         saveBtn.textContent = '…';
 
         try {
           if (mode === 'create') {
-            const res = await api.post('/notes', { title, content: cnt, color, pinned, category_ids });
+            const res = await api.post('/notes', { title, content: cnt, color, pinned, category_ids, ...readAccessFields(panel) });
             state.notes.unshift(res.data);
           } else {
-            const res = await api.put(`/notes/${note.id}`, { title, content: cnt, color, pinned, category_ids });
+            const res = await api.put(`/notes/${note.id}`, { title, content: cnt, color, pinned, category_ids, ...readAccessFields(panel) });
             const idx = state.notes.findIndex((n) => n.id === note.id);
             if (idx !== -1) state.notes[idx] = res.data;
             state.notes.sort((a, b) => b.pinned - a.pinned);
@@ -1424,8 +1591,22 @@ function openNoteModal({ mode, note = null }) {
           closeSavedEditorWhenActive();
           renderNotesAndFilters({ motion: true });
           window.yuvomi?.showToast(mode === 'create' ? t('notes.createdToast') : t('notes.savedToast'), 'success');
+          // Ueber einer fremden Seite frischt diese sich auf (openNewNote).
+          if (!hostedHere()) await notifyAwayChanged();
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+          window.yuvomi?.showToast(errorSentence(err), 'danger');
+          // Die Notiz gibt es nicht mehr (#1909): nichts mehr zu speichern -
+          // der Editor geht zu, solange er der offene ist.
+          if (isEdit && dropGoneNote(err, note.id)) {
+            noteSavePending = false;
+            if (editorIsCurrent()) closeModal({ force: true, context: dialog });
+            return;
+          }
+          if (!editorIsCurrent()) return;
+          // Eine gewaehlte Kategorie ist inzwischen weg: der Editor bleibt
+          // offen, die Kategorien kommen frisch, und was es nicht mehr gibt,
+          // faellt aus der Auswahl.
+          if (err?.data?.reason === 'notes_selected_category_not_found') await offerCurrentCategories();
           if (!editorIsCurrent()) return;
           btnError(saveBtn);
           noteSavePending = false;
@@ -1509,7 +1690,7 @@ function openNoteCategoryManager() {
 // --------------------------------------------------------
 
 async function togglePin(id) {
-  if (readOnly()) return;
+  if (!mayChange(noteById(id))) return;
   try {
     const res  = await api.patch(`/notes/${id}/pin`, {});
     const note = state.notes.find((n) => n.id === id);
@@ -1517,7 +1698,8 @@ async function togglePin(id) {
     state.notes.sort((a, b) => b.pinned - a.pinned);
     renderGrid({ motion: true });
   } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+    window.yuvomi?.showToast(errorSentence(err), 'danger');
+    dropGoneNote(err, id);
   }
 }
 
@@ -1539,22 +1721,34 @@ async function reloadNotes() {
 }
 
 async function deleteNote(id) {
-  if (readOnly()) return;
+  if (!mayChange(noteById(id))) return;
   closeModal({ force: true });
   const note = state.notes.find((n) => n.id === id);
   state.notes = state.notes.filter((n) => n.id !== id);
   renderNotesAndFilters({ motion: true });
   vibrate([30, 50, 30]);
 
+  // Der Toast nennt die Notiz (Critique R23, D6): "Notiz geloescht" sagte nach
+  // zwei schnellen Loeschungen nicht, welche zurueckkaeme. Ohne Titel bleibt
+  // der allgemeine Satz.
+  const name = String(note?.title ?? '').trim();
   scheduleUndoableDelete({
-    message: t('notes.deletedToast'),
-    commit: ({ keepalive }) => api.delete(`/notes/${id}`, { keepalive }),
+    message: name ? t('common.deletedNamed', { name }) : t('notes.deletedToast'),
+    commit: async ({ keepalive }) => {
+      try {
+        await api.delete(`/notes/${id}`, { keepalive });
+      } catch (err) {
+        // SCHON GELOESCHT IST EIN ERFOLG (#1909): ein anderes Haushaltsmitglied
+        // war schneller. Kein Toast, die Notiz kommt nicht zurueck.
+        if (!isAlreadyDeleted(err, 'notes_note_not_found')) throw err;
+      }
+    },
     restore: (err) => {
       if (note) {
         state.notes = [...state.notes, note].sort((a, b) => b.pinned - a.pinned);
         renderNotesAndFilters({ motion: true });
       }
-      if (err) window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+      if (err) window.yuvomi?.showToast(errorSentence(err), 'danger');
     },
   });
 }
@@ -1575,4 +1769,9 @@ export const __test = {
   openNoteModal,
   // #1821: der Tiefenlink `?open=<id>` wird am Programm gemessen.
   openNoteFromQuery,
+  // #1909: Anpinnen und Loeschen einer Notiz, die es nicht mehr gibt.
+  togglePin, deleteNote,
+  // #1514, #1602: Sichtbarkeit und Sperre - Felder im Editor, Zeichen an der Karte.
+  renderAccessFields, renderAccessMarks,
+  setContainerForTest(container) { _container = container; },
 };

@@ -1,12 +1,12 @@
-<!-- version: 2.78.0 -->
-This update makes Yuvomi start faster, gives phones more room for content and reworks many screens, with a few new features along the way.
+<!-- version: 2.83.0 -->
+This update brings servings to recipes, your own defaults for new tasks and a broad round of fixes across the app.
 
-You can now find your weather location by name instead of typing coordinates. Birthdays and name days have their own calendar feed, the budget ledger sorts by date or amount and filters by account, and on wide screens the calendar shows a sidebar with a mini month, people and what is up next. The search palette (Cmd+K or Ctrl+K) remembers the places you opened recently.
+A recipe can now say how many servings it is for, and a stepper recalculates every amount; planning a meal or adding it to the shopping list takes the servings you chose. New tasks open with the visibility and lock setting you pick under Settings > Tasks. Shared expenses use your budget categories, and recipes mirrored from Mealie now bring their preparation steps along.
 
-New child accounts start with child defaults: budget off, household help read-only without amounts, and their own points first. Existing accounts keep their permissions. A household help payment task is now only visible to the adults who pay.
+Recurring tasks keep their repeat on a CalDAV server, old daily series show up in the calendar again, and imported calendars take on a new colour when you change it. Amount fields accept a comma or a point, weights in grams and kilograms share one chart, and email with encryption set to "None" now sends. Many smaller fixes make phone layouts, settings and the welcome tour easier to use.
 
-On a phone the tab bar shrinks to a small pill while you read, headers take less space, and lists react faster when you tick off items. Budget figures are clearer: loans keep money you owe apart from money owed to you, statistics share one scale, and a missing pulse is no longer drawn as zero. Settings, dialogs and empty screens follow one layout across all modules.
+A member colour can now only be a real colour. Before, another account in the household could place its own styling on other members' screens through that field.
 
-Two database migrations run automatically on first start: one prepares the birthday feed, the other moves open household help payment tasks to the adults who pay. No action is needed. As always, a backup before updating is a good idea.
+This update changes the database. The changes are applied automatically on the first start and need no action from you; as always, a backup before updating is a good idea.
 
-Full release notes are available at https://github.com/ulsklyc/yuvomi/releases/tag/v2.78.0
+Full release notes are available at https://github.com/ulsklyc/yuvomi/releases/tag/v2.83.0

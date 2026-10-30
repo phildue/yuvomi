@@ -23,6 +23,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { register } from 'node:module';
 import express from 'express';
+import { eachRule } from './css-rules.js';
 
 process.env.DB_PATH = ':memory:';
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'dashboard-rewards-test-secret';
@@ -251,36 +252,67 @@ test('Ein einziges Mitglied: die eigene Zeile wird zur eigenen Sicht, eine fremd
 test('Groessen: die Kachel entscheidet, wie viel davon steht', () => {
   const recent = [1, 2, 3].map((n) => ({ delta: n, reason: `R${n}`, type: 'earn', created_at: '2026-09-01T08:00:00Z' }));
   const kid = (size) => renderRewardsWidget({ view: 'self', me: 7, standings: [emma(45)], catalog: [KINO], recent }, size);
-  const rowsOf = (html) => (html.match(/rewards-recent__row"/g) || []).length;
-  assert.equal(rowsOf(kid('1x1')), 0, '1x1 traegt nur den Weg zum Ziel');
+  // Gezaehlt wird, was ohne Streckung steht.
+  const rowsOf = (html) => (html.match(/<li class="rewards-recent__row"[^>]*>/g) || []).filter((tag) => !tag.includes('data-fill-row')).length;
+  const fillRowsOf = (html) => (html.match(/<li class="rewards-recent__row" data-fill-row>/g) || []).length;
+  // R22 S10, seit U14 ueber die eine Mechanik aller Listen: 1x1 traegt den Weg
+  // zum Ziel - und den Verlauf nur als Zusatzzeilen (`data-fill-row`), die
+  // stehen, wenn die Packung der Kachel Hoehe zuteilt. Der Block samt
+  // Ueberschrift kommt mit der ersten (`data-fill-group`). Breit und hoch
+  // steht er wie bisher in `.rewards-self__recent`.
+  const small = kid('1x1');
+  assert.equal(rowsOf(small), 0, '1x1 zeigt ohne Streckung keinen Verlauf');
+  assert.equal(fillRowsOf(small), 3, 'der Verlauf fuellt hoechstens drei Zeilen');
+  assert.match(small, /class="rewards-self__recent" data-fill-group/, 'die Ueberschrift kommt mit der ersten Zeile');
   assert.equal(rowsOf(kid('2x1')), 2);
+  assert.equal(fillRowsOf(kid('2x1')), 1, 'breit wartet die dritte');
   assert.equal(rowsOf(kid('1x2')), 3);
+  assert.equal(fillRowsOf(kid('1x2')), 0, 'hoch steht alles, was geladen ist');
+  const css = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
+  assert.doesNotMatch(css, /rewards-recent--fill/, 'keine eigene Fuell-Liste mehr neben der Mechanik aller Listen');
   assert.equal(progressValue(kid('1x1')), 75, 'der Balken bleibt auf jeder Groesse');
 
   const kids = ['Anna', 'Ben', 'Carla'].map((name, i) => ({ id: 20 + i, display_name: name, balance: 10 }));
   const parent = (size) => renderRewardsWidget({ view: 'approver', me: 1, standings: kids, catalog: [KINO], pending: 1 }, size);
   const short = parent('1x1');
-  assert.equal((short.match(/class="rewards-member"/g) || []).length, 2);
+  const members = (html) => (html.match(/<li class="list-row rewards-member"[^>]*>/g) || []).filter((tag) => !tag.includes('data-fill-row')).length;
+  assert.equal(members(short), 2);
+  assert.equal((short.match(/<li class="list-row rewards-member" data-fill-row>/g) || []).length, 1, 'die dritte wartet als Zusatzzeile (U14)');
   assert.match(short, /dashboard\.shoppingMore\{"count":1\}/, 'wer nicht passt, wird gezaehlt');
   assert.doesNotMatch(short, /class="rewards-goal__label"/, 'die flache Kachel zeigt den Balken ohne Satz');
   assert.match(short, /aria-valuetext="rewards\.remainingToReward/, 'die Ansage behaelt den Satz');
   const tall = parent('1x2');
-  assert.equal((tall.match(/class="rewards-member"/g) || []).length, 3);
+  assert.equal(members(tall), 3);
   assert.match(tall, /class="rewards-goal__label"/);
+
+  // U1 b (DW-P1-3): die Kachel ist so hoch wie das, was in ihrer Groesse steht -
+  // und sagt fuer jede Groesse dieselbe Hoehe, die sie in dieser Groesse meldet
+  // (der Lueckenhinweis probiert Groessen, ohne neu zu zeichnen).
+  const spuren = (html) => Number(/data-span-rows="(\d+)"/.exec(html)?.[1]);
+  const jeGroesse = (html) => Object.fromEntries((/data-span-sizes="([^"]*)"/.exec(html)?.[1] ?? '').split(',').map((e) => e.split(':')).map(([k, v]) => [k, Number(v)]));
+  assert.ok(spuren(kid('1x2')) > spuren(kid('1x1')), 'hoch steht der Verlauf - die Kachel ist hoeher');
+  assert.ok(spuren(parent('1x2')) > spuren(parent('1x1')), 'hoch drei Mitglieder mit Satz, flach zwei ohne');
+  for (const view of [kid, parent]) {
+    const angesagt = jeGroesse(view('1x1'));
+    for (const size of ['1x1', '2x1', '1x2', '2x2']) assert.equal(angesagt[size], spuren(view(size)), `${size}: angesagt = gemeldet`);
+  }
 });
 
 test('Leerzustand: ein Kind bekommt keinen Knopf, den es nicht benutzen darf', () => {
   const kid = renderRewardsWidget({ view: 'self', me: 7, standings: [], catalog: [] }, '1x1');
   assert.match(kid, /dashboard\.noRewards/);
-  assert.doesNotMatch(kid, /rewards\.addReward/, 'Praemien anlegen ist Elternsache');
+  // Seit DW p7 traegt die Aktion der ruhigen Zeile nur das Verb ("Hinzufuegen"),
+  // der Satz daneben nennt das Objekt - erkannt wird sie an ihrem Ziel.
+  assert.doesNotMatch(kid, /card-empty-row__action/, 'Praemien anlegen ist Elternsache');
   const parent = renderRewardsWidget({ view: 'approver', me: 1, standings: [], catalog: [] }, '1x1');
-  assert.match(parent, /rewards\.addReward/);
+  assert.match(parent, /<button type="button" class="btn btn--secondary btn--sm card-empty-row__action"[^>]*data-route="\/rewards"/);
 });
 
 test('Kennzahlkachel: das Kind sieht den eigenen Stand, niemand einen Spitzenreiter', () => {
   global.window = { yuvomi: null };
-  // Eine Kachelreihe braucht mindestens zwei Kacheln - das Budget ist die zweite.
-  const base = { budget: { entryCount: 3, balance: 100, income: 200 }, birthdays: [], pinnedNotes: [], health: {}, housekeeping: {} };
+  // Eine Kachelreihe braucht mindestens zwei Kacheln - die Notiz ist die zweite
+  // (der Saldo steht seit R21 nicht mehr in der Reihe).
+  const base = { birthdays: [], pinnedNotes: [{ title: 'Zettel', pinned: 1 }], pinnedNotesCount: 1, health: {}, housekeeping: {} };
   const kidTile = selectMetricTiles({
     ...base, rewards: { view: 'self', me: 7, standings: [emma(45)], catalog: [KINO] },
   }, 'EUR', new Set()).find((tile) => tile.id === 'rewards');
@@ -297,7 +329,7 @@ test('Kennzahlkachel: das Kind sieht den eigenen Stand, niemand einen Spitzenrei
 
 test('Kennzahlkachel: offene Geld-Anfragen zaehlen mit - aber nur fuer den, der freigibt', () => {
   global.window = { yuvomi: null };
-  const base = { budget: { entryCount: 3, balance: 100, income: 200 }, birthdays: [], pinnedNotes: [], health: {}, housekeeping: {} };
+  const base = { birthdays: [], pinnedNotes: [{ title: 'Zettel', pinned: 1 }], pinnedNotesCount: 1, health: {}, housekeeping: {} };
   const tile = (rewards) => selectMetricTiles({ ...base, rewards }, 'EUR', new Set()).find((t) => t.id === 'rewards');
   // Eltern: Praemien- und Geld-Anfragen zusammen, auch wenn nur Geld offen ist.
   const both = tile({ view: 'approver', me: 1, standings: [leo(60), emma(30)], catalog: [KINO], pending: 1, moneyPending: 2 });
@@ -338,8 +370,10 @@ const { __test: rewardsPage } = await import('../public/pages/rewards.js');
 function markupEl() {
   return {
     html: '',
+    dataset: {},
     replaceChildren() { this.html = ''; },
     insertAdjacentHTML(_pos, html) { this.html += html; },
+    addEventListener() {},
     querySelector() { return null; },
     querySelectorAll() { return []; },
   };
@@ -358,7 +392,7 @@ test('Belohnungen: nur der Katalog ist ein breiter Abschnitt, Uebersicht und Ver
     for (const [name, render] of [['renderOverview', rewardsPage.renderOverview], ['renderLedger', rewardsPage.renderLedger]]) {
       const el = markupEl();
       render(el);
-      assert.match(el.html, /class="rw-section"/, `${name}: der Abschnitt steht da`);
+      assert.match(el.html, /class="rw-section[" ]/, `${name}: der Abschnitt steht da`);
       assert.doesNotMatch(el.html, wide, `${name}: eine Zeilenliste ist kein breiter Abschnitt`);
     }
     const katalog = markupEl();
@@ -421,13 +455,15 @@ test('Belohnungen: Uebersicht und Verlauf stehen im Spaltenraster, die Seitenspa
       assert.doesNotMatch(el.html, /page-columns__rail/, `recentLedger=${JSON.stringify(leer)}: keine Seitenspalte`);
     }
 
-    // Verlauf: Buchungen links, Punktestaende in Kurzform rechts.
+    // Verlauf (R24, E8): eine Ebene unter "Punkte" - Rueckweg, Titel,
+    // Personen, Buchungen. Die Punktestaende als Seitenspalte waren genau die
+    // Spiegelung der Uebersicht, die E8 aufhebt.
     el = markupEl();
     rewardsPage.renderLedger(el);
-    const [lMain, lRail] = el.html.split('<div class="page-columns__rail">');
-    assert.match(lMain, /<ul class="rw-ledger row-carrier">/, 'die Buchungen stehen in der Listenspalte');
-    assert.match(lRail ?? '', /rw-standing--compact[\s\S]*Emma/, 'die Punktestaende stehen in der Seitenspalte');
-    assert.doesNotMatch(lRail ?? '', /rw-redeem-open|rw-progress__track/, 'Kurzform: kein Fortschritt, kein Einloesen');
+    assert.match(el.html, /<ul class="rw-ledger row-carrier">/, 'die Buchungen stehen da');
+    assert.doesNotMatch(el.html, /page-columns__rail|rw-standing/, 'keine Punktestaende-Spalte mehr im Verlauf');
+    assert.match(el.html, /<button type="button" class="rw-back" data-rw-back>[\s\S]*rewards\.tabPoints[\s\S]*<h2[^>]*>rewards\.tabLedger<\/h2>/,
+      'vorn der Rueckweg mit dem Namen der Ebene darueber, dann der Titel');
   } finally {
     Object.assign(s, vorher);
   }
@@ -498,7 +534,8 @@ test('Belohnungen: Verlaufs-Chips sind Kanon-Filterchips mit aria-pressed (Re-Cr
     s.ledgerFilter = 3;
     const el = markupEl();
     rewardsPage.renderLedger(el);
-    const chips = [...el.html.matchAll(/<button[^>]*data-filter="([^"]*)"[^>]*>/g)];
+    // Seit R24 die EINE Personenzeile: Achse `ledger-member`, Person im Wert.
+    const chips = [...el.html.matchAll(/<button[^>]*data-filter="ledger-member" data-value="([^"]*)"[^>]*>/g)];
     assert.equal(chips.length, 3, 'Alle + zwei Personen');
     for (const [tag, id] of chips) {
       assert.match(tag, /class="[^"]*\bfilter-chip\b/, `Chip ${id}: .filter-chip`);
@@ -737,76 +774,38 @@ function wiredEl() {
   return el;
 }
 
-test('Uebersicht: "Bonus vergeben" steht im Kopf der Punktestaende und oeffnet den Bonus-Dialog (#1787)', async () => {
-  // Der Bonus war nur ueber den FAB im Reiter Verlauf zu erreichen; Eltern
-  // suchen ihn dort, wo die Punktestaende stehen.
-  const { setPermissions, clearPermissions } = await import('../public/permissions.js');
+test('Uebersicht: der Bonus ist der FAB auf "Punkte", im Kopf der Punktestaende steht "Teilnehmer verwalten" als Knopf (#1787, R23 S10, R24)', async () => {
+  // #1787: der Bonus war nur ueber den FAB im Reiter Verlauf zu erreichen;
+  // Eltern suchen ihn dort, wo die Punktestaende stehen. Bis R23 stand er
+  // deshalb als Abschnittsknopf dort - und im Verlauf als FAB: zwei Bauformen,
+  // auf "Punkte" fehlte die Kopfpille (Critique G2 P3). Seit R23 traegt der
+  // Reiter "Punkte" den FAB "Bonus" (nur mit Teilnehmenden), der Kopf der
+  // Punktestaende nur noch das Mehr-Menue mit "Teilnehmende verwalten".
   const s = rewardsPage.state;
-  const vorher = { user: s.user, overview: s.overview, catalog: s.catalog, redemptions: s.redemptions, open: globalThis.__openModal };
-  const dialoge = [];
-  globalThis.__openModal = (options) => { dialoge.push(options); };
+  const vorher = { user: s.user, overview: s.overview, catalog: s.catalog, redemptions: s.redemptions };
   const kopf = (html) => (html.match(/<div class="rw-section__head">\s*<h2[^>]*>rewards\.standings<\/h2>([\s\S]*?)<\/div>\s*<ul class="row-carrier rw-standings">/) || [])[1];
   try {
     s.user = { id: 1, role: 'admin' };
     s.overview = { me: 1, balances: [{ id: 2, display_name: 'Emma', balance: 30 }] };
     s.catalog = [];
     s.redemptions = [];
-
     const el = wiredEl();
     rewardsPage.renderOverview(el);
     const head = kopf(el.html);
     assert.ok(head, 'Vorbedingung: der Kopf der Punktestaende steht da');
-    const knoepfe = [...head.matchAll(/<button class="([^"]*)" type="button">[\s\S]*?<\/i>([^<]*)<\/button>/g)].map(([, cls, label]) => ({ cls, label }));
-    assert.deepEqual(knoepfe.map((k) => k.label), ['rewards.manageParticipants', 'rewards.grantBonus'],
-      'zwei beschriftete Kopfaktionen, der Bonus am Ende');
-    assert.match(knoepfe[1].cls, /\bbtn--secondary\b/, 'der Bonus ist die staerkere der beiden');
-    assert.match(knoepfe[0].cls, /\bbtn--ghost\b/, 'Teilnehmer verwalten bleibt leise');
-    assert.equal((el.html.match(/rw-grant-bonus/g) || []).length, 1, 'genau EIN Knopf - keiner je Personenzeile');
-
-    assert.equal(typeof el.clicks.get('rw-grant-bonus'), 'function', 'der Knopf ist verdrahtet');
-    el.clicks.get('rw-grant-bonus')({ type: 'click' });
-    assert.equal(dialoge.length, 1, 'ein Klick oeffnet einen Dialog');
-    assert.equal(dialoge[0].title, 'rewards.grantBonus');
-    assert.match(dialoge[0].content, /id="rw-bonus-form"/, 'und zwar den vorhandenen Bonus-Dialog');
-    assert.match(dialoge[0].content, /<option value="2">Emma/);
-
-    // Kind: weder Knopf noch Verdrahtung.
-    s.user = { id: 2, role: 'member' };
-    const kind = wiredEl();
-    rewardsPage.renderOverview(kind);
-    assert.ok(kopf(kind.html) !== undefined, 'Vorbedingung: das Kind sieht die Punktestaende');
-    assert.doesNotMatch(kind.html, /rw-grant-bonus|rewards\.grantBonus/);
-    assert.equal(kind.clicks.has('rw-grant-bonus'), false);
-
-    // Nur lesen: der Zustand bleibt, die Handlung geht - auch fuer ein Elternteil.
-    s.user = { id: 1, role: 'admin' };
-    setPermissions({ admin: false, modules: { rewards: 'read' }, widgets: {}, capabilities: {} });
-    try {
-      const ro = wiredEl();
-      rewardsPage.renderOverview(ro);
-      assert.match(ro.html, /rewards\.standings/);
-      assert.doesNotMatch(ro.html, /rw-grant-bonus|rewards\.grantBonus/);
-    } finally {
-      clearPermissions();
-    }
-
-    // Ohne Teilnehmende gibt es keinen Kopf und damit keinen Knopf (gewollt).
-    const { installMiniDom } = await import('./mini-dom.js');
-    const domZurueck = installMiniDom();
-    try {
-      s.overview = { me: 1, balances: [], setup: { participantCount: 0, catalogCount: 1, pointedTaskCount: 1 } };
-      const leer = wiredEl();
-      rewardsPage.renderOverview(leer);
-      assert.match(leer.html, /rewards\.emptyOverviewTitle/);
-      assert.doesNotMatch(leer.html, /rw-grant-bonus/);
-    } finally {
-      domZurueck();
-    }
+    assert.doesNotMatch(head, /rw-grant-bonus|rewards\.grantBonus/, 'kein zweiter Bonus-Knopf neben dem FAB');
+    // R24 (G2-Belohnungen-P3-3): EINE Handlung im Kopf ist der direkte Knopf
+    // mit Wort (D5, S5-F1) - wie "Taschengeld einrichten" daneben, kein "..."
+    // mit genau einem Eintrag.
+    assert.doesNotMatch(head, /rw-section-tools\b|popover-menu__trigger/, 'kein Mehr-Menue mit einem einzigen Eintrag');
+    assert.match(head, /<button class="btn btn--secondary btn--sm" type="button" data-action="manage-participants"><i data-lucide="users-round"[^>]*><\/i>rewards\.manageParticipants<\/button>/);
   } finally {
-    const { open, ...rest } = vorher;
-    Object.assign(s, rest);
-    globalThis.__openModal = open;
+    Object.assign(s, vorher);
   }
+  const src = readFileSync(new URL('../public/pages/rewards.js', import.meta.url), 'utf8');
+  const fab = src.slice(src.indexOf('function updateRewardsFab()'), src.indexOf('function renderShell('));
+  assert.match(fab, /\(state\.tab === LEDGER \|\| \(state\.tab === 'overview' && balances\(\)\.length\)\) && isAdmin\(\)/,
+    'der FAB "Bonus" steht auf Punkte (mit Teilnehmenden) und im Verlauf');
 });
 
 test('Uebersicht ohne Teilnehmende: die offene Anfrage steht trotzdem da und ist entscheidbar (#1623)', async () => {
@@ -843,7 +842,7 @@ test('Uebersicht ohne Teilnehmende: die offene Anfrage steht trotzdem da und ist
       rewardsPage.renderOverview(ro);
       assert.match(ro.html, /rw-pending-panel/);
       assert.doesNotMatch(ro.html, /data-decide=/);
-      assert.doesNotMatch(ro.html, /rw-manage-participants/);
+      assert.doesNotMatch(ro.html, /data-action="manage-participants"/);
     } finally {
       clearPermissions();
     }
@@ -854,6 +853,71 @@ test('Uebersicht ohne Teilnehmende: die offene Anfrage steht trotzdem da und ist
     rewardsPage.renderOverview(leer);
     assert.doesNotMatch(leer.html, /rw-pending/);
     assert.match(leer.html, /rewards\.emptyOverviewTitle/);
+  } finally {
+    Object.assign(s, vorher);
+    domZurueck();
+  }
+});
+
+/**
+ * Die oeffnenden Tags aller Knoepfe im Markup, je als Attributtabelle. Nur so
+ * viel Selektor, wie `wireOverview` fragt: `.klasse`, `[attr]`, `[attr="wert"]`.
+ */
+function buttonTags(html) {
+  return [...html.matchAll(/<button\b([^>]*)>/g)].map((m) => {
+    const attrs = new Map();
+    for (const a of m[1].matchAll(/([\w-]+)(?:="([^"]*)")?/g)) attrs.set(a[1], a[2] ?? '');
+    return attrs;
+  });
+}
+function tagMatches(attrs, selector) {
+  const cls = /^\.([\w-]+)$/.exec(selector);
+  if (cls) return (attrs.get('class') ?? '').split(/\s+/).includes(cls[1]);
+  const attr = /^\[([\w-]+)(?:="([^"]*)")?\]$/.exec(selector);
+  if (attr) return attrs.has(attr[1]) && (attr[2] === undefined || attrs.get(attr[1]) === attr[2]);
+  return false;
+}
+
+/** Ein Inhaltsknoten, der merkt, welcher Selektor welchen Klick-Handler bekommt - nur fuer Knoepfe, die das Markup wirklich traegt. */
+function listeningEl() {
+  const el = markupEl();
+  el.bound = [];
+  const stub = (selector) => ({
+    addEventListener: (type, fn) => { if (type === 'click') el.bound.push({ selector, fn }); },
+  });
+  el.querySelector = (selector) => (buttonTags(el.html).some((a) => tagMatches(a, selector)) ? stub(selector) : null);
+  el.querySelectorAll = (selector) => buttonTags(el.html).filter((a) => tagMatches(a, selector)).map(() => stub(selector));
+  return el;
+}
+
+test('#2210: "Teilnehmende verwalten" oeffnet den Dialog - im Leerzustand UND im Mehr-Menue', async () => {
+  // Seit #2052 trug der Knopf im Leerzustand nur `rw-manage-participants`,
+  // `wireOverview` band aber allein `[data-action="manage-participants"]` (das
+  // Attribut des Menueeintrags). Der Klick lief ins Leere, und ohne Teilnehmende
+  // ist dieser Knopf der einzige Weg, jemanden einzutragen.
+  const { installMiniDom } = await import('./mini-dom.js');
+  const domZurueck = installMiniDom();
+  const s = rewardsPage.state;
+  const vorher = { user: s.user, overview: s.overview, catalog: s.catalog, redemptions: s.redemptions, recentLedger: s.recentLedger };
+  const oeffnet = (el) => buttonTags(el.html)
+    .filter((attrs) => el.bound.some((b) => b.fn === rewardsPage.openParticipantsModal && tagMatches(attrs, b.selector)));
+  try {
+    s.user = { id: 1, role: 'admin' };
+    s.catalog = [];
+    s.redemptions = [];
+    s.recentLedger = [];
+
+    s.overview = { me: 1, balances: [], setup: { participantCount: 0, catalogCount: 0, pointedTaskCount: 0 } };
+    const leer = listeningEl();
+    rewardsPage.renderOverview(leer);
+    const cta = buttonTags(leer.html).filter((a) => (a.get('class') ?? '').split(/\s+/).includes('empty-state__cta'));
+    assert.equal(cta.length, 1, 'Vorbedingung: der Leerzustand traegt genau einen Knopf');
+    assert.deepEqual(oeffnet(leer), cta, 'der Knopf im Leerzustand ist an openParticipantsModal gebunden');
+
+    s.overview = { me: 1, balances: [{ id: 2, display_name: 'Emma', balance: 30 }] };
+    const voll = listeningEl();
+    rewardsPage.renderOverview(voll);
+    assert.equal(oeffnet(voll).length, 1, 'der Menueeintrag im Kopf der Punktestaende oeffnet denselben Dialog');
   } finally {
     Object.assign(s, vorher);
     domZurueck();
@@ -921,6 +985,10 @@ test('Belohnungen: das Kind sieht seine eigene Karte "Deine Punkte -> naechste P
     assert.match(card, /role="progressbar"[^>]*aria-valuenow="75"/, '30 von 40 - der Weg als Balken');
     assert.doesNotMatch(card, /rw-redeem-open/, '30 reicht fuer nichts: kein Einloese-Knopf');
     assert.match(card, /rw-own__history/, 'der eigene Verlauf bleibt erreichbar');
+    // R22 S9 (Persona Emma): Reiter, Seitenspalte und Knopf hiessen alle
+    // „Verlauf" und fuehrten an zwei Orte - der Knopf nennt die EIGENEN Buchungen.
+    assert.match(card, /rw-own__history"[^>]*>rewards\.ownLedger</, 'der Knopf heisst nicht wie der Reiter');
+    assert.doesNotMatch(card, />rewards\.tabLedger</, 'kein drittes „Verlauf" in der eigenen Karte');
     assert.doesNotMatch(card, /rw-standing__id/, 'keine Rangzeile in der eigenen Karte');
     assert.doesNotMatch(el.html.slice(others), /data-member="3"/, 'unten stehen nur die anderen');
 
@@ -938,5 +1006,129 @@ test('Belohnungen: das Kind sieht seine eigene Karte "Deine Punkte -> naechste P
     assert.doesNotMatch(el.html, /class="rw-own"/);
   } finally {
     Object.assign(s, vorher);
+  }
+});
+
+// R22 S9 (Critique 2026-10-22, a2): bei 1280 mit Seitenspalte liessen drei
+// Spalten dem Ziel der eigenen Karte 220px - „Eine Stunde zocken" brach um,
+// rechts standen zwei Knoepfe. Unter 48rem Kartenbreite stehen sie darunter.
+test('R22: die eigene Punktekarte gibt dem Ziel die Breite, die Knoepfe ruecken unter Stand und Ziel', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { eachRule } = await import('./css-rules.js');
+  const rules = [...eachRule(readFileSync(new URL('../public/styles/rewards.css', import.meta.url), 'utf8'))];
+  const own = rules.find((r) => r.selector.trim() === '.rw-section--own' && !r.at.length);
+  assert.match(own?.body ?? '', /container:\s*rw-own \/ inline-size/);
+  const narrow = rules.filter((r) => r.at.some((a) => /@container rw-own \(max-width: 48rem\)/.test(a)));
+  assert.match(narrow.find((r) => r.selector.trim() === '.rw-own')?.body ?? '', /grid-template-columns:\s*auto minmax\(0, 1fr\)/);
+  assert.match(narrow.find((r) => r.selector.trim() === '.rw-own__actions')?.body ?? '', /grid-column:\s*1 \/ -1/);
+});
+
+// --------------------------------------------------------
+// Critique R24 (2026-10-28): E8, G2-Belohnungen-P3-1, G2-Belohnungen-P3-3
+// --------------------------------------------------------
+
+test('R24 E8: zwei Reiter Punkte | Praemien, der Verlauf ist eine Ebene unter "Punkte"', () => {
+  assert.deepEqual(rewardsPage.TABS, ['overview', 'catalog'], 'kein dritter Reiter "Verlauf"');
+  const s = rewardsPage.state;
+  const vorher = s.tab;
+  try {
+    s.tab = 'ledger';
+    assert.match(rewardsPage.tabButton('overview', 'Punkte'), /aria-selected="true"/, 'im Verlauf bleibt "Punkte" der aktive Reiter');
+    assert.match(rewardsPage.tabButton('catalog', 'Praemien'), /aria-selected="false"/);
+  } finally {
+    s.tab = vorher;
+  }
+  const src = readFileSync(new URL('../public/pages/rewards.js', import.meta.url), 'utf8');
+  const shell = src.slice(src.indexOf('function renderShell('), src.indexOf('function content('));
+  assert.equal((shell.match(/\$\{tabButton\(/g) ?? []).length, 2, 'die Leiste baut genau zwei Reiter');
+  assert.doesNotMatch(shell, /tabButton\('ledger'/);
+});
+
+test('R24 P3-1: der Bonus ist Gutschrift ODER Abzug mit positiver Zahl, der Knopf nennt die Handlung', () => {
+  const s = rewardsPage.state;
+  const vorher = { user: s.user, overview: s.overview };
+  let opts = null;
+  globalThis.__openModal = (o) => { opts = o; };
+  try {
+    s.user = { id: 1, role: 'admin' };
+    s.overview = { me: 1, balances: [{ id: 2, display_name: 'Emma', balance: 30 }] };
+    rewardsPage.openBonusModal();
+  } finally {
+    delete globalThis.__openModal;
+    Object.assign(s, vorher);
+  }
+  assert.ok(opts, 'der Dialog oeffnet');
+  const html = String(opts.content);
+  assert.match(html, /class="segmented rw-bonus-kind" role="radiogroup"/, 'ein Segment sagt, was passiert');
+  assert.match(html, /data-tab-id="credit" aria-checked="true"[\s\S]*data-tab-id="debit" aria-checked="false"/, 'Gutschrift vorgewaehlt');
+  assert.match(html, /id="rw-bonus-points" type="number"[^>]*min="1"/, 'die Zahl ist ein Betrag, kein Vorzeichen');
+  assert.doesNotMatch(html, /pointsSigned/, 'kein "Punkte (+/-)" mit Erklaersatz mehr');
+  assert.match(html, /id="rw-bonus-submit">rewards\.bonusCredit</, 'der Primaerknopf nennt die Handlung, nicht "Speichern"');
+});
+
+test('R24 P3-3: Taschengeld bietet keine Elternrolle als Konto an, Mitglieder ohne Rolle bleiben waehlbar', () => {
+  const s = rewardsPage.state;
+  const vorher = s.money;
+  try {
+    s.money = { accounts: [], candidates: [
+      { id: 1, display_name: 'Alex', family_role: 'dad' },
+      { id: 2, display_name: 'Linda', family_role: 'mom' },
+      { id: 3, display_name: 'Oma', family_role: 'grandparent' },
+      { id: 4, display_name: 'Leo', family_role: 'child' },
+      { id: 5, display_name: 'Sam', family_role: 'other' },
+    ] };
+    assert.deepEqual(rewardsPage.moneyCandidates().map((m) => m.display_name), ['Leo', 'Sam']);
+    s.money.candidates = s.money.candidates.slice(0, 3);
+    s.user = { id: 1, role: 'admin' };
+    assert.doesNotMatch(rewardsPage.renderMoneySection(), /rw-money-setup/, 'nur Eltern uebrig: kein "Taschengeld einrichten"');
+  } finally {
+    s.money = vorher;
+  }
+});
+
+// R24 S8-F1 (Ulas 28.10.): der Verlauf ist ein Ort. Zurueck fuehrt auf
+// "Punkte", Neuladen und Link landen im Verlauf - wie die Bereiche der
+// Gesundheit (`/health/*`). Der Router laedt fuer beide Adressen dieselbe
+// Seite und wechselt per Soft-Navigation (update()).
+test('R24 S8-F1: der Verlauf hat die Adresse /rewards/history, der Router fuehrt sie als Teil der Belohnungen', () => {
+  const router = readFileSync(new URL('../public/router.js', import.meta.url), 'utf8');
+  assert.match(router, /\{ path: '\/rewards\/history',\s*page: '\/pages\/rewards\.js',\s*requiresAuth: true,\s*module: 'rewards'/,
+    'eigene Route, dieselbe Seite, dasselbe Modul (Rechte- und Modul-Gates gelten wie fuer /rewards)');
+  assert.match(router, /function topLevelSection\(path\) \{[\s\S]*?path === '\/rewards\/history'[\s\S]*?return '\/rewards'/,
+    'ein aktives Nav-Ziel: der Verlauf markiert "Belohnungen"');
+  const rewards = readFileSync(new URL('../public/pages/rewards.js', import.meta.url), 'utf8');
+  assert.match(rewards, /export async function update\(/, 'die Seite tauscht per Soft-Navigation');
+  assert.match(rewards, /if \(isHistoryPath\(location\.pathname\)\) state\.tab = LEDGER;/,
+    'Neuladen und Direktaufruf beginnen im Verlauf');
+  assert.ok(rewardsPage.isHistoryPath('/rewards/history'));
+  assert.equal(rewardsPage.isHistoryPath('/rewards'), false);
+});
+
+test('R24 S8-F1: hinein ueber die Adresse, zurueck ueber den Verlaufseintrag - ein Direktaufruf geht auf /rewards', () => {
+  const s = rewardsPage.state;
+  const vorher = s.tab;
+  const savedWin = globalThis.window;
+  const savedHistory = globalThis.history;
+  const calls = [];
+  globalThis.window = { ...(savedWin ?? {}), yuvomi: { navigate: (p) => calls.push(['navigate', p]) } };
+  globalThis.history = { back: () => calls.push(['back']) };
+  try {
+    s.tab = 'overview';
+    rewardsPage.openLedgerRoute();
+    assert.deepEqual(calls.at(-1), ['navigate', '/rewards/history'], '"Verlauf ›" schreibt einen Verlaufseintrag');
+    s.tab = 'ledger';
+    rewardsPage.closeLedgerRoute();
+    assert.deepEqual(calls.at(-1), ['back'], '"‹ Punkte" nach dem Hineingehen ist Browser-Zurueck: kein zweiter Eintrag');
+    // Direkt aufgerufen (Neuladen, Link): es gibt keinen Eintrag "Punkte" davor.
+    rewardsPage.closeLedgerRoute();
+    assert.deepEqual(calls.at(-1), ['navigate', '/rewards'], 'ohne Vorgaenger fuehrt der Rueckweg auf die Adresse der Seite');
+    const n = calls.length;
+    s.tab = 'catalog';
+    rewardsPage.closeLedgerRoute();
+    assert.equal(calls.length, n, 'ausserhalb des Verlaufs tut der Rueckweg nichts');
+  } finally {
+    s.tab = vorher;
+    globalThis.window = savedWin;
+    globalThis.history = savedHistory;
   }
 });

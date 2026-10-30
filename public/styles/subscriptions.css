@@ -29,6 +29,54 @@
   min-height: 0;
 }
 
+/* ABOS IN DER BAHN DES BUDGETS (R21 S7, D9). Als Budget-Reiter lief die Liste
+ * ueber die ganze Bahn (1124px bei 1440): vom Namen bei x 308 bis zum Betrag
+ * bei x 1312 lagen 1000px Blickweg, und Kennzahlen und Diagramme standen als
+ * eigene Baender darueber und darunter. Jetzt dieselbe Zweispalte wie
+ * Uebersicht und Plan (budget.css): links die Liste auf dem Lesemass, rechts
+ * die Kennzahlleiste - eine Karte je Zeile (`--summary-cards: 1` mit dem
+ * Wertgrad der Seitenspalte) - und darunter die Diagramme einspaltig. Im
+ * Markup bleibt die Reihenfolge (Kennzahlen, Liste, Diagramme); schmal
+ * aendert sich nichts. Die Gast-Route ohne Budget-Seite bleibt, wie sie ist. */
+@container budget-page (min-width: 960px) {
+  .budget-page .subscriptions-page {
+    display: grid;
+    grid-template-columns:
+      minmax(0, var(--layout-reading))
+      clamp(
+        var(--budget-rail-min),
+        calc(100% - var(--layout-reading) - var(--budget-column-gap)),
+        var(--budget-rail-max)
+      );
+    grid-template-rows: auto 1fr;
+    gap: var(--space-4) var(--budget-column-gap);
+    align-items: start;
+  }
+
+  /* DIE KENNZAHL STEHT OBEN IN DER BAHN (R24, E2; Critique G4-Budget-P2-3):
+   * EINE Kurzzeile ueber der Liste, die Seitenspalte traegt nur noch die
+   * Zweitansichten (Prognose, Kategorie, Zahlungsart). Bis R24 stapelten sich
+   * dort drei Kennzahlkarten ueber den Diagrammen. */
+  .budget-page .subscriptions-summary {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .budget-page .subscriptions-list-section {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .budget-page #subscriptions-analytics {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+  }
+
+  .budget-page .subscriptions-analytics {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 /* Suche, Filterknopf und Werkzeug-Menue stehen im Kopf der Abo-Liste
  * (`.subscriptions-section-head.section-toolbar`, R14 P8): die Suche liest
  * Breite und Lage aus page-search.css (`--page-search-width`, mobil Icon-Form
@@ -62,10 +110,6 @@
   align-items: center;
   gap: var(--space-2);
   margin-bottom: var(--space-3);
-}
-
-.subscriptions-active-filters[hidden] {
-  display: none;
 }
 
 .subscriptions-filter-chip > span {
@@ -244,25 +288,19 @@
   font-size: var(--text-sm);
 }
 
+/* EIN KATEGORIEBALKEN IM BUDGET (R23, Critique G4 "drei Bauformen"). Die
+ * Abo-Aufteilung trug eine eigene: Name 14px in Primaertinte und abgeschnitten,
+ * 8px-Literal auf --color-surface-3, ein <i> mit width-Prozent im Modulton.
+ * Jetzt spricht sie die Sprache der Kategoriezeile der Uebersicht und
+ * Statistik (`.budget-bar-row`, budget.css): Name als Fussnote in
+ * Sekundaertinte, umbrechend statt gekappt; Bahn und Fuellung SIND deren
+ * Bausteine (die Bahn teilt sich die Regel mit `.budget-bar-row__track`, die
+ * Fuellung ist `.budget-bar-row__fill--expenses`, waechst per scaleX). */
 .subscriptions-chart-row__label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.subscriptions-chart-row__track {
-  display: block;
-  height: 8px;
-  overflow: hidden;
-  border-radius: var(--radius-full);
-  background: var(--color-surface-3);
-}
-
-.subscriptions-chart-row__track i {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: var(--module-accent);
+  font-size: var(--type-caption);
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+  hyphens: auto;
 }
 
 .subscriptions-chart-row > strong {
@@ -388,29 +426,11 @@
 }
 
 /* Monogramm: die Marke trägt Fläche und Rahmen, die Schrift kommt aus dem
- * Text-Token. Vorher kamen Vorder- und Hintergrund aus DERSELBEN Markenfarbe
- * (Vollton auf aufgehelltem Ton desselben Tons) — damit hing das Kontrast-
- * verhältnis vollständig an der Datenlage: gemessen 10 AA-Verstöße über 7 Marken
- * im Seed, bis hinunter auf 1.83:1 (Critique 2026-07-30, P1). Jede helle oder
- * gesättigte Marke (Amazon-Orange, Spotify-Grün) fiel automatisch durch, und
- * kein Nutzer konnte das umgehen, außer indem er die Markenfarbe änderte. */
+ * Text-Token (Critique 2026-07-30, P1: Vorder- und Hintergrund aus derselben
+ * Markenfarbe fielen bis 1.83:1). Die Form ist seit R22 (D9) die Lead-Kachel
+ * des Budgets (`.budget-tile`, budget.css); hier steht nur die Farbe. */
 .subscription-card__brand {
-  display: grid;
-  width: 40px;
-  height: 40px;
-  place-items: center;
-  overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--subscription-color) var(--tint-hint), transparent);
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--subscription-color) var(--tint-surface), var(--color-surface));
-  color: var(--color-text-primary);
-  font-weight: var(--font-weight-bold);
-}
-
-.subscription-card__brand img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
+  --tile-color: var(--subscription-color);
 }
 
 /* Die Textspalte (minmax(0, 1fr)) darf schrumpfen, der Betrag daneben nicht. */
@@ -495,7 +515,6 @@
   gap: 0 var(--space-3);
   margin-top: var(--space-0h);
   color: var(--color-text-secondary);
-  font-size: var(--text-xs);
 }
 
 /* Eine Angabe bricht als Ganzes um, nicht mitten in „Faellig in 6 | Tagen" -
@@ -591,13 +610,23 @@
  * `.row-action`, layout.css) - vorher violett umrandete `btn--secondary
  * btn--icon`, und Loeschen stand im selben Violett statt im Danger-Ton. */
 
-/* „Ueber Budget" nennt sich im Label und traegt das Warnsymbol davor - im
- * Ton der Ueberschreitung (Danger, wie im Plan). */
-.subscriptions-page .metric-card--over .metric-card__label svg {
+/* „Ueber Budget" nennt sich im Label und traegt das Warnsymbol davor, in der
+ * Zeile des Labels. Seit R21 S7 in der Farbe des Labels: das Rot traegt der
+ * Balken der Kostenkarte (die Warnung steht einmal, D8). */
+.subscriptions-page .metric-card__label svg {
   display: inline-block;
   vertical-align: -2px;
   margin-inline-end: var(--space-1);
-  color: var(--color-danger);
+}
+
+/* Die Fussnote vor den Zeilen der Liste (R24 E2, seit S13 nicht mehr unter
+ * der Kurzzeile - dort wuchs der Kennzahl-Slot ueber sein Skelett): "126 %
+ * des Budgets genutzt" und der Weg "Teuerste zuerst", nur bei einer
+ * Ueberschreitung. */
+.subscriptions-over-budget {
+  margin-block: 0 var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
 }
 
 /* Der Weg aus „Ueber Budget" heraus: ein Textknopf IN der Fussnote, hinter
@@ -641,7 +670,6 @@
  * .btn--icon auf --target-base); ein Modul, das sie neu beantwortet, gibt eine
  * zweite Antwort auf eine Shell-Frage. */
 
-.subscriptions-enabled-row,
 .subscriptions-metadata-add,
 .subscriptions-logo-search,
 .subscriptions-settings-section {
@@ -668,27 +696,33 @@
   gap: var(--space-3);
 }
 
-/* Formularabschnitt im Sheet: Inset-Well statt Kasten (tokens.css). */
+/* FLACH GRUPPIERT WIE BUCHUNG UND INVENTAR (R22, D9). Die Abschnitte waren
+ * graue Wells mit eigenem Innenabstand und einem Modulton-Zeichen am Titel -
+ * der einzige Dialog des Moduls in Kaesten. Jetzt stehen die Felder auf der
+ * Flaeche des Blatts; ein Abschnitt beginnt mit einer Haarlinie und einem
+ * leisen Titel (Sekundaertext, ohne Zeichen). */
 .subscription-form__section {
-  padding: var(--space-4);
+  padding: 0;
   border: none;
-  border-radius: var(--radius-md);
-  background: var(--color-fill-well);
+  background: none;
 }
 
-.subscription-form__section > h3 {
-  display: flex;
-  gap: var(--space-2);
-  align-items: center;
+.subscription-form__section + .subscription-form__section {
+  padding-block-start: var(--space-4);
+  border-block-start: var(--space-px) solid var(--color-border-subtle);
+}
+
+/* Der Schalter "Zahlungserinnerung" flucht mit den Feldern: ohne Well
+ * stand sein Zeileneinzug als 12px-Versatz allein. */
+.subscription-form__section > .toggle-row {
+  padding-inline: 0;
+}
+
+.subscription-form__title {
   margin: 0 0 var(--space-3);
   font-size: var(--text-sm);
+  font-weight: var(--font-weight-semibold);
   color: var(--color-text-secondary);
-}
-
-.subscription-form__section > h3 svg {
-  width: 17px;
-  height: 17px;
-  color: var(--module-budget);
 }
 
 .subscription-form__identity {
@@ -700,20 +734,28 @@
 
 .subscription-form__identity-fields {
   display: grid;
-  gap: var(--space-3);
+  /* Feldtakt des Dialogs (layout.css "EIN FELDTAKT IM DIALOG"). */
+  gap: var(--space-4);
 }
 
 .subscription-logo-picker {
   display: grid;
-  gap: var(--space-2);
-  justify-items: center;
+  padding: 0;
+  border: 0;
+  background: none;
+  border-radius: var(--radius-lg);
   cursor: pointer;
+}
+
+.subscription-logo-picker:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
 }
 
 .subscription-logo-tools {
   display: grid;
   gap: var(--space-2);
-  justify-items: stretch;
+  justify-items: center;
 }
 
 .subscription-logo-picker > span {
@@ -735,55 +777,32 @@
   object-fit: contain;
 }
 
-.subscription-logo-picker small {
-  display: inline-flex;
-  gap: var(--space-1);
-  align-items: center;
-  color: var(--color-text-secondary);
-  text-align: center;
-}
-
-.subscription-logo-picker small svg {
-  width: 14px;
-  height: 14px;
-}
-
-.subscription-logo-picker input {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-}
-
 .subscription-find-logo-btn {
   justify-content: center;
-  min-height: 38px;
-  padding-inline: var(--space-2);
-  font-size: var(--text-sm);
-}
-
-.subscription-find-logo-btn svg {
-  width: 16px;
-  height: 16px;
 }
 
 .subscription-form__billing-grid {
   display: grid;
-  grid-template-columns: minmax(110px, 0.8fr) minmax(180px, 1.3fr) minmax(130px, 1fr) minmax(90px, 0.65fr);
+  /* Betrag mit der Waehrung im Suffix, daneben der Zyklus als Satz "Alle
+     [1] [Monate]", darunter die naechste Zahlung (R24, G4-Budget-P1-1 und
+     P3-3) - bis dahin Betrag, eine eigene Waehrungs-Combobox und der Zyklus
+     in drei Spalten, die naechste Zahlung im Abschnitt der Erinnerung. */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
   gap: var(--space-3);
   align-items: end;
 }
 
 .subscription-form__organization-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 90px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: var(--space-3);
   align-items: end;
 }
 
-.subscription-form__color .form-input--color {
-  width: 100%;
+/* Die Markenfarbe ist die Farbreihe (Critique R24 E6) und nimmt die ganze
+   Zeile; die 90px-Spalte war fuer das nackte Farbfeld. */
+.subscription-form__color {
+  grid-column: 1 / -1;
 }
 
 .subscriptions-combobox {
@@ -853,15 +872,6 @@
   outline-offset: var(--focus-ring-offset-inset);
 }
 
-.subscriptions-enabled-row > div {
-  display: grid;
-  gap: var(--space-0h);
-}
-
-.subscriptions-enabled-row small {
-  color: var(--color-text-secondary);
-}
-
 /* Abschnitt in der Einstellungskarte: Inset-Well statt Kasten (tokens.css). */
 .subscriptions-settings-section {
   justify-content: space-between;
@@ -876,11 +886,6 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
-}
-
-.subscriptions-enabled-row {
-  justify-content: space-between;
-  min-height: 44px;
 }
 
 .subscriptions-modal-footer {
@@ -1005,15 +1010,41 @@
   min-height: 36px;
 }
 
-/* Name behält Vorrang; die vier Icon-Buttons rutschen bei Enge (schmales
- * Mobile) in die nächste Zeile, statt den Namen auf wenige Zeichen zu quetschen. */
-.subscriptions-metadata-row__view > span {
+/* Der Name ist das Bearbeiten-Ziel der Zeile (D10, #2152): ein Button, der wie
+ * Text steht - dieselbe Haut wie der Name im Kategorien-Verwalter. Rechts davon
+ * nur noch Mehr-Knopf und Griff; der Name behaelt die ganze uebrige Breite. */
+.subscriptions-metadata-row__name {
+  appearance: none;
   flex: 1 1 7rem;
   min-width: 0;
+  min-height: var(--target-md);
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--color-text-primary);
+  font: inherit;
+  text-align: start;
+  overflow-wrap: anywhere;
+  hyphens: auto;
+  hyphenate-limit-chars: 6 4 4;
+  -webkit-hyphenate-limit-before: 4;
+  -webkit-hyphenate-limit-after: 4;
+  cursor: pointer;
+}
+
+.subscriptions-metadata-row__name:hover {
+  color: var(--color-accent);
+}
+
+.subscriptions-metadata-row__name:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+  border-radius: var(--radius-xs);
 }
 
 .subscriptions-metadata-row__view .subscriptions-metadata-row__actions {
-  margin-left: auto;
+  margin-inline-start: auto;
 }
 
 .subscriptions-metadata-row__edit {
@@ -1023,21 +1054,21 @@
   min-height: 36px;
 }
 
-/* [hidden] hat gegenüber den display-Klassen zu geringe Spezifität - explizit übersteuern. */
-.subscriptions-metadata-row__view[hidden],
-.subscriptions-metadata-row__edit[hidden] {
-  display: none;
-}
-
 .subscriptions-metadata-edit-name {
   flex: 1 1 auto;
   min-width: 0;
 }
 
-.subscriptions-metadata-row__edit .form-input--color {
-  width: 44px;
-  flex: 0 0 44px;
-  padding: 2px;
+/* Die Farbreihe der Kategorie bricht unter den Namen (Critique R24 E6) -
+   neben Name und zwei Knoepfen haetten elf Swatches keinen Platz. */
+.subscriptions-metadata-row__edit {
+  flex-wrap: wrap;
+}
+
+.subscriptions-metadata-row__color,
+.subscriptions-metadata-add__color {
+  order: 1;
+  flex: 1 0 100%;
 }
 
 .subscriptions-metadata-row__view > i {
@@ -1050,9 +1081,8 @@
   align-items: stretch;
 }
 
-.subscriptions-metadata-add .form-input--color {
-  width: 52px;
-  flex: 0 0 52px;
+.subscriptions-metadata-add {
+  flex-wrap: wrap;
 }
 
 .subscriptions-metadata > .subscriptions-modal-footer {
@@ -1124,19 +1154,14 @@
     grid-template-columns: 1fr;
   }
 
+  /* Mobil steht "Logo finden" neben der Kachel, nicht darunter. */
   .subscription-logo-tools {
     grid-template-columns: auto 1fr;
     align-items: center;
-    justify-items: stretch;
-  }
-
-  .subscription-logo-picker {
-    grid-template-columns: auto minmax(0, 1fr);
     justify-items: start;
   }
 
   .subscription-logo-picker > span {
-    grid-row: span 2;
     width: 68px;
     height: 68px;
   }
@@ -1176,7 +1201,10 @@
    * Screenreader-Baum, und die Wischgesten sind reine `touch*`-Handler. Aus dem
    * Fluss genommen gibt die Zeile den Platz genauso frei; beim Fokus kommen sie
    * zurueck. */
-  .subscription-card__actions {
+  /* SEIT R22 (D9) NUR DER HAKEN: der Mehr-Knopf daneben bleibt sichtbar und
+   * traegt Verlaengern und Loeschen auch am Finger (Endzone R21-D10). Er steht
+   * schmal (`.row-action--slim`), die Textspalte ist hier knapp. */
+  .subscription-card__actions > .row-action:not(.row-action--more) {
     position: absolute;
     width: var(--space-px);
     height: var(--space-px);
@@ -1184,7 +1212,7 @@
     clip-path: inset(50%);
   }
 
-  .subscription-card__actions:focus-within {
+  .subscription-card__actions > .row-action:not(.row-action--more):focus-visible {
     position: static;
     width: auto;
     height: auto;
@@ -1192,11 +1220,17 @@
     clip-path: none;
   }
 
-  /* Die Reserve am Zeilenende gehört dann dem Wisch-Chevron
-     (.swipe-row::after, layout.css). */
-  .subscription-card {
+  /* Der schmale Mehr-Knopf bringt seinen Innenabstand selbst mit: ohne Luecke
+   * und Kantenabstand davor kostet er die Textspalte so viel wie vorher der
+   * Wisch-Chevron samt Reserve (28px), sonst brach "Faellig in 3 Tagen" um. */
+  .swipe-row:not(.swipe-row--static) > .subscription-card {
+    gap: 0;
+    padding-inline-end: 0;
+  }
+
+  /* Die Nur-lesen-Zeile hat keine Endzone: die Spalte faellt weg. */
+  .swipe-row--static > .subscription-card {
     grid-template-columns: minmax(0, 1fr);
-    padding-inline-end: calc(var(--space-2) + var(--space-3) + var(--space-2));
   }
 }
 

@@ -365,6 +365,16 @@ test('GET /invites/preview: gültiger Token liefert die vorgegebenen Namen', asy
   assert.equal(res.body.data.valid, true);
   assert.equal(res.body.data.username, 'gustav');
   assert.equal(res.body.data.display_name, 'Gustav');
+  // R24 (G6-Zugang-P3-1): die Seite nennt, wer eingeladen hat.
+  assert.equal(res.body.data.invited_by, 'ADMIN');
+});
+
+test('GET /invites/preview: ohne einladendes Konto nennt die Vorschau niemanden', async () => {
+  const { token } = await invite({ username: 'ida' });
+  routeDb.prepare('UPDATE invites SET created_by = NULL WHERE username = ?').run('ida');
+  const res = await call('GET', `/auth/invites/preview?token=${token}`, { actor: null });
+  assert.equal(res.body.data.valid, true);
+  assert.equal(res.body.data.invited_by, null);
 });
 
 test('accept legt den Nutzer an; Rolle und Familienrolle stammen aus der Einladung', async () => {
@@ -602,12 +612,16 @@ test('accept einer Kinder-Einladung bringt die Kinder-Startrechte mit (R20), bei
   // aus. Mit der Vorlage "wie das Rollenprofil" kommen nur diese dazu.
   const cases = [
     ['xenia', 'restricted', [
-      'capability:health_use_fasting=none', 'capability:housekeeping_view_amounts=none',
-      'module:budget=none', 'module:documents=none', 'module:health=none', 'module:housekeeping=read',
+      'capability:calendar_edit_others=none', 'capability:health_use_fasting=none', 'capability:housekeeping_view_amounts=none',
+      'capability:inventory_edit_others=none', 'capability:inventory_view_prices=none', 'capability:notes_edit_others=none',
+      'capability:tasks_reorder_family=none',
+      'module:budget=none', 'module:documents=none', 'module:health=none', 'module:housekeeping=read', 'module:waste=read',
     ]],
     ['yara', 'role', [
-      'capability:health_use_fasting=none', 'capability:housekeeping_view_amounts=none',
-      'module:budget=none', 'module:housekeeping=read',
+      'capability:calendar_edit_others=none', 'capability:health_use_fasting=none', 'capability:housekeeping_view_amounts=none',
+      'capability:inventory_edit_others=none', 'capability:inventory_view_prices=none', 'capability:notes_edit_others=none',
+      'capability:tasks_reorder_family=none',
+      'module:budget=none', 'module:housekeeping=read', 'module:waste=read',
     ]],
   ];
   for (const [username, preset, expected] of cases) {

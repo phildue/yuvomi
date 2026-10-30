@@ -1,9 +1,12 @@
 import { api } from '/api.js';
-import { openModal as openSharedModal, closeModal, advancedSection } from '/components/modal.js';
+import { openModal as openSharedModal, closeModal, advancedSection, reportFieldErrors, captureModalContext, captureOpenContext, isModalContextCurrent, swapFieldsKeepingDirtyBase, isOwnModalOpen, refocusAfterRender, dialogInitialFocus } from '/components/modal.js';
+import { errorSentence, isAlreadyDeleted, loadErrorSentence } from '/utils/friendly-error.js';
 import { stagger, scheduleUndoableDelete } from '/utils/ux.js';
 import { wireSwipeRows, maybeShowSwipeHint } from '/utils/swipe-row.js';
-import { t, formatDate, formatMonthYear, parseDateInput, isDateInputValid, getLocale, formatUnit } from '/i18n.js';
-import { esc } from '/utils/html.js';
+import { t, formatMonthYear, parseDateInput, isDateInputValid, getLocale, formatUnit } from '/i18n.js';
+import { dateText, daysFromTodayText } from '/utils/date-format.js';
+import { mediaPickerBadgeHtml } from '/utils/media-picker.js';
+import { esc, REQUIRED_MARK } from '/utils/html.js';
 import { initials } from '/utils/initials.js';
 import { rowMenuHtml } from '/utils/row-action.js';
 import { readRowHtml, readRowHintHtml } from '/utils/read-row.js';
@@ -16,7 +19,8 @@ import { moduleAccess, isNavModuleReadOnly } from '/permissions.js';
 import { findPageFab } from '/utils/fab.js';
 import { mountMasterDetail, splitViewDetailHtml } from '/utils/master-detail.js';
 import { redrawList, collapseRow } from '/utils/list-motion.js';
-import { openDetailView } from '/components/detail-view.js';
+import { openDetailView, leaveDetailTo } from '/components/detail-view.js';
+import { pathAccess } from '/utils/module-access.js';
 // Alias: dieses Modul fuehrt selbst eine `emptyStateHtml()`, die den Renderer
 // mit den Geburtstags-Texten fuellt. Zwei Namen, die sich nur in der
 // Gross-Schreibung unterscheiden, waeren im Modul nicht auseinanderzuhalten.
@@ -30,6 +34,8 @@ import {
   renderPageActions,
   renderListSection,
 } from '/utils/page-layout.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
+import { birthDateText, birthDateShort, birthDateFieldHtml, wireBirthDateField } from '/utils/birth-date.js';
 
 let state = {
   birthdays: [],
@@ -198,7 +204,7 @@ function renderBirthdayReminderSection(birthday = null) {
   const customUnit = birthday?.reminder_custom_unit || 'days';
   return `
     <div class="reminder-section">
-      <div class="form-group" style="margin:0">
+      <div class="form-group">
         <label class="form-label" for="bd-reminder-offset">${t('reminders.offsetLabel')}</label>
         <select class="form-input birthday-modal__select" id="bd-reminder-offset">
           ${birthdayReminderOptions(birthday).map((o) =>
@@ -207,11 +213,11 @@ function renderBirthdayReminderSection(birthday = null) {
         </select>
       </div>
       <div class="modal-grid modal-grid--2 reminder-custom" id="bd-reminder-custom" ${currentOffset === 'custom' ? '' : 'hidden'}>
-        <div class="form-group" style="margin:0">
+        <div class="form-group">
           <label class="form-label" for="bd-reminder-custom-amount">${t('reminders.customAmountLabel')}</label>
           <input class="form-input" type="number" id="bd-reminder-custom-amount" min="1" max="${REMINDER_AMOUNT_MAX}" step="1" value="${customAmount}">
         </div>
-        <div class="form-group" style="margin:0">
+        <div class="form-group">
           <label class="form-label" for="bd-reminder-custom-unit">${t('reminders.customUnitLabel')}</label>
           <select class="form-input" id="bd-reminder-custom-unit">
             <option value="minutes" ${customUnit === 'minutes' ? 'selected' : ''}>${t('reminders.customMinutes')}</option>
@@ -285,20 +291,30 @@ export function renderNameDayField(birthday = null) {
 }
 
 // Datum + Alter in einer Zeile: „12.08.2026 · wird 30". Der Countdown lebt
-// getrennt im Chip, damit keine Zahl doppelt erscheint.
-function ageMeta(birthday) {
-  const date = formatDate(birthday.next_birthday);
-  return `${date} · ${t('birthdays.turnsAge', { age: birthday.next_age })}`;
+// getrennt im Chip, damit keine Zahl doppelt erscheint. Ohne Jahr gibt es kein
+// Alter (#2095): der Server liefert `next_age: null`, die Zeile nennt nur den Tag.
+// Der Wochentag nur, solange er beim Planen hilft (die naechsten zwei Wochen):
+// "in 3 Monaten · Mo, 08.02.2027 · wird 42" war bei 390 px breiter als die
+// Zeile und kappte das Alter (R23 S12, Sichtpruefung; seit D11 stand der
+// Wochentag an jedem Eintrag).
+const WEEKDAY_WITHIN_DAYS = 14;
+
+export function ageMeta(birthday) {
+  const near = Number.isFinite(birthday.days_until) && birthday.days_until < WEEKDAY_WITHIN_DAYS;
+  const date = dateText(birthday.next_birthday, { weekday: near });
+  return birthday.next_age != null
+    ? `${date} · ${t('birthdays.turnsAge', { age: birthday.next_age })}`
+    : date;
 }
 
 // Countdown im einheitlichen Wort-Register (kein „5d"-Kürzel): Heute / Morgen
 // / in N Tagen. EINE Weiche fuer Geburtstag UND Namenstag - der Namenstag
 // hatte sie nicht und las „in 0 Tagen" (Critique 2026-09-26). `count` statt
 // `days`, damit t() die Pluralform der Sprache waehlt.
+// Seit R23 (D11) aus utils/date-format.js: dieselbe Stufung wie die
+// Uebersicht ("in 4 Monaten" statt "in 120 Tagen" jenseits eines Monats).
 function countdownLabel(days) {
-  if (days === 0) return t('common.today');
-  if (days === 1) return t('common.tomorrow');
-  return t('birthdays.inDays', { count: days });
+  return daysFromTodayText(days);
 }
 
 // Countdown-Chip; `mod` steuert die visuelle Stufe.
@@ -387,7 +403,7 @@ export function birthdayItemHtml(birthday, { next = false } = {}) {
   const nameDayMeta = hasNameDay
     ? `<span class="birthday-item__name-day">`
       + `${esc(countdownLabel(birthday.name_day_days_until))} · `
-      + `${esc(formatDate(birthday.next_name_day))} · ${esc(t('birthdays.celebratesNameDay'))}`
+      + `${esc(dateText(birthday.next_name_day, { weekday: true }))} · ${esc(t('birthdays.celebratesNameDay'))}`
       + '</span>'
     : '';
   // Wischbedienung (Redesign Runde 4, C-2): auf Touch tragen die beiden
@@ -468,14 +484,23 @@ ${/* EIN MEHR-KNOPF (Entscheidung 2026-10-07, utils/row-action.js): der
  * Gruppenkoepfe der Aufgaben IN der Liste), und der naechste Geburtstag
  * (`birthday-item--next`) hebt seinen Countdown im Modulton hervor - die
  * Antwort auf die Frage, mit der man die Seite oeffnet.
+ *
+ * DER KOPF IST EIN REGISTER, ERST WENN ER GRUPPIERT (R21 S9b, Critique a3).
+ * Im Seed standen 7 Monatskoepfe ueber 8 Geburtstagen - fast jede Zeile trug
+ * einen eigenen Kopf, der nur wiederholte, was ihr Datum schon sagt (224px
+ * Chrome bei 390px). Die Koepfe stehen deshalb erst, wenn im Mittel mindestens
+ * zwei Geburtstage auf einen Monat kommen; darunter ist die Liste eine Folge
+ * nach Naehe, und der naechste fuehrt weiter im Modulton.
  * @param {Array} list nach Naehe sortiert (sortByProximity)
  * @returns {string}
  */
 function birthdayListHtml(list) {
+  const months = new Set(list.map((b) => String(b.next_birthday ?? '').slice(0, 7)).filter(Boolean));
+  const grouped = list.length >= 2 * months.size;
   let month = '';
   return list.map((birthday, i) => {
     const key = String(birthday.next_birthday ?? '').slice(0, 7);
-    const head = key && key !== month
+    const head = grouped && key && key !== month
       ? `<h2 class="list-group__title birthdays-month">${esc(formatMonthYear(key.slice(0, 4), key.slice(5, 7)))}</h2>`
       : '';
     if (key) month = key;
@@ -635,7 +660,11 @@ function importActionHtml() {
     id: 'birthdays-tools-menu',
     label: t('common.moreActions'),
     items: [
-      { action: 'import-contacts', label: t('birthdays.importButton'), icon: 'download' },
+      // `user-plus` statt `download` (Critique R22, D7): der Eintrag holt
+      // Menschen aus dem Adressbuch, er laedt keine Datei herunter. Seit R23
+      // (Critique G1 P3 "Import-Icon mehrdeutig") das Zeichen der Kontakte:
+      // `user-plus` las sich wie "Person anlegen", nicht wie "aus Kontakten".
+      { action: 'import-contacts', label: t('birthdays.importButton'), icon: 'book-user' },
     ],
   });
 }
@@ -776,6 +805,27 @@ async function onListClick(e) {
 // Ohne Bild und ohne Namen stand hier das "?" aus initials() - es las sich
 // wie ein Hilfe-Knopf (Critique 2026-09-26). Die Kamera sagt, was ein Tipp
 // auf die Flaeche tut; mit Namen bleiben die Initialen.
+/**
+ * WAS HINTER "WEITERE ANGABEN" STEHT (R23 S10, Critique G1 P3 "Aufklapper
+ * ohne Inhaltsangabe"). Der Aufklapper hiess nur "Weitere Angaben" - wer einen
+ * Namenstag oder eine Erinnerung suchte, musste ihn oeffnen, um es zu wissen.
+ * Aus denselben Beschriftungen wie die Felder (wie im Termin-Dialog,
+ * eventAdvancedTopics), als Liste der Sprache.
+ */
+function birthdayAdvancedTopics(withContact) {
+  const topics = [
+    withContact ? t('newLabel.contacts') : null,
+    t('birthdays.nameDayLabel'),
+    t('birthdays.notesLabel'),
+    t('reminders.sectionTitle'),
+  ].filter(Boolean);
+  try {
+    return new Intl.ListFormat(getLocale(), { style: 'long', type: 'conjunction' }).format(topics);
+  } catch {
+    return topics.join(', ');
+  }
+}
+
 function birthdayPreviewHtml(name, photoData) {
   if (photoData) return `<img class="birthday-preview__image" src="${photoData}" alt="${esc(name || '')}">`;
   if (!String(name || '').trim()) return '<i data-lucide="camera" class="birthday-preview__glyph" aria-hidden="true"></i>';
@@ -849,7 +899,7 @@ function birthdayReadHtml(birthday) {
         </div>
         <div class="birthday-modal__fields detail-view">
           <div class="detail-view__rows">
-            ${readRowHtml({ icon: 'cake', label: t('birthdays.birthDateLabel'), value: birthday.birth_date ? formatDate(birthday.birth_date) : '' })}
+            ${readRowHtml({ icon: 'cake', label: t('birthdays.birthDateLabel'), value: birthDateText(birthday.birth_date, birthday.year_unknown) })}
             ${readRowHtml({ icon: 'calendar-heart', label: t('birthdays.nameDay'), value: nameDayReadText(birthday.name_day) })}
             ${readRowHtml({ icon: 'align-left', label: t('birthdays.notesLabel'), value: birthday.notes || '', multiline: true })}
             ${readRowHtml({ icon: 'bell', label: t('reminders.offsetLabel'), value: reminderReadText(birthday) })}
@@ -879,6 +929,140 @@ function openBirthdayReadModal(birthday) {
   });
 }
 
+/**
+ * DARF DER DIALOG MIT EINEM KONTAKT VERKNUEPFEN? (Critique R22, D7)
+ *
+ * Die Auswahl listet das Adressbuch, und der Server verlangt dafuer das
+ * Leserecht auf `contacts` (routes/birthdays.js `checkContactLink`) - ohne es
+ * gaebe es nur "Keiner" und ein 403. Ein haushaltweit abgeschaltetes Modul
+ * hat keine Kontakte, die man verknuepfen wollte. Mitglieder-Geburtstage
+ * haengen am Konto (`family_user_id`), nicht an einem Kontakt.
+ */
+/** Absagen, nach denen die Kontaktauswahl des Dialogs neu geladen wird. */
+const CONTACT_CHOICE_REFUSALS = new Set(['birthdays_contact_linked', 'birthdays_selected_contact_not_found']);
+
+function mayLinkContacts(birthday) {
+  if (birthday?.family_user_id) return false;
+  return moduleAccess('contacts') !== 'none' && !window.yuvomi?.isModuleDisabled?.('contacts');
+}
+
+/**
+ * "Mit Kontakt verknuepfen": eine Auswahl wie die Erinnerung darunter. Sie
+ * steht sofort mit dem verknuepften Kontakt (`contact_name` liefert der
+ * Server mit), die freien Kontakte reicht `fillContactLinkOptions` nach.
+ * Der Hinweis sagt, was die Verknuepfung tut und was nicht: das Datum folgt
+ * dem Kontakt NICHT (#2124 bleibt eigenstaendig).
+ */
+function contactLinkFieldHtml(birthday) {
+  const current = birthday?.contact_id
+    ? `<option value="${esc(String(birthday.contact_id))}" selected>${esc(birthday.contact_name || t('birthdays.contactSuggestLabel'))}</option>`
+    : '';
+  return `
+    <div class="form-group" id="bd-contact-group">
+      <label class="form-label" for="bd-contact">${t('birthdays.contactLinkLabel')}</label>
+      <select class="form-input birthday-modal__select" id="bd-contact" aria-describedby="bd-contact-hint">
+        <option value="">${t('birthdays.contactLinkNone')}</option>
+        ${current}
+      </select>
+      <p class="form-hint" id="bd-contact-hint">${t('birthdays.contactLinkHint')}</p>
+    </div>`;
+}
+
+/**
+ * Reicht die verknuepfbaren Kontakte nach: jeder, der noch keinen Geburtstag
+ * traegt, dazu der eigene. Die Kandidatenliste des Imports kennt beides
+ * (`already_imported`, auch fuer Kontakte ohne Datum). Nachgereichte
+ * Optionen sind keine Eingabe - der Tausch laeuft deshalb ueber
+ * `swapFieldsKeepingDirtyBase`, sonst fragte das Schliessen nach Aenderungen,
+ * die niemand gemacht hat. Gibt es nichts zu verknuepfen, faellt das Feld weg.
+ * Ein Fehler beim Laden laesst die Auswahl stehen, wie sie ist.
+ */
+async function fillContactLinkOptions(panel, select, birthday) {
+  let candidates;
+  try {
+    candidates = (await api.get('/birthdays/import/candidates')).data ?? {};
+  } catch {
+    return;
+  }
+  if (!select.isConnected) return;
+  const current = birthday?.contact_id ?? null;
+  const linkable = [...(candidates.withBirthday ?? []), ...(candidates.withoutBirthday ?? [])]
+    .filter((c) => !c.already_imported || c.id === current)
+    .sort((a, b) => String(a.name).localeCompare(String(b.name), getLocale(), { sensitivity: 'base' }));
+  swapFieldsKeepingDirtyBase(panel, () => {
+    if (!linkable.length && !current) {
+      select.closest('#bd-contact-group')?.remove();
+      return;
+    }
+    // Die Wahl bleibt, solange es sie noch gibt - nach einer Absage (409,
+    // Kontakt weg) faellt sie auf "Keiner".
+    const keep = select.value;
+    const stillThere = keep === '' || linkable.some((c) => String(c.id) === keep);
+    const option = (value, label) => {
+      const node = document.createElement('option');
+      node.value = value;
+      node.textContent = label;
+      return node;
+    };
+    select.replaceChildren(option('', t('birthdays.contactLinkNone')), ...linkable.map((c) => option(String(c.id), c.name)));
+    select.value = stillThere ? keep : '';
+  });
+}
+
+/**
+ * Verknuepft einen Geburtstag mit einem Kontakt (D7) - die Folgeaktion des
+ * ruhigen Hinweises "Ein Kontakt heisst genauso". Danach steht an der
+ * Datumszeile "Kontakt anzeigen", und der Fokus geht dorthin: der Knopf, auf
+ * dem er stand, ist mit dem Hinweis weg.
+ *
+ * @param {object} birthday
+ * @param {number} contactId
+ * @param {{ button?: HTMLButtonElement|null, onLinked?: ((fresh: object) => void)|null }} [opts]
+ */
+async function linkBirthdayToContact(birthday, contactId, { button = null, onLinked = null } = {}) {
+  if (readOnly()) return;
+  if (button) button.disabled = true;
+  const owner = _container;
+  try {
+    await api.put(`/birthdays/${birthday.id}`, { contact_id: contactId });
+    window.yuvomi?.showToast(t('birthdays.linkedToast'), 'success');
+    await reloadAfterSave(() => loadData());
+    if (_container !== owner) return;
+    renderList({ repaint: true });
+    const fresh = state.birthdays.find((b) => b.id === birthday.id);
+    if (fresh) onLinked?.(fresh);
+    // Die Spalte zeichnet ihr Detail einen Mikrotakt spaeter (master-detail.js
+    // `paint` wartet auf den Renderer) - der Fokus folgt im naechsten Bild.
+    const nextFrame = globalThis.requestAnimationFrame ?? ((fn) => setTimeout(fn, 0));
+    nextFrame(() => document.getElementById('birthday-detail-contact')?.focus());
+  } catch (err) {
+    if (button?.isConnected) button.disabled = false;
+    window.yuvomi?.showToast(errorSentence(err), 'danger');
+  }
+}
+
+/**
+ * Der ruhige Hinweis (D7): ein unverknuepfter Geburtstag, dessen Name genau
+ * einem unverknuepften Kontakt gleicht (`suggested_contact_id`, vom Server
+ * nur mit Kontakte-Leserecht). Eine Zeile wie jede andere der Ansicht, mit
+ * "Verknuepfen" als Folgeaktion - kein Banner, keine Farbe. Ohne Schreibrecht
+ * gibt es nichts zu tun, also auch keine Zeile.
+ */
+function contactSuggestionRow(birthday, onLinked) {
+  if (!birthday.suggested_contact_id || birthday.contact_id || readOnly()) return null;
+  return {
+    icon: 'book-user',
+    label: t('birthdays.contactSuggestLabel'),
+    value: t('birthdays.contactSuggestValue'),
+    action: {
+      id: 'birthday-detail-link',
+      label: t('birthdays.linkContact'),
+      icon: 'link',
+      onClick: ({ button } = {}) => linkBirthdayToContact(birthday, birthday.suggested_contact_id, { button, onLinked }),
+    },
+  };
+}
+
 function openBirthdayModal({ mode, birthday = null }) {
   // Der Riegel steht VOR jeder Vorbereitung: der Anlegeweg entfaellt ganz, ein
   // bestehender Geburtstag geht als Leseansicht auf (Muster aus notes.js).
@@ -891,47 +1075,61 @@ function openBirthdayModal({ mode, birthday = null }) {
   const today = todayKey();
 
   openSharedModal({
+    staged: !isEdit, // Buehne zuerst, Felder nach dem ersten Bild (modal.js, R21 a6)
     title: isEdit ? t('birthdays.editTitle') : t('birthdays.newTitle'),
+    // Anlegen: erstes Pflichtfeld; Bearbeiten: am Finger der Titel (R24 D4).
+    initialFocus: dialogInitialFocus(isEdit),
     content: `
       <div class="birthday-modal">
         <div class="birthday-modal__identity">
+          ${/* EIN BEDIENELEMENT FUER DAS BILD (Critique R24 G1-Geburtstage-P3-1,
+               Baustein `.media-picker` in layout.css): die Scheibe IST die Wahl,
+               das Stift-Abzeichen sagt es; der zweite Knopf mit demselben Stift
+               daneben ist weg. "Bild entfernen" steht nur mit Bild darunter, als
+               Text - eine andere Handlung, kein zweiter Weg zur selben. */ ''}
           <div class="birthday-modal__photo-wrap">
-            <button type="button" class="birthday-avatar-editor" id="birthday-preview" aria-label="${t('birthdays.photoLabel')}">
-              ${birthdayPreviewHtml(birthday?.name || '', photoData)}
-            </button>
+            <span class="media-picker">
+              <button type="button" class="birthday-avatar-editor" id="birthday-preview" aria-label="${t('birthdays.photoLabel')}">
+                ${birthdayPreviewHtml(birthday?.name || '', photoData)}
+              </button>
+              ${mediaPickerBadgeHtml()}
+            </span>
             <input class="sr-only" id="bd-photo" type="file" accept="image/png,image/jpeg,image/webp"
                    aria-label="${t('birthdays.photoLabel')}" tabindex="-1">
-            <div class="birthday-modal__photo-actions">
-              <button type="button" class="birthday-modal__photo-action" id="bd-photo-edit" aria-label="${t('birthdays.photoLabel')}" title="${t('birthdays.photoLabel')}">
-                <i data-lucide="pencil" aria-hidden="true"></i>
-              </button>
-              <button type="button" class="birthday-modal__photo-action birthday-modal__photo-action--danger" id="bd-remove-photo" aria-label="${t('birthdays.removePhoto')}" title="${t('birthdays.removePhoto')}"${photoData ? '' : ' hidden'}>
-                <i data-lucide="trash-2" aria-hidden="true"></i>
-              </button>
-            </div>
+            <button type="button" class="btn btn--ghost btn--sm media-picker__remove" id="bd-remove-photo"${photoData ? '' : ' hidden'}>${t('birthdays.removePhoto')}</button>
           </div>
           <div class="birthday-modal__fields">
             <div class="form-group">
-              <label class="form-label" for="bd-name">${t('birthdays.nameLabel')}</label>
-              <input class="form-input" id="bd-name" type="text" value="${esc(birthday?.name || '')}" autocomplete="name">
+              <label class="form-label" for="bd-name">${t('birthdays.nameLabel')}${REQUIRED_MARK}</label>
+              <input class="form-input" id="bd-name" type="text" value="${esc(birthday?.name || '')}" autocomplete="name" required>
             </div>
-            <div class="form-group">
-              <label class="form-label" for="bd-birth-date">${t('birthdays.birthDateLabel')}</label>
-              <yuvomi-datepicker id="bd-birth-date" type="date" max="${today}" value="${esc(birthday?.birth_date || '')}"></yuvomi-datepicker>
-            </div>
+            ${birthDateFieldHtml({
+              id: 'bd-birth-date',
+              label: t('birthdays.birthDateLabel'),
+              value: birthday?.birth_date || '',
+              yearUnknown: birthday?.year_unknown,
+              max: today,
+              required: true,
+              // DER HINWEIS STEHT IM KOPF, BEIM DATUM (R24, Critique
+              // G1-Geburtstage-P3-1): was mit dem Datum geschieht (Kalender,
+              // Erinnerung), sagt der Hinweis des Felds, wo es eingegeben wird -
+              // nicht mehr unter dem Aufklapper ueber dem Fuss.
+              hint: t('birthdays.calendarHint'),
+            })}
           </div>
         </div>
         ${advancedSection(`
+          ${mayLinkContacts(birthday) ? contactLinkFieldHtml(birthday) : ''}
           ${renderNameDayField(birthday)}
           <div class="form-group">
             <label class="form-label" for="bd-notes">${t('birthdays.notesLabel')}</label>
             <textarea class="form-input" id="bd-notes" rows="3" placeholder="${t('birthdays.notesPlaceholder')}">${esc(birthday?.notes || '')}</textarea>
           </div>
           ${renderBirthdayReminderSection(birthday)}`,
-          { open: isEdit && (!!birthday?.name_day || !!birthday?.notes || reminderOpensAdvanced(birthday)) })}
-        <div class="birthday-modal__hint">${t('birthdays.calendarHint')}</div>
+          { open: isEdit && (!!birthday?.contact_id || !!birthday?.name_day || !!birthday?.notes || reminderOpensAdvanced(birthday)),
+            hint: birthdayAdvancedTopics(mayLinkContacts(birthday)) })}
         <div class="modal-panel__footer modal-panel__footer--plain">
-          ${isEdit ? `<button type="button" class="btn btn--danger-outline" id="bd-delete" style="margin-inline-end:auto">
+          ${isEdit ? `<button type="button" class="btn btn--danger-outline" id="bd-delete">
             <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${t('common.delete')}
           </button>` : '<div></div>'}
           <div class="birthday-modal__footer-actions">
@@ -946,7 +1144,6 @@ function openBirthdayModal({ mode, birthday = null }) {
       const nameInput = panel.querySelector('#bd-name');
       const preview = panel.querySelector('#birthday-preview');
       const fileInput = panel.querySelector('#bd-photo');
-      const photoEdit = panel.querySelector('#bd-photo-edit');
       // Den Entfernen-Knopf gibt es nur mit Bild: ein roter Muelleimer fuer
       // ein Bild, das es nicht gibt, war eine Handlung ohne Gegenstand.
       const removePhoto = panel.querySelector('#bd-remove-photo');
@@ -958,7 +1155,6 @@ function openBirthdayModal({ mode, birthday = null }) {
       };
       nameInput.addEventListener('input', renderPreview);
       preview.addEventListener('click', () => fileInput?.click());
-      photoEdit?.addEventListener('click', () => fileInput?.click());
       fileInput?.addEventListener('change', async (e) => {
         const file = e.target.files?.[0];
         if (!file) return;
@@ -967,15 +1163,22 @@ function openBirthdayModal({ mode, birthday = null }) {
         // stehen, feuert `change` beim nächsten Griff zu DERSELBEN Datei nicht
         // mehr, und „nochmal anders zuschneiden" täte gar nichts.
         e.target.value = '';
+        let ImageProblemType = null;
         try {
-          const { pickCroppedImage } = await import('/utils/avatar-crop.js');
+          const { pickCroppedImage, ImageProblem } = await import('/utils/avatar-crop.js');
+          ImageProblemType = ImageProblem;
           const cropped = await pickCroppedImage(file);
           // Abgebrochener Zuschnitt: das bisherige Bild bleibt stehen.
           if (cropped === undefined) return;
           photoData = cropped;
           renderPreview();
         } catch (err) {
-          window.yuvomi?.showToast(err.message, 'danger');
+          // Die Pruefung des Bildes sagt ihren Satz; jeder andere Wurf den
+          // allgemeinen, nie seinen eigenen, unuebersetzten Text (#1909).
+          window.yuvomi?.showToast(
+            ImageProblemType && err instanceof ImageProblemType ? err.sentence : t('common.errorGeneric'),
+            'danger',
+          );
         }
       });
       removePhoto.addEventListener('click', () => {
@@ -986,6 +1189,14 @@ function openBirthdayModal({ mode, birthday = null }) {
         // waehlen" daneben, nicht an BODY.
         photoEdit?.focus();
       });
+
+      const birthDateField = wireBirthDateField(panel, 'bd-birth-date');
+
+      // Die Auswahl steht mit dem, was der Geburtstag schon weiss (verknuepft:
+      // sein Kontakt, sonst "Keiner"); die uebrigen Kontakte kommen nach.
+      const contactSelect = panel.querySelector('#bd-contact');
+      const contactAsOpened = contactSelect?.value ?? '';
+      if (contactSelect) fillContactLinkOptions(panel, contactSelect, birthday);
 
       const reminderOffset = panel.querySelector('#bd-reminder-offset');
       const reminderCustom = panel.querySelector('#bd-reminder-custom');
@@ -1044,8 +1255,22 @@ function openBirthdayModal({ mode, birthday = null }) {
       });
       panel.querySelector('#bd-save').addEventListener('click', async () => {
         const saveBtn = panel.querySelector('#bd-save');
-        const birthDateRaw = panel.querySelector('#bd-birth-date').value;
-        const birthDate = parseDateInput(birthDateRaw);
+        // Mit Jahr wie bisher aus dem Datumswaehler; ohne Jahr aus Monat und
+        // Tag, mit dem Platzhalterjahr, das der Server ohnehin setzt (#2095).
+        const birth = birthDateField.read();
+        const birthDateRaw = birth.raw;
+        const birthDate = birth.yearUnknown ? birth.date : parseDateInput(birthDateRaw);
+        // DER FEHLER STEHT AM FELD (R23, D8): Name und Datum sind Pflicht und
+        // tragen den Stern; wer sie leer laesst, landet im Feld, statt einen
+        // Sammel-Toast zu lesen, der nicht sagt, welches gemeint ist.
+        const nameInput = panel.querySelector('#bd-name');
+        const dateMissing = !birthDate || !isDateInputValid(birthDateRaw);
+        if (reportFieldErrors([
+          !nameInput.value.trim() && [nameInput, t('common.nameRequired')],
+          birth.yearUnknown && (!birth.complete || dateMissing)
+            && [panel.querySelector('#bd-birth-date-month'), t('birthdays.yearlessIncomplete')],
+          !birth.yearUnknown && dateMissing && [panel.querySelector('#bd-birth-date'), t('common.required')],
+        ])) return;
         const nameDay = normalizeNameDaySelection(nameDayMonth?.value, nameDayDay?.value);
         if (!nameDay.complete) {
           window.yuvomi?.showToast(t('birthdays.nameDayIncomplete'), 'warning');
@@ -1054,6 +1279,7 @@ function openBirthdayModal({ mode, birthday = null }) {
         const body = {
           name: panel.querySelector('#bd-name').value.trim(),
           birth_date: birthDate,
+          year_unknown: birth.yearUnknown,
           name_day: nameDay.value,
           notes: panel.querySelector('#bd-notes').value.trim(),
           photo_data: photoData,
@@ -1064,16 +1290,17 @@ function openBirthdayModal({ mode, birthday = null }) {
         // Geprueft wird nur, was mitgeht: eine gespeicherte Anzahl ausserhalb
         // 1-999, die niemand angefasst hat, laesst eine Namensaenderung nicht
         // scheitern - der Server nimmt sie unveraendert zurueck (#1384).
+        // Die Verknuepfung geht nur mit, wenn sie sich geaendert hat - wie die
+        // Erinnerung. Ein neuer Geburtstag ohne Auswahl schickt nichts.
+        if (contactSelect && contactSelect.value !== contactAsOpened) {
+          body.contact_id = contactSelect.value === '' ? null : Number(contactSelect.value);
+        }
         const { reminder, invalid } = reminderToSave(readReminder());
         const reminderChanged = !isEdit
           || Object.keys(reminder).some((key) => reminder[key] !== reminderAsOpened[key]);
         if (reminderChanged) Object.assign(body, reminder);
         const reminderInvalid = reminderChanged && invalid;
 
-        if (!body.name || !body.birth_date || !isDateInputValid(birthDateRaw)) {
-          window.yuvomi?.showToast(t('birthdays.requiredFields'), 'warning');
-          return;
-        }
         if (reminderInvalid) {
           window.yuvomi?.showToast(t('birthdays.reminderAmountInvalid', { max: REMINDER_AMOUNT_MAX }), 'warning');
           panel.querySelector('#bd-reminder-custom-amount')?.focus();
@@ -1081,6 +1308,8 @@ function openBirthdayModal({ mode, birthday = null }) {
         }
 
         saveBtn.disabled = true;
+        const owner = _container;
+        const dialog = captureModalContext();
         try {
           if (isEdit) {
             await api.put(`/birthdays/${birthday.id}`, body);
@@ -1089,12 +1318,27 @@ function openBirthdayModal({ mode, birthday = null }) {
             await api.post('/birthdays', body);
             window.yuvomi?.showToast(t('birthdays.createdToast'), 'success');
           }
-          await loadData();
+          await reloadAfterSave(() => loadData());
           renderList({ repaint: true, motion: true });
-          closeModal({ force: true });
+          // Nur dieser Dialog, nicht einer, der waehrend der Anfrage
+          // aufgegangen ist (#1997).
+          closeModal({ force: true, context: dialog });
         } catch (err) {
-          window.yuvomi?.showToast(err.message, 'danger');
+          window.yuvomi?.showToast(errorSentence(err), 'danger');
           saveBtn.disabled = false;
+          // Der gewaehlte Kontakt ist inzwischen vergeben oder weg (D7): der
+          // Dialog bleibt offen und bietet die Kontakte an, die es jetzt gibt.
+          if (contactSelect && CONTACT_CHOICE_REFUSALS.has(err?.data?.reason)) {
+            fillContactLinkOptions(panel, contactSelect, birthday);
+          }
+          // Den Geburtstag gibt es nicht mehr (#1909): das Formular geht zu,
+          // solange es das offene ist, und der Eintrag faellt aus der Liste.
+          if (isEdit && isAlreadyDeleted(err, 'birthdays_birthday_not_found')) {
+            closeModal({ force: true, context: dialog });
+            state.birthdays = state.birthdays.filter((b) => b.id !== birthday.id);
+            updateBirthdayBadge();
+            if (_container === owner) renderList({ repaint: true });
+          }
         }
       });
     },
@@ -1107,28 +1351,46 @@ function importCandidateRowHtml(c) {
       <div class="bd-import-row bd-import-row--done">
         <span class="bd-import-row__check" aria-hidden="true"><i data-lucide="check"></i></span>
         <span class="bd-import-row__name">${esc(c.name)}</span>
-        <span class="bd-import-row__date">${esc(formatDate(c.birthday))}</span>
+        <span class="bd-import-row__date">${esc(birthDateShort(c.birthday, c.birthday_year_unknown))}</span>
         <span class="bd-import-row__badge">${t('birthdays.importAlreadyAdded')}</span>
+      </div>`;
+  }
+  // Gibt es den Menschen schon als Geburtstag (gleicher Name oder Tag, vom
+  // Server als `suggested_birthday_id`), legte der Haken eine zweite Zeile an.
+  // Die Zeile fragt stattdessen "Mit X verknuepfen?" (R23, G5-P2).
+  if (c.suggested_birthday_id) {
+    return `
+      <div class="bd-import-row bd-import-row--suggest">
+        <span class="bd-import-row__text">
+          <span class="bd-import-row__name">${esc(c.name)}</span>
+          <span class="bd-import-row__hint">${esc(t('birthdays.importLinkSuggest', { name: c.suggested_birthday_name ?? '' }))}</span>
+        </span>
+        <span class="bd-import-row__date">${esc(birthDateShort(c.birthday, c.birthday_year_unknown))}</span>
+        <button class="btn btn--secondary btn--sm" type="button" data-import-link="${c.suggested_birthday_id}" data-contact-id="${c.id}">${t('birthdays.linkContact')}</button>
       </div>`;
   }
   return `
     <label class="bd-import-row">
       <input type="checkbox" value="${c.id}">
       <span class="bd-import-row__name">${esc(c.name)}</span>
-      <span class="bd-import-row__date">${esc(formatDate(c.birthday))}</span>
+      <span class="bd-import-row__date">${esc(birthDateShort(c.birthday, c.birthday_year_unknown))}</span>
     </label>`;
 }
 
 async function openImportModal() {
   if (readOnly()) return;
+  // Kommen die Kandidaten erst, nachdem der Nutzer einen anderen Dialog
+  // geoeffnet oder die Seite verlassen hat, geht der Import nicht mehr auf (#1997).
+  const context = captureOpenContext();
   let candidates;
   try {
     const res = await api.get('/birthdays/import/candidates');
     candidates = res.data;
   } catch (err) {
-    window.yuvomi?.showToast(err.message, 'danger');
+    window.yuvomi?.showToast(loadErrorSentence(err) ?? t('common.errorGeneric'), 'danger');
     return;
   }
+  if (!isModalContextCurrent(context)) return;
 
   const withBirthday = candidates.withBirthday ?? [];
   const withoutBirthday = candidates.withoutBirthday ?? [];
@@ -1155,18 +1417,28 @@ async function openImportModal() {
       <div class="bd-import">
         <p class="bd-import__intro">${t('birthdays.importIntro')}</p>
         <span class="sr-only" role="status" aria-live="polite" id="bd-import-status"></span>
+        ${withBirthday.some((c) => !c.already_imported && !c.suggested_birthday_id) ? `
+          <div class="bd-import__bar">
+            <button class="btn btn--ghost btn--sm" type="button" id="bd-import-toggle">${t('contacts.importSelectAll')}</button>
+          </div>` : ''}
         ${listHtml}
         ${withoutHtml}
+        <p class="form-hint form-hint--danger bd-import__reason" data-import-reason role="status" hidden></p>
         <div class="modal-panel__footer modal-panel__footer--plain">
           <button class="btn btn--secondary" type="button" id="bd-import-cancel">${t('common.cancel')}</button>
-          <button class="btn btn--primary" type="button" id="bd-import-submit" disabled>${t('birthdays.importSubmit', { count: 0 })}</button>
+          <button class="btn btn--primary" type="button" id="bd-import-submit">${t('birthdays.importSubmit', { count: 0 })}</button>
         </div>
       </div>
     `,
     onSave(panel) {
       const submitBtn = panel.querySelector('#bd-import-submit');
+      const toggleBtn = panel.querySelector('#bd-import-toggle');
       const status = panel.querySelector('#bd-import-status');
+      const reasonEl = panel.querySelector('[data-import-reason]');
       const selectable = [...panel.querySelectorAll('.bd-import__list input:not(:disabled)')];
+      let submitting = false;
+      // A retry continues the same import, including batches already saved.
+      let imported = 0;
 
       const selectedIds = () =>
         selectable.filter((cb) => cb.checked).map((cb) => Number(cb.value));
@@ -1174,31 +1446,102 @@ async function openImportModal() {
       const refresh = (announce = false) => {
         const n = selectedIds().length;
         submitBtn.textContent = t('birthdays.importSubmit', { count: n });
-        submitBtn.disabled = n === 0;
+        // Gesperrt nur, solange die Anfrage laeuft; ohne Wahl sagt der Knopf
+        // beim Tippen, was fehlt (R24, D4 - kein grauer Primaerknopf).
+        if (submitting) submitBtn.disabled = true;
+        else submitBtn.disabled = false;
+        if (n > 0 && reasonEl) reasonEl.hidden = true;
+        if (toggleBtn) {
+          toggleBtn.textContent = n === selectable.length
+            ? t('contacts.importDeselectAll')
+            : t('contacts.importSelectAll');
+          toggleBtn.disabled = submitting;
+        }
+        selectable.forEach((cb) => { cb.disabled = submitting; });
         // Nur bei echter Interaktion ansagen, nicht beim initialen Öffnen.
         if (announce && status) status.textContent = t('birthdays.importSelected', { count: n });
       };
       selectable.forEach((cb) => cb.addEventListener('change', () => refresh(true)));
+      toggleBtn?.addEventListener('click', () => {
+        if (submitting) return;
+        const allChecked = selectable.every((cb) => cb.checked);
+        selectable.forEach((cb) => { cb.checked = !allChecked; });
+        refresh(true);
+      });
       refresh();
 
       panel.querySelector('#bd-import-cancel').addEventListener('click', closeModal);
 
+      // "Verknuepfen" statt einer zweiten Zeile: der Dialog bleibt offen, die
+      // Zeile wird zu "Bereits uebernommen", die Liste dahinter laedt neu.
+      panel.querySelectorAll('[data-import-link]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const owner = _container;
+          const candidate = withBirthday.find((c) => c.id === Number(btn.dataset.contactId));
+          btn.disabled = true;
+          try {
+            await api.put(`/birthdays/${Number(btn.dataset.importLink)}`, { contact_id: Number(btn.dataset.contactId) });
+            window.yuvomi?.showToast(t('birthdays.linkedToast'), 'success');
+            const row = btn.closest('.bd-import-row');
+            if (row && candidate) {
+              row.insertAdjacentHTML('afterend', importCandidateRowHtml({ ...candidate, already_imported: true }));
+              const done = row.nextElementSibling;
+              row.remove();
+              if (done && window.lucide) window.lucide.createIcons({ el: done });
+            }
+            await reloadAfterSave(() => loadData());
+            if (_container === owner) renderList({ repaint: true });
+          } catch (err) {
+            if (btn.isConnected) btn.disabled = false;
+            window.yuvomi?.showToast(errorSentence(err), 'danger');
+          }
+        });
+      });
+
       submitBtn.addEventListener('click', async () => {
+        if (submitting) return;
         const ids = selectedIds();
         if (ids.length === 0) {
-          window.yuvomi?.showToast(t('birthdays.importNothingSelected'), 'warning');
+          // Am Dialog, nicht als Toast: die Meldung steht dort, wo gewaehlt wird.
+          reasonEl.textContent = t('birthdays.importNothingSelected');
+          reasonEl.hidden = false;
+          selectable[0]?.focus();
           return;
         }
-        submitBtn.disabled = true;
+        // Geschlossen wird nur dieser Dialog, nicht einer, der waehrend der
+        // Anfrage aufgegangen ist (#1997).
+        const dialog = captureModalContext();
+        submitting = true;
+        refresh();
         try {
-          const res = await api.post('/birthdays/import', { contact_ids: ids });
-          window.yuvomi?.showToast(t('birthdays.importSuccess', { count: res.data.imported }), 'success');
-          await loadData();
+          // Keep large selections within the API's 500-contact request limit.
+          for (let offset = 0; offset < ids.length; offset += 500) {
+            const res = await api.post('/birthdays/import', { contact_ids: ids.slice(offset, offset + 500) });
+            imported += res.data.imported;
+          }
+          window.yuvomi?.showToast(t('birthdays.importSuccess', { count: imported }), 'success');
+          await reloadAfterSave(() => loadData());
           renderList({ repaint: true, motion: true });
-          closeModal({ force: true });
+          closeModal({ force: true, context: dialog });
         } catch (err) {
-          window.yuvomi?.showToast(err.message, 'danger');
-          submitBtn.disabled = false;
+          if (imported > 0) {
+            window.yuvomi?.showToast(`${t('birthdays.importSuccess', { count: imported })} ${errorSentence(err)}`, 'warning');
+            await reloadAfterSave(() => loadData());
+            renderList({ repaint: true });
+            refocusAfterRender();
+          } else {
+            window.yuvomi?.showToast(errorSentence(err), 'danger');
+          }
+        } finally {
+          submitting = false;
+          refresh();
+          // The button was disabled during the request, which drops keyboard
+          // focus. Hand it back for the retry while this dialog is still open,
+          // unless the user has moved focus elsewhere in the meantime.
+          const active = document.activeElement;
+          if (isOwnModalOpen(dialog) && (!active || active === document.body || active === submitBtn)) {
+            submitBtn.focus();
+          }
         }
       });
     },
@@ -1231,7 +1574,16 @@ function deleteBirthday(id) {
 
   scheduleUndoableDelete({
     message: t('birthdays.deletedToast'),
-    commit: ({ keepalive }) => api.delete(`/birthdays/${id}`, { keepalive }),
+    commit: async ({ keepalive }) => {
+      try {
+        await api.delete(`/birthdays/${id}`, { keepalive });
+      } catch (err) {
+        // SCHON GELOESCHT IST EIN ERFOLG (#1909): ein anderes Haushaltsmitglied
+        // war schneller. Geburtstage haben keine Sichtbarkeit - die 404 heisst
+        // nur "gibt es nicht mehr". Kein Toast, die Zeile kommt nicht zurueck.
+        if (!isAlreadyDeleted(err, 'birthdays_birthday_not_found')) throw err;
+      }
+    },
     restore: (err) => {
       state.birthdays = [
         ...state.birthdays.slice(0, index),
@@ -1240,7 +1592,7 @@ function deleteBirthday(id) {
       ];
       updateBirthdayBadge();
       if (_container === owner) renderList({ motion: true });
-      if (err) window.yuvomi?.showToast(err.data?.error ?? t('common.unknownError'), 'danger');
+      if (err) window.yuvomi?.showToast(errorSentence(err), 'danger');
     },
   });
 }
@@ -1249,13 +1601,27 @@ function deleteBirthday(id) {
 // Liste + Detail (R10 L5)
 // --------------------------------------------------------
 
+/** Die Adresse eines Kontakts: dieselbe wie aus der Suche (`?open=`). */
+function contactHref(id) {
+  return `/contacts?open=${encodeURIComponent(String(id))}`;
+}
+
+/**
+ * Darf die Leseansicht zum Kontakt springen? Ein Modul ohne Zugang oder ein
+ * haushaltweit abgeschaltetes leitet der Router um - der Knopf fuehrte dann
+ * zurueck auf die Uebersicht (Critique R21, D7).
+ */
+function mayOpenContacts() {
+  return !globalThis.window?.yuvomi?.isModuleDisabled?.('contacts') && pathAccess('/contacts') !== 'none';
+}
+
 /**
  * Der Geburtstag in der Detailspalte: dieselben Angaben wie die Leseansicht
  * (birthdayReadHtml), dazu die Auskunft, die die Zeile nur knapp traegt - wann
  * und wie alt. Gebaut aus den Zeilen der geteilten Leseansicht
  * (components/detail-view.js), damit die Spalte aussieht wie in Kontakten.
  */
-function birthdayPaneSections(birthday) {
+function birthdayPaneSections(birthday, { onLinked = null } = {}) {
   const nameDay = nameDayReadText(birthday.name_day);
   const nameDayNext = nameDay && Number.isInteger(birthday.name_day_days_until)
     ? `${nameDay} · ${countdownLabel(birthday.name_day_days_until)}` : nameDay;
@@ -1266,11 +1632,25 @@ function birthdayPaneSections(birthday) {
     // Critique 2026-10-16: "das Geburtstagsdetail sagt dasselbe dreimal").
     // Alter und Abstand stehen als Kennzahlen im Kopf, das Datum als seine
     // Unterzeile (birthdayDetailHead).
-    { icon: 'cake', label: t('birthdays.birthDateLabel'), value: birthday.birth_date ? formatDate(birthday.birth_date) : '' },
+    // DER WEG ZUM KONTAKT (Critique R21, D7): ein importierter Geburtstag kennt
+    // seinen Kontakt (`contact_id`, Migration 90). Wie "Kontakt anzeigen" an
+    // einem Geburtstag in Apples Kalender - an der Datumszeile, nicht im Fuss.
+    {
+      icon: 'cake',
+      label: t('birthdays.birthDateLabel'),
+      value: birthDateText(birthday.birth_date, birthday.year_unknown),
+      action: birthday.contact_id && mayOpenContacts() ? {
+        id: 'birthday-detail-contact',
+        label: t('birthdays.showContact'),
+        icon: 'book-user',
+        onClick: () => leaveDetailTo(contactHref(birthday.contact_id)),
+      } : null,
+    },
+    contactSuggestionRow(birthday, onLinked),
     { icon: 'calendar-heart', label: t('birthdays.nameDay'), value: nameDayNext },
     { icon: 'align-left', label: t('birthdays.notesLabel'), value: birthday.notes || '', multiline: true },
     { icon: 'bell', label: t('reminders.offsetLabel'), value: reminderReadText(birthday) },
-  ];
+  ].filter(Boolean);
 }
 
 /**
@@ -1289,7 +1669,9 @@ function birthdayDetailHead(birthday) {
     media,
     // Das Datum des naechsten Geburtstags, einmal: unter dem Bild, ueber Alter
     // und Abstand (vorher zusaetzlich als erste Zeile darunter, R19).
-    subtitle: birthday.next_birthday ? formatDate(birthday.next_birthday) : '',
+    // Mit Etikett (Critique R22, a3 Klein): ohne stand "02.11.2026" ueber
+    // der Zeile "Geburtsdatum 02.11.1985" - zwei Daten, eins davon namenlos.
+    subtitle: birthday.next_birthday ? t('birthdays.nextBirthdayOn', { date: dateText(birthday.next_birthday, { weekday: true }) }) : '',
     facts: [
       birthday.next_age != null ? t('birthdays.turnsAge', { age: birthday.next_age }) : '',
       Number.isInteger(days) ? countdownLabel(days) : '',
@@ -1312,7 +1694,7 @@ function renderBirthdayPane(id, body) {
     actions: ro ? [] : [{
       id: 'birthday-detail-delete',
       label: t('common.delete'),
-      variant: 'danger-ghost',
+      variant: 'danger-outline',
       icon: 'trash-2',
       align: 'start',
       onClick: () => deleteBirthday(birthday.id),
@@ -1349,16 +1731,24 @@ function renderBirthdayPane(id, body) {
  */
 function openBirthdaySheet(birthday) {
   if (readOnly()) { openBirthdayModal({ mode: 'edit', birthday }); return; }
-  openDetailView({
+  // Nach dem Verknuepfen (D7) steht das Blatt mit dem frischen Eintrag neu:
+  // der Hinweis geht, "Kontakt anzeigen" kommt, und Bearbeiten oeffnet den
+  // Editor mit der Verknuepfung statt mit dem Stand beim Oeffnen.
+  let current = birthday;
+  const onLinked = (fresh) => {
+    current = fresh;
+    view?.update(birthdayPaneSections(fresh, { onLinked }));
+  };
+  const view = openDetailView({
     title: birthday.name,
     key: `birthday:${birthday.id}`,
     head: birthdayDetailHead(birthday),
     size: 'md',
-    sections: birthdayPaneSections(birthday),
+    sections: birthdayPaneSections(birthday, { onLinked }),
     actions: [{
       id: 'birthday-detail-delete',
       label: t('common.delete'),
-      variant: 'danger-ghost',
+      variant: 'danger-outline',
       icon: 'trash-2',
       align: 'start',
       onClick: async ({ close }) => {
@@ -1375,7 +1765,7 @@ function openBirthdaySheet(birthday) {
         // Der Editor merkt sich beim Oeffnen, wo der Fokus steht - das muss
         // die Zeile sein, nicht <body> zwischen zwei Dialogen.
         _container?.querySelector(`[data-open="${birthday.id}"]`)?.focus();
-        openBirthdayModal({ mode: 'edit', birthday });
+        openBirthdayModal({ mode: 'edit', birthday: current });
       },
     }],
   });
@@ -1500,7 +1890,14 @@ export const __test = {
   onListClick, openBirthdayModal,
   birthdayPreviewHtml,
   // R10 L5: die Detailspalte.
-  birthdayPaneSections, birthdayDetailHead, renderBirthdayPane,
+  birthdayPaneSections, birthdayDetailHead, renderBirthdayPane, contactHref,
+  // R22 D7: verknuepfen im Dialog und aus dem Hinweis.
+  contactLinkFieldHtml, fillContactLinkOptions, linkBirthdayToContact, mayLinkContacts, openBirthdaySheet,
   // #1821: `?open=` unter der Spaltenschwelle.
   openBirthdayFromQueryNarrow,
+  // #1909: Speichern, Loeschen und Import, wenn der Server ablehnt.
+  deleteBirthday, openImportModal,
+  // R23 G5-P2: gleicher Name oder Tag - die Importzeile fragt statt anzulegen.
+  importCandidateRowHtml,
+  setContainerForTest(container) { _container = container; },
 };

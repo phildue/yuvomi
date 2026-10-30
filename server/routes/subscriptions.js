@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import express from 'express';
 import * as db from '../db.js';
 import { createLogger } from '../logger.js';
@@ -22,6 +23,7 @@ import { refuseWhileRestoring } from '../middleware/restore-gate.js';
 import { findLogoOptions } from '../services/subscription-logo.js';
 import { normalizeObjectVisibility, budgetVisibilityWhere, budgetDetailsVisibleWhere, canEditEntry, resolveBudgetMode } from '../services/budget-visibility.js';
 import { dataUrlContentMatches } from '../utils/file-signature.js';
+import { budgetFilter, budgetAccountCurrency, listAccounts, validateAccountRef } from './budget/helpers.js';
 
 const log = createLogger('Subscriptions');
 const router = express.Router();
@@ -76,6 +78,27 @@ function selectedMetaGone(categoryId, paymentMethodId) {
   return null;
 }
 
+/**
+ * Das gewaehlte Konto (#1277): `{ value }` (null = ohne Konto) oder die
+ * Absage. Dieselbe Pruefung wie an einer Buchung (validateAccountRef): eine
+ * Kontohuelle ist fuer wen sie nichts traegt "nicht gefunden". Ein PUT ohne
+ * `account_id` laesst die Vorgabe stehen, ein unveraendertes wird nicht neu
+ * geprueft - das Konto kann inzwischen archiviert sein, und dann bucht das
+ * Abo ohne Konto, statt das Speichern abzulehnen.
+ */
+function accountChoice(req, current = null) {
+  if (req.body.account_id === undefined) return { value: current?.account_id ?? null };
+  if (current && req.body.account_id !== null && req.body.account_id !== ''
+      && Number(req.body.account_id) === current.account_id) return { value: current.account_id };
+  const ref = validateAccountRef(req.body.account_id, budgetFilter(req, 'e', { scoped: false }));
+  // Nur "gibt es nicht" erreicht der Dialog; eine ungueltige id nur die API.
+  if (ref.error === 'Account not found.') {
+    return { problem: { error: ref.error, code: 400, reason: 'subscriptions_account_not_found' } };
+  }
+  if (ref.error) return { problem: { error: ref.error, code: 400 } };
+  return { value: ref.value };
+}
+
 function actorId(req) {
   return req.authUserId || req.session.userId;
 }
@@ -111,16 +134,34 @@ function syncReminder(subscription) {
   );
 }
 
+/**
+ * DAS KONTO AM ABO (#1277), mitgelesen: Name und ob es archiviert ist. Eine
+ * Huelle (archived = 2, budget/helpers.js) zaehlt als archiviert - eine
+ * Vorgabe zeigt nie auf sie, denn das Loeschen eines Kontos leert jede.
+ */
+const ACCOUNT_COLUMNS = 'a.name AS account_name, a.archived AS account_archived';
+
+/**
+ * Das Konto, auf das die Buchung des Abos geht: die Vorgabe, solange ihr Konto
+ * aktiv ist. Ist es archiviert, bucht das Abo OHNE Konto (Entscheidung zu
+ * #1277) und sagt es am Abo (`account_archived`) - auf ein archiviertes Konto
+ * soll nichts Neues mehr laufen, und eine Absage braeche jede Zahlung ab.
+ */
+function bookingAccountId(row) {
+  return row.account_id != null && !row.account_archived ? row.account_id : null;
+}
+
 function loadSubscription(id) {
   return db.get().prepare(`
     SELECT s.*, c.name AS category_name, c.color AS category_color,
            c.label_key AS category_label_key, c.budget_subcategory_key,
            p.name AS payment_method_name, p.label_key AS payment_method_label_key,
-           u.display_name AS creator_name
+           u.display_name AS creator_name, ${ACCOUNT_COLUMNS}
     FROM budget_subscriptions s
     LEFT JOIN subscription_categories c ON c.id = s.category_id
     LEFT JOIN subscription_payment_methods p ON p.id = s.payment_method_id
     LEFT JOIN users u ON u.id = s.created_by
+    LEFT JOIN budget_accounts a ON a.id = s.account_id
     WHERE s.id = ?
   `).get(id);
 }
@@ -165,6 +206,7 @@ function decorate(row) {
     ...row,
     enabled: Boolean(row.enabled),
     reminder_enabled: Boolean(row.reminder_enabled),
+    account_archived: row.account_id != null && Boolean(row.account_archived),
     status: subscriptionStatus(row),
     occurrences_remaining: occurrencesRemaining(row),
   };
@@ -205,6 +247,17 @@ function endConfigErrors({ end_type, end_date, occurrence_count, next_payment_da
 
 function budgetCurrency() {
   return subscriptionBudgetCurrency(db.get());
+}
+
+/**
+ * Die Waehrung der Buchung (#2302): die ihres Kontos, ohne Konto die
+ * Budget-Waehrung. Eine Buchung auf einem Konto in Fremdwaehrung steht in
+ * dessen Waehrung wie jede andere dort; das Abo rechnet mit demselben
+ * Kurs-Cache in sie um wie bisher in die Budget-Waehrung.
+ */
+function bookingCurrency(row) {
+  const accountId = bookingAccountId(row);
+  return accountId != null ? budgetAccountCurrency(accountId) : budgetCurrency();
 }
 
 // Betrag und Titel der Buchung rechnet services/subscription-budget-projection.js:
@@ -256,39 +309,53 @@ async function fetchBookingRates(currency, budgetCur) {
   return { currency, budgetCurrency: budgetCur, rates: result.rates };
 }
 
-/** Betrag der Buchung aus einer Zeile, oder undefined, wenn der Kurs nicht zur Zeile passt. */
+/**
+ * Betrag der Buchung aus einer Zeile; undefined, wenn der Kurs nicht zur
+ * Zeile passt, null, wenn es fuer das Paar keinen Kurs gibt. KEIN KURS, KEIN
+ * BETRAG (Codex zu #2302): ein fehlender Kurs buchte den Betrag des Abos
+ * unveraendert, und auf einem Konto in Fremdwaehrung wurden aus 30 EUR still
+ * 30 USD. Ohne Kurs zur Kontowaehrung bleibt eine Buchung, wie sie ist, und
+ * eine neue entsteht erst mit dem Kurs.
+ */
 function bookingAmount(row, budgetCur, fetched) {
   if (row.currency === budgetCur) return subscriptionBudgetAmount(row, budgetCur, {});
   if (!fetched || fetched.currency !== row.currency || fetched.budgetCurrency !== budgetCur) return undefined;
-  return subscriptionBudgetAmount(row, budgetCur, fetched.rates);
+  // Die Budget-Waehrung behaelt ihren Rueckfall auf den Betrag des Abos: ohne
+  // FIXER_API_KEY gibt es dort oft gar keinen Kurs, und ein Abo in Fremdwaehrung
+  // buchte sonst nie. Fuer die Waehrung eines Kontos gibt es ihn nicht.
+  if (budgetCur === budgetCurrency()) return subscriptionBudgetAmount(row, budgetCur, fetched.rates);
+  const converted = convertAmount(row.amount, row.currency, budgetCur, fetched.rates);
+  return converted == null ? null : Math.abs(converted);
 }
 
 /**
  * Schreibt die verknuepfte Buchung aus `row`, legt sie an, wenn es sie nicht
  * (mehr) gibt, und verknuepft sie. Eigentuemer + Sichtbarkeit kommen aus der
- * Zeile (#476/#505): ein privates Abo hat eine private Buchung.
+ * Zeile (#476/#505): ein privates Abo hat eine private Buchung. Das Konto auch
+ * (#1277, bookingAccountId); es ist von der Sichtbarkeit unabhaengig wie bei
+ * jeder Buchung - Konten tragen keine.
  */
 function writeLinkedBooking(row, budgetCur, amount) {
   const database = db.get();
   const values = [
     subscriptionBudgetTitle(row, budgetCur), -amount, row.budget_subcategory_key || '', row.next_payment_date,
-    row.owner_id ?? row.created_by, row.visibility || 'shared',
+    row.owner_id ?? row.created_by, row.visibility || 'shared', bookingAccountId(row),
   ];
   if (row.budget_entry_id) {
     const updated = database.prepare(`
       UPDATE budget_entries
       SET title = ?, amount = ?, category = 'subscriptions', subcategory = ?, date = ?,
-          owner_id = ?, visibility = ?
+          owner_id = ?, visibility = ?, account_id = ?
       WHERE id = ?
     `).run(...values, row.budget_entry_id);
     if (updated.changes) return row.budget_entry_id;
   }
-  const [title, signed, subcategory, date, ownerId, visibility] = values;
+  const [title, signed, subcategory, date, ownerId, visibility, accountId] = values;
   const entryId = database.prepare(`
     INSERT INTO budget_entries
-      (title, amount, category, subcategory, date, is_recurring, created_by, owner_id, visibility)
-    VALUES (?, ?, 'subscriptions', ?, ?, 0, ?, ?, ?)
-  `).run(title, signed, subcategory, date, row.created_by, ownerId, visibility).lastInsertRowid;
+      (title, amount, category, subcategory, date, is_recurring, created_by, owner_id, visibility, account_id)
+    VALUES (?, ?, 'subscriptions', ?, ?, 0, ?, ?, ?, ?)
+  `).run(title, signed, subcategory, date, row.created_by, ownerId, visibility, accountId).lastInsertRowid;
   database.prepare('UPDATE budget_subscriptions SET budget_entry_id = ? WHERE id = ?').run(entryId, row.id);
   return entryId;
 }
@@ -309,7 +376,7 @@ const applyBooking = (id, fetched) => db.get().transaction(() => {
     }
     return { row: loadSubscription(id) };
   }
-  const budgetCur = budgetCurrency();
+  const budgetCur = bookingCurrency(row);
   const amount = bookingAmount(row, budgetCur, fetched);
   if (amount === undefined) {
     // Bis der Kurs da ist, wird die Buchung nur ENGER, nie weiter: steht das
@@ -324,7 +391,26 @@ const applyBooking = (id, fetched) => db.get().transaction(() => {
       db.get().prepare("UPDATE budget_entries SET visibility = 'private' WHERE id = ? AND visibility <> 'private'")
         .run(row.budget_entry_id);
     }
+    // Das Konto haengt an keinem Kurs (#1277): es geht SOFORT auf die Buchung.
+    // Sonst gaebe ein Verlaengern waehrend des Kursabrufs die Buchung mit dem
+    // alten Konto ab, und sie bliebe dort, waehrend die naechste das neue traegt.
+    if (row.budget_entry_id) {
+      db.get().prepare('UPDATE budget_entries SET account_id = ? WHERE id = ? AND account_id IS NOT ?')
+        .run(bookingAccountId(row), row.budget_entry_id, bookingAccountId(row));
+    }
     return { needs: { currency: row.currency, budgetCurrency: budgetCur } };
+  }
+  if (amount === null) {
+    if (row.budget_entry_id) {
+      if (row.visibility === 'private') {
+        db.get().prepare("UPDATE budget_entries SET visibility = 'private' WHERE id = ? AND visibility <> 'private'")
+          .run(row.budget_entry_id);
+      }
+      db.get().prepare('UPDATE budget_entries SET account_id = ? WHERE id = ? AND account_id IS NOT ?')
+        .run(bookingAccountId(row), row.budget_entry_id, bookingAccountId(row));
+    }
+    log.warn(`Booking of subscription ${id} left as it is: no exchange rate from ${row.currency} to ${budgetCur}.`);
+    return { row: loadSubscription(id) };
   }
   writeLinkedBooking(row, budgetCur, amount);
   return { row: loadSubscription(id) };
@@ -348,6 +434,23 @@ async function syncBudgetExpense(id, fetched = null) {
       return row;
     }
     rates = await fetchBookingRates(result.needs.currency, result.needs.budgetCurrency);
+  }
+}
+
+/**
+ * Rechnet die wartenden Buchungen der Abos `ids` neu (#2302). Archivieren,
+ * Loeschen oder eine neue Waehrung eines Kontos aendern die Waehrung der
+ * Buchung; ohne diesen Schritt stuende ihr Betrag bis zum naechsten Schreiben
+ * des Abos in der alten. Fehler bleiben hier: das Konto ist schon geschrieben,
+ * und das naechste Schreiben des Abos holt es nach.
+ */
+export async function resyncSubscriptionBookings(ids) {
+  for (const id of ids) {
+    try {
+      await syncBudgetExpense(id);
+    } catch (err) {
+      if (!(err instanceof SubscriptionGoneError)) log.warn(`Booking of subscription ${id} not rewritten: ${err.message}`);
+    }
   }
 }
 
@@ -391,12 +494,19 @@ const renewBooking = (current, { completed, nextDate, occurrencesDone }) => db.g
   // Buchung wie auf main - abgekoppelt bliebe sie als Waise liegen.
   if (!current.enabled) return { paid: null };
   database.prepare('UPDATE budget_subscriptions SET budget_entry_id = NULL WHERE id = ?').run(current.id);
-  const budgetCur = budgetCurrency();
+  const budgetCur = bookingCurrency(current);
   const amount = bookingAmount(current, budgetCur, null);
   const linked = current.budget_entry_id
-    ? database.prepare('SELECT id, amount FROM budget_entries WHERE id = ?').get(current.budget_entry_id)
+    ? database.prepare('SELECT id, amount, account_id FROM budget_entries WHERE id = ?').get(current.budget_entry_id)
     : null;
   const known = amount ?? (linked ? Math.abs(Number(linked.amount)) : subscriptionBudgetAmount(current, budgetCur, {}));
+  // Die bezahlte Buchung kann fuer diese eine Zahlung auf ein anderes Konto
+  // gestellt sein (#1277); ihr Betrag steht in DESSEN Waehrung (Codex zu
+  // #2302), nicht in der der Vorgabe.
+  const paidCur = linked
+    ? (linked.account_id != null ? budgetAccountCurrency(linked.account_id) : budgetCurrency())
+    : budgetCur;
+  const paidAmount = linked ? bookingAmount(current, paidCur, null) : undefined;
   if (linked) {
     // Die bezahlte Buchung: Betrag, Titel und Tag nach dem Stand des Abos am
     // bezahlten Tag, dann abgekoppelt. Eigentuemer und Sichtbarkeit bleiben,
@@ -410,12 +520,13 @@ const renewBooking = (current, { completed, nextDate, occurrencesDone }) => db.g
       SET title = ?, amount = ?, category = 'subscriptions', subcategory = ?, date = ?
       WHERE id = ?
     `).run(
-      subscriptionBudgetTitle(current, budgetCur), -known, current.budget_subcategory_key || '', current.next_payment_date,
+      subscriptionBudgetTitle(current, paidCur), -(paidAmount ?? Math.abs(Number(linked.amount))),
+      current.budget_subcategory_key || '', current.next_payment_date,
       linked.id,
     );
   }
   if (!completed) writeLinkedBooking({ ...current, next_payment_date: nextDate, budget_entry_id: null }, budgetCur, known);
-  return { paid: linked && amount === undefined ? { id: linked.id, budgetCurrency: budgetCur } : null };
+  return { paid: linked && paidAmount === undefined ? { id: linked.id, budgetCurrency: paidCur } : null };
 })();
 
 function validatePayload(body, { partial = false } = {}) {
@@ -485,11 +596,7 @@ async function subscriptionsWithConversions(rows, baseCurrency, refresh = false)
       const nativeMonthly = monthlyEquivalent(row.amount, row.billing_cycle, row.cycle_interval);
       const baseMonthly = convertAmount(nativeMonthly, row.currency, baseCurrency, ratesResult.rates);
       return {
-        ...row,
-        enabled: Boolean(row.enabled),
-        reminder_enabled: Boolean(row.reminder_enabled),
-        status: subscriptionStatus(row),
-        occurrences_remaining: occurrencesRemaining(row),
+        ...decorate(row),
         monthly_native: Number(nativeMonthly.toFixed(2)),
         monthly_base: baseMonthly === null ? null : Number(baseMonthly.toFixed(2)),
         base_currency: baseCurrency,
@@ -502,7 +609,7 @@ async function subscriptionsWithConversions(rows, baseCurrency, refresh = false)
   };
 }
 
-router.get('/meta', (_req, res) => {
+router.get('/meta', (req, res) => {
   try {
     const categories = db.get().prepare(`
       SELECT c.*, (SELECT COUNT(*) FROM budget_subscriptions s WHERE s.category_id = c.id) AS usage_count
@@ -514,7 +621,15 @@ router.get('/meta', (_req, res) => {
       FROM subscription_payment_methods p
       ORDER BY p.sort_order, p.name COLLATE NOCASE
     `).all();
-    res.json({ data: { categories, payment_methods: paymentMethods, billing_cycles: BILLING_CYCLES } });
+    // Fuer den Abo-Dialog (#1277, #1701): die Konten zur Wahl (archivierte mit
+    // Kennzeichen, eine Huelle nur fuer wen sie etwas traegt - listAccounts)
+    // und der Budget-Modus, der entscheidet, ob es eine Sichtbarkeit gibt.
+    const accounts = listAccounts(true, budgetFilter(req, 'e', { scoped: false }))
+      .map((a) => ({ id: a.id, name: a.name, archived: Boolean(a.archived) }));
+    res.json({ data: {
+      categories, payment_methods: paymentMethods, billing_cycles: BILLING_CYCLES,
+      budget_mode: budgetMode(), accounts,
+    } });
   } catch (err) {
     log.error('GET /meta error:', err);
     res.status(500).json({ error: 'Subscription metadata could not be loaded.', code: 500 });
@@ -798,11 +913,12 @@ router.get('/', refuseWhileRestoring, async (req, res) => {
       SELECT s.*, c.name AS category_name, c.color AS category_color,
              c.label_key AS category_label_key, c.budget_subcategory_key,
              p.name AS payment_method_name, p.label_key AS payment_method_label_key,
-             u.display_name AS creator_name
+             u.display_name AS creator_name, ${ACCOUNT_COLUMNS}
       FROM budget_subscriptions s
       LEFT JOIN subscription_categories c ON c.id = s.category_id
       LEFT JOIN subscription_payment_methods p ON p.id = s.payment_method_id
       LEFT JOIN users u ON u.id = s.created_by
+      LEFT JOIN budget_accounts a ON a.id = s.account_id
       ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
       ORDER BY s.next_payment_date, s.name COLLATE NOCASE
     `).all(...params);
@@ -868,6 +984,8 @@ router.post('/', async (req, res) => {
     if (endErrors.length) return res.status(400).json(problemBody(endErrors));
     const metaGone = selectedMetaGone(req.body.category_id, req.body.payment_method_id);
     if (metaGone) return res.status(400).json(metaGone);
+    const account = accountChoice(req);
+    if (account.problem) return res.status(400).json(account.problem);
     const me = actorId(req);
     const visibility = normalizeObjectVisibility(
       req.body.visibility,
@@ -878,8 +996,8 @@ router.post('/', async (req, res) => {
         (name, description, amount, currency, billing_cycle, cycle_interval, next_payment_date,
          category_id, payment_method_id, reminder_days, reminder_enabled, enabled, website_url, logo_data,
          brand_color, notes, account_username, created_by, owner_id, visibility,
-         end_type, end_date, occurrence_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         end_type, end_date, occurrence_count, account_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       req.body.name.trim(), req.body.description?.trim() || null, Number(req.body.amount), validated.currency,
       req.body.billing_cycle, validated.cycleInterval, req.body.next_payment_date,
@@ -888,7 +1006,7 @@ router.post('/', async (req, res) => {
       req.body.enabled === false ? 0 : 1, req.body.website_url?.trim() || null, req.body.logo_data || null,
       req.body.brand_color || null, req.body.notes?.trim() || null,
       req.body.account_username?.trim() || null, me, me, visibility,
-      endType, endDate, occurrenceCount,
+      endType, endDate, occurrenceCount, account.value,
     );
     const row = await syncBudgetExpense(Number(result.lastInsertRowid));
     syncReminder(row);
@@ -933,12 +1051,14 @@ router.put('/:id', async (req, res) => {
     if (endErrors.length) return res.status(400).json(problemBody(endErrors));
     const metaGone = selectedMetaGone(value('category_id', current.category_id), value('payment_method_id', current.payment_method_id));
     if (metaGone) return res.status(400).json(metaGone);
+    const account = accountChoice(req, current);
+    if (account.problem) return res.status(400).json(account.problem);
     db.get().prepare(`
       UPDATE budget_subscriptions SET
         name = ?, description = ?, amount = ?, currency = ?, billing_cycle = ?, cycle_interval = ?,
         next_payment_date = ?, category_id = ?, payment_method_id = ?, reminder_days = ?, reminder_enabled = ?, enabled = ?,
         website_url = ?, logo_data = ?, brand_color = ?, notes = ?, account_username = ?, visibility = ?,
-        end_type = ?, end_date = ?, occurrence_count = ?, completed_at = ?
+        end_type = ?, end_date = ?, occurrence_count = ?, completed_at = ?, account_id = ?
       WHERE id = ?
     `).run(
       value('name', current.name)?.trim(), value('description', current.description)?.trim() || null,
@@ -951,7 +1071,7 @@ router.put('/:id', async (req, res) => {
       value('website_url', current.website_url)?.trim() || null, value('logo_data', current.logo_data) || null,
       value('brand_color', current.brand_color) || null, value('notes', current.notes)?.trim() || null,
       value('account_username', current.account_username)?.trim() || null, nextVisibility,
-      endType, endDate, occurrenceCount, completedAt, id,
+      endType, endDate, occurrenceCount, completedAt, account.value, id,
     );
     const row = await syncBudgetExpense(id);
     syncReminder(row);
@@ -984,6 +1104,10 @@ router.post('/:id/renew', async (req, res) => {
     // bezahlten Buchung stehen im selben synchronen Schritt wie das Lesen
     // oben (#2004).
     const { paid } = renewBooking(current, resolveRenewal(current));
+    // Der Rueckweg des Toasts (R23, D6): was vor der Zahlung stand, AM SERVER
+    // gemerkt. Der Client bekommt nur eine Marke - keine Buchungs-Id, die er
+    // gegen eine fremde tauschen koennte (Sicherheitspruefung zu R23).
+    const undo = rememberRenewal(current, actorId(req));
     let row;
     try {
       let fetched = null;
@@ -991,8 +1115,10 @@ router.post('/:id/renew', async (req, res) => {
         // Die bezahlte Buchung gehoert jetzt nur noch diesem Request: ihr Betrag
         // kommt aus dem Schnappschuss `current`, dem Stand im Moment der Zahlung.
         fetched = await fetchBookingRates(current.currency, paid.budgetCurrency);
-        db.get().prepare('UPDATE budget_entries SET amount = ? WHERE id = ?')
-          .run(-bookingAmount(current, paid.budgetCurrency, fetched), paid.id);
+        const paidAmount = bookingAmount(current, paid.budgetCurrency, fetched);
+        if (paidAmount != null) {
+          db.get().prepare('UPDATE budget_entries SET amount = ? WHERE id = ?').run(-paidAmount, paid.id);
+        }
       }
       row = await syncBudgetExpense(id, fetched);
     } catch (err) {
@@ -1005,11 +1131,120 @@ router.post('/:id/renew', async (req, res) => {
       if (!row) throw new SubscriptionGoneError();
     }
     syncReminder(row);
-    res.json({ data: decorate(row) });
+    // Die Buchung, die DIESES Verlaengern als naechste anlegte: nur sie darf das
+    // Zuruecknehmen loeschen (ein spaeterer Sync koennte sie ersetzen).
+    noteRenewalNextEntry(id, undo.token, row.budget_entry_id ?? null);
+    res.json({ data: decorate(row), undo: { token: undo.token } });
   } catch (err) {
     if (err instanceof SubscriptionGoneError) return subscriptionGone(res);
     log.error('POST /:id/renew error:', err);
     res.status(500).json({ error: 'Subscription renewal could not be saved.', code: 500 });
+  }
+});
+
+/** So lange nach dem Bezahlen nimmt "Rueckgaengig" es zurueck (Minuten). */
+const RENEW_UNDO_MINUTES = 10;
+/**
+ * Der Stand vor einer Zahlung, je Abo der juengste, im Speicher des Servers
+ * (Sicherheitspruefung zu R23). Bis dahin trug der Client ihn samt der
+ * bezahlten Buchungs-Id zurueck, und die Route haengte die genannte Buchung an
+ * das Abo - eine fremde Buchung gleicher Kategorie und gleichen Datums haette
+ * genuegt. Jetzt kennt der Client nur eine Marke; Buchungen, Zaehler und
+ * `enabled` kommen aus dem, was das Verlaengern selbst hier abgelegt hat. Nach
+ * einem Neustart ist der Rueckweg weg - er ist der eines Toasts.
+ */
+const renewalUndo = new Map();
+
+function rememberRenewal(current, userId) {
+  const token = crypto.randomBytes(16).toString('hex');
+  renewalUndo.set(current.id, {
+    token, userId, at: Date.now(),
+    paid_entry_id: current.enabled ? (current.budget_entry_id ?? null) : null,
+    next_entry_id: null,
+    next_payment_date: current.next_payment_date,
+    occurrences_done: Number(current.occurrences_done || 0),
+    enabled: current.enabled ? 1 : 0,
+  });
+  return { token };
+}
+
+function noteRenewalNextEntry(id, token, entryId) {
+  const saved = renewalUndo.get(id);
+  if (saved?.token === token) saved.next_entry_id = entryId;
+}
+
+/** Der gemerkte Stand, wenn Marke, Person und Frist passen - und dann verbraucht. */
+function takeRenewal(id, token, userId) {
+  const saved = renewalUndo.get(id);
+  if (!saved || typeof token !== 'string' || saved.token !== token || saved.userId !== userId
+    || Date.now() - saved.at > RENEW_UNDO_MINUTES * 60_000) return null;
+  renewalUndo.delete(id);
+  return saved;
+}
+
+/*
+ * EINE ZAHLUNG ZURUECKNEHMEN (Critique R23, D6). "Bezahlt" fragte vorher nach,
+ * weil ein zweiter Wisch nichts zurueckholte (N4: Rueckfrage am Rueckweg statt
+ * eines Rueckwegs). Jetzt fragt nichts vorher, und der Toast nimmt die Zahlung
+ * ECHT zurueck: Faelligkeit und Zaehler stehen wie vorher, ein Abschluss ist
+ * aufgehoben, die beim Bezahlen angelegte Buchung der naechsten Zahlung ist
+ * weg, und die bezahlte Buchung ist wieder die verknuepfte "naechste Zahlung" -
+ * der Sync schreibt sie danach aus der Zeile, wie vor dem Tipp.
+ *
+ * Body: { token } aus der Antwort von POST /:id/renew. Er gilt nur fuer die
+ * juengste Zahlung, fuer den, der bezahlt hat, und nur, wenn die Zeile genau
+ * der Stand ist, den EIN Verlaengern aus dem gemerkten macht - sonst hat
+ * seither jemand anderes bezahlt oder bearbeitet, und die Antwort ist 409.
+ */
+router.post('/:id/renew/undo', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const current = loadSubscription(id);
+    if (!current) return subscriptionGone(res);
+    if (!mayEditSub(req, current)) return res.status(403).json({ error: 'You cannot modify this subscription.', code: 403 });
+    const stale = () => res.status(409).json({ error: 'The subscription changed since this payment.', code: 409, reason: 'subscriptions_renew_undo_stale' });
+    const saved = takeRenewal(id, req.body?.token, actorId(req));
+    if (!saved) return stale();
+    const prev = { ...current, next_payment_date: saved.next_payment_date, occurrences_done: saved.occurrences_done };
+    const step = resolveRenewal(prev);
+    if (step.nextDate !== current.next_payment_date || step.occurrencesDone !== Number(current.occurrences_done || 0)
+      || Boolean(step.completed) !== Boolean(current.completed_at)
+      || (current.budget_entry_id ?? null) !== saved.next_entry_id) return stale();
+    const paid = saved.paid_entry_id == null ? null : db.get().prepare(`
+      SELECT id FROM budget_entries
+      WHERE id = ? AND category = 'subscriptions' AND date = ?
+        AND NOT EXISTS (SELECT 1 FROM budget_subscriptions s WHERE s.budget_entry_id = budget_entries.id)
+    `).get(saved.paid_entry_id, saved.next_payment_date);
+    if (saved.paid_entry_id != null && !paid) return stale();
+    const prevDate = { value: saved.next_payment_date };
+    const prevDone = saved.occurrences_done;
+    const b = { enabled: saved.enabled };
+    // Bis hierher kein await: Pruefen und Zuruecksetzen in einem synchronen Schritt.
+    db.get().transaction(() => {
+      if (current.budget_entry_id) db.get().prepare('DELETE FROM budget_entries WHERE id = ?').run(current.budget_entry_id);
+      db.get().prepare(`
+        UPDATE budget_subscriptions
+        SET next_payment_date = ?, occurrences_done = ?, budget_entry_id = ?,
+            enabled = CASE WHEN ? THEN ? ELSE enabled END,
+            completed_at = CASE WHEN ? THEN NULL ELSE completed_at END
+        WHERE id = ?
+      `).run(prevDate.value, prevDone, paid?.id ?? null, step.completed ? 1 : 0, b.enabled ? 1 : 0, step.completed ? 1 : 0, id);
+    })();
+    let row;
+    try {
+      row = await syncBudgetExpense(id);
+    } catch (err) {
+      if (err instanceof SubscriptionGoneError) throw err;
+      log.warn(`Undo of renewal ${id} saved; its booking amount waits for the exchange rate:`, err.message);
+      row = loadSubscription(id);
+      if (!row) throw new SubscriptionGoneError();
+    }
+    syncReminder(row);
+    res.json({ data: decorate(row) });
+  } catch (err) {
+    if (err instanceof SubscriptionGoneError) return subscriptionGone(res);
+    log.error('POST /:id/renew/undo error:', err);
+    res.status(500).json({ error: 'Subscription renewal could not be taken back.', code: 500 });
   }
 });
 

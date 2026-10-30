@@ -1,27 +1,34 @@
 import { api, auth } from '/api.js';
 import {
-  formatDate,
   isDateInputValid,
   parseDateInput,
   t,
 } from '/i18n.js';
-import { esc } from '/utils/html.js';
+import { dateText } from '/utils/date-format.js';
+import { esc, REQUIRED_MARK } from '/utils/html.js';
 import { initials } from '/utils/initials.js';
 import { prefersInkText } from '/utils/contrast.js';
-import { AVATAR_COLORS } from '/utils/color.js';
+import { USER_COLORS, USER_COLOR_DEFAULT } from '/utils/color.js';
+import { colorPickerHtml, wireColorPicker } from '/utils/color-picker.js';
 import { sortMembers } from '/utils/member-order.js';
 import { makeSortable } from '/utils/sortable.js';
 import { vibrate } from '/utils/ux.js';
-import { openModal, closeModal, confirmModal, refocusAfterRender } from '/components/modal.js';
+import { rowMenuHtml } from '/utils/row-action.js';
+import { installPopoverMenus } from '/utils/popover-menu.js';
+import { openModal, closeModal, captureModalContext, captureOpenContext, isModalContextCurrent, confirmModal, refocusAfterRender, reportFieldErrors, constraintErrors } from '/components/modal.js';
 import { createRetryState, formSwitchRowHtml, settingSwitchRowHtml } from '/settings/components.js';
 import { formRowHtml, formRowsHtml } from '/utils/form-row.js';
+import { birthDateControlHtml, wireBirthDateField } from '/utils/birth-date.js';
+import { mediaPickerBadgeHtml } from '/utils/media-picker.js';
 import {
   renderUserMultiSelect, getSelectedUserIds, bindUserMultiSelect,
 } from '/components/user-multi-select.js';
 
 const FAMILY_ROLES = ['dad', 'mom', 'parent', 'child', 'grandparent', 'relative', 'other'];
 
-const randomAvatarColor = () => AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)];
+// Aus den Familientoenen, die der Farbwaehler auch anbietet (Critique R24 E6):
+// die Vorgabe steht dann als gewaehlter Swatch in der Reihe, nicht als "Eigene".
+const randomAvatarColor = () => USER_COLORS[Math.floor(Math.random() * USER_COLORS.length)];
 
 /**
  * Ist auf diesem Server SSO konfiguriert? (#847)
@@ -113,18 +120,18 @@ function avatarHtml(user, className = 'settings-avatar') {
 function avatarEditorHtml(user, prefix) {
   return `
     <div class="settings-avatar-editor">
-      <button type="button" class="settings-avatar-button" id="${prefix}-avatar-preview" aria-label="${t('settings.profilePictureLabel')}">
-        ${avatarHtml(user, 'settings-avatar settings-avatar--lg')}
-      </button>
+      ${/* Dieselbe Bildwahl wie im Konto (R24, `.media-picker`): die Scheibe
+           ist der Knopf, Entfernen steht als Text nur mit Bild. */ ''}
+      <span class="media-picker">
+        <button type="button" class="settings-avatar-button" id="${prefix}-avatar-preview" aria-label="${t('settings.profilePictureLabel')}">
+          ${avatarHtml(user, 'settings-avatar settings-avatar--lg')}
+        </button>
+        ${mediaPickerBadgeHtml()}
+      </span>
       <input class="sr-only" type="file" id="${prefix}-avatar-file" accept="image/png,image/jpeg,image/webp"
         aria-label="${t('settings.profilePictureLabel')}" tabindex="-1" />
       <div class="settings-avatar-actions">
-        <button type="button" class="settings-avatar-action" id="${prefix}-avatar-edit" aria-label="${t('settings.profilePictureLabel')}" title="${t('settings.profilePictureLabel')}">
-          <i data-lucide="edit-2" aria-hidden="true"></i>
-        </button>
-        <button type="button" class="settings-avatar-action settings-avatar-action--danger" id="${prefix}-avatar-remove" aria-label="${t('settings.profilePictureRemove')}" title="${t('settings.profilePictureRemove')}">
-          <i data-lucide="trash-2" aria-hidden="true"></i>
-        </button>
+        <button type="button" class="btn btn--ghost btn--sm media-picker__remove" id="${prefix}-avatar-remove"${user?.avatar_data ? '' : ' hidden'}>${t('settings.profilePictureRemove')}</button>
       </div>
     </div>
   `;
@@ -133,6 +140,9 @@ function avatarEditorHtml(user, prefix) {
 function setAvatarPreview(container, selector, user) {
   const preview = container.querySelector(selector);
   if (!preview) return;
+  // Entfernen gibt es nur, wenn es ein Bild gibt (R24, `.media-picker`).
+  const remove = container.querySelector(selector.replace(/-preview$/, '-remove'));
+  if (remove) remove.hidden = !user?.avatar_data;
   preview.replaceChildren();
   preview.insertAdjacentHTML('beforeend', avatarHtml(user, 'settings-avatar settings-avatar--lg'));
   window.lucide?.createIcons({ el: preview });
@@ -140,33 +150,10 @@ function setAvatarPreview(container, selector, user) {
 
 function bindAvatarPicker(container, prefix) {
   const fileInput = container.querySelector(`#${prefix}-avatar-file`);
-  [
-    container.querySelector(`#${prefix}-avatar-preview`),
-    container.querySelector(`#${prefix}-avatar-edit`),
-  ].forEach((picker) => {
-    picker?.addEventListener('click', () => fileInput?.click());
-  });
+  container.querySelector(`#${prefix}-avatar-preview`)?.addEventListener('click', () => fileInput?.click());
 }
 
 function memberHtml(u, currentUserId, { orderable = false, aligned = false } = {}) {
-  // Der Griff der Haushaltsreihenfolge (#1644). Ein BUTTON wie in der
-  // Einkaufsliste: er traegt den Tastaturpfad selbst (Pfeiltasten bei Fokus),
-  // statt ein Auf/Ab-Paar neben Bearbeiten und Entfernen zu stellen. Nur an
-  // Zeilen, die eine Position haben koennen - Hauspersonal, Gaeste und
-  // Ehemalige stehen in dieser Verwaltung, aber nicht in der Reihenfolge.
-  const handle = orderable ? `
-      <button type="button" class="row-action settings-member__drag" data-member-handle="${u.id}"
-              aria-label="${esc(t('shopping.reorderHandle', { name: u.display_name }))}"
-              title="${esc(t('shopping.reorderHandleHint'))}">
-        <i data-lucide="grip-vertical" class="icon-md" aria-hidden="true"></i>
-      </button>`
-    // Eine Zeile ohne Position (Personal, Gast, ehemalig) haelt den Platz des
-    // Griffs frei, solange die Liste Griffe zeigt - sonst stuende ihr Avatar
-    // links neben der Flucht der anderen. Ein leerer Platz, kein toter Knopf.
-    : aligned ? `
-      <span class="row-action settings-member__drag settings-member__drag--none" aria-hidden="true">
-        <i data-lucide="grip-vertical" class="icon-md"></i>
-      </span>` : '';
   // Konten der Haushaltshilfe sind keine Familienmitglieder: sie tragen das
   // Label ihrer Rolle statt einer Familienrolle (Audit A2-25e). Ein eigener
   // Schluessel: der Reiter im Modul nennt die Mehrzahl, der Ersatz fuer einen
@@ -179,30 +166,69 @@ function memberHtml(u, currentUserId, { orderable = false, aligned = false } = {
   // loescht es, sobald nichts Geteiltes mehr auf es zeigt.
   const former = Boolean(u.deactivated_at);
   const formerBadge = former ? ` · ${esc(t('settings.memberFormerBadge'))}` : '';
+  // DER GEBURTSTAG STEHT NICHT IN DER ZEILE (R22, D13): er machte jede Zeile
+  // dreizeilig (117px mobil) und kappte den Namen, obwohl er im Dialog und in
+  // den Geburtstagen steht. Telefon und Adresse bleiben: sie sind das, woran
+  // man ein Konto ohne Avatar wiedererkennt.
   const profileMeta = [
     u.phone ? t('settings.memberPhoneMeta', { value: u.phone }) : '',
     u.email || '',
-    u.birth_date ? t('settings.memberBirthdayMeta', { date: formatDate(u.birth_date) }) : '',
   ].filter(Boolean).map(esc).join(' · ');
-  // Row-Action-Grammatik statt dauerhaft rotem Outline-Button: Löschen wird
-  // erst bei Hover/Fokus laut. Der eigene Account bekommt keine Lösch-Aktion
-  // in der Mitgliederliste (Audit A2-25d).
-  const deleteBtn = u.id === currentUserId ? '' : `
-      <button class="row-action row-action--danger" data-delete-user="${u.id}" data-name="${esc(u.display_name)}" aria-label="${esc(t('settings.removeMemberNamed', { name: u.display_name }))}" title="${esc(t('settings.removeMemberLabel'))}">
-        <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>
-      </button>`;
-  const editBtn = former ? '' : `
-      <button class="row-action" data-edit-user="${u.id}" aria-label="${esc(t('common.editNamed', { name: u.display_name }))}" title="${t('settings.editMemberLabel')}">
-        <i data-lucide="edit-2" class="icon-md" aria-hidden="true"></i>
-      </button>`;
+  // D10 ZEILEN-ENDZONE (#2152), SEIT R22 (D13) [Mehr][Griff]: der Tipp auf die
+  // Zeile IST Bearbeiten - wie jede Liste mit Detail in der App. Der Stift
+  // stand als dritter Knopf daneben und nahm dem Namen die Breite. Der Name
+  // ist der Knopf; seine Flaeche reicht ueber die ganze Zeile (settings.css),
+  // Mehr und Griff liegen darueber. Das Entfernen steht im Mehr-Knopf
+  // (`danger`). Der eigene Account bekommt keine Lösch-Aktion in der
+  // Mitgliederliste (Audit A2-25d); seine Zeile haelt den Platz des
+  // Mehr-Knopfs frei, damit der Griff in der Spalte der anderen steht.
+  const deleteBtn = u.id === currentUserId
+    ? '<span class="settings-member__slot" aria-hidden="true"></span>'
+    : rowMenuHtml({
+      id: `settings-member-menu-${u.id}`,
+      label: t('common.moreActionsNamed', { name: u.display_name }),
+      items: [{
+        action: 'remove-member',
+        icon: 'trash-2',
+        danger: true,
+        label: t('settings.removeMemberNamed', { name: u.display_name }),
+        attrs: { 'data-delete-user': u.id, 'data-name': u.display_name },
+      }],
+    });
+  // Der Griff der Haushaltsreihenfolge (#1644), ganz rechts (D10, #2152) -
+  // und deshalb auch im Quelltext nach Bearbeiten und Mehr. Ein BUTTON wie in der
+  // Einkaufsliste: er traegt den Tastaturpfad selbst (Pfeiltasten bei Fokus),
+  // statt ein Auf/Ab-Paar neben Bearbeiten und Entfernen zu stellen. Nur an
+  // Zeilen, die eine Position haben koennen - Hauspersonal, Gaeste und
+  // Ehemalige stehen in dieser Verwaltung, aber nicht in der Reihenfolge.
+  const handle = orderable ? `
+      <button type="button" class="row-action settings-member__drag" data-member-handle="${u.id}"
+              aria-label="${esc(t('shopping.reorderHandle', { name: u.display_name }))}"
+              title="${esc(t('shopping.reorderHandleHint'))}">
+        <i data-lucide="grip-vertical" class="icon-md" aria-hidden="true"></i>
+      </button>`
+    // Eine Zeile ohne Position (Personal, Gast, ehemalig) haelt den Platz des
+    // Griffs frei, solange die Liste Griffe zeigt - sonst rueckten ihr
+    // Bearbeiten und ihr Mehr-Knopf um die Griffbreite aus der Spalte der
+    // anderen (der Griff steht seit #2152 ganz rechts, D10). Ein leerer Platz,
+    // kein toter Knopf.
+    : aligned ? `
+      <span class="row-action settings-member__drag settings-member__drag--none" aria-hidden="true">
+        <i data-lucide="grip-vertical" class="icon-md"></i>
+      </span>` : '';
+  const self = u.id === currentUserId ? ` <span class="settings-member__self">${esc(t('settings.memberYou'))}</span>` : '';
+  // Ehemalige lassen sich nicht bearbeiten: ihr Name bleibt Text.
+  const nameHtml = former
+    ? `<span class="settings-member__name" data-member-name>${esc(u.display_name)}${self}</span>`
+    : `<button type="button" class="settings-member__name settings-member__open" data-edit-user="${u.id}" data-member-name aria-label="${esc(t('common.editNamed', { name: u.display_name }))}">${esc(u.display_name)}${self}</button>`;
   return `
-    <li class="settings-member${former ? ' settings-member--former' : ''}${orderable ? ' settings-member--orderable' : ''}" data-id="${u.id}">${handle}
+    <li class="settings-member${former ? ' settings-member--former' : ''}${orderable ? ' settings-member--orderable' : ''}" data-id="${u.id}">
       ${avatarHtml(u, 'settings-avatar settings-avatar--sm')}
       <div class="settings-member__info">
-        <span class="settings-member__name" data-member-name>${esc(u.display_name)}${u.id === currentUserId ? ` <span class="settings-member__self">${esc(t('settings.memberYou'))}</span>` : ''}</span>
+        ${nameHtml}
         <span class="settings-member__meta">@${esc(u.username)} · ${esc(familyRole)}${systemRole}${formerBadge}</span>
         ${profileMeta ? `<span class="settings-member__meta">${profileMeta}</span>` : ''}
-      </div>${editBtn}${deleteBtn}
+      </div>${deleteBtn}${handle}
     </li>
   `;
 }
@@ -256,25 +282,25 @@ function switchRowHtml({ id, label, hint = '', checked = false }) {
 
 function addMemberFormHtml() {
   return `
-        <form id="add-member-form" class="settings-form">
+        <form id="add-member-form" class="settings-form" novalidate>
           ${formRowsHtml([
             formRowHtml({
-              label: t('settings.usernameLabel'), labelFor: 'new-username', field: true,
+              label: t('settings.usernameLabel'), labelFor: 'new-username', labelExtra: REQUIRED_MARK, field: true,
               control: '<input class="form-input" type="text" id="new-username" required autocomplete="off" />',
             }),
             formRowHtml({
-              label: t('settings.displayNameLabel'), labelFor: 'new-display-name', field: true,
+              label: t('settings.displayNameLabel'), labelFor: 'new-display-name', labelExtra: REQUIRED_MARK, field: true,
               control: '<input class="form-input" type="text" id="new-display-name" required />',
             }),
             formRowHtml({
-              label: t('settings.colorLabel'), labelFor: 'new-avatar-color',
-              control: `<input class="settings-color-button" type="color" id="new-avatar-color" value="${randomAvatarColor()}" />`,
+              label: t('settings.colorLabel'), labelId: 'new-avatar-color-label', stacked: true,
+              control: colorPickerHtml({ id: 'new-avatar-color', value: randomAvatarColor(), labelledBy: 'new-avatar-color-label' }),
             }),
             ssoAvailable ? switchRowHtml({
               id: 'new-member-sso-only', label: t('settings.memberSsoOnlyLabel'), hint: t('settings.memberSsoOnlyHint'),
             }) : '',
             formRowHtml({
-              label: t('settings.memberPasswordLabel'), labelFor: 'new-member-password', field: true,
+              label: t('settings.memberPasswordLabel'), labelFor: 'new-member-password', labelExtra: REQUIRED_MARK, field: true,
               attrs: { id: 'new-member-password-group' },
               control: '<input class="form-input" type="password" id="new-member-password" minlength="8" required autocomplete="new-password" />',
             }),
@@ -308,13 +334,12 @@ function addMemberFormHtml() {
 
 function addInviteFormHtml() {
   return `
-        <form id="add-invite-form" class="settings-form">
+        <form id="add-invite-form" class="settings-form" novalidate>
+          ${/* DER ERSTFOKUS STEHT AUF DEM NAMEN (R24, Critique G6 P2-1): vorn
+               stand der optionale Benutzername, den die eingeladene Person
+               meist selbst waehlt. Jetzt Anzeigename, Rolle, Startrechte, dann
+               die optionalen Konto-Felder. */ ''}
           ${formRowsHtml([
-            formRowHtml({
-              label: t('settings.usernameLabel'), labelFor: 'invite-username', field: true,
-              description: t('settings.invites.usernameHint'), descriptionId: 'invite-username-hint',
-              control: '<input class="form-input" type="text" id="invite-username" autocomplete="off" aria-describedby="invite-username-hint" />',
-            }),
             formRowHtml({
               label: t('settings.displayNameLabel'), labelFor: 'invite-display-name', field: true,
               control: '<input class="form-input" type="text" id="invite-display-name" maxlength="128" />',
@@ -333,6 +358,11 @@ function addInviteFormHtml() {
               extra: '<p class="form-hint" id="invite-preset-hint"></p>',
             }),
             formRowHtml({
+              label: t('settings.usernameLabel'), labelFor: 'invite-username', field: true,
+              description: t('settings.invites.usernameHint'), descriptionId: 'invite-username-hint',
+              control: '<input class="form-input" type="text" id="invite-username" autocomplete="off" aria-describedby="invite-username-hint" />',
+            }),
+            formRowHtml({
               label: t('settings.memberEmailLabel'), labelFor: 'invite-email', field: true,
               control: '<input class="form-input" type="email" id="invite-email" autocomplete="email" />',
             }),
@@ -345,17 +375,23 @@ function addInviteFormHtml() {
           <label class="form-label" for="invite-link-value">${t('settings.invites.linkTitle')}</label>
           <div class="settings-token-output__row">
             <input class="form-input" id="invite-link-value" type="text" readonly />
-            <button type="button" class="btn btn--secondary btn--sm" id="invite-link-copy">
-              <i data-lucide="copy" class="icon-sm" aria-hidden="true"></i>
-              ${t('settings.invites.copy')}
-            </button>
           </div>
           <p class="form-hint">${t('settings.invites.linkOnce')}</p>
           <p class="form-hint" id="invite-email-note" hidden></p>
+          <p class="form-hint" id="invite-copy-status" role="status"></p>
         </div>
+        ${/* NACH DEM ERSTELLEN IST DER LINK DIE AUFGABE (R24, Critique G6 P2-1).
+             Vorher blieb der Fuss [Abbrechen][Einladung erstellen], und ein
+             zweiter Klick legte eine zweite Einladung an. Jetzt tauscht der Fuss
+             auf [Fertig][Link kopieren]; das Formular tritt ab. */ ''}
         <div class="modal-panel__footer modal-panel__footer--plain">
           <button type="button" class="btn btn--secondary" id="cancel-add-invite">${t('settings.cancelAddMember')}</button>
           <button type="submit" class="btn btn--primary" form="add-invite-form">${t('settings.invites.submit')}</button>
+          <button type="button" class="btn btn--secondary" id="invite-done" hidden>${t('settings.invites.done')}</button>
+          <button type="button" class="btn btn--primary" id="invite-link-copy" hidden>
+            <i data-lucide="copy" class="icon-sm" aria-hidden="true"></i>
+            ${t('settings.invites.copy')}
+          </button>
         </div>`;
 }
 
@@ -483,6 +519,7 @@ function renderMemberList(container, users, currentUserId, currentUser = null) {
     list.insertAdjacentHTML('beforeend', ordered.map((u) => memberHtml(u, currentUserId, { orderable: canOrder.has(u.id), aligned: canOrder.size > 0 })).join(''));
   }
   window.lucide?.createIcons({ el: list });
+  installPopoverMenus(list);
 }
 
 // --------------------------------------------------------
@@ -657,13 +694,15 @@ function wireMemberOrder(container, currentUser, users) {
 }
 
 function inviteHtml(invite) {
-  // Eine Einladung muss weder Namen noch Adresse tragen: dann benennt sie die
-  // Familienrolle, damit die Zeile nicht namenlos in der Liste steht.
+  // Eine Einladung muss weder Namen noch Adresse tragen.
+  // Ohne beides heisst sie "Offene Einladung"; die Rolle steht in der
+  // Metazeile wie bei jedem Mitglied (R24, Critique G6 P2-1) - als Titel
+  // stand sie groesser als jeder Mitgliedsname darueber.
   const roleLabel = familyRoleLabel(invite.family_role);
-  const primary = invite.display_name || invite.username || invite.email || roleLabel;
+  const primary = invite.display_name || invite.username || invite.email || t('settings.invites.untitled');
   const meta = [
     invite.username && invite.username !== primary ? `@${invite.username}` : '',
-    roleLabel === primary ? '' : roleLabel,
+    roleLabel,
     invite.role === 'admin' ? t('settings.systemAdminBadge') : '',
   ].filter(Boolean).map(esc).join(' · ');
   return `
@@ -671,12 +710,20 @@ function inviteHtml(invite) {
       <div class="settings-member__info">
         <span class="settings-member__name">${esc(primary)}</span>
         ${meta ? `<span class="settings-member__meta">${meta}</span>` : ''}
-        <span class="settings-member__meta">${esc(t('settings.invites.expires', { date: formatDate(invite.expires_at) }))}</span>
+        <span class="settings-member__meta">${esc(t('settings.invites.expires', { date: dateText(invite.expires_at) }))}</span>
       </div>
-      <button class="row-action row-action--danger" data-revoke-invite="${invite.id}" data-name="${esc(primary)}"
-        aria-label="${esc(primary)} ${t('settings.invites.revoke')}" title="${t('settings.invites.revoke')}">
-        <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>
-      </button>
+      ${rowMenuHtml({
+    // D10 (#2152): auch das Widerrufen ist destruktiv und steht im Mehr-Knopf.
+    id: `settings-invite-menu-${invite.id}`,
+    label: t('common.moreActionsNamed', { name: primary }),
+    items: [{
+      action: 'revoke-invite',
+      icon: 'trash-2',
+      danger: true,
+      label: t('settings.invites.revoke'),
+      attrs: { 'data-revoke-invite': invite.id, 'data-name': primary },
+    }],
+  })}
     </li>
   `;
 }
@@ -691,6 +738,7 @@ function renderInviteList(container, invites) {
     list.insertAdjacentHTML('beforeend', invites.map(inviteHtml).join(''));
   }
   window.lucide?.createIcons({ el: list });
+  installPopoverMenus(list);
 }
 
 /**
@@ -751,12 +799,19 @@ function bindInviteEvents(container, initialInvites) {
         async function updatePresetHint() {
           if (!presetSelect || !presetHint) return;
           const role = roleSelect?.value || 'other';
+          // EIN KIND BEKOMMT DIE STARTRECHTE AUS DEM HINWEIS OBEN (R23): dieser
+          // Satz sagte bei "wie das Rollenprofil" "sieht alle Module", zwei
+          // Zeilen unter "startet ohne Budget". Fuer ein Kind nennt er deshalb
+          // nur, was die Vorlage sperrt, und verweist auf die Startrechte.
+          const child = role === 'child';
           if (presetSelect.value === 'restricted') {
             const names = (permissionCatalog?.invitePresets?.restrictedModules || []).map(moduleLabel);
             const base = names.length
               ? t('settings.invites.presetHintRestricted', { modules: names.join(', ') })
               : t('settings.invites.presetHintUnavailable');
-            presetHint.textContent = appendCapabilityState(base, capabilityStateText('health_use_fasting', null, true));
+            presetHint.textContent = child
+              ? `${base} ${t('settings.invites.presetHintChildExtra')}`
+              : appendCapabilityState(base, capabilityStateText('health_use_fasting', null, true));
             return;
           }
           if (!roleProfiles.has(role)) {
@@ -777,6 +832,12 @@ function bindInviteEvents(container, initialInvites) {
             return;
           }
           const denied = deniedModuleNames(profile.modules);
+          if (child) {
+            presetHint.textContent = denied.length
+              ? `${t('settings.invites.presetHintRoleLimited', { role: roleName, modules: denied.join(', ') })} ${t('settings.invites.presetHintChildExtra')}`
+              : t('settings.invites.presetHintRoleChild', { role: roleName });
+            return;
+          }
           const base = denied.length
             ? t('settings.invites.presetHintRoleLimited', { role: roleName, modules: denied.join(', ') })
             : t('settings.invites.presetHintRoleOpen', { role: roleName });
@@ -797,6 +858,8 @@ function bindInviteEvents(container, initialInvites) {
         form.addEventListener('submit', async (event) => {
           event.preventDefault();
           errorEl.hidden = true;
+          // KEINE BROWSER-BLASEN (Critique R21): `novalidate`, die Regeln des Markups melden sich am Feld (constraintErrors, components/modal.js).
+          if (reportFieldErrors(constraintErrors(form))) return;
           output.hidden = true;
           const sendEmail = panel.querySelector('#invite-send-email')?.checked === true;
           const payload = {
@@ -815,9 +878,6 @@ function bindInviteEvents(container, initialInvites) {
             const res = await auth.createInvite(payload);
             invites.unshift(res.data.invite);
             renderInviteList(container, invites);
-            form.reset();
-            updatePresetHint();
-            syncChildHint?.();
             // Der Klartext-Token kommt nur aus dieser einen Antwort. Der Dialog
             // bleibt deshalb offen: wuerde er sich wie beim Mitglied-Anlegen
             // schliessen, waere der Link im selben Moment weg, in dem er entsteht.
@@ -831,10 +891,15 @@ function bindInviteEvents(container, initialInvites) {
             } else {
               emailNote.hidden = true;
             }
-            window.lucide?.createIcons({ el: output });
+            // Das Formular tritt ab, der Fuss traegt jetzt den Link. KEIN Toast:
+            // er lag ueber dem Label "Einladungslink", und die Meldung ist der
+            // Link selbst.
+            form.hidden = true;
+            for (const el of panel.querySelectorAll('#cancel-add-invite, .modal-panel__footer [type=submit]')) el.hidden = true;
+            for (const el of panel.querySelectorAll('#invite-done, #invite-link-copy')) el.hidden = false;
+            window.lucide?.createIcons({ el: panel.querySelector('.modal-panel__footer') ?? output });
             outputValue.focus();
             outputValue.select();
-            window.yuvomi?.showToast(t('settings.invites.created'), 'success');
           } catch (err) {
             showError(errorEl, err.message);
           } finally {
@@ -842,13 +907,13 @@ function bindInviteEvents(container, initialInvites) {
           }
         });
 
+        panel.querySelector('#invite-done')?.addEventListener('click', () => closeModal());
         panel.querySelector('#invite-link-copy')?.addEventListener('click', async () => {
           if (!outputValue.value) return;
           const copied = await copyInviteLink(outputValue);
-          window.yuvomi?.showToast(
-            copied ? t('settings.invites.copied') : t('settings.invites.copyFailed'),
-            copied ? 'success' : 'danger',
-          );
+          // Die Rueckmeldung steht am Link, nicht als Toast ueber dem Dialog.
+          const status = panel.querySelector('#invite-copy-status');
+          if (status) status.textContent = copied ? t('settings.invites.copied') : t('settings.invites.copyFailed');
         });
       },
     });
@@ -966,28 +1031,30 @@ async function loadCaregiverIds(memberId) {
 
 async function openEditMemberModal(member, currentUser, users, container) {
   const state = { avatarData: member.avatar_data ?? null };
+  // Kommen die Betreuenden erst, nachdem der Nutzer einen anderen Dialog
+  // geoeffnet oder die Seite verlassen hat, geht dieser Dialog nicht mehr auf (#1997).
+  const context = captureOpenContext();
   const caregiverIds = await loadCaregiverIds(member.id);
+  if (!isModalContextCurrent(context)) return;
   openModal({
     title: t('settings.editMemberTitle'),
     size: 'md',
     content: `
-      <form id="edit-member-form" class="settings-form">
+      <form id="edit-member-form" class="settings-form" novalidate>
         <div class="settings-profile-editor">
           ${avatarEditorHtml(member, 'edit-member')}
           <div class="settings-profile-editor__fields">
             <div class="form-group">
-              <label class="form-label" for="edit-member-username">${t('settings.usernameLabel')}</label>
+              <label class="form-label" for="edit-member-username">${t('settings.usernameLabel')}${REQUIRED_MARK}</label>
               <input class="form-input" type="text" id="edit-member-username" value="${esc(member.username)}" required autocomplete="off" />
             </div>
-            <div class="settings-name-color-row">
-              <div class="form-group settings-name-color-row__name">
-                <label class="form-label" for="edit-member-display-name">${t('settings.displayNameLabel')}</label>
-                <input class="form-input" type="text" id="edit-member-display-name" value="${esc(member.display_name)}" required maxlength="128" />
-              </div>
-              <div class="form-group settings-color-field">
-                <label class="form-label" for="edit-member-avatar-color">${t('settings.colorLabel')}</label>
-                <input class="settings-color-button" type="color" id="edit-member-avatar-color" value="${esc(member.avatar_color || '#007AFF')}" />
-              </div>
+            <div class="form-group">
+              <label class="form-label" for="edit-member-display-name">${t('settings.displayNameLabel')}${REQUIRED_MARK}</label>
+              <input class="form-input" type="text" id="edit-member-display-name" value="${esc(member.display_name)}" required maxlength="128" />
+            </div>
+            <div class="form-group">
+              <span class="form-label" id="edit-member-avatar-color-label">${t('settings.colorLabel')}</span>
+              ${colorPickerHtml({ id: 'edit-member-avatar-color', value: member.avatar_color || USER_COLOR_DEFAULT, labelledBy: 'edit-member-avatar-color-label' })}
             </div>
           </div>
         </div>
@@ -1015,9 +1082,14 @@ async function openEditMemberModal(member, currentUser, users, container) {
             control: `<input class="form-input" type="email" id="edit-member-email" value="${esc(member.email || '')}" autocomplete="email" />`,
           }),
           formRowHtml({
-            label: t('settings.memberBirthDateLabel'), labelFor: 'edit-member-birth-date',
+            label: t('settings.memberBirthDateLabel'), labelFor: 'edit-member-birth-date', labelId: 'edit-member-birth-date-label',
             description: t('settings.memberContactBirthdayHint'),
-            control: `<yuvomi-datepicker type="date" id="edit-member-birth-date" value="${esc(member.birth_date || '')}"></yuvomi-datepicker>`,
+            // Wie im Geburtstags-Editor (#2095).
+            control: birthDateControlHtml({
+              id: 'edit-member-birth-date',
+              value: member.birth_date || '',
+              yearUnknown: member.birth_year_unknown,
+            }),
           }),
           ssoAvailable ? switchRowHtml({
             id: 'edit-member-sso-only', label: t('settings.memberSsoOnlyLabel'),
@@ -1042,6 +1114,7 @@ async function openEditMemberModal(member, currentUser, users, container) {
       </form>
     `,
     onSave(panel) {
+      wireColorPicker(panel);
       const fileInput = panel.querySelector('#edit-member-avatar-file');
       const errorEl = panel.querySelector('#edit-member-error');
       bindAvatarPicker(panel, 'edit-member');
@@ -1079,6 +1152,7 @@ async function openEditMemberModal(member, currentUser, users, container) {
       });
 
       if (caregiverIds !== null) bindUserMultiSelect(panel, 'member_caregivers');
+      const memberBirthField = wireBirthDateField(panel, 'edit-member-birth-date');
 
       // Der Umschalter fuehrt das Passwortfeld in beide Richtungen (#847): an
       // versteckt es, aus macht es zur Pflicht - aber nur, wenn das Konto
@@ -1101,15 +1175,25 @@ async function openEditMemberModal(member, currentUser, users, container) {
       panel.querySelector('#edit-member-cancel')?.addEventListener('click', closeModal);
       panel.querySelector('#edit-member-form')?.addEventListener('submit', async (event) => {
         event.preventDefault();
+        // KEINE BROWSER-BLASEN (Critique R21): `novalidate`, die Regeln des Markups melden sich am Feld (constraintErrors, components/modal.js).
+        if (reportFieldErrors(constraintErrors(event.currentTarget))) return;
         const submitBtn = panel.querySelector('[type=submit]');
         errorEl.hidden = true;
-        const birthDateRaw = panel.querySelector('#edit-member-birth-date')?.value || '';
+        const birth = memberBirthField.read();
+        if (birth.yearUnknown && !birth.complete) {
+          showError(errorEl, t('birthdays.yearlessIncomplete'));
+          return;
+        }
+        const birthDateRaw = birth.raw;
         if (!isDateInputValid(birthDateRaw)) {
           showError(errorEl, t('settings.memberBirthDateInvalid'));
           submitBtn.disabled = false;
           return;
         }
         const newPassword = panel.querySelector('#edit-member-password')?.value || '';
+        // Geschlossen wird nur dieser Dialog, nicht einer, der waehrend der
+        // Anfrage aufgegangen ist (#1997).
+        const modalContext = captureModalContext();
         submitBtn.disabled = true;
         try {
           const res = await auth.updateUser(member.id, {
@@ -1121,7 +1205,8 @@ async function openEditMemberModal(member, currentUser, users, container) {
             system_admin: panel.querySelector('#edit-member-system-admin').checked,
             phone: panel.querySelector('#edit-member-phone')?.value.trim() || null,
             email: panel.querySelector('#edit-member-email')?.value.trim() || null,
-            birth_date: parseDateInput(birthDateRaw) || null,
+            birth_date: (birth.yearUnknown ? birth.date : parseDateInput(birthDateRaw)) || null,
+            birth_year_unknown: birth.yearUnknown,
             ...(newPassword ? { password: newPassword } : {}),
             ...(ssoToggle ? { sso_only: ssoToggle.checked } : {}),
           });
@@ -1135,7 +1220,7 @@ async function openEditMemberModal(member, currentUser, users, container) {
           const idx = users.findIndex((u) => u.id === member.id);
           if (idx !== -1) users[idx] = res.user;
           if (currentUser?.id === member.id) Object.assign(currentUser, res.user);
-          closeModal({ force: true });
+          closeModal({ force: true, context: modalContext });
           window.yuvomi?.showToast(t('settings.memberUpdatedToast', { name: res.user.display_name }), 'success');
           repaintMembers(container, currentUser, users);
         } catch (err) {
@@ -1181,6 +1266,7 @@ function openAddMemberModal(container, currentUser, users) {
     size: 'md',
     content: addMemberFormHtml(),
     onSave(panel) {
+      wireColorPicker(panel);
       const form = panel.querySelector('#add-member-form');
       form.querySelector('#new-member-sso-only')
         ?.addEventListener('change', () => syncSsoOnlyField(panel));
@@ -1190,6 +1276,8 @@ function openAddMemberModal(container, currentUser, users) {
 
       form.addEventListener('submit', async (event) => {
         event.preventDefault();
+        // KEINE BROWSER-BLASEN (Critique R21): `novalidate`, die Regeln des Markups melden sich am Feld (constraintErrors, components/modal.js).
+        if (reportFieldErrors(constraintErrors(form))) return;
         const errorEl = panel.querySelector('#member-error');
         errorEl.hidden = true;
         const birthDateRaw = panel.querySelector('#new-member-birth-date')?.value || '';
@@ -1214,6 +1302,7 @@ function openAddMemberModal(container, currentUser, users) {
         };
 
         const btn = panel.querySelector('[type=submit]');
+        const modalContext = captureModalContext();
         btn.disabled = true;
         try {
           const res = await auth.createUser(data);
@@ -1221,7 +1310,7 @@ function openAddMemberModal(container, currentUser, users) {
           repaintMembers(container, currentUser, users);
           // Der Dialog gibt den Fokus beim Schliessen an "Mitglied hinzufuegen"
           // zurueck (modal.js) - kein Fall auf BODY wie beim Inline-Formular.
-          closeModal({ force: true });
+          closeModal({ force: true, context: modalContext });
           window.yuvomi?.showToast(t('settings.memberAddedToast', { name: res.user.display_name }), 'success');
         } catch (err) {
           showError(errorEl, err.message);
@@ -1351,4 +1440,4 @@ export async function render(container, { user } = {}) {
 
 // Der Avatar als Programm (test:initials): welche Zeichen ohne Bild auf der
 // Scheibe stehen.
-export const __test = { childStartHintHtml, bindChildStartHint, addMemberFormHtml, addInviteFormHtml, avatarHtml, memberHtml, orderableIds, movedOrder, orderedMembers, wireMemberOrder, renderMemberList };
+export const __test = { openEditMemberModal, openAddMemberModal, childStartHintHtml, bindChildStartHint, addMemberFormHtml, addInviteFormHtml, avatarHtml, memberHtml, inviteHtml, orderableIds, movedOrder, orderedMembers, wireMemberOrder, renderMemberList };

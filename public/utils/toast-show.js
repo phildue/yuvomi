@@ -17,6 +17,8 @@ export const TOAST_SUCCESS_MAX = 50;
 export const TOAST_RESUME_MIN_MS = 2000;
 /** So lange steht eine stille Ansage in der Live-Region, dann raeumt sie sich ab. */
 const ANNOUNCE_MS = 5000;
+/** So oft schaut eine angehaltene Frist nach, ob ihr Toast noch im Dokument steht. */
+const DETACHED_CHECK_MS = 1000;
 
 function _toastSvg(children) {
   const NS = 'http://www.w3.org/2000/svg';
@@ -49,9 +51,38 @@ const TOAST_ICONS = {
   ]),
 };
 
-export function showToast(message, type = 'default', duration = 3000, onUndo = null) {
-  const container = toastSurface((type === 'danger' || type === 'warning') ? 'assertive' : 'polite');
-  if (!container) return;
+/**
+ * @param {string} message
+ * @param {'default'|'success'|'danger'|'warning'} [type='default']
+ * @param {number} [duration=3000]  Frist in ms
+ * @param {null | (() => void) | { label: string, onClick: () => void }} [onUndo]
+ * @param {{ onExpire?: () => void, scope?: number, handle?: object }} [opts]
+ *        `onExpire` laeuft einmal, wenn die Frist des Toasts endet, ohne dass
+ *        seine Aktion genutzt wurde (abgelaufen, weggewischt, oder aus dem
+ *        Dokument genommen, waehrend ihn ein Griff hielt). Sie steht mit der
+ *        Frist still: was an ihr haengt (das Loeschen hinter "Rueckgaengig",
+ *        scheduleUndoableDelete in utils/ux.js), laeuft mit dem Toast synchron.
+ *        `scope` ist die Modul-Marke von VOR der Anfrage (`feedbackScope()`):
+ *        gilt inzwischen ein anderes Modul, erscheint die Rueckmeldung nicht.
+ *        `handle` bekommt `setMessage(text)`: der Satz eines stehenden Toasts
+ *        laesst sich nachtragen, ohne einen zweiten zu zeigen (offerUndo).
+ * @returns {boolean} ob dieser Aufruf einen Toast anlegte, dessen `onExpire` noch kommt
+ */
+export function showToast(message, type = 'default', duration = 3000, onUndo = null, { onExpire = null, scope = null, handle = null } = {}) {
+  const alarm = type === 'danger' || type === 'warning';
+  // DIE RUECKMELDUNG ENDET AUCH, WENN SIE ZU SPAET KOMMT (Critique R24,
+  // G0-Shell-P1-2). `endModuleFeedback` beendet beim Modulwechsel, was steht -
+  // eine Quittung hinter einem `await` stand da noch nicht: "Aufgabe erledigt"
+  // erschien 300 ms nach dem Wechsel im Kalender und blieb dort. Wer seine
+  // Marke vor der Anfrage nimmt, endet hier wie eine, die schon stand: keine
+  // Flaeche, keine Ansage, ihre Handlung gilt (`onExpire`). Fehler und
+  // Warnung erscheinen trotzdem - sie sagen, dass etwas NICHT geschah.
+  if (scope != null && scope !== feedbackEpoch && !alarm) {
+    onExpire?.();
+    return false;
+  }
+  const container = toastSurface(alarm ? 'assertive' : 'polite');
+  if (!container) return false;
 
   // Aktions-Button: Legacy-Undo (Funktion) oder benannte Aktion ({ label, onClick }).
   const action = typeof onUndo === 'function'
@@ -64,12 +95,34 @@ export function showToast(message, type = 'default', duration = 3000, onUndo = n
   // Aktions-Toasts (Undo oder benannte Aktion) sind wichtig -> nie still.
   if (type === 'success' && !action && successSurfaceSpent()) {
     announceQuietly(container, message);
-    return;
+    return false;
   }
 
-  // Max. 3 gleichzeitige Toasts (global): ältesten entfernen falls Limit erreicht
-  const existing = document.querySelectorAll('.toast-container .toast');
-  if (existing.length >= 3) existing[0].remove();
+  // GLEICHES STEHT EINMAL DA (Critique R21, a2): dreimal derselbe Satz
+  // ("Konnte nicht gespeichert werden") stapelte sich zu drei gleichen Toasts,
+  // die zwei andere verdraengten. Ein Toast ohne Aktion mit demselben Typ und
+  // Text, der noch steht, nimmt die Wiederholung auf: seine Frist beginnt von
+  // vorn, eine Zahl zaehlt mit. Der Screenreader hoert die Wiederholung
+  // trotzdem (stille Ansage) - die Region kuendigt unveraenderten Text nicht
+  // neu an. Toasts mit Aktion bleiben einzeln: jedes "Rueckgaengig" meint etwas
+  // anderes.
+  const key = `${type}\u0000${message}`;
+  if (!action) {
+    const twin = Array.from(container.children ?? []).find((el) => el._toastKey === key && !el.classList.contains('toast--out'));
+    if (twin) {
+      twin._toastRepeat(duration);
+      announceQuietly(container, message);
+      return false;
+    }
+  }
+
+  // HOECHSTENS EINE RUECKMELDUNG STEHT DA (Critique R22, D18). Bis hierher
+  // stapelten sich bis zu drei, und zwei "Rueckgaengig" uebereinander liessen
+  // offen, welches welche Handlung meint (a2, Casey). Die neue ersetzt die alte,
+  // und fuer die alte gilt ihre Handlung: sie endet wie nach ihrer Frist
+  // (`onExpire` - das Loeschen hinter ihrem "Rueckgaengig" laeuft). Dauerhafte
+  // Toasts (die faellige Erinnerung) sind keine Rueckmeldung und bleiben.
+  endFeedbackToasts();
 
   const toast = document.createElement('div');
   toast.className = `toast ${type !== 'default' ? `toast--${type}` : ''}`;
@@ -77,11 +130,20 @@ export function showToast(message, type = 'default', duration = 3000, onUndo = n
   // `role="alert"` machte jeden Toast bestimmt, auch in der hoeflichen Region,
   // und liess ihn je nach Screenreader doppelt ansagen.
 
-  const iconEl = TOAST_ICONS[type]?.();
+  // EIN DIALEKT FUER DIE RUECKMELDUNG MIT RUECKWEG (Critique R23, D6/N1): ein
+  // Toast mit Aktion traegt kein Haekchen. Bis R23 sagte dieselbe Quittung mal
+  // mit, mal ohne Haken "erledigt" - je nachdem, ob die Seite 'success' oder
+  // 'default' schrieb. Der Satz ("<Objekt> <Verb>") und sein "Rueckgaengig"
+  // tragen die Rueckmeldung; das Haekchen bleibt der Bestaetigung OHNE Rueckweg
+  // ("Gespeichert"). Fehler und Warnung behalten ihr Zeichen: sie sollen
+  // unterbrechen, auch wenn sie eine Aktion anbieten.
+  const iconEl = (action && type === 'success') ? null : TOAST_ICONS[type]?.();
   if (iconEl) toast.appendChild(iconEl);
   const span = document.createElement('span');
   span.textContent = message;
   toast.appendChild(span);
+  // Nur, solange dieser Toast steht: ein ersetzter nimmt keinen Satz mehr an.
+  if (handle) handle.setMessage = (text) => { if (toast.isConnected) span.textContent = text; };
 
   if (action) {
     const actionBtn = document.createElement('button');
@@ -96,10 +158,26 @@ export function showToast(message, type = 'default', duration = 3000, onUndo = n
   }
 
   container.appendChild(toast);
+  let expired = false;
   const dismiss = () => {
     deadline.cancel();
     toast.classList.add('toast--out');
+    // Ein gehender Toast nimmt keinen Klick mehr: seine Frist ist um, und ein
+    // "Rueckgaengig" in der Ausfahrt liefe ins Leere (das Loeschen laeuft schon).
+    toast.inert = true;
     toast.addEventListener('animationend', () => toast.remove(), { once: true });
+    if (expired) return;
+    expired = true;
+    onExpire?.();
+  };
+  // Sofort weg, ohne Ausfahrt (ersetzt oder Modulwechsel, D18): eine gehende
+  // Rueckmeldung neben der neuen waere fuer ihre Ausfahrt wieder zwei.
+  toast._toastEnd = () => {
+    deadline.cancel();
+    toast.remove();
+    if (expired) return;
+    expired = true;
+    onExpire?.();
   };
   // Die Frist pausiert unter Zeiger und Fokus (A1 P2-3, WCAG 2.2.1): wer zu
   // "Rueckgaengig" tabbt oder langsamer liest als die Frist, verliert den Toast
@@ -110,8 +188,63 @@ export function showToast(message, type = 'default', duration = 3000, onUndo = n
   // `wireSwipeToDismiss` (utils/ux.js), das CSS-Gegenstück ist das
   // `touch-action: pan-y` auf `.toast`.
   wireSwipeToDismiss(toast, { onDismiss: dismiss });
+
+  if (!action) {
+    let count = 1;
+    let badge = null;
+    toast._toastKey = key;
+    toast._toastRepeat = (ms) => {
+      count += 1;
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'toast__count';
+        // Nur fuer die Augen: die Wiederholung sagt die stille Ansage.
+        badge.setAttribute('aria-hidden', 'true');
+        toast.appendChild(badge);
+      }
+      badge.textContent = String(count);
+      deadline.restart(ms);
+    };
+  }
+  return true;
 }
 
+
+/**
+ * Beendet jede stehende Rueckmeldung (Critique R22, D18): beim naechsten Toast
+ * und beim Modulwechsel (`endModuleFeedback`). Wie nach ihrer Frist - ihre
+ * Handlung gilt, `onExpire` laeuft. Dauerhafte Toasts (Erinnerungen) bleiben.
+ */
+export function endFeedbackToasts() {
+  for (const toast of document.querySelectorAll('.toast-container .toast')) {
+    if (typeof toast._toastEnd === 'function') toast._toastEnd();
+  }
+}
+
+/**
+ * DIE MODUL-MARKE DER RUECKMELDUNG (Critique R24, G0-Shell-P1-2). Sie zaehlt
+ * die Modulwechsel; eine Seite nimmt sie VOR einer Anfrage, deren Quittung
+ * hinter dem `await` steht, und reicht sie an `showToast({ scope })`. Hat der
+ * Router inzwischen das Modul gewechselt, ist die Marke alt, und die Quittung
+ * erscheint nicht mehr im falschen Modul. Wer im Tipp quittiert (optimistisch,
+ * DESIGN.md "Eine Geste, deren Ergebnis feststeht, wartet nicht auf den
+ * Server"), braucht sie nicht: sein Toast steht schon, wenn der Wechsel kommt.
+ */
+let feedbackEpoch = 0;
+
+/** @returns {number} die Marke des Moduls, das gerade gilt */
+export function feedbackScope() {
+  return feedbackEpoch;
+}
+
+/**
+ * Der Modulwechsel (router.js): stehende Rueckmeldungen enden, und jede Marke
+ * von vorher ist ab jetzt alt - auch die einer Quittung, die erst noch kommt.
+ */
+export function endModuleFeedback() {
+  feedbackEpoch += 1;
+  endFeedbackToasts();
+}
 
 /**
  * Zaehlt einen Erfolg und sagt, ob die sichtbare Flaeche verbraucht ist.
@@ -152,6 +285,13 @@ function announceQuietly(container, message) {
  * Ein Fokuswechsel INNERHALB des Toasts (Text -> Rueckgaengig) ist kein
  * Loslassen: `focusout` mit einem `relatedTarget` im Toast zaehlt nicht.
  *
+ * EIN GRIFF HAELT NUR, SOLANGE DER TOAST IM DOKUMENT STEHT. Nimmt ihn jemand
+ * heraus, waehrend er gehalten ist (der Stapel verdraengt den aeltesten, die
+ * Erinnerungen in reminders.js ebenso), kommt kein `pointerleave`, `focusout`
+ * oder `toast:release` mehr - die Frist stuende fuer immer, und mit ihr das
+ * Loeschen hinter "Rueckgaengig" (scheduleUndoableDelete). Solange sie steht,
+ * schaut sie deshalb nach; ist der Toast weg, ist sie um.
+ *
  * @param {HTMLElement} el
  * @param {() => void} onExpire
  * @param {number} duration  ms
@@ -162,29 +302,43 @@ export function pausableDeadline(el, onExpire, duration, { minRest = TOAST_RESUM
   let remaining = duration;
   let startedAt = Date.now();
   let timer = setTimeout(expire, remaining);
+  let watch = 0;
   let done = false;
   const holds = new Set();
 
   function expire() {
     if (done) return;
     done = true;
+    clearTimeout(watch);
     onExpire();
+  }
+  function watchDetached() {
+    watch = setTimeout(() => {
+      if (el.isConnected === false) expire();
+      else watchDetached();
+    }, DETACHED_CHECK_MS);
   }
   function hold(reason) {
     if (done) return;
     if (holds.size === 0) {
       clearTimeout(timer);
       remaining -= Date.now() - startedAt;
+      watchDetached();
     }
     holds.add(reason);
   }
   function release(reason) {
     if (done || !holds.delete(reason) || holds.size > 0) return;
+    clearTimeout(watch);
     remaining = Math.max(remaining, minRest);
     startedAt = Date.now();
     timer = setTimeout(expire, remaining);
   }
 
+  // Der Stapel weicht einer Flaeche (das Mehr-Blatt, utils/toast-placement.js):
+  // solange der Toast nicht zu sehen ist, laeuft seine Frist nicht ab.
+  el.addEventListener('toast:hold', () => hold('yield'));
+  el.addEventListener('toast:release', () => release('yield'));
   el.addEventListener('pointerenter', () => hold('pointer'));
   el.addEventListener('pointerleave', () => release('pointer'));
   el.addEventListener('focusin', () => hold('focus'));
@@ -197,6 +351,15 @@ export function pausableDeadline(el, onExpire, duration, { minRest = TOAST_RESUM
     cancel() {
       done = true;
       clearTimeout(timer);
+      clearTimeout(watch);
+    },
+    /** Die volle Frist von vorn (ein gleicher Toast kam dazu); ein Griff haelt weiter. */
+    restart(ms = duration) {
+      if (done) return;
+      clearTimeout(timer);
+      remaining = ms;
+      startedAt = Date.now();
+      if (holds.size === 0) timer = setTimeout(expire, remaining);
     },
   };
 }

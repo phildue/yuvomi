@@ -22,6 +22,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { readFileSync } from 'node:fs';
 import express from 'express';
 import Database from 'better-sqlite3-multiple-ciphers';
 
@@ -218,7 +219,7 @@ async function dialog(oeffne, werte = {}) {
   const element = (selector) => {
     if (!elements.has(selector)) {
       elements.set(selector, {
-        value: '', checked: false, hidden: false, disabled: false, dataset: {}, files: [], html: null,
+        value: '', checked: false, hidden: false, disabled: false, dataset: {}, files: [], html: null, style: {},
         addEventListener(type, fn) { handlers.set(`${selector}:${type}`, fn); },
         focus() { fokus.push(selector); },
         replaceChildren() { this.html = ''; },
@@ -242,6 +243,11 @@ async function dialog(oeffne, werte = {}) {
       assert.equal(typeof fn, 'function', `${selector} hat einen Submit-Handler`);
       return fn({ preventDefault() {} });
     },
+    klicken: (selector) => {
+      const fn = handlers.get(`${selector}:click`);
+      assert.equal(typeof fn, 'function', `${selector} hat einen Klick-Handler`);
+      return fn({ preventDefault() {}, currentTarget: element(selector) });
+    },
   };
 }
 
@@ -261,7 +267,46 @@ const LOESCHEN = [
   ['Tageseintrag', () => page.deleteDayLog({ id: 8 }), '/health/cycle/logs/8', 'health_cycle_log_not_found', 'health.errorCycleDayGone', 'health.cycle.deleteError', '/health/cycle/logs'],
 ];
 
+// Seit R23 (D6) gehen Dosis-Eintrag, Aktivitaet, Periode und Tageseintrag mit
+// Rueckgaengig: geloescht wird mit dem Ende der Toast-Frist, und ein Fehler dort
+// laeuft durch restore(err). Die Behaelter (Medikament, Befund) fragen weiter.
+const MIT_UNDO = new Set(['Dosis-Eintrag', 'Aktivitaet', 'Periode', 'Tageseintrag']);
+
+/** Loeschen bis zum Ende der Frist: der erste Lauf faengt das Undo-Fenster, der zweite schliesst es. */
+async function loeschenBisZumEnde(loesche, antworten) {
+  let opts = null;
+  globalThis.__undoStub = (o) => { opts = o; };
+  try {
+    const erst = await mit({}, loesche);
+    assert.ok(opts, 'Loeschen mit Rueckgaengig');
+    assert.ok(!erst.calls.some(([verb]) => verb === 'DELETE'), 'geloescht wird erst mit dem Ende der Frist');
+    const ende = await mit(antworten, async () => {
+      try { await opts.commit({ keepalive: false }); } catch (err) { await opts.restore(err); }
+    });
+    return { ...ende, closed: erst.closed };
+  } finally {
+    delete globalThis.__undoStub;
+  }
+}
+
 for (const [name, loesche, path, reason, goneKey, fallbackKey, reloadPrefix] of LOESCHEN) {
+  if (MIT_UNDO.has(name)) {
+    test(`Seite: ${name} loeschen mit Rueckgaengig - "nicht gefunden" am Ende der Frist ist kein Erfolg, sein Satz, der Bereich kommt frisch`, async () => {
+      const { calls, closed, gets } = await loeschenBisZumEnde(loesche, { delete: async () => { throw fehler(404, reason); } });
+      assert.deepEqual(calls.find(([verb]) => verb === 'DELETE'), ['DELETE', path]);
+      assert.deepEqual(toasts, [[goneKey, 'danger']]);
+      assert.equal(closed.length, 1, 'der Dialog geht zu');
+      if (reloadPrefix) assert.ok(gets.some((p) => p.startsWith(reloadPrefix)), `nachgeladen: ${gets.join(', ')}`);
+    });
+    test(`Seite: ${name} loeschen scheitert am Ende der Frist an etwas anderem - der allgemeine Satz der Stelle, nie der des Servers`, async () => {
+      for (const err of [fehler(400), fehler(404), fehler(500), fehler(404, 'health_future_not_found')]) {
+        await loeschenBisZumEnde(loesche, { delete: async () => { throw err; } });
+        assert.deepEqual(toasts, [[fallbackKey, 'danger']], `${err.status} ${err.data.reason ?? ''}`);
+        assertNoServerText();
+      }
+    });
+    continue;
+  }
   test(`Seite: ${name} loeschen, das "nicht gefunden" wird - kein Erfolg, sein Satz, der Dialog geht zu, der Bereich kommt frisch`, async () => {
     const { calls, closed, gets } = await mit({ delete: async () => { throw fehler(404, reason); } }, loesche);
     assert.deepEqual(calls[0], ['DELETE', path]);
@@ -490,4 +535,200 @@ test('Einstellungen: eine Vorsorgeart speichern, die ein anderer Admin geloescht
     () => d.absenden('#health-prevention-type-form'));
   assert.deepEqual(toasts, [['health.errorPreventionTypeGone', 'danger']]);
   assert.equal(closed.length, 1);
+});
+
+// #1997: die ERFOLGSWEGE. Kommt die Antwort erst, nachdem der Nutzer den
+// Dialog geschlossen und einen anderen geoeffnet hat, schliesst sie nur den
+// EIGENEN. Ob der Slot noch denselben Dialog haelt, entscheidet
+// closeModal({ context }) in components/modal.js (am echten Modul gemessen in
+// test-modal-dead-time.js); hier zaehlt die Verdrahtung: jeder Erfolgsweg der
+// Seite reicht den VOR der Anfrage gemerkten Kontext hinein. Ohne ihn traefe
+// das force-Schliessen den Dialog, der gerade offen ist, samt seinen Eingaben.
+const ERFOLGSWEGE = [
+  ['Messwert', () => dialog(() => page.openVitalModal({ type: 'weight' }), {
+    '#vital-measured-at': { value: '2026-01-05T08:00' }, '#vital-value': { value: '70' },
+  }), '#vital-form'],
+  ['Dosis-Eintrag', () => dialog(() => page.openMedLogModal(4), { '#medlog-status': { value: 'skipped' } }), '#medlog-form'],
+  ['Medikament', () => dialog(() => page.openMedModal(null), { '#med-name': { value: 'Ibuprofen' } }), '#med-form'],
+  ['Befund', () => dialog(() => page.openLabModal(null), { '#lab-date': { value: '2026-01-05' } }), '#lab-form'],
+  ['Aktivitaet', () => dialog(() => page.openActivityModal(null), {
+    '#activity-type': { value: 'walk' }, '#activity-performed-at': { value: '2026-01-05T08:00' },
+  }), '#activity-form'],
+  ['Vorsorge', () => vorsorgeDialog(null), '#prevention-form'],
+  ['Naehrwert-Ziel', () => dialog(() => page.openNutritionTargetModal()), '#nutrition-target-form'],
+  ['Naehrwert-Eintrag', () => dialog(() => page.openNutritionModal(null), {
+    '#nutrition-title': { value: 'Apfel' }, '#nutrition-consumed-at': { value: '2026-01-05T08:00' },
+  }), '#nutrition-form'],
+  ['Periode', () => dialog(() => page.openPeriodModal(null), { '#cycle-start': { value: '2026-01-05' } }), '#cycle-period-form'],
+  ['Import der Historie', () => dialog(() => page.openCycleImportModal(), { '#cycle-import-paste': { value: 'start_date' } }), '#cycle-import-form'],
+  ['Tageseintrag', () => dialog(() => page.openDayLogModal('2026-01-05')), '#cycle-log-form'],
+  ['Zyklus-Einstellungen', () => dialog(() => page.openCycleSettingsModal()), '#cycle-settings-form'],
+];
+
+test('Seite: Erfolg nach Dialogwechsel - jeder Erfolgsweg schliesst nur mit dem Kontext von VOR der Anfrage (#1997)', async () => {
+  page.setViewStateForTest('meds', { list: [{ id: 3, name: 'Ibuprofen' }], logsByMed: { 3: [{ id: 4, status: 'taken', taken_at: '2026-01-05T08:00' }] } });
+  page.setViewStateForTest('prevention', { types: [{ id: 12, name: 'Tetanus' }], records: [] });
+  const wege = [
+    ...ERFOLGSWEGE.map(([name, oeffne, form]) => [name, async () => { const d = await oeffne(); await d.absenden(form); }]),
+    ['Dosis-Eintrag loeschen', () => page.deleteMedLog({ id: 4 })],
+  ];
+  try {
+    for (const [name, lauf] of wege) {
+      let kontext = 'eigener-dialog';
+      globalThis.__modalContextId = () => kontext;
+      const wechsel = (antwort) => { kontext = 'ein-anderer-dialog'; return antwort; };
+      try {
+        const { closed } = await mit({
+          post: () => wechsel({ data: { id: 77, imported: 0, skipped: 0 } }),
+          put: () => wechsel({ data: null }),
+          patch: () => wechsel({ data: {} }),
+          delete: () => wechsel({}),
+        }, lauf);
+        assert.equal(toasts.some(([, art]) => art === 'danger'), false, `${name}: der Erfolg ist kein Fehler (${JSON.stringify(toasts)})`);
+        assert.equal(closed.length, 1, `${name}: genau ein Schliessen`);
+        assert.equal(closed[0].force, true, `${name}: force wie bisher`);
+        assert.equal(closed[0].context, 'eigener-dialog',
+          `${name}: geschlossen wird ohne den Kontext von vor der Anfrage - die spaete Antwort traefe den Dialog, der jetzt offen ist`);
+      } finally {
+        delete globalThis.__modalContextId;
+      }
+    }
+  } finally {
+    page.setViewStateForTest('meds', { list: [], logsByMed: {} });
+    page.setViewStateForTest('prevention', { types: [], records: [] });
+  }
+});
+
+// #1997, Einstellungen: dieselbe Regel fuer das Register der Vorsorgearten.
+// Das Loeschen fragt vorher ueber confirmOverModal nach, die den Dialog parkt:
+// der Kontext wird VOR der Rueckfrage festgehalten, sonst gehoerte er ihr.
+test('Einstellungen: Erfolg nach Dialogwechsel - Vorsorgeart anlegen, aendern, loeschen schliessen nur mit dem Kontext von VOR Rueckfrage und Anfrage (#1997)', async () => {
+  const FELDER = {
+    '#hpt-name': { value: 'Tetanus' }, '#hpt-kind': { value: 'vaccination' }, '#hpt-interval': { value: '' },
+    '#hpt-interval-unit': { value: 'months' }, '#hpt-icon': { value: 'syringe' },
+  };
+  const ART = { id: 12, name: 'Tetanus', kind: 'vaccination', icon: 'syringe' };
+  // Die Seite einmal an einen Attrappen-Container haengen: das Loeschen laedt
+  // danach die Liste neu und zeichnet dorthin.
+  const healthSettings = await import('../public/settings/pages/modules-health.js');
+  globalThis.__apiStub = { get: async () => ({ data: [] }) };
+  try {
+    await healthSettings.render({ replaceChildren() {}, insertAdjacentHTML() {}, querySelector: () => null, querySelectorAll: () => [] });
+  } finally {
+    delete globalThis.__apiStub;
+  }
+  const wege = [
+    ['Vorsorgeart anlegen', false, async () => (await dialog(() => settings.openTypeModal(null), FELDER)).absenden('#health-prevention-type-form')],
+    ['Vorsorgeart aendern', false, async () => (await dialog(() => settings.openTypeModal(ART), FELDER)).absenden('#health-prevention-type-form')],
+    ['Vorsorgeart loeschen (mit Rueckfrage)', true, async () => (await dialog(() => settings.openTypeModal(ART), FELDER)).klicken('[data-action="delete"]')],
+  ];
+  for (const [name, mitRueckfrage, lauf] of wege) {
+    let kontext = 'eigener-dialog';
+    let gefragt = 0;
+    globalThis.__modalContextId = () => kontext;
+    globalThis.__confirmOverModal = async () => { gefragt += 1; kontext = 'die-rueckfrage'; return true; };
+    const wechsel = (antwort) => { kontext = 'ein-anderer-dialog'; return antwort; };
+    try {
+      const { closed, calls } = await mit({
+        post: () => wechsel({ data: { id: 13 } }), patch: () => wechsel({ data: {} }), delete: () => wechsel({}),
+      }, lauf);
+      assert.equal(gefragt, mitRueckfrage ? 1 : 0, `${name}: die Rueckfrage kam ${gefragt}-mal`);
+      assert.ok(calls.some(([verb]) => verb !== 'GET'), `${name}: der Weg schreibt`);
+      assert.equal(toasts.some(([, art]) => art === 'danger'), false, `${name}: der Erfolg ist kein Fehler (${JSON.stringify(toasts)})`);
+      assert.equal(closed.length, 1, `${name}: genau ein Schliessen`);
+      assert.equal(closed[0].force, true, `${name}: force wie bisher`);
+      assert.equal(closed[0].context, 'eigener-dialog',
+        `${name}: geschlossen wird mit ${JSON.stringify(closed[0].context)} statt mit dem Kontext von vor Rueckfrage und Anfrage`);
+    } finally {
+      delete globalThis.__modalContextId;
+      delete globalThis.__confirmOverModal;
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// KEINE BROWSER-BLASEN, KEINE ORTLOSEN TOASTS (Critique R21, a5)
+//
+// Keines der zwoelf Gesundheitsformulare trug `novalidate`: `required`, `min`
+// und `step` zeigten die Blase des Browsers, gegen die DESIGN.md-Regel "Keine
+// Browser-Blasen", die die Einstellungen seit R20 halten. Und wo der Handler
+// selbst pruefte, sagte er es oft als Toast ohne Ort ("Bitte gueltige Werte
+// eingeben."). Jetzt traegt jedes Formular `novalidate`, jeder Handler fragt
+// die Regeln des Markups (constraintErrors) und meldet am Feld.
+// ---------------------------------------------------------------------------
+
+test('Seite: jedes Gesundheitsformular traegt novalidate und fragt die Regeln seines Markups (Critique R21)', () => {
+  const src = readFileSync(new URL('../public/pages/health.js', import.meta.url), 'utf8');
+  const forms = [...src.matchAll(/<form id="([\w-]+)"([^>]*)>/g)];
+  assert.ok(forms.length >= 12, `Reichweite: ${forms.length} Formulare gefunden`);
+  const ohne = forms.filter(([, , attrs]) => !/\bnovalidate\b/.test(attrs)).map(([, id]) => id);
+  assert.deepEqual(ohne, [], 'ohne novalidate zeigt der Browser seine Blase');
+  for (const [, id] of forms) {
+    // Der Handler haengt am Formular per Selektor - oder, beim Messwert, an
+    // der Variablen `form` hinter dem Markup.
+    let at = src.indexOf(`'#${id}').addEventListener('submit'`);
+    if (at < 0) at = src.indexOf("form.addEventListener('submit'", src.indexOf(`<form id="${id}"`));
+    assert.ok(at > 0, `${id}: Submit-Handler gefunden`);
+    const handler = src.slice(at, at + 1600);
+    assert.match(handler, /reportFieldErrors\(\[?\s*(?:\.\.\.)?constraintErrors\(/, `${id}: der Handler meldet die Regeln des Markups am Feld`);
+  }
+  // Ein Blutdruck ist nie ein Beispiel: "120 / 80" und "72" standen grau in
+  // leeren Feldern und lasen sich wie eine eingetragene Messung.
+  const pair = page.valueFieldsMarkup('bp');
+  assert.match(pair, /id="vital-sys"/, 'Vorbedingung: das Blutdruck-Paar');
+  assert.doesNotMatch(pair, /placeholder=/, 'keine Beispielwerte als Platzhalter');
+});
+
+test('Seite: Periode - Beginn fehlt oder Ende vor Beginn: der Fehler steht am Feld, kein Toast, keine Anfrage (Critique R21)', async () => {
+  const gemeldet = [];
+  globalThis.__reportFieldError = (feld, text) => gemeldet.push([feld, text]);
+  try {
+    const d = await dialog(() => page.openPeriodModal(null), {
+      '#cycle-start': { value: '2026-01-10' }, '#cycle-end': { value: '2026-01-05' },
+    });
+    const { calls } = await mit({}, () => d.absenden('#cycle-period-form'));
+    assert.deepEqual(gemeldet.map(([feld, text]) => [feld === d.element('#cycle-end'), text]), [[true, 'health.cycle.endBeforeStart']],
+      'die Meldung steht am Ende-Feld');
+    assert.equal(toasts.length, 0, `kein ortloser Toast (${JSON.stringify(toasts)})`);
+    assert.equal(calls.filter(([verb]) => verb !== 'GET').length, 0, 'nichts gesendet');
+
+    gemeldet.length = 0;
+    const leer = await dialog(() => page.openPeriodModal(null), { '#cycle-start': { value: '' } });
+    await mit({}, () => leer.absenden('#cycle-period-form'));
+    assert.deepEqual(gemeldet.map(([feld, text]) => [feld === leer.element('#cycle-start'), text]), [[true, 'common.required']]);
+    assert.equal(toasts.length, 0);
+  } finally {
+    delete globalThis.__reportFieldError;
+  }
+});
+
+test('Seite: Import der Historie ohne Inhalt meldet am Einfuegefeld, Aktivitaet ohne Zeitpunkt am Zeitpunkt (Critique R21)', async () => {
+  const gemeldet = [];
+  globalThis.__reportFieldError = (feld, text) => gemeldet.push([feld, text]);
+  try {
+    const imp = await dialog(() => page.openCycleImportModal(), { '#cycle-import-paste': { value: '  ' } });
+    await mit({}, () => imp.absenden('#cycle-import-form'));
+    assert.deepEqual(gemeldet.map(([feld, text]) => [feld === imp.element('#cycle-import-paste'), text]), [[true, 'health.cycle.import.emptyError']]);
+    assert.equal(toasts.length, 0, `kein Toast (${JSON.stringify(toasts)})`);
+
+    gemeldet.length = 0;
+    const akt = await dialog(() => page.openActivityModal(null), { '#activity-type': { value: 'walk' }, '#activity-performed-at': { value: '' } });
+    await mit({}, () => akt.absenden('#activity-form'));
+    assert.deepEqual(gemeldet.map(([feld, text]) => [feld === akt.element('#activity-performed-at'), text]), [[true, 'common.required']]);
+    assert.equal(toasts.length, 0, `kein Toast (${JSON.stringify(toasts)})`);
+
+    // Die Regeln des Markups selbst: was constraintErrors meldet, haelt den
+    // Handler an, bevor er etwas sendet (Messwert, Zyklus-Einstellungen).
+    gemeldet.length = 0;
+    globalThis.__constraintErrors = (form) => [[form ?? 'feld', 'common.fieldMin{"min":"15"}']];
+    const vital = await dialog(() => page.openVitalModal({ type: 'weight' }), {
+      '#vital-measured-at': { value: '2026-01-05T08:00' }, '#vital-value': { value: '70' },
+    });
+    const { calls } = await mit({}, () => vital.absenden('#vital-form'));
+    assert.equal(calls.filter(([verb]) => verb !== 'GET').length, 0, 'ein Feldfehler sendet nichts');
+    assert.equal(gemeldet.length, 1);
+  } finally {
+    delete globalThis.__reportFieldError;
+    delete globalThis.__constraintErrors;
+  }
 });

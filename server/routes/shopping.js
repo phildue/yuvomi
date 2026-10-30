@@ -11,7 +11,7 @@ import { createLogger } from '../logger.js';
 import express from 'express';
 import * as db from '../db.js';
 import { str, oneOf, url, date, collectErrors, MAX_TITLE, MAX_SHORT, MAX_TEXT } from '../middleware/validate.js';
-import { aggregateMealIngredients } from '../services/shopping-import.js';
+import { handOverToShoppingList, mealPlanSource, previewHandover } from '../services/kitchen-handover.js';
 import { loadItemTagsFor } from '../utils/task-tags.js';
 import {
   flushOutbound, markTodoOutbound, queueTodoDeletions, moveShoppingMirror,
@@ -197,7 +197,7 @@ router.get('/categories', (_req, res) => {
 // --------------------------------------------------------
 router.post('/categories', (req, res) => {
   try {
-    const vName = str(req.body.name, 'Name', { max: MAX_SHORT });
+    const vName = str(req.body.name, 'name', { max: MAX_SHORT });
     if (vName.error) return res.status(400).json({ error: vName.error, code: 400 });
 
     const existing = db.get()
@@ -236,7 +236,7 @@ router.put('/categories/:catId', (req, res) => {
       .get(req.params.catId);
     if (!cat) return res.status(404).json({ error: 'Category not found.', code: 404, reason: 'shopping_category_not_found' });
 
-    const vName = str(req.body.name, 'Name', { max: MAX_SHORT });
+    const vName = str(req.body.name, 'name', { max: MAX_SHORT });
     if (vName.error) return res.status(400).json({ error: vName.error, code: 400 });
 
     const conflict = db.get()
@@ -332,7 +332,7 @@ router.patch('/categories/reorder', (req, res) => {
   try {
     const { order } = req.body;
     if (!Array.isArray(order) || order.length === 0)
-      return res.status(400).json({ error: 'order muss ein nicht-leeres Array von IDs sein.', code: 400 });
+      return res.status(400).json({ error: 'order must be a non-empty array of ids.', code: 400 });
 
     const update = db.get().prepare('UPDATE shopping_categories SET sort_order = ? WHERE id = ?');
     db.get().transaction(() => {
@@ -446,7 +446,7 @@ router.get('/stores', (_req, res) => {
 // POST /api/v1/shopping/stores  Body: { name }
 router.post('/stores', (req, res) => {
   try {
-    const vName = str(req.body.name, 'Name', { max: MAX_SHORT });
+    const vName = str(req.body.name, 'name', { max: MAX_SHORT });
     const errors = collectErrors([vName]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
 
@@ -478,7 +478,7 @@ router.put('/stores/:id', (req, res) => {
     const store = db.get().prepare('SELECT * FROM shopping_stores WHERE id = ?').get(id);
     if (!store) return res.status(404).json({ error: 'Store not found.', code: 404, reason: 'shopping_store_not_found' });
 
-    const vName = str(req.body.name, 'Name', { max: MAX_SHORT });
+    const vName = str(req.body.name, 'name', { max: MAX_SHORT });
     const errors = collectErrors([vName]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
 
@@ -565,7 +565,7 @@ router.patch('/items/:itemId', (req, res) => {
         // Ganze Cent, nicht negativ, und eine Obergrenze, damit ein Vertipper
         // nicht als Millionenbetrag in der spaeteren Historie steht.
         if (!Number.isInteger(n) || n < 0 || n > 100_000_000) {
-          return res.status(400).json({ error: 'price_cents muss eine ganze Zahl in Cent zwischen 0 und 100000000 sein.', code: 400 });
+          return res.status(400).json({ error: 'price_cents must be a whole number of cents from 0 to 100000000.', code: 400 });
         }
         priceCents = n;
       }
@@ -579,7 +579,7 @@ router.patch('/items/:itemId', (req, res) => {
       else {
         const n = bodyId(roh);
         if (n === null) {
-          return res.status(400).json({ error: 'store_id muss eine Laden-ID sein.', code: 400 });
+          return res.status(400).json({ error: 'store_id must be a store id.', code: 400 });
         }
         // Ein unbekannter Laden wird abgelehnt statt still verworfen: anders als
         // bei einer Personenauswahl ist das hier ein Aufruffehler - die Liste
@@ -591,7 +591,7 @@ router.patch('/items/:itemId', (req, res) => {
       }
     }
 
-    if (!name?.trim()) return res.status(400).json({ error: 'name darf nicht leer sein.', code: 400 });
+    if (!name?.trim()) return res.status(400).json({ error: 'name must not be empty.', code: 400 });
 
     // ZIELLISTE (#1700). Nicht mitgeschickt oder die eigene Liste heisst: kein
     // Umzug. Geprüft wird hier, nicht nur im Dialog: die Route ist Teil der
@@ -604,10 +604,19 @@ router.patch('/items/:itemId', (req, res) => {
     if (req.body.list_id !== undefined && req.body.list_id !== null) {
       const n = bodyId(req.body.list_id);
       if (n === null) {
-        return res.status(400).json({ error: 'list_id muss eine Listen-ID sein.', code: 400 });
+        return res.status(400).json({ error: 'list_id must be a list id.', code: 400 });
       }
-      if (n !== item.list_id && !db.get().prepare('SELECT 1 FROM shopping_lists WHERE id = ?').get(n)) {
+      const target = n === item.list_id ? null : db.get().prepare(
+        `SELECT ${ACCEPTS_NEW_ITEMS_SQL} AS accepts_new_items FROM shopping_lists sl WHERE sl.id = ?`
+      ).get(n);
+      if (n !== item.list_id && !target) {
         return res.status(400).json({ error: 'Unknown list.', code: 400, reason: 'shopping_list_not_found' });
+      }
+      // Eine nur lesbar gespiegelte Liste ist kein Umzugsziel (#2283). Die
+      // eigene Liste bleibt es: wer einen Artikel darauf bearbeitet, zieht
+      // nicht um.
+      if (target && !target.accepts_new_items) {
+        return res.status(400).json({ error: 'list_id: this list does not accept new items.', code: 400 });
       }
       targetListId = n;
     }
@@ -618,7 +627,7 @@ router.patch('/items/:itemId', (req, res) => {
       return res.status(400).json({ error: 'Invalid category.', code: 400, reason: 'shopping_category_not_found' });
 
     // notes/url gleich validieren wie beim Anlegen (URL nur http/https → XSS-sicher).
-    const vNotes = str(notes, 'Notiz', { max: MAX_TEXT, required: false });
+    const vNotes = str(notes, 'notes', { max: MAX_TEXT, required: false });
     const vUrl   = url(urlVal, 'URL');
     const fieldErrors = collectErrors([vNotes, vUrl]);
     if (fieldErrors.length) return res.status(400).json({ error: fieldErrors.join(' '), code: 400 });
@@ -629,7 +638,7 @@ router.patch('/items/:itemId', (req, res) => {
       // dessen Objekt in eine Liste gezogen würde, in der er nicht steht.
       db.get().transaction(() => {
         // VOR dem Umzug, mit der Zeile der alten Liste.
-        if (moved) moveShoppingMirror(item, targetListId);
+        if (moved) moveShoppingMirror(item, targetListId, req.authUserId || req.session.userId);
 
         db.get().prepare(`
           UPDATE shopping_items
@@ -680,7 +689,8 @@ router.patch('/items/:itemId', (req, res) => {
 // --------------------------------------------------------
 // POST /api/v1/shopping/items/undo-transfer
 // Nimmt einen Übertrag aus einem Nachbar-Tab der Küche zurück.
-// Body: { ids: number[] } - die `added_ids` aus der Transfer-Antwort.
+// Body: { ids: number[], ingredient_ids?: number[] } - `added_ids` und
+// `ingredient_ids` aus der Transfer-Antwort.
 // Response: { data: { removed: number } }
 //
 // Die drei erzeugenden Pfade der Küche (Vorrat, Rezept, Mahlzeit → Einkauf)
@@ -708,7 +718,14 @@ router.post('/items/undo-transfer', (req, res) => {
     const ids = Array.isArray(req.body?.ids)
       ? req.body.ids.map(Number).filter(Number.isInteger)
       : [];
-    if (!ids.length) return res.json({ data: { removed: 0 } });
+    // Seit R23 (D2) nennt der Transfer die Zutaten, die er markiert hat
+    // (`ingredient_ids`), auch die uebersprungenen - sie stehen ja auf der
+    // Liste. Die Ruecknahme setzt genau diese zurueck. Ohne das Feld (aeltere
+    // Clients) bleibt es beim Rueckschluss ueber Mahlzeit und Name unten.
+    const ingredientIds = Array.isArray(req.body?.ingredient_ids)
+      ? req.body.ingredient_ids.map(Number).filter(Number.isInteger)
+      : null;
+    if (!ids.length && !ingredientIds?.length) return res.json({ data: { removed: 0 } });
 
     // DIESELBE GEGENRICHTUNG (#1290), aber nur fuer den Mahlzeit-Pfad. Die
     // Ruecknahme loescht Einkaufsartikel UND setzt aus Grund 2. oben
@@ -721,7 +738,7 @@ router.post('/items/undo-transfer', (req, res) => {
     // Je ID eine Abfrage statt eines `IN (...)`: die Liste kommt vom Client
     // und ist unbegrenzt, die Platzhalter-Grenze von SQLite dagegen nicht.
     const findSource = db.get().prepare('SELECT added_from_meal FROM shopping_items WHERE id = ?');
-    const touchesMealPlan = ids.some((id) => findSource.get(id)?.added_from_meal);
+    const touchesMealPlan = Boolean(ingredientIds?.length) || ids.some((id) => findSource.get(id)?.added_from_meal);
     if (touchesMealPlan && !mayWriteModule(req, 'meals')) {
       return res.status(403).json({ error: 'Write access to the meal plan is required.', code: 403, reason: 'cross_module_access' });
     }
@@ -735,14 +752,19 @@ router.post('/items/undo-transfer', (req, res) => {
         WHERE meal_id = ? AND name = ? AND on_shopping_list = 1
       `);
 
+      const unmarkById = db.get().prepare(
+        'UPDATE meal_ingredients SET on_shopping_list = 0 WHERE id = ? AND on_shopping_list = 1',
+      );
+
       let count = 0;
       for (const id of ids) {
         const item = findItem.get(id);
         if (!item) continue;
         deleteItem.run(id);
-        if (item.added_from_meal) unmarkIngredient.run(item.added_from_meal, item.name);
+        if (!ingredientIds && item.added_from_meal) unmarkIngredient.run(item.added_from_meal, item.name);
         count += 1;
       }
+      for (const id of ingredientIds ?? []) unmarkById.run(id);
       return count;
     })();
 
@@ -779,9 +801,21 @@ router.delete('/items/:itemId', (req, res) => {
   }
 });
 
+// Nimmt die Liste neue Artikel an (#2283)? Nein, wenn eine eingeschaltete
+// Zuordnung sie aus einer Erinnerungsliste spiegelt, die für das Konto nur
+// lesbar ist (`writable` = 0, #1840): deren Server wiese den Upload eines
+// hierher verschobenen Artikels ab. NULL heisst, der Server sagt es nicht, und
+// zählt als beschreibbar - wie bei den Zielen für Termine und Aufgaben (#2280).
+// `sl` ist die Liste der umgebenden Abfrage.
+const ACCEPTS_NEW_ITEMS_SQL = `CASE WHEN EXISTS (
+          SELECT 1 FROM caldav_reminder_selection s
+           WHERE s.target_list_id = sl.id AND s.target_module = 'shopping'
+             AND s.enabled = 1 AND s.writable = 0
+        ) THEN 0 ELSE 1 END`;
+
 // --------------------------------------------------------
 // GET /api/v1/shopping
-// Alle Einkaufslisten mit Artikel-Zähler.
+// Alle Einkaufslisten mit Artikel-Zähler und `accepts_new_items` (#2283).
 // Response: { data: ShoppingList[] }
 // --------------------------------------------------------
 router.get('/', (req, res) => {
@@ -790,7 +824,8 @@ router.get('/', (req, res) => {
       SELECT
         sl.*,
         COUNT(si.id)                                          AS item_total,
-        SUM(CASE WHEN si.is_checked = 1 THEN 1 ELSE 0 END)   AS item_checked
+        SUM(CASE WHEN si.is_checked = 1 THEN 1 ELSE 0 END)   AS item_checked,
+        ${ACCEPTS_NEW_ITEMS_SQL}                              AS accepts_new_items
       FROM shopping_lists sl
       LEFT JOIN shopping_items si ON si.list_id = sl.id
       GROUP BY sl.id
@@ -811,7 +846,7 @@ router.get('/', (req, res) => {
 // --------------------------------------------------------
 router.post('/', (req, res) => {
   try {
-    const vName = str(req.body.name, 'Name', { max: MAX_TITLE });
+    const vName = str(req.body.name, 'name', { max: MAX_TITLE });
     if (vName.error) return res.status(400).json({ error: vName.error, code: 400 });
 
     const result = db.get()
@@ -836,7 +871,7 @@ router.post('/', (req, res) => {
 // --------------------------------------------------------
 router.put('/:listId', (req, res) => {
   try {
-    const vName = str(req.body.name, 'Name', { max: MAX_TITLE });
+    const vName = str(req.body.name, 'name', { max: MAX_TITLE });
     if (vName.error) return res.status(400).json({ error: vName.error, code: 400 });
 
     const result = db.get()
@@ -894,7 +929,7 @@ router.post('/:listId/duplicate', (req, res) => {
 
     // Express 5 laesst req.body bei einem POST ohne Body undefined -
     // ohne das ?. antwortete die Route hier mit 500 statt 400.
-    const vName = str(req.body?.name, 'Name', { max: MAX_TITLE });
+    const vName = str(req.body?.name, 'name', { max: MAX_TITLE });
     if (vName.error) return res.status(400).json({ error: vName.error, code: 400 });
 
     // Die drei Flags sind optional, aber wenn gesetzt, echte Booleans. Ohne
@@ -1027,18 +1062,18 @@ router.patch('/:listId/items/reorder', (req, res) => {
 
     const { category, order } = req.body;
     if (!Array.isArray(order) || order.length === 0)
-      return res.status(400).json({ error: 'order muss ein nicht-leeres Array von IDs sein.', code: 400 });
+      return res.status(400).json({ error: 'order must be a non-empty array of ids.', code: 400 });
 
     const ids = order.map(Number);
     if (ids.some((id) => !Number.isInteger(id)))
-      return res.status(400).json({ error: 'order darf nur Artikel-IDs enthalten.', code: 400 });
+      return res.status(400).json({ error: 'order may only contain item ids.', code: 400 });
     if (new Set(ids).size !== ids.length)
-      return res.status(400).json({ error: 'order darf keine ID doppelt enthalten.', code: 400 });
+      return res.status(400).json({ error: 'order must not contain an id twice.', code: 400 });
 
     // oneOf lässt Leerwerte durch (es validiert optionale Felder); hier ist die
     // Kategorie der Geltungsbereich der Ränge und damit Pflicht.
-    if (!category) return res.status(400).json({ error: 'category ist erforderlich.', code: 400 });
-    const vCat = oneOf(category, validCategoryNames(), 'Kategorie');
+    if (!category) return res.status(400).json({ error: 'category is required.', code: 400 });
+    const vCat = oneOf(category, validCategoryNames(), 'category');
     if (vCat.error) return res.status(400).json({ error: vCat.error, code: 400 });
 
     // Die Kategorie ist der Geltungsbereich der Ränge - eine fremde ID darin
@@ -1049,9 +1084,9 @@ router.patch('/:listId/items/reorder', (req, res) => {
       .map((r) => r.id);
     const ownSet = new Set(own);
     if (ids.some((id) => !ownSet.has(id)))
-      return res.status(400).json({ error: 'order enthält Artikel außerhalb dieser Liste oder Kategorie.', code: 400 });
+      return res.status(400).json({ error: 'order contains items outside this list or category.', code: 400 });
     if (ids.length !== own.length)
-      return res.status(400).json({ error: 'order muss alle Artikel der Kategorie enthalten.', code: 400 });
+      return res.status(400).json({ error: 'order must contain every item of the category.', code: 400 });
 
     const update = db.get().prepare('UPDATE shopping_items SET sort_order = ? WHERE id = ?');
     const { list_change } = withListChange(req.params.listId, () => {
@@ -1097,10 +1132,10 @@ router.post('/:listId/items', (req, res) => {
     const defaultCat = (validNames.includes('Sonstiges') ? 'Sonstiges' : validNames.at(-1)) ?? 'Sonstiges';
     const requestedCat = req.body.category || defaultCat;
 
-    const vName  = str(req.body.name, 'Name', { max: MAX_TITLE });
-    const vQty   = str(req.body.quantity, 'Menge', { max: MAX_SHORT, required: false });
-    const vCat   = oneOf(requestedCat, validNames, 'Kategorie');
-    const vNotes = str(req.body.notes, 'Notiz', { max: MAX_TEXT, required: false });
+    const vName  = str(req.body.name, 'name', { max: MAX_TITLE });
+    const vQty   = str(req.body.quantity, 'quantity', { max: MAX_SHORT, required: false });
+    const vCat   = oneOf(requestedCat, validNames, 'category');
+    const vNotes = str(req.body.notes, 'notes', { max: MAX_TEXT, required: false });
     const vUrl   = url(req.body.url, 'URL');
     const errors = collectErrors([vName, vQty, vCat, vNotes, vUrl]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
@@ -1236,7 +1271,13 @@ router.post('/:listId/send', sendListLimiter, async (req, res) => {
 // Body: { from: YYYY-MM-DD, to: YYYY-MM-DD, preview?: boolean }
 // preview:true rechnet nur (keine Schreib-Transaktion) - für die Vorschau
 // "X Zutaten aus Y Mahlzeiten" im Import-Dialog (Audit A1-22).
-// Response: { data: { transferred: number, added: number, meals: number, preview?: true } }
+// Response: { data: { transferred, added, skipped, meals, added_ids, ingredient_ids, preview?: true } }
+//
+// Seit R23 (D2) mit den Mahlzeiten, die aus einem Rezept geplant sind (vorher
+// las die Route nur meal_ingredients und uebersah sie), unter der EINEN
+// Dublettenregel der Kueche (services/kitchen-handover.js) und mit `added_ids`
+// fuer das Rueckgaengig - der Import schrieb bis dahin als einziger Kuechenweg
+// ohne Ruecknahme in die Liste.
 // --------------------------------------------------------
 router.post('/:listId/import-meal-plan', (req, res) => {
   try {
@@ -1269,46 +1310,28 @@ router.post('/:listId/import-meal-plan', (req, res) => {
       return res.status(400).json({ error: 'From date must be before or equal to end date.', code: 400 });
     }
 
-    const ingredients = db.get().prepare(`
-      SELECT mi.id, mi.meal_id, mi.name, mi.quantity, mi.category
-      FROM meal_ingredients mi
-      JOIN meals m ON m.id = mi.meal_id
-      WHERE m.date BETWEEN ? AND ?
-        AND mi.on_shopping_list = 0
-      ORDER BY m.date ASC, mi.id ASC
-    `).all(vFrom.value, vTo.value);
+    const range = { from: vFrom.value, to: vTo.value };
+    const empty = { transferred: 0, added: 0, skipped: 0, meals: 0, added_ids: [], ingredient_ids: [] };
 
-    if (!ingredients.length) {
-      return res.json({ data: { transferred: 0, added: 0, meals: 0 } });
-    }
-
-    const mealCount = new Set(ingredients.map((i) => i.meal_id)).size;
-    const aggregated = aggregateMealIngredients(ingredients);
-
-    // Vorschau (Audit A1-22): identische Auswahl und Aggregation, aber ohne
-    // Schreib-Transaktion. Der Client zeigt "X Zutaten aus Y Mahlzeiten",
-    // bevor der Nutzer den Import bestätigt.
+    // Vorschau (Audit A1-22): dieselbe Auswahl und Aggregation, aber ohne
+    // Schreib-Transaktion - Rezept-Mahlzeiten werden dafuer aus dem Rezept
+    // gelesen statt kopiert. Der Client zeigt "X Zutaten aus Y Mahlzeiten",
+    // und seit R23 auch, wie viele davon schon auf der Liste stehen.
     if (req.body.preview === true) {
-      return res.json({ data: { transferred: ingredients.length, added: aggregated.length, meals: mealCount, preview: true } });
+      const { ingredients, rows, meals } = mealPlanSource(db.get(), range, { materialize: false });
+      if (!ingredients.length) return res.json({ data: { ...empty, preview: true } });
+      const { added, skipped } = previewHandover(db.get(), req.params.listId, rows);
+      return res.json({ data: { transferred: ingredients.length, added, skipped, meals, preview: true } });
     }
 
-    const added = db.get().transaction(() => {
-      const insertItem = db.get().prepare(`
-        INSERT INTO shopping_items (list_id, name, quantity, category, added_from_meal)
-        VALUES (?, ?, ?, ?, ?)
-      `);
-      const markDone = db.get().prepare('UPDATE meal_ingredients SET on_shopping_list = 1 WHERE id = ?');
+    const result = db.transaction(() => {
+      const { ingredients, rows, meals } = mealPlanSource(db.get(), range);
+      if (!ingredients.length) return null;
+      return { transferred: ingredients.length, meals, ...handOverToShoppingList(db.get(), req.params.listId, rows) };
+    });
+    if (!result) return res.json({ data: empty });
 
-      for (const item of aggregated) {
-        insertItem.run(req.params.listId, item.name, item.quantity, item.category, item.added_from_meal);
-      }
-      for (const ingredient of ingredients) {
-        markDone.run(ingredient.id);
-      }
-      return aggregated.length;
-    })();
-
-    res.json({ data: { transferred: ingredients.length, added, meals: mealCount } });
+    res.json({ data: { ...result, added: result.added_ids.length } });
   } catch (err) {
     log.error('POST /:listId/import-meal-plan error:', err);
     res.status(500).json({ error: 'Internal server error.', code: 500 });
@@ -1318,7 +1341,10 @@ router.post('/:listId/import-meal-plan', (req, res) => {
 // --------------------------------------------------------
 // POST /api/v1/shopping/:listId/import-pantry
 // Setzt Vorratsartikel auf die Einkaufsliste (leer oder unter Mindestbestand).
-// Body: { items: [{ pantry_item_id, quantity? }] }
+// Body: { items: [{ pantry_item_id, quantity? } | { pantry_product_id }] }
+//
+// `pantry_product_id` hands over a household product without batches (#1448):
+// its name and category, no quantity, like an empty batch without a minimum.
 //
 // Die Mengen-Angabe kommt als fertiger Anzeigetext vom Client: shopping_items.quantity
 // ist Freitext, und die Einheiten des Vorrats ('pcs', 'can', …) sind erst über t()
@@ -1361,33 +1387,29 @@ router.post('/:listId/import-pantry', (req, res) => {
     // beiden Routen sollen nicht auseinanderlaufen.
     const defaultCat = (validNames.includes('Sonstiges') ? 'Sonstiges' : validNames.at(-1)) ?? 'Sonstiges';
 
-    const result = db.get().transaction(() => {
+    // Die Dublettenregel ist die der ganzen Kueche (services/kitchen-handover.js,
+    // R23 D2) - bis dahin stand hier eine eigene mit SQLites NOCASE, die nur
+    // ASCII kennt: "Öl" und "öl" waren zwei Artikel.
+    const result = db.transaction(() => {
       const findPantryItem = db.get().prepare('SELECT name, category FROM pantry_items WHERE id = ?');
-      const findDuplicate = db.get().prepare(`
-        SELECT id FROM shopping_items
-        WHERE list_id = ? AND is_checked = 0 AND name = ? COLLATE NOCASE
-        LIMIT 1
-      `);
-      const insertItem = db.get().prepare(`
-        INSERT INTO shopping_items (list_id, name, quantity, category) VALUES (?, ?, ?, ?)
-      `);
-
-      let skipped = 0;
-      const addedIds = [];
-
+      const findPantryProduct = db.get().prepare('SELECT name, category FROM pantry_products WHERE id = ?');
+      let missing = 0;
+      const rows = [];
       for (const entry of entries) {
-        const pantryItem = findPantryItem.get(Number(entry?.pantry_item_id));
-        if (!pantryItem) { skipped += 1; continue; }
-        if (findDuplicate.get(req.params.listId, pantryItem.name)) { skipped += 1; continue; }
-
-        const vQty = str(entry.quantity, 'Menge', { max: MAX_SHORT, required: false });
+        const byProduct = entry?.pantry_item_id == null && entry?.pantry_product_id != null;
+        const pantryItem = byProduct
+          ? findPantryProduct.get(Number(entry.pantry_product_id))
+          : findPantryItem.get(Number(entry?.pantry_item_id));
+        if (!pantryItem) { missing += 1; continue; }
+        // A product without batches has no stock to measure a shortfall
+        // against: it goes over without a quantity.
+        const vQty = byProduct ? { value: null } : str(entry.quantity, 'quantity', { max: MAX_SHORT, required: false });
         const category = validNames.includes(pantryItem.category) ? pantryItem.category : defaultCat;
-        const info = insertItem.run(req.params.listId, pantryItem.name, vQty.value, category);
-        addedIds.push(Number(info.lastInsertRowid));
+        rows.push({ name: pantryItem.name, quantity: vQty.value, category });
       }
-
-      return { added: addedIds.length, skipped, added_ids: addedIds };
-    })();
+      const { added_ids: addedIds, skipped } = handOverToShoppingList(db.get(), req.params.listId, rows);
+      return { added: addedIds.length, skipped: skipped + missing, added_ids: addedIds };
+    });
 
     res.json({ data: result });
   } catch (err) {
@@ -1413,10 +1435,10 @@ router.delete('/:listId/items/checked', (req, res) => {
     let ids = null;
     if (req.body?.ids !== undefined) {
       if (!Array.isArray(req.body.ids) || req.body.ids.length === 0)
-        return res.status(400).json({ error: 'ids muss ein nicht-leeres Array von Artikel-IDs sein.', code: 400 });
+        return res.status(400).json({ error: 'ids must be a non-empty array of item ids.', code: 400 });
       ids = req.body.ids.map(Number);
       if (ids.some((id) => !Number.isInteger(id) || id <= 0))
-        return res.status(400).json({ error: 'ids darf nur Artikel-IDs enthalten.', code: 400 });
+        return res.status(400).json({ error: 'ids may only contain item ids.', code: 400 });
     }
     const scope = ids
       ? { where: `list_id = ? AND is_checked = 1 AND id IN (${ids.map(() => '?').join(',')})`, params: [req.params.listId, ...ids] }

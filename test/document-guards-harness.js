@@ -43,6 +43,7 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3-multiple-ciphers';
 import puppeteer from 'puppeteer';
+import { launchBrowser } from '../scripts/lib/chrome-executable.js';
 import { SETTINGS_LEAVES } from '../public/settings/registry.js';
 import { tempDir } from './tmp-dir.js';
 
@@ -311,7 +312,7 @@ export async function startHarness() {
   let browser = null;
 
   // SCHEITERT EIN SCHRITT NACH DEM ERSTEN SERVERSTART, RAEUMT ER AUF (#1446).
-  // Warf `puppeteer.launch()` - etwa weil der gepinnte Chrome lokal fehlt -,
+  // Warf der Browserstart - damals etwa, weil der gepinnte Chrome lokal fehlte -,
   // stoppte niemand den eben gestarteten Server: der Kindprozess hielt den
   // Testprozess am Leben, die Suite hing statt rot zu werden, und wer sie
   // abbrach, liess den Server laufen. Dasselbe galt fuer eine gescheiterte
@@ -332,13 +333,18 @@ export async function startHarness() {
       await waitForHttp(baseUrl);
       await stopServer(migrator);
 
-      await run(process.execPath, ['scripts/seed-demo.js', '--db', dbPath, '--locale', 'de']);
+      // Der Seed liest `.env` (#2114), dieser Server nicht: derselbe Schluessel
+      // wie beim Server, sonst verschluesselte ein Schluessel aus einer lokalen
+      // `.env` die Datei, die der Server danach nicht mehr oeffnet.
+      await run(process.execPath, ['scripts/seed-demo.js', '--db', dbPath, '--locale', 'de'], {
+        DB_ENCRYPTION_KEY: process.env.DB_ENCRYPTION_KEY ?? '',
+      });
 
       server = startServer(dbPath, port);
       await waitForHttp(baseUrl);
     }
 
-    browser = await puppeteer.launch({
+    browser = await launchBrowser(puppeteer, {
       headless: true,
       args: ['--no-sandbox', '--disable-dev-shm-usage'],
     });
@@ -579,11 +585,12 @@ export async function openAnonPage(harness, { device = 'mobile', theme = 'light'
   await disableServiceWorker(page);
   // DIE SPRACHE STEHT FEST, BEVOR EIN SKRIPT DER SEITE LAEUFT. Ohne
   // `yuvomi-locale` greifen lang-init.js und i18n.js auf `navigator.languages`
-  // zurueck, und das ist im headless Chrome Englisch. Solange alle Sonden einen
+  // zurueck, und die uebernimmt headless Chrome vom Rechner: auf einem deutschen
+  // macOS `de-DE`, auf einem englischen System Englisch. Solange alle Sonden einen
   // Kontext teilten, hatte ein frueheres `openPage()` den Schluessel schon
   // gesetzt; mit einem frischen Kontext je Sonde ist er weg, und Sonde 10 mass
-  // die Seiten vor der Anmeldung auf Englisch - bei Ueberlauf und Zielgroessen,
-  // die an der Textlaenge haengen.
+  // die Seiten vor der Anmeldung in der Sprache des Rechners statt in `locale` -
+  // bei Ueberlauf und Zielgroessen, die an der Textlaenge haengen.
   await page.evaluateOnNewDocument((l) => {
     try { localStorage.setItem('yuvomi-locale', l); } catch { /* undurchsichtiger Ursprung */ }
   }, locale);

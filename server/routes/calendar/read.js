@@ -43,7 +43,7 @@ router.get('/', (req, res) => {
     const to   = req.query.to   || `${year}-${month}-31`;
 
     if (!DATE_RE.test(from) || !DATE_RE.test(to))
-      return res.status(400).json({ error: 'from/to müssen YYYY-MM-DD sein', code: 400 });
+      return res.status(400).json({ error: 'from and to must be in YYYY-MM-DD format.', code: 400 });
 
     let sql = `
       SELECT e.*,
@@ -66,7 +66,7 @@ router.get('/', (req, res) => {
              ${localCalendarColorSql()} AS local_calendar_color,
              ${SOURCE_CALENDAR_COLUMNS},
              COALESCE(bd.name, nd.name) AS birthday_name,
-             bd.birth_date AS birthday_date,
+             CASE WHEN bd.year_unknown = 1 THEN NULL ELSE bd.birth_date END AS birthday_date,
              nd.name_day   AS name_day,
              CASE WHEN nd.id IS NOT NULL THEN 'name_day'
                   WHEN bd.id IS NOT NULL THEN 'birthday' END AS birthday_event_kind,
@@ -130,7 +130,7 @@ router.get('/', (req, res) => {
     res.json({ data: events, from, to });
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -158,7 +158,7 @@ router.get('/upcoming', (req, res) => {
     res.json({ data: expanded });
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -218,7 +218,7 @@ router.get('/search', (req, res) => {
              ${localCalendarColorSql()} AS local_calendar_color,
              ${SOURCE_CALENDAR_COLUMNS},
              COALESCE(bd.name, nd.name) AS birthday_name,
-             bd.birth_date AS birthday_date,
+             CASE WHEN bd.year_unknown = 1 THEN NULL ELSE bd.birth_date END AS birthday_date,
              nd.name_day   AS name_day,
              CASE WHEN nd.id IS NOT NULL THEN 'name_day'
                   WHEN bd.id IS NOT NULL THEN 'birthday' END AS birthday_event_kind,
@@ -257,7 +257,7 @@ router.get('/search', (req, res) => {
     });
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 

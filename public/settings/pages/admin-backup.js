@@ -1,7 +1,9 @@
 import { api } from '/api.js';
-import { formatDate, formatTime, t } from '/i18n.js';
+import { t } from '/i18n.js';
+import { dateTimeText } from '/utils/date-format.js';
 import { confirmModal, whenModalClosed } from '/components/modal.js';
 import { formatCronSchedule } from '/settings/cron-label.js';
+import { wirePasswordToggle } from '/utils/auth-ui.js';
 import {
   backupKeyFieldHtml,
   encodeBackupKey,
@@ -23,13 +25,28 @@ function scheduleValue(schedule) {
   const readable = formatCronSchedule(schedule);
   if (!readable) return { value: schedule, code: true };
 
+  // DER AUSDRUCK STEHT HINTER "MEHR DAZU" (Critique R24 G6-Einst-P3-4):
+  // unter "Taeglich um 02:00" stand "0 2 * * *" fuer jeden sichtbar - ein
+  // Beleg fuer wenige, Rauschen fuer alle. Ein natives <details> wie die
+  // Hinweise der Blaetter (hintFoldHtml).
   const wrapper = document.createElement('span');
   wrapper.className = 'settings-info-value__stack';
   const text = document.createElement('span');
   text.textContent = readable;
+  const more = document.createElement('details');
+  more.className = 'settings-hint-fold__more';
+  const summary = document.createElement('summary');
+  summary.className = 'settings-hint-fold__summary';
+  summary.textContent = t('settings.hintMore');
+  const chevron = document.createElement('i');
+  chevron.setAttribute('data-lucide', 'chevron-down');
+  chevron.className = 'settings-hint-fold__icon';
+  chevron.setAttribute('aria-hidden', 'true');
+  summary.append(chevron);
   const expression = document.createElement('code');
   expression.textContent = schedule;
-  wrapper.append(text, expression);
+  more.append(summary, expression);
+  wrapper.append(text, more);
   return { value: wrapper, code: false };
 }
 
@@ -68,7 +85,7 @@ function renderPage(container) {
           <form id="backup-restore-form" class="settings-form settings-form--compact">
             <label class="settings-backup-dropzone" id="backup-dropzone" for="backup-restore-file">
               <i data-lucide="upload-cloud" aria-hidden="true"></i>
-              <span>${t('settings.backupDropzoneTitle')}</span>
+              <span><span class="u-pointer-only">${t('settings.backupDropzoneTitle')}</span><span class="u-touch-only">${t('settings.backupDropzoneTitleTouch')}</span></span>
               <small>${t('settings.backupDropzoneHint')}</small>
             </label>
             <input class="sr-only" type="file" id="backup-restore-file" accept=".db,.sqlite,.sqlite3,application/octet-stream" />
@@ -112,15 +129,10 @@ function renderPage(container) {
             })}
             ${settingRowHtml({
               label: t('settings.backupWebdavPassword'), labelFor: 'webdav-password',
-              control: `<div class="settings-webdav-pw-wrap">
-                <input class="form-input" type="password" id="webdav-password" name="password"
-                  autocomplete="current-password"
-                  placeholder="${t('settings.backupWebdavPasswordPlaceholder')}" />
-                <button type="button" class="btn btn--icon btn--ghost settings-webdav-reveal-btn"
-                  data-reveal-target="webdav-password" aria-label="${t('common.togglePasswordVisibility')}">
-                  <i data-lucide="eye" class="icon-sm" aria-hidden="true"></i>
-                </button>
-              </div>`,
+              // Das Auge sitzt IM Feld (wirePasswordToggle, Critique R24 G6-Einst-P3-4).
+              control: `<input class="form-input" type="password" id="webdav-password" name="password"
+                  autocomplete="new-password"
+                  placeholder="${t('settings.backupWebdavPasswordPlaceholder')}" />`,
             })}
             ${settingRowHtml({
               label: t('settings.backupWebdavPath'), labelFor: 'webdav-path',
@@ -215,7 +227,7 @@ async function loadBackupSchedulerStatus(container) {
 
     let lastBackupText = t('settings.backupSchedulerNever');
     if (lastBackup?.timestamp) {
-      const date = `${formatDate(lastBackup.timestamp)} ${formatTime(lastBackup.timestamp)}`;
+      const date = dateTimeText(lastBackup.timestamp);
       lastBackupText = lastBackup.success
         ? t('settings.backupSchedulerLastSuccess', { date })
         : t('settings.backupSchedulerLastFail', { date });
@@ -276,7 +288,7 @@ function renderWebdavStatus(grid, container, d) {
   if (!d.configured) { grid.replaceChildren(); return; }
 
   const lastUploadValue = d.lastUpload
-    ? `${formatDate(d.lastUpload)} ${formatTime(d.lastUpload)}`
+    ? dateTimeText(d.lastUpload)
     : t('settings.backupWebdavNeverUploaded');
 
   const rows = [
@@ -414,19 +426,7 @@ function bindWebdavBackupEvents(container) {
 
   loadWebdavConfig(container);
 
-  form.querySelectorAll('[data-reveal-target]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const input = form.querySelector(`#${btn.dataset.revealTarget}`);
-      if (!input) return;
-      const isText = input.type === 'text';
-      input.type = isText ? 'password' : 'text';
-      const icon = btn.querySelector('[data-lucide]');
-      if (icon) {
-        icon.setAttribute('data-lucide', isText ? 'eye' : 'eye-off');
-        window.lucide?.createIcons({ el: btn });
-      }
-    });
-  });
+  wirePasswordToggle(form.querySelector('#webdav-password'), { show: t('login.showPassword'), hide: t('login.hidePassword') });
 
   testBtn?.addEventListener('click', async () => {
     testBtn.disabled = true;

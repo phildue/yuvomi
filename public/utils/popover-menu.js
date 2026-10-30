@@ -74,7 +74,7 @@ function itemAttrs(attrs) {
 // graues Ghost-Icon neben beringten Knoepfen anderer Module - eine dritte
 // Haut fuer denselben Kopfknopf. Zeilen- und Sonderknoepfe geben ihre Klasse
 // ohnehin selbst mit (rowMenuHtml, Erledigt-von-Wahl).
-export function popoverMenuHtml({ id, label, items = [], triggerClass = 'btn btn--secondary btn--icon', icon = 'ellipsis' }) {
+export function popoverMenuHtml({ id, label, items = [], triggerClass = 'btn btn--secondary btn--icon', icon = 'ellipsis', defer = false }) {
   const entry = (item, index) => {
     if (item.separator) return '\n    <div class="popover-menu__separator" role="separator"></div>';
     // EINE GRUPPE MIT NAMEN (Critique 2026-10-05, R16): `{ group, items }`.
@@ -111,7 +111,33 @@ export function popoverMenuHtml({ id, label, items = [], triggerClass = 'btn btn
             aria-label="${esc(label)}" title="${esc(label)}">
       <i data-lucide="${esc(icon)}" class="icon-md" aria-hidden="true"></i>
     </button>
-    <div class="popover-menu" id="${esc(id)}" popover role="menu">${entries}</div>`;
+    <div class="popover-menu" id="${esc(id)}" popover role="menu">${defer ? `<template ${DEFERRED_ATTR}>${entries}</template>` : entries}</div>`;
+}
+
+/**
+ * EIN ZEILENMENUE ENTSTEHT ERST, WENN ES AUFGEHT (Critique R22, D22).
+ *
+ * Jede Aufgabe trug zwei Menues (Mehr, "Wer hat erledigt?") samt ihrer
+ * Eintraege und Zeichen im Baum: 39 von 83 Knoten je Zeile, 161 Aufgaben
+ * 13.700 Knoten, und jedes Zeichen darin ersetzte Lucide beim Seitenaufbau
+ * einzeln - der Aufbau hielt die Seite bei 4x CPU ueber 300 ms am Stueck.
+ * Geoeffnet wird davon fast nie eines.
+ *
+ * `defer: true` legt die Eintraege in ein `<template>` im Panel: der Parser
+ * baut sie als losen Inhalt, der weder im Dokument steht noch Stil, Layout
+ * oder Zeichen kostet. Das Panel selbst, sein Ausloeser mit `popovertarget`
+ * und alle Attribute bleiben, wie sie sind - dieselbe Zeichenkette, dieselben
+ * `data-action`s. `beforetoggle` haengt die Eintraege direkt vor dem Oeffnen
+ * ein und zeichnet ihre Zeichen (`installPopoverMenus`); wer ein Menue vorher
+ * lesen muss, ruft `expandPopoverMenu`.
+ */
+const DEFERRED_ATTR = 'data-popover-entries';
+
+export function expandPopoverMenu(panel) {
+  const tpl = panel?.querySelector?.(`:scope > template[${DEFERRED_ATTR}]`);
+  if (!tpl) return;
+  tpl.replaceWith(tpl.content);
+  window.lucide?.createIcons?.({ el: panel });
 }
 
 /**
@@ -204,7 +230,7 @@ export function syncPopoverMenuItem(root, action, checked) {
 function onBeforeToggle(event) {
   const panel = event.target;
   if (!(panel instanceof HTMLElement) || !panel.matches('.popover-menu')) return;
-  if (event.newState === 'open') { panel.style.opacity = '0'; return; }
+  if (event.newState === 'open') { expandPopoverMenu(panel); panel.style.opacity = '0'; return; }
   // SCHLIESSEN: die Inline-Werte gehen JETZT, nicht erst im `toggle` danach.
   // Der Ausgang (layout.css: `overlay`/`display` diskret, Blende, Schrumpfen)
   // beginnt mit dem Schliessen; blieben Deckkraft und Groesse bis zum spaeter
@@ -212,6 +238,53 @@ function onBeforeToggle(event) {
   // waehrend das Panel noch in voller Deckung stuende.
   panel.style.opacity = '';
   panel.style.transform = '';
+}
+
+/**
+ * EIN KONTEXTMENUE GEHT AM ZEIGER AUF, NICHT AM AUSLOESER (R22 S9).
+ *
+ * Manche Menues haben keinen sichtbaren Ausloeser: die Personenauswahl der
+ * Aufgabenzeile oeffnet per Rechtsklick und Long-Press, ihr Knopf steht
+ * unsichtbar am Zeilenanfang (tasks.css). Rechtsbuendig an diesem Knopf
+ * gerechnet hing das Menue am Laptop links neben der Zeile ueber der
+ * Seitenleiste - 148px vom Rechtsklick entfernt, an keiner Stelle, die der
+ * Nutzer angefasst hat. macOS und iOS oeffnen ein Kontextmenue dort, wo der
+ * Finger oder Zeiger ist; dieser Weg tut dasselbe. Der Punkt gilt fuer genau
+ * ein Oeffnen und faellt beim Schliessen weg - ein spaeterer Klick auf einen
+ * sichtbaren Ausloeser rechnet wieder an dem.
+ *
+ * `above`: das Menue steht UEBER dem Punkt, solange dort Platz ist - fuer
+ * einen Ausloeser im Fuss (Aufgabendetail: „Erledigt von ..." im Mehr-Menue),
+ * wo unten nie Platz ist und ein nach unten gekipptes Menue den Fuss deckte.
+ *
+ * @param {HTMLElement} panel
+ * @param {{x: number, y: number, above?: boolean}} [point] Position im Viewport.
+ * @returns {boolean} ob ein Panel da war.
+ */
+export function showPopoverMenuAt(panel, point) {
+  if (!panel || typeof panel.showPopover !== 'function') return false;
+  if (point && Number.isFinite(point.x) && Number.isFinite(point.y) && panel.dataset) {
+    panel.dataset.anchorX = String(Math.round(point.x));
+    panel.dataset.anchorY = String(Math.round(point.y));
+    if (point.above) panel.dataset.anchorAbove = '';
+    else delete panel.dataset.anchorAbove;
+  }
+  if (!panel.matches(':popover-open')) panel.showPopover();
+  return true;
+}
+
+function anchorPointOf(panel) {
+  const x = Number(panel.dataset?.anchorX);
+  const y = Number(panel.dataset?.anchorY);
+  if (panel.dataset?.anchorX == null || !Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { x, y, above: panel.dataset.anchorAbove != null };
+}
+
+function dropAnchorPoint(panel) {
+  if (!panel.dataset) return;
+  delete panel.dataset.anchorX;
+  delete panel.dataset.anchorY;
+  delete panel.dataset.anchorAbove;
 }
 
 /**
@@ -227,6 +300,59 @@ function triggerOf(id) {
   const all = typeof document.querySelectorAll === 'function' ? [...document.querySelectorAll(selector)] : [];
   if (all.length < 2) return all[0] ?? document.querySelector(selector);
   return all.find((el) => (typeof el.getClientRects === 'function' ? el.getClientRects().length > 0 : false)) ?? all[0];
+}
+
+/**
+ * SCROLLT DER INHALT, SCHLIESST DAS MENUE (#2041).
+ *
+ * Das Panel steht `position: fixed` im Top-Layer und wird beim Oeffnen EINMAL
+ * an den Ausloeser gerechnet. Scrollte danach die Liste (Mausrad, Trackpad,
+ * Tastatur), blieb es stehen und zeigte auf eine fremde Zeile - in den
+ * Kontakten wuchs der Abstand von 4 auf 124px, "Loeschen" stand unter dem
+ * falschen Eintrag. Am Telefon schliesst der Tipp zum Scrollen das Menue per
+ * Light-Dismiss; Mausrad und Trackpad tippen nicht.
+ *
+ * WARUM SCHLIESSEN STATT MITFUEHREN: iOS- und macOS-Menues schliessen, wenn
+ * der Inhalt darunter scrollt, und die Kopie der Dokumente (`openContextMenu`)
+ * tut es schon. Mitfuehren per CSS-Anchor-Positioning ist nicht ueberall da
+ * (siehe Kopf dieser Datei), und ein mitgefuehrtes Menue liefe mit seiner
+ * Zeile aus dem Scrollport hinaus, ueber Kopf oder Tab-Leiste.
+ *
+ * WARUM DER AUSLOESER ENTSCHEIDET UND NICHT JEDES `scroll`: Ein langes Menue
+ * scrollt in sich, eine Chip-Leiste daneben quer, ein Trackpad-Schwung rollt
+ * mit Subpixeln aus - nichts davon trennt Menue und Zeile. Geschlossen wird,
+ * sobald der Ausloeser sich bewegt hat. Capture am Dokument, weil `scroll`
+ * nicht aufsteigt: so erreicht auch der Scrollport eines Blatts den Handler.
+ * Die Fokusrueckgabe an den Ausloeser macht `hidePopover()` selbst.
+ */
+const scrollWatchers = new WeakMap();
+const SCROLL_TOLERANCE_PX = 2;
+
+function watchScroll(panel, trigger) {
+  unwatchScroll(panel);
+  if (!trigger || typeof document.addEventListener !== 'function') return;
+  const start = trigger.getBoundingClientRect();
+  const onScroll = () => {
+    // Ein Re-Render nimmt das offene Panel aus dem DOM, und der Browser
+    // schliesst es dabei ohne `toggle` - dann raeumt der naechste Scroll ab.
+    if (panel.isConnected === false) { unwatchScroll(panel); return; }
+    const now = trigger.getBoundingClientRect();
+    if (Math.abs(now.top - start.top) < SCROLL_TOLERANCE_PX
+      && Math.abs(now.left - start.left) < SCROLL_TOLERANCE_PX) return;
+    unwatchScroll(panel);
+    try { panel.hidePopover?.(); } catch { /* war schon zu */ }
+  };
+  document.addEventListener('scroll', onScroll, { capture: true, passive: true });
+  scrollWatchers.set(panel, onScroll);
+}
+
+function unwatchScroll(panel) {
+  const onScroll = scrollWatchers.get(panel);
+  if (!onScroll) return;
+  scrollWatchers.delete(panel);
+  if (typeof document.removeEventListener === 'function') {
+    document.removeEventListener('scroll', onScroll, { capture: true });
+  }
 }
 
 function onToggle(event) {
@@ -246,9 +372,29 @@ function onToggle(event) {
   }
   trigger?.setAttribute('aria-expanded', String(event.newState === 'open'));
 
-  if (event.newState !== 'open') { panel.style.opacity = ''; panel.style.transform = ''; return; }
+  if (event.newState !== 'open') {
+    unwatchScroll(panel);
+    dropAnchorPoint(panel);
+    panel.style.opacity = '';
+    panel.style.transform = '';
+    return;
+  }
 
-  if (trigger) {
+  const point = anchorPointOf(panel);
+  if (point) {
+    const width = panel.offsetWidth || 200;
+    const height = panel.offsetHeight || 48;
+    // Die linke obere Ecke am Zeiger; reicht der Platz rechts oder unten
+    // nicht, kippt das Menue auf die andere Seite des Punkts - wie das
+    // Kontextmenue des Systems.
+    const flipX = point.x + width > window.innerWidth - 8;
+    const flipY = point.above ? point.y - height >= 8 : point.y + height > window.innerHeight - 8;
+    const left = Math.min(Math.max(8, flipX ? point.x - width : point.x), window.innerWidth - width - 8);
+    const top = Math.max(8, flipY ? point.y - height : point.y);
+    panel.style.left = `${Math.round(left)}px`;
+    panel.style.top = `${Math.round(top)}px`;
+    panel.style.transformOrigin = `${flipY ? 'bottom' : 'top'} ${flipX ? 'right' : 'left'}`;
+  } else if (trigger) {
     const rect = trigger.getBoundingClientRect();
     const width = panel.offsetWidth || 200;
     const height = panel.offsetHeight || 48;
@@ -277,6 +423,7 @@ function onToggle(event) {
   }
   panel.style.opacity = '1';
   panel.style.transform = 'none';
+  watchScroll(panel, trigger);
 
   // DER FOKUS ZIEHT MIT INS MENUE. `role="menu"` sagt der assistiven Technik
   // eine Menue-Bedienung zu, und die Popover-API haelt davon nichts: sie

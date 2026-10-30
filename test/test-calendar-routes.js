@@ -54,6 +54,29 @@ const {
 } = await import('../public/utils/recurrence-scope.js');
 const db = dbmod.get();
 
+// Die Standard-Personen eines Kalenders stehen seit #1897 in der Join-Tabelle
+// (Migration 265); die alte Spalte liest niemand mehr. Eine verwaiste Person
+// (Konto weg) laesst der Fremdschluessel nicht zu - sie entsteht hier wie in
+// einer Datenbank ohne ihn (Restore, Altbestand), damit der JOIN auf users
+// weiter geprueft ist.
+function withCalendarDefault(calendarId, userId) {
+  const id = Number(calendarId);
+  db.prepare('DELETE FROM external_calendar_assignees WHERE calendar_id = ?').run(id);
+  if (userId == null) return id;
+  const orphan = !db.prepare('SELECT 1 FROM users WHERE id = ?').get(userId);
+  if (orphan) db.pragma('foreign_keys = OFF');
+  try {
+    db.prepare('INSERT INTO external_calendar_assignees (calendar_id, user_id) VALUES (?, ?)').run(id, userId);
+  } finally {
+    if (orphan) db.pragma('foreign_keys = ON');
+  }
+  return id;
+}
+const calendarDefaultOf = (source, externalId) => db.prepare(`
+  SELECT a.user_id AS a FROM external_calendar_assignees a JOIN external_calendars ec ON ec.id = a.calendar_id
+  WHERE ec.source = ? AND ec.external_id = ? ORDER BY a.position
+`).get(source, externalId)?.a ?? null;
+
 // ── Nutzer anlegen (IDs deterministisch ab 1: eigener Prozess je Testdatei) ──────
 const ADMIN = { id: 1, role: 'admin' };
 const MARIA = { id: 2, role: 'member' };
@@ -349,6 +372,34 @@ test('GET /google/status — configured:false ohne Config', async () => {
   assert.equal(res.body.connected, false);
 });
 
+test('GET /google/status — nennt fehlende Variablen, nie ihre Werte (#2221)', async () => {
+  const keys = ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI'];
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  try {
+    process.env.GOOGLE_CLIENT_ID = 'client-id-geheim-123';
+    process.env.GOOGLE_CLIENT_SECRET = 'client-secret-geheim-456';
+    delete process.env.GOOGLE_REDIRECT_URI;
+    const res = await call('GET', '/google/status', { actor: ADMIN });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.configured, false);
+    assert.deepEqual(res.body.missingEnv, ['GOOGLE_REDIRECT_URI'], 'nur der Name der fehlenden Variable');
+    assert.equal(res.body.redirectUri, null);
+    assert.doesNotMatch(JSON.stringify(res.body), /geheim/, 'kein Wert einer gesetzten Variable');
+
+    process.env.GOOGLE_REDIRECT_URI = 'https://home.example.net/api/v1/calendar/google/callback';
+    const done = await call('GET', '/google/status', { actor: ADMIN });
+    assert.equal(done.body.configured, true);
+    assert.deepEqual(done.body.missingEnv, []);
+    assert.equal(done.body.redirectUri, 'https://home.example.net/api/v1/calendar/google/callback');
+    assert.doesNotMatch(JSON.stringify(done.body), /geheim/);
+  } finally {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+});
+
 test('GET /apple/status — configured:false ohne Config', async () => {
   const res = await call('GET', '/apple/status', { actor: MARIA });
   assert.equal(res.status, 200);
@@ -407,8 +458,8 @@ test('PATCH /external-calendars — setzt Standard-Zuweisung (#459)', async () =
   const res = await call('PATCH', '/external-calendars', { body: { source: 'google', external_id: 'cal-xyz', default_assignee_user_id: 2 } });
   assert.equal(res.status, 200);
   assert.equal(res.body.data.default_assignee_user_id, 2);
-  const row = db.prepare("SELECT default_assignee_user_id AS a FROM external_calendars WHERE source='google' AND external_id='cal-xyz'").get();
-  assert.equal(row.a, 2);
+  assert.equal(calendarDefaultOf('google', 'cal-xyz'), 2);
+  assert.deepEqual(res.body.data.default_assignee_user_ids, [2]);
   // null wieder entfernen
   const cleared = await call('PATCH', '/external-calendars', { body: { source: 'google', external_id: 'cal-xyz', default_assignee_user_id: null } });
   assert.equal(cleared.body.data.default_assignee_user_id, null);
@@ -440,9 +491,9 @@ test('PATCH /external-calendars — legt die Zeile für einen bekannten, noch ni
     assert.equal(res.status, 200, 'vorher antwortete der Server hier mit 404');
 
     const row = db.prepare(
-      "SELECT name, default_assignee_user_id AS a FROM external_calendars WHERE source='caldav' AND external_id='https://dav.example/privat/'"
+      "SELECT name FROM external_calendars WHERE source='caldav' AND external_id='https://dav.example/privat/'"
     ).get();
-    assert.equal(row.a, 2);
+    assert.equal(calendarDefaultOf('caldav', 'https://dav.example/privat/'), 2);
     assert.equal(row.name, 'Privat', 'der Name kommt aus der Auswahlliste, nicht aus dem Request');
   } finally {
     // Die Datenbank wird über die ganze Datei geteilt, und ein Nachbartest
@@ -473,10 +524,10 @@ test('PATCH /external-calendars — ein unbekannter Kalender bleibt 404 (#730)',
 
 test('default-assignee-backfill - füllt nur unzugewiesene Termine aus Kalendern mit Standard-Zuweisung (#1154)', async () => {
   const route = '/external-calendars/default-assignee-backfill';
-  const calendar = (source, externalId, assignee) => db.prepare(`
-    INSERT INTO external_calendars (source, external_id, name, default_assignee_user_id)
-    VALUES (?, ?, 'Backfill', ?)
-  `).run(source, externalId, assignee).lastInsertRowid;
+  const calendar = (source, externalId, assignee) => withCalendarDefault(db.prepare(`
+    INSERT INTO external_calendars (source, external_id, name)
+    VALUES (?, ?, 'Backfill')
+  `).run(source, externalId).lastInsertRowid, assignee);
   const event = (title, { refId = null, subId = null, source = null, assignedTo = null, rows = [], visibility = 'all', documentId = null, targetGoogle = null, targetCaldav = null, ownUid = false } = {}) => {
     const id = db.prepare(`
       INSERT INTO calendar_events
@@ -506,9 +557,10 @@ test('default-assignee-backfill - füllt nur unzugewiesene Termine aus Kalendern
   const orphan  = calendar('caldav', 'https://dav.example/backfill-c/', 99999);
   const apple   = calendar('apple', 'https://icloud.example/backfill/', MARIA.id);
   const subId = db.prepare(`
-    INSERT INTO ics_subscriptions (name, url, color, created_by, shared, default_assignee_user_id)
-    VALUES ('Backfill', 'https://x/backfill.ics', '#123456', 1, 1, ?)
-  `).run(MARIA.id).lastInsertRowid;
+    INSERT INTO ics_subscriptions (name, url, color, created_by, shared)
+    VALUES ('Backfill', 'https://x/backfill.ics', '#123456', 1, 1)
+  `).run().lastInsertRowid;
+  db.prepare('INSERT INTO ics_subscription_assignees (subscription_id, user_id) VALUES (?, ?)').run(subId, MARIA.id);
 
   // Ein eingeschränkter Anhang: die neue Person muss ihn danach auch öffnen dürfen.
   const documentId = db.prepare(`
@@ -613,10 +665,10 @@ test('default-assignee-backfill - füllt nur unzugewiesene Termine aus Kalendern
 
 test('default-assignee-backfill - die Bestätigung bindet die Menge, nicht nur ihre Größe (#1171)', async () => {
   const route = '/external-calendars/default-assignee-backfill';
-  const refId = db.prepare(`
-    INSERT INTO external_calendars (source, external_id, name, default_assignee_user_id)
-    VALUES ('caldav', 'https://dav.example/backfill-token/', 'Token', ?)
-  `).run(TOM.id).lastInsertRowid;
+  const refId = withCalendarDefault(db.prepare(`
+    INSERT INTO external_calendars (source, external_id, name)
+    VALUES ('caldav', 'https://dav.example/backfill-token/', 'Token')
+  `).run().lastInsertRowid, TOM.id);
   const mk = (title) => db.prepare(`
     INSERT INTO calendar_events (title, start_datetime, created_by, external_source, calendar_ref_id)
     VALUES (?, '2035-06-01T10:00', ?, 'caldav', ?)
@@ -643,7 +695,7 @@ test('default-assignee-backfill - die Bestätigung bindet die Menge, nicht nur i
 
     // Dieselben Termine, andere Person: eine umgestellte Standard-Zuweisung ist ebenfalls eine andere Menge.
     const recounted = (await call('GET', route)).body.data;
-    db.prepare('UPDATE external_calendars SET default_assignee_user_id = ? WHERE id = ?').run(MARIA.id, refId);
+    withCalendarDefault(refId, MARIA.id);
     const reassigned = await call('POST', route, { body: { expected_count: recounted.count, expected_token: recounted.token } });
     assert.equal(reassigned.status, 409, 'bestaetigt war Tom, nicht Maria');
     assert.equal(who(arrived), null);
@@ -676,10 +728,10 @@ test('default-assignee-backfill - die Bestätigung bindet die Menge, nicht nur i
 // ────────────────────────────────────────────────────────────────────────────
 
 function seedMovedFixture() {
-  const calendar = (source, externalId, assignee) => Number(db.prepare(`
-    INSERT INTO external_calendars (source, external_id, name, default_assignee_user_id)
-    VALUES (?, ?, 'Moved', ?)
-  `).run(source, externalId, assignee).lastInsertRowid);
+  const calendar = (source, externalId, assignee) => withCalendarDefault(db.prepare(`
+    INSERT INTO external_calendars (source, external_id, name)
+    VALUES (?, ?, 'Moved')
+  `).run(source, externalId).lastInsertRowid, assignee);
   const account = (name) => Number(db.prepare(`
     INSERT INTO caldav_accounts (name, caldav_url, username, password) VALUES (?, ?, 'u', 'p')
   `).run(name, `https://dav.example/${name}/`).lastInsertRowid);
@@ -798,6 +850,8 @@ test('default-assignee-backfill - die Vorschau listet vor #1306 umgezogene Termi
     assert.deepEqual(first, {
       event_id: ids.moved, title: 'mv-moved', start_datetime: '2036-02-04T10:00', all_day: 0,
       calendar_name: 'Moved', from_user_id: MARIA.id, from_name: 'Maria', to_user_id: TOM.id, to_name: 'Tom',
+      // Die Mengen (#1897), mit einer Person je Kalender je ein Eintrag.
+      from_user_ids: [MARIA.id], from_names: ['Maria'], to_user_ids: [TOM.id], to_names: ['Tom'],
     }, 'Titel, Datum, Kalender und "X -> Y" fuer die Vorschau');
   } finally {
     cleanup();
@@ -1021,7 +1075,7 @@ test('default-assignee-backfill - die Bestaetigung prueft die Umzuege in Happen 
     // Aufruf im Protokoll, hat die Pruefung nach dem ersten Happen Luft gegeben.
     db.prepare = function prepareSpy(sql) {
       const stmt = original.call(this, sql);
-      if (!String(sql).includes('JOIN event_assignments cur') || !String(sql).includes('e.id = @eventId')) return stmt;
+      if (!String(sql).includes('eca.id <> ec.id') || !String(sql).includes('e.id = @eventId')) return stmt;
       prepared += 1;
       const get = stmt.get.bind(stmt);
       stmt.get = (...args) => {
@@ -1099,7 +1153,7 @@ test('default-assignee-backfill - die Bestaetigung bindet jeden abgehakten Termi
     // Zwischen Bestaetigung und Abarbeitung von Hand bearbeitet: bleibt stehen.
     const { applyDefaultAssigneesToExisting } = await import('../server/services/sync-assignment.js');
     db.prepare('UPDATE calendar_events SET user_modified = 1 WHERE id = ?').run(ids.moved);
-    const written = await applyDefaultAssigneesToExisting(db, [{ eventId: ids.moved, userId: TOM.id, fromUserId: MARIA.id }]);
+    const written = await applyDefaultAssigneesToExisting(db, [{ eventId: ids.moved, userIds: [TOM.id], fromUserIds: [MARIA.id] }]);
     assert.equal(written, 0);
     assert.deepEqual(assignmentOf(ids.moved), { assignedTo: MARIA.id, users: [MARIA.id] }, 'die Hand gewinnt auch mitten im Lauf');
   } finally {
@@ -1109,10 +1163,10 @@ test('default-assignee-backfill - die Bestaetigung bindet jeden abgehakten Termi
 
 test('default-assignee-backfill - oeffnet kein privates Anhang-Dokument und macht keins family (#1358)', async () => {
   const { applyDefaultAssigneesToExisting, listBackfillCandidates } = await import('../server/services/sync-assignment.js');
-  const refId = db.prepare(`
-    INSERT INTO external_calendars (source, external_id, name, default_assignee_user_id)
-    VALUES ('caldav', 'https://dav.example/backfill-private/', 'Privat', ?)
-  `).run(TOM.id).lastInsertRowid;
+  const refId = withCalendarDefault(db.prepare(`
+    INSERT INTO external_calendars (source, external_id, name)
+    VALUES ('caldav', 'https://dav.example/backfill-private/', 'Privat')
+  `).run().lastInsertRowid, TOM.id);
   const doc = (visibility) => db.prepare(`
     INSERT INTO family_documents (name, original_name, mime_type, file_size, content_data, visibility, created_by)
     VALUES ('bf-privat', 'bf-privat.txt', 'text/plain', 1, 'x', ?, ?)
@@ -1143,10 +1197,10 @@ test('default-assignee-backfill - oeffnet kein privates Anhang-Dokument und mach
 
 test('default-assignee-backfill - arbeitet in Happen und kommt trotzdem bis zum Ende (#1154)', async () => {
   const { applyDefaultAssigneesToExisting } = await import('../server/services/sync-assignment.js');
-  const refId = db.prepare(`
-    INSERT INTO external_calendars (source, external_id, name, default_assignee_user_id)
-    VALUES ('caldav', 'https://dav.example/backfill-batch/', 'Batch', ?)
-  `).run(TOM.id).lastInsertRowid;
+  const refId = withCalendarDefault(db.prepare(`
+    INSERT INTO external_calendars (source, external_id, name)
+    VALUES ('caldav', 'https://dav.example/backfill-batch/', 'Batch')
+  `).run().lastInsertRowid, TOM.id);
   const ids = [1, 2, 3].map((n) => db.prepare(`
     INSERT INTO calendar_events (title, start_datetime, created_by, external_source, calendar_ref_id)
     VALUES (?, '2035-04-01T10:00', ?, 'caldav', ?)
@@ -1166,10 +1220,10 @@ test('default-assignee-backfill - arbeitet in Happen und kommt trotzdem bis zum 
 
 test('default-assignee-backfill - arbeitet nur die bestätigte Liste ab und prüft jede Zeile erneut (#1154)', async () => {
   const { applyDefaultAssigneesToExisting, listBackfillCandidates } = await import('../server/services/sync-assignment.js');
-  const refId = db.prepare(`
-    INSERT INTO external_calendars (source, external_id, name, default_assignee_user_id)
-    VALUES ('caldav', 'https://dav.example/backfill-snapshot/', 'Snapshot', ?)
-  `).run(TOM.id).lastInsertRowid;
+  const refId = withCalendarDefault(db.prepare(`
+    INSERT INTO external_calendars (source, external_id, name)
+    VALUES ('caldav', 'https://dav.example/backfill-snapshot/', 'Snapshot')
+  `).run().lastInsertRowid, TOM.id);
   const mk = (title) => db.prepare(`
     INSERT INTO calendar_events (title, start_datetime, created_by, external_source, calendar_ref_id)
     VALUES (?, '2035-05-01T10:00', ?, 'caldav', ?)
@@ -1538,7 +1592,8 @@ test('create response immediately satisfies browser occurrence edit and delete c
   assert.equal(created.status, 201);
   const event = created.body.data;
   assert.equal(event.series_id, event.id);
-  assert.equal(event.recurrence_id, '2040-03-15');
+  // Format A (#2034): eine lokale Serie ohne Zone nennt ihr Vorkommen schwebend.
+  assert.equal(event.recurrence_id, '2040-03-15T09:00:00');
   assert.equal(event.is_local_recurring_series, true);
   assert.equal(event.can_override_occurrence, true);
   assert.equal(event.assignment_owner_id, event.id);
@@ -1547,7 +1602,7 @@ test('create response immediately satisfies browser occurrence edit and delete c
   const editTarget = calendarOccurrenceMutationTarget(event, 'this');
   assert.deepEqual(editTarget, {
     method: 'put',
-    path: `/calendar/${event.id}/occurrences/2040-03-15`,
+    path: `/calendar/${event.id}/occurrences/${encodeURIComponent('2040-03-15T09:00:00')}`,
     carriesReminderOffsets: true,
   });
   const edited = await call('PUT', editTarget.path.replace('/calendar', ''), {
@@ -1556,12 +1611,12 @@ test('create response immediately satisfies browser occurrence edit and delete c
   });
   assert.equal(edited.status, 200);
   assert.equal(edited.body.data.series_id, event.id);
-  assert.equal(edited.body.data.recurrence_id, '2040-03-15');
+  assert.equal(edited.body.data.recurrence_id, '2040-03-15T09:00:00');
 
   const deleteTarget = calendarOccurrenceDeleteTarget(event, 'this');
   assert.deepEqual(deleteTarget, {
     method: 'delete',
-    path: `/calendar/${event.id}/occurrences/2040-03-15`,
+    path: `/calendar/${event.id}/occurrences/${encodeURIComponent('2040-03-15T09:00:00')}`,
   });
   const deleted = await call('DELETE', deleteTarget.path.replace('/calendar', ''), { actor: ADMIN });
   assert.equal(deleted.status, 204);
@@ -1852,6 +1907,83 @@ test('PUT /:id — externes Event wird als user_modified markiert', async () => 
   assert.equal(res.body.data.user_modified, 1, 'Bearbeitung eines externen Events setzt user_modified');
 });
 
+// ── Mehrzeiliger Ort eines gespiegelten Termins (#2202) ────────────────────────
+//
+// Apple legt einen ueber die Ortssuche gewaehlten Ort mehrzeilig ab ("Name\n
+// Strasse\nOrt"). Das Ortsfeld im Formular ist ein <input type="text">, und das
+// entfernt beim Setzen des Werts jeden Zeilenumbruch (HTML-Wertbereinigung).
+// Das Formular schickt `location` bei jedem Speichern mit - eine reine
+// Zuweisung kam deshalb als geaenderter Ort an, ging als PUT nach iCloud, und
+// iOS zeigte danach nur noch Text statt des verknuepften Orts.
+//
+// Ohne `external_object_url` und ohne Kalenderauswahl fasst der Sofortversuch
+// nichts an: der Test misst die Vormerkung, kein Netz.
+function seedMultilineLocationEvent(title) {
+  const accountId = Number(db.prepare(`
+    INSERT INTO caldav_accounts (name, caldav_url, username, password) VALUES (?, ?, 'u', 'p')
+  `).run(title, `https://dav.example/${title}/`).lastInsertRowid);
+  const id = Number(db.prepare(`
+    INSERT INTO calendar_events
+      (title, start_datetime, end_datetime, created_by, external_source, external_calendar_id,
+       caldav_account_id, location, recurrence_rule)
+    VALUES (?, '2041-06-03T09:00', '2041-06-03T10:00', ?, 'caldav', ?, ?, ?, 'FREQ=WEEKLY')
+  `).run(title, ADMIN.id, `${title}@icloud`, accountId, 'Apple Park\nOne Apple Park Way\nCupertino CA 95014').lastInsertRowid);
+  const cleanup = () => {
+    db.prepare('DELETE FROM event_assignments WHERE event_id = ?').run(id);
+    db.prepare('DELETE FROM calendar_events WHERE id = ?').run(id);
+    db.prepare('DELETE FROM caldav_accounts WHERE id = ?').run(accountId);
+  };
+  return { id, cleanup };
+}
+
+/** Was <input type="text"> aus dem Wert macht, plus das `.trim()` des Formulars. */
+const asSingleLineInput = (value) => value.replace(/[\r\n]/g, '').trim();
+
+test('PUT /:id - eine reine Zuweisung laesst den mehrzeiligen Ort eines gespiegelten Termins stehen (#2202)', async () => {
+  const { id, cleanup } = seedMultilineLocationEvent('loc-2202-assign');
+  try {
+    const stored = db.prepare('SELECT location FROM calendar_events WHERE id = ?').get(id).location;
+    const res = await call('PUT', `/${id}`, {
+      body: {
+        title: 'loc-2202-assign',
+        location: asSingleLineInput(stored),
+        assigned_to: [MARIA.id],
+        recurrence_rule: 'FREQ=WEEKLY',
+      },
+    });
+    assert.equal(res.status, 200, `bekommen ${res.status}: ${JSON.stringify(res.body)}`);
+    const row = db.prepare('SELECT location, outbound_dirty, assigned_to FROM calendar_events WHERE id = ?').get(id);
+    assert.equal(row.assigned_to, MARIA.id, 'die Zuweisung kommt an');
+    assert.equal(row.outbound_dirty, 0, 'eine reine Zuweisung darf keinen PUT zum Anbieter vormerken');
+    assert.equal(row.location, stored, 'der Ort bleibt Zeichen fuer Zeichen, samt Zeilenumbruechen');
+  } finally {
+    cleanup();
+  }
+});
+
+test('PUT /:id - Gegenprobe: ein wirklich geaenderter Ort geht weiter hinaus (#2202)', async () => {
+  const { id, cleanup } = seedMultilineLocationEvent('loc-2202-change');
+  try {
+    const res = await call('PUT', `/${id}`, {
+      body: { title: 'loc-2202-change', location: 'Rathaus, Marktplatz 1', assigned_to: [MARIA.id] },
+    });
+    assert.equal(res.status, 200, `bekommen ${res.status}: ${JSON.stringify(res.body)}`);
+    const row = db.prepare('SELECT location, outbound_dirty FROM calendar_events WHERE id = ?').get(id);
+    assert.equal(row.location, 'Rathaus, Marktplatz 1');
+    assert.equal(row.outbound_dirty, 1, 'eine echte Ortsaenderung muss vorgemerkt werden');
+
+    // Ein geleerter Ort ist ebenfalls eine Aenderung, kein Zeilenumbruch-Rest.
+    db.prepare("UPDATE calendar_events SET outbound_dirty = 0, location = 'A\nB' WHERE id = ?").run(id);
+    const leer = await call('PUT', `/${id}`, { body: { location: null } });
+    assert.equal(leer.status, 200);
+    const geleert = db.prepare('SELECT location, outbound_dirty FROM calendar_events WHERE id = ?').get(id);
+    assert.equal(geleert.location, null);
+    assert.equal(geleert.outbound_dirty, 1);
+  } finally {
+    cleanup();
+  }
+});
+
 // ── color_modified: die Farbe fuehrt ihren eigenen Zustand (#899) ──────────────
 //
 // `user_modified` heisst "an diesem Termin wurde etwas bearbeitet". Der Inbound
@@ -2033,9 +2165,32 @@ test('POST /:id/exceptions — sichtbare Nicht-Eigentümer dürfen wie bei der g
   const serie = insertEvent({ title: 'EXC-OK', start_datetime: '2042-03-01T09:00', recurrence_rule: 'FREQ=DAILY', created_by: MARIA.id });
   const ok = await call('POST', `/${serie}/exceptions`, { actor: TOM, body: { date: '2042-03-05' } });
   assert.equal(ok.status, 201);
-  assert.equal(ok.body.data.exception_date, '2042-03-05');
-  const row = db.prepare('SELECT COUNT(*) AS n FROM calendar_event_exceptions WHERE event_id=? AND exception_date=?').get(serie, '2042-03-05');
+  // Die alte Form als Eingabe, gespeichert der exakte Schluessel (#2034).
+  assert.equal(ok.body.data.exception_date, '2042-03-05T09:00:00');
+  assert.equal(ok.body.data.recurrence_id, '2042-03-05T09:00:00');
+  const row = db.prepare('SELECT COUNT(*) AS n FROM calendar_event_exceptions WHERE event_id=? AND exception_date=?').get(serie, '2042-03-05T09:00:00');
   assert.equal(row.n, 1);
+});
+
+test('POST /:id/exceptions - recurrence_id in Format A, kein Vorkommen 400 (#2034)', async () => {
+  const serie = insertEvent({ title: 'EXC-A', start_datetime: '2042-03-01T09:00', recurrence_rule: 'FREQ=DAILY', created_by: MARIA.id });
+  const exact = await call('POST', `/${serie}/exceptions`, { actor: TOM, body: { recurrence_id: '2042-03-06T09:00:00' } });
+  assert.equal(exact.status, 201);
+  assert.equal(exact.body.data.recurrence_id, '2042-03-06T09:00:00');
+  const offRule = await call('POST', `/${serie}/exceptions`, { actor: TOM, body: { recurrence_id: '2042-03-06T10:00:00' } });
+  assert.equal(offRule.status, 400);
+  assert.equal(offRule.body.reason, 'invalid_recurrence_id');
+  const malformed = await call('POST', `/${serie}/exceptions`, { actor: TOM, body: { recurrence_id: '06.03.2042' } });
+  assert.equal(malformed.status, 400);
+  // Beide 400er tragen einen Grund (#1909-Muster), der Browser hat fuer
+  // beide einen Satz.
+  assert.equal(malformed.body.reason, 'malformed_recurrence_id');
+  const malformedDate = await call('POST', `/${serie}/exceptions`, { actor: TOM, body: { date: '06.03.2042' } });
+  assert.equal(malformedDate.status, 400);
+  assert.equal(malformedDate.body.reason, 'malformed_recurrence_id');
+  assert.deepEqual(db.prepare(
+    'SELECT exception_date FROM calendar_event_exceptions WHERE event_id = ? ORDER BY exception_date'
+  ).all(serie).map((r) => r.exception_date), ['2042-03-06T09:00:00']);
 });
 
 test('POST /:id/exceptions — fremde private Serie bleibt auch für Admin unsichtbar', async () => {
@@ -2077,7 +2232,7 @@ test('PUT /:seriesId/occurrences/:recurrenceId uses whole-series visibility righ
   });
   assert.equal(creator.status, 200);
   assert.equal(creator.body.data.series_id, seriesId);
-  assert.equal(creator.body.data.recurrence_id, '2046-01-02');
+  assert.equal(creator.body.data.recurrence_id, '2046-01-02T09:00:00');
 
   const visibleMember = await call('PUT', `/${seriesId}/occurrences/2046-01-02`, {
     actor: TOM,
@@ -2130,12 +2285,12 @@ test('generic child-id PUT and DELETE cannot bypass occurrence routing or metada
       `).get(childId) }, {
         title: 'Owned occurrence title',
         recurrence_parent_id: seriesId,
-        recurrence_id: '2046-01-11',
+        recurrence_id: '2046-01-11T09:00:00',
         overridden_fields: '["title"]',
       });
       assert.equal(db.prepare(`
         SELECT COUNT(*) AS count FROM calendar_event_exceptions
-        WHERE event_id = ? AND exception_date = '2046-01-11'
+        WHERE event_id = ? AND exception_date = '2046-01-11T09:00:00'
       `).get(seriesId).count, 1);
     }
   }
@@ -2222,7 +2377,7 @@ test('occurrence PUT distinguishes missing, ineligible and invalid original slot
   assert.equal(invalid.status, 400);
   assert.equal(invalid.body.code, 400);
   assert.equal(invalid.body.reason, 'invalid_recurrence_id');
-  assert.match(invalid.body.error, /Serientermin.*Datum/);
+  assert.match(invalid.body.error, /occurrence.*series/);
 });
 
 test('occurrence PUT refuses every provider-owned, imported, generated and outbound-targeted series', async () => {
@@ -2434,7 +2589,7 @@ test('restored Outlook write access never sends existing linked children through
     const event = (await call('GET', `/${childId}`)).body.data;
     await assert.rejects(requestCalendarOccurrenceDelete({ api, event, scope: 'this' }), { status: 400 });
     await assert.rejects(requestCalendarOccurrenceMutation({ api, event, scope: 'this', body: { title: 'Duplicate' } }),
-      (error) => error.status === 400 && /deaktiviere/i.test(error.data.error));
+      (error) => error.status === 400 && /switched off/i.test(error.data.error));
     assert.equal(writes.some((write) => write.method === 'post'), false);
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM calendar_events WHERE recurrence_parent_id = ?').get(seriesId).n, 1);
     const disabled = await call('PATCH', `/outlook/accounts/${accountId}/calendars`, {
@@ -2593,7 +2748,7 @@ test('following rejects an empty successor before attachment persistence', async
     assert.equal(response.status, 400);
     assert.equal(response.body.code, 400);
     assert.equal(response.body.reason, 'empty_successor_series');
-    assert.match(response.body.error, /Folgeserie.*Startdatum/);
+    assert.match(response.body.error, /successor series.*start date/);
     assert.equal(db.prepare('SELECT recurrence_rule FROM calendar_events WHERE id = ?')
       .get(seriesId).recurrence_rule, 'FREQ=DAILY');
     assert.equal(db.prepare(`
@@ -3296,7 +3451,10 @@ test('occurrence mutation routes reject schema-invalid values before persistence
         body,
       });
       assert.equal(response.status, 400, `${suffix || '/only'} ${JSON.stringify(body)}`);
-      assert.doesNotMatch(response.body.error, /\bmust\b|unknown user ID|duplicate user IDs/);
+      // Englisch fuer API-Clients, ohne Grund: das Formular laesst keinen dieser
+      // Werte durch, die App sagt ihren allgemeinen Satz (#1909).
+      assert.doesNotMatch(response.body.error, /[äöüß]|Gib |Wähle/);
+      assert.equal(response.body.reason, undefined, JSON.stringify(body));
       assert.equal(db.prepare(`
         SELECT COUNT(*) AS count FROM calendar_events WHERE recurrence_parent_id = ?
       `).get(seriesId).count, 0);
@@ -3321,7 +3479,7 @@ test('a partial occurrence move cannot persist an inverted interval or disappear
 
   const range = await call('GET', '/?from=2046-07-02&to=2046-07-02');
   assert.ok(range.body.data.some((event) => Number(event.series_id) === seriesId
-    && event.recurrence_id === '2046-07-02'));
+    && event.recurrence_id === '2046-07-02T09:00:00'));
 });
 
 test('DELETE occurrence scopes keep only-this suppression and truncate following state', async () => {
@@ -3338,7 +3496,7 @@ test('DELETE occurrence scopes keep only-this suppression and truncate following
   ).get(onlyId).count, 0);
   assert.equal(db.prepare(`
     SELECT COUNT(*) AS count FROM calendar_event_exceptions
-    WHERE event_id = ? AND exception_date = '2046-05-02'
+    WHERE event_id = ? AND exception_date = '2046-05-02T09:00:00'
   `).get(onlyId).count, 1);
 
   const followingId = insertEvent({
@@ -3358,7 +3516,7 @@ test('DELETE occurrence scopes keep only-this suppression and truncate following
   assert.deepEqual(db.prepare(`
     SELECT recurrence_id FROM calendar_events
     WHERE recurrence_parent_id = ? ORDER BY recurrence_id
-  `).all(followingId).map((row) => row.recurrence_id), ['2046-06-02']);
+  `).all(followingId).map((row) => row.recurrence_id), ['2046-06-02T09:00:00']);
 });
 
 test('following delete from the first slot and whole-series delete cascade linked state', async () => {
@@ -3413,11 +3571,11 @@ test('PUT occurrence following creates a successor and reparents future replacem
   assert.equal(db.prepare('SELECT recurrence_rule FROM calendar_events WHERE id = ?')
     .get(seriesId).recurrence_rule, 'FREQ=DAILY;UNTIL=20460901');
   assert.equal(db.prepare(`
-    SELECT recurrence_parent_id FROM calendar_events WHERE recurrence_id = '2046-09-03'
+    SELECT recurrence_parent_id FROM calendar_events WHERE recurrence_id = '2046-09-03T09:00:00'
   `).get().recurrence_parent_id, successorId);
   assert.equal(db.prepare(`
     SELECT COUNT(*) AS count FROM calendar_events
-    WHERE recurrence_parent_id = ? AND recurrence_id = '2046-09-02'
+    WHERE recurrence_parent_id = ? AND recurrence_id = '2046-09-02T09:00:00'
   `).get(successorId).count, 0);
 });
 
@@ -3442,7 +3600,7 @@ test('whole-series rule update requires the exact orphan count and detaches conf
   });
   assert.equal(first.status, 409);
   assert.deepEqual(first.body, {
-    error: 'Die Änderung benötigt eine aktuelle Bestätigung. Prüfe die Anzahl der betroffenen Einzelausnahmen und bestätige, dass sie als eigenständige Termine erhalten bleiben sollen.',
+    error: 'This change needs a current confirmation of the affected occurrence overrides (confirmed_orphan_count).',
     code: 409,
     conflict: 'calendar_override_orphans',
     orphaned_override_count: 1,
@@ -3477,9 +3635,9 @@ test('whole-series rule update requires the exact orphan count and detaches conf
     SELECT exception_date FROM calendar_event_exceptions
     WHERE event_id = ? ORDER BY exception_date
   `).all(seriesId).map((row) => row.exception_date), [
-    '2046-10-02',
+    '2046-10-02T09:00:00',
     '2046-10-04',
-    '2046-10-08',
+    '2046-10-08T09:00:00',
   ]);
 });
 
@@ -3512,7 +3670,7 @@ test('visible non-owner keeps generic whole-series edit and delete authorization
   assert.equal(afterChild.status, 200);
   assert.equal(afterChild.body.data.title, 'Shared non-owner after child');
   assert.equal(afterChild.body.data.series_id, seriesId);
-  assert.equal(afterChild.body.data.recurrence_id, '2046-10-12');
+  assert.equal(afterChild.body.data.recurrence_id, '2046-10-12T09:00:00');
   assert.equal(afterChild.body.data.is_local_recurring_series, true);
   assert.equal(afterChild.body.data.can_override_occurrence, true);
   assert.equal(db.prepare('SELECT title FROM calendar_events WHERE id = ?').get(childId).title,
@@ -3666,7 +3824,7 @@ test('whole-series stale orphan confirmation is rejected after the count reaches
   assert.deepEqual(response, {
     status: 409,
     body: {
-      error: 'Die Änderung benötigt eine aktuelle Bestätigung. Prüfe die Anzahl der betroffenen Einzelausnahmen und bestätige, dass sie als eigenständige Termine erhalten bleiben sollen.',
+      error: 'This change needs a current confirmation of the affected occurrence overrides (confirmed_orphan_count).',
       code: 409,
       conflict: 'calendar_override_orphans',
       orphaned_override_count: 0,
@@ -3692,7 +3850,7 @@ test('first-slot following update returns and accepts the exact orphan confirmat
   assert.deepEqual(first, {
     status: 409,
     body: {
-      error: 'Die Änderung benötigt eine aktuelle Bestätigung. Prüfe die Anzahl der betroffenen Einzelausnahmen und bestätige, dass sie als eigenständige Termine erhalten bleiben sollen.',
+      error: 'This change needs a current confirmation of the affected occurrence overrides (confirmed_orphan_count).',
       code: 409,
       conflict: 'calendar_override_orphans',
       orphaned_override_count: 1,
@@ -5220,4 +5378,80 @@ test('POST /:id/reset: ein Termin, den die Person nicht sieht, ist 404 - nicht 4
 
   db.prepare('DELETE FROM calendar_events WHERE id IN (?, ?)').run(ics, priv);
   db.prepare('DELETE FROM ics_subscriptions WHERE id = ?').run(subId);
+});
+
+// #1909, Termine: der Server benennt jeden Fall, den ein Nutzer beim Speichern,
+// Zuruecksetzen oder Loeschen erreicht, mit einem `reason`; der Text in `error`
+// ist englisch und bleibt fuer API-Clients stehen.
+test('die Termin-Faelle tragen einen reason und einen englischen Text (#1909)', async () => {
+  const GERMAN = /[äöüß]|Termin|Kalender|Gib |Wähle|Serie |Fehler/;
+  const english = (res, label) => {
+    assert.equal(typeof res.body?.error, 'string', label);
+    assert.doesNotMatch(res.body.error, GERMAN, `${label}: ${res.body.error}`);
+  };
+  const missing = 999999;
+  for (const [method, route, body] of [
+    ['GET', `/${missing}`, undefined],
+    ['PUT', `/${missing}`, { title: 'Weg' }],
+    ['DELETE', `/${missing}`, undefined],
+    ['POST', `/${missing}/reset`, undefined],
+    ['POST', `/${missing}/exceptions`, { recurrence_id: '2035-03-10' }],
+  ]) {
+    const res = await call(method, route, { body });
+    assert.equal(res.status, 404, `${method} ${route}`);
+    assert.equal(res.body.reason, 'calendar_event_not_found', `${method} ${route}`);
+    english(res, `${method} ${route}`);
+  }
+  for (const [method, route] of [
+    ['DELETE', `/${missing}/occurrences/2035-03-10`],
+    ['DELETE', `/${missing}/occurrences/2035-03-10/following`],
+    ['PUT', `/${missing}/occurrences/2035-03-10`],
+  ]) {
+    const res = await call(method, route, { body: method === 'PUT' ? { title: 'Weg' } : undefined });
+    assert.equal(res.status, 404, `${method} ${route}`);
+    assert.equal(res.body.reason, 'calendar_series_not_found', `${method} ${route}`);
+    english(res, `${method} ${route}`);
+  }
+
+  // Der im Dialog gewaehlte Kalender ist inzwischen geloescht.
+  const single = insertEvent({ title: 'GRUND-EINZEL', start_datetime: '2035-03-10T09:00' });
+  const series = insertEvent({ title: 'GRUND-SERIE', start_datetime: '2035-03-01T09:00', recurrence_rule: 'FREQ=DAILY' });
+  try {
+    for (const [method, route, extra] of [
+      ['POST', '/', { title: 'Neu', start_datetime: '2035-03-10T09:00' }],
+      ['PUT', `/${single}`, {}],
+      ['PUT', `/${series}/occurrences/2035-03-05T09:00:00/following`, {}],
+    ]) {
+      const res = await call(method, route, { body: { ...extra, local_calendar_id: missing } });
+      assert.equal(res.status, 400, `${method} ${route}: ${JSON.stringify(res.body)}`);
+      assert.equal(res.body.reason, 'calendar_selected_calendar_not_found', `${method} ${route}`);
+      english(res, `${method} ${route}`);
+    }
+    // Eine Kennung, die keine Zahl ist, schickt nur ein Aufrufer: kein Fall.
+    const malformed = await call('POST', '/', { body: { title: 'Neu', start_datetime: '2035-03-10T09:00', local_calendar_id: 'x' } });
+    assert.equal(malformed.status, 400);
+    assert.equal(malformed.body.reason, undefined);
+    english(malformed, 'local_calendar_id x');
+    // Ein leerer Titel ebenso (das Formular prueft ihn selbst).
+    const untitled = await call('POST', '/', { body: { title: '', start_datetime: '2035-03-10T09:00' } });
+    assert.equal(untitled.status, 400);
+    assert.equal(untitled.body.reason, undefined);
+    english(untitled, 'title leer');
+
+    // Eine Wiederholung ohne ein Vorkommen (#960) und ein Ende vor dem Start (#1607).
+    for (const [method, route] of [['POST', '/'], ['PUT', `/${single}`]]) {
+      const none = await call(method, route, { body: {
+        title: 'Leer', start_datetime: '2035-01-15T09:00', recurrence_rule: 'FREQ=MONTHLY;BYMONTHDAY=-1;UNTIL=20350120',
+      } });
+      assert.equal(none.status, 400, `${method}: ${JSON.stringify(none.body)}`);
+      assert.equal(none.body.reason, 'calendar_series_no_occurrence', method);
+      const before = await call(method, route, { body: {
+        title: 'Vorher', start_datetime: '2035-01-15T09:00', recurrence_rule: 'FREQ=DAILY;UNTIL=20350110',
+      } });
+      assert.equal(before.status, 400, `${method}: ${JSON.stringify(before.body)}`);
+      assert.equal(before.body.reason, 'calendar_series_ends_before_start', method);
+    }
+  } finally {
+    db.prepare("DELETE FROM calendar_events WHERE title IN ('GRUND-EINZEL', 'GRUND-SERIE')").run();
+  }
 });

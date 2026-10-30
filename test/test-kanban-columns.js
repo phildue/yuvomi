@@ -132,7 +132,7 @@ test('die anderen Spalten bleiben vom Zuklappen unberuehrt', () => {
     'und meldet das auch');
 });
 
-test('der Koerper hat eine eigene hidden-Regel, weil display: flex sie sonst sticht', () => {
+test('der Koerper ist ausblendbar, obwohl display: flex die UA-Regel sticht', async () => {
   // NICHT KOSMETIK: `.kanban-col__body` setzt `display: flex`, und eine
   // Klassenregel sticht das `[hidden] { display: none }` des Browsers. Ohne
   // diese Regel traegt eine zugeklappte Spalte ihr Attribut und steht trotzdem
@@ -142,9 +142,9 @@ test('der Koerper hat eine eigene hidden-Regel, weil display: flex sie sonst sti
   assert.ok(koerper, '.kanban-col__body fehlt');
   assert.match(koerper.body, /display:\s*flex/, 'der Koerper ist ein Flex-Container');
 
-  const versteckt = regeln.find((r) => r.selector === '.kanban-col__body[hidden]');
-  assert.ok(versteckt, '.kanban-col__body[hidden] fehlt - hidden waere wirkungslos');
-  assert.match(versteckt.body, /display:\s*none/, 'und sie muss display: none setzen');
+  // Seit R21 S9a die EINE globale Regel in reset.css statt einer je Klasse.
+  const { globalHiddenRule } = await import('./css-rules.js');
+  assert.ok(globalHiddenRule(), 'ohne die globale [hidden]-Regel waere hidden wirkungslos');
 });
 
 /**
@@ -285,4 +285,80 @@ test('der Weiterschalt-Knopf einer Brettkarte nennt seine Aufgabe', () => {
   const boese = { ...AUFGABE(5, 'open'), title: 'a"><img src=x onerror=1>' };
   assert.doesNotMatch(tasks.renderKanbanCard(boese), /<img/, 'der Titel bricht aus dem Attribut aus');
   assert.ok(name(boese).includes('&quot;'), 'der Name traegt den Titel maskiert');
+});
+
+/**
+ * R22 (Critique a2, Persona Alex; D17/D22): EINE SPALTE HAT EINEN DECKEL.
+ * "Offen" trug 158 Karten untereinander, jede mit Knoten und Zeichen, die der
+ * Wechsel ins Brett im selben Frame baute (4x CPU: 282-338 ms, 4.100 Knoten).
+ * Ab KANBAN_COL_CAP steht darunter "N weitere anzeigen", der Spaltenkopf zaehlt
+ * weiter alle, und der Tipp zeigt die ganze Spalte.
+ */
+test('R22: eine Spalte zeigt hoechstens KANBAN_COL_CAP Karten, darunter "N weitere anzeigen"', async () => {
+  const cols = tasks.KANBAN_COLS();
+  const cap = tasks.KANBAN_COL_CAP;
+  assert.equal(cap, 50, 'der Deckel liegt bei 50 Karten (D17)');
+  const grouped = {};
+  for (const col of cols) grouped[col.status] = [];
+  for (let i = 1; i <= cap + 12; i++) grouped.open.push(AUFGABE(i, 'open'));
+  grouped.done.push(AUFGABE(900, 'done'));
+  const html = tasks.kanbanBoardHtml(cols, grouped);
+  const offen = html.match(/data-status="open"[\s\S]*?(?=<div class="kanban-col[ "])/)[0];
+  assert.equal((offen.match(/class="kanban-card /g) ?? []).length, cap, 'mehr Karten als der Deckel');
+  assert.match(offen, /<span class="kanban-col__count">62<\/span>/, 'der Spaltenkopf zaehlt alle Karten');
+  const de = JSON.parse(await readFile(new URL('../public/locales/de.json', import.meta.url), 'utf8'));
+  assert.ok(de.tasks.kanbanShowMore, 'tasks.kanbanShowMore fehlt in de.json');
+  assert.match(offen, /<button type="button" class="kanban-col__more" data-kanban-more="open">/, 'ohne Knopf bleibt der Rest unerreichbar');
+  assert.doesNotMatch(html.replace(offen, ''), /kanban-col__more/, 'eine Spalte unter dem Deckel traegt keinen Knopf');
+  tasks.showWholeKanbanCol('open');
+  const ganz = tasks.kanbanBoardHtml(cols, grouped);
+  assert.equal((ganz.match(/class="kanban-card /g) ?? []).length, cap + 13, 'nach dem Tipp steht die ganze Spalte');
+  assert.doesNotMatch(ganz, /kanban-col__more/);
+});
+
+// R23 S11 (Critique G2 P3 "Kanban ⏵ mehrdeutig"): "In Bearbeitung setzen"
+// trug das Abspielzeichen eines Medienspielers. Der Knopf sagt einen STATUS
+// an wie seine Geschwister (Haken = erledigt, Pfeil zurueck = wieder offen).
+test('R23: der Weiterschalt-Knopf der Karte traegt kein Abspielzeichen', async () => {
+  const src = await readFile(new URL('../public/pages/tasks.js', import.meta.url), 'utf8');
+  const line = src.split('\n').find((l) => /next === 'in_progress' \? '/.test(l)) ?? '';
+  assert.match(line, /next === 'in_progress' \? 'circle-dot-dashed'/, line);
+  assert.doesNotMatch(src, /'circle-play'/);
+});
+
+// R24 (Critique G2-Aufgaben-P3-1): die LEERE Ablage nahm ein Viertel des
+// Bretts ("Keine Aufgaben" in 280px neben drei arbeitenden Spalten). Leer ist
+// sie am Desktop nur so breit wie ihr Kopf - und bleibt Ablageziel.
+test('R24: die leere Ablage ist nur ihr Kopf breit, die gefuellte eine volle Spalte', () => {
+  const cols = tasks.KANBAN_COLS();
+  const grouped = {};
+  for (const col of cols) grouped[col.status] = [];
+  grouped.open.push(AUFGABE(1, 'open'));
+  const leer = tasks.kanbanBoardHtml(cols, grouped);
+  assert.match(leer, /class="kanban-col kanban-col--vacant" data-status="archived"/, 'die leere Ablage traegt ihre Marke');
+  assert.match(leer, /data-drop-zone="archived"/, 'und bleibt Ablageziel');
+  assert.equal((leer.match(/kanban-col--vacant/g) ?? []).length, 1, 'nur die Ablage, keine leere Arbeitsspalte');
+  grouped.archived.push({ ...AUFGABE(2, 'done'), archived_at: '2026-10-01T10:00:00Z' });
+  assert.doesNotMatch(tasks.kanbanBoardHtml(cols, grouped), /kanban-col--vacant/, 'mit Karte ist sie eine volle Spalte');
+  const regel = [...eachRule(tasksCss)].find((r) => r.selector.trim() === '.kanban-board:has(> .kanban-col--vacant)');
+  assert.ok(regel, 'Rasterregel fuer die leere Ablage fehlt');
+  assert.ok(regel.at.some((a) => /min-width:\s*1024px/.test(a)), 'nur dort, wo alle Spalten nebeneinander stehen');
+  assert.match(regel.body, new RegExp(`repeat\\(${cols.length - 1}, minmax\\(0, 1fr\\)\\) max-content`),
+    'die arbeitenden Spalten teilen sich den Rest, die Ablage nimmt ihre Inhaltsbreite');
+});
+
+// R24 (Critique G2-Aufgaben-P3-4): der Weiterschalt-Knopf war ein 24px-Kreis
+// mit wechselndem Zeichen; das Verb stand nur im Tooltip. Jetzt steht es da.
+test('R24: der Weiterschalt-Knopf traegt sein Verb sichtbar, der Name nennt weiter die Aufgabe', () => {
+  const verb = (task) => /<span class="kanban-card__status-verb">([^<]*)<\/span>/.exec(tasks.renderKanbanCard(task))?.[1];
+  assert.equal(verb(AUFGABE(1, 'open')), 'tasks.detailStart');
+  assert.equal(verb(AUFGABE(1, 'in_progress')), 'tasks.detailFinish');
+  assert.equal(verb(AUFGABE(1, 'done')), 'tasks.detailReopen');
+  assert.equal(verb({ ...AUFGABE(1, 'done'), archived_at: '2026-10-01T10:00:00Z' }), 'tasks.kanbanRestore');
+  assert.match(tasks.renderKanbanCard(AUFGABE(1, 'open')), /aria-label="[^"]*kanbanMoveToInProgressNamed/,
+    'der Name nennt weiter Handlung UND Aufgabe (#1607)');
+  // Mobil ist die Karte eine Zeile: dort bleibt der Kreis, das Verb geht.
+  const mobil = [...eachRule(tasksCss)].find((r) => r.selector.trim() === '.kanban-card__status-verb'
+    && r.at.some((a) => /max-width:\s*639px/.test(a)));
+  assert.ok(mobil && /display:\s*none/.test(mobil.body), 'unter 640px kostete das Verb dem Titel 90px');
 });

@@ -1,4 +1,5 @@
 import {
+  formatTime,
   formatUnit,
   getLocale,
   getSupportedLocales,
@@ -7,12 +8,14 @@ import {
 } from '/i18n.js';
 import { api } from '/api.js';
 import { esc } from '/utils/html.js';
-import { appendCurrencyOptions, persistCurrencySelection } from '/settings/currency.js';
+import { currencyName, currencyShortLabel, persistCurrencySelection } from '/settings/currency.js';
+import { CURRENCY_CODES } from '/utils/currency-codes.js';
 import { getPreferences, resetPreferencesCache, savePreferences } from '/settings/preferences-cache.js';
 import { settingRowHtml, settingSwitchRowHtml } from '/settings/components.js';
 import { wireTablist } from '/utils/tablist.js';
 import { attachSegmentIndicator } from '/utils/segment-indicator.js';
 import { isWallModeEnabled, setWallModeEnabled } from '/utils/wall-mode.js';
+import { getNightHours, setNightHours } from '/utils/night-hours.js';
 import {
   SCREENSAVER_IDLE_STEPS,
   getScreensaverIdleSeconds,
@@ -31,8 +34,15 @@ import {
   detectRegion,
   resolveRegion,
   regionLabel,
+  regionShortLabel,
+  languageLabel,
+  languageShortLabel,
+  languageShortKey,
+  SHORT_NAME_COUNTRIES,
+  SHORT_NAME_LANGUAGES,
   numberLocaleFor,
 } from '/settings/region-presets.js';
+import { errorSentence } from '/utils/friendly-error.js';
 
 // Der Name jedes Segments ist sein sichtbares Wort - vorher trug es ein
 // abweichendes aria-label („Dunkles Design" zu „Dunkel"), und die Gruppe
@@ -100,19 +110,47 @@ function formatOptions(selected) {
  * bekommt ein 400 statt still zu landen.
  *
  * Die erste Option speichert den leeren Wert und stellt damit auf den Rückfall
- * zurück (TZ → Systemzone → UTC). Ihr Label nennt die Zone, die dann tatsächlich
- * gilt - sonst wäre "Automatisch" eine Zusage ohne Inhalt.
+ * zurück (TZ → Systemzone → UTC). Die Zone, die dann tatsächlich gilt, nennt
+ * die Hinweiszeile (`timezoneHintText`) - sonst wäre "Automatisch" eine Zusage
+ * ohne Inhalt. Bis R21 stand sie im Label selbst und wurde mobil gekappt
+ * ("Automatisch (Eur…").
  */
-function timeZoneOptions(selected, effective) {
+function timeZoneList(selected) {
   let zones = [];
   try { zones = Intl.supportedValuesOf('timeZone'); } catch { zones = []; }
   // Eine gespeicherte Zone, die dieses ICU nicht (mehr) kennt, muss sichtbar
   // bleiben: sonst zeigte das Feld "Automatisch", während der Server weiter die
   // alte Zone benutzt - ein Select, das die Wahrheit verschweigt.
   if (selected && !zones.includes(selected)) zones = [...zones, selected].sort();
+  return zones;
+}
 
-  const auto = `<option value=""${selected ? '' : ' selected'}>`
-    + `${esc(t('settings.timezoneAuto', { zone: effective || 'UTC' }))}</option>`;
+const zoneArea = (zone) => (zone.includes('/') ? zone.slice(0, zone.indexOf('/')) : 'Other');
+// Was nach der Region (der optgroup) uebrig bleibt: "Argentina/Buenos Aires".
+const zoneRest = (zone) => (zone.includes('/') ? zone.slice(zone.indexOf('/') + 1) : zone).replace(/_/g, ' ');
+
+/**
+ * Name einer Zone in der Auswahl (#2166): die Stadt ("New Salem" statt
+ * "North Dakota/New Salem", das am Telefon gekappt war). Teilen sich zwei
+ * Zonen einer Gruppe die Stadt, behalten beide den Rest mit Zwischenstufe -
+ * die Liste bleibt unterscheidbar. Der volle Name steht dann in der
+ * Hinweiszeile (`timezoneHintText`).
+ */
+function timeZoneLabels(zones) {
+  const city = (zone) => zone.slice(zone.lastIndexOf('/') + 1).replace(/_/g, ' ');
+  const seen = new Map();
+  for (const zone of zones) {
+    const key = `${zoneArea(zone)}/${city(zone)}`;
+    seen.set(key, (seen.get(key) ?? 0) + 1);
+  }
+  return new Map(zones.map((zone) => [zone, seen.get(`${zoneArea(zone)}/${city(zone)}`) > 1 ? zoneRest(zone) : city(zone)]));
+}
+
+function timeZoneOptions(selected) {
+  const zones = timeZoneList(selected);
+  const labels = timeZoneLabels(zones);
+
+  const auto = `<option value=""${selected ? '' : ' selected'}>${esc(t('settings.timezoneAuto'))}</option>`;
 
   // UTC von Hand davor. `Intl.supportedValuesOf('timeZone')` fuehrt WEDER `UTC`
   // NOCH ein einziges `Etc/*` - und UTC ist ausgerechnet der Auslieferungs-
@@ -125,23 +163,52 @@ function timeZoneOptions(selected, effective) {
   const groups = new Map();
   for (const zone of zones) {
     if (zone === 'UTC') continue; // steht schon oben
-    const area = zone.includes('/') ? zone.slice(0, zone.indexOf('/')) : 'Other';
+    const area = zoneArea(zone);
     if (!groups.has(area)) groups.set(area, []);
     groups.get(area).push(zone);
   }
   const body = [...groups.entries()].map(([area, list]) => {
     const opts = list.map((zone) => {
       // Das Label laesst die Region weg - die steht schon an der optgroup, und
-      // "America > America/New York" liest sich wie ein Fehler. Was uebrig
-      // bleibt, behaelt seine restlichen Schraegstriche
-      // ("Argentina/Buenos Aires"); der VALUE bleibt die volle IANA-Kennung.
-      const label = (zone.includes('/') ? zone.slice(zone.indexOf('/') + 1) : zone).replace(/_/g, ' ');
+      // "America > America/New York" liest sich wie ein Fehler. Seit #2166
+      // auch eine Zwischenstufe ("Argentina/", "North Dakota/"): die Stadt
+      // allein, siehe `timeZoneLabels`. Der VALUE bleibt die volle IANA-Kennung.
+      const label = labels.get(zone);
       return `<option value="${esc(zone)}"${zone === selected ? ' selected' : ''}>${esc(label)}</option>`;
     }).join('');
     return `<optgroup label="${esc(area)}">${opts}</optgroup>`;
   }).join('');
 
   return auto + utc + body;
+}
+
+const withLanguage = (region, language) => t('settings.regionWithLanguage', { region, language });
+
+/** Voller Name einer Region ("Vereinigte Arabische Emirate", "Kanada (Französisch)"). */
+function regionFullName(code) {
+  return regionLabel(code, getLocale(), withLanguage);
+}
+
+/**
+ * Name einer Region in der Auswahl (#2151): kurz genug fuer die geschlossene
+ * Auswahl am Telefon ("VAE", "Kanada (FR)"). Der volle Name steht dann in der
+ * Hinweiszeile (`regionHintText`).
+ */
+export function regionShortName(code) {
+  return regionShortLabel(code, getLocale(), {
+    countryName: (country) => (SHORT_NAME_COUNTRIES.includes(country) ? t(`settings.regionShort.${country}`) : null),
+    withLanguage,
+  });
+}
+
+/**
+ * Die Hinweiszeile der Region: beginnt mit dem vollen Namen, wenn die Auswahl
+ * nur die Kurzform zeigt - dasselbe Muster wie Datensprache und Zone (R21).
+ */
+export function regionHintText(code) {
+  if (!REGION_CODES.includes(code)) return t('settings.regionHint');
+  const full = regionFullName(code);
+  return hintWithCurrent(t('settings.regionHint'), full === regionShortName(code) ? null : full);
 }
 
 function regionOptions(selectedRegion) {
@@ -152,7 +219,7 @@ function regionOptions(selectedRegion) {
   // über 60 - da findet man "Spanisch (Peru)" nur alphabetisch wieder.
   // detectRegion() bleibt von der Sortierung unberührt, es liest das Objekt.
   const presets = [...REGION_CODES]
-    .map((code) => ({ code, label: regionLabel(code, locale) }))
+    .map((code) => ({ code, label: regionShortName(code) }))
     .sort((a, b) => a.label.localeCompare(b.label, locale))
     .map(({ code, label }) => (
       `<option value="${esc(code)}"${selectedRegion === code ? ' selected' : ''}>${esc(label)}</option>`
@@ -162,11 +229,18 @@ function regionOptions(selectedRegion) {
 }
 
 function localeLabel(locale) {
-  try {
-    return new Intl.DisplayNames([getLocale()], { type: 'language' }).of(locale) || locale;
-  } catch {
-    return locale;
-  }
+  return languageLabel(locale, getLocale());
+}
+
+/**
+ * Name einer Sprache in den beiden Sprachwahlen, kurz (#2151, siehe
+ * `languageShortLabel`). Der volle Name (`localeLabel`) steht in der
+ * Hinweiszeile der Datensprache.
+ */
+export function localeShortLabel(locale) {
+  return languageShortLabel(locale, getLocale(), (tag) => (
+    SHORT_NAME_LANGUAGES.includes(tag) ? t(`settings.languageShort.${languageShortKey(tag)}`) : null
+  ));
 }
 
 function localeOptions() {
@@ -174,24 +248,92 @@ function localeOptions() {
   return [
     `<option value="system"${storedLocale ? '' : ' selected'}>${t('settings.localeSystem')}</option>`,
     ...getSupportedLocales().map((locale) => (
-      `<option value="${esc(locale)}"${storedLocale === locale ? ' selected' : ''}>${esc(localeLabel(locale))}</option>`
+      `<option value="${esc(locale)}"${storedLocale === locale ? ' selected' : ''}>${esc(localeShortLabel(locale))}</option>`
     )),
   ].join('');
 }
 
 /**
- * Optionen für die Datensprache des Haushalts (#631, #632). Der leere Wert steht
- * für "automatisch"; sein Label nennt die Sprache, auf die die Automatik fiele -
- * `language_auto`, nicht `language_effective`. Bei explizit gewählter Sprache
- * sind die beiden verschieden, und `language_effective` würde dort genau die
- * gewählte Sprache als Automatik-Ergebnis ausgeben.
+ * DER WERT IST KURZ, DAS DETAIL STEHT VORN IN DER HINWEISZEILE (R21, Critique
+ * 2026-10-21, Entscheidung Ulas): mobil hat die geschlossene Auswahl rund
+ * 180 px, und "Automatisch (Englisch)" endete dort als "Automatisch (Engl…" -
+ * abgeschnitten genau an der Stelle, die sagt, was gilt. Die Zeile sagt jetzt
+ * "Automatisch", die Hinweiszeile beginnt mit "Zurzeit: Englisch." (bis R24
+ * "Gerade Englisch." - G6-Einst-P3-6: neben deutscher Oberflaeche las sich
+ * das wie "sogar Englisch"; jetzt dieselbe Form wie in jeder anderen Sprache).
+ *
+ * Ohne `current` bleibt der Hinweis, wie er ist: eine ausdrücklich gewählte
+ * Sprache oder Zone steht schon vollständig in der Auswahl. Seit #2151 gilt
+ * dasselbe fuer Region und Sprache in Kurzform: "VAE" in der Auswahl,
+ * "Zurzeit: Vereinigte Arabische Emirate." vorn im Hinweis.
  */
-function dataLanguageOptions(selected, auto_) {
-  const auto = t('settings.dataLanguageAuto', { language: localeLabel(auto_) });
+export function hintWithCurrent(hint, current) {
+  return current ? t('settings.hintWithCurrent', { value: current, hint }) : hint;
+}
+
+/**
+ * Die Hinweiszeile der Datensprache. Bei "automatisch" nennt sie die Sprache,
+ * auf die die Automatik fiele - `language_auto`, nicht `language_effective`.
+ * Bei explizit gewählter Sprache sind die beiden verschieden, und
+ * `language_effective` würde dort genau die gewählte Sprache als
+ * Automatik-Ergebnis ausgeben.
+ */
+export function dataLanguageHintText(selected, auto_) {
+  if (!selected) return hintWithCurrent(t('settings.dataLanguageHint'), localeLabel(auto_ || 'en'));
+  const full = localeLabel(selected);
+  return hintWithCurrent(t('settings.dataLanguageHint'), full === localeShortLabel(selected) ? null : full);
+}
+
+/**
+ * Die Hinweiszeile der Haushaltszone: bei "automatisch" mit der Zone, die gilt.
+ * Eine gewaehlte Zone, die in der Auswahl nur als Stadt steht ("New Salem"),
+ * nennt hier ihren vollen Namen (#2166).
+ */
+export function timezoneHintText(selected, effective) {
+  if (!selected) return hintWithCurrent(t('settings.timezoneHint'), effective || 'UTC');
+  const short = timeZoneLabels(timeZoneList(selected)).get(selected);
+  return hintWithCurrent(t('settings.timezoneHint'), short === zoneRest(selected) ? null : selected.replace(/_/g, ' '));
+}
+
+/**
+ * Die Waehrungen der Auswahl (#2166): Code und Symbol ("GBP £"), der Code
+ * haelt jede Option unterscheidbar. "AED - Dirham der Vereinigten Arabischen
+ * Emirate" war am Telefon in 17 von 26 Sprachen gekappt; der volle Name steht
+ * jetzt vorn in der Hinweiszeile (`currencyHintText`). Der Kreditdialog im
+ * Budget hat die volle Breite und behaelt "Code - Name".
+ */
+function currencyOptions(selected) {
+  return CURRENCY_CODES.map((code) => (
+    `<option value="${esc(code)}"${code === selected ? ' selected' : ''}>${esc(currencyShortLabel(code))}</option>`
+  )).join('');
+}
+
+/** Die Hinweiszeile der Waehrung: beginnt mit ihrem vollen Namen. */
+export function currencyHintText(code) {
+  return hintWithCurrent(t('settings.currencyHint'), code ? currencyName(code) : null);
+}
+
+function syncCurrencyHint(container) {
+  setHint(container, 'currency-hint', currencyHintText(container.querySelector('#currency-select')?.value));
+}
+
+/** Setzt den Text einer Hinweiszeile (per id), wenn es sie gibt. */
+function setHint(container, id, text) {
+  const hint = container.querySelector(`#${id}`);
+  if (hint) hint.textContent = text;
+}
+
+/**
+ * Optionen für die Datensprache des Haushalts (#631, #632). Der leere Wert steht
+ * für "automatisch"; welche Sprache das gerade ist, sagt die Hinweiszeile
+ * (`dataLanguageHintText`).
+ */
+function dataLanguageOptions(selected) {
+  const auto = t('settings.dataLanguageAuto');
   return [
     `<option value=""${selected ? '' : ' selected'}>${esc(auto)}</option>`,
     ...getSupportedLocales().map((locale) => (
-      `<option value="${esc(locale)}"${selected === locale ? ' selected' : ''}>${esc(localeLabel(locale))}</option>`
+      `<option value="${esc(locale)}"${selected === locale ? ' selected' : ''}>${esc(localeShortLabel(locale))}</option>`
     )),
   ].join('');
 }
@@ -246,6 +388,52 @@ export function bindScreensaverIdleSelect(select) {
     const seconds = setScreensaverIdleSeconds(Number(select.value));
     window.yuvomi?.showToast(t('settings.screensaverIdleSaved', { delay: screensaverIdleText(seconds) }), 'success');
   });
+}
+
+// A whole hour as the household writes its times ("22:00", "10:00 PM"). A
+// bare "HH:MM" is wall time to formatTime, so no zone shifts the hour.
+function nightHourText(hour) {
+  return formatTime(`${String(hour).padStart(2, '0')}:00`);
+}
+
+/**
+ * The 24 hours of one end of the night window (#2234). The hour the OTHER end
+ * stands on is disabled: equal ends would be an empty window, an "off" the
+ * setting does not offer. Exported so test:screensaver-device can check the
+ * selects open on the stored value.
+ */
+export function nightHourOptions(selected, other) {
+  return Array.from({ length: 24 }, (_, hour) => `
+    <option value="${hour}"${hour === selected ? ' selected' : ''}${hour === other ? ' disabled' : ''}>${esc(nightHourText(hour))}</option>`).join('');
+}
+
+/**
+ * Device-local like wall mode (#2234): no server request. Wall and
+ * screensaver ask the stored hours each time they look - the wall on the next
+ * route change and the clock's minute, the screensaver at every photo - so
+ * nothing needs a reload. Each select disables the hour the other one holds, and the toast
+ * names the window that now applies. Exported so test:screensaver-device can
+ * drive the real handler.
+ */
+export function bindNightHoursSelects(fromSelect, untilSelect) {
+  if (!fromSelect || !untilSelect) return;
+  const sync = () => {
+    for (const [select, other] of [[fromSelect, untilSelect], [untilSelect, fromSelect]]) {
+      for (const option of select.options) option.disabled = option.value === other.value;
+    }
+  };
+  const onChange = () => {
+    const hours = setNightHours(Number(fromSelect.value), Number(untilSelect.value));
+    fromSelect.value = String(hours.from);
+    untilSelect.value = String(hours.to);
+    sync();
+    window.yuvomi?.showToast(
+      t('settings.nightHoursSaved', { from: nightHourText(hours.from), until: nightHourText(hours.to) }),
+      'success',
+    );
+  };
+  fromSelect.addEventListener('change', onChange);
+  untilSelect.addEventListener('change', onChange);
 }
 
 function renderLoadError(container) {
@@ -327,11 +515,11 @@ function renderPage(container, preferences, isAdmin) {
         ${isAdmin ? settingRowHtml({
           label: t('settings.dataLanguageLabel'),
           labelFor: 'data-language-select',
-          description: t('settings.dataLanguageHint'),
+          description: dataLanguageHintText(preferences.language, preferences.language_auto),
           descriptionId: 'data-language-hint',
           extra: '<div id="data-language-error" class="form-error" role="alert" hidden></div>',
           control: `<select class="form-input" id="data-language-select" aria-describedby="data-language-hint data-language-error">
-            ${dataLanguageOptions(preferences.language, preferences.language_auto)}
+            ${dataLanguageOptions(preferences.language)}
           </select>`,
         }) : ''}
       </div>
@@ -345,7 +533,7 @@ function renderPage(container, preferences, isAdmin) {
         ${settingRowHtml({
           label: t('settings.regionLabel'),
           labelFor: 'region-select',
-          description: t('settings.regionHint'),
+          description: regionHintText(activeRegion),
           descriptionId: 'region-hint',
           extra: '<div id="region-error" class="form-error" role="alert" hidden></div>',
           control: `<select class="form-input" id="region-select" aria-describedby="region-hint region-error">
@@ -369,10 +557,12 @@ function renderPage(container, preferences, isAdmin) {
         ${settingRowHtml({
           label: t('settings.currencyLabel'),
           labelFor: 'currency-select',
-          description: t('settings.currencyHint'),
+          description: currencyHintText(preferences.currency),
           descriptionId: 'currency-hint',
           extra: '<div id="currency-error" class="form-error" role="alert" hidden></div>',
-          control: '<select class="form-input" id="currency-select" aria-describedby="currency-hint currency-error"></select>',
+          control: `<select class="form-input" id="currency-select" aria-describedby="currency-hint currency-error">
+            ${currencyOptions(preferences.currency)}
+          </select>`,
         })}
         <!-- Eigene Zeile, nicht im Formatblock darunter: die Zeitzone ist
              keine Formatierung. Datum und Uhrzeit dort ändern nur, WIE ein Wert
@@ -384,20 +574,27 @@ function renderPage(container, preferences, isAdmin) {
         ${settingRowHtml({
           label: t('settings.timezoneLabel'),
           labelFor: 'timezone-select',
-          description: t('settings.timezoneHint'),
+          description: timezoneHintText(preferences.timezone, preferences.timezone_effective),
           descriptionId: 'timezone-hint',
           extra: '<div id="timezone-error" class="form-error" role="alert" hidden></div>',
           control: `<select class="form-input" id="timezone-select" aria-describedby="timezone-hint timezone-error">
-            ${timeZoneOptions(preferences.timezone, preferences.timezone_effective)}
+            ${timeZoneOptions(preferences.timezone)}
           </select>`,
           attrs: { id: 'timezone-card' },
         })}
       </div>` : `
       <div class="row-carrier settings-group">
+        <!-- Dieselbe Aufteilung wie in der Auswahl der Admins: der Wert kurz,
+             die gerade geltende Zone vorn im Hinweis. Eine gesetzte Zone steht
+             selbst da - bis R21 hiess sie hier immer "Automatisch (...)", auch
+             wenn ein Admin sie ausdruecklich gewaehlt hatte. -->
         ${settingRowHtml({
           label: t('settings.timezoneTitle'),
-          description: t('settings.timezoneAdminOnly'),
-          control: `<span class="settings-setting-row__value">${esc(t('settings.timezoneAuto', { zone: preferences.timezone_effective || 'UTC' }))}</span>`,
+          description: hintWithCurrent(
+            t('settings.timezoneAdminOnly'),
+            preferences.timezone ? null : (preferences.timezone_effective || 'UTC'),
+          ),
+          control: `<span class="settings-setting-row__value">${esc(preferences.timezone ? preferences.timezone.replace(/_/g, ' ') : t('settings.timezoneAuto'))}</span>`,
           attrs: { id: 'timezone-card' },
         })}
       </div>
@@ -507,6 +704,7 @@ function syncRegionSelect(container, { mayHide = true, region = null } = {}) {
     date_format: container.querySelector('#date-format-select')?.value,
     time_format: container.querySelector('#time-format-select')?.value,
   });
+  setHint(container, 'region-hint', regionHintText(regionSelect.value));
   // Die Karte muss der Anzeige folgen. Seit die Waehrung ausserhalb von ihr
   // steht (#934), kann eine Aenderung die Region auf "Benutzerdefiniert"
   // schieben, ohne dass der Nutzer die Karte je gesehen hat - stuende sie dann
@@ -521,17 +719,33 @@ function syncRegionSelect(container, { mayHide = true, region = null } = {}) {
  * steht die Datensprache auf "automatisch", leitet der Server sie aus der Region
  * ab, und das Label nennt dann eine andere Sprache. Die Ableitung bleibt dabei
  * beim Server - hier wird nur der frisch gelesene Wert angezeigt, statt die
- * Regel im Client zu wiederholen.
+ * Regel im Client zu wiederholen. Die Hinweiszeile geht mit (R21).
  */
-async function refreshDataLanguageOptions(container) {
+export async function refreshDataLanguageOptions(container) {
   const select = container.querySelector('#data-language-select');
   if (!select) return;
   const preferences = await getPreferences();
   select.replaceChildren();
-  select.insertAdjacentHTML('beforeend', dataLanguageOptions(
-    preferences.language || null,
-    preferences.language_auto || 'en',
-  ));
+  select.insertAdjacentHTML('beforeend', dataLanguageOptions(preferences.language || null));
+  // Die Hinweiszeile traegt das Automatik-Ergebnis ("Zurzeit: Englisch.") - sie
+  // geht mit, auch wenn sich nur die Ableitung geaendert hat (Regionswechsel).
+  setHint(container, 'data-language-hint', dataLanguageHintText(preferences.language || null, preferences.language_auto));
+}
+
+/**
+ * Zieht Auswahl und Hinweiszeile der Haushaltszone einer frischen Antwort nach.
+ * Zwei Wege fuehren hierher: der Wechsel in der Auswahl (PUT-Antwort) und das
+ * "Uebernehmen" im Zonen-Hinweis - der setzte die Zone bis R21, waehrend die
+ * Auswahl darunter weiter "Automatisch" zeigte. Exportiert wie
+ * `refreshDataLanguageOptions`, damit test:settings-navigation beide Wege fahren kann.
+ */
+export function refreshTimezone(container, { timezone, timezone_effective: effective } = {}) {
+  const select = container.querySelector('#timezone-select');
+  if (select) {
+    select.replaceChildren();
+    select.insertAdjacentHTML('beforeend', timeZoneOptions(timezone ?? null));
+  }
+  setHint(container, 'timezone-hint', timezoneHintText(timezone ?? null, effective));
 }
 
 /**
@@ -559,11 +773,14 @@ function mountTimezoneMismatch(container, preferences, isAdmin) {
         api: { get: (path) => api.get(path), put: (_path, patch) => savePreferences(patch) },
       });
       resetPreferencesCache();
+      // Gesetzt ist die Zone in beiden Faellen (uebernommen oder schon von
+      // jemand anderem gewaehlt) - Auswahl und Hinweiszeile zeigen sie.
+      if (result.timezone) refreshTimezone(container, { timezone: result.timezone, timezone_effective: result.timezone });
       if (result.adopted) window.yuvomi?.showToast(t('settings.timezoneSaved'), 'success');
     } : undefined,
     onError: (error) => {
-      if (errorElement) showError(errorElement, error?.message);
-      else window.yuvomi?.showToast(error?.message || t('common.errorGeneric'), 'danger');
+      if (errorElement) showError(errorElement, errorSentence(error, 'settings.preferenceSaveFailed'));
+      else window.yuvomi?.showToast(errorSentence(error, 'settings.preferenceSaveFailed'), 'danger');
     },
   }));
 }
@@ -592,6 +809,7 @@ function deviceDisplayRowsHtml({ screensaverOn = true, isAdmin = false } = {}) {
           descriptionId: 'wall-mode-hint',
           attrs: { id: 'wall-mode-toggle', 'aria-describedby': 'wall-mode-hint' },
         })}
+        ${nightHoursRowHtml()}
         <!-- Next to wall mode and for the same reason: device-local (#885). A
              photo frame and a kitchen tablet in one household want different
              delays, and a household value would reach every phone too. The
@@ -637,12 +855,41 @@ function deviceDisplayRowsHtml({ screensaverOn = true, isAdmin = false } = {}) {
 `;
 }
 
+/**
+ * DIE NACHTSTUNDEN STEHEN UNTER DEM WAND-MODUS UND VOR DEM SCHONER (#2234,
+ * #1901): sie gelten fuer beide, deshalb immer sichtbar - auch ohne Immich,
+ * denn die Wand dunkelt trotzdem ab. Eine Zeile, zwei randlose Auswahlen im
+ * zusammengesetzten Feld ("22:00 - 06:00"), die Gruppe heisst wie die Zeile.
+ */
+function nightHoursRowHtml() {
+  const { from, to } = getNightHours();
+  return settingRowHtml({
+    label: t('settings.nightHoursLabel'),
+    labelId: 'night-hours-label',
+    description: t('settings.nightHoursHint'),
+    descriptionId: 'night-hours-hint',
+    control: `<span class="form-composite" role="group" aria-labelledby="night-hours-label" aria-describedby="night-hours-hint">
+      <select class="form-input" id="night-hours-from" aria-label="${esc(t('settings.nightHoursFrom'))}">${nightHourOptions(from, to)}</select>
+      <span class="form-composite__sep" aria-hidden="true">-</span>
+      <select class="form-input" id="night-hours-until" aria-label="${esc(t('settings.nightHoursUntil'))}">${nightHourOptions(to, from)}</select>
+    </span>`,
+    attrs: { id: 'night-hours-row' },
+  });
+}
+
 function renderDeviceDisplay(container, options = {}) {
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
     <section class="settings-section">
       <h2 class="settings-section__title">${t('settings.sectionDeviceDisplay')}</h2>
       <div class="row-carrier settings-group">${deviceDisplayRowsHtml(options)}</div>
+      ${/* WAND AN ZWEI ORTEN, GEGENSEITIG VERWIESEN (R22, D13): der Modus
+           dieses Geraets hier, das eigene Konto eines Wandtabletts unter
+           "Wandtabletts" - das darf nur ein Admin anlegen. */ ''}
+      ${options.isAdmin ? `<p class="form-hint settings-group__footer" id="wall-displays">
+        ${esc(t('settings.wallDisplaysLinkHint'))}
+        <a href="/settings/admin/displays" id="wall-displays-link">${esc(t('settings.pageDisplays'))}</a>
+      </p>` : ''}
     </section>`);
   bindDeviceDisplay(container);
   window.lucide?.createIcons({ el: container });
@@ -672,6 +919,7 @@ function bindDeviceDisplay(container) {
     window.yuvomi.navigate('/settings/admin/integrations');
   });
 
+  bindNightHoursSelects(container.querySelector('#night-hours-from'), container.querySelector('#night-hours-until'));
   bindScreensaverIdleSelect(container.querySelector('#screensaver-idle-select'));
   bindScreensaverSwitch(container.querySelector('#screensaver-clock-toggle'), setScreensaverClockOn);
   bindScreensaverSwitch(container.querySelector('#screensaver-cover-toggle'), setScreensaverCoverOn);
@@ -742,7 +990,7 @@ function bindEvents(container, user) {
       // Zurück auf den gespeicherten Wert: sonst zeigt die Seite eine
       // Datensprache an, die nie geschrieben wurde.
       dataLanguageSelect.value = persistedDataLanguage;
-      showError(errorElement, error.message);
+      showError(errorElement, errorSentence(error, 'settings.preferenceSaveFailed'));
     } finally {
       if (dataLanguageSelect.isConnected) dataLanguageSelect.disabled = false;
     }
@@ -755,15 +1003,12 @@ function bindEvents(container, user) {
     timezoneSelect.disabled = true;
     try {
       const saved = await savePreferences({ timezone: timezoneSelect.value || null });
-      // Neu beschriften statt nur zu speichern: das Label der ersten Option
-      // nennt die Zone, die bei "Automatisch" GILT. Wer von einer gesetzten Zone
-      // auf Automatisch zurückstellt, sieht sonst weiter den alten Rückfallwert.
-      // Genommen wird die PUT-Antwort, nicht ein zweiter GET - beide Felder
-      // stehen dort, und der Server hat sie gerade frisch aufgelöst.
-      timezoneSelect.replaceChildren();
-      timezoneSelect.insertAdjacentHTML(
-        'beforeend', timeZoneOptions(saved?.data?.timezone, saved?.data?.timezone_effective)
-      );
+      // Neu beschriften statt nur zu speichern: die Hinweiszeile nennt die Zone,
+      // die bei "Automatisch" GILT. Wer von einer gesetzten Zone auf Automatisch
+      // zurückstellt, sieht sonst weiter den alten Rückfallwert. Genommen wird
+      // die PUT-Antwort, nicht ein zweiter GET - beide Felder stehen dort, und
+      // der Server hat sie gerade frisch aufgelöst.
+      refreshTimezone(container, saved?.data);
       // Die Anzeige folgt der neuen Zone sofort - dasselbe Paar aus Spiegeln und
       // Neuzeichnen wie bei Datums- und Zeitformat. Ohne das Ereignis blieben die
       // bereits gezeichneten Uhrzeiten bis zum naechsten Seitenwechsel stehen.
@@ -773,7 +1018,7 @@ function bindEvents(container, user) {
       }));
       window.yuvomi?.showToast(t('settings.timezoneSaved'), 'success');
     } catch (error) {
-      showError(errorElement, error.message);
+      showError(errorElement, errorSentence(error, 'settings.preferenceSaveFailed'));
     } finally {
       if (timezoneSelect.isConnected) timezoneSelect.disabled = false;
     }
@@ -781,6 +1026,8 @@ function bindEvents(container, user) {
 
   const regionSelect = container.querySelector('#region-select');
   regionSelect?.addEventListener('change', async () => {
+    // Der volle Name gehoert zur Auswahl, nicht zum Speichern: er folgt sofort.
+    setHint(container, 'region-hint', regionHintText(regionSelect.value));
     if (regionSelect.value === CUSTOM_REGION) {
       applyCustomVisibility(container, CUSTOM_REGION);
       return;
@@ -809,6 +1056,7 @@ function bindEvents(container, user) {
       });
       const currencySelect = container.querySelector('#currency-select');
       if (currencySelect) currencySelect.value = preset.currency;
+      syncCurrencyHint(container);
       const dateSelect = container.querySelector('#date-format-select');
       if (dateSelect) dateSelect.value = preset.date_format;
       const timeSelect = container.querySelector('#time-format-select');
@@ -833,7 +1081,7 @@ function bindEvents(container, user) {
       await refreshDataLanguageOptions(container).catch(() => {});
       window.yuvomi?.showToast(t('settings.regionSaved'), 'success');
     } catch (error) {
-      showError(errorElement, error.message);
+      showError(errorElement, errorSentence(error, 'settings.preferenceSaveFailed'));
     } finally {
       if (regionSelect.isConnected) regionSelect.disabled = false;
       if (currencyDuringRegion?.isConnected) currencyDuringRegion.disabled = false;
@@ -844,6 +1092,8 @@ function bindEvents(container, user) {
   let persistedCurrency = currencySelect?.value;
   currencySelect?.addEventListener('change', async () => {
     if (currencySelect.disabled) return;
+    // Der volle Name gehoert zur Auswahl, nicht zum Speichern: er folgt sofort.
+    syncCurrencyHint(container);
     const errorElement = container.querySelector('#currency-error');
     clearError(errorElement);
     try {
@@ -874,7 +1124,8 @@ function bindEvents(container, user) {
       applyNumberLocale(readFormatState(container));
       window.yuvomi?.showToast(t('settings.currencySaved'), 'success');
     } catch (error) {
-      showError(errorElement, error.message);
+      syncCurrencyHint(container);
+      showError(errorElement, errorSentence(error, 'settings.preferenceSaveFailed'));
     }
   });
 
@@ -893,7 +1144,7 @@ function bindEvents(container, user) {
       applyNumberLocale(readFormatState(container));
       window.yuvomi?.showToast(t('settings.dateFormatSavedToast'), 'success');
     } catch (error) {
-      showError(errorElement, error.message);
+      showError(errorElement, errorSentence(error, 'settings.preferenceSaveFailed'));
     } finally {
       dateFormatSelect.disabled = false;
     }
@@ -914,7 +1165,7 @@ function bindEvents(container, user) {
       applyNumberLocale(readFormatState(container));
       window.yuvomi?.showToast(t('settings.timeFormatSavedToast'), 'success');
     } catch (error) {
-      showError(errorElement, error.message);
+      showError(errorElement, errorSentence(error, 'settings.preferenceSaveFailed'));
     } finally {
       timeFormatSelect.disabled = false;
     }
@@ -953,9 +1204,6 @@ export async function render(container, { user }) {
     applyNumberLocale(preferences);
     const isAdmin = user?.role === 'admin';
     renderPage(container, preferences, isAdmin);
-    if (isAdmin) {
-      appendCurrencyOptions(container.querySelector('#currency-select'), preferences.currency);
-    }
     bindEvents(container, user);
     mountTimezoneMismatch(container, preferences, isAdmin);
     window.lucide?.createIcons({ el: container });

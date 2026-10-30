@@ -8,11 +8,12 @@
  */
 import { api } from '/api.js';
 import { t } from '/i18n.js';
-import { esc } from '/utils/html.js';
-import { openModal, closeModal, confirmOverModal, refocusAfterRender } from '/components/modal.js';
+import { esc, REQUIRED_MARK } from '/utils/html.js';
+import { openModal, closeModal, captureModalContext, confirmOverModal, refocusAfterRender, reportFieldErrors, constraintErrors, dialogInitialFocus } from '/components/modal.js';
 import { intervalMonthsToInput, intervalInputToMonths } from '/utils/health-prevention.js';
 import { rowActionHtml } from '/utils/row-action.js';
 import { errorSentence, isGone, isAlreadyDeleted } from '/utils/friendly-error.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
 
 const KINDS = ['vaccination', 'checkup'];
 const MAX_INTERVAL_MONTHS = 600;
@@ -116,11 +117,15 @@ async function reload() {
  * Fehler-Toast der Seite (#1909): der Satz der App, nie der des Servers. Gibt
  * es die bearbeitete Art nicht mehr, geht der Dialog zu und die Liste kommt
  * frisch vom Server.
+ *
+ * Geschlossen wird nur der Dialog, aus dem die Anfrage kam (`modalContext`
+ * von VOR der Anfrage): kommt die Antwort, nachdem der Nutzer einen anderen
+ * geoeffnet hat, bleibt der stehen (#1997).
  */
-function reportError(err) {
+function reportError(err, modalContext) {
   window.yuvomi?.showToast(errorSentence(err), 'danger');
   if (!isGone(err)) return;
-  closeModal({ force: true }).then(() => reload()).then(() => refocusAfterRender()).catch(() => {});
+  closeModal({ force: true, context: modalContext }).then(() => reload()).then(() => refocusAfterRender()).catch(() => {});
 }
 
 function openTypeModal(type) {
@@ -130,33 +135,34 @@ function openTypeModal(type) {
 
   openModal({
     title: isEdit ? t('settings.healthPreventionEditType') : t('settings.healthPreventionAddType'),
+    initialFocus: dialogInitialFocus(isEdit),
     size: 'sm',
     content: `
-      <form id="health-prevention-type-form" class="form-stack">
+      <form id="health-prevention-type-form" class="form-stack" novalidate>
         <div class="form-field">
-          <label class="label" for="hpt-name">${esc(t('settings.healthPreventionTypeName'))}</label>
-          <input class="input" id="hpt-name" type="text" maxlength="200" required value="${esc(val(type?.name))}">
+          <label class="form-label" for="hpt-name">${esc(t('settings.healthPreventionTypeName'))}${REQUIRED_MARK}</label>
+          <input class="form-input" id="hpt-name" type="text" maxlength="200" required value="${esc(val(type?.name))}">
         </div>
         <div class="form-field">
-          <label class="label" for="hpt-kind">${esc(t('settings.healthPreventionTypeKind'))}</label>
-          <select class="input" id="hpt-kind">
+          <label class="form-label" for="hpt-kind">${esc(t('settings.healthPreventionTypeKind'))}</label>
+          <select class="form-input" id="hpt-kind">
             ${KINDS.map((k) => `<option value="${esc(k)}" ${type?.kind === k ? 'selected' : ''}>${esc(t(`settings.healthPreventionKind.${k}`))}</option>`).join('')}
           </select>
         </div>
         <div class="modal-grid modal-grid--2">
           <div class="form-field">
-            <label class="label" for="hpt-interval">${esc(t('settings.healthPreventionTypeInterval'))}</label>
-            <input class="input" id="hpt-interval" type="number" inputmode="numeric" min="1" step="1"
+            <label class="form-label" for="hpt-interval">${esc(t('settings.healthPreventionTypeInterval'))}</label>
+            <input class="form-input" id="hpt-interval" type="number" inputmode="numeric" min="1" step="1"
                    value="${esc(val(interval.value))}" placeholder="${esc(t('settings.healthPreventionTypeIntervalPlaceholder'))}">
           </div>
           <div class="form-field">
-            <label class="label" for="hpt-interval-unit">${esc(t('common.unit'))}</label>
-            <select class="input" id="hpt-interval-unit">${intervalUnitOptions(interval.unit)}</select>
+            <label class="form-label" for="hpt-interval-unit">${esc(t('common.unit'))}</label>
+            <select class="form-input" id="hpt-interval-unit">${intervalUnitOptions(interval.unit)}</select>
           </div>
         </div>
         <p class="form-hint">${esc(t('settings.healthPreventionTypeIntervalHint'))}</p>
         <div class="form-field">
-          <label class="label" id="hpt-icon-label">${esc(t('settings.healthPreventionTypeIcon'))}</label>
+          <label class="form-label" id="hpt-icon-label">${esc(t('settings.healthPreventionTypeIcon'))}</label>
           <button type="button" class="btn btn--secondary settings-icon-trigger" id="hpt-icon-trigger" aria-labelledby="hpt-icon-label">
             <i data-lucide="${esc(type?.icon || 'syringe')}" aria-hidden="true"></i>
             <span>${esc(t('iconPicker.title'))}</span>
@@ -164,7 +170,7 @@ function openTypeModal(type) {
           <input type="hidden" id="hpt-icon" value="${esc(type?.icon || 'syringe')}">
         </div>
         <div class="modal-panel__footer modal-panel__footer--plain">
-          ${isEdit ? `<button type="button" class="btn btn--danger-outline" data-action="delete" style="margin-inline-end:auto">
+          ${isEdit ? `<button type="button" class="btn btn--danger-outline" data-action="delete">
             <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${esc(t('common.delete'))}
           </button>` : ''}
           <button type="button" class="btn btn--secondary" data-action="cancel">${esc(t('common.cancel'))}</button>
@@ -187,6 +193,9 @@ function openTypeModal(type) {
 
       panel.querySelector('[data-action="cancel"]')?.addEventListener('click', () => closeModal({ force: true }));
       panel.querySelector('[data-action="delete"]')?.addEventListener('click', async () => {
+        // VOR der Rueckfrage: geschlossen wird nur dieser Dialog, nicht einer,
+        // der waehrend der Anfrage aufgegangen ist (#1997).
+        const modalContext = captureModalContext();
         const confirmed = await confirmOverModal(t('settings.healthPreventionDeleteTypeConfirm'), {
           danger: true,
           confirmLabel: t('common.delete'),
@@ -200,12 +209,12 @@ function openTypeModal(type) {
           } catch (err) {
             if (!isAlreadyDeleted(err, 'health_prevention_type_not_found')) throw err;
           }
-          closeModal({ force: true });
+          closeModal({ force: true, context: modalContext });
           window.yuvomi?.showToast(t('settings.healthPreventionTypeDeleted'), 'success');
           await reload();
           refocusAfterRender();
         } catch (err) {
-          reportError(err);
+          reportError(err, modalContext);
         }
       });
 
@@ -217,19 +226,25 @@ function openTypeModal(type) {
         const intervalRaw = panel.querySelector('#hpt-interval').value.trim();
         const intervalUnit = panel.querySelector('#hpt-interval-unit').value;
         const icon = panel.querySelector('#hpt-icon').value.trim() || 'syringe';
-        if (!name) {
-          window.yuvomi?.showToast(t('settings.healthPreventionTypeNameRequired'), 'danger');
-          return;
-        }
+        // KEINE BROWSER-BLASEN UND KEIN TOAST OHNE ORT (Critique R21, Muster
+        // der Gesundheitsformulare): `novalidate`, die Regeln des Markups und
+        // die zwei eigenen Pruefungen stehen am Feld, nicht als Meldung oben.
         const intervalMonths = intervalInputToMonths(intervalRaw, intervalUnit);
-        if (Number.isNaN(intervalMonths) || (intervalMonths != null && (intervalMonths < 1 || intervalMonths > MAX_INTERVAL_MONTHS))) {
-          window.yuvomi?.showToast(t('settings.healthPreventionTypeIntervalInvalid'), 'danger');
-          return;
+        const errors = constraintErrors(e.currentTarget);
+        const flagged = (el) => errors.some(([field]) => field === el);
+        const nameEl = panel.querySelector('#hpt-name');
+        const intervalEl = panel.querySelector('#hpt-interval');
+        if (!name && !flagged(nameEl)) errors.push([nameEl, t('settings.healthPreventionTypeNameRequired')]);
+        if ((Number.isNaN(intervalMonths) || (intervalMonths != null && (intervalMonths < 1 || intervalMonths > MAX_INTERVAL_MONTHS)))
+          && !flagged(intervalEl)) {
+          errors.push([intervalEl, t('settings.healthPreventionTypeIntervalInvalid')]);
         }
+        if (reportFieldErrors(errors)) return;
         const body = { name, kind, icon };
         if (intervalMonths != null) body.default_interval_months = intervalMonths;
         else if (isEdit) body.default_interval_months = null;
 
+        const modalContext = captureModalContext();
         submitBtn.disabled = true;
         try {
           if (isEdit) {
@@ -237,13 +252,13 @@ function openTypeModal(type) {
           } else {
             await api.post('/health/prevention/types', body);
           }
-          closeModal({ force: true });
+          closeModal({ force: true, context: modalContext });
           window.yuvomi?.showToast(t('settings.healthPreventionTypeSaved'), 'success');
-          await reload();
+          await reloadAfterSave(() => reload());
           refocusAfterRender();
         } catch (err) {
           submitBtn.disabled = false;
-          reportError(err);
+          reportError(err, modalContext);
         }
       });
     },

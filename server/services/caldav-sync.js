@@ -13,7 +13,8 @@ import {
   legacyColorSnapshotKey, forgetLegacyColorSnapshot, legacyColorChosenIds,
   legacyColorHealKey, legacyColorHealEnded, legacyColorCutoff,
 } from './legacy-color-snapshot.js';
-import { assignDefaultToEvent, reassignDefaultOnCalendarMove } from './sync-assignment.js';
+import { assignNewOverride, calendarDefaultAssignees, reassignDefaultOnCalendarMove } from './sync-assignment.js';
+import { assigneeFields, readAllDefaultAssignees } from './default-assignees.js';
 import {
   pruneDeletedEvents, countMirroredEvents, deleteMirroredEvents,
   countAccountEvents as countEventsOfAccount, deleteAccountEvents,
@@ -27,14 +28,19 @@ import { toICSDatetime, escapeICSText } from '../utils/ics-format.js';
 import { eventDateTimeFields, rruleForDtstart } from '../utils/ics-datetime.js';
 import { vtimezoneFor } from '../utils/vtimezone.js';
 import { householdTimeZone } from '../utils/timezone.js';
-import { createCalDAVClient, supportsComponent, createUploadGate, withAccountOrigin } from '../utils/caldav-client.js';
+import {
+  createCalDAVClient, supportsComponent, createUploadGate, withAccountOrigin,
+  writableColumn, writableFromColumn, acceptsNewEntries,
+} from '../utils/caldav-client.js';
 import { sqlLooksLikeOwnEventUid } from '../utils/own-uid.js';
 import { sameCredentialOrigin } from '../utils/credential-origin.js';
 import { rruleLine } from './recurrence.js';
 import { nearestIcalColorName } from '../utils/ical-color.js';
-import { authoredAfterInbound, outboundEvent } from './outbound-dtstart.js';
+import { normalizeCalColor, calendarDisplayName } from '../utils/calendar-meta.js';
+import { authoredAfterInbound, outboundEvent, outboundRecurrenceRule } from './outbound-dtstart.js';
 import { icsReading, icsSnapshot, isEcho } from './outbound-echo.js';
 import { followInboundStartChange } from './calendar-occurrence-overrides.js';
+import { storeImportedExceptions } from './imported-occurrence-key.js';
 
 // Reused functions from apple-calendar.js
 import {
@@ -83,9 +89,10 @@ function buildCalDAVICS(event, householdZone = null) {
   if (colorName) lines.push(`COLOR:${colorName}`);
 
   // Ein reines Datum als UNTIL wird neben einem getimten DTSTART zum Ende des
-  // Ortstags in UTC (#1974, utils/rrule-until.js).
+  // Ortstags in UTC (#1974, utils/rrule-until.js); ein UNTIL aus dem alten
+  // Formular an einer eigenen Serie ohne Zone zuvor zum Datum (#1992).
   if (event.recurrence_rule) {
-    lines.push(rruleLine(rruleForDtstart(event.recurrence_rule, when)));
+    lines.push(rruleLine(rruleForDtstart(outboundRecurrenceRule(event), when)));
   }
 
   lines.push('END:VEVENT', 'END:VCALENDAR');
@@ -357,13 +364,6 @@ function legacyCalendarColors(conn, accountId, serverCalendars = []) {
   return colors;
 }
 
-function normalizeCalColor(c) {
-  if (!c) return null;
-  if (/^#[0-9a-fA-F]{8}$/.test(c)) return c.slice(0, 7); // strip alpha
-  if (/^#[0-9a-fA-F]{6}$/.test(c)) return c;
-  return null;
-}
-
 // --------------------------------------------------------
 // Credentials Helpers
 // --------------------------------------------------------
@@ -461,14 +461,14 @@ async function addAccount(name, caldavUrl, username, password, { createClient } 
     const calendarData = [];
     for (const cal of eventCalendars(calendars)) {
       const calColor = normalizeCalColor(cal.calendarColor) || '#4A90E2';
-      const calName = cal.displayName || 'Unnamed Calendar';
+      const calName = calendarDisplayName(cal.displayName, 'Unnamed Calendar');
 
       db.get().prepare(`
-        INSERT INTO caldav_calendar_selection (account_id, calendar_url, calendar_name, calendar_color, enabled)
-        VALUES (?, ?, ?, ?, 0)
-      `).run(accountId, cal.url, calName, calColor);
+        INSERT INTO caldav_calendar_selection (account_id, calendar_url, calendar_name, calendar_color, enabled, writable)
+        VALUES (?, ?, ?, ?, 0, ?)
+      `).run(accountId, cal.url, calName, calColor, writableColumn(cal));
 
-      calendarData.push({ url: cal.url, name: calName, color: calColor, enabled: false });
+      calendarData.push({ url: cal.url, name: calName, color: calColor, enabled: false, writable: writableFromColumn(writableColumn(cal)) });
     }
 
     // Hat das neue Konto nichts zu heilen, laeuft die Heilung dort nie (#1270).
@@ -563,12 +563,12 @@ async function updateAccount(accountId, { name, caldavUrl, username, password, c
       // Insert new selections
       for (const cal of eventCalendars(calendars)) {
         const calColor = normalizeCalColor(cal.calendarColor) || '#4A90E2';
-        const calName = cal.displayName || 'Unnamed Calendar';
+        const calName = calendarDisplayName(cal.displayName, 'Unnamed Calendar');
 
         db.get().prepare(`
-          INSERT INTO caldav_calendar_selection (account_id, calendar_url, calendar_name, calendar_color, enabled)
-          VALUES (?, ?, ?, ?, ?)
-        `).run(accountId, cal.url, calName, calColor, (previous.get(cal.url) ?? false) ? 1 : 0);
+          INSERT INTO caldav_calendar_selection (account_id, calendar_url, calendar_name, calendar_color, enabled, writable)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(accountId, cal.url, calName, calColor, (previous.get(cal.url) ?? false) ? 1 : 0, writableColumn(cal));
       }
     }
   }
@@ -673,6 +673,15 @@ function deleteAccount(accountId, { deleteEvents = false } = {}) {
     db.get().prepare(
       "DELETE FROM calendar_pending_deletions WHERE source = 'caldav' AND caldav_account_id = ?"
     ).run(accountId);
+    // Das Upload-Ziel (`target_caldav_account_id`) trägt keinen Fremdschlüssel
+    // und zeigte sonst ins Leere (#1885). Ein lokaler Termin ohne Ziel bleibt
+    // lokal, wird nie gesendet und steht wieder im lokalen Standardkalender -
+    // mit Ziel stand er in keinem.
+    db.get().prepare(`
+      UPDATE calendar_events
+      SET target_caldav_account_id = NULL, target_caldav_calendar_url = NULL
+      WHERE target_caldav_account_id = ?
+    `).run(accountId);
     // Ebenso die Notizen nie gebuchter Uploads (#1882).
     dropUploadAttemptsOf({ source: 'caldav', accountId });
     const rows = detachAccountRows(accountId);
@@ -704,16 +713,18 @@ async function getCalendars(accountId, { refresh = false, createClient } = {}) {
   if (!refresh) {
     // Return from DB
     const calendars = db.get().prepare(`
-      SELECT calendar_url, calendar_name, calendar_color, enabled
+      SELECT calendar_url, calendar_name, calendar_color, enabled, writable
       FROM caldav_calendar_selection
       WHERE account_id = ?
       ORDER BY calendar_name
     `).all(accountId);
 
-    // Standard-Zuweisung je Kalender (#459) aus der geteilten external_calendars-Tabelle.
+    // Standard-Personen je Kalender (#459, #1897) aus der geteilten
+    // external_calendars-Tabelle und ihrer Join-Tabelle.
+    const sets = readAllDefaultAssignees(db.get(), 'calendar');
     const assigneeMap = new Map(
-      db.get().prepare(`SELECT external_id, default_assignee_user_id FROM external_calendars WHERE source = 'caldav'`)
-        .all().map((r) => [r.external_id, r.default_assignee_user_id])
+      db.get().prepare(`SELECT id, external_id FROM external_calendars WHERE source = 'caldav'`)
+        .all().map((r) => [r.external_id, sets.get(Number(r.id)) ?? []])
     );
 
     return calendars.map(cal => ({
@@ -721,7 +732,12 @@ async function getCalendars(accountId, { refresh = false, createClient } = {}) {
       calendarName: cal.calendar_name,
       calendarColor: cal.calendar_color,
       enabled: cal.enabled === 1,
-      default_assignee_user_id: assigneeMap.get(cal.calendar_url) ?? null,
+      // Nimmt der Kalender neue Termine an (#1840)? null: der Server sagt es
+      // nicht. Dazu, wie viele Termine auf ihren Upload hierher warten - bei
+      // einem nur lesbaren Kalender sind das die, die nie ankommen.
+      writable: writableFromColumn(cal.writable),
+      waitingUploads: countWaitingUploads(accountId, cal.calendar_url),
+      ...assigneeFields(assigneeMap.get(cal.calendar_url) ?? []),
       synced: assigneeMap.has(cal.calendar_url),
       // Die Zahl reist mit der Liste, damit die Rückfrage beim Abwählen sie
       // sofort nennen kann (#732). Ein eigener Endpunkt dafür wäre ein zweiter
@@ -751,21 +767,22 @@ async function getCalendars(accountId, { refresh = false, createClient } = {}) {
   const result = [];
   for (const cal of eventCalendars(calendars)) {
     const calColor = normalizeCalColor(cal.calendarColor) || '#4A90E2';
-    const calName = cal.displayName || 'Unnamed Calendar';
+    const calName = calendarDisplayName(cal.displayName, 'Unnamed Calendar');
     // Bekannter Kalender behaelt seinen Stand, ein neu gemeldeter kommt
     // abgewaehlt - dieselbe Opt-in-Regel wie beim Anlegen des Kontos (#732).
     const enabled = previous.get(cal.url) ?? false;
 
     db.get().prepare(`
-      INSERT INTO caldav_calendar_selection (account_id, calendar_url, calendar_name, calendar_color, enabled)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(accountId, cal.url, calName, calColor, enabled ? 1 : 0);
+      INSERT INTO caldav_calendar_selection (account_id, calendar_url, calendar_name, calendar_color, enabled, writable)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(accountId, cal.url, calName, calColor, enabled ? 1 : 0, writableColumn(cal));
 
     result.push({
       calendarUrl: cal.url,
       calendarName: calName,
       calendarColor: calColor,
       enabled,
+      writable: writableFromColumn(writableColumn(cal)),
     });
   }
 
@@ -902,6 +919,38 @@ function localUploadsOf(accountId, id = null) {
       )
       AND (? IS NULL OR e.id = ?)
   `).all(accountId, id, id);
+}
+
+/**
+ * Wie viele lokale Termine haben diesen Kalender als Ziel und warten noch
+ * auf ihren Upload (#1840)? Die Kontoeinstellungen nennen die Zahl neben
+ * einem Kalender, der keine neuen Termine annimmt: ein schon gewähltes Ziel,
+ * das sich als nur lesbar herausstellt, wird nicht still geleert.
+ */
+function countWaitingUploads(accountId, calendarUrl) {
+  return db.get().prepare(`
+    SELECT COUNT(*) AS n FROM calendar_events
+    WHERE external_source = 'local' AND target_caldav_account_id = ?
+      AND target_caldav_calendar_url = ?
+  `).get(accountId, calendarUrl).n;
+}
+
+/**
+ * Die Schreibrechte aus einer Auflistung in die Auswahl übernehmen (#1840):
+ * jeder Lauf liest sie mit, und ein Kalender, der inzwischen nur lesbar
+ * geteilt ist (oder wieder beschreibbar), steht so in der Auswahl, die die
+ * Formulare anbieten. Ein Kalender, den die Auflistung nicht nennt, bleibt,
+ * wie er war.
+ */
+function rememberCalendarWritability(accountId, serverCalendars) {
+  const update = db.get().prepare(`
+    UPDATE caldav_calendar_selection SET writable = ?
+    WHERE account_id = ? AND calendar_url = ?
+  `);
+  for (const cal of serverCalendars || []) {
+    if (!cal?.url) continue;
+    update.run(writableColumn(cal), accountId, cal.url);
+  }
 }
 
 /** Echter tsdav-Client für einen Account; in Tests durch eine Factory ersetzbar. */
@@ -1101,11 +1150,12 @@ async function runSync({ createClient } = {}) {
        external_object_url, caldav_account_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'caldav', ?, ?, ?, ?, ?, ?)
   `);
-  // EXDATE-Ausnahmen der Serie (#489/#549). Additiv (INSERT OR IGNORE): entfernt
-  // keine lokal vom Nutzer ausgenommenen Einzeltermine.
-  const insException = conn.prepare(
-    'INSERT OR IGNORE INTO calendar_event_exceptions (event_id, exception_date) VALUES (?, ?)'
-  );
+  // Die Serie einer neu angelegten Ausnahme (#2202), im selben Konto.
+  const selSeriesRow = conn.prepare(`
+    SELECT id FROM calendar_events
+    WHERE external_calendar_id = ? AND external_source = 'caldav' AND caldav_account_id IS ?
+    ORDER BY id LIMIT 1
+  `);
   // Besitzer (created_by-Fallback) einmal auflösen — konstant über den ganzen Sync.
   const ownerRow = conn.prepare('SELECT id FROM users ORDER BY id ASC LIMIT 1').get();
   const createdBy = ownerRow ? ownerRow.id : 1;
@@ -1164,6 +1214,9 @@ async function runSync({ createClient } = {}) {
         );
         continue;
       }
+
+      // Schreibrechte je Kalender für die Zielauswahl der Formulare (#1840).
+      rememberCalendarWritability(account.id, serverCalendars);
 
       // Löschaufträge für Kalender, die der Server nicht mehr nennt, haben ihr
       // Ziel erreicht (#1884). Dieselbe Auflistung schaltet unten einen
@@ -1253,10 +1306,8 @@ async function runSync({ createClient } = {}) {
 
         // Upsert external calendar metadata
         const calRefId = upsertExternalCalendar('caldav', selCal.calendar_url, selCal.calendar_name, selCal.calendar_color);
-        // Standard-Zuweisung dieses Kalenders (#459) einmal auflösen, nicht pro Event.
-        const calDefaultAssignee = db.get()
-          .prepare('SELECT default_assignee_user_id FROM external_calendars WHERE id = ?')
-          .get(calRefId)?.default_assignee_user_id ?? null;
+        // Standard-Personen dieses Kalenders (#459, #1897) einmal auflösen, nicht pro Event.
+        const calDefaultAssignees = calendarDefaultAssignees(db.get(), calRefId);
 
         // Parse and upsert events
         const calendarUids = new Set();
@@ -1415,7 +1466,7 @@ async function runSync({ createClient } = {}) {
                 reassignDefaultOnCalendarMove(db.get(), eventId, {
                   fromCalRefId: existing.calendar_ref_id,
                   toCalRefId: calRefId,
-                  toDefaultUserId: calDefaultAssignee,
+                  toDefaultUserIds: calDefaultAssignees,
                 });
               } else {
                 // Insert
@@ -1426,18 +1477,20 @@ async function runSync({ createClient } = {}) {
                 );
                 eventId = Number(inserted.lastInsertRowid);
                 changed = true;
-                // Standard-Zuweisung dieses Kalenders (#459) auf den neuen Termin.
-                assignDefaultToEvent(db.get(), eventId, calDefaultAssignee);
+                // Standard-Zuweisung dieses Kalenders (#459) auf den neuen
+                // Termin; eine Ausnahme einer Serie erbt deren Zuweisung (#2202).
+                const seriesId = ev.seriesUid ? selSeriesRow.get(ev.seriesUid, account.id)?.id ?? null : null;
+                assignNewOverride(db.get(), eventId, seriesId, calDefaultAssignees);
               }
 
               // EXDATE + ersetzte Override-Termine als Instanz-Ausnahmen ablegen,
               // damit die Expansion diese Vorkommen überspringt (#489/#549).
               // INSERT OR IGNORE meldet changes = 0, wenn die Ausnahme schon
               // steht, sodass auch hier nur echter Zuwachs als Änderung zählt.
+              // Schluessel in Format A, die alte Zeile desselben Rohwerts heilt
+              // (#2000, #2034 Schritt 5).
               if (ev.rrule && Array.isArray(ev.exdates)) {
-                for (const exDate of ev.exdates) {
-                  if (insException.run(eventId, exDate).changes > 0) changed = true;
-                }
+                if (storeImportedExceptions(conn, eventId, ev) > 0) changed = true;
               }
 
               accountEventCount++;
@@ -1504,6 +1557,11 @@ async function runSync({ createClient } = {}) {
         }
       }
 
+      // Ein Stoppsignal für jede schreibende Phase dieses Kontos (#1863,
+      // #2135): Aufräumen, Löschen, Ändern und Uploads. Nach der ersten
+      // kontoweiten Absage geht in diesem Lauf nichts mehr an das Konto.
+      const stop = outbound.createRefusalStop();
+
       // Ausgehende Löschungen und Änderungen (#593). Nach dem Inbound, weil der
       // Weg zum Objekt für Bestandstermine erst aus dessen Abruf bekannt wird;
       // der Inbound überspringt dafür alles, was hier noch aussteht.
@@ -1513,16 +1571,16 @@ async function runSync({ createClient } = {}) {
         // Die Reste nie bestätigter Uploads entfernen (#1882), in den
         // Kalendern, die dieser Lauf abgerufen hat.
         await outbound.releaseLeftoverUploads(client, {
-          source: 'caldav', accountId: account.id, calendarUrls: ownCalendarUrls,
+          source: 'caldav', accountId: account.id, calendarUrls: ownCalendarUrls, stop,
         });
         await processPendingDeletions(client, 'caldav', objectIndex, ownCalendarUrls, {
           accountId: account.id, complete: fetchedEveryCalendar, outcome: deletions,
-          isSelected: selectionOf(account.id),
+          isSelected: selectionOf(account.id), stop,
         });
         if (deletions.sent) log.info(`${deletions.sent} pending deletion(s) applied on the server.`);
         reportWaitingDeletions(account);
         const pushed = await processPendingUpdates(client, 'caldav', objectIndex, calendarsByUrl, {
-          accountId: account.id, fullRun: true,
+          accountId: account.id, fullRun: true, stop,
         });
         if (pushed) log.info(`${pushed} local change(s) pushed to the server.`);
       } catch (err) {
@@ -1535,7 +1593,8 @@ async function runSync({ createClient } = {}) {
       // Einmal je Lauf: die Zone, an der naive Zeiten haengen (#938).
       const householdZone = householdTimeZone(db.get());
 
-      const uploadGate = createUploadGate();
+      const uploadGate = createUploadGate(stop);
+      const readOnlyWaiting = new Map();
       for (const listed of localEvents) {
         // Frisch lesen (#1862): die Liste stammt von vor der Schleife, und
         // jeder Upload davor war ein await. Wer inzwischen bearbeitet wurde,
@@ -1556,6 +1615,14 @@ async function runSync({ createClient } = {}) {
           // wartenden Termin dieselbe Absage abholen.
           if (uploadGate.isClosed(targetCal.url)) continue;
 
+          // Nimmt der Kalender laut seinen Rechten keine neuen Termine an
+          // (#1840), geht keine Anfrage hinaus: die Absage wäre sicher. Der
+          // Termin bleibt lokal und wartet, die Kontoeinstellungen nennen ihn.
+          if (!acceptsNewEntries(targetCal)) {
+            readOnlyWaiting.set(targetCal.url, (readOnlyWaiting.get(targetCal.url) || 0) + 1);
+            continue;
+          }
+
           const uid     = outbound.eventUidFor(event.id);
           const icsData = buildCalDAVICS(event, householdZone);
 
@@ -1567,7 +1634,7 @@ async function runSync({ createClient } = {}) {
 
           const calRefId  = upsertExternalCalendar(
             'caldav', event.target_caldav_calendar_url,
-            targetCal.displayName || event.target_caldav_calendar_url, null
+            calendarDisplayName(targetCal.displayName, event.target_caldav_calendar_url), null
           );
           // Gebucht wird gegen den Stand NACH dem await (bookEventUpload).
           const booked = outbound.bookEventUpload(event, {
@@ -1585,6 +1652,10 @@ async function runSync({ createClient } = {}) {
             log.error(`Failed to upload event ${event.id} to CalDAV:`, err.message);
           }
         }
+      }
+      for (const [calendarUrl, waiting] of readOnlyWaiting) {
+        log.warn(`Calendar ${calendarUrl} is read-only for this account; `
+          + `${waiting} event(s) stay local until it accepts new events or they get another calendar.`);
       }
       // EINE Zeile je Kalender, der in diesem Lauf abgelehnt hat.
       uploadGate.report((calendarUrl, err, waiting) => log.error(

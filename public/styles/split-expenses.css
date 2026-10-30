@@ -72,7 +72,6 @@
 /* Die Angaben des Gruppen-Dialogs bei `budget: read` (#1265 P7): eine Zeile
  * unter der Beschreibung, eine Stufe kleiner, damit sie als Nachsatz liest. */
 .split-group-meta {
-  font-size: var(--text-sm);
   overflow-wrap: anywhere;
 }
 
@@ -130,6 +129,27 @@
   padding: 0 var(--space-1) var(--space-2);
 }
 
+/* DIE OFFENE SUCHE NIMMT DIE ZWEITE ZEILE, NICHT DER MEHR-KNOPF (R23, D13;
+ * Rest aus S1). Schmal steht die Gruppensuche als Icon neben Titel und „...".
+ * Aufgeklappt (Fokus oder Begriff) wuchs sie auf ihre volle Breite, und der
+ * Mehr-Knopf brach allein in eine eigene Zeile darunter - ein 48px-Kreis
+ * zwischen Suche und Segment. Jetzt rueckt die Suche selbst unter Titel und
+ * Knopf, wie zweispaltig (unten). Zwei Regeln statt einer Liste: `:has()`
+ * in einer Selektorliste verwirft ohne Unterstuetzung die ganze Liste (F4.2). */
+.split-panel-head.section-toolbar > label.split-search:focus-within {
+  order: 3;
+  flex: 1 0 100%;
+  max-width: none;
+  margin-inline-start: 0;
+}
+
+.split-panel-head.section-toolbar > label.split-search:has(input:not(:placeholder-shown)) {
+  order: 3;
+  flex: 1 0 100%;
+  max-width: none;
+  margin-inline-start: 0;
+}
+
 /* Die Gruppensuche steht im Kopf der Liste (.section-toolbar, R14 P1): mobil
  * als Icon neben „+", damit die erste Gruppe eine Zeile hoeher steht. Erst wo
  * die Gruppen eine eigene schmale Spalte bekommen (zweispaltig ab 976px
@@ -161,8 +181,14 @@
     box-shadow: var(--shadow-sm);
   }
 
-  .split-groups-panel .split-groups:has(> .empty-state),
   .split-groups-panel .split-groups:empty {
+    background-color: transparent;
+    box-shadow: none;
+  }
+
+  /* Eigene Regel: ein `:has()` in einer Selektorliste verwirft ohne
+   * `:has()`-Unterstuetzung die ganze Liste (F4.2). */
+  .split-groups-panel .split-groups:has(> .empty-state) {
     background-color: transparent;
     box-shadow: none;
   }
@@ -247,30 +273,24 @@
   border-top: 1px solid var(--color-border-subtle);
 }
 
-.split-group--active,
-.split-group:hover {
+/* HOVER IST NICHT AUSWAHL (R21 S7, D9; Critique a4). Beide trugen dieselbe
+ * Modultoenung: wer mit der Maus ueber die zweite Gruppe fuhr, sah zwei
+ * gewaehlte Gruppen. Gewaehlt bleibt die Toenung (wie die Auswahl in jeder
+ * Liste + Detail, layout.css); Hover ist die neutrale Flaeche einer Zeile,
+ * und nur wo es Hover gibt (Regel am Dateiende - vor einem Raster duerfen
+ * hier keine Media-Queries stehen, test:frontend-audit). */
+.split-group--active {
   background: color-mix(in srgb, var(--module-accent) var(--tint-state), var(--color-surface));
 }
 
-.split-group__avatar,
-.split-expense__icon {
-  width: 42px;
-  height: 42px;
-  flex: 0 0 42px;
-  display: grid;
-  place-items: center;
-  border-radius: var(--radius-md);
-  /* KEIN VOLLTON, UND DAS IST DIESELBE REGEL, NICHT IHRE AUSNAHME. Die
-   * Herkunfts-Regel (DESIGN.md) laesst ein Modulzeichen an MISCHSTELLEN stehen
-   * und verbietet es als Dauer-Dekor in den Listen eines einzelnen Moduls: jede
-   * Zeile sagte hier „Geteilte Ausgaben" auf eine Seite, die genau das schon
-   * im Kopf sagt. Unterschieden werden die Eintraege ohnehin vom GLYPH, nicht
-   * vom Ton - Gruppentypen und Ausgabenkategorien fuehren keine eigenen Farben.
-   * Also neutral, bis sie welche haben; dann traegt die Marke DEREN Ton im
-   * Vollton (Vollton-Regel, erster Zweig). */
-  color: var(--color-text-secondary);
-  background: var(--color-fill-well);
-}
+/* KEIN MODULTON, sondern der Ton der KATEGORIE (R22, D9). Die Herkunfts-Regel
+ * (DESIGN.md) verbietet das Modulzeichen als Dauer-Dekor in den Listen eines
+ * Moduls - das bleibt. Seit R22 traegt jede Ausgabenkategorie eine Farbe
+ * (`--tile-color`, split-expenses.js categoryTone), und die Kachel hat die Form
+ * der Lead-Kachel des Budgets (`.budget-tile`, budget.css) wie Konto und Abo;
+ * bis dahin war sie die einzige graue 42px-Kachel ohne Kante im Modul. Das
+ * Zeichen einer Gruppe steht in derselben Kachel, neutral (Gruppentypen haben
+ * keine Farbe). */
 
 .split-group__body,
 .split-expense__body,
@@ -301,7 +321,6 @@
 .split-expense__body span,
 .split-activity-item span {
   color: var(--color-text-secondary);
-  font-size: var(--text-sm);
 }
 
 /* Beleg-Marke in der Metazeile (#583): gleiche Größe wie der Text daneben,
@@ -315,6 +334,21 @@
 .split-expense__receipt svg {
   width: 14px;
   height: 14px;
+}
+
+/* Die Spalte der Gruppe: Kennzahlen, dann Kopf und Inhalt (R21 S7, D9). */
+.split-main-column {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+/* Der Traeger der Kurzzeile ist kein Kasten: breit ist die Kurzzeile aus dem
+ * Bild, und ein leerer Kasten haette der Spalte trotzdem einen Abstand vor
+ * die Karten gesetzt (16px unter der Oberkante der Gruppenliste). */
+.split-main-column > #split-glance {
+  display: contents;
 }
 
 .split-main {
@@ -393,11 +427,22 @@
 }
 
 /* Die Ausgaben stehen links neben ALLEN Abschnitten der rechten Spalte - seit
- * #1647 drei (Salden, Wiederkehrend, Verlauf). Reichte die Spanne nur ueber
- * zwei, schoebe eine lange Ausgabenliste den Verlauf unter ihr Ende. */
-.split-content-grid > .split-section:nth-child(2) {
+ * #1647 drei (Salden, Wiederkehrend, Verlauf), seit #1888/#1941 bis zu fuenf
+ * (dazu die Summen je Person und je Kategorie). Reichte die Spanne nicht ueber
+ * alle, schoebe eine lange Ausgabenliste den Verlauf unter ihr Ende. Die Liste
+ * heisst nach ihrer Rolle, nicht nach ihrer Stelle; die rechte Spalte fuellt
+ * sich in DOM-Folge um sie herum. */
+.split-content-grid > .split-section--expenses {
   grid-column: 1;
-  grid-row: 1 / span 3;
+  grid-row: 1 / span 5;
+}
+
+/* Der Kategoriefilter (#1941) steht in der Zeile des Listentitels, so breit
+ * wie sein laengster Eintrag und nie breiter als die Spalte. */
+.split-category-filter {
+  flex: 0 1 auto;
+  width: auto;
+  max-width: 100%;
 }
 
 .split-section-head {
@@ -410,6 +455,12 @@
    * sobald sie nebeneinander nicht mehr passen - ohne Umbruch schiebt der
    * Zusatz über den Kartenrand in die Nachbarkarte. */
   flex-wrap: wrap;
+}
+
+/* Die Salden ohne eigene Zeile (die einzige Schuld steht in der Kennzahl,
+ * S10-F6): nur ihre Handlung, am Ende der Zeile. */
+.split-section--folded > .split-section-head {
+  justify-content: flex-end;
 }
 
 .split-section-head > * {
@@ -475,10 +526,6 @@
   margin: 0;
   color: var(--color-text-secondary);
   font-size: var(--text-sm);
-}
-
-.split-groups-total[hidden] {
-  display: none;
 }
 
 .split-groups-total__label {
@@ -573,11 +620,14 @@ button.split-expense:hover {
 /* "Mehr laden" unter dem Verlauf (#1309). Die Liste ist Fokusziel, wenn der
  * Knopf mit der letzten Seite verschwindet - sichtbar ohne Ring, denn sie ist
  * kein Bedienelement, nur der Ort, an dem es weitergeht. */
-.split-activity-list:focus {
+.split-activity-list:focus,
+.split-expense-rows:focus {
   outline: none;
 }
 
+/* Derselbe Knopf unter den Ausgaben (#2108). */
 .split-activity-more,
+.split-expenses-more,
 .split-recurring-add {
   display: flex;
   margin: var(--space-2) auto 0;
@@ -645,7 +695,7 @@ button.split-expense:hover {
   padding-inline-end: var(--space-1);
 }
 
-.split-recurring-row .split-expense__icon {
+.split-recurring-row .split-expense__dot {
   grid-column: 1;
   grid-row: 1 / span 4;
   align-self: center;
@@ -697,13 +747,6 @@ button.split-expense:hover {
   margin-inline-end: var(--space-1);
 }
 
-/* Die Kategorie-Marke braucht 54px. In der schmalen Spalte gehoeren die dem
- * Termin, der sonst wieder umbricht; ab 400px Traegerbreite steht sie. */
-@container list-rows (max-width: 399px) {
-  .split-recurring-row .split-expense__icon {
-    display: none;
-  }
-}
 
 /* Die Frage beim Fortsetzen (#1647): zwei Antworten, jede mit ihrem Datum im
  * Text. Ein Knopf kuerzt sonst nicht und bricht nicht um - hier muss die ganze
@@ -736,7 +779,6 @@ button.split-expense:hover {
  * 16px primaer, Pflicht-Stern, Betrag als `.budget-amount-input`. Diese Regel
  * gilt nur noch den Haken-Zeilen und den Gruppen. */
 .split-form .split-check,
-.split-participants,
 .split-defaults {
   display: flex;
   flex-direction: column;
@@ -768,7 +810,6 @@ button.split-expense:hover {
 }
 
 /* Formular-Gruppen im Sheet: Inset-Well statt Kasten (tokens.css). */
-.split-participants,
 .split-defaults {
   border: none;
   border-radius: var(--radius-md);
@@ -784,16 +825,43 @@ button.split-expense:hover {
   font-weight: var(--font-weight-medium);
 }
 
+/* DIE BETEILIGTEN ALS PERSONEN-CHIPS (Critique R24 G4-Budget-P1-1):
+ * dieselbe Chip-Form wie renderUserMultiSelect (`.user-ms__option`). Gleich
+ * verteilt ist die Liste eine umbrechende Reihe; braucht die Aufteilung je
+ * Person einen Wert, wird sie ein Raster Chip | Wert. Die Zeile loest sich
+ * dafuer auf (`display: contents`), Chip und Feld stehen direkt im Raster. */
 .split-participant-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(96px, 140px);
+  grid-template-columns: minmax(0, 1fr) minmax(calc(var(--space-16) + var(--space-8)), calc(var(--space-16) + var(--space-12) + var(--space-5)));
   align-items: center;
   gap: var(--space-2);
 }
 
-.split-split-value[hidden],
-.split-default-value[hidden] {
-  display: none;
+.split-participant-list > .split-participant-row {
+  display: contents;
+}
+
+.split-participant-list:has(.split-split-value:not([hidden])) {
+  display: grid;
+  grid-template-columns: minmax(0, max-content) minmax(calc(var(--space-16) + var(--space-8)), 1fr);
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+
+.split-participant-list:has(.split-split-value:not([hidden])) .user-ms__option {
+  justify-self: start;
+  max-inline-size: 100%;
+}
+
+.split-participant-list .user-ms__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Der Kategoriepunkt einer Ausgabe (R24, E12): derselbe Punkt wie im Journal
+ * des Budgets (`.budget-entry__indicator`, budget.css), mittig zur Zeile. */
+.split-expense__dot {
+  align-self: center;
 }
 
 .split-empty-inline {
@@ -860,6 +928,7 @@ button.split-expense:hover {
        bleiben sichtbar;
      - Salden und Karten ruecken zusammen. */
   .split-layout,
+  .split-main-column,
   .split-main {
     gap: var(--space-3);
   }
@@ -1000,21 +1069,20 @@ button.split-expense:hover {
   }
 
   .split-content-grid > .split-section,
-  .split-content-grid > .split-section:nth-child(2) {
+  .split-content-grid > .split-section--expenses {
     grid-column: auto;
     grid-row: auto;
   }
 }
 
 /* Formularzeilen leben im Modal und richten sich nach dessen Container. */
-@container modal-body (max-width: 480px) {
+/* Zwei kurze Felder (Datum | Zahler, Aufteilung | Kategorie) bleiben am
+ * Telefon eine Zeile wie Datum | Konto der Buchung (R22 D9, Critique R24
+ * G4-Budget-P1-1); erst unter 320px Dialogbreite stapeln sie. */
+@container modal-body (max-width: 320px) {
   .split-form-row {
     align-items: stretch;
     flex-direction: column;
-  }
-
-  .split-participant-row {
-    grid-template-columns: 1fr;
   }
 }
 
@@ -1028,5 +1096,13 @@ button.split-expense:hover {
 
   .split-topbar > .btn {
     display: none;
+  }
+}
+
+/* Hover einer nicht gewaehlten Gruppe: neutrale Zeilenflaeche (R21 S7, Regel
+ * "Hover ist nicht Auswahl" bei `.split-group--active` oben). */
+@media (hover: hover) {
+  .split-group:not(.split-group--active):hover {
+    background: var(--color-surface-hover);
   }
 }

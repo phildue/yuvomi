@@ -33,6 +33,43 @@ function commonHost(els) {
 }
 
 /**
+ * DIE ZEICHEN EINER LANGEN LISTE KOMMEN IN SICHT-REIHENFOLGE (R20 Aufgaben,
+ * seit R22 geteilt mit dem Einkauf, D22). Jede Zeile traegt Lucide-Platzhalter;
+ * `createIcons` ueber die ganze Liste ersetzte bei 260 Zeilen rund tausend im
+ * Frame des Wechsels. Was nicht in einer Zeile steht (Gruppenkoepfe,
+ * Leerzustand) und die ersten `rowsNow` Zeilen bekommen ihre Zeichen sofort,
+ * der Rest danach in Happen je Task, sodass ein Tipp dazwischen drankommt.
+ * JE ZEILE, NICHT JE GRUPPE: eine Gruppe mit 120 Aufgaben war vorher ein
+ * einziger Happen im Frame des Wechsels. Ein neueres Zeichnen derselben Liste
+ * bricht den Rest ab; was nicht mehr im Dokument haengt, bleibt liegen.
+ *
+ * @param {Element} listEl
+ * @param {object} opts
+ * @param {string} opts.rowSelector  Selektor einer Zeile
+ * @param {number} [opts.rowsNow=30] so viele Zeilen sofort - mehr stehen auf keinem Bildschirm
+ * @param {number} [opts.chunk=120]  so viele Zeichen je Nachlauf-Task
+ */
+const iconRuns = new WeakMap();
+
+export function drawIconsInSightOrder(listEl, { rowSelector, rowsNow = 30, chunk = 120 } = {}) {
+  if (!window.lucide || !listEl) return;
+  const run = (iconRuns.get(listEl) ?? 0) + 1;
+  iconRuns.set(listEl, run);
+  const later = new Set([...listEl.querySelectorAll(rowSelector)].slice(rowsNow));
+  const rest = [];
+  for (const node of listEl.querySelectorAll('i[data-lucide]')) {
+    if (later.size && later.has(node.closest(rowSelector))) rest.push(node);
+    else window.lucide.createIcons({ el: node });
+  }
+  const next = () => {
+    if (iconRuns.get(listEl) !== run) return;
+    for (const node of rest.splice(0, chunk)) if (node.isConnected) window.lucide.createIcons({ el: node });
+    if (rest.length) setTimeout(next, 0);
+  };
+  if (rest.length) setTimeout(next, 0);
+}
+
+/**
  * Gestaffeltes Einblenden einer NodeList oder eines Arrays von Elementen -
  * EINMAL je Listentraeger (siehe `staggeredHosts`).
  * Maximal MAX_STAGGER Elemente werden verzögert, der Rest sofort eingeblendet.
@@ -93,6 +130,20 @@ export function stagger(elements, { host = null, delay = 30, duration = duration
       duration, delay: i < max ? i * delay : max * delay, easing, fill: 'backwards',
     });
   });
+}
+
+/**
+ * Gehört dieser Tastendruck einer laufenden IME-Umwandlung (Japanisch,
+ * Koreanisch, Chinesisch)? Dann bestätigt Enter das Schriftzeichen und darf
+ * weder absenden noch einen Vorschlag übernehmen. `keyCode 229` fängt Safari,
+ * das das bestätigende Enter schon mit `isComposing: false` meldet (WebKit-Bug
+ * 165004).
+ *
+ * @param {KeyboardEvent} event
+ * @returns {boolean}
+ */
+export function isImeComposing(event) {
+  return Boolean(event?.isComposing || event?.keyCode === 229);
 }
 
 /**
@@ -238,6 +289,18 @@ function closedFrame() {
  * Entscheid 26.09.: `--ease-out` warf die Nachbarn in den ersten 60ms fast ganz
  * nach oben - ein Ruck statt eines Nachrueckens).
  *
+ * ERST GLEITEN, DANN SCHLIESSEN (Critique R21, D3). Fiel die Zeile in Schritt 2
+ * sofort auf null, schrumpfte ihre Karte (`.row-carrier`) im selben Frame - die
+ * Zeilen darunter glitten aber erst noch von unten heran: die letzte war bis zu
+ * 64px lang von der Kartenkante abgeschnitten, und zwischen Karte und naechster
+ * Gruppe stand ein leeres Band derselben Hoehe (gemessen 200ms, Aufgaben und
+ * Einkauf). Jetzt misst Schritt 2 die geschlossene Lage nur (ein Frame, der nie
+ * gemalt wird), die Nachbarn gleiten per `transform` DORTHIN, und die Karte
+ * kuerzt ihre Unterkante im selben Takt per `clip-path` - erst am Ende faellt
+ * die Zeile auf null und die Bewegung ab, in einem Frame und ohne sichtbaren
+ * Unterschied (`glideThenClose`). Zeilen, die im selben Moment gehen (Einkauf:
+ * mehrere Haken in einer Pause), schliessen gemeinsam.
+ *
  * @param {Element} el
  * @param {Object} [opts]
  * @param {number} [opts.duration] - ms des Nachrueckens, Standard `--duration-lg`
@@ -257,6 +320,7 @@ export function collapseOut(el, { duration = durationToken('--duration-lg', 250)
     // Abgebrochen (eine Gegenbewegung hat die Zeile zurueckgeholt) oder
     // inzwischen ausgehaengt: kein zweiter Schritt.
     if (leaving.playState === 'idle' || el.isConnected === false) return undefined;
+    if (!reduced && canClipCards()) return closeTogether(el, { duration, easing });
     const neighbours = followingNeighbours(el);
     const before = flipSnapshotElements(neighbours);
     el.style.overflow = 'hidden';
@@ -275,12 +339,179 @@ export function collapseOut(el, { duration = durationToken('--duration-lg', 250)
 
 const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Kann der Browser eine Karte per `clip-path: inset(... round ...)` kuerzen? */
+function canClipCards() {
+  return typeof CSS !== 'undefined' && typeof CSS.supports === 'function'
+    && CSS.supports('clip-path', 'inset(0px round 1px)');
+}
+
+/**
+ * Zeilen, deren Blende im selben Moment endet, schliessen GEMEINSAM: ihre
+ * Nachbarn gleiten einmal um die Summe, statt dass die zweite Messung die
+ * erste ueberschreibt. Gesammelt wird bis zur naechsten Microtask.
+ */
+let _closing = null;
+function closeTogether(el, timing) {
+  if (!_closing) {
+    const batch = { items: [], timing };
+    _closing = batch;
+    batch.done = Promise.resolve().then(() => {
+      if (_closing === batch) _closing = null;
+      return glideThenClose(batch.items.filter((x) => x.isConnected !== false), batch.timing);
+    });
+  }
+  _closing.items.push(el);
+  return _closing.done;
+}
+
+/** Luft der Kartenkappe nach aussen, damit Schatten und Haarlinie der Karte stehen bleiben. */
+const CARD_CLIP_BLEED = 2;
+
+/**
+ * Die Vorfahren bis zum Scrollbereich, die eine sichtbare Flaeche malen
+ * (Hintergrund, Schatten, Unterkante) - die Karten, deren Unterkante mit den
+ * Zeilen hochgehen muss. Dieselbe Grenze wie `followingNeighbours`.
+ */
+function paintedAncestors(el, limit = 4) {
+  const out = [];
+  let node = el.parentElement;
+  for (let depth = 0; node && node !== document.body && depth < limit; depth += 1) {
+    const cs = getComputedStyle(node);
+    if (/^(auto|scroll)$/.test(cs.overflowY || '')) break;
+    const bg = cs.backgroundColor || '';
+    const paints = (bg && bg !== 'transparent' && !/,\s*0\)$/.test(bg))
+      || (cs.boxShadow && cs.boxShadow !== 'none')
+      || parseFloat(cs.borderBottomWidth) > 0;
+    if (paints) out.push(node);
+    node = node.parentElement;
+  }
+  return out;
+}
+
+/** Die Kappe einer Karte, `bottom` px von unten gekuerzt, mit ihren unteren Ecken. */
+function cardClip(cs, bottom) {
+  const b = CARD_CLIP_BLEED;
+  const r = (v) => { const n = parseFloat(v) || 0; return n > 0 ? n + b : 0; };
+  return `inset(${-b}px ${-b}px ${bottom}px ${-b}px round 0px 0px ${r(cs.borderBottomRightRadius)}px ${r(cs.borderBottomLeftRadius)}px)`;
+}
+
+/**
+ * Schritt 2 von collapseOut fuer eine oder mehrere Zeilen: die geschlossene
+ * Lage messen, dorthin gleiten (Nachbarn per transform, Karten per clip-path),
+ * dann in EINEM Frame schliessen und die Bewegung abnehmen.
+ */
+function glideThenClose(items, { duration, easing }) {
+  if (!items.length) return Promise.resolve();
+  const inLeaving = (n) => items.some((x) => x === n || x.contains?.(n));
+  const neighbours = [...new Set(items.flatMap((el) => followingNeighbours(el)))].filter((n) => !inLeaving(n));
+  const cards = [...new Set(items.flatMap((el) => paintedAncestors(el)))].filter((c) => !inLeaving(c));
+  const before = flipSnapshotElements(neighbours);
+  const heights = cards.map((c) => c.getBoundingClientRect().height);
+  // Die geschlossene Lage nur MESSEN: dieselbe Aufgabe nimmt sie wieder zurueck,
+  // dazwischen wird kein Frame gemalt.
+  const probes = items.map((el) => {
+    el.style.overflow = 'hidden';
+    return el.animate([closedFrame(), closedFrame()], { duration: 1, fill: 'forwards' });
+  });
+  const delta = new Map();
+  for (const [n, prev] of before) {
+    const now = n.getBoundingClientRect();
+    delta.set(n, { dx: now.left - prev.left, dy: now.top - prev.top });
+  }
+  const shrink = cards.map((c, i) => heights[i] - c.getBoundingClientRect().height);
+  const cardStyles = cards.map((c) => getComputedStyle(c));
+  probes.forEach((p) => p.cancel());
+
+  // Je Bewegung: Element, Eigenschaft und Endwert - am Ende haelt der
+  // Inline-Wert genau diese Lage, bis die Zeile geschlossen ist.
+  const moves = [];
+  for (const [n, d] of delta) {
+    // Ein Nachbar IN einem gleitenden Nachbarn faehrt dessen Weg schon mit.
+    let up = n.parentElement;
+    while (up && !delta.has(up)) up = up.parentElement;
+    const base = up ? delta.get(up) : { dx: 0, dy: 0 };
+    const dx = d.dx - base.dx;
+    const dy = d.dy - base.dy;
+    if ((Math.abs(dx) < 1 && Math.abs(dy) < 1) || typeof n.animate !== 'function') continue;
+    const to = `translate(${dx}px, ${dy}px)`;
+    moves.push({ el: n, prop: 'transform', value: to, anim: n.animate([{ transform: 'none' }, { transform: to }], { duration, easing, fill: 'forwards' }) });
+  }
+  cards.forEach((c, i) => {
+    if (shrink[i] < 1 || typeof c.animate !== 'function') return;
+    const to = cardClip(cardStyles[i], shrink[i]);
+    moves.push({ el: c, prop: 'clipPath', value: to, anim: c.animate([{ clipPath: cardClip(cardStyles[i], 0) }, { clipPath: to }], { duration, easing, fill: 'forwards' }) });
+  });
+  const close = () => {
+    for (const el of items) {
+      el.style.overflow = 'hidden';
+      el.animate([closedFrame(), closedFrame()], { duration: 1, fill: 'forwards' });
+    }
+  };
+  if (!moves.length) { close(); return Promise.resolve(); }
+  return settleAnimation(moves[0].anim, duration).then(() => new Promise((resolve) => {
+    // ERST DIE ENDLAGE ALS INLINE-WERT, EINEN FRAME SPAETER SCHLIESSEN. Die
+    // Messung der Layout-Verschiebung sieht vom Compositor gefahrene Werte
+    // nicht (holdThenGlide, R20): schloss die Zeile im selben Frame, in dem die
+    // Bewegung endete, zaehlte sie den ganzen Weg als Sprung (gemessen CLS
+    // 0,06). Mit dem gemalten Inline-Halt davor steht alles schon dort, wo das
+    // Layout es hinlegt. Im verdeckten Tab kommt kein Frame - dort sofort.
+    for (const m of moves) {
+      m.prev = m.el.style[m.prop] || '';
+      m.el.style[m.prop] = m.value;
+      // Der Browser schreibt den Wert in seiner eigenen Form zurueck - verglichen
+      // wird beim Abnehmen mit DIESER, sonst bliebe der Halt stehen.
+      m.held = m.el.style[m.prop];
+      m.anim.cancel();
+    }
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      close();
+      for (const m of moves) if (m.el.style[m.prop] === m.held) m.el.style[m.prop] = m.prev;
+      resolve();
+    };
+    if (document.visibilityState === 'hidden' || typeof requestAnimationFrame !== 'function') { finish(); return; }
+    setTimeout(finish, 500);
+    try {
+      requestAnimationFrame(() => requestAnimationFrame(finish));
+    } catch {
+      finish();
+    }
+  }));
+}
+
 /**
  * Was nachrueckt, wenn `el` auf null faellt: die folgenden Geschwister, und
  * die seiner Vorfahren bis zum naechsten Scrollbereich (eine Zeile in einer
  * Gruppe schiebt auch die Gruppen darunter). Gedeckelt - weiter unten liegt,
  * was ohnehin niemand sieht.
  */
+/**
+ * DIE TEILE IN DEN ZEILEN DES KOPFES GLEITEN MIT (R22-F, F1 Punkt 4). Der
+ * FLIP beim Ein- und Ausklappen hielt nur die direkten Kinder des Kopfes -
+ * aber beim Umordnen rueckt auch IN einer Zeile etwas: im Kalender der
+ * Zeitraum (x 64 -> 16, die Pfeile treten zurueck) und die Ansichtswahl
+ * (x 282 -> 186), beide zwei, drei Ebenen tief. Gemessen mobil in der Agenda
+ * CLS 0,0047 je Umschalten. Die Ebenen zwei und drei gleiten jetzt mit; sie
+ * stehen in Dokumentreihenfolge HINTER ihren Vorfahren, und holdThenGlide
+ * misst jedes Element erst, nachdem sein Vorfahr schon gehalten ist - der
+ * Versatz eines Kindes ist damit nur noch sein eigener Weg in der Zeile, und
+ * beide laufen mit derselben Kurve, also ist die Summe der alte Weg.
+ * Nur was gerade gezeichnet ist (ein verborgenes Element hat keine alte Lage)
+ * und keine Zeichen (SVG, `<i>`): sie gehen mit ihrem Knopf, und ein Zeichen
+ * mit eigener `transform`-Transition (der Pfeil der Ansichtswahl) liefe sonst
+ * ueber die Transition statt zu springen - gemessen schlechter (0,0001).
+ * @param {Element} toolbar
+ * @returns {Element[]}
+ */
+function nestedHeadParts(toolbar) {
+  if (typeof toolbar?.querySelectorAll !== 'function') return [];
+  return [...toolbar.querySelectorAll(':scope > * > *, :scope > * > * > *')]
+    .filter((el) => el.namespaceURI === 'http://www.w3.org/1999/xhtml' && el.tagName !== 'I'
+      && el.getClientRects().length > 0);
+}
+
 function followingNeighbours(el, limit = 60) {
   const out = [];
   let node = el;
@@ -301,10 +532,15 @@ function followingNeighbours(el, limit = 60) {
  * ein Inline-`transform` die alte Lage im Umschalt-Frame, und erst im
  * naechsten Frame uebernimmt die Animation von genau dort. Reduzierte
  * Bewegung: kein Halten, kein Gleiten - der Wechsel steht.
+ *
+ * Liefert ein Promise, das aufloest, wenn das Gleiten vorbei ist (sonst
+ * `null`): solange stehen die Elemente per transform an ihrer ALTEN Lage, und
+ * wer in dieser Zeit misst (getBoundingClientRect), misst den alten Zustand.
  * @param {Map<Element, {left: number, top: number}>} before - flipSnapshotElements()
+ * @returns {Promise<void>|null}
  */
 function holdThenGlide(before) {
-  if (!before?.size || window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return;
+  if (!before?.size || window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return null;
   const duration = durationToken('--duration-md', 200);
   const easing = easingToken('--ease-out', 'ease-out');
   const held = [];
@@ -314,24 +550,32 @@ function holdThenGlide(before) {
     const dx = prev.left - now.left;
     const dy = prev.top - now.top;
     if (Math.abs(dx) < 1 && Math.abs(dy) < 1) continue;
-    const from = `translate(${dx}px, ${dy}px)`;
-    el.style.transform = from;
-    held.push([el, from]);
+    el.style.transform = `translate(${dx}px, ${dy}px)`;
+    // Der Vergleich beim Freigeben braucht den Wert, wie der Browser ihn
+    // ablegt: er rundet Bruchteile (-147.1875px -> -147.188px), und gegen das
+    // geschriebene Literal verglichen blieb der Versatz nach dem Gleiten
+    // stehen (R21 S7, Reiter-Zeile beim Andocken um 147px verschoben).
+    held.push([el, el.style.transform]);
   }
-  if (!held.length) return;
+  if (!held.length) return null;
   // ZWEI Frames Halt: der Wechsel kommt aus einem Scroll-Ereignis, das im
   // selben Frame VOR den rAF-Rueckrufen laeuft - ein einfaches rAF raeumte
   // ihn, bevor der Frame gemalt war. Eine sofort gestartete Animation zaehlt
   // die Messung nicht (gemessen: CLS 0,055). Danach uebernimmt die Animation;
   // der Inline-Wert geht erst, wenn sie laeuft (`ready`) - sonst stuende ein
   // Frame lang die neue Lage ohne Versatz da.
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    for (const [el, from] of held) {
-      const anim = el.animate([{ transform: from }, { transform: 'none' }], { duration, easing });
-      const release = () => { if (el.style.transform === from) el.style.transform = ''; };
-      Promise.resolve(anim.ready).then(release, release);
-    }
-  }));
+  return new Promise((resolve) => {
+    // Rueckfall fuer den verdeckten Tab, in dem kein rAF kommt.
+    const fallback = setTimeout(resolve, duration + 500);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      for (const [el, from] of held) {
+        const anim = el.animate([{ transform: from }, { transform: 'none' }], { duration, easing });
+        const release = () => { if (el.style.transform === from) el.style.transform = ''; };
+        Promise.resolve(anim.ready).then(release, release);
+      }
+      setTimeout(() => { clearTimeout(fallback); resolve(); }, duration);
+    }));
+  });
 }
 
 /**
@@ -620,15 +864,78 @@ export function scheduleUndoableDelete({
     }
   };
   entry.flush = () => { finish({ keepalive: true }); };
-  entry.timer = setTimeout(() => finish(), duration);
   _pendingDeletes.add(entry);
-  window.yuvomi?.showToast(message, 'default', duration, () => {
+  const undo = () => {
     if (settled) return;
     settled = true;
     _pendingDeletes.delete(entry);
     clearTimeout(entry.timer);
     restore?.();
+  };
+  // DAS LOESCHEN HAENGT AN DER FRIST DES TOASTS, nicht an einer eigenen Uhr
+  // (Review an #2142). Die Frist steht still, solange der Toast gehalten ist:
+  // unter Zeiger und Fokus, und seit R21, waehrend der Stapel dem Mehr-Blatt
+  // weicht (`toast:hold`, utils/toast-placement.js). Ein eigener Timer loeschte
+  // nach `duration` trotzdem, und nach dem Schliessen stand ein "Rueckgaengig"
+  // da, das nichts mehr zuruecknahm. Jetzt loescht das Ende der Frist
+  // (`onExpire`): mit ihr angehalten, mit ihrer Restzeit weiter. Die eigene Uhr
+  // zaehlt nur, wenn kein Toast steht, der das zusagt (keine Shell, kein Container).
+  const shown = window.yuvomi?.showToast(message, 'default', duration, undo, {
+    onExpire: () => { finish(); },
   });
+  if (shown !== true) entry.timer = setTimeout(() => finish(), duration);
+}
+
+/**
+ * DIE QUITTUNG EINER STATUSAKTION MIT RUECKWEG (Critique R23, D6). Abhaken,
+ * Freigeben, Auschecken, Einnehmen, Abo bezahlen: die Tat ist am Server schon
+ * geschehen, und "Rueckgaengig" nimmt sie dort ECHT zurueck (Bestand, Buchung,
+ * Punkte - jede Route hat dafuer ihren Gegenweg). Anders als beim Loeschen
+ * (`scheduleUndoableDelete`) wartet hier nichts auf die Frist: wer die Seite
+ * schliesst, hat getan, was er getan hat.
+ *
+ * Der Satz ist "<Objekt> <Verb>" ("„Ibuprofen“ eingenommen.") - der Aufrufer
+ * baut ihn ueber t(), dieser Helfer nur die eine Form: kein Haekchen (der Toast
+ * traegt eine Aktion, toast-show.js), fuenf Sekunden, ein Knopf.
+ *
+ * QUITTUNG IM TIPP (Critique R24, G0-Shell-P1-2): wer das Ergebnis kennt, ehe
+ * der Server antwortet (Abhaken, Erledigen, Auschecken), quittiert sofort und
+ * reicht die laufende Anfrage als `pending` herein. "Rueckgaengig" wartet dann
+ * auf sie und nimmt erst danach zurueck; scheitert sie, tut es nichts - den
+ * Fehler meldet der Aufrufer, und sein Fehler-Toast ersetzt diesen. Vorher
+ * kam die Quittung 700-1500 ms nach dem Tipp und erschien nach einem
+ * Modulwechsel im naechsten Modul.
+ *
+ * @param {Object} opts
+ * @param {string} opts.message
+ * @param {() => Promise<void>} opts.undo  der Gegenweg am Server; wirft er, kommt `onError`
+ * @param {(err: Error) => void} [opts.onError]  Fehlersatz zeigen, Ansicht neu laden
+ * @param {string} [opts.label]  ein anderer Knopf als "Rueckgaengig" ("Alle abhaken")
+ * @param {number} [opts.duration=5000]
+ * @param {Promise<unknown>} [opts.pending]  die Anfrage, die quittiert wird, wenn sie noch laeuft
+ * @param {number} [opts.scope]  die Modul-Marke von vor der Anfrage (feedbackScope, toast-show.js)
+ * @returns {{ shown: boolean, update: (message: string) => void }} ob ein Toast
+ *          steht, und der Weg, seinen Satz nachzutragen (die naechste
+ *          Faelligkeit einer Serie kennt erst die Antwort)
+ */
+export function offerUndo({ message, undo, onError, label, duration = 5000, pending = null, scope = null }) {
+  let running = false;
+  const run = async () => {
+    if (running) return;
+    running = true;
+    if (pending) {
+      try { await pending; } catch { return; }
+    }
+    try {
+      await undo();
+    } catch (err) {
+      onError?.(err);
+    }
+  };
+  const action = label ? { label, onClick: run } : run;
+  const handle = {};
+  const shown = window.yuvomi?.showToast(message, 'default', duration, action, { scope, handle }) === true;
+  return { shown, update: (text) => handle.setMessage?.(text) };
 }
 
 /**
@@ -896,19 +1203,138 @@ export function wireCollapsingHeader(toolbar, opts = {}) {
    * gedeckelte Kopf ordnet seine Zeilen um (der Zeitraum rueckt in die
    * Titelzeile), das ist keine Strecke, die sich an den Scroll binden laesst.
    * Reduzierte Bewegung: flipPlayElements tut nichts - der Wechsel steht. */
+  // WAEHREND DES GLEITENS WIRD NICHT GEMESSEN (Critique R21, D9). Beim
+  // Ausklappen waechst der Kopf, der ResizeObserver ruft `update`, und die
+  // Zeilen stehen in diesem Moment noch per transform an ihrer EINGEKLAPPTEN
+  // Lage - die Zeilenmessung sah eine Zeile, setzte Lead 0 und nahm dem Kopf
+  // `--capped`: danach klappte er nie wieder ein (gemessen in Woche und
+  // Monat, 2. Scroll). Gemessen wird, wenn das Gleiten vorbei ist.
+  let gliding = null;
   const setCollapsed = (on, states) => {
     if (states.every((c) => toolbar.classList.contains(c) === on)) return;
-    const moving = [...toolbar.children, ...followingNeighbours(toolbar)];
+    const moving = [...toolbar.children, ...nestedHeadParts(toolbar), ...followingNeighbours(toolbar)];
     const before = flipSnapshotElements(moving);
     if (on) toolbar.classList.add(...states, 'was-collapsed');
     else toolbar.classList.remove(...states);
+    const glide = holdThenGlide(before);
+    if (!glide) return;
+    gliding = glide;
+    glide.then(() => {
+      if (gliding !== glide) return;
+      gliding = null;
+      update();
+    });
+  };
+
+  // ANDOCKEN IN DER SCROLLENDEN ARCHITEKTUR. Traegt die Reiter-Zeile den
+  // angedockten Titel (`--dock-tabs`, siehe update), rueckt die Leiste beim
+  // Andocken um seine Breite: die Reiter gleiten dorthin (derselbe FLIP wie
+  // oben), und der gewaehlte Reiter bleibt im Bild, auch wenn die Leiste jetzt
+  // scrollt.
+  const setDocked = (on) => {
+    if (toolbar.classList.contains('is-docked') === on) return;
+    const tabs = toolbar.classList.contains('page-toolbar--dock-tabs')
+      ? [...toolbar.children].find((el) => el.getAttribute('role') === 'tablist') ?? null
+      : null;
+    // Gehalten wird die Leiste selbst, nicht ihre Reiter: ihr Kasten rueckt um
+    // die Breite des Titels, und ein Kasten, der ohne Transform springt, zaehlt
+    // als Layout-Shift (gemessen 0,0091 mit gehaltenen Reitern, 0 so).
+    const before = tabs ? flipSnapshotElements([tabs]) : null;
+    toolbar.classList.toggle('is-docked', on);
+    if (!tabs) return;
+    [...tabs.children].find((tab) => tab.getAttribute('aria-selected') === 'true')
+      ?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
     holdThenGlide(before);
+  };
+
+  // DER KOPF FOLGT EINEM MODUL, DAS SEINE FLAECHE SELBST FALTET (Critique
+  // R21, D9). Der Telefon-Monat klappt sein Raster beim Hochziehen der
+  // Tagesliste auf die Woche ein - und der Kopf darueber blieb bei 117px
+  // stehen: die Liste hat meist zu wenig Reserve fuer die Regel unten, und
+  // ihre eigene Schwelle (12px) ist nicht die des Kopfes (24px). Ein solcher
+  // Port traegt `data-head-collapse="module"`; seine Scroll-Ereignisse
+  // urteilen hier nicht, und das Modul sagt per HEAD_COLLAPSE_EVENT, wann der
+  // Kopf mitfaltet - EINE Geste, EIN Zustand, derselbe Gleitweg wie beim
+  // Scrollen (setCollapsed).
+  const onModuleCollapse = (e) => {
+    const fold = toolbar.classList.contains('page-toolbar--fold-row') && foldH > 0;
+    if (!fold && !toolbar.classList.contains('page-toolbar--capped')) return;
+    setCollapsed(Boolean(e.detail?.collapsed), fold ? ['is-collapsed'] : ['is-collapsed', 'is-docked']);
+  };
+
+  // DIE FALTZEILE KOMMT BEIM HOCHSCROLLEN ZURUECK (R22 D15). Bis R21 kam
+  // sie erst ganz oben wieder (scrollTop < 8): wer im Einkauf mitten in der
+  // Liste die Liste wechseln oder suchen wollte, scrollte bis zum Anfang.
+  // Jetzt entscheidet die RICHTUNG - Safaris Werkzeugleiste, Apples
+  // `hidesBarsOnSwipe`: 24px abwaerts falten sie, 40px aufwaerts holen sie
+  // zurueck. Die Strecke zaehlt ab dem Wendepunkt (`dirAnchor` haelt den
+  // tiefsten bzw. hoechsten Stand seit der letzten Entscheidung), damit ein
+  // Zittern des Fingers nichts ausloest. Scroll-getrieben (CSS) geht das
+  // nicht: eine Zeitleiste kennt die Lage, nicht die Richtung.
+  // WAS DER UMBAU SELBST AUSLOEST, ZAEHLT NICHT. Faltet die Zeile, waechst
+  // der Port um ihre Hoehe; am Listenende klemmt der Browser dann scrollTop
+  // zurueck - ein Scroll „nach oben" ohne Finger, der die Zeile sofort
+  // zurueckholte und so pendelte. Aendert sich die Hoehe des Ports oder
+  // gleitet der Kopf noch, setzt das nur den Wendepunkt neu.
+  // Die 65-px-Koepfe der uebrigen Module bleiben bei der Lage-Regel unten.
+  const FOLD_DOWN_PX = 24;
+  const REVEAL_UP_PX = 40;
+  let dirPort = null;
+  let dirClient = 0;
+  let dirAnchor = 0;
+  const foldByDirection = (port, top) => {
+    const client = port.clientHeight;
+    const collapsed = toolbar.classList.contains('is-collapsed');
+    // Ein neuer Port beginnt ausgeklappt am Listenanfang: die erste Geste
+    // urteilt wie bis R21 nach der Lage (> 24px faltet).
+    if (port !== dirPort) {
+      dirPort = port;
+      dirClient = client;
+      dirAnchor = collapsed ? top : 0;
+    } else if (client !== dirClient || gliding) {
+      dirClient = client;
+      dirAnchor = top;
+      return;
+    }
+    if (top < 8) {
+      setCollapsed(false, ['is-collapsed']);
+      dirAnchor = top;
+      return;
+    }
+    if (collapsed) {
+      if (dirAnchor - top >= REVEAL_UP_PX) {
+        setCollapsed(false, ['is-collapsed']);
+        dirAnchor = top;
+      } else {
+        dirAnchor = Math.max(dirAnchor, top);
+      }
+      return;
+    }
+    if (top > 24 && top - dirAnchor >= FOLD_DOWN_PX) {
+      setCollapsed(true, ['is-collapsed']);
+      dirAnchor = top;
+    } else {
+      dirAnchor = Math.min(dirAnchor, top);
+    }
   };
 
   // Hysterese, damit der Kopf nicht um seine eigene Schwelle flattert.
   const onInnerScroll = (e) => {
     const port = e.target;
     if (!(port instanceof Element) || port === toolbar || toolbar.contains(port)) return;
+    if (port.closest?.(`[${HEAD_COLLAPSE_ATTR}="module"]`)) return;
+    // ERST DIE FRAGEN OHNE LAYOUT (Critique R24 G3-Quer-P2-2, G4-Budget-P3-8).
+    // Jede Messung unten verlangt ein aktuelles Layout - und je Scroll-Ereignis
+    // hatte ein anderer Lauscher oft gerade eine Klasse gewechselt (Kapsel
+    // minimiert, angedockter Titel): gemessen als erzwungenes Layout in
+    // `onInnerScroll` (Vorrat 155 ms, Abos 139 ms bei 4x CPU unter Last). Ein
+    // Kopf, der nicht falten kann, und ein Scroll ohne Geste an einem
+    // ausgeklappten Kopf entscheiden nichts - sie kommen ohne Messung aus.
+    const collapsedNow = toolbar.classList.contains('is-collapsed');
+    const foldRow = toolbar.classList.contains('page-toolbar--fold-row') && foldH > 0;
+    if (!foldRow && !toolbar.classList.contains('page-toolbar--capped')) return;
+    const byUser = Boolean(gestureTarget) && port.contains(gestureTarget);
+    if (!byUser && !collapsedNow) return;
     const reserve = port.scrollHeight - port.clientHeight;
     // EIN WAAGERECHTER STREIFEN IST NICHT DER SCROLLPORT DER SEITE. Der
     // Lauscher haengt in der Capture-Phase am Modul-Root und faengt damit auch
@@ -928,8 +1354,7 @@ export function wireCollapsingHeader(toolbar, opts = {}) {
     // Eine Faltzeile (siehe `foldRow` in update) hat keine Lead-Zone, aber
     // eine vermessene Hoehe - sie ist ihre ganze Lead-Zone. Ihre Linie bleibt
     // in beiden Zustaenden: sie ist die Kante des angedockten Kopfes.
-    const fold = toolbar.classList.contains('page-toolbar--fold-row') && foldH > 0;
-    if (!fold && !toolbar.classList.contains('page-toolbar--capped')) return;
+    const fold = foldRow;
     const states = fold ? ['is-collapsed'] : ['is-collapsed', 'is-docked'];
     // Nur kollabieren, wenn der Port das Ausklappen danach auch verkraftet -
     // sonst schiebt die zurückkehrende Kopfhöhe den Scroll auf 0, der Kopf
@@ -946,19 +1371,26 @@ export function wireCollapsingHeader(toolbar, opts = {}) {
     // eingeklappte Reserve gemessen, pendelte eine Liste, deren Reserve
     // zwischen Schwelle und Schwelle + Differenz liegt. `openH` ist die Hoehe
     // der letzten ausgeklappten Messung.
-    const shorter = !fold && toolbar.classList.contains('is-collapsed') && openH > 0
+    const shorter = !fold && collapsedNow && openH > 0
       ? Math.max(0, openH - toolbar.getBoundingClientRect().height)
       : 0;
+    // Ausgeklappt traegt die Faltzeile keinen negativen Rand - der Stil wird
+    // nur gefragt, wenn sie gefaltet ist (Fokus, Suchbegriff und offenes Menue
+    // halten sie dann trotzdem offen, layout.css).
     const unfolded = fold
-      ? reserve - Math.min(0, parseFloat(getComputedStyle(toolbar).marginBlockEnd) || 0)
+      ? reserve - (collapsedNow ? Math.min(0, parseFloat(getComputedStyle(toolbar).marginBlockEnd) || 0) : 0)
       : reserve + shorter;
     if (unfolded < (fold ? foldH : lead) + 48) {
       setCollapsed(false, states);
       return;
     }
     // Ab hier nur noch der Nutzer (siehe `gestureTarget` oben).
-    if (!gestureTarget || !port.contains(gestureTarget)) return;
+    if (!byUser) return;
     const top = port.scrollTop;
+    if (fold) {
+      foldByDirection(port, top);
+      return;
+    }
     // `was-collapsed`: ab jetzt darf der Titel beim Ausklappen einblenden
     // (layout.css, `page-title-settle-back`) - nicht schon beim Seitenaufbau.
     if (top > 24) setCollapsed(true, states);
@@ -972,6 +1404,8 @@ export function wireCollapsingHeader(toolbar, opts = {}) {
     // lead 0 ergeben und dem CSS die Grundlage entziehen, die es zum Ausklappen
     // braucht. Der Wert der ausgeklappten Form bleibt stehen.
     if (toolbar.classList.contains('is-collapsed')) return;
+    // Mitten im Gleiten stehen die Zeilen an ihrer alten Lage (setCollapsed).
+    if (gliding) return;
     // EIN KASTEN OHNE HÖHE MACHT KEINE ZEILE AUF. Ein leerer Slot bleibt im
     // Markup stehen (das Modul füllt ihn je nach Zustand) und sitzt als
     // Flex-Item mit Höhe 0 unter seinen Geschwistern - die Zeilenmessung unten
@@ -1158,7 +1592,21 @@ export function wireCollapsingHeader(toolbar, opts = {}) {
     // ueber 11 Breiten 320-1023px mit und ohne Touch: keine Route erreichte die
     // Bauart mehr - sie ist mit ihren Regeln (layout.css) entfallen.
 
-    if (lead > 0 && !capped && heading && (roomForDockTitle || fold)) {
+    // DIE REITER-ZEILE NENNT ANGEDOCKT DEN ORT (Critique R21, S7). Seit S6
+    // stehen Schichtplan, Belohnungen und Haushaltshilfe mobil wieder mit
+    // Siegel und Large Title ueber ihren Reitern (121-129px); beim Scrollen
+    // wandert der Titel weg und die Reiter kleben - ohne ein Wort, wo man ist
+    // (R9 M9, "nie ein Kopf ohne Ortsangabe"). Ein Band darunter (bis R20)
+    // kostete wieder Hoehe. Hier teilt sich die Reiter-Zeile den Platz: der
+    // angedockte Titel steht vorn, die Leiste nimmt den Rest und scrollt, wenn
+    // ihre Reiter nicht mehr passen (Werkzeugzeilen-Regel 2, wie im Budget).
+    // Die Zeile bleibt so hoch wie die Leiste - das negative `top` gilt weiter.
+    const tabRow = lead > 0 && !capped && Boolean(heading)
+      && toolbar.classList.contains('page-toolbar--tabs-title')
+      && Boolean(lastLine?.els.some((el) => el.getAttribute('role') === 'tablist'));
+    toolbar.classList.toggle('page-toolbar--dock-tabs', tabRow);
+
+    if (lead > 0 && !capped && heading && (roomForDockTitle || fold || tabRow)) {
       if (!dockTitle) {
         dockTitle = document.createElement('span');
         dockTitle.className = 'page-toolbar__dock-title';
@@ -1170,7 +1618,10 @@ export function wireCollapsingHeader(toolbar, opts = {}) {
       // triggert sich damit selbst.
       const text = heading.textContent.trim();
       if (dockTitle.textContent !== text) dockTitle.textContent = text;
-      const anchor = toolbar.querySelector(':scope > .page-toolbar__actions');
+      // In der Reiter-Zeile steht er vor der Leiste, sonst vor den Aktionen.
+      const anchor = tabRow
+        ? lastLine.els.find((el) => el.getAttribute('role') === 'tablist')
+        : toolbar.querySelector(':scope > .page-toolbar__actions');
       if (dockTitle.parentElement !== toolbar || dockTitle.nextElementSibling !== anchor) {
         toolbar.insertBefore(dockTitle, anchor);
       }
@@ -1212,7 +1663,7 @@ export function wireCollapsingHeader(toolbar, opts = {}) {
     const firstBottom = firstEl.getBoundingClientRect().bottom - toolbar.getBoundingClientRect().top;
     const overhang = Math.max(0, Math.ceil(firstBottom - lead));
     io = new IntersectionObserver(
-      ([entry]) => toolbar.classList.toggle('is-docked', !entry.isIntersecting),
+      ([entry]) => setDocked(!entry.isIntersecting),
       { root: scrollport, threshold: 0, rootMargin: `-${overhang + 1}px 0px 0px 0px` },
     );
     io.observe(firstEl);
@@ -1253,6 +1704,7 @@ export function wireCollapsingHeader(toolbar, opts = {}) {
     }
   };
   toolbar.addEventListener('beforetoggle', onMenuToggle, { capture: true });
+  toolbar.addEventListener(HEAD_COLLAPSE_EVENT, onModuleCollapse);
 
   const ro = new ResizeObserver(update);
   ro.observe(toolbar);
@@ -1275,6 +1727,7 @@ export function wireCollapsingHeader(toolbar, opts = {}) {
       for (const type of GESTURES) capped?.removeEventListener(type, onGesture, { capture: true });
       gestureTarget = null;
       toolbar.removeEventListener('beforetoggle', onMenuToggle, { capture: true });
+      toolbar.removeEventListener(HEAD_COLLAPSE_EVENT, onModuleCollapse);
       toolbar.querySelectorAll('[data-dock-fold]').forEach((el) => el.removeAttribute('data-dock-fold'));
       toolbar.style.removeProperty('--dock-fold-bar-h');
       dockTitle?.remove();
@@ -1292,6 +1745,22 @@ export function wireCollapsingHeader(toolbar, opts = {}) {
 
 /** Unter dieser Breite bliebe vom angedockten Titel nur die Ellipse. */
 export const DOCK_TITLE_MIN_WIDTH = 88;
+
+/** Ereignis am Kopf: ein Modul faltet ihn mit seiner Flaeche (wireCollapsingHeader). */
+export const HEAD_COLLAPSE_EVENT = 'yuvomi:head-collapse';
+/** Attribut am Port, dessen Scrollen den Kopf NICHT faltet - das Modul tut es per Ereignis. */
+export const HEAD_COLLAPSE_ATTR = 'data-head-collapse';
+
+/**
+ * Faltet den Kopf mit der Flaeche des Moduls (Telefon-Monat: Raster auf die
+ * Woche). Ein Kopf, der noch nicht vermessen ist, bleibt, wie er ist.
+ * @param {Element|null} toolbar - die `.page-toolbar`
+ * @param {boolean} collapsed
+ */
+export function requestHeadCollapse(toolbar, collapsed) {
+  if (!toolbar || typeof CustomEvent !== 'function') return;
+  toolbar.dispatchEvent(new CustomEvent(HEAD_COLLAPSE_EVENT, { detail: { collapsed: Boolean(collapsed) } }));
+}
 
 /**
  * Das Werkzeugmenue der Bar-Zeile (`pageToolsMenuHtml`, Kennklasse
@@ -1652,6 +2121,45 @@ function measureNavPill(nav) {
   nav.style.setProperty('--nav-pill-shift', `${g.shift}px`);
   nav.style.setProperty('--nav-item-width', `${g.itemWidth}px`);
   for (const tab of tabs) tab.classList.toggle('nav-item--pill', tab === active);
+  // FLACHER PER `scale` (R21, layout.css): der Faktor von der ausgefahrenen
+  // auf die minimierte Hoehe und sein Kehrwert fuer die Ziele.
+  const flat = navFlatScale(items.getBoundingClientRect().height, flatCapsuleHeight(nav));
+  if (flat) {
+    nav.style.setProperty('--nav-flat-scale', String(flat.scale));
+    nav.style.setProperty('--nav-flat-unscale', String(flat.unscale));
+  }
+}
+
+/**
+ * Der Stauchfaktor der minimierten Kapsel (R21). Rein, damit der Test die
+ * Rechnung pruefen kann. Null, wenn nichts zu stauchen ist.
+ * @param {number} full  ausgefahrene Hoehe (px)
+ * @param {number} flat  minimierte Hoehe (px)
+ * @returns {{scale: number, unscale: number}|null}
+ */
+export function navFlatScale(full, flat) {
+  if (!(full > 0) || !(flat > 0) || flat >= full) return null;
+  const round = (n) => Math.round(n * 1e4) / 1e4;
+  return { scale: round(flat / full), unscale: round(full / flat) };
+}
+
+/**
+ * Die minimierte Hoehe in px - aus `--nav-height-minimized`, aufgeloest am
+ * Browser statt in JS nachgerechnet (der Token ist ein calc() aus Zielgroesse
+ * und Abstand). Ein unsichtbarer Messfuehler in der Zone, einmal je Kapsel.
+ * @param {Element} nav
+ * @returns {number}
+ */
+function flatCapsuleHeight(nav) {
+  let probe = nav.querySelector?.(':scope > .nav-bottom__probe');
+  if (!probe && nav.ownerDocument?.createElement) {
+    probe = nav.ownerDocument.createElement('span');
+    probe.className = 'nav-bottom__probe';
+    probe.setAttribute('aria-hidden', 'true');
+    nav.appendChild(probe);
+  }
+  if (!probe || typeof getComputedStyle !== 'function') return 0;
+  return parseFloat(getComputedStyle(probe).minHeight) || 0;
 }
 
 /**

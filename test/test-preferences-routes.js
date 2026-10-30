@@ -941,7 +941,7 @@ test('abgelehnte Patch: ein HAUSHALTSFELD vor dem ungueltigen Feld bleibt unvera
   cfgSet('week_start', 'monday');
   await assertPatchAppliesNothing(
     { week_start: 'sunday', holiday_school_color: 'kein-hex' },
-    { status: 400, error: 'holiday_school_color muss ein gültiger Hex-Farbwert sein (z. B. #34C759).', untouched: ['week_start'] },
+    { status: 400, error: 'holiday_school_color must be a valid hex color (e.g. #34C759).', untouched: ['week_start'] },
   );
   assert.equal(db.prepare("SELECT value FROM sync_config WHERE key = 'week_start'").get().value, 'monday');
   cfgDelete('week_start');
@@ -951,7 +951,7 @@ test('abgelehnte Patch: ein NUTZERFELD vor dem ungueltigen Feld bleibt unveraend
   cfgSet('hidden_modules:user:1', '["budget"]');
   await assertPatchAppliesNothing(
     { hidden_modules: ['tasks'], holiday_school_color: 'kein-hex' },
-    { status: 400, error: 'holiday_school_color muss ein gültiger Hex-Farbwert sein (z. B. #34C759).', untouched: ['hidden_modules'] },
+    { status: 400, error: 'holiday_school_color must be a valid hex color (e.g. #34C759).', untouched: ['hidden_modules'] },
   );
   assert.equal(db.prepare("SELECT value FROM sync_config WHERE key = 'hidden_modules:user:1'").get().value, '["budget"]');
   cfgDelete('hidden_modules:user:1');
@@ -963,7 +963,7 @@ test('abgelehnte Patch: ein ADMIN-FELD vor dem ungueltigen Feld bleibt unveraend
   cfgSet('budget_mode', 'shared');
   await assertPatchAppliesNothing(
     { timezone_hint_dismissed: true, budget_mode: 'personal', holiday_school_color: 'kein-hex' },
-    { status: 400, error: 'holiday_school_color muss ein gültiger Hex-Farbwert sein (z. B. #34C759).', untouched: ['timezone_hint_dismissed', 'budget_mode'] },
+    { status: 400, error: 'holiday_school_color must be a valid hex color (e.g. #34C759).', untouched: ['timezone_hint_dismissed', 'budget_mode'] },
   );
   assert.equal(db.prepare("SELECT value FROM sync_config WHERE key = 'household_timezone_hint_dismissed'").get(), undefined);
   assert.equal(db.prepare("SELECT value FROM sync_config WHERE key = 'budget_mode'").get().value, 'shared');
@@ -990,7 +990,7 @@ test('abgelehnte Patch: ein Sync, den ein frueheres Feld anstoesst, bleibt nicht
   cfgSet('disabled_modules', '[]');
   await assertPatchAppliesNothing(
     { disabled_modules: ['health'], holiday_school_color: 'kein-hex' },
-    { status: 400, error: 'holiday_school_color muss ein gültiger Hex-Farbwert sein (z. B. #34C759).', untouched: ['disabled_modules'] },
+    { status: 400, error: 'holiday_school_color must be a valid hex color (e.g. #34C759).', untouched: ['disabled_modules'] },
   );
   cfgDelete('disabled_modules');
 });
@@ -1028,11 +1028,56 @@ test('wirft die Berechnung der Erfolgsantwort, ist die Patch nicht geschrieben (
     db.exec('DROP TABLE temp.note_categories');
   }
   assert.equal(res.status, 500);
-  assert.deepEqual(res.body, { error: 'Interner Fehler', code: 500 });
+  assert.deepEqual(res.body, { error: 'Internal server error.', code: 500 });
   assert.equal(db.inTransaction, false);
   const after = (await get()).body.data;
   assert.equal(after.week_start, 'monday', 'week_start wurde trotz 500 geschrieben');
   assert.deepEqual(after, before);
   assert.equal(db.prepare("SELECT value FROM sync_config WHERE key = 'dashboard_widgets:user:1'").get(), undefined);
   cfgDelete('week_start');
+});
+
+// --------------------------------------------------------
+// tasks_default_visibility / tasks_default_locked (#2125)
+// --------------------------------------------------------
+test('tasks_default_visibility: PUT speichert den Wert, GET liefert ihn zurueck', async () => {
+  const r = await put({ tasks_default_visibility: 'private' }, { userId: 2 });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.data.tasks_default_visibility, 'private');
+  const r2 = await get({ userId: 2 });
+  assert.equal(r2.body.data.tasks_default_visibility, 'private');
+  cfgDelete('tasks_default_visibility:user:2');
+});
+
+test('tasks_default_visibility: ein anderer Nutzer sieht den eigenen Standard, nicht den des ersten', async () => {
+  await put({ tasks_default_visibility: 'private' }, { userId: 1 });
+  const r = await get({ userId: 3 });
+  assert.equal(r.body.data.tasks_default_visibility, 'all', 'Nutzer 3 sieht nicht den Wert von Nutzer 1');
+  cfgDelete('tasks_default_visibility:user:1');
+});
+
+test('tasks_default_visibility: 400 fuer ungueltige Sichtbarkeit', async () => {
+  const r = await put({ tasks_default_visibility: 'public' });
+  assert.equal(r.status, 400);
+});
+
+test('tasks_default_locked: PUT speichert true, GET liefert true zurueck', async () => {
+  const r = await put({ tasks_default_locked: true }, { userId: 4 });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.data.tasks_default_locked, true);
+  const r2 = await get({ userId: 4 });
+  assert.equal(r2.body.data.tasks_default_locked, true);
+  cfgDelete('tasks_default_locked:user:4');
+});
+
+test('tasks_default_locked: ein anderer Nutzer erhaelt false als Standard', async () => {
+  await put({ tasks_default_locked: true }, { userId: 1 });
+  const r = await get({ userId: 5 });
+  assert.equal(r.body.data.tasks_default_locked, false, 'Nutzer 5 sieht nicht den Wert von Nutzer 1');
+  cfgDelete('tasks_default_locked:user:1');
+});
+
+test('tasks_default_locked: 400 fuer nicht-boolean', async () => {
+  const r = await put({ tasks_default_locked: 'true' });
+  assert.equal(r.status, 400);
 });

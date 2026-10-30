@@ -13,7 +13,7 @@ import { translate, resolveHouseholdLocale } from '../../utils/i18n.js';
 import { todayKey } from '../../utils/timezone.js';
 import {
   budgetFilter, mayEdit, getBudgetMode, loanSummaryRow, loadLoan, refreshLoanStatus, cents,
-  budgetCurrency, toBudgetAmount, CURRENCY_RE, validateAccountRef, addMonths,
+  budgetCurrency, toBudgetAmount, loanEntryRate, CURRENCY_RE, validateAccountRef, addMonths,
   LOAN_DIRECTIONS, bookingFor, refusal, refusals, refuse, dueDateInMonth,
 } from './helpers.js';
 
@@ -367,7 +367,7 @@ router.post('/loans', (req, res) => {
     if (money.error) errors.push(money);
     const dir = validateDirection(req.body);
     if (dir.error) errors.push(dir);
-    const account = validateAccountRef(req.body.account_id);
+    const account = validateAccountRef(req.body.account_id, budgetFilter(req, 'e', { scoped: false }));
     if (account.error) errors.push(refusal('loan_account_invalid', account.error));
     const dueDay = validateDueDay(req.body);
     if (dueDay.error) errors.push(dueDay);
@@ -476,7 +476,7 @@ router.put('/loans/:id', (req, res) => {
       if (iDir.error) iErrors.push(iDir);
       const iAccount = req.body.account_id === undefined
         ? { value: loan.account_id }
-        : validateAccountRef(req.body.account_id);
+        : validateAccountRef(req.body.account_id, budgetFilter(req, 'e', { scoped: false }));
       if (iAccount.error) iErrors.push(refusal('loan_account_invalid', iAccount.error));
       const iDueDay = validateDueDay(req.body, loan);
       if (iDueDay.error) iErrors.push(iDueDay);
@@ -536,7 +536,7 @@ router.put('/loans/:id', (req, res) => {
     if (dir.error) errors.push(dir);
     const account = req.body.account_id === undefined
       ? { value: loan.account_id }
-      : validateAccountRef(req.body.account_id);
+      : validateAccountRef(req.body.account_id, budgetFilter(req, 'e', { scoped: false }));
     if (account.error) errors.push(refusal('loan_account_invalid', account.error));
     const dueDay = validateDueDay(req.body, loan);
     if (dueDay.error) errors.push(dueDay);
@@ -620,7 +620,12 @@ router.post('/loans/:id/payments', (req, res) => {
     // Budget kennt aber nur eine Währung - der gekoppelte Eintrag wird deshalb mit
     // dem festen Kurs umgerechnet. Der Kurs wird nur hier, zum Buchungszeitpunkt,
     // angewandt: eine spätere Kursänderung lässt gebuchte Raten unberührt.
-    const budgetAmount = toBudgetAmount(paymentAmount, loan);
+    // Seit #2302 in der Waehrung des Kontos, auf das die Rate bucht.
+    const entryRate = loanEntryRate(loan, loanRow.account_id ?? null);
+    if (entryRate == null) {
+      return refuse(res, [refusal('loan_payment_rate_unavailable', 'No exchange rate is known for the account currency.')], 409);
+    }
+    const budgetAmount = cents(paymentAmount * entryRate);
     const foreign = loan.is_foreign_currency ? ` (${loan.currency})` : '';
     // Der Titel wird in der Datensprache des Haushalts gespeichert, wie schon bei
     // Geburtstagsterminen (#524/#631/#632). Grund ist derselbe: die Zeile in

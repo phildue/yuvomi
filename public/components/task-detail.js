@@ -30,20 +30,22 @@
  */
 
 import { api } from '/api.js';
-import { t, formatDate, formatTime } from '/i18n.js';
+import { t, formatTime } from '/i18n.js';
+import { dateText } from '/utils/date-format.js';
 import { openDetailView, closeDetailView, visibilityRow } from '/components/detail-view.js';
 import { closeModal, btnLoading, refocusAfterRender } from '/components/modal.js';
 import { recurrenceRow } from '/rrule-ui.js';
-import { scheduleUndoableDelete, acknowledgeCheck } from '/utils/ux.js';
+import { scheduleUndoableDelete, acknowledgeCheck, isImeComposing } from '/utils/ux.js';
 import { rowActionEl } from '/utils/row-action.js';
 import { renderMarkdownLight } from '/utils/html.js';
 import { splitKeepingLineEndings } from '/utils/markdown-checklist.js';
+import { errorSentence, isAlreadyDeleted } from '/utils/friendly-error.js';
 import { splitMentions, applyMention } from '/utils/mentions.js';
 import { refresh as refreshReminders } from '/reminders.js';
 import { parseRemindAtAsUtc } from '/utils/reminder-offset.js';
 import { isNavModuleReadOnly } from '/permissions.js';
 import { pathAccess } from '/utils/module-access.js';
-import { installPopoverMenus } from '/utils/popover-menu.js';
+import { installPopoverMenus, showPopoverMenuAt } from '/utils/popover-menu.js';
 import { zonedDateKey } from '/utils/timezone.js';
 import { historyDayLabel } from '/utils/day-label.js';
 import {
@@ -51,6 +53,7 @@ import {
   isArchived, canEditTaskDefinition, catLabel, normalizeTagList,
   docMime, docHref, docIcon, formatDueDate, seriesDoneText,
 } from '/utils/task-fields.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
 
 // --------------------------------------------------------
 // Schreibwege, die die Ansicht selbst geht
@@ -112,14 +115,20 @@ export async function deleteTaskWithUndo(id, { container = null, onChanged = () 
       // `tasks: write` + `calendar: read` in ein verschlucktes 403, und selbst
       // wenn er ankam, loeschte er nur die EIGENEN Zeilen: die Erinnerung, die
       // sich jemand anderes auf dieselbe Aufgabe gesetzt hatte, blieb stehen.
-      await api.delete(`/tasks/${id}`, { keepalive });
+      try {
+        await api.delete(`/tasks/${id}`, { keepalive });
+      } catch (err) {
+        // Schon geloescht (oder privat gestellt) ist, was gewollt war (#1909):
+        // kein Fehler, die Zeile kommt nicht zurueck.
+        if (!isAlreadyDeleted(err, 'tasks_task_not_found')) throw err;
+      }
       if (keepalive) return; // Seite verschwindet — kein UI-Refresh mehr
       refreshReminders();
       await onChanged();
     },
     restore: (err) => {
       for (const el of rows) el.style.display = '';
-      if (err) window.yuvomi.showToast(err.message ?? t('common.unknownError'), 'danger');
+      if (err) window.yuvomi.showToast(errorSentence(err), 'danger');
     },
   });
 }
@@ -144,7 +153,10 @@ export async function addSubtask(parentId, title, { onChanged = () => {} } = {})
     await onChanged();
     return res.data ?? null;
   } catch (err) {
-    window.yuvomi.showToast(err.message, 'danger');
+    // Der Satz der App, nie der des Servers (#1909). Ist die Aufgabe selbst
+    // inzwischen weg, kommt die Umgebung frisch - sie zeigt sie dann nicht mehr.
+    window.yuvomi.showToast(errorSentence(err), 'danger');
+    if (isAlreadyDeleted(err, 'tasks_parent_not_found')) await Promise.resolve(onChanged()).catch(() => {});
     return null;
   }
 }
@@ -190,11 +202,17 @@ const STATUS_ACTIONS = {
   ],
 };
 
-/** Prioritätsbadge als DOM - dieselbe Optik wie auf der Karte. */
+/**
+ * Die Prioritaet als WERT, nicht als Etikett (Critique R24, G2-Aufgaben-P2-2).
+ * Hier stand `.priority-badge` - das Etikett der Metazeile (13px, sekundaer) -
+ * mitten unter Werten in Body 17: "Offen", "Haushalt", und dazwischen "Hoch"
+ * zwei Stufen kleiner. Der Punkt bleibt die Rangmarke, der Text ist ein Wert
+ * wie jeder andere in der Leseansicht (`.detail-priority`, tasks.css).
+ */
 function priorityNode(priority) {
   if (!priority || priority === 'none') return null;
   const badge = document.createElement('span');
-  badge.className = 'priority-badge';
+  badge.className = 'detail-priority';
   const dot = document.createElement('span');
   dot.className = `priority-dot priority-dot--${priority}`;
   badge.append(dot, document.createTextNode(PRIORITY_LABELS()[priority] ?? priority));
@@ -208,7 +226,7 @@ function chipListNode(items, toLabel) {
   wrap.className = 'detail-chips';
   items.forEach((item) => {
     const chip = document.createElement('span');
-    chip.className = 'task-tag';
+    chip.className = 'tag task-tag';
     chip.textContent = toLabel(item);
     wrap.appendChild(chip);
   });
@@ -272,13 +290,22 @@ function subtaskListNode(task, ctx) {
       row.setAttribute('aria-pressed', String(status === 'done'));
       row.setAttribute('aria-label', t('tasks.subtaskMarkDone', { title }));
     }
+    // DERSELBE RING WIE IN DER ZEILE (R23, D7): `.check-ring--sm`, erledigt in
+    // Erfolgsfarbe mit Haken - bis R23 ein Lucide-Kreis von 12px, das dritte
+    // Zeichen fuer dieselbe Geste. Die Zeile ist der Knopf, der Ring nur Bild.
+    const ring = document.createElement('span');
+    ring.className = ['detail-subtask__ring', 'check-ring', 'check-ring--sm', 'check-ring--static',
+      status === 'done' ? 'check-ring--done' : ''].filter(Boolean).join(' ');
+    ring.setAttribute('aria-hidden', 'true');
     const icon = document.createElement('i');
-    icon.dataset.lucide = status === 'done' ? 'check-circle-2' : 'circle';
-    icon.className = 'icon-sm';
+    icon.dataset.lucide = 'check';
+    icon.className = 'check-ring__check';
     icon.setAttribute('aria-hidden', 'true');
+    ring.appendChild(icon);
     const label = document.createElement('span');
+    label.className = 'detail-subtask__title';
     label.textContent = title;
-    row.replaceChildren(icon, label);
+    row.replaceChildren(ring, label);
     if (window.lucide) window.lucide.createIcons({ el: row });
   };
 
@@ -308,8 +335,16 @@ function subtaskListNode(task, ctx) {
         // Elternkarte - die Liste, das Widget, der Kalendertag.
         await ctx.onChanged();
       } catch (err) {
+        window.yuvomi.showToast(errorSentence(err), 'danger');
+        if (isAlreadyDeleted(err, 'tasks_task_not_found')) {
+          // Den Teilschritt gibt es nicht mehr: die Zeile geht, die Umgebung
+          // (Fortschritt der Elternkarte) kommt frisch.
+          row.remove();
+          task.subtasks = (task.subtasks ?? []).filter((sub) => sub.id !== s.id);
+          await Promise.resolve(ctx.onChanged()).catch(() => {});
+          return;
+        }
         paint(row, previous, s.title);
-        window.yuvomi.showToast(err.message, 'danger');
       } finally {
         row.disabled = false;
       }
@@ -486,9 +521,10 @@ function documentListNode(docs) {
       link.rel = 'noopener';
       link.title = doc.name || '';
       const img = document.createElement('img');
-      img.src = `/api/v1/documents/${doc.id}/preview`;
-      img.alt = doc.name || '';
+      // `loading` vor `src`: sonst laedt Safari sofort statt faul (#2048).
       img.loading = 'lazy';
+      img.alt = doc.name || '';
+      img.src = `/api/v1/documents/${doc.id}/preview`;
       link.appendChild(img);
       grid.appendChild(link);
     }
@@ -562,8 +598,8 @@ function commentRowNode(comment, { onChanged, ctx }) {
   when.className = 'task-comment__when';
   const at = new Date(comment.updated_at || comment.created_at);
   when.textContent = comment.updated_at
-    ? t('tasks.commentEditedAt', { date: formatDate(at), time: formatTime(at) })
-    : `${formatDate(at)} ${formatTime(at)}`;
+    ? t('tasks.commentEditedAt', { date: dateText(at), time: formatTime(at) })
+    : `${dateText(at)} ${formatTime(at)}`;
 
   head.append(author, when);
 
@@ -604,13 +640,18 @@ function commentRowNode(comment, { onChanged, ctx }) {
       scheduleUndoableDelete({
         message: t('tasks.commentDeletedToast'),
         commit: async ({ keepalive }) => {
-          await api.delete(`/tasks/${comment.task_id}/comments/${comment.id}`, { keepalive });
+          try {
+            await api.delete(`/tasks/${comment.task_id}/comments/${comment.id}`, { keepalive });
+          } catch (err) {
+            // Schon geloescht ist, was gewollt war (#1909).
+            if (!isAlreadyDeleted(err, 'tasks_comment_not_found')) throw err;
+          }
           if (keepalive) return; // Seite verschwindet - kein Nachladen mehr
           await onChanged();
         },
         restore: (err) => {
           row.hidden = false;
-          if (err) window.yuvomi.showToast(err.message ?? t('common.errorGeneric'), 'danger');
+          if (err) window.yuvomi.showToast(errorSentence(err), 'danger');
         },
       });
     });
@@ -663,7 +704,11 @@ function startCommentEdit(row, comment, { onChanged, ctx }) {
       await onChanged();
     } catch (err) {
       save.disabled = false;
-      window.yuvomi.showToast(err.message ?? t('common.errorGeneric'), 'danger');
+      window.yuvomi.showToast(errorSentence(err), 'danger');
+      // Kommentar oder Aufgabe sind inzwischen weg: die Liste kommt frisch.
+      if (isAlreadyDeleted(err, 'tasks_comment_not_found') || isAlreadyDeleted(err, 'tasks_task_not_found')) {
+        await Promise.resolve(onChanged()).catch(() => {});
+      }
     }
   });
 
@@ -765,7 +810,7 @@ function wireMentionSuggest(field, ctx) {
     if (!box || !matches.length) return;
     if (e.key === 'ArrowDown')      { e.preventDefault(); active = (active + 1) % matches.length; render(); }
     else if (e.key === 'ArrowUp')   { e.preventDefault(); active = (active - 1 + matches.length) % matches.length; render(); }
-    else if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); apply(matches[active]); }
+    else if ((e.key === 'Enter' && !isImeComposing(e)) || e.key === 'Tab') { e.preventDefault(); apply(matches[active]); }
     else if (e.key === 'Escape')    { e.stopPropagation(); close(); }
   });
 
@@ -819,37 +864,64 @@ function commentsNode(task, ctx) {
 
   const form = document.createElement('form');
   form.className = 'task-comments__form';
+  // EINE ZEILE MIT DEM SENDEN IM FELD (Critique R24, G2-Aufgaben-P2-2). Hier
+  // stand eine zweizeilige Textarea mit nativem Ziehgriff und darunter ein
+  // eigener Knopf "Kommentieren" in einer eigenen Zeile; mobil lag er halb
+  // unter dem Blattfuss. Jetzt ist es das Muster von Nachrichten: einzeilig,
+  // waechst beim Tippen (`field-sizing: content`, tasks.css), der Pfeil steht
+  // im Feld - dieselbe Bauart wie das Auge im Passwortfeld.
   const field = document.createElement('textarea');
   field.className = 'input task-comment__input';
-  field.rows = 2;
+  field.rows = 1;
   field.maxLength = 5000;
   field.placeholder = t('tasks.commentPlaceholder');
   field.setAttribute('aria-label', t('tasks.commentsLabel'));
   const submit = document.createElement('button');
   submit.type = 'submit';
   // Bewusst nicht `--primary`: der auffälligste Knopf im Panel gehört der
-  // Fußzeile („Starten", „Ablegen"). Ein leuchtendes „Kommentieren" mitten im
-  // Blatt zöge die Aufmerksamkeit auf die Nebensache.
-  submit.className = 'btn btn--secondary btn--sm task-comments__submit';
-  submit.textContent = t('tasks.commentSubmit');
+  // Fußzeile („Erledigen"). Der Pfeil traegt den Akzent erst, wenn im Feld
+  // etwas steht (tasks.css, `:placeholder-shown`).
+  submit.className = 'task-comments__send';
+  submit.setAttribute('aria-label', t('tasks.commentSubmit'));
+  submit.title = t('tasks.commentSubmit');
+  const sendIcon = document.createElement('i');
+  sendIcon.dataset.lucide = 'arrow-up';
+  sendIcon.setAttribute('aria-hidden', 'true');
+  submit.appendChild(sendIcon);
   const fieldBox = document.createElement('div');
   // Eigener Träger: die Vorschlagsliste hängt relativ darin, nicht am Formular.
   fieldBox.className = 'task-comments__field';
-  fieldBox.appendChild(field);
-  form.append(fieldBox, submit);
+  fieldBox.append(field, submit);
+  form.append(fieldBox);
+  // Mit Cmd/Strg+Enter abschicken, Enter allein bleibt der Zeilenumbruch
+  // (ein Kommentar darf Absaetze haben).
+  field.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !isImeComposing(e)) {
+      e.preventDefault();
+      form.requestSubmit();
+    }
+  });
 
+  // Die Sperre steht im Handler, nicht nur am Pfeil: Cmd/Strg+Enter ruft
+  // `requestSubmit()`, das ein gesperrter Knopf nicht aufhaelt - ein zweiter
+  // Druck (oder die Tastenwiederholung) schickte denselben Kommentar samt
+  // Erwaehnungen noch einmal (Codex an #2364).
+  let saving = false;
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
+    if (saving) return;
     const value = field.value.trim();
     if (!value) return;
+    saving = true;
     submit.disabled = true;
     try {
       await api.post(`/tasks/${task.id}/comments`, { comment: value });
       field.value = '';
-      await load();
+      await reloadAfterSave(() => load());
     } catch (err) {
-      window.yuvomi.showToast(err.message ?? t('common.errorGeneric'), 'danger');
+      window.yuvomi.showToast(errorSentence(err), 'danger');
     } finally {
+      saving = false;
       submit.disabled = false;
     }
   });
@@ -867,7 +939,7 @@ function taskReminderSummary(reminders) {
     .map((r) => {
       if (!r?.remind_at) return '';
       const at = parseRemindAtAsUtc(r.remind_at);
-      return `${formatDate(at)} ${formatTime(at)}`.trim();
+      return `${dateText(at)} ${formatTime(at)}`.trim();
     })
     .filter(Boolean)
     .join(', ');
@@ -894,14 +966,14 @@ function renderTaskDetail(task, reminders = [], ctx) {
     { icon: 'circle-dot', label: t('tasks.statusLabel'), value: STATUS_LABELS()[task.status] ?? task.status },
     // Eigene Zeile statt eines Ersatzes für den Status: die Ablage sagt etwas
     // ANDERES als „offen/erledigt", nicht dasselbe anders (#688).
-    { icon: 'archive', label: t('tasks.archivedLabel'), value: isArchived(task) ? formatDate(task.archived_at) : '' },
+    { icon: 'archive', label: t('tasks.archivedLabel'), value: isArchived(task) ? dateText(task.archived_at) : '' },
     { icon: 'flag', label: t('tasks.priorityLabel'), node: priorityNode(task.priority) },
     // Nur wenn gesetzt - eine Zeile "nicht gesperrt" an jeder Aufgabe waere
     // Rauschen. Die leere `value` blendet die Zeile aus (#830).
     { icon: 'lock', label: t('tasks.lockedLabel'), value: task.locked ? t('tasks.lockedDetail') : '' },
     // FAELLIGKEIT und PERSONEN stehen seit R18 im Kopf (taskDetailHead): "Heute
     // faellig" als die eine Angabe ueber den Zeilen, die Personen als Avatare.
-    { icon: 'calendar-clock', label: t('tasks.startDateLabel'), value: task.start_date ? formatDate(task.start_date) : '' },
+    { icon: 'calendar-clock', label: t('tasks.startDateLabel'), value: task.start_date ? dateText(task.start_date) : '' },
     recurrenceRow(task.recurrence_rule, { fromCompletion: !!task.recurrence_from_completion }),
     { icon: 'folder', label: t('tasks.categoryLabel'), value: task.category && task.category !== FALLBACK_CATEGORY ? catLabel(task.category, ctx.categories) : '' },
     { icon: 'award', label: t('tasks.pointsLabel'), value: task.points ? String(task.points) : '' },
@@ -1023,7 +1095,7 @@ async function toggleDescriptionCheck(task, box) {
   } catch (err) {
     paint(!checked);
     window.yuvomi?.showToast(
-      err.status === 409 ? t('tasks.checkConflict') : (err.data?.error ?? t('common.unknownError')),
+      err.status === 409 ? t('tasks.checkConflict') : errorSentence(err, 'common.unknownError'),
       'danger',
     );
   }
@@ -1107,7 +1179,7 @@ export function openTaskDetail({
   const actions = canEdit ? [{
     id: 'task-detail-delete',
     label: t('common.delete'),
-    variant: 'danger-ghost',
+    variant: 'danger-outline',
     icon: 'trash-2',
     align: 'start',
     // Siehe closeDetailView: nach dem Löschen gibt es nichts mehr zu verwerfen,
@@ -1172,7 +1244,12 @@ export function openTaskDetail({
   // am Desktop stehen sie weiter im Fuss, und dort gibt es den Knopf nicht.
   // Seit R19 auch Loeschen: mit Loeschen, Bearbeiten, Erledigen, Wer und
   // Mehr brach der Fuss auf dem Telefon wieder auf zwei Reihen.
-  const overflowIds = ['task-detail-start', 'task-detail-archive', 'task-detail-delete'];
+  // SEIT R22 (D17) AUCH „WER HAT ERLEDIGT?": der Personenknopf stand als
+  // Icon ohne Wort hinter dem Primaerknopf - ein zweites Ziel 0px neben
+  // „Erledigen", das keiner als Frage las. Im Menue steht er als erster
+  // Eintrag mit Wort („Erledigt von ..."); die Personen gehen ueber dem
+  // Mehr-Knopf auf.
+  const overflowIds = [DOER_BUTTON_ID, 'task-detail-start', 'task-detail-archive', 'task-detail-delete'];
   if (actions.some((a) => overflowIds.includes(a.id))) {
     actions.push({ id: MORE_BUTTON_ID, label: '', variant: 'ghost', icon: 'more-horizontal' });
   }
@@ -1236,23 +1313,33 @@ function wireDetailMoreMenu(task, overflowIds, pane = null) {
   panel.setAttribute('role', 'menu');
   for (const target of targets) {
     target.classList.add('task-detail__overflow');
+    const doer = target.id === DOER_BUTTON_ID;
     const item = document.createElement('button');
     item.type = 'button';
     // Loeschen bleibt im Menue als destruktiv erkennbar.
-    item.className = target.classList.contains('btn--danger-ghost')
+    item.className = target.classList.contains('btn--danger-outline')
       ? 'popover-menu__item popover-menu__item--danger' : 'popover-menu__item';
     item.setAttribute('role', 'menuitem');
     const icon = document.createElement('i');
-    icon.dataset.lucide = target.querySelector('[data-lucide]')?.dataset.lucide
-      ?? target.querySelector('svg[data-lucide]')?.getAttribute('data-lucide') ?? 'circle';
+    icon.dataset.lucide = doer ? 'user-round-check'
+      : target.querySelector('[data-lucide]')?.dataset.lucide
+        ?? target.querySelector('svg[data-lucide]')?.getAttribute('data-lucide') ?? 'circle';
     icon.className = 'icon-md';
     icon.setAttribute('aria-hidden', 'true');
     const name = document.createElement('span');
-    name.textContent = target.querySelector('.btn__label')?.textContent ?? target.textContent.trim();
+    name.textContent = doer ? t('tasks.doneByMenuItem')
+      : target.querySelector('.btn__label')?.textContent ?? target.textContent.trim();
     item.append(icon, name);
     item.addEventListener('click', () => {
       panel.hidePopover?.();
-      if (!target.disabled) target.click();
+      if (target.disabled) return;
+      if (!doer) { target.click(); return; }
+      // Der Personenknopf ist verborgen (Rechteck 0/0) - an ihm gerechnet
+      // ginge das Menue in der Fensterecke auf. Es steht ueber dem Mehr-Knopf,
+      // an seiner Anfangskante, wo der Finger gerade war.
+      const rect = button.getBoundingClientRect?.();
+      const people = document.getElementById?.(target.getAttribute('popovertarget'));
+      showPopoverMenuAt(people, rect ? { x: rect.left, y: rect.top - 4, above: true } : undefined);
     });
     panel.appendChild(item);
   }
@@ -1336,7 +1423,7 @@ async function completeFor(task, person, button, ctx, close) {
   } catch (err) {
     stop();
     siblings.forEach((el) => { el.disabled = false; });
-    window.yuvomi.showToast(err.message ?? t('common.errorGeneric'), 'danger');
+    await sayWriteFailed(err, ctx, close);
     return;
   }
   task.status = 'done';
@@ -1399,7 +1486,7 @@ async function advanceTaskStatus(task, status, button, ctx, close = closeDetailV
     siblings.forEach((el) => { el.disabled = false; });
     // Gescheitert ist ein Schreibvorgang, kein Laden - tasks.loadError („Aufgabe
     // konnte nicht geladen werden") beschriebe den falschen Vorgang.
-    window.yuvomi.showToast(err.message ?? t('common.errorGeneric'), 'danger');
+    await sayWriteFailed(err, ctx, close);
     return;
   }
   task.status = status;
@@ -1407,9 +1494,20 @@ async function advanceTaskStatus(task, status, button, ctx, close = closeDetailV
   // gleich, und die Umgebung zeigt danach eine offene Zeile, die aussieht wie
   // diese. Ohne Serie bleibt es still wie bisher - der Knopf selbst und die
   // verschwindende Zeile sind dort die Quittung.
-  const seriesText = status === 'done' ? seriesDoneText(response) : null;
+  const seriesText = status === 'done' ? seriesDoneText(response, { title: task.title }) : null;
   if (seriesText) window.yuvomi.showToast(seriesText, 'default', SERIES_TOAST_MS);
   await afterConfirmedWrite(ctx, close);
+}
+
+/**
+ * Ein Schreibvorgang aus der Ansicht ist gescheitert: der Satz der App, nie der
+ * des Servers (#1909). Gibt es die Aufgabe nicht mehr (geloescht oder privat
+ * gestellt), hat die Ansicht nichts mehr zu zeigen - sie geht zu, und die
+ * Umgebung kommt frisch, wie nach einem Erfolg.
+ */
+async function sayWriteFailed(err, ctx, close) {
+  window.yuvomi.showToast(errorSentence(err), 'danger');
+  if (isAlreadyDeleted(err, 'tasks_task_not_found')) await afterConfirmedWrite(ctx, close);
 }
 
 /**
@@ -1455,7 +1553,7 @@ async function toggleTaskArchive(task, button, ctx, close = closeDetailView) {
     await setTaskArchived(task.id, !archived);
   } catch (err) {
     stop();
-    window.yuvomi.showToast(err.message ?? t('common.errorGeneric'), 'danger');
+    await sayWriteFailed(err, ctx, close);
     return;
   }
   task.archived_at = archived ? null : new Date().toISOString();
@@ -1510,7 +1608,8 @@ function seriesHistoryNode(task) {
       // Zeile im Haushaltsverlauf "Lea - abgehakt von Mama" ist und hier bloss
       // "Lea": genau die Auskunft, die diese Aenderung neu aufbewahrt, ginge in
       // der einen der beiden Ansichten wieder verloren (Review Runde 1).
-      who.textContent = entry.person_name || t('tasks.historyUnknownMember');
+      who.textContent = entry.person_name
+        || (entry.source === 'caldav' ? t('tasks.historyViaSync') : t('tasks.historyUnknownMember'));
       row.append(when, who);
       if (entry.done_by_user_id && entry.done_by_user_id !== entry.user_id) {
         const by = document.createElement('span');
@@ -1536,4 +1635,4 @@ function seriesHistoryNode(task) {
  * der sich die Nur-lesen-Regel (#467) an dieser Ansicht MESSEN laesst - alles
  * andere hier haengt an `openDetailView` und damit am echten DOM.
  */
-export const __test = { subtaskListNode, descriptionNode, documentListNode, doerChoices, wireDetailDoerMenu, DOER_BUTTON_ID, completeFor };
+export const __test = { subtaskListNode, descriptionNode, documentListNode, doerChoices, wireDetailDoerMenu, wireDetailMoreMenu, DOER_BUTTON_ID, completeFor, advanceTaskStatus, toggleTaskArchive, toggleDescriptionCheck, commentRowNode, startCommentEdit };

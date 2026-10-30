@@ -19,11 +19,16 @@ export { KITCHEN_MODULES } from '/utils/module-accent.js';
 export const KITCHEN_ROUTES = Object.freeze(KITCHEN_MODULES_SOURCE.map((mod) => `/${mod}`));
 export const KITCHEN_STORAGE_KEY = 'yuvomi-kitchen-tab';
 
+// TEXT-REITER OHNE ZEICHEN (R22 S9, DESIGN.md D3). Am Desktop trug die Kueche
+// als einzige Unternavigation eine Glyphe vor jedem Wort - Budget,
+// Belohnungen, Haushaltshilfe und Schichtplan fuehren nur das Wort, und mobil
+// wich das Zeichen hier ohnehin schon. Die Modulzeichen stehen in Seitenleiste
+// und Tab-Leiste; die Reiter benennen nur die Station.
 const TABS = () => [
-  { route: '/meals',    labelKey: 'nav.meals',    icon: 'utensils'      },
-  { route: '/recipes',  labelKey: 'nav.recipes',  icon: 'book-text'     },
-  { route: '/shopping', labelKey: 'nav.shopping', icon: 'shopping-cart' },
-  { route: '/pantry',   labelKey: 'nav.pantry',   icon: 'archive'       },
+  { route: '/meals',    labelKey: 'nav.meals'    },
+  { route: '/recipes',  labelKey: 'nav.recipes'  },
+  { route: '/shopping', labelKey: 'nav.shopping' },
+  { route: '/pantry',   labelKey: 'nav.pantry'   },
 ].filter(({ route }) => !window.yuvomi?.isModuleDisabled(route.slice(1)));
 
 export function getLastKitchenRoute() {
@@ -193,8 +198,13 @@ export function refreshKitchenBadges() {
  *      Seitentausch bricht eine CSS-Transition ab, eine Script-Animation laeuft
  *      weiter.
  *
- * Die Bewegung beginnt schon beim Tipp (onChange), nicht erst, wenn die neue
- * Seite steht - wie die Pille der unteren Kapsel (updateNav in router.js).
+ * DIE KAPSEL STEHT IM FRAME DES NEUEN INHALTS AM ZIEL (Critique R22, D1).
+ * Bis dahin begann sie beim Tipp zu gleiten und war am Ziel, bevor der Koerper
+ * wechselte. Jetzt bleibt die Auswahl beim Tipp stehen (`markOnNavigate:
+ * false`), und die naechste Seite zieht sie beim Wiedereinhaengen nach - im
+ * Update-Callback des Seitenwechsels, ohne Gleiten. Wie die Pille der unteren
+ * Kapsel (updateNav in router.js). Quittiert ist der Tipp durch den
+ * Druckzustand des Reiters.
  *
  * Die Kapsel selbst ist seit der Re-Critique 2026-09-27 der geteilte Baustein
  * aller Segment-Leisten (utils/segment-indicator.js): Messen, Gleiten,
@@ -233,11 +243,11 @@ function syncToLocation() {
   placeIndicator({ glide: true });
 }
 
-/** Tipp auf einen Tab: Zahlen und Kapsel ziehen sofort, die Seite folgt. */
+/**
+ * Tipp auf einen Tab: die Seite wechselt, und mit ihr Auswahl, Zahlen und
+ * Kapsel (renderKitchenTabsBar, D1).
+ */
 function onTabChosen(route) {
-  _activeRoute = route;
-  applyBadges(_lastSummary);
-  placeIndicator({ glide: true });
   // Abgelehnt loest das Promise sofort auf, angenommen nach dem Render - beide
   // Male steht danach fest, wo die App ist.
   Promise.resolve(window.yuvomi?.navigate(route)).finally(syncToLocation);
@@ -257,7 +267,9 @@ export function renderKitchenTabsBar(container, activeRoute) {
     applyBadges(_lastSummary);
     // Das Wiedereinhaengen setzt den waagrechten Scrollstand zurueck.
     scrollActiveSubTabIntoView(_bar);
-    placeIndicator({ glide: true });
+    // Ohne Gleiten und SYNCHRON: der Beobachter der Kapsel faende danach
+    // dieselbe Lage vor und gliede nicht mehr los (D1).
+    placeIndicator();
     refreshKitchenBadges();
     return _bar;
   }
@@ -276,7 +288,7 @@ export function renderKitchenTabsBar(container, activeRoute) {
     // abschaltbar). Die Leiste wird damit zur Navigation aus echten Links -
     // cmd-Klick öffnet den Vorrat im neuen Tab, wie überall sonst in der Shell.
     semantics: 'nav',
-    tabs: tabs.map(({ route, labelKey, icon }) => ({ id: route, label: t(labelKey), icon })),
+    tabs: tabs.map(({ route, labelKey }) => ({ id: route, label: t(labelKey) })),
     activeId: activeRoute,
     storageKey: KITCHEN_STORAGE_KEY,
     extraClass: 'kitchen-tabs-bar',
@@ -290,6 +302,7 @@ export function renderKitchenTabsBar(container, activeRoute) {
     // Bottom-Nav für „Küche" führt (kitchenNavButtonEl in router.js).
     sealIcon: () => moduleIconEl(MODULE_ICON.kitchen),
     insertPosition: 'afterbegin',
+    markOnNavigate: false,
     onChange: onTabChosen,
   });
   _indicator = attachSegmentIndicator(_bar, { itemSelector: '.sub-tab' });

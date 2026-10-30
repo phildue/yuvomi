@@ -126,6 +126,27 @@ export const DIALOG_SELECTOR = '[role="dialog"], .modal-panel';
  */
 export const PANE_SELECTOR = '.split-view__detail';
 
+/**
+ * DIE DETAILSPALTE IST EINE SPERRZONE, KEIN DIALOG (Critique R22, D18). Ohne
+ * Dialog richtete sich der Stapel an der Spalte aus wie an einem Dialog und
+ * landete mittig ueber ihrem Inhalt (gemessen a1: Aufgaben 1440, y 432, ueber
+ * den Tags; s1: x 883-1263 in der Spalte 738-1408). Er gehoert aber zur Liste,
+ * deren Handlung er meldet: unten in der Listenspalte, in deren Breite. Die
+ * Spalte bleibt frei wie eine Sperrzone (`keepout`), ihre Leisten ebenso.
+ *
+ * Rein, damit sie ohne Browser pruefbar ist.
+ * @param {object} input
+ * @param {DOMRect|object} input.stack  der Stapel an seinem Platz
+ * @param {DOMRect|object} input.list   die Listenspalte neben der Detailspalte
+ * @param {number} input.gap
+ * @returns {{ width: number, center: number }}
+ */
+export function listColumnDock({ stack, list, gap }) {
+  const room = Math.max(list.width - 2 * gap, 0);
+  const width = Math.min(stack.width, room) || stack.width;
+  return { width, center: list.left + list.width / 2 };
+}
+
 /** Dialog oder Detailspalte: jede Flaeche, deren Leisten der Stapel frei haelt. */
 const SURFACE_SELECTOR = `${DIALOG_SELECTOR}, ${PANE_SELECTOR}`;
 
@@ -134,6 +155,19 @@ const SURFACE_SELECTOR = `${DIALOG_SELECTOR}, ${PANE_SELECTOR}`;
  * der Stapel frei wie eine Bedienleiste. Siehe Kopf.
  */
 export const KEEPOUT_SELECTOR = '[data-toast-keepout]';
+
+/**
+ * FLAECHEN, VOR DENEN DER STAPEL GANZ WEICHT (Critique R21): `[data-toast-yield]`.
+ * Das Mehr-Blatt steht fast so hoch wie das Bild; es gab keine freie Lage, und
+ * der Rueckgaengig-Toast landete oben auf Griff und Suche (gemessen 390x844:
+ * Toast 12-66 ueber dem Blatt ab 32, die Suche ab 62). Das Blatt ist ein
+ * Startpunkt in einen anderen Raum, keine Arbeit an der Seite, deren Meldung
+ * der Toast ist. Solange es offen ist, nimmt der Stapel seine Toasts zurueck
+ * (`inert`, wie beim Weichen vor einem Dialog) und haelt ihre Frist an
+ * (`toast:hold`, utils/toast-show.js) - mit dem Schliessen kommen sie mit der
+ * Restfrist wieder, ein Rueckgaengig geht nicht verloren.
+ */
+export const YIELD_SELECTOR = '[data-toast-yield]';
 
 /** Die ausgezeichneten Bedienleisten eines Dialogs (und der Detailspalte). */
 export const ACTION_ZONE_SELECTOR =
@@ -503,6 +537,27 @@ function undock(stack) {
   clearDock(stack);
 }
 
+/** Weicht vor einer offenen `[data-toast-yield]`-Flaeche: zurueck und Frist angehalten. */
+function yieldStack(stack) {
+  for (const toast of stack.querySelectorAll('.toast')) {
+    if (toast.dataset.toastYielded) continue;
+    toast.dataset.toastYielded = '1';
+    toast.classList.add('toast--tucked');
+    toast.inert = true;
+    toast.dispatchEvent(new CustomEvent('toast:hold'));
+  }
+}
+
+/** Die Flaeche ist zu: die geweichten Toasts kommen mit ihrer Restfrist wieder. */
+function releaseYield(stack) {
+  for (const toast of stack.querySelectorAll('.toast[data-toast-yielded]')) {
+    delete toast.dataset.toastYielded;
+    toast.classList.remove('toast--tucked');
+    toast.inert = false;
+    toast.dispatchEvent(new CustomEvent('toast:release'));
+  }
+}
+
 /** Der Stapel steht wieder an seinem Platz; Zurueckgenommenes bleibt es. */
 function clearDock(stack) {
   delete stack.dataset.dock;
@@ -517,13 +572,22 @@ function clearDock(stack) {
  * @param {HTMLElement} stack
  */
 export function placeToastStack(stack) {
+  if ([...document.querySelectorAll(YIELD_SELECTOR)].some(isOpen)) {
+    yieldStack(stack);
+    clearDock(stack);
+    return null;
+  }
+  releaseYield(stack);
   undock(stack);
   const rect = stack.getBoundingClientRect();
   if (rect.height === 0) return null;
 
   const realDialogs = openDialogs();
-  const dialogEls = [...realDialogs, ...openPanes(realDialogs)];
+  const panes = openPanes(realDialogs);
   const keepout = keepoutRects(keepoutElements(realDialogs));
+  // Ohne Dialog, mit Detailspalte: unten in die Listenspalte (D18, listColumnDock).
+  if (!realDialogs.length && panes.length) return placeBesidePane(stack, rect, panes, keepout);
+  const dialogEls = [...realDialogs, ...panes];
   if (!dialogEls.length && !keepout.length) return null;
   // Ausgerichtet wird am obersten MODALEN Dialog; eine Datumswahl oder ein
   // Popover in ihm bekommt keine eigene Lage, zaehlt aber als Bedienflaeche.
@@ -624,6 +688,50 @@ export function placeToastStack(stack) {
   stack.style.setProperty('--toast-dock-top', `${decision.top}px`);
   stack.dataset.dock = 'placed';
   return decision;
+}
+
+/**
+ * Der Stapel neben der Detailspalte (D18): in Breite und Mitte der Listenspalte,
+ * senkrecht an seinem Platz - es sei denn, dort liegt eine Sperrzone oder die
+ * Spalte selbst; dann sucht chooseToastPlacement die naechste freie Hoehe.
+ */
+function placeBesidePane(stack, rect, panes, keepout) {
+  const pane = panes[panes.length - 1];
+  const list = pane.closest('.split-view')?.querySelector('.split-view__list');
+  const listRect = list && list.getClientRects().length > 0 ? list.getBoundingClientRect() : null;
+  if (!listRect || listRect.width === 0) {
+    clearDock(stack);
+    return null;
+  }
+  const gap = pxProperty(stack, '--toast-dock-gap');
+  const { width, center } = listColumnDock({ stack: rect, list: listRect, gap });
+  stack.style.setProperty('--toast-dock-width', `${width}px`);
+  stack.style.setProperty('--toast-dock-center', `${center}px`);
+  stack.dataset.dock = 'measure';
+  const height = stack.getBoundingClientRect().height;
+  const at = { top: rect.bottom - height, bottom: rect.bottom, left: center - width / 2, right: center + width / 2, width, height };
+  const viewport = { width: document.documentElement.clientWidth, height: document.documentElement.clientHeight };
+  const paneZones = panes.flatMap((p) => [p.getBoundingClientRect(), ...dialogZones(p)]);
+  const decision = chooseToastPlacement({
+    viewport,
+    gap,
+    safeTop: pxProperty(document.documentElement, '--safe-area-inset-top'),
+    safeBottom: pxProperty(document.documentElement, '--safe-area-inset-bottom'),
+    stack: at,
+    dockedHeight: height,
+    dockedWidth: width,
+    dockedCenter: center,
+    primary: at,
+    dialogs: [],
+    zones: [],
+    keepClear: uncoveredChrome(),
+    focused: null,
+    beside: false,
+    keepout: [...keepout, ...paneZones],
+  });
+  stack.style.setProperty('--toast-dock-top', `${decision ? decision.top : at.top}px`);
+  stack.dataset.dock = 'placed';
+  return decision ?? { top: at.top, covers: false };
 }
 
 /**

@@ -202,7 +202,6 @@
 }
 
 .day-header__date {
-  font-size: var(--text-sm);
   color: var(--color-text-secondary);
 }
 
@@ -487,6 +486,14 @@
   /* cursor bleibt auf der Karte: auch außerhalb des Titel-Buttons ist sie
    * per Pointer greifbar (Drag & Drop, wireDragDrop). */
   cursor: pointer;
+  transition: transform var(--transition-fast);
+}
+
+/* Druck wie jede Karte (tokens.css, Druckzustand). Ein Knopf IN der Karte
+ * (Einkauf, Kochen, Mehr) drueckt sie nicht mit - ausser ihrer Titelflaeche. */
+.meal-card:active:not(:has(button:not(.meal-card__open):active)) {
+  transform: scale(var(--press-scale-lg));
+  transition-duration: var(--duration-2xs);
 }
 
 .meal-card + .meal-card {
@@ -500,7 +507,7 @@
   display: none;
 }
 
-/* Die Titelfläche ist der Öffnen-Button der Karte (edit-meal). Sie trägt das
+/* Die Titelfläche ist der Öffnen-Button der Karte (meal-details, seit R24 E1 das Leseblatt). Sie trägt das
  * obere Karten-Padding, die Aktionszeile darunter das untere - zusammen ergibt
  * das die frühere Klickfläche der Karte, nur ohne Buttons IM Button
  * (invalides HTML, Critique 2026-08-17). */
@@ -575,7 +582,6 @@
 }
 
 .meal-card__ingredients-count {
-  font-size: var(--text-xs);
   color: var(--color-text-secondary);
   font-variant-numeric: tabular-nums;
 }
@@ -655,21 +661,17 @@
   background-color: var(--color-surface-hover);
 }
 
-/* Der Transfer trägt den MODUL-AKZENT, im Ruhezustand und auf Hover.
- *
- * Dieselbe Aktion („Auf die Einkaufsliste") hatte im Modul drei Erscheinungsformen:
- * hier ein 24px-Glyph in --color-text-disabled mit GRÜNEM Hover, im Vorrat ein
- * 48px-Glyph in --module-accent, in den Rezepten ein beschriftetes Pill (Critique
- * 2026-07-30, P1). Drei Farben für einen Weg.
- *
- * Die GRÖSSE bleibt unterschiedlich, und das ist kein Versehen: dieser Knopf sitzt
- * in einer 148px-Wochenspalte neben zwei Geschwistern, drei 48px-Ziele passen dort
- * nicht (3 × 48 = 144 von 148px). Die Trefferfläche ist über das ::before ohnehin
- * 40px bzw. auf Touch --target-lg. Was sich vereinheitlichen LÄSST, ist Ikone,
- * Farbe und Name - und die sind es jetzt: shopping-cart, --module-accent,
- * common.toShoppingList in allen vier Tabs. */
-.meal-card__action-btn--shopping {
-  color: var(--module-accent);
+/* EIN TON FUER BEIDE ZEICHEN (R24, Critique G3-Mahlzeiten-P3-2). Bis R24
+ * stand die Kochmuetze grau neben dem Wagen in Orange (`--module-accent`) - zwei
+ * Toene fuer zwei gleichrangige Wege, und der Wagen wirkte wie eine Meldung,
+ * obwohl er nur sagt „Zutaten noch nicht auf der Liste". Beide ruhen jetzt in
+ * der Sekundaertinte wie mobil; den Modulton bekommen sie erst unter dem
+ * Zeiger, als Einladung. Ikone und Name des Transfers bleiben die der vier
+ * Tabs (shopping-cart, common.toShoppingList); im Vorrat traegt der Wagen den
+ * Ton, weil er dort ZUSTAND ist (nur an knappen und leeren Artikeln). */
+.meal-card__action-btn--shopping,
+.meal-card__action-btn--recipe {
+  color: var(--color-text-secondary);
 }
 
 .meal-card__action-btn--shopping:hover {
@@ -924,8 +926,15 @@
     gap: var(--space-2);
   }
 
-  .day-header__date {
-    margin-inline-start: auto;
+  /* TAG UND DATUM STEHEN ZUSAMMEN, „+" AM ENDE (R24, Critique
+   * G3-Mahlzeiten-P3-4). Bis R24 stand der Wochentag links und das Datum
+   * rechts neben dem Plus - eine Angabe an zwei Kanten, und daneben zwei Toene
+   * (Heute-Scheibe Violett, Plus Orange). Jetzt liest der Kopf „Mi 28.10." wie
+   * das Board am Desktop; das Plus schiebt sich ans Ende und ruht in der
+   * Sekundaertinte wie jede Zeilenaktion, den Modulton bekommt es unter dem
+   * Finger. */
+  .day-header {
+    justify-content: flex-start;
   }
 
   .day-header > .day-add {
@@ -934,11 +943,12 @@
     min-width: var(--target-base);
     min-height: var(--target-base);
     margin: 0;
+    margin-inline-start: auto;
     margin-inline-end: calc(-1 * var(--space-2));
     padding: 0;
     border: none;
     border-radius: var(--radius-full);
-    color: var(--module-accent);
+    color: var(--color-text-secondary);
   }
 
   .day-header > .day-add .day-add__label {
@@ -996,6 +1006,37 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
+}
+
+/* Die Zutaten des Rezepts zum Lesen (R23, D13): eine ruhige Liste mit der
+ * Menge vorn, rechts im Kopf "Anpassen" (meals.js recipeIngredientsToRows). */
+.meal-recipe-ingredients__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.meal-recipe-ingredients__head .form-label {
+  margin: 0;
+}
+
+.meal-recipe-ingredients__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: var(--space-3);
+  list-style: none;
+  border-radius: var(--radius-md);
+  background-color: var(--color-surface-2);
+  color: var(--color-text-primary);
+  font-size: var(--text-sm);
+}
+
+.meal-recipe-ingredients__qty {
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
 }
 
 /* .ingredient-row* lebt jetzt global in layout.css (geteilt mit Rezepte-Modal,
@@ -1079,10 +1120,6 @@
 .meal-randomize-modal {
   display: grid;
   gap: var(--space-4);
-}
-
-.meal-randomize-modal__toggle {
-  align-items: center;
 }
 
 /* Vorschauzeile: sagt vor dem Klick, wie viele Slots gefüllt und wie viele
@@ -1229,10 +1266,26 @@
 @media (min-width: 1024px) {
   .meals-layout {
     display: grid;
-    /* 1024-1439px: Rezept-Sidebar schmaler (272px), damit die 7 Tagesspalten
-     * lesbare Breite behalten (Audit F-04); ab 1440px wieder volle 320px. */
-    grid-template-columns: minmax(0, 1fr) 272px;
-    gap: var(--space-4);
+    /* DIE REZEPTE STEHEN ALS LEISTE UNTER DEM PLAN (R23, D13; Critique G3
+     * "1440 mit Rezeptspalte 4,5 Tage, 1920 Spalte zu"). Als Spalte rechts
+     * kostete sie 272-320px - genau die Breite des sechsten und siebten Tags -,
+     * und weil sie deshalb von selbst einklappte, sobald die Woche nicht
+     * passte, stand sie auf keinem Laptop offen. Unter dem Plan nimmt sie der
+     * Woche keine Breite: die sieben Tage behalten die volle Inhaltsspalte,
+     * die Leiste hat ihre eigene Zeile und scrollt quer. */
+    grid-template-columns: minmax(0, 1fr);
+    /* DIE LEISTE FOLGT DEM PLAN (R24, Critique G3-Mahlzeiten-P2-1). Mit
+     * `minmax(0, 1fr)` nahm die Woche die ganze Resthoehe, und die Leiste
+     * klebte am Fensterboden: 145px leeres Band bei 1440, 325px bei 1920.
+     * `max-content` laesst die Woche so hoch wie ihr Inhalt, `0` erlaubt ihr
+     * zu schrumpfen (dann scrollt sie in sich), und `align-content: start`
+     * haelt beide Zeilen oben zusammen. */
+    grid-template-rows: minmax(0, max-content) auto;
+    align-content: start;
+    /* Die Woche misst sich an der Flaeche (Tageszeilen statt Typspalte
+     * unter 72rem, unten). */
+    container: meals-board / inline-size;
+    gap: var(--space-3);
     /* Horizontal weiter über --page-inline-pad, sonst überschreibt dieser
      * Breakpoint den Bleed-Gutter mit dem alten Festwert (Issue #577). */
     padding-inline: var(--page-inline-pad);
@@ -1386,24 +1439,47 @@
     -webkit-mask-image: linear-gradient(to left, var(--mask-opaque) calc(100% - var(--space-6)), transparent);
   }
 
+  /* Die Leiste: Titel und Hinweis auf einer Zeile, darunter die Rezepte
+   * nebeneinander in EINEM Traeger, der quer scrollt. Die Haarlinie oben
+   * trennt sie vom Plan, wie vorher die linke Kante. */
   .recipe-sidebar {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: baseline;
+    column-gap: var(--space-3);
     min-height: 0;
-    border-left: 1px solid var(--color-border-subtle);
-    padding-left: var(--space-4);
+    min-width: 0;
+    border-top: 1px solid var(--color-border-subtle);
+    padding-top: var(--space-2);
   }
 
   .recipe-sidebar__title {
     margin: 0;
-    padding: var(--space-3) 0 var(--space-2);
-    color: var(--color-text-primary);
+    padding: 0 0 var(--space-2);
   }
 
   .recipe-sidebar__hint {
-    margin: 0 0 var(--space-3);
+    margin: 0 0 var(--space-2);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: var(--color-text-secondary);
     font-size: var(--text-sm);
+  }
+
+  /* Bis die Rezepte geladen sind, steht die Leiste nicht im Fluss. Leer und
+   * sichtbar lag ihre Oberkante unten an der Flaeche und wanderte beim
+   * Fuellen um ihre Hoehe nach oben - ein Layout-Shift (0,0086 bei 1280). So
+   * erscheint sie mit ihrem Inhalt; das Raster darueber behaelt seine
+   * Oberkante. */
+  .recipe-sidebar:empty {
+    display: none;
+  }
+
+  /* Leerzustand und Liste nehmen die ganze Breite unter der Kopfzeile. */
+  .recipe-sidebar > :not(.recipe-sidebar__title):not(.recipe-sidebar__hint) {
+    grid-column: 1 / -1;
   }
 
   /* EIN TRAEGER, N ZEILEN (Critique 2026-08-10, P2 „Karte pro Zeile").
@@ -1420,13 +1496,17 @@
    * Muster wie bei `.search-result` (eea2291b). */
   .recipe-sidebar__list {
     display: grid;
-    overflow-y: auto;
+    grid-auto-flow: column;
+    grid-auto-columns: var(--meal-rail-card-width);
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
     background: var(--color-surface);
     border-radius: var(--radius-md);
-    /* Der Radius muss die Ecken der Randzeilen tatsaechlich beschneiden -
-     * ohne das steht die Fuellung der ersten Zeile quadratisch im runden
-     * Traeger. Mit `overflow-y: auto` ist die Achse ohnehin geklemmt. */
-    overflow-x: hidden;
+    /* Der Radius muss die Ecken der Randkarten tatsaechlich beschneiden -
+     * ohne das steht die Fuellung der ersten Karte quadratisch im runden
+     * Traeger. Mit `overflow-x: auto` ist die Achse ohnehin geklemmt. */
+    overflow-y: hidden;
+    --meal-rail-card-width: 13.75rem;
   }
 
   .recipe-sidebar__card {
@@ -1468,16 +1548,61 @@
    * keine Kante ueber sich und die letzte keine unter sich, ohne dass eine
    * Regel `:first-child`/`:last-child` nachpflegen muesste. */
   .recipe-sidebar__card + .recipe-sidebar__card {
-    border-top: 1px solid var(--color-border-subtle);
+    border-inline-start: 1px solid var(--color-border-subtle);
   }
 
   .recipe-sidebar__card--dragging {
     opacity: 0.5;
   }
 
+  /* Bild links, Name und Zutatenzahl daneben (R24): die Kachel sagt, was man
+   * einplant und wie viel dafuer auf die Liste kommt. Ohne Bild bleibt nur die
+   * Textspalte - kein Platzhalter. */
+  .recipe-sidebar__card-open:has(.recipe-sidebar__thumb) {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    column-gap: var(--space-3);
+  }
+
+  .recipe-sidebar__card-open:has(.recipe-sidebar__thumb) > .recipe-sidebar__card-types {
+    grid-column: 1 / -1;
+  }
+
+  .recipe-sidebar__thumb {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--target-lg);
+    height: var(--target-lg);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: var(--color-surface-2);
+    color: var(--color-text-tertiary);
+  }
+
+  .recipe-sidebar__thumb-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .recipe-sidebar__card-text {
+    display: grid;
+    gap: var(--space-0h);
+    min-width: 0;
+  }
+
   .recipe-sidebar__card-title {
     color: var(--color-text-primary);
     font-weight: var(--font-weight-semibold);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Groesse aus der Rolle Metazeile (typography.css). */
+  .recipe-sidebar__card-meta {
+    color: var(--color-text-secondary);
   }
 
   .recipe-sidebar__card-types {
@@ -1611,20 +1736,138 @@
    * „Lammkotelett / s" (Re-Critique 2026-09-27, A4). Mit `hyphens: auto` und
    * der Untergrenze von vier Zeichen je Seite steht dort „Tomaten- / suppe",
    * „Lammkote- / letts"; break-word bleibt die letzte Stufe. Die Trennung
-   * selbst erbt die Regel von der Basis (`.meal-card__title-text` oben). */
+   * selbst erbt die Regel von der Basis (`.meal-card__title-text` oben).
+   *
+   * DREI ZEILEN (R24, Critique G3-Mahlzeiten-P3-1): bei zwei standen
+   * „Überba-ckenes…" und „Lammkote-letts mit…" getrennt UND gekuerzt, waehrend
+   * die Reihe ohnehin 83-130px hoch war - die Hoehe war da, nur der Titel
+   * durfte sie nicht nehmen. Die Zeile waechst mit ihrer hoechsten Karte. */
   .meal-card__title-text {
     white-space: normal;
     display: -webkit-box;
     -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
     overflow-wrap: break-word;
+  }
+
+  /* DIE KARTE IST SO HOCH WIE IHR INHALT (R24 S13-F1, Ulas 29.10.). Bei
+   * 1024x768 stand die Snack-Reihe unter der Falz (Port 611px, Woche 684px).
+   * Zwei Hoehen kamen nicht aus dem Inhalt: die Aktionsleiste trug ihren
+   * Abstand und ihr Polster auch ohne einen Knopf (20px unter einem Titel,
+   * 16 darueber), und der Slot hielt 72px Mindesthoehe - eine leere Reihe war
+   * so hoch wie eine einzeilige Karte. Das Polster der Karte folgt der
+   * Spaltenbreite (128-140px): `--space-3` wie die Kacheln der Leiste.
+   * Gemessen 1024x768: Woche 684 -> 624px in 624px Port, kein Hochscrollen. */
+  .week-grid .meal-slot {
+    min-height: var(--target-lg);
+  }
+
+  .week-grid .meal-card__open {
+    padding: var(--space-3) var(--space-3) 0;
+  }
+
+  .week-grid .meal-card__actions {
+    padding: 0 var(--space-3) var(--space-3);
+  }
+
+  .week-grid .meal-card__actions:not(:has(*)) {
+    margin-top: 0;
+  }
+
+  /* Der Plan ist ein eigener Scrollport mit eigenem Bodenpolster
+   * (`--scrollport-pad`); darunter reicht der Abstand der Kalenderwoche. Nur
+   * ohne Leiste - mit ihr steht die Leiste unten und haelt den Seitenabstand. */
+  .meals-layout--rail-hidden {
+    padding-block-end: var(--space-4);
   }
 }
 
-@media (min-width: 1440px) {
-  .meals-layout {
-    grid-template-columns: minmax(0, 1fr) 320px;
+/* --------------------------------------------------------
+ * SIEBEN TAGE AUF DEM LAPTOP (R23, D13; Critique G3 "1280 Montag weggescrollt
+ * ohne Zeichen"). Die Typspalte links (116px) plus sieben Tage zu 140px braucht
+ * 1152px; bei 1280 hat die Woche 996px, und das Raster lief als Fenster mit
+ * ausgescrolltem Montag. Unter 72rem Flaeche wandert der Mahlzeittyp aus der
+ * Spalte in eine Zeile UEBER seine Plaetze („● Mittagessen" ueber der Reihe,
+ * wie die Abschnittskoepfe jeder Liste) - die Spalte faellt weg, und sieben
+ * Tage stehen mit mindestens 128px (bei 1280: 134px). Darunter (1024) bleibt
+ * das Fenster, mit Anriss an beiden Kanten statt der Gutter-Linie.
+ * -------------------------------------------------------- */
+@media (min-width: 1024px) {
+  @container meals-board (width < 72rem) {
+    .week-grid {
+      --meal-gutter-width: 0px;
+      /* Die Spalte 1 bleibt als Nullspalte stehen, damit Tage und Plaetze
+       * ihre Nummern (--day-col ab 2) behalten; ihre Luecke gibt der negative
+       * Rand zurueck, damit der Montag an der Titelkante steht. */
+      grid-template-columns: 0 repeat(7, minmax(128px, 1fr));
+      margin-inline-start: calc(-1 * var(--space-2));
+      scroll-padding-left: 0;
+    }
+
+    .week-grid::before {
+      display: none;
+    }
+
+    /* Der Typ als Kopf seiner Reihe: so breit wie sein Wort, ueber den
+     * Plaetzen; beim Querscrollen (1024) bleibt er an der linken Kante. */
+    .week-gutter-label {
+      grid-column: 1 / -1;
+      justify-self: start;
+      align-self: start;
+      align-items: center;
+      padding: 0;
+      margin-inline-start: var(--space-2);
+      background-color: transparent;
+    }
+
+    /* Beim Querscrollen haelt er hinter dem Anriss der Kante (24px), sonst
+     * laege sein Punkt im Verlauf. Nur dann: am Anfang steht er auf der
+     * Titelkante. */
+    .week-grid.has-fade-start .week-gutter-label {
+      left: var(--space-6);
+    }
+
+    .week-gutter-label::before {
+      margin-top: 0;
+    }
+
+    /* DIE TYPZEILE IST SO HOCH WIE IHR WORT (R24 S13-F1): das Etikett trug
+     * 20px Mindesthoehe in 24px Abstand fuer 15px Schrift. Jetzt traegt der
+     * Abstand das Wort (15px) und eine Luecke darunter; ueber ihm bleibt die
+     * Reihenluecke (8px) - mehr Luft ueber dem Kopf als unter ihm. Der
+     * Tageskopf ruht oben auf der Kopfleiste und braucht dort nur `--space-2`. */
+    .week-grid .meal-slot {
+      margin-block-start: var(--space-5);
+    }
+
+    .week-grid .day-header {
+      padding-block-start: var(--space-2);
+    }
+
+    .week-grid.has-fade-start .week-gutter-label {
+      box-shadow: none;
+    }
+
+    .week-grid.has-fade-start {
+      mask-image: linear-gradient(to right, transparent, var(--mask-opaque) var(--space-6));
+      -webkit-mask-image: linear-gradient(to right, transparent, var(--mask-opaque) var(--space-6));
+    }
+
+    [dir="rtl"] .week-grid.has-fade-start {
+      mask-image: linear-gradient(to left, transparent, var(--mask-opaque) var(--space-6));
+      -webkit-mask-image: linear-gradient(to left, transparent, var(--mask-opaque) var(--space-6));
+    }
+
+    .week-grid.has-fade-start.has-fade-end {
+      mask-image: linear-gradient(to right, transparent, var(--mask-opaque) var(--space-6), var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+      -webkit-mask-image: linear-gradient(to right, transparent, var(--mask-opaque) var(--space-6), var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+    }
+
+    [dir="rtl"] .week-grid.has-fade-start.has-fade-end {
+      mask-image: linear-gradient(to left, transparent, var(--mask-opaque) var(--space-6), var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+      -webkit-mask-image: linear-gradient(to left, transparent, var(--mask-opaque) var(--space-6), var(--mask-opaque) calc(100% - var(--space-6)), transparent);
+    }
   }
 }
 
@@ -1647,7 +1890,7 @@
 
 @media (min-width: 1024px) {
   .meals-layout--rail-hidden {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, max-content);
   }
 
   .meals-layout--rail-hidden .recipe-sidebar {

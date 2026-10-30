@@ -1,13 +1,15 @@
 import { api } from '/api.js';
-import { formatDate, formatTime, t } from '/i18n.js';
-import { esc } from '/utils/html.js';
+import { t } from '/i18n.js';
+import { dateTimeText } from '/utils/date-format.js';
+import { esc, REQUIRED_MARK } from '/utils/html.js';
 import { emptyHintEl } from '/utils/empty-state.js';
 import {
+  captureModalContext,
   closeModal,
   confirmModal,
   openModal,
   validateAll,
-  wireBlurValidation, refocusAfterRender } from '/components/modal.js';
+  wireBlurValidation, refocusAfterRender, dialogInitialFocus } from '/components/modal.js';
 import {
   createDisclosure,
   createInlineError,
@@ -18,14 +20,14 @@ import { withBusy } from '/utils/ux.js';
 import { formRowHtml, formRowsHtml } from '/utils/form-row.js';
 
 /** Das Pflichtzeichen hinter einem Etikett - Markup, kein Text (aria-hidden). */
-const REQUIRED_MARK = '<span class="required-marker" aria-hidden="true"> *</span>';
 import { renderSkeletonList } from '/utils/skeleton.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
 
 function formatSyncTime(value) {
   if (!value) return null;
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
-  return `${formatDate(date)} ${formatTime(date)}`.trim();
+  return dateTimeText(date);
 }
 
 function lastSyncDetail(value) {
@@ -254,7 +256,7 @@ function renderAccount(container, account, addressbooks, refresh, user) {
       try {
         await api.post(`/contacts/cardav/accounts/${account.id}/sync`);
         showToast(t('settings.cardavSyncSuccess'), 'success');
-        await refresh();
+        await reloadAfterSave(() => refresh());
       } catch (err) {
         showToast(err?.data?.errorCode ? errorMessage(err) : (err.message || t('settings.cardavSyncFailed')), 'danger');
       }
@@ -351,7 +353,7 @@ function renderAccount(container, account, addressbooks, refresh, user) {
     try {
       await api.post(`/contacts/cardav/accounts/${account.id}/addressbooks/refresh`);
       showToast(t('settings.addressbooksRefreshed'), 'success');
-      await refresh();
+      await reloadAfterSave(() => refresh());
     } catch (err) {
       showToast(errorMessage(err), 'danger');
     }
@@ -501,9 +503,11 @@ async function loadAccounts(container, user) {
  * leer und optional - leer lassen heißt „bestehendes behalten"; die Adressbuch-
  * Auswahl bleibt in jedem Fall erhalten.
  *
- * Passwortfeld: autocomplete="off". Gefragt ist ein bestehendes Passwort für
- * einen FREMDEN Server - "current-password" bietet das Yuvomi-Passwort an,
- * "new-password" schlägt ein generiertes vor. Beides ist hier falsch.
+ * Passwortfeld: autocomplete="new-password". Gefragt ist ein bestehendes
+ * Passwort für einen FREMDEN Server - "current-password" bietet das
+ * Yuvomi-Passwort an, und "off" ignorieren viele Browser an Passwortfeldern
+ * (MDN). "new-password" ist der Hinweis, der kein gespeichertes Passwort
+ * einfüllt; dass der Manager eines vorschlägt, ist der kleinere Schaden.
  *
  * @param {Object|null} account - null = neues Konto
  * @param {() => Promise<void>} onDone
@@ -512,6 +516,8 @@ function openAccountModal(account, onDone) {
   const isEdit = Boolean(account);
   openModal({
     title: isEdit ? t('settings.cardavEditAccount') : t('settings.cardavAddAccount'),
+    // Anlegen: erstes Pflichtfeld; Bearbeiten: am Finger der Titel (R24 D4).
+    initialFocus: dialogInitialFocus(isEdit),
     size: 'sm',
     content: `
       <form id="cardav-account-form" novalidate autocomplete="off">
@@ -543,7 +549,7 @@ function openAccountModal(account, onDone) {
             label: t('settings.cardavPasswordLabel'), labelFor: 'cardav-password',
             labelExtra: isEdit ? '' : REQUIRED_MARK, field: true,
             control: `<input class="form-input" type="password" id="cardav-password" ${isEdit ? '' : 'required'}
-                 autocomplete="off"
+                 autocomplete="new-password"
                  aria-describedby="${isEdit ? 'cardav-password-keep ' : ''}cardav-password-hint" />`,
             extra: `${isEdit ? `<small class="form-hint" id="cardav-password-keep">${t('settings.cardavPasswordKeepHint')}</small>` : ''}`
               + `<small class="form-hint" id="cardav-password-hint">${t('settings.cardavPasswordHint')}</small>`,
@@ -585,13 +591,16 @@ function openAccountModal(account, onDone) {
           password: panel.querySelector('#cardav-password').value,
         };
 
+        // Geschlossen wird nur dieser Dialog, nicht einer, der waehrend der
+        // Anfrage aufgegangen ist (#1997).
+        const modalContext = captureModalContext();
         try {
           if (isEdit) {
             await api.put(`/contacts/cardav/accounts/${account.id}`, payload);
           } else {
             await api.post('/contacts/cardav/accounts', payload);
           }
-          closeModal({ force: true });
+          closeModal({ force: true, context: modalContext });
           showToast(
             isEdit ? t('settings.cardavAccountUpdated') : t('settings.cardavAccountAdded'),
             'success',
@@ -621,3 +630,6 @@ export async function render(container, { user }) {
   await loadAccounts(container, user);
   window.lucide?.createIcons({ el: container });
 }
+
+// #1997: der Konto-Dialog, bis in seinen Speichern-Weg.
+export const __test = { openAccountModal };

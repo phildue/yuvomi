@@ -44,7 +44,9 @@ const { baseUrl: BASE } = await startTestServer({
 });
 const dbmod = await import('../server/db.js');
 const db = dbmod.get();
-const { DISPLAY_COOKIE, DISPLAY_SCOPES } = await import('../server/services/display-accounts.js');
+const {
+  DISPLAY_COOKIE, DISPLAY_SCOPES, DISPLAY_OFFLINE_GRACE_MS, OFFLINE_EXPIRES_HEADER,
+} = await import('../server/services/display-accounts.js');
 
 await fetch(`${BASE}/api/v1/auth/setup`, {
   method: 'POST',
@@ -80,7 +82,7 @@ function asDisplay(token) {
       headers: { 'Content-Type': 'application/json', Cookie: `${DISPLAY_COOKIE}=${token}` },
       body: body ? JSON.stringify(body) : undefined,
     });
-    return { status: res.status, body: await res.json().catch(() => null) };
+    return { status: res.status, headers: res.headers, body: await res.json().catch(() => null) };
   };
 }
 
@@ -383,6 +385,45 @@ test('die Rechte-Nutzlast traegt die Scope-Liste als Modulrechte', async () => {
   }
   // `read` und nicht `write`: daran haengt, dass der Anlege-Knopf verschwindet.
   assert.ok(!Object.values(modules).includes('write'), 'ein Display schreibt in keinem Modul');
+});
+
+// DIE OFFLINE-FRIST EINES DISPLAYS GLEITET (Folge von #2293). Ein Display hat
+// keine Anmeldesitzung, also keinen Cookie-Ablauf. Ohne Ablauf legte der
+// Service Worker keinen Offline-Stand an, und ein Tablett an der Wand sah
+// offline keine Listen mehr. Der Server nennt deshalb jetzt + 72 Stunden - in
+// `/auth/me` und in jeder Antwort, damit die Frist mit jedem Kontakt vorrueckt.
+test('ein Display meldet als Ablauf jetzt + 72 Stunden', async () => {
+  assert.equal(DISPLAY_OFFLINE_GRACE_MS, 72 * 60 * 60 * 1000, 'die Frist ist die entschiedene: 72 Stunden');
+  const before = Date.now();
+  const me = await asDisplay(displayToken)('GET', '/auth/me');
+  const after = Date.now();
+  assert.equal(me.status, 200);
+  const expiresAt = me.body.sessionExpiresAt;
+  assert.ok(Number.isFinite(expiresAt), `ein Display meldet einen Ablauf, war ${expiresAt}`);
+  assert.ok(expiresAt >= before + DISPLAY_OFFLINE_GRACE_MS && expiresAt <= after + DISPLAY_OFFLINE_GRACE_MS,
+    'jetzt + 72 Stunden, gemessen am Server');
+});
+
+test('jede Antwort an ein Display traegt die vorgerueckte Frist', async () => {
+  const first = await asDisplay(displayToken)('GET', '/tasks');
+  assert.equal(first.status, 200);
+  const firstAt = Number(first.headers.get(OFFLINE_EXPIRES_HEADER));
+  assert.ok(Number.isFinite(firstAt) && firstAt > Date.now(), `Listen tragen die Frist, war ${first.headers.get(OFFLINE_EXPIRES_HEADER)}`);
+  await new Promise((r) => setTimeout(r, 5));
+  const second = await asDisplay(displayToken)('GET', '/tasks');
+  assert.ok(Number(second.headers.get(OFFLINE_EXPIRES_HEADER)) > firstAt, 'ein neuer Kontakt rueckt sie vor');
+});
+
+test('der Service Worker liest die Frist aus derselben Kopfzeile', async () => {
+  const { readFileSync } = await import('node:fs');
+  const sw = readFileSync(new URL('../public/sw.js', import.meta.url), 'utf8');
+  assert.ok(sw.includes(`'${OFFLINE_EXPIRES_HEADER.toLowerCase()}'`), 'public/sw.js nennt die Kopfzeile des Servers');
+});
+
+test('eine Familiensitzung bekommt keine Display-Frist', async () => {
+  const res = await fetch(`${BASE}/api/v1/tasks`, { headers: { Cookie: (await login('admin', 'adminpass123')).cookie } });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get(OFFLINE_EXPIRES_HEADER), null);
 });
 
 test('gesperrte Module nehmen ihre Kacheln mit', async () => {
@@ -912,6 +953,10 @@ test('ein Display sieht die Verwaltungsdaten der Sync-Konten NICHT', async () =>
   assert.equal(googleDisplay.body.lastError, undefined, 'der Fehlertext fehlt');
   assert.equal(googleDisplay.body.lastErrorAt, undefined, 'und sein Zeitpunkt auch');
   assert.ok('connected' in googleDisplay.body, 'der Rest der Antwort bleibt stehen');
+  // Fehlende Variablen und Rueckrufadresse sind Einrichtung des Haushalts (#2221).
+  assert.ok(Array.isArray(alsMenschGoogle.body.missingEnv), 'Vorbedingung: die Sitzung sieht die fehlenden Variablen');
+  assert.equal(googleDisplay.body.missingEnv, undefined, 'das Display sieht sie nicht');
+  assert.equal(googleDisplay.body.redirectUri, undefined, 'und die Rueckrufadresse auch nicht');
 
   // Apple mit eigenem Fehlertext, nicht nur mit fehlendem Schluessel: ohne die
   // Zeile belegte die Probe bloss, dass das Feld leer ist - nicht, dass ein
@@ -1270,6 +1315,71 @@ test('der Katalog beschreibt den Rumpf der Kopplung', async () => {
   const create = spec?.paths?.['/api/v1/displays']?.post
     ?.requestBody?.content?.['application/json']?.schema;
   assert.deepEqual(create?.required, ['display_name']);
+});
+
+// --------------------------------------------------------
+// Wand-Parität (#1903): Mahlzeiten, Einkauf, Haushaltshilfe, Abfuhr, Vorrat
+// --------------------------------------------------------
+test('das Display-Dashboard liefert Mahlzeiten fuer die Wand, ohne sensible Felder (#1903)', async () => {
+  // Frisches Display: der geteilte displayToken ist nach dem Widerruf oben ungueltig.
+  const d = await admin('POST', '/displays', { display_name: 'WandParitaetMeals' });
+  const code = (await admin('POST', `/displays/${d.body.data.id}/pairing-code`, {})).body.data.code;
+  const wall = asDisplay((await pair(code)).token);
+
+  // Ohne Mahlzeit kann der Test nur belegen, dass das Gate oeffnet (leere Liste
+  // statt undefined). Mit einer Mahlzeit prueft er zusaetzlich, dass `notes` und
+  // `created_by` nicht durchkommen.
+  // UTC stellen: neue Date().toISOString().slice(0,10) und todayLocalKey muessen uebereinstimmen.
+  db.prepare("INSERT OR REPLACE INTO sync_config (key, value) VALUES ('household_timezone', 'UTC')").run();
+  const today = new Date().toISOString().slice(0, 10);
+  const meal = await admin('POST', '/meals', { date: today, meal_type: 'lunch', title: 'Testgericht', notes: 'Geheimes Rezept' });
+  assert.ok([200, 201].includes(meal.status), `Mahlzeit anlegen: ${meal.status} ${JSON.stringify(meal.body)}`);
+
+  const res = await wall('GET', '/dashboard?audience=household');
+  assert.equal(res.status, 200);
+  const meals = res.body.todayMeals;
+  assert.ok(Array.isArray(meals), 'todayMeals muss ein Array sein, nicht undefined');
+  assert.ok(meals.length > 0, 'die eben angelegte Mahlzeit muss erscheinen');
+  for (const m of meals) {
+    assert.ok(!('notes' in m), `notes darf kein Display erreichen (Mahlzeit ${m.id})`);
+    assert.ok(!('created_by' in m), `created_by darf kein Display erreichen (Mahlzeit ${m.id})`);
+    assert.ok('title' in m, 'title muss vorhanden sein');
+    assert.ok('meal_type' in m, 'meal_type muss vorhanden sein');
+  }
+});
+
+test('das Display-Dashboard liefert Einkauf, Haushaltshilfe, Abfuhr und Vorrat fuer die Wand (#1903)', async () => {
+  // Frisches Display: der geteilte displayToken ist nach dem Widerruf oben ungueltig.
+  const d = await admin('POST', '/displays', { display_name: 'WandParitaetData' });
+  const code = (await admin('POST', `/displays/${d.body.data.id}/pairing-code`, {})).body.data.code;
+  const wall = asDisplay((await pair(code)).token);
+
+  // EINKAUF: der Zaehler muss eine Zahl sein, nicht undefined.
+  const shopping = await admin('POST', '/shopping', { name: 'Wandliste' });
+  assert.ok([200, 201].includes(shopping.status), `Liste anlegen: ${shopping.status}`);
+  const listId = shopping.body.data?.id ?? shopping.body.id;
+  const item = await admin('POST', `/shopping/${listId}/items`, { name: 'Milch' });
+  assert.ok([200, 201].includes(item.status), `Artikel anlegen: ${item.status}`);
+
+  const res = await wall('GET', '/dashboard?audience=household');
+  assert.equal(res.status, 200);
+
+  assert.equal(typeof res.body.shoppingOpenCount, 'number', 'shoppingOpenCount muss eine Zahl sein');
+  assert.ok(res.body.shoppingOpenCount >= 1, 'mindestens ein offener Artikel');
+
+  // HAUSHALTSHILFE: alle Schluessel bleiben - householdAudienceAnswer nullt die
+  // Kennzahlen, entfernt sie aber nicht. Das haelt die Form der Antwort stabil.
+  assert.ok('housekeeping' in res.body, 'housekeeping muss vorhanden sein');
+  assert.equal(res.body.housekeeping.unpaidAmount, 0, 'unpaidAmount ist 0 (nullt, nicht fehlt)');
+  assert.equal(res.body.housekeeping.visitsThisMonth, 0, 'visitsThisMonth ist 0 (nullt, nicht fehlt)');
+  assert.ok('configured' in res.body.housekeeping, 'configured muss vorhanden sein');
+  assert.ok('present' in res.body.housekeeping, 'present muss vorhanden sein');
+
+  // ABFUHR: die Liste muss vorhanden sein (auch wenn sie heute leer ist).
+  assert.ok(Array.isArray(res.body.wastePickups), 'wastePickups muss ein Array sein');
+
+  // VORRAT: muss vorhanden sein (null oder Objekt, nie undefined).
+  assert.ok('pantryExpiring' in res.body, 'pantryExpiring muss vorhanden sein');
 });
 
 // --------------------------------------------------------

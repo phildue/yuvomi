@@ -131,21 +131,14 @@
    *
    * Er ist dort auch kein Chrome mehr, sondern ein Knopf im Inhalt, und für
    * den gilt die Primärknopf-Form aus DESIGN.md: deckende Fläche, kein Blur,
-   * kein Sheen. Dieselbe Regel, die Glas ohnehin auf die Shell beschränkt. */
-  .page-fab--docked {
-    /* `var(--neutral-950)` und NICHT das Literal `#0E0D0B` (Critique
-     * 2026-08-13, zweite Runde). Beide sind im hellen Theme derselbe Wert -
-     * aber das Token kippt im Dunkelmodus auf `#FBFAF7`, und genau das ist
-     * hier gewollt: der angedockte Knopf soll gegen den Grund seines Themes
-     * mischen, nicht immer gegen Schwarz. Als Literal war die
-     * Theme-Abhaengigkeit beim Kopieren verlorengegangen. */
-    background-color: color-mix(in srgb, var(--color-accent) 88%, var(--neutral-950));
-    box-shadow: var(--shadow-sm);
-  }
-
-  .page-fab--docked:hover {
-    background-color: color-mix(in srgb, var(--color-accent) 76%, var(--neutral-950));
-  }
+   * kein Sheen. Dieselbe Regel, die Glas ohnehin auf die Shell beschränkt.
+   *
+   * EINE EIGENE REGEL BRAUCHT ER DAFÜR NICHT. Fläche, Hover und Schatten
+   * kommen von `.btn--primary` (layout.css und Abschnitt 4 unten): dieselbe
+   * 88-%/76-%-Mischung gegen `--neutral-950`, das im Dunkelmodus mitkippt.
+   * Bis 2026-10-22 stand hier eine `.page-fab--docked`-Regel, die Fläche und
+   * Hover wortgleich wiederholte; ihr Schatten verlor gegen `.btn--primary` in
+   * Abschnitt 4 (test:page-fab-docked-browser). */
 }
 
 /* ================================================================
@@ -231,9 +224,10 @@
 
 /* Blur nur wenn unterstützt */
 @supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
-  /* Der Grund des nativen Dialogs (`::backdrop`, D7) traegt dasselbe Glas. */
+  /* Der Grund des nativen Dialogs (`.modal-overlay__scrim`, #1801) traegt
+   * dasselbe Glas. */
   .modal-overlay,
-  dialog.modal-overlay::backdrop,
+  .modal-overlay__scrim,
   dialog.dialog-surface::backdrop {
     background-color: var(--color-overlay-glass);
     backdrop-filter: var(--blur-xs) saturate(120%);
@@ -604,6 +598,37 @@ textarea.form-input {
   }
 }
 
+/* DAS BLATT STEIGT VOM UNTEREN RAND AUF (#1802). Mit der kritisch gedaempften
+ * Blattfeder (`--ease-sheet`, tokens.css) faehrt es seinen vollen Weg - die
+ * eigene Hoehe plus den Abstand zum Rand (`--sheet-rise`) - und blendet nicht:
+ * es kommt von irgendwo, statt 24px ueber einer Blende zu erscheinen. Vorher
+ * trug die Back-Out-Feder nur den kurzen Hub, ueber die volle Hoehe warf sie
+ * das Blatt gemessen 28,5px ueber seine Ruhelage.
+ *
+ * NUR MIT `linear()`: ohne die Feder liefe der Vollhub auf der Bezier von
+ * heute, und genau die schiesst ueber. Ein alter Browser (Wand-WebView 106)
+ * behaelt `glass-sheet-in` oben - Kurve und Hub von heute. Unter reduzierter
+ * Bewegung steht das Blatt ohne Weg (modal.js blendet, reset.css).
+ *
+ * Dieselben Selektoren wie oben, also gewinnt diese Regel (spaeter in der
+ * Datei); die Ausgangsregeln tragen eine Klasse mehr und schlagen sie. Das
+ * Mehr-Blatt und die Suche steigen genauso (layout.css). */
+@keyframes sheet-rise {
+  from { transform: translateY(var(--sheet-rise)); }
+  to   { transform: translateY(0); }
+}
+
+@supports (transition-timing-function: linear(0, 1)) {
+  @media (prefers-reduced-motion: no-preference) {
+    @media (max-width: 767px) {
+      .modal-panel:not(.modal-panel--closing),
+      dialog.dialog-surface:not(.dialog-surface--closing) {
+        animation: sheet-rise var(--sheet-in) forwards;
+      }
+    }
+  }
+}
+
 /* ================================================================
  * 19. Seitentransitionen - entfallen (2026-09-26)
  *
@@ -790,20 +815,23 @@ html.navigating .app-content *::after {
  * Gleiche Bereinigung wie bei den Note-Items: der Dashboard-Zweig war
  * geglast, der Modul-Zweig nicht. Eine Fläche für beide.
  * ================================================================ */
-.dashboard .meal-slot,
 .meals-page .meal-slot {
   background-color: var(--color-surface-work);
 }
 
-.dashboard .meal-slot:hover,
-.meals-page .meal-slot:hover {
-  background-color: var(--color-surface-raised);
+@media (hover: hover) {
+  .meals-page .meal-slot:hover {
+    background-color: var(--color-surface-raised);
+  }
 }
 
-.dashboard .meal-slot--filled,
 .meals-page .meal-slot--filled {
   background-color: color-mix(in srgb, var(--module-accent, var(--module-meals)) var(--tint-wash), var(--color-surface-raised));
 }
+
+/* Die Uebersicht stand hier mit im Selektor (`.dashboard .meal-slot*`) und
+ * wusch ihre gefuellten Slots damit in IHREM Akzent, also violett (DW-P2-8).
+ * Ihr Slot ist seither eine neutrale Mulde und steht in dashboard.css. */
 
 /* ================================================================
  * 31. Form-Inputs — Arbeitsfläche

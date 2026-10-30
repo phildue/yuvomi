@@ -1,9 +1,9 @@
 /**
  * Modul: Fehler -> Satz
- * Zweck: friendlyError - der eine Satz, den die App fuer einen Fehler zeigt, den
- *        keine Seite selbst behandelt (Fehlerbildschirm, unbehandelte Rejection,
- *        window.yuvomi.friendlyError). Aus router.js hierher gezogen (#1640),
- *        damit die Zuordnung ohne Browser pruefbar ist:
+ * Zweck: der Satz, den die App fuer einen Fehler zeigt - errorSentence fuer die
+ *        Seiten, loadErrorSentence fuer Ladefehler, unhandledErrorSentence fuer
+ *        Fehlerbildschirm und unbehandelte Rejection. Aus router.js hierher
+ *        gezogen (#1640), damit die Zuordnung ohne Browser pruefbar ist:
  *        test/test-friendly-error.js.
  * Abhaengigkeiten: i18n.js
  */
@@ -13,7 +13,7 @@ import { t } from '/i18n.js';
  * Grund einer Absage (403, `reason` im Rumpf) -> Schluessel ihres Satzes.
  *
  * EINE Liste fuer beide Stellen: api.js uebersetzt damit `message` und
- * `data.error`, friendlyError reicht denselben Satz durch. Eine Map, damit ein
+ * `data.error`, errorSentence sagt denselben Satz. Eine Map, damit ein
  * Grund wie `__proto__` nichts findet.
  *
  * Hier steht nur, was fuer JEDE Seite dasselbe heisst. Gruende, die eine Seite
@@ -25,6 +25,7 @@ export const REFUSAL_MESSAGES = new Map([
   ['module_access_denied', 'common.errorModuleNoAccess'],
   ['module_read_only', 'settings.permReadOnlyBanner'],
   ['task_locked', 'tasks.errorLocked'],
+  ['note_locked', 'notes.errorLocked'],
   ['recipe_mirrored', 'recipes.errorMirrored'],
   // api.js holt bei einer 403 auf einen Schreibzugriff einmal ein frisches
   // Token und wiederholt. Diesen Satz sieht also nur, wem das nicht half.
@@ -32,6 +33,10 @@ export const REFUSAL_MESSAGES = new Map([
   ['contact_email_protected', 'contacts.emailLockedHint'],
   // Bezahlen ohne das Recht, Betraege der Haushaltshilfe zu sehen (R20).
   ['amounts_hidden', 'housekeeping.errorAmountsHidden'],
+  // Fremdes aendern ohne `*_edit_others` (R23, D5) - Kalender, Notizen, Inventar.
+  ['not_owner', 'common.errorNotOwner'],
+  // Die Handordnung der Aufgaben ohne `tasks_reorder_family` (R23, D15).
+  ['reorder_not_allowed', 'tasks.errorReorderNotAllowed'],
 ]);
 
 /**
@@ -183,6 +188,10 @@ export const CASE_MESSAGES = new Map([
   // Die im Zuordnungs-Dialog GEWAEHLTE Vorratszeile fehlt: der Dialog bleibt
   // offen und bietet den aktuellen Vorrat an.
   ['recipes_selected_pantry_item_not_found', 'recipes.errorSelectedPantryItemGone'],
+  // Die Uebernahme mit umgerechneten Mengen nannte Zutaten, die das Rezept so
+  // nicht mehr hat (gespeichert oder abgeglichen seit dem Laden). KEIN "gibt es
+  // nicht mehr": das Rezept steht, die Seite zeigt den Stand aus der Antwort.
+  ['recipes_ingredients_changed', 'recipes.errorIngredientsChanged'],
   // Eine Mahlzeit aus einem Rezept, das es nicht mehr gibt (server/routes/meals.js).
   ['meals_selected_recipe_not_found', 'recipes.errorRecipeGone'],
   // Abos (#1909). Die "gibt es nicht mehr" stehen auch in GONE_REASONS. Die
@@ -198,6 +207,7 @@ export const CASE_MESSAGES = new Map([
   // der Dialog bleibt offen und bietet die aktuellen an.
   ['subscriptions_selected_category_not_found', 'subscriptions.errorSelectedCategoryGone'],
   ['subscriptions_selected_payment_method_not_found', 'subscriptions.errorSelectedPaymentMethodGone'],
+  ['subscriptions_account_not_found', 'subscriptions.errorAccountGone'],
   ['subscriptions_category_exists', 'subscriptions.errorCategoryExists'],
   ['subscriptions_payment_method_exists', 'subscriptions.errorPaymentMethodExists'],
   // Eingaben, die der Abo-Dialog durchlaesst und erst der Server prueft.
@@ -206,6 +216,189 @@ export const CASE_MESSAGES = new Map([
   ['subscriptions_logo_content_mismatch', 'subscriptions.errorLogoContentMismatch'],
   // Die Logo-Suche hat geantwortet, aber nichts Brauchbares gefunden.
   ['subscriptions_no_logo_found', 'subscriptions.logoSearchEmpty'],
+  // Inventar (#1909). Die "gibt es nicht mehr" stehen auch in GONE_REASONS.
+  // Gegenstaende haben keine Sichtbarkeit: die 404 heisst "geloescht". Ein
+  // Loeschen mit diesem Grund ist deshalb ein Erfolg (isAlreadyDeleted).
+  ['inventory_item_not_found', 'inventory.errorItemGone'],
+  // Die Frist, die als erledigt markiert werden sollte, steht nicht mehr am
+  // Gegenstand (beim Bearbeiten entfernt).
+  ['inventory_tracked_date_not_found', 'inventory.errorTrackedDateGone'],
+  // Der im Formular GEWAEHLTE Ort fehlt: das Formular bleibt offen und bietet
+  // die aktuellen Orte an.
+  ['inventory_selected_location_not_found', 'inventory.errorSelectedLocationGone'],
+  // Die Buchung, die verknuepft, vorbelegt oder geloest werden sollte, gibt es
+  // nicht mehr (geloescht, oder fuer diese Person nicht mehr sichtbar).
+  ['inventory_booking_not_found', 'inventory.errorBookingGone'],
+  ['inventory_booking_already_linked', 'inventory.errorBookingAlreadyLinked'],
+  // Notizen (#1909). Notizen haben keine Sichtbarkeit: die 404 heisst
+  // "geloescht", ein Loeschen mit diesem Grund ist ein Erfolg.
+  ['notes_note_not_found', 'notes.errorNoteGone'],
+  // Eine im Editor GEWAEHLTE Kategorie gibt es nicht mehr: der Editor bleibt
+  // offen und bietet die aktuellen Kategorien an.
+  ['notes_selected_category_not_found', 'notes.errorSelectedCategoryGone'],
+  // Kontakte (#1909). Die 404 heisst "geloescht", ein Loeschen mit diesem
+  // Grund ist ein Erfolg.
+  ['contacts_contact_not_found', 'contacts.errorContactGone'],
+  // Geburtstage (#1909), ebenso.
+  ['birthdays_birthday_not_found', 'birthdays.errorBirthdayGone'],
+  // Verknuepfen im Geburtstag-Dialog (R22, D7): der GEWAEHLTE Kontakt hat
+  // inzwischen einen anderen Geburtstag, oder es gibt ihn nicht mehr - der
+  // Dialog bleibt offen und frischt die Auswahl auf.
+  ['birthdays_contact_linked', 'birthdays.errorContactLinked'],
+  ['birthdays_selected_contact_not_found', 'contacts.errorContactGone'],
+  // Die im Kontaktformular GEWAEHLTE Kategorie gibt es nicht mehr: das
+  // Formular bleibt offen und bietet die aktuellen Kategorien an.
+  ['contacts_selected_category_not_found', 'contacts.errorSelectedCategoryGone'],
+  // Ein Feld, das der Server abweist (#1909): je Feld ein ganzer Satz, die
+  // Grenze als Zahl (CASE_PARAMS). Erreicht vor allem der vCard-Import, dessen
+  // Toast bis dahin den englischen Servertext zeigte, weil der das Feld nannte.
+  // Das Formular begrenzt seine Felder nicht alle selbst und trifft sie auch.
+  ['contacts_name_too_long', 'contacts.errorNameTooLong'],
+  ['contacts_phone_too_long', 'contacts.errorPhoneTooLong'],
+  ['contacts_email_too_long', 'contacts.errorEmailTooLong'],
+  ['contacts_address_too_long', 'contacts.errorAddressTooLong'],
+  ['contacts_notes_too_long', 'contacts.errorNotesTooLong'],
+  ['contacts_birthday_invalid', 'contacts.errorBirthdayInvalid'],
+  // Die Mehrfachfelder des Formulars (phones, emails, addresses): je Fall ein
+  // ganzer Satz, der das Feld selbst nennt - nie ein eingesetztes Nomen. Eine
+  // zu lange Nummer oder Adresse in der Liste ist derselbe Satz wie im
+  // Einzelfeld oben, nur mit der Grenze der Liste. `*_entry_invalid` deckt,
+  // was nur ein API-Client falsch schicken kann (server/routes/contacts.js).
+  ['contacts_phone_entry_invalid', 'contacts.errorPhoneEntryInvalid'],
+  ['contacts_phones_too_many', 'contacts.errorPhonesTooMany'],
+  ['contacts_phone_label_too_long', 'contacts.errorPhoneLabelTooLong'],
+  ['contacts_email_entry_invalid', 'contacts.errorEmailEntryInvalid'],
+  ['contacts_email_invalid', 'contacts.errorEmailInvalid'],
+  ['contacts_emails_too_many', 'contacts.errorEmailsTooMany'],
+  ['contacts_email_label_too_long', 'contacts.errorEmailLabelTooLong'],
+  ['contacts_address_entry_invalid', 'contacts.errorAddressEntryInvalid'],
+  ['contacts_addresses_too_many', 'contacts.errorAddressesTooMany'],
+  ['contacts_address_label_too_long', 'contacts.errorAddressLabelTooLong'],
+  ['contacts_address_part_too_long', 'contacts.errorAddressPartTooLong'],
+  // Orte und Kategorien des Inventars (#1909). Den Namen gibt es auf dieser
+  // Ebene schon (`category_exists` deckt die Kategorien, oben); ein Ort oder
+  // eine Kategorie, die inzwischen geloescht wurde, ist ein "gibt es nicht
+  // mehr" - der Verwalter laedt nach, ein Loeschen ist ein Erfolg.
+  ['inventory_location_exists', 'inventory.errorLocationExists'],
+  ['inventory_location_not_found', 'inventory.errorLocationGone'],
+  ['inventory_category_not_found', 'inventory.errorCategoryGone'],
+  // Vorrat (#1448): ein Produkt ohne Charge wird geloescht, und im
+  // Rueckgaengig-Fenster hat jemand wieder eine Charge eingebucht.
+  ['pantry_product_has_batches', 'pantry.errorProductHasStock'],
+  // Aufgaben (#1909). Die 404 heisst "geloescht oder nicht mehr sichtbar"
+  // (privat gestellt) - fuer diese Person ist die Aufgabe in beiden Faellen
+  // weg, ein Loeschen mit diesem Grund ist deshalb ein Erfolg.
+  ['tasks_task_not_found', 'tasks.errorTaskGone'],
+  // Die Aufgabe, an die eine neue Teilaufgabe sollte, ist inzwischen weg; ein
+  // Kommentar, der geaendert oder geloescht werden sollte, ebenso (#1909).
+  ['tasks_parent_not_found', 'tasks.errorParentGone'],
+  ['tasks_comment_not_found', 'tasks.errorCommentGone'],
+  // Dienstplan (#1909). Die "gibt es nicht mehr" stehen auch in GONE_REASONS;
+  // die Seite laedt dann nach, ein Loeschen mit einem davon ist ein Erfolg.
+  // Abweichung und Zusatzschicht sind fuer den Nutzer beide "ein Eintrag".
+  ['schedule_shift_type_not_found', 'schedule.errorShiftTypeGone'],
+  ['schedule_custom_field_not_found', 'schedule.errorCustomFieldGone'],
+  ['schedule_pattern_not_found', 'schedule.errorPatternGone'],
+  ['schedule_override_not_found', 'schedule.errorEntryGone'],
+  ['schedule_extra_shift_not_found', 'schedule.errorEntryGone'],
+  // Die im Dialog GEWAEHLTE Schichtart oder ein gewaehltes Feld fehlt: der
+  // Dialog bleibt offen, die Seite dahinter kommt frisch.
+  ['schedule_selected_shift_type_not_found', 'schedule.errorSelectedShiftTypeGone'],
+  ['schedule_selected_custom_field_not_found', 'schedule.errorSelectedCustomFieldGone'],
+  // Bis #1909 ordnete die Seite diese drei am WORTLAUT des Servers zu.
+  ['schedule_shift_type_in_use', 'schedule.typeInUse'],
+  ['schedule_cycle_length_conflict', 'schedule.cycleLengthConflictGeneric'],
+  ['schedule_shift_type_required', 'schedule.shiftTypeRequiredError'],
+  // Aelter als die Regel (#1777) und schon Teil der API: nur der Dienstplan
+  // schickt ihn.
+  ['range_reversed', 'schedule.rangeOrderError'],
+  // Haushaltshilfe (#1909). Die "gibt es nicht mehr" stehen auch in
+  // GONE_REASONS; die Seite laedt dann nach. Haushaltshilfe, Einsatz und
+  // Aufgabe haben keine Sichtbarkeit: die 404 heisst "geloescht", ein Loeschen
+  // mit diesem Grund ist ein Erfolg. Keine offene Sitzung beim Auschecken
+  // heisst: jemand anderes hat schon ausgecheckt.
+  ['housekeeping_worker_not_found', 'housekeeping.errorWorkerGone'],
+  ['housekeeping_visit_not_found', 'housekeeping.errorVisitGone'],
+  ['housekeeping_task_not_found', 'housekeeping.errorTaskGone'],
+  ['housekeeping_open_session_not_found', 'housekeeping.errorAlreadyCheckedOut'],
+  ['housekeeping_already_checked_in', 'housekeeping.errorAlreadyCheckedIn'],
+  ['housekeeping_username_taken', 'join.usernameTaken'],
+  ['housekeeping_username_invalid', 'setup.errorUsernameInvalid'],
+  // Belohnungen (#1909). Die aelteren Gruende ohne Praefix (out_of_stock,
+  // insufficient_funds, account_deactivated ...) liest die Seite selbst:
+  // `account_deactivated` schickt auch die Kontoverwaltung, mit anderem Sinn.
+  // Eine Praemie, die geloescht oder abgeschaltet wurde, ist "nicht mehr
+  // verfuegbar"; Konto und Plan, die schon weg sind, sind beim Loeschen ein Erfolg.
+  ['rewards_reward_not_found', 'rewards.errorRewardGone'],
+  ['rewards_redemption_not_found', 'rewards.errorRequestGone'],
+  ['rewards_redemption_decided', 'rewards.errorRequestDecided'],
+  ['rewards_insufficient_points', 'rewards.errorNotEnoughPoints'],
+  ['rewards_not_participating', 'rewards.errorNotParticipating'],
+  ['rewards_money_account_not_found', 'rewards.errorMoneyAccountGone'],
+  ['rewards_money_plan_not_found', 'rewards.errorMoneyPlanGone'],
+  // Schnellzugriffe (#1909). Die 404 heisst "geloescht" - oder privat fuer
+  // jemand anderen, was fuer diese Person dasselbe ist. Ein Loeschen mit diesem
+  // Grund ist deshalb ein Erfolg. Die Grenze traegt ihre Zahl (CASE_PARAMS).
+  ['quick_links_link_not_found', 'quickLinks.errorLinkGone'],
+  ['quick_links_limit_reached', 'quickLinks.errorLimitReached'],
+  // Rezeptdienste in den Kuechen-Einstellungen (#1909). Das private Netz nennt
+  // im Satz den Schalter, den der Admin setzen kann - wie bisher der Servertext.
+  ['recipe_providers_account_not_found', 'settings.recipeProviderErrorAccountGone'],
+  ['recipe_providers_url_invalid', 'settings.recipeProviderErrorUrlInvalid'],
+  ['recipe_providers_external_url_invalid', 'settings.recipeProviderErrorExternalUrlInvalid'],
+  ['recipe_providers_private_network', 'settings.recipeProviderErrorPrivateNetwork'],
+  ['recipe_providers_connection_failed', 'settings.recipeProviderErrorConnectionFailed'],
+  ['recipe_providers_account_exists', 'settings.recipeProviderErrorAccountExists'],
+  // Der letzte gescheiterte Abgleich eines Kontos (#1909, Migration 255): der
+  // Server speichert den Fall neben dem rohen Text, die Konto-Karte sagt den
+  // Satz (server/services/recipe-providers/failure.js). Das private Netz oben
+  // gilt auch hier.
+  ['recipe_providers_sync_auth_failed', 'settings.recipeProviderErrorSyncAuth'],
+  ['recipe_providers_sync_wrong_url', 'settings.recipeProviderErrorSyncWrongUrl'],
+  ['recipe_providers_sync_http_status', 'settings.recipeProviderErrorSyncStatus'],
+  ['recipe_providers_sync_timeout', 'settings.recipeProviderErrorSyncTimeout'],
+  ['recipe_providers_sync_unreachable', 'settings.recipeProviderErrorSyncUnreachable'],
+  ['recipe_providers_sync_certificate', 'settings.recipeProviderErrorSyncCertificate'],
+  ['recipe_providers_sync_bad_response', 'settings.recipeProviderErrorSyncBadResponse'],
+  // Kalender-Verwaltung (#1909). Der Kalender, der weg ist, steht auch in
+  // GONE_REASONS: die Verwaltung laedt dann nach, ein Loeschen mit diesem Grund
+  // ist ein Erfolg. Eine geaenderte Liste beim Umsortieren laedt ebenso nach
+  // (pages/calendar.js). Die Grenze des Namens traegt ihre Zahl (CASE_PARAMS).
+  ['calendar_calendar_not_found', 'calendar.errorCalendarGone'],
+  ['calendar_name_invalid', 'calendar.errorCalendarNameInvalid'],
+  ['calendar_order_changed', 'calendar.errorCalendarOrderChanged'],
+  // Termine (#1909). Den Termin gibt es nicht mehr (geloescht, oder fuer diese
+  // Person nicht mehr sichtbar): die Seite laedt nach, ein Loeschen mit diesem
+  // Grund ist ein Erfolg. Der im Termin-Dialog GEWAEHLTE Kalender fehlt: der
+  // Dialog bleibt offen und bietet die aktuellen an. Die Gruende einer
+  // Einzelausnahme ohne Praefix (invalid_recurrence_id ...) liest die Seite
+  // selbst (occurrenceErrorMessage in pages/calendar.js).
+  ['calendar_event_not_found', 'calendar.errorEventGone'],
+  ['calendar_selected_calendar_not_found', 'calendar.errorSelectedCalendarGone'],
+  // Eine Wiederholung ohne ein einziges Vorkommen ab dem Start (#960) und ein
+  // Serienende vor dem Start (#1607): das Formular prueft das zweite selbst,
+  // dieser Satz ist derselbe wie dort.
+  ['calendar_series_no_occurrence', 'calendar.errorSeriesNoOccurrence'],
+  ['calendar_series_ends_before_start', 'calendar.recurrenceEndBeforeStart'],
+  // Personen einer Sync-Quelle oder eines Imports (#1897, #1221, #1940): die
+  // Auswahl bietet nur Mitglieder an, beide Saetze erreicht nur ein veralteter
+  // Stand (Person entfernt, Konto geloescht). Die Einkaufsliste nennt, warum
+  // sie keine Personen traegt.
+  ['calendar_assignee_not_member', 'settings.syncAssigneeNotMember'],
+  ['calendar_assignee_unknown', 'settings.syncAssigneeUnknown'],
+  ['reminder_list_assignee_not_tasks', 'settings.reminderListAssigneesTasksOnly'],
+  // Immich-Bildschirmschoner in den Admin-Einstellungen (#1909). Die drei
+  // Eingaben, die der Server beim Speichern abweist, und was der
+  // Verbindungstest von Immich zurueckbekommt: ein abgelehnter API-Schluessel
+  // (401/403 von Immich), ein anderer Fehlerstatus (mit Zahl, CASE_PARAMS),
+  // keine Verbindung.
+  ['immich_url_invalid', 'settings.immichErrorUrlInvalid'],
+  ['immich_album_id_invalid', 'settings.immichErrorAlbumIdInvalid'],
+  ['immich_api_key_invalid', 'settings.immichErrorApiKeyInvalid'],
+  ['immich_not_configured', 'settings.immichErrorNotConfigured'],
+  ['immich_api_key_rejected', 'settings.immichErrorApiKeyRejected'],
+  ['immich_http_status', 'settings.immichErrorStatus'],
+  ['immich_unreachable', 'settings.immichErrorUnreachable'],
 ]);
 
 /**
@@ -230,6 +423,22 @@ export const CASE_PARAMS = new Map([
   ['health_cycle_import_too_large', ['limit_kb']],
   ['health_cycle_import_too_many_rows', ['limit']],
   ['documents_folder_too_deep', ['limit']],
+  ['quick_links_limit_reached', ['limit']],
+  ['contacts_name_too_long', ['limit']],
+  ['contacts_phone_too_long', ['limit']],
+  ['contacts_email_too_long', ['limit']],
+  ['contacts_address_too_long', ['limit']],
+  ['contacts_notes_too_long', ['limit']],
+  ['contacts_phones_too_many', ['limit']],
+  ['contacts_phone_label_too_long', ['limit']],
+  ['contacts_emails_too_many', ['limit']],
+  ['contacts_email_label_too_long', ['limit']],
+  ['contacts_addresses_too_many', ['limit']],
+  ['contacts_address_label_too_long', ['limit']],
+  ['contacts_address_part_too_long', ['limit']],
+  ['recipe_providers_sync_http_status', ['status']],
+  ['calendar_name_invalid', ['limit']],
+  ['immich_http_status', ['status']],
 ]);
 
 const PARAM_MAX = 1_000_000_000;
@@ -301,6 +510,44 @@ export const GONE_REASONS = new Set([
   'subscriptions_payment_method_not_found',
   'subscriptions_selected_category_not_found',
   'subscriptions_selected_payment_method_not_found',
+  'subscriptions_account_not_found',
+  'inventory_item_not_found',
+  'inventory_tracked_date_not_found',
+  'inventory_selected_location_not_found',
+  'inventory_booking_not_found',
+  'notes_note_not_found',
+  'notes_selected_category_not_found',
+  'contacts_contact_not_found',
+  'birthdays_birthday_not_found',
+  // Der im Geburtstag-Dialog GEWAEHLTE Kontakt (R22, D7): der Dialog bleibt
+  // offen und bietet die aktuellen an.
+  'birthdays_selected_contact_not_found',
+  'contacts_selected_category_not_found',
+  'inventory_location_not_found',
+  'inventory_category_not_found',
+  'tasks_task_not_found',
+  'tasks_parent_not_found',
+  'tasks_comment_not_found',
+  'schedule_shift_type_not_found',
+  'schedule_custom_field_not_found',
+  'schedule_pattern_not_found',
+  'schedule_override_not_found',
+  'schedule_extra_shift_not_found',
+  'schedule_selected_shift_type_not_found',
+  'schedule_selected_custom_field_not_found',
+  'housekeeping_worker_not_found',
+  'housekeeping_visit_not_found',
+  'housekeeping_task_not_found',
+  'housekeeping_open_session_not_found',
+  'rewards_reward_not_found',
+  'rewards_redemption_not_found',
+  'rewards_money_account_not_found',
+  'rewards_money_plan_not_found',
+  'quick_links_link_not_found',
+  'recipe_providers_account_not_found',
+  'calendar_calendar_not_found',
+  'calendar_event_not_found',
+  'calendar_selected_calendar_not_found',
 ]);
 
 /**
@@ -337,7 +584,8 @@ export function isAlreadyDeleted(err, reason) {
 
 /**
  * Der Satz, den die App fuer diesen Fehler SICHER kennt - oder nichts.
- * Eine Stelle fuer friendlyError und errorSentence, damit beide dasselbe sagen.
+ * Eine Stelle fuer errorSentence, loadErrorSentence und unhandledErrorSentence,
+ * damit alle dasselbe sagen.
  *
  * @param {unknown} err
  * @returns {string|undefined} Schluessel
@@ -388,49 +636,36 @@ function knownSentence(err) {
  * `err.message`) kommt hier nie heraus; aus der Antwort stammen hoechstens die
  * Zahlen, die CASE_PARAMS fuer den Fall freigibt.
  *
+ * DER SATZ DER STELLE DARF SEIN OBJEKT NENNEN (Critique R21, D15): ein
+ * zurueckgerollter Haken sagte nur "Ein Fehler ist aufgetreten." - weder welcher
+ * Artikel noch dass er wieder offen steht noch was jetzt zu tun ist. `params`
+ * setzt t() in den Satz der Stelle ein ("„Milch" ist wieder offen ...").
+ *
  * @param {unknown} err
  * @param {string} [fallbackKey] - der allgemeine Satz dieser Stelle
+ * @param {Record<string, unknown>} [params] - Werte fuer den Satz der Stelle
  * @returns {string} uebersetzter Satz
  */
-export function errorSentence(err, fallbackKey = 'common.errorGeneric') {
-  return knownSentence(err) ?? t(fallbackKey);
+export function errorSentence(err, fallbackKey = 'common.errorGeneric', params = undefined) {
+  return knownSentence(err) ?? (params ? t(fallbackKey, params) : t(fallbackKey));
 }
 
 /**
- * UEBERGANG (#1909): der Satz fuer Aufrufer, die noch nicht umgestellt sind.
- * Jeder wandert mit der Scheibe seines Moduls zu `errorSentence`; bis dahin
- * sagt er hier nicht weniger als vor #1909. Bekannter Fall -> sein Satz, sonst
- * der Text des Servers (`err.data.error`), sonst der allgemeine Satz. Wer noch
- * hier fragt, steht als Zahl in test:frontend-audit (FRIENDLY_ERROR_CALLERS).
+ * DER SATZ FUER DAS, WAS KEINE SEITE SELBST FAENGT (#1909): Fehlerbildschirm
+ * und unbehandelte Rejection im Router. Bekannter Fall, offline, 404, 5xx, Zeitueberschreitung, Netzfehler -, nur
+ * kommt an einer unbekannten Antwort (400, 409) oder einem Wurf im Code nie
+ * dessen Text heraus, sondern der unerwartete Fehler. Die rohe Meldung steht
+ * beim Fehlerbildschirm in den aufklappbaren Details.
  *
- * @param {unknown} err - ApiError (status, data), ein Netzfehler oder irgendein Wurf
- * @returns {string} uebersetzter Satz, oder an einem Status ohne eigenen Satz
- *   (400, 409, 422 ohne bekannten Grund) der Text des Servers
+ * Offline-Mutation (status 0) zuerst: loadErrorSentence sagte dort "keine
+ * Verbindung", der Satz einer gescheiterten Aenderung ist der genauere.
+ *
+ * @param {unknown} err
+ * @returns {string} uebersetzter Satz
  */
-export function friendlyError(err) {
-  // Offline-Mutation (ApiError status 0): spezifische Meldung - auch wenn
-  // navigator.onLine faelschlich true meldet (Netz weg, aber kein offline-Event).
-  if (err?.status === 0) return t('common.errorOfflineMutation');
-  if (!navigator.onLine) return t('common.errorOffline');
-  // Nachgeschlagen wird am Grund, nicht am Text des Fehlers - an einer Absage
-  // (403) ergibt ein unbekannter oder gar kein Grund den allgemeinen Satz, nie
-  // den des Servers. Bis #1640 stand fuer die 403 ein zweiter Satz hier
-  // ("Zugriff verweigert. Bitte erneut anmelden."), und der riet zur Anmeldung,
-  // wo die Sitzung in Ordnung war: eine abgelaufene Sitzung ist ein 401 und
-  // laeuft ueber auth:expired, nie hier durch.
-  const known = knownSentence(err);
-  if (known) return known;
-  const status = err?.status ?? err?.response?.status;
-  if (status === 404) return t('common.errorNotFound');
-  if (status >= 500) return t('common.errorServer');
-  if (err?.name === 'AbortError' || err?.name === 'TimeoutError') return t('common.errorTimeout');
-  if (/Failed to fetch|NetworkError|Load failed/i.test(err?.message || '')) return t('common.errorServer');
-  if (err?.name === 'TypeError') return t('common.unexpectedError');
-  // Jede andere Antwort des Servers (400, 409, 422 ohne bekannten Grund):
-  // ihr eigener Text. Er nennt die Ursache (welches Feld, welcher Konflikt),
-  // und der allgemeine Satz an seiner Stelle sagte weniger - das gilt, bis der
-  // Aufrufer umgestellt ist und der Server den Fall mit einem `reason` benennt.
-  return err?.data?.error || err?.message || t('common.errorGeneric');
+export function unhandledErrorSentence(err) {
+  if (err?.status === 0) return errorSentence(err);
+  return loadErrorSentence(err) ?? errorSentence(err, 'common.unexpectedError');
 }
 
 /**
@@ -440,8 +675,8 @@ export function friendlyError(err) {
  * Bis hierher sagte jeder Ladefehler fest "Bitte pruefe die Verbindung", auch
  * bei einer Bremse (429) oder einem Serverfehler: die Familie suchte den Fehler
  * am eigenen WLAN, waehrend der Server nur kurz warten wollte. Die Zuordnung
- * ist die von friendlyError, mit EINEM Unterschied: der Text des Servers kommt
- * hier nie heraus. Bei einer unbekannten Ursache (400, 409 ohne Grund) bleibt
+ * kennt dieselben Faelle wie unhandledErrorSentence, und der Text des Servers
+ * kommt hier nie heraus. Bei einer unbekannten Ursache (400, 409 ohne Grund) bleibt
  * der allgemeine Satz des Aufrufers stehen - `mountLoadError` und der
  * Fehlerzustand der Shell nehmen ihn als Rueckfall.
  *
