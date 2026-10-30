@@ -357,10 +357,11 @@ router.get('/', (req, res) => {
       params.push(from, to);
     }
 
-    // Nur gebuchte Eintraege: der Statistik-Tab summiert ebenfalls nur diese
-    // (bookedOnly), die Liste soll zu den Balken darueber passen.
+    // Nur gebuchte Eintraege ohne Umbuchungen: der Statistik-Tab summiert
+    // ebenfalls nur diese (bookedOnly, transfer_entry_id IS NULL), die Liste
+    // soll zu den Balken darueber passen.
     const bookedOnlyList = hasRange && req.query.booked_only === '1';
-    if (bookedOnlyList) sql += bookedOnly('b');
+    if (bookedOnlyList) sql += `${bookedOnly('b')} AND b.transfer_entry_id IS NULL`;
 
     // GEFILTERT WIRD AUF DIE MASKIERTE KATEGORIE (#659), nicht auf die Spalte.
     // Fremde 'shared_amount'-Zeilen tragen in der Antwort '__private__'; ein

@@ -64,7 +64,7 @@ export function computeStats(database, { range, anchor }, filter = { clause: '',
            COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS income,
            COALESCE(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END), 0) AS expenses,
            COALESCE(SUM(amount), 0) AS total
-    FROM budget_entries WHERE date BETWEEN ? AND ? AND subcategory != ''${f.clause}${bookedOnly()}
+    FROM budget_entries WHERE date BETWEEN ? AND ? AND subcategory != ''${f.clause}${bookedOnly()} AND transfer_entry_id IS NULL
     GROUP BY 1, 2 ORDER BY ABS(SUM(amount)) DESC
   `).all(...c.params, ...sc.params, r.from, r.to, ...f.params);
 

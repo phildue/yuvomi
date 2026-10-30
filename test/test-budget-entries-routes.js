@@ -310,6 +310,17 @@ test('GET /: from/to liefert Buchungen ueber mehrere Monate (Statistik-Drilldown
   assert.deepEqual(booked.body.data.map((e) => e.title), ['range-jan']);
 });
 
+test('GET /: booked_only laesst Umbuchungen aus, die Statistik zaehlt sie auch nicht', async () => {
+  insertEntry({ title: 'tr-booked', amount: -5, category: 'housing', subcategory: 'utilities', date: '2035-02-10' });
+  const out = insertEntry({ title: 'tr-out', amount: -50, category: 'housing', subcategory: 'utilities', date: '2035-02-11' });
+  const inn = insertEntry({ title: 'tr-in', amount: 50, category: 'housing', subcategory: 'utilities', date: '2035-02-11' });
+  db.prepare('UPDATE budget_entries SET transfer_entry_id = ? WHERE id = ?').run(inn, out);
+  db.prepare('UPDATE budget_entries SET transfer_entry_id = ? WHERE id = ?').run(out, inn);
+  const booked = await call('GET', '/?from=2035-01-01&to=2035-12-31&booked_only=1&category=housing');
+  assert.equal(booked.status, 200);
+  assert.deepEqual(booked.body.data.map((e) => e.title), ['tr-booked']);
+});
+
 test('GET /: from/to validiert Format, Reihenfolge und Spanne', async () => {
   assert.equal((await call('GET', '/?from=2033-01-01')).status, 400);
   assert.equal((await call('GET', '/?from=nope&to=2033-01-01')).status, 400);
