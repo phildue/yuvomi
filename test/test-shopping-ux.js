@@ -518,6 +518,52 @@ test('parseShoppingQuantity: die Schreibweisen aus dem Seed bleiben, wie sie war
   assert.deepEqual(p(null), { quantity: 1, unit: 'pcs' });
 });
 
+// R23 (D3): „2 Dosen" und „1 Packung" landeten bei Stück und legten im Vorrat
+// eine zweite Zeile neben die Dosen im Regal. Gelesen werden die Einheitennamen
+// der Sprache (dieselben Keys, die der Vorrat zeigt) und englische Kurzformen.
+test('parseShoppingQuantity: Einheiten als Wort, mit und ohne Leerzeichen (R23, D3)', () => {
+  const p = __test.parseShoppingQuantity;
+  const de = new Map([['dose', 'can'], ['dosen', 'can'], ['packung', 'pkg'], ['packungen', 'pkg'], ['stück', 'pcs'], ['flaschen', 'bottle'], ['g', 'g'], ['l', 'l']]);
+  assert.deepEqual(p('2 Dosen', de), { quantity: 2, unit: 'can' });
+  assert.deepEqual(p('1 Packung', de), { quantity: 1, unit: 'pkg' });
+  assert.deepEqual(p('3 Flaschen', de), { quantity: 3, unit: 'bottle' });
+  assert.deepEqual(p('500g', de), { quantity: 500, unit: 'g' });
+  assert.deepEqual(p('2 x 500 g', de), { quantity: 2, unit: 'pcs' }, 'das x ist keine Einheit, die 2 ist die Menge');
+  assert.deepEqual(p('1 Laib', de), { quantity: 1, unit: 'pcs' }, 'ein unbekanntes Wort bleibt Stück');
+  assert.deepEqual(p('1 Liter', de), { quantity: 1, unit: 'pcs' }, 'kein Raten ueber die bekannten Woerter hinaus');
+
+  const words = __test.pantryUnitWords(['pkg', 'can', 'g']);
+  assert.equal(words.get('pack'), 'pkg', 'englische Kurzformen gelten in jeder Sprache');
+  assert.equal(words.get('pkg'), 'pkg', 'der Schluessel selbst gilt');
+  assert.equal(words.get('cans'), 'can');
+  assert.equal(words.get('g'), 'g');
+  assert.deepEqual(p('2 cans', words), { quantity: 2, unit: 'can' });
+});
+
+// R23 (D3): EIN Ort fuer den ganzen Einkauf legte die Milch in den
+// Vorratsschrank. Je Zeile vorbelegt: Bestand, sonst Kategorie, sonst Kopf.
+test('pantryTransferPreset: Bestand vor Kategorie vor Kopfauswahl (R23, D3)', () => {
+  const pre = __test.pantryTransferPreset;
+  const words = new Map([['g', 'g'], ['l', 'l']]);
+  const pantry = {
+    items: [
+      { name: 'Milch', unit: 'l', location_id: 2, category: 'Milchprodukte' },
+      { name: 'Joghurt', unit: 'pcs', location_id: 2, category: 'Milchprodukte' },
+      { name: 'Quark', unit: 'pcs', location_id: 2, category: 'Milchprodukte' },
+      { name: 'Sahne', unit: 'pcs', location_id: 3, category: 'Milchprodukte' },
+      { name: 'Reis', unit: 'kg', location_id: 1, category: 'Grundnahrung' },
+    ],
+  };
+  assert.deepEqual(pre({ name: ' MILCH ', quantity: '', category: 'Sonstiges' }, pantry, words, '1'),
+    { quantity: 1, unit: 'l', locationId: '2', source: 'stock' }, 'gleichnamiger Bestand: sein Ort und seine Einheit');
+  assert.deepEqual(pre({ name: 'Reis', quantity: '500 g', category: 'Grundnahrung' }, pantry, words, '1'),
+    { quantity: 500, unit: 'g', locationId: '1', source: 'stock' }, 'eine genannte Einheit bleibt - der Server rechnet g in kg');
+  assert.deepEqual(pre({ name: 'Butter', quantity: '', category: 'Milchprodukte' }, pantry, words, '1'),
+    { quantity: 1, unit: 'pcs', locationId: '2', source: 'category' }, 'der Ort, an dem die Kategorie meistens liegt');
+  assert.deepEqual(pre({ name: 'Batterien', quantity: '4', category: 'Haushalt' }, pantry, words, '1'),
+    { quantity: 4, unit: 'pcs', locationId: '1', source: 'default' }, 'sonst die Kopfauswahl');
+});
+
 test('parseShoppingQuantity: der Dezimaltrenner kommt aus der Region, nicht aus dem Quelltext', () => {
   // In de trennt das Komma. Das konnte die alte Fassung auch - sie hatte den
   // Trenner nur fest verdrahtet und lag damit ueberall sonst falsch.
@@ -754,7 +800,10 @@ test('scheitert der PATCH, bleibt kein Merker stehen', async () => {
   await __test.toggleShoppingItem(10, 0, makeNullContainer());
   assert.equal(__test.checkedOf(__test.state.items[0]), 0, 'zurueckgedreht');
   assert.equal(__test.intents.size, 0, 'ein gescheiterter Wunsch darf nichts auftragen');
-  assert.equal(toasts.length, 1);
+  // ZURUECKGEROLLT NENNT ARTIKEL, STAND UND NAECHSTEN SCHRITT (Critique R21,
+  // D15): bis hier stand "Ein Fehler ist aufgetreten." - weder welcher Artikel
+  // noch dass er wieder offen ist. Der Text des Servers kommt nie an.
+  assert.deepEqual(toasts, [[`common.errorCheckRolledBack${JSON.stringify({ name: __test.state.items[0].name })}`, 'danger']]);
 
   // Und die naechste Auffrischung traegt nichts nach.
   await __test.loadItems(1);
@@ -1938,6 +1987,40 @@ const dialogFields = (name, qty = '') => ({
   'item-details-link': '', 'item-details-cancel': '',
 });
 
+test('an en-US comma price replaces an existing shopping price without clearing it (#2170)', async () => {
+  const previousLocale = globalThis.__formatLocale;
+  globalThis.__formatLocale = 'en-US';
+  resetShoppingState();
+  __test.state.currency = 'EUR';
+  __test.state.lists = [listRow(0)];
+  __test.state.items = [{ ...milk(0), price_cents: 499 }];
+  __test.state.categories = [{ id: 1, name: 'Sonstiges' }];
+  let onSave;
+  const writes = [];
+  globalThis.__openModal = opts => { onSave = opts.onSave; };
+  globalThis.__apiStub = {
+    get: async () => ({ data: [listRow(0)] }),
+    patch: async (_path, body) => {
+      writes.push(body);
+      return { data: { ...milk(0), ...body }, list_change: { list_id: 1, before: 6, after: 7 } };
+    },
+  };
+  try {
+    __test.openItemDetails(10, makeNullContainer());
+    const panel = makeDialogPanel({ ...dialogFields('Milch'), 'item-details-price': '1,99' });
+    onSave(panel);
+    await panel.submit();
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].price_cents, 199);
+    assert.equal(__test.state.items.find(item => item.id === 10).price_cents, 199);
+  } finally {
+    if (previousLocale === undefined) delete globalThis.__formatLocale;
+    else globalThis.__formatLocale = previousLocale;
+    delete globalThis.__apiStub;
+    delete globalThis.__openModal;
+  }
+});
+
 test('Speichern im Artikeldialog nach einer Auffrischung trifft die Zeile im BESTAND, nicht das alte Objekt', async () => {
   resetShoppingState();
   __test.state.lists = [listRow(0)];
@@ -2229,8 +2312,13 @@ test('der Neu-Knopf der Listenleiste baut am Desktop nicht hoeher als die Kapsel
   assert.ok(minHeight(tab), '.list-tab nennt keine Mindesthoehe - der Test liest shopping.css nicht mehr');
   const desktop = rules.filter((r) => r.selector.trim() === '.list-tab__new'
     && r.at.some((a) => /min-width:\s*1024px/.test(a)) && minHeight(r));
-  assert.equal(desktop.length, 1, 'am Desktop (min-width: 1024px) setzt genau eine Regel die Hoehe des Neu-Knopfs');
-  assert.equal(minHeight(desktop[0]), minHeight(tab), 'Neu-Knopf und Kapsel bauen am Desktop gleich hoch');
+  assert.ok(desktop.length >= 1, 'am Desktop (min-width: 1024px) setzt keine Regel die Hoehe des Neu-Knopfs');
+  // Je Bedingung dieselbe Hoehe wie die Kapsel: ab 1024px die Basis der Kapsel,
+  // am Zeiger (R22, D8: `and (hover: hover)`) beide auf --target-md.
+  for (const r of desktop) {
+    const twin = rules.find((t) => t.selector.trim() === '.list-tab' && t.at.join() === r.at.join() && minHeight(t));
+    assert.equal(minHeight(r), minHeight(twin ?? tab), `Neu-Knopf und Kapsel bauen unter ${r.at.join(' ')} gleich hoch`);
+  }
   const base = rules.find((r) => r.selector.trim() === '.list-tab__new' && r.at.length === 0);
   assert.equal(minHeight(base), 'var(--target-lg)', 'mobil bleibt der Neu-Knopf auf der Touch-Hoehe');
 });
@@ -2259,7 +2347,8 @@ test('ab 60rem Einkaufsflaeche stehen die Kategorien dicht gepackt in zwei Spalt
 
   // Die Huelle steht im Markup UM die Gruppen - der Scroller selbst hat eine
   // feste Hoehe, und Multicol liefe dort seitlich statt nach unten weiter.
-  assert.match(js, /insertAdjacentHTML\('beforeend', `<div class="items-lanes">\$\{renderItems\(\)\}<\/div>`\)/);
+  // Die Zeilen darin baut der erste Aufbau als Platzhalter (utils/row-fill.js).
+  assert.match(js, /insertAdjacentHTML\('beforeend', `<div class="items-lanes">\$\{renderItems\(fill\.rows\)\}<\/div>`\)/);
   const narrow = rules.find((r) => r.at.length === 0 && r.selector.trim() === '.items-lanes');
   assert.match(narrow?.body ?? '', /display:\s*contents/, 'schmal aendert die Huelle nichts');
 
@@ -2297,19 +2386,42 @@ test('Einkauf: kein Wisch-Chevron an der Zeile, keine Reserve dafuer', async () 
 });
 
 // Re-Critique 2026-09-28 (P7 / A4 P2-4): am Zeiger standen zwei violette "+"
-// fuer dieselbe Absicht - die angedockte Kopf-Pille "+ Artikel" und der
-// Absender des Schnellfelds. Das "+" bleibt der Pille; der Absender ist die
-// ruhige Return-Glyphe wie in Erinnerungen (tippen, Enter).
-test('Einkauf: EIN Plus - der Absender des Schnellfelds ist eine ruhige Return-Glyphe', async () => {
+// fuer dieselbe Absicht - das "+" bleibt der Pille. R24 (Critique
+// G3-Einkauf-P3-1): der Absender war danach eine nackte Return-Glyphe, die nur
+// versteht, wer Enter schon kennt; jetzt ein ruhiger Knopf mit Wort.
+test('Einkauf: EIN Plus - der Absender des Schnellfelds ist ein ruhiger Knopf mit Wort', async () => {
   const src = readFileSync(new URL('../public/pages/shopping.js', import.meta.url), 'utf8');
-  const btn = /<button class="quick-add__btn"[^>]*>\s*<i data-lucide="([^"]+)"/.exec(src);
+  const btn = /<button class="([^"]*quick-add__btn[^"]*)" type="submit">([^<]*)<\/button>/.exec(src);
   assert.ok(btn, 'der Absender bleibt ein echter Submit-Knopf');
-  assert.equal(btn[1], 'corner-down-left', 'kein zweites Plus neben der Kopf-Pille');
+  assert.match(btn[1], /\bbtn--secondary\b/, 'sekundaer, keine zweite gefuellte Stimme');
+  assert.match(btn[1], /\bbtn--sm\b/, 'in der kleinen Knopfgroesse der Zeile');
+  assert.match(btn[2], /t\('common\.add'\)/, 'mit dem Wort "Hinzufuegen"');
+  assert.doesNotMatch(btn[0], /data-lucide="(?:plus|corner-down-left)"/, 'kein Plus und keine nackte Glyphe');
   const { eachRule } = await import('./css-rules.js');
-  const rule = [...eachRule(readFileSync(new URL('../public/styles/shopping.css', import.meta.url), 'utf8'))]
-    .find((r) => r.selector.trim() === '.quick-add__btn' && !r.at.length);
-  assert.doesNotMatch(rule?.body ?? '', /background-color:\s*var\(--color-accent\)/, 'keine zweite gefuellte Stimme');
-  assert.match(rule?.body ?? '', /color:\s*var\(--color-text-(?:secondary|tertiary)\)/);
+  const rules = [...eachRule(readFileSync(new URL('../public/styles/shopping.css', import.meta.url), 'utf8'))];
+  const rule = rules.find((r) => r.selector.trim() === '.quick-add .quick-add__btn' && !r.at.length);
+  assert.ok(rule, 'die Regel des Absenders fehlt');
+  assert.doesNotMatch(rule.body, /background|border-radius|width/, 'die Haut kommt vom Knopf-Baustein');
+  // Am Zeiger stehen die Felder in der Hoehe der Shell (40px), nicht 50.
+  const zeiger = rules.find((r) => r.selector.trim() === '.quick-add__form' && r.at.some((at) => /hover:\s*hover/.test(at)));
+  assert.match(zeiger?.body ?? '', /--quick-add-height:\s*var\(--target-md\)/);
+});
+
+// R24 S14: am Finger stand das Namensfeld 50px hoch neben 48px Menge, Kategorie
+// und "Hinzufuegen", am Zeiger 41,5 neben 40 - die Felder trugen ihr Polster
+// auf die Mindesthoehe obendrauf. Die Zeile nennt ihre Hoehe EINMAL.
+test('Einkauf: Schnellfeld - Felder und Absender stehen in EINER Hoehe', async () => {
+  const { eachRule } = await import('./css-rules.js');
+  const rules = [...eachRule(readFileSync(new URL('../public/styles/shopping.css', import.meta.url), 'utf8'))];
+  const base = (sel) => rules.filter((r) => r.selector.trim() === sel && !r.at.length).map((r) => r.body).join('\n');
+  assert.match(base('.quick-add__form'), /--quick-add-height:\s*var\(--target-base\)/, 'am Finger die Zielgroesse der Geraetewelt');
+  for (const sel of ['.quick-add__input', '.quick-add__qty', '.quick-add__cat']) {
+    assert.match(base(sel), /min-height:\s*var\(--quick-add-height\)/, `${sel}: die Hoehe der Zeile`);
+    assert.match(base(sel), /padding-block:\s*0/, `${sel}: kein Polster obendrauf`);
+  }
+  assert.match(base('.quick-add .quick-add__btn'), /min-height:\s*var\(--quick-add-height\)/, 'der Knopf nimmt dieselbe Hoehe');
+  const fremd = rules.filter((r) => /quick-add__(?:input|qty|cat|btn)\b/.test(r.selector) && /(?:min-)?height:\s*var\(--target-/.test(r.body));
+  assert.deepEqual(fremd.map((r) => `${r.at.join(' ')} ${r.selector.trim()}`), [], 'keine zweite Hoehe neben der Zeile');
 });
 
 // Re-Critique 2026-09-28 (P11 / A4 P2-8): eine neu gezeichnete Einkaufsliste
@@ -2386,4 +2498,101 @@ test('R20: die Kapseln der Sammel-Pille haben am Finger eine 48px-Trefferflaeche
   assert.match(after.body, /inset-block:\s*calc\(\(100% - var\(--target-base\)\) \/ 2\)/, 'senkrecht auf --target-base');
   const host = coarse.find((r) => r.selector.split(',').some((s) => s.trim() === '.list-bulkbar__action') && /position:\s*relative/.test(r.body));
   assert.ok(host, 'die Kapsel ist der Bezug des Saums');
+});
+
+// --------------------------------------------------------------------------
+// R22 (Critique a2 P2 "lange Listen", D22): eine Zeile baut nur, was man
+// sieht, und die Zeichen kommen in Sicht-Reihenfolge.
+// --------------------------------------------------------------------------
+
+const { expandSwipeReveals, deferredRevealHtml, wireSwipeRows, maybeShowSwipeHint } = await import('../public/utils/swipe-row.js');
+
+test('R22 D22: Mehr-Menue und Aufdeck-Flaechen einer Einkaufszeile entstehen erst bei Bedarf', () => {
+  resetShoppingState();
+  const html = __test.renderItem({ id: 9, name: 'Milch', quantity: '1', category: 'Sonstiges', is_checked: 0, tags: [] });
+  const outside = html.replace(/<template[\s\S]*?<\/template>/g, '');
+  assert.match(html, /role="menu"><template data-popover-entries>[\s\S]*data-action="item-details"[\s\S]*data-action="delete-item"/,
+    'die Eintraege des Mehr-Menues stehen im Baum');
+  assert.equal((html.match(/class="swipe-reveal [^"]*" aria-hidden="true"><template data-swipe-reveal>/g) ?? []).length, 2,
+    'die Aufdeck-Flaechen tragen ihren Inhalt im Baum');
+  assert.doesNotMatch(outside, /popover-menu__item|data-lucide="(?:trash-2|pencil)"/, 'ausserhalb der Templates steht noch ein Eintrag');
+  assert.equal((outside.match(/data-lucide=/g) ?? []).length, 3, 'Haken, Mehr-Knopf und Griff - mehr Zeichen braucht die Zeile nicht');
+});
+
+/** Zeile mit zwei aufgeschobenen Flaechen; zeichnet mit, was eingehaengt wird. */
+function deferredRow() {
+  const listeners = {};
+  const swapped = [];
+  const flaeche = (name) => {
+    const host = { name };
+    host.tpl = { parentElement: host, content: { of: name }, replaceWith(node) { swapped.push(node.of); host.tpl = null; } };
+    return host;
+  };
+  const flaechen = [flaeche('done'), flaeche('delete')];
+  const row = {
+    classList: { add() {}, remove() {} },
+    addEventListener(type, handler) { (listeners[type] ??= []).push(handler); },
+    querySelector: (sel) => (sel === '.shopping-item' ? { style: {} } : null),
+    querySelectorAll: (sel) => (sel === ':scope > .swipe-reveal > template[data-swipe-reveal]' ? flaechen.map((f) => f.tpl).filter(Boolean) : []),
+  };
+  return { row, swapped, fire: (type, e) => listeners[type]?.forEach((h) => h(e)) };
+}
+
+test('R22 D22: der Inhalt der Aufdeck-Flaechen entsteht mit der Beruehrung, nicht mit der Zeile', () => {
+  assert.equal(deferredRevealHtml('<i data-lucide="check"></i>'), '<template data-swipe-reveal><i data-lucide="check"></i></template>');
+  const icons = [];
+  global.window.lucide = { createIcons: ({ el }) => icons.push(el.name) };
+  const doc = global.document.getElementById;
+  try {
+    const z = deferredRow();
+    wireSwipeRows({ querySelectorAll: () => [z.row] }, { card: '.shopping-item', leading: { reveal: '.swipe-reveal--done', run() {} } });
+    assert.deepEqual(z.swapped, [], 'das Verdrahten haengt nichts ein');
+    z.fire('touchstart', { target: {}, touches: [{ clientX: 10, clientY: 10 }] });
+    assert.deepEqual(z.swapped, ['done', 'delete'], 'die Beruehrung haengt beide Flaechen ein');
+    assert.deepEqual(icons, ['done', 'delete'], 'und zeichnet ihre Zeichen');
+    expandSwipeReveals(z.row);
+    assert.equal(z.swapped.length, 2, 'ein zweites Mal baut nichts nach');
+  } finally {
+    delete global.window.lucide;
+    global.document.getElementById = doc;
+  }
+});
+
+test('R22 D22: die Zeichen der Einkaufsliste kommen in Sicht-Reihenfolge, nicht alle im Frame des Wechsels', () => {
+  const calls = [];
+  globalThis.__iconStub = (listEl, opts) => calls.push([listEl, opts]);
+  try {
+    const listEl = { id: 'items-list' };
+    __test.drawItemIcons(listEl);
+    assert.deepEqual(calls, [[listEl, { rowSelector: '.swipe-row', rowsNow: __test.ICON_ROWS_NOW }]],
+      'die Liste zeichnet ueber den geteilten Baustein, je Zeile');
+    const src = readFileSync(new URL('../public/pages/shopping.js', import.meta.url), 'utf8');
+    const fn = src.match(/function updateItemsList\(container\) \{[\s\S]*?\n\}/)[0];
+    assert.match(fn, /drawItemIcons\(listEl\);/);
+    assert.doesNotMatch(fn, /createIcons\(\{ el: listEl \}\)/, 'alle Zeichen im Frame des Wechsels');
+  } finally {
+    delete globalThis.__iconStub;
+  }
+});
+
+test('R22 D22: der Wisch-Hinweis liest den Viewport per Medienabfrage und zeigt seine Flaeche', () => {
+  // `innerWidth` zwingt mitten im Aufbau ein Layout nach (gemessen 11 ms bei
+  // 1x CPU); die Medienabfrage liest nur den Viewport.
+  let gelesen = 0;
+  Object.defineProperty(global.window, 'innerWidth', { configurable: true, get() { gelesen += 1; return 390; } });
+  const location0 = global.location;
+  global.location = { pathname: '/r22-hinweis' };
+  const icons = [];
+  global.window.lucide = { createIcons: ({ el }) => icons.push(el.name) };
+  try {
+    const z = deferredRow();
+    z.row.addEventListener = () => {};
+    maybeShowSwipeHint({ querySelector: (sel) => (sel === '.swipe-row' ? z.row : null) });
+    assert.equal(gelesen, 0, 'innerWidth erzwingt ein Layout im Aufbau');
+    assert.deepEqual(z.swapped, ['done', 'delete'], 'der Hinweis zeigt die Flaeche mit Inhalt');
+  } finally {
+    delete global.window.innerWidth;
+    delete global.window.lucide;
+    global.location = location0;
+  }
 });

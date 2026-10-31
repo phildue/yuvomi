@@ -168,7 +168,8 @@ async function apiFetch(path, options = {}, _retried = false) {
     // Aufgabe, gespiegeltes Rezept, CSRF): der Satz zum Grund statt des
     // englischen vom Server. Manche Seiten zeigen `err.data.error` statt
     // `err.message` (Gesundheit, deren Einstellungen) - deshalb traegt beides
-    // die Uebersetzung. Die Liste steht bei friendlyError, das denselben Satz zeigt.
+    // die Uebersetzung. Die Liste steht in public/utils/friendly-error.js, wo
+    // unhandledErrorSentence denselben Satz zeigt.
     const refusalKey = response.status === 403 ? REFUSAL_MESSAGES.get(data?.reason) : undefined;
     if (refusalKey) {
       const text = t(refusalKey);
@@ -192,7 +193,10 @@ async function apiFetch(path, options = {}, _retried = false) {
     throw new ApiError(message, response.status, data, response.headers.get('Retry-After'));
   }
 
-  if (stateChanging) notifyCountedMutation(path);
+  if (stateChanging) {
+    notifyWrite(path);
+    notifyCountedMutation(path);
+  }
 
   // `withSource` beantwortet EINE Frage: kam diese Antwort aus dem
   // Offline-Cache des Service Workers?
@@ -231,6 +235,27 @@ async function apiFetch(path, options = {}, _retried = false) {
  * vergessen kostet eine veraltete Zahl bis zum Ablauf der TTL; jeden
  * Einstellungsklick mitzuzaehlen kostet eine Aggregation pro Klick. */
 const COUNTED_PATHS = ['/tasks', '/shopping', '/rewards', '/health', '/birthdays', '/inventory'];
+
+/** Name des Ereignisses, mit dem jeder geglueckte Schreibvorgang sich meldet.
+ * Leser schreiben ihn aus (der Test-Loader stubt diese Datei - ein neuer
+ * Export braeche jede Suite, die einen Leser importiert). */
+const WRITE_EVENT = 'yuvomi:write';
+
+/* JEDER GEGLUECKTE SCHREIBVORGANG MELDET SICH (Critique R21). Wer einen Stand
+ * ueber den Seitenwechsel haelt, muss wissen, wann er nicht mehr stimmt: die
+ * Uebersicht zeichnet einen eben geladenen Stand beim Zurueckkommen sofort
+ * (pages/dashboard.js, `takeOverviewMemo`) - aber nicht, wenn dazwischen
+ * irgendwo etwas geaendert wurde. Ein Ereignis am window statt eines Exports:
+ * die API-Schicht kennt ihre Leser nicht. */
+function notifyWrite(path) {
+  // Anmelden aendert keine Daten - es beginnt nur eine Sitzung (dieselben
+  // zwei Pfade, die auch kein `auth:expired` ausloesen).
+  const base = path.split('?')[0];
+  if (base === '/auth/login' || base === '/auth/2fa/verify') return;
+  try {
+    window.dispatchEvent(new CustomEvent(WRITE_EVENT, { detail: { path } }));
+  } catch { /* ein Leser darf keinen Schreibvorgang scheitern lassen */ }
+}
 
 function notifyCountedMutation(path) {
   const base = path.split('?')[0];
@@ -439,6 +464,11 @@ const auth = {
   },
   forgotPassword: (identifier) => api.post('/auth/forgot-password', { identifier }),
   resetPassword: (token, password) => api.post('/auth/reset-password', { token, password }),
+  /**
+   * Gilt dieser Reset-Link noch? Fragt, ohne ihn einzuloesen (Critique R22,
+   * D19). Der Token geht im Koerper, nicht in der URL. `{ data: { valid } }`.
+   */
+  checkResetToken: (token) => api.post('/auth/reset-password/check', { token }),
   /**
    * Kann dieser Server einen Passwort-Reset ueberhaupt durchfuehren?
    *

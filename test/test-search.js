@@ -48,6 +48,9 @@ db.exec(MIGRATIONS_SQL[66]);
 db.exec(MIGRATIONS_SQL[197]);
 // Migration 206: FTS triggers + backfill for waste_types.
 db.exec(MIGRATIONS_SQL[206]);
+db.exec(MIGRATIONS_SQL[262]); // notes.visibility - die Notizsuche fragt sie seit #1514
+db.exec(MIGRATIONS_SQL[174]); // birthdays.name_day_calendar_event_id - Geburtstagsfelder der Termin-Treffer
+db.exec(MIGRATIONS_SQL[254]); // birthdays.year_unknown
 
 console.log('\n[Search-Test] FTS5-Volltextsuche\n');
 
@@ -288,6 +291,36 @@ test('"heute" der globalen Suche ist der Tag der Haushaltszone (#1607)', () => {
   assert(utc.start_datetime.slice(0, 10) === '2027-10-14', `UTC: ${utc.start_datetime}`);
 });
 
+test('R24 G0 P1-1: ein Geburtstagstermin traegt birthday_name, damit der Client ihn uebersetzt', () => {
+  const bday = db.prepare(`INSERT INTO calendar_events (title, start_datetime, all_day, recurrence_rule, created_by)
+    VALUES ('Birthday: Qzxemma', '2015-03-08', 1, 'FREQ=YEARLY', ?)`).run(uid).lastInsertRowid;
+  const nday = db.prepare(`INSERT INTO calendar_events (title, start_datetime, all_day, recurrence_rule, created_by)
+    VALUES ('Name day: Qzxemma', '2015-07-22', 1, 'FREQ=YEARLY', ?)`).run(uid).lastInsertRowid;
+  const plain = db.prepare(`INSERT INTO calendar_events (title, start_datetime, all_day, created_by)
+    VALUES ('Qzxemma Schulfest', '2026-11-02', 1, ?)`).run(uid).lastInsertRowid;
+  const person = db.prepare(`INSERT INTO birthdays (name, birth_date, calendar_event_id, name_day_calendar_event_id, created_by)
+    VALUES ('Qzxemma', '2015-03-08', ?, ?, ?)`).run(bday, nday, uid).lastInsertRowid;
+  try {
+    const hits = mitUhr('2026-10-02T10:00:00Z', 'UTC', () => runSearch(db, 'Qzxemma', uid).events);
+    const byId = new Map(hits.map((h) => [h.id, h]));
+    assert(byId.size === 3, `drei Treffer erwartet, bekommen ${hits.length}`);
+    const b = byId.get(Number(bday));
+    assert(b.birthday_name === 'Qzxemma' && b.birthday_event_kind === 'birthday' && b.birthday_date === '2015-03-08',
+      `Geburtstag: ${JSON.stringify(b)}`);
+    const n = byId.get(Number(nday));
+    assert(n.birthday_name === 'Qzxemma' && n.birthday_event_kind === 'name_day' && n.birthday_date === null,
+      `Namenstag: ${JSON.stringify(n)}`);
+    assert(!('birthday_name' in byId.get(Number(plain))), 'ein gewoehnlicher Termin behaelt seine Form');
+    // Unbekanntes Geburtsjahr: kein erfundenes Datum, wie serializeEvent().
+    db.prepare('UPDATE birthdays SET year_unknown = 1 WHERE id = ?').run(person);
+    const again = mitUhr('2026-10-02T10:00:00Z', 'UTC', () => runSearch(db, 'Qzxemma', uid).events);
+    assert(again.find((h) => h.id === Number(bday)).birthday_date === null, 'Jahr unbekannt -> kein Datum');
+  } finally {
+    db.prepare('DELETE FROM birthdays WHERE id = ?').run(person);
+    db.prepare('DELETE FROM calendar_events WHERE id IN (?, ?, ?)').run(bday, nday, plain);
+  }
+});
+
 test('globale Suche und Kalendersuche fragen dasselbe Fenster ab (#1607)', () => {
   // Synchron, wie jeder Test dieser Datei: der eigene Zaehler wartet nicht.
   const { eventSearchWindow } = searchModule;
@@ -328,6 +361,28 @@ test('ohne kommenden Termin bleibt der Treffer die Stammzeile; ein Einzeltermin 
   assert(beendet.start_datetime.slice(0, 10) === '2001-03-05', `beendete Serie: ${beendet.start_datetime}`);
   const einmal = mitUhr('2026-10-02T10:00:00Z', 'UTC', () => runSearch(db, 'Qzxsingle', uid).events[0]);
   assert(einmal.start_datetime === '1999-06-01T09:00:00', `Einzeltermin: ${einmal.start_datetime}`);
+});
+
+test('globale Suche: kommende Termine vorn, vergangene dahinter, der juengste zuerst (Critique R21)', () => {
+  // Die Palette reihte aufsteigend nach Start: der Termin vom letzten Jahr
+  // stand vor dem von naechster Woche.
+  const ins = db.prepare(`INSERT INTO calendar_events (title, start_datetime, all_day, recurrence_rule, created_by)
+                          VALUES (?, ?, 0, NULL, ?)`);
+  ins.run('Alt Qzxdentist', '2025-03-10T09:00:00', uid);
+  ins.run('Kuerzlich Qzxdentist', '2026-09-20T09:00:00', uid);
+  ins.run('Bald Qzxdentist', '2026-10-09T09:00:00', uid);
+  ins.run('Spaeter Qzxdentist', '2027-01-15T09:00:00', uid);
+  // Heute frueh liegt der Termin vor "jetzt", aber auf dem heutigen Tag: er gilt als kommend.
+  ins.run('Heute Qzxdentist', '2026-10-02T08:00:00', uid);
+  const titel = mitUhr('2026-10-02T10:00:00Z', 'UTC', () => runSearch(db, 'Qzxdentist', uid).events.map((e) => e.title.split(' ')[0]));
+  assert(JSON.stringify(titel) === JSON.stringify(['Heute', 'Bald', 'Spaeter', 'Kuerzlich', 'Alt']),
+    `Reihenfolge: ${titel.join(', ')}`);
+  // Die Grenze ist der Tag der HAUSHALTSZONE: in Los Angeles ist um 03:00 UTC
+  // am 3. noch der 2. - "Heute" bleibt vorn; in UTC ist er gestern.
+  const la = mitUhr('2026-10-03T03:00:00Z', 'America/Los_Angeles', () => runSearch(db, 'Qzxdentist', uid).events[0].title);
+  const utc = mitUhr('2026-10-03T03:00:00Z', 'UTC', () => runSearch(db, 'Qzxdentist', uid).events.map((e) => e.title.split(' ')[0]));
+  assert(la.startsWith('Heute'), `Los Angeles: ${la}`);
+  assert(utc[0] === 'Bald' && utc[utc.length - 3] === 'Heute', `UTC: ${utc.join(', ')}`);
 });
 
 test('globale Suche löst große Anhänge auf, ohne attachment_data zu lesen', () => {

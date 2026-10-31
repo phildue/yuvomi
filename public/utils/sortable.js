@@ -68,6 +68,23 @@ function prefersReducedMotion() {
  *        bekommt das rohe SortableJS-Event (item, from, to, oldIndex, newIndex, ...)
  * @returns {Promise<object|null>} die Sortable-Instanz (zum späteren `.destroy()`) oder null
  */
+/**
+ * DAS ZIEHBILD IST DECKEND (Critique R23, N3). SortableJS schreibt dem
+ * mitgefuehrten Klon im Fallback-Modus `opacity: 0.8` als Inline-Stil - neben
+ * dem Platz an der Zielstelle stand die Zeile damit zweimal halb da. Der Klon
+ * entsteht erst bei der ersten Bewegung; bis er da ist, sieht ein Bild je Frame
+ * nach (hoechstens ein paar), dann nie wieder.
+ */
+function liftDragImage(frames = 30) {
+  if (typeof requestAnimationFrame !== 'function' || typeof document === 'undefined') return;
+  const tick = (left) => {
+    const clone = document.querySelector('.sortable-drag');
+    if (clone) { clone.style.opacity = ''; return; }
+    if (left > 0) requestAnimationFrame(() => tick(left - 1));
+  };
+  requestAnimationFrame(() => tick(frames));
+}
+
 export async function makeSortable(listEl, { handle, draggable, filter, group, sort = true, onEnd } = {}) {
   if (!listEl || typeof onEnd !== 'function') return null;
   const Sortable = await loadSortable();
@@ -85,10 +102,12 @@ export async function makeSortable(listEl, { handle, draggable, filter, group, s
     preventOnFilter: false,
     group,
     sort,
-    // Dauer und Feder aus tokens.css (--duration-sm, --ease-glass): die Kurve
-    // stand hier als zweite Quelle neben dem Token.
+    // Dauer und Kurve aus tokens.css (--duration-sm, --ease-out). Bis R23 die
+    // Feder `--ease-glass`: die Nachbarzeilen schossen beim Ausweichen ueber
+    // ihr Ziel hinaus und federten zurueck - Bewegung, die nichts mitteilt,
+    // unter einer Zeile, die man gerade festhaelt (Critique R23, N3).
     animation: reduced ? 0 : durationToken('--duration-sm', 150),
-    easing: easingToken('--ease-glass', 'ease-out'),
+    easing: easingToken('--ease-out', 'ease-out'),
     delay: 120,
     delayOnTouchOnly: true,
     touchStartThreshold: 5,
@@ -100,6 +119,7 @@ export async function makeSortable(listEl, { handle, draggable, filter, group, s
     ghostClass: 'sortable-ghost',
     chosenClass: 'sortable-chosen',
     dragClass: 'sortable-drag',
+    onStart() { liftDragImage(); },
     onEnd(evt) {
       // ZWISCHEN LISTEN ZAEHLT DER INDEX NICHT. Die Bedingung war
       // `oldIndex === newIndex` und stimmte, solange jede Liste fuer sich blieb:
@@ -115,4 +135,70 @@ export async function makeSortable(listEl, { handle, draggable, filter, group, s
       onEnd(evt);
     },
   });
+}
+
+/**
+ * Die Sortable-Instanzen EINES Dialogs, der sich neu aufbaut (Codex an #2177).
+ *
+ * Ein Dialog, der bei jedem Schreiben schliesst und mit frischem Stand neu
+ * aufgeht (Abo-Verwalter, Schnelllinks), erzeugte je Aufbau neue Instanzen
+ * und gab keine frei - SortableJS haelt jede in seiner Registry, samt
+ * Listenern am Dokument. `add()` legt eine an und merkt sie sich; `clear()`
+ * gibt alle frei und macht jede noch laufende Erzeugung ungueltig: eine
+ * Instanz, deren lazy Import erst nach dem Schliessen fertig wird, wird sofort
+ * wieder zerstoert statt zu verwaisen. Aufzurufen beim Neuaufbau UND im
+ * onClose des Dialogs.
+ *
+ * @param {object} [opts]
+ * @param {Function} [opts.create] - Erzeuger (Standard: makeSortable; Tests reichen eine Attrappe)
+ * @returns {{ add: (listEl: HTMLElement, opts: object) => Promise<object|null>, clear: () => void, size: () => number }}
+ */
+export function sortableSet({ create = makeSortable } = {}) {
+  const live = new Set();
+  let generation = 0;
+  return {
+    add(listEl, opts) {
+      const own = generation;
+      return Promise.resolve(create(listEl, opts)).then((instance) => {
+        if (!instance) return null;
+        if (own !== generation || listEl?.isConnected === false) {
+          instance.destroy?.();
+          return null;
+        }
+        live.add(instance);
+        return instance;
+      });
+    },
+    clear() {
+      generation += 1;
+      for (const instance of live) instance.destroy?.();
+      live.clear();
+    },
+    size: () => live.size,
+  };
+}
+
+/**
+ * Stellt die gespeicherte Reihenfolge einer Liste wieder her, nachdem ein Zug
+ * nicht gespeichert werden konnte (Codex an #2177).
+ *
+ * SortableJS - und ein Tastaturpfad, der die Zeile vorab umhaengt - verschiebt
+ * das DOM VOR der Anfrage. Scheitert sie, stuende eine Reihenfolge da, die es
+ * nirgends gibt, samt falscher Positionen in Griff-Labels und Menue. Die
+ * Zeilen werden in der gespeicherten Folge `ids` neu angehaengt; die Liste
+ * darf dafuer nur diese Zeilen fuehren. Der Fokus bleibt, wo er war.
+ *
+ * @param {HTMLElement} listEl
+ * @param {Array<string|number>} ids  - gespeicherte Reihenfolge
+ * @param {(row: HTMLElement) => string|number} idOf
+ */
+export function restoreOrder(listEl, ids, idOf) {
+  if (!listEl) return;
+  const active = globalThis.document?.activeElement ?? null;
+  const rows = new Map([...listEl.children].map((row) => [String(idOf(row)), row]));
+  for (const id of ids) {
+    const row = rows.get(String(id));
+    if (row) listEl.appendChild(row);
+  }
+  if (active && globalThis.document?.activeElement !== active) active.focus?.();
 }

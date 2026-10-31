@@ -217,7 +217,7 @@ test('im Sheet steht Bearbeiten als Hauptaktion unten, Löschen zurückgenommen 
   // Der Kalender: sein Löschen bleibt zurückgenommen.
   const cal = await calendarJs();
   const detail = cal.slice(cal.indexOf('async function openEventDetail('), cal.indexOf('async function loadReminderForEvent('));
-  assert.match(detail, /id: 'detail-delete',[\s\S]{0,80}variant: 'danger-ghost',[\s\S]{0,40}align: 'start'/,
+  assert.match(detail, /id: 'detail-delete',[\s\S]{0,80}variant: 'danger-outline',[\s\S]{0,40}align: 'start'/,
     'Löschen bleibt destruktiv gestylt und am Anfang, nicht an der Primärposition');
 });
 
@@ -308,7 +308,9 @@ test('das alte Termin-Popup ist rückstandslos entfernt', async () => {
 test('jeder Weg zu einem Termin führt in die Detailansicht', async () => {
   const src = await calendarJs();
   // Seit R10 (L5) mit der Detailspalte der Agenda als drittem Ort - derselbe Einstieg.
-  assert.match(src, /async function openEventDetail\(ev, anchor = null, \{ pane = null \} = \{\}\)/, 'ein einziger Einstieg');
+  // Seit R22-F auch ueber der Uebersicht (openEventById ruft denselben Einstieg).
+  assert.match(src, /async function openEventDetail\(ev, anchor = null, \{ pane = null, formReady: formReadyExtra = null \} = \{\}\)/, 'ein einziger Einstieg');
+  assert.match(src, /await openEventDetail\(ev, anchor, \{ formReady: away\?\.ready \}\);/, 'auch der Termin ueber der Uebersicht');
   assert.match(src, /import \{ openDetailView.*\} from '\/components\/detail-view\.js'/);
 
   // Kein Aufrufpfad darf an der Detailansicht vorbei ins Formular führen; der
@@ -339,14 +341,16 @@ test('das Formular wartet auf die Erinnerungen, die Leseansicht nicht', async ()
 
   // Das Formular dagegen MUSS sie haben: saveEvent liest die Erinnerungen aus
   // den Formularzeilen und löscht die des Termins, wenn es keine findet.
-  assert.match(fn, /ready:\s*remindersReady/, 'der Wechsel ins Formular wartet auf die Erinnerungen');
-  assert.match(fn, /standalone:\s*async[\s\S]*?await remindersReady/, 'der Desktop-Weg ebenso');
+  // Seit R22-F zusammen mit dem Formular-Zustand ueber einer fremden Seite.
+  assert.match(fn, /const formReady = Promise\.all\(\[remindersReady, formReadyExtra\]\);/, 'das Formular wartet auf die Erinnerungen');
+  assert.match(fn, /ready:\s*formReady/, 'der Wechsel ins Formular wartet auf die Erinnerungen');
+  assert.match(fn, /standalone:\s*async[\s\S]*?await formReady/, 'der Desktop-Weg ebenso');
   assert.match(fn, /view\.update\(/, 'die Erinnerungszeile wird nachgetragen');
 });
 
 test('ein neuer Termin startet weiterhin direkt im Formular', async () => {
   const src = await calendarJs();
-  assert.match(src, /openEventModal\(\{ mode: 'create' \}\)/, 'der Anlege-Pfad bleibt unangetastet');
+  assert.match(src, /openEventModal\(\{ mode: 'create'[,}]/, 'der Anlege-Pfad bleibt unangetastet');
 });
 
 test('die Termin-Verdrahtung ist zweigeteilt', async () => {
@@ -509,7 +513,7 @@ test('die Leseansicht ist nicht an ihr Modul genagelt (#918)', async () => {
   // Und die zwei Ansichten, die vorher eine kleinere Fassung bauten oder
   // wegnavigierten, oeffnen jetzt genau diese.
   const dash = await dashboardJs();
-  assert.match(dash, /openTaskById\(taskId, \{ user, container, onChanged: rerender \}\)/,
+  assert.match(dash, /openTaskById\(taskId, \{ user, container, onChanged: refresh \}\)/,
     'die Uebersicht oeffnet die geteilte Ansicht');
   assert.doesNotMatch(dash, /openTaskQuickAction/,
     'das Zwei-Knopf-Kaertchen ist ersetzt, nicht daneben stehen geblieben');
@@ -568,7 +572,7 @@ test('der Rueckgaengig-Streifen blendet JEDE Darstellung der Aufgabe aus (#918)'
   const dash = await dashboardJs();
   assert.match(dash, /data-object-kind="\$\{esc\(row\.kind\)\}" data-object-id=/,
     'die Cockpit-Zeile benennt ihr Objekt');
-  assert.match(dash, /class="task-item" data-task-id=/, 'die Widget-Zeile nennt ihre Aufgabe');
+  assert.match(dash, /class="list-row task-item" data-task-id=/, 'die Widget-Zeile nennt ihre Aufgabe');
 });
 
 test('wer die Aufgabe von aussen oeffnet, bekommt ihr Blatt (#918)', async () => {
@@ -1274,7 +1278,8 @@ test('R19: Bearbeiten ist ueberall der eine Primaerknopf am Ende des Fusses', as
   // weiter destruktiv gefaerbt), Bearbeiten steht als Stift vor dem vollen
   // Erledigen (Ulas 2026-10-16).
   const task = readFileSync(new URL('../public/components/task-detail.js', import.meta.url), 'utf8');
-  assert.match(task, /const overflowIds = \['task-detail-start', 'task-detail-archive', 'task-detail-delete'\];/);
+  // Seit R22 (D17) steht auch „Wer hat erledigt?" im Menue, als erster Eintrag.
+  assert.match(task, /const overflowIds = \[DOER_BUTTON_ID, 'task-detail-start', 'task-detail-archive', 'task-detail-delete'\];/);
   const more = task.slice(task.indexOf('function wireDetailMoreMenu('), task.indexOf('const DOER_BUTTON_ID'));
   assert.match(more, /popover-menu__item--danger/, 'Loeschen bleibt im Menue destruktiv');
   const css = await detailCss();
@@ -1300,4 +1305,53 @@ test('R20: keine Leseansicht zieht einen Farbstreifen im blossen Modulton', asyn
     for (const m of src.matchAll(/accentColor:\s*'var\(--module-[a-z-]+\)'/g)) hits.push(`${file}: ${m[0]}`);
   }
   assert.deepEqual(hits, []);
+});
+
+/* Fremde Adressen als Link: nur http(s) wird zum href. Die Website eines
+ * Kontakts kommt ungeprueft aus dem vCard-Feld URL (CardDAV), die Rezept-URL
+ * aus Formular, API und Rezept-Anbietern. Stand dort `javascript:...`, wurde es
+ * ein klickbarer Link - heute bremst das nur die CSP (script-src ohne
+ * unsafe-inline), eine zweite Schicht gab es nicht.
+ */
+test('externalHref laesst nur http(s) als Linkziel durch', async () => {
+  const { externalHref } = await import('../public/utils/html.js');
+  assert.equal(typeof externalHref, 'function', 'utils/html.js exportiert externalHref');
+  assert.equal(externalHref('https://example.org/a?b=1'), 'https://example.org/a?b=1');
+  assert.equal(externalHref('  HTTP://example.org  '), 'HTTP://example.org');
+  assert.equal(externalHref('javascript:alert(1)'), '');
+  assert.equal(externalHref(' JavaScript:alert(1)'), '');
+  assert.equal(externalHref('data:text/html,<b>x</b>'), '');
+  assert.equal(externalHref('www.example.org'), '', 'ohne Schema kein relativer Link in die App');
+  assert.equal(externalHref(null), '');
+});
+
+test('Kontakt-Website und Rezept-URL laufen durch externalHref', async () => {
+  const contacts = await read('public/pages/contacts.js');
+  assert.match(contacts, /externalHref\(contact\.website\)/, 'contacts.js: Website');
+  assert.doesNotMatch(contacts, /href: contact\.website\b/, 'contacts.js: roher Wert als href');
+  const recipes = await read('public/pages/recipes.js');
+  assert.match(recipes, /externalHref\(recipe\.recipe_url\)/, 'recipes.js: Rezept-Link');
+  assert.doesNotMatch(recipes, /link\.href = recipe\.recipe_url/, 'recipes.js: roher Wert als href');
+  const meals = await read('public/pages/meals.js');
+  assert.match(meals, /externalHref\(meal\.recipe_url\)/, 'meals.js: Rezept-Knopf der Mahlzeitkarte');
+  assert.doesNotMatch(meals, /href="\$\{esc\(meal\.recipe_url\)\}"/, 'meals.js: roher Wert als href');
+});
+
+/* R24 S13 (Uebergabe S9): das Popover ist ein Behaelter, kein Steuerelement.
+ * Es nimmt beim Oeffnen den Fokus (tabIndex -1, popover.focus()), und Chrome
+ * gab ihm nach einem Mausklick auf eine Mahlzeitkarte den violetten
+ * Fokusring (`:focus-visible` true - der Klick fokussierte nichts, die Karte
+ * haengt an SortableJS), am Termin nicht. Derselbe Fall wie der Dialogtitel
+ * (`.modal-panel__title[tabindex="-1"]:focus`): ein Ring um eine Karte
+ * verspraeche eine Bedienung, die es nicht gibt. Tab fuehrt in die Knoepfe,
+ * die ihren Ring tragen. */
+test('R24 S13: das Detail-Popover traegt als Fokusziel keinen Ring - Mahlzeit wie Termin', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { eachRule } = await import('./css-rules.js');
+  const rules = [...eachRule(readFileSync(new URL('../public/styles/detail-view.css', import.meta.url), 'utf8'))];
+  const quiet = rules.find((r) => !r.at.length && r.selector.trim() === '.detail-popover:focus');
+  assert.ok(quiet, 'Regel fehlt - nach einem Mausklick stand ein violetter Ring um die ganze Karte');
+  assert.match(quiet.body, /outline:\s*none/);
+  const js = readFileSync(new URL('../public/components/detail-view.js', import.meta.url), 'utf8');
+  assert.match(js, /popover\.tabIndex = -1;/, 'die Regel gilt nur dem Behaelter als Fokusziel');
 });

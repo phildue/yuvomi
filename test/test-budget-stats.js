@@ -71,6 +71,7 @@ function freshDb() {
       title TEXT NOT NULL, amount REAL NOT NULL,
       category TEXT NOT NULL DEFAULT 'Sonstiges', subcategory TEXT NOT NULL DEFAULT '',
       date TEXT NOT NULL, is_recurring INTEGER NOT NULL DEFAULT 0, created_by INTEGER NOT NULL DEFAULT 1,
+      transfer_entry_id INTEGER,
       is_pending INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE budget_plans (
@@ -140,6 +141,18 @@ test('computeStats bySubcategory: Jahr, nur Eintraege mit Unterkategorie, ohne P
   eq(r.bySubcategory[0].category, 'housing', 'Kategorie mitgeliefert');
   eq(r.bySubcategory[0].total, -2400, 'Jahressumme');
   eq(r.bySubcategory[1].total, -90, 'pending zaehlt nicht');
+});
+
+test('computeStats bySubcategory: Umbuchungen zaehlen nicht, wie in byCategory', () => {
+  const db = freshDb();
+  db.prepare("INSERT INTO budget_entries (title, amount, category, subcategory, date) VALUES ('x', -90, 'housing', 'utilities', '2026-03-05')").run();
+  const out = db.prepare("INSERT INTO budget_entries (title, amount, category, subcategory, date) VALUES ('t', -500, 'housing', 'utilities', '2026-03-06')").run().lastInsertRowid;
+  const inn = db.prepare("INSERT INTO budget_entries (title, amount, category, subcategory, date, transfer_entry_id) VALUES ('t', 500, 'housing', 'utilities', '2026-03-06', ?)").run(out).lastInsertRowid;
+  db.prepare('UPDATE budget_entries SET transfer_entry_id = ? WHERE id = ?').run(inn, out);
+  const r = computeStats(db, { range: 'year', anchor: '2026-06-15' });
+  eq(r.bySubcategory.length, 1, 'eine Unterkategorie');
+  eq(r.bySubcategory[0].total, -90, 'Umbuchung nicht in der Summe');
+  eq(r.bySubcategory[0].income, 0, 'Eingang der Umbuchung nicht als Einnahme');
 });
 
 test('computeStats comparison: Vormonat', () => {

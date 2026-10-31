@@ -92,6 +92,53 @@ test('Aufgaben: Badge nennt alle offenen, nicht die fuenf dringendsten', () => {
   assert.ok(!/tasksMore/.test(__test.renderUrgentTasks(tasks, 5)));
 });
 
+/* #2087: die Aufgaben-Kachel bekam keine Groesse und zeigte immer die fuenf
+ * dringendsten - auch als 1x1, wo jede andere Liste drei zeigt. */
+function onPhone(fn) {
+  const prev = globalThis.window;
+  globalThis.window = { ...(prev ?? {}), matchMedia: (query) => ({ matches: query === '(max-width: 639px)' }) };
+  try {
+    return fn();
+  } finally {
+    globalThis.window = prev;
+  }
+}
+// Was ohne Streckung steht: Zusatzzeilen (U14, `data-fill-row`) zeigt erst applyRowFill.
+const taskRows = (html) => (html.match(/<div class="list-row task-item"[^>]*>/g) ?? []).filter((tag) => !tag.includes('data-fill-row')).length;
+
+test('Aufgaben: die Kachel folgt ihrer Groesse wie jede Liste (#2087)', () => {
+  const tasks = Array.from({ length: 5 }, (_, i) => ({ id: i + 1, title: `Aufgabe ${i}`, priority: 'none', status: 'open' }));
+  const small = __test.renderUrgentTasks(tasks, 12, '1x1');
+  assert.equal(taskRows(small), __test.listRowCap('1x1'), '1x1 zeigt drei');
+  assert.equal(taskRows(small), 3);
+  assert.equal(badgeOf(small), '12', 'die Badge zaehlt weiter alle offenen');
+  assert.match(small, /dashboard\.tasksMore\{&quot;count&quot;:9\}/, 'die Fusszeile nennt, was nicht in DIESER Groesse steht');
+  const tall = __test.renderUrgentTasks(tasks, 12, '1x2');
+  assert.equal(taskRows(tall), 5);
+  assert.match(tall, /dashboard\.tasksMore\{&quot;count&quot;:7\}/);
+  assert.equal(taskRows(__test.renderUrgentTasks(tasks, 3, '1x1')), 3);
+  assert.ok(!/tasksMore/.test(__test.renderUrgentTasks(tasks.slice(0, 3), 3, '1x1')), 'drei von drei: keine Fusszeile');
+  assert.equal(taskRows(onPhone(() => __test.renderUrgentTasks(tasks, 12, '1x2'))), 3, 'die Telefon-Buehne zeigt drei');
+});
+
+test('Aufgaben: das Raster reicht der Kachel ihre Groesse durch (#2087)', async () => {
+  const { setPermissions, clearPermissions } = await import('../public/permissions.js');
+  const tasks = Array.from({ length: 5 }, (_, i) => ({ id: i + 1, title: `Aufgabe ${i}`, priority: 'none', status: 'open' }));
+  const layout = (size) => __test.renderDashboardLayout(
+    [{ id: 'tasks', visible: true, order: 0, size }], { urgentTasks: tasks, openTaskCount: 12 }, null, 'EUR',
+  );
+  const prev = globalThis.window;
+  globalThis.window = { yuvomi: { isModuleDisabled: () => false }, matchMedia: () => ({ matches: false }) };
+  setPermissions({ admin: true, modules: {}, widgets: {}, capabilities: {} });
+  try {
+    assert.equal(taskRows(layout('1x1')), 3);
+    assert.equal(taskRows(layout('1x2')), 5);
+  } finally {
+    clearPermissions();
+    globalThis.window = prev;
+  }
+});
+
 test('Kalender: keine Badge - "5" waere nur die Obergrenze der Liste', () => {
   // Die Liste ist nach vorn offen (bis 90 Tage) und bei fuenf geschnitten; eine
   // Gesamtzahl gibt es nicht. Eine Badge "5" stuende genau so lange da, wie
@@ -131,7 +178,7 @@ test('Einkauf: jede Listenzeile fuehrt zu IHRER Liste, per Klick und per Tastatu
     return {
       tagName: m[1].toUpperCase(),
       id: '',
-      isListRow: /class="shopping-widget-list"/.test(m[2]),
+      isListRow: /class="list-row shopping-widget-list"/.test(m[2]),
       attrs: m[2],
       dataset: { route: unesc(m[3]) },
       closest: () => null,
@@ -192,7 +239,7 @@ test('Einkauf: jede Listenzeile fuehrt zu IHRER Liste, per Klick und per Tastatu
 function rowRoutesOf(html, className) {
   const unesc = (v) => v.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
   return [...html.matchAll(/<[a-z]+\b([^>]*\bdata-route="([^"]*)"[^>]*)>/g)]
-    .filter((m) => new RegExp(`class="${className}(?:["\\s])`).test(m[1]))
+    .filter((m) => new RegExp(`class="(?:list-row )?${className}(?:["\\s])`).test(m[1]))
     .map((m) => unesc(m[2]));
 }
 
@@ -552,12 +599,15 @@ test('#1821 Fokus: der Neuaufbau der Seite ruft Erfassen und Wiederfokus, um das
   const fn = src.slice(src.indexOf('  function rebuildDashboard(cfg) {'));
   const body = fn.slice(0, fn.indexOf('\n  }\n')).split('\n').filter((line) => !/^\s*(\/\/|\/?\*)/.test(line)).join('\n');
   const capture = body.indexOf('const { key: keepFocus, had: hadFocus } = captureRebuildFocus(shell, document.activeElement, document.body);');
-  const paint = body.indexOf('setHtml(shell, `\n      <section class="dashboard-masthead');
+  // Das Markup kommt seit DW-P1-2 aus dashboardShellHtml(cfg).
+  const paint = body.indexOf('setHtml(shell, html);');
   // R19: mobil steht der Anpassen-Einstieg im Menue (`.dashboard-tools-btn`) -
   // der Knopf ist dort nicht gerendert, das Menue ist der Rueckweg.
   // R20 (D, Wand-Modus): nach dem Verlassen der Wand steht danach der
   // Einstieg in die Wand als letzter Kandidat - nach den drei oben.
-  const restore = body.search(/^ {4}restoreFocusAfterRebuild\(container, \[\n {6}keepFocus,\n {6}\.\.\.\(focusAfterRebuild \?\? \[\]\),\n {6}\.\.\.\(hadFocus && modeChanged \? \['#dashboard-customize-btn', '\.dashboard-tools-btn'\] : \[\]\),\n(?: {6}\.\.\.\(takeWallFocusIntent\('leave'\) \? \[[^\n]*\] : \[\]\),\n)? {4}\]\);$/m);
+  // Lauf 2 (Critique 2026-10-26): ganz zuletzt die Ersatzkandidaten des
+  // Heute-Blatts fuer einen Buehnenwechsel (todayFocusFallbacks).
+  const restore = body.search(/^ {4}restoreFocusAfterRebuild\(container, \[\n {6}keepFocus,\n {6}\.\.\.\(focusAfterRebuild \?\? \[\]\),\n {6}\.\.\.\(hadFocus && modeChanged \? \['#dashboard-customize-btn', '\.dashboard-tools-btn'\] : \[\]\),\n(?: {6}\.\.\.\(takeWallFocusIntent\('leave'\) \? \[[^\n]*\] : \[\]\),\n)? {6}\.\.\.todayFallback,\n {4}\]\);$/m);
   assert.ok(capture > 0, 'erfasst wird vor dem Aufbau');
   assert.ok(paint > capture, 'dann wird gebaut');
   assert.ok(restore > paint, 'und danach wieder fokussiert: eigener Schluessel, Nachfolger der Geste, Anpassen-Knopf');
@@ -702,7 +752,7 @@ const ev = (id, title, start, end, people, allDay = 0) => ({
 
 /** Der Status-Text der Zeile, die mit diesem Namen beginnt. */
 function rowStatus(html, name) {
-  const rows = html.split('<div class="family-member');
+  const rows = html.split('<div class="list-row family-member');
   const row = rows.find((chunk) => chunk.includes(`family-member__name">${name}<`));
   if (!row) return null;
   return (/family-member__status[^"]*">([\s\S]*?)<\/span>/.exec(row) || [])[1]?.trim() ?? null;
@@ -855,36 +905,55 @@ test('FLIP: jede Kachel laeuft von ihrer alten Lage in die neue, statt zu spring
     flipTile('shown', box(0, 400, 100, 100)),
   ];
   const root = { querySelectorAll: (sel) => (sel === '#dashboard-widget-grid > .widget-wrapper[data-widget-id]' ? tiles : []) };
-  const timing = { duration: 250, easing: 'cubic-bezier(0.34, 1.56, 0.64, 1)' };
-  const played = __test.playTileFlip(root, before, { reduced: false, timing });
+  const played = __test.playTileFlip(root, before, { reduced: false });
   const [moved, grown, shrunk, still, shown] = tiles;
 
   assert.equal(played.length, 4, 'die ruhende Kachel bewegt sich nicht');
   assert.deepEqual(moved.calls[0].keyframes.map((k) => k.transform), ['translate(-100px, 0px)', 'none']);
-  assert.equal(moved.calls[0].timing.duration, 250);
+  // DW-P2-2: `--ease-out` + `--duration-lg` wie das Raster (playGridShift), nicht
+  // die Glasfeder - sie schoss 35/53 px uebers Ziel. Im Test ohne Stylesheet
+  // gelten die Rueckfaelle der Tokens.
+  for (const tile of [moved, grown, shrunk, shown]) {
+    assert.deepEqual(tile.calls[0].timing, { duration: 250, easing: 'ease-out' }, 'Dauer und Kurve aus --duration-lg / --ease-out');
+  }
   assert.match(grown.calls[0].keyframes[0].clipPath, /^inset\(0px 100px 0px 0px/, 'wer waechst, deckt seine neue Flaeche von der alten Groesse aus auf');
   assert.match(grown.calls[0].keyframes[1].clipPath, /^inset\(0px 0px 0px 0px/);
   assert.equal(shrunk.calls[0].keyframes[0].opacity, 0.6, 'wer schrumpft, blendet den umgebrochenen Inhalt auf');
   assert.equal(still.calls.length, 0);
   assert.equal(shown.calls[0].keyframes[0].opacity, 0, 'eine wieder eingeblendete Kachel hat keine Vorlage und blendet ein');
 
-  // Reduzierte Bewegung: es bleibt beim Sprung - und ohne Vorher-Messung auch.
+  // DW-P3-9: unter reduzierter Bewegung kein Weg, aber auch kein stummer
+  // Sprung - was sich bewegt haette, blendet 0,4 -> 1 in --duration-sm
+  // (das Muster von swapContent). Die ruhende Kachel bleibt ruhig.
   for (const t of tiles) t.calls = [];
-  assert.deepEqual(__test.playTileFlip(root, before, { reduced: true, timing }), []);
-  assert.deepEqual(__test.playTileFlip(root, null, { reduced: false, timing }), []);
+  const reduced = __test.playTileFlip(root, before, { reduced: true });
+  assert.equal(reduced.length, 4);
+  for (const tile of [moved, grown, shrunk, shown]) {
+    assert.deepEqual(tile.calls[0].keyframes, [{ opacity: 0.4 }, { opacity: 1 }], 'nur Deckkraft, kein transform, kein clip-path');
+    assert.deepEqual(tile.calls[0].timing, { duration: 150, easing: 'ease-out' });
+  }
+  assert.equal(still.calls.length, 0);
+  for (const t of tiles) t.calls = [];
+  assert.deepEqual(__test.playTileFlip(root, null, { reduced: false }), [], 'ohne Vorher-Messung kein Gleiten');
   assert.ok(tiles.every((t) => t.calls.length === 0));
 });
 
-test('FLIP haengt am Neuaufbau: vorher messen, nach dem setHtml abspielen - nur innerhalb des Anpassen-Modus', async () => {
+test('FLIP haengt am Neuaufbau: vorher messen, nach dem setHtml abspielen - im Anpassen-Modus und beim stillen Abgleich', async () => {
   const { readFileSync } = await import('node:fs');
   const src = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
   const body = src.match(/function rebuildDashboard\(cfg\) \{[\s\S]*?\n {2}\}\n/)?.[0];
   assert.ok(body, 'rebuildDashboard() nicht gefunden - die Signatur greift nicht mehr');
-  const capture = body.search(/const tileRectsBefore = isCustomizing && renderedCustomizing === true \? captureTileRects\(shell\) : null;/);
-  const rebuild = body.search(/setHtml\(shell, `\s*<section class="dashboard-masthead/);
-  const play = body.search(/playTileFlip\(shell, tileRectsBefore\)/);
-  assert.ok(capture > -1 && rebuild > -1 && play > -1, 'Messen, Neuaufbau und Abspielen stehen alle drei im Neuaufbau');
-  assert.ok(capture < rebuild && rebuild < play, 'erst messen, dann neu bauen, dann abspielen');
+  // U1 b: auch ein stiller Abgleich gleitet (die Spanne einer Kachel folgt ihren
+  // Daten) - nicht aus dem Skelett und nicht beim Moduswechsel.
+  const quiet = body.search(/const quietRebuild = !isCustomizing && !modeChanged && !shell\.querySelector\('\.widget-skeleton'\);/);
+  const capture = body.search(/const tileRectsBefore = \(isCustomizing && renderedCustomizing === true\) \|\| quietRebuild \? captureTileRects\(shell\) : null;/);
+  // Das Markup kommt seit DW-P1-2 aus dashboardShellHtml(cfg).
+  const rebuild = body.search(/setHtml\(shell, html\);/);
+  const restore = body.search(/if \(scroller && scroller\.scrollTop !== keptScroll\) scroller\.scrollTop = keptScroll;/);
+  const play = body.search(/if \(tileRectsBefore\?\.size\) playTileFlip\(shell, tileRectsBefore\)/);
+  assert.ok(quiet > -1 && capture > -1 && rebuild > -1 && play > -1, 'Messen, Neuaufbau und Abspielen stehen alle drei im Neuaufbau');
+  assert.ok(quiet < capture && capture < rebuild && rebuild < restore && restore < play,
+    'erst messen, dann neu bauen, die Scrolllage zurueck, dann abspielen');
   assert.ok(capture < body.indexOf('renderedCustomizing = isCustomizing;'),
     'gemessen wird, bevor der Modus des letzten Aufbaus ueberschrieben ist - sonst gleitet auch das Betreten des Modus');
 });
@@ -917,7 +986,8 @@ test('Anpassen-Modus betreten/verlassen: das Raster gleitet als Ganzes, ohne Fed
   const src = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
   const body = src.match(/function rebuildDashboard\(cfg\) \{[\s\S]*?\n {2}\}\n/)?.[0] ?? '';
   const capture = body.search(/const gridTopBefore = modeChanged\s*\?/);
-  const rebuild = body.search(/setHtml\(shell, `\s*<section class="dashboard-masthead/);
+  // Das Markup kommt seit DW-P1-2 aus dashboardShellHtml(cfg).
+  const rebuild = body.search(/setHtml\(shell, html\);/);
   const play = body.search(/playGridShift\(shell, gridTopBefore\)/);
   assert.ok(capture > -1 && capture < rebuild && rebuild < play, 'nur beim Moduswechsel: vorher messen, neu bauen, gleiten');
 });
@@ -929,8 +999,14 @@ test('Anpassen-Modus: das Raster traegt eine Kante, keine Toenung ueber allen Ka
   const rules = [...eachRule(css)].filter((r) => r.selector.split(',').some((s) => s.trim().startsWith('.dashboard__grid--editing')));
   assert.ok(rules.length > 0, 'die Regel fuer das Raster im Anpassen-Modus fehlt');
   assert.ok(rules.some((r) => /border:\s*1px dashed/.test(r.body)), 'die Kante bleibt');
-  assert.deepEqual(rules.filter((r) => /background(-color|-image)?\s*:/.test(r.body)).map((r) => r.selector), [],
-    'keine Flaeche ueber dem ganzen Raster');
+  // U1 b / DW-P2-9: ab 768px liegt die Kante ausserhalb (outline) - ein Polster
+  // machte die Spalten im Anpassen-Modus schmaler als danach.
+  assert.ok(rules.some((r) => r.selector.trim() === '.dashboard__grid--editing' && r.at.some((a) => /min-width:\s*768px/.test(a))
+    && /outline:[^;]*dashed/.test(r.body) && /padding:\s*0/.test(r.body)), 'breit: die Kante als outline, ohne Polster');
+  // Flaechen tragen nur die Leiste und der Geist einer Fuellung, nie das Raster.
+  assert.deepEqual(rules.filter((r) => /background(-color|-image)?\s*:/.test(r.body)
+    && !/widget-edit-controls|::after/.test(r.selector)).map((r) => r.selector), [],
+  'keine Flaeche ueber dem ganzen Raster');
 });
 
 // --------------------------------------------------------
@@ -1042,7 +1118,7 @@ test('#1455: leerer Mahlzeiten-Slot und Sparquote ohne Einnahmen zeigen "-"', ()
 // Dieselbe Stufung wie `relativeDateLabel` gilt jetzt fuer alles Kommende der
 // Uebersicht; der letzte Besuch liest rueckwaerts (`earnedWhenLabel`). Nennt
 // die Zeile daneben schon „Heute"/„Morgen", steht das Wort einmal da.
-const metaOf = (html, cls) => [...html.matchAll(new RegExp(`class="${cls}">([^<]*)<`, 'g'))].map((m) => m[1]);
+const metaOf = (html, cls) => [...html.matchAll(new RegExp(`class="(?:list-row__meta )?${cls}">([^<]*)<`, 'g'))].map((m) => m[1]);
 
 test('#1454: die Geburtstagszeile sagt Wochentag, Tag+Monat oder Datum mit Jahr', () => {
   at(CRITIQUE_NOW, 'Europe/Berlin', () => {
@@ -1055,9 +1131,11 @@ test('#1454: die Geburtstagszeile sagt Wochentag, Tag+Monat oder Datum mit Jahr'
     ], '1x2', 4);
     assert.deepEqual(metaOf(html, 'birthday-widget-item__meta'), [
       'common.today',
-      `${wd('2026-09-26')} · dashboard.daysLeft{"count":3}`,
-      'DM:2026-10-15 · dashboard.daysLeft{"count":22}',
-      '2027-01-05 · dashboard.daysLeft{"count":104}',
+      // R23 (D11): der Abstand wie im Geburtstagsmodul ("in 3 Tagen", jenseits
+      // eines Monats grob), nicht "3 Tage" wie eine Dauer.
+      `${wd('2026-09-26')} · in 3 Tagen`,
+      'DM:2026-10-15 · in 22 Tagen',
+      '2027-01-05 · in 3 Monaten',
     ]);
   });
 });
@@ -1103,7 +1181,8 @@ test('#1454: der letzte Besuch liest rueckwaerts, ohne Jahr', () => {
       const note = (lastVisit) => __test.selectMetricTiles({ health, housekeeping: hk(lastVisit) }, 'EUR')
         .find((tile) => tile.id === 'housekeeping').note;
       assert.equal(note('2026-09-22T07:00:00.000Z'), 'dashboard.housekeepingLastVisit{"date":"common.yesterday"}');
-      assert.equal(note('2026-09-10T07:00:00.000Z'), 'dashboard.housekeepingLastVisit{"date":"DM:2026-09-10T07:00:00.000Z"}');
+      // Seit R23 S11 ueber dateText: der Tag der Haushaltszone, dann ohne Jahr.
+      assert.equal(note('2026-09-10T07:00:00.000Z'), 'dashboard.housekeepingLastVisit{"date":"DM:2026-09-10"}');
       const widget = __test.renderHousekeepingWidget(hk('2026-09-22T07:00:00.000Z'), 'EUR');
       assert.match(widget, /dashboard\.housekeepingLastVisit\{"date":"common\.yesterday"\}/,
         'Kachel und Widget sagen dasselbe');
@@ -1208,20 +1287,27 @@ test('#1607: jeder Weg aus der Budget-Kachel nennt den Reiter der Monatsuebersic
   assert.deepEqual([...new Set(gefuellt)], ['/budget?tab=budget']);
 });
 
-test('#1607: die Kennzahl-Kachel „Monatssaldo" nennt denselben Reiter', () => {
+test('#1607 + R21: der Monatssaldo steht nur im Budget-Widget, und dessen Kopf nennt denselben Reiter', async () => {
+  const { readFileSync } = await import('node:fs');
   const prevWindow = global.window;
   global.window = { yuvomi: { isModuleDisabled: () => false } };
   try {
-    // Zwei Kacheln, sonst ist es keine Reihe (selectMetricTiles).
-    const tile = __test.selectMetricTiles({
+    // R21 (D5): die Kennzahlreihe fuehrt keinen Kontostand mehr - auch wenn
+    // das Budget-Widget fehlt, was seit R21 die Vorgabe ist.
+    const tiles = __test.selectMetricTiles({
       budget: { income: 100, expenses: 40, balance: 60, entryCount: 2 },
       housekeeping: { configured: true, present: false, visitsThisMonth: 4 },
-    }, 'EUR').find((entry) => entry.id === 'budget');
-    assert.ok(tile, 'Reichweite: die Budget-Kachel steht in der Reihe');
-    assert.equal(tile.route, '/budget?tab=budget');
+      birthdays: [{ name: 'Oma', days_until: 3 }],
+    }, 'EUR');
+    assert.ok(tiles.length >= 2, 'Reichweite: die Reihe steht');
+    assert.ok(!tiles.some((entry) => entry.id === 'budget'), 'kein Saldo in der Reihe');
   } finally {
     global.window = prevWindow;
   }
+  const src = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
+  assert.match(src, /const BUDGET_MONTH_ROUTE = '\/budget\?tab=budget';/);
+  assert.match(src, /widgetHeader\('budget', t\('nav\.budget'\), null, BUDGET_MONTH_ROUTE\)/,
+    'der Widget-Kopf fuehrt in den Monatsreiter');
 });
 
 test('#1607: der Reiter aus der Kachel ist einer, den das Budget kennt', async () => {
@@ -1291,9 +1377,10 @@ test('R18: die umgestellten Inhaltsklassen der Uebersicht stehen auf der Lese-Le
     '.budget-widget__savings span': '--type-caption',
     '.budget-widget__savings strong': '--type-card-title',
     '.budget-widget__flow-item > strong': '--type-caption',
-    '.birthday-widget-item__name': '--type-secondary',
-    '.birthday-widget-item__age': '--type-caption',
-    '.rewards-member__name': '--type-secondary',
+    // Die Zeilentitel und Endangaben der Listen-Kacheln (Geburtstage,
+    // Belohnungen) stehen seit DW-P1-4 in den Rollen der geteilten Zeile
+    // (`.list-row__name` 16/500, `.list-row__end` 13/600) - gehalten von
+    // test:typography "R21 S5 + DW-P1-4".
   };
   const rules = [...eachRule(css)];
   for (const [selector, token] of Object.entries(expected)) {
@@ -1306,7 +1393,7 @@ test('R18: die umgestellten Inhaltsklassen der Uebersicht stehen auf der Lese-Le
     assert.ok(sized.some((r) => r.at.length === 0 && new RegExp(`font-size:\\s*var\\(${token}\\)`).test(r.body)), `${selector}: Basis ${token}`);
   }
   // Kein Fett auf den Nebenwerten: semibold traegt die Zahl, bold bleibt Kennzahl und Avatar.
-  for (const selector of ['.budget-widget__savings strong', '.budget-widget__flow-item > strong', '.birthday-widget-item__age']) {
+  for (const selector of ['.budget-widget__savings strong', '.budget-widget__flow-item > strong']) {
     const body = rules.filter((r) => r.at.length === 0 && r.selector.split(',').some((s) => s.trim() === selector)).map((r) => r.body).join(';');
     assert.match(body, /font-weight:\s*var\(--font-weight-semibold\)/, selector);
   }
@@ -1414,13 +1501,20 @@ test('die Uebersicht polstert am Desktop mit --page-inline-pad und kennt kein ei
  * Masthead auch neben der Karte, der Wand-Modus im Anpassen-Menue. */
 test('R19 mobil: die Familie ist eine Avatar-Reihe mit Zaehler, Name und Satz bleiben im Baum', async () => {
   const { readFileSync } = await import('node:fs');
+  const { eachRule } = await import('./css-rules.js');
   const css = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
   const html = __test.renderFamilyWidget([ALEX, LEO, LINDA], { memberTodayTasks: [{ user_id: 1, open_count: 2 }] });
-  assert.match(html, /<span class="family-member__face">[\s\S]*?class="family-widget-avatar"[\s\S]*?<span class="family-member__count" aria-hidden="true">2<\/span>/,
-    'die Zahl offener Aufgaben steht als Marke am Gesicht');
-  assert.equal((html.match(/family-member__count/g) || []).length, 1, 'nur wer offene Aufgaben hat, traegt eine Marke');
+  // DIE MARKE NENNT IHRE EINHEIT (Critique R21, clarify): eine nackte "1" am
+  // Gesicht las sich wie eine Benachrichtigung - eins wovon? Vor der Zahl
+  // steht das Zeichen der Aufgaben (MODULE_ICON.tasks), dasselbe wie in der
+  // Leiste; die Zahl allein sagte nichts.
+  assert.match(html, /<span class="list-row__lead family-member__face">[\s\S]*?class="family-widget-avatar"[\s\S]*?<span class="family-member__count" aria-hidden="true"><i data-lucide="check-square" class="family-member__count-icon"><\/i>2<\/span>/,
+    'die Zahl offener Aufgaben steht als Marke am Gesicht, mit dem Aufgaben-Zeichen als Einheit');
+  const badge = [...eachRule(css)].filter((r) => r.selector.trim() === '.family-member__count-icon');
+  assert.ok(badge.some((r) => /inline-size:\s*var\(--icon-sm\)/.test(r.body)), 'das Zeichen hat die Groesse eines Inline-Markers');
+  assert.equal((html.match(/family-member__count"/g) || []).length, 1, 'nur wer offene Aufgaben hat, traegt eine Marke');
   assert.match(html, /<span class="family-member__short" aria-hidden="true">Alex<\/span>/, 'der Vorname unter dem Gesicht');
-  assert.match(html, /<span class="family-member__name">Alex<\/span>/, 'der volle Name bleibt der Name fuer Screenreader');
+  assert.match(html, /<span class="list-row__name family-member__name">Alex<\/span>/, 'der volle Name bleibt der Name fuer Screenreader');
   const phone = css.slice(css.indexOf('MOBIL IST DIE FAMILIE EINE AVATAR-REIHE'));
   const block = phone.slice(phone.indexOf('@media (max-width: 639px) {'), phone.indexOf('\n}\n') + 2);
   assert.match(block, /\.family-widget__list \{[^}]*flex-flow:\s*row wrap/, 'eine Reihe statt einer Liste');
@@ -1431,7 +1525,35 @@ test('R19 mobil: die Familie ist eine Avatar-Reihe mit Zaehler, Name und Satz bl
   assert.match(block, /\.family-widget__footer \{\s*display:\s*none/, 'die Tagesbilanz steht in den Marken');
 });
 
-test('R19 mobil: die Wetterzeile steht im Masthead auch neben der Karte, breit schliessen sich beide aus', async () => {
+test('R21 S7 mobil: ab sechs Gesichtern liegt keine Marke auf dem Nachbarn, der gemeinsame Termin bleibt lesbar', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { eachRule } = await import('./css-rules.js');
+  const css = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
+  const rules = [...eachRule(css)];
+  // Gemessen 390px mit sechs Personen: Zelle 52px, die 33px-Marke ragte 25px
+  // hinaus und lag dreimal 7x16px auf dem naechsten Gesicht.
+  const cell = rules.find((r) => /\.family-member:not\(\.family-member--more, \.family-member--shared\)/.test(r.selector)
+    && r.at.some((a) => /max-width:\s*639px/.test(a)));
+  assert.ok(cell && /container:\s*family-member \/ inline-size/.test(cell.body), 'jede Person ist ihr eigener Container');
+  const narrow = rules.find((r) => r.selector.trim() === '.family-member__count' && r.at.some((a) => /@container family-member \(max-width: \d+px\)/.test(a)));
+  assert.ok(narrow, 'in der engen Zelle eine eigene Lage fuer die Marke');
+  assert.match(narrow.body, /inset-inline-start:\s*auto/, 'eng haengt sie nicht ueber die Kante hinaus');
+  assert.match(narrow.body, /inset-inline-end:\s*calc\(-1 \* var\(--space-1\)\)/);
+  // Teilt nur ein Teil der Familie den Termin, stehen die Namen statt "Alle":
+  // sie kuerzen, der Termin nicht.
+  // DW-P2-10: der Termin nimmt die volle Breite - kein Prozentdeckel mehr (60 %
+  // eines inhaltsbreiten Koerpers kuerzten "20:00 Filmabend" auf 82px neben
+  // "Alle"); die Namen schrumpfen zuerst, hundertfach schneller als er.
+  const name = rules.find((r) => r.selector.trim() === '.family-member--shared .family-member__name');
+  const shrink = (body) => Number(/flex:\s*0 (\d+) auto/.exec(body)?.[1]);
+  assert.ok(shrink(name.body) >= 100, 'die Namensliste schrumpft zuerst');
+  assert.match(name.body, /min-inline-size:\s*0/);
+  const status = rules.find((r) => r.selector.trim() === '.family-member--shared .family-member__status');
+  assert.ok(status && shrink(status.body) === 1, 'der Termin schrumpft erst, wenn die Namen am Ende sind');
+  assert.doesNotMatch(status.body, /max-inline-size:\s*\d+%/, 'kein Prozentdeckel am Termin');
+});
+
+test('R24 E7: die Wetterzeile steht im Masthead auch neben der Karte, in jeder Breite', async () => {
   const { readFileSync } = await import('node:fs');
   const src = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
   const css = readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8');
@@ -1440,8 +1562,11 @@ test('R19 mobil: die Wetterzeile steht im Masthead auch neben der Karte, breit s
   const weather = { current: { temp: 18, desc: 'Sonnig', icon: '01d' }, units: 'metric' };
   const head = __test.renderDashboardOverview({ display_name: 'Linda' }, false, weather, { weatherCard: true });
   assert.match(head, /class="dashboard-overview__weather dashboard-overview__weather--card"/);
-  assert.match(css, /@media \(min-width: 768px\) \{\s*\.dashboard-overview__weather--card \{\s*display: none;/,
-    'ab 768px steht die Karte im Bild - dort nur sie');
+  // Bis R24 blendete ab 768px eine Regel die Zeile aus, sobald die Karte stand -
+  // am Desktop lag das Jetzt dann nur unter der Falz (Critique G1-Uebersicht-P3-5).
+  const { eachRule } = await import('./css-rules.js');
+  const hides = [...eachRule(css)].filter((r) => r.selector.includes('dashboard-overview__weather--card') && /display:\s*none/.test(r.body));
+  assert.deepEqual(hides.map((r) => r.selector), [], 'keine Breite blendet die Wetterzeile neben der Karte aus');
 });
 
 test('R19 mobil: der Wand-Modus steht im Anpassen-Menue, je Breite ein Weg', async () => {
@@ -1458,4 +1583,256 @@ test('R19 mobil: der Wand-Modus steht im Anpassen-Menue, je Breite ein Weg', asy
   assert.match(css, /@media \(max-width: 767px\) \{\s*\.dashboard-tools-btn \{\s*display: inline-flex;\s*\}\s*\.dashboard-overview__tools:has\(> \.dashboard-tools-btn\) > #dashboard-wall-enter,\s*\.dashboard-overview__tools:has\(> \.dashboard-tools-btn\) > #dashboard-customize-btn \{\s*display: none;/,
     'schmal ersetzt das Menue die zwei Knoepfe');
   assert.match(src, /if \(action === 'dashboard-wall'\) container\.querySelector\('#dashboard-wall-enter'\)\?\.click\(\);/);
+});
+
+// --------------------------------------------------------
+// R21: der Rueckweg zeichnet den eben geladenen Stand sofort
+// --------------------------------------------------------
+// Zurueck auf der Uebersicht stand das Skelett ohne Gruss im neuen Bild der
+// Seitenblende, der Inhalt schnitt danach hart darueber - auch wenn derselbe
+// Stand Sekunden vorher schon dagewesen war. Gemessen mobil: neues Bild bei
+// +108 ms (4x: +141) aus dem Netz, aus dem gemerkten Stand bei +26-32 ms
+// (4x: +84-87), ohne Neubau danach, wenn die Nachfrage dasselbe liefert.
+test('R21 Rueckweg: ein frischer Stand desselben Mitglieds taugt, ein alter, fremder oder gestriger nicht', () => {
+  const at = new RealDate('2026-10-21T08:00:00Z');
+  const memo = { key: '7|de', at, day: '2026-10-21' };
+  const use = (overrides = {}) => __test.usableOverviewMemo(memo, {
+    key: '7|de', now: new RealDate(at.getTime() + 5_000), today: '2026-10-21', ...overrides,
+  });
+  assert.equal(use(), memo, 'fuenf Sekunden alt, dasselbe Mitglied: sofort zeichnen');
+  assert.equal(use({ key: '8|de' }), null, 'ein anderes Mitglied bekommt nie den Stand eines anderen');
+  assert.equal(use({ key: '7|en' }), null, 'eine andere Sprache uebersetzt neu');
+  assert.equal(use({ now: new RealDate(at.getTime() + 61_000) }), null, 'aelter als eine Minute: neu laden');
+  assert.equal(use({ today: '2026-10-22' }), null, 'ein neuer Haushaltstag: "Heute" waere gestern');
+  assert.equal(__test.usableOverviewMemo(null, { key: '7|de', now: at, today: '2026-10-21' }), null);
+});
+
+test('R21 Rueckweg: ein Schreibvorgang irgendwo verwirft den gemerkten Stand', () => {
+  const prev = globalThis.window;
+  const target = new EventTarget();
+  globalThis.window = { addEventListener: target.addEventListener.bind(target) };
+  try {
+    __test.watchOverviewWrites();
+    __test.setOverviewMemo({ key: '7|de' });
+    target.dispatchEvent(new Event('yuvomi:other'));
+    assert.ok(__test.getOverviewMemo(), 'ein fremdes Ereignis verwarf den Stand');
+    // Dasselbe Ereignis, das api.js nach jedem geglueckten Schreiben meldet (test:api).
+    target.dispatchEvent(new Event('yuvomi:write'));
+    assert.equal(__test.getOverviewMemo(), null, 'nach einem Schreibvorgang zeichnete die Uebersicht den alten Stand');
+  } finally {
+    globalThis.window = prev;
+    __test.setOverviewMemo(null);
+  }
+});
+
+test('R21 Rueckweg: die Nachfrage vergleicht den Inhalt, nicht die Reihenfolge der Slices', async () => {
+  const a = { events: [1, 2], pendingReminders: [], cycle: null, schedule: { x: 1 } };
+  const b = { cycle: null, schedule: { x: 1 }, events: [1, 2], pendingReminders: [] };
+  assert.equal(__test.overviewSignature(a), __test.overviewSignature(b));
+  assert.notEqual(__test.overviewSignature(a), __test.overviewSignature({ ...b, events: [1] }));
+  // Und render() nimmt den Stand wirklich (ohne DOM nur am Quelltext lesbar;
+  // die Wirkung misst die Browser-Sonde oben): kein Skelett, keine Anfrage
+  // davor, danach still nachfragen und nur bei Aenderung neu bauen.
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
+  const render = src.slice(src.indexOf('export async function render('));
+  assert.match(render, /: memo \? '' : renderDashboardSkeleton\(user, \{ head \}\)/, 'mit gemerktem Stand steht wieder ein Skelett im ersten Bild');
+  assert.match(render, /= memo\s*\? \[memo\.data, memo\.weatherRes, \{ data: memo\.prefs \}, memo\.data\.pendingReminders\]\s*: await Promise\.all\(/,
+    'der gemerkte Stand wird nicht ohne Anfrage gezeichnet');
+  assert.match(render, /if \(memo\) refreshDashboardData\(\{ onlyIfChanged: true \}\);/, 'nach dem Zeichnen aus dem Stand fragt die Seite nicht nach');
+  // Seit DW-P1-2 klappen gehende Zeilen vorher aus (closeLeavingRows) - gebaut
+  // wird weiterhin nur bei geaenderter Antwort.
+  assert.match(render, /if \(unchanged\) return;\n[\s\S]{0,700}?rebuildDashboard\(widgetConfig\);/, 'eine gleiche Antwort baut die Flaeche trotzdem neu');
+});
+
+// Review zu R21 (PR #2142): der gemerkte Stand traegt die eigenen Slices
+// (Abfuhr, Zyklus), die /dashboard nie mitliefert - die ensure*-Aufrufe fragen
+// beim Aufbau daraus nichts. Reichte die stille Nachfrage sie dann nur weiter
+// (`fresh.waste = data.waste;`) und stempelte den Stand neu (`rememberOverview`),
+// hielten Besuche unter einer Minute Abstand einen alten Abholtermin oder einen
+// auf einem anderen Geraet geaenderten Zyklus unbegrenzt. Vorher holte jedes
+// Mounten die Slices neu. Jeder Slice, den die Nachfrage in den neuen Stand
+// uebernimmt, wird deshalb vorher zurueckgesetzt und neu geholt - derselbe Weg
+// wie beim Dienstplan (test:dashboard, M-6a).
+test('R21 Rueckweg: die stille Nachfrage holt jeden eigenen Slice neu, bevor sie den Stand neu stempelt', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
+  const refreshFn = src.slice(src.indexOf('async function refreshDashboardData('), src.indexOf('const refreshTimerId'));
+  assert.ok(refreshFn.length > 0, 'refreshDashboardData() nicht gefunden');
+  const carried = [...refreshFn.matchAll(/fresh\.(\w+) = data\.\1;/g)].map((m) => m[1]);
+  for (const slice of ['cycle', 'waste']) {
+    assert.ok(carried.includes(slice), `fresh.${slice} wird in der Nachfrage gar nicht mehr gesetzt - die Kachel fiele auf ihren Leerzustand`);
+  }
+  const stamp = refreshFn.indexOf('rememberOverview();');
+  assert.ok(stamp > 0, 'die Nachfrage merkt den neuen Stand nicht mehr');
+  for (const slice of carried) {
+    const ensure = `ensure${slice[0].toUpperCase()}${slice.slice(1)}Slice`;
+    // Ohne Ruecksetzen kehrt ensure*() an seinem eigenen "schon geladen" um.
+    assert.match(src, new RegExp(`async function ${ensure}\\(\\) \\{\\s*if \\(data\\.${slice} !== undefined\\) return;`),
+      `${ensure}() laedt nicht mehr nur bei undefined - dann misst dieser Test das Falsche`);
+    const visible = refreshFn.indexOf(`widgetConfig.some((w) => w.id === '${slice}' && w.visible)`);
+    const reset = refreshFn.indexOf(`data.${slice} = undefined;`);
+    const reload = refreshFn.indexOf(`await ${ensure}();`);
+    const carry = refreshFn.indexOf(`fresh.${slice} = data.${slice};`);
+    assert.ok(visible > -1 && reset > visible,
+      `${slice}: die Nachfrage setzt den Slice nicht (fuer eine sichtbare Kachel) zurueck - er reist nur weiter und bleibt alt, solange man unter einer Minute wiederkommt`);
+    assert.ok(reload > reset, `${slice}: nach dem Ruecksetzen wird nicht neu geholt`);
+    assert.ok(carry > reload, `${slice}: der Slice wird uebernommen, bevor er neu geholt ist`);
+    assert.ok(stamp > carry, `${slice}: der Stand wird neu gestempelt, bevor der Slice neu ist`);
+  }
+});
+
+// R22 S9 (Critique 2026-10-22, a1 Klein): Schritt 2 trug den Lucide-Ortungspfeil
+// (`navigation`) zu einem Text ueber Leiste und Module, Schritt 3 versprach das
+// Wischen fuer alle Listeneintraege - es gibt es in Aufgaben, Einkauf, Vorrat.
+test('R22: der Rundgang zeigt in Schritt 2 Module und verspricht das Wischen nur, wo es geht', async () => {
+  const { readFileSync } = await import('node:fs');
+  const dashboard = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
+  const steps = dashboard.slice(dashboard.indexOf('function getOnboardingSteps'), dashboard.indexOf('function showOnboarding'));
+  assert.match(steps, /icon: 'layout-grid',\s+title: t\('onboarding\.step2Title'\)/);
+  assert.doesNotMatch(steps, /icon: 'navigation'/, 'kein Ortungspfeil');
+  const de = JSON.parse(readFileSync(new URL('../public/locales/de.json', import.meta.url), 'utf8')).onboarding.step3Body;
+  assert.match(de, /In Aufgaben, Einkauf und Vorrat wischst du/);
+  assert.doesNotMatch(de, /Wische Listeneinträge/);
+  const en = JSON.parse(readFileSync(new URL('../public/locales/en.json', import.meta.url), 'utf8')).onboarding.step3Body;
+  assert.match(en, /In Tasks, Shopping and Pantry/);
+});
+
+// "+ NEU > AUFGABE" OEFFNET DAS ANLEGEN-BLATT (DW-P1-1, Critique 2026-10-26).
+// Pille und Speed-Dial wechseln ins Modul und klicken dort dessen Anlegen-Knopf.
+// Die Aufgaben-Seite heisst ihn seit #1483 `fab-new-task`, die Uebersicht suchte
+// weiter `#btn-new-task` - der Tipp landete in der Liste, und nichts ging auf.
+// Gemessen wird die Map aus dem geladenen Modul gegen das Markup der Zielseite
+// (welche Datei, sagt die Routentabelle des Routers) und die Verdrahtung beider
+// Wege mit dem echten `findPageFab()`.
+function stubEl(extra = {}) {
+  const listeners = [];
+  return {
+    dataset: {}, listeners, tabIndex: 0, hidden: false,
+    classList: { toggle() {}, add() {}, remove() {}, contains: () => false },
+    setAttribute() {}, getAttribute: () => null, focus() {},
+    addEventListener(type, fn, opts) { listeners.push({ type, fn, opts }); },
+    querySelector: () => null, querySelectorAll: () => [], closest: () => null,
+    ...extra,
+  };
+}
+
+async function withNewTargets(fn) {
+  const { setPermissions, clearPermissions } = await import('../public/permissions.js');
+  const prevWindow = globalThis.window;
+  const prevDocument = globalThis.document;
+  const visited = [];
+  const clicked = [];
+  // Jeder Knopf, den die Zielseite tatsaechlich traegt, ist per Id auffindbar -
+  // eine andere Id liefert wie im Browser `null`.
+  const pageIds = new Set();
+  const byId = (id) => (pageIds.has(id) ? { click: () => clicked.push(id) } : null);
+  globalThis.document = {
+    getElementById: byId,
+    // Auch der Selektor-Weg sieht nur Knoepfe, die es gibt - so misst die Probe
+    // das Ziel, nicht die Art der Suche.
+    querySelector: (sel) => (sel.startsWith('#') ? byId(sel.slice(1)) : null),
+    addEventListener() {},
+  };
+  globalThis.window = {
+    yuvomi: { navigate: async (route) => { visited.push(route); }, isModuleDisabled: () => false },
+    matchMedia: () => ({ matches: false }),
+  };
+  setPermissions({ admin: true, modules: {}, widgets: {}, capabilities: {} });
+  try {
+    return await fn({ visited, clicked, pageIds });
+  } finally {
+    clearPermissions();
+    globalThis.window = prevWindow;
+    globalThis.document = prevDocument;
+  }
+}
+
+test('DW-P1-1: jedes "+ Neu"-Ziel nennt eine Id, die seine Zielseite traegt', async () => {
+  const { readFileSync } = await import('node:fs');
+  const router = readFileSync(new URL('../public/router.js', import.meta.url), 'utf8');
+  const targets = __test.FAB_NEW_BTN;
+  assert.ok(targets && typeof targets === 'object', 'FAB_NEW_BTN ist nicht erreichbar');
+  await withNewTargets(async () => {
+    const offered = __test.FAB_ACTIONS().map((a) => a.route);
+    assert.deepEqual(offered.slice().sort(), Object.keys(targets).sort(),
+      'Speed-Dial und Pille bieten genau die Ziele an, fuer die die Map einen Knopf kennt');
+  });
+  for (const [route, id] of Object.entries(targets)) {
+    assert.match(id, /^[a-z][\w-]*$/, `${route}: "${id}" ist eine Id fuer findPageFab(), kein Selektor`);
+    const page = new RegExp(`\\{ path: '${route}',\\s*page: '([^']+)'`).exec(router)?.[1];
+    assert.ok(page, `${route}: keine Seite in der Routentabelle`);
+    const src = readFileSync(new URL(`../public${page}`, import.meta.url), 'utf8');
+    assert.ok(src.includes(`id="${id}"`), `${route}: ${page} traegt keinen Knopf mit id="${id}" - "+ Neu" oeffnet dort nichts`);
+  }
+});
+
+test('DW-P1-1 + U2: ohne Blatt ueber der Uebersicht wechseln Pille und Speed-Dial ins Modul und klicken dort den Knopf', async () => {
+  const targets = __test.FAB_NEW_BTN;
+  assert.ok(targets, 'FAB_NEW_BTN ist nicht erreichbar');
+  // Die Zielseiten tragen die Knoepfe, die ihr Markup traegt (vorige Probe).
+  const real = ['fab-new-task', 'fab-new-event', 'fab-new-item', 'fab-new-note'];
+  // Seit U2 oeffnen Aufgabe, Termin und Notiz ihr Blatt ueber der Uebersicht
+  // (test:dashboard). Der Weg ins Modul bleibt fuer Einkauf - und fuer jedes
+  // Ziel, dessen Blatt nicht laedt: hier scheitern alle Blaetter.
+  const sheets = __test.NEW_SHEETS;
+  const original = { ...sheets };
+  for (const route of Object.keys(sheets)) sheets[route] = async () => { throw new Error('offline'); };
+  const origError = console.error;
+  console.error = () => {};
+  try {
+    await withNewTargets(async ({ visited, clicked, pageIds }) => {
+      real.forEach((id) => pageIds.add(id));
+      // Pille (Desktop): Klick auf einen Menuepunkt im Seiten-Container.
+      const container = stubEl();
+      __test.wireNewMenu(container, new AbortController().signal);
+      const onClick = container.listeners.find((l) => l.type === 'click' && !l.opts?.capture)?.fn;
+      assert.ok(onClick, 'wireNewMenu haengt keinen Klick an den Container');
+      for (const route of Object.keys(targets)) {
+        const item = stubEl({ dataset: { newRoute: route } });
+        await onClick({ target: { closest: (sel) => (sel === '[data-new-route]' ? item : null) } });
+      }
+      assert.deepEqual(visited, Object.keys(targets));
+      assert.deepEqual(clicked, real, 'Pille: jedes Ziel oeffnet sein Anlegen-Blatt');
+
+      // Speed-Dial (Telefon): der Knopf lebt in der Shell-Layer, findPageFab findet ihn.
+      visited.length = 0;
+      clicked.length = 0;
+      const items = Object.keys(targets).map((route) => stubEl({ dataset: { route } }));
+      const fabActions = stubEl({ querySelectorAll: (sel) => (sel === '[data-route]' ? items : []) });
+      const group = stubEl({ querySelector: (sel) => (sel === '#fab-actions' ? fabActions : null) });
+      const fabMain = stubEl({ closest: (sel) => (sel === '.page-fab-group' ? group : null) });
+      const getById = globalThis.document.getElementById;
+      globalThis.document.getElementById = (id) => (id === 'fab-main' ? fabMain : getById(id));
+      __test.initFab(new AbortController().signal);
+      for (const el of items) {
+        const go = el.listeners.find((l) => l.type === 'click')?.fn;
+        assert.ok(go, `Speed-Dial: ${el.dataset.route} ist nicht verdrahtet`);
+        await go();
+        // `go` wartet auf den Wechsel und klickt dann - einen Takt Luft fuer den Klick.
+        await new Promise((r) => setImmediate(r));
+      }
+      assert.deepEqual(visited, Object.keys(targets));
+      assert.deepEqual(clicked, real, 'Speed-Dial: jedes Ziel oeffnet sein Anlegen-Blatt');
+    });
+  } finally {
+    console.error = origError;
+    Object.assign(sheets, original);
+  }
+});
+
+test('U2: jedes Blatt ueber der Uebersicht ruft eine Anlegen-Funktion, die sein Modul exportiert', async () => {
+  const { readFileSync } = await import('node:fs');
+  const sheets = __test.NEW_SHEETS;
+  assert.ok(sheets, 'NEW_SHEETS ist nicht erreichbar');
+  await withNewTargets(async () => {
+    const offered = __test.FAB_ACTIONS().map((a) => a.route);
+    for (const route of Object.keys(sheets)) assert.ok(offered.includes(route), `${route}: ein Blatt fuer ein Ziel, das "+ Neu" nicht anbietet`);
+  });
+  for (const [route, open] of Object.entries(sheets)) {
+    const m = /import\('([^']+)'\)\)\.(\w+)\(/.exec(String(open));
+    assert.ok(m, `${route}: das Blatt laedt sein Modul nicht beim Tipp nach`);
+    const src = readFileSync(new URL(`../public${m[1]}`, import.meta.url), 'utf8');
+    assert.match(src, new RegExp(`export async function ${m[2]}\\(`), `${m[1]} exportiert ${m[2]} nicht - "+ Neu" fiele still ins Modul zurueck`);
+  }
 });

@@ -20,6 +20,9 @@
  *        4. GANZE BLOECKE. Kein Stylesheet nutzt ein Konstrukt, bei dem ein
  *           Browser an der Mindestversion einen ganzen Block verwirft
  *           (`@layer`, `@scope`, Nesting, Media-Bereichssyntax) (#1369).
+ *        5. POPOVER. Ohne Popover-API bleibt jedes Popover zu: reset.css reicht
+ *           die UA-Regel `[popover] { display: none }` nach, und keine Regel
+ *           schlaegt sie mit einem `display` an einer Popover-Klasse (#2107).
  *
  * DIE MINDESTVERSION steht in docs/installation.md, Abschnitt "Browser
  * Support", zweite Tabellenzeile - gemessen am 21.09.2026 (#1369). Die Suite
@@ -199,22 +202,11 @@ const HINTS = {
  * Enden geprueft: der Verstoss muss noch bestehen (sonst ist sie ueberfluessig)
  * und der Anlass auch (sonst gehoert der Rueckfall hinein).
  */
-const EXCEPTIONS = [
-  {
-    file: 'public/styles/dashboard.css',
-    selector: '.wall',
-    declaration: 'min-height: 100dvh',
-    reason: 'Wand-Modus, kein kritischer Pfad. Ein Zwilling `min-height: 100vh` waere die einzige '
-      + 'vh-Einheit in den Wand-Regeln, und die verbietet der Wand-Guard in '
-      + 'test-frontend-audit.js aus gemessenem Grund: eine Wand kann nicht gescrollt werden, und '
-      + 'auf einem mobilen Browser ohne dvh ist 100vh die GROSSE Fensterhoehe - sie schoebe '
-      + 'Datenstand und Ausstieg unter die Adressleiste, genau den Fehler, den der Wand-Guard '
-      + 'festhaelt. Ohne min-height ist die Wand so hoch wie ihr Inhalt, und nichts faellt heraus. '
-      + 'Die Wand braucht ohnehin @container (Chrome 105).',
-    stillValid: () => read('test/test-frontend-audit.js')
-      .includes("test('die Distanzskala der Wand haengt an der KNAPPEN Seite, nicht an der Hoehe'"),
-  },
-];
+// Leer seit #2183. Hier stand `.wall { min-height: 100dvh }` (Wand-Modus):
+// ohne dvh war die Wand so hoch wie ihr Inhalt, und auf einem Wandrahmen mit
+// WebView 106 sass der Fuss mitten im Bild. Die Wand nimmt ihre Hoehe jetzt
+// von der Shell (eigener Test unten), eine Viewport-Einheit braucht sie nicht.
+const EXCEPTIONS = [];
 const isException = (file, finding) => EXCEPTIONS.some((ex) => ex.file === file
   && ex.selector === finding.selector && norm(ex.declaration) === norm(finding.declaration));
 
@@ -967,4 +959,469 @@ test('die Pille der Kapsel steht nur dort, wo translate gilt', () => {
   const open = pillRules.filter(({ at }) => !at.some((a) => /^@supports \(translate: 0\)/.test(a)))
     .map(({ selector }) => selector);
   assert.deepEqual(open, [], 'Regeln der Pille ohne @supports (translate: 0)');
+});
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Teil 5: Popover ohne Popover-API (#2107)
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Jedes Popover der App verlaesst sich fuer den geschlossenen Zustand auf das
+ * UA-Blatt (`[popover] { display: none }`). Ein Browser ohne die API (Chrome
+ * < 114, Firefox < 125, Safari < 17, also zwischen den beiden Zeilen der
+ * Doku) hat diese Regel nicht und verwirft jede Autorenregel mit
+ * `:popover-open`, auch `.popover-menu:not(:popover-open)`. In einer WebView
+ * mit Chrome 106 stand deshalb jedes Menue der Seite offen und fing die Klicks
+ * darunter ab. reset.css reicht die UA-Regel in
+ * `@supports not selector(:popover-open)` nach.
+ *
+ * Zwei Zusagen:
+ *   1. der Rueckfall steht in einem Stylesheet, das index.html laedt;
+ *   2. keine Regel, die in so einem Browser gilt, setzt `display` (ausser
+ *      `none`) an einer Klasse, die im Markup ein `popover`-Attribut traegt.
+ *      `[popover]` hat die Spezifitaet einer Klasse: eine spaeter geladene
+ *      `.x-menu { display: flex }` schluege den Rueckfall still. Erlaubt ist
+ *      `display` unter `:popover-open` (die Regel faellt dort weg) und in
+ *      `@supports selector(:popover-open)`.
+ */
+const POPOVER_FALLBACK_AT = /^@supports not selector\(\s*:popover-open\s*\)$/;
+
+// Selektorliste an Kommas ausserhalb von Klammern trennen.
+function selectorParts(selector) {
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < selector.length; i += 1) {
+    const c = selector[i];
+    if (c === '(') depth += 1;
+    else if (c === ')') depth -= 1;
+    else if (c === ',' && depth === 0) {
+      parts.push(selector.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(selector.slice(start));
+  return parts.map((part) => part.trim()).filter(Boolean);
+}
+
+// Das Subjekt eines Selektors: der letzte zusammengesetzte Teil hinter dem
+// letzten Kombinator. Klammerinhalte zaehlen nicht (`:not(.a .b)`).
+function subjectCompound(part) {
+  let flat = part;
+  while (/\([^()]*\)/.test(flat)) flat = flat.replace(/\([^()]*\)/g, '');
+  return flat.trim().split(/\s*[>+~]\s*|\s+/).pop();
+}
+
+/**
+ * Klassen der Elemente, die ein `popover`-Attribut tragen - aus Markup in
+ * Template-Literalen (`class="a b" ... popover`) und aus DOM-Code
+ * (`el.className = 'a b'` vor `el.setAttribute('popover', ...)`).
+ * `popovertarget` ist kein Popover.
+ */
+function popoverClasses(source) {
+  const classes = new Set();
+  const add = (list) => list.split(/\s+/)
+    .filter((name) => /^[\w-]+$/.test(name))
+    .forEach((name) => classes.add(name));
+  for (const tag of source.matchAll(/<[a-z][\w-]*\s([^<>]*)>/gi)) {
+    const attrs = tag[1];
+    if (!/(?:^|\s)popover(?![\w-])/.test(attrs)) continue;
+    const cls = attrs.match(/(?:^|\s)class="([^"]*)"/);
+    if (cls) add(cls[1]);
+  }
+  for (const call of source.matchAll(/\b(\w+)\.setAttribute\(\s*['"]popover['"]/g)) {
+    const before = source.slice(Math.max(0, call.index - 800), call.index);
+    const assignments = [...before.matchAll(new RegExp(`\\b${call[1]}\\.className\\s*=\\s*(['"\`])([^'"\`]*)\\1`, 'g'))];
+    if (assignments.length) add(assignments.at(-1)[2]);
+  }
+  return classes;
+}
+
+function popoverDisplayFindings(css, classes) {
+  const findings = [];
+  for (const { selector, body, at } of eachRule(css)) {
+    if (at.some((a) => /^@supports selector\(\s*:popover-open\s*\)$/.test(a))) continue;
+    const display = declarations(body).filter((d) => d.property === 'display' && !/^none\b/i.test(d.value));
+    if (!display.length) continue;
+    for (const part of selectorParts(selector)) {
+      if (part.includes(':popover-open')) continue;
+      const subject = subjectCompound(part);
+      const hit = [...classes].find((name) => new RegExp(`\\.${name}(?![\\w-])`).test(subject));
+      if (hit) findings.push({ selector: part, className: hit, value: display.at(-1).value });
+    }
+  }
+  return findings;
+}
+
+const hasPopoverFallback = (css) => [...eachRule(css)].some(({ selector, body, at }) => (
+  selector === '[popover]'
+  && at.length === 1 && POPOVER_FALLBACK_AT.test(at[0])
+  && declarations(body).some((d) => d.property === 'display' && /^none$/i.test(d.value))
+));
+
+test('Leser: Popover-Klassen aus Markup und DOM-Code, nicht aus popovertarget (erfundene Faelle)', () => {
+  const names = (source) => [...popoverClasses(source)].sort();
+  assert.deepEqual(names('<div class="popover-menu x-menu" id="${esc(id)}" popover role="menu">'), ['popover-menu', 'x-menu']);
+  assert.deepEqual(names('<span class="tip" role="tooltip" popover="manual" hidden>'), ['tip']);
+  assert.deepEqual(names('<button class="trigger" popovertarget="m">'), []);
+  assert.deepEqual(names([
+    "const menu = document.createElement('div');",
+    "menu.className = 'ctx-menu';",
+    "menu.setAttribute('role', 'menu');",
+    "menu.setAttribute('popover', 'auto');",
+    "button.className = 'not-a-popover';",
+    "button.setAttribute('popovertarget', 'x');",
+  ].join('\n')), ['ctx-menu']);
+});
+
+test('Leser: display an einer Popover-Klasse schlaegt den Rueckfall, unter :popover-open nicht (erfundene Faelle)', () => {
+  const classes = new Set(['popover-menu', 'x-menu']);
+  const hits = (css) => popoverDisplayFindings(css, classes).map((f) => f.selector);
+  assert.deepEqual(hits('.popover-menu { display: flex }'), ['.popover-menu']);
+  assert.deepEqual(hits('.page .x-menu, .other { display: grid }'), ['.page .x-menu']);
+  assert.deepEqual(hits('@media (min-width: 768px) { .x-menu.is-wide { display: block } }'), ['.x-menu.is-wide']);
+  assert.deepEqual(hits([
+    '.popover-menu:popover-open { display: flex }',
+    '.popover-menu:not(:popover-open) { display: block }',
+    '.popover-menu { display: none }',
+    '.popover-menu__item { display: flex }',
+    '.popover-menu .row { display: flex }',
+    '@supports selector(:popover-open) { .x-menu { display: flex } }',
+    '.popover-menu { position: fixed }',
+  ].join('\n')), []);
+  assert.equal(hasPopoverFallback('@supports not selector(:popover-open) { [popover] { display: none; } }'), true);
+  assert.equal(hasPopoverFallback('[popover] { display: none; }'), false);
+  assert.equal(hasPopoverFallback('@supports selector(:popover-open) { [popover] { display: none; } }'), false);
+  assert.equal(hasPopoverFallback('@supports not selector(:popover-open) { [popover] { opacity: 0; } }'), false);
+});
+
+test('ohne Popover-API bleibt jedes Popover zu: der Rueckfall steht im Basis-Blatt (#2107)', () => {
+  const linked = [...read('public/index.html').matchAll(/<link\s[^>]*rel="stylesheet"[^>]*href="\/([^"]+\.css)"/g)]
+    .map((m) => `public/${m[1]}`);
+  const carriers = linked.filter((file) => hasPopoverFallback(read(file)));
+  assert.ok(linked.length >= 5, `Reichweite: nur ${linked.length} Stylesheets in index.html gefunden`);
+  assert.deepEqual(carriers, ['public/styles/reset.css'],
+    'Genau ein von index.html geladenes Stylesheet traegt `@supports not selector(:popover-open) '
+    + '{ [popover] { display: none } }` - sonst steht in einem Browser ohne Popover-API jedes Menue offen');
+});
+
+test('keine Regel setzt display an einem Popover ausserhalb von :popover-open (#2107)', () => {
+  const classes = new Set();
+  for (const file of appScripts()) popoverClasses(read(file)).forEach((name) => classes.add(name));
+  // Reichweite: die bekannten Popover-Familien muessen gefunden werden, sonst
+  // ist der Leser blind und der Test gruen ueber einer leeren Menge.
+  for (const known of ['popover-menu', 'nav-sidebar__account-menu', 'documents-context-menu',
+    'ydp-popover', 'note-category-overflow-tooltip', 'filter-popover', 'fasting-help__tooltip']) {
+    assert.ok(classes.has(known), `Reichweite: Popover-Klasse ${known} nicht gefunden`);
+  }
+  const offenders = [];
+  for (const file of appStylesheets()) {
+    for (const f of popoverDisplayFindings(read(file), classes)) {
+      offenders.push(`${file}: ${f.selector} { display: ${f.value} } (Popover-Klasse .${f.className})`);
+    }
+  }
+  assert.deepEqual(offenders, [],
+    'Diese Regel schlaegt in einem Browser ohne Popover-API den Rueckfall `[popover] { display: none }` '
+    + '(reset.css) - das Panel stuende offen. `display` an einem Popover nur unter `:popover-open`:\n'
+    + offenders.join('\n'));
+});
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * (6) Wand-Modus ohne dvh (#2183)
+ *
+ * Die Wand stand mit `min-height: 100dvh` da. Chrome < 108 verwirft die
+ * Zeile, und ein vh-Zwilling ist auf der Wand verboten (test:frontend-audit,
+ * Wand-Guard: auf dem Telefon ist 100vh die GROSSE Hoehe). Ergebnis auf einem
+ * Wandrahmen mit Android-WebView 106: die Wand war so hoch wie ihr Inhalt, und
+ * Datenstand, Kuechentimer und Ausstieg standen mitten im Bild.
+ *
+ * Die Shell hat die Hoehe schon, mit Rueckfallkette (100vh ->
+ * -webkit-fill-available -> 100dvh), und `.page-transition` reicht sie als
+ * `height: 100%` durch. Die Wand fuellt diesen Platz ueber `min-height: 100%`
+ * an der Seite und Flex darunter - in jedem Browser, ohne Viewport-Einheit.
+ * ────────────────────────────────────────────────────────────────────────── */
+const wallRule = (css, selector) => [...eachRule(css)]
+  .find((r) => !r.at.length && r.selector.replace(/\s+/g, ' ').trim() === selector);
+const decl = (rule, property) => (rule ? declarations(rule.body).filter((d) => d.property === property).at(-1)?.value : undefined);
+
+test('die Wand nimmt ihre Hoehe von der Shell, nicht vom Viewport (#2183)', () => {
+  const css = read('public/styles/dashboard.css');
+  const viewportHeight = /(?<![\w.])(?:\d*\.)?\d+[dsl]?vh\b/i;
+  const wallHeights = [...eachRule(css)]
+    .filter((r) => /(^|[\s,])\.wall(?![\w-])/.test(r.selector))
+    .flatMap((r) => declarations(r.body)
+      .filter((d) => /^(min-|max-)?height$/.test(d.property) && viewportHeight.test(d.value))
+      .map((d) => `${r.selector.trim()} { ${d.text} }`));
+  assert.deepEqual(wallHeights, [],
+    'Die Wand-Flaeche haengt ihre Hoehe an eine Viewport-Einheit - ohne dvh (Chrome < 108) ist sie '
+    + 'dann so hoch wie ihr Inhalt und der Fuss steht mitten im Bild:\n' + wallHeights.join('\n'));
+
+  // Die Kette von der Shell bis zur Flaeche, Glied fuer Glied.
+  assert.equal(decl(wallRule(read('public/styles/layout.css'), '.page-transition'), 'height'), '100%',
+    '.page-transition reicht die Hoehe der Shell nicht mehr durch - min-height: 100% darunter griffe ins Leere');
+  const page = wallRule(css, '.dashboard--wall');
+  assert.equal(decl(page, 'min-height'), '100%', '.dashboard--wall fuellt die Hoehe der Shell nicht');
+  const shell = wallRule(css, '.dashboard--wall .dashboard-shell');
+  assert.equal(decl(shell, 'display'), 'flex', 'die Shell der Wand reicht die Hoehe nicht weiter (display: flex)');
+  assert.equal(decl(shell, 'flex-direction'), 'column');
+  assert.match(decl(shell, 'flex') || '', /^1\b/, 'die Shell der Wand waechst nicht in die Seite (flex: 1 ...)');
+  assert.match(decl(wallRule(css, '.wall'), 'flex') || '', /^1\b/, 'die Wand-Flaeche waechst nicht in die Shell (flex: 1 ...)');
+});
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * (7) color-mix() ohne Unterstuetzung (#2184; Entscheidung 25.10.2026:
+ *     gezielte Rueckfaelle)
+ *
+ * Chrome < 111, Firefox < 113, Safari < 16.2 kennen color-mix() nicht. Fast
+ * jede Stelle traegt ein var(): die Deklaration gilt beim Parsen als gueltig,
+ * gewinnt die Kaskade und faellt erst beim Berechnen auf ihren Anfangswert -
+ * eine Flaeche wird durchsichtig, ein `border` verschwindet ganz. Ein Zwilling
+ * davor (das dvh-Muster) wirkt deshalb nicht.
+ *
+ * Die meisten der rund 270 Stellen kosten dort nur Tonung, und das ist die
+ * Zusage der Zeile "Starts, every screen opens, scrolls" in
+ * docs/installation.md. Einen Rueckfall bekommt nur, was INFORMATION verliert:
+ * Schrift, die ohne ihre Flaeche unlesbar wird (weiss auf durchsichtig), eine
+ * Auswahl, die nur an der Tonung hing, eine Flaeche, die Inhalt verdecken muss,
+ * eine vom Nutzer gewaehlte Farbe ohne andere Spur, eine leere Checkbox ohne
+ * Rand. Alle Rueckfaelle stehen in EINEM Block in reset.css (neben dem
+ * Popover-Rueckfall, im zweiten Blatt nach den Tokens) und nehmen nur
+ * Token-Werte. Sie muessen die color-mix-Regeln der spaeter geladenen Blaetter
+ * schlagen, also hoehere Spezifitaet (`:root ` davor).
+ *
+ * Bewusst ohne Rueckfall (Spur bleibt): Kalendertermine (farbige Kante),
+ * Segment-Steuerungen und Unter-Reiter (eigene Flaeche + Schatten), Auswahl
+ * mit Modulkante (Gesundheit, Widget-Groesse), Dialog-Hintergruende (der Dialog
+ * hat seine eigene Flaeche), Skelette, Glyphen-Schimmer, Hover/Fokus/Drag.
+ * ────────────────────────────────────────────────────────────────────────── */
+const COLOR_MIX_FALLBACK_AT = /^@supports not \(color: color-mix\(in srgb, red, red\)\)$/;
+
+/**
+ * Was einen Rueckfall braucht. `selector` ist ein Teil der Quell-Selektorliste,
+ * wortgleich; `property` die Eigenschaft der color-mix-Zeile dort. Bedingungen
+ * aus `@media`/`@container` der Quelle muss der Rueckfall wiederholen.
+ */
+const COLOR_MIX_FALLBACKS = [
+  // Schrift auf einer Fuellung: ohne sie unlesbar. (Der Primaerknopf fuellt sich
+  // aus einem Token, eigener Test unten.)
+  { file: 'public/styles/glass.css', selector: '.page-fab:not(.page-fab--docked)', property: 'background-color',
+    why: 'das weisse Plus des Schnellknopfs auf durchsichtiger Flaeche' },
+  { file: 'public/styles/glass.css', selector: '.toast:not(.toast--danger):not(.toast--warning)', property: 'background-color',
+    why: 'Meldungstext (helle Schrift) ohne Grund ueber der Seite' },
+  { file: 'public/styles/glass.css', selector: '.list-bulkbar', property: 'background-color',
+    why: 'Sammelaktionen, dieselbe Glasregel wie die Meldung' },
+  { file: 'public/styles/calendar.css', selector: '.month-day__holiday', property: 'background',
+    why: 'Feiertagsname in --holi-ink (weiss) auf durchsichtiger Flaeche' },
+  { file: 'public/styles/calendar.css', selector: '.allday-holiday', property: 'background',
+    why: 'wie oben, Ganztagszeile der Woche und des Tags' },
+  { file: 'public/styles/documents.css', selector: '.dms-result__open', property: 'background',
+    why: 'Oeffnen-Zeichen in Flaechenfarbe auf dem Vorschaubild' },
+  { file: 'public/styles/documents.css', selector: '.document-viewer__pdf-indicator', property: 'background',
+    why: 'Seitenzahl ueber dem PDF ohne eigenen Grund' },
+  // Flaechen, die Inhalt verdecken muessen.
+  { file: 'public/styles/layout.css', selector: '.search-overlay', property: 'background-color',
+    why: 'Suchergebnisse ueber der durchscheinenden Seite' },
+  { file: 'public/styles/layout.css', selector: '.search-overlay', property: 'background-color',
+    media: '@media (min-width: 768px)', why: 'am Desktop die Abblendung hinter dem Suchfeld' },
+  // Auswahl, die nur an der Tonung hing.
+  { file: 'public/styles/layout.css', selector: '.search-result[aria-selected="true"]', property: 'background-color',
+    why: 'der Treffer, den Enter oeffnet' },
+  { file: 'public/styles/layout.css', selector: '.split-view [data-md-id].is-selected', property: 'background-color',
+    media: '@container module-surface (min-width: 65rem)', why: 'die Zeile, deren Detail daneben steht' },
+  { file: 'public/styles/tasks.css', selector: '.tasks-page .task-card--selected > .task-card__main', property: 'background-color',
+    why: 'die Aufgabe, deren Detail daneben steht' },
+  { file: 'public/styles/contacts.css', selector: '.contact-item--selected', property: 'background-color',
+    why: 'der gewaehlte Kontakt' },
+  { file: 'public/styles/documents.css', selector: '.document-row.is-selected', property: 'background-color',
+    why: 'das gewaehlte Dokument' },
+  { file: 'public/styles/split-expenses.css', selector: '.split-group--active', property: 'background',
+    why: 'die gewaehlte Gruppe' },
+  { file: 'public/styles/budget.css', selector: '.budget-bar-row.is-category-selected', property: 'background',
+    why: 'die Kategorie, nach der die Liste filtert' },
+  { file: 'public/styles/filter-chip.css', selector: '.filter-chip--active', property: 'background-color',
+    why: 'der aktive Filter - Flaeche, Kante und Schrift hingen alle an color-mix()' },
+  { file: 'public/styles/documents.css', selector: '.documents-folder-chip[data-folder-active]', property: 'background-color',
+    media: '@media (max-width: 1023px)', why: 'der offene Ordner als Chip' },
+  { file: 'public/styles/documents.css', selector: '.documents-folder-chip[data-category-active]', property: 'background-color',
+    media: '@media (max-width: 767px)', why: 'die gewaehlte Kategorie als Chip' },
+  // Vom Nutzer gewaehlte Farbe ohne andere Spur.
+  { file: 'public/styles/notes.css', selector: '.note-card', property: 'background',
+    why: 'die Farbe der Notiz' },
+  { file: 'public/styles/glass.css', selector: '.dashboard .note-item', property: 'background-color',
+    why: 'die Farbe der Notiz auf der Uebersicht' },
+  { file: 'public/styles/schedule.css', selector: '.schedule-overview__block', property: 'background',
+    why: 'die Farbe der Schichtart - der Block hat keine Kante' },
+  // Leerer Zustand ohne Rand.
+  { file: 'public/styles/typography.css', selector: '.note-md-box', property: 'border',
+    why: 'die offene Checkbox einer Notiz-Checkliste - `border` faellt ganz weg' },
+];
+
+// Spezifitaet (a, b, c) eines einzelnen Selektors. Reicht fuer die Formen der
+// App: :not()/:is()/:has() zaehlen ihr Argument, :where() nichts.
+function specificity(selector) {
+  let s = selector;
+  let a = 0; let b = 0; let c = 0;
+  const add = ([x, y, z]) => { a += x; b += y; c += z; };
+  for (;;) {
+    const m = s.match(/:(not|is|has|where)\(([^()]*)\)/);
+    if (!m) break;
+    if (m[1] !== 'where') {
+      const inner = selectorParts(m[2]).map(specificity)
+        .sort((p, q) => (q[0] - p[0]) || (q[1] - p[1]) || (q[2] - p[2]))[0] || [0, 0, 0];
+      add(inner);
+    }
+    s = s.replace(m[0], ' ');
+  }
+  s = s.replace(/"[^"]*"|'[^']*'/g, '');
+  a += (s.match(/#[\w-]+/g) || []).length;
+  b += (s.match(/\.[\w-]+/g) || []).length + (s.match(/\[[^\]]*\]/g) || []).length
+    + (s.match(/(?<!:):(?!:)[\w-]+/g) || []).length;
+  c += (s.match(/::[\w-]+/g) || []).length
+    + (s.replace(/\[[^\]]*\]/g, '').match(/(?:^|[\s>+~(])([a-z][\w-]*)/gi) || []).length;
+  return [a, b, c];
+}
+const higher = (p, q) => p[0] !== q[0] ? p[0] > q[0] : p[1] !== q[1] ? p[1] > q[1] : p[2] > q[2];
+const family = (property) => (/^background(-color)?$/.test(property) ? 'background'
+  : /^border(-color)?$/.test(property) ? 'border' : property);
+const conditions = (at) => at.filter((a) => /^@(media|container)\b/.test(a)).map(norm);
+
+/** Die Rueckfall-Regeln eines Blatts: nur im color-mix-@supports. */
+function colorMixFallbackRules(css) {
+  return [...eachRule(css)].filter(({ at }) => at.length
+    && COLOR_MIX_FALLBACK_AT.test(at[0].replace(/\s+/g, ' ').trim()));
+}
+
+/** Wirkt ein Rueckfall fuer diesen Eintrag? Liefert den Grund, wenn nicht. */
+function fallbackProblem(entry, fallbackRules) {
+  const want = entry.media ? [norm(entry.media)] : [];
+  const candidates = fallbackRules.filter((r) => JSON.stringify(conditions(r.at)) === JSON.stringify(want));
+  for (const rule of candidates) {
+    const part = selectorParts(rule.selector).find((p) => p.replace(/^:root\s+/, '') === entry.selector);
+    if (!part) continue;
+    const ds = declarations(rule.body).filter((d) => family(d.property) === family(entry.property));
+    if (!ds.length) return `${part}: setzt ${entry.property} nicht`;
+    if (ds.some((d) => /color-mix\(/i.test(d.value))) return `${part}: der Rueckfall nimmt selbst color-mix()`;
+    if (!higher(specificity(part), specificity(entry.selector))) {
+      return `${part}: Spezifitaet (${specificity(part).join(",")}) schlaegt ${entry.selector} (${specificity(entry.selector).join(",")}) nicht`;
+    }
+    return null;
+  }
+  return 'kein Rueckfall' + (entry.media ? ` unter ${entry.media}` : '');
+}
+
+test('Leser: Spezifitaet und color-mix-Rueckfaelle (erfundene Faelle)', () => {
+  assert.deepEqual(specificity('.a'), [0, 1, 0]);
+  assert.deepEqual(specificity(':root .a'), [0, 2, 0]);
+  assert.deepEqual(specificity('.a:not(.b):not(.c)'), [0, 3, 0]);
+  assert.deepEqual(specificity('.a [data-x].b'), [0, 3, 0]);
+  assert.deepEqual(specificity('.a > .b::before'), [0, 2, 1]);
+  assert.deepEqual(specificity('dialog.a::backdrop'), [0, 1, 2]);
+  assert.deepEqual(specificity('.a:where(.b, .c)'), [0, 1, 0]);
+  assert.deepEqual(specificity('.a[aria-selected="true"]'), [0, 2, 0]);
+
+  const entry = { selector: '.a', property: 'background-color' };
+  const rules = (css) => colorMixFallbackRules(css);
+  const at = '@supports not (color: color-mix(in srgb, red, red))';
+  assert.equal(fallbackProblem(entry, rules(`${at} { :root .a { background-color: var(--x); } }`)), null);
+  assert.equal(fallbackProblem(entry, rules(`${at} { :root .z, :root .a { background: var(--x); } }`)), null,
+    'background und background-color sind dieselbe Familie, Selektorlisten zaehlen');
+  assert.match(fallbackProblem(entry, rules(`${at} { .a { background-color: var(--x); } }`)), /Spezifitaet/);
+  assert.match(fallbackProblem(entry, rules(`${at} { :root .a { color: red; } }`)), /setzt background-color nicht/);
+  assert.match(fallbackProblem(entry, rules(`${at} { :root .a { background-color: color-mix(in srgb, red, blue); } }`)), /selbst color-mix/);
+  assert.match(fallbackProblem(entry, rules(':root .a { background-color: var(--x); }')), /kein Rueckfall/);
+  assert.match(fallbackProblem(entry, rules(`@supports (color: color-mix(in srgb, red, red)) { :root .a { background-color: var(--x); } }`)), /kein Rueckfall/);
+  const media = { ...entry, media: '@media (min-width: 768px)' };
+  assert.match(fallbackProblem(media, rules(`${at} { :root .a { background-color: var(--x); } }`)), /unter @media/);
+  assert.equal(fallbackProblem(media, rules(`${at} { @media (min-width: 768px) { :root .a { background-color: var(--x); } } }`)), null);
+});
+
+test('ohne color-mix() bleibt lesbar, was nur an der Tonung hing: die Rueckfaelle stehen im Basis-Blatt (#2184)', () => {
+  const linked = [...read('public/index.html').matchAll(/<link\s[^>]*rel="stylesheet"[^>]*href="\/([^"]+\.css)"/g)]
+    .map((m) => `public/${m[1]}`);
+  const carriers = linked.filter((file) => colorMixFallbackRules(read(file)).length);
+  assert.deepEqual(carriers, ['public/styles/reset.css'],
+    'Genau ein von index.html geladenes Blatt traegt die color-mix-Rueckfaelle '
+    + '(`@supports not (color: color-mix(in srgb, red, red))`) - verstreut verliert man den Ueberblick');
+  // Und nirgends sonst: ein Modulblatt laedt spaeter und fiele aus der Liste.
+  const elsewhere = appStylesheets().filter((file) => file !== 'public/styles/reset.css'
+    && colorMixFallbackRules(read(file)).length);
+  assert.deepEqual(elsewhere, [], 'color-mix-Rueckfaelle ausserhalb von reset.css');
+
+  const fallbackRules = colorMixFallbackRules(read('public/styles/reset.css'));
+  const problems = [];
+  for (const entry of COLOR_MIX_FALLBACKS) {
+    // Die Quelle besteht noch: sonst ist der Eintrag ueberfluessig.
+    const source = [...eachRule(read(entry.file))].find((r) => selectorParts(r.selector).includes(entry.selector)
+      && JSON.stringify(conditions(r.at)) === JSON.stringify(entry.media ? [norm(entry.media)] : [])
+      && declarations(r.body).some((d) => d.property === entry.property && /color-mix\(/i.test(d.value)));
+    if (!source) {
+      problems.push(`${entry.file}: ${entry.selector} { ${entry.property}: color-mix(...) } besteht nicht mehr - Eintrag und Rueckfall streichen`);
+      continue;
+    }
+    const problem = fallbackProblem(entry, fallbackRules);
+    if (problem) problems.push(`${entry.file}: ${entry.selector}${entry.media ? ` (${entry.media})` : ''} - ${problem} (${entry.why})`);
+  }
+  assert.ok(COLOR_MIX_FALLBACKS.length >= 20, 'Reichweite: die Liste ist geschrumpft');
+  assert.deepEqual(problems, [],
+    'In einem Browser ohne color-mix() (Chrome < 111, Safari < 16.2) geht hier Information verloren, '
+    + 'und der Rueckfall in reset.css fehlt oder wirkt nicht:\n' + problems.join('\n'));
+});
+
+/**
+ * Der Sweep fuer neue Stellen: eine Regel, die ihre Schrift fuer eine Fuellung
+ * waehlt (die Ink-Token auf Vollton, die Flaechenfarbe als Schrift) und die
+ * Fuellung per color-mix() setzt, wird ohne color-mix() unlesbar. Ruhezustand
+ * zaehlt; Hover/Fokus/Drag nicht.
+ */
+const INK_FOR_A_FILL = /var\(--(color-ink-on-vivid|color-text-on-accent|holi-ink|color-surface)\b/;
+test('jede Schrift, die eine color-mix-Fuellung braucht, hat einen Rueckfall (#2184)', () => {
+  const listed = new Set(COLOR_MIX_FALLBACKS.map((e) => `${e.file}|${e.selector}`));
+  const offenders = [];
+  let seen = 0;
+  for (const file of appStylesheets()) {
+    for (const { selector, body } of eachRule(read(file))) {
+      if (/^@/.test(selector)) continue;
+      const ds = declarations(body.replace(/\/\*[\s\S]*?\*\//g, ''));
+      const fill = ds.find((d) => family(d.property) === 'background' && /color-mix\(/i.test(d.value));
+      const ink = ds.find((d) => d.property === 'color' && INK_FOR_A_FILL.test(d.value));
+      if (!fill || !ink) continue;
+      for (const part of selectorParts(selector)) {
+        if (/:(hover|focus|focus-visible|focus-within|active)\b|drag|sortable/.test(part)) continue;
+        seen += 1;
+        if (!listed.has(`${file}|${part}`)) offenders.push(`${file}: ${part} { ${fill.property}: color-mix(...); ${ink.text} }`);
+      }
+    }
+  }
+  assert.ok(seen >= 3, `Reichweite: nur ${seen} Schrift-auf-Fuellung-Regeln gefunden - greift der Leser noch?`);
+  assert.deepEqual(offenders, [],
+    'Ohne color-mix() steht diese Schrift auf einer durchsichtigen Flaeche. Rueckfall in reset.css '
+    + 'und Eintrag in COLOR_MIX_FALLBACKS:\n' + offenders.join('\n'));
+});
+
+/**
+ * Der Primaerknopf ist der wichtigste Fall und laeuft anders: ueber Tokens wie
+ * --viewport-height. Ein Rueckfall in reset.css braeuchte fuer den Hover
+ * `:root .btn--primary:hover` (0,3,0) und stiege damit ueber die
+ * Rueckmelde-Zustaende `button.<zustand>:is(:enabled, :disabled)` (0,2,1,
+ * test:frontend-audit, #2180) - ein gruener Erfolgsknopf waere unter dem
+ * Zeiger wieder lila. Mit Token gibt es keinen Spezifitaetsstreit.
+ */
+test('der Primaerknopf fuellt sich aus einem Token: Vollton ohne color-mix(), Abdunklung im @supports (#2184)', () => {
+  const tokens = [...eachRule(read('public/styles/tokens.css'))];
+  const setters = (name) => tokens.flatMap((r) => declarations(r.body)
+    .filter((d) => d.property === name).map((d) => ({ at: r.at.map((a) => a.replace(/\s+/g, ' ').trim()), selector: r.selector.trim(), value: d.value })));
+  const plain = { '--btn-primary-fill': 'var(--color-accent)', '--btn-primary-fill-hover': 'var(--color-accent-hover)' };
+  for (const [name, value] of Object.entries(plain)) {
+    const all = setters(name);
+    const base = all.filter((x) => !x.at.length && x.selector === ':root');
+    const mixed = all.filter((x) => x.at.length === 1 && x.at[0] === '@supports (color: color-mix(in srgb, red, red))' && x.selector === ':root');
+    assert.deepEqual(base.map((x) => x.value), [value],
+      `${name}: an :root ohne Bedingung muss der Vollton stehen (${value}) - ohne color-mix() sonst keine Flaeche`);
+    assert.equal(mixed.length, 1, `${name}: die Abdunklung gehoert in @supports (color: color-mix(in srgb, red, red))`);
+    assert.match(mixed[0].value, /^color-mix\(/);
+    assert.equal(all.length, 2, `${name}: weitere Stellen setzen den Token:\n${JSON.stringify(all, null, 1)}`);
+  }
+  const layout = read('public/styles/layout.css');
+  assert.equal(decl(wallRule(layout, '.btn--primary'), 'background-color'), 'var(--btn-primary-fill)');
+  assert.equal(decl(wallRule(layout, '.btn--primary:hover'), 'background-color'), 'var(--btn-primary-fill-hover)');
 });

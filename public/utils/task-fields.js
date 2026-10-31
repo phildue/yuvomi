@@ -14,7 +14,8 @@
  * auseinanderlaeuft.
  */
 
-import { t, formatDate, formatDayMonth, formatTime } from '/i18n.js';
+import { t, formatTime } from '/i18n.js';
+import { dateText } from '/utils/date-format.js';
 import { parseLocalDateKey } from '/utils/date.js';
 import { nowFields } from '/utils/timezone.js';
 import { isPreviewable } from '/utils/document-preview.js';
@@ -230,12 +231,10 @@ export function formatDueDate(dateStr, timeStr, isDone = false) {
    * einzige Angabe, die nichts beitrug: eine Aufgabe, die dieses Jahr fällig
    * ist, sagt mit „11.08." dasselbe in 35px weniger.
    *
-   * Über `formatDayMonth` und nicht per slice: die Reihenfolge und das
-   * Trennzeichen hängen an der Datumsformat-Präferenz (dmy, mdy, ymd), und ein
-   * abgeschnittener String hätte sie in drei von sieben Formaten verdreht. */
-  const dateLabel = dayKey.slice(0, 4) === todayDay.slice(0, 4)
-    ? formatDayMonth(dayKey)
-    : formatDate(dayKey);
+   * Seit R23 sagt das `dateText` (utils/date-format.js) fuer die ganze App:
+   * Reihenfolge und Trenner der Datumsformat-Praeferenz, das Jahr nur
+   * ausserhalb des laufenden. */
+  const dateLabel = dateText(dayKey, { today: todayDay });
   const fullLabel = dueTime ? `${dateLabel}, ${formatTime(dueStamp)}` : dateLabel;
 
   // Erledigte/archivierte Aufgaben können nicht überfällig sein - neutrales Datum.
@@ -284,14 +283,19 @@ export function formatDueDate(dateStr, timeStr, isDone = false) {
  * oder „Heute faellig" gehoeren an die Zeile, nicht in diesen Satz.
  *
  * @param {{ data?: { next_due_date?: string|null } | null } | null | undefined} response
- * @param {{ name?: string }} [who] die benannte Person (#1205), falls es eine gibt
+ * @param {{ name?: string, title?: string }} [who] die benannte Person (#1205), falls es eine gibt,
+ *   und der Titel der Aufgabe fuer den Satz ohne Person
  * @returns {string|null}
  */
-export function seriesDoneText(response, { name } = {}) {
+export function seriesDoneText(response, { name, title } = {}) {
   const next = response?.data?.next_due_date;
   const due = next ? formatDueDate(next, null, true) : null;
   if (!due) return null;
-  return name
-    ? t('tasks.seriesDoneByToast', { name, date: due.label })
+  if (name) return t('tasks.seriesDoneByToast', { name, date: due.label });
+  // DER SATZ NENNT DIE AUFGABE (Critique R24, Uebergabe S2; R22 D6
+  // "‹Objekt› ‹Verb›"): "Erledigt - naechstes Mal am 04.11." sagte nicht,
+  // WAS - neben jedem anderen Haken der Liste, der "„Titel“ erledigt." sagt.
+  return title
+    ? t('tasks.seriesDoneNamed', { title, date: due.label })
     : t('tasks.seriesDoneToast', { date: due.label });
 }

@@ -119,32 +119,70 @@ function unfoldVCard(text) {
 }
 
 /**
+ * Platzhalterjahr eines Geburtstags ohne Jahr (#2095): ein Schaltjahr, damit
+ * der 29.02. gueltig bleibt. Spiegel von server/services/birthdays.js.
+ */
+export const YEAR_UNKNOWN_PLACEHOLDER = 2000;
+
+/** Tag und Monat ohne Jahr, im Schaltjahr gueltig - sonst null. */
+function yearlessBirthday(month, day) {
+  const m = Number(month);
+  const d = Number(day);
+  const probe = new Date(Date.UTC(YEAR_UNKNOWN_PLACEHOLDER, m - 1, d));
+  if (probe.getUTCMonth() !== m - 1 || probe.getUTCDate() !== d) return null;
+  return { date: `${YEAR_UNKNOWN_PLACEHOLDER}-${month}-${day}`, yearUnknown: true };
+}
+
+/**
  * Normalisiert einen vCard-BDAY-Wert auf ISO YYYY-MM-DD.
  * Spiegelt server/services/cardav-sync.js#parseBirthday (Layer-Boundary
  * verbietet den direkten Import von Server-Code im Frontend). Verhalten muss
  * mit dem CardDAV-Sync identisch bleiben, damit contacts.birthday einheitlich
  * ist und der #518-Geburtstags-Import beide Quellen gleich behandelt.
- * @param {string} value - Roher BDAY-Wert (z. B. "1990-01-01", "19900101", "1990")
- * @returns {string|null} ISO-Datum oder null, wenn nicht verwertbar
+ *
+ * Ohne Jahr (#2095): Apples `BDAY;X-APPLE-OMIT-YEAR=1604:1604-03-15`, ein
+ * blankes 1604 und vCard-4 `--0315` / `--03-15` liefern Tag und Monat mit dem
+ * Platzhalterjahr und `yearUnknown: true`.
+ *
+ * Mit Uhrzeit: vCard 3.0 erlaubt `VALUE=date-time` (RFC 2426 3.1.5,
+ * `1953-10-15T23:10:00Z`), vCard 4 `date-and-or-time` (RFC 6350 6.2.5,
+ * `19531015T231000Z`). Es zaehlt das Datum, wie es dasteht.
+ * @param {string} value - Roher BDAY-Wert (z. B. "1990-01-01", "19900101", "1990", "--0315")
+ * @param {string} [params] - Parameter der Zeile ohne fuehrendes ';' (z. B. "X-APPLE-OMIT-YEAR=1604")
+ * @returns {{ date: string, yearUnknown: boolean }|null} ISO-Datum oder null, wenn nicht verwertbar
  */
-export function parseBirthdayValue(value) {
+export function parseBirthdayValue(value, params = '') {
   if (!value) return null;
 
+  // Uhrzeit abschneiden, vor der Bereinigung: die haengte ihre Ziffern sonst
+  // an das Datum ("1990-07-1800000000" -> kein Muster -> null). Keine
+  // Umrechnung der Zone - ein Geburtstag ist ein Kalendertag, und
+  // `1990-07-18T00:00:00+02:00` in UTC waere der 17.
+  const trimmed = String(value).trim();
+  const dateTime = /^(\d{4}-?\d{2}-?\d{2}|--\d{2}-?\d{2})T\d/.exec(trimmed);
+  const datePart = dateTime ? dateTime[1] : trimmed;
+
+  // vCard 4 ohne Jahr, vor der Bereinigung (sie liesse die Striche stehen).
+  const yearless = /^--(\d{2})-?(\d{2})$/.exec(datePart);
+  if (yearless) return yearlessBirthday(yearless[1], yearless[2]);
+
   // Alle Zeichen ausser Ziffern und Bindestrich entfernen (TZ-Suffixe etc.)
-  const cleaned = String(value).replace(/[^\d-]/g, '');
+  const cleaned = datePart.replace(/[^\d-]/g, '');
 
+  let date = null;
   // ISO (YYYY-MM-DD)
-  if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) return cleaned;
-
+  if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) date = cleaned;
   // Kompakt (YYYYMMDD)
-  if (/^\d{8}$/.test(cleaned)) {
-    return `${cleaned.slice(0, 4)}-${cleaned.slice(4, 6)}-${cleaned.slice(6, 8)}`;
-  }
-
+  else if (/^\d{8}$/.test(cleaned)) date = `${cleaned.slice(0, 4)}-${cleaned.slice(4, 6)}-${cleaned.slice(6, 8)}`;
   // Nur Jahr
-  if (/^\d{4}$/.test(cleaned)) return `${cleaned}-01-01`;
+  else if (/^\d{4}$/.test(cleaned)) date = `${cleaned}-01-01`;
+  if (!date) return null;
 
-  return null;
+  const omitYear = /(?:^|;)X-APPLE-OMIT-YEAR=(\d{4})(?:;|$)/i.exec(params || '');
+  if ((omitYear && omitYear[1] === date.slice(0, 4)) || date.startsWith('1604-')) {
+    return yearlessBirthday(date.slice(5, 7), date.slice(8, 10));
+  }
+  return { date, yearUnknown: false };
 }
 
 /**
@@ -166,7 +204,7 @@ export function splitVCards(text) {
  * @param {{ resolveCategory?: (rawCategories: string) => (string|null), fallbackCategory?: string }} [opts]
  * @returns {{ name: string|null, phone: string|null, email: string|null,
  *             address: string|null, notes: string|null, birthday: string|null,
- *             category: string }}
+ *             birthdayYearUnknown: boolean, category: string }}
  */
 export function parseVCard(text, opts = {}) {
   const { resolveCategory, fallbackCategory = 'misc' } = opts;
@@ -225,11 +263,14 @@ export function parseVCard(text, opts = {}) {
   }
 
   const notes = get('NOTE') || null;
-  const birthday = parseBirthdayValue(get('BDAY'));
+  const bdayField = getField('BDAY');
+  const parsedBirthday = bdayField ? parseBirthdayValue(get('BDAY'), bdayField.params) : null;
+  const birthday = parsedBirthday ? parsedBirthday.date : null;
+  const birthdayYearUnknown = parsedBirthday ? parsedBirthday.yearUnknown : false;
   const catRaw = get('CATEGORIES') || '';
   const category = (resolveCategory && resolveCategory(catRaw)) || fallbackCategory;
 
-  return { name, ...nameParts, phone, email, address, notes, birthday, category };
+  return { name, ...nameParts, phone, email, address, notes, birthday, birthdayYearUnknown, category };
 }
 
 /**

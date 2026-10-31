@@ -1,12 +1,16 @@
 import { api } from '/api.js';
-import { formatDate, formatTime, t } from '/i18n.js';
+import { t } from '/i18n.js';
+import { dateText, dateTimeText } from '/utils/date-format.js';
 import {
   captureModalContext,
+  captureOpenContext,
   closeModal,
   confirmModal,
   isModalContextCurrent,
   openModal,
   refocusAfterRender,
+  reportFieldErrors,
+  constraintErrors,
 } from '/components/modal.js';
 import {
   createDisclosure,
@@ -14,18 +18,22 @@ import {
   createRetryState,
   createSettingRow,
   createStatusSummary,
+  hintFoldHtml,
   settingRowHtml,
   settingSwitchRowHtml,
 } from '/settings/components.js';
 import { withBusy } from '/utils/ux.js';
 import { formRowHtml, formRowsHtml } from '/utils/form-row.js';
-import { esc } from '/utils/html.js';
+import { esc, REQUIRED_MARK } from '/utils/html.js';
 import { loadFamilyUsers } from '/settings/family-users.js';
+import { buildAssigneeMenu } from '/settings/assignee-menu.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
+import { errorSentence, loadErrorSentence } from '/utils/friendly-error.js';
 
-// Seit R10 ein Abschnitt im Blatt Kalender (registry.js). Neu laden heisst,
-// das Blatt an dieser Stelle neu zu zeichnen - nicht ueber die Alt-Adresse,
-// die erst umleitet und dabei an den Blattanfang springt.
-const SYNC_CALENDAR_HREF = '/settings/modules/calendar?section=sync-calendar';
+// Seit R23 ein eigenes Blatt (registry.js, D14; R10-R22 ein Abschnitt im
+// Blatt Kalender). Neu laden heisst, das Blatt neu zu zeichnen - nicht ueber
+// die Alt-Adresse, die erst umleitet.
+const SYNC_CALENDAR_HREF = '/settings/modules/calendar-sync?section=sync-calendar';
 
 const MORE_PROVIDERS_ID = 'sync-more-providers';
 const GOOGLE_PROVIDER_ID = 'sync-provider-google';
@@ -36,7 +44,7 @@ function formatSyncTime(value) {
   if (!value) return null;
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
-  return `${formatDate(date)} ${formatTime(date)}`.trim();
+  return dateTimeText(date);
 }
 
 function lastSyncDetail(value) {
@@ -105,7 +113,7 @@ function renderPage(container, user) {
       <section class="settings-section">
         <h2 class="settings-section__title">${t('settings.sync.backfillTitle')}</h2>
         <div class="settings-card">
-          <p class="settings-card-description">${t('settings.sync.backfillDescription')}</p>
+          ${hintFoldHtml({ lead: t('settings.sync.backfillDescription'), moreHtml: `<p>${esc(t('settings.sync.backfillDescriptionMore'))}</p>` })}
           <div class="settings-form-actions">
             <button type="button" class="btn btn--secondary" id="sync-default-assignee-backfill-btn">
               ${t('settings.sync.backfillAction')}
@@ -152,7 +160,7 @@ function bindDefaultAssigneeBackfill(container) {
         data = (await api.get(`${endpoint}${query}`)).data ?? {};
       });
     } catch (err) {
-      if (isModalContextCurrent(context)) showToast(err.message || t('common.errorGeneric'), 'danger');
+      if (isModalContextCurrent(context)) showToast(errorSentence(err), 'danger');
       return null;
     }
     if (!isModalContextCurrent(context)) return null;
@@ -181,15 +189,19 @@ function bindDefaultAssigneeBackfill(container) {
         ok = true;
       } catch (err) {
         if (err.status === 409) showToast(t('settings.sync.backfillChanged'), 'warning');
-        else showToast(err.message || t('common.errorGeneric'), 'danger');
+        else showToast(errorSentence(err), 'danger');
       }
     });
     return ok;
   };
 
   btn.addEventListener('click', async () => {
+    // loadPage() gibt ohne seinen Kontext schon null zurueck; die Frage, die
+    // aus der Antwort entsteht, prueft ihn hier noch einmal dort, wo der
+    // Scanner aus test/late-modal-close.js ihn sieht (#2134).
+    const context = captureOpenContext();
     let page = await loadPage(null);
-    if (!page) return;
+    if (!page || !isModalContextCurrent(context)) return;
     if (page.count === 0 && page.moved.length === 0) {
       showToast(t('settings.sync.backfillNone'));
       return;
@@ -221,7 +233,7 @@ function bindDefaultAssigneeBackfill(container) {
 function movedCandidateMeta(entry) {
   const value = String(entry.start_datetime || '');
   const timed = !entry.all_day && value.length > 10;
-  const when = timed ? `${formatDate(value)} ${formatTime(value)}`.trim() : formatDate(value);
+  const when = timed ? dateTimeText(value) : dateText(value);
   return [when, entry.calendar_name].filter(Boolean).join(' · ');
 }
 
@@ -318,7 +330,8 @@ function pickMovedCandidates({ count, moved, total, offset, next }) {
             action: 'apply',
             moves: boxes.filter((b) => b.checked).map((b) => {
               const entry = moved[Number(b.dataset.index)];
-              return { event_id: entry.event_id, from_user_id: entry.from_user_id, to_user_id: entry.to_user_id };
+              // Mengen (#1897): genau die Personen, die die Vorschau gezeigt hat.
+              return { event_id: entry.event_id, from_user_ids: entry.from_user_ids, to_user_ids: entry.to_user_ids };
             }),
           });
         });
@@ -333,65 +346,24 @@ function pickMovedCandidates({ count, moved, total, offset, next }) {
 // --------------------------------------------------------------------------
 
 /**
- * Kompaktes Auswahlfeld „Standard-Zuweisung" für eine synchronisierte
- * Kalenderzeile (Google/Apple/CalDAV). Schreibt provider-übergreifend über
- * PATCH /calendar/external-calendars. Options werden async nachgeladen, damit die
- * Zeile sofort rendert; Interaktionen werden vom Zeilen-Label entkoppelt.
+ * Die Standard-Personen einer synchronisierten Kalenderzeile (Google/Apple/
+ * CalDAV, #459, #1897): ein Knopf mit den Namen, der ein Menue mit einem
+ * Schalter je Person oeffnet (assignee-menu.js). Jeder Haken schreibt sofort
+ * ueber PATCH /calendar/external-calendars. Das Panel steht in `host`, nicht
+ * im Zeilen-Label.
  */
-function buildCalendarAssigneeSelect({ source, externalId, currentId }) {
-  const select = document.createElement('select');
-  select.className = 'caldav-calendar-assignee';
-  select.title = t('settings.sync.defaultAssignee');
-  select.setAttribute('aria-label', t('settings.sync.defaultAssignee'));
-
-  const none = document.createElement('option');
-  none.value = '';
-  none.textContent = t('settings.sync.defaultAssigneeNone');
-  select.appendChild(none);
-
-  // Kurzer Ladehinweis, bis die Nutzerliste aufgelöst ist.
-  const loadingOpt = document.createElement('option');
-  loadingOpt.value = '';
-  loadingOpt.disabled = true;
-  loadingOpt.textContent = t('common.loading');
-  select.appendChild(loadingOpt);
-
-  // Klicks/Änderungen nicht an das umschließende Label (Checkbox) weiterreichen.
-  ['click', 'mousedown', 'change'].forEach((ev) =>
-    select.addEventListener(ev, (e) => e.stopPropagation()));
-
-  loadFamilyUsers(currentId).then((users) => {
-    loadingOpt.remove();
-    for (const u of users) {
-      const opt = document.createElement('option');
-      opt.value = String(u.id);
-      opt.textContent = u.display_name;
-      if (Number(currentId) === u.id) opt.selected = true;
-      select.appendChild(opt);
-    }
+function buildCalendarAssigneeMenu({ source, externalId, currentIds, host }) {
+  return buildAssigneeMenu({
+    currentIds,
+    host,
+    save: (ids) => api.patch('/calendar/external-calendars', {
+      source,
+      external_id: externalId,
+      default_assignee_user_ids: ids,
+    }),
+    onSaved: () => showToast(t('settings.ics.updatedToast'), 'success'),
+    onError: (err) => showToast(errorSentence(err), 'danger'),
   });
-
-  let last = currentId ? String(currentId) : '';
-  select.addEventListener('change', async () => {
-    const value = select.value;
-    select.disabled = true;
-    try {
-      await api.patch('/calendar/external-calendars', {
-        source,
-        external_id: externalId,
-        default_assignee_user_id: value ? Number(value) : null,
-      });
-      last = value;
-      showToast(t('settings.ics.updatedToast'), 'success');
-    } catch (err) {
-      select.value = last;
-      showToast(err.message || t('common.errorGeneric'), 'danger');
-    } finally {
-      select.disabled = false;
-    }
-  });
-
-  return select;
 }
 
 // --------------------------------------------------------------------------
@@ -399,6 +371,7 @@ function buildCalendarAssigneeSelect({ source, externalId, currentId }) {
 // --------------------------------------------------------------------------
 
 let calendarListSeq = 0;
+let calendarNameSeq = 0;
 
 function buildCalendarList(account, calendars) {
   const list = document.createElement('div');
@@ -419,18 +392,35 @@ function buildCalendarList(account, calendars) {
     const name = document.createElement('span');
     name.className = 'caldav-calendar-name';
     name.textContent = cal.calendarName || cal.calendarUrl;
+    // Nur lesbar geteilt (#1840): lesen geht, als Ziel neuer Termine wird
+    // der Kalender nicht angeboten. Wartet schon etwas auf den Upload
+    // hierher, nennt die Zeile die Zahl - ein gespeichertes Ziel wird nicht
+    // still geleert.
+    if (cal.writable === false) {
+      const note = document.createElement('span');
+      note.className = 'caldav-calendar-source';
+      note.textContent = cal.waitingUploads > 0
+        ? t('settings.caldavCalendarReadOnlyWaiting', { count: cal.waitingUploads })
+        : t('settings.caldavCalendarReadOnly');
+      name.appendChild(note);
+    }
 
     label.append(checkbox, color, name);
+    // Der Haken heisst wie der Kalender. Als Label-Text trug sein Name sonst
+    // auch den Personen-Knopf mit, der in derselben Zeile steht (#1897).
+    name.id = `caldav-calendar-name-${++calendarNameSeq}`;
+    checkbox.setAttribute('aria-labelledby', name.id);
     // VOR DEM HAKEN, NICHT NACH DEM SYNC: Das Feld stand früher erst da, wenn
     // der Kalender aktiv UND einmal synchronisiert war - also frühestens, als
     // der erste Schwung Termine bereits ohne Zuweisung hereingekommen war, bei
     // Serien Dutzende (#730). Jetzt lässt es sich vorher setzen; der PATCH legt
     // die external_calendars-Zeile nötigenfalls selbst an, und der spätere Sync
     // aktualisiert daran nur Name und Farbe.
-    label.appendChild(buildCalendarAssigneeSelect({
+    label.appendChild(buildCalendarAssigneeMenu({
       source: 'caldav',
       externalId: cal.calendarUrl,
-      currentId: cal.default_assignee_user_id,
+      currentIds: cal.default_assignee_user_ids,
+      host: list,
     }));
     list.appendChild(label);
 
@@ -531,7 +521,7 @@ function renderCalDAVAccount(container, account, calendars, refresh, user) {
     try {
       await api.post('/calendar/caldav/sync');
       showToast(t('settings.caldavSyncSuccess'), 'success');
-      await refresh();
+      await reloadAfterSave(() => refresh());
     } catch (err) {
       showToast(err.message || t('settings.caldavSyncFailed'), 'danger');
       syncBtn.disabled = false;
@@ -552,7 +542,7 @@ function renderCalDAVAccount(container, account, calendars, refresh, user) {
   if (calendars.length) {
     const routingHint = document.createElement('p');
     routingHint.className = 'form-hint';
-    routingHint.textContent = t('settings.sync.defaultAssigneeRoutingHint');
+    routingHint.textContent = t('settings.sync.defaultAssigneesRoutingHint');
     card.appendChild(routingHint);
   }
 
@@ -687,7 +677,6 @@ async function loadCalDAVAccounts(container, user) {
 }
 
 /** Das Pflichtzeichen hinter einem Etikett - Markup, kein Text (aria-hidden). */
-const REQUIRED_MARK = '<span class="required-marker" aria-hidden="true"> *</span>';
 
 function bindCalDAVAddButton(container, user) {
   const addBtn = container.querySelector('#caldav-add-account-btn');
@@ -720,7 +709,7 @@ function bindCalDAVAddButton(container, user) {
             formRowHtml({
               label: t('settings.caldavPasswordLabel'), labelFor: 'caldav-password', labelExtra: REQUIRED_MARK, field: true,
               description: t('settings.caldavPasswordHint'), descriptionId: 'caldav-password-hint',
-              control: '<input class="form-input" type="password" id="caldav-password" required autocomplete="current-password" aria-describedby="caldav-password-hint" />',
+              control: '<input class="form-input" type="password" id="caldav-password" required autocomplete="new-password" aria-describedby="caldav-password-hint" />',
             }),
           ])}
           <div id="caldav-add-error" class="form-error" role="alert" hidden></div>
@@ -750,6 +739,9 @@ function bindCalDAVAddButton(container, user) {
             return;
           }
 
+          // Geschlossen wird nur dieser Dialog, nicht einer, der waehrend der
+          // Anfrage aufgegangen ist (#1997).
+          const modalContext = captureModalContext();
           try {
             await api.post('/calendar/caldav/accounts', {
               name,
@@ -757,9 +749,9 @@ function bindCalDAVAddButton(container, user) {
               username,
               password,
             });
-            closeModal({ force: true });
+            closeModal({ force: true, context: modalContext });
             showToast(t('settings.caldavAccountAdded'), 'success');
-            await loadCalDAVAccounts(container, user);
+            await reloadAfterSave(() => loadCalDAVAccounts(container, user));
             refocusAfterRender();
           } catch (err) {
             errorEl.textContent = err.message || t('common.errorGeneric');
@@ -840,7 +832,12 @@ function buildGoogleProvider(googleStatus, user) {
     : null;
 
   if (!googleStatus?.configured) {
-    section.appendChild(buildProviderHint(t('settings.notConfigured')));
+    // Fuer den Admin eine Anleitung statt der Sackgasse (#2221); die
+    // Statuszeile oben sagt "Nicht konfiguriert" schon, ein zweites Mal
+    // derselbe Satz half niemandem weiter.
+    section.appendChild(user?.role === 'admin'
+      ? buildGoogleSetupGuide(googleStatus)
+      : buildProviderHint(t('settings.notConfigured')));
     if (cleanup) section.appendChild(cleanup);
     return section;
   }
@@ -880,7 +877,7 @@ function buildGoogleProvider(googleStatus, user) {
         showToast(t('settings.syncSuccess', { provider: 'Google Calendar' }), 'success');
       } catch (err) {
         if (err.reauthHandled) return;
-        showToast(err.message || t('common.errorGeneric'), 'danger');
+        showToast(googleErrorSentence(err), 'danger');
       } finally {
         syncBtn.disabled = false;
         syncBtn.textContent = t('settings.syncNow');
@@ -929,7 +926,7 @@ function buildGoogleDisconnectButton(googleStatus) {
       );
       window.yuvomi?.navigate(SYNC_CALENDAR_HREF);
     } catch (err) {
-      showToast(err.message || t('common.errorGeneric'), 'danger');
+      showToast(errorSentence(err), 'danger');
     }
   });
   return disconnectBtn;
@@ -1028,7 +1025,7 @@ function buildMirroredCleanup({ count, endpoint }) {
         // hatte. Der Block existiert wegen des Rückstands; der ist jetzt fort.
         group.remove();
       } catch (err) {
-        showToast(err.message || t('common.errorGeneric'), 'danger');
+        showToast(errorSentence(err), 'danger');
       }
     });
   });
@@ -1036,6 +1033,157 @@ function buildMirroredCleanup({ count, endpoint }) {
   group.appendChild(actions);
 
   return group;
+}
+
+const GOOGLE_SETUP_GUIDE_URL = 'https://github.com/ulsklyc/yuvomi/blob/main/docs/installation.md#google-calendar-sync-optional';
+const GOOGLE_CALLBACK_PATH = '/api/v1/calendar/google/callback';
+const CALENDAR_SUBSCRIPTIONS_HREF = '/settings/modules/calendar?section=personal-calendar-subscriptions';
+const GOOGLE_ENV_KEYS = ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI'];
+
+/**
+ * Nimmt Google diese Rueckrufadresse an? Google verlangt HTTPS und einen
+ * Hostnamen, `localhost` ist ausgenommen (docs/installation.md, "Setting it up
+ * at Google"). Eine IP-Adresse oder http faellt dort erst nach dem Eintragen
+ * auf - hier soll es vorher auffallen.
+ */
+function googleAcceptsRedirect(uri) {
+  let url;
+  try { url = new URL(uri); } catch { return false; }
+  const host = url.hostname.replace(/^\[|\]$/g, '');
+  if (host === 'localhost') return true;
+  const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':');
+  return url.protocol === 'https:' && !isIp;
+}
+
+/**
+ * Kopiert den Wert eines Feldes und sagt, ob es wirklich geklappt hat. Ueber
+ * http im Heimnetz - genau dort, wo die Einrichtung meist passiert - gibt es
+ * `navigator.clipboard` nicht; dann bleibt der Auswahl-Weg, und das Feld steht
+ * markiert, falls auch der scheitert. Dasselbe Muster wie `copyInviteLink`
+ * (admin-family.js).
+ */
+async function copyFieldValue(input) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(input.value);
+      return true;
+    } catch { /* auf den Auswahl-Weg zurueckfallen */ }
+  }
+  try {
+    input.focus();
+    input.select();
+    return document.execCommand('copy') === true;
+  } catch {
+    return false;
+  }
+}
+
+function iconNote(icon, ...content) {
+  const note = document.createElement('p');
+  note.className = 'settings-provider-note settings-provider-note--hint';
+  const glyph = document.createElement('i');
+  glyph.dataset.lucide = icon;
+  glyph.setAttribute('aria-hidden', 'true');
+  const text = document.createElement('span');
+  text.append(...content);
+  note.append(glyph, text);
+  return note;
+}
+
+function envName(name) {
+  const code = document.createElement('code');
+  code.textContent = name;
+  return code;
+}
+
+/**
+ * Die Google-Karte, solange die OAuth-Zugangsdaten fehlen (#2221): was fehlt,
+ * welche Rueckrufadresse bei Google hingehoert, die vier Schritte, und daneben
+ * die Wege ganz ohne Google-Einrichtung. Nur Namen von Variablen, nie Werte.
+ */
+function buildGoogleSetupGuide(googleStatus) {
+  const guide = document.createElement('div');
+  guide.className = 'settings-provider__setup';
+
+  const missing = Array.isArray(googleStatus?.missingEnv) && googleStatus.missingEnv.length
+    ? googleStatus.missingEnv
+    : GOOGLE_ENV_KEYS;
+  const names = [];
+  missing.forEach((name, i) => {
+    if (i) names.push(', ');
+    names.push(envName(name));
+  });
+  guide.appendChild(iconNote('key-round', `${t('settings.googleSetupMissing')} `, ...names));
+
+  const steps = document.createElement('ol');
+  steps.className = 'settings-provider__steps';
+  const step = (...content) => {
+    const li = document.createElement('li');
+    li.append(...content);
+    steps.appendChild(li);
+    return li;
+  };
+  step(t('settings.googleSetupStepApi'));
+  step(t('settings.googleSetupStepConsent'));
+
+  const redirectUri = googleStatus?.redirectUri || `${window.location.origin}${GOOGLE_CALLBACK_PATH}`;
+  const uriId = 'google-setup-redirect-uri';
+  const uriStep = step(t('settings.googleSetupStepClient'));
+  const uriRow = document.createElement('div');
+  uriRow.className = 'settings-provider__copy-row';
+  const uriInput = document.createElement('input');
+  uriInput.id = uriId;
+  uriInput.className = 'form-input';
+  uriInput.type = 'text';
+  uriInput.readOnly = true;
+  uriInput.value = redirectUri;
+  uriInput.setAttribute('aria-label', t('settings.googleSetupRedirectLabel'));
+  const copy = document.createElement('button');
+  copy.type = 'button';
+  copy.className = 'btn btn--secondary';
+  copy.textContent = t('settings.googleSetupCopy');
+  copy.addEventListener('click', async () => {
+    const copied = await copyFieldValue(uriInput);
+    showToast(t(copied ? 'settings.googleSetupCopied' : 'settings.googleSetupCopyFailed'), copied ? 'success' : 'danger');
+  });
+  uriRow.append(uriInput, copy);
+  uriStep.appendChild(uriRow);
+  if (!googleAcceptsRedirect(redirectUri)) {
+    const warn = document.createElement('p');
+    warn.className = 'form-hint';
+    warn.textContent = t('settings.googleSetupRedirectHttps');
+    uriStep.appendChild(warn);
+  }
+
+  step(t('settings.googleSetupStepEnv'), ' ', envName('GOOGLE_CLIENT_ID'), ', ', envName('GOOGLE_CLIENT_SECRET'), ', ', envName('GOOGLE_REDIRECT_URI'));
+  guide.appendChild(steps);
+
+  const more = document.createElement('p');
+  more.className = 'settings-provider-note';
+  const link = document.createElement('a');
+  link.href = GOOGLE_SETUP_GUIDE_URL;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.textContent = t('settings.googleSetupGuideLink');
+  more.appendChild(link);
+  guide.appendChild(more);
+
+  guide.appendChild(iconNote('calendar-plus', t('settings.googleSetupWithout')));
+  const actions = document.createElement('div');
+  actions.className = 'settings-sync-actions';
+  const alt = document.createElement('a');
+  alt.className = 'btn btn--secondary';
+  alt.href = CALENDAR_SUBSCRIPTIONS_HREF;
+  alt.textContent = t('settings.googleSetupWithoutAction');
+  alt.addEventListener('click', (event) => {
+    if (!window.yuvomi?.navigate) return;
+    event.preventDefault();
+    window.yuvomi.navigate(CALENDAR_SUBSCRIPTIONS_HREF);
+  });
+  actions.appendChild(alt);
+  guide.appendChild(actions);
+
+  return guide;
 }
 
 function buildProviderHint(text) {
@@ -1047,6 +1195,16 @@ function buildProviderHint(text) {
 
 /** Grund, mit dem /calendar/google/calendars ein abgelehntes Token meldet (#2019). */
 const GOOGLE_REAUTH_REASON = 'google_reauth_required';
+
+/**
+ * Der Satz der App zu einem gescheiterten Google-Aufruf (#1695), nie der Text
+ * des Servers. Konnte handleReauth die Karte nicht neu aufbauen (Status-Abruf
+ * gescheitert), nennt der Toast die abgelaufene Anmeldung - in den Worten, die
+ * die Outlook-Karte fuer denselben Fall hat.
+ */
+function googleErrorSentence(err) {
+  return err?.data?.reason === GOOGLE_REAUTH_REASON ? t('settings.outlookReauthRequired') : errorSentence(err);
+}
 
 function buildGoogleCalendarPicker(googleCall) {
   // Eine Liste, kein Feld (R19): ihr Name ist keine `<label>` ohne
@@ -1076,7 +1234,7 @@ function buildGoogleCalendarPicker(googleCall) {
   // wo sie gesetzt wird, samt der Kalender, fuer die die zweite nicht gilt.
   const routingHint = document.createElement('p');
   routingHint.className = 'form-hint';
-  routingHint.textContent = t('settings.sync.defaultAssigneeRoutingHint');
+  routingHint.textContent = t('settings.sync.defaultAssigneesRoutingHint');
   group.appendChild(routingHint);
 
   (async () => {
@@ -1102,13 +1260,16 @@ function buildGoogleCalendarPicker(googleCall) {
         name.textContent = cal.summary || cal.id;
 
         item.append(checkbox, dot, name);
+        name.id = `google-calendar-name-${++calendarNameSeq}`;
+        checkbox.setAttribute('aria-labelledby', name.id);
         // Wie bei CalDAV vor dem Haken setzbar (#730) - hier zählt es doppelt:
         // Das Aktivieren startet den Sync unmittelbar (PATCH /google/calendars),
         // eine Zuweisung danach käme für die erste Ladung immer zu spät.
-        item.appendChild(buildCalendarAssigneeSelect({
+        item.appendChild(buildCalendarAssigneeMenu({
           source: 'google',
           externalId: cal.id,
-          currentId: cal.default_assignee_user_id,
+          currentIds: cal.default_assignee_user_ids,
+          host: list,
         }));
         list.appendChild(item);
 
@@ -1123,7 +1284,7 @@ function buildGoogleCalendarPicker(googleCall) {
               );
             } catch (err) {
               checkbox.checked = !enabled;
-              if (!err.reauthHandled) showToast(err.message || t('common.errorGeneric'), 'danger');
+              if (!err.reauthHandled) showToast(googleErrorSentence(err), 'danger');
             }
           });
         });
@@ -1132,7 +1293,7 @@ function buildGoogleCalendarPicker(googleCall) {
       if (err.reauthHandled) return;
       const p = document.createElement('p');
       p.className = 'form-hint';
-      p.textContent = err.message || t('common.errorGeneric');
+      p.textContent = loadErrorSentence(err) ?? t('common.errorGeneric');
       list.replaceChildren(p);
     }
   })();
@@ -1159,7 +1320,7 @@ function buildGoogleReadonlyToggle(googleStatus, googleCall) {
         await googleCall(() => api.put('/calendar/google/readonly', { readonly: enabled }));
       } catch (err) {
         checkbox.checked = !enabled;
-        if (!err.reauthHandled) showToast(err.message || t('common.errorGeneric'), 'danger');
+        if (!err.reauthHandled) showToast(googleErrorSentence(err), 'danger');
       }
     });
   });
@@ -1209,7 +1370,7 @@ function buildOutlookCalendarList(account, calendars, user) {
           );
         } catch (err) {
           checkbox.checked = !enabled;
-          showToast(err.message || t('common.errorGeneric'), 'danger');
+          showToast(errorSentence(err), 'danger');
         }
       });
     });
@@ -1325,7 +1486,7 @@ function buildOutlookAccountCard(account, refresh, user) {
     try {
       await api.post('/calendar/outlook/sync');
       showToast(t('settings.syncSuccess', { provider: 'Outlook' }), 'success');
-      await refresh();
+      await reloadAfterSave(() => refresh());
     } catch (err) {
       showToast(err.message || t('common.errorGeneric'), 'danger');
       syncBtn.disabled = false;
@@ -1564,22 +1725,25 @@ function buildAppleProvider(appleStatus, user) {
 function buildAppleConnectForm() {
   const form = document.createElement('form');
   form.className = 'settings-form settings-form--compact';
+  // KEINE BROWSER-BLASEN (Critique R21): die Regeln des Markups melden sich
+  // am Feld (constraintErrors, components/modal.js).
+  form.noValidate = true;
   // EIN FORMULAR-DIALEKT (R19, Einstellungen B7): die drei Felder als Zeilen
   // der Gruppe, der Passwort-Hinweis unter seiner Zeile.
   form.insertAdjacentHTML('beforeend', `
     <div class="row-carrier settings-group">
       ${settingRowHtml({
-        label: t('settings.caldavUrlLabel'), labelFor: 'apple-caldav-url',
+        label: t('settings.caldavUrlLabel'), labelFor: 'apple-caldav-url', labelExtra: REQUIRED_MARK,
         control: `<input class="form-input" type="url" id="apple-caldav-url" placeholder="${t('settings.caldavUrlPlaceholder')}" required />`,
       })}
       ${settingRowHtml({
-        label: t('settings.appleIdLabel'), labelFor: 'apple-username',
-        control: '<input class="form-input" type="email" id="apple-username" autocomplete="username" required />',
+        label: t('settings.appleIdLabel'), labelFor: 'apple-username', labelExtra: REQUIRED_MARK,
+        control: '<input class="form-input" type="email" id="apple-username" autocomplete="off" required />',
       })}
       ${settingRowHtml({
-        label: t('settings.applePasswordLabel'), labelFor: 'apple-password',
+        label: t('settings.applePasswordLabel'), labelFor: 'apple-password', labelExtra: REQUIRED_MARK,
         description: t('settings.applePasswordHint'), descriptionId: 'apple-password-hint',
-        control: '<input class="form-input" type="password" id="apple-password" autocomplete="current-password" aria-describedby="apple-password-hint" required />',
+        control: '<input class="form-input" type="password" id="apple-password" autocomplete="new-password" aria-describedby="apple-password-hint" required />',
       })}
     </div>
     <div id="apple-connect-error" class="form-error" role="alert" hidden></div>
@@ -1588,6 +1752,7 @@ function buildAppleConnectForm() {
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
+    if (reportFieldErrors(constraintErrors(form))) return;
     const errorEl = form.querySelector('#apple-connect-error');
     errorEl.hidden = true;
     const url = form.querySelector('#apple-caldav-url').value.trim();
@@ -1726,4 +1891,4 @@ export async function render(container, { user, query } = {}) {
 }
 
 // Für die Suite: die Google-Karte für sich, ohne die ganze Seite (#2019).
-export const __test = { buildGoogleProvider };
+export const __test = { buildGoogleProvider, bindCalDAVAddButton, googleAcceptsRedirect, copyFieldValue };

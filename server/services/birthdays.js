@@ -21,6 +21,42 @@ const BIRTHDAY_RRULE = 'FREQ=YEARLY;INTERVAL=1';
 // sie also nur eine weitere Quelle für Scheinänderungen.
 const AUTHORED_FIELDS = ['title', 'description', 'start_datetime'];
 
+/**
+ * DAS JAHR EINES GEBURTSTAGS OHNE JAHR (#2095). `birth_date` bleibt ein volles
+ * Datum, damit Sortierung, naechster Geburtstag und Erinnerung dieselbe Spalte
+ * lesen; `year_unknown` sagt, dass dieses Jahr nur Platzhalter ist. 2000 ist ein
+ * Schaltjahr, der 29.02. bleibt gueltig - wie beim Namenstag (`2000-MM-DD`).
+ * Spiegel im Browser: YEAR_UNKNOWN_PLACEHOLDER in public/utils/vcard.js.
+ */
+const YEAR_UNKNOWN_PLACEHOLDER = 2000;
+
+/** `YYYY-MM-DD` mit Platzhalterjahr; das Jahr des Eingangs zaehlt nicht. */
+function placeholderBirthDate(date) {
+  return `${YEAR_UNKNOWN_PLACEHOLDER}${String(date).slice(4, 10)}`;
+}
+
+/**
+ * "Jahr unbekannt" als Eingang (#2095): true/false und 0/1. Die Antworten
+ * liefern die Spalte als 0/1, und ein GET, ein Feld aendern, PUT soll nicht an
+ * ihr scheitern. null zaehlt als false.
+ */
+function validateYearUnknown(val, field) {
+  if (val === undefined) return { value: undefined, error: null };
+  if (val === true || val === 1) return { value: true, error: null };
+  if (val === false || val === 0 || val === null) return { value: false, error: null };
+  return { value: null, error: `${field} must be a boolean.` };
+}
+
+/**
+ * Ohne Jahr zaehlen nur Tag und Monat: das Jahr des Eingangs weicht dem
+ * Platzhalter, BEVOR geprueft wird - so ist ein 29.02. gueltig, auch wenn der
+ * Client ein Jahr ohne ihn mitschickt.
+ */
+function birthDateInput(raw, yearUnknown) {
+  if (yearUnknown && typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw)) return placeholderBirthDate(raw);
+  return raw;
+}
+
 function pad2(n) {
   return String(n).padStart(2, '0');
 }
@@ -60,7 +96,13 @@ function nextBirthdayDate(birthDate, today = todayKey(null)) {
   return thisYear >= today ? thisYear : normalizedMonthDay(birthDate, year + 1);
 }
 
-function nextBirthdayAge(birthDate, today = todayKey(null)) {
+/**
+ * Das Alter am naechsten Geburtstag - oder null, wenn das Jahr unbekannt ist:
+ * das Platzhalterjahr ist kein Geburtsjahr, und ein Alter daraus waere erfunden
+ * (#2095; aus Apples 1604 wurde "wird 422").
+ */
+function nextBirthdayAge(birthDate, today = todayKey(null), yearUnknown = false) {
+  if (yearUnknown) return null;
   const next = nextBirthdayDate(birthDate, today);
   return parseInt(next.slice(0, 4), 10) - parseInt(String(birthDate).slice(0, 4), 10);
 }
@@ -128,8 +170,10 @@ function eventTitle(name, locale) {
   return translate(locale, 'birthdays.calendarEventTitle', { name });
 }
 
-function eventDescription(name, birthDate, locale, dateFormat) {
-  return birthDate
+// Ohne Jahr steht kein Datum in der Beschreibung: das gespeicherte traegt das
+// Platzhalterjahr (#2095), und Tag und Monat nennt der Termin selbst.
+function eventDescription(name, birthDate, locale, dateFormat, yearUnknown = false) {
+  return birthDate && !yearUnknown
     ? translate(locale, 'birthdays.calendarEventDescription', {
         name,
         date: formatDateKey(birthDate, dateFormat),
@@ -189,7 +233,7 @@ function syncBirthdayCalendarEvent(database, birthday, kind = 'birthday') {
     title: isNameDay ? nameDayEventTitle(birthday.name, locale) : eventTitle(birthday.name, locale),
     description: isNameDay
       ? nameDayEventDescription(birthday.name, locale)
-      : eventDescription(birthday.name, birthday.birth_date, locale, dateFormat),
+      : eventDescription(birthday.name, birthday.birth_date, locale, dateFormat, birthday.year_unknown === 1),
     start_datetime: sourceDate,
     end_datetime: null,
     all_day: 1,
@@ -402,12 +446,12 @@ function deleteBirthdayArtifacts(database, birthday) {
 function retitleBirthdayEvents(database) {
   const { locale, dateFormat } = resolveHouseholdFormats(database);
   const rows = database.prepare(`
-    SELECT b.name, b.birth_date, 'birthday' AS event_kind,
+    SELECT b.name, b.birth_date, b.year_unknown, 'birthday' AS event_kind,
            e.id, e.title, e.description, e.external_source, e.external_calendar_id, e.caldav_account_id
     FROM birthdays b
     JOIN calendar_events e ON e.id = b.calendar_event_id
     UNION ALL
-    SELECT b.name, NULL AS birth_date, 'name_day' AS event_kind,
+    SELECT b.name, NULL AS birth_date, 0 AS year_unknown, 'name_day' AS event_kind,
            e.id, e.title, e.description, e.external_source, e.external_calendar_id, e.caldav_account_id
     FROM birthdays b
     JOIN calendar_events e ON e.id = b.name_day_calendar_event_id
@@ -424,7 +468,7 @@ function retitleBirthdayEvents(database) {
       : eventTitle(row.name, locale);
     const description = row.event_kind === 'name_day'
       ? nameDayEventDescription(row.name, locale)
-      : eventDescription(row.name, row.birth_date, locale, dateFormat);
+      : eventDescription(row.name, row.birth_date, locale, dateFormat, row.year_unknown === 1);
     if (title === row.title && description === (row.description ?? null)) continue;
 
     update.run(title, description, row.id);
@@ -450,7 +494,7 @@ function hydrateBirthday(database, row, from = new Date()) {
   return {
     ...row,
     next_birthday,
-    next_age: nextBirthdayAge(row.birth_date, today),
+    next_age: nextBirthdayAge(row.birth_date, today, row.year_unknown === 1),
     days_until: daysUntilBirthday(row.birth_date, today),
     next_name_day: row.name_day ? nextNameDayDate(row.name_day, today) : null,
     name_day_days_until: row.name_day ? daysUntilNameDay(row.name_day, today) : null,
@@ -517,21 +561,50 @@ function syncAllBirthdayReminders(database, userId, from = new Date()) {
 }
 
 /**
+ * WANN EIN KONTAKT SCHON EINEN GEBURTSTAG HAT (#2214). Zwei Wege fuehren
+ * dorthin: der Import oder der Geburtstag-Dialog verknuepfen ueber
+ * `birthdays.contact_id` (Migration 90), und der Kontakt eines
+ * Haushaltsmitglieds teilt sich mit dessen Profil-Geburtstag das Konto
+ * (`family_user_id`, beide von `syncFamilyMemberArtifacts` angelegt). Der
+ * zweite Weg fehlte bis hierher: der Kontakt des Mitglieds bot "Zu
+ * Geburtstagen hinzufuegen" an, der Import nannte ihn neu und legte einen
+ * zweiten Geburtstag fuer denselben Menschen an.
+ *
+ * EIN Ausdruck fuer alle Leser (Kontaktansicht, Kandidaten, Import,
+ * Verknuepfen), damit keiner von ihnen den zweiten Weg wieder vergisst.
+ * `b` ist die Geburtstagszeile, `alias` die Kontaktzeile.
+ * @param {string} alias  Tabellenalias des Kontakts in der umgebenden Abfrage
+ * @returns {string} SQL-Bedingung
+ */
+function contactBirthdayMatch(alias) {
+  return `(b.contact_id = ${alias}.id OR (${alias}.family_user_id IS NOT NULL AND b.family_user_id = ${alias}.family_user_id))`;
+}
+
+/**
  * Liefert Kontakte als Import-Kandidaten für Geburtstage. Kontakte, die ein
  * Haushaltsmitglied im Housekeeping repräsentieren, werden ausgeschlossen (wie
  * GET /contacts). Kandidaten werden nach "mit Geburtstag" (importierbar) und
  * "ohne Geburtstag" (nur zur Information, manuell zu ergänzen) getrennt.
  *
- * `already_imported` markiert Kontakte, die über birthdays.contact_id bereits an
- * einen Geburtstag gekoppelt sind (haushaltsweit, nicht pro Nutzer).
+ * `already_imported` markiert Kontakte, die schon einen Geburtstag haben
+ * (haushaltsweit, nicht pro Nutzer): über birthdays.contact_id oder, beim
+ * Kontakt eines Haushaltsmitglieds, dessen Profil-Geburtstag
+ * (`contactBirthdayMatch`, #2214).
  *
  * @param {object} database
- * @returns {{ withBirthday: Array<{id:number,name:string,birthday:string,already_imported:boolean}>, withoutBirthday: Array<{id:number,name:string}> }}
+ * @returns {{ withBirthday: Array<{id:number,name:string,birthday:string,birthday_year_unknown:boolean,already_imported:boolean}>, withoutBirthday: Array<{id:number,name:string,already_imported:boolean}> }}
  */
+function linkSuggestionFields(database, contact) {
+  const hit = birthdayLinkSuggestion(database, contact);
+  if (!hit) return {};
+  const name = hit.name ?? database.prepare('SELECT name FROM birthdays WHERE id = ?').get(hit.id)?.name ?? null;
+  return { suggested_birthday_id: hit.id, suggested_birthday_name: name };
+}
+
 function listBirthdayImportCandidates(database) {
   const rows = database.prepare(`
-    SELECT c.id, c.name, c.birthday,
-           EXISTS(SELECT 1 FROM birthdays b WHERE b.contact_id = c.id) AS already_imported
+    SELECT c.id, c.name, c.birthday, c.birthday_year_unknown,
+           EXISTS(SELECT 1 FROM birthdays b WHERE ${contactBirthdayMatch('c')}) AS already_imported
     FROM contacts c
     WHERE NOT EXISTS (
       SELECT 1 FROM housekeeping_workers hw WHERE hw.user_id = c.family_user_id
@@ -547,10 +620,19 @@ function listBirthdayImportCandidates(database) {
         id: r.id,
         name: r.name,
         birthday: r.birthday,
+        // Der Kontakt kennt nur Tag und Monat (#2095): die Liste zeigt das Jahr
+        // nicht, der Import uebernimmt die Marke.
+        birthday_year_unknown: r.birthday_year_unknown === 1,
         already_imported: r.already_imported === 1,
+        // Gibt es den Menschen schon als Geburtstag (gleicher Name oder Tag),
+        // fragt die Zeile "Mit X verknuepfen?" statt still eine zweite
+        // anzulegen (R23, G5-P2).
+        ...(r.already_imported === 1 ? {} : linkSuggestionFields(database, r)),
       });
     } else {
-      withoutBirthday.push({ id: r.id, name: r.name });
+      // Auch ohne Datum verknuepfbar (R22, D7: der Geburtstag-Dialog bietet
+      // jeden Kontakt an, der noch keinen Eintrag traegt).
+      withoutBirthday.push({ id: r.id, name: r.name, already_imported: r.already_imported === 1 });
     }
   }
   return { withBirthday, withoutBirthday };
@@ -577,11 +659,15 @@ function importBirthdaysFromContacts(database, contactIds, userId, from = new Da
   let imported = 0;
   let skipped = 0;
 
-  const getContact = database.prepare('SELECT id, name, birthday FROM contacts WHERE id = ?');
-  const alreadyLinked = database.prepare('SELECT 1 FROM birthdays WHERE contact_id = ?');
+  const getContact = database.prepare('SELECT id, name, birthday, birthday_year_unknown FROM contacts WHERE id = ?');
+  // Auch der Profil-Geburtstag eines Mitglieds zaehlt (#2214): sonst entstuende
+  // fuer dieselbe Person eine zweite Zeile samt Kalendereintrag.
+  const alreadyLinked = database.prepare(`
+    SELECT 1 FROM contacts c JOIN birthdays b ON ${contactBirthdayMatch('c')} WHERE c.id = ?
+  `);
   const insert = database.prepare(`
-    INSERT INTO birthdays (name, birth_date, created_by, contact_id, reminder_offset)
-    VALUES (?, ?, ?, ?, NULL)
+    INSERT INTO birthdays (name, birth_date, year_unknown, created_by, contact_id, reminder_offset)
+    VALUES (?, ?, ?, ?, ?, NULL)
   `);
   const load = database.prepare('SELECT * FROM birthdays WHERE id = ?');
 
@@ -593,7 +679,11 @@ function importBirthdaysFromContacts(database, contactIds, userId, from = new Da
     if (!contact || !contact.birthday || !String(contact.birthday).trim()) { skipped++; continue; }
     if (alreadyLinked.get(id)) { skipped++; continue; }
 
-    const newId = insert.run(contact.name, contact.birthday, userId, id).lastInsertRowid;
+    // "Jahr unbekannt" geht mit (#2095); das Datum traegt dann schon das
+    // Platzhalterjahr, aus einem alten 1604 wird es hier nachgezogen.
+    const yearUnknown = contact.birthday_year_unknown === 1;
+    const birthDate = yearUnknown ? placeholderBirthDate(contact.birthday) : contact.birthday;
+    const newId = insert.run(contact.name, birthDate, yearUnknown ? 1 : 0, userId, id).lastInsertRowid;
     syncBirthdayArtifacts(database, load.get(newId), from);
     imported++;
   }
@@ -601,9 +691,95 @@ function importBirthdaysFromContacts(database, contactIds, userId, from = new Da
   return { imported, skipped };
 }
 
+/**
+ * DER GLEICHE NAME (Critique R22, D7). Ein Geburtstag und ein Kontakt, die
+ * gleich heissen und nicht verknuepft sind, bekommen auf BEIDEN Seiten den
+ * ruhigen Hinweis "heisst genauso" mit "Verknuepfen". Damit beide Seiten
+ * dasselbe Paar sehen, vergleichen sie mit EINEM Schluessel - hier, in JS.
+ *
+ * Bis hierher rechnete der Geburtstag den Kontaktnamen in SQL (`lower(trim())`)
+ * und seinen eigenen in JS (`trim().toLowerCase()`). SQLite senkt nur ASCII:
+ * "Özlem" blieb "Özlem", JS machte "özlem" daraus, und der Hinweis fehlte
+ * genau bei Namen mit Umlaut oder Akzent am Anfang. NFC dazu, damit ein
+ * zerlegt gespeichertes "é" (CardDAV) dem getippten gleicht.
+ * @param {unknown} name
+ * @returns {string}
+ */
+function sameNameKey(name) {
+  return String(name ?? '').normalize('NFC').trim().toLowerCase();
+}
+
+/**
+ * Der eine unverknuepfte Geburtstag, der so heisst wie ein Kontakt - die
+ * Gegenrichtung zu `suggested_contact_id` (routes/birthdays.js). Gezaehlt
+ * werden wie dort nur Eintraege ohne Verknuepfung und keine
+ * Mitglieder-Geburtstage (die haengen am Konto, nicht an einem Kontakt). Zwei
+ * gleichnamige Geburtstage sind eine Frage, kein Vorschlag: dann `null`.
+ * @param {import('better-sqlite3').Database} database
+ * @param {unknown} name  der Name des Kontakts
+ * @returns {number|null}
+ */
+function sameNameBirthdayId(database, name) {
+  const key = sameNameKey(name);
+  if (!key) return null;
+  const rows = database.prepare('SELECT id, name FROM birthdays WHERE contact_id IS NULL AND family_user_id IS NULL').all();
+  const hits = rows.filter((row) => sameNameKey(row.name) === key);
+  return hits.length === 1 ? hits[0].id : null;
+}
+
+/**
+ * DER GLEICHE TAG (Critique R23, G5-P2; Ulas 25.10.). Heisst der Kontakt
+ * anders als der Geburtstag ("Tante Ingrid" gegen "Ingrid Mueller"), fand der
+ * Namensschluessel nichts, und "Hinzufuegen" oder der Import legten still eine
+ * zweite Zeile fuer denselben Menschen an. Jetzt fragt die Seite "Mit X
+ * verknuepfen?", wenn GENAU EIN unverknuepfter Geburtstag (kein
+ * Mitglieder-Geburtstag) auf denselben Tag faellt. Ein Vorschlag, kein
+ * Riegel: Zwillinge teilen das Datum, der Import bleibt moeglich.
+ *
+ * Gleich heisst: Monat und Tag gleich, und das Jahr gleich, sobald beide eins
+ * kennen. Ein Platzhalterjahr (2000 im Geburtstag, 1604 aus alten vCards) ist
+ * kein Jahr.
+ * @param {import('better-sqlite3').Database} database
+ * @param {{birthday?: unknown, birthday_year_unknown?: unknown}} contact
+ * @returns {{id: number, name: string}|null}
+ */
+function sameDateBirthday(database, contact) {
+  const mine = birthDayParts(contact?.birthday, contact?.birthday_year_unknown === 1 || contact?.birthday_year_unknown === true);
+  if (!mine) return null;
+  const rows = database.prepare('SELECT id, name, birth_date, year_unknown FROM birthdays WHERE contact_id IS NULL AND family_user_id IS NULL').all();
+  const hits = rows.filter((row) => {
+    const theirs = birthDayParts(row.birth_date, row.year_unknown === 1);
+    return theirs && theirs.monthDay === mine.monthDay
+      && (theirs.year === null || mine.year === null || theirs.year === mine.year);
+  });
+  return hits.length === 1 ? { id: hits[0].id, name: hits[0].name } : null;
+}
+
+/** `YYYY-MM-DD` in Monat-Tag und Jahr (null = unbekannt); Unlesbares ist null. */
+function birthDayParts(date, yearUnknown) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(date ?? '').trim());
+  if (!m) return null;
+  const year = yearUnknown || m[1] === '1604' ? null : m[1];
+  return { monthDay: `${m[2]}-${m[3]}`, year };
+}
+
+/**
+ * Der eine Verknuepfungs-Vorschlag fuer einen Kontakt: zuerst der Name (R22),
+ * sonst der Tag (R23). `by` sagt der Seite, welcher Satz passt.
+ * @returns {{id: number, name: string|null, by: 'name'|'date'}|null}
+ */
+function birthdayLinkSuggestion(database, contact) {
+  const byName = sameNameBirthdayId(database, contact?.name);
+  if (byName) return { id: byName, name: null, by: 'name' };
+  const byDate = sameDateBirthday(database, contact);
+  return byDate ? { ...byDate, by: 'date' } : null;
+}
+
 export {
   BIRTHDAY_COLOR,
   BIRTHDAY_RRULE,
+  YEAR_UNKNOWN_PLACEHOLDER,
+  birthDateInput,
   birthdayReminderAt,
   daysUntilBirthday,
   daysUntilNameDay,
@@ -618,7 +794,14 @@ export {
   nextBirthdayDate,
   nameDayEventTitle,
   nextNameDayDate,
+  placeholderBirthDate,
   retitleBirthdayEvents,
+  birthdayLinkSuggestion,
+  contactBirthdayMatch,
+  sameDateBirthday,
+  sameNameBirthdayId,
+  sameNameKey,
   syncAllBirthdayReminders,
   syncBirthdayArtifacts,
+  validateYearUnknown,
 };

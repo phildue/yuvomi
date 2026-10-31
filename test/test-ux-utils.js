@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { eachRule } from './css-rules.js';
 
 // Minimales Window/Navigator-Mock für Node
-const { stagger, vibrate, withBusy, scheduleUndoableDelete, wireSwipeToDismiss, wireCollapsingHeader, collapseOut, expandIn, watchNavCapsuleHeight, wireScrollFade, nextNavMinimized, NAV_MINIMIZE_DOWN, NAV_MINIMIZE_UP, bindNavMinimize, navPillGeometry, NAV_PILL_MAX_INNER, STAGGER_ROWS, durationToken } = await (async () => {
+const { stagger, vibrate, withBusy, scheduleUndoableDelete, wireSwipeToDismiss, wireCollapsingHeader, requestHeadCollapse, HEAD_COLLAPSE_EVENT, collapseOut, expandIn, watchNavCapsuleHeight, wireScrollFade, nextNavMinimized, NAV_MINIMIZE_DOWN, NAV_MINIMIZE_UP, bindNavMinimize, navPillGeometry, NAV_PILL_MAX_INNER, STAGGER_ROWS, durationToken, isImeComposing, drawIconsInSightOrder } = await (async () => {
   global.window = {
     matchMedia: () => ({ matches: false }),
     addEventListener: () => {},
@@ -761,7 +761,7 @@ test('showToast verdrahtet die Geste über den geteilten Helfer', () => {
   // der Router reicht sie nur weiter. Beide duerfen keinen Zwilling halten.
   const router = readFileSync(new URL('../public/router.js', import.meta.url), 'utf8');
   const toastShow = readFileSync(new URL('../public/utils/toast-show.js', import.meta.url), 'utf8');
-  assert.match(router, /import \{ showToast \} from '\/utils\/toast-show\.js'/,
+  assert.match(router, /import \{ showToast(?:, \w+)* \} from '\/utils\/toast-show\.js'/,
     'der Router muss showToast aus utils/toast-show.js beziehen, sonst lebt ein Zwilling');
   assert.ok(
     toastShow.includes('wireSwipeToDismiss(toast'),
@@ -861,6 +861,28 @@ test('wireCollapsingHeader: ein Scroll, den die Seite selbst setzt, klappt den K
   } finally { s.restore(); }
 });
 
+// R24 S12 (Critique G3-Quer-P2-2, G4-Budget-P3-8): ein Scroll, den keine
+// Geste fuehrt, an einem ausgeklappten Kopf entscheidet nichts - er misst
+// nichts. Vorher las jedes Ereignis zuerst scrollHeight/clientHeight und damit
+// ein erzwungenes Layout (Vorrat 155 ms, Abos 139 ms bei 4x CPU).
+test('wireCollapsingHeader R24: ein Scroll ohne Geste am ausgeklappten Kopf liest kein Layout', () => {
+  const s = collapsingStub();
+  try {
+    wireCollapsingHeader(s.toolbar);
+    let reads = 0;
+    let height = 1600;
+    Object.defineProperty(s.port, 'scrollHeight', { get: () => { reads += 1; return height; }, set: (v) => { height = v; }, configurable: true });
+    s.scrollTo(s.port, 300);
+    s.scrollTo(s.port, 600);
+    assert.equal(reads, 0, 'ohne Geste und ausgeklappt: keine Messung');
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), false);
+    s.fire('touchstart', s.cell);
+    s.scrollTo(s.port, 640);
+    assert.ok(reads > 0, 'mit Geste wird gemessen');
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), true, 'und eingeklappt wie zuvor');
+  } finally { s.restore(); }
+});
+
 test('wireCollapsingHeader: der Nutzer-Scroll klappt weiter ein und aus', () => {
   const s = collapsingStub();
   try {
@@ -908,6 +930,81 @@ test('wireCollapsingHeader R20: der Inhalt unter dem Kopf springt nicht, er glei
   }
 });
 
+// R21 S7: der Browser legt einen Bruchteil gerundet ab (-147.1875px ->
+// -147.188px). Gegen das geschriebene Literal verglichen gab die Freigabe den
+// Haltewert nie frei - die Reiter der Haushaltshilfe standen nach dem Andocken
+// dauerhaft 147px zu weit links, unter dem angedockten Titel.
+test('wireCollapsingHeader R21: ein Versatz mit Bruchteil wird nach dem Gleiten freigegeben', async () => {
+  const s = collapsingStub();
+  const frames = [];
+  const savedRaf = global.requestAnimationFrame;
+  global.requestAnimationFrame = (cb) => { frames.push(cb); return frames.length; };
+  try {
+    Object.defineProperty(s.port, 'rect', {
+      get: () => (s.toolbar.classList.contains('is-collapsed') ? { top: 40, bottom: 540, left: 0 } : { top: 90.4375, bottom: 590, left: 0 }),
+      set: () => {},
+    });
+    let stored = '';
+    // Wie der Browser: Zahlen auf drei Stellen gerundet abgelegt.
+    Object.defineProperty(s.port.style, 'transform', {
+      get: () => stored,
+      set: (v) => { stored = String(v).replace(/-?\d+\.\d+/g, (n) => String(Math.round(Number(n) * 1000) / 1000)); },
+      configurable: true,
+    });
+    s.port.animate = () => ({ ready: Promise.resolve() });
+    wireCollapsingHeader(s.toolbar);
+    s.fire('touchstart', s.cell);
+    s.scrollTo(s.port, 120);
+    assert.equal(s.port.style.transform, 'translate(0px, 50.438px)', 'Attrappe muss den gerundeten Haltewert ablegen');
+    frames.shift()();
+    frames.shift()();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(s.port.style.transform, '', 'nach dem Start der Animation steht kein Haltewert mehr');
+  } finally {
+    global.requestAnimationFrame = savedRaf;
+    s.restore();
+  }
+});
+
+// R22-F (F1 Punkt 4): der FLIP hielt nur die direkten Kinder des Kopfes. Beim
+// Einklappen rueckt aber auch IN einer Zeile etwas - im Kalender der Zeitraum
+// (x 64 -> 16) und die Ansichtswahl (x 282 -> 186), zwei, drei Ebenen tief:
+// gemessen CLS 0,0047 je Umschalten in der Agenda, Tablet 0,051 je Scroll.
+test('wireCollapsingHeader R22-F: auch ein Teil IN einer Zeile des Kopfes gleitet statt zu springen', () => {
+  const s = collapsingStub();
+  const frames = [];
+  const savedRaf = global.requestAnimationFrame;
+  global.requestAnimationFrame = (cb) => { frames.push(cb); return frames.length; };
+  try {
+    const titleRow = s.toolbar.children[0];
+    const label = new s.FakeEl('label');
+    label.namespaceURI = 'http://www.w3.org/1999/xhtml';
+    label.tagName = 'SPAN';
+    Object.defineProperty(label, 'rect', {
+      get: () => (s.toolbar.classList.contains('is-collapsed') ? { top: 8, bottom: 32, left: 16 } : { top: 8, bottom: 32, left: 64 }),
+      set: () => {},
+    });
+    label.animate = () => ({ ready: Promise.resolve() });
+    titleRow.append(label);
+    const glyph = new s.FakeEl('glyph', { rect: { top: 8, bottom: 20, left: 0 } });
+    glyph.namespaceURI = 'http://www.w3.org/2000/svg';
+    glyph.tagName = 'svg';
+    glyph.animate = () => ({ ready: Promise.resolve() });
+    titleRow.append(glyph);
+    s.toolbar.querySelectorAll = (sel) => (/:scope > \* > \*/.test(sel) ? [label, glyph] : []);
+    wireCollapsingHeader(s.toolbar);
+    s.fire('touchstart', s.cell);
+    s.scrollTo(s.port, 120);
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), true);
+    assert.equal(label.style.transform, 'translate(48px, 0px)', 'der Zeitraum steht im Umschalt-Frame nicht an seiner alten Lage - er springt');
+    assert.equal(glyph.style.transform, undefined, 'ein Zeichen geht mit seinem Knopf, es wird nicht selbst gehalten');
+  } finally {
+    global.requestAnimationFrame = savedRaf;
+    s.restore();
+  }
+});
+
 test('wireCollapsingHeader: ein Ansichtswechsel haelt den eingeklappten Kopf, wo der neue Port ihn tragen kann', () => {
   const s = collapsingStub();
   try {
@@ -942,6 +1039,86 @@ test('wireCollapsingHeader: ein Port, der den Kollaps nicht traegt, klappt auch 
     s.scrollTo(monthRows, 0);
     assert.equal(s.toolbar.classList.contains('is-collapsed'), false);
   } finally { s.restore(); }
+});
+
+/* R21 (Critique 2026-10-21, D9): der Telefon-Monat klappt sein Raster beim
+ * Hochziehen der Tagesliste auf die Woche ein - der Kopf blieb bei 117px, weil
+ * die Liste kaum Reserve hat. Jetzt faltet das Modul den Kopf mit seiner
+ * Flaeche (requestHeadCollapse), und sein Port (`data-head-collapse="module"`)
+ * urteilt nicht mehr selbst: weder klappt sein Scrollen den Kopf ein, noch
+ * holt seine fehlende Reserve ihn wieder auf. */
+test('wireCollapsingHeader R21: ein Modul faltet den Kopf mit seiner Flaeche, sein Port urteilt nicht', () => {
+  const s = collapsingStub();
+  try {
+    s.toolbar.dispatchEvent = (ev) => { for (const fn of s.toolbar.handlers[ev.type] ?? []) fn(ev); };
+    wireCollapsingHeader(s.toolbar);
+    const rows = new s.FakeEl('month-rows', { overflowY: 'auto' });
+    rows.scrollHeight = 1600;
+    rows.clientHeight = 500;
+    rows.closest = (sel) => (/data-head-collapse="module"/.test(sel) ? rows : null);
+    s.root.append(rows);
+    s.fire('touchstart', rows);
+    s.scrollTo(rows, 300);
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), false, 'der Port des Moduls klappt den Kopf nicht selbst ein');
+    requestHeadCollapse(s.toolbar, true);
+    assert.equal(HEAD_COLLAPSE_EVENT, 'yuvomi:head-collapse');
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), true, 'das Modul faltet den Kopf mit seinem Raster');
+    // Eingeklappt waechst die Liste und hat keine Reserve mehr - das darf den
+    // Kopf nicht wieder aufholen, solange das Raster eingeklappt ist.
+    rows.scrollHeight = 500;
+    s.scrollTo(rows, 0);
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), true, 'die fehlende Reserve des Modul-Ports klappt den Kopf nicht auf');
+    requestHeadCollapse(s.toolbar, false);
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), false, 'mit dem Raster klappt der Kopf wieder auf');
+  } finally { s.restore(); }
+});
+
+/* R21 (D9, Beifang): nach dem ersten Ausklappen klappte der Kopf nie wieder
+ * ein - gemessen in Woche und Monat. Der Kopf waechst, der ResizeObserver ruft
+ * `update`, und die Zeilen stehen in diesem Moment per transform noch an ihrer
+ * EINGEKLAPPTEN Lage (holdThenGlide): die Zeilenmessung sah eine Zeile, setzte
+ * Lead 0 und nahm `--capped`. Gemessen wird jetzt nach dem Gleiten. */
+test('wireCollapsingHeader R21: nach dem Ausklappen bleibt der Kopf faltbar - gemessen wird nach dem Gleiten', async () => {
+  const s = collapsingStub();
+  const frames = [];
+  const savedRaf = global.requestAnimationFrame;
+  global.requestAnimationFrame = (cb) => { frames.push(cb); return frames.length; };
+  const flush = async () => {
+    while (frames.length) frames.shift()();
+    await new Promise((r) => setTimeout(r, 260));
+  };
+  try {
+    // Eingeklappt rueckt die zweite Zeile in die erste (der Zeitraum neben den Werkzeugen).
+    const at = (el, open, closed) => Object.defineProperty(el, 'rect', {
+      get: () => {
+        const b = s.toolbar.classList.contains('is-collapsed') ? closed : open;
+        const m = /translate\(([-\d.]+)px, ([-\d.]+)px\)/.exec(el.style.transform || '');
+        const dy = m ? Number(m[2]) : 0;
+        return { top: b.top + dy, bottom: b.bottom + dy, left: 0 };
+      },
+      set: () => {},
+    });
+    at(s.tab, { top: 50, bottom: 90 }, { top: 0, bottom: 40 });
+    at(s.port, { top: 90, bottom: 590 }, { top: 40, bottom: 540 });
+    for (const el of [s.tab, s.port]) el.animate = () => ({ ready: Promise.resolve() });
+    const header = wireCollapsingHeader(s.toolbar);
+    assert.ok(s.toolbar.classList.contains('page-toolbar--capped'));
+    s.fire('touchstart', s.cell);
+    s.scrollTo(s.port, 300);
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), true);
+    await flush();
+    s.scrollTo(s.port, 0);
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), false);
+    // Der Kopf ist gewachsen - der ResizeObserver meldet sich mitten im Halt.
+    header.update();
+    await flush();
+    assert.ok(s.toolbar.classList.contains('page-toolbar--capped'), 'nach dem Ausklappen hat der Kopf seine Lead-Zone verloren');
+    s.scrollTo(s.port, 300);
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), true, 'der zweite Scroll klappt den Kopf nicht mehr ein');
+  } finally {
+    global.requestAnimationFrame = savedRaf;
+    s.restore();
+  }
 });
 
 test('watchNavCapsuleHeight: die gemessene Kapselhoehe steht am Root, eine verborgene Kapsel raeumt sie (Review zu #1475)', () => {
@@ -1056,12 +1233,14 @@ test('wireScrollFade: eine abgehaengte Leiste haengt ihre Beobachter selbst ab, 
  */
 function dockStub({ withMenu = true, tabBar = false, padTop = 0, barTop = 57 } = {}) {
   const matchOne = (el, s) => {
-    const m = s.match(/^([a-z0-9]*)((?:\.[\w-]+)*)((?:\[[\w-]+\])*)$/i);
+    const m = s.match(/^([a-z0-9]*)((?:\.[\w-]+)*)((?:\[[\w-]+(?:="[^"]*")?\])*)$/i);
     if (!m) throw new Error(`Attrappe kennt den Selektor nicht: ${s}`);
     const [, tag, cls, attrs] = m;
     if (tag && el.tag !== tag.toLowerCase()) return false;
     for (const c of cls.split('.').filter(Boolean)) if (!el.classes.has(c)) return false;
-    for (const a of (attrs.match(/[\w-]+/g) ?? [])) if (!(a in el.attrs)) return false;
+    for (const [, a, v] of attrs.matchAll(/\[([\w-]+)(?:="([^"]*)")?\]/g)) {
+      if (!(a in el.attrs) || (v !== undefined && el.attrs[a] !== v)) return false;
+    }
     return true;
   };
   const matches = (el, sel) => sel.split(',').map((s) => s.trim()).some((s) => matchOne(el, s));
@@ -1260,6 +1439,44 @@ test('R20: eine Tab-Leiste ohne Platz und ohne Menue bekommt keinen Band-Modus m
   } finally { s.restore(); }
 });
 
+// R21 S7 (Leitlinie Ulas "mobil mehr Platz fuer Inhalt", R9 M9 "nie ein Kopf
+// ohne Ortsangabe"): seit S6 stehen Schichtplan, Belohnungen und
+// Haushaltshilfe mobil zweizeilig (121-129px). Angedockt blieb die
+// Reiter-Zeile ohne ein Wort, wo man ist. Jetzt traegt sie den angedockten
+// Titel VOR der Leiste - in derselben Zeile, ohne Band darunter.
+test('R21 S7: angedockt nennt die Reiter-Zeile eines --tabs-title-Kopfes den Ort', () => {
+  const s = dockStub({ tabBar: true });
+  let ioCallback = null;
+  global.IntersectionObserver = class { constructor(cb, opts) { ioCallback = cb; s.ioOptions.push(opts); } observe() {} disconnect() {} };
+  try {
+    s.toolbar.classList.add('page-toolbar--tabs-title');
+    const tab = new s.title.constructor('button', { attrs: { role: 'tab', 'aria-selected': 'true' }, rect: { top: 57, bottom: 105, left: 0, width: 80 } });
+    let shown = 0;
+    tab.scrollIntoView = () => { shown += 1; };
+    s.tabs.append(tab);
+    // Die Reiter gleiten (holdThenGlide liest die Dauer am Wurzelelement).
+    global.document.documentElement = { cs: { getPropertyValue: () => '' } };
+    wireCollapsingHeader(s.toolbar);
+    assert.ok(s.toolbar.classList.contains('page-toolbar--stacked'), 'Attrappe muss einen gestapelten Kopf ergeben');
+    assert.ok(s.toolbar.classList.contains('page-toolbar--dock-tabs'), 'die Reiter-Zeile ist als Traeger des Titels markiert');
+    assert.equal(s.dockTitle()?.textContent, 'Schichtplan', 'der angedockte Titel nennt den Ort');
+    assert.equal(s.dockTitle()?.nextElementSibling, s.tabs, 'er steht vorn, vor der Leiste');
+    assert.equal(s.toolbar.classList.contains('page-toolbar--dock-band'), false, 'kein Band: die Zeile bleibt eine');
+    ioCallback([{ isIntersecting: false }]);
+    assert.ok(s.toolbar.classList.contains('is-docked'), 'angedockt, sobald die erste Zeile den Port verlassen hat');
+    assert.equal(shown, 1, 'der gewaehlte Reiter bleibt im Bild, auch wenn die Leiste jetzt scrollt');
+    ioCallback([{ isIntersecting: true }]);
+    assert.equal(s.toolbar.classList.contains('is-docked'), false);
+  } finally { s.restore(); }
+  // Ohne die Variante (Reiter in einer Bar-Zeile mit Platz) bleibt es beim alten Kopf.
+  const plain = dockStub({ tabBar: true });
+  try {
+    wireCollapsingHeader(plain.toolbar);
+    assert.equal(plain.toolbar.classList.contains('page-toolbar--dock-tabs'), false);
+    assert.equal(plain.dockTitle(), null);
+  } finally { plain.restore(); }
+});
+
 test('H1: wo der Titel in die Bar-Zeile passt oder faltet, bleibt es beim alten Kopf ohne Band', () => {
   const s = dockStub();
   try {
@@ -1421,6 +1638,33 @@ test('K1: die Kuechen-Kontextzeile aus reinen Werkzeugen klappt beim Andocken ei
   } finally { s.restore(); }
 });
 
+// R22 D15 (Critique 2026-10-22, a2 P2): die Faltzeile der Kueche kam erst
+// ganz oben zurueck - wer mitten im Einkauf die Liste wechseln oder suchen
+// wollte, scrollte bis zum Anfang. Sie folgt jetzt der Richtung.
+test('R22 D15: die Faltzeile kommt beim Hochscrollen zurueck, ein Zittern und ein Klemmen nicht', () => {
+  const s = kitchenFoldStub();
+  try {
+    wireCollapsingHeader(s.toolbar);
+    s.fire('touchstart', s.row);
+    s.scrollTo(600);
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), true, 'abwaerts faltet sie wie bisher');
+    s.scrollTo(900);
+    s.scrollTo(880);
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), true, '20px zurueck sind ein Zittern, keine Absicht');
+    s.scrollTo(855);
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), false, '45px aufwaerts ab dem Wendepunkt holen sie mitten in der Liste zurueck');
+    s.scrollTo(870);
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), false, '15px abwaerts falten noch nicht');
+    s.scrollTo(890);
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), true, '24px abwaerts ab dem Wendepunkt falten wieder');
+    // Gefaltet waechst der Port; am Listenende klemmt der Browser scrollTop
+    // zurueck. Dieses Ereignis kommt ohne Finger und darf nichts entscheiden.
+    s.port.clientHeight += 64;
+    s.scrollTo(826);
+    assert.equal(s.toolbar.classList.contains('is-collapsed'), true, 'ein Klemmen nach dem Umbau holt die Zeile nicht zurueck');
+  } finally { s.restore(); }
+});
+
 // R17 Schritt 5 (Critique 2026-10-07): bis dahin blieben Wochenstepper
 // (Mahlzeiten) und Listen-Kapseln (Einkauf) stehen - 121px Kopf in jedem
 // Scrollstand, der Vorrat daneben 56. Jede Zeile unter der Leiste faltet.
@@ -1465,7 +1709,8 @@ test('K1: das CSS faltet die Zeile nur eingeklappt, nie mit Fokus, Suchbegriff o
     assert.match(r.selector, /:not\(:has\(input:not\(:placeholder-shown\)\)\)/, `${r.selector}: ein Suchbegriff haelt die Zeile offen`);
     assert.match(r.selector, /:not\(:has\(:popover-open\)\)/, `${r.selector}: ein offenes Menue haelt seinen Knopf`);
   }
-  assert.doesNotMatch(folded.filter((r) => !/>\s*\*\s*$/.test(r.selector)).map((r) => r.body).join(';'), /opacity/,
+  // Die Blende haengt an den Kindern - seit R21 S8 beim Namen (`> :is(...)`), nicht `> *`.
+  assert.doesNotMatch(folded.filter((r) => !/>\s*(?:\*|:is\([^)]*\))\s*$/.test(r.selector)).map((r) => r.body).join(';'), /opacity/,
     'die Zeile selbst blendet nicht aus - ihre Linie bleibt die Kante unter der Leiste');
   const base = compact.find((r) => r.selector.trim() === '.page-toolbar--fold-row');
   // Seit R20 gleitet nicht mehr der Rand (Layout je Frame, CLS 0,06), sondern die
@@ -1950,4 +2195,244 @@ test('watchNavCapsuleHeight: minimiert oder auf dem Rueckweg misst die Kapsel ni
   } finally {
     globalThis.ResizeObserver = saved;
   }
+});
+
+/* Enter bestaetigt bei japanischer, koreanischer oder chinesischer Eingabe
+ * (IME) erst die Umwandlung. Ein eigener keydown-Handler, der auf Enter
+ * absendet oder einen Vorschlag uebernimmt, speichert sonst einen halb
+ * geschriebenen Text. Safari meldet das bestaetigende Enter teils schon mit
+ * isComposing=false, aber keyCode 229 (WebKit-Bug 165004).
+ */
+test('isImeComposing erkennt das Enter einer laufenden IME-Umwandlung', () => {
+  assert.equal(typeof isImeComposing, 'function', 'utils/ux.js exportiert isImeComposing');
+  assert.equal(isImeComposing({ key: 'Enter', isComposing: true, keyCode: 13 }), true);
+  assert.equal(isImeComposing({ key: 'Enter', isComposing: false, keyCode: 229 }), true, 'Safari');
+  assert.equal(isImeComposing({ key: 'Enter', isComposing: false, keyCode: 13 }), false);
+  assert.equal(isImeComposing({}), false);
+});
+
+test('jeder Enter-Handler eines Textfelds fragt isImeComposing', () => {
+  // Ein Handler, der Enter OHNE Leertaste prueft, gehoert einem Textfeld;
+  // Enter-oder-Leertaste ist die Tastaturbedienung eines Knopfs. Die
+  // Listenzeile in master-detail.js ist kein Textfeld.
+  const allowed = new Set(['utils/master-detail.js']);
+  const root = fileURLToPath(new URL('../public/', import.meta.url));
+  const offenders = [];
+  for (const rel of globSync('**/*.js', { cwd: root })) {
+    if (rel.startsWith('vendor/') || allowed.has(rel)) continue;
+    const lines = readFileSync(root + rel, 'utf8').split('\n');
+    lines.forEach((line, i) => {
+      if (!/\.key\s*[!=]==\s*'Enter'/.test(line) || /'\s'/.test(line)) return;
+      const handler = lines.slice(Math.max(0, i - 15), i + 1).join('\n');
+      // palette-combobox.js prueft inline (laedt ohne Browser-Loader, kein Import).
+      if (!/isImeComposing\(|keyCode === 229/.test(handler)) offenders.push(`${rel}:${i + 1}`);
+    });
+  }
+  assert.deepEqual(offenders, [], 'Enter ohne IME-Pruefung');
+});
+
+// R21 S7: beim Andocken rueckt die Reiter-Leiste um die Breite des Titels.
+// Gehalten wurden zuerst ihre Reiter - der Kasten der Leiste selbst sprang und
+// zaehlte als Layout-Shift (0,0091 beim Scrollen der Haushaltshilfe, 390px).
+// Die Leiste wird als Ganzes gehalten und gleitet: 0.
+test('R21 S7: angedockt gleitet die Leiste als Ganzes, nicht nur ihre Reiter', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../public/utils/ux.js', import.meta.url), 'utf8');
+  const fn = src.slice(src.indexOf('const setDocked = (on) => {'), src.indexOf('const onModuleCollapse'));
+  assert.match(fn, /flipSnapshotElements\(\[tabs\]\)/, 'der Kasten der Leiste wird gehalten');
+  assert.doesNotMatch(fn, /flipSnapshotElements\(\[\.\.\.tabs\.children\]\)/);
+  assert.match(fn, /holdThenGlide\(before\)/);
+});
+
+/**
+ * R22 (Critique a2 P2 "lange Listen", D22): DIE ZEICHEN KOMMEN JE ZEILE IN
+ * SICHT-REIHENFOLGE. Die Aufgaben zeichneten je GRUPPE (R20): eine Gruppe mit
+ * 120 Aufgaben bekam alle Zeichen im Frame des Wechsels, und der Einkauf
+ * ersetzte gleich alle. Sofort: was ausserhalb der Zeilen steht und die ersten
+ * `rowsNow` Zeilen; der Rest in eigenen Tasks, ein neueres Zeichnen bricht ab.
+ */
+test('R22 D22: drawIconsInSightOrder zeichnet je Zeile, der Rest folgt in eigenen Tasks', async () => {
+  const replaced = [];
+  global.window.lucide = { createIcons: ({ el }) => replaced.push(el.id) };
+  try {
+    const rows = Array.from({ length: 40 }, (_, i) => ({ i }));
+    const nodes = [{ id: 'kopf', closest: () => null },
+      ...rows.map((row) => ({ id: `z${row.i}`, isConnected: row.i !== 39, closest: (sel) => (sel === '.swipe-row' ? row : null) }))];
+    const listEl = { querySelectorAll: (sel) => (sel === '.swipe-row' ? rows : sel === 'i[data-lucide]' ? nodes : []) };
+    drawIconsInSightOrder(listEl, { rowSelector: '.swipe-row', rowsNow: 30, chunk: 4 });
+    assert.equal(replaced.length, 31, 'im selben Frame: der Kopf und die ersten 30 Zeilen, auch wenn sie in EINER Gruppe stehen');
+    assert.ok(replaced.includes('kopf') && !replaced.includes('z30'));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(replaced.length, 40, 'der Rest folgt in Happen; was nicht mehr haengt, bleibt liegen');
+    assert.ok(!replaced.includes('z39'));
+
+    replaced.length = 0;
+    drawIconsInSightOrder(listEl, { rowSelector: '.swipe-row', rowsNow: 30, chunk: 4 });
+    drawIconsInSightOrder(listEl, { rowSelector: '.swipe-row', rowsNow: 30, chunk: 4 });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(replaced.filter((id) => id === 'z31').length, 1, 'ein neueres Zeichnen bricht den alten Nachlauf ab');
+  } finally {
+    delete global.window.lucide;
+  }
+});
+
+/**
+ * Critique R22-F (F2.1): LANGE LISTEN - ERST WAS IM BILD STEHT, DER REST IN
+ * HAPPEN (utils/row-fill.js). Der Wechsel in die Aufgaben mit 261 Eintraegen
+ * hielt das alte Bild 276 ms (mobil, 4x CPU), der Einkauf 216 ms, am Laptop
+ * 315 bzw. 396 ms - fast alles fuer Zeilen, die niemand sah.
+ *
+ * Gefahren wird der Baustein an einer kleinen DOM-Attrappe mit Geometrie:
+ * jede Zeile und jeder Platzhalter ist 50px hoch, das Fenster 200px - im
+ * Bild stehen also vier Zeilen, mit dem Vorlauf (ein Viertel) fuenf.
+ */
+const ROW_H = 50;
+class FakeEl {
+  constructor(attrs = {}) {
+    this.attrs = { ...attrs };
+    this.children = [];
+    this.parentNode = null;
+    this.listeners = {};
+    this.root = false;
+  }
+  get isConnected() { let n = this; while (n.parentNode) n = n.parentNode; return n.root; }
+  get className() { return this.attrs.class ?? ''; }
+  getAttribute(name) { return name in this.attrs ? this.attrs[name] : null; }
+  get previousElementSibling() { const s = this.parentNode?.children ?? []; return s[s.indexOf(this) - 1] ?? null; }
+  get nextElementSibling() { const s = this.parentNode?.children ?? []; const i = s.indexOf(this); return i < 0 ? null : s[i + 1] ?? null; }
+  get firstElementChild() { return this.children[0] ?? null; }
+  remove() { if (!this.parentNode) return; this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1); this.parentNode = null; }
+  closest() { return null; }
+  /** Nur das Markup dieser Tests: `<div a="b" ...></div>` hintereinander. */
+  insertAdjacentHTML(where, html) {
+    if (where !== 'beforebegin' && where !== 'beforeend') throw new Error(`unerwartet: ${where}`);
+    const made = [...html.matchAll(/<div ([^>]*)><\/div>/g)].map(([, a]) => {
+      const el = new FakeEl(Object.fromEntries([...a.matchAll(/([\w-]+)="([^"]*)"/g)].map(([, k, v]) => [k, v])));
+      return el;
+    });
+    const parent = where === 'beforeend' ? this : this.parentNode;
+    const at = where === 'beforeend' ? parent.children.length : parent.children.indexOf(this);
+    for (const el of made) el.parentNode = parent;
+    parent.children.splice(at, 0, ...made);
+  }
+  all() { return this.children.flatMap((c) => [c, ...c.all()]); }
+  querySelectorAll(sel) {
+    const m = sel.match(/^\.([\w-]+)\[([\w-]+)\]$/);
+    if (!m) throw new Error(`unerwarteter Selektor: ${sel}`);
+    return this.all().filter((el) => el.className.split(' ').includes(m[1]) && m[2] in el.attrs);
+  }
+  /** Zeilen stehen untereinander, jede 50px, in DOM-Reihenfolge des Wirts. */
+  getBoundingClientRect() {
+    let host = this; while (host.parentNode && !host.root) host = host.parentNode;
+    const leaves = host.all().filter((el) => !el.children.length);
+    const i = leaves.indexOf(this);
+    const top = i < 0 ? 0 : i * ROW_H;
+    return { top, bottom: top + ROW_H, height: ROW_H };
+  }
+  addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); }
+  removeEventListener(type, fn) { this.listeners[type] = (this.listeners[type] ?? []).filter((f) => f !== fn); }
+  fire(type) { for (const fn of [...(this.listeners[type] ?? [])]) fn({ type }); }
+}
+
+const rowFill = await import('../public/utils/row-fill.js');
+const scrollRestore = await import('../public/utils/scroll-restore.js');
+
+/** Ein Wirt mit EINEM Zeilentraeger, wie `#task-list > .task-group > .row-carrier`. */
+function fillHost() {
+  const host = new FakeEl({ id: 'liste' });
+  host.root = true;
+  host.insertAdjacentHTML('beforeend', '<div class="row-carrier"></div>');
+  return { host, carrier: host.children[0] };
+}
+
+async function withViewport(fn) {
+  const saved = { innerHeight: global.window.innerHeight, raf: global.requestAnimationFrame, doc: global.document };
+  global.window.innerHeight = 200;
+  global.requestAnimationFrame = (cb) => setTimeout(cb, 0);
+  global.document = { visibilityState: 'visible' };
+  try { await fn(); } finally {
+    if (saved.innerHeight === undefined) delete global.window.innerHeight; else global.window.innerHeight = saved.innerHeight;
+    if (saved.raf === undefined) delete global.requestAnimationFrame; else global.requestAnimationFrame = saved.raf;
+    if (saved.doc === undefined) delete global.document; else global.document = saved.doc;
+  }
+}
+
+const settle = async () => { for (let i = 0; i < 40; i++) await new Promise((r) => setTimeout(r, 0)); };
+const ids = (carrier) => carrier.children.map((c) => c.getAttribute('data-id') ?? 'P');
+
+test('R22-F F2.1: der erste Aufbau zeichnet nur, was im Bild steht - der Rest kommt nach dem Bild', async () => {
+  await withViewport(async () => {
+    const { host, carrier } = fillHost();
+    const items = Array.from({ length: 20 }, (_, i) => i);
+    const rendered = [];
+    const render = (i) => { rendered.push(i); return `<div class="row" data-id="${i}"></div>`; };
+    const fill = rowFill.beginRowFill(host);
+    assert.equal(fill.lazy, true, 'der erste Aufbau eines Traegers ist der aufgeschobene');
+    carrier.insertAdjacentHTML('beforeend', fill.rows(items, render));
+    assert.equal(rendered.length, 0, 'Platzhalter kosten kein Zeilen-Markup');
+    assert.equal(carrier.children.length, 20, 'jede Zeile hat ihren Platzhalter - die Laenge des Bildlaufs stimmt');
+
+    const drawn = [];
+    fill.start({ onRows: (rows) => drawn.push(...rows.map((r) => r.getAttribute('data-id'))) });
+    assert.deepEqual(ids(carrier).slice(0, 6), ['0', '1', '2', '3', '4', 'P'], 'im selben Frame: das Bild und ein Viertel darunter');
+    assert.deepEqual(drawn, ['0', '1', '2', '3', '4'], 'die neuen Zeilen gehen an onRows (Zeichen, Wischgeste)');
+
+    await settle();
+    assert.deepEqual(ids(carrier), items.map(String), 'danach in Happen der Rest, in Reihenfolge und ohne Platzhalter');
+    assert.equal(rendered.length, 20, 'jede Zeile genau einmal gebaut');
+    assert.equal(drawn.length, 20);
+    assert.deepEqual(host.listeners.pointerdown, [], 'fertig gefuellt: kein Zuhoerer bleibt haengen');
+  });
+});
+
+test('R22-F F2.1: jeder weitere Aufbau und jeder Rueckweg zeichnet ganz', async () => {
+  await withViewport(async () => {
+    const { host } = fillHost();
+    rowFill.beginRowFill(host);
+    const again = rowFill.beginRowFill(host);
+    assert.equal(again.lazy, false, 'Schreiben, Suche, Filter: die Wege danach suchen ihre Zeile sofort');
+    assert.equal(again.rows([1, 2], (i) => `<div class="row" data-id="${i}"></div>`), '<div class="row" data-id="1"></div><div class="row" data-id="2"></div>');
+
+    scrollRestore.noteRestoringScroll(true);
+    try {
+      const back = rowFill.beginRowFill(fillHost().host);
+      assert.equal(back.lazy, false, 'der Rueckweg braucht die echte Hoehe der Zeilen ueber dem Ziel (D2)');
+    } finally {
+      scrollRestore.noteRestoringScroll(false);
+    }
+    assert.equal(rowFill.beginRowFill(fillHost().host, { progressive: false }).lazy, false);
+  });
+});
+
+test('R22-F F2.1: eine Eingabe vor dem Ende fuellt sofort, ein neuer Aufbau beendet den alten', async () => {
+  await withViewport(async () => {
+    const { host, carrier } = fillHost();
+    const render = (i) => `<div class="row" data-id="${i}"></div>`;
+    const fill = rowFill.beginRowFill(host);
+    carrier.insertAdjacentHTML('beforeend', fill.rows(Array.from({ length: 12 }, (_, i) => i), render));
+    fill.start();
+    assert.ok(ids(carrier).includes('P'));
+    host.fire('pointerdown');
+    assert.deepEqual(ids(carrier), Array.from({ length: 12 }, (_, i) => String(i)), 'der Tipp findet jede Zeile');
+
+    const second = fillHost();
+    const calls = [];
+    const f2 = rowFill.beginRowFill(second.host);
+    second.carrier.insertAdjacentHTML('beforeend', f2.rows(Array.from({ length: 12 }, (_, i) => i), (i) => { calls.push(i); return render(i); }));
+    f2.start();
+    const before = calls.length;
+    // Der naechste Aufbau ersetzt die Zeilen - was der alte noch fuellen wollte, faellt weg.
+    rowFill.beginRowFill(second.host);
+    second.carrier.children.splice(0);
+    await settle();
+    assert.equal(calls.length, before, 'kein Happen nach dem neuen Aufbau');
+
+    // flushRowFill: ein Weg, der eine bestimmte Zeile braucht (Deep-Link).
+    const third = fillHost();
+    const f3 = rowFill.beginRowFill(third.host);
+    third.carrier.insertAdjacentHTML('beforeend', f3.rows(Array.from({ length: 12 }, (_, i) => i), render));
+    f3.start();
+    rowFill.flushRowFill(third.host);
+    assert.ok(!ids(third.carrier).includes('P'));
+  });
 });

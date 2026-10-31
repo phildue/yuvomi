@@ -24,6 +24,9 @@ const { default: recipesRouter } = await import('../server/routes/recipes.js');
 // ihn läuft (POST /shopping/items/undo-transfer) - ohne ihn wäre nur die halbe
 // Handlung getestet.
 const { default: shoppingRouter } = await import('../server/routes/shopping.js');
+// Der Planer traegt die Bildversion des Rezepts mit (#2048) - gemessen am echten
+// Meals-Router, nicht an seinem SQL-Text.
+const { default: mealsRouter } = await import('../server/routes/meals.js');
 const recipeProviders = await import('../server/services/recipe-providers/index.js');
 const db = dbmod.get();
 
@@ -42,6 +45,11 @@ app.use((req, _res, next) => {
   next();
 });
 app.use('/shopping', shoppingRouter);
+app.use('/meals', mealsRouter);
+// Derselbe Router noch einmal unter seinem echten Pfad: die MCP-Bruecke ruft
+// `/api/v1/recipes` per Loopback auf (#2197), und genau diesen Weg nimmt der
+// Test am Ende dieser Datei.
+app.use('/api/v1/recipes', recipesRouter);
 app.use('/', recipesRouter);
 const server = app.listen(0, '127.0.0.1');
 const baseUrl = await new Promise((r) => server.on('listening', () => r(`http://127.0.0.1:${server.address().port}`)));
@@ -77,7 +85,7 @@ test('GET /: leere Sammlung → leeres Array', async () => {
 test('POST /: fehlender Titel → 400', async () => {
   const r = await call('POST', '/', { title: '  ' });
   assert.equal(r.status, 400);
-  assert.match(r.body.error, /Titel/);
+  assert.match(r.body.error, /^title /);
 });
 
 test('POST /: legt Rezept an; created_by, 201, meal_types-Default = alle vier', async () => {
@@ -316,6 +324,20 @@ test('POST /:id/to-shopping-list: abgehakte Artikel blockieren die Übernahme ni
   assert.equal(shoppingItems(listId).length, 2);
 });
 
+// R23 (D2): die Regel der ganzen Kueche normalisiert wie ingredientMatchKey -
+// Raender, Leerraum und Gross-/Kleinschreibung auch jenseits von ASCII.
+test('POST /:id/to-shopping-list: "ÖL" auf der Liste deckt " öl " im Rezept (D2)', async () => {
+  const listId = newList('Transfer Unicode');
+  db.prepare('INSERT INTO shopping_items (list_id, name) VALUES (?, ?)').run(listId, 'ÖL');
+  const created = await call('POST', '/', {
+    title: 'Unicode', ingredients: [{ name: ' öl ' }, { name: 'Brot  dunkel' }, { name: 'brot dunkel', quantity: '1' }],
+  });
+  const r = await call('POST', `/${created.body.data.id}/to-shopping-list`, { listId });
+  assert.equal(r.body.data.transferred, 1, 'zweimal Brot im Rezept ist EINE Zeile');
+  assert.equal(r.body.data.skipped, 1, 'nur das Öl stand schon da');
+  assert.deepEqual(shoppingItems(listId).map((i) => i.name), ['ÖL', 'Brot  dunkel']);
+});
+
 test('POST /:id/to-shopping-list: Rezept ohne Zutaten → 0/0 statt Fehler', async () => {
   const listId = newList('Transfer D');
   const created = await call('POST', '/', { title: 'Leer', ingredients: [] });
@@ -506,9 +528,83 @@ function registerMirrorTests(provider) {
     recipeProviders._setAdapterFactory(null);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('content-type'), 'image/png');
+    // Ohne provider_updated_at keine Version, also kein Cache - wie vor #2048.
     assert.equal(res.headers.get('cache-control'), 'no-store');
     const buf = Buffer.from(await res.arrayBuffer());
     assert.equal(buf.length, png1x1.length);
+  });
+
+  // #2048: 500 gespiegelte Rezepte waren bei jedem Oeffnen der Liste 500
+  // Live-Abrufe beim Provider, alle `no-store`. Mit der Version aus der Zeile
+  // darf der Browser das Bild behalten, und eine Nachfrage kostet den Provider
+  // nichts.
+  test(`GET /:id/provider-thumbnail: revalidierbar mit ?v=<provider_updated_at>, nie max-age, 304 ohne Provider-Abruf (${provider}, #2048)`, async () => {
+    const updatedAt = '2026-10-01T08:15:30.123456';
+    const recipeId = db.prepare(`
+      INSERT INTO recipes (title, created_by, provider_account_id, provider_recipe_id, provider_slug, provider_has_image, provider_updated_at) VALUES (?, ?, ?, ?, ?, 1, ?)
+    `).run('Versioniert', OWNER, accountId, `thumb-v-${provider}`, `slug-v-${provider}`, updatedAt).lastInsertRowid;
+    const png1x1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+    let upstream = 0;
+    recipeProviders._setAdapterFactory(() => ({
+      fetchThumbnail: async () => { upstream += 1; return { buffer: png1x1, mime: 'image/png' }; },
+    }));
+    try {
+      // Die Liste nennt genau diesen Wert - die Oberflaeche baut daraus ?v=.
+      const list = await call('GET', '/');
+      assert.equal(list.body.data.find((x) => x.id === recipeId).provider_updated_at, updatedAt);
+
+      const url = `${baseUrl}/${recipeId}/provider-thumbnail?v=${encodeURIComponent(updatedAt)}`;
+      const first = await fetch(url);
+      assert.equal(first.status, 200);
+      // NIE max-age (Codex-Review zu #2067): ein Bild aus dem HTTP-Cache kaeme
+      // nach dem Abmelden oder einem Kontowechsel ohne Auth- und Modul-Gate.
+      // Jede Nutzung fragt nach, die Nachfrage ist das 304 unten.
+      assert.equal(first.headers.get('cache-control'), 'private, no-cache');
+      const etag = first.headers.get('etag');
+      assert.match(etag ?? '', /^"[0-9a-f]{32}"$/);
+      assert.equal(upstream, 1);
+
+      const again = await fetch(url, { headers: { 'If-None-Match': etag } });
+      assert.equal(again.status, 304);
+      assert.equal(again.headers.get('cache-control'), 'private, no-cache');
+      assert.equal(upstream, 1, 'die Nachfrage beantwortet die Route, ohne den Provider zu fragen');
+
+      // Ohne oder mit alter Version: dieselbe Antwort.
+      for (const stale of ['', '?v=2020-01-01']) {
+        const r = await fetch(`${baseUrl}/${recipeId}/provider-thumbnail${stale}`);
+        assert.equal(r.status, 200);
+        assert.equal(r.headers.get('cache-control'), 'private, no-cache');
+        assert.equal(r.headers.get('etag'), etag);
+      }
+
+      // Neuer Sync, neue Version: das alte ETag passt nicht mehr.
+      db.prepare('UPDATE recipes SET provider_updated_at = ? WHERE id = ?').run('2026-10-02T09:00:00', recipeId);
+      const changed = await fetch(url, { headers: { 'If-None-Match': etag } });
+      assert.equal(changed.status, 200);
+      assert.notEqual(changed.headers.get('etag'), etag);
+    } finally {
+      recipeProviders._setAdapterFactory(null);
+    }
+  });
+
+  test(`GET /:id/provider-thumbnail: Fehler bleiben no-store, auch mit passender Version (${provider}, #2048)`, async () => {
+    const updatedAt = '2026-10-03T10:00:00';
+    const recipeId = db.prepare(`
+      INSERT INTO recipes (title, created_by, provider_account_id, provider_recipe_id, provider_has_image, provider_updated_at) VALUES (?, ?, ?, ?, 1, ?)
+    `).run('Kaputt', OWNER, accountId, `thumb-err-${provider}`, updatedAt).lastInsertRowid;
+    recipeProviders._setAdapterFactory(() => ({
+      fetchThumbnail: async () => { throw new Error('upstream down'); },
+    }));
+    try {
+      const r = await fetch(`${baseUrl}/${recipeId}/provider-thumbnail?v=${encodeURIComponent(updatedAt)}`);
+      assert.equal(r.status, 502);
+      assert.doesNotMatch(r.headers.get('cache-control') ?? '', /max-age|immutable/);
+      // Express haengt an jede JSON-Antwort ein schwaches ETag; das Versions-
+      // ETag der Route darf ein Fehler nie tragen.
+      assert.doesNotMatch(r.headers.get('etag') ?? '', /^"[0-9a-f]{32}"$/);
+    } finally {
+      recipeProviders._setAdapterFactory(null);
+    }
   });
 
   test(`GET /:id/provider-thumbnail: Bild seit letztem Sync beim Provider gelöscht (404 vom Adapter, ${provider}) → 404 statt 500`, async () => {
@@ -538,6 +634,22 @@ function registerMirrorTests(provider) {
 
 registerMirrorTests('mealie');
 registerMirrorTests('tandoor');
+
+test('GET /meals: eine Mahlzeit aus einem gespiegelten Rezept traegt recipe_image_version (#2048)', async () => {
+  const updatedAt = '2026-10-04T12:00:00';
+  const recipeId = db.prepare(`
+    INSERT INTO recipes (title, created_by, provider_account_id, provider_recipe_id, provider_has_image, provider_updated_at) VALUES (?, ?, ?, ?, 1, ?)
+  `).run('Im Planer', OWNER, PROVIDER_ACCOUNTS.mealie.id, 'planner-version', updatedAt).lastInsertRowid;
+  const mealId = db.prepare(`
+    INSERT INTO meals (date, meal_type, title, recipe_id, created_by) VALUES ('2026-10-05', 'dinner', 'Im Planer', ?, ?)
+  `).run(recipeId, OWNER).lastInsertRowid;
+  const r = await call('GET', '/meals?week=2026-10-05');
+  assert.equal(r.status, 200);
+  const meal = r.body.data.find((m) => m.id === mealId);
+  assert.ok(meal, 'die Mahlzeit steht in der Woche');
+  assert.equal(meal.recipe_has_image, 1);
+  assert.equal(meal.recipe_image_version, updatedAt);
+});
 
 // --------------------------------------------------------------------------
 // #750: Eine leere Auswahl ist eine Antwort, keine Lücke. Vorher machte die
@@ -649,4 +761,240 @@ test('POST /recipes: ein Bild, dessen Inhalt nicht zum Typ passt -> 400', async 
   const gelogen = PNG_1X1.replace('image/png', 'image/jpeg');
   const r = await call('POST', '/', { title: 'Gelogen', image_data: gelogen });
   assert.equal(r.status, 400);
+});
+
+// --------------------------------------------------------------------------
+// Ohne Body (#2197): Express 5 laesst `req.body` undefined, wenn eine Anfrage
+// keinen JSON-Body traegt. Jede Schreibroute las daraus unbesehen und
+// antwortete mit 500 "Internal error" statt mit ihrer eigenen Validierung.
+// --------------------------------------------------------------------------
+test('POST /: ohne Body → 400 mit der Titel-Meldung, nicht 500 (#2197)', async () => {
+  const before = db.prepare('SELECT COUNT(*) AS n FROM recipes').get().n;
+  const r = await call('POST', '/');
+  assert.equal(r.status, 400, JSON.stringify(r.body));
+  assert.match(r.body.error, /title is required/);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM recipes').get().n, before);
+});
+
+test('PUT /:id: ohne Body → 400, das Rezept bleibt unveraendert (#2197)', async () => {
+  const created = await call('POST', '/', { title: 'OhneBody', ingredients: [{ name: 'Bleibt' }] });
+  const id = created.body.data.id;
+  const r = await call('PUT', `/${id}`);
+  assert.equal(r.status, 400, JSON.stringify(r.body));
+  assert.match(r.body.error, /title is required/);
+  assert.deepEqual(ingredientRows(id).map((x) => x.name), ['Bleibt']);
+});
+
+test('POST /:id/to-shopping-list und PUT /:id/ingredient-match: ohne Body → 400 (#2197)', async () => {
+  const created = await call('POST', '/', { title: 'OhneBodyZiel', ingredients: [{ name: 'Mehl' }] });
+  const id = created.body.data.id;
+  const transfer = await call('POST', `/${id}/to-shopping-list`);
+  assert.equal(transfer.status, 400, JSON.stringify(transfer.body));
+  const match = await call('PUT', `/${id}/ingredient-match`);
+  assert.equal(match.status, 400, JSON.stringify(match.body));
+});
+
+test('POST / und PUT /:id: Zutaten, die keine Liste sind → 400, nichts geschrieben (#2197)', async () => {
+  const before = db.prepare('SELECT COUNT(*) AS n FROM recipes').get().n;
+  const post = await call('POST', '/', { title: 'Zutatenobjekt', ingredients: { name: 'Mehl' } });
+  assert.equal(post.status, 400, JSON.stringify(post.body));
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM recipes').get().n, before);
+
+  const created = await call('POST', '/', { title: 'ZutatenBleiben', ingredients: [{ name: 'Salz' }] });
+  const id = created.body.data.id;
+  const put = await call('PUT', `/${id}`, { title: 'ZutatenBleiben', ingredients: { name: 'Mehl' } });
+  assert.equal(put.status, 400, JSON.stringify(put.body));
+  assert.deepEqual(ingredientRows(id).map((x) => x.name), ['Salz']);
+
+  const nullItem = await call('POST', '/', { title: 'NullZutat', ingredients: [null, { name: 'Zucker' }] });
+  assert.equal(nullItem.status, 201, JSON.stringify(nullItem.body));
+  assert.deepEqual(ingredientRows(nullItem.body.data.id).map((x) => x.name), ['Zucker']);
+});
+
+// --------------------------------------------------------------------------
+// Ueber die MCP-Bruecke (#2197): `call_api_operation` geht per Loopback an
+// genau diesen Router. Ein Assistent, der die Rezeptfelder neben
+// `operation_key` statt in `payload` legt, schickte einen POST ohne Body und
+// bekam "Internal error". Termine, Einkauf und Aufgaben haben eigene
+// MCP-Werkzeuge mit flachen Argumenten, Rezepte nur die Bruecke - deshalb traf
+// es nur sie.
+// --------------------------------------------------------------------------
+test('MCP call_api_operation post_recipes: Felder neben payload → klare Meldung, kein Request (#2197)', async () => {
+  const { callTool } = await import('../server/mcp/tools.js');
+  const previous = process.env.MCP_INTERNAL_BASE_URL;
+  process.env.MCP_INTERNAL_BASE_URL = baseUrl;
+  actor = { id: ADMIN, role: 'admin' };
+  const ctx = { actor: { id: ADMIN, role: 'admin' }, requestHeaders: {} };
+  try {
+    const before = db.prepare('SELECT COUNT(*) AS n FROM recipes').get().n;
+    await assert.rejects(
+      callTool(ctx, 'call_api_operation', { operation_key: 'post_recipes', title: 'error-probe' }),
+      (err) => {
+        assert.doesNotMatch(err.message, /Internal error/);
+        assert.match(err.message, /payload/);
+        assert.match(err.message, /title/);
+        return true;
+      },
+    );
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM recipes').get().n, before, 'kein Rezept ohne payload');
+
+    // Ganz ohne payload: die Route antwortet mit ihrer eigenen Validierung.
+    await assert.rejects(
+      callTool(ctx, 'call_api_operation', { operation_key: 'post_recipes' }),
+      (err) => {
+        assert.doesNotMatch(err.message, /Internal error/);
+        assert.match(err.message, /title is required/);
+        return true;
+      },
+    );
+
+    const created = await callTool(ctx, 'call_api_operation', {
+      operation_key: 'post_recipes',
+      payload: { title: 'error-probe', ingredients: [{ name: 'Mehl' }] },
+    });
+    assert.equal(created.data.title, 'error-probe');
+    assert.deepEqual(ingredientRows(created.data.id).map((x) => x.name), ['Mehl']);
+  } finally {
+    actor = { id: OWNER, role: 'member' };
+    if (previous === undefined) delete process.env.MCP_INTERNAL_BASE_URL;
+    else process.env.MCP_INTERNAL_BASE_URL = previous;
+  }
+});
+
+// --------------------------------------------------------------------------
+// Portionen (R24, E12): Migration 270, Routen, umgerechnete Uebergabe
+// --------------------------------------------------------------------------
+test('Migration 270: eine frische Datenbank traegt recipes.servings, NULL als Standard, CHECK 1-99', () => {
+  const col = db.prepare('PRAGMA table_info(recipes)').all().find((c) => c.name === 'servings');
+  assert.ok(col, 'Spalte servings vorhanden');
+  assert.equal(col.dflt_value, null);
+  assert.equal(col.notnull, 0);
+  const id = db.prepare("INSERT INTO recipes (title, created_by) VALUES ('Frisch', ?)").run(OWNER).lastInsertRowid;
+  assert.equal(db.prepare('SELECT servings FROM recipes WHERE id = ?').get(id).servings, null);
+  assert.throws(() => db.prepare('UPDATE recipes SET servings = 0 WHERE id = ?').run(id), /CHECK/);
+  assert.throws(() => db.prepare('UPDATE recipes SET servings = 100 WHERE id = ?').run(id), /CHECK/);
+});
+
+test('Migration 270: eine Bestandsdatenbank mit altem Schema behaelt ihre Rezepte, servings faellt auf NULL', async () => {
+  const { default: Database } = await import('better-sqlite3-multiple-ciphers');
+  const old = new Database(':memory:');
+  // Das Schema der Rezepte vor 270 (Migration 13 + meal_types + Bild).
+  old.exec(`
+    CREATE TABLE recipes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, notes TEXT, recipe_url TEXT,
+      created_by INTEGER NOT NULL, meal_types TEXT NOT NULL DEFAULT 'breakfast,lunch,dinner,snack',
+      image_data TEXT, created_at TEXT, updated_at TEXT
+    );
+    CREATE TABLE recipe_ingredients (id INTEGER PRIMARY KEY AUTOINCREMENT, recipe_id INTEGER NOT NULL, name TEXT NOT NULL, quantity TEXT, category TEXT);
+    INSERT INTO recipes (title, notes, created_by, meal_types) VALUES ('Alt-Curry', 'scharf', 1, 'dinner');
+    INSERT INTO recipe_ingredients (recipe_id, name, quantity, category) VALUES (1, 'Reis', '300 g', 'Sonstiges');
+  `);
+  const migration = dbmod.MIGRATIONS.find((m) => m.version === 270);
+  assert.ok(migration, 'Migration 270 vorhanden');
+  migration.up(old);
+  migration.up(old); // ein zweiter Lauf (gedriftete Datenbank) scheitert nicht
+  assert.deepEqual(
+    { ...old.prepare('SELECT title, notes, meal_types, servings FROM recipes WHERE id = 1').get() },
+    { title: 'Alt-Curry', notes: 'scharf', meal_types: 'dinner', servings: null },
+  );
+  assert.equal(old.prepare('SELECT quantity FROM recipe_ingredients WHERE recipe_id = 1').get().quantity, '300 g');
+  old.prepare('UPDATE recipes SET servings = 4 WHERE id = 1').run();
+  assert.equal(old.prepare('SELECT servings FROM recipes WHERE id = 1').get().servings, 4);
+  old.close();
+});
+
+test('POST/PUT /: servings wird gespeichert, ein Teil-Update laesst es stehen, null loescht es', async () => {
+  const created = await call('POST', '/', { title: 'Portionen-Rezept', servings: 4, ingredients: [{ name: 'Mehl', quantity: '200 g' }] });
+  assert.equal(created.status, 201);
+  assert.equal(created.body.data.servings, 4);
+  const id = created.body.data.id;
+  const kept = await call('PUT', `/${id}`, { title: 'Portionen-Rezept', ingredients: [{ name: 'Mehl', quantity: '200 g' }] });
+  assert.equal(kept.status, 200);
+  assert.equal(db.prepare('SELECT servings FROM recipes WHERE id = ?').get(id).servings, 4);
+  await call('PUT', `/${id}`, { title: 'Portionen-Rezept', servings: 6 });
+  assert.equal(db.prepare('SELECT servings FROM recipes WHERE id = ?').get(id).servings, 6);
+  await call('PUT', `/${id}`, { title: 'Portionen-Rezept', servings: null });
+  assert.equal(db.prepare('SELECT servings FROM recipes WHERE id = ?').get(id).servings, null);
+  const list = await call('GET', '/');
+  assert.ok(list.body.data.some((r) => r.id === id && r.servings === null));
+});
+
+test('POST/PUT /: servings ausserhalb 1-99 oder keine ganze Zahl -> 400, nichts geschrieben', async () => {
+  for (const servings of [0, 100, 2.5, 'vier', -1]) {
+    const r = await call('POST', '/', { title: `Falsch ${servings}`, servings });
+    assert.equal(r.status, 400, `servings ${servings}`);
+    assert.match(r.body.error, /Servings/);
+  }
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM recipes WHERE title LIKE 'Falsch %'").get().n, 0);
+});
+
+/** Die Zeilen-IDs der Zutaten, wie GET /recipes sie liefert (`id` je Zutat). */
+function ingredientIds(recipeId) {
+  return db.prepare('SELECT id FROM recipe_ingredients WHERE recipe_id = ? ORDER BY id ASC').all(recipeId).map((r) => r.id);
+}
+
+test('POST /:id/to-shopping-list: quantities ersetzt die Mengen fuer diese Uebergabe, Namen bleiben', async () => {
+  const listId = newList('Portionen-Liste');
+  const created = await call('POST', '/', {
+    title: 'Skaliert', servings: 2,
+    ingredients: [{ name: 'Nudeln', quantity: '250 g', category: 'Backen' }, { name: 'Salz' }],
+  });
+  const id = created.body.data.id;
+  assert.deepEqual(created.body.data.ingredients.map((i) => i.id), ingredientIds(id), 'die API liefert die Zeilen-ID je Zutat');
+  const r = await call('POST', `/${id}/to-shopping-list`, { listId, quantities: ['500 g', null], ingredientIds: ingredientIds(id) });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const items = shoppingItems(listId);
+  assert.deepEqual(items.map((i) => [i.name, i.quantity, i.category]), [['Nudeln', '500 g', 'Backen'], ['Salz', null, 'Sonstiges']]);
+  // Das Rezept selbst bleibt unveraendert.
+  assert.deepEqual(ingredientRows(id).map((x) => x.quantity), ['250 g', null]);
+});
+
+test('POST /:id/to-shopping-list: quantities in falscher Form, ohne oder mit kaputten ingredientIds -> 400, nichts uebernommen', async () => {
+  const listId = newList('Portionen-Falsch');
+  const created = await call('POST', '/', { title: 'Skaliert-Falsch', ingredients: [{ name: 'Mehl', quantity: '1 kg' }] });
+  const id = created.body.data.id;
+  const ids = ingredientIds(id);
+  for (const body of [
+    { quantities: 'x', ingredientIds: ids },
+    { quantities: [42], ingredientIds: ids },
+    { quantities: ['2 kg'] },
+    { quantities: ['2 kg'], ingredientIds: 'x' },
+    { quantities: ['2 kg'], ingredientIds: ['1'] },
+    { quantities: ['2 kg'], ingredientIds: [...ids, ids[0] + 1] },
+  ]) {
+    const r = await call('POST', `/${id}/to-shopping-list`, { listId, ...body });
+    assert.equal(r.status, 400, JSON.stringify(body));
+  }
+  assert.equal(shoppingItems(listId).length, 0);
+});
+
+// Codex an #2364 (P2): die Mengen lagen positionsweise auf den Zutaten des
+// Servers. Aenderte jemand das Rezept zwischen Laden und Uebernahme (oder ein
+// Abgleich die Reihenfolge), landeten sie still bei den falschen Zutaten.
+test('POST /:id/to-shopping-list: hat sich das Rezept seit dem Laden geaendert, antwortet die Uebergabe 409 und nennt den neuen Stand', async () => {
+  const listId = newList('Portionen-Geaendert');
+  const created = await call('POST', '/', {
+    title: 'Geaendert', servings: 2,
+    ingredients: [{ name: 'Nudeln', quantity: '250 g' }, { name: 'Salz', quantity: '1 TL' }],
+  });
+  const id = created.body.data.id;
+  const loaded = ingredientIds(id);
+  // Inzwischen dreht jemand die Reihenfolge um - gleiche Laenge, gleiche Namen.
+  const edited = await call('PUT', `/${id}`, {
+    title: 'Geaendert', servings: 2,
+    ingredients: [{ name: 'Salz', quantity: '1 TL' }, { name: 'Nudeln', quantity: '250 g' }],
+  });
+  assert.equal(edited.status, 200);
+  const r = await call('POST', `/${id}/to-shopping-list`, { listId, quantities: ['500 g', '2 TL'], ingredientIds: loaded });
+  assert.equal(r.status, 409, JSON.stringify(r.body));
+  assert.equal(r.body.reason, 'recipes_ingredients_changed');
+  assert.deepEqual(r.body.recipe.ingredients.map((i) => [i.id, i.name]), ingredientIds(id).map((rid, i) => [rid, ['Salz', 'Nudeln'][i]]),
+    'die Antwort traegt das Rezept, wie es jetzt ist');
+  assert.equal(shoppingItems(listId).length, 0, 'nichts uebernommen, statt Mengen falsch zuzuordnen');
+  const fewer = await call('PUT', `/${id}`, { title: 'Geaendert', ingredients: [] });
+  assert.equal(fewer.status, 200);
+  const none = await call('POST', `/${id}/to-shopping-list`, { listId, quantities: ['500 g', '2 TL'], ingredientIds: loaded });
+  assert.equal(none.status, 409, 'auch ohne Zutaten: die geladenen gibt es nicht mehr');
+  const plain = await call('POST', `/${id}/to-shopping-list`, { listId });
+  assert.equal(plain.status, 200, 'ohne quantities unveraendert');
 });

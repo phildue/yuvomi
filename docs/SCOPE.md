@@ -329,7 +329,7 @@ argument.
   ([CONTRIBUTING.md](../CONTRIBUTING.md#what-a-human-guarantees)); two automated reviewers
   comment on every pull request and merge nothing. A required second approval with one person
   holding the key would be theatre. *Opens with:* the same second maintainer.
-- **No translation platform.** The 26 locales live in the repository as JSON, and a guard
+- **No translation platform.** The 27 locales live in the repository as JSON, and a guard
   (`test:i18n-translated`) refuses a locale that regresses toward untranslated English. A hosted
   platform would not run that guard, so a pull request from it could turn a translated file back
   into a copy of the reference without anyone seeing it. Translations arrive as pull requests
@@ -339,7 +339,8 @@ argument.
   machine; a public instance filled with a fictional family's health notes and finances would
   be the opposite of that promise as a first impression, and it would be one more server to
   keep patched. What exists instead is a seed that fills a fresh installation with a realistic
-  household in one command, in English or German, so anyone can have a demo that is theirs:
+  household in one command, in English or German, so anyone can have a demo that is theirs.
+  It reads the same `.env` as the server, so an encrypted database works too:
 
   ```bash
   node scripts/seed-demo.js --db ./yuvomi.db --locale en

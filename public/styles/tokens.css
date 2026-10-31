@@ -530,6 +530,17 @@
   --color-btn-primary:        var(--_color-btn-primary);    /* Weißes Label 6.1:1 — WCAG AA */
   --_color-btn-primary-hover: #5B2FD4;
   --color-btn-primary-hover:  var(--_color-btn-primary-hover);
+  /* Fuellung von `.btn--primary` (#2184). Hier der Vollton der Stimme fuer
+   * Browser ohne color-mix() (Chrome < 111, Safari < 16.2): mit color-mix()
+   * direkt an der Regel war die Flaeche dort durchsichtig und die Beschriftung
+   * (--color-ink-on-vivid) verschwand - Speichern, Anmelden, Koppeln. Die
+   * Abdunklung 88 %/76 % setzt der @supports-Block "Primaerknopf" weiter
+   * unten, wie --viewport-height. Kontrast des Rueckfalls: Weiss auf #6C3AED
+   * 5.9:1, Dunkel auf #A78BFA 7.6:1. Als Token und nicht als Rueckfall in
+   * reset.css, weil der Hover sonst ueber die Rueckmelde-Zustaende der Knoepfe
+   * stiege (test:frontend-audit, #2180). */
+  --btn-primary-fill:         var(--color-accent);
+  --btn-primary-fill-hover:   var(--color-accent-hover);
 
   /* --------------------------------------------------------
    * 3. Farben - Semantisch (Apple-Vokabular, AA-vertieft)
@@ -989,7 +1000,12 @@
    * hat es dieselben Ausschalter: in prefers-reduced-transparency und
    * prefers-contrast stehen beide auf 0. Ein Wert in der Komponente hätte
    * diese Kopplung nicht mitgebracht. */
-  --weather-glow-opacity: 1;
+  /* Die Staerke des Lichthauchs je Buehne. Auf der Kohle-Buehne (unten) die
+   * Haelfte: die aufgehellten Lagen (Schiefer #A8BBCC) standen dort in voller
+   * Staerke als grauer Fleck neben der Wolke, nicht als Licht (DW-P3-8). Die
+   * Ausschalter der Gattung setzen weiter `--weather-glow-opacity` auf 0. */
+  --weather-glow-strength: 1;
+  --weather-glow-opacity: var(--weather-glow-strength);
 
   /* --------------------------------------------------------
    * 6. Farben - Prioritäten
@@ -1178,10 +1194,28 @@
    * AA ueber alle neun Familien, knappster Wert Gesundheit 4,51:1, Kontakte
    * 5,05, Dokumente 5,08, Uebersicht 5,16. Heller geht nicht: --_neutral-300
    * druckte Gesundheit auf 3,68. Guard: test-frontend-audit.js, "der
-   * Segmentdaumen ist heller als seine Bahn". */
+   * Segmentdaumen ist heller als seine Bahn".
+   *
+   * DUNKEL TRAEGT DER DAUMEN EINE KANTE (R23, Critique G6-1). 1,19:1 ist ein
+   * Abstand, kein Zustand: die Grenze des gewaehlten Segments muss als Grafik
+   * 3:1 halten (WCAG 1.4.11), und der Schatten, der hell die Kante zeichnet,
+   * ist auf Kohle wirkungslos. Die Kante ist die Feldkante
+   * (--color-border-control, #857F76): 3,16:1 gegen die Bahn #37332E. Heller
+   * fuellen geht nicht (siehe oben, die Tinte darauf), also zeichnet ein 1px-
+   * Innenring die Form.
+   *
+   * HELL TRAEGT ER DIESELBE KANTE (R23 S11). Weiss auf der Bahn #EDEAE3 ist
+   * 1,20:1, und der Schatten zeichnet die Form nur optisch - als Grenze eines
+   * Zustands zaehlt er nicht (WCAG 1.4.11 gilt fuer beide Themes). Die helle
+   * Feldkante (--color-border-control, #8C8880) haelt gegen die Bahn nur
+   * 2,94:1 - sie ist gegen Weiss gerechnet. Der Ring nimmt deshalb in beiden
+   * Themes dieselbe Farbe #857F76: hell 3,30:1 gegen die Bahn, 3,97:1 gegen
+   * den Daumen; der Schatten bleibt als Tiefe. Guard: test-frontend-audit.js,
+   * "der Segmentdaumen hat in jedem Theme eine 3:1-Kante". */
+  --_seg-active-ring:  #857F76;
   --_seg-active-bg:    var(--_color-surface);
   --seg-active-bg:     var(--_seg-active-bg);
-  --seg-active-shadow: var(--shadow-xs);
+  --seg-active-shadow: inset 0 0 0 1px var(--_seg-active-ring), var(--shadow-xs);
 
   /* --------------------------------------------------------
    * 7. Overlay / Backdrop
@@ -1446,10 +1480,10 @@
    *    (Zentrumsabstand 31,5), Aufgaben-Tagfilter (29,3), Sidebar-Umschalter
    *    (31,5). Wer eine Ausnahme braucht, braucht in Wahrheit Abstand.
    *
-   *    GEMESSEN WIRD DIE TREFFERFLÄCHE, NICHT DIE BOX. .weather-widget__refresh
-   *    ist 34x34 groß und dehnt seine Fläche per ::before auf --target-base
-   *    aus; eine Box-Messung meldet ihn als Verstoß, obwohl der Finger 44px
-   *    findet. Das ist zugleich das Rezept für „kompakt aussehen, voll
+   *    GEMESSEN WIRD DIE TREFFERFLÄCHE, NICHT DIE BOX. Der „Alle"-Link im
+   *    Widget-Kopf (.widget__link) ist 32px hoch und dehnt seine Fläche per
+   *    ::before auf 48px aus; eine Box-Messung meldet ihn als Verstoß, obwohl
+   *    der Finger 48px findet (ebenso der Wetter-Knopf: 40px am Zeiger, 44px Fläche). Das ist zugleich das Rezept für „kompakt aussehen, voll
    *    treffen".
    *
    *    Geprüft auf Ebene 4 (Dokument, Puppeteer: `Sonde 4` in
@@ -1470,10 +1504,19 @@
    * 11b2. Icon-Größen — VIER Stufen, je Stufe genau ein Name.
    * Utility-Klassen dazu in layout.css.
    * -------------------------------------------------------- */
-  --icon-sm: 12px;   /* Inline-Marker in Fließtext, Chips */
-  --icon-md: 16px;   /* Standard: Buttons, Listenzeilen */
+  --icon-sm: 12px;   /* Inline-Marker in Fließtext */
+  --icon-md: 16px;   /* Standard: Glyphe jedes `.btn` (Grundregel), Filter-Chips, Listenzeilen */
   --icon-lg: 20px;   /* Betonte Aktionen, Toolbar */
   --icon-xl: 24px;   /* FAB, Empty-State, Dialog-Kopf */
+
+  /* DIE ZEILENGLYPHE (R22, D8): die Zeichen der Zeilenaktionen am Zeilenende
+   * (`.row-action`: Mehr, Abhaken, Warenkorb), der Notiz-Nadel und des
+   * Ordner-Menues. Sie liegen eine Stufe ueber `--icon-md`, weil sie allein in
+   * einem 48px-Kreis ohne Wort stehen und neben der 15px-Zeilenschrift mit
+   * 16px duenner wirkten als der Text. Kein Groessenschritt der Skala oben
+   * (keine `.icon-*`-Klasse), sondern die Rolle EINES Bauteils - deshalb ein
+   * eigener Name statt des 18px-Literals, das bis R22 in layout.css stand. */
+  --icon-row: 18px;
 
   /* Die STRICHSTÄRKE der Modulzeichen, in gerenderten Pixeln (das Zeichen
    * trägt dazu `vector-effect: non-scaling-stroke`, sonst skalierte der Strich
@@ -1620,8 +1663,11 @@
    * 65rem = 1040px Modulflaeche: ein 1280er-Laptop (1060px neben der
    * Seitenleiste) bekommt Liste + Detail (420 + 24 + ~560), auch mit einer
    * klassischen 15-17px-Bildlaufleiste an #main-content. Bis R10 stand hier
-   * 75rem, und 1280 fiel auf den Einspalter mit Modal zurueck (A3 P2-2). */
-  --layout-list-min: 26.25rem;
+   * 75rem, und 1280 fiel auf den Einspalter mit Modal zurueck (A3 P2-2).
+   * MINDESTENS 480px LISTE (R23, D13): mit 420px blieben dem Aufgabentitel bei
+   * 1280 194px, und 11 von 11 Titeln brachen um (Critique G2). Das Detail
+   * behaelt bei 1280 rund 500px; ab 1220px Flaeche traegt die 40-%-Formel. */
+  --layout-list-min: 30rem;
   --layout-list-max: 32.5rem;
   /* Listenbahn, sobald der Baustein auf der Content-Spalte steht (Modulflaeche
    * ab 84rem = 1280 + 2 x 32px Gutter, layout.css): dann waechst er nicht
@@ -1637,6 +1683,12 @@
    * Seitenleiste (320px, Apples Systemeinstellungen), nicht die Listenbahn
    * oben. EIN Wert fuer beide, damit sie nicht auseinanderlaufen (R10). */
   --layout-nav-list: 20rem;
+  /* Breite eines Textfelds in einer Formularzeile der Einstellungen (R21 S7,
+   * Critique a5): die Bedienspalte ist die halbe Zeile (50cqi), aber hoechstens
+   * so breit. Ohne Obergrenze standen die Felder einer Seite an drei Kanten
+   * (Konto bei 1280: 972 / 922 / 999px), weil Profil, Kontaktdaten und
+   * Datumsfeld verschieden breite Zeilen haben. */
+  --layout-field-max: 16rem;
   /* Seitenspalte der Flaechen mit Spalten (`.page-columns`, layout.css;
    * DESIGN.md, Breitenregel, R16 2026-10-05): links die Liste auf dem
    * Lesemass, rechts eine Spalte, die den Rest bis zur Modulkante nimmt und
@@ -1685,6 +1737,11 @@
    * Tag, Ganztag und Listenzeile tragen sie gleich breit. Die Titelfassung des
    * Telefon-Monats nimmt 2px (--space-0h), eine Geometrie, keine zweite Kante. */
   --cal-event-edge: 3px;
+  /* Das Polster ueber und unter dem Titel eines Monatschips (R21 S9b): 3px
+   * statt 2px, damit die Zeile nicht buendig an Kante und Flaeche liegt
+   * (Detektor cramped-padding ab 3px). Die Spurhoehe der Monatsbaender
+   * (--month-band-h, calendar.css) rechnet mit demselben Wert. */
+  --cal-chip-pad-block: 3px;
   --sub-tabs-height: 52px;
   --kitchen-tabs-height: 56px;
 
@@ -1721,6 +1778,10 @@
    * Das Reveal-Panel stellt Icon und Etikett in genau diesen Streifen: was
    * beim Ausloesen aufgedeckt ist, ist dann auch vollstaendig zu lesen. */
   --swipe-threshold: 80px;
+  /* Der Fastenring als Begleiter eines Satzes (Uebersicht, DW-P3-5): die
+   * Viewbox des Rings (components/fasting-dial.js) in Pixeln - groesser
+   * fuehrt er, kleiner wird der Ring zur Glyphe. */
+  --fasting-widget-dial: 120px;
   --fab-size: 52px;
   --fab-gap: var(--space-6);
   /* Mitte der Nav-Kapsel: safe-area + Bar-Polster + halbe Resthoehe. Die
@@ -1816,6 +1877,20 @@
    * auf ihr ruhen, bevor sie ausklappt (150-250ms, A1 P3-1 der Re-Critique
    * 2026-09-27). Eine Wartezeit, keine Bewegungsdauer. */
   --sidebar-hover-intent: 200ms;
+  /* EIN TEMPO FUER JEDEN SPINNER (Critique R21, D12): eine Umdrehung der
+   * Statusdrehung. Vorher drehten drei Spinner in drei Tempi (Knopf 550ms,
+   * Anmeldung 700ms, Dokumentvorschau 800ms) - dieselbe Aussage "es laeuft
+   * noch" in drei Stimmen. Eine Schleife, kein Uebergang: deshalb ausserhalb
+   * der --duration-Stufen. Unter reduzierter Bewegung dreht er weiter (reset.css). */
+  --spin-period: 700ms;
+  /* DIE ANDEREN BEIDEN ZEITEN AUSSERHALB DER STUFEN (R23 S11, Critique G0
+   * S-P3-3): sie standen als Literale in layout.css. Der Lade-Schimmer ist
+   * eine Schleife wie der Spinner (eine Bahn ueber das Skelett); der
+   * Wisch-Hinweis ist ein einmaliger Stups an einer neuen Zeile - seine
+   * Dauer und die Wartezeit davor, damit er erst nach dem Aufbau kommt. */
+  --shimmer-period: 1.5s;
+  --hint-nudge: 800ms;
+  --hint-delay: 1200ms;
 
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   /* Symmetrische Kurve fuer Hoehenwechsel (Einklappen/Aufziehen von Zeilen und
@@ -1823,6 +1898,20 @@
    * dort wie ein Ruck; eine Hoehe, der die Nachbarn folgen, braucht Anlauf
    * UND Auslauf (Critique 2026-09-26, Runde 3). */
   --ease-in-out: cubic-bezier(0.42, 0, 0.58, 1);
+
+  /* DRUCKZUSTAND: ZWEI STUFEN (R22, D8). Was gedrueckt wird, gibt um eine
+   * von zwei Stufen nach - vorher standen sechs Literale (0.92 FAB, 0.94
+   * Zeilenaktion, 0.96 Reiter, 0.98 Knopf, 0.985 Suchfeld), und Chips,
+   * Segmente, Menueeintraege und Karten quittierten den Druck gar nicht.
+   *   sm: kleine, kompakte Ziele - Chips, Segmente, Reiter, Icon-Knoepfe,
+   *       Zeilenaktionen, Menueeintraege, FAB. 5 % sind an 40px zwei Pixel.
+   *   lg: breite Flaechen - Textknoepfe, Karten, Zeilen, Suchfeld. Auf 300px
+   *       waeren 5 % ein Sprung von 15px; 2 % sind dieselben sechs.
+   * Listenzeilen des Press-Bausteins (list-row.css) druecken bewusst ohne
+   * Bewegung (R18) - fuer sie gilt die Flaeche, nicht die Stufe.
+   * `test:motion` haelt: kein :active setzt eine Skala ausser ueber diese zwei. */
+  --press-scale-sm: 0.95;
+  --press-scale-lg: 0.98;
 
   /* --------------------------------------------------------
    * 15. Z-Indizes
@@ -2087,8 +2176,16 @@
    * 300ms, Mehr-Blatt Vollhub in 250ms, Suche Vollhub. Der Eintritt federt,
    * der Austritt ist kuerzer und ohne Ueberschwinger. Die Feder vertraegt nur
    * den kurzen Hub (`--sheet-lift`): ueber einen Vollhub wirft sie das Blatt
-   * sichtbar ueber seine Ruhelage (gemessen 28,5px bei 40 %, test:motion). */
-  --sheet-in:   var(--duration-xl) var(--ease-glass);
+   * sichtbar ueber seine Ruhelage (gemessen 28,5px bei 40 %, test:motion).
+   *
+   * DIE BLATTFEDER (#1802): wo der Browser `linear()` kennt, ist sie eine
+   * kritisch gedaempfte Feder (unten im @supports-Rahmen) - kein
+   * Ueberschwinger, also traegt sie den vollen Weg (`--sheet-rise`), und das
+   * Blatt steigt vom unteren Rand auf, statt 24px ueber einer Blende zu
+   * erscheinen. Ohne `linear()` bleibt sie die Glasfeder von heute, mit dem
+   * kurzen Hub und der Blende (glass.css, `glass-sheet-in`). */
+  --ease-sheet: var(--ease-glass);
+  --sheet-in:   var(--duration-xl) var(--ease-sheet);
   /* Die BLENDE der Einfahrt federt nicht (Critique 2026-10-16, A5): eine
    * Deckkraft ueber 1 gibt es nicht, die Feder kappte bei 1 und das Blatt
    * stand nach rund einem Drittel der Zeit voll da, waehrend es noch hob.
@@ -2096,6 +2193,11 @@
   --sheet-fade-in: var(--duration-xl) var(--ease-out);
   --sheet-out:  var(--duration-md) var(--ease-out);
   --sheet-lift: 24px;
+  /* Der volle Weg der Einfahrt: die eigene Hoehe plus der Abstand zum unteren
+   * Rand (das Polster des Dialogs), sonst stuende im ersten Frame ein Streifen
+   * im Bild. Prozent meint die Box des Blatts selbst. Das Mehr-Blatt setzt
+   * seinen Abstand ueber der Leiste selbst (layout.css). */
+  --sheet-rise: calc(100% + max(var(--space-3), env(safe-area-inset-bottom)));
 
   /* h) Liquid Glass - Saettigung.
    *    Hier standen bis R18 (2026-10-07) drei Werte fuer einen Backdrop, den
@@ -2120,6 +2222,40 @@
   --mask-opaque: #000;
 }
 
+/* DIE GLASFEDER ALS FEDER (Critique R21, D1). `--ease-glass` ist eine
+ * Back-Out-Bezier: der Gipfel des Ueberschwingers liegt bei 57 % der Zeit, und
+ * erst ab 91 % steht sie innerhalb von 1 % - das Blatt hing gemessen 117ms
+ * sichtbar ueber seiner Ruhelage (Gipfel -2,33px bei +162ms der 300ms). Wo der
+ * Browser `linear()` kennt, laeuft dieselbe Bewegung als gedaempfte Feder
+ * (Daempfung 0,6, Eigenfrequenz 11/Dauer): gleicher Gipfel (1,095 gegen 1,098),
+ * gleiche Dauer, aber der Gipfel liegt bei 36 % und sie steht ab 57 % - das
+ * Blatt schwingt einmal kurz und ruht dann. Die Stuetzstellen sind die Feder,
+ * abgetastet in 2,5-%-Schritten (Interpolationsfehler unter 1 %). Ohne
+ * `linear()` bleibt die Bezier; ungetestet waere der Wert dort ungueltig und
+ * jede Transition, die ihn liest, fiele aus - daher der @supports-Rahmen. */
+@supports (transition-timing-function: linear(0, 1)) {
+  :root {
+    --ease-glass: linear(0, 0.034 2.5%, 0.12 5%, 0.238 7.5%, 0.372 10%, 0.508 12.5%, 0.638 15%, 0.754 17.5%,
+      0.853 20%, 0.934 22.5%, 0.997 25%, 1.042 27.5%, 1.071 30%, 1.088 32.5%, 1.094 35%, 1.093 37.5%,
+      1.086 40%, 1.076 42.5%, 1.063 45%, 1.05 47.5%, 1.038 50%, 1.026 52.5%, 1.016 55%, 1.008 57.5%,
+      1.002 60%, 0.997 62.5%, 0.992 67.5%, 0.991 72.5%, 0.994 80%, 0.998 90%, 1);
+    /* Die Feder der Sidebar-Pille (#1802): Daempfung 0,78, Eigenfrequenz
+     * 11/Dauer - derselbe Gipfel wie die Bezier (1,018 gegen 1,020), aber er
+     * liegt bei 46 statt 57 % und die Pille steht ab 59 statt 76 % der Zeit. */
+    --ease-sidebar-glide: linear(0, 0.006 1%, 0.027 2.25%, 0.068 3.75%, 0.133 5.5%, 0.243 8%, 0.498 13.5%,
+      0.614 16.25%, 0.705 18.75%, 0.782 21.25%, 0.846 23.75%, 0.902 26.5%, 0.946 29.5%, 0.98 32.75%,
+      1.004 36.75%, 1.018 41.75%, 1.018 49.75%, 1.002 73%, 1);
+    /* Die Blattfeder (#1802): kritisch gedaempft, x(t) = 1 - (1 + wt)e^-wt
+     * mit w = 10/Dauer. Kein Ueberschwinger und monoton, deshalb faehrt sie
+     * den vollen Weg (`--sheet-rise`): bei 1 % Rest steht sie nach 66 % der
+     * Zeit, am Ende fehlen 0,05 % (0,4px bei 740px). Stuetzstellen mit einem
+     * Interpolationsfehler unter 0,15 %. */
+    --ease-sheet: linear(0, 0.005 1%, 0.022 2.25%, 0.055 3.75%, 0.106 5.5%, 0.191 8%, 0.4 13.75%,
+      0.499 16.75%, 0.587 19.75%, 0.657 22.5%, 0.723 25.5%, 0.781 28.75%, 0.832 32.25%, 0.874 36%,
+      0.91 40.25%, 0.94 45.25%, 0.964 51.5%, 0.982 59.5%, 0.994 71.5%, 0.999 96.75%, 1);
+  }
+}
+
 /* ================================================================
  * Fensterhoehe: dvh, wo der Browser es kennt (#1276)
  *
@@ -2130,6 +2266,21 @@
 @supports (height: 100dvh) {
   :root {
     --viewport-height: 100dvh;
+  }
+}
+
+/* ================================================================
+ * Primaerknopf: die Abdunklung, wo der Browser color-mix() kennt (#2184)
+ *
+ * Steht HINTER dem :root-Block oben, wie --viewport-height. Ohne color-mix()
+ * bleibt der Vollton aus --btn-primary-fill; die Werte hier sieht so ein
+ * Browser gar nicht erst. --color-accent wird nur an der Wurzel gesetzt
+ * (auch im Dark), deshalb darf der Token hier mischen.
+ * ================================================================ */
+@supports (color: color-mix(in srgb, red, red)) {
+  :root {
+    --btn-primary-fill:       color-mix(in srgb, var(--color-accent) 88%, var(--neutral-950));
+    --btn-primary-fill-hover: color-mix(in srgb, var(--color-accent) 76%, var(--neutral-950));
   }
 }
 
@@ -2339,6 +2490,8 @@
     --_color-switch-off:   #948E85;  /* = --_neutral-500 */
     /* Der Segmentdaumen: eine Stufe UEBER der Bahn (#37332E), Begruendung im :root-Block. */
     --_seg-active-bg:      #443E37;  /* = --_neutral-250 */
+    /* Und seine Kante (R23, G6-1): 3,16:1 gegen die Bahn. Als Hex = --color-border-control. */
+    --_seg-active-ring:    #857F76;
 
     --_sidebar-bg:           #221F1D;
     --_sidebar-shadow-light: rgba(255, 255, 255, 0.04);
@@ -2497,6 +2650,7 @@
     --_weather-rain:   #7FC4F0;
     --_weather-snow:   #5EDDE8;
     --_weather-storm:  #D8A6F5;
+    --weather-glow-strength: 0.5;
     --_weather-band-icy:  #67E8F9;
     --_weather-band-cold: #7FB8FF;
     --_weather-band-mild: #5EEAD4;
@@ -2621,6 +2775,8 @@
     --_color-switch-off:   #948E85;  /* = --_neutral-500 */
     /* Der Segmentdaumen: eine Stufe UEBER der Bahn (#37332E), Begruendung im :root-Block. */
     --_seg-active-bg:      #443E37;  /* = --_neutral-250 */
+    /* Und seine Kante (R23, G6-1): 3,16:1 gegen die Bahn. Als Hex = --color-border-control. */
+    --_seg-active-ring:    #857F76;
 
     /* Sidebar */
     --_sidebar-bg:           #221F1D;
@@ -2742,6 +2898,7 @@
     --_weather-rain:   #7FC4F0;
     --_weather-snow:   #5EDDE8;
     --_weather-storm:  #D8A6F5;
+    --weather-glow-strength: 0.5;
     --_weather-band-icy:  #67E8F9;
     --_weather-band-cold: #7FB8FF;
     --_weather-band-mild: #5EEAD4;
@@ -2869,5 +3026,17 @@
     --brand-field-opacity: 0;  /* Marken-Lichtfeld aus - gleiche Gattung */
     /* Specular aus, siehe der Schwesterblock oben. */
     --glass-inset-strength: 0;
+
+    /* METATEXT HEBT SICH MIT (R21, Critique 2026-10-21, D4). Glas, Kanten
+     * und Blur wurden hier gehaertet, die Metazeile - die kleinste Schrift
+     * des Schirms - blieb in derselben Farbe (gemessen hell #63615B, dunkel
+     * #B4AEA5). Sekundaer- und Tertiaertext stehen eine Rampenstufe naeher an
+     * der Textfarbe: hell #4A4741 (9,3:1 auf Weiss statt 6,2), dunkel #CBC5BC
+     * (8,6:1 auf der Karte #2B2825 statt 6,7).
+     * Ueber die Rampe, nicht als Literal: die Dark-Bloecke setzen nur die
+     * private Haelfte (--_neutral-700), der Wert folgt so dem Theme.
+     * Guard: test:typography "prefers-contrast: more hebt". */
+    --color-text-secondary: var(--neutral-700);
+    --color-text-tertiary:  var(--neutral-700);
   }
 }

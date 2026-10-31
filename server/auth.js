@@ -15,7 +15,7 @@ import { refuseWhileRestoring } from './middleware/restore-gate.js';
 import { restoreInProgressError } from './utils/restore-messages.js';
 import { runExternalJob } from './utils/restore-state.js';
 import { SESSION_MAX_AGE_MS, sessionCookieRefreshDue } from './utils/session-lifetime.js';
-import { collectErrors, date as validateDate, str, MAX_SHORT, MAX_TITLE } from './middleware/validate.js';
+import { collectErrors, color as validateColor, date as validateDate, str, MAX_SHORT, MAX_TITLE } from './middleware/validate.js';
 import { createLogger } from './logger.js';
 import { memberEmail } from './services/member-email.js';
 import { GravatarError, fetchGravatar, gravatarEnabled, gravatarHost } from './services/gravatar.js';
@@ -26,9 +26,10 @@ import {
 import { RemovalRefused, removeUser } from './services/user-removal.js';
 import {
   DISPLAY_COOKIE, DISPLAY_SCOPES, authenticateDisplayDevice, displayCookieIdentity, displayCookieOptions,
-  displayMayRead, displayTokenFromRequest, isDisplayAccount, markDisplayCookieRefreshed,
+  displayMayRead, displayOfflineExpiresAt, displayTokenFromRequest, isDisplayAccount,
+  markDisplayCookieRefreshed, OFFLINE_EXPIRES_HEADER,
 } from './services/display-accounts.js';
-import { deleteBirthdayArtifacts, syncBirthdayArtifacts } from './services/birthdays.js';
+import { birthDateInput, deleteBirthdayArtifacts, placeholderBirthDate, syncBirthdayArtifacts, validateYearUnknown } from './services/birthdays.js';
 import { syncFastingRemindersForUser } from './services/fasting-reminders.js';
 import { revokePaymentTasksForUsers } from './services/payment-task-audience.js';
 import * as oidcClient from 'openid-client';
@@ -204,7 +205,8 @@ const USER_PUBLIC_COLUMNS = `
   created_at,
   (SELECT phone FROM contacts WHERE contacts.family_user_id = users.id LIMIT 1) AS phone,
   (SELECT email FROM contacts WHERE contacts.family_user_id = users.id LIMIT 1) AS email,
-  (SELECT birth_date FROM birthdays WHERE birthdays.family_user_id = users.id LIMIT 1) AS birth_date
+  (SELECT birth_date FROM birthdays WHERE birthdays.family_user_id = users.id LIMIT 1) AS birth_date,
+  (SELECT year_unknown FROM birthdays WHERE birthdays.family_user_id = users.id LIMIT 1) AS birth_year_unknown
 `;
 
 // --------------------------------------------------------
@@ -618,6 +620,9 @@ function publicUser(row) {
     phone: row.phone ?? null,
     email: row.email ?? null,
     birth_date: row.birth_date ?? null,
+    // Nur Tag und Monat bekannt (#2095): `birth_date` traegt dann das
+    // Platzhalterjahr 2000, das kein Profil als Geburtsjahr zeigen darf.
+    birth_year_unknown: row.birth_year_unknown === 1,
     created_at: row.created_at,
     // Seit wann dieses Konto ein ehemaliges ist (#1381), sonst `null`. Die
     // Zeile bleibt, damit Urheberschaft und Salden bleiben; die Oberflaeche
@@ -649,9 +654,10 @@ function publicUser(row) {
     // Nur wenn die Query das Flag mitselektiert (GET /users); andere
     // publicUser-Pfade behalten ihre bisherige Feldmenge.
     ...(row.is_worker !== undefined && { is_worker: Boolean(row.is_worker) }),
-    // Ebenso bedingt, und zusaetzlich nur fuer Administratoren (#847): "dieses
-    // Konto hat ein Passwort" ist dieselbe Sorte Angabe wie die
+    // Ebenso bedingt, und ueber FREMDE Konten nur fuer Administratoren (#847):
+    // "dieses Konto hat ein Passwort" ist dieselbe Sorte Angabe wie die
     // 2FA-Uebersicht, die aus demselben Grund nicht an /auth/users haengt.
+    // Ueber sich selbst erfaehrt es jedes Konto aus GET /me (#1703).
     ...(row.sso_only !== undefined && { sso_only: Boolean(row.sso_only) }),
   };
 }
@@ -663,16 +669,19 @@ function validateMemberProfileFields(body) {
   const vEmail = body.email !== undefined
     ? str(body.email, 'Email', { max: MAX_TITLE, required: false })
     : { value: undefined, error: null };
+  // Ohne Jahr (#2095) weicht das Jahr dem Platzhalter, bevor geprueft wird.
+  const vYearUnknown = validateYearUnknown(body.birth_year_unknown, 'birth_year_unknown');
   const vBirthDate = body.birth_date !== undefined
-    ? validateDate(body.birth_date, 'Birthday date')
+    ? validateDate(birthDateInput(body.birth_date, vYearUnknown.value === true), 'Birthday date')
     : { value: undefined, error: null };
   return {
     values: {
       phone: vPhone.value,
       email: vEmail.value,
       birth_date: vBirthDate.value,
+      birth_year_unknown: vYearUnknown.value,
     },
-    errors: collectErrors([vPhone, vEmail, vBirthDate]),
+    errors: collectErrors([vPhone, vEmail, vYearUnknown, vBirthDate]),
   };
 }
 
@@ -681,6 +690,7 @@ function syncFamilyMemberArtifacts(database, userId, {
   phone = undefined,
   email = undefined,
   birthDate = undefined,
+  birthYearUnknown = undefined,
   avatarData = undefined,
   actorUserId,
 } = {}) {
@@ -742,6 +752,24 @@ function syncFamilyMemberArtifacts(database, userId, {
           updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
       WHERE id = ?
     `).run(name, birthDate ?? null, photo ?? null, birthday.id);
+    // "JAHR UNBEKANNT" (#2095). Der Aufrufer entscheidet, wenn er das Feld
+    // schickt: `true` setzt die Marke (ein gespeichertes Jahr weicht dem
+    // Platzhalter), `false` nimmt sie ab - auch bei unveraendertem Datum, denn
+    // wer wirklich im Jahr 2000 geboren ist, schickt genau dieses. Nur ein
+    // Client OHNE das Feld (er kennt es nicht) behaelt die Marke, solange kein
+    // anderes Datum kommt: sonst wuerde sein zurueckgeschicktes
+    // Platzhalterjahr still zum Geburtsjahr. Geschrieben wird nur, was sich
+    // aendert.
+    const storedUnknown = birthday.year_unknown === 1;
+    const newDate = !!birthDate && birthDate !== birthday.birth_date;
+    const wantUnknown = birthYearUnknown !== undefined
+      ? birthYearUnknown
+      : storedUnknown && !newDate;
+    if (wantUnknown !== storedUnknown) {
+      const current = database.prepare('SELECT birth_date FROM birthdays WHERE id = ?').get(birthday.id).birth_date;
+      database.prepare('UPDATE birthdays SET year_unknown = ?, birth_date = ? WHERE id = ?')
+        .run(wantUnknown ? 1 : 0, wantUnknown ? placeholderBirthDate(current) : current, birthday.id);
+    }
     const updated = database.prepare('SELECT * FROM birthdays WHERE id = ?').get(birthday.id);
     syncBirthdayArtifacts(database, updated);
     return;
@@ -752,6 +780,10 @@ function syncFamilyMemberArtifacts(database, userId, {
       INSERT INTO birthdays (name, birth_date, photo_data, created_by, family_user_id)
       VALUES (?, ?, ?, ?, ?)
     `).run(name, birthDate, photo ?? null, actorUserId || userId, userId);
+    if (birthYearUnknown === true) {
+      database.prepare('UPDATE birthdays SET year_unknown = 1, birth_date = ? WHERE id = ?')
+        .run(placeholderBirthDate(birthDate), result.lastInsertRowid);
+    }
     const created = database.prepare('SELECT * FROM birthdays WHERE id = ?').get(result.lastInsertRowid);
     syncBirthdayArtifacts(database, created);
   }
@@ -1005,6 +1037,12 @@ function requireAuth(req, res, next) {
       req.authScopes = [...DISPLAY_SCOPES];
       req.displayDeviceId = device.deviceId;
       req.displayShowsScreensaver = device.showScreensaver === true;
+      // DIE OFFLINE-FRIST RUECKT MIT JEDEM KONTAKT VOR (Folge von #2293). Der
+      // Service Worker legt sie neben die gecachten Listen; `/auth/me` nennt
+      // denselben Wert als `sessionExpiresAt`. Begruendung und Dauer bei
+      // `DISPLAY_OFFLINE_GRACE_MS`.
+      req.displayOfflineExpiresAt = displayOfflineExpiresAt();
+      res.set(OFFLINE_EXPIRES_HEADER, String(req.displayOfflineExpiresAt));
       // DAS COOKIE WIRD NACHDATIERT, ABER NICHT BEI JEDEM ZUGRIFF. Browser
       // kappen die Lebensdauer persistenter Cookies (Chromium: 400 Tage), eine
       // einmal geschriebene Jahreszahl haelt also nicht, was sie sagt - ein
@@ -1891,6 +1929,51 @@ export function buildResetRoutes(targetRouter, {
     }
   });
 
+  /**
+   * Darf das Konto hinter einem gueltigen Token sein Passwort jetzt noch neu
+   * setzen?
+   *
+   * Zwischen dem Ausstellen des Tokens und dem Einloesen kann der Admin das
+   * Konto auf SSO umgestellt oder die eingebaute Anmeldung abgeschaltet haben
+   * (#847). Ein noch gueltiger Token darf diese Entscheidung nicht ueberholen.
+   * Dasselbe fuer ein Konto, das zwischen Ausstellen und Einloesen deaktiviert
+   * wurde (#1381). Das Deaktivieren loescht seine Reset-Tokens; diese Pruefung
+   * haelt es auch fuer eines, das danach noch auftaucht. Geteilt von Einloesen
+   * und Vorabpruefung, damit beide dieselbe Antwort geben.
+   */
+  function accountAcceptsReset(userId) {
+    return (isPasswordLoginEnabled(getDb()) || isSplitExpenseGuest(userId, getDb()))
+      && hasResettablePassword(userId)
+      && isActiveAccount(userId, { db: getDb() });
+  }
+
+  /**
+   * Vorabpruefung fuer die Seite "Neues Passwort" (Critique R22, D19): gilt
+   * der Link noch? Sonst zeigte sie ein Formular, dessen Absenden erst sagt,
+   * dass alles Eingetippte umsonst war.
+   *
+   * - Verbraucht den Token NIE, auch nicht fuer ein Konto, das keinen Reset
+   *   mehr annimmt - das bleibt dem Einloesen vorbehalten.
+   * - Dieselbe Ratenbegrenzung wie das Einloesen (`limiter`, gleicher Topf):
+   *   die Pruefung ist kein zweiter, freier Weg, Tokens durchzuprobieren.
+   * - Eine Antwort fuer unbekannt, abgelaufen, eingeloest und "Konto nimmt
+   *   keinen Reset an": `valid: false`, kein Name, kein Grund. Die Seite
+   *   braucht nur die eine Unterscheidung, und mehr gaebe dem Inhaber eines
+   *   Links Auskunft ueber ein Konto, die das Einloesen auch nicht gibt.
+   * - POST statt GET: der Token steht im Koerper, nicht in einer URL, die in
+   *   Zugriffslogs oder einem Cache landet.
+   */
+  targetRouter.post('/reset-password/check', limiter, (req, res) => {
+    try {
+      const { token } = req.body || {};
+      const userId = typeof token === 'string' && token ? resetService.verifyToken(token) : null;
+      res.json({ data: { valid: !!userId && accountAcceptsReset(userId) } });
+    } catch (err) {
+      log.error('reset-password check error:', err.message);
+      res.status(500).json({ error: 'Internal server error.', code: 500 });
+    }
+  });
+
   targetRouter.post('/reset-password', limiter, async (req, res) => {
     try {
       const { token, password } = req.body || {};
@@ -1904,17 +1987,9 @@ export function buildResetRoutes(targetRouter, {
       if (!userId) {
         return res.status(400).json({ error: 'Invalid or expired token.', code: 400 });
       }
-      // Zwischen dem Ausstellen des Tokens und dem Einloesen kann der Admin das
-      // Konto auf SSO umgestellt oder die eingebaute Anmeldung abgeschaltet
-      // haben (#847). Ein noch gueltiger Token darf diese Entscheidung nicht
-      // ueberholen. Bewusst dieselbe Meldung wie ein ungueltiger Token: der
-      // Unterschied ginge sonst an jemanden, der das Konto nicht besitzt.
-      // Dasselbe fuer ein Konto, das zwischen Ausstellen und Einloesen
-      // deaktiviert wurde (#1381). Das Deaktivieren loescht seine Reset-Tokens;
-      // diese Zeile haelt es auch fuer eines, das danach noch auftaucht.
-      if ((!isPasswordLoginEnabled(getDb()) && !isSplitExpenseGuest(userId, getDb()))
-          || !hasResettablePassword(userId)
-          || !isActiveAccount(userId, { db: getDb() })) {
+      // Bewusst dieselbe Meldung wie ein ungueltiger Token: der Unterschied
+      // ginge sonst an jemanden, der das Konto nicht besitzt.
+      if (!accountAcceptsReset(userId)) {
         resetService.consumeToken(token);
         return res.status(400).json({ error: 'Invalid or expired token.', code: 400 });
       }
@@ -2080,6 +2155,13 @@ export function buildInviteRoutes(targetRouter, {
     try {
       const invite = inviteService.verifyToken(String(req.query.token || ''));
       if (!invite) return res.json({ data: { valid: false } });
+      // WER EINLAEDT, STEHT AUF DER SEITE (Critique R24, G6-Zugang-P3-1): die
+      // Seite sagte nur "Du wurdest zu Yuvomi eingeladen" - ohne Haushalt, ohne
+      // Person. Der Anzeigename der einladenden Person ist alles, was der
+      // Inhaber eines gueltigen Links dafuer braucht, und nichts darueber hinaus
+      // (kein Benutzername, keine Rolle). Ein geloeschtes Konto nennt niemanden.
+      const inviter = invite.created_by == null ? null
+        : getDb().prepare('SELECT display_name FROM users WHERE id = ?').get(invite.created_by);
       res.json({
         // `password_required` sagt der /join-Seite, ob sie ueberhaupt nach einem
         // Passwort fragen soll (#847). Ohne die Angabe zeigte sie zwei
@@ -2089,6 +2171,7 @@ export function buildInviteRoutes(targetRouter, {
           valid: true,
           display_name: invite.display_name,
           username: invite.username,
+          invited_by: inviter?.display_name || null,
           password_required: isPasswordLoginEnabled(getDb()),
         },
       });
@@ -2678,14 +2761,33 @@ router.post('/setup', loginLimiter, async (req, res) => {
 });
 
 /**
+ * Der Ablauf, bis zu dem der Service Worker den Offline-Stand dieses Geraets
+ * halten darf: fuer eine Anmeldesitzung der Ablauf ihres Cookies, fuer ein
+ * Display seine gleitende Frist, sonst keiner (`null`, fail-closed).
+ */
+function sessionExpiresAtFor(req) {
+  if (req.authMethod === 'display') {
+    return Number.isFinite(req.displayOfflineExpiresAt) ? req.displayOfflineExpiresAt : null;
+  }
+  if (req.authMethod === 'session' && req.session.cookie?.expires instanceof Date) {
+    return req.session.cookie.expires.getTime();
+  }
+  return null;
+}
+
+/**
  * GET /api/v1/auth/me
  * Response: { user: { id, username, display_name, avatar_color, role } }
  */
 router.get('/me', requireAuth, (req, res) => {
   try {
+    // `sso_only` sagt dem EIGENEN Konto, ob es ohne Passwort gefuehrt wird
+    // (#1703): das Konto-Blatt laesst dann die Karte "Passwort aendern" weg,
+    // deren Pflichtfeld "Aktuelles Passwort" es fuer dieses Konto nicht gibt.
+    // Eine Zeile fuer beide Zweige darunter, Session und API-Token.
     const user = db.get()
-      .prepare(`SELECT ${USER_PUBLIC_COLUMNS} FROM users WHERE id = ?`)
-      .get(req.authUserId);
+      .prepare(`SELECT ${USER_PUBLIC_COLUMNS}, (password_hash = ?) AS sso_only FROM users WHERE id = ?`)
+      .get(OIDC_PASSWORD_SENTINEL, req.authUserId);
 
     if (!user) {
       if (req.authMethod === 'session' && typeof req.session.destroy === 'function') {
@@ -2746,6 +2848,16 @@ router.get('/me', requireAuth, (req, res) => {
       othersCanRead: othersCanRead(db.get(), user.id),
       ...gravatarClientState(user.id),
       csrfToken: req.session.csrfToken,
+      // Wann diese Sitzung ohne weitere Benutzung endet: der Ablauf, den der
+      // Browser fuer sein Session-Cookie zuletzt bekommen hat (bei der Anmeldung
+      // oder von refreshSessionCookieIfDue). Der Service Worker haelt den
+      // Offline-Abzug samt Listen nicht laenger (#2293, public/sw.js); ohne
+      // diesen Wert legt er keinen an. Ein Wanddisplay laeuft auf seinem
+      // eigenen Cookie, und das `req.session` daneben ist eine leere Huelle:
+      // es bekommt stattdessen seine gleitende Offline-Frist, jetzt + 72 h
+      // (`DISPLAY_OFFLINE_GRACE_MS`, gesetzt in `requireAuth`). Einen
+      // Sitzungsabzug legt der Worker fuer ein Display trotzdem nicht an.
+      sessionExpiresAt: sessionExpiresAtFor(req),
     });
   } catch (err) {
     log.error('/me error:', err);
@@ -3423,6 +3535,8 @@ router.post('/users', requireAuth, requireAdmin, csrfMiddleware, async (req, res
     if (!FAMILY_ROLES.includes(family_role)) {
       return res.status(400).json({ error: 'Invalid family role.', code: 400 });
     }
+    const colorError = validateColor(avatar_color, 'avatar_color').error;
+    if (colorError) return res.status(400).json({ error: colorError, code: 400 });
 
     const normalizedAvatarData = normalizeAvatarData(avatar_data);
     if (normalizedAvatarData?.error) {
@@ -3457,6 +3571,7 @@ router.post('/users', requireAuth, requireAdmin, csrfMiddleware, async (req, res
         phone: memberFields.values.phone,
         email: memberFields.values.email,
         birthDate: memberFields.values.birth_date,
+        birthYearUnknown: memberFields.values.birth_year_unknown,
         avatarData: normalizedAvatarData ?? null,
         actorUserId: req.authUserId,
       });
@@ -3532,6 +3647,8 @@ router.patch('/users/:id', requireAuth, requireAdmin, csrfMiddleware, async (req
     if (!FAMILY_ROLES.includes(familyRole)) {
       return res.status(400).json({ error: 'Invalid family role.', code: 400 });
     }
+    const colorError = validateColor(avatarColor, 'avatar_color').error;
+    if (colorError) return res.status(400).json({ error: colorError, code: 400 });
     if (avatarData?.error) {
       return res.status(400).json({ error: avatarData.error, code: 400 });
     }
@@ -3613,6 +3730,7 @@ router.patch('/users/:id', requireAuth, requireAdmin, csrfMiddleware, async (req
         phone: memberFields.values.phone,
         email: memberFields.values.email,
         birthDate: memberFields.values.birth_date,
+        birthYearUnknown: memberFields.values.birth_year_unknown,
         avatarData: avatarData ?? null,
         actorUserId: req.authUserId,
       });
@@ -3664,6 +3782,10 @@ router.patch('/me/profile', requireAuth, csrfMiddleware, (req, res) => {
     if (displayName.length > 128) {
       return res.status(400).json({ error: 'Display name may be at most 128 characters long.', code: 400 });
     }
+    // Die Farbe steht bei allen Mitgliedern in einem style-Attribut: nur #RRGGBB,
+    // sonst setzt sich ein Konto eine CSS-Deklaration in fremde Ansichten.
+    const colorError = validateColor(avatarColor, 'avatar_color').error;
+    if (colorError) return res.status(400).json({ error: colorError, code: 400 });
     if (avatarData?.error) {
       return res.status(400).json({ error: avatarData.error, code: 400 });
     }
@@ -3698,6 +3820,7 @@ router.patch('/me/profile', requireAuth, csrfMiddleware, (req, res) => {
         phone: memberFields.values.phone,
         email: memberFields.values.email,
         birthDate: memberFields.values.birth_date,
+        birthYearUnknown: memberFields.values.birth_year_unknown,
         avatarData: avatarData ?? null,
         actorUserId: req.authUserId,
       });

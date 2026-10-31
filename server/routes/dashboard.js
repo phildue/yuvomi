@@ -10,11 +10,13 @@ import { hydrateNotesWithCategories } from '../services/note-categories.js';
 import * as db from '../db.js';
 import { hydrateBirthdayOccurrences } from '../services/birthdays.js';
 import { getEventsOverlappingDays, getUpcomingEvents } from '../services/calendar-event-reader.js';
+import { resolveCalendarSelection } from '../services/calendar-selection.js';
 import { taskScopeWhere, taskCategoryWhere, categoryBindings, normalizeCategoryFilter } from '../services/task-scope.js';
 import { getCountdowns } from '../services/countdowns.js';
 import { listQuickLinksFor } from './quick-links.js';
 import {
-  asksHouseholdAudience, householdAudienceAnswer, householdAudienceShows, householdVisibleWhere, visibilityWhere,
+  asksHouseholdAudience, householdAudienceAnswer, householdAudienceShows, householdVisibleWhere, noteVisibleWhere,
+  visibilityWhere,
 } from '../services/visibility.js';
 import { resolveBudgetMode } from '../services/budget-visibility.js';
 import { hiddenModulesFor, requestHasCapability } from '../permissions.js';
@@ -35,6 +37,7 @@ import { activeCatalog, ledgerBalanceSql } from '../services/rewards.js';
 import { moneyParams, moneyReader, moneyVisibleSql } from '../services/reward-money.js';
 import { MEAL_COOK_COLUMNS_SQL, MEAL_COOK_JOIN_SQL } from '../services/meal-cook.js';
 import { clampEventLimit } from '../../public/utils/dashboard-event-limit.js';
+import { personAvatarUrlSql } from '../services/person-avatar.js';
 
 const log = createLogger('Dashboard');
 
@@ -182,7 +185,7 @@ function emptyBudget(month) {
 const ASSIGNED_USERS_SQL = `(
   SELECT json_group_array(json_object(
     'id', u.id, 'display_name', u.display_name, 'color', u.avatar_color,
-    'avatar_data', u.avatar_data
+    'avatar_data', ${personAvatarUrlSql('u')}
   ))
   FROM task_assignments ta JOIN users u ON u.id = ta.user_id
   WHERE ta.task_id = t.id
@@ -449,6 +452,29 @@ router.get('/', (req, res) => {
   // Allowlist, die der Browser mit dieser Route teilt. Alles andere - fehlend,
   // leer, `7`, `500`, `abc`, doppelt angegeben - ist die Vorgabe fuenf.
   const eventsLimit = clampEventLimit(req.query.events_limit);
+  /* WELCHE KALENDER DIE KACHEL ZEIGT (#2062, aus D#2037). `events_calendar`
+   * nennt Kalender-Schluessel (`local:N`, `cal:N`, `sub:N`, die des
+   * Kalendermoduls); ohne den Parameter bleibt alles, wie es war.
+   *
+   * DIE ACHSE DER ANDEREN KALENDER-OPTIONEN, nicht die der Einkaufs-Kachel:
+   * „nur meine" und die Geburtstage wirken auf die Termine der ganzen
+   * Uebersicht (Liste, Wochenstreifen, Heute-Blatt), und die Wand liest
+   * dieselbe Einstellung aus der Vorgabe des Haushalts. Eine Kalender-Auswahl,
+   * die nur die Liste traefe, liesse den Streifen derselben Kachel Termine
+   * zeigen, die die Liste verschweigt. Die Familienkarte bleibt ungefiltert:
+   * sie ist eine eigene Kachel und zeigt je Mitglied, was ansteht.
+   *
+   * GEPRUEFT WIRD GEGEN DEN KATALOG (services/calendar-selection.js), nicht nur
+   * die Form: ein Kalender, den es nicht mehr gibt, faellt aus der Auswahl, und
+   * bleibt keiner uebrig, gilt die Anfrage als ungefiltert - keine Auswahl
+   * heisst „alle", nie eine leere Kachel. Ohne Zugang zum Kalender laeuft
+   * keiner der Leser, die Auswahl bleibt also folgenlos. */
+  let eventCalendars = null;
+  try {
+    eventCalendars = resolveCalendarSelection(d, req.query.events_calendar, userId);
+  } catch (err) {
+    log.error('calendar selection error:', err.message);
+  }
 
   const now = new Date();
 
@@ -490,6 +516,18 @@ router.get('/', (req, res) => {
   // nicht die Module darin. Eine Kachel, deren Modul das Token nicht lesen darf,
   // kommt in derselben leeren Fassung wie bei einer Rollensperre.
   const denied = hiddenModulesFor(req, Object.keys(DENIED_PAYLOAD));
+  // Wand-Displays zeigen Mahlzeiten, Einkauf, Haushaltshilfe, Abfuhr und Vorrat
+  // (#1903): das Heute-Blatt auf der Wand braucht diese Quellen, aber das
+  // Display-Credential hat keinen Modulzugang. Die fuenf Schluessel werden VOR
+  // `modulesLeftOut` aus `denied` entfernt, NICHT danach aus `leftOut` - so
+  // wirkt der Haushaltsschalter weiter: hat ein Haushalt Mahlzeiten abgeschaltet,
+  // fuegt `modulesLeftOut` sie aus `householdDisabledModules` wieder hinzu.
+  const isDisplay = req.authMethod === 'display';
+  if (isDisplay && householdAudience) {
+    for (const key of ['meals', 'shopping', 'housekeeping', 'waste', 'pantry']) {
+      denied.delete(key);
+    }
+  }
   // UND DER HAUSHALTSSCHALTER (#1660, docs/DECISIONS.md 11). Bis dahin fragte
   // diese Stelle nur nach Rechten und Scopes: ein haushaltsweit abgeschaltetes
   // Modul lieferte seine Termine, Aufgaben, Buchungen und Medikamente weiter
@@ -534,7 +572,7 @@ router.get('/', (req, res) => {
     // Browser an der Uhr: ein Termin endet auch zwischen zwei Abrufen.
     result.upcomingEvents = serializeEvents(getUpcomingEvents(d, {
       userId, limit: eventsLimit, fromToday: true, assignedTo: eventsAssignedTo, includeBirthdays,
-      keepEndedToday: ENDED_TODAY_POOL, household: householdAudience,
+      keepEndedToday: ENDED_TODAY_POOL, household: householdAudience, calendars: eventCalendars,
     }), { database: d, viewer: documentViewer(req), actorId: userId, isAdmin: isAdminUser(req) });
   } catch (err) {
     log.error('upcomingEvents error:', err.message);
@@ -559,7 +597,7 @@ router.get('/', (req, res) => {
   if (allows('calendar')) try {
     result.weekEvents = serializeEvents(getEventsOverlappingDays(d, {
       userId, fromKey: shiftDateKey(todayLocalKey, -1), days: 9,
-      assignedTo: eventsAssignedTo, includeBirthdays, household: householdAudience,
+      assignedTo: eventsAssignedTo, includeBirthdays, household: householdAudience, calendars: eventCalendars,
     }), { database: d, viewer: documentViewer(req), actorId: userId, isAdmin: isAdminUser(req) })
       .map(weekEventFields);
   } catch (err) {
@@ -717,6 +755,8 @@ router.get('/', (req, res) => {
              -- entscheidet die Kachel ohne Nachfrage - eigenes zuerst, sonst das
              -- des Providers.
              r.provider_has_image AS recipe_has_image,
+             -- Version des Providerbildes fuer ?v= (#2048, routes/recipes.js).
+             r.provider_updated_at AS recipe_image_version,
              (r.image_data IS NOT NULL) AS recipe_has_own_image,
              -- Wer kocht (#1679): Name, Farbe und Bild neben der Mahlzeit, aus
              -- derselben Quelle wie im Planer.${MEAL_COOK_COLUMNS_SQL}
@@ -737,6 +777,17 @@ router.get('/', (req, res) => {
     log.error('todayMeals error:', err.message);
     result.todayMeals = [];
   }
+  // Displays zeigen nur, was die Wand-Zeile braucht: Datum, Typ, Titel und Koch.
+  // `notes` und `created_by` bleiben zurueck (#1903).
+  if (isDisplay && householdAudience && Array.isArray(result.todayMeals)) {
+    result.todayMeals = result.todayMeals.map(({
+      id, date, meal_type, title, recipe_id, cook_user_id, cook_name, cook_color,
+      recipe_has_image, recipe_has_own_image,
+    }) => ({
+      id, date, meal_type, title, recipe_id, cook_user_id, cook_name, cook_color,
+      recipe_has_image: recipe_has_image ?? null, recipe_has_own_image: recipe_has_own_image ?? null,
+    }));
+  }
 
   // Neueste Notizen (gepinnte zuerst, dann aktuellste)
   if (allows('notes')) try {
@@ -744,7 +795,7 @@ router.get('/', (req, res) => {
       SELECT n.*, u.display_name AS author_name, u.avatar_color AS author_color
       FROM notes n
       LEFT JOIN users u ON n.created_by = u.id
-      WHERE 1 = 1 ${noteCategoryAnd}
+      WHERE ${noteVisibleWhere('n', '@me')} ${noteCategoryAnd}
       ORDER BY n.pinned DESC, n.updated_at DESC
       -- FUENF, WEIL DIE KACHEL ZWEI HOCH SEIN DARF - dieselbe Korrektur, die
       -- die Geburtstage oben schon bekommen haben und bei der die Notizen
@@ -765,7 +816,7 @@ router.get('/', (req, res) => {
      * braucht deshalb eine eigene, echte Zahl. */
     result.pinnedNotesCount = d.prepare(`
       SELECT COUNT(*) AS n FROM notes n
-      WHERE n.pinned = 1 ${noteCategoryAnd}
+      WHERE n.pinned = 1 AND ${noteVisibleWhere('n', '@me')} ${noteCategoryAnd}
     `).get({ me: userId, ...noteCategoryBinds }).n;
     /* UND DIE MENGE, AUS DER DIE VORSCHAU SCHOEPFT - fuer die Badge und das
      * „+N weitere" der Kachel. `pinnedNotesCount` ist dafuer die falsche Zahl:
@@ -775,7 +826,7 @@ router.get('/', (req, res) => {
      * (#814: Filter vor Schnitt UND Zahl). */
     result.notesTotal = d.prepare(`
       SELECT COUNT(*) AS n FROM notes n
-      WHERE 1 = 1 ${noteCategoryAnd}
+      WHERE ${noteVisibleWhere('n', '@me')} ${noteCategoryAnd}
     `).get({ me: userId, ...noteCategoryBinds }).n;
   } catch (err) {
     log.error('pinnedNotes error:', err.message);
@@ -922,8 +973,12 @@ router.get('/', (req, res) => {
       // 1x2-Standardgroesse blieb darunter rund ein Drittel der Karte leer, weil
       // der Server gar nicht mehr hergab. Wie viele Zeilen wirklich erscheinen,
       // entscheidet die Kachel (`listRowCap` in public/pages/dashboard.js) - der
-      // Server liefert nur den Vorrat fuer die groesste Fassung.
-      .slice(0, 5);
+      // Server liefert nur den Vorrat fuer die groesste Fassung. ACHT seit U14:
+      // eine hohe Kachel, die die Packung streckt, zeigt im gewonnenen Platz
+      // weitere Zeilen (gemessen 1440px bis 93px, knapp zwei Zeilen). Die Liste
+      // ist schon sortiert im Speicher, drei Eintraege mehr kosten nichts; das
+      // Heute-Blatt liest daraus nur, was heute ist.
+      .slice(0, 8);
     result.birthdayCount = rows.length;
     // Die Liste zaehlt ANLAESSE (Geburtstag und Namenstag je eine Zeile),
     // `birthdayCount` die Personen. Badge und „+N weitere" der Kachel brauchen
@@ -1000,21 +1055,23 @@ router.get('/', (req, res) => {
       FROM budget_entries
       -- Erwartete, noch unbestaetigte Buchungen zaehlen nicht mit (#637), wie in
       -- Uebersicht, Statistik, Plan und Kontostand.
-      WHERE date BETWEEN ? AND ?${ownerClause} AND is_pending = 0
+      WHERE date BETWEEN ? AND ?${ownerClause} AND is_pending = 0 AND transfer_entry_id IS NULL
     `).get(from, to, ...ownerParams);
 
-    // Die drei groessten Ausgabenkategorien, nicht nur die groesste: die hohe
+    // Die groessten Ausgabenkategorien, nicht nur die groesste: die hohe
     // Budget-Kachel (1x2) fuellt damit ihre Hoehe mit Inhalt statt mit einem
-    // leeren Band ueber der Fusszeile (Critique 2026-09-23). Die erste bleibt
+    // leeren Band ueber der Fusszeile (Critique 2026-09-23). Sie zeigt drei;
+    // FUENF, weil eine gestreckte Kachel weitere zeigt (U14, Hoehe wird
+    // Inhalt) - dieselbe Gruppierung, nur zwei Zeilen mehr. Die erste bleibt
     // zusaetzlich als `topExpenseCategory`/`topExpenseAmount` stehen - die
     // flache Kachel und aeltere Clients lesen genau diese beiden Felder.
     const topExpenses = d.prepare(`
       SELECT category, SUM(amount) AS amount
       FROM budget_entries
-      WHERE amount < 0 AND date BETWEEN ? AND ?${ownerClause} AND is_pending = 0
+      WHERE amount < 0 AND date BETWEEN ? AND ?${ownerClause} AND is_pending = 0 AND transfer_entry_id IS NULL
       GROUP BY category
       ORDER BY ABS(SUM(amount)) DESC
-      LIMIT 3
+      LIMIT 5
     `).all(from, to, ...ownerParams);
     const topExpense = topExpenses[0];
 
@@ -1274,7 +1331,6 @@ router.get('/', (req, res) => {
     log.error('housekeeping error:', err.message);
     result.housekeeping = { configured: false, present: false, presentSince: null, workerName: null, visitsThisMonth: 0, unpaidAmount: 0, lastVisit: null };
   }
-
   // Abfuhr fuer das Heute-Blatt: heute (Tonne raus) und morgen (heute Abend
   // rausstellen). Dieselbe Aufloesung wie Kachel, Modul und Kalender
   // (`getOccurrences`, invariant #3: nie doppelt), nur das Zwei-Tage-Fenster
@@ -1332,6 +1388,14 @@ router.get('/', (req, res) => {
   } catch (err) {
     log.error('pantryExpiring error:', err.message);
     result.pantryExpiring = null;
+  }
+  // Displays erhalten nur den Namen: Menge, Einheit und Ort sind interne
+  // Kennzahlen und gehoeren nicht an die Wand (#1903).
+  if (isDisplay && householdAudience && Array.isArray(result.pantryExpiring?.todayItems)) {
+    result.pantryExpiring = {
+      ...result.pantryExpiring,
+      todayItems: result.pantryExpiring.todayItems.map(({ name }) => ({ name })),
+    };
   }
 
   // „Heute dran"-Karte: pro Mitglied die Zahl der heute fälligen oder über-

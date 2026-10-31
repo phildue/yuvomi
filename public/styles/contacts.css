@@ -54,21 +54,23 @@
  * es schon traegt) und die Desktop-Kappung, die genau dieses Polster
  * gegenrechnete.
  * -------------------------------------------------------- */
-.contacts-filters:empty {
+/* DIE REIHE HAELT IHREN PLATZ, BIS DIE DATEN DA SIND (R23). Leer ist sie,
+ * solange die Kontakte laden, und erschien dann mit ihren Chips: die Liste
+ * darunter rutschte um die Hoehe der Reihe nach unten (390x844: y 65 -> 129,
+ * Layout-Shift 0,068 bei 4x CPU; 1440: 0,013). `data-pending` steht im Markup
+ * und faellt beim ersten Zeichnen mit Daten (renderCategoryFilters); erst dann
+ * entscheidet, ob es Chips gibt. Ein Adressbuch mit weniger als zwei
+ * Kategorien rueckt dann einmal nach oben - der seltene Fall statt des
+ * haeufigen. */
+.contacts-filters:empty:not([data-pending]) {
   display: none;
 }
 
-/* AM ZEIGERGERAET BRICHT DIE REIHE UM (R10 L8, A5 P2-6). Eine Maus hat keine
- * waagerechte Geste: in der 424px-Listenspur standen bei 1440 nur vier von
- * zehn Chips sichtbar, der Rest hinter einem Scroller ohne Balken. Mit nur
- * belegten Kategorien (contacts.js) sind es wenige, und die passen in zwei
- * Reihen. Am Finger bleibt der Querscroller - dort ist Wischen die Geste. */
-@media (hover: hover) and (pointer: fine) {
-  .contacts-filters {
-    flex-wrap: wrap;
-    overflow-x: visible;
-  }
-}
+/* EINE REIHE IN JEDER BREITE (Critique R22, D20). Am Zeigergeraet brach sie
+ * seit R10 L8 in zwei Reihen um (1280/1440: rund 48px mehr Kopf ueber der
+ * Liste). Jetzt scrollt sie wie mobil: Fade an der Kante (`wireScrollFade`),
+ * das Mausrad bewegt sie waagerecht (`wireWheelToRow` in contacts.js), die
+ * Tastatur holt den fokussierten Chip ins Bild. `test:contacts-list-detail`. */
 
 /* Die Reihe endet an der Lesekante wie die Gruppen darunter: im Port ist sie
  * so breit wie der Port (1156px bei 1440), die Traeger aber kappen aufs
@@ -170,6 +172,29 @@
 
 .contact-item:hover {
   background-color: var(--color-surface-2);
+}
+
+/* LANGE LISTEN RECHNEN NUR, WAS IN SICHT IST (Modern-Web-Guidance-Audit,
+ * Befund 18; Guide defer-rendering-heavy-content). 500 Kontakte sind 22.000
+ * Knoten; der Wechsel nach /contacts hielt die Seite bei 4x CPU 781 ms am
+ * Stueck, mit dieser Regel 568 ms. Zeilen ausserhalb der Sicht ueberspringt
+ * der Browser, bis sie in die Naehe kommen; `auto` merkt sich danach die
+ * echte Hoehe - der Bildlaufbalken springt nicht. Fokusringe liegen in der
+ * Zeile innen und bleiben ganz (im Browser geprueft). Ohne Unterstuetzung
+ * bleibt alles, wie es war.
+ *
+ * ERST AB ZEILE 20, UND DER PLATZHALTER IST DIE CONTENT-BOX (Critique R22, D4).
+ * `contain-intrinsic-size` gilt der Content-Box; hier standen die 65px der
+ * ganzen Zeile, die mit 16px Polster als 81 statt 64 lag. Beim Aufbau
+ * schrumpften die Zeilen an der Falz in den ersten Frames und zogen die
+ * Gruppen darunter hoch: CLS 0,098 mobil bei 4x CPU, 0,018 am Desktop. Die
+ * ersten 19 Zeilen einer Gruppe stehen immer (sie sind die Falz), der Rest
+ * haelt seine echte Content-Hoehe (48px, gemessen 390 und 1280px). */
+@supports (content-visibility: auto) and (contain-intrinsic-size: auto none auto 1px) {
+  .contact-group__list > .contact-item:nth-child(n+20) {
+    content-visibility: auto;
+    contain-intrinsic-size: auto none auto 48px;
+  }
 }
 
 /* --------------------------------------------------------
@@ -306,7 +331,6 @@
   display: flex;
   align-items: baseline;
   gap: var(--space-1);
-  font-size: var(--text-sm);
   color: var(--color-text-secondary);
   margin-top: 1px;
   min-width: 0;
@@ -357,7 +381,7 @@
 }
 
 /* Zeilen-Aktionen (Anrufen/Mehr) nutzen die geteilte .row-action-Grammatik aus
- * layout.css (Audit F1). Anrufen trägt row-action--success (grün, semantisch);
+ * layout.css (Audit F1), seit R23 auch Anrufen neutral wie jede Zeilenaktion;
  * der tel:-Link braucht nur noch text-decoration: none. */
 .contact-item__actions .row-action[href] {
   text-decoration: none;
@@ -397,10 +421,12 @@
 /* Vor- und Nachname sind ein Feldpaar (#535): die Legende trägt die
    Pflicht-Markierung für beide zusammen ("Name *"), die Einzel-Labels bleiben
    unmarkiert - Pflicht ist die Gruppe, nicht jedes Feld. */
+/* Ohne eigene Marge: der Dialog-Rumpf setzt den Feldtakt per `gap` (layout.css,
+   "EIN FELDTAKT IM DIALOG"); die 16px hier standen darauf - 32px am Desktop. */
 .contact-modal__name-group {
   border: none;
   padding: 0;
-  margin: 0 0 var(--space-4);
+  margin: 0;
   min-width: 0;
 }
 
@@ -425,8 +451,10 @@
     gap: var(--space-1);
   }
 
+  /* 24px wie gedacht: Rumpf-Luecke (--space-4) plus --space-2. Die alte
+     --space-6 stand auf der Luecke und ergab 40px. */
   .contact-modal__name-group {
-    margin-bottom: var(--space-6);
+    margin-bottom: var(--space-2);
   }
 }
 
@@ -614,6 +642,7 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
+  container: contact-mv / inline-size;
 }
 
 .contact-mv-row {
@@ -639,8 +668,30 @@
   .contact-mv-row { transition: none; }
 }
 
+/* "+ Telefonnummer hinzufuegen" ist eine leise Zeilenaktion an der Kante der
+ * Felder, kein Knopf ueber die volle Breite (Critique R24 G5-Kontakte-P3-3):
+ * mittig und 486px breit las er sich wie die Hauptaktion des Dialogs. */
 .contact-mv-add {
+  align-self: flex-start;
   margin-top: var(--space-2);
+  margin-inline-start: calc(-1 * var(--space-2));
+}
+
+/* SCHMAL STEHT DAS LABEL UNTER DEM WERT (R21 S7, Critique a3). In der
+ * 1:1,6-Teilung blieben dem Labelfeld mobil 122px, und sein Platzhalter
+ * "Label (z. B. Arbeit)" brauchte 162 - er endete als "Label (z. B. A"; es
+ * "Etiqueta (p. ej. trabajo)" noch frueher. Unter 28rem Listenbreite steht
+ * das Label deshalb in einer eigenen Zeile unter dem Wert, so breit wie er;
+ * Entfernen bleibt neben dem Wert. */
+@container contact-mv (max-width: 27.99rem) {
+  .contact-mv-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .contact-mv-row > .contact-mv-row__label {
+    grid-column: 1;
+    grid-row: 2;
+  }
 }
 
 /* Telefon-Tipphilfe (AsYouType-Vorschau / Plausibilitäts-Hinweis). Rein visuell,
@@ -693,6 +744,16 @@
   color: var(--color-text-primary);
   text-decoration: none;
   overflow-wrap: anywhere;
+}
+
+/* DIE TREFFERFLAECHE WAECHST, NICHT DER ABSTAND ZUM LABEL (R21 S7, Critique
+ * a3). Das 44px-Ziel stellte den ersten Wert mit seinem halben Ueberstand
+ * unter das Label: Label -> Wert 20px bei Telefon, E-Mail und Adresse, 8px
+ * bei Kategorie und Notizen im selben Blatt. Der erste Link zieht seinen
+ * Ueberstand oben zurueck (negativer Rand, Rezept aus tokens.css); die Ziele
+ * untereinander behalten ihren Abstand. */
+.contact-detail__value:first-child > .contact-detail__link {
+  margin-block-start: calc((var(--line-height-base) * 1em - var(--target-base)) / 2);
 }
 
 .detail-row:has(.contact-detail__link) > .detail-row__icon {
@@ -752,7 +813,6 @@
 
 .contact-card__sub {
   margin: 0;
-  font-size: var(--text-sm);
   color: var(--color-text-secondary);
   overflow-wrap: anywhere;
 }
@@ -817,3 +877,14 @@
    @container-Kappung auf die Bahnbreite (424px bei 1440), die gegen die
    Shell-Regel (0,2,1) ohnehin nicht mehr ankam. test-contacts-list-detail.js
    haelt die Ungleichung. */
+
+/* IM AUSWAHLMODUS TRITT DAS MENUE AB (R23, Critique G5 P2). Neben Suche,
+ * „Abbrechen" und „..." blieben dem Titel bei 390px 108px - „Kont...". Sein
+ * einziger Eintrag fuer diesen Moment („Auswaehlen") ist gesperrt, die
+ * anderen (Kategorien, Import, Export) gehoeren nicht in eine Auswahl;
+ * „Abbrechen" steht an seiner Stelle am Ende der Zeile, wie in Apples Listen
+ * im Bearbeiten-Modus. Beim Verlassen kommt es zurueck und nimmt den Fokus
+ * (contacts.js exitSelectMode). */
+.contacts-page.is-selecting .contacts-toolbar .page-tools-btn {
+  display: none;
+}

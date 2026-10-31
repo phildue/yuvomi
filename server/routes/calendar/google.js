@@ -10,7 +10,9 @@ import express from 'express';
 import * as db from '../../db.js';
 import * as googleCalendar from '../../services/google-calendar.js';
 import { requireAdmin } from '../../auth.js';
-import { newNonMembers, nonMemberMessage } from '../../services/household-members.js';
+import {
+  assigneeFields, readDefaultAssignees, validateAssigneeIds, writeDefaultAssignees,
+} from '../../services/default-assignees.js';
 import {
   applyDefaultAssigneesToExisting,
   backfillCandidatesToken,
@@ -57,7 +59,7 @@ const router = express.Router();
 router.get('/google/auth', requireAdmin, refuseWhileRestoring, (req, res) => {
   try {
     const url = googleCalendar.getAuthUrl(req.session);
-    if (!url) return res.status(503).json({ error: 'Google nicht konfiguriert.', code: 503 });
+    if (!url) return res.status(503).json({ error: 'Google Calendar is not configured.', code: 503 });
     res.redirect(url);
   } catch (err) {
     log.error('', err);
@@ -74,7 +76,7 @@ router.get('/google/callback', refuseWhileRestoring, async (req, res) => {
   try {
     const { code, error, state } = req.query;
     if (error) return res.redirect('/settings?sync_error=google');
-    if (!code)  return res.status(400).json({ error: 'Kein Code erhalten.', code: 400 });
+    if (!code)  return res.status(400).json({ error: 'No authorization code received.', code: 400 });
 
     // OAuth CSRF-Schutz: state-Parameter validieren
     if (!state || !req.session.googleOAuthState || state !== req.session.googleOAuthState) {
@@ -110,7 +112,7 @@ router.post('/google/sync', requireAdmin, async (req, res) => {
 
 /**
  * GET /api/v1/calendar/google/status
- * Response: { configured, connected, lastSync }
+ * Response: { configured, connected, lastSync, missingEnv, redirectUri, ... }
  */
 router.get('/google/status', (req, res) => {
   try {
@@ -120,11 +122,13 @@ router.get('/google/status', (req, res) => {
     // in sich - `calendar:read` reicht bis hierher, weil der Pfad-Guard am
     // ersten Segment urteilt. Dieselbe Regel wie bei /caldav/status und
     // /outlook/status, an den Scopes gemessen und nicht am Kontotyp.
-    const { lastError, lastErrorAt, ...rest } = status;
+    // Fehlende Variablen und Rueckrufadresse sind Einrichtung des Haushalts
+    // (#2221) und gehen denselben Weg wie der Fehlertext.
+    const { lastError, lastErrorAt, missingEnv, redirectUri, ...rest } = status;
     res.json(integrationDetailsVisible(req) ? status : rest);
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -156,10 +160,10 @@ router.get('/google/calendars', requireAdmin, refuseWhileRestoring, async (req, 
 router.patch('/google/calendars', requireAdmin, async (req, res) => {
   const { calendarId, enabled } = req.body;
   if (!calendarId || typeof calendarId !== 'string' || calendarId.trim().length === 0) {
-    return res.status(400).json({ error: 'calendarId fehlt oder ist ungültig.', code: 400 });
+    return res.status(400).json({ error: 'calendarId is missing or invalid.', code: 400 });
   }
   if (typeof enabled !== 'boolean') {
-    return res.status(400).json({ error: 'enabled muss ein Boolean sein.', code: 400 });
+    return res.status(400).json({ error: 'enabled must be a boolean.', code: 400 });
   }
   try {
     // Abgelehntes Token (#2019): nichts an der Auswahl ändern, was der Sync
@@ -209,53 +213,51 @@ function knownCalendarName(source, externalId) {
  * aktualisiert beim Anlegen nur Name und Farbe (ON CONFLICT DO UPDATE), die
  * Zuweisung bleibt also stehen.
  *
- * Body: { source: 'google'|'apple'|'caldav', external_id: string, default_assignee_user_id: number|null }
- * Response: { data: { source, external_id, default_assignee_user_id } }
+ * MEHRERE PERSONEN (#1897): `default_assignee_user_ids` ersetzt die Menge des
+ * Kalenders (Join-Tabelle, Migration 265), die erste ist die primaere. Die
+ * Altform `default_assignee_user_id` (eine Person oder null) bleibt gueltig und
+ * setzt die Menge auf diese eine Person. Die Antwort traegt beides.
+ *
+ * Body: { source: 'google'|'apple'|'caldav', external_id: string,
+ *         default_assignee_user_ids?: number[], default_assignee_user_id?: number|null }
+ * Response: { data: { source, external_id, default_assignee_user_ids, default_assignee_user_id } }
  */
 router.patch('/external-calendars', requireAdmin, (req, res) => {
   try {
     const { source, external_id } = req.body;
     if (!['google', 'apple', 'caldav'].includes(source)) {
-      return res.status(400).json({ error: 'source muss google, apple oder caldav sein.', code: 400 });
+      return res.status(400).json({ error: 'source must be google, apple or caldav.', code: 400 });
     }
     if (typeof external_id !== 'string' || external_id.trim().length === 0) {
-      return res.status(400).json({ error: 'external_id fehlt oder ist ungültig.', code: 400 });
+      return res.status(400).json({ error: 'external_id is missing or invalid.', code: 400 });
     }
-    const raw = req.body.default_assignee_user_id;
-    const assignee = (raw === null || raw === undefined || raw === '') ? null : Number(raw);
-    if (assignee !== null && !Number.isInteger(assignee)) {
-      return res.status(400).json({ error: 'default_assignee_user_id muss eine Zahl oder null sein.', code: 400 });
-    }
-    if (assignee !== null && !db.get().prepare('SELECT 1 FROM users WHERE id = ?').get(assignee)) {
-      return res.status(400).json({ error: 'Unbekannte Nutzer-ID.', code: 400 });
-    }
-    // Neu nur Haushaltsmitglieder (#1207); die gespeicherte Zuweisung bleibt gueltig.
-    if (assignee !== null) {
-      const stored = db.get().prepare('SELECT default_assignee_user_id AS a FROM external_calendars WHERE source = ? AND external_id = ?').get(source, external_id)?.a;
-      const strangers = newNonMembers([assignee], { stored: stored == null ? [] : [stored] });
-      if (strangers.length) return res.status(400).json({ error: nonMemberMessage(strangers), code: 400 });
-    }
+    const d = db.get();
+    const row = d.prepare('SELECT id FROM external_calendars WHERE source = ? AND external_id = ?').get(source, external_id);
+    // Neu nur Haushaltsmitglieder (#1207); wer schon an dem Kalender steht, bleibt gueltig.
+    const stored = row ? readDefaultAssignees(d, 'calendar', row.id) : [];
+    const checked = validateAssigneeIds(d, req.body, { stored });
+    if (checked.error) return res.status(400).json({ error: checked.error, code: 400, reason: checked.reason });
+    // Ein Body ohne eines der Felder leert die Menge, wie frueher ein fehlendes Feld.
+    const ids = checked.present ? checked.ids : [];
 
-    const result = db.get().prepare(
-      'UPDATE external_calendars SET default_assignee_user_id = ? WHERE source = ? AND external_id = ?'
-    ).run(assignee, source, external_id);
-
-    if (result.changes === 0) {
+    let calendarId = row?.id;
+    if (!calendarId) {
       const name = knownCalendarName(source, external_id);
       if (!name) {
-        return res.status(404).json({ error: 'Kalender noch nicht synchronisiert.', code: 404 });
+        return res.status(404).json({ error: 'This calendar has not been synced yet.', code: 404 });
       }
       // Farbe bleibt offen: Sie gehört dem Provider, und der nächste Sync trägt
       // sie zusammen mit dem endgültigen Namen nach.
-      db.get().prepare(`
-        INSERT INTO external_calendars (source, external_id, name, color, default_assignee_user_id)
-        VALUES (?, ?, ?, NULL, ?)
-      `).run(source, external_id, name, assignee);
+      calendarId = Number(d.prepare(`
+        INSERT INTO external_calendars (source, external_id, name, color)
+        VALUES (?, ?, ?, NULL)
+      `).run(source, external_id, name).lastInsertRowid);
     }
-    res.json({ data: { source, external_id, default_assignee_user_id: assignee } });
+    writeDefaultAssignees(d, 'calendar', calendarId, ids);
+    res.json({ data: { source, external_id, ...assigneeFields(readDefaultAssignees(d, 'calendar', calendarId)) } });
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -277,16 +279,23 @@ function movedPreviewFields(d, viewerId, after = null) {
   const { total, before } = countMovedCandidates(d, { viewerId, after });
   const more = before + rows.length < total && rows.length > 0;
   return {
+    // Mengen (#1897): `from_user_ids`/`to_user_ids` mit ihren Namen. Die
+    // Einzelfelder tragen fuer Aufrufer der Altform die primaere Person und
+    // alle Namen in einem Text.
     moved: rows.map((m) => ({
       event_id: m.eventId,
       title: m.title,
       start_datetime: m.startDatetime,
       all_day: m.allDay,
       calendar_name: m.calendarName,
-      from_user_id: m.fromUserId,
-      from_name: m.fromName,
-      to_user_id: m.userId,
-      to_name: m.toName,
+      from_user_ids: m.fromUserIds,
+      from_names: m.fromNames,
+      to_user_ids: m.userIds,
+      to_names: m.toNames,
+      from_user_id: m.fromUserIds[0] ?? null,
+      from_name: m.fromNames.join(', '),
+      to_user_id: m.userIds[0] ?? null,
+      to_name: m.toNames.join(', '),
     })),
     moved_total: total,
     moved_offset: before,
@@ -294,27 +303,38 @@ function movedPreviewFields(d, viewerId, after = null) {
   };
 }
 
+/** Eine Menge aus einem Umzugseintrag: die Liste oder die Altform (eine Id). */
+function moveIds(list, single) {
+  const raw = list !== undefined ? list : (single !== undefined ? [single] : null);
+  if (!Array.isArray(raw) || !raw.length || raw.length > 100) return null;
+  if (!raw.every((v) => Number.isInteger(v) && v > 0)) return null;
+  return [...new Set(raw)];
+}
+
 /**
- * `moves` aus dem Body: eine Liste { event_id, from_user_id, to_user_id }, je
- * Termin hoechstens einmal und hoechstens movedCandidatesLimit.max Eintraege -
- * so viele, wie die Vorschau zeigt. Fehlt sie, ist nichts abgehakt.
- * @returns {{ eventId: number, fromUserId: number, userId: number }[] | { error: string }}
+ * `moves` aus dem Body: eine Liste { event_id, from_user_ids, to_user_ids }
+ * (oder, Altform, { event_id, from_user_id, to_user_id }), je Termin
+ * hoechstens einmal und hoechstens movedCandidatesLimit.max Eintraege - so
+ * viele, wie die Vorschau zeigt. Fehlt sie, ist nichts abgehakt.
+ * @returns {{ eventId: number, fromUserIds: number[], userIds: number[] }[] | { error: string }}
  */
 function parseMoves(raw) {
   if (raw === undefined || raw === null) return [];
-  if (!Array.isArray(raw)) return { error: 'moves ist ungültig.' };
+  if (!Array.isArray(raw)) return { error: 'moves is invalid.' };
   const max = movedCandidatesLimit.max;
-  if (raw.length > max) return { error: `moves nimmt höchstens ${max} Termine je Bestätigung an.` };
-  const invalid = { error: 'moves ist ungültig.' };
+  if (raw.length > max) return { error: `moves takes at most ${max} events per confirmation.` };
+  const invalid = { error: 'moves is invalid.' };
   const seen = new Set();
   const moves = [];
   for (const item of raw) {
     if (!item || typeof item !== 'object') return invalid;
-    const { event_id: eventId, from_user_id: fromUserId, to_user_id: userId } = item;
-    if (![eventId, fromUserId, userId].every((v) => Number.isInteger(v) && v > 0)) return invalid;
+    const { event_id: eventId } = item;
+    const fromUserIds = moveIds(item.from_user_ids, item.from_user_id);
+    const userIds = moveIds(item.to_user_ids, item.to_user_id);
+    if (!Number.isInteger(eventId) || eventId < 1 || !fromUserIds || !userIds) return invalid;
     if (seen.has(eventId)) return invalid;
     seen.add(eventId);
-    moves.push({ eventId, fromUserId, userId });
+    moves.push({ eventId, fromUserIds, userIds });
   }
   return moves;
 }
@@ -340,7 +360,7 @@ router.get('/external-calendars/default-assignee-backfill', requireAdmin, (req, 
     let after = null;
     if (req.query.moved_after !== undefined) {
       after = parseMovedCursor(req.query.moved_after);
-      if (!after) return res.status(400).json({ error: 'moved_after ist ungültig.', code: 400 });
+      if (!after) return res.status(400).json({ error: 'moved_after is invalid.', code: 400 });
     }
     const d = db.get();
     const candidates = listBackfillCandidates(d);
@@ -351,7 +371,7 @@ router.get('/external-calendars/default-assignee-backfill', requireAdmin, (req, 
     } });
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -383,19 +403,19 @@ router.get('/external-calendars/default-assignee-backfill', requireAdmin, (req, 
  * geschrieben.
  * Ohne `moves` wird kein Termin umgestellt.
  * Body: { expected_count: number, expected_token?: string,
- *         moves?: { event_id, from_user_id, to_user_id }[] }
+ *         moves?: { event_id, from_user_ids, to_user_ids }[] } (Altform: from_user_id, to_user_id)
  * Response: { data: { assigned } } | 409 { data: { count, token, moved, moved_total, moved_offset, moved_next } }
  */
 router.post('/external-calendars/default-assignee-backfill', requireAdmin, async (req, res) => {
   try {
     const expected = req.body?.expected_count;
     if (!Number.isInteger(expected) || expected < 0) {
-      return res.status(400).json({ error: 'expected_count fehlt oder ist ungültig.', code: 400 });
+      return res.status(400).json({ error: 'expected_count is missing or invalid.', code: 400 });
     }
     const expectedToken = req.body?.expected_token;
     if (expectedToken !== undefined && expectedToken !== null
       && (typeof expectedToken !== 'string' || !/^[0-9a-f]{64}$/.test(expectedToken))) {
-      return res.status(400).json({ error: 'expected_token ist ungültig.', code: 400 });
+      return res.status(400).json({ error: 'expected_token is invalid.', code: 400 });
     }
     const moves = parseMoves(req.body?.moves);
     if (!Array.isArray(moves)) {
@@ -412,7 +432,7 @@ router.post('/external-calendars/default-assignee-backfill', requireAdmin, async
     const token = backfillCandidatesToken(candidates);
     if (candidates.length !== expected || (expectedToken && expectedToken !== token) || !movesOffered) {
       return res.status(409).json({
-        error: 'Die Termine haben sich seit der Zählung geändert.',
+        error: 'The events have changed since they were counted.',
         code: 409,
         data: { count: candidates.length, token, ...movedPreviewFields(d, viewerId) },
       });
@@ -420,7 +440,7 @@ router.post('/external-calendars/default-assignee-backfill', requireAdmin, async
     res.json({ data: { assigned: await applyDefaultAssigneesToExisting(d, [...candidates, ...moves], { viewerId }) } });
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -438,7 +458,7 @@ router.delete('/google/disconnect', requireAdmin, (req, res) => {
     res.json({ ok: true, removed });
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -456,7 +476,7 @@ router.delete('/google/mirrored-events', requireAdmin, (req, res) => {
     res.json({ data: { removed: googleCalendar.clearMirroredEvents() } });
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -469,7 +489,7 @@ router.delete('/google/mirrored-events', requireAdmin, (req, res) => {
 router.put('/google/readonly', requireAdmin, (req, res) => {
   const { readonly } = req.body;
   if (typeof readonly !== 'boolean') {
-    return res.status(400).json({ error: 'readonly muss ein Boolean sein.', code: 400 });
+    return res.status(400).json({ error: 'readonly must be a boolean.', code: 400 });
   }
   try {
     googleCalendar.setReadonly(readonly);

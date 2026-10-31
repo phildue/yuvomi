@@ -563,10 +563,12 @@ test('synced calendars: a new ICS subscription default assignee must be a househ
 
 test('synced calendars: a stored ICS subscription assignee stays saveable, a new guest does not', async () => {
   const subId = Number(db.prepare(`
-    INSERT INTO ics_subscriptions (name, url, color, created_by, default_assignee_user_id)
-    VALUES ('Verein', 'https://example.org/verein.ics', '#654321', ?, ?)
-  `).run(ANNA, CLARA).lastInsertRowid);
-  const assignee = () => db.prepare('SELECT default_assignee_user_id AS a FROM ics_subscriptions WHERE id = ?').get(subId).a;
+    INSERT INTO ics_subscriptions (name, url, color, created_by)
+    VALUES ('Verein', 'https://example.org/verein.ics', '#654321', ?)
+  `).run(ANNA).lastInsertRowid);
+  // Die Standard-Personen stehen seit #1897 in der Join-Tabelle (Migration 265).
+  db.prepare('INSERT INTO ics_subscription_assignees (subscription_id, user_id) VALUES (?, ?)').run(subId, CLARA);
+  const assignee = () => db.prepare('SELECT user_id AS a FROM ics_subscription_assignees WHERE subscription_id = ?').get(subId)?.a;
 
   const kept = await call('PATCH', `/calendar/subscriptions/${subId}`, { body: { name: 'Verein neu', default_assignee_user_id: CLARA } });
   assert.equal(kept.status, 200, JSON.stringify(kept.body));
@@ -579,9 +581,10 @@ test('synced calendars: a stored ICS subscription assignee stays saveable, a new
 
 test('synced calendars: an external calendar default assignee (Google, Apple, CalDAV)', async () => {
   const target = { source: 'google', external_id: 'haus@group.calendar.google.com' };
-  db.prepare('INSERT INTO external_calendars (source, external_id, name, default_assignee_user_id) VALUES (?, ?, ?, ?)')
-    .run(target.source, target.external_id, 'Haus', CLARA);
-  const assignee = () => db.prepare('SELECT default_assignee_user_id AS a FROM external_calendars WHERE external_id = ?').get(target.external_id).a;
+  const calId = Number(db.prepare('INSERT INTO external_calendars (source, external_id, name) VALUES (?, ?, ?)')
+    .run(target.source, target.external_id, 'Haus').lastInsertRowid);
+  db.prepare('INSERT INTO external_calendar_assignees (calendar_id, user_id) VALUES (?, ?)').run(calId, CLARA);
+  const assignee = () => db.prepare('SELECT user_id AS a FROM external_calendar_assignees WHERE calendar_id = ?').get(calId)?.a;
 
   const kept = await call('PATCH', '/calendar/external-calendars', { body: { ...target, default_assignee_user_id: CLARA } });
   assert.equal(kept.status, 200, JSON.stringify(kept.body));
@@ -691,7 +694,7 @@ test('calendar: an occurrence that owns its attendees is the stored state, not t
   const seriesId = addSeries('Einkauf', '2030-08-01T09:00:00', [CLARA]);
   const removed = await call('PUT', `/calendar/${seriesId}/occurrences/2030-08-03`, { body: { assigned_to: [BEN] } });
   assert.equal(removed.status, 200, JSON.stringify(removed.body));
-  const child = db.prepare('SELECT id, overridden_fields FROM calendar_events WHERE recurrence_parent_id = ? AND recurrence_id = ?').get(seriesId, '2030-08-03');
+  const child = db.prepare('SELECT id, overridden_fields FROM calendar_events WHERE recurrence_parent_id = ? AND recurrence_id = ?').get(seriesId, '2030-08-03T09:00:00');
   assert.match(String(child?.overridden_fields), /assignments/, 'Vorbedingung: das Vorkommen besitzt seine Zuweisungen');
   assert.deepEqual(assignedIds('event_assignments', 'event_id', child.id), [BEN]);
 

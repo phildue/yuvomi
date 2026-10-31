@@ -44,7 +44,7 @@ export const NAVIGATE_DEPS = Object.freeze([
   'hasLeaveGuard', 'mayLeave', 'whenHistorySettled', 'consumeOverlayMarker',
   // Sitzung
   'auth', 'syncPreferencesOnce', 'startThirdPartyModulePolling', 'loadReminderStyles', 'initReminders', 'initPush',
-  'armScreensaver', 'showSessionUnreachable',
+  'armScreensaver', 'showSessionUnreachable', 'forgetSessionState', 'holdOfflineSession',
   // Seite
   'rememberScrollPosition', 'scrollPositionFor', 'renderPage', 'adoptPageFab', 'updateNav', 'topLevelSection',
   'syncWallMode', 'applyModuleAccentForRoute', 'updateThemeColorForRoute', 'updateBranding',
@@ -68,6 +68,15 @@ export function prefetchPathOf(dataset) {
   if (typeof target !== 'string') return null;
   return target.split(/[?#]/)[0] || null;
 }
+
+/**
+ * So lange wartet die Navigation hoechstens auf den Tausch, bevor sie den
+ * Tipp vorab quittiert (Critique R22, D1) - dieselbe Frist, die das alte Bild
+ * auf den ersten Render wartet (`FIRST_RENDER_WAIT_MS` in
+ * utils/view-transition.js; dieses Modul importiert nichts, test:motion haelt
+ * beide gleich).
+ */
+export const NAV_ACK_MS = 150;
 
 /** Grund eines ueberholten Seitenaufbaus - einmal erzeugt, ohne Stapel der Navigation. */
 const NAVIGATION_SUPERSEDED = typeof DOMException === 'function'
@@ -197,7 +206,7 @@ export function createNavigate(state, deps) {
     location, history, window, document,
     hasLeaveGuard, mayLeave, whenHistorySettled, consumeOverlayMarker,
     auth, syncPreferencesOnce, startThirdPartyModulePolling, loadReminderStyles, initReminders, initPush,
-    armScreensaver, showSessionUnreachable,
+    armScreensaver, showSessionUnreachable, forgetSessionState, holdOfflineSession,
     rememberScrollPosition, scrollPositionFor, renderPage, adoptPageFab, updateNav, topLevelSection,
     syncWallMode, applyModuleAccentForRoute, updateThemeColorForRoute, updateBranding,
     focusMainContentAfterNavigation, showToast, t,
@@ -341,6 +350,12 @@ export function createNavigate(state, deps) {
       if (typeof userOrPushState === 'object' && userOrPushState !== null) {
         state.currentUser = userOrPushState;
         state._setupRequired = false;
+        // EINMAL DIE SITZUNG ABFRAGEN, BEVOR DIE SEITE LAEDT (#2293). Nur die
+        // Antwort von `/auth/me` traegt den Sitzungsablauf, neben dem der
+        // Service Worker Listen ablegt (sw.js); ohne sie bliebe nach einer
+        // Anmeldung die ganze Sitzung ohne Offline-Stand. Ein Fehler hier
+        // haelt die Anmeldung nicht auf.
+        await auth.me().catch(() => null);
         // Ab hier gibt es jemanden, dessen Bildschirmschoner es sein kann
         // (#1919). VOR dem await: laeuft die Sitzung dabei ab, entschaerft
         // `auth:expired` ihn wieder. Fuer jedes Konto, auch Gast und Display.
@@ -447,13 +462,22 @@ export function createNavigate(state, deps) {
           // antwortet ihm mit seinem Konto.
           armScreensaver();
           await syncPreferencesOnce();
-          startThirdPartyModulePolling();
-          // currentUser kann während des await oben auf null gesetzt worden sein
-          // (auth:expired bei 401 von /preferences), daher Guard gegen null.
-          if (state.currentUser && !['split_guest', 'display'].includes(state.currentUser.access_scope)) {
-            loadReminderStyles();
-            initReminders();
-            initPush();
+          // KALTSTART OHNE VERBINDUNG (#2293). Der Service Worker antwortete mit
+          // dem Abzug der letzten Sitzung (sw.js API_SNAPSHOTS): die Seite zeigt
+          // den gespeicherten Stand, aber NIEMAND hat die Sitzung geprueft. Der
+          // Router sagt das an und prueft nach, sobald der Server antwortet;
+          // Erinnerungen, Push und Modulabfrage starten erst dann.
+          if (result?.offlineSnapshot === true) {
+            if (state.currentUser) holdOfflineSession();
+          } else {
+            startThirdPartyModulePolling();
+            // currentUser kann während des await oben auf null gesetzt worden sein
+            // (auth:expired bei 401 von /preferences), daher Guard gegen null.
+            if (state.currentUser && !['split_guest', 'display'].includes(state.currentUser.access_scope)) {
+              loadReminderStyles();
+              initReminders();
+              initPush();
+            }
           }
         } catch (err) {
           state.currentPath = null; // Reset damit navigate('/login') nicht geblockt wird
@@ -596,8 +620,15 @@ export function createNavigate(state, deps) {
           // Auch die Soft-Navigation wechselt den Inhalt (Settings-Blatt, Health-Tab)
           // und muss den Scrollport nachziehen - hier zwangsläufig NACH dem Render,
           // weil kein Teardown existiert, an den man sich hängen könnte.
+          //
+          // AUSSER, DAS MODUL HAT SEINEN STAND SELBST GESETZT (R23): update()
+          // antwortet dann `'own-scroll'`. Der Schichtplan stellt die Uebersicht
+          // beim Reiterwechsel auf die laufende Stunde und haelt einen
+          // angedockten Kopf angedockt - diese Zeile setzte beides danach auf 0
+          // zurueck (Kopf klappte auf, die Stunde war weg). Zurueck/Vor stellt
+          // weiter den gemerkten Stand her.
           const main = document.getElementById('main-content');
-          if (main) main.scrollTop = scrollTarget;
+          if (main && !(handled === 'own-scroll' && pushState)) main.scrollTop = scrollTarget;
           // Ein Tabwechsel kann einen neuen FAB anlegen (Health-Tabs) - der muss
           // denselben Weg aus dem Scrollport nehmen wie beim vollen Rendern.
           adoptPageFab();
@@ -622,18 +653,39 @@ export function createNavigate(state, deps) {
       // tokens.css, Wortlaut bei moduleAccentToken().
       applyModuleAccentForRoute(route);
 
-      // Optimistisches Chrome-Feedback: aktive Nav-Markierung + Indikator-Pille und
-      // Statusbar-Farbe schon VOR dem Modul-Render setzen, sobald die Shell existiert.
-      // So quittiert der Tap sofort (Pille gleitet, Akzent wechselt), während Modul-
-      // CSS und -Daten noch laden - statt erst nach Abschluss des Renders. Beim aller-
-      // ersten Laden wird die Shell erst in renderPage gebaut; dann greift allein die
-      // autoritative Aktualisierung danach.
-      if (document.querySelector('.nav-bottom')) {
-        updateNav(topLevelSection(basePath));
+      // Beim allerersten Laden wird die Shell erst in renderPage gebaut; dann
+      // greift allein die autoritative Aktualisierung nach dem Render.
+      //
+      // PILLE UND INHALT WECHSELN IM SELBEN FRAME (Critique R22, D1). Die Pille
+      // glitt seit dem Tipp und stand nach rund 120 ms am Ziel, der Inhalt kam
+      // 80-165 ms nach dem Tipp und blendete danach noch 200 ms - die Leiste
+      // meldete einen Ort, den der Inhalt noch nicht zeigte. Jetzt setzt der
+      // Tausch selbst die Navigation (`onSwap`, im Update-Callback der View
+      // Transition, also im Frame des neuen Inhalts), und die Pille springt.
+      // Quittiert ist der Tipp bis dahin durch den Druckzustand des Ziels. Laedt
+      // das Seitenmodul laenger als die Frist des alten Bildes (erster Besuch
+      // ueber ein langsames Netz), zieht die Navigation nach der Frist vorab
+      // nach - ein Tipp ohne sichtbare Antwort wirkt sonst wie ein Haenger.
+      const hasShell = Boolean(document.querySelector('.nav-bottom'));
+      let navShown = false;
+      const showNav = ({ instant = false } = {}) => {
+        clearTimeout(navAck);
+        if (navShown || run.signal.aborted) return;
+        navShown = true;
+        updateNav(topLevelSection(basePath), { instant });
         updateThemeColorForRoute(route);
-      }
+      };
+      const navAck = hasShell ? setTimeout(() => showNav(), NAV_ACK_MS) : null;
 
-      const shown = await renderPage(route, previousPath, scrollTarget, { signal: run.signal });
+      let shown;
+      try {
+        shown = await renderPage(route, previousPath, scrollTarget, {
+          signal: run.signal,
+          onSwap: hasShell ? () => showNav({ instant: true }) : null,
+        });
+      } finally {
+        clearTimeout(navAck);
+      }
       if (run.signal.aborted) {
         // Ueberholt. Hat renderPage() nichts gezeichnet (`false`), gilt die
         // Seite, die zu sehen ist, und der Eintrag dieser Navigation gehoert dem
@@ -672,12 +724,52 @@ export function createNavigate(state, deps) {
         state._pendingLoginRedirect = false;
         queued?.resolve();
         queued = null;
-        navigate('/login');
+        toSignIn();
       } else if (handOver) {
         startQueued();
       }
     }
   }
+
+  /**
+   * Nach einem Sitzungsende zur Anmeldung - es sei denn, die Seite, die steht,
+   * braucht gar keine Sitzung (#1945).
+   *
+   * DIE EINE STELLE, DIE DAS ENTSCHEIDET, fuer beide Wege: sofort aus
+   * `auth:expired` und nachgeholt im finally einer laufenden Navigation. Bis
+   * hierher fuehrten beide bedingungslos auf `/login`, und navigate() kennt
+   * keinen Ausstieg fuer dieselbe Adresse: es zeichnete die Anmeldeseite neu -
+   * ein halb getippter Name samt Passwort war weg (im Browser gemessen). Waehrend
+   * die Einrichtung aussteht, leitet `/login` auf `/setup` um und zeichnete diese
+   * Seite neu. Dasselbe gilt fuer jede oeffentliche Seite (`/join`, `/pair`,
+   * Passwort vergessen/zuruecksetzen): ohne Sitzung gibt es dort nichts, was
+   * eine Sitzung braeuchte, und das Formular bleibt stehen. Unbekannt (Kaltstart,
+   * noch keine Seite) heisst: zur Anmeldung, wie bisher.
+   *
+   * `currentPath` ist das ZIEL, nicht das Gezeichnete (Review #2070): laedt das
+   * Modul einer oeffentlichen Seite nicht, zeichnet renderPage() nur den Fehler
+   * in den Inhalt, und die Shell der Sitzung steht weiter. Ob sie steht, sagt
+   * `.nav-bottom` - dasselbe Zeichen, an dem renderPage() und navigate() sie
+   * erkennen. Steht sie, geht es zur Anmeldung, die sie abraeumt.
+   */
+  function toSignIn() {
+    const standing = allRoutes().find((r) => r.path === state.currentPath);
+    if (standing && !standing.requiresAuth && !document.querySelector('.nav-bottom')) return;
+    navigate('/login');
+  }
+
+  // Sitzung abgelaufen (api.js feuert das Ereignis vor dem Wurf eines 401).
+  // Der Listener steht HIER und nicht in router.js, damit der Test genau ihn
+  // ausloest und nicht eine Nachbildung (test/router-navigate-harness.js).
+  window.addEventListener('auth:expired', () => {
+    forgetSessionState();
+    if (state.isNavigating) {
+      // Waehrend einer Navigation nicht sofort: ihr finally holt es nach.
+      state._pendingLoginRedirect = true;
+    } else {
+      toSignIn();
+    }
+  });
 
   return navigate;
 }

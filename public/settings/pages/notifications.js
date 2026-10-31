@@ -4,8 +4,9 @@
 import { t } from '/i18n.js';
 import { pushSupported, pushStatus, enablePush, disablePush, repairPush } from '/push.js';
 import { api, notifications } from '/api.js';
-import { confirmModal } from '/components/modal.js';
+import { confirmModal, reportFieldErrors, constraintErrors } from '/components/modal.js';
 import { esc } from '/utils/html.js';
+import { emptyStateHTML } from '/utils/empty-state.js';
 import { getPwaInstallState } from '/utils/pwa-install.js';
 import { toggleRowHtml, settingSwitchRowHtml } from '/settings/components.js';
 
@@ -147,7 +148,11 @@ function renderChannelList(container, channels, providers = DEFAULT_PROVIDERS) {
   if (!list) return;
   list.replaceChildren();
   if (!channels.length) {
-    list.insertAdjacentHTML('beforeend', `<p class="form-hint">${t('settings.notificationChannelEmpty')}</p>`);
+    // DER LEERZUSTAND IST DER BAUSTEIN (R23 S11, Critique G6 P2): hier stand
+    // ein nackter Hinweissatz, jede andere leere Liste der Einstellungen
+    // zeigt den kompakten Leerzustand (modules-navigation.js). Der Anlegeweg
+    // steht darueber im Formular.
+    list.insertAdjacentHTML('beforeend', emptyStateHTML({ compact: true, description: t('settings.notificationChannelEmpty') }));
     return;
   }
   channels.forEach((rawChannel, index) => {
@@ -167,7 +172,7 @@ function renderChannelList(container, channels, providers = DEFAULT_PROVIDERS) {
     // genau dann nicht, wenn er gebraucht wird.
     const notReady = providerNotReady(providers, channel.provider);
     list.insertAdjacentHTML('beforeend', `
-      <form class="settings-card settings-form notification-channel-form" data-channel-index="${index}" data-channel-id="${esc(channel.id ?? '')}">
+      <form class="settings-card settings-form notification-channel-form" data-channel-index="${index}" data-channel-id="${esc(channel.id ?? '')}" novalidate>
         <h3 class="settings-card__title">${esc(channel.name || t('settings.notificationChannelAdd'))}</h3>
         <div class="form-field">
           <label class="form-label" for="notification-provider-${suffix}">${t('settings.notificationChannelProvider')}</label>
@@ -235,7 +240,7 @@ function renderChannelList(container, channels, providers = DEFAULT_PROVIDERS) {
           </div>
           <div class="form-field notification-ntfy-basic-field${channel.config.authType === 'basic' ? '' : ' settings-card--hidden'}">
             <label class="form-label" for="notification-ntfy-username-${suffix}">${t('settings.notificationChannelNtfyUsername')}</label>
-            <input class="form-input" id="notification-ntfy-username-${suffix}" name="ntfyUsername" autocomplete="username">
+            <input class="form-input" id="notification-ntfy-username-${suffix}" name="ntfyUsername" autocomplete="off">
           </div>
           <div class="form-field notification-ntfy-basic-field${channel.config.authType === 'basic' ? '' : ' settings-card--hidden'}">
             <label class="form-label" for="notification-ntfy-password-${suffix}">${t('settings.notificationChannelNtfyPassword')}</label>
@@ -386,6 +391,8 @@ async function setupChannelControls(container, user) {
     const form = event.target.closest?.('.notification-channel-form');
     if (!form) return;
     event.preventDefault();
+    // KEINE BROWSER-BLASEN (Critique R21): `novalidate`, die Regeln des Markups melden sich am Feld (constraintErrors, components/modal.js).
+    if (reportFieldErrors(constraintErrors(form))) return;
     const id = form.dataset.channelId;
     try {
       const body = readChannelForm(form);
@@ -508,10 +515,19 @@ export async function render(container, { user } = {}) {
     testBtn.addEventListener('click', async () => {
       testBtn.disabled = true;
       try {
-        const sendTest = () => api.post('/push/test', {
-          title: t('settings.pushTestTitle'),
-          body: t('settings.pushTestBody'),
-        });
+        const sendTest = async () => {
+          let endpoint;
+          try {
+            const reg = await navigator.serviceWorker.ready;
+            const sub = await reg.pushManager.getSubscription();
+            endpoint = sub?.endpoint;
+          } catch { /* ignore - push may not be set up */ }
+          return api.post('/push/test', {
+            title: t('settings.pushTestTitle'),
+            body: t('settings.pushTestBody'),
+            ...(endpoint ? { endpoint } : {}),
+          });
+        };
 
         // sent === 0 heisst: nichts zugestellt. Ohne diese Unterscheidung meldet
         // der Button Erfolg, obwohl kein Geraet erreicht wurde.
@@ -550,4 +566,4 @@ export async function render(container, { user } = {}) {
 // DOM-Ausschnitt und damit ohne Browser pruefbar. Sie hat zwei Fehler getragen,
 // die ein Textguard nicht gesehen haette: ein verstecktes `type="email"`, das
 // das Absenden blockiert, und einen Hinweis, der beim Anlegen nie erscheint.
-export const __test = { updateProviderVisibility, setBlockActive, providerNotReady, channelDefaults, usesBaseUrl, readChannelForm };
+export const __test = { updateProviderVisibility, setBlockActive, providerNotReady, channelDefaults, usesBaseUrl, readChannelForm, renderChannelList };

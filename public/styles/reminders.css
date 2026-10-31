@@ -90,11 +90,37 @@ button.toast__reminder-text:focus-visible {
   white-space: nowrap;
 }
 
+/* EINE MELDUNG IST EIN SATZ, KEIN NAME (#1912). Die Zeile darunter traegt
+ * sonst einen Titel und darf abschneiden; "Umzug zurueckgenommen" sagt Artikel,
+ * beide Listen und den Grund, abgeschnitten waere die Meldung nutzlos. Sie
+ * bricht deshalb ganz um, ohne Zeilengrenze: der laengste Satz (Frist, de)
+ * braucht im Desktop-Toast schon sieben Zeilen, und eine Grenze schnitte
+ * genau das Ende ab, das sagt, wann der Artikel wiederkommt. */
+.toast--sentence .toast__reminder-text span {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* Auf dem Telefon steht der Reminder-Toast ohne Innenabstand oben und unten
+ * (layout.css, die Zielgroesse traegt die Hoehe); ein Satz ueber mehrere
+ * Zeilen stiesse dort an die Kante. */
+@media (max-width: 767px) {
+  .toast.toast--reminder.toast--sentence {
+    padding-block: var(--space-2, 8px);
+  }
+}
+
 /* Reminder-Abschnitt in Modals */
 .reminder-section {
   border-top: 1px solid var(--color-border);
   padding-top: var(--space-4, 16px);
   margin-top: var(--space-4, 16px);
+}
+
+/* Im Gap-Behaelter ("Weitere Angaben") setzt die Luecke den Abstand ueber der
+ * Linie; die Marge stand darauf (32px ueber, 16px unter der Linie). */
+.form-advanced__body > .reminder-section {
+  margin-top: 0;
 }
 
 .reminder-section__header {
@@ -104,8 +130,12 @@ button.toast__reminder-text:focus-visible {
   margin-bottom: var(--space-3, 12px);
 }
 
-.reminder-section__title {
-  color: var(--color-text-primary);
+/* Der Schalter "Erinnerung setzen" ist seit R23 (D8) die Schalterzeile der
+ * Dialoge (formSwitchRowHtml) - sie fuellt die Kopfzeile, damit der Schalter
+ * wie jeder andere am Ende steht und nicht hinter dem Wort. */
+.reminder-section__header > .form-switch {
+  flex: 1;
+  min-width: 0;
 }
 
 /* Die Hinweiszeile im gesperrten Abschnitt gehoert zum SCHALTER UEBER IHR.
@@ -144,8 +174,4 @@ button.toast__reminder-text:focus-visible {
 
 .reminder-custom {
   margin-top: var(--space-3);
-}
-
-.reminder-custom[hidden] {
-  display: none !important;
 }

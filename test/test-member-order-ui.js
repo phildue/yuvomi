@@ -58,6 +58,8 @@ function fakeList() {
     replaceChildren() { this.html = ''; },
     insertAdjacentHTML(_position, markup) { this.html += markup; },
     appendChild() {},
+    // Die Mehr-Menues der Zeilen (#2152) haengen sich an die Liste.
+    addEventListener() {},
   };
 }
 
@@ -185,4 +187,128 @@ test('R20: Anlegen und Einladen nennen die Kinder-Startrechte genau bei der Roll
     assert.equal(hint.hidden, true);
     assert.equal(attrs['aria-describedby'], undefined, 'der Verweis geht mit dem Hinweis');
   }
+});
+
+// -------------------------------------------------------------------------
+// #1997: eine spaete Erfolgsantwort schliesst nur ihren EIGENEN Dialog
+// -------------------------------------------------------------------------
+
+// Kommt die Antwort erst, nachdem der Nutzer den Dialog geschlossen und einen
+// anderen geoeffnet hat, darf das force-Schliessen nur den eigenen treffen. Ob
+// der Slot noch denselben Dialog haelt, entscheidet closeModal({ context }) in
+// components/modal.js (am echten Modul gemessen in test-modal-dead-time.js);
+// hier zaehlt die Verdrahtung: beide Speichern-Wege der Familienseite reichen
+// den Kontext von VOR der Anfrage hinein. Gefahren wird je Weg der echte
+// Submit-Handler an einem Attrappen-Panel; die Anfrage wechselt den Kontext.
+
+/** Oeffnet einen Dialog ueber den Modal-Stub; liefert den Submit des Formulars `formSel`. */
+async function familyDialog(oeffne, formSel, werte = {}) {
+  let opts = null;
+  globalThis.__openModal = (o) => { opts = o; };
+  try { await oeffne(); } finally { delete globalThis.__openModal; }
+  assert.ok(opts, 'der Dialog wurde geoeffnet');
+  const handlers = {};
+  const els = {};
+  const el = (sel) => {
+    if (!els[sel]) {
+      els[sel] = {
+        value: '', checked: false, hidden: false, disabled: false, required: false, textContent: '', dataset: {}, style: {},
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+        setAttribute() {}, removeAttribute() {}, getAttribute: () => null,
+        addEventListener(type, fn) { handlers[`${sel}:${type}`] = fn; },
+        querySelector: (inner) => el(inner), querySelectorAll: () => [], focus() {},
+        replaceChildren() {}, insertAdjacentHTML() {}, appendChild() {},
+        ...werte[sel],
+      };
+    }
+    return els[sel];
+  };
+  opts.onSave({ querySelector: el, querySelectorAll: () => [], addEventListener() {} });
+  return () => handlers[`${formSel}:submit`]({ preventDefault() {} });
+}
+
+test('#1997: Erfolg nach Dialogwechsel - Mitglied anlegen und bearbeiten schliessen nur mit dem Kontext von VOR der Anfrage', async () => {
+  const { auth } = await import('/api.js');
+  const vorher = { createUser: auth.createUser, updateUser: auth.updateUser, window: globalThis.window };
+  const toasts = [];
+  globalThis.window = { ...vorher.window, yuvomi: { showToast: (text, kind) => toasts.push([text, kind]) } };
+  const container = { querySelector: () => null, querySelectorAll: () => [] };
+  const users = [person(1, 'Mara', { role: 'admin' }), person(2, 'Zoe')];
+  const NEU = {
+    '#new-username': { value: 'zoe' }, '#new-display-name': { value: 'Zoe' }, '#new-member-password': { value: 'geheim-genug' },
+    '#new-avatar-color': { value: '#123456' }, '#new-family-role': { value: 'other' },
+  };
+  const BEARBEITET = {
+    '#edit-member-username': { value: 'u2' }, '#edit-member-display-name': { value: 'Zoe' },
+    '#edit-member-avatar-color': { value: '#123456' }, '#edit-member-family-role': { value: 'other' },
+  };
+  const WEGE = [
+    ['Mitglied anlegen', () => familyDialog(() => family.openAddMemberModal(container, users[0], [...users]), '#add-member-form', NEU)],
+    ['Mitglied bearbeiten', () => familyDialog(() => family.openEditMemberModal(users[1], users[0], [...users], container), '#edit-member-form', BEARBEITET)],
+  ];
+  try {
+    for (const [name, vorbereiten] of WEGE) {
+      let kontext = 'eigener-dialog';
+      const geschlossen = [];
+      const geschrieben = [];
+      globalThis.__apiStub = { get: async () => ({ data: {} }) };
+      const ausloesen = await vorbereiten();
+      toasts.length = 0;
+      globalThis.__modalContextId = () => kontext;
+      globalThis.__closeModal = (opts) => { geschlossen.push(opts); };
+      const schreibe = (verb) => async () => {
+        geschrieben.push(verb);
+        kontext = 'ein-anderer-dialog';
+        return { user: person(2, 'Zoe') };
+      };
+      auth.createUser = schreibe('createUser');
+      auth.updateUser = schreibe('updateUser');
+      try {
+        await ausloesen();
+        assert.equal(geschrieben.length, 1, `${name}: der Weg schreibt`);
+        assert.equal(toasts.some(([, art]) => art === 'danger'), false, `${name}: der Erfolg ist kein Fehler (${JSON.stringify(toasts)})`);
+        assert.equal(geschlossen.length, 1, `${name}: genau ein Schliessen (${JSON.stringify(geschlossen)})`);
+        assert.equal(geschlossen[0].force, true, `${name}: force wie bisher`);
+        assert.equal(geschlossen[0].context, 'eigener-dialog',
+          `${name}: geschlossen wird ohne den Kontext von vor der Anfrage - die spaete Antwort traefe den Dialog, der jetzt offen ist`);
+      } finally {
+        delete globalThis.__modalContextId;
+        delete globalThis.__closeModal;
+        delete globalThis.__apiStub;
+      }
+    }
+  } finally {
+    auth.createUser = vorher.createUser;
+    auth.updateUser = vorher.updateUser;
+    globalThis.window = vorher.window;
+  }
+});
+
+// R24 (Critique G6 P2-1): die Einladung nach dem Erstellen. Der Fuss blieb
+// [Abbrechen][Einladung erstellen] - ein zweiter Klick legte eine zweite
+// Einladung an -, ein Erfolgs-Toast lag ueber dem Label "Einladungslink", der
+// Erstfokus stand auf dem optionalen Benutzernamen, und eine Einladung ohne
+// Namen trug ihre Rolle als Titel, groesser als jeder Mitgliedsname.
+test('R24: Einladen - Name zuerst, nach dem Erstellen [Fertig][Link kopieren], kein Toast', () => {
+  const html = family.addInviteFormHtml();
+  const ids = [...html.matchAll(/id="(invite-[\w-]+)"/g)].map((m) => m[1]);
+  assert.ok(ids.indexOf('invite-display-name') < ids.indexOf('invite-username'), 'der Anzeigename steht vor dem optionalen Benutzernamen');
+  assert.ok(ids.indexOf('invite-family-role') < ids.indexOf('invite-username'), 'die Rolle steht vor dem optionalen Benutzernamen');
+  const foot = html.slice(html.indexOf('modal-panel__footer'));
+  assert.match(foot, /<button type="button" class="btn btn--secondary" id="invite-done" hidden>settings\.invites\.done<\/button>/);
+  assert.match(foot, /<button type="button" class="btn btn--primary" id="invite-link-copy" hidden>/, 'Link kopieren ist der Primaerknopf des Fusses');
+  assert.ok(foot.indexOf('invite-done') < foot.indexOf('invite-link-copy'), '[Fertig] vor [Link kopieren]');
+  assert.equal((html.match(/id="invite-link-copy"/g) || []).length, 1, 'genau ein Kopieren-Knopf');
+
+  const source = readFileSync(path.join(ROOT, 'public/settings/pages/admin-family.js'), 'utf8');
+  const submit = source.slice(source.indexOf("form.addEventListener('submit'", source.indexOf('function openInviteModal(')), source.indexOf("panel.querySelector('#invite-done')"));
+  assert.match(submit, /form\.hidden = true;/, 'das Formular tritt nach dem Erstellen ab');
+  assert.match(submit, /#cancel-add-invite, \.modal-panel__footer \[type=submit\]'\)\) el\.hidden = true/);
+  assert.match(submit, /#invite-done, #invite-link-copy'\)\) el\.hidden = false/);
+  assert.doesNotMatch(submit, /showToast/, 'kein Toast im offenen Dialog');
+  assert.match(source, /panel\.querySelector\('#invite-done'\)\?\.addEventListener\('click', \(\) => closeModal\(\)\)/);
+
+  const untitled = family.inviteHtml({ id: 9, family_role: 'grandparent', expires_at: '2026-11-04T10:00:00Z' });
+  assert.match(untitled, /<span class="settings-member__name">settings\.invites\.untitled<\/span>/, 'ohne Namen: "Offene Einladung" als Titel');
+  assert.match(untitled, /<span class="settings-member__meta">[^<]*familyRole[^<]*<\/span>/, 'die Rolle steht in der Metazeile');
 });

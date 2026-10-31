@@ -4,9 +4,8 @@
  */
 import { CATEGORY_SERIES_COLORS, CATEGORY_OTHER_COLOR, categoryColorIndex, categoryColor, categoryTexture } from '/utils/budget-category-colors.js';
 import { api } from '/api.js';
-import { t, formatDate, getLocale } from '/i18n.js';
-import { wireTablist } from '/utils/tablist.js';
-import { attachSegmentIndicator } from '/utils/segment-indicator.js';
+import { t, getLocale } from '/i18n.js';
+import { dateRangeText, dateText } from '/utils/date-format.js';
 import { renderSkeletonChart, renderSkeletonList } from '/utils/skeleton.js';
 import { growBars, drawChartOnce } from '/utils/ux.js';
 import { mountEmptyState, mountLoadError } from '/utils/empty-state.js';
@@ -30,11 +29,8 @@ const view = {
   entriesKey: null,
 };
 
-const RANGE_LABELS = {
-  week: 'budget.statsRangeWeek',
-  month: 'budget.statsRangeMonth',
-  year: 'budget.statsRangeYear',
-};
+const RANGE_LABEL_KEYS = { week: 'budget.statsRangeWeek', month: 'budget.statsRangeMonth', year: 'budget.statsRangeYear' };
+
 
 export async function renderStats(panel, ctx) {
   view.ctx = ctx;
@@ -133,21 +129,20 @@ function renderShell() {
          eigener Modus je Reiter hiesse, auch den Kopf je Reiter umzuschalten -
          das ist Welle C in docs/PAGE-COMPOSITION.md, keine Nebenwirkung. -->
     <div class="budget-stats app-page app-page--reading page-measure--narrow" data-composition="reading">
-      <!-- Nur noch die Auflösung: der Zeitraum selbst wird über den geteilten
-           Kopf-Stepper des Moduls gewählt. Optik aus dem geteilten
-           .segmented-Baustein. -->
-      <div class="budget-stats__controls">
-        <div class="segmented budget-stats__ranges" role="tablist" aria-label="${t('budget.statsRangeLabel')}">
-          ${['week', 'month', 'year'].map((r) => {
-            const on = r === view.range;
-            return `
-            <button type="button" role="tab" class="segmented__item${on ? ' is-active' : ''}"
-              data-tab-id="${r}" aria-selected="${on}" tabindex="${on ? '0' : '-1'}"
-              aria-controls="budget-stats-body">${t(RANGE_LABELS[r])}</button>`;
-          }).join('')}
-        </div>
+      <!-- Zeitraum UND Aufloesung stehen seit R24 (Critique G4-Budget-P2-5)
+           im geteilten Kopf: der Bereich ist eine Wahl am Wert des Steppers
+           (budget.js statsRangeHtml), kein Segment hier. Am Telefon ist die
+           Kopfzeile voll; dort oeffnet dieser zweite Ausloeser dasselbe Menue
+           (je Breite steht genau einer, budget.css). -->
+      <div class="budget-stats__resolution">
+        <button type="button" class="btn btn--secondary btn--sm budget-nav__range-trigger budget-stats__resolution-trigger popover-menu__trigger"
+                popovertarget="budget-range-menu" aria-haspopup="menu" aria-expanded="false"
+                aria-label="${t('budget.statsRangeLabel')}: ${t(RANGE_LABEL_KEYS[view.range] ?? RANGE_LABEL_KEYS.month)}">
+          <span class="budget-range-value">${t(RANGE_LABEL_KEYS[view.range] ?? RANGE_LABEL_KEYS.month)}</span>
+          <i data-lucide="chevron-down" class="icon-sm" aria-hidden="true"></i>
+        </button>
       </div>
-      <div id="budget-stats-body" role="tabpanel" tabindex="0"></div>
+      <div id="budget-stats-body" tabindex="-1"></div>
     </div>
   `);
   if (window.lucide) lucide.createIcons({ el: view.root });
@@ -155,20 +150,7 @@ function renderShell() {
 }
 
 function wire() {
-  // Geteilte Tablist-Grammatik (Klick + Pfeiltasten/Home/End + Roving-Tabindex)
-  // wie die Budget-Haupttabs — vorher trug der Container role="tablist", ohne
-  // dass ein Kind role="tab" hatte, und Pfeiltasten taten nichts.
-  //
-  // Die Auflösung meldet das Modul zurück (onRangeChange), damit sie den
-  // Tabwechsel überlebt und der Kopf-Stepper in derselben Schrittweite läuft.
-  wireTablist(view.root.querySelector('.budget-stats__ranges'), {
-    activeId: view.range,
-    activeClass: 'is-active',
-    onChange: (id) => view.ctx.onRangeChange(id),
-  });
-  // Gleitende Auswahl-Kapsel wie jede Segmentleiste (Kanon, Runde 7 D8); das
-  // Panel wird mit dem Berichte-Tab neu gebaut, der Schluessel haelt die Lage.
-  attachSegmentIndicator(view.root.querySelector('.budget-stats__ranges'), { key: 'budget-stats-range' });
+  // Die Aufloesung waehlt der Kopf (budget.js), hier nur die Drilldown-Filter.
 
   // Filter-Klicks per Delegation: der Körper wird bei jeder Filteränderung neu
   // gezeichnet, direkte Listener gingen dabei verloren.
@@ -291,7 +273,7 @@ function renderBodyContent(body) {
   // Laufender Zeitraum: sagen, bis wohin gezaehlt ist - sonst fehlt der
   // angebrochene Monat ohne Erklaerung.
   const untilNote = d.until && d.until < d.to && d.until >= d.from
-    ? `<p class="budget-stats__note budget-stats__until">${view.ctx.esc(t('budget.statsUntilNote', { date: formatDate(d.until) }))}</p>`
+    ? `<p class="budget-stats__note budget-stats__until">${view.ctx.esc(t('budget.statsUntilNote', { date: dateText(d.until) }))}</p>`
     : '';
   body.insertAdjacentHTML('beforeend', `
     ${untilNote}
@@ -346,13 +328,13 @@ function categoryAmounts(byCategory, kind) {
 function previousPeriodLabel(prev) {
   if (!prev?.from) return '';
   // Gekuerzter Vorzeitraum (nur abgeschlossene Einheiten): die echte Strecke.
-  if (prev.until && prev.until < prev.to) return `${formatDate(prev.from)} - ${formatDate(prev.until)}`;
+  if (prev.until && prev.until < prev.to) return dateRangeText(prev.from, prev.until);
   if (view.range === 'year') return prev.from.slice(0, 4);
   if (view.range === 'month') {
     const [y, m] = prev.from.split('-').map(Number);
     return new Intl.DateTimeFormat(getLocale(), { month: 'long', year: 'numeric' }).format(new Date(y, m - 1, 1));
   }
-  return `${formatDate(prev.from)} - ${formatDate(prev.to)}`;
+  return dateRangeText(prev.from, prev.to);
 }
 
 /* VERGLEICH JE KATEGORIE STATT EINER ZWEITEN KATEGORIELISTE (Critique
@@ -367,6 +349,11 @@ function previousPeriodLabel(prev) {
  * aus utils/budget-category-colors.js, dieselbe Zuordnung wie Uebersicht und
  * Plan (groesste Ausgabe zuerst, jenseits der Palette die Sammelscheibe). */
 
+/* DIE RICHTUNG STEHT IM BLOCK, NICHT IM VORZEICHEN (Critique R24
+ * G4-Budget-P3-5, R23 "Minus doppelt"): unter "Ausgaben" stand "-1.620,99 €",
+ * dieselbe Kategorie in der Uebersicht "1.620,99 €". Betraege und Summe eines
+ * Blocks stehen ohne Vorzeichen wie in der Uebersicht; nur die Veraenderung
+ * gegenueber dem Vorzeitraum traegt eins - sie IST eine Richtung. */
 function renderCatBars() {
   const host = view.root.querySelector('#budget-stats-cat');
   if (!host) return;
@@ -375,8 +362,8 @@ function renderCatBars() {
   // Zeitraum exakt mit dem stetigen Monatsplan (kein irreführendes Hochskalieren).
   const plans = view.data.range === 'month' ? (view.data.plans || {}) : {};
   const blocks = [
-    { kind: 'expenses', labelKey: 'budget.statsExpenses', betterWhen: 'lower' },
-    { kind: 'income', labelKey: 'budget.statsIncome', betterWhen: 'higher' },
+    { kind: 'expenses', labelKey: 'budget.statsExpenses' },
+    { kind: 'income', labelKey: 'budget.statsIncome' },
   ].filter((b) => !view.filter.type || view.filter.type === b.kind).map((b) => {
     const now = categoryAmounts(view.data.byCategory, b.kind);
     const before = categoryAmounts(view.prev?.byCategory, b.kind);
@@ -388,7 +375,7 @@ function renderCatBars() {
   if (!blocks.length) return;
 
   const colors = categoryColorIndex(view.data.byCategory, view.ctx.expenseCategoryKeys);
-  const html = blocks.map(({ kind, labelKey, betterWhen, rows }) => {
+  const html = blocks.map(({ kind, labelKey, rows }) => {
     // DAS EIGENE MAXIMUM DES BLOCKS, wie im Monats-Diagramm - samt der Ziele
     // (Critique R19): eine Zielmarke ueber dem groessten Betrag klemmte vorher
     // per Math.min an der Kante und sagte damit "Ziel erreicht", wo noch Luft war.
@@ -407,8 +394,12 @@ function renderCatBars() {
       const targetMarker = target != null
         ? `<div class="budget-bar-row__target" style="--target-pos:${(target / max).toFixed(4)}" aria-hidden="true"></div>`
         : '';
+      // ROT ERST AM UEBERSCHRITTENEN PLAN (Critique R21, D8): das "von 80 €"
+      // traegt die Warnung, nicht das Delta daneben. Der Text sagt es mit
+      // (95 € von 80 €, im Screenreader samt Prozent) - nie die Farbe allein.
+      const over = target != null && target > 0 && Math.abs(r.amount) > target;
       const targetText = target != null
-        ? `<span class="budget-bar-row__of"><span aria-hidden="true">${view.ctx.esc(t('budget.planTargetOf', { amount: view.ctx.formatAmount(target) }))}</span><span class="sr-only">${view.ctx.esc(t('budget.planTargetSr', {
+        ? `<span class="budget-bar-row__of${over ? ' budget-bar-row__of--over' : ''}"><span aria-hidden="true">${view.ctx.esc(t('budget.planTargetOf', { amount: view.ctx.formatAmount(target) }))}</span><span class="sr-only">${view.ctx.esc(t('budget.planTargetSr', {
           amount: view.ctx.formatAmount(target),
           percent: target > 0 ? sharePercent(Math.abs(r.amount), target) : '-',
         }))}</span></span>`
@@ -419,11 +410,15 @@ function renderCatBars() {
       // Auf die Waehrung gerundet (Critique R19): sonst trug eine Differenz
       // von 2e-14 einen roten Pfeil neben "0,00 €".
       const delta = roundToCurrency(Math.abs(r.amount) - Math.abs(r.prev), view.ctx.currency);
+      // KEINE VALENZFARBE (Critique R21, D8): "+25,00 €" bei 25 von 80 € Plan
+      // stand rot - siebenmal auf einer Seite. Das Delta ist Sekundaerfarbe mit
+      // Vorzeichen und Pfeil; Rot traegt der ueberschrittene Plan (oben).
       const deltaHtml = (hasPrev
-        ? trendMarkup({ delta, betterWhen, text: view.ctx.esc(signed(delta)) })
+        ? trendMarkup({ delta, text: view.ctx.esc(signed(delta)) })
         : '');
       // Ausgaben: Farbe des Donut-Segments und der Anteil als Text - die Farbe
       // ist Zuordnung, der Anteil die Aussage (auch ohne Farbsehen lesbar).
+      // Die Farbe steht am Track, damit der Stummel sie mitliest (#2084).
       const color = kind === 'expenses' ? categoryColor(colors, r.category) : null;
       const fillColor = color ? `;--bar-fill:${color}` : '';
       const texture = kind === 'expenses' ? categoryTexture(colors, r.category) : null;
@@ -441,11 +436,11 @@ function renderCatBars() {
                 data-category="${view.ctx.esc(r.category)}" aria-pressed="${isActive}"
                 aria-label="${view.ctx.esc(t('budget.viewCategoryTransactions', { name: view.ctx.categoryLabel(r.category) }))}">
           <div class="budget-bar-row__label" title="${catLabel}">${catLabel}</div>
-          <div class="budget-bar-row__track" style="--bar-visible:${r.amount !== 0 ? 1 : 0}">
-            <div class="budget-bar-row__fill budget-bar-row__fill--${kind}" style="--bar-scale:${scale.toFixed(4)}${fillColor}"${texture ? ` data-texture="${texture}"` : ''} data-bar-key="${kind}:${view.ctx.esc(String(r.category))}"></div>
+          <div class="budget-bar-row__track" style="--bar-visible:${r.amount !== 0 ? 1 : 0}${fillColor}">
+            <div class="budget-bar-row__fill budget-bar-row__fill--${kind}" style="--bar-scale:${scale.toFixed(4)}"${texture ? ` data-texture="${texture}"` : ''} data-bar-key="${kind}:${view.ctx.esc(String(r.category))}"></div>
             ${targetMarker}
           </div>
-          <div class="budget-bar-row__amount">${view.ctx.esc(signed(r.amount))}${share}</div>
+          <div class="budget-bar-row__amount">${view.ctx.esc(fmtAmount(Math.abs(r.amount)))}${share}</div>
           ${deltaHtml || targetText ? `<div class="budget-bar-row__delta">${targetText}${deltaHtml}</div>` : ''}
         </button>
         ${subs.length ? renderSubBars(subs) : ''}`;
@@ -454,7 +449,7 @@ function renderCatBars() {
       <section class="budget-chart-block budget-chart-block--${kind}" aria-labelledby="${titleId}">
         <h3 class="budget-chart-block__title" id="${titleId}">
           <span>${t(labelKey)}</span>
-          <span class="budget-chart-block__total">${view.ctx.esc(signed(total))}</span>
+          <span class="budget-chart-block__total">${view.ctx.esc(fmtAmount(Math.abs(total)))}</span>
         </h3>
         <div class="budget-chart-block__rows">${body}</div>
       </section>`;
@@ -596,7 +591,7 @@ function renderEntryRows() {
         <div class="budget-entry__indicator ${isIncome ? 'budget-entry__indicator--income' : 'budget-entry__indicator--expenses'}"></div>
         <div class="list-row__main">
           <div class="list-row__name budget-entry__title">${view.ctx.esc(title)}</div>
-          <div class="list-row__meta budget-entry__meta">${view.ctx.esc(formatDate(e.date))} · ${view.ctx.esc(view.ctx.categoryLabel(e.category))}${view.ctx.esc(sub)}</div>
+          <div class="list-row__meta budget-entry__meta">${view.ctx.esc(dateText(e.date))} · ${view.ctx.esc(view.ctx.categoryLabel(e.category))}${view.ctx.esc(sub)}</div>
         </div>
         <div class="budget-entry__amount ${isIncome ? 'budget-entry__amount--income' : 'budget-entry__amount--expenses'}">${view.ctx.formatFlow(e.amount)}</div>
       </div>`;
@@ -1034,19 +1029,19 @@ function renderTrendChart() {
 function legendMarkup({ showIncome, showExpenses, stats, drawRefs, income, expenses, comparison }) {
   // Zahlen aus trendLegendFigures: der Wert am beschrifteten Punkt, der Rest
   // als "geplant", der Vergleich auf die Summe.
-  const typeItem = (type, label, { total, value, planned }, previous, betterWhen) => {
+  const typeItem = (type, label, { total, value, planned }, previous) => {
     const on = view.filter.type === type;
     const plannedHtml = planned > 0
       ? ` <span class="budget-stats__legend-planned">${view.ctx.esc(t('budget.statsPlannedRest', { amount: fmtAmount(planned) }))}</span>`
       : '';
     return `<button type="button" class="budget-stats__legend-item budget-stats__legend-toggle${on ? ' is-active' : ''}"
               data-type-filter="${type}" aria-pressed="${on}"
-              aria-label="${view.ctx.esc(t(type === 'income' ? 'budget.filterIncomeLabel' : 'budget.filterExpensesLabel'))}"><i class="budget-stats__swatch budget-stats__swatch--${type === 'income' ? 'income' : 'expense'}"></i>${label} · ${fmtAmount(value)}${plannedHtml}${totalTrend(total, previous, betterWhen)}</button>`;
+              aria-label="${view.ctx.esc(t(type === 'income' ? 'budget.filterIncomeLabel' : 'budget.filterExpensesLabel'))}"><i class="budget-stats__swatch budget-stats__swatch--${type === 'income' ? 'income' : 'expense'}"></i>${label} · ${fmtAmount(value)}${plannedHtml}${totalTrend(total, previous)}</button>`;
   };
   const refItem = (kind, labelKey, value) => `<span class="budget-stats__legend-item">${drawRefs ? `<i class="budget-stats__swatch budget-stats__swatch--${kind}"></i>` : ''}${view.ctx.esc(t(labelKey))} · ${fmtAmount(value)}</span>`;
   return [
-    showIncome ? typeItem('income', t('budget.statsIncome'), income, comparison?.income, 'higher') : '',
-    showExpenses ? typeItem('expenses', t('budget.statsExpenses'), expenses, comparison && Math.abs(comparison.expenses), 'lower') : '',
+    showIncome ? typeItem('income', t('budget.statsIncome'), income, comparison?.income) : '',
+    showExpenses ? typeItem('expenses', t('budget.statsExpenses'), expenses, comparison && Math.abs(comparison.expenses)) : '',
     stats.count ? refItem('average', 'budget.statsAverage', stats.average) : '',
     stats.count ? refItem('median', 'budget.statsMedian', stats.median) : '',
   ].join('');
@@ -1236,7 +1231,7 @@ function periodLabel(period) {
     const [y, m] = period.split('-').map(Number);
     return new Intl.DateTimeFormat(getLocale(), { month: 'short', year: 'numeric' }).format(new Date(y, m - 1, 1));
   }
-  return formatDate(period);
+  return dateText(period);
 }
 
 // Ableselinie + Roving-Tabindex über den Datenpunkten. Ein Tabstopp für die
@@ -1271,10 +1266,11 @@ function trendLegendFigures(shownArr, rawArr, markIndex, running) {
   return { total, value, planned: planned > 0 ? planned : 0 };
 }
 
-function totalTrend(current, previous, betterWhen) {
+function totalTrend(current, previous) {
   if (previous == null) return '';
   const delta = roundToCurrency(current - previous, view.ctx.currency);
-  return ` ${trendMarkup({ delta, betterWhen, text: view.ctx.esc(signed(delta)) })}`;
+  // Sekundaerfarbe mit Vorzeichen und Pfeil, keine Valenz (Critique R21, D8).
+  return ` ${trendMarkup({ delta, text: view.ctx.esc(signed(delta)) })}`;
 }
 
 function wireTrendPoints(host, series, labelKey, raw = series, startIndex = null) {

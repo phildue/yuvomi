@@ -323,14 +323,54 @@ test('Kontaktfilter: nur belegte Kategorien, die aktive bleibt, und mit einer Ka
   }
 });
 
-test('Kontaktfilter: die Gruppe heisst nach ihrer Frage, und am Zeigergeraet bricht die Reihe um', () => {
+test('Kontaktfilter: die Gruppe heisst nach ihrer Frage, und die Reihe bleibt EINE Reihe - auch am Zeigergeraet (R22 D20)', () => {
   const js = read('../public/pages/contacts.js');
   assert.match(js, /id="contacts-filters" role="group" aria-label="\$\{t\('contacts\.categoryLabel'\)\}"/,
     'die Gruppe hiess „Alle" - der Name des ersten Chips, nicht der Frage');
   const css = read('../public/styles/contacts.css');
-  const wrap = [...eachRule(css)].find((r) => r.selector.trim() === '.contacts-filters'
-    && r.at.some((a) => /hover:\s*hover/.test(a) && /pointer:\s*fine/.test(a)));
-  assert.ok(wrap && /flex-wrap:\s*wrap/.test(wrap.body), 'eine Maus hat keine waagerechte Geste');
+  const wrap = [...eachRule(css)].filter((r) => /\.contacts-filters\b/.test(r.selector)
+    && (/flex-wrap:\s*wrap/.test(r.body) || /overflow-x:\s*visible/.test(r.body)));
+  assert.deepEqual(wrap.map((r) => r.selector), [],
+    'am Desktop brach die Reihe in zwei um (1280: rund 48px mehr Kopf) - sie scrollt jetzt mit Fade wie mobil');
+  assert.match(js, /wireScrollFade\(_container\.querySelector\('#contacts-filters'\)\);\s*wireWheelToRow\(_container\.querySelector\('#contacts-filters'\)\)/,
+    'Fade an der Kante und das Mausrad bewegt die Reihe');
+});
+
+test('R22 D20: das Mausrad bewegt die Chipreihe waagerecht, bis sie am Ende ist - dann scrollt die Seite', () => {
+  let handler = null;
+  const row = {
+    scrollLeft: 0, scrollWidth: 900, clientWidth: 400,
+    addEventListener(type, fn, opts) { if (type === 'wheel') { handler = fn; assert.equal(opts?.passive, false, 'sonst greift preventDefault nicht'); } },
+  };
+  Object.defineProperty(row, 'scrollLeft', {
+    get() { return this._x ?? 0; },
+    set(v) { this._x = Math.max(0, Math.min(v, this.scrollWidth - this.clientWidth)); },
+  });
+  contacts.wireWheelToRow(row);
+  assert.ok(handler, 'die Reihe hoert auf das Rad');
+  const rad = (over) => {
+    const e = { deltaX: 0, deltaY: 100, ctrlKey: false, prevented: false, preventDefault() { this.prevented = true; }, ...over };
+    handler(e);
+    return e.prevented;
+  };
+  assert.equal(rad({}), true, 'senkrechtes Rad bewegt die Reihe');
+  assert.equal(row.scrollLeft, 100);
+  row.scrollLeft = 500;
+  assert.equal(rad({}), false, 'am Ende geht das Rad an die Seite weiter - nie fest');
+  assert.equal(rad({ deltaX: 30 }), false, 'eine echte Waagerecht-Geste bleibt beim Browser');
+  assert.equal(rad({ ctrlKey: true }), false, 'Strg+Rad zoomt');
+  row.scrollWidth = 300;
+  row.scrollLeft = 0;
+  assert.equal(rad({}), false, 'ohne Ueberlauf nichts zu bewegen');
+});
+
+test('R22 D7: ein ueber den Geburtstag verknuepfter Kontakt ohne eigenes Datum zeigt das verknuepfte - und den Weg', () => {
+  const rows = contacts.renderContactDetail({ id: 9, name: 'Mike', birthday: null, birthday_id: 4, birthday_link_date: '1985-11-02', birthday_link_year_unknown: 0 });
+  const row = rows.find((r) => r.icon === 'cake');
+  assert.ok(row?.value, 'ohne Wert fiele die Zeile weg und mit ihr der Rueckweg');
+  assert.equal(row.action?.label, 'contacts.showBirthday');
+  const eigen = contacts.renderContactDetail({ id: 9, name: 'Mike', birthday: '1985-11-03', birthday_id: 4, birthday_link_date: '1985-11-02' });
+  assert.match(eigen.find((r) => r.icon === 'cake').value, /03|3/, 'das eigene Datum des Kontakts geht vor');
 });
 
 test('Neuer Kontakt ist nicht als „Arzt" vorbelegt: aktive Filterkategorie, sonst misc (Re-Critique 2026-09-28 P2-5)', () => {
@@ -362,59 +402,56 @@ test('Neuer Kontakt ist nicht als „Arzt" vorbelegt: aktive Filterkategorie, so
 });
 
 // -------------------------------------------------------------------------
-// Der Import-Toast nennt die Ursache (#1909, Uebergang)
+// Der Import-Toast nennt die Ursache in der Sprache des Nutzers (#1909)
 //
-// Schlaegt jede Anlage fehl, sagt der Toast "Import fehlgeschlagen: <Ursache>"
-// und fragt die Ursache bei `window.yuvomi.friendlyError`. #1916 hatte dessen
-// Rueckfall fuer alle Aufrufer auf den allgemeinen Satz verengt; hier stand
-// dann "Import fehlgeschlagen: Ein Fehler ist aufgetreten" statt des Felds, das
-// der Server ablehnt. Gemessen wird am echten Aufrufer mit der echten Funktion,
-// die der Router an `window.yuvomi` haengt - ein Stellvertreter an ihrer Stelle
-// haette den Fehler nicht gesehen.
+// Schlaegt jede Anlage fehl, sagt der Toast "Import fehlgeschlagen: <Ursache>".
+// Bis #1909 kam die Ursache ueber `window.yuvomi.friendlyError` und war der
+// englische Text des Servers ("Telefon may be at most 100 characters long."),
+// weil nur er das abgewiesene Feld nannte. Jetzt nennt der Server den Fall
+// (`reason`, `params.limit`, server/routes/contacts.js), und der Satz der App
+// nennt Feld und Grenze. Gemessen wird am echten Aufrufer mit der echten
+// Zuordnung (utils/friendly-error.js).
 // -------------------------------------------------------------------------
-test('Import-Toast: schlaegt alles fehl, nennt er die Ursache des Servers (#1909)', async () => {
-  const { friendlyError } = await import('../public/utils/friendly-error.js');
-  assert.match(read('../public/router.js'), /window\.yuvomi = \{[^}]*\bfriendlyError,/,
-    'der Router haengt nicht mehr diese Funktion an window.yuvomi - der Test misst dann die falsche');
-
+test('Import-Toast: schlaegt alles fehl, nennt er das Feld als Satz der App, nie den Servertext (#1909)', async () => {
   // Wie der Fehler aus api.js kommt: `message` und `data.error` tragen den Text des Servers.
-  const answer = (status, error, reason) => Object.assign(new Error(error), {
-    name: 'ApiError', status, data: { error, code: status, ...(reason ? { reason } : {}) },
+  const answer = (status, error, extra = {}) => Object.assign(new Error(error), {
+    name: 'ApiError', status, data: { error, code: status, ...extra },
   });
   const yuvomi = globalThis.window.yuvomi;
-  const saved = { showToast: yuvomi.showToast, friendlyError: yuvomi.friendlyError };
+  const saved = { showToast: yuvomi.showToast };
   const savedNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
   Object.defineProperty(globalThis, 'navigator', { value: { onLine: true }, configurable: true, writable: true });
   const toasts = [];
   yuvomi.showToast = (message, type, duration, action) => toasts.push({ message, type, duration, action });
-  yuvomi.friendlyError = friendlyError;
   const failed = (lastError) => {
     toasts.length = 0;
     contacts.showImportResult({ imported: 0, withBirthday: 0, failedList: [{ name: '' }], lastName: null, lastError });
     assert.equal(toasts.length, 1, 'genau ein Toast');
     return toasts[0];
   };
+  const toast = (error) => 'contacts.importError' + JSON.stringify({ error });
   try {
-    // POST /contacts lehnt mit 400 ab und nennt das Feld (server/routes/contacts.js).
-    const invalid = failed(answer(400, 'Name is required. Telefon must not exceed 50 characters.'));
-    assert.equal(invalid.type, 'danger');
-    assert.equal(invalid.message,
-      'contacts.importError' + JSON.stringify({ error: 'Name is required. Telefon must not exceed 50 characters.' }),
-      'die Ursache steht im Toast, nicht der allgemeine Satz');
-    assert.equal(invalid.action?.label, 'contacts.importRetry');
+    // POST /contacts lehnt mit 400 ab und nennt das Feld als Fall.
+    const phone = failed(answer(400, 'Telefon may be at most 100 characters long.',
+      { reason: 'contacts_phone_too_long', params: { limit: 100 } }));
+    assert.equal(phone.type, 'danger');
+    assert.equal(phone.message, toast('contacts.errorPhoneTooLong' + JSON.stringify({ limit: 100 })),
+      'der Satz der App nennt Feld und Grenze');
+    assert.equal(phone.action?.label, 'contacts.importRetry');
+    assert.equal(failed(answer(400, 'Geburtstag must be a valid calendar date.', { reason: 'contacts_birthday_invalid' })).message,
+      toast('contacts.errorBirthdayInvalid'));
+    // Fehlt die Grenze, gibt es keinen Satz mit leerem Platzhalter, sondern den allgemeinen.
+    assert.equal(failed(answer(400, 'Notizen may be at most 5000 characters long.', { reason: 'contacts_notes_too_long' })).message,
+      toast('common.errorGeneric'));
 
-    // Ein Konflikt mit einem Grund ohne eigenen Satz. `email_in_use` schickt
-    // heute nur PUT /contacts/:id, nicht die Anlage - der Toast fragt aber nicht
-    // nach der Route, und ein 409 der Anlage kaeme genauso hier an.
-    const taken = failed(answer(409, 'This email address already belongs to another account.', 'email_in_use'));
-    assert.equal(taken.message,
-      'contacts.importError' + JSON.stringify({ error: 'This email address already belongs to another account.' }));
+    // Ein Befund ohne benannten Fall: der allgemeine Satz, nie der Servertext.
+    const unnamed = failed(answer(400, 'Name is required.'));
+    assert.equal(unnamed.message, toast('common.errorGeneric'));
+    assert.ok(!unnamed.message.includes('required'), 'der englische Servertext steht nicht im Toast');
 
     // Was die App selbst sagen kann, sagt sie weiter in der Sprache des Nutzers.
-    assert.equal(failed(answer(403, 'Not authorized.')).message,
-      'contacts.importError' + JSON.stringify({ error: 'common.errorNoPermission' }));
-    assert.equal(failed(answer(500, 'Internal error.')).message,
-      'contacts.importError' + JSON.stringify({ error: 'common.errorServer' }));
+    assert.equal(failed(answer(403, 'Not authorized.')).message, toast('common.errorNoPermission'));
+    assert.equal(failed(answer(500, 'Internal error.')).message, toast('common.errorGeneric'));
   } finally {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete yuvomi[k];
@@ -423,4 +460,307 @@ test('Import-Toast: schlaegt alles fehl, nennt er die Ursache des Servers (#1909
     if (savedNavigator) Object.defineProperty(globalThis, 'navigator', savedNavigator);
     else delete globalThis.navigator;
   }
+});
+
+/* D7 (Critique R21): KONTAKT UND GEBURTSTAG KENNEN EINANDER. Ein importierter
+ * Geburtstag traegt seit Migration 90 seinen Kontakt (`contact_id`), die
+ * Kontaktseite bekommt den Rueckweg (`birthday_id`, routes/contacts.js). Die
+ * Geburtstagszeile der Leseansicht fuehrt dann "In Geburtstagen anzeigen" -
+ * ein Schritt statt Modulwechsel, Suche und Antippen. Ohne Verknuepfung, oder
+ * ohne Zugang zum Geburtstagsmodul, gibt es den Knopf nicht. */
+test('R21 D7: die Geburtstagszeile eines verknuepften Kontakts fuehrt zum Geburtstag', async () => {
+  const rows = contacts.renderContactDetail({ id: 7, name: 'Tante', birthday: '1970-05-04', birthday_year_unknown: 0, birthday_id: 42 });
+  const row = rows.find((r) => r.icon === 'cake');
+  assert.ok(row?.action, 'die Zeile traegt eine Folgeaktion');
+  assert.equal(row.action.label, 'contacts.showBirthday');
+  assert.equal(contacts.birthdayHref(42), '/birthdays?open=42');
+  const lose = contacts.renderContactDetail({ id: 8, name: 'Onkel', birthday: '1968-02-01', birthday_year_unknown: 0, birthday_id: null });
+  const { setPermissions, clearPermissions } = await import('../public/permissions.js');
+  setPermissions({ admin: false, modules: { calendar: 'read' }, widgets: {}, capabilities: {} });
+  try {
+    const lose = contacts.renderContactDetail({ id: 8, name: 'Onkel', birthday: '1968-02-01', birthday_year_unknown: 0, birthday_id: null });
+    assert.equal(lose.find((r) => r.icon === 'cake')?.action ?? null, null, 'ohne Verknuepfung und ohne Schreibrecht kein Weg');
+  } finally {
+    clearPermissions();
+  }
+});
+
+/* #2149: EIN KONTAKT MIT GEBURTSDATUM, ABER OHNE EINTRAG IN GEBURTSTAGE.
+ * Dieselbe Folgeaktion der Geburtstagszeile legt ihn an - den Eintrag, den
+ * der Import anlegen wuerde (`POST /birthdays/import` mit genau dieser id).
+ * Angeboten nur, wo der Server annimmt: `calendar: write` und das Modul
+ * nicht abgeschaltet. Ohne Geburtsdatum gibt es nichts anzulegen. */
+test('#2149: unverknuepft bietet die Geburtstagszeile "Zu Geburtstagen hinzufuegen" an - nur mit Schreibrecht', async () => {
+  const { setPermissions, clearPermissions } = await import('../public/permissions.js');
+  const LOSE = { id: 8, name: 'Onkel', birthday: '1968-02-01', birthday_year_unknown: 0, birthday_id: null };
+  const actionOf = (c) => contacts.renderContactDetail(c).find((r) => r.icon === 'cake')?.action ?? null;
+  const yuvomi = globalThis.window.yuvomi;
+  const savedDisabled = yuvomi.isModuleDisabled;
+  try {
+    setPermissions({ admin: false, modules: { calendar: 'write', contacts: 'read' }, widgets: {}, capabilities: {} });
+    const add = actionOf(LOSE);
+    assert.equal(add?.label, 'contacts.addToBirthdays', 'mit Schreibrecht steht der Weg in Geburtstage an der Zeile');
+    assert.equal(add.id, 'contact-detail-birthday-add');
+    assert.equal(actionOf({ ...LOSE, birthday_id: 5 })?.label, 'contacts.showBirthday', 'verknuepft bleibt es beim Anzeigen');
+    assert.equal(actionOf({ ...LOSE, birthday: null }), null, 'ohne Geburtsdatum nichts anzulegen');
+
+    setPermissions({ admin: false, modules: { calendar: 'read' }, widgets: {}, capabilities: {} });
+    assert.equal(actionOf(LOSE), null, 'calendar: read - der Import nimmt nicht an');
+    setPermissions({ admin: false, modules: { calendar: 'none' }, widgets: {}, capabilities: {} });
+    assert.equal(actionOf(LOSE), null, 'calendar: none');
+
+    setPermissions({ admin: false, modules: { calendar: 'write' }, widgets: {}, capabilities: {} });
+    yuvomi.isModuleDisabled = (key) => key === 'birthdays';
+    assert.equal(actionOf(LOSE), null, 'haushaltweit abgeschaltet - der Router leitet um');
+  } finally {
+    clearPermissions();
+    if (savedDisabled === undefined) delete yuvomi.isModuleDisabled;
+    else yuvomi.isModuleDisabled = savedDisabled;
+  }
+});
+
+/* R22 D7: DER HINWEIS "HEISST GENAUSO" AUCH IM KONTAKT. Der Geburtstag zeigte
+ * ihn (birthdays.js, contactSuggestionRow), der Kontakt nicht. Jetzt traegt
+ * der Kontakt `suggested_birthday_id` (routes/contacts.js), und die Ansicht
+ * zeigt dieselbe ruhige Zeile mit "Verknuepfen" - nur mit Schreibrecht auf
+ * Geburtstage, und dann ohne "Hinzufuegen" an der Datumszeile: das legte
+ * einen zweiten Geburtstag fuer denselben Menschen an. */
+test('R22 D7: gleichnamiger Geburtstag - der Kontakt zeigt den Hinweis mit "Verknuepfen"', async () => {
+  const { setPermissions, clearPermissions } = await import('../public/permissions.js');
+  const SAME = { id: 9, name: 'Tante', birthday: '1970-05-04', birthday_year_unknown: 0, birthday_id: null, suggested_birthday_id: 31 };
+  const hintOf = (c) => contacts.renderContactDetail(c).find((r) => r?.action?.id === 'contact-detail-birthday-link') ?? null;
+  const yuvomi = globalThis.window.yuvomi;
+  const savedDisabled = yuvomi.isModuleDisabled;
+  try {
+    setPermissions({ admin: false, modules: { calendar: 'write', contacts: 'read' }, widgets: {}, capabilities: {} });
+    const hint = hintOf(SAME);
+    assert.ok(hint, 'die Zeile steht da');
+    assert.equal(hint.value, 'contacts.birthdaySuggestValue');
+    assert.equal(hint.action.label, 'birthdays.linkContact', 'dasselbe Wort wie auf der Geburtstagsseite');
+    assert.equal(hint.action.icon, 'link');
+    const dateRow = contacts.renderContactDetail(SAME).find((r) => r?.icon === 'cake' && r.label === 'contacts.birthdayLabel');
+    assert.equal(dateRow?.action ?? null, null, 'kein "Hinzufuegen" neben dem Hinweis - es legte einen zweiten Geburtstag an');
+    // R23 G5-P2: gleicher Tag, anderer Name - der Satz nennt den Geburtstag.
+    const sameDay = hintOf({ ...SAME, suggested_birthday_name: 'Ingrid Mueller' });
+    assert.equal(sameDay?.value, 'contacts.birthdaySuggestSameDate{"name":"Ingrid Mueller"}', 'gleicher Tag: "Mit X verknuepfen?"');
+    assert.equal(sameDay.action.label, 'birthdays.linkContact');
+    assert.ok(hintOf({ ...SAME, birthday: null }), 'auch ohne eigenes Datum');
+    assert.equal(hintOf({ ...SAME, suggested_birthday_id: undefined }), null, 'ohne Vorschlag keine Zeile');
+    assert.equal(hintOf({ ...SAME, birthday_id: 31 }), null, 'verknuepft keine Zeile');
+
+    setPermissions({ admin: false, modules: { calendar: 'read' }, widgets: {}, capabilities: {} });
+    assert.equal(hintOf(SAME), null, 'calendar: read - nichts zu tun, also keine Zeile');
+    setPermissions({ admin: false, modules: { calendar: 'write' }, widgets: {}, capabilities: {} });
+    yuvomi.isModuleDisabled = (key) => key === 'birthdays';
+    assert.equal(hintOf(SAME), null, 'haushaltweit abgeschaltet');
+  } finally {
+    clearPermissions();
+    if (savedDisabled === undefined) delete yuvomi.isModuleDisabled;
+    else yuvomi.isModuleDisabled = savedDisabled;
+  }
+});
+
+test('R22 D7: Verknuepfen schreibt den Geburtstag und liest den Kontakt neu', async () => {
+  const { setPermissions, clearPermissions } = await import('../public/permissions.js');
+  const yuvomi = globalThis.window.yuvomi;
+  const savedToast = yuvomi.showToast;
+  const calls = [];
+  const toasts = [];
+  yuvomi.showToast = (message, type) => toasts.push({ message, type });
+  let linked = 31;
+  globalThis.__apiStub = {
+    put: (path, body) => { calls.push(['PUT', path, body]); return { data: { id: 31, contact_id: 9 } }; },
+    get: (path) => { calls.push(['GET', path]); return { data: { id: 9, name: 'Tante', birthday_id: linked } }; },
+  };
+  contacts.state.contacts = [{ id: 9, name: 'Tante', birthday_id: null }];
+  setPermissions({ admin: false, modules: { calendar: 'write', contacts: 'read' }, widgets: {}, capabilities: {} });
+  try {
+    const seen = [];
+    const button = { disabled: false, isConnected: true };
+    const loaded = await contacts.linkContactToBirthday({ id: 9, name: 'Tante' }, 31, { button, onLinked: (c) => seen.push(c) });
+    assert.deepEqual(calls[0], ['PUT', '/birthdays/31', { contact_id: 9 }], 'der Geburtstag bekommt den Kontakt');
+    assert.deepEqual(calls[1], ['GET', '/contacts/9']);
+    assert.equal(loaded?.birthday_id, 31);
+    assert.equal(seen[0]?.birthday_id, 31, 'die Ansicht zeichnet mit Verknuepfung neu');
+    assert.equal(contacts.state.contacts[0].birthday_id, 31);
+    assert.deepEqual(toasts.at(-1), { message: 'contacts.linkedToBirthday', type: 'success' });
+
+    linked = null;
+    const again = await contacts.linkContactToBirthday({ id: 9, name: 'Tante' }, 31, { button });
+    assert.equal(again, null);
+    assert.equal(toasts.at(-1)?.type, 'danger');
+    assert.equal(button.disabled, false);
+  } finally {
+    clearPermissions();
+    delete globalThis.__apiStub;
+    contacts.state.contacts = [];
+    if (savedToast === undefined) delete yuvomi.showToast;
+    else yuvomi.showToast = savedToast;
+  }
+});
+
+test('#2149: Hinzufuegen ruft den Import mit genau diesem Kontakt und liest die Verknuepfung neu', async () => {
+  const yuvomi = globalThis.window.yuvomi;
+  const savedToast = yuvomi.showToast;
+  const calls = [];
+  const toasts = [];
+  yuvomi.showToast = (message, type) => toasts.push({ message, type });
+  let linked = 77;
+  globalThis.__apiStub = {
+    post: (path, body) => { calls.push(['POST', path, body]); return { data: { imported: 1, skipped: 0 } }; },
+    get: (path) => { calls.push(['GET', path]); return { data: { id: 8, name: 'Onkel', birthday: '1968-02-01', birthday_id: linked } }; },
+  };
+  contacts.state.contacts = [{ id: 8, name: 'Onkel', birthday: '1968-02-01', birthday_id: null }];
+  try {
+    const seen = [];
+    const button = { disabled: false, isConnected: true };
+    const loaded = await contacts.addContactToBirthdays({ id: 8, name: 'Onkel', birthday: '1968-02-01' }, { button, onLinked: (c) => seen.push(c) });
+    assert.deepEqual(calls[0], ['POST', '/birthdays/import', { contact_ids: [8] }], 'der bestehende Import, eine id');
+    assert.deepEqual(calls[1], ['GET', '/contacts/8'], 'danach der Kontakt selbst');
+    assert.equal(loaded?.birthday_id, 77);
+    assert.equal(seen[0]?.birthday_id, 77, 'die Ansicht bekommt den Kontakt mit Verknuepfung');
+    assert.equal(contacts.state.contacts[0].birthday_id, 77, 'die Liste kennt die Verknuepfung');
+    assert.equal(toasts.at(-1)?.type, 'success');
+
+    // Kommt der Kontakt trotzdem ohne Eintrag zurueck, ist das kein Erfolg.
+    linked = null;
+    calls.length = 0;
+    const again = await contacts.addContactToBirthdays({ id: 8, name: 'Onkel', birthday: '1968-02-01' }, { button });
+    assert.equal(again, null);
+    assert.equal(toasts.at(-1)?.type, 'danger');
+    assert.equal(button.disabled, false, 'der Knopf ist wieder bedienbar');
+  } finally {
+    delete globalThis.__apiStub;
+    contacts.state.contacts = [];
+    if (savedToast === undefined) delete yuvomi.showToast;
+    else yuvomi.showToast = savedToast;
+  }
+});
+
+// R21 S7 (Critique a3): zwei Kanten im Kontakt. Im Leseblatt stand der erste
+// antippbare Wert mit dem halben Ueberstand seines 44px-Ziels unter dem Label
+// (Label -> Wert 15px, bei Kategorie 3px); im Formular endete der Platzhalter
+// des Labelfelds mobil als "Label (z. B. A" (122 von 162px).
+test('R21 S7: Label und Wert stehen dicht, das Labelfeld steht schmal unter dem Wert', () => {
+  const css = readFileSync(new URL('../public/styles/contacts.css', import.meta.url), 'utf8');
+  const rules = [...eachRule(css)];
+  const pull = rules.find((r) => r.selector.trim() === '.contact-detail__value:first-child > .contact-detail__link');
+  assert.match(pull?.body ?? '', /margin-block-start:\s*calc\(\(var\(--line-height-base\) \* 1em - var\(--target-base\)\) \/ 2\)/,
+    'der erste Wert zieht den Ueberstand seines Ziels zurueck');
+  const list = rules.find((r) => r.selector.trim() === '.contact-mv-list');
+  assert.match(list?.body ?? '', /container:\s*contact-mv \/ inline-size/);
+  const label = rules.find((r) => r.selector.trim() === '.contact-mv-row > .contact-mv-row__label' && r.at.some((a) => /@container contact-mv \(max-width:/.test(a)));
+  assert.match(label?.body ?? '', /grid-row:\s*2/, 'schmal steht das Label in einer eigenen Zeile');
+});
+
+// R21 S9b (Critique a3): Liste und Detail zeigten dieselbe Nummer verschieden -
+// die Zeile formatiert (enhancePhones), der Link der Detailansicht behielt den
+// Rohwert, weil der A-Zweig nur das Ziel setzte. Jetzt bekommt ein Link, der die
+// Nummer selbst traegt, dieselbe Anzeige; ein Aktionslink ("Anrufen") behaelt
+// sein Wort.
+test('Liste und Detail zeigen eine Telefonnummer in derselben Form', async () => {
+  const { __primePhoneLib } = await import('../public/utils/phone.js');
+  __primePhoneLib({
+    parse: (value) => ({
+      country: 'DE', number: '+492314452210',
+      formatNational: () => '0231 4452210', formatInternational: () => '+49 231 4452210',
+    }),
+    AsYouType: class {}, isPossible: () => true, metadata: {},
+  });
+  try {
+    contacts.state.defaultCountry = 'AT';
+    const raw = '+49 231 445 2210';
+    const el = (tag, text) => {
+      const node = document.createElement(tag);
+      // mini-dom fuehrt den Tag klein; der Browser (und enhancePhones) gross.
+      node.tagName = tag.toUpperCase();
+      node.dataset.phoneRaw = raw;
+      node.textContent = text;
+      if (tag === 'a') node.href = 'tel:x';
+      return node;
+    };
+    const zeile = el('span', raw);
+    const detail = el('a', raw);
+    const aktion = el('a', 'Anrufen');
+    const root = { querySelectorAll: () => [zeile, detail, aktion] };
+    await contacts.enhancePhones(root);
+    assert.equal(zeile.textContent, '+49 231 4452210', 'die Zeile formatiert');
+    assert.equal(detail.textContent, zeile.textContent, 'der Link der Detailansicht zeigt dieselbe Form');
+    assert.equal(detail.getAttribute('dir'), 'ltr');
+    assert.match(detail.href, /^tel:\+492314452210$/, 'und waehlt E.164');
+    assert.equal(aktion.textContent, 'Anrufen', 'ein Aktionslink behaelt sein Wort');
+    assert.match(aktion.href, /^tel:\+492314452210$/);
+  } finally {
+    __primePhoneLib(null);
+  }
+});
+
+// R23 (Critique G5 P2/P3): im Auswahlmodus kuerzte der Titel auf "Kont..."
+// (390px: Suche, "Abbrechen" und "..." daneben), und "Name noetig" kam als
+// Toast statt am Feld.
+test('R23: im Auswahlmodus tritt das Menue ab, der Name meldet sich am Feld', () => {
+  const css = read('../public/styles/contacts.css');
+  const hide = [...eachRule(css)].find((r) => r.selector.trim() === '.contacts-page.is-selecting .contacts-toolbar .page-tools-btn');
+  assert.ok(hide && /display:\s*none/.test(hide.body), 'das Menue weicht im Auswahlmodus');
+  const js = read('../public/pages/contacts.js');
+  const exit = js.slice(js.indexOf('function exitSelectMode()'), js.indexOf('function syncSelectChrome()'));
+  assert.ok(exit.indexOf("classList.remove('is-selecting')") > -1
+    && exit.indexOf("classList.remove('is-selecting')") < exit.indexOf(".page-tools-btn')?.focus()"),
+    'erst die Klasse, dann der Fokus - ein ausgeblendeter Knopf nimmt keinen');
+  assert.match(js, /if \(!name && reportFieldErrors\(\[\[panel\.querySelector\('#cm-first-name'\), t\('contacts\.nameRequiredHint'\)\]\]\)\) return;/);
+  assert.doesNotMatch(js, /showToast\(t\('contacts\.nameRequiredHint'\)/, 'kein Toast mehr fuer ein Feld');
+});
+
+// R23: die Chipreihe erschien erst mit den Daten, und die Liste rutschte um
+// ihre Hoehe nach unten (390x844 Layout-Shift 0,068 bei 4x CPU).
+test('R23: die Chipreihe haelt ihren Platz, bis die Kontakte geladen sind', () => {
+  const css = read('../public/styles/contacts.css');
+  const rules = [...eachRule(css)];
+  assert.ok(!rules.some((r) => r.selector.trim() === '.contacts-filters:empty' && /display:\s*none/.test(r.body)), 'leer heisst nicht weg, solange geladen wird');
+  const hide = rules.find((r) => r.selector.trim() === '.contacts-filters:empty:not([data-pending])');
+  assert.ok(hide && /display:\s*none/.test(hide.body), 'erst nach dem Laden faellt eine leere Reihe weg');
+  const js = read('../public/pages/contacts.js');
+  assert.match(js, /id="contacts-filters" role="group" aria-label="\$\{t\('contacts\.categoryLabel'\)\}" data-pending><\/div>/, 'die Marke steht im ersten Bild');
+  const fn = js.slice(js.indexOf('function renderCategoryFilters()'), js.indexOf('function openContactCategoryManager()'));
+  assert.match(fn, /bar\.removeAttribute\('data-pending'\);/, 'und faellt beim ersten Zeichnen mit Daten');
+});
+
+// R23 S11b (Critique G5 P3): "Kontakt bearbeiten" hatte mobil drei Ausgaenge
+// (Zurueck, x, Abbrechen), und Abbrechen schloss das ganze Blatt. Die
+// Detailansicht erkennt ein Abbrechen nur an `data-action="close-modal"` (R19,
+// detail-view.js) - dann ist es der Weg zurueck in die Leseansicht, und das
+// Kopf-"Zurueck" faellt weg, wie in Rezepten, Notizen und Inventar.
+test('Kontakt bearbeiten: Abbrechen ist der eine Rueckweg in die Leseansicht', () => {
+  const js = read('../public/pages/contacts.js');
+  assert.match(js, /<button type="button" class="btn btn--secondary" id="cm-cancel" data-action="close-modal">/);
+  const dv = read('../public/components/detail-view.js');
+  assert.match(dv, /state\.formCancel = state\.formFooter\?\.querySelector\('\[data-action="close-modal"\]'\)/, 'daran erkennt die Detailansicht das Abbrechen');
+});
+
+// R24 (Critique G5 Kontakte-P3-2): die Kategorie-Chips liefen am Desktop in
+// der 424px-Spalte aus dem Bild („Dienstleistungen" nur per Querscroll), am
+// Telefon schon ab „Familie". Gemessen nachher: 1440 und 390 ein Filterknopf
+// „Filter", Blatt/Popover mit 5 Chips, Wahl „Arzt" -> 2 Zeilen, „1 Filter
+// aktiv"; 1024 (Lesemass, Reihe passt) bleiben die Chips.
+test('R24 Kontakte-P3-2: passt die Kategoriereihe nicht oder sind es mehr als vier, steht ein Filterknopf', () => {
+  const src = read('../public/pages/contacts.js');
+  const fn = src.slice(src.indexOf('function renderCategoryFilters()'), src.indexOf('function openContactCategoryManager()'));
+  assert.match(src, /const CONTACT_CHIP_MAX = 4;/);
+  assert.match(fn, /const asButton = keys\.length > CONTACT_CHIP_MAX \|\| _chipOverflowWidth != null;/, 'Zahl ODER gemessene Enge');
+  assert.match(fn, /filterButtonHtml\(\{ id: 'contacts-category-filter', count: active \? 1 : 0, showLabel: true \}\)/, 'der geteilte Filterknopf mit Zaehler');
+  assert.match(fn, /if \(bar\.clientWidth > 0 && bar\.scrollWidth > bar\.clientWidth \+ 1\) \{\s*_chipOverflowWidth = bar\.clientWidth;/, 'schneidet die Reihe, wird sie zum Knopf');
+  const sheet = src.slice(src.indexOf('function openContactCategoryFilter()'), src.indexOf('function renderCategoryFilters()'));
+  assert.match(sheet, /openFilterSheet\(\{/, 'die Kategorien im geteilten Filterblatt');
+  assert.match(sheet, /filterChipHtml\(\{ filter: 'contacts-category', value: '', label: t\('contacts\.filterAll'\)/);
+  assert.match(src, /if \(e\.target\.closest\('#contacts-category-filter'\)\) \{ openContactCategoryFilter\(\); return; \}/);
+});
+
+// R24 D4: der vCard-Import sperrt seinen Primaerknopf nicht mehr; ohne Wahl
+// sagt er am Dialog, was fehlt. Weitere Angaben nennt, was dahinter liegt.
+test('R24 D4: Kontakte - Import nie gesperrt, Weitere Angaben benannt', () => {
+  const src = read('../public/pages/contacts.js');
+  const imp = src.slice(src.indexOf('<div class="vcard-import">'), src.indexOf('importParsedContacts(chosen)'));
+  assert.doesNotMatch(imp, /submitBtn\.disabled = n === 0/);
+  assert.match(imp, /reasonEl\.textContent = t\('birthdays\.importNothingSelected'\)/);
+  assert.match(src, /advancedSection\(advancedFieldsHtml, \{\s*open: advancedOpen,[\s\S]{0,120}hint: \[t\('contacts\.addressLabel'\)/);
 });

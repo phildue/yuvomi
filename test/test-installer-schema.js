@@ -141,6 +141,15 @@ const INTENTIONALLY_NOT_IN_INSTALLER = {
     + 'ohnehin von Hand an. Eine Checkbox waere hier ausserdem invertiert beschriftet ("private '
     + 'Ziele SPERREN") und damit die einzige im Wizard, die man rueckwaerts liest.',
 
+  // Der Wizard erzeugt die Schluessel selbst und schreibt sie in die .env. Die
+  // _FILE-Varianten sind fuer Betreiber, die Secrets ausserhalb der .env halten.
+  SESSION_SECRET_FILE:
+    'Fuer Docker/Podman-Secrets: der Wizard schreibt SESSION_SECRET in die .env, und beides '
+    + 'zugleich bricht den Start ab. Wer das Secret aus einer Datei liest, pflegt es von Hand.',
+  DB_ENCRYPTION_KEY_FILE:
+    'Wie SESSION_SECRET_FILE. Ein vom Wizard erzeugter Schluessel in der .env und eine Datei '
+    + 'daneben waeren zwei Quellen fuer denselben Schluessel; die App bricht dann ab, statt zu raten.',
+
   // Werden zur Laufzeit erzeugt und in der Datenbank abgelegt.
   VAPID_PUBLIC_KEY: 'Wird bei Erstnutzung automatisch erzeugt; nur VAPID_SUBJECT ist konfigurierbar.',
   VAPID_PRIVATE_KEY: 'Wird bei Erstnutzung automatisch erzeugt.',
@@ -192,6 +201,11 @@ const INTENTIONALLY_NOT_IN_INSTALLER = {
   BACKUP_UPLOAD_LIMIT:
     'Betriebs-Feinjustage: Body-Limit fuer den Restore-Upload im Admin-UI, nur beim '
     + 'Zurueckspielen einer ueberdimensionierten Datenbank relevant.',
+  OIDC_TOKEN_AUTH_METHOD:
+    'Interop-Ausweg fuer einen Anbieter, der die automatische Wahl der Client-Authentifizierung '
+    + 'mit invalid_client beantwortet (#2144). Leer ist fuer jede neue Installation richtig, und '
+    + 'der Wizard kennt den Anbieter nicht: ein Feld waere eine Frage, die niemand vor der ersten '
+    + 'Anmeldung beantworten kann. Ein Schema-Eintrag ohne Feld verbietet der Guard weiter unten.',
   DB_ALLOW_NEWER_SCHEMA:
     'Notfallschalter, keine Installationsentscheidung: laesst eine aeltere App auf einer '
     + 'neueren Datenbank starten, obwohl das dabei Geschriebene beim naechsten Update verloren '
@@ -1209,6 +1223,44 @@ test('die Unraid-Vorlage gibt keinem UI-sperrenden Schlüssel einen Wert vor', (
   assert.deepEqual(offenders.sort(), [],
     'Die Unraid-Vorlage fuellt diese UI-sperrenden Schluessel vor - jeder neue Container sperrt damit '
     + `das Feld in den Einstellungen:\n${offenders.join('\n')}`);
+});
+
+// Dieselbe Regel fuer die dritte Bauart: das Portainer-App-Template, das
+// Lissy93/portainer-templates jede Nacht von `main` zieht. Portainer fuellt sein Formular
+// aus `env[].default` vor, und was dort steht, landet als Stack-Variable in der Umgebung -
+// die Suche nach `${KEY:-...}` sieht die JSON-Datei aber nicht. Das Template traegt kein
+// eigenes Compose, es zeigt auf den Portainer-Descriptor: ein Name, den der Stack nicht
+// interpoliert, waere ein Formularfeld ohne Wirkung, ein fehlendes Pflichtfeld ein Deploy,
+// der an `${VAR:?...}` scheitert.
+test('das Portainer-App-Template fragt genau ab, was der verlinkte Stack braucht', () => {
+  const template = JSON.parse(readFileSync(
+    new URL('../deploy/portainer/portainer-template.json', import.meta.url), 'utf8'));
+  assert.equal(template.type, 3, 'Das Template muss auf den Stack zeigen (type 3), kein eigener Container');
+  assert.equal(template.repository?.url, 'https://github.com/ulsklyc/yuvomi');
+  const stack = readFileSync(new URL(`../${template.repository.stackfile}`, import.meta.url), 'utf8');
+  const env = template.env ?? [];
+
+  const unknown = env.map((e) => e.name)
+    .filter((name) => !new RegExp(`\\$\\{${name}[:}]`).test(stack));
+  assert.deepEqual(unknown, [],
+    `Diese Formularfelder interpoliert ${template.repository.stackfile} nicht.`);
+
+  const required = [...stack.matchAll(/\$\{([A-Z0-9_]+):\?/g)].map((m) => m[1]);
+  assert.ok(required.length >= 2,
+    `Nur ${required.length} Pflichtvariablen im Stack gefunden (gemessen: SESSION_SECRET, `
+    + 'DB_ENCRYPTION_KEY) - die Suche greift nicht mehr.');
+  for (const name of required) {
+    const field = env.find((e) => e.name === name);
+    assert.ok(field, `${name} ist im Stack Pflicht, fehlt aber im Formular`);
+    assert.equal(field.default ?? '', '',
+      `${name} darf keinen Default tragen - er waere fuer jede Installation derselbe`);
+  }
+
+  const locking = new Set(uiLockingEnvKeys());
+  const offenders = env.filter((e) => locking.has(e.name) && (e.default ?? '') !== '')
+    .map((e) => `${e.name}: default ${JSON.stringify(e.default)}`);
+  assert.deepEqual(offenders, [],
+    `Diese Defaults sperren ein Feld in den Einstellungen:\n${offenders.join('\n')}`);
 });
 
 test('der Dokument-Mount zielt auf DOCUMENT_STORAGE_LOCAL_PATH, nie auf einen festen Pfad', () => {

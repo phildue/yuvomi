@@ -14,6 +14,47 @@
  * `resolveHouseholdLocale(database)` in server/utils/i18n.js.
  */
 
+/*
+ * EIN FORMATIERER JE ZONE, NICHT EINER JE AUFRUF. `new Intl.DateTimeFormat()`
+ * ist teuer (ICU laedt Zone und Muster), `formatToParts()` dagegen billig. Die
+ * Serien-Expansion liest seit #2034 je Vorkommen bis zu fuenf Offsets ueber
+ * utcToWall - mit einem neuen Formatierer je Aufruf brauchte /dashboard bei
+ * einem Haushalt mit synchronisierten Kalendern 1,6 s auf einem schnellen
+ * Rechner, und der Profiler fand 85 % davon im Konstruktor. Ein Formatierer
+ * haelt keinen Zustand zwischen zwei Aufrufen, er darf also geteilt werden. Eine
+ * ungueltige Zone wirft weiter beim Anlegen und wird nicht gemerkt.
+ */
+const NUMERIC_PARTS = {
+  year: 'numeric', month: 'numeric', day: 'numeric',
+  hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false,
+};
+const TWO_DIGIT_PARTS = {
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+};
+const NUMERIC_FORMATTERS = new Map();
+const TWO_DIGIT_FORMATTERS = new Map();
+// Schreibweise -> Name, den ICU fuer die Zone fuehrt. ICS-Feeds schicken
+// Zonen in beliebiger Gross-/Kleinschreibung (`europe/berlin`, `Europe/Berlin`):
+// gemerkt wird der Formatierer unter dem aufgeloesten Namen, damit eine Zone
+// einen Eintrag hat und nicht einen je Schreibweise. Der Schluessel hier ist
+// kleingeschrieben - Zonennamen unterscheiden keine Groesse, und so bleibt auch
+// diese Tabelle bei hoechstens einem Eintrag je IANA-Name.
+const ZONE_NAMES = new Map();
+
+function cachedFormatter(cache, tzid, parts) {
+  // Ohne Zone gilt die des Prozesses, und die kann sich (TZ in Tests) aendern.
+  if (!tzid) return new Intl.DateTimeFormat('en-US', { timeZone: tzid, ...parts });
+  const spelling = String(tzid).toLowerCase();
+  const known = cache.get(ZONE_NAMES.get(spelling));
+  if (known) return known;
+  const formatter = new Intl.DateTimeFormat('en-US', { timeZone: tzid, ...parts });
+  const zone = formatter.resolvedOptions().timeZone;
+  ZONE_NAMES.set(spelling, zone);
+  if (!cache.has(zone)) cache.set(zone, formatter);
+  return cache.get(zone);
+}
+
 /**
  * Ist `zone` eine von dieser Node-/ICU-Version gekannte IANA-Zone?
  * @param {unknown} zone
@@ -338,10 +379,7 @@ export function localToUTC(localStr, tzid) {
     if (isNaN(fakeUTC.getTime())) return localStr;
     // Der Offset wird an der ganzen Sekunde gelesen (siehe wholeSecondMs).
     const wholeMs = wholeSecondMs(fakeUTC.getTime());
-    const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone: tzid, year: 'numeric', month: 'numeric', day: 'numeric',
-      hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false,
-    }).formatToParts(new Date(wholeMs));
+    const parts = cachedFormatter(NUMERIC_FORMATTERS, tzid, NUMERIC_PARTS).formatToParts(new Date(wholeMs));
     const get = (type) => {
       const part = parts.find((p) => p.type === type);
       const v = part ? part.value : '0';
@@ -389,9 +427,11 @@ function offsetMinutesAt(utcMs, tzid) {
  * also nicht eindeutig.
  *
  * ZWEI FASSUNGEN, NICHT EINE GEAENDERTE: `localToUTC()` bleibt, wie es ist -
- * ICS-Parser, Expansion und Outbound verlassen sich auf sein exaktes
+ * ICS-Parser und Outbound verlassen sich auf sein exaktes
  * Ein-Durchgang-Verhalten, und eine Umstellung dort waere eine andere Frage mit
- * anderen Tests. Wer die tatsaechliche Minute braucht (eine Erinnerung, die eine
+ * anderen Tests. Die Serien-Expansion rechnet die Zeitpunkte ihrer Vorkommen
+ * seit #2034 ueber `localToUTCOccurrence()` (unten); nur ihr Tagesschluessel
+ * bleibt bis zur Umstellung des Schluesselformats auf `localToUTC()`. Wer die tatsaechliche Minute braucht (eine Erinnerung, die eine
  * Stunde zu frueh oder spaet feuert, ist keine Erinnerung mehr), nimmt diese
  * hier: der Schichtplan-Sync (#786) und der Erinnerungspfad des Kalenders
  * (#1300).
@@ -451,6 +491,51 @@ export function localToUTCPrecise(localStr, tzid) {
 }
 
 /**
+ * Wanduhr einer Serie -> Zeitpunkt eines Vorkommens, nach RFC 5545 (#2034).
+ *
+ * Die Serien-Expansion (`expandRecurringEvents`, `expandRRULE`) schreibt eine
+ * Wanduhrzeit Tag fuer Tag fort und braucht je Vorkommen den Zeitpunkt. Mit
+ * `localToUTC()` stand ein Vorkommen am Umstellungstag eine Stunde daneben:
+ * Europe/Berlin 01:30 am 25.03.2035 kam als 23:30Z des Vortags heraus statt
+ * 00:30Z (der Offset wird an der falschen Stelle gelesen, siehe oben). Hier
+ * gilt EINE Uhr mit zwei festgenagelten Regeln fuer die Stellen, an denen es
+ * die Wanduhrzeit nicht genau einmal gibt (RFC 5545, 3.3.5):
+ *
+ * - LUECKE (Fruehjahr, die Wanduhrzeit gibt es nicht): um die Lueckenbreite
+ *   nach vorn. Berlin 02:30 am 25.03.2035 -> 03:30 CEST = 01:30Z. Das liefert
+ *   `localToUTCPrecise()` schon, fuer beide Vorzeichen des Offsets.
+ * - DOPPELSTUNDE (Herbst, die Wanduhrzeit gibt es zweimal): das ERSTE
+ *   Auftreten. Berlin 02:30 am 28.10.2035 -> 02:30 CEST = 00:30Z.
+ *   `localToUTCPrecise()` waehlt hier je nach Vorzeichen des Offsets: oestlich
+ *   von UTC die spaetere Lage (01:30Z), westlich die fruehere. Deshalb wird
+ *   hier nachgefragt, ob es eine fruehere Lage mit derselben Wanduhr gibt.
+ *
+ * `localToUTCPrecise()` selbst bleibt, wie es ist: seine anderen Aufrufer
+ * (Erinnerungen, Schichtplan, Haushalt) sind eine eigene Frage.
+ *
+ * @param {string} localStr  'YYYY-MM-DDTHH:mm:ss[.sss]' ohne Offset
+ * @param {string} tzid      IANA-Zone
+ * @returns {string} UTC-ISO mit 'Z' (oder localStr bei ungueltiger Eingabe)
+ */
+export function localToUTCOccurrence(localStr, tzid) {
+  const precise = localToUTCPrecise(localStr, tzid);
+  const ms = Date.parse(precise);
+  const naiveMs = Date.parse(`${localStr}Z`);
+  if (!hasExplicitZone(precise) || Number.isNaN(ms) || Number.isNaN(naiveMs)) return precise;
+  const offsetHere = offsetMinutesAt(ms, tzid);
+  // Liegt die Wanduhr in einer Doppelstunde, gab es kurz vor `ms` einen
+  // groesseren Offset. Drei Stunden decken jede heutige Umstellung ab.
+  const offsetBefore = offsetMinutesAt(ms - 3 * 3600000, tzid);
+  if (offsetHere == null || offsetBefore == null || offsetBefore <= offsetHere) return precise;
+  const earlier = naiveMs - offsetBefore * 60000;
+  // Rundlauf: die fruehere Lage zaehlt nur, wenn dort wirklich dieser Offset galt.
+  if (earlier < ms && offsetMinutesAt(earlier, tzid) === offsetBefore) {
+    return new Date(earlier).toISOString().replace('.000Z', 'Z');
+  }
+  return precise;
+}
+
+/**
  * UTC-Instant (ISO …Z) -> lokale Wanduhr-Bestandteile in einer IANA-Zone.
  * @param {string} iso   UTC-ISO
  * @param {string} tzid  z.B. 'Europe/Berlin'
@@ -460,10 +545,7 @@ export function utcToWall(iso, tzid) {
   try {
     const d = new Date(iso);
     if (isNaN(d.getTime())) return null;
-    const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone: tzid, year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
-    }).formatToParts(d);
+    const parts = cachedFormatter(TWO_DIGIT_FORMATTERS, tzid, TWO_DIGIT_PARTS).formatToParts(d);
     const g = (t) => { const p = parts.find((x) => x.type === t); return p ? p.value : '00'; };
     let hh = g('hour'); if (hh === '24') hh = '00'; // Mitternacht '24' → '00'
     return { date: `${g('year')}-${g('month')}-${g('day')}`, time: `${hh}:${g('minute')}:${g('second')}` };

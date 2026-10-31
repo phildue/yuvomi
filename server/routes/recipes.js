@@ -6,6 +6,7 @@
 
 import { createLogger } from '../logger.js';
 import express from 'express';
+import { createHash } from 'node:crypto';
 import * as db from '../db.js';
 import { str, num, collectErrors, MAX_TITLE, MAX_TEXT, MAX_SHORT } from '../middleware/validate.js';
 import { normalizeRecipeMealTypes } from '../../public/utils/recipe-meal-types.js';
@@ -13,6 +14,7 @@ import { ingredientMatchKey } from '../../public/utils/ingredient-match-key.js';
 import { getAdapter } from '../services/recipe-providers/index.js';
 import { dataUrlContentMatches } from '../utils/file-signature.js';
 import { mayReadModule, mayWriteModule } from '../permissions.js';
+import { handOverToShoppingList } from '../services/kitchen-handover.js';
 
 const log = createLogger('Recipes');
 const router = express.Router();
@@ -182,25 +184,69 @@ function validateRecipeImage(val) {
   return { value: s, error: null };
 }
 
+/* OHNE BODY KEIN 500 (#2197).
+ *
+ * Express 5 laesst `req.body` undefined, wenn eine Anfrage keinen JSON-Body
+ * traegt (Express 4 setzte `{}`). Jede Schreibroute unten las daraus unbesehen,
+ * und ein POST ohne Body - so kam er ueber die MCP-Bruecke, wenn ein Assistent
+ * die Felder neben `payload` legte - endete als TypeError und 500 "Internal
+ * error". Mit dem leeren Objekt greift die Validierung der Route und sagt, was
+ * fehlt. Ein Array ist kein Body dieser Routen und zaehlt wie keiner.
+ */
+function bodyOf(req) {
+  const body = req.body;
+  return body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+}
+
+/* Die Zutaten muessen eine Liste sein. Ein Objekt an ihrer Stelle lief in der
+ * Transaktion als "not iterable" auf und war ebenfalls ein 500; ein PUT hatte
+ * die alten Zutaten da schon geloescht (die Transaktion rollte zurueck). Jetzt
+ * scheitert es vorher, mit 400. Eintraege, die kein Objekt sind, ueberspringt
+ * die Schleife wie einen leeren Namen.
+ */
+function validateIngredients(val) {
+  if (val === undefined || val === null) return { value: [], error: null };
+  if (!Array.isArray(val)) return { value: [], error: 'Ingredients must be a list.' };
+  return { value: val.filter((ing) => ing && typeof ing === 'object'), error: null };
+}
+
+/* PORTIONEN (R24, E12): fuer wie viele Portionen die Mengen gelten.
+ *
+ * `undefined` heisst "nicht mitgeschickt" und laesst den gespeicherten Wert
+ * stehen (Teil-Update, wie Bild und meal_types); `null` oder '' loescht ihn.
+ * Sonst eine ganze Zahl von 1 bis 99 - dieselbe Grenze haelt der CHECK der
+ * Spalte (Migration 270).
+ */
+function validateServings(val) {
+  if (val === undefined) return { value: undefined, error: null };
+  if (val === null || val === '') return { value: null, error: null };
+  const n = Number(val);
+  if (!Number.isInteger(n) || n < 1 || n > 99) return { value: null, error: 'Servings must be a whole number from 1 to 99.' };
+  return { value: n, error: null };
+}
+
 router.post('/', (req, res) => {
   try {
-    const { ingredients = [] } = req.body;
+    const body = bodyOf(req);
+    const vIngredients = validateIngredients(body.ingredients);
+    const ingredients = vIngredients.value;
 
-    const vTitle = str(req.body.title, 'Titel', { max: MAX_TITLE });
-    const vNotes = str(req.body.notes, 'Notizen', { max: MAX_TEXT, required: false });
-    const vRecipeUrl = str(req.body.recipe_url, 'Rezept-URL', { max: MAX_TEXT, required: false });
-    const mealTypes = normalizeRecipeMealTypes(req.body.meal_types);
+    const vTitle = str(body.title, 'title', { max: MAX_TITLE });
+    const vNotes = str(body.notes, 'notes', { max: MAX_TEXT, required: false });
+    const vRecipeUrl = str(body.recipe_url, 'recipe_url', { max: MAX_TEXT, required: false });
+    const mealTypes = normalizeRecipeMealTypes(body.meal_types);
 
-    const vImage = validateRecipeImage(req.body.image_data);
-    const errors = collectErrors([vTitle, vNotes, vRecipeUrl, vImage]);
+    const vImage = validateRecipeImage(body.image_data);
+    const vServings = validateServings(body.servings);
+    const errors = collectErrors([vTitle, vNotes, vRecipeUrl, vImage, vIngredients, vServings]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
 
     const recipeId = db.transaction(() => {
       const result = db.get().prepare(`
-        INSERT INTO recipes (title, notes, recipe_url, meal_types, image_data, created_by)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO recipes (title, notes, recipe_url, meal_types, image_data, servings, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(vTitle.value, vNotes.value, vRecipeUrl.value, mealTypes.join(','),
-        vImage.value ?? null, req.authUserId || req.session.userId);
+        vImage.value ?? null, vServings.value ?? null, req.authUserId || req.session.userId);
 
       const rid = Number(result.lastInsertRowid);
       const insertIng = db.get().prepare(`
@@ -245,20 +291,23 @@ router.put('/:id', (req, res) => {
     // Provider-Account angelegt hat (und damit als created_by dieser Rezepte gilt).
     if (existing.provider_account_id) return res.status(403).json({ error: 'Mirrored recipes are managed by their source provider and cannot be edited here.', code: 403, reason: 'recipe_mirrored' });
 
-    const { ingredients = [] } = req.body;
+    const body = bodyOf(req);
+    const vIngredients = validateIngredients(body.ingredients);
+    const ingredients = vIngredients.value;
 
-    const vTitle = str(req.body.title, 'Titel', { max: MAX_TITLE });
-    const vNotes = str(req.body.notes, 'Notizen', { max: MAX_TEXT, required: false });
-    const vRecipeUrl = str(req.body.recipe_url, 'Rezept-URL', { max: MAX_TEXT, required: false });
+    const vTitle = str(body.title, 'title', { max: MAX_TITLE });
+    const vNotes = str(body.notes, 'notes', { max: MAX_TEXT, required: false });
+    const vRecipeUrl = str(body.recipe_url, 'recipe_url', { max: MAX_TEXT, required: false });
     // Fehlt das Feld, bleibt die gespeicherte Auswahl stehen - ein Teil-Update
     // darf sie nicht mitnehmen. Ohne den Rückgriff schriebe jeder Aufruf ohne
     // meal_types wieder alle vier Mahlzeiten hin und machte eine bewusst leere
     // Auswahl (#750) beim nächsten Speichern zunichte.
     const mealTypes = normalizeRecipeMealTypes(
-      req.body.meal_types === undefined ? existing.meal_types : req.body.meal_types
+      body.meal_types === undefined ? existing.meal_types : body.meal_types
     );
-    const vImage = validateRecipeImage(req.body.image_data);
-    const errors = collectErrors([vTitle, vNotes, vRecipeUrl, vImage]);
+    const vImage = validateRecipeImage(body.image_data);
+    const vServings = validateServings(body.servings);
+    const errors = collectErrors([vTitle, vNotes, vRecipeUrl, vImage, vIngredients, vServings]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
 
     db.transaction(() => {
@@ -269,10 +318,12 @@ router.put('/:id', (req, res) => {
       db.get().prepare(`
         UPDATE recipes
         SET title = ?, notes = ?, recipe_url = ?, meal_types = ?,
-            image_data = CASE WHEN ? = 1 THEN ? ELSE image_data END
+            image_data = CASE WHEN ? = 1 THEN ? ELSE image_data END,
+            servings = CASE WHEN ? = 1 THEN ? ELSE servings END
         WHERE id = ?
       `).run(vTitle.value, vNotes.value, vRecipeUrl.value, mealTypes.join(','),
-        vImage.value === undefined ? 0 : 1, vImage.value ?? null, id);
+        vImage.value === undefined ? 0 : 1, vImage.value ?? null,
+        vServings.value === undefined ? 0 : 1, vServings.value ?? null, id);
 
       db.get().prepare('DELETE FROM recipe_ingredients WHERE recipe_id = ?').run(id);
 
@@ -403,6 +454,33 @@ router.delete('/:id', (req, res) => {
  * erreichen (siehe publicAccount() in routes/recipe-providers.js) - also holt
  * der Server die Bytes und reicht sie durch, wie der DMS-Vorschau-Proxy es für
  * Paperless/Papra tut.
+ *
+ * CACHEBAR UEBER `?v=` (#2048). Vorher holte jeder Aufruf die Bytes live beim
+ * Provider und antwortete `no-store`: eine Liste mit 500 gespiegelten Rezepten
+ * kostete bei jedem Oeffnen 500 Abrufe bei Mealie und 500 Anfragen aus dem
+ * 300er-Budget des apiLimiter. Jetzt nennt die Liste die Version in der
+ * Adresse (wie die Profilbilder in routes/people.js, #2056).
+ *
+ * DIE VERSION IST `provider_updated_at`. Mealie und Tandoor setzen ihr
+ * `updatedAt` neu, wenn ein Rezept gespeichert wird, ein neues Bild
+ * eingeschlossen; der Sync schreibt `provider_slug` und `provider_has_image`
+ * ohnehin nur, wenn dieser Wert wechselt (services/recipe-provider-sync.js).
+ * Eine neue Version heisst also eine neue Adresse und einen frischen Abruf.
+ *
+ * DAS ETAG HAENGT AN DERSELBEN VERSION, NICHT AN DEN BYTES. So beantwortet die
+ * Route eine Nachfrage mit 304, ohne den Provider zu fragen - ein ETag ueber
+ * die Bytes muesste sie dafuer erst holen.
+ *
+ * IMMER `no-cache`, NIE `max-age` (Codex-Review zu #2067). Ein `immutable`
+ * fuer ein Jahr liess das Bild nach dem Abmelden oder einem Kontowechsel im
+ * selben Browser aus dem HTTP-Cache kommen, ohne dass requireAuth oder das
+ * meals-Gate liefen - das Abmelden leert nur den Cache des Service Workers.
+ * Mit `no-cache` fragt der Browser jedes Mal nach, die Nachfrage laeuft durch
+ * alle Gates, und die Antwort ist ein 304 ohne Bytes und ohne Provider-Abruf.
+ * Die Flut bleibt trotzdem weg: das Teure war der Abruf beim Provider, und die
+ * Bildabrufe zaehlen im eigenen imageLimiter (server/index.js). `?v=` haelt
+ * die Adresse je Version eindeutig, damit der Browser nie ein altes Bild als
+ * Kandidaten fuer die Nachfrage nimmt.
  */
 router.get('/:id/provider-thumbnail', async (req, res) => {
   try {
@@ -410,7 +488,7 @@ router.get('/:id/provider-thumbnail', async (req, res) => {
     if (!id) return res.status(400).json({ error: 'Invalid recipe ID.', code: 400 });
 
     const recipe = db.get().prepare(
-      'SELECT provider_account_id, provider_recipe_id, provider_slug, provider_has_image FROM recipes WHERE id = ?'
+      'SELECT provider_account_id, provider_recipe_id, provider_slug, provider_has_image, provider_updated_at FROM recipes WHERE id = ?'
     ).get(id);
     if (!recipe?.provider_account_id || !recipe.provider_has_image) {
       return res.status(404).json({ error: 'No thumbnail available.', code: 404 });
@@ -418,6 +496,22 @@ router.get('/:id/provider-thumbnail', async (req, res) => {
 
     const account = db.get().prepare('SELECT * FROM recipe_provider_accounts WHERE id = ?').get(recipe.provider_account_id);
     if (!account) return res.status(404).json({ error: 'No thumbnail available.', code: 404 });
+
+    const version = recipe.provider_updated_at ? String(recipe.provider_updated_at) : null;
+    const etag = version
+      ? `"${createHash('sha256').update(`${id}|${recipe.provider_account_id}|${version}`).digest('hex').slice(0, 32)}"`
+      : null;
+    // Ueberschreibt das `no-store`, das server/index.js jeder API-Antwort setzt.
+    // `private`: das Bild gehoert zu einer Sitzung, kein geteilter Cache
+    // dazwischen darf es halten. `no-cache`: siehe Kopfkommentar.
+    const cacheControl = etag ? 'private, no-cache' : 'no-store';
+    // Die Kopfzeilen erst an den beiden Erfolgswegen: ein 404 oder 502 von
+    // unten behaelt das globale `no-store` und bleibt nie ein Jahr liegen.
+    if (etag && req.get('If-None-Match') === etag) {
+      res.setHeader('Cache-Control', cacheControl);
+      res.setHeader('ETag', etag);
+      return res.status(304).end();
+    }
 
     const thumb = await getAdapter(account).fetchThumbnail({ id: recipe.provider_recipe_id, slug: recipe.provider_slug });
     const mime = normalizeMime(thumb?.mime);
@@ -427,8 +521,9 @@ router.get('/:id/provider-thumbnail', async (req, res) => {
     res.setHeader('Content-Type', mime);
     res.setHeader('Content-Length', String(thumb.buffer.length));
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'");
+    res.setHeader('Cache-Control', cacheControl);
+    if (etag) res.setHeader('ETag', etag);
     res.end(thumb.buffer);
   } catch (err) {
     if (err.status === 404) return res.status(404).json({ error: 'No thumbnail available.', code: 404 });
@@ -444,7 +539,8 @@ router.get('/:id/provider-thumbnail', async (req, res) => {
 /**
  * POST /api/v1/recipes/:id/to-shopping-list
  * Zutaten eines Rezepts auf eine Einkaufsliste übernehmen.
- * Body: { listId: number }
+ * Body: { listId: number, quantities?: (string|null)[], ingredientIds?: number[] }
+ * (`ingredientIds` ist Pflicht, sobald `quantities` mitkommt.)
  * Response: { data: { transferred: number, skipped: number, added_ids: number[] } }
  *
  * Anders als bei Mahlzeiten wird hier NICHTS am Rezept markiert: ein Rezept ist
@@ -477,7 +573,7 @@ router.post('/:id/to-shopping-list', (req, res) => {
     const recipe = db.get().prepare('SELECT id FROM recipes WHERE id = ?').get(id);
     if (!recipe) return res.status(404).json({ error: 'Recipe not found.', code: 404, reason: 'recipes_recipe_not_found' });
 
-    const vList = num(req.body.listId, 'Listen-ID', { required: true });
+    const vList = num(bodyOf(req).listId, 'Listen-ID', { required: true });
     const errors = collectErrors([vList]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
 
@@ -486,30 +582,49 @@ router.post('/:id/to-shopping-list', (req, res) => {
     if (!list) return res.status(404).json({ error: 'Shopping list not found.', code: 404, reason: 'shopping_list_not_found' });
 
     const ingredients = db.get().prepare(
-      'SELECT name, quantity, category FROM recipe_ingredients WHERE recipe_id = ? ORDER BY id ASC',
+      'SELECT id, name, quantity, category FROM recipe_ingredients WHERE recipe_id = ? ORDER BY id ASC',
     ).all(id);
+
+    // UMGERECHNETE MENGEN (R24, E12). Wer das Rezept fuer mehr oder weniger
+    // Portionen ansieht, uebernimmt auch diese Mengen. Gerechnet wird im
+    // Browser (scaleQuantityText, utils/scale-quantity.js - dieselbe Rechnung
+    // wie im Mahlzeit-Dialog); hierher kommt nur der Text je Zutat. Namen und
+    // Kategorien bleiben die des Rezepts: die Liste ersetzt die Menge, sie
+    // legt keine Zutat an.
+    //
+    // JE MENGE DIE ZEILE, ZU DER SIE GEHOERT (Codex an #2364). Die Mengen
+    // lagen positionsweise auf den Zutaten DIESER Abfrage; aenderte jemand das
+    // Rezept zwischen Laden und Uebernahme (oder ein Abgleich mit der
+    // Rezeptquelle die Reihenfolge), landeten sie still bei falschen Zutaten.
+    // `ingredientIds` nennt deshalb die Zeilen-ID je Menge, und sie ist Pflicht:
+    // Speichern und Abgleich legen alle Zutaten neu an, eine geaenderte Zeile
+    // hat also immer eine neue ID - auch eine geaenderte Grundmenge, auf der
+    // die umgerechnete aufbaut. Weicht der Stand ab, 409 mit dem Rezept, wie es
+    // jetzt ist, statt still falsch zuzuordnen.
+    const { quantities, ingredientIds } = bodyOf(req);
+    if (quantities !== undefined) {
+      if (!Array.isArray(quantities)
+        || quantities.some((q) => q !== null && (typeof q !== 'string' || q.length > MAX_SHORT))) {
+        return res.status(400).json({ error: 'Quantities must be one text per ingredient.', code: 400 });
+      }
+      if (!Array.isArray(ingredientIds) || ingredientIds.length !== quantities.length
+        || ingredientIds.some((v) => !Number.isSafeInteger(v) || v < 1)) {
+        return res.status(400).json({ error: 'Quantities need the ingredientIds they belong to, one per quantity.', code: 400 });
+      }
+      if (ingredientIds.length !== ingredients.length || ingredients.some((ing, i) => ing.id !== ingredientIds[i])) {
+        return res.status(409).json({
+          error: 'The recipe ingredients changed since they were loaded.', code: 409,
+          reason: 'recipes_ingredients_changed', recipe: loadRecipeWithIngredients(req, id),
+        });
+      }
+      quantities.forEach((q, i) => { ingredients[i].quantity = q?.trim() || null; });
+    }
     if (!ingredients.length) return res.json({ data: { transferred: 0, skipped: 0, added_ids: [] } });
 
+    // Die Regel ist die der ganzen Kueche (services/kitchen-handover.js, R23 D2):
+    // dieser Weg hatte sie als einziger schon, die drei anderen nicht.
     const result = db.transaction(() => {
-      const existing = db.get().prepare(
-        'SELECT name FROM shopping_items WHERE list_id = ? AND is_checked = 0',
-      ).all(vList.value);
-      const present = new Set(existing.map((i) => i.name.trim().toLowerCase()));
-
-      const insertItem = db.get().prepare(`
-        INSERT INTO shopping_items (list_id, name, quantity, category)
-        VALUES (?, ?, ?, ?)
-      `);
-
-      const addedIds = [];
-      let skipped = 0;
-      for (const ing of ingredients) {
-        const key = ing.name.trim().toLowerCase();
-        if (present.has(key)) { skipped += 1; continue; }
-        const info = insertItem.run(vList.value, ing.name, ing.quantity, ing.category || 'Sonstiges');
-        present.add(key);
-        addedIds.push(Number(info.lastInsertRowid));
-      }
+      const { added_ids: addedIds, skipped } = handOverToShoppingList(db.get(), vList.value, ingredients.map(({ name, quantity, category }) => ({ name, quantity, category })));
       return { transferred: addedIds.length, skipped, added_ids: addedIds };
     });
 
@@ -560,7 +675,7 @@ router.put('/:id/ingredient-match', (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'Invalid recipe ID.', code: 400 });
 
-    const vName = str(req.body.name, 'Zutat', { max: MAX_TITLE });
+    const vName = str(bodyOf(req).name, 'Zutat', { max: MAX_TITLE });
     const errors = collectErrors([vName]);
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
 
@@ -579,7 +694,7 @@ router.put('/:id/ingredient-match', (req, res) => {
     // der Abgleich mit der Rezeptquelle hat seine Zutaten ersetzt.
     if (!treffer) return res.status(404).json({ error: 'Ingredient not found in this recipe.', code: 404, reason: 'recipes_ingredient_not_found' });
 
-    const raw = req.body.pantryItemId;
+    const raw = bodyOf(req).pantryItemId;
     if (raw === null || raw === undefined || raw === '') {
       db.get().prepare(
         'DELETE FROM recipe_ingredient_pantry_matches WHERE recipe_id = ? AND ingredient_key = ?',
@@ -589,7 +704,7 @@ router.put('/:id/ingredient-match', (req, res) => {
       });
     }
 
-    const vItem = num(raw, 'Vorrats-ID', { required: true });
+    const vItem = num(raw, 'pantry_item_id', { required: true });
     const itemErrors = collectErrors([vItem]);
     if (itemErrors.length) return res.status(400).json({ error: itemErrors.join(' '), code: 400 });
 

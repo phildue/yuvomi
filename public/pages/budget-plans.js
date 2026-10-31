@@ -6,12 +6,15 @@
  */
 import { api } from '/api.js';
 import { t } from '/i18n.js';
-import { openModal, closeModal, reportFieldError, refocusAfterRender } from '/components/modal.js';
-import { vibrate } from '/utils/ux.js';
+import { REQUIRED_MARK } from '/utils/html.js';
+import { openModal, closeModal, captureModalContext, reportFieldError, refocusAfterRender } from '/components/modal.js';
+import { vibrate, isImeComposing } from '/utils/ux.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
 import { emptyStateHTML, mountLoadError } from '/utils/empty-state.js';
-import { amountPlaceholder, amountStep, amountIsSavable, smallestUnitLabel } from '/utils/money.js';
+import { parseAmountInput } from '/utils/money.js';
+import { amountInputAttrs, amountFieldError } from '/utils/amount-field.js';
 import { isNavModuleReadOnly } from '/permissions.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
 
 const view = { month: '', data: null, error: false, ctx: null, root: null };
 
@@ -102,7 +105,12 @@ function renderBody(body) {
       <p class="budget-plan__historic-note">
         <i data-lucide="info" class="icon-md" aria-hidden="true"></i>${t('budget.planHistoricNote')}
       </p>`}
-    ${renderSavingsCard(d.savings)}
+    ${/* DER PLAN BEGINNT MIT DEM PLAN (R21 S7, Critique a4). Ohne Sparziel
+          stand mobil zuerst die Aufforderung, eines zu setzen - eine 117px-
+          Karte vor dem ersten Kategorie-Budget. Ein gesetztes Ziel ist Zustand
+          und steht vorn; die Aufforderung steht hinter den Kategorien. Breit
+          setzt das Raster sie ohnehin in die Seitenspalte (`dense`). */ ''}
+    ${d.savings ? renderSavingsCard(d.savings) : ''}
     <div class="budget-plan__section">
       <!-- KEIN ZWEITES „+ BUDGET FESTLEGEN" IM KOERPER (Re-Critique
            2026-09-27, A5 / R10 L11): der Budget-FAB nennt auf diesem Reiter
@@ -113,6 +121,7 @@ function renderBody(body) {
       </div>
       <div id="budget-plan-rows" class="row-carrier">${renderRows(d.plans)}</div>
     </div>
+    ${d.savings ? '' : renderSavingsCard(d.savings)}
   `);
   if (window.lucide) lucide.createIcons({ el: body });
   wire(body);
@@ -256,6 +265,7 @@ export function openAddPlan() {
   const optHtml = options.map((c) =>
     `<option value="${view.ctx.esc(c.key)}">${view.ctx.esc(view.ctx.categoryLabel(c))}</option>`).join('');
   openModal({
+    staged: true, // Buehne zuerst, Felder nach dem ersten Bild (modal.js, R21 a6)
     title: t('budget.planAddBudget'),
     content: `
       <div class="form-group">
@@ -265,7 +275,7 @@ export function openAddPlan() {
       ${amountFieldHtml('')}
       <div class="modal-panel__footer modal-panel__footer--plain">
         <div></div>
-        <div style="display:flex;gap:var(--space-3)">
+        <div class="modal-panel__footer-group">
           <button class="btn btn--secondary" data-action="close-modal">${t('common.cancel')}</button>
           <button class="btn btn--primary" id="plan-save">${t('common.add')}</button>
         </div>
@@ -293,10 +303,10 @@ function openPlanEditor({ category, savings = false }) {
       ${savings ? `<p class="form-hint" style="margin-bottom:var(--space-3)">${t('budget.planSavingsHint')}</p>` : ''}
       ${amountFieldHtml(hasCurrent ? current : '')}
       <div class="modal-panel__footer modal-panel__footer--plain">
-        ${hasCurrent ? `<button type="button" class="btn btn--danger-outline" id="plan-delete" style="margin-inline-end:auto">
+        ${hasCurrent ? `<button type="button" class="btn btn--danger-outline" id="plan-delete">
           <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${t('common.delete')}
         </button>` : '<div></div>'}
-        <div style="display:flex;gap:var(--space-3)">
+        <div class="modal-panel__footer-group">
           <button class="btn btn--secondary" data-action="close-modal">${t('common.cancel')}</button>
           <button class="btn btn--primary" id="plan-save">${t('common.save')}</button>
         </div>
@@ -320,46 +330,39 @@ function openPlanEditor({ category, savings = false }) {
 function amountFieldHtml(value) {
   return `
     <div class="form-group">
-      <label class="form-label" for="plan-amount">${t('budget.planMonthlyAmount')}</label>
-      <input id="plan-amount" class="form-input" type="number" inputmode="decimal" min="0"
-             step="${amountStep(view.ctx.currency, value)}"
-             value="${value === '' ? '' : String(value)}" placeholder="${amountPlaceholder(view.ctx.currency)}" />
+      <label class="form-label" for="plan-amount">${t('budget.planMonthlyAmount')}${REQUIRED_MARK}</label>
+      <input id="plan-amount" class="form-input"${amountInputAttrs(view.ctx.currency, value)} required />
     </div>`;
 }
 
 function bindEnter(panel, fn) {
   panel.querySelector('#plan-amount')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); fn(); }
+    if (e.key === 'Enter' && !isImeComposing(e)) { e.preventDefault(); fn(); }
   });
 }
 
 async function savePlan(panel, category, original = null) {
   if (readOnly()) return;
-  const raw = panel.querySelector('#plan-amount').value;
-  const amount = parseFloat(raw);
-  if (isNaN(amount) || amount <= 0) {
-    // Fehler am Feld statt als ortloser Toast (geteiltes Muster, Critique P1).
-    reportFieldError(panel.querySelector('#plan-amount'), t('budget.validAmountRequired'));
+  // Fehler am Feld statt als ortloser Toast (geteiltes Muster, Critique P1),
+  // mit dem benannten Grund (D1): gruppiert, keine Zahl, nicht positiv oder
+  // mehr Stellen, als die Waehrung kennt. Ein unangetasteter Bestandswert,
+  // der schon vorher neben dem Raster lag, bleibt speicherbar.
+  const problem = amountFieldError(panel.querySelector('#plan-amount'), view.ctx.currency, { required: true, original });
+  if (problem) {
+    reportFieldError(...problem);
     return;
   }
-  // Der Dialog ist kein <form>: gespeichert wird über einen Button-Handler, die
-  // native step-Prüfung läuft also nie. Ohne diese Zeile nähme ein Feld mit
-  // step="1" trotzdem 12,5 JPY entgegen. Ein unangetasteter Bestandswert, der
-  // schon vorher neben dem Raster lag, bleibt speicherbar.
-  if (!amountIsSavable(amount, view.ctx.currency, { original })) {
-    reportFieldError(panel.querySelector('#plan-amount'), t('common.amountPrecisionRequired', {
-      currency: view.ctx.currency,
-      step: smallestUnitLabel(view.ctx.currency),
-    }));
-    return;
-  }
+  const amount = parseAmountInput(panel.querySelector('#plan-amount').value);
   const btn = panel.querySelector('#plan-save');
+  // Geschlossen wird nur dieser Dialog, nicht einer, der waehrend der Anfrage
+  // aufgegangen ist (#1997).
+  const modalContext = captureModalContext();
   btn.disabled = true;
   try {
     await api.put(`/budget/plans/${encodeURIComponent(category)}`, { amount });
     vibrate(10);
-    closeModal({ force: true });
-    await load();
+    closeModal({ force: true, context: modalContext });
+    await reloadAfterSave(() => load());
     refocusAfterRender();
     window.yuvomi?.showToast(t('budget.planSavedToast'), 'success');
   } catch (err) {
@@ -378,17 +381,18 @@ async function deletePlan(category) {
   const previous = category === '__savings__'
     ? view.data?.savings?.planned
     : view.data?.plans?.find((p) => p.category === category)?.planned;
+  const modalContext = captureModalContext();
   try {
     await api.delete(`/budget/plans/${encodeURIComponent(category)}`);
     vibrate(10);
-    closeModal({ force: true });
+    closeModal({ force: true, context: modalContext });
     await load();
     refocusAfterRender();
     window.yuvomi?.showToast(t('budget.planRemovedToast'), 'default', 5000, async () => {
       if (previous == null) return;
       try {
         await api.put(`/budget/plans/${encodeURIComponent(category)}`, { amount: previous });
-        await load();
+        await reloadAfterSave(() => load());
         refocusAfterRender();
       } catch (err) {
         console.error('[Budget] plan restore error:', err);
@@ -405,4 +409,4 @@ async function deletePlan(category) {
  * Messflaeche fuer die Nur-lesen-Regel (#1265 P7): die drei Renderer sind reine
  * Funktionen ueber `view`, das der Test mit `ctx` fuellt.
  */
-export const __test = { readOnly, renderSavingsCard, renderRows, view, openAddPlan, toneForRatio };
+export const __test = { readOnly, renderSavingsCard, renderRows, view, openAddPlan, openPlanEditor, toneForRatio };

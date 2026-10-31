@@ -182,11 +182,13 @@ test('die Hoehe der klebenden Spalte rechnet ab ihrer gemessenen Oberkante bis z
     && r.at.some((a) => /module-surface/.test(a)));
   assert.ok(rule, 'Regel der klebenden Detailspalte fehlt');
   assert.match(rule.body, /position:\s*sticky/);
-  // R10 L3 (A8 P1-2): VOLLE Hoehe (`height`, nicht `max-height` - sonst eine
-  // 301px-Karte) und buendig mit der Liste (kein Versatz nach unten).
-  assert.doesNotMatch(rule.body, /max-height\s*:/, 'die Spalte ist ein Ort, keine mit dem Inhalt wachsende Karte');
+  // R10 L3 (A8 P1-2) stand hier VOLLE Hoehe. R21 S7 (D9, "Detailspalten
+  // nicht kuenstlich strecken"): hoechstens bis zur Luft ueber dem Fensterrand,
+  // sonst so hoch wie der Inhalt (1920: 194px leer ueber dem Fuss). Buendig
+  // mit der Liste bleibt sie (kein Versatz nach unten).
+  assert.doesNotMatch(rule.body, /(?:^|;|\s)height\s*:/, 'keine feste Hoehe: die Spalte folgt ihrem Inhalt');
   assert.doesNotMatch(rule.body, /margin-block-start\s*:/, 'die Spalte beginnt buendig mit der Liste');
-  const maxHeight = rule.body.match(/(?:^|;|\s)height:\s*([^;]+);/)?.[1] ?? '';
+  const maxHeight = rule.body.match(/(?:^|;|\s)max-height:\s*([^;]+);/)?.[1] ?? '';
   // Die Oberkante ist der Messwert; ohne ihn (erster Frame) der Klebestand.
   // Und sie endet ueber dem Nachlauf der Shell (Installationsbanner, FAB):
   // eine klebende Spalte bis an den Fensterrand liegt sonst mit ihrem Fuss
@@ -288,16 +290,14 @@ test('die geteilte Leseansicht zeichnet Gruppen mit Titel und laesst leere ganz 
   }
 });
 
-test('in der Spalte: Kennzahlen als Zeilen ohne Wortbruch, nicht als drei 136px-Kacheln (A8 P1-2)', async () => {
+test('R24 E2 (vorher A8 P1-2, R23 D12): keine Kennzahlkarten mehr - die Kurzzeile und der Fristen-Chip auf dem Lesemass', async () => {
   const { eachRule } = await import('./css-rules.js');
   const css = readFileSync(new URL('../public/styles/inventory.css', import.meta.url), 'utf8');
-  const inSplit = [...eachRule(css)].filter((r) => r.at.some((a) => /module-surface/.test(a)));
-  const body = (sel) => inSplit.filter((r) => r.selector.trim() === sel).map((r) => r.body).join(';');
-  assert.match(body('.inventory-list .metric-grid'), /grid-template-columns:\s*minmax\(0, 1fr\)/, 'eine Kennzahl je Zeile');
-  assert.match(body('.inventory-list .metric-grid > .metric-card'), /flex-direction:\s*row/, 'Wort links, Zahl rechts');
-  const label = body('.inventory-list .metric-grid .metric-card__label');
-  assert.match(label, /overflow-wrap:\s*normal/, 'kein Bruch mitten im Wort („AUFMERKSAMKE/IT")');
-  assert.match(label, /white-space:\s*nowrap/);
+  const all = [...eachRule(css)];
+  assert.ok(!all.some((r) => /\.inventory-list \.metric-grid/.test(r.selector)), 'keine Kartenreihe mehr im Inventar');
+  const measure = all.find((r) => r.at.length === 0 && r.selector.includes('.inventory-list > .budget-glance'));
+  assert.match(measure?.body ?? '', /max-width:\s*var\(--page-measure, var\(--layout-reading\)\)/, 'auf dem Lesemass der Gruppen');
+  assert.ok(measure.selector.includes('.inventory-list > .inventory-attention'), 'der Chip ebenso');
 });
 
 // Review R11: der Kilometerstand-Trend rechnet X nach dem Datum. Zwei
@@ -414,7 +414,9 @@ test('E3: ein Chip zeigt nur seine Kategorie (nach Ort gruppiert) und ersetzt di
     assert.equal(hist.state?.path, '/inventory?category=electronics', 'der Router liest `path` bei popstate');
     const groups = inventory.visibleGroups();
     assert.deepEqual(groups.flatMap((g) => g.items.map((i) => i.id)).sort(), [42, 8].sort());
-    assert.ok(groups.every((g) => g.icon === 'map-pin'), 'unter einem Chip gruppiert der Ort - der Kategoriename stuende sonst doppelt');
+    // Die Gruppen nach Ort tragen die Ort-ID als Schluessel (oder "ohne Ort"), die nach
+    // Kategorie den Kategorienamen; das Ort-Zeichen gibt es seit R23 (D10) nicht mehr.
+    assert.ok(groups.every((g) => /^(\d+|__unlocated__)$/.test(g.key)), 'unter einem Chip gruppiert der Ort - der Kategoriename stuende sonst doppelt');
     inventory.selectCategory(null);
     assert.deepEqual(entries(), ['/inventory'], '„Alle" nimmt die Kategorie aus der Adresse');
     inventory.selectCategory('sports');
@@ -484,7 +486,9 @@ test('E3: das Detail setzt kurze Angaben zweispaltig, wenn die SPALTE es traegt'
   assert.match(grid.body, /grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
   const wide = pane.find(({ selector }) => /detail-row--multiline/.test(selector));
   assert.ok(wide && /grid-column:\s*1\s*\/\s*-1/.test(wide.body), 'Notizen, Fristen, Belege und Verlauf nehmen beide Spalten');
-  assert.match(wide.selector, /\.detail-row__value:not\(span\)/, 'ein Knoten statt eines kurzen Werts nimmt die Zeile');
+  // Eigene Regel (F4.2): in der Liste mit --multiline verwarf ein Browser ohne :has() beide.
+  const node = pane.find(({ selector }) => /\.detail-row__value:not\(span\)/.test(selector));
+  assert.ok(node && /grid-column:\s*1\s*\/\s*-1/.test(node.body), 'ein Knoten statt eines kurzen Werts nimmt die Zeile');
 });
 
 test('E3: die Garantie-Zeile heisst „Garantie" und nennt Dauer UND Stand', async () => {
@@ -543,4 +547,55 @@ test('Inventar-Dialog: Kauf, Garantie, Foto, Dokumente hinter „Weitere Angaben
   const css = readFileSync(new URL('../public/styles/inventory.css', import.meta.url), 'utf8');
   const filters = [...eachRule(css)].find((r) => !r.at.length && r.selector.trim() === '.inventory-filters');
   assert.match(filters?.body ?? '', /padding-block:\s*var\(--space-3\);/, 'Abstand oben UND unten');
+});
+
+// Critique R22 (a4 P3/Klein): angelegt wurde ein "Gegenstand", bearbeitet ein
+// "Artikel" (das Wort des Einkaufs); und "Braucht Aufmerksamkeit 0" stand als
+// Akzent-Knopf da, der einen leeren Filter versprach.
+test('R22: der Gegenstand heisst beim Bearbeiten so wie beim Anlegen, null Fristen sind kein Knopf', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../public/pages/inventory.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(src, /t\('common\.editItem'\)/, 'kein Artikel-Titel im Inventar');
+  assert.equal((src.match(/t\('inventory\.editItem'\)/g) ?? []).length, 2, 'Dialog und Bearbeiten aus der Detailansicht');
+  for (const f of ['de', 'en']) {
+    const d = JSON.parse(readFileSync(new URL(`../public/locales/${f}.json`, import.meta.url), 'utf8'));
+    assert.ok(d.inventory.editItem, `${f}: inventory.editItem fehlt`);
+  }
+  const de = JSON.parse(readFileSync(new URL('../public/locales/de.json', import.meta.url), 'utf8'));
+  assert.equal(de.inventory.editItem, 'Gegenstand bearbeiten');
+  const metrics = src.slice(src.indexOf('function renderMetrics('), src.indexOf('function groupItemsByCategory('));
+  // Seit R24 (E2, G4-Inventar-P3-1) EINE Kurzzeile in jeder Breite und die
+  // Fristen als Filterchip - ohne Frist (und ohne aktiven Filter) gar keiner.
+  assert.match(metrics, /const attention = needsAttention > 0 \|\| state\.filterAttention/, 'null Fristen sind kein Knopf');
+  assert.match(metrics, /<button type="button" class="filter-chip filter-chip--sm\$\{state\.filterAttention \? ' filter-chip--active' : ''\}"\s+data-action="toggle-attention-filter" aria-pressed="\$\{state\.filterAttention\}">/, 'mit Frist ein Filterchip');
+  assert.match(metrics, /metricGlanceHtml\(\{[\s\S]*?everywhere: true,/, 'die Kurzzeile in jeder Breite');
+  assert.doesNotMatch(metrics, /metric-grid|metric-card/, 'keine Kacheln mehr');
+});
+
+// Critique R22 (aus S1): die globale Suche fuehrt mit `/inventory?open=<id>`
+// ins Inventar; unter der Schwelle blieb der Treffer zu (Probe 390x844:
+// Blatt offen nein -> ja, nach dem Schliessen `/inventory` ohne Parameter).
+test('R22: `?open=` oeffnet auch am Telefon das Blatt des Gegenstands', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../public/pages/inventory.js', import.meta.url), 'utf8');
+  const mount = src.slice(src.indexOf('_md = mountMasterDetail({'), src.indexOf('onModeChange: onInventoryModeChange'));
+  assert.match(mount, /deepLinkNarrow: true,/);
+  assert.match(mount, /openNarrow: openItemNarrow,/, 'das Blatt, das der Link oeffnet');
+});
+
+// R23 S11 (optimize): versteckt geladen erschien die Chipreihe mit den Daten
+// und schob Liste und Detail um ihre Hoehe nach unten (1440x900, 4x CPU:
+// Layout-Shift 0,035). Sie haelt ihren Platz, bis die Chips entschieden sind.
+test('R23: die Kategorie-Reihe haelt ihren Platz, bis die Daten da sind', async () => {
+  const { eachRule } = await import('./css-rules.js');
+  const src = readFileSync(new URL('../public/pages/inventory.js', import.meta.url), 'utf8');
+  const render = src.slice(src.indexOf('export async function render('));
+  assert.match(render.slice(0, render.indexOf("page.append(toolbar, filters, split, fab);")), /filters\.dataset\.pending = '';/);
+  assert.doesNotMatch(render.slice(0, render.indexOf("page.append(toolbar, filters, split, fab);")), /filters\.hidden = true;/, 'nicht versteckt starten');
+  const update = src.slice(src.indexOf('function updateFilterChips()'), src.indexOf('function computeMetrics('));
+  assert.ok(update.indexOf("host.removeAttribute('data-pending');") > 0 && update.indexOf("host.removeAttribute('data-pending');") < update.indexOf('host.hidden ='),
+    'erst mit den Daten entscheidet sich, ob es Chips gibt');
+  const css = readFileSync(new URL('../public/styles/inventory.css', import.meta.url), 'utf8');
+  const pending = [...eachRule(css)].filter((r) => r.selector.trim() === '.inventory-filters[data-pending]');
+  assert.ok(pending.some((r) => /min-block-size:\s*calc\(var\(--target-md\) \+ 2 \* var\(--space-3\)\)/.test(r.body)), 'eine Chiphoehe plus Polster');
 });

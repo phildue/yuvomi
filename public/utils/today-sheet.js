@@ -40,6 +40,7 @@ import { MODULE_ICON } from '/nav-icons.js';
 import { zonedDateKey, zonedTimeKey } from '/utils/timezone.js';
 import { housekeepingSinceLabel } from '/utils/day-label.js';
 import { pantryExpiryPhrase } from '/utils/pantry-status.js';
+import { shiftTypeLabel } from '/utils/shift-label.js';
 
 /** Zeitlose Plaetze im Tag - dieselben drei Stufen, die das Programm schon kennt. */
 export const SORT_DUE_NOW = '00:00';
@@ -115,7 +116,8 @@ export const TODAY_SHEET_SOURCES = [
         sub: open === 1 || !next?.name ? t('dashboard.todayDose') : t('dashboard.todayNextUp', { event: next.name }),
         icon: MODULE_ICON.health,
         tone: 'health',
-        route: '/health',
+        // Der Bereich, in dem eingenommen wird - nicht die Wurzel (R22, D3).
+        route: '/health/meds',
         who: null,
         priority: 10,
         open: true,
@@ -223,7 +225,8 @@ export const TODAY_SHEET_SOURCES = [
           sub: b.kind === 'name_day' ? t('birthdays.nameDay') : t('contacts.birthdayLabel'),
           icon: MODULE_ICON.birthdays,
           tone: 'birthdays',
-          route: '/birthdays',
+          // Der Geburtstag selbst (`?open=`, R22 D3), wie aus der Suche.
+          route: b.id != null ? `/birthdays?open=${encodeURIComponent(String(b.id))}` : '/birthdays',
           who: null,
           priority: 60,
           open: false,
@@ -280,7 +283,7 @@ export const TODAY_SHEET_SOURCES = [
           objectId: type.id ?? null,
           sortKey: start ?? SORT_ALL_DAY,
           timeLabel: start && end ? `${formatTime(start)} - ${formatTime(end)}` : '',
-          title: type.short_code ? `${type.short_code} · ${type.name}` : type.name,
+          title: shiftTypeLabel(type),
           sub: t('nav.schedule'),
           icon: MODULE_ICON.schedule,
           tone: 'schedule',
@@ -380,6 +383,11 @@ export function sourceSpeaks(source, ctx) {
   return source.allowed ? Boolean(source.allowed(ctx)) : true;
 }
 
+/** Module, die ein Display auf der Wand zeigen darf, obwohl sein Credential
+ *  `none`-Zugang hat: der Server liefert sie nur fuer `audience=household`,
+ *  und die Wand braucht sie im Programm (#1903). */
+const WALL_DISPLAY_MODULES = new Set(['meals', 'shopping', 'housekeeping', 'waste', 'pantry']);
+
 /**
  * Der Kontext, den jede Quelle liest. Die Riegel kommen von aussen, damit
  * Cockpit (mit Widget-Konfiguration) und Wand (ohne) dieselben Quellen fragen.
@@ -389,12 +397,21 @@ export function todaySheetContext({
   isModuleDisabled = () => false,
   canSeeWidget = canSeeWidgetDefault,
   existing = [],
+  isDisplay = false,
 } = {}) {
   const widgetShown = (id) => Array.isArray(cfg) && cfg.some((w) => w.id === id && w.visible);
   // Zwei Achsen, wie ueberall (#467): der Haushaltsschalter des Moduls und das
   // Modulrecht des Betrachters. Der Server liefert gesperrte Module ohnehin
   // leer - der Riegel hier haelt auch einen alten Stand im Speicher stumm.
-  const moduleOff = (module) => Boolean(isModuleDisabled(module)) || moduleAccess(module) === 'none';
+  // Displays auf der Wand (isDisplay) kommen ohne Modulrecht, aber der Server
+  // schickt die fuenf Wand-Quellen trotzdem. Nur der `moduleAccess`-Riegel
+  // weicht - der Haushaltsschalter (`isModuleDisabled`) bleibt stets aktiv:
+  // ein haushaltsweit abgeschaltetes Modul schweigt auch an der Wand.
+  const moduleOff = (module) => {
+    if (isModuleDisabled(module)) return true;
+    if (isDisplay && WALL_DISPLAY_MODULES.has(module)) return false;
+    return moduleAccess(module) === 'none';
+  };
   return { todayKey, tomorrowKey, nowTime, isAdmin, viewer, moduleOff, canSeeWidget, widgetShown, existing };
 }
 
@@ -436,7 +453,8 @@ const byPriority = (a, b) => (a.priority ?? 50) - (b.priority ?? 50);
  * Gezeigt wird danach wieder chronologisch - das Blatt ist ein Programm, keine
  * Rangliste.
  */
-export function composeTodaySheet(rows, { cap }) {
+export function composeTodaySheet(rows, { cap, lead = null, anchor = null }) {
+  if (lead) return composeLeadSheet(lead, rows, { cap, anchor });
   const sorted = [...rows].sort((a, b) => bySortKey(a, b) || byPriority(a, b));
   const openCount = sorted.filter((row) => row.open).length;
   if (sorted.length <= cap) return { rows: sorted, allRows: sorted, overflow: 0, openCount };
@@ -445,6 +463,35 @@ export function composeTodaySheet(rows, { cap }) {
     .slice(0, cap));
   const visible = sorted.filter((row) => keep.has(row));
   return { rows: visible, allRows: sorted, overflow: sorted.length - visible.length, openCount };
+}
+
+/* ZWEI TEILE, WIE DIE BREITE BUEHNE SIE ZEIGT (Critique 2026-10-26, Lauf 2,
+ * D6). Unter der Kurzfassung hielt der Deckel zuerst das Offene: gemessen bei
+ * 390x844 um 16:30 standen Abendessen, Sportfest und drei Aufgaben oben, der
+ * laufende Fussball, der Elternabend und der Filmabend erst hinter
+ * „+6 weitere" - unter einem Kopf, der „noch 4 Termine" sagte. Jetzt kommen
+ * zuerst die Eintraege der Leiste (`lead`), chronologisch, Ganztaegiges vorn;
+ * danach „Ausserdem heute" mit dem Rest in der bisherigen Ordnung. Der Deckel
+ * kuerzt ZUERST den Rest (dort gilt weiter: Offenes bleibt), dann die Leiste
+ * von hinten - `anchor` (der erste Eintrag mit Uhrzeit) bleibt dabei stehen,
+ * auch wenn Ganztaegiges davor den Deckel fuellt. `leadShown` sagt, wie
+ * viele der gezeigten Zeilen zur Leiste gehoeren; `allRows` steht in derselben
+ * Gliederung, die verdeckten Zeilen also auch. */
+function composeLeadSheet(lead, rows, { cap, anchor }) {
+  const first = [...lead].sort((a, b) => bySortKey(a, b) || byPriority(a, b));
+  const rest = [...rows].sort((a, b) => bySortKey(a, b) || byPriority(a, b));
+  const allRows = [...first, ...rest];
+  const openCount = allRows.filter((row) => row.open).length;
+  if (allRows.length <= cap) return { rows: allRows, allRows, overflow: 0, openCount, leadShown: first.length };
+  let shownLead = first.slice(0, cap);
+  if (anchor && first.includes(anchor) && !shownLead.includes(anchor)) {
+    shownLead = [...shownLead.slice(0, Math.max(0, cap - 1)), anchor];
+  }
+  const keep = new Set([...rest]
+    .sort((a, b) => (Number(Boolean(b.open)) - Number(Boolean(a.open))) || byPriority(a, b) || bySortKey(a, b))
+    .slice(0, Math.max(0, cap - shownLead.length)));
+  const visible = [...shownLead, ...rest.filter((row) => keep.has(row))];
+  return { rows: visible, allRows, overflow: allRows.length - visible.length, openCount, leadShown: shownLead.length };
 }
 
 /**

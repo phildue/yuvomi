@@ -4,17 +4,20 @@
  */
 
 import { api } from '/api.js';
-import { t, formatDate, formatDateInput, parseDateInput, isDateInputValid } from '/i18n.js';
-import { esc, REQUIRED_MARK } from '/utils/html.js';
-import { openModal as openSharedModal, closeModal as closeSharedModal, advancedSection, wireBlurValidation, reportFieldError, refocusAfterRender, captureModalContext, isModalContextCurrent, isOwnModalOpen } from '/components/modal.js';
+import { t, formatDateInput, parseDateInput, isDateInputValid } from '/i18n.js';
+import { dateText } from '/utils/date-format.js';
+import { esc, REQUIRED_MARK, externalHref } from '/utils/html.js';
+import { openModal as openSharedModal, closeModal as closeSharedModal, advancedSection, wireBlurValidation, reportFieldError, refocusAfterRender, captureModalContext, captureOpenContext, isModalContextCurrent, isOwnModalOpen } from '/components/modal.js';
 import { DEFAULT_CATEGORY_NAME, categoryLabel } from '/utils/shopping-categories.js';
 import { renderKitchenTabsBar } from '/utils/kitchen-tabs.js';
-import { resolveShoppingTarget, announceTransfer, mayTransferRecipeToShopping } from '/utils/kitchen-transfer.js';
+import { resolveShoppingTarget, announceTransfer, transferMessage, mayTransferRecipeToShopping } from '/utils/kitchen-transfer.js';
 import { popoverMenuHtml, installPopoverMenus } from '/utils/popover-menu.js';
 import { ingredientRowHTML } from '/utils/ingredient-row.js';
 import { scheduleUndoableDelete } from '/utils/ux.js';
 import { normalizeRecipeMealTypes, RECIPE_MEAL_TYPE_KEYS } from '/utils/recipe-meal-types.js';
 import { mealPayloadFromRecipe } from '/utils/recipe-to-meal.js';
+import { scaleQuantityText, scaledIngredients, servingsFactor } from '/utils/scale-quantity.js';
+import { servingsStepperHtml, wireServingsSteppers, setServingsValue } from '/utils/servings-stepper.js';
 import { todayKey } from '/utils/date.js';
 import '/components/datepicker.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
@@ -23,13 +26,15 @@ import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
 import { mealTypeList, ensureMealTypeNames } from '/utils/meal-types.js';
 import { recipeThumbEl, recipeHeroEl } from '/utils/recipe-thumb.js';
 import { navModuleAccess } from '/permissions.js';
-import { mountMasterDetail, splitViewDetailHtml, detailPaneHeaderEl } from '/utils/master-detail.js';
+import { mountMasterDetail, splitViewDetailHtml, detailPaneHeaderEl, releaseAddressOnClose } from '/utils/master-detail.js';
 import { openDetailView, closeDetailView, detailFooterEl, withPrimaryEdit } from '/components/detail-view.js';
 import { mayWritePath } from '/utils/module-access.js';
 import { errorSentence, isGone, isAlreadyDeleted } from '/utils/friendly-error.js';
 import { ingredientMatchKey } from '/utils/ingredient-match-key.js';
 
 let _container = null;
+/** Laufende Nummer fuer die Label-IDs der Portionen-Stepper (Spalte + Blatt). */
+let _stepperSeq = 0;
 /**
  * Rezepte, deren Loeschen gerade im Ruecknahme-Fenster steht: sie stehen noch
  * in `state.recipes` (Rueckgaengig stellt sie zurueck), aber nicht mehr in der
@@ -56,7 +61,21 @@ const state = {
   sourceFilter: 'all',
   // Rezept-IDs, die im Wochenplan der AKTUELLEN Woche stehen (loadPlannedRecipes).
   plannedRecipeIds: new Set(),
+  // Gewaehlte Portionen je Rezept (R24, E12): der Stepper ueber den Zutaten.
+  // Fuer den Besuch der Seite, nicht gespeichert - die gespeicherte Zahl ist
+  // die des Rezepts. Einplanen und „Auf die Einkaufsliste" nehmen die Wahl mit.
+  servingsChoice: new Map(),
 };
+
+/** Die gewaehlten Portionen eines Rezepts (sonst seine eigenen bzw. 1). */
+function chosenServings(recipe) {
+  return state.servingsChoice.get(recipe.id) ?? recipe.servings ?? 1;
+}
+
+/** Der Faktor der aktuellen Wahl gegenueber den gespeicherten Mengen. */
+function chosenFactor(recipe) {
+  return servingsFactor(recipe.servings ?? null, chosenServings(recipe));
+}
 
 /**
  * Darf dieses Konto Rezepte schreiben? Regel 1 in utils/module-access.js
@@ -255,6 +274,7 @@ function recipeThumb(recipe) {
     recipeId: recipe.id,
     hasImage: recipe.provider_has_image,
     hasOwnImage: recipe.has_own_image,
+    imageVersion: recipe.provider_updated_at,
     className: 'recipe-row__thumb',
   });
 }
@@ -367,7 +387,11 @@ function openRecipeFromQuery() {
   if (_md?.isSplit()) return;
 
   const recipe = state.recipes.find((r) => r.id === id);
-  if (recipe && row.querySelector('[data-action="open-detail"]')) openRecipeSheet(recipe);
+  if (recipe && row.querySelector('[data-action="open-detail"]')) {
+    openRecipeSheet(recipe);
+    // Das Leseblatt schliesst - `?open=` geht mit ihm (R22, D2).
+    releaseAddressOnClose('open', raw);
+  }
 }
 
 /**
@@ -477,6 +501,7 @@ export async function render(container, { signal } = {}) {
 
   const list = document.createElement('div');
   list.className = 'list-scroller page-scrollport recipes-list split-view__list';
+  list.dataset.scrollPort = 'recipes';
   list.id = 'recipes-list';
   // Lade-Skeleton bis loadRecipes() aufgelöst ist (Router blendet den Wrapper
   // bereits vor dem Daten-await ein).
@@ -759,7 +784,7 @@ function renderRecipePane(id, body) {
 
 /**
  * Die Aktionen eines Rezepts im Fuss von Leseblatt und Detailspalte: Loeschen
- * zurueckgenommen am Anfang, Duplizieren leise, Bearbeiten als Primaerknopf
+ * am Anfang, Duplizieren im Mehr-Menue (R24), Bearbeiten als Primaerknopf
  * am Ende (withPrimaryEdit). Ein gespiegeltes Rezept ist schreibgeschuetzt:
  * nur Duplizieren (legt eine eigene Kopie an).
  */
@@ -768,9 +793,9 @@ function recipeActions(recipe, { edit, duplicate, remove }) {
   return withPrimaryEdit([
     !isMirrored && {
       id: 'recipe-detail-delete', label: t('common.delete'), icon: 'trash-2',
-      variant: 'danger-ghost', align: 'start', onClick: remove,
+      variant: 'danger-outline', align: 'start', onClick: remove,
     },
-    { id: 'recipe-detail-duplicate', label: t('recipes.duplicate'), icon: 'copy', variant: 'ghost', onClick: duplicate },
+    { id: 'recipe-detail-duplicate', label: t('recipes.duplicate'), icon: 'copy', more: true, onClick: duplicate },
   ], isMirrored ? null : { label: t('common.edit'), ...edit });
 }
 
@@ -908,6 +933,11 @@ function buildRecipeList() {
   }
 
   const visible = filteredRecipes();
+  // „DIESE WOCHE GEPLANT" UNTERSCHEIDET NUR, WENN NICHT ALLE ES SIND (R24,
+  // Critique G3-Rezepte-P3-1): im Seed standen 6 von 6 Zeilen damit da - eine
+  // Angabe in jeder Zeile sagt nichts. Gemessen an der ganzen Sammlung, nicht
+  // an der Suche: ein Treffer verliert sein Wort nicht, weil er allein steht.
+  const allPlanned = listedRecipes().every((r) => state.plannedRecipeIds.has(r.id));
   if (!visible.length) {
     // Geteilter Renderer, Variante 'no-results' (role="status", sekundärer CTA).
     // Vorher war das hier ein nacktes <p class="recipes-search-empty"> - die eine
@@ -1021,7 +1051,7 @@ function buildRecipeList() {
     // Zweite Meta-Angabe, getrennt ueber den Mittelpunkt des +-Kombinators
     // (Hausform, Vorrat): neutraler Sekundaertext, keine Flaeche - der
     // Zustand ist eine Meldung, keine Identitaet (Skalen-Regel).
-    if (state.plannedRecipeIds.has(recipe.id)) {
+    if (state.plannedRecipeIds.has(recipe.id) && !allPlanned) {
       const planned = document.createElement('span');
       planned.className = 'recipe-row__planned';
       planned.textContent = t('recipes.plannedThisWeek');
@@ -1030,10 +1060,12 @@ function buildRecipeList() {
     toggle.appendChild(sub);
 
     if (hasDetail) {
-      // Ein Wegweiser, kein Aufklapp-Winkel: die Zeile oeffnet das Rezept.
+      // Die Zeile oeffnet das Rezept. KEIN Chevron (R21, D10 Zeilen-Endzone):
+      // ein Wegweiser steht nur an reiner Navigation (Bereiche der Gesundheit,
+      // Einstellungen); eine Zeile, die ein Objekt oeffnet UND einen
+      // Mehr-Knopf traegt, zeigt keinen - der Chevron stand 12px versetzt
+      // neben dem Mehr-Knopf und war die einzige Zeile dieser Art.
       toggle.setAttribute('aria-haspopup', 'dialog');
-      toggle.insertAdjacentHTML('beforeend',
-        '<i data-lucide="chevron-right" class="icon-sm recipe-row__chevron" aria-hidden="true"></i>');
     } else if (!isMirrored) {
       // Ohne Detail kein Versprechen: kein Chevron, kein aria-expanded. Der
       // Button öffnet dann direkt das Bearbeiten-Formular.
@@ -1053,12 +1085,6 @@ function buildRecipeList() {
       // sein Detail rechts, also ist die Zeile dort ein Knopf wie jede andere
       // (syncRowMode).
       toggle.dataset.narrowInert = "";
-      // Trotzdem einen (unsichtbaren) Chevron-Platzhalter einfügen: sonst
-      // wächst der Name per flex-grow um genau dessen Breite, und das Badge
-      // vor ihm rutscht gegenüber jeder anderen gespiegelten Zeile nach
-      // rechts - derselbe Mechanismus wie bei der Zutatenzahl oben.
-      toggle.insertAdjacentHTML('beforeend',
-        '<i data-lucide="chevron-right" class="icon-sm recipe-row__chevron recipe-row__chevron--placeholder" aria-hidden="true"></i>');
     }
 
     heading.appendChild(toggle);
@@ -1067,9 +1093,7 @@ function buildRecipeList() {
     // Mirror-Rezepte sind read-only (der Provider bleibt Quelle der Wahrheit) - Edit
     // und Delete entfallen, Duplizieren bleibt: das legt eine eigenständige,
     // frei bearbeitbare Kopie an (duplicateRecipe() postet immer als natives
-    // Rezept, unabhängig von der Quelle des Originals). Eine Liste speist
-    // sowohl die Inline-Buttons als auch das Überlaufmenü weiter unten, damit
-    // beide Fassungen nie auseinanderlaufen.
+    // Rezept, unabhängig von der Quelle des Originals).
     // Bei `read` bleibt keine: alle drei schreiben (Duplizieren legt ein
     // Rezept an). Die Bedienzone entfaellt dann samt Ueberlaufmenue.
     const ROW_ACTIONS = ro ? [] : [
@@ -1081,32 +1105,16 @@ function buildRecipeList() {
     const actions = document.createElement('div');
     actions.className = 'list-row__actions';
 
-    // Drei Zeilenaktionen kosten 152px von 262px Zeilenbreite bei 320px - 58% der
-    // Zeile für Sekundäraktionen. Für den Namen blieben 98px, und weil er in einem
-    // Flex-Elternteil steht, fiel er auf min-content: 8px, Zeilenhöhe 448px
-    // (Critique 2026-07-30, P0).
-    //
-    // Unter 30rem Zeilenbreite wandern sie deshalb in dasselbe Überlaufmenü, das der
-    // Einkaufs-Kopf benutzt - mit Labels, und ein 48px-Trigger statt drei Knöpfen.
-    // Die Container-Query dazu steht in recipes.css; hier stehen beide Fassungen im
-    // DOM, CSS entscheidet. Dieselbe Mechanik wie beim Kopf: `display: none` nimmt
-    // die ungenutzte Fassung auch aus der Tabfolge.
-    const inline = document.createElement('div');
-    inline.className = 'recipe-row__inline-actions';
-    for (const a of ROW_ACTIONS) {
-      const btn = document.createElement('button');
-      btn.className = `row-action${a.danger ? ' row-action--danger' : ''}`;
-      btn.type = 'button';
-      btn.dataset.action = a.action;
-      btn.dataset.id = String(recipe.id);
-      btn.setAttribute('aria-label', `${a.label}: ${recipe.title}`);
-      btn.title = a.label;
-      btn.insertAdjacentHTML('beforeend',
-        `<i data-lucide="${a.icon}" class="icon-md" aria-hidden="true"></i>`);
-      inline.appendChild(btn);
-    }
-    actions.appendChild(inline);
-
+    // DIE ZEILE TRAEGT NUR DEN MEHR-KNOPF, AUF JEDER BREITE (R21, Critique
+    // 2026-10-21, Zeilen-Endzone D10). Ab 30rem standen hier Stift,
+    // Duplizieren und ein dauerhaft sichtbarer Papierkorb nebeneinander - bei
+    // 1920px drei Icons je Zeile, der Titel ~130px gekuerzt, und die
+    // Detailspalte daneben bot dieselben drei noch einmal. Die Zeile oeffnet das
+    // Rezept (Leseblatt bzw. Detailspalte), Bearbeiten steht dort; was die Zeile
+    // selbst anbietet, liegt im Ueberlaufmenue, Loeschen als letzter, roter
+    // Eintrag (R18, `danger: true`). Die frueheren Inline-Knoepfe baute
+    // `document.createElement` - darum sah row-danger-visible sie nicht
+    // (test-control-dialect.js, `domRowActions`).
     const more = document.createElement('div');
     more.className = 'recipe-row__more';
     more.insertAdjacentHTML('beforeend', popoverMenuHtml({
@@ -1184,7 +1192,13 @@ function fillRecipeDetail(detail, recipe) {
   // VOLLSTÄNDIGE Zutatenliste, nicht die ersten vier: das Kürzen war nur
   // nötig, um die Kartenhöhe zu bändigen. Ein Detail, das sich öffnet, hat
   // keinen Grund, etwas zu verschweigen.
-  if (ingredients.length) detail.appendChild(ingredientsSectionEl(recipe));
+  if (ingredients.length) {
+    detail.appendChild(ingredientsSectionEl(recipe));
+    wireServingsSteppers(detail, (stepper, value, factor) => {
+      state.servingsChoice.set(recipe.id, value);
+      rescaleIngredientSections(recipe, value, factor);
+    });
+  }
 
   if (recipe.notes) {
     const section = detailSectionEl(t('recipes.notesLabel'));
@@ -1223,14 +1237,15 @@ function fillRecipeDetail(detail, recipe) {
   const addToShopping = shoppingTransferButton(recipe, ingredients);
   if (addToShopping) detailActions.appendChild(addToShopping);
 
-  if (recipe.recipe_url) {
+  const recipeHref = externalHref(recipe.recipe_url);
+  if (recipeHref) {
     const link = document.createElement('a');
     link.className = 'btn btn--ghost';
-    link.href = recipe.recipe_url;
+    link.href = recipeHref;
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
     link.insertAdjacentHTML('beforeend',
-      '<i data-lucide="external-link" class="icon-sm" aria-hidden="true"></i>');
+      '<i data-lucide="external-link" class="icon-md" aria-hidden="true"></i>');
     const linkLabel = document.createElement('span');
     linkLabel.textContent = t('recipes.openLink');
     link.appendChild(linkLabel);
@@ -1251,13 +1266,22 @@ function fillRecipeDetail(detail, recipe) {
  * dem Rezepttitel: der ist im Aufklapper wie in der Detailspalte ein <h2>
  * (`recipe-row__heading`, `detailPaneHeaderEl`). Die Worte sind die Feldnamen
  * des Formulars - dieselbe Sache heisst an beiden Stellen gleich. */
-function detailSectionEl(title) {
+function detailSectionEl(title, { headExtraHtml = '' } = {}) {
   const section = document.createElement('section');
   section.className = 'recipe-detail__section';
   const heading = document.createElement('h3');
   heading.className = 'recipe-detail__section-title u-section-title u-compact';
   heading.textContent = title;
-  section.appendChild(heading);
+  if (!headExtraHtml) {
+    section.appendChild(heading);
+    return section;
+  }
+  // Ueberschrift plus Werkzeug in EINER Zeile (Portionen-Stepper, R24 E12).
+  const head = document.createElement('div');
+  head.className = 'recipe-detail__section-head';
+  head.appendChild(heading);
+  head.insertAdjacentHTML('beforeend', headExtraHtml);
+  section.appendChild(head);
   return section;
 }
 
@@ -1268,7 +1292,17 @@ function detailSectionEl(title) {
  */
 function ingredientsSectionEl(recipe) {
   const ingredients = recipe.ingredients ?? [];
-  const section = detailSectionEl(t('recipes.ingredientsLabel'));
+  // PORTIONEN NEBEN DER UEBERSCHRIFT (R24, E12): „Zutaten ... Portionen − 4 +".
+  // Der Stepper rechnet die Mengen darunter live um; ohne gespeicherte
+  // Portionen in Vielfachen (utils/servings-stepper.js).
+  const factor = chosenFactor(recipe);
+  const section = detailSectionEl(t('recipes.ingredientsLabel'), {
+    headExtraHtml: servingsStepperHtml({
+      id: `recipe-servings-${recipe.id}-${++_stepperSeq}`,
+      base: recipe.servings ?? null,
+      value: chosenServings(recipe),
+    }),
+  });
   section.classList.add('recipe-detail__ingredients-section');
   section.dataset.recipeId = String(recipe.id);
   const ul = document.createElement('ul');
@@ -1285,7 +1319,8 @@ function ingredientsSectionEl(recipe) {
     // steht auch ohne Menge da (leer), damit der Name seine Spalte haelt.
     const quantity = document.createElement('span');
     quantity.className = 'recipe-detail__ingredient-quantity';
-    quantity.textContent = ing.quantity ?? '';
+    quantity.dataset.quantity = ing.quantity ?? '';
+    quantity.textContent = scaleQuantityText(ing.quantity ?? '', factor) ?? '';
     item.appendChild(quantity);
     label.textContent = ing.name;
     item.appendChild(label);
@@ -1306,6 +1341,21 @@ function ingredientsSectionEl(recipe) {
   const bulk = pantryMatchBulkEl(recipe);
   if (bulk) section.appendChild(bulk);
   return section;
+}
+
+/**
+ * Rechnet die Mengen jedes Zutaten-Abschnitts dieses Rezepts um (Spalte und
+ * offenes Blatt) - im Platz, ohne Neubau: der Fokus bleibt auf dem Stepper.
+ */
+function rescaleIngredientSections(recipe, value, factor) {
+  const sel = `.recipe-detail__ingredients-section[data-recipe-id="${CSS.escape(String(recipe.id))}"]`;
+  for (const section of document.querySelectorAll(sel)) {
+    const stepper = section.querySelector('[data-servings-stepper]');
+    if (stepper && Number(stepper.dataset.value) !== value) setServingsValue(stepper, value);
+    for (const cell of section.querySelectorAll('.recipe-detail__ingredient-quantity')) {
+      cell.textContent = scaleQuantityText(cell.dataset.quantity ?? '', factor) ?? '';
+    }
+  }
 }
 
 /** Baut jeden Zutaten-Abschnitt dieses Rezepts neu (Aufklapper + Spalte). */
@@ -1412,7 +1462,7 @@ function pantryMatchBulkEl(recipe) {
   btn.className = 'btn btn--ghost recipe-detail__match-open';
   btn.dataset.action = 'match-ingredients';
   btn.dataset.id = String(recipe.id);
-  btn.insertAdjacentHTML('beforeend', '<i data-lucide="link" class="icon-sm" aria-hidden="true"></i>');
+  btn.insertAdjacentHTML('beforeend', '<i data-lucide="link" class="icon-md" aria-hidden="true"></i>');
   const label = document.createElement('span');
   label.textContent = t('recipes.ingredientMatchOpen', { count: open.length });
   btn.appendChild(label);
@@ -1423,7 +1473,7 @@ function pantryMatchBulkEl(recipe) {
 function pantryOptionLabel(item) {
   const teile = [item.name];
   if (item.location_name) teile.push(item.location_name);
-  if (item.expires_on) teile.push(formatDate(item.expires_on));
+  if (item.expires_on) teile.push(dateText(item.expires_on));
   return teile.join(' · ');
 }
 
@@ -1478,6 +1528,9 @@ async function openPantryMatchModal(recipe, ingredientName) {
 
   let items = [];
   const owner = _container;
+  // Kommt der Vorrat erst, nachdem der Nutzer einen anderen Dialog geoeffnet
+  // oder die Seite verlassen hat, geht die Zuordnung nicht mehr auf (#1997).
+  const context = captureOpenContext();
   try {
     const res = await api.get('/pantry');
     items = res.data ?? [];
@@ -1485,6 +1538,7 @@ async function openPantryMatchModal(recipe, ingredientName) {
     reportError(err, { owner, fallbackKey: 'recipes.ingredientMatchLoadError' });
     return;
   }
+  if (!isModalContextCurrent(context)) return;
 
   openSharedModal({
     title: t('recipes.ingredientMatchTitle', { name: ingredientName }),
@@ -1584,6 +1638,9 @@ async function openPantryBulkMatchModal(recipe) {
 
   let items = [];
   const owner = _container;
+  // Kommt der Vorrat erst, nachdem der Nutzer einen anderen Dialog geoeffnet
+  // oder die Seite verlassen hat, geht die Zuordnung nicht mehr auf (#1997).
+  const context = captureOpenContext();
   try {
     const res = await api.get('/pantry');
     items = res.data ?? [];
@@ -1591,6 +1648,7 @@ async function openPantryBulkMatchModal(recipe) {
     reportError(err, { owner, fallbackKey: 'recipes.ingredientMatchLoadError' });
     return;
   }
+  if (!isModalContextCurrent(context)) return;
   const fields = open.map((ing, i) => `
         <div class="form-group">
           <label class="form-label" for="pantry-bulk-match-${i}">${esc(ing.quantity ? `${ing.quantity} · ${ing.name}` : ing.name)}</label>
@@ -1690,7 +1748,7 @@ function recipeModalFooterHtml(isEdit, recipe) {
   const canDelete = isEdit && recipe?.source === 'native';
   return `
       <div class="modal-panel__footer modal-panel__footer--plain">
-        ${canDelete ? `<button type="button" class="btn btn--danger-outline" id="recipe-delete" style="margin-inline-end:auto"><i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${esc(t('common.delete'))}</button>` : ''}
+        ${canDelete ? `<button type="button" class="btn btn--danger-outline" id="recipe-delete"><i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${esc(t('common.delete'))}</button>` : ''}
         <button class="btn btn--secondary" id="recipe-cancel">${t('common.cancel')}</button>
         <button class="btn btn--primary" id="recipe-save">${isEdit ? t('common.save') : t('common.add')}</button>
       </div>`;
@@ -1705,8 +1763,11 @@ function openRecipeModal(mode, recipe = null) {
   const isEdit = mode === 'edit';
 
   openSharedModal({
+    staged: !isEdit, // Buehne zuerst, Felder nach dem ersten Bild (modal.js, R21 a6)
     title: isEdit ? t('recipes.editRecipe') : t('recipes.addRecipe'),
     size: 'md',
+    // Bearbeiten holt am Finger keine Tastatur (R23 D13, R24 S9).
+    initialFocus: isEdit ? 'edit' : 'first-field',
     content: `
       <div class="form-group">
         <label class="form-label" for="recipe-title">${t('common.nameLabel')}${REQUIRED_MARK}</label>
@@ -1724,6 +1785,12 @@ function openRecipeModal(mode, recipe = null) {
           `).join('')}
           <input type="hidden" id="recipe-meal-types-value" value="">
         </div>
+      </div>
+      <div class="form-group recipe-servings-field">
+        <label class="form-label" for="recipe-servings">${t('recipes.servingsLabel')}</label>
+        <input id="recipe-servings" class="form-input" type="number" min="1" max="99" step="1" inputmode="numeric"
+               aria-describedby="recipe-servings-hint">
+        <p class="form-hint" id="recipe-servings-hint">${esc(t('recipes.servingsHint'))}</p>
       </div>
       <div class="form-group">
         <label class="form-label">${t('recipes.ingredientsLabel')}</label>
@@ -1754,13 +1821,14 @@ function openRecipeModal(mode, recipe = null) {
           <label class="form-label" for="recipe-url">${t('recipes.urlLabel')}</label>
           <input id="recipe-url" class="form-input" type="url" placeholder="${t('recipes.urlPlaceholder')}">
         </div>`,
-        { open: isEdit && (!!recipe.notes || !!recipe.recipe_url) })}
+        { open: isEdit && (!!recipe.notes || !!recipe.recipe_url), hint: t('recipes.moreDetailsHint') })}
       ${recipeModalFooterHtml(isEdit, recipe)}
     `,
     onSave(panel) {
       panel.querySelector('#recipe-title').value = isEdit ? recipe.title : '';
       panel.querySelector('#recipe-notes').value = isEdit && recipe.notes ? recipe.notes : '';
       panel.querySelector('#recipe-url').value = isEdit && recipe.recipe_url ? recipe.recipe_url : '';
+      panel.querySelector('#recipe-servings').value = isEdit && recipe.servings ? String(recipe.servings) : '';
 
       /* BILD (#1059, Schritt 2) - dasselbe Vorgehen wie beim Gegenstandsfoto:
        * Auswahl, Zuschnitt und Groessenpruefung macht `pickCroppedImage`.
@@ -1905,6 +1973,15 @@ async function saveRecipe(panel, mode, recipe) {
     return;
   }
 
+  // Portionen (R24, E12): leer heisst „nicht angegeben", sonst 1 bis 99.
+  const servingsField = panel.querySelector('#recipe-servings');
+  const servingsRaw = servingsField?.value.trim() ?? '';
+  const servings = servingsRaw === '' ? null : Number(servingsRaw);
+  if (servings !== null && (!Number.isInteger(servings) || servings < 1 || servings > 99)) {
+    reportFieldError(servingsField, t('recipes.servingsInvalid'));
+    return;
+  }
+
   const ingredients = [];
   panel.querySelectorAll('.ingredient-row').forEach((row) => {
     const name = row.querySelector('.ingredient-row__name')?.value.trim() || '';
@@ -1925,11 +2002,13 @@ async function saveRecipe(panel, mode, recipe) {
   try {
     let createdId = null;
     if (mode === 'create') {
-      const res = await api.post('/recipes', { title, notes, recipe_url, meal_types, ingredients, ...bildFeld });
+      const res = await api.post('/recipes', { title, notes, recipe_url, meal_types, servings, ingredients, ...bildFeld });
       state.recipes.push(res.data);
       createdId = res.data?.id ?? null;
     } else {
-      const res = await api.put(`/recipes/${recipe.id}`, { title, notes, recipe_url, meal_types, ingredients, ...bildFeld });
+      const res = await api.put(`/recipes/${recipe.id}`, { title, notes, recipe_url, meal_types, servings, ingredients, ...bildFeld });
+      // Neue Portionen: die Wahl des Steppers beginnt wieder bei der gespeicherten Zahl.
+      state.servingsChoice.delete(recipe.id);
       const idx = state.recipes.findIndex((r) => r.id === recipe.id);
       if (idx >= 0) state.recipes[idx] = res.data;
     }
@@ -2033,10 +2112,14 @@ async function planRecipe(recipe, btn) {
         const dialog = captureModalContext();
         const owner = _container;
         try {
-          await api.post('/meals', mealPayloadFromRecipe(recipe, date, mealType));
+          // Mit den gewaehlten Portionen (R24, E12): die Mahlzeit traegt die
+          // umgerechneten Mengen als ihre eigenen Zutaten.
+          const factor = chosenFactor(recipe);
+          const source = factor === 1 ? recipe : { ...recipe, ingredients: scaledIngredients(recipe.ingredients, factor) };
+          await api.post('/meals', mealPayloadFromRecipe(source, date, mealType));
           closeSharedModal({ force: true, context: dialog });
           window.yuvomi?.showToast(
-            t('recipes.planSuccess', { name: recipe.title, date: formatDate(date) }),
+            t('recipes.planSuccess', { name: recipe.title, date: dateText(date, { weekday: true }) }),
             'success',
           );
         } catch (err) {
@@ -2082,7 +2165,18 @@ async function transferRecipe(recipe, btn) {
   if (btn) btn.disabled = true;
   const owner = _container;
   try {
-    const res = await api.post(`/recipes/${recipe.id}/to-shopping-list`, { listId: target.id });
+    // Die gewaehlten Portionen gehen mit (R24, E12): der Server ersetzt die
+    // Mengen je Zutat, Namen und Kategorien bleiben die des Rezepts.
+    // Jede Menge nennt die Zeile, zu der sie gehoert (Codex an #2364): hat
+    // jemand das Rezept seit dem Laden gespeichert, antwortet der Server 409,
+    // statt die Mengen positionsweise auf andere Zutaten zu legen.
+    const factor = chosenFactor(recipe);
+    const body = { listId: target.id };
+    if (factor !== 1) {
+      body.quantities = scaledIngredients(recipe.ingredients, factor).map((ing) => ing.quantity);
+      body.ingredientIds = recipe.ingredients.map((ing) => ing.id);
+    }
+    const res = await api.post(`/recipes/${recipe.id}/to-shopping-list`, body);
     const added = res.data?.transferred ?? 0;
     const skipped = res.data?.skipped ?? 0;
 
@@ -2094,20 +2188,38 @@ async function transferRecipe(recipe, btn) {
       // Rücknahme über den geteilten Baustein: dieser Pfad überträgt am meisten
       // auf einmal - eine ganze Zutatenliste - in eine Liste, die der Nutzer
       // gerade nicht ansieht (Audit 2026-07-30, P1-B).
+      //
+      // Was schon darauf stand, nennt der Satz mit (R23, D2): vorher sagte er
+      // "3 Zutaten übernommen" und verschwieg die zwei, die er übersprungen hat.
       announceTransfer({
-        message: t('recipes.toShoppingSuccess', { count: added, list: target.name }),
+        message: transferMessage('recipes.toShoppingSuccess', { added, skipped, list: target.name }),
         addedIds: res.data?.added_ids ?? [],
       });
     } else if (skipped > 0) {
-      window.yuvomi?.showToast(t('recipes.toShoppingAllPresent'), 'info');
+      window.yuvomi?.showToast(t('kitchen.transferAllPresent'), 'info');
     } else {
       window.yuvomi?.showToast(t('recipes.toShoppingNoIngredients'), 'info');
     }
   } catch (err) {
     reportError(err, { owner, recipeId: recipe.id, listId: target.id });
+    if (err?.data?.reason === 'recipes_ingredients_changed') showChangedRecipe(err.data.recipe, owner);
   } finally {
     if (btn) btn.disabled = false;
   }
+}
+
+/**
+ * Das Rezept, wie der Server es jetzt kennt (409 `recipes_ingredients_changed`
+ * traegt es mit): genau dieses eine ersetzen, wie nach dem eigenen Speichern -
+ * kein Nachladen der ganzen Liste. Die Portionswahl bleibt; der Nutzer sieht
+ * die neuen Zutaten und uebernimmt noch einmal.
+ */
+function showChangedRecipe(fresh, owner) {
+  if (!fresh || fresh.id == null || !stillShown(owner)) return;
+  const idx = state.recipes.findIndex((r) => r.id === fresh.id);
+  if (idx < 0) return;
+  state.recipes[idx] = fresh;
+  renderRecipeList({ repaint: true });
 }
 
 async function removeRecipe(recipe) {
@@ -2196,7 +2308,8 @@ async function duplicateRecipe(recipe) {
 
   const owner = _container;
   try {
-    const res = await api.post('/recipes', { title, notes, recipe_url, ingredients });
+    // Die Kopie nimmt die Portionen mit: ihre Mengen gelten fuer dieselbe Zahl.
+    const res = await api.post('/recipes', { title, notes, recipe_url, servings: recipe.servings ?? null, ingredients });
     state.recipes.push(res.data);
     renderRecipeList();
     // Die Kopie ist das, was man als Naechstes bearbeitet: in der Spalte steht

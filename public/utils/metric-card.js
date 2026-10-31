@@ -57,14 +57,13 @@ export function trendMarkup({ delta, betterWhen = null, text, icon = true }) {
 }
 
 /**
- * DIE LEITZAHL WAEHLT IHRE STUFE NACH IHRER LAENGE (Critique R18, 2026-10-07).
+ * DIE ZEICHENZAHL EINER LEITZAHL (Critique R18, 2026-10-07).
  *
- * Je Geld-Reiter fuehrt EINE Zahl auf einer Display-Stufe. Wie breit sie
- * laeuft, weiss CSS nicht - die Zeichenzahl schon: "2.503,89 €" (10 Zeichen)
- * traegt bei 390px die volle Stufe, "175.444,93 €" (12) braucht eine darunter,
- * "CHF 175'444.93" (14) noch eine. Gemessen in fetten Systemziffern: rund
- * 0,6em je Zeichen. Die Stufen selbst stehen als clamp() in panel.css
- * (`--metric-lead-size`); diese Funktion nennt nur die Klasse.
+ * Bis R23 waehlte die Leitzahl daraus ihre Schriftstufe. Seit D12 steht sie in
+ * EINER festen Stufe je Ort und wird nur kleiner, wenn sie wirklich nicht passt
+ * (`fitMetricLeads` unten). Die Zahl bleibt fuer eine LAYOUT-Frage: eine
+ * Viererreihe mit langer Leitzahl bricht am Tablet in zwei mal zwei
+ * (budget.css `.metric-grid--long-lead`).
  *
  * @param {string} text der fertig formatierte Wert (Klartext)
  * @returns {''|'long'|'xlong'|'xxlong'}
@@ -77,8 +76,67 @@ export function leadStep(text) {
   return 'xxlong';
 }
 
-/** Klassen der fuehrenden Kennzahlkarte: `metric-card--lead` samt Laengenstufe. */
-export function leadCardClass(text) {
-  const step = leadStep(text);
-  return `metric-card--lead${step ? ` metric-card--lead-${step}` : ''}`;
+/**
+ * Klassen der fuehrenden Kennzahlkarte. Der Wert-Parameter bleibt fuer die
+ * Aufrufer stehen, entscheidet aber nichts mehr (R23, D12).
+ */
+export function leadCardClass() {
+  return 'metric-card--lead';
+}
+
+// Die Werte, die fitMetricLeads misst: die fuehrende Karte, die Kurzzeile mit
+// Leitzahl (utils/metric-glance.js) und die Kennzahlkachel der Uebersicht
+// (`.metric-card--tile`, DW-P2-7) - mobil fuellt sie sich per `auto-fit`, ab
+// 768px steht sie in der Spaltenzahl ihres Hoehenmodells (U15); die Breite der
+// Reihe sagt in beiden Faellen nichts ueber die Breite der Kachel.
+const LEAD_VALUES = '.metric-card--lead > .metric-card__value, .budget-glance--lead .budget-glance__value, .metric-card--tile > .metric-card__value';
+const FIT_STEPS = 2;
+let fitObserver = null;
+
+/**
+ * VERKLEINERN NUR BEI UEBERLAUF (R23, D12).
+ *
+ * Misst je Leitzahl ihren Traeger (die Karte bzw. die Kurzzeile): laeuft der
+ * Inhalt ueber, tritt die Zahl eine Stufe zurueck (`data-fit="1"`, Title 2),
+ * notfalls zwei (`"2"`, Title 3) - die Stufen stehen in panel.css. Ueber einen
+ * ResizeObserver: sein erster Rueckruf kommt nach dem Layout und VOR dem
+ * ersten Bild, also ohne sichtbaren Sprung, und jede Breitenaenderung
+ * (Drehen, Seitenleiste, aufgeklappte Kennzahlen) misst neu. Ein verborgener
+ * Traeger (0px) wird nicht gemessen; er meldet sich, sobald er erscheint.
+ *
+ * @param {ParentNode} root  frisch gezeichneter Bereich
+ */
+export function fitMetricLeads(root) {
+  if (!root?.querySelectorAll || typeof ResizeObserver === 'undefined') return;
+  const values = root.querySelectorAll(LEAD_VALUES);
+  if (!values.length) return;
+  fitObserver ??= new ResizeObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.target.isConnected) fitObserver.unobserve(entry.target);
+      else fitLead(entry.target);
+    }
+  });
+  for (const value of values) {
+    const box = value.closest('.metric-card, .budget-glance__row');
+    if (box) fitObserver.observe(box);
+  }
+}
+
+/* UEBERLAUF HEISST AUCH: UEBER DIE EIGENE BOX (U15, Review p11). Gemessen
+ * wurde nur der Traeger - eine Zahl, die in sein Polster lief, fiel dort nicht
+ * auf: "10 im Monat" stand in der 176px-Kachel der Uebersicht 3px vor der
+ * Kante, in 158px "-196,14 €" 10px. Darum zaehlt die Box der Zahl mit (1px
+ * Rundung Spiel; eine Box ohne Breite, etwa inline, wird nicht gefragt). */
+function overflows(box, value) {
+  return box.scrollWidth > box.clientWidth
+    || (value.clientWidth > 0 && value.scrollWidth > value.clientWidth + 1);
+}
+
+function fitLead(box) {
+  const value = box.querySelector(LEAD_VALUES);
+  if (!value || box.clientWidth === 0) return;
+  value.removeAttribute('data-fit');
+  for (let step = 1; step <= FIT_STEPS && overflows(box, value); step += 1) {
+    value.setAttribute('data-fit', String(step));
+  }
 }

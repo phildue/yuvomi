@@ -1,5 +1,6 @@
 import { api } from '/api.js';
-import { formatDate, formatTime, t } from '/i18n.js';
+import { t } from '/i18n.js';
+import { dateTimeText } from '/utils/date-format.js';
 import { esc } from '/utils/html.js';
 import { confirmModal, refocusAfterRender } from '/components/modal.js';
 import { rowMenuHtml } from '/utils/row-action.js';
@@ -10,6 +11,7 @@ import {
   bindDisclosure,
   createDisclosure,
   createInfoList,
+  hintFoldHtml,
   thirdPartyStatusLabel,
   toggleRowHtml,
 } from '/settings/components.js';
@@ -27,6 +29,7 @@ import { MODULE_ICON, moduleIconHTML } from '/nav-icons.js';
 import { moduleAccentVar } from '/utils/module-accent.js';
 import { moduleDisplayLabel } from '/utils/extension-i18n.js';
 import { deleteErrorText, installErrorText } from '/settings/module-install-errors.js';
+import { errorSentence, loadErrorSentence } from '/utils/friendly-error.js';
 
 /**
  * Blatt: Einstellungen -> Module -> Aktive Module (adminOnly)
@@ -246,12 +249,12 @@ function rowHtml(row) {
 
   return `
     <div class="settings-module-row settings-module-row--fixed${menuClass} ${stateClass}${row.hasError ? ' settings-module-row--error' : ''}" data-module-row-id="${esc(row.id)}">
-      <div class="settings-module-row__icon vivid-mark"${accentStyle}>
+      <div class="settings-module-row__icon"${accentStyle}>
         ${moduleIconHTML(row.icon)}
       </div>
       <div class="settings-module-row__body">
         <div class="settings-module-row__title">
-          <strong>${esc(row.label)}</strong>
+          <strong class="settings-module-row__name">${esc(row.label)}</strong>
           ${row.type === 'third-party' ? `<span class="settings-module-origin">${esc(t('settings.modulesExternalBadge'))}</span>` : ''}
           ${statusChipHtml(row)}
         </div>
@@ -275,7 +278,7 @@ function rowHtml(row) {
 function installedAtText(install) {
   const date = install?.installedAt ? new Date(install.installedAt) : null;
   if (!date || Number.isNaN(date.getTime())) return t('settings.moduleDetailUnknown');
-  return `${formatDate(date)} ${formatTime(date)}`.trim();
+  return dateTimeText(date);
 }
 
 /**
@@ -462,8 +465,8 @@ function bindEvents(container, user) {
       // Installation oder ein Loeschen laeuft (die Freigabe nimmt dieselbe
       // Sperre), 503 `not_writable`, wenn der Datensatz im Modulordner nicht
       // geschrieben werden kann, 403 `module_session_required` fuer ein Token.
-      // Ohne reason bleibt es beim Servertext.
-      window.yuvomi?.showToast(error?.data?.reason ? installErrorText(error) : (error?.message ?? t('common.errorGeneric')), 'danger');
+      // Ohne reason der Satz der App, nie der Text des Servers (#1909).
+      window.yuvomi?.showToast(error?.data?.reason ? installErrorText(error) : errorSentence(error), 'danger');
     }
   });
 
@@ -548,7 +551,7 @@ async function deleteThirdPartyModule(container, user, button) {
     // not_web_installed: not_found, not_a_module, not_web_installed,
     // module_session_required und module_web_install_disabled sagen dem Admin
     // etwas, der Servertext nur auf Englisch.
-    window.yuvomi?.showToast(error?.data?.reason ? deleteErrorText(error) : (error?.message || t('common.errorGeneric')), 'danger');
+    window.yuvomi?.showToast(error?.data?.reason ? deleteErrorText(error) : errorSentence(error), 'danger');
     return;
   }
   try {
@@ -595,7 +598,7 @@ async function renderActiveModules(container, user) {
     installInfo = info;
   } catch (error) {
     container.insertAdjacentHTML('beforeend',
-      `<p class="form-error" role="alert">${esc(error.message ?? t('common.errorGeneric'))}</p>`);
+      `<p class="form-error" role="alert">${esc(loadErrorSentence(error) ?? t('common.errorGeneric'))}</p>`);
     return;
   }
 
@@ -605,7 +608,8 @@ async function renderActiveModules(container, user) {
     <section class="settings-section">
       <section class="settings-navigation-panel">
         <h2 class="settings-navigation-panel__title">${t('settings.activeModulesTitle')}</h2>
-        <p class="form-hint">${t('settings.activeModulesHint')}</p>
+        ${/* Hoechstens ein Satz vor dem ersten Feld (R23 D14), der Rest hinter "Mehr dazu". */ ''}
+        ${hintFoldHtml({ lead: t('settings.activeModulesHint'), moreHtml: `<p>${esc(t('settings.activeModulesHintMore'))}</p>` })}
         <div class="settings-navigation-groups" id="module-toggles">
           ${NAV_SECTIONS.map((section) => sectionHtml(section, rows)).join('')}
         </div>

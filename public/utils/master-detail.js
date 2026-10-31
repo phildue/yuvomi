@@ -38,6 +38,7 @@ import { t } from '/i18n.js';
 import { swapContent } from '/utils/content-swap.js';
 import { setBulkPill, clearBulkPill, setBulkPane } from '/utils/bulk-pill.js';
 import { dockNextModal } from '/components/modal.js';
+import { onceOverlaysClosed } from '/utils/overlay-history.js';
 
 /** Wie lange die Ansage der Auswahlzahl wartet: schnelles Tippen sagt nur die letzte Zahl. */
 const BULK_ANNOUNCE_MS = 400;
@@ -262,13 +263,16 @@ export function setSelectionBulk(handle, spec) {
  *        zeichnet der Router); `href` baut die Adresse einer Auswahl. Mit
  *        `address` gilt `param` nicht.
  * @param {AbortSignal} [opts.signal]     Router-Signal; Abbruch baut ab.
+ * @param {string} [opts.splitMedia]      Media Query, unter der die Spalte sicher fehlt
+ *        (die Schwelle der Container-Abfrage als Fensterbreite); `isSplit()`
+ *        fragt darunter die Box nicht ab.
  * @returns {{open: Function, select: Function, clear: Function, selectedId: Function,
  *   isSplit: Function, refresh: Function, destroy: Function}}
  */
 export function mountMasterDetail({
   root, list, param = 'open', renderDetail, openNarrow, onEnter, onModeChange,
   narrow = 'sheet', deepLinkNarrow = false, claimInitial = true, onNarrowSync,
-  preselect = true, address = null, signal,
+  preselect = true, address = null, signal, splitMedia = null,
 } = {}) {
   if (!root) throw new TypeError('mountMasterDetail: root fehlt');
   const listEl = list ?? root.querySelector('.split-view__list');
@@ -320,10 +324,26 @@ export function mountMasterDetail({
   let bulkAnnounceTimer = null;
   let bulkAnnounced = '';
 
-  const isSplit = () => root.isConnected && getComputedStyle(detailEl).display !== 'none';
+  // `splitMedia` (R22-F): die Fensterbreite, unter der die Spalte sicher
+  // fehlt - die Flaeche ist nie breiter als das Fenster. Darunter wird die Box
+  // nicht abgefragt: getComputedStyle loest die Container-Abfrage auf und
+  // erzwang mitten im Aufbau ein Layout (Kalender-Agenda 390px, 4x CPU: 9 ms).
+  const isSplit = () => root.isConnected
+    && !(splitMedia && typeof window.matchMedia === 'function' && !window.matchMedia(splitMedia).matches)
+    && getComputedStyle(detailEl).display !== 'none';
 
-  const rows = () => [...listEl.querySelectorAll('[data-md-id]')]
-    .filter((row) => !row.hidden && row.getClientRects().length > 0);
+  const shown = (row) => !row.hidden && row.getClientRects().length > 0;
+  const rows = () => [...listEl.querySelectorAll('[data-md-id]')].filter(shown);
+  // DIE VORWAHL FRAGT NUR BIS ZUR ERSTEN SICHTBAREN ZEILE (Critique R22, D22).
+  // `getClientRects()` an einer Zeile in einer aufgeschobenen Gruppe
+  // (`content-visibility: auto`) zwingt deren ganzes Layout nach - `rows()`
+  // tat das beim Aufbau fuer JEDE Zeile und hob die Regel am Desktop auf: 261
+  // Aufgaben, 162 ms erzwungenes Layout bei 4x CPU, im Frame des Wechsels.
+  // Die Pfeiltasten fragen weiter alle (dann zaehlt die Reihenfolge).
+  const firstRow = () => {
+    for (const row of listEl.querySelectorAll('[data-md-id]')) if (shown(row)) return row;
+    return null;
+  };
   const rowFor = (id) => listEl.querySelector(`[data-md-id="${CSS.escape(String(id))}"]`);
   const focusTarget = (row) => row?.querySelector('[data-md-focus]') ?? row;
 
@@ -481,7 +501,22 @@ export function mountMasterDetail({
   function callNarrow(id, trigger) {
     abortNarrow();
     narrowAbort = new AbortController();
-    openNarrow?.(String(id), trigger, { signal: narrowAbort.signal });
+    const narrowSignal = narrowAbort.signal;
+    openNarrow?.(String(id), trigger, { signal: narrowSignal });
+    // `?open=` GEHT MIT DEM BLATT (Critique R22, D2). Unter der Schwelle nennt
+    // die Adresse das offene Blatt; nach dem Schliessen blieb sie stehen, und
+    // ein Neuladen oeffnete es wieder (gemessen mobil: Aufgaben, Kontakte).
+    // Ist das letzte Overlay zu und nennt die Adresse noch DIESEN Eintrag,
+    // nimmt `replaceState` die Auswahl weg - kein neuer Schritt. In der Spalte
+    // ist die Adresse die Auswahl und bleibt (der Wechsel bricht das Signal ab).
+    if (narrow !== 'sheet') return;
+    const shown = String(id);
+    onceOverlaysClosed(() => {
+      if (narrowSignal.aborted || active !== handle || isSplit()) return;
+      if (readAddress() !== shown) return;
+      selected = null;
+      writeHistory('replace', hrefFor, null);
+    }, { signal: narrowSignal });
   }
 
   /**
@@ -517,7 +552,9 @@ export function mountMasterDetail({
     // Nennt die Adresse eine Auswahl (auch eine, die die Seite selbst
     // einloest - Aufgaben mit `claimInitial: false`), gilt die.
     if (readAddress() != null) return;
-    const ids = rows().map((row) => row.dataset.mdId).filter((id) => id != null && id !== '');
+    const ids = typeof preselect === 'function'
+      ? rows().map((row) => row.dataset.mdId).filter((id) => id != null && id !== '')
+      : [firstRow()?.dataset.mdId].filter((id) => id != null && id !== '');
     if (!ids.length) return;
     const id = typeof preselect === 'function' ? preselect(ids) : ids[0];
     if (id == null || id === '') return;
@@ -596,6 +633,13 @@ export function mountMasterDetail({
     // dieselbe Richtung wie ein Schliessen, ohne das Gelesene wegzuwerfen.
     // Ein offenes Menue oder Feld im Detail hat Esc schon selbst verbraucht.
     if (event.defaultPrevented) return;
+    // EIN OFFENES POPOVER-MENUE SCHLIESST DER BROWSER SELBST (R24, Critique G5
+    // P2-5) - aber erst NACH keydown und nur, wenn niemand preventDefault()
+    // gerufen hat. Hier stand der Fokus im Menue, also kam Esc vor dem Browser
+    // an: das "..." des Fastens blieb offen, und der Fokus sprang in die
+    // Bereichsliste. Ein Menue (Fokus im Panel) und sein Ausloeser, solange
+    // es offen ist, behalten Esc fuer sich.
+    if (event.target?.closest?.('[popover], [aria-haspopup][aria-expanded="true"]')) return;
     const row = rowFor(selected);
     if (!row) return;
     event.preventDefault();
@@ -770,6 +814,27 @@ export function mountMasterDetail({
   tryPreselect();
 
   return handle;
+}
+
+/**
+ * `?<param>=<value>` geht, sobald das Blatt dazu zu ist (Critique R22, D2) -
+ * fuer Seiten, die ihren Deep-Link SELBST einloesen (Kalender `?open=<id>`,
+ * Rezepte unter der Schwelle). Dieselbe Regel wie im Baustein: erst wenn das
+ * letzte Overlay zu ist, nur wenn die Adresse noch genau diesen Wert nennt,
+ * nie in der Spalte (dort ist sie die Auswahl), per `replaceState`.
+ * @param {string} param
+ * @param {string|number} value
+ * @param {{ signal?: AbortSignal|null }} [options] - das Seitensignal
+ */
+export function releaseAddressOnClose(param, value, { signal = null } = {}) {
+  const pathname = location.pathname;
+  const wanted = String(value);
+  onceOverlaysClosed(() => {
+    if (signal?.aborted || location.pathname !== pathname) return;
+    if (new URLSearchParams(location.search).get(param) !== wanted) return;
+    if (active?._root.isConnected && active._pathname === pathname && active.isSplit()) return;
+    writeHistory('replace', (id) => urlWith(param, id), null);
+  }, { signal });
 }
 
 /**

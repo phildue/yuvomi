@@ -15,7 +15,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { toDecimalString, amountInputToCents, centsToAmountInput, amountToInput, breaksOffAtSeparator, toStoredNumber, amountInputProblem, amountExample, currencyFractionDigits } from '../public/utils/money.js';
+import { formatMoney, formatSignedAmount, formatMoneyAxis, currencySymbol, setFallbackCurrency } from '../public/utils/money.js';
+import { toDecimalString, toAmountDecimalString, amountInputToCents, centsToAmountInput, amountToInput, breaksOffAtSeparator, toStoredNumber, amountInputProblem, amountExample, currencyFractionDigits, parseAmountInput, smallestUnitLabel } from '../public/utils/money.js';
 import { parseQuantity } from '../server/services/shopping-import.js';
 
 /**
@@ -35,6 +36,29 @@ function um(locale, eingabe, erwartet) {
     assert.equal(toDecimalString(eingabe), erwartet, `${locale}: "${eingabe}"`);
   });
 }
+
+test('decimal-keyboard amounts accept comma and point across device/household locales (#2170)', () => {
+  for (const locale of ['en-US', 'de', 'nl-BE', 'de-CH', 'ar-EG', 'fa']) {
+    withFormatLocale(locale, () => {
+      for (const input of ['12,50', '12.50', ' 12,50 ', '12', '0,01', ',50', '.50']) {
+        assert.equal(parseAmountInput(input), Number(input.trim().replace(',', '.')), `${locale}: ${input}`);
+        assert.equal(amountInputProblem(input, 'EUR', { decimalComma: true }), null, `${locale}: validate ${input}`);
+      }
+      for (const input of ['12,50 EUR', '12.50oops', '12,50.00', '1,2,3', '1e3', 'Infinity', '1 234,50']) {
+        assert.ok(Number.isNaN(parseAmountInput(input)), `${locale}: reject ${input}`);
+      }
+      assert.equal(parseAmountInput(''), null);
+      assert.equal(parseAmountInput(' '), null);
+      for (const currency of ['EUR', 'JPY', 'KWD']) {
+        for (const amount of [12.5, 1.234, 0.001, 12.5555]) {
+          assert.equal(parseAmountInput(amountToInput(amount, currency)), amount, `${locale}/${currency}: edit ${amount}`);
+        }
+      }
+    });
+  }
+  withFormatLocale('en-US', () => assert.ok(Number.isNaN(parseAmountInput('1,234'))));
+  withFormatLocale('de', () => assert.ok(Number.isNaN(parseAmountInput('1.234'))));
+});
 
 test('toDecimalString: Ziffern und Trenner kommen aus der eingestellten Region', () => {
   um('de', '12,50', '12.50');
@@ -159,6 +183,26 @@ test('toDecimalString: positionstreu in CODEPOINTS, nicht in UTF-16-Einheiten', 
   // Ziffer eben NICHT, und das ist der Grund fuer die Codepoint-Zaehlung.
   withFormatLocale('de', () => {
     assert.notEqual(toDecimalString('𞥒 kg').length, '𞥒 kg'.length);
+  });
+});
+
+test('shopping prices accepted with a keyboard comma retain their cents (#2170)', () => {
+  withFormatLocale('en-US', () => {
+    for (const [text, cents] of [['1,99', 199], ['1.99', 199], [',99', 99], ['0,00', 0]]) {
+      assert.equal(amountInputProblem(text, 'EUR', { decimalComma: true, sign: 'nonNegative' }), null);
+      assert.equal(amountInputToCents(text, 'EUR'), cents, `${text}: an accepted price must not become null`);
+    }
+    for (const text of ['1,000', '1,99oops', '1,99.00', '']) assert.equal(amountInputToCents(text, 'EUR'), null);
+  });
+});
+
+test('comma-aware decimal strings preserve exact digits and precision (#2170)', () => {
+  withFormatLocale('en-US', () => {
+    assert.equal(toAmountDecimalString('12,50'), '12.50');
+    assert.equal(toAmountDecimalString('90071992547409,91'), '90071992547409.91');
+    assert.equal(toAmountDecimalString('12,5000'), '12.5000');
+    assert.equal(amountInputProblem('12,5000', 'EUR', { decimalComma: true }), 'precision');
+    assert.equal(toAmountDecimalString('1,000'), '', 'grouping remains rejected');
   });
 });
 
@@ -433,4 +477,99 @@ test('roundToCurrency: Float-Rest wird 0, -0 wird 0, die Nachkommastellen folgen
   assert.equal(roundToCurrency(1700.10 - 1700.00, 'EUR'), 0.1);
   assert.equal(roundToCurrency(12.4, 'JPY'), 12);
   assert.equal(roundToCurrency(1.23456, 'KWD'), 1.235);
+});
+
+// R21 S9b (Critique a4) "200 statt 200,00", seit R23 im TEXTfeld: der Bestand
+// steht in den Stellen der Waehrung und in der Schreibweise der Region. Nur
+// aufgefuellt, nie gerundet - ein Wert neben dem Raster bleibt, wie er ist.
+test('amountToInput fuellt auf die Stellen der Waehrung auf und rundet nie', () => {
+  withFormatLocale('de', () => {
+    assert.equal(amountToInput(200, 'EUR'), '200,00');
+    assert.equal(amountToInput('38.5', 'EUR'), '38,50');
+    assert.equal(amountToInput(0, 'EUR'), '0,00');
+    assert.equal(amountToInput('12.555', 'EUR'), '12,555', 'mehr Stellen als die Waehrung: unveraendert');
+    assert.equal(amountToInput(1300, 'JPY'), '1300');
+    assert.equal(amountToInput(12.5, 'JPY'), '12,5', 'neben dem Raster: nicht gerundet');
+    assert.equal(amountToInput('1.5', 'KWD'), '1,500');
+    assert.equal(amountToInput(-250, 'EUR'), '-250,00', 'ein negativer Startsaldo bleibt negativ');
+    assert.equal(amountToInput('', 'EUR'), '');
+    assert.equal(amountToInput(null, 'EUR'), '');
+  });
+  withFormatLocale('en-US', () => assert.equal(amountToInput(1200, 'USD'), '1200.00', 'ohne Gruppierung - sonst liest es toDecimalString nicht wieder'));
+});
+
+// Critique R23 P1 (D1): ein `type="number"`-Feld las "1.200" unter de still als
+// 1,2. Das Textfeld liest ueber toDecimalString: gruppiert ist abgewiesen,
+// nie umgedeutet.
+test('parseAmountInput liest den Text eines Betragsfeldes, nie still gruppiert', () => {
+  withFormatLocale('de', () => {
+    assert.equal(parseAmountInput('1200'), 1200);
+    assert.equal(parseAmountInput('1200,50'), 1200.5);
+    assert.ok(Number.isNaN(parseAmountInput('1.200')), '"1.200" ist unter de gruppiert, nicht 1,2');
+    assert.ok(Number.isNaN(parseAmountInput('1.234,56')));
+    assert.ok(Number.isNaN(parseAmountInput('abc')));
+    assert.equal(parseAmountInput(''), null);
+    assert.equal(parseAmountInput('  '), null);
+    assert.equal(parseAmountInput('-50,25'), -50.25);
+    assert.equal(parseAmountInput('\u221250,25'), -50.25, 'das typografische Minus der Anzeige (sv, fi) gilt');
+  });
+  withFormatLocale('en-US', () => {
+    assert.equal(parseAmountInput('1.20'), 1.2);
+    assert.ok(Number.isNaN(parseAmountInput('1,200')));
+  });
+  withFormatLocale('fa', () => assert.equal(parseAmountInput('۱۲٫۵۰'), 12.5));
+});
+
+test('amountInputProblem: Vorzeichen je Feld (sign)', () => {
+  const grund = (eingabe, sign) => {
+    let out;
+    withFormatLocale('de', () => { out = amountInputProblem(eingabe, 'EUR', { sign }); });
+    return out;
+  };
+  // positive (Standard): eine Buchung, ein Darlehen, ein Plan
+  assert.equal(grund('0', undefined), 'notPositive');
+  assert.equal(grund('-5', undefined), 'notPositive');
+  // nonNegative: Kreditrahmen, Abo (Gratis-Tarif), Kaufpreis, Zuschlag
+  assert.equal(grund('0', 'nonNegative'), null);
+  assert.equal(grund('0,00', 'nonNegative'), null);
+  assert.equal(grund('-5', 'nonNegative'), 'invalid', 'ein Minus gehoert dort nicht hin');
+  assert.equal(grund('-0', 'nonNegative'), 'invalid');
+  assert.equal(grund('1.200', 'nonNegative'), 'grouped');
+  // any: Startsaldo eines Kontos
+  assert.equal(grund('-250,50', 'any'), null);
+  assert.equal(grund('0', 'any'), null);
+  assert.equal(grund('-250,505', 'any'), 'precision');
+  assert.equal(grund('-1.200', 'any'), 'grouped');
+});
+
+// Critique R23 P1: die Meldung "nur in Schritten von 0.01" stand unter de neben
+// dem Platzhalter "0,00" - die kleinste Einheit folgt jetzt der Region.
+test('smallestUnitLabel schreibt die kleinste Einheit in der Schreibweise der Region', () => {
+  withFormatLocale('de', () => {
+    assert.equal(smallestUnitLabel('EUR'), '0,01');
+    assert.equal(smallestUnitLabel('JPY'), '1');
+    assert.equal(smallestUnitLabel('KWD'), '0,001');
+  });
+  withFormatLocale('en-US', () => assert.equal(smallestUnitLabel('EUR'), '0.01'));
+  withFormatLocale('ar-EG', () => assert.equal(smallestUnitLabel('EUR'), '٠٫٠١'));
+});
+
+// #2302 (Security-Befund): ein Budget-Konto nahm bis dahin einen freien Text bis
+// 8 Zeichen als Waehrung an. "XYZ1" liess Intl.NumberFormat werfen, und die
+// Budget-Seite renderte fuer den ganzen Haushalt nicht mehr. Die Formatierer
+// fallen auf die Haushaltswaehrung zurueck, statt zu werfen.
+test('ein unbrauchbarer Waehrungscode faellt auf die Haushaltswaehrung zurueck', () => {
+  setFallbackCurrency('CHF');
+  try {
+    for (const bad of ['XYZ1', '', undefined, 'eu ro']) {
+      assert.equal(formatMoney(5, bad), formatMoney(5, 'CHF'), `formatMoney(${bad})`);
+      assert.equal(formatSignedAmount(-5, { currency: bad, role: 'flow' }).text, formatSignedAmount(-5, { currency: 'CHF', role: 'flow' }).text);
+      assert.equal(formatMoneyAxis(5, bad), formatMoneyAxis(5, 'CHF'));
+      assert.equal(currencySymbol(bad), currencySymbol('CHF'));
+    }
+    assert.equal(formatMoney(5, 'USD'), formatMoney(5, 'USD'), 'ein gueltiger Code bleibt');
+    assert.notEqual(formatMoney(5, 'USD'), formatMoney(5, 'CHF'));
+  } finally {
+    setFallbackCurrency('EUR');
+  }
 });

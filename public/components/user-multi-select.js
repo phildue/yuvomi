@@ -6,8 +6,8 @@
 
 import { esc } from '/utils/html.js';
 import { t } from '/i18n.js';
-import { getReadableTextColor, AVATAR_FALLBACK_COLOR } from '/utils/color.js';
-import { initials, compactInitials } from '/utils/initials.js';
+import { getReadableTextColor, safeHexColor } from '/utils/color.js';
+import { initials, compactInitials, sharedSurname } from '/utils/initials.js';
 
 // Der Rand von `.avatar-stack__item` (user-multi-select.css). Er steht hier
 // als Zahl, weil die Scheibe ihre Groesse und Schrift ohnehin inline in px
@@ -56,7 +56,7 @@ export function renderAvatarStack(users, { size = 28, maxVisible = 3, minFont = 
       ? `<img src="${esc(u.avatar_data)}" alt="${esc(u.display_name ?? '')}" loading="lazy">`
       : (showText ? esc(text) : '');
     return `<span class="avatar-stack__item"
-      style="width:${size}px;height:${size}px;font-size:${fs}px;background-color:${esc(u.color ?? AVATAR_FALLBACK_COLOR)};color:${getReadableTextColor(u.color ?? AVATAR_FALLBACK_COLOR)}"
+      style="width:${size}px;height:${size}px;font-size:${fs}px;background-color:${safeHexColor(u.color)};color:${getReadableTextColor(safeHexColor(u.color))}"
       title="${esc(u.display_name ?? '')}">
       ${inner}
     </span>`;
@@ -69,24 +69,10 @@ export function renderAvatarStack(users, { size = 28, maxVisible = 3, minFont = 
   return `<span class="avatar-stack">${avatars.join('')}</span>`;
 }
 
-/**
- * DER GETEILTE NACHNAME STEHT NICHT IN JEDEM CHIP (R19, Critique 2026-10-16:
- * Termin-Dialog mobil 1,6 Bildschirme). "Alex Johnson, Emma Johnson, Leo
- * Johnson, Linda Johnson" brauchten bei 390px drei Chip-Zeilen, und das
- * vierfache "Johnson" unterscheidet niemanden. Tragen ALLE Personen der Wahl
- * denselben Nachnamen, zeigt der Chip den Vornamen; der volle Name bleibt sein
- * zugaenglicher Name (`.sr-only`). Ein Konto mit anderem Nachnamen (Hilfe,
- * Grosseltern) laesst alle Namen voll stehen - dann unterscheidet er.
- * @param {Array<{display_name?: string}>} users
- * @returns {string} der geteilte Nachname, sonst ''
- */
-export function sharedSurname(users) {
-  if (!Array.isArray(users) || users.length < 2) return '';
-  const lasts = users.map((u) => String(u?.display_name ?? '').trim().split(/\s+/))
-    .map((parts) => (parts.length >= 2 ? parts[parts.length - 1] : ''));
-  const [first] = lasts;
-  return first && lasts.every((l) => l === first) ? first : '';
-}
+// sharedSurname wohnt seit Critique R24 in utils/initials.js (die Personenzeile
+// der Filter nutzt sie, und utils/filter-sheet.js gehoert zur Shell - dieses
+// Modul nicht). Hier bleibt der Re-Export fuer die bisherigen Aufrufer.
+export { sharedSurname };
 
 function userChipName(displayName, surname) {
   const full = String(displayName ?? '').trim();
@@ -101,13 +87,14 @@ function userChipName(displayName, surname) {
  * @param {number[]} selectedIds                               Bereits ausgewählte IDs
  * @param {string}   inputName                                 Name-Attribut des Widgets
  * @param {string}   labelKey                                  i18n-Schlüssel für das Label
- * @param {string}   [noneLabelKey]                            i18n-Schlüssel für die "Niemand"-Zeile;
- *   Vorgabe passt für "wem zugewiesen" (Tasks/Kalender/Budget). Ein Aufrufer, dessen Auswahl kein
- *   Zuweisen ist - z. B. der Schedule-Vergleich, wo "Niemand" nur die Auswahl leert - übergibt
- *   seinen eigenen Schlüssel (S-19).
+ * @param {string|null} [noneLabelKey]                         i18n-Schlüssel für einen "Niemand"-Chip.
+ *   NUR FÜR DIE EINZELWAHL (Critique R21, a5): in einer Mehrfachwahl - Zuständige, Betreuende,
+ *   der Schichtplan-Vergleich - stand "Niemand" als erster Chip zwischen den Personen, wie eine
+ *   weitere Person. Dort heißt "niemand" schlicht: kein Chip gewählt. Eine Einzelwahl (der Koch
+ *   einer Mahlzeit, `single`) übergibt `'userMultiSelect.nobody'` - dort ist es eine der Antworten.
  * @returns {string} HTML-String
  */
-export function renderUserMultiSelect(allUsers, selectedIds, inputName, labelKey, noneLabelKey = 'userMultiSelect.nobody') {
+export function renderUserMultiSelect(allUsers, selectedIds, inputName, labelKey, noneLabelKey = null) {
   const selectedSet = new Set(selectedIds ?? []);
   const surname = sharedSurname(allUsers);
   const items = allUsers.map((u) => {
@@ -119,7 +106,7 @@ export function renderUserMultiSelect(allUsers, selectedIds, inputName, labelKey
       <label class="user-ms__option">
         <input type="checkbox" class="user-ms__checkbox" value="${u.id}" ${checked}
                data-ms-input="${esc(inputName)}">
-        <span class="user-ms__avatar" style="background-color:${esc(u.avatar_color ?? AVATAR_FALLBACK_COLOR)};color:${getReadableTextColor(u.avatar_color ?? AVATAR_FALLBACK_COLOR)}">
+        <span class="user-ms__avatar" style="background-color:${safeHexColor(u.avatar_color)};color:${getReadableTextColor(safeHexColor(u.avatar_color))}">
           ${inner}
         </span>
         <span class="user-ms__name">${userChipName(u.display_name, surname)}</span>
@@ -130,16 +117,17 @@ export function renderUserMultiSelect(allUsers, selectedIds, inputName, labelKey
   // Striche um das Wort. Hier stand ein grauer Kreis mit einem Gedankenstrich
   // und „- Niemand -" daneben - ein Platzhalter-Gesicht, das neben echten
   // Initialen wie ein weiteres Mitglied aussah (Critique 2026-09-24).
-  const noneLabel = t(noneLabelKey);
+  const none = noneLabelKey ? `
+        <label class="user-ms__option user-ms__option--none">
+          <input type="checkbox" class="user-ms__checkbox user-ms__none" value=""
+                 data-ms-input="${esc(inputName)}" ${selectedSet.size === 0 ? 'checked' : ''}>
+          <span class="user-ms__name">${t(noneLabelKey)}</span>
+        </label>` : '';
   return `
     <div class="user-ms" data-ms-name="${esc(inputName)}">
       <label class="label">${t(labelKey)}</label>
       <div class="user-ms__options">
-        <label class="user-ms__option user-ms__option--none">
-          <input type="checkbox" class="user-ms__checkbox user-ms__none" value=""
-                 data-ms-input="${esc(inputName)}" ${selectedSet.size === 0 ? 'checked' : ''}>
-          <span class="user-ms__name">${noneLabel}</span>
-        </label>
+        ${none}
         ${items.join('')}
       </div>
     </div>`;

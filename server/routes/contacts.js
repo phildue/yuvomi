@@ -10,7 +10,10 @@ import * as db from '../db.js';
 import { str, oneOf, date, collectErrors, MAX_TITLE, MAX_TEXT, MAX_SHORT } from '../middleware/validate.js';
 import { uniqueKey } from '../utils/category-slug.js';
 import { composeDisplayName, normalizeNameParts } from '../../public/utils/contact-name.js';
+import { CONTACT_PHONE_MAX_LENGTH } from '../../public/utils/contact-limits.js';
 import { toE164, defaultCountryFromConfig } from '../utils/phone.js';
+import { birthDateInput, placeholderBirthDate, validateYearUnknown, birthdayLinkSuggestion, contactBirthdayMatch } from '../services/birthdays.js';
+import { mayReadModule } from '../permissions.js';
 import {
   contactActorFromRequest, mayChangeContactEmails, bodyChangesContactEmails,
   emailsTakenByOtherAccounts, EMAIL_IN_USE_MESSAGE,
@@ -42,15 +45,38 @@ function readNameParts(body) {
   return { parts, provided, displayName: composeDisplayName(parts) };
 }
 
+/**
+ * Ein Textfeld mit Laengengrenze, das seinen Fall benennt (#1909): ist es zu
+ * lang, traegt die Pruefung `case` mit Grund und Grenze. Die Antwort reicht
+ * ihn als `reason` und `params.limit` neben `error` weiter (fieldCase), und die
+ * App sagt ihren Satz statt des englischen Servertexts. Gemeint ist vor allem
+ * der vCard-Import: dort nannte der Toast bis dahin den rohen Text, weil er das
+ * abgewiesene Feld nennt. Ein fehlender Pflichtwert ist kein "zu lang" und
+ * bleibt ohne Grund.
+ */
+function limitedStr(val, label, max, { reason }, required = false) {
+  const check = str(val, label, { max, required });
+  if (check.error && val !== undefined && val !== null && String(val).trim().length > max) {
+    check.case = { reason, params: { limit: max } };
+  }
+  return check;
+}
+
 /** Längen-Validierung der Namensteile (gleiche Grenze wie der Anzeigename). */
 function namePartChecks(parts) {
   return [
-    str(parts.firstName,  'Vorname',   { max: MAX_TITLE, required: false }),
-    str(parts.lastName,   'Nachname',  { max: MAX_TITLE, required: false }),
-    str(parts.middleName, 'Zweitname', { max: MAX_TITLE, required: false }),
-    str(parts.namePrefix, 'Namenszusatz', { max: MAX_SHORT, required: false }),
-    str(parts.nameSuffix, 'Namenssuffix', { max: MAX_SHORT, required: false }),
+    limitedStr(parts.firstName,  'firstName',    MAX_TITLE, { reason: 'contacts_name_too_long' }),
+    limitedStr(parts.lastName,   'lastName',     MAX_TITLE, { reason: 'contacts_name_too_long' }),
+    limitedStr(parts.middleName, 'middleName',   MAX_TITLE, { reason: 'contacts_name_too_long' }),
+    limitedStr(parts.namePrefix, 'namePrefix',   MAX_SHORT, { reason: 'contacts_name_too_long' }),
+    limitedStr(parts.nameSuffix, 'nameSuffix',   MAX_SHORT, { reason: 'contacts_name_too_long' }),
   ];
+}
+
+/** Ein Geburtstag, den der Server als Datum abweist, benennt seinen Fall (#1909). */
+function birthdayCheck(check) {
+  if (check.error) check.case = { reason: 'contacts_birthday_invalid' };
+  return check;
 }
 
 /** Verwaltbare Kontakt-Kategorien aus der DB (nach sort_order). */
@@ -95,6 +121,29 @@ function normalizeCategoryColor(value) {
 /** Nur die Keys — für die dynamische Kategorie-Validierung. */
 function validContactCategoryKeys() {
   return loadContactCategories().map((c) => c.key);
+}
+
+/**
+ * Die im Formular GEWAEHLTE Kategorie gibt es nicht mehr (#1909): jemand hat sie
+ * geloescht, waehrend das Formular offen war. Der Grund nennt den Fall nur, wenn
+ * er der EINZIGE Befund ist - die Seite haelt das Formular dann offen und bietet
+ * die aktuellen Kategorien an. Fehlt die Kategorie im Rumpf, ist nichts gewaehlt.
+ */
+function selectedCategoryGone(vCat, errors) {
+  return vCat?.error && errors.length === 1 ? { reason: 'contacts_selected_category_not_found' } : {};
+}
+
+/**
+ * Der Fall einer abgewiesenen Eingabe (#1909): die geloeschte Kategorie, wenn
+ * sie der einzige Befund ist (selectedCategoryGone), sonst das ERSTE Feld, das
+ * seinen Fall benennt (limitedStr, birthdayCheck). Der Satz dazu nennt dieses
+ * Feld - stimmt also auch, wenn daneben ein zweites scheitert. Ohne benannten
+ * Fall: nichts, und die App sagt ihren allgemeinen Satz.
+ */
+function fieldCase(vCat, checks, errors) {
+  const gone = selectedCategoryGone(vCat, errors);
+  if (gone.reason) return gone;
+  return checks.find((check) => check?.error && check.case)?.case ?? {};
 }
 
 /** Anzahl Kontakte, die eine Kategorie referenzieren (Guard vor dem Löschen). */
@@ -150,24 +199,60 @@ function loadMultiValueFields(contactId) {
 }
 
 /**
+ * Die Mehrfachfelder (phones, emails, addresses) benennen jede Absage als Fall
+ * (#1909), wie die Einzelfelder (limitedStr): `case` traegt Grund und, wo es
+ * eine Grenze gibt, die Zahl. Die Antwort reicht ihn als `reason` und
+ * `params.limit` neben dem unveraenderten `error` weiter. Gemeint ist vor allem
+ * das Kontaktformular: es schickt jede Telefonnummer und Adresse als Eintrag,
+ * und eine E-Mail-Adresse ohne @ oder eine zu lange Nummer bekam bis dahin nur
+ * den allgemeinen Satz. Der ERSTE Eintrag, der scheitert, wird
+ * benannt; die Felder nacheinander (phones, emails, addresses), alle erst nach
+ * den Einzelfeldern.
+ *
+ * Was nur ein API-Client falsch schicken kann (keine Liste, kein Objekt, ohne
+ * Bezeichnung oder Wert, kein Text, `isPrimary` kein Boolean), ist EIN Fall je
+ * Feld (`*_entry_invalid`): der Satz dazu sagt "unvollstaendig oder ungueltig",
+ * und das stimmt fuer jede dieser Absagen. Zu lang, zu viele und die E-Mail
+ * ohne gueltige Form haben je einen eigenen Satz, weil der Nutzer daran
+ * etwas aendern kann.
+ */
+const MV_MAX_ENTRIES = 20;
+const MV_MAX_LABEL = 50;
+// Dieselbe Grenze wie das Einzelfeld `phone`: das Formular schickt die erste
+// Nummer in beiden, und zwei Grenzen nannten nacheinander zwei Zahlen.
+const MV_MAX_PHONE = CONTACT_PHONE_MAX_LENGTH;
+const MV_MAX_EMAIL = 255;
+const MV_MAX_ADDRESS_PART = 255;
+
+/** Eine Absage eines Mehrfachfelds mit ihrem Fall (`params.limit` nur, wo der Satz eine Grenze nennt). */
+function refuse(error, refusal) {
+  return { valid: false, error, case: refusal };
+}
+
+/**
  * Validates phones array for multi-value contact fields.
  * @param {Array} phones - Array of { label, value, isPrimary? }
- * @returns {{ valid: boolean, error?: string }}
+ * @returns {{ valid: boolean, error?: string, case?: { reason: string, params?: { limit: number } } }}
  */
 function validatePhones(phones) {
-  if (!Array.isArray(phones)) return { valid: false, error: 'Phones must be an array' };
-  if (phones.length > 20) return { valid: false, error: 'Too many phone entries (max 20)' };
+  const invalid = (error) => refuse(error, { reason: 'contacts_phone_entry_invalid' });
+  if (!Array.isArray(phones)) return invalid('Phones must be an array');
+  if (phones.length > MV_MAX_ENTRIES) {
+    return refuse(`Too many phone entries (max ${MV_MAX_ENTRIES})`, { reason: 'contacts_phones_too_many', params: { limit: MV_MAX_ENTRIES } });
+  }
   for (const p of phones) {
-    if (!p || typeof p !== 'object') return { valid: false, error: 'Phone entry must be an object' };
-    if (!p.label || !p.value) return { valid: false, error: 'Phone requires label and value' };
-    if (typeof p.label !== 'string' || p.label.trim().length === 0 || p.label.length > 50) {
-      return { valid: false, error: 'Phone label invalid or too long' };
+    if (!p || typeof p !== 'object') return invalid('Phone entry must be an object');
+    if (!p.label || !p.value) return invalid('Phone requires label and value');
+    if (typeof p.label !== 'string' || p.label.trim().length === 0) return invalid('Phone label invalid or too long');
+    if (p.label.length > MV_MAX_LABEL) {
+      return refuse('Phone label invalid or too long', { reason: 'contacts_phone_label_too_long', params: { limit: MV_MAX_LABEL } });
     }
-    if (typeof p.value !== 'string' || p.value.trim().length === 0 || p.value.length > 50) {
-      return { valid: false, error: 'Phone value invalid or too long' };
+    if (typeof p.value !== 'string' || p.value.trim().length === 0) return invalid('Phone value invalid or too long');
+    if (p.value.length > MV_MAX_PHONE) {
+      return refuse('Phone value invalid or too long', { reason: 'contacts_phone_too_long', params: { limit: MV_MAX_PHONE } });
     }
     if (p.isPrimary !== undefined && typeof p.isPrimary !== 'boolean') {
-      return { valid: false, error: 'Phone isPrimary must be boolean' };
+      return invalid('Phone isPrimary must be boolean');
     }
   }
   return { valid: true };
@@ -176,61 +261,65 @@ function validatePhones(phones) {
 /**
  * Validates emails array for multi-value contact fields.
  * @param {Array} emails - Array of { label, value, isPrimary? }
- * @returns {{ valid: boolean, error?: string }}
+ * @returns {{ valid: boolean, error?: string, case?: { reason: string, params?: { limit: number } } }}
  */
 function validateEmails(emails) {
-  if (!Array.isArray(emails)) return { valid: false, error: 'Emails must be an array' };
-  if (emails.length > 20) return { valid: false, error: 'Too many email entries (max 20)' };
+  const invalid = (error) => refuse(error, { reason: 'contacts_email_entry_invalid' });
+  if (!Array.isArray(emails)) return invalid('Emails must be an array');
+  if (emails.length > MV_MAX_ENTRIES) {
+    return refuse(`Too many email entries (max ${MV_MAX_ENTRIES})`, { reason: 'contacts_emails_too_many', params: { limit: MV_MAX_ENTRIES } });
+  }
   for (const e of emails) {
-    if (!e || typeof e !== 'object') return { valid: false, error: 'Email entry must be an object' };
-    if (!e.label || !e.value) return { valid: false, error: 'Email requires label and value' };
-    if (typeof e.label !== 'string' || e.label.trim().length === 0 || e.label.length > 50) {
-      return { valid: false, error: 'Email label invalid or too long' };
+    if (!e || typeof e !== 'object') return invalid('Email entry must be an object');
+    if (!e.label || !e.value) return invalid('Email requires label and value');
+    if (typeof e.label !== 'string' || e.label.trim().length === 0) return invalid('Email label invalid or too long');
+    if (e.label.length > MV_MAX_LABEL) {
+      return refuse('Email label invalid or too long', { reason: 'contacts_email_label_too_long', params: { limit: MV_MAX_LABEL } });
     }
-    if (typeof e.value !== 'string' || e.value.trim().length === 0 || e.value.length > 255) {
-      return { valid: false, error: 'Email value invalid or too long' };
+    if (typeof e.value !== 'string' || e.value.trim().length === 0) return invalid('Email value invalid or too long');
+    if (e.value.length > MV_MAX_EMAIL) {
+      return refuse('Email value invalid or too long', { reason: 'contacts_email_too_long', params: { limit: MV_MAX_EMAIL } });
     }
     if (!/^.+@.+$/.test(e.value)) {
-      return { valid: false, error: 'Email value must be a valid email address' };
+      return refuse('Email value must be a valid email address', { reason: 'contacts_email_invalid' });
     }
     if (e.isPrimary !== undefined && typeof e.isPrimary !== 'boolean') {
-      return { valid: false, error: 'Email isPrimary must be boolean' };
+      return invalid('Email isPrimary must be boolean');
     }
   }
   return { valid: true };
 }
 
+/** Die Teile einer Adresse, die je hoechstens MV_MAX_ADDRESS_PART Zeichen tragen. */
+const ADDRESS_PARTS = ['street', 'city', 'state', 'postalCode', 'country'];
+
 /**
  * Validates addresses array for multi-value contact fields.
  * @param {Array} addresses - Array of { label, street?, city?, state?, postalCode?, country?, isPrimary? }
- * @returns {{ valid: boolean, error?: string }}
+ * @returns {{ valid: boolean, error?: string, case?: { reason: string, params?: { limit: number } } }}
  */
 function validateAddresses(addresses) {
-  if (!Array.isArray(addresses)) return { valid: false, error: 'Addresses must be an array' };
-  if (addresses.length > 20) return { valid: false, error: 'Too many address entries (max 20)' };
+  const invalid = (error) => refuse(error, { reason: 'contacts_address_entry_invalid' });
+  if (!Array.isArray(addresses)) return invalid('Addresses must be an array');
+  if (addresses.length > MV_MAX_ENTRIES) {
+    return refuse(`Too many address entries (max ${MV_MAX_ENTRIES})`, { reason: 'contacts_addresses_too_many', params: { limit: MV_MAX_ENTRIES } });
+  }
   for (const a of addresses) {
-    if (!a || typeof a !== 'object') return { valid: false, error: 'Address entry must be an object' };
-    if (!a.label) return { valid: false, error: 'Address requires label' };
-    if (typeof a.label !== 'string' || a.label.trim().length === 0 || a.label.length > 50) {
-      return { valid: false, error: 'Address label invalid or too long' };
+    if (!a || typeof a !== 'object') return invalid('Address entry must be an object');
+    if (!a.label) return invalid('Address requires label');
+    if (typeof a.label !== 'string' || a.label.trim().length === 0) return invalid('Address label invalid or too long');
+    if (a.label.length > MV_MAX_LABEL) {
+      return refuse('Address label invalid or too long', { reason: 'contacts_address_label_too_long', params: { limit: MV_MAX_LABEL } });
     }
-    if (a.street !== undefined && (typeof a.street !== 'string' || a.street.length > 255)) {
-      return { valid: false, error: 'Address street invalid or too long' };
-    }
-    if (a.city !== undefined && (typeof a.city !== 'string' || a.city.length > 255)) {
-      return { valid: false, error: 'Address city invalid or too long' };
-    }
-    if (a.state !== undefined && (typeof a.state !== 'string' || a.state.length > 255)) {
-      return { valid: false, error: 'Address state invalid or too long' };
-    }
-    if (a.postalCode !== undefined && (typeof a.postalCode !== 'string' || a.postalCode.length > 255)) {
-      return { valid: false, error: 'Address postalCode invalid or too long' };
-    }
-    if (a.country !== undefined && (typeof a.country !== 'string' || a.country.length > 255)) {
-      return { valid: false, error: 'Address country invalid or too long' };
+    for (const part of ADDRESS_PARTS) {
+      if (a[part] === undefined) continue;
+      if (typeof a[part] !== 'string') return invalid(`Address ${part} invalid or too long`);
+      if (a[part].length > MV_MAX_ADDRESS_PART) {
+        return refuse(`Address ${part} invalid or too long`, { reason: 'contacts_address_part_too_long', params: { limit: MV_MAX_ADDRESS_PART } });
+      }
     }
     if (a.isPrimary !== undefined && typeof a.isPrimary !== 'boolean') {
-      return { valid: false, error: 'Address isPrimary must be boolean' };
+      return invalid('Address isPrimary must be boolean');
     }
   }
   return { valid: true };
@@ -247,14 +336,14 @@ router.get('/categories', (_req, res) => {
     res.json({ data: loadContactCategories() });
   } catch (err) {
     log.error('GET /categories error:', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
 // POST /api/v1/contacts/categories  Body: { name } → { data: ContactCategory }
 router.post('/categories', (req, res) => {
   try {
-    const vName = str(req.body.name, 'Name', { max: MAX_SHORT });
+    const vName = str(req.body.name, 'name', { max: MAX_SHORT });
     if (vName.error) return res.status(400).json({ error: vName.error, code: 400 });
 
     const conflict = db.get().prepare(`
@@ -275,7 +364,7 @@ router.post('/categories', (req, res) => {
     res.status(201).json({ data: cat });
   } catch (err) {
     log.error('POST /categories error:', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -288,7 +377,7 @@ router.patch('/categories/reorder', (req, res) => {
     res.json({ data: loadContactCategories() });
   } catch (err) {
     log.error('PATCH /categories/reorder error:', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -311,7 +400,7 @@ router.put('/categories/:key', (req, res) => {
       return res.json({ data: db.get().prepare('SELECT key, name, label_key, icon, sort_order, color FROM contact_categories WHERE key = ?').get(cat.key) });
     }
 
-    const vName = str(req.body.name, 'Name', { max: MAX_SHORT });
+    const vName = str(req.body.name, 'name', { max: MAX_SHORT });
     if (vName.error) return res.status(400).json({ error: vName.error, code: 400 });
 
     const conflict = db.get().prepare(`
@@ -325,7 +414,7 @@ router.put('/categories/:key', (req, res) => {
     res.json({ data: updated });
   } catch (err) {
     log.error('PUT /categories/:key error:', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -346,9 +435,17 @@ router.delete('/categories/:key', (req, res) => {
     res.status(204).end();
   } catch (err) {
     log.error('DELETE /categories/:key error:', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
+
+// Der Geburtstag eines Kontakts kommt ueber die Verknuepfung ODER, beim
+// Kontakt eines Haushaltsmitglieds, ueber das Konto (#2214,
+// `contactBirthdayMatch`). Gibt es aus der Zeit davor beides (ein Import legte
+// fuer das Mitglied eine zweite Zeile an), gewinnt die ausdrueckliche
+// Verknuepfung, und alle drei Felder nennen dieselbe Zeile.
+const CONTACT_BIRTHDAY = contactBirthdayMatch('contacts');
+const CONTACT_BIRTHDAY_ORDER = 'ORDER BY (b.contact_id = contacts.id) DESC, b.id ASC LIMIT 1';
 
 /**
  * EIN MENSCH, EINE FARBE - auch hier.
@@ -376,9 +473,65 @@ const CONTACT_SELECT = `
   SELECT contacts.*,
          u.display_name  AS family_display_name,
          u.avatar_color  AS family_avatar_color,
-         u.avatar_data   AS family_avatar_data
+         u.avatar_data   AS family_avatar_data,
+         (SELECT b.id FROM birthdays b WHERE ${CONTACT_BIRTHDAY} ${CONTACT_BIRTHDAY_ORDER}) AS birthday_id,
+         (SELECT b.birth_date FROM birthdays b WHERE ${CONTACT_BIRTHDAY} ${CONTACT_BIRTHDAY_ORDER}) AS birthday_link_date,
+         (SELECT b.year_unknown FROM birthdays b WHERE ${CONTACT_BIRTHDAY} ${CONTACT_BIRTHDAY_ORDER}) AS birthday_link_year_unknown
     FROM contacts
     LEFT JOIN users u ON u.id = contacts.family_user_id`;
+
+/**
+ * DER WEG ZUM GEBURTSTAG (Critique R21, D7). `birthday_id` ist der Eintrag im
+ * Geburtstagsmodul, den der Import aus diesem Kontakt angelegt hat
+ * (Migration 90, `birthdays.contact_id`, eindeutig je Kontakt), beim Kontakt
+ * eines Haushaltsmitglieds dessen Profil-Geburtstag (#2214). Die
+ * Kontaktseite fuehrt damit einen Link "In Geburtstagen anzeigen".
+ *
+ * Geburtstage gehoeren dem Modul `calendar` (server/permissions.js) - eine
+ * Mischstelle wie der Import in die Gegenrichtung (routes/birthdays.js,
+ * `contactsHidden`). Wer den Kalender nicht lesen darf, bekommt keine id:
+ * sie verriete sonst, wer im Geburtstagsmodul steht.
+ *
+ * SEIT R22 (D7) VERKNUEPFT AUCH DER GEBURTSTAG-DIALOG, und dann hat der Kontakt
+ * oft selbst kein Datum: die Zeile "Geburtstag" fiele weg und mit ihr der Weg
+ * zurueck. `birthday_link_date`/`_year_unknown` sind das Datum des
+ * verknuepften Eintrags - zum ANZEIGEN, wo der Kontakt keins traegt. Das Datum
+ * des Kontakts selbst bleibt unberuehrt (#2124 bleibt eigenstaendig). Dieselbe
+ * Schranke wie die id: ohne Kalender-Leserecht nichts.
+ */
+function withBirthdayLink(req, contact) {
+  if (!contact || mayReadModule(req, 'calendar')) return contact;
+  return { ...contact, birthday_id: null, birthday_link_date: null, birthday_link_year_unknown: null };
+}
+
+/**
+ * DER RUHIGE HINWEIS AUCH IM KONTAKT (Critique R22, D7). Der Geburtstag zeigt
+ * "Ein Kontakt heisst genauso" (`suggested_contact_id`, routes/birthdays.js);
+ * die Gegenrichtung fehlte, und wer vom Kontakt aus kam, sah nie, dass es den
+ * Menschen schon als Geburtstag gibt. `suggested_birthday_id` ist der eine
+ * unverknuepfte Geburtstag mit demselben Namen (derselbe Schluessel,
+ * `sameNameKey`).
+ *
+ * Nur am EINZELNEN Kontakt (GET/PUT /:id): die Leseansicht laedt ihn ohnehin
+ * nach, und die Liste muesste sonst je Zeile alle Geburtstage durchgehen.
+ * Dieselbe Schranke wie `birthday_id` (ohne Kalender-Leserecht nichts, es
+ * verriete die Namen im Geburtstagsmodul), und nichts fuer einen schon
+ * verknuepften Kontakt oder den einer Haushaltshilfe, den die Geburtstagsseite
+ * nie vorschlaegt.
+ */
+function withBirthdaySuggestion(req, contact) {
+  if (!contact || contact.birthday_id || !mayReadModule(req, 'calendar')) return contact;
+  if (contact.family_user_id && db.get().prepare('SELECT 1 FROM housekeeping_workers WHERE user_id = ?').get(contact.family_user_id)) {
+    return contact;
+  }
+  // Erst der Name (R22), sonst derselbe Tag (R23): dann nennt die Ansicht den
+  // Geburtstag beim Namen ("Mit X verknuepfen?"), weil er anders heisst.
+  const hit = birthdayLinkSuggestion(db.get(), contact);
+  if (!hit) return contact;
+  return hit.by === 'date'
+    ? { ...contact, suggested_birthday_id: hit.id, suggested_birthday_name: hit.name }
+    : { ...contact, suggested_birthday_id: hit.id };
+}
 
 /**
  * GET /api/v1/contacts
@@ -409,11 +562,11 @@ router.get('/', (req, res) => {
     // `category` sonst mehrdeutig.
     sql += ' ORDER BY contacts.category ASC, COALESCE(NULLIF(contacts.last_name, \'\'), contacts.name) COLLATE NOCASE ASC, contacts.name COLLATE NOCASE ASC';
 
-    const contacts = db.get().prepare(sql).all(...params);
+    const contacts = db.get().prepare(sql).all(...params).map((c) => withBirthdayLink(req, c));
     res.json({ data: contacts });
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -427,49 +580,53 @@ router.post('/', (req, res) => {
   try {
     // Strukturierte Namensteile haben Vorrang vor einem mitgesendeten `name` (#535).
     const nameParts = readNameParts(req.body);
-    const vName    = str(nameParts.displayName ?? req.body.name, 'Name', { max: MAX_TITLE });
-    const vCat     = oneOf(req.body.category || FALLBACK_CATEGORY, validContactCategoryKeys(), 'Kategorie');
-    const vPhone   = str(req.body.phone,   'Telefon', { max: MAX_SHORT, required: false });
-    const vEmail   = str(req.body.email,   'E-Mail',  { max: MAX_TITLE, required: false });
-    const vAddress = str(req.body.address, 'Adresse', { max: MAX_TEXT,  required: false });
-    const vNotes   = str(req.body.notes,   'Notizen', { max: MAX_TEXT,  required: false });
+    const vName    = limitedStr(nameParts.displayName ?? req.body.name, 'name', MAX_TITLE, { reason: 'contacts_name_too_long' }, true);
+    const vCat     = oneOf(req.body.category || FALLBACK_CATEGORY, validContactCategoryKeys(), 'category');
+    const vPhone   = limitedStr(req.body.phone,   'phone',   CONTACT_PHONE_MAX_LENGTH, { reason: 'contacts_phone_too_long' });
+    const vEmail   = limitedStr(req.body.email,   'email',   MAX_TITLE, { reason: 'contacts_email_too_long' });
+    const vAddress = limitedStr(req.body.address, 'address', MAX_TEXT,  { reason: 'contacts_address_too_long' });
+    const vNotes   = limitedStr(req.body.notes,   'notes',   MAX_TEXT,  { reason: 'contacts_notes_too_long' });
     // Geburtstag (ISO YYYY-MM-DD, optional) - u. a. aus vCard-BDAY beim Import.
     // Speist den bestehenden #518-Geburtstags-Import (GET /birthdays/import/candidates).
-    const vBirthday = date(req.body.birthday, 'Geburtstag', false);
-    const errors   = collectErrors([vName, vCat, vPhone, vEmail, vAddress, vNotes, vBirthday,
-                                    ...namePartChecks(nameParts.parts)]);
-    if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
+    // Ohne Jahr (#2095): `birthday_year_unknown` setzt das Jahr auf den
+    // Platzhalter, die Anzeige laesst es weg.
+    const vYearUnknown = validateYearUnknown(req.body.birthday_year_unknown, 'birthday_year_unknown');
+    const vBirthday = birthdayCheck(date(birthDateInput(req.body.birthday, vYearUnknown.value === true), 'birthday', false));
+    const checks   = [vName, vCat, vPhone, vEmail, vAddress, vNotes, vYearUnknown, vBirthday,
+                      ...namePartChecks(nameParts.parts)];
+    const errors   = collectErrors(checks);
+    if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400, ...fieldCase(vCat, checks, errors) });
 
     // Validate multi-value fields if provided
     if (req.body.phones !== undefined) {
       const phonesValidation = validatePhones(req.body.phones);
       if (!phonesValidation.valid) {
-        return res.status(400).json({ error: phonesValidation.error, code: 400 });
+        return res.status(400).json({ error: phonesValidation.error, code: 400, ...phonesValidation.case });
       }
     }
 
     if (req.body.emails !== undefined) {
       const emailsValidation = validateEmails(req.body.emails);
       if (!emailsValidation.valid) {
-        return res.status(400).json({ error: emailsValidation.error, code: 400 });
+        return res.status(400).json({ error: emailsValidation.error, code: 400, ...emailsValidation.case });
       }
     }
 
     if (req.body.addresses !== undefined) {
       const addressesValidation = validateAddresses(req.body.addresses);
       if (!addressesValidation.valid) {
-        return res.status(400).json({ error: addressesValidation.error, code: 400 });
+        return res.status(400).json({ error: addressesValidation.error, code: 400, ...addressesValidation.case });
       }
     }
 
     // Insert contact and multi-value fields in a transaction
     const transaction = db.get().transaction(() => {
       const result = db.get().prepare(`
-        INSERT INTO contacts (name, category, phone, email, address, notes, birthday,
+        INSERT INTO contacts (name, category, phone, email, address, notes, birthday, birthday_year_unknown,
                               first_name, last_name, middle_name, name_prefix, name_suffix)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(vName.value, vCat.value || FALLBACK_CATEGORY, vPhone.value, vEmail.value,
-             vAddress.value, vNotes.value, vBirthday.value,
+             vAddress.value, vNotes.value, vBirthday.value, vBirthday.value && vYearUnknown.value ? 1 : 0,
              nameParts.parts.firstName, nameParts.parts.lastName, nameParts.parts.middleName,
              nameParts.parts.namePrefix, nameParts.parts.nameSuffix);
 
@@ -529,15 +686,17 @@ router.post('/', (req, res) => {
     const contact = db.get().prepare('SELECT * FROM contacts WHERE id = ?').get(contactId);
     const multiValueFields = loadMultiValueFields(contactId);
 
+    // Beim Anlegen schon der Vorschlag (R23, G5-P2): wer "Tante Ingrid" mit
+    // dem Datum von "Ingrid Mueller" anlegt, sieht die Frage sofort.
     res.status(201).json({
       data: {
-        ...contact,
+        ...withBirthdaySuggestion(req, contact),
         ...multiValueFields
       }
     });
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -551,7 +710,7 @@ router.put('/:id', (req, res) => {
   try {
     const id      = parseInt(req.params.id, 10);
     const contact = db.get().prepare('SELECT * FROM contacts WHERE id = ?').get(id);
-    if (!contact) return res.status(404).json({ error: 'Kontakt nicht gefunden', code: 404 });
+    if (!contact) return res.status(404).json({ error: 'Contact not found.', code: 404, reason: 'contacts_contact_not_found' });
 
     // Namensteile (#535): sobald welche mitkommen, ersetzen sie die gespeicherten
     // und der Anzeigename wird neu daraus abgeleitet.
@@ -560,35 +719,51 @@ router.put('/:id', (req, res) => {
 
     const checks = [];
     if (nameParts.provided)              checks.push(...namePartChecks(nameParts.parts));
-    if (req.body.name     !== undefined) checks.push(str(req.body.name,     'Name',    { max: MAX_TITLE, required: false }));
-    if (req.body.category !== undefined) checks.push(oneOf(req.body.category, validContactCategoryKeys(), 'Kategorie'));
-    if (req.body.phone    !== undefined) checks.push(str(req.body.phone,    'Telefon', { max: MAX_SHORT, required: false }));
-    if (req.body.email    !== undefined) checks.push(str(req.body.email,    'E-Mail',  { max: MAX_TITLE, required: false }));
-    if (req.body.address  !== undefined) checks.push(str(req.body.address,  'Adresse', { max: MAX_TEXT,  required: false }));
-    if (req.body.notes    !== undefined) checks.push(str(req.body.notes,    'Notizen', { max: MAX_TEXT,  required: false }));
-    if (req.body.birthday !== undefined) checks.push(date(req.body.birthday, 'Geburtstag', false));
+    if (req.body.name     !== undefined) checks.push(limitedStr(req.body.name, 'name', MAX_TITLE, { reason: 'contacts_name_too_long' }));
+    const vCat = req.body.category !== undefined ? oneOf(req.body.category, validContactCategoryKeys(), 'category') : null;
+    if (vCat) checks.push(vCat);
+    if (req.body.phone    !== undefined) checks.push(limitedStr(req.body.phone,   'phone',   CONTACT_PHONE_MAX_LENGTH, { reason: 'contacts_phone_too_long' }));
+    if (req.body.email    !== undefined) checks.push(limitedStr(req.body.email,   'email',   MAX_TITLE, { reason: 'contacts_email_too_long' }));
+    if (req.body.address  !== undefined) checks.push(limitedStr(req.body.address, 'address', MAX_TEXT,  { reason: 'contacts_address_too_long' }));
+    if (req.body.notes    !== undefined) checks.push(limitedStr(req.body.notes,   'notes',   MAX_TEXT,  { reason: 'contacts_notes_too_long' }));
+    // Fehlt `birthday_year_unknown`, bleibt die gespeicherte Marke (#2095); wer
+    // sie abnimmt, schickt das Jahr mit, sonst wuerde der Platzhalter 2000 zum
+    // echten Geburtsjahr.
+    const vYearUnknown = validateYearUnknown(req.body.birthday_year_unknown, 'birthday_year_unknown');
+    checks.push(vYearUnknown);
+    const yearUnknown = vYearUnknown.value ?? contact.birthday_year_unknown === 1;
+    let birthday = contact.birthday;
+    if (req.body.birthday !== undefined) {
+      const vBirthday = birthdayCheck(date(birthDateInput(req.body.birthday, yearUnknown), 'birthday', false));
+      checks.push(vBirthday);
+      birthday = vBirthday.value;
+    } else if (yearUnknown && contact.birthday_year_unknown !== 1 && contact.birthday) {
+      birthday = placeholderBirthDate(contact.birthday);
+    } else if (vYearUnknown.value === false && contact.birthday_year_unknown === 1 && contact.birthday) {
+      checks.push({ value: null, error: 'Birthday with its year is required when birthday_year_unknown is turned off.' });
+    }
     const errors = collectErrors(checks);
-    if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
+    if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400, ...fieldCase(vCat, checks, errors) });
 
     // Validate multi-value fields if provided
     if (req.body.phones !== undefined) {
       const phonesValidation = validatePhones(req.body.phones);
       if (!phonesValidation.valid) {
-        return res.status(400).json({ error: phonesValidation.error, code: 400 });
+        return res.status(400).json({ error: phonesValidation.error, code: 400, ...phonesValidation.case });
       }
     }
 
     if (req.body.emails !== undefined) {
       const emailsValidation = validateEmails(req.body.emails);
       if (!emailsValidation.valid) {
-        return res.status(400).json({ error: emailsValidation.error, code: 400 });
+        return res.status(400).json({ error: emailsValidation.error, code: 400, ...emailsValidation.case });
       }
     }
 
     if (req.body.addresses !== undefined) {
       const addressesValidation = validateAddresses(req.body.addresses);
       if (!addressesValidation.valid) {
-        return res.status(400).json({ error: addressesValidation.error, code: 400 });
+        return res.status(400).json({ error: addressesValidation.error, code: 400, ...addressesValidation.case });
       }
     }
 
@@ -645,6 +820,7 @@ router.put('/:id', (req, res) => {
             address     = ?,
             notes       = ?,
             birthday    = ?,
+            birthday_year_unknown = ?,
             first_name  = ?,
             last_name   = ?,
             middle_name = ?,
@@ -658,7 +834,8 @@ router.put('/:id', (req, res) => {
         req.body.email   !== undefined ? (req.body.email?.trim()   || null) : contact.email,
         req.body.address !== undefined ? (req.body.address?.trim() || null) : contact.address,
         req.body.notes   !== undefined ? (req.body.notes?.trim()   || null) : contact.notes,
-        req.body.birthday !== undefined ? (req.body.birthday || null) : contact.birthday,
+        birthday || null,
+        birthday && yearUnknown ? 1 : 0,
         nameParts.provided ? nameParts.parts.firstName  : contact.first_name,
         nameParts.provided ? nameParts.parts.lastName   : contact.last_name,
         nameParts.provided ? nameParts.parts.middleName : contact.middle_name,
@@ -727,13 +904,13 @@ router.put('/:id', (req, res) => {
 
     res.json({
       data: {
-        ...updated,
+        ...withBirthdaySuggestion(req, withBirthdayLink(req, updated)),
         ...multiValueFields
       }
     });
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -746,19 +923,19 @@ router.delete('/:id', (req, res) => {
   try {
     const id     = parseInt(req.params.id, 10);
     const contact = db.get().prepare('SELECT family_user_id FROM contacts WHERE id = ?').get(id);
-    if (!contact) return res.status(404).json({ error: 'Kontakt nicht gefunden', code: 404 });
+    if (!contact) return res.status(404).json({ error: 'Contact not found.', code: 404, reason: 'contacts_contact_not_found' });
     
     if (contact.family_user_id) {
-      return res.status(403).json({ error: 'Familienmitglieder können nicht aus der Kontaktliste gelöscht werden.', code: 403, reason: 'family_member_contact' });
+      return res.status(403).json({ error: 'A household member cannot be deleted from the contact list.', code: 403, reason: 'family_member_contact' });
     }
 
     const result = db.get().prepare('DELETE FROM contacts WHERE id = ?').run(id);
     if (result.changes === 0)
-      return res.status(404).json({ error: 'Kontakt nicht gefunden', code: 404 });
+      return res.status(404).json({ error: 'Contact not found.', code: 404, reason: 'contacts_contact_not_found' });
     res.status(204).end();
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -777,7 +954,7 @@ router.get('/meta', (_req, res) => {
     res.json({ data: { categories: loadContactCategories(), categoryColors: CONTACT_CATEGORY_COLORS } });
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -790,20 +967,20 @@ router.get('/:id', (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     const contact = db.get().prepare(`${CONTACT_SELECT} WHERE contacts.id = ?`).get(id);
-    if (!contact) return res.status(404).json({ error: 'Kontakt nicht gefunden', code: 404 });
+    if (!contact) return res.status(404).json({ error: 'Contact not found.', code: 404, reason: 'contacts_contact_not_found' });
 
     // Load multi-value fields
     const multiValueFields = loadMultiValueFields(id);
 
     res.json({
       data: {
-        ...contact,
+        ...withBirthdaySuggestion(req, withBirthdayLink(req, contact)),
         ...multiValueFields
       }
     });
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 
@@ -816,7 +993,7 @@ router.get('/:id/vcard', (req, res) => {
   try {
     const id      = parseInt(req.params.id, 10);
     const contact = db.get().prepare('SELECT * FROM contacts WHERE id = ?').get(id);
-    if (!contact) return res.status(404).json({ error: 'Kontakt nicht gefunden', code: 404 });
+    if (!contact) return res.status(404).json({ error: 'Contact not found.', code: 404, reason: 'contacts_contact_not_found' });
 
     const esc = (v) => String(v || '').replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/,/g, '\\,').replace(/;/g, '\\;');
 
@@ -834,7 +1011,15 @@ router.get('/:id/vcard', (req, res) => {
     if (contact.email)   lines.push(`EMAIL:${esc(contact.email)}`);
     if (contact.address) lines.push(`ADR;TYPE=HOME:;;${esc(contact.address)};;;;`);
     if (contact.notes)   lines.push(`NOTE:${esc(contact.notes)}`);
-    if (contact.birthday) lines.push(`BDAY:${esc(contact.birthday)}`);
+    // Ohne Jahr in Apples Form (#2095): vCard 3.0 kennt kein `--MMDD`, und
+    // sabre/vobject (Nextcloud, Baikal) schreibt jahrlose Geburtstage in 3.0
+    // genau so. Apple liest die Marke und zeigt kein Jahr; der eigene Import
+    // (Sync und .vcf) erkennt sie ebenfalls.
+    if (contact.birthday && contact.birthday_year_unknown === 1) {
+      lines.push(`BDAY;X-APPLE-OMIT-YEAR=1604:1604${esc(contact.birthday).slice(4, 10)}`);
+    } else if (contact.birthday) {
+      lines.push(`BDAY:${esc(contact.birthday)}`);
+    }
     if (contact.category) lines.push(`CATEGORIES:${esc(contact.category)}`);
     lines.push('END:VCARD');
 
@@ -846,7 +1031,7 @@ router.get('/:id/vcard', (req, res) => {
     res.send(vcf);
   } catch (err) {
     log.error('', err);
-    res.status(500).json({ error: 'Interner Fehler', code: 500 });
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
   }
 });
 

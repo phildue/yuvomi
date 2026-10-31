@@ -1,4 +1,4 @@
-import { op, jsonBody, idParam } from '../helpers.js';
+import { op, jsonBody, idParam, withCaseReasons } from '../helpers.js';
 
 // Der Koch einer Mahlzeit (#1679). EINE Beschreibung fuer jede Stelle, die ihn
 // annimmt - anlegen, bearbeiten, apply-plan.
@@ -46,7 +46,7 @@ function mealBody({ required = [], create = false } = {}) {
 }
 
 export function mealsPaths() {
-  return withCaseReasons({
+  return withCaseReasons('meals', CASE_REASONS, {
     '/api/v1/meals': {
       get: op({
         summary: 'List meal plan entries',
@@ -86,7 +86,7 @@ export function mealsPaths() {
       post: op({
         summary: 'Transfer meal ingredients to shopping list',
         tag: 'Meals',
-        description: 'Creates shopping items, so it requires write access to the `shopping` module in addition to `meals` - a credential scoped to the meal plan alone is refused with 403.',
+        description: 'An open (unchecked) item of the same name on the list - compared trimmed, with whitespace collapsed and case-insensitive - means the ingredient is skipped and counted in `skipped` instead of being added twice; rows of one name in one transfer become one item. This is the one rule of every kitchen path to the shopping list (recipe, meal, meal-plan import, pantry). A meal planned from a recipe gets the recipe ingredients as its own on the first transfer. The response carries `added_ids` and `ingredient_ids` for POST /api/v1/shopping/items/undo-transfer. ' + 'Creates shopping items, so it requires write access to the `shopping` module in addition to `meals` - a credential scoped to the meal plan alone is refused with 403.',
         params: [idParam()],
         stateChanging: true,
         requestBody: jsonBody(null),
@@ -102,7 +102,7 @@ export function mealsPaths() {
       post: op({
         summary: 'Transfer weekly meal ingredients to shopping list',
         tag: 'Meals',
-        description: 'Creates shopping items, so it requires write access to the `shopping` module in addition to `meals` - a credential scoped to the meal plan alone is refused with 403.',
+        description: 'An open (unchecked) item of the same name on the list - compared trimmed, with whitespace collapsed and case-insensitive - means the ingredient is skipped and counted in `skipped` instead of being added twice; rows of one name in one transfer become one item. This is the one rule of every kitchen path to the shopping list (recipe, meal, meal-plan import, pantry). Meals planned from a recipe are included (their recipe ingredients become their own). ' + 'Creates shopping items, so it requires write access to the `shopping` module in addition to `meals` - a credential scoped to the meal plan alone is refused with 403.',
         stateChanging: true,
         requestBody: jsonBody(null),
         responses: {
@@ -192,20 +192,11 @@ export function mealsPaths() {
 // #1909: die Faelle, die ein Nutzer erreicht, tragen einen `reason` neben dem
 // englischen `error` - je Operation der Satz, der sie nennt.
 const SELECTED_RECIPE_GONE = '`meals_selected_recipe_not_found` (400, the chosen `recipe_id` does not exist)';
+const SHOPPING_WRITE_REQUIRED = '`cross_module_access` (403, the caller has no write access to the shopping module - for API tokens a `shopping:write` scope)';
 const CASE_REASONS = {
   '/api/v1/meals': { post: SELECTED_RECIPE_GONE },
   '/api/v1/meals/{id}': { put: SELECTED_RECIPE_GONE },
   '/api/v1/meals/apply-plan': { post: SELECTED_RECIPE_GONE },
+  '/api/v1/meals/{id}/to-shopping-list': { post: SHOPPING_WRITE_REQUIRED },
+  '/api/v1/meals/week-to-shopping-list': { post: SHOPPING_WRITE_REQUIRED },
 };
-
-function withCaseReasons(paths) {
-  for (const [path, operations] of Object.entries(CASE_REASONS)) {
-    for (const [method, reasons] of Object.entries(operations)) {
-      const operation = paths[path]?.[method];
-      if (!operation) throw new Error(`openapi meals: ${method} ${path} is not documented`);
-      const note = `A refusal a user can reach carries a \`reason\` next to \`error\` (#1909): ${reasons}.`;
-      operation.description = operation.description ? `${operation.description}\n\n${note}` : note;
-    }
-  }
-  return paths;
-}

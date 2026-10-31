@@ -385,48 +385,13 @@
   font-weight: var(--font-weight-bold);
 }
 
-.birthday-modal__photo-actions {
-  display: flex;
-  gap: var(--space-2);
-  justify-content: center;
-}
-
-.birthday-modal__photo-action {
-  width: var(--target-base);
-  height: var(--target-base);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: var(--radius-full);
-  border: 1px solid var(--color-border);
-  background: var(--color-surface);
-  color: var(--color-text-secondary);
-  cursor: pointer;
-}
-
-/* `display: inline-flex` schlaegt das UA-`[hidden]` - ohne diese Regel stand
- * "Bild entfernen" auch ohne Bild da. */
-.birthday-modal__photo-action[hidden] {
-  display: none;
-}
-
-.birthday-modal__photo-action:hover {
-  background: var(--color-surface-hover);
-}
-
-.birthday-modal__photo-action svg {
-  width: 16px;
-  height: 16px;
-}
-
-.birthday-modal__photo-action--danger {
-  color: var(--color-danger);
-}
-
 .birthday-modal__identity {
   display: flex;
   align-items: flex-start;
   gap: var(--space-4);
+  /* Seit der Kalender-Hinweis unter dem Datum steht (R24), endet der Kopf mit
+   * Text - er braucht Luft bis zur Linie von „Weitere Angaben". */
+  padding-block-end: var(--space-3);
 }
 
 .birthday-modal__photo-wrap {
@@ -465,12 +430,7 @@
 .birthday-name-day__hint {
   margin-top: var(--space-1);
   color: var(--color-text-secondary);
-  font-size: var(--text-sm);
-}
-
-.birthday-modal__hint {
-  color: var(--color-text-secondary);
-  font-size: var(--text-sm);
+  font-size: var(--type-caption);
 }
 
 .birthday-modal__footer-actions {
@@ -514,6 +474,12 @@
   color: var(--color-text-secondary);
   font-size: var(--text-sm);
   margin-bottom: var(--space-3);
+}
+
+.bd-import__bar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: var(--space-1);
 }
 
 .bd-import__list {
@@ -563,6 +529,31 @@
   color: var(--color-text-secondary);
   font-size: var(--text-sm);
   font-variant-numeric: tabular-nums;
+}
+
+/* Gleicher Name oder Tag wie ein Geburtstag (R23, G5-P2): kein Haken, sondern
+ * die Frage "Mit X verknuepfen?" unter dem Namen und der Knopf dazu. Die Zeile
+ * selbst ist kein Ziel mehr, also kein Zeiger und keine Hover-Flaeche. */
+.bd-import-row--suggest {
+  cursor: default;
+}
+
+.bd-import-row--suggest:hover,
+.bd-import-row--suggest:focus-within {
+  background: transparent;
+}
+
+.bd-import-row__text {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0h);
+}
+
+.bd-import-row__hint {
+  color: var(--color-text-secondary);
+  font-size: var(--type-caption);
 }
 
 /* Schon hinzugefuegt: Zuruecknehmen-Muster (tokens.css, #1230) statt
@@ -674,8 +665,10 @@
      * (birthdays.js, syncBirthdaysDetailTop); ohne Messwert der Klebestand.
      * Minus `--shell-tail`: was unten fest steht (Installationsbanner, FAB),
      * verlangt seinen Nachlauf auch von einer klebenden Spalte - sonst endet
-     * ihr Fuss darunter (test:dashboard-surface-browser, Nachlauf). */
-    height: calc(var(--viewport-height) - var(--birthdays-detail-top, calc(var(--birthdays-head-block, 0px) + var(--space-3))) - var(--space-4) - var(--shell-tail, 0px));
+     * ihr Fuss darunter (test:dashboard-surface-browser, Nachlauf).
+     * HOECHSTENS so hoch, nicht immer (R21, D9): die Spalte endet unter ihrem
+     * Inhalt - gemessen 1920 standen 528px leer ueber dem Fuss. */
+    max-height: calc(var(--viewport-height) - var(--birthdays-detail-top, calc(var(--birthdays-head-block, 0px) + var(--space-3))) - var(--space-4) - var(--shell-tail, 0px));
   }
 }
 

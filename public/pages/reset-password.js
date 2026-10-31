@@ -6,7 +6,8 @@
 import { auth } from '/api.js';
 import { t } from '/i18n.js';
 import { esc } from '/utils/html.js';
-import { authHeroHtml, authErrorHtml, wirePasswordToggle } from '/utils/auth-ui.js';
+import { errorSentence } from '/utils/friendly-error.js';
+import { authHeroHtml, authErrorHtml, wirePasswordToggle, passwordRuleHtml, flagField, hideAuthError } from '/utils/auth-ui.js';
 
 function wireLinks(container) {
   container.querySelectorAll('a[data-link]').forEach((a) =>
@@ -44,18 +45,31 @@ export async function render(container) {
   // Bewusst eine Auskunft und kein `navigate('/login')`: der Router verwirft
   // eine Navigation, die aus einem laufenden `render()` heraus startet
   // (`isNavigating`), und zurueck bliebe eine leere Seite.
-  if (!(await auth.passwordLoginEnabled())) {
+  const token = new URLSearchParams(window.location.search).get('token') || '';
+  // Gilt der Link noch? Der Server sagt es vorab, ohne ihn einzuloesen
+  // (Critique R22, D19) - parallel zur Frage nach dem Anmeldeweg, damit die
+  // Seite gleich im richtigen Zustand steht statt ein Formular zu zeigen und
+  // es wieder wegzunehmen. Nur `valid: false` heisst "tot". Ein voller
+  // Limiter (429), ein Netz- oder Serverfehler laesst das Formular stehen:
+  // das Absenden fragt den Server ohnehin noch einmal, und wer bei einem
+  // Aussetzer "Link ungueltig" liest, wirft einen intakten Link weg.
+  const [loginEnabled, tokenAlive] = await Promise.all([
+    auth.passwordLoginEnabled(),
+    token
+      ? auth.checkResetToken(token).then((r) => r?.data?.valid !== false, () => true)
+      : false,
+  ]);
+  if (!loginEnabled) {
     renderUnavailable(container);
     return;
   }
 
-  const token = new URLSearchParams(window.location.search).get('token') || '';
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
     <main class="auth-page" id="main-content">
       ${authHeroHtml({ heading: false })}
       <div class="auth-card card card--padded">
-        <h1 class="auth-card__title">${esc(t('resetPassword.title'))}</h1>
+        <h1 class="auth-card__title" id="reset-title">${esc(t('resetPassword.title'))}</h1>
         <!-- Beide Meldungen stehen außerhalb des Formulars: der Erfolgsfall
              blendet das Formular aus, und ein Kind davon wäre mit ihm weg. -->
         ${authErrorHtml('reset-error')}
@@ -64,7 +78,8 @@ export async function render(container) {
           <div class="form-group">
             <label class="label" for="password">${esc(t('resetPassword.passwordLabel'))}</label>
             <input class="input" type="password" id="password" name="password"
-              autocomplete="new-password" required />
+              autocomplete="new-password" minlength="8" aria-describedby="reset-password-rule" required />
+            ${passwordRuleHtml('reset-password-rule', t('common.passwordMinLength'))}
           </div>
           <div class="form-group">
             <label class="label" for="confirm">${esc(t('resetPassword.confirmLabel'))}</label>
@@ -75,6 +90,9 @@ export async function render(container) {
             ${esc(t('resetPassword.submit'))}
           </button>
         </form>
+        <!-- Der Weg zu einem neuen Link steht nur, wenn dieser hier tot ist
+             (dead() unten); sonst reicht der Rueckweg zur Anmeldung. -->
+        <a class="btn btn--primary auth-form__submit" id="reset-request-new" href="/forgot-password" data-link hidden>${esc(t('resetPassword.requestNew'))}</a>
         <p class="auth-form__forgot"><a href="/login" data-link>${esc(t('forgotPassword.backToLogin'))}</a></p>
       </div>
     </main>
@@ -91,16 +109,37 @@ export async function render(container) {
   wireLinks(container);
 
   const show = (el, msg) => { el.textContent = msg; el.hidden = false; };
+  // KEINE SACKGASSE (Critique R21, Persona Inge; D15): ein toter Link macht
+  // das Formular sinnlos. Statt eines gesperrten Formulars unter "kein
+  // gueltiger Token" stehen der Satz mit dem naechsten Schritt und der Weg
+  // dorthin, betont wie die Anmeldung auf /join (join.js).
+  // Seit R22 (D19) wie die tote Einladung: der Titel nennt den ungueltigen
+  // Link, "Neuen Link anfordern" ist der Primaerknopf. Die Vorabpruefung oben
+  // faengt den toten Link vor dem Tippen; das Absenden bleibt die zweite
+  // Stelle, weil er in der Zwischenzeit ablaufen oder eingeloest werden kann.
+  const dead = (msg) => {
+    container.querySelector('#reset-title').textContent = t('resetPassword.invalidTitle');
+    show(errorEl, msg);
+    form.hidden = true;
+    const again = container.querySelector('#reset-request-new');
+    again.hidden = false;
+    again.focus();
+  };
 
-  if (!token) { show(errorEl, t('resetPassword.missingToken')); btn.disabled = true; return; }
+  if (!token) { dead(t('resetPassword.missingToken')); return; }
+  if (!tokenAlive) { dead(t('resetPassword.invalidToken')); return; }
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    errorEl.hidden = true;
+    hideAuthError(form, errorEl);
     const password = form.password.value;
     const confirm = form.confirm.value;
-    if (password.length < 8) { show(errorEl, t('resetPassword.tooShort')); return; }
-    if (password !== confirm) { show(errorEl, t('resetPassword.mismatch')); return; }
+    // Jede Pruefung markiert das Feld, das sie meint (utils/auth-ui.js, flagField).
+    // Gezaehlt wird wie auf dem Server (normalizePassword, NFC): sonst kaeme ein
+    // zerlegtes "é" hier durch, der Server antwortete 400, und der Zweig unten
+    // erklaerte einen gueltigen Link fuer tot.
+    if (password.normalize('NFC').length < 8) { flagField(form.password, errorEl); show(errorEl, t('resetPassword.tooShort')); return; }
+    if (password !== confirm) { flagField(form.confirm, errorEl); show(errorEl, t('resetPassword.mismatch')); return; }
     btn.disabled = true;
     try {
       await auth.resetPassword(token, password);
@@ -108,7 +147,12 @@ export async function render(container) {
       show(successEl, t('resetPassword.success'));
       setTimeout(() => window.yuvomi.navigate('/login'), 1500);
     } catch (err) {
-      show(errorEl, t('resetPassword.invalidToken'));
+      // Ein 400 heisst hier: der Link gilt nicht (mehr) - die Laenge prueft
+      // das Formular selbst, und ohne Token kaeme es gar nicht bis hierher.
+      // Alles andere (429, Netz, Server) laesst das Formular stehen: ein
+      // voller Limiter darf nicht wirken wie ein abgelaufener Link.
+      if (err?.status === 400) { dead(t('resetPassword.invalidToken')); return; }
+      show(errorEl, errorSentence(err));
       btn.disabled = false;
     }
   });

@@ -4,12 +4,15 @@ import {
   parseDateInput,
   t,
 } from '/i18n.js';
-import { esc } from '/utils/html.js';
+import { esc, REQUIRED_MARK } from '/utils/html.js';
 import { initials } from '/utils/initials.js';
 import { confirmModal, reportFieldError, reportFieldErrors } from '/components/modal.js';
 import { errorSentence } from '/utils/friendly-error.js';
 import { prefersInkText } from '/utils/contrast.js';
 import { settingRowHtml } from '/settings/components.js';
+import { colorPickerHtml, wireColorPicker } from '/utils/color-picker.js';
+import { birthDateControlHtml, wireBirthDateField } from '/utils/birth-date.js';
+import { mediaPickerBadgeHtml } from '/utils/media-picker.js';
 
 function avatarHtml(user, className = 'settings-avatar') {
   const safeName = esc(user?.display_name || '');
@@ -55,19 +58,22 @@ function avatarEditorHtml(user, { gravatarAvailable = false } = {}) {
   const gravatarReady = hasSavedEmail(user);
   return `
     <div class="settings-avatar-editor">
-      <button type="button" class="settings-avatar-button" id="profile-avatar-preview" aria-label="${t('settings.profilePictureLabel')}">
-        ${avatarHtml(user, 'settings-avatar settings-avatar--lg')}
-      </button>
+      ${/* EIN BEDIENELEMENT FUER DAS BILD (R24, Baustein `.media-picker` aus
+           S3 wie am Geburtstag): die Scheibe IST die Wahl, das Abzeichen sagt
+           es. Der Stift daneben oeffnete dieselbe Dateiwahl ein zweites Mal,
+           Entfernen und Gravatar waren nackte Symbole - jetzt Text, Entfernen
+           nur mit Bild. */ ''}
+      <span class="media-picker">
+        <button type="button" class="settings-avatar-button" id="profile-avatar-preview" aria-label="${t('settings.profilePictureLabel')}">
+          ${avatarHtml(user, 'settings-avatar settings-avatar--lg')}
+        </button>
+        ${mediaPickerBadgeHtml()}
+      </span>
       <input class="sr-only" type="file" id="profile-avatar-file" accept="image/png,image/jpeg,image/webp" aria-label="${t('settings.profilePictureLabel')}" aria-describedby="profile-error" tabindex="-1">
       <div class="settings-avatar-actions">
-        <button type="button" class="settings-avatar-action" id="profile-avatar-edit" aria-label="${t('settings.profilePictureLabel')}" title="${t('settings.profilePictureLabel')}">
-          <i data-lucide="edit-2" aria-hidden="true"></i>
-        </button>
-        <button type="button" class="settings-avatar-action settings-avatar-action--danger" id="profile-avatar-remove" aria-label="${t('settings.profilePictureRemove')}" title="${t('settings.profilePictureRemove')}">
-          <i data-lucide="trash-2" aria-hidden="true"></i>
-        </button>
-        ${gravatarAvailable ? `<button type="button" class="settings-avatar-action" id="profile-avatar-gravatar" aria-label="${t('settings.gravatarUse')}" title="${t('settings.gravatarUse')}" aria-describedby="profile-gravatar-hint"${gravatarReady ? '' : ' aria-disabled="true"'}>
-          <i data-lucide="cloud-download" aria-hidden="true"></i>
+        <button type="button" class="btn btn--ghost btn--sm media-picker__remove" id="profile-avatar-remove"${user?.avatar_data ? '' : ' hidden'}>${t('settings.profilePictureRemove')}</button>
+        ${gravatarAvailable ? `<button type="button" class="btn btn--secondary btn--sm" id="profile-avatar-gravatar" aria-describedby="profile-gravatar-hint"${gravatarReady ? '' : ' aria-disabled="true"'}>
+          <i data-lucide="cloud-download" class="icon-md" aria-hidden="true"></i><span class="btn__label">${t('settings.gravatarUse')}</span>
         </button>` : ''}
       </div>
     </div>
@@ -281,7 +287,7 @@ export function twoFactorCardHtml(state) {
       <p class="form-hint">${t('settings.twoFactorHint')}</p>
       ${state.required ? `<p class="form-error settings-2fa__note" role="status">${t('settings.twoFactorRequiredSetUpNow')}</p>` : ''}
       <div class="settings-form-actions settings-2fa__actions">
-        <button type="button" class="btn btn--primary" id="two-factor-start">${t('settings.twoFactorSetUp')}</button>
+        <button type="button" class="btn btn--secondary" id="two-factor-start">${t('settings.twoFactorSetUp')}</button>
       </div>
     `;
 
@@ -616,6 +622,48 @@ function bindSetupForm(card, reload) {
   });
 }
 
+/**
+ * Die Karte "Passwort aendern" - nur fuer ein Konto, das ein Passwort HAT
+ * (#1703). Ein per Single Sign-on angelegtes Konto traegt nur den Platzhalter;
+ * das Formular verlangte von ihm das aktuelle Passwort, das es nicht gibt, und
+ * konnte nie gelingen. Woran es haengt, sagt GET /auth/me (`sso_only`).
+ *
+ * Fehlt die Angabe (Antwort aus dem Speicher, /me nicht erreichbar), bleibt
+ * die Karte stehen wie bisher: weggelassen wird sie nur auf ein
+ * ausdrueckliches `true`. Ein Konto mit Passwort behaelt sie, verknuepft oder
+ * nicht.
+ * @param {{ sso_only?: boolean }|null|undefined} user
+ * @returns {string}
+ */
+function passwordCardHtml(user) {
+  if (user?.sso_only === true) return '';
+  return `
+    <div class="settings-card">
+      <h3 class="settings-card__title">${t('settings.changePassword')}</h3>
+      <form id="password-form" class="settings-form" novalidate>
+        <div class="row-carrier settings-group">
+          ${settingRowHtml({
+            label: t('settings.currentPasswordLabel'), labelFor: 'current-password', labelExtra: REQUIRED_MARK, field: true,
+            control: '<input class="form-input" type="password" id="current-password" autocomplete="current-password" aria-describedby="password-error" required>',
+          })}
+          ${settingRowHtml({
+            label: t('settings.newPasswordLabel'), labelFor: 'new-password', labelExtra: REQUIRED_MARK, field: true,
+            control: '<input class="form-input" type="password" id="new-password" autocomplete="new-password" minlength="8" aria-describedby="password-error" required>',
+          })}
+          ${settingRowHtml({
+            label: t('settings.confirmPasswordLabel'), labelFor: 'confirm-password', labelExtra: REQUIRED_MARK, field: true,
+            control: '<input class="form-input" type="password" id="confirm-password" autocomplete="new-password" minlength="8" aria-describedby="password-error" required>',
+          })}
+        </div>
+        <div id="password-error" class="form-error" role="alert" hidden></div>
+        <div class="settings-form-actions">
+          <button type="submit" class="btn btn--primary">${t('settings.savePassword')}</button>
+        </div>
+      </form>
+    </div>
+  `;
+}
+
 function renderPage(container, user, refreshFailed, accessNotice, oidcState, oidcNotice, twoFactorState, gravatarAvailable = false) {
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
@@ -652,12 +700,14 @@ function renderPage(container, user, refreshFailed, accessNotice, oidcState, oid
                  als gesperrtes Feld. */ ''}
             <div class="settings-profile-editor__fields row-carrier settings-group">
               ${settingRowHtml({
-                label: t('settings.displayNameLabel'), labelFor: 'profile-display-name', field: true,
+                label: t('settings.displayNameLabel'), labelFor: 'profile-display-name', labelExtra: REQUIRED_MARK, field: true,
                 control: `<input class="form-input" type="text" id="profile-display-name" maxlength="128" value="${esc(user?.display_name || '')}" autocomplete="name" aria-describedby="profile-error" required>`,
               })}
               ${settingRowHtml({
-                label: t('settings.colorLabel'), labelFor: 'profile-avatar-color',
-                control: `<input class="settings-color-button" type="color" id="profile-avatar-color" value="${esc(user?.avatar_color || '')}" aria-describedby="profile-error">`,
+                // EIN FARBWAEHLER (Critique R24 E6): die Familientoene als Reihe
+                // UNTER dem Etikett (wie eine Chip-Gruppe), "Eigene" dahinter.
+                label: t('settings.colorLabel'), labelId: 'profile-avatar-color-label', stacked: true,
+                control: colorPickerHtml({ id: 'profile-avatar-color', value: user?.avatar_color || '', labelledBy: 'profile-avatar-color-label' }),
               })}
               ${settingRowHtml({
                 label: t('settings.usernameLabel'), labelId: 'profile-username-label',
@@ -683,8 +733,15 @@ function renderPage(container, user, refreshFailed, accessNotice, oidcState, oid
                 control: `<input class="form-input" type="email" id="profile-email" value="${esc(user?.email || '')}" autocomplete="email" aria-describedby="profile-error">`,
               })}
               ${settingRowHtml({
-                label: t('settings.memberBirthDateLabel'), labelFor: 'profile-birth-date', field: true,
-                control: `<yuvomi-datepicker type="date" id="profile-birth-date" value="${esc(user?.birth_date || '')}" aria-describedby="profile-error"></yuvomi-datepicker>`,
+                label: t('settings.memberBirthDateLabel'), labelFor: 'profile-birth-date', field: true, labelId: 'profile-birth-date-label',
+                // Wie im Geburtstags-Editor: "Jahr unbekannt" tauscht den
+                // Datumswaehler gegen Monat und Tag (#2095).
+                control: birthDateControlHtml({
+                  id: 'profile-birth-date',
+                  value: user?.birth_date || '',
+                  yearUnknown: user?.birth_year_unknown,
+                  describedBy: 'profile-error',
+                }),
               })}
             </div>
             <p class="form-hint settings-group__footer">${t('settings.memberContactBirthdayHint')}</p>
@@ -696,29 +753,7 @@ function renderPage(container, user, refreshFailed, accessNotice, oidcState, oid
         </form>
       </div>
 
-      <div class="settings-card">
-        <h3 class="settings-card__title">${t('settings.changePassword')}</h3>
-        <form id="password-form" class="settings-form" novalidate>
-          <div class="row-carrier settings-group">
-            ${settingRowHtml({
-              label: t('settings.currentPasswordLabel'), labelFor: 'current-password', field: true,
-              control: '<input class="form-input" type="password" id="current-password" autocomplete="current-password" aria-describedby="password-error" required>',
-            })}
-            ${settingRowHtml({
-              label: t('settings.newPasswordLabel'), labelFor: 'new-password', field: true,
-              control: '<input class="form-input" type="password" id="new-password" autocomplete="new-password" minlength="8" aria-describedby="password-error" required>',
-            })}
-            ${settingRowHtml({
-              label: t('settings.confirmPasswordLabel'), labelFor: 'confirm-password', field: true,
-              control: '<input class="form-input" type="password" id="confirm-password" autocomplete="new-password" minlength="8" aria-describedby="password-error" required>',
-            })}
-          </div>
-          <div id="password-error" class="form-error" role="alert" hidden></div>
-          <div class="settings-form-actions">
-            <button type="submit" class="btn btn--primary">${t('settings.savePassword')}</button>
-          </div>
-        </form>
-      </div>
+      ${passwordCardHtml(user)}
 
       ${twoFactorCardHtml(twoFactorState)}
 
@@ -778,8 +813,11 @@ function bindEvents(container, user, profileState, { gravatarHost = '' } = {}) {
   const avatarFile = container.querySelector('#profile-avatar-file');
   const displayName = container.querySelector('#profile-display-name');
   const avatarColor = container.querySelector('#profile-avatar-color');
+  wireColorPicker(container);
 
   const updatePreview = () => {
+    const remove = container.querySelector('#profile-avatar-remove');
+    if (remove) remove.hidden = !profileState.avatarData;
     setAvatarPreview(container, {
       display_name: displayName?.value || user?.display_name,
       avatar_color: avatarColor?.value || user?.avatar_color,
@@ -788,7 +826,6 @@ function bindEvents(container, user, profileState, { gravatarHost = '' } = {}) {
   };
 
   container.querySelector('#profile-avatar-preview')?.addEventListener('click', () => avatarFile?.click());
-  container.querySelector('#profile-avatar-edit')?.addEventListener('click', () => avatarFile?.click());
   displayName?.addEventListener('input', updatePreview);
   avatarColor?.addEventListener('input', updatePreview);
 
@@ -836,8 +873,8 @@ function bindEvents(container, user, profileState, { gravatarHost = '' } = {}) {
   // gefuellt - als Text, damit die Adresse woertlich dasteht.
   syncGravatarButton();
   const labelGravatarButton = (label) => {
-    gravatarButton.setAttribute('aria-label', label);
-    gravatarButton.title = label;
+    const text = gravatarButton?.querySelector('.btn__label');
+    if (text) text.textContent = label;
   };
   gravatarButton?.addEventListener('click', async () => {
     if (gravatarBusy || !hasSavedEmail(user)) return;
@@ -877,6 +914,9 @@ function bindEvents(container, user, profileState, { gravatarHost = '' } = {}) {
   });
 
   const profileForm = container.querySelector('#profile-form');
+  const birthDateField = profileForm?.querySelector('#profile-birth-date')
+    ? wireBirthDateField(profileForm, 'profile-birth-date')
+    : null;
   profileForm?.addEventListener('submit', async (event) => {
     event.preventDefault();
     clearError(profileError);
@@ -885,13 +925,17 @@ function bindEvents(container, user, profileState, { gravatarHost = '' } = {}) {
     // das Formular traegt `novalidate`, alle Meldungen stehen zugleich an
     // ihren Zeilen, der Fokus geht aufs erste (reportFieldErrors).
     const birthDatePicker = container.querySelector('#profile-birth-date');
-    const birthDateRaw = birthDatePicker?.value || '';
+    // Ohne Jahr kommen Monat und Tag mit dem Platzhalterjahr (#2095).
+    const birth = birthDateField?.read() ?? { date: null, yearUnknown: false, complete: true, raw: birthDatePicker?.value || '' };
+    const birthDateRaw = birth.raw;
     const emailInput = container.querySelector('#profile-email');
     const emailValue = emailInput?.value.trim() || '';
     if (reportFieldErrors([
       !displayName.value.trim() && [displayName, t('common.required')],
       emailValue && !isEmailAddress(emailValue) && [emailInput, t('common.emailInvalid')],
       !isDateInputValid(birthDateRaw) && [birthDatePicker, t('settings.memberBirthDateInvalid')],
+      birth.yearUnknown && !birth.complete
+        && [container.querySelector('#profile-birth-date-month'), t('birthdays.yearlessIncomplete')],
     ])) return;
 
     const submitButton = profileForm.querySelector('[type="submit"]');
@@ -903,7 +947,8 @@ function bindEvents(container, user, profileState, { gravatarHost = '' } = {}) {
         avatar_data: profileState.avatarData,
         phone: container.querySelector('#profile-phone')?.value.trim() || null,
         email: container.querySelector('#profile-email')?.value.trim() || null,
-        birth_date: parseDateInput(birthDateRaw) || null,
+        birth_date: (birth.yearUnknown ? birth.date : parseDateInput(birthDateRaw)) || null,
+        birth_year_unknown: birth.yearUnknown,
       });
       if (response?.user) {
         Object.assign(user, response.user);
@@ -1073,4 +1118,4 @@ export async function render(container, { user }) {
 
 // Der Avatar als Programm (test:initials): welche Zeichen ohne Bild auf der
 // Scheibe stehen.
-export const __test = { avatarHtml, avatarEditorHtml, gravatarHintText, gravatarHintHtml, fillGravatarHint, passwordProblems, passwordRefusalKey, isEmailAddress };
+export const __test = { avatarHtml, passwordCardHtml, avatarEditorHtml, gravatarHintText, gravatarHintHtml, fillGravatarHint, passwordProblems, passwordRefusalKey, isEmailAddress };

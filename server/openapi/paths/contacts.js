@@ -1,10 +1,10 @@
-import { op, jsonBody, idParam, stringPathParam } from '../helpers.js';
+import { op, jsonBody, idParam, stringPathParam, withCaseReasons } from '../helpers.js';
 
 export function contactsPaths() {
-  return {
+  return withCaseReasons('contacts', CASE_REASONS, {
     '/api/v1/contacts': {
       get: op({ summary: 'List contacts', tag: 'Contacts' }),
-      post: op({ summary: 'Create contact with multi-value fields', tag: 'Contacts', stateChanging: true, requestBody: jsonBody(null) }),
+      post: op({ summary: 'Create contact with multi-value fields', tag: 'Contacts', description: '`birthday_year_unknown` (boolean or 0/1) marks a birthday without a year (#2095): `birthday` then carries the placeholder year 2000 whatever year is sent, and responses carry the flag as 0 or 1.', stateChanging: true, requestBody: jsonBody(null) }),
     },
     '/api/v1/contacts/meta': { get: op({ summary: 'Get contact metadata', tag: 'Contacts' }) },
     '/api/v1/contacts/categories': {
@@ -54,7 +54,7 @@ export function contactsPaths() {
       put: op({
         summary: 'Update contact with multi-value fields',
         tag: 'Contacts',
-        description: 'On a contact linked to an account (`family_user_id`), `email` and `emails` can only be changed by that member or an admin, in a session or with an unscoped token; anyone else, and any token scoped to modules, is refused with 403. Addresses are compared without regard to letter case; sending them unchanged or only in another case is not a change, and the stored spelling is kept. When the member edits their own linked contact, a newly added address that already belongs to another account (split-expense guests excluded) is refused with 409 and `reason: "email_in_use"`; an admin may assign it. All other fields stay editable for anyone with write access to contacts.',
+        description: 'On a contact linked to an account (`family_user_id`), `email` and `emails` can only be changed by that member or an admin, in a session or with an unscoped token; anyone else, and any token scoped to modules, is refused with 403. Addresses are compared without regard to letter case; sending them unchanged or only in another case is not a change, and the stored spelling is kept. When the member edits their own linked contact, a newly added address that already belongs to another account (split-expense guests excluded) is refused with 409 and `reason: "email_in_use"`; an admin may assign it. All other fields stay editable for anyone with write access to contacts. `birthday_year_unknown` (boolean or 0/1) marks a birthday without a year (#2095): `birthday` then carries the placeholder year 2000 whatever year is sent, and responses carry the flag as 0 or 1. Omitted, the stored flag stays; turning it off needs a `birthday` with its real year in the same request.',
         params: [idParam()],
         stateChanging: true,
         requestBody: jsonBody(null),
@@ -68,6 +68,45 @@ export function contactsPaths() {
       }),
       delete: op({ summary: 'Delete contact', tag: 'Contacts', params: [idParam()], stateChanging: true }),
     },
-    '/api/v1/contacts/{id}/vcard': { get: op({ summary: 'Download contact as vCard', tag: 'Contacts', params: [idParam()] }) },
-  };
+    '/api/v1/contacts/{id}/vcard': { get: op({ summary: 'Download contact as vCard', tag: 'Contacts', description: 'vCard 3.0. A birthday without a year is written the way Apple and sabre/vobject write it in 3.0, `BDAY;X-APPLE-OMIT-YEAR=1604:1604-MM-DD`.', params: [idParam()] }) },
+  });
 }
+
+// #1909: die Faelle, die ein Nutzer erreicht, tragen einen `reason` neben dem
+// englischen `error` - je Operation der Satz, der sie nennt.
+const CONTACT_GONE = '`contacts_contact_not_found` (404, the contact does not exist - deleted)';
+const CATEGORY_GONE = '`contacts_selected_category_not_found` (400, the chosen `category` does not exist - deleted; only when it is the sole finding)';
+// Ein zu langes Feld oder ein ungueltiger Geburtstag: das ERSTE Feld, das so
+// scheitert, mit der Grenze als Zahl (vor allem der vCard-Import erreicht sie).
+const FIELD_CASES = '`contacts_name_too_long`, `contacts_phone_too_long`, `contacts_email_too_long`, '
+  + '`contacts_address_too_long`, `contacts_notes_too_long` (400, the first field that is too long; '
+  + '`params.limit` carries its maximum length), `contacts_birthday_invalid` (400, `birthday` is not a valid date)';
+// Die Mehrfachfelder: erst nach den Einzelfeldern geprueft, in der Reihenfolge
+// phones, emails, addresses, und je Liste der ERSTE Eintrag, der scheitert.
+const MULTI_CASES = 'for `phones`, `emails` and `addresses`, checked after the fields above and in this order, '
+  + 'naming the first entry that fails: `contacts_phones_too_many`, `contacts_emails_too_many`, `contacts_addresses_too_many` '
+  + '(400, more than `params.limit` entries), `contacts_phone_too_long`, `contacts_email_too_long` (400, an entry\'s `value` '
+  + 'is longer than `params.limit`), `contacts_phone_label_too_long`, `contacts_email_label_too_long`, '
+  + '`contacts_address_label_too_long` (400, an entry\'s `label` is longer than `params.limit`), '
+  + '`contacts_address_part_too_long` (400, `street`, `city`, `state`, `postalCode` or `country` is longer than `params.limit`), '
+  + '`contacts_email_invalid` (400, an email `value` has no `@` with text on both sides), '
+  + '`contacts_phone_entry_invalid`, `contacts_email_entry_invalid`, `contacts_address_entry_invalid` (400, the field is not '
+  + 'a list, or an entry is not an object, lacks its `label` or `value`, carries one that is not text, or an `isPrimary` that is not a boolean)';
+const CAT_EXISTS = '`category_exists` (409, a category with this name already exists)';
+const EMAIL_PROTECTED = '`contact_email_protected` (403, the contact is a household member and only that member or an admin, '
+  + 'signed in or with a full-access token, may change its email addresses)';
+const FAMILY_MEMBER = '`family_member_contact` (403, the contact is a household member and cannot be deleted from the contact list)';
+const CASE_REASONS = {
+  '/api/v1/contacts/categories': { post: CAT_EXISTS },
+  '/api/v1/contacts/categories/{key}': {
+    put: CAT_EXISTS,
+    delete: '`category_in_use` (409, contacts still use the category; `count` carries how many), `category_last` (409, the last category cannot be deleted)',
+  },
+  '/api/v1/contacts': { post: `${CATEGORY_GONE}, ${FIELD_CASES}; ${MULTI_CASES}` },
+  '/api/v1/contacts/{id}': {
+    get: CONTACT_GONE,
+    put: `${CONTACT_GONE}, ${EMAIL_PROTECTED}, ${CATEGORY_GONE}, ${FIELD_CASES}; ${MULTI_CASES}`,
+    delete: `${CONTACT_GONE}, ${FAMILY_MEMBER}`,
+  },
+  '/api/v1/contacts/{id}/vcard': { get: CONTACT_GONE },
+};

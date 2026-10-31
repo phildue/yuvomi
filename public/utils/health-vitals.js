@@ -46,6 +46,14 @@ export const MOOD_MAX = MOOD_SCALE[MOOD_SCALE.length - 1].value;
 // ist der Wert eine schlichte Zahl mit Einheit. Vor #609 stand diese
 // Fallunterscheidung als `type === 'bp'` an fünf Stellen im Seitenmodul; jede
 // weitere Metrik hätte sie ein weiteres Mal vervielfacht.
+// `minSpan` (R21, Critique 2026-10-21, D6) ist die MINDESTSPANNE der Werteachse
+// je Einheit. Ohne sie zoomte das Diagramm auf die vorkommenden Werte: drei
+// Blutzuckerwerte zwischen 88 und 90 standen auf einer Achse "88 / 88,5 / 89 /
+// 89,5 / 90" und sahen aus wie ein Ausschlag - Rauschen als Drama. Die Spanne
+// ist so gewaehlt, dass eine alltaegliche Schwankung flach bleibt und eine
+// echte Veraenderung sichtbar wird; sie ist keine Bewertung und kein
+// Normbereich. `axes` teilt die Kanaele auf eigene Achsen: der Puls zaehlt
+// Schlaege je Minute und stand auf der mmHg-Achse des Blutdrucks.
 export const VITAL_METRICS = Object.freeze([
   {
     type: 'bp',
@@ -59,6 +67,11 @@ export const VITAL_METRICS = Object.freeze([
     ],
     units: ['mmHg'],
     format: 'pair',
+    minSpan: { mmHg: 40 },
+    axes: [
+      { channels: [0, 1] },
+      { channels: [2], unit: '/min', minSpan: 40 },
+    ],
   },
   {
     type: 'glucose',
@@ -67,6 +80,7 @@ export const VITAL_METRICS = Object.freeze([
     channels: ['value_num'],
     channelLabelKeys: ['health.vitals.metric.glucose'],
     units: ['mg/dL', 'mmol/L'],
+    minSpan: { 'mg/dL': 40, 'mmol/L': 2 },
   },
   {
     type: 'weight',
@@ -75,6 +89,7 @@ export const VITAL_METRICS = Object.freeze([
     channels: ['value_num'],
     channelLabelKeys: ['health.vitals.metric.weight'],
     units: ['kg', 'lb'],
+    minSpan: { kg: 5, lb: 10 },
   },
   // Körpermaße (#683). Stehen bewusst neben dem Gewicht: bei einem Säugling
   // werden die drei gemeinsam erhoben, und wer eines eintragen will, sucht die
@@ -88,6 +103,7 @@ export const VITAL_METRICS = Object.freeze([
     channels: ['value_num'],
     channelLabelKeys: ['health.vitals.metric.height'],
     units: ['cm', 'in'],
+    minSpan: { cm: 10, in: 4 },
   },
   {
     type: 'head_circumference',
@@ -96,6 +112,7 @@ export const VITAL_METRICS = Object.freeze([
     channels: ['value_num'],
     channelLabelKeys: ['health.vitals.metric.headCircumference'],
     units: ['cm', 'in'],
+    minSpan: { cm: 4, in: 2 },
   },
   {
     type: 'spo2',
@@ -104,6 +121,8 @@ export const VITAL_METRICS = Object.freeze([
     channels: ['value_num'],
     channelLabelKeys: ['health.vitals.metric.spo2'],
     units: ['%'],
+    minSpan: { '%': 10 },
+    ceiling: 100,
   },
   {
     type: 'temp',
@@ -112,6 +131,7 @@ export const VITAL_METRICS = Object.freeze([
     channels: ['value_num'],
     channelLabelKeys: ['health.vitals.metric.temp'],
     units: ['°C', '°F'],
+    minSpan: { '°C': 2, '°F': 4 },
   },
   // Schlafdauer einer Nacht (#609). Gespeichert werden Dezimalstunden, damit
   // Trend, Mittelwert und Delta dieselbe Rechnung wie bei jeder anderen Metrik
@@ -127,6 +147,7 @@ export const VITAL_METRICS = Object.freeze([
     channelLabelKeys: ['health.vitals.metric.sleep'],
     units: ['h'],
     format: 'duration',
+    minSpan: { h: 4 },
   },
   // Stimmung als 1-5-Skala (#609). Bewusst ohne Einheit: die Zahl ist eine
   // Stufe, kein Messwert. Nicht zu verwechseln mit der Stimmung im
@@ -275,11 +296,104 @@ export function vitalMetric(type) {
   return VITAL_METRICS.find((m) => m.type === type) || null;
 }
 
+/**
+ * Die Werteachse einer Messart: mindestens `span` breit, um die Mitte der
+ * Werte gelegt (R21, D6). Unter 0 wird keine Spanne erfunden, wenn kein Wert
+ * darunter liegt; ueber `ceiling` (Sauerstoffsaettigung: 100 %) ebenso wenig.
+ * Die runden Schritte legt danach `niceDomain` (utils/chart.js).
+ * @param {number} lo  kleinster Wert
+ * @param {number} hi  groesster Wert
+ * @param {number} span  Mindestspanne (0/undefined: unveraendert)
+ * @param {{ ceiling?: number }} [opts]
+ * @returns {{ lo: number, hi: number }}
+ */
+export function widenToSpan(lo, hi, span, { ceiling = Infinity } = {}) {
+  if (!(span > 0) || !Number.isFinite(lo) || !Number.isFinite(hi) || hi - lo >= span) return { lo, hi };
+  const mid = (lo + hi) / 2;
+  let a = mid - span / 2;
+  let b = mid + span / 2;
+  if (a < 0 && lo >= 0) { b -= a; a = 0; }
+  if (b > ceiling && hi <= ceiling) { a -= b - ceiling; b = ceiling; }
+  return { lo: a, hi: b };
+}
+
 const CHANNEL_KEYS = ['value_num', 'value_num2', 'value_num3'];
+
+// EINE EINHEIT JE SERIE (#2328). `unit` ist freier Text, und die API nimmt
+// auch an, was der Dialog nicht anbietet: 95.400 g neben 95,4 kg zeichneten
+// eine Spitze bei 95400 und eine Aenderung von +95.304,7. Umgerechnet wird
+// beim Lesen, gespeichert bleibt, was kam. Je Messart eine Basis-Einheit und
+// je Einheit (klein geschrieben) die Umrechnung dorthin; Temperatur ist nicht
+// proportional und traegt deshalb Hin- und Rueckweg.
+const linear = (factor) => ({ toBase: (v) => v * factor, fromBase: (v) => v / factor });
+const fahrenheit = { toBase: (v) => (v - 32) * 5 / 9, fromBase: (v) => v * 9 / 5 + 32 };
+const LENGTH_UNITS = { cm: linear(1), mm: linear(0.1), m: linear(100), in: linear(2.54) };
+const UNIT_CONVERSIONS = Object.freeze({
+  weight: { kg: linear(1), g: linear(0.001), lb: linear(0.45359237), lbs: linear(0.45359237) },
+  height: LENGTH_UNITS,
+  head_circumference: LENGTH_UNITS,
+  // 1 mmol/L Glukose = 18,0182 mg/dL (molare Masse 180,182 g/mol).
+  glucose: { 'mg/dl': linear(1), 'mmol/l': linear(18.0182) },
+  temp: { '°c': linear(1), c: linear(1), '°f': fahrenheit, f: fahrenheit },
+});
+
+function unitConversion(type, unit) {
+  if (unit === null || unit === undefined) return undefined;
+  return ownEntry(ownEntry(UNIT_CONVERSIONS, type), String(unit).trim().toLowerCase());
+}
+
+/**
+ * Die Einheit, in der eine Messart gezeigt wird: die haeufigste der im Dialog
+ * waehlbaren (`metric.units`), bei Gleichstand die erste der Liste; kommt
+ * keine vor (nur Gramm per API), die erste waehlbare.
+ */
+function vitalDisplayUnit(metric, rows) {
+  const units = metric?.units ?? [];
+  if (units.length < 2) return units[0] ?? null;
+  const counts = new Map(units.map((u) => [u.toLowerCase(), 0]));
+  for (const row of rows) {
+    const key = row.unit == null ? '' : String(row.unit).trim().toLowerCase();
+    if (counts.has(key)) counts.set(key, counts.get(key) + 1);
+  }
+  let best = units[0];
+  for (const u of units) if (counts.get(u.toLowerCase()) > counts.get(best.toLowerCase())) best = u;
+  return best;
+}
+
+/**
+ * Rechnet einen Wert zwischen zwei Einheiten derselben Messart um. Ohne
+ * bekannte Umrechnung (fremde Einheit, Einheit fehlt) kommt der Wert
+ * unveraendert zurueck - raten waere schlimmer als stehen lassen.
+ */
+export function convertVitalValue(type, value, fromUnit, toUnit) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return value;
+  const from = unitConversion(type, fromUnit);
+  const to = unitConversion(type, toUnit);
+  if (!from || !to || from === to) return value;
+  // Auf 1e-6 gerundet: 95400 * 0,001 ist sonst 95,39999999999999.
+  return Math.round(to.fromBase(from.toBase(value)) * 1e6) / 1e6;
+}
+
+/** Kopie einer Zeile in der Anzeige-Einheit; ohne Umrechnung die Zeile selbst. */
+function toDisplayUnit(row, type, unit) {
+  if (!unit || !unitConversion(type, row.unit) || !unitConversion(type, unit)) return row;
+  const out = { ...row, unit };
+  for (const key of CHANNEL_KEYS) {
+    const val = toFiniteOrNull(row[key]);
+    if (val !== null) out[key] = convertVitalValue(type, val, row.unit, unit);
+  }
+  return out;
+}
 
 /** Datums-Anteil (YYYY-MM-DD) eines measured_at-Zeitstempels ohne UTC-Shift. */
 function dateKeyOf(measuredAt) {
   return String(measuredAt).slice(0, 10);
+}
+
+/** Minuten seit Mitternacht eines measured_at-Zeitstempels (Wanduhr, ohne Zone). */
+function minutesOf(measuredAt) {
+  const m = /T(\d{2}):(\d{2})/.exec(String(measuredAt));
+  return m ? Number(m[1]) * 60 + Number(m[2]) : 0;
 }
 
 function toFiniteOrNull(value) {
@@ -332,7 +446,7 @@ export function isRollingAnchor(range, anchorKey, weekStartsOn = 1, { today = to
  * Monat blaettert ueber den Monatsersten: `setMonth()` auf einem 31. lief in
  * den uebernaechsten Monat ueber und liess einen ganzen Monat aus.
  *
- * @param {'week'|'month'|'year'} range
+ * @param {'day'|'week'|'month'|'year'} range
  * @param {string} anchorKey  YYYY-MM-DD
  * @param {number} dir        -1 zurueck, +1 weiter
  * @param {number} [weekStartsOn=1]
@@ -341,6 +455,7 @@ export function isRollingAnchor(range, anchorKey, weekStartsOn = 1, { today = to
  */
 export function stepVitalAnchor(range, anchorKey, dir, weekStartsOn = 1, { today = todayKey() } = {}) {
   const anchor = anchorKey || today;
+  if (range === 'day') return addLocalDays(anchor, dir);
   if (range === 'year') {
     const d = parseLocalDateKey(anchor);
     d.setFullYear(d.getFullYear() + dir);
@@ -368,6 +483,7 @@ export function stepVitalAnchor(range, anchorKey, dir, weekStartsOn = 1, { today
 
 /**
  * Baut die Bucket-Achse für einen Zeitraum.
+ * - day:   ein Bucket (der Tag), Achse in Stunden
  * - week:  7 Tages-Buckets
  * - month: ein Tages-Bucket je Tag
  * - year:  12 Monats-Buckets (Jan–Dez) des Anker-Jahres
@@ -400,6 +516,14 @@ export function buildVitalBuckets(range, anchorKey, weekStartsOn = 1, { today = 
     }
     return { buckets, from: buckets[0].date, to: today, gran: 'day' };
   };
+
+  // DER TAG (#1699) ist kein vierter Bucket-Zuschnitt: sein einziger Bucket
+  // traegt die Kennzahlen, gezeichnet werden die einzelnen Messungen
+  // (`readings`) an ihrer Uhrzeit. `gran: 'hour'` sagt dem Diagramm, dass die
+  // X-Achse die Stunden des Tages sind.
+  if (range === 'day') {
+    return { buckets: [{ key: anchor, date: anchor, gran: 'day' }], from: anchor, to: anchor, gran: 'hour' };
+  }
 
   if (range === 'year') {
     const year = parseLocalDateKey(anchor).getFullYear();
@@ -449,14 +573,17 @@ export function buildVitalBuckets(range, anchorKey, weekStartsOn = 1, { today = 
  *                                 unit, measured_at.
  * @param {Object} opts
  * @param {string} opts.type            - Metrik-Typ (bp|glucose|weight|spo2|temp)
- * @param {'week'|'month'|'year'} [opts.range='month']
+ * @param {'day'|'week'|'month'|'year'} [opts.range='month']
  * @param {string} [opts.anchor]        - Anker-Datum (YYYY-MM-DD) im Zeitraum
  * @param {number} [opts.weekStartsOn=1]
  * @returns {{
  *   type: string, range: string, from: string, to: string, gran: string,
- *   channels: string[],
+ *   channels: string[], unit: string|null,  // Anzeige-Einheit (#2328)
  *   points: Array<{ key:string, date:string, count:number,
- *                   value_num:number|null, value_num2:number|null, value_num3:number|null }>,
+ *                   value_num:number|null, value_num2:number|null, value_num3:number|null,
+ *                   min: Object, max: Object }>,  // je Kanal kleinster/groesster Wert
+ *   readings: Array<{ id, index:number, date:string, minutes:number, measured_at:string,
+ *                     note:string|null, value_num, value_num2, value_num3 }>,
  *   hasData: boolean,
  *   latest: Object|null, previous: Object|null,
  *   deltas: { value_num:number|null, value_num2:number|null, value_num3:number|null }
@@ -467,7 +594,10 @@ export function computeVitalSeries(rows, opts = {}) {
   const metric = vitalMetric(type);
   const channels = metric ? metric.channels : ['value_num'];
 
-  const typeRows = (Array.isArray(rows) ? rows : []).filter((r) => r && r.type === type);
+  const ownRows = (Array.isArray(rows) ? rows : []).filter((r) => r && r.type === type);
+  // #2328: vor Delta, Mittelwert und Achse alles in eine Einheit.
+  const unit = vitalDisplayUnit(metric, ownRows);
+  const typeRows = ownRows.map((r) => toDisplayUnit(r, type, unit));
 
   // Kennzahlen: letzter + vorletzter Wert über ALLE Messungen dieses Typs,
   // unabhängig vom gewählten Zeitraum (das Delta zeigt die jüngste Änderung).
@@ -496,8 +626,17 @@ export function computeVitalSeries(rows, opts = {}) {
     count: 0,
     sums: { value_num: 0, value_num2: 0, value_num3: 0 },
     counts: { value_num: 0, value_num2: 0, value_num3: 0 },
+    min: { value_num: null, value_num2: null, value_num3: null },
+    max: { value_num: null, value_num2: null, value_num3: null },
   }));
 
+  // DIE EINZELNEN MESSUNGEN BLEIBEN STEHEN (#1699, #1798). Der Mittelwert je
+  // Bucket machte aus 55 um 07:00 und 190 um 13:00 einen unauffaelligen Punkt.
+  // Jeder Bucket fuehrt deshalb auch den kleinsten und den groessten Wert (das
+  // Tagesband), und `readings` traegt jede Messung des Fensters mit Uhrzeit:
+  // die Tagesansicht zeichnet sie an ihrer Stunde, der Blutdruck als eigenen
+  // Balken.
+  const readings = [];
   for (const row of typeRows) {
     const dk = dateKeyOf(row.measured_at);
     if (dk < from || dk > to) continue;
@@ -505,11 +644,25 @@ export function computeVitalSeries(rows, opts = {}) {
     const i = index.get(bucketKey);
     if (i === undefined) continue;
     acc[i].count += 1;
+    const reading = { id: row.id, index: i, date: dk, minutes: minutesOf(row.measured_at), measured_at: row.measured_at, note: row.note ?? null };
     for (const key of CHANNEL_KEYS) {
       const val = toFiniteOrNull(row[key]);
-      if (val !== null) { acc[i].sums[key] += val; acc[i].counts[key] += 1; }
+      reading[key] = val;
+      if (val === null) continue;
+      const a = acc[i];
+      a.sums[key] += val;
+      a.counts[key] += 1;
+      if (a.min[key] === null || val < a.min[key]) a.min[key] = val;
+      if (a.max[key] === null || val > a.max[key]) a.max[key] = val;
     }
+    readings.push(reading);
   }
+  readings.sort((a, b) => {
+    const ka = String(a.measured_at);
+    const kb = String(b.measured_at);
+    if (ka === kb) return (a.id || 0) - (b.id || 0);
+    return ka < kb ? -1 : 1;
+  });
 
   const points = buckets.map((b, i) => {
     const a = acc[i];
@@ -521,6 +674,8 @@ export function computeVitalSeries(rows, opts = {}) {
       value_num: avg('value_num'),
       value_num2: avg('value_num2'),
       value_num3: avg('value_num3'),
+      min: { ...a.min },
+      max: { ...a.max },
     };
   });
 
@@ -531,7 +686,9 @@ export function computeVitalSeries(rows, opts = {}) {
     to,
     gran,
     channels,
+    unit,
     points,
+    readings,
     hasData: points.some((p) => p.count > 0),
     latest,
     previous,

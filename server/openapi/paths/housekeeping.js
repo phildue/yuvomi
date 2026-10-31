@@ -1,4 +1,4 @@
-import { op, jsonBody, idParam } from '../helpers.js';
+import { op, jsonBody, idParam, withCaseReasons } from '../helpers.js';
 
 const VISIT_CAPABILITY_NOTE = 'Each visit carries `can_edit` and `can_delete`: true when the caller may write to the Housekeeping module and the visit is either unpaid or the caller is an admin '
   + '(a paid visit is settled), `can_mark_paid`: true when the caller may write, may see amounts and the visit is unpaid, and `can_mark_unpaid`: true when the visit is paid and the caller is an admin. '
@@ -43,7 +43,7 @@ const LAST_COMPLETED_INPUT = '`last_completed` with `Z` or a numeric offset is r
   + 'kept, and a value without offset was read in the time zone of the server.';
 
 export function housekeepingPaths() {
-  return {
+  return withCaseReasons('housekeeping', CASE_REASONS, {
     '/api/v1/housekeeping/dashboard': {
       get: op({ summary: 'Get housekeeping dashboard', tag: 'Housekeeping', description: RECEIPT_NOTE + AMOUNTS_NOTE + HOUSEHOLD_DAY_NOTE }),
     },
@@ -52,7 +52,8 @@ export function housekeepingPaths() {
     },
     '/api/v1/housekeeping/worker': {
       get: op({ summary: 'Get primary housekeeper profile', tag: 'Housekeeping', description: RECEIPT_NOTE + AMOUNTS_NOTE + HOUSEHOLD_DAY_NOTE }),
-      post: op({ summary: 'Create or update housekeeper profile', tag: 'Housekeeping', admin: true, stateChanging: true, requestBody: jsonBody(null) }),
+      post: op({ summary: 'Create or update housekeeper profile', tag: 'Housekeeping', admin: true, stateChanging: true, requestBody: jsonBody(null),
+        description: '`birth_year_unknown` (boolean) saves a birthday known by day and month only (#2095): the server stores the placeholder year 2000 whatever year is sent, and profiles return the flag next to `birth_date`. Omitted, the stored flag stays unless a different date arrives.' }),
     },
     '/api/v1/housekeeping/workers': {
       get: op({ summary: 'List housekeeper profiles', tag: 'Housekeeping', description: 'Next to `data`, `can_manage` is true when the caller may create and edit profiles (`POST /housekeeping/worker`): write access to the module and the admin role. ' + RECEIPT_NOTE + AMOUNTS_NOTE + HOUSEHOLD_DAY_NOTE }),
@@ -68,6 +69,9 @@ export function housekeepingPaths() {
     },
     '/api/v1/housekeeping/work-sessions/check-out': {
       post: op({ summary: 'Check out a housekeeper', tag: 'Housekeeping', description: AMOUNTS_WRITE_NOTE.trim(), stateChanging: true, requestBody: jsonBody(null) }),
+    },
+    '/api/v1/housekeeping/work-sessions/{id}/reopen': {
+      post: op({ summary: 'Take a check-out back (undo)', tag: 'Housekeeping', params: [idParam()], description: 'The undo of a check-out (R23): the visit is open again - no end, and for an hourly rate no worked minutes and an amount of 0, as at check-in. Calendar event and payment task stay. Only within 10 minutes of the check-out, only while unpaid, and only while the housekeeper has no other open session.', stateChanging: true }),
     },
     '/api/v1/housekeeping/visits': {
       get: op({ summary: 'List housekeeping visits for a month', tag: 'Housekeeping', description: VISIT_CAPABILITY_NOTE + RECEIPT_NOTE + AMOUNTS_NOTE }),
@@ -137,5 +141,35 @@ export function housekeepingPaths() {
       get: op({ summary: 'List housekeeping maintenance log entries', tag: 'Housekeeping' }),
       post: op({ summary: 'Create housekeeping maintenance log entry', tag: 'Housekeeping', stateChanging: true, requestBody: jsonBody(null) }),
     },
-  };
+  });
 }
+
+// #1909: die Faelle, die ein Nutzer erreicht, tragen einen `reason` neben dem
+// englischen `error` - je Operation der Satz, der sie nennt.
+const WORKER_GONE = '`housekeeping_worker_not_found` (404, the housekeeper was deleted)';
+const VISIT_GONE = '`housekeeping_visit_not_found` (404, the visit was deleted)';
+const TASK_GONE = '`housekeeping_task_not_found` (404, the task was deleted)';
+const SHOPPING_WRITE_REQUIRED = '`cross_module_access` (403, a supply request writes to the shopping list and needs write access to it - for API tokens a `shopping:write` scope)';
+const CASE_REASONS = {
+  '/api/v1/housekeeping/supply-requests': { post: SHOPPING_WRITE_REQUIRED },
+  '/api/v1/housekeeping/worker': {
+    post: `${WORKER_GONE}, \`housekeeping_username_invalid\` (400, the username breaks the naming rule), `
+      + '`housekeeping_username_taken` (409, another account uses the username)',
+  },
+  '/api/v1/housekeeping/work-sessions/check-in': {
+    post: `${WORKER_GONE}, \`housekeeping_already_checked_in\` (409, the housekeeper has an open session)`,
+  },
+  '/api/v1/housekeeping/work-sessions/check-out': {
+    post: '`housekeeping_open_session_not_found` (404, there is no open session; somebody checked out already)',
+  },
+  '/api/v1/housekeeping/work-sessions/{id}/reopen': {
+    post: `${VISIT_GONE}, \`housekeeping_visit_open\` (409, the visit has no check-out), `
+      + '`housekeeping_reopen_expired` (409, paid or checked out more than 10 minutes ago), '
+      + '`housekeeping_already_checked_in` (409, the housekeeper has another open session)',
+  },
+  '/api/v1/housekeeping/visits/{id}': { get: VISIT_GONE, put: VISIT_GONE, delete: VISIT_GONE },
+  '/api/v1/housekeeping/visits/{id}/pay': { post: VISIT_GONE },
+  '/api/v1/housekeeping/visits/{id}/unpay': { post: VISIT_GONE },
+  '/api/v1/housekeeping/decay-tasks/{taskId}': { patch: TASK_GONE, delete: TASK_GONE },
+  '/api/v1/housekeeping/decay-tasks/{taskId}/complete': { post: TASK_GONE },
+};

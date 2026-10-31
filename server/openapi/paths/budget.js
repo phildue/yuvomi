@@ -1,8 +1,28 @@
-import { op, jsonBody, idParam, stringPathParam, langParam, DOCUMENT_LINKS_READ_NOTE } from '../helpers.js';
+import { op, jsonBody, idParam, stringPathParam, langParam, DOCUMENT_LINKS_READ_NOTE, withCaseReasons } from '../helpers.js';
 
 export function budgetPaths() {
-  return withCaseReasons({
-    '/api/v1/budget/summary': { get: op({ summary: 'Get budget summary', tag: 'Budget', description: '`pending` (`count`, `income`, `expenses`) reports what is expected and in no total: expected bookings and the subscription payments projected for the month (see `GET /api/v1/budget`). `pending.expected_omitted: true` appears only when the projection hit its limit of 5000 lines; the figures then contain no subscription payment.', params: [{
+  return withCaseReasons('budget', CASE_REASONS, {
+    '/api/v1/budget/transfers': {
+      post: op({
+        summary: 'Transfer money between two budget accounts', tag: 'Budget', stateChanging: true,
+        requestBody: jsonBody(null, 'Required: title, positive amount matching the account currency precision (no silent rounding), date (YYYY-MM-DD), from_account_id and to_account_id (two different active accounts). Optional: outgoing expense category and subcategory (Financials / Savings when present, otherwise the first remaining expense category and its default subcategory), visibility, is_recurring, recurrence_interval, recurrence_interval_count and recurrence_confirm. Virtual recurrence and recurrence_rule are not supported; transfer_entry_id is read-only.'),
+        description: 'Creates linked outgoing and incoming entries atomically. New transfers and account changes require active accounts (400 transfer_account_archived); existing bookings on archived accounts remain editable. Both accounts must have the same effective currency (account currency or household currency); currency exchange is not supported. This also applies when changing accounts through transfer, generic entry or series updates: a mismatch returns 400 with reason transfer_currency_mismatch. Existing bookings remain editable after account or household currency changes when their account assignments stay the same. Returns the outgoing entry in data, including from_account_id, to_account_id and transfer_entry_id. Transfers affect account balances but are excluded from income and expense totals.',
+        responses: {
+          201: { description: 'Transfer created' },
+          400: { description: 'Different effective account currencies: transfer_currency_mismatch. Archived account assignment: transfer_account_archived. Off-grid amount: entry_amount_invalid. Other invalid transfer fields: transfer_invalid.' },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
+      }),
+    },
+    '/api/v1/budget/transfers/{id}': {
+      get: op({ summary: 'Get a transfer by either linked entry ID', tag: 'Budget', params: [idParam()], description: 'Returns the outgoing entry in data with from_account_id and to_account_id. For recurring transfers, series holds the current outgoing definition, both current account IDs, its start date, recurrence interval/count and confirmation flag, including when reading a generated occurrence. Requires edit permission for both linked entries; otherwise returns 403. An unknown or non-transfer entry returns 404.' }),
+      put: op({ summary: 'Update both entries of a transfer', tag: 'Budget', params: [idParam()], stateChanging: true, requestBody: jsonBody(null, 'Transfer fields as for POST /budget/transfers; omitted fields retain their stored values.'), description: 'Updates both linked entries atomically. Requires edit permission for both. Changing recurrence fields here returns 400 with reason transfer_series_required; use the series endpoint. Invalid fields return 400 with reason transfer_invalid; an unknown transfer returns 404.' }),
+    },
+    '/api/v1/budget/transfers/{id}/series': {
+      put: op({ summary: 'Update a recurring transfer series', tag: 'Budget', params: [idParam()], stateChanging: true, requestBody: jsonBody(null, 'Transfer fields as for POST /budget/transfers; date is the series start date. Omitted fields retain their current series values from both linked definitions, including the destination account.'), description: 'Updates both series definitions and their future bookings atomically, preserving past bookings when the schedule changes. Visibility applies to the entire series, including its past. Requires edit permission for both linked entries. Returns the outgoing anchor in data. Returns 400 for a non-recurring transfer, invalid fields, an invalid start date, or is_recurring set to false; delete the series to end it. An unknown transfer returns 404.' }),
+    },
+    '/api/v1/budget/summary': { get: op({ summary: 'Get budget summary', tag: 'Budget', description: '`byCategory` uses the reserved `__saving__` bucket for Financials / Savings; pass it as the entry-list category filter to drill down without colliding with a household category named `saving`. `transfers` is the sum of booked transfer outflows for the month, regardless of category; linked transfers are excluded from income, expenses and balance. With `account_id`, `transfers_in` is the sum of booked transfers arriving on that account; it is absent without the filter, where both halves of a transfer cancel out. `pending` (`count`, `income`, `expenses`) reports what is expected and in no total: expected bookings and the subscription payments projected for the month (see `GET /api/v1/budget`). `pending.expected_omitted: true` appears only when the projection hit its limit of 5000 lines; the figures then contain no subscription payment.', params: [{
       name: 'account_id',
       in: 'query',
       required: false,
@@ -41,12 +61,12 @@ export function budgetPaths() {
       delete: op({ summary: 'Delete budget subcategory', tag: 'Budget', params: [stringPathParam('key', 'Category key'), stringPathParam('subKey', 'Subcategory key')], stateChanging: true }),
     },
     '/api/v1/budget/accounts': {
-      get: op({ summary: 'List accounts with starting and running balance, net worth, and available limit on credit cards', tag: 'Budget' }),
-      post: op({ summary: 'Create account (name, type, starting balance; credit cards also take credit_bank and credit_limit)', tag: 'Budget', stateChanging: true, requestBody: jsonBody(null) }),
+      get: op({ summary: 'List accounts with starting and running balance, net worth, and available limit on credit cards', tag: 'Budget', description: 'Balances and amounts of an account are in its `currency` (the budget currency when `null`). `net_worth` adds the active accounts in the budget currency. When some are in another currency it is converted with the cached exchange rates: then `net_worth_approx: true`, `net_worth_rates_at` (the oldest rate used) and `net_worth_by_currency` (`[{ currency, amount }]`) are added. When a rate is missing, `net_worth` is `null` and only `net_worth_by_currency` is given.' }),
+      post: op({ summary: 'Create account (name, type, starting balance; credit cards also take credit_bank and credit_limit)', tag: 'Budget', stateChanging: true, requestBody: jsonBody(null), description: '`currency` is one of the supported ISO 4217 codes (case is ignored) or empty/`null` for the budget currency; anything else is refused with 400 and `reason: account_currency_invalid`.' }),
     },
     '/api/v1/budget/accounts/{id}': {
-      put: op({ summary: 'Update account (credit cards also take credit_bank and credit_limit)', tag: 'Budget', params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
-      delete: op({ summary: 'Delete account (linked entries are kept, account_id cleared)', tag: 'Budget', params: [idParam()], stateChanging: true }),
+      put: op({ summary: 'Update account (credit cards also take credit_bank and credit_limit)', tag: 'Budget', params: [idParam()], stateChanging: true, requestBody: jsonBody(null), description: '`currency` is one of the supported ISO 4217 codes (case is ignored) or empty/`null` for the budget currency; anything else is refused with 400 and `reason: account_currency_invalid`. An unchanged stored code is accepted as sent.' }),
+      delete: op({ summary: 'Delete account without linked transfers (ordinary entries are kept, account_id cleared)', tag: 'Budget', description: 'Returns 409 with reason account_has_transfers while linked transfers reference this account. Entries the caller cannot see (private entries of other members in personal mode) keep the account: it then stays for them as an archived account, while the caller gets the same 204 and no longer sees it. Archive it with PUT instead.', params: [idParam()], stateChanging: true }),
     },
     '/api/v1/budget/loans': {
       get: op({ summary: 'List loans and repayment summary', tag: 'Budget', description: 'Each loan carries `due_day` (1 to 31, or `null`), `next_due_month` (`YYYY-MM`) and `next_due_date` (`YYYY-MM-DD`): the due day in the month the next installment is due, clamped to the last day of a shorter month. For a loan without a due day, `next_due_date` is the 1st of `next_due_month` when that month lies before the household\'s current month (a booking date, not a due date), and `null` for an installment due in the current or a later month. Both are `null` once the loan is settled. `projected_end_month` (`YYYY-MM`) is the month of the last installment: the remaining installments counted from the later of `next_due_month` and the household\'s current month, following the payments actually booked for a loan with interest; `null` once settled and for a loan whose installment does not cover its interest. A loan with interest carries `interest.current_rate`, the rate that applies today: that of the installment due in the household\'s current month, at least the next unrecorded one (the fixed rate during the fixed-rate period, the follow-up rate after it). `summary.by_direction.borrowed` and `summary.by_direction.lent` carry the summary figures per direction (`count`, `active_count`, `has_interest`, `total_amount`, `paid_amount`, `remaining_amount`, `remaining_principal`, `remaining_installments`): a borrowed balance is owed by the household, a lent one is owed to it. The top-level figures add both directions.' }),
@@ -60,7 +80,7 @@ export function budgetPaths() {
       post: op({ summary: 'Preview a loan without saving it', tag: 'Budget', stateChanging: true, requestBody: jsonBody(null), description: 'Computes the monthly instalment, term, total interest and remaining debt for the values in the dialog, without writing anything. The server stays the single source of the interest maths - duplicating the formula in the client would give two answers that drift.' }),
     },
     '/api/v1/budget/loans/{id}/payments': {
-      post: op({ summary: 'Record loan repayment', tag: 'Budget', params: [idParam()], stateChanging: true, requestBody: jsonBody(null), description: '`paid_date` (`YYYY-MM-DD`) is required and stored as sent, on the installment and on its budget entry. To date an installment the way the loan card does, send the loan\'s `next_due_date`: the due day, or for a loan without one the 1st of a due month that is already over. It is `null` for a loan without a due day whose next installment is due in the current or a later month; send the household\'s today then.' }),
+      post: op({ summary: 'Record loan repayment', tag: 'Budget', params: [idParam()], stateChanging: true, requestBody: jsonBody(null), description: '`paid_date` (`YYYY-MM-DD`) is required and stored as sent, on the installment and on its budget entry. To date an installment the way the loan card does, send the loan\'s `next_due_date`: the due day, or for a loan without one the 1st of a due month that is already over. It is `null` for a loan without a due day whose next installment is due in the current or a later month; send the household\'s today then. The budget entry is in the currency of the loan\'s account, or the budget currency without one: the same currency as the loan books unconverted, the budget currency uses the loan\'s fixed `exchange_rate`, any other goes through that rate and the cached exchange rate to the account currency. Without a cached rate the payment is refused with 409 and `reason: loan_payment_rate_unavailable`.' }),
     },
     '/api/v1/budget/loans/{id}/payments/{paymentId}': {
       delete: op({ summary: 'Delete loan repayment', tag: 'Budget', params: [idParam(), idParam('paymentId', 'Loan payment ID')], stateChanging: true }),
@@ -93,7 +113,7 @@ export function budgetPaths() {
       post: op({ summary: 'Create budget entry (optional `visibility`: private|shared; owner is the creator; optional `attachment_document_ids`: receipts from the documents module)', tag: 'Budget', description: DOCUMENT_LINKS_READ_NOTE, stateChanging: true, documentDeleteConflict: true, documentLinkRefusal: true, requestBody: jsonBody(null) }),
     },
     '/api/v1/budget/{id}': {
-      put: op({ summary: 'Update budget entry (`attachment_document_ids` replaces the receipt links; omit the field to leave them untouched)', tag: 'Budget', params: [idParam()], description: `${DOCUMENT_LINKS_READ_NOTE} On the first entry of a running series, a changed rhythm (\`recurrence_interval\`, \`recurrence_interval_count\`, \`recurrence_virtual\`, \`recurrence_rule\`) applies to the whole series: missing past occurrences are created on the old grid, occurrences from today on are rebuilt, and none is generated before today on the new grid. The entry's \`date\` is that booking's date only; the series keeps its start day.`, stateChanging: true, documentDeleteConflict: true, documentLinkRefusal: true, requestBody: jsonBody(null) }),
+      put: op({ summary: 'Update budget entry (`attachment_document_ids` replaces the receipt links; omit the field to leave them untouched)', tag: 'Budget', params: [idParam()], description: `${DOCUMENT_LINKS_READ_NOTE} On the first entry of a running series, a changed rhythm (\`recurrence_interval\`, \`recurrence_interval_count\`, \`recurrence_virtual\`, \`recurrence_rule\`) applies to the whole series: missing past occurrences are created on the old grid, occurrences from today on are rebuilt, and none is generated before today on the new grid. The entry's \`date\` is that booking's date only; the series keeps its start day. An amount is in the currency of the entry's account (the budget currency without one); changing the amount of a loan repayment converts it back to the loan currency the same way the repayment was booked, and is refused with 409 and \`reason: loan_payment_rate_unavailable\` when no rate is known.`, stateChanging: true, documentDeleteConflict: true, documentLinkRefusal: true, requestBody: jsonBody(null) }),
       delete: op({ summary: 'Delete budget entry', tag: 'Budget', params: [idParam()], stateChanging: true }),
     },
     '/api/v1/budget/{id}/confirm': {
@@ -107,11 +127,11 @@ export function budgetPaths() {
       get: op({ summary: 'Get budget statistics for week, month, or year', tag: 'Budget', description: 'Query: `range` (week|month|year), `anchor` (YYYY-MM-DD), optional `until` (YYYY-MM-DD). Only completed units count: in a year, months up to the last completed one; in a week or month, days up to and including today (household time zone). Entries dated later never count, including generated occurrences of recurring entries. `from`/`to` are the period bounds; `until` is the last day counted (equal to `to` once the period is over, before `from` while it lies ahead). The comparison is cut to the same stretch of the previous period, ending at `prevUntil`; pass that as `until` when fetching the previous period itself.' }),
     },
     '/api/v1/budget/subscriptions': {
-      get: op({ summary: 'List subscriptions with normalized costs and analytics', tag: 'Budget', description: 'The `by_category` and `by_payment_method` breakdowns group by ROW, not by display text: each entry is `{ id, name, label_key, amount }`. `id` is `null` for the catch-all bucket of subscriptions without a category or payment method, and `name`/`label_key` are then `null` too - the caller supplies the wording. A seeded row carries `label_key` (an i18n key such as `subscriptions.paymentMethodCreditCard`) and a `name` of its original English wording; a row the household created or renamed carries only `name`. Resolve as `label_key ? t(label_key) : name`. Subscription objects include boolean `reminder_enabled` (default true). When false, no payment reminder is scheduled, including after edits and renewals; subscription status and costs are unaffected. `reminder_days: 0` still means a reminder on the payment date when enabled. Subscription objects carry the same pair denormalized as `category_label_key` / `category_name` and `payment_method_label_key` / `payment_method_name`.' }),
-      post: op({ summary: 'Create subscription', description: 'Optional boolean `reminder_enabled` defaults to true. Set false to create an active subscription without a payment reminder. `reminder_days` remains a lead time of 0-365 days; zero means the payment date.', tag: 'Budget', stateChanging: true, requestBody: jsonBody(null) }),
+      get: op({ summary: 'List subscriptions with normalized costs and analytics', tag: 'Budget', description: 'The `by_category` and `by_payment_method` breakdowns group by ROW, not by display text: each entry is `{ id, name, label_key, amount }`. `id` is `null` for the catch-all bucket of subscriptions without a category or payment method, and `name`/`label_key` are then `null` too - the caller supplies the wording. A seeded row carries `label_key` (an i18n key such as `subscriptions.paymentMethodCreditCard`) and a `name` of its original English wording; a row the household created or renamed carries only `name`. Resolve as `label_key ? t(label_key) : name`. Subscription objects include boolean `reminder_enabled` (default true). When false, no payment reminder is scheduled, including after edits and renewals; subscription status and costs are unaffected. `reminder_days: 0` still means a reminder on the payment date when enabled. Subscription objects carry the same pair denormalized as `category_label_key` / `category_name` and `payment_method_label_key` / `payment_method_name`. `account_id` is the budget account every booking of the subscription goes to (null: none), with `account_name`; `account_archived: true` means that account is archived and the subscription books without an account until another one is chosen.' }),
+      post: op({ summary: 'Create subscription', description: 'Optional boolean `reminder_enabled` defaults to true. Set false to create an active subscription without a payment reminder. `reminder_days` remains a lead time of 0-365 days; zero means the payment date. Optional `visibility` (`private`|`shared`; default `private` in the personal budget mode, `shared` otherwise; the owner is the creator) and `account_id` (a budget account, null for none): the booking of the next payment inherits both. A booking on an archived account goes without an account. The booking is in the account\'s currency (the budget currency without one), converted with the cached exchange rate. An account that does not exist is 400 with `reason: "subscriptions_account_not_found"`.', tag: 'Budget', stateChanging: true, requestBody: jsonBody(null) }),
     },
     '/api/v1/budget/subscriptions/meta': {
-      get: op({ summary: 'Get subscription categories, payment methods, and billing cycles', tag: 'Budget', description: 'Categories and payment methods each carry `label_key` (an i18n key) when they are one of the seeded defaults and `null` once the household renamed them - resolve as `label_key ? t(label_key) : name`.' }),
+      get: op({ summary: 'Get subscription categories, payment methods, and billing cycles', tag: 'Budget', description: 'Categories and payment methods each carry `label_key` (an i18n key) when they are one of the seeded defaults and `null` once the household renamed them - resolve as `label_key ? t(label_key) : name`. Also `budget_mode` (`shared`|`personal`; a subscription visibility only applies in `personal`) and `accounts`: the budget accounts to choose from as `{ id, name, archived }`.' }),
     },
     '/api/v1/budget/subscriptions/settings': {
       get: op({ summary: 'Get subscription budget and base currency', tag: 'Budget' }),
@@ -138,10 +158,13 @@ export function budgetPaths() {
       post: op({ summary: 'Find selectable logo options from a website URL or service name', tag: 'Budget', stateChanging: true, requestBody: jsonBody(null) }),
     },
     '/api/v1/budget/subscriptions/{id}/renew': {
-      post: op({ summary: 'Advance a subscription to its next renewal date, or complete it when its end condition is reached', description: 'Preserves `reminder_enabled`. A renewed subscription with reminders disabled has no reminder row.', tag: 'Budget', params: [idParam()], stateChanging: true }),
+      post: op({ summary: 'Advance a subscription to its next renewal date, or complete it when its end condition is reached', description: 'Preserves `reminder_enabled`. A renewed subscription with reminders disabled has no reminder row. Besides `data` the answer carries `undo: { token }`; the state before the payment stays on the server, and POST /renew/undo with that token takes the payment back (R23).', tag: 'Budget', params: [idParam()], stateChanging: true }),
+    },
+    '/api/v1/budget/subscriptions/{id}/renew/undo': {
+      post: op({ summary: 'Take a payment back (undo a renewal)', description: 'Body: { token } from the `undo` block of POST /renew. Valid for the latest payment only, for the account that paid, within 10 minutes; the bookings involved come from what the renewal recorded on the server, never from the request. Due date and payment count go back, a completion is lifted, the booking of the next payment that the renewal created is deleted, and the paid booking is the linked next-payment booking again (rewritten from the subscription). Only valid while the subscription is exactly what ONE renewal made of the recorded state; otherwise (or with an unknown, used or expired token) 409 with `reason: "subscriptions_renew_undo_stale"`. Same write rule as PUT.', tag: 'Budget', params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
     },
     '/api/v1/budget/subscriptions/{id}': {
-      put: op({ summary: 'Update subscription', description: 'Optional boolean `reminder_enabled`: false removes the payment reminder; true schedules it using `reminder_days`. Omitting the field preserves its current value. Changing it does not pause the subscription or remove its budget expense.', tag: 'Budget', params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
+      put: op({ summary: 'Update subscription', description: 'Optional boolean `reminder_enabled`: false removes the payment reminder; true schedules it using `reminder_days`. Omitting the field preserves its current value. Changing it does not pause the subscription or remove its budget expense. Optional `visibility` (`private`|`shared`; the owner stays) and `account_id` (null clears it); omitted, both stay. They apply to the booking of the next payment, never to payments already booked.', tag: 'Budget', params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
       delete: op({ summary: 'Delete subscription', tag: 'Budget', params: [idParam()], stateChanging: true }),
     },
   });
@@ -150,7 +173,7 @@ export function budgetPaths() {
 // #1909: die Faelle, die ein Nutzer bei den Abos erreicht, tragen einen
 // `reason` neben dem englischen `error` - je Operation der Satz, der sie nennt.
 const SUBSCRIPTION_GONE = '`subscriptions_subscription_not_found` (404, the subscription does not exist)';
-const SELECTED_META_GONE = '`subscriptions_selected_category_not_found`, `subscriptions_selected_payment_method_not_found` (400, the chosen category or payment method does not exist)';
+const SELECTED_META_GONE = '`subscriptions_selected_category_not_found`, `subscriptions_selected_payment_method_not_found` (400, the chosen category or payment method does not exist), `subscriptions_account_not_found` (400, the chosen budget account does not exist)';
 const SUBSCRIPTION_CHECKS = '`subscriptions_end_before_next_payment`, `subscriptions_occurrence_count_too_low`, `subscriptions_logo_content_mismatch` (400, only when it is the single finding)';
 const CASE_REASONS = {
   // Anlegen nennt den Fall auch: wird das neue Abo geloescht, waehrend seine
@@ -161,6 +184,7 @@ const CASE_REASONS = {
     delete: SUBSCRIPTION_GONE,
   },
   '/api/v1/budget/subscriptions/{id}/renew': { post: `${SUBSCRIPTION_GONE}, \`subscriptions_subscription_completed\` (409, the subscription is completed; reactivate it first)` },
+  '/api/v1/budget/subscriptions/{id}/renew/undo': { post: `${SUBSCRIPTION_GONE}, \`subscriptions_renew_undo_stale\` (409, somebody renewed or edited the subscription since)` },
   '/api/v1/budget/subscriptions/categories': { post: '`subscriptions_category_exists` (409)' },
   '/api/v1/budget/subscriptions/categories/{id}': {
     put: '`subscriptions_category_not_found` (404), `subscriptions_category_exists` (409)',
@@ -172,16 +196,14 @@ const CASE_REASONS = {
     delete: '`subscriptions_payment_method_not_found` (404)',
   },
   '/api/v1/budget/subscriptions/logo-search': { post: '`subscriptions_no_logo_found` (404, no supported logo was found)' },
+  '/api/v1/budget/categories': { post: '`category_exists` (409, a category with this name already exists)' },
+  '/api/v1/budget/categories/{key}': {
+    put: '`category_exists` (409, a category with this name already exists)',
+    delete: '`category_in_use` (409, budget entries or split expenses and their recurring series still use the category; `count` carries how many), `category_last` (409, the last category cannot be deleted)',
+  },
+  '/api/v1/budget/categories/{categoryKey}/subcategories': { post: '`subcategory_exists` (409, a subcategory with this name already exists)' },
+  '/api/v1/budget/categories/{key}/subcategories/{subKey}': {
+    put: '`subcategory_exists` (409, a subcategory with this name already exists)',
+    delete: '`subcategory_in_use` (409, entries still use the subcategory; `count` carries how many), `subcategory_last` (409, the last subcategory cannot be deleted)',
+  },
 };
-
-function withCaseReasons(paths) {
-  for (const [path, operations] of Object.entries(CASE_REASONS)) {
-    for (const [method, reasons] of Object.entries(operations)) {
-      const operation = paths[path]?.[method];
-      if (!operation) throw new Error(`openapi budget: ${method} ${path} is not documented`);
-      const note = `A refusal a user can reach carries a \`reason\` next to \`error\` (#1909): ${reasons}.`;
-      operation.description = operation.description ? `${operation.description}\n\n${note}` : note;
-    }
-  }
-  return paths;
-}

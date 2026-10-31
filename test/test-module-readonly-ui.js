@@ -493,11 +493,14 @@ test('und an der Zeile der Leseansicht - dort war es nur noch nicht schaedlich',
 });
 
 test('dasselbe an der Teilaufgabe - dort seit #1209', () => {
-  const zeichen = ['subtask-item__checkbox', 'subtask-item__checkbox--done', 'subtask-item__checkbox--static'];
-  assert.equal(effektiverWert(TASKS_CSS, zeichen, 'border-color', ':hover'), null);
-  assert.equal(effektiverWert(TASKS_CSS, zeichen, 'border-color'), 'var(--color-success)');
+  // Seit R23 (D7) traegt die Teilaufgabe denselben Ring (`.check-ring--sm`):
+  // die Regeln stehen in list-row.css, also misst der Test die Kaskade.
+  const KASKADE = `${readFileSync(new URL('../public/styles/list-row.css', import.meta.url), 'utf8')}\n${TASKS_CSS}`;
+  const zeichen = ['subtask-item__checkbox', 'subtask-item__checkbox--static', 'check-ring', 'check-ring--sm', 'check-ring--done', 'check-ring--static'];
+  assert.equal(effektiverWert(KASKADE, zeichen, 'border-color', ':hover::after'), null);
+  assert.equal(effektiverWert(KASKADE, zeichen, 'border-color', '::after'), 'var(--color-success)');
   assert.match(
-    effektiverWert(TASKS_CSS, ['subtask-item__checkbox', 'subtask-item__checkbox--done'], 'border-color', ':hover') ?? '',
+    effektiverWert(KASKADE, ['subtask-item__checkbox', 'check-ring', 'check-ring--sm', 'check-ring--done'], 'border-color', ':hover::after') ?? '',
     /module-accent/,
   );
 });
@@ -1018,6 +1021,46 @@ test('Taschengeld: ein Betrag ueberlebt den Rundlauf durch das Feld, in jeder wa
     `die Probe braucht Waehrungen, bei denen Intl und ISO 4217 auseinandergehen (gefunden: ${abweichend.join(', ')})`);
 });
 
+test('rewards plan accepts an en-US keyboard comma and submits a decimal string (#2170)', async () => {
+  const previous = { locale: globalThis.__formatLocale, modal: globalThis.__openModal, api: globalThis.__apiStub };
+  globalThis.__formatLocale = 'en-US';
+  try {
+    await mitTaschengeld(() => withAccess({ rewards: 'write' }, async () => {
+      let options;
+      let submit;
+      const writes = [];
+      const fields = new Map();
+      const panel = { querySelector(selector) {
+        if (!fields.has(selector)) fields.set(selector, { value: '', checked: false, hidden: false,
+          setAttribute() {}, removeAttribute() {}, addEventListener(type, fn) {
+            if (selector === '#rw-plan-form' && type === 'submit') submit = fn;
+          } });
+        return fields.get(selector);
+      } };
+      panel.querySelector('#rw-plan-frequency').value = 'weekly';
+      panel.querySelector('#rw-plan-weekday').value = '5';
+      globalThis.__openModal = value => { options = value; };
+      // Capture the request; a refused response keeps this test in the dialog.
+      globalThis.__apiStub = { put: async (_path, body) => { writes.push(body); throw new Error('offline'); } };
+      rewards.openMoneyPlanModal(3);
+      options.onSave(panel);
+      assert.equal(rewards.moneyAmountProblem('12,50', { currency: 'EUR', minor_unit: 2 }), null);
+      panel.querySelector('#rw-money-amount').value = '12,50';
+      await submit({ preventDefault() {} });
+      assert.equal(writes[0]?.amount, '12.50');
+      panel.querySelector('#rw-money-amount').value = '12,5000';
+      await submit({ preventDefault() {} });
+      assert.equal(writes.length, 1, 'excess precision must not reach the API');
+      assert.equal(panel.querySelector('#rw-money-error').hidden, false);
+    }), { role: 'admin', me: 1 });
+  } finally {
+    if (previous.locale === undefined) delete globalThis.__formatLocale;
+    else globalThis.__formatLocale = previous.locale;
+    globalThis.__openModal = previous.modal;
+    globalThis.__apiStub = previous.api;
+  }
+});
+
 test('Taschengeld: der Plan-Dialog eines Forint-Haushalts zeigt 5000, nicht 500000', () => {
   const vorher = rewards.state.money;
   try {
@@ -1090,8 +1133,16 @@ test('Taschengeld: scheitert "Plan beenden", sagt die Seite es - keine unbehande
     globalThis.__apiStub = { delete: async () => { throw Object.assign(new Error('Server nicht erreichbar'), { status: 503 }); } };
     await assert.doesNotReject(rewards.removeMoneyPlan({ id: 3, display_name: 'Emma' }),
       'das Formular ist schon zu - der Fehler darf nicht ins Leere fallen');
-    assert.deepEqual(sonde.gefragt, ['Server nicht erreichbar'], 'die Meldung steht in einem Dialog');
+    // #1909: der Satz der App, nie der Text des Wurfs.
+    assert.deepEqual(sonde.gefragt, ['common.errorGeneric'], 'die Meldung steht in einem Dialog');
     assert.equal(sonde.reloads, 1, 'und die Liste zeigt danach, was gilt');
+
+    // Schon beendet (eine andere Person war schneller): erledigt, kein Dialog.
+    sonde.gefragt.length = 0;
+    globalThis.__apiStub = { delete: async () => { throw Object.assign(new Error('Plan not found.'), { status: 404, data: { error: 'Plan not found.', reason: 'rewards_money_plan_not_found' } }); } };
+    await rewards.removeMoneyPlan({ id: 3, display_name: 'Emma' });
+    assert.deepEqual(sonde.gefragt, [], 'ein schon beendeter Plan ist kein Fehler');
+    assert.equal(sonde.reloads, 2);
 
     sonde.gefragt.length = 0;
     const calls = [];
@@ -1166,29 +1217,36 @@ test('openEventModal() riegelt ALLE Anlegewege an einer Stelle ab', () => {
 });
 
 test('requestDeleteEvent() riegelt alle drei Serien-Löschwege ab', () => {
+  // Seit R23 (D5) fragt der Riegel je Termin: mayChangeEvent() schliesst
+  // readOnly() ein und sperrt dazu fremde Termine ohne `calendar_edit_others`.
   const fn = CAL_CODE.slice(CAL_CODE.indexOf('async function requestDeleteEvent(event) {'));
-  assert.ok(fn.indexOf('if (readOnly()) return;') > -1 && fn.indexOf('if (readOnly()) return;') < 200);
+  const riegel = fn.indexOf('if (!mayChangeEvent(event)) return;');
+  assert.ok(riegel > -1 && riegel < 400);
+  assert.match(CAL_CODE, /function mayChangeEvent\(ev\) \{\s*if \(readOnly\(\) \|\| !ev\) return false;/);
 });
 
-test('Kalender: FAB und beide Leerzustands-CTAs hängen an readOnly()', () => {
+test('Kalender: FAB und der Leerzustands-CTA der Agenda hängen an readOnly()', () => {
   // Einen eigenen Kopfknopf gibt es nicht mehr (Re-Critique 2026-09-27, D3):
   // am Zeigergeraet dockt die Shell den FAB in den Kopf.
   assert.doesNotMatch(CAL_CODE, /toolbar-new-btn(?![\w-])/, 'kein zweiter Primaerknopf neben dem FAB');
   for (const [name, muster] of [
     ['der FAB', /\$\{readOnly\(\) \? '' : `\s*<button class="page-fab" id="fab-new-event"/],
-    ['der Agenda-CTA', /action: readOnly\(\) \? undefined : \{ label: t\('calendar\.newEvent'\), attrs: \{ id: 'agenda-empty-cta' \} \}/],
-    ['der Such-CTA', /\$\{readOnly\(\) \? '' : `<button class="btn btn--secondary" id="cal-search-empty-cta">/],
+    ['der Agenda-CTA', /action: readOnly\(\) \? undefined : \{ tone: 'secondary', label: t\('calendar\.newEvent'\), attrs: \{ id: 'agenda-empty-cta' \} \}/],
   ]) {
     assert.match(CAL_CODE, muster, `${name} muss bei 'calendar: read' verschwinden`);
   }
+  // Die leere Suche traegt seit R23 keinen Anlegeknopf mehr (geteilter Baustein,
+  // "Suche zuruecksetzen" liest nur).
+  assert.doesNotMatch(CAL_CODE, /cal-search-empty-cta/, 'kein Anlegen in der leeren Suche');
 });
 
 test('Kalender-Detailansicht: Löschen, Zurücksetzen und Bearbeiten fallen weg, die Karte bleibt', () => {
-  assert.match(CAL_CODE, /const actions = readOnly\(\) \? \[\] : \[\{\s*id: 'detail-delete'/,
+  // `locked` = !mayChangeEvent(ev): Nur-lesen ODER fremder Termin ohne Recht (R23).
+  assert.match(CAL_CODE, /const locked = !mayChangeEvent\(ev\);\s*const actions = locked \? \[\] : \[\{\s*id: 'detail-delete'/,
     'die Fußzeile fängt bei Nur-lesen leer an');
-  assert.match(CAL_CODE, /ev\.external_source === 'ics' && ev\.user_modified === 1 && !readOnly\(\)/,
+  assert.match(CAL_CODE, /ev\.external_source === 'ics' && ev\.user_modified === 1 && !locked/,
     'auch das Zurücksetzen eines ICS-Termins ist ein Schreibvorgang');
-  assert.match(CAL_CODE, /edit: readOnly\(\) \? undefined : \{/,
+  assert.match(CAL_CODE, /edit: locked \? undefined : \{/,
     'ohne Mounter baut die geteilte Ansicht keinen Bearbeiten-Knopf');
   // Und die einzige nicht schreibende Aktion bleibt bedingungslos drin - seit
   // R10 als Folgeaktion der Ort-Zeile (mapRowAction), nicht im Fuss.
@@ -2396,7 +2454,7 @@ test('Geburtstagszeile mit `calendar: read`: beide Handlungen weg, die Auskunft 
     // Nichts davon war ein Zustand, der ohne die Knoepfe unlesbar wuerde - die
     // Zeile traegt ihre Auskunft selbst, und sie ist wirklich gerendert.
     assert.match(html, /Oma Erna/);
-    assert.match(html, /birthdays\.inDays/);
+    assert.match(html, /in 12 Tagen/, 'der Abstand bleibt (R23: utils/date-format.js)');
     assert.match(html, /birthdays\.turnsAge/);
     assert.match(html, /Mag Kuchen/);
     assert.match(html, /data-id="9"/);
@@ -2585,7 +2643,7 @@ test('R17 E7: ein Tipp auf die Geburtstagszeile oeffnet das Leseblatt, Bearbeite
   assert.equal(blatt.pane, undefined, 'als Blatt, nicht in der Spalte');
   assert.ok(blatt.sections.some((row) => row.value === 'Mag Kuchen'), 'die Notiz, die die Zeile am Telefon ausblendet');
   assert.deepEqual(blatt.actions.map((a) => [a.id, a.variant, a.align ?? 'end']), [
-    ['birthday-detail-delete', 'danger-ghost', 'start'],
+    ['birthday-detail-delete', 'danger-outline', 'start'],
     ['detail-view-edit', 'primary', 'end'],
   ], 'Loeschen zurueckgenommen am Anfang, Bearbeiten als Primaerknopf am Ende - wie im Termin');
 
@@ -2737,9 +2795,13 @@ async function geburtstagSpeichern(eintrag, { mode = 'edit', bedienen = async ()
     '#bd-name': editorElement({ value: eintrag.name }),
     '#birthday-preview': editorElement(),
     '#bd-photo': editorElement(),
-    '#bd-photo-edit': editorElement(),
     '#bd-remove-photo': editorElement(),
     '#bd-birth-date': editorElement({ value: eintrag.birth_date }),
+    // "Jahr unbekannt" (#2095, utils/birth-date.js): Haken, Monat, Tag.
+    '#bd-birth-date-yearless': editorElement({ hidden: true }),
+    '#bd-birth-date-month': editorElement(),
+    '#bd-birth-date-day': editorElement(),
+    '#bd-birth-date-year-unknown': editorElement({ checked: false }),
     '#bd-notes': editorElement({ value: eintrag.notes ?? '' }),
     '#bd-name-day-month': editorElement(),
     '#bd-name-day-day': editorElement(),
@@ -2769,19 +2831,75 @@ async function geburtstagSpeichern(eintrag, { mode = 'edit', bedienen = async ()
   globalThis.window.yuvomi = globalThis.window.yuvomi ?? {};
   const toasts = [];
   globalThis.window.yuvomi.showToast = (text, art) => { toasts.push({ text, art }); };
+  // Feldfehler (R23, D8): wo das Formular einen Fehler an ein Feld schreibt.
+  const felder = [];
+  const vorherFeld = globalThis.__reportFieldError;
+  globalThis.__reportFieldError = (feld, text) => { felder.push({ feld: Object.keys(el).find((k) => el[k] === feld) ?? '?', text }); };
   try {
     await el['#bd-save'].feuern('click');
   } finally {
     globalThis.__apiStub = vorher.api;
     globalThis.window.yuvomi.showToast = vorher.toast;
+    globalThis.__reportFieldError = vorherFeld;
     birthdays.state.birthdays = vorher.liste;
   }
-  if (roh) return { gesendet, toasts, el };
+  if (roh) return { gesendet, toasts, felder, el };
   assert.equal(gesendet.length, 1, 'genau ein Schreibaufruf - sonst misst der Test den Speichern-Weg nicht');
   return gesendet[0];
 }
 
 const ERINNERUNGSFELDER = ['reminder_offset', 'reminder_custom_amount', 'reminder_custom_unit'];
+
+// #2095: "Jahr unbekannt" im Editor. Angehakt gehen Monat und Tag mit dem
+// Platzhalterjahr und der Marke an den Server, nie ein erfundenes Jahr; ohne
+// Haken bleibt das Datum, wie der Datumswaehler es zeigt.
+test('Jahr unbekannt: der Editor schickt Monat, Tag und die Marke (#2095)', async () => {
+  const ohneJahr = await geburtstagSpeichern(geburtstag(), {
+    bedienen: async (el) => {
+      el['#bd-birth-date-year-unknown'].checked = true;
+      el['#bd-birth-date-month'].value = '07';
+      el['#bd-birth-date-day'].value = '18';
+    },
+  });
+  assert.equal(ohneJahr.body.year_unknown, true);
+  assert.equal(ohneJahr.body.birth_date, '2000-07-18');
+
+  const mitJahr = await geburtstagSpeichern(geburtstag());
+  assert.equal(mitJahr.body.year_unknown, false);
+  assert.equal(mitJahr.body.birth_date, '1950-04-03');
+
+  const { gesendet, toasts, felder } = await geburtstagSpeichern(geburtstag(), {
+    roh: true,
+    bedienen: async (el) => {
+      el['#bd-birth-date-year-unknown'].checked = true;
+      el['#bd-birth-date-month'].value = '07';
+    },
+  });
+  assert.equal(gesendet.length, 0, 'ohne Tag geht nichts an den Server');
+  // R23 (D8): der Fehler steht am Feld, nicht als Toast.
+  assert.deepEqual(felder, [{ feld: '#bd-birth-date-month', text: 'birthdays.yearlessIncomplete' }], JSON.stringify({ felder, toasts }));
+  assert.deepEqual(toasts, []);
+});
+
+test('Geburtstag: Name und Datum sind Pflicht, der Fehler steht am Feld (R23, D8)', async () => {
+  const { gesendet, toasts, felder } = await geburtstagSpeichern(geburtstag(), {
+    roh: true,
+    bedienen: async (el) => {
+      el['#bd-name'].value = '  ';
+      el['#bd-birth-date'].value = '';
+    },
+  });
+  assert.equal(gesendet.length, 0);
+  assert.deepEqual(felder.map((f) => f.feld), ['#bd-name', '#bd-birth-date'], JSON.stringify({ felder, toasts }));
+  assert.deepEqual(toasts, [], 'kein Sammel-Toast');
+  const html = withAccess({ calendar: 'write' }, () => modalOptionen(
+    () => birthdays.openBirthdayModal({ mode: 'create', birthday: null }),
+  )).content;
+  assert.match(html, /for="bd-name">[^<]*<span class="required-marker"/, 'Stern am Namen');
+  assert.match(html, /id="bd-name"[^>]*\srequired/, 'und required');
+  assert.match(html, /for="bd-birth-date" id="bd-birth-date-label">[^<]*<span class="required-marker"/, 'Stern am Datum');
+  assert.match(html, /<yuvomi-datepicker id="bd-birth-date" type="date" required/, 'und required');
+});
 
 test('eigene Angabe mit ungueltiger Anzahl: der Editor speichert nicht und sagt es ueber t() (Nachzug zu #1384)', async () => {
   for (const anzahl of ['0', '1000', '1.5', '']) {
@@ -3201,7 +3319,10 @@ test('Vitalwerte-Historie mit `health: read`: die Messung bleibt, ihr Bearbeiten
       const html = health.recentMeasurementsMarkup(gewicht());
       // R8 H9: die Zeile oeffnet Bearbeiten (Stift) statt nur zu loeschen.
       assert.match(html, /data-vital-edit="41"/);
-      assert.match(html, /health\.vitals\.editMeasurement/);
+      // R23: die ganze Zeile ist der Knopf, kein Stift am Ende; ihr Name ist
+      // ihr Inhalt (Tag und Wert), kein aria-label, das ihn ersetzt.
+      assert.match(html, /<li class="list-row health-recent__row">\s*<button type="button" class="list-row__main list-row__main--interactive health-recent__open" data-vital-edit="41"/);
+      assert.doesNotMatch(html, /data-lucide="pencil"/);
       assert.doesNotMatch(html, /data-delete-vital/, 'Loeschen steht im Dialogfuss, nicht mehr in der Zeile');
     });
     withAccess({ health: 'read' }, () => {
@@ -3231,7 +3352,9 @@ test('R8 H9: eine Messung oeffnet sich mit Bestand, Loeschen steht links im Dial
   const loeschen = fuss.indexOf('data-action="vital-delete"');
   assert.ok(loeschen >= 0, 'Loeschen steht im Dialogfuss');
   assert.ok(loeschen < fuss.indexOf('data-action="cancel"'), 'links vor Abbrechen und Speichern (Kanon)');
-  assert.match(fuss, /btn--danger-outline" data-action="vital-delete"[^>]* style="margin-inline-end:auto"/);
+  // Den Anfangsrand haelt `.modal-panel__delete` (decorateFooterDelete), kein Inline-Stil (R22 D12).
+  assert.match(fuss, /btn--danger-outline" data-action="vital-delete"/);
+  assert.doesNotMatch(fuss, /style="/);
   // Mobil ist Loeschen ein Papierkorb ohne Wort (R9 M8, modal.js); sein Name
   // kommt aus data-delete-name - ohne nahm modal.js das erste Feld ("128").
   assert.match(fuss, /data-action="vital-delete" data-delete-name="health\.vitals\.metric\.bp"/, 'der Papierkorb nennt die Metrik');
@@ -3258,24 +3381,28 @@ test('R18: "Messwert erfassen" spricht in Formularzeilen - der Blutdruck ist EIN
   assert.match(neu, /<div class="form-field">\s*<label class="form-label" for="vital-note">/);
 
   const bp = health.valueFieldsMarkup('bp', { id: 1, type: 'bp', value_num: 128, value_num2: 84, value_num3: 66 });
-  assert.match(bp, /<span class="form-row__label" id="vital-pair-label">health\.vitals\.metric\.bp<\/span>/, 'die Zeile heisst "Blutdruck"');
+  assert.match(bp, /<span class="form-row__label" id="vital-pair-label">health\.vitals\.metric\.bp<span class="required-marker" aria-hidden="true"> \*<\/span><\/span>/,
+    'die Zeile heisst "Blutdruck" und traegt den Stern (R23, D8) - stumm fuer den Namen der Gruppe');
   assert.match(bp, /<span class="form-composite" role="group" aria-labelledby="vital-pair-label">/);
-  assert.match(bp, /id="vital-sys" aria-label="health\.vitals\.field\.systolic" placeholder="120" value="128">/);
+  assert.match(bp, /id="vital-sys" aria-label="health\.vitals\.field\.systolic" value="128">/);
   assert.match(bp, /<span class="form-composite__sep" aria-hidden="true">\/<\/span>/);
-  assert.match(bp, /id="vital-dia" aria-label="health\.vitals\.field\.diastolic" aria-describedby="vital-dia-unit" placeholder="80" value="84">/);
+  assert.match(bp, /id="vital-dia" aria-label="health\.vitals\.field\.diastolic" aria-describedby="vital-dia-unit" value="84">/);
   assert.match(bp, /<span class="form-composite__unit" id="vital-dia-unit">mmHg<\/span>/, 'die Einheit steht als Suffix am Paar');
   assert.match(bp, /<label class="form-row__label" for="vital-pulse">health\.vitals\.field\.pulse<\/label>/, 'der Puls ist eine eigene Zeile daneben');
-  assert.match(bp, /id="vital-pulse" aria-describedby="vital-pulse-suffix" placeholder="72" value="66">/);
+  assert.match(bp, /id="vital-pulse" aria-describedby="vital-pulse-suffix" value="66">/);
   assert.ok(bp.indexOf('id="vital-sys"') < bp.indexOf('id="vital-dia"') && bp.indexOf('id="vital-dia"') < bp.indexOf('id="vital-pulse"'),
     'Tastaturfolge: systolisch, diastolisch, Puls');
-  // Ein leeres Paar traegt Beispielwerte als Platzhalter, keinen Bestand.
+  // Ein leeres Paar ist leer: keine Beispielwerte als Platzhalter (Critique
+  // R21 - "120 / 80" las sich wie eine eingetragene Messung), kein Bestand.
   const leer = health.valueFieldsMarkup('bp');
-  assert.match(leer, /id="vital-sys"[^>]*placeholder="120">/);
+  assert.match(leer, /id="vital-sys"/);
+  assert.doesNotMatch(leer, /placeholder=/);
   assert.doesNotMatch(leer, /id="vital-sys"[^>]*value=/);
 
   // Einfacher Wert: Zahl und Einheit sind ein Feld; die Einheit ist Auswahl oder Text.
   const gewicht = health.valueFieldsMarkup('weight');
-  assert.match(gewicht, /<label class="form-row__label" for="vital-value">health\.vitals\.metric\.weight<\/label>/);
+  // Der Messwert ist Pflicht: hinter dem Namen steht der Stern (REQUIRED_MARK).
+  assert.match(gewicht, /<label class="form-row__label" for="vital-value">health\.vitals\.metric\.weight<span class="required-marker" aria-hidden="true"> \*<\/span><\/label>/);
   assert.match(gewicht, /<select class="form-input" id="vital-unit" aria-label="health\.vitals\.field\.unit">/, 'die Einheitenauswahl hat einen eigenen Namen');
   // Dauer: die Worte hinter den Zahlen sind die Etiketten der Teilfelder.
   const schlaf = health.valueFieldsMarkup('sleep');
@@ -3395,8 +3522,11 @@ test('Codex an #1485: ein Blutdruck in kPa bleibt beim Speichern einer Notiz kPa
 test('R8 H9: ein Laborwert laesst sich korrigieren, nicht nur loeschen', () => {
   const analyt = { id: 3, analyte: 'Ferritin', value_num: 88, unit: 'ng/ml', ref_low: 30, ref_high: 300, flag: 'normal' };
   const zeile = health.resultEditRowMarkup(analyt);
-  assert.match(zeile, /data-result-edit="3"/, 'die Zeile traegt einen Stift');
-  assert.match(zeile, /common\.editNamed/, 'mit dem Objektnamen');
+  assert.match(zeile, /data-result-edit="3"/, 'die Zeile oeffnet den Wert');
+  // R23 S11b: DIE ZEILE OEFFNET - Analyt, Wert und Markierung sind der Knopf
+  // (`.list-row__main--interactive`), sein Name ist der Inhalt; kein Stift.
+  assert.match(zeile, /<li class="list-row health-results-row"[^>]*>\s*<button type="button" class="list-row__main list-row__main--interactive health-results-row__open" data-result-edit="3">\s*<span class="health-results-row__analyte">Ferritin<\/span>/);
+  assert.doesNotMatch(zeile, /data-lucide="pencil"|common\.editNamed/, 'kein Stift neben dem Papierkorb');
   assert.match(zeile, /data-result-del="3"/);
   const form = health.resultFormMarkup(analyt);
   assert.match(form, /id="res-analyte"[^>]*value="Ferritin"/, 'das Formular traegt den Bestand');
@@ -3506,6 +3636,8 @@ test('Faellige Dosis mit `health: read`: kein Buchungsknopf, aber die Ansage „
       const html = health.dueRowMarkup(dosis(), medikament(), null);
       assert.doesNotMatch(html, /data-dose-take|data-dose-skip/);
       assert.doesNotMatch(html, /<button/);
+      // Der Ring bleibt als Zeichen (R24, E10), nicht als Knopf.
+      assert.match(html, /<span class="health-dose__check check-ring check-ring--static" aria-hidden="true">/);
       // ZUSTAND BLEIBT ALS ZEICHEN: die Zeile sagt weiter, woran sie ist.
       assert.match(html, /<span class="health-dose__status">health\.meds\.status\.pending<\/span>/);
       assert.match(html, /Ibuprofen/);
@@ -3516,8 +3648,9 @@ test('Faellige Dosis mit `health: read`: kein Buchungsknopf, aber die Ansage „
     for (const stufe of ['read', 'write']) {
       withAccess({ health: stufe }, () => {
         const html = health.dueRowMarkup(dosis(), medikament(), { id: 5, status: 'taken' });
-        assert.match(html, /health-dose__status--taken/);
-        assert.match(html, /health\.meds\.status\.taken/);
+        // Eingenommen sagt der volle Ring vorn (R24, E10), benannt fuer die Hilfstechnik.
+        assert.match(html, /class="health-dose__check check-ring check-ring--static check-ring--done" role="img" aria-label="health\.meds\.status\.taken"/);
+        assert.doesNotMatch(html, /<button/);
       });
     }
   });
@@ -3605,7 +3738,13 @@ test('Befund-Detail mit `health: read`: kein Bearbeiten, die Tabelle steht volls
 
 test('Aktivitaetszeile: Bearbeiten weg, Strecke und Dauer bleiben', () => {
   const zeile = { id: 21, type: 'run', performed_at: '2026-06-14', duration_min: 45, distance_km: 8.2, calories: 510, note: 'Waldweg' };
-  assert.match(health.activityRowMarkup(zeile, true), /data-activity-edit="21"/);
+  const eigen = health.activityRowMarkup(zeile, true);
+  assert.match(eigen, /data-activity-edit="21"/);
+  // R23 (Critique G5 P2): DIE ZEILE OEFFNET - der Koerper ist der Knopf
+  // (`.list-row__main--interactive` streckt sich ueber die Zeile), kein Stift.
+  assert.match(eigen, /<li class="list-row health-activity-row">/);
+  assert.match(eigen, /<button type="button" class="list-row__main list-row__main--interactive health-activity-row__body" data-activity-edit="21">/);
+  assert.doesNotMatch(eigen, /row-action|data-lucide="pencil"/, 'kein Stift als einziges Ziel');
   const html = health.activityRowMarkup(zeile, false);
   assert.doesNotMatch(html, /data-activity-edit/);
   assert.doesNotMatch(html, /<button/);
@@ -3615,7 +3754,12 @@ test('Aktivitaetszeile: Bearbeiten weg, Strecke und Dauer bleiben', () => {
 
 test('Vorsorge-Zeile: Bearbeiten weg, Datum und Charge bleiben', () => {
   const zeile = { id: 33, given_on: '2026-03-02', dose_number: 2, provider: 'Dr. Meier', batch: 'X-42', note: 'gut vertragen' };
-  assert.match(health.preventionRowMarkup(zeile, true), /data-prevention-edit="33"/);
+  const eigen = health.preventionRowMarkup(zeile, true);
+  assert.match(eigen, /data-prevention-edit="33"/);
+  // R23 S11b: DIE ZEILE OEFFNET wie Trainings-Log und Messungen (S9) - der
+  // Koerper ist der Knopf, kein Stift am Ende.
+  assert.match(eigen, /<li class="list-row health-prevention-row"[^>]*>\s*<button type="button" class="list-row__main list-row__main--interactive health-prevention-row__body" data-prevention-edit="33">/);
+  assert.doesNotMatch(eigen, /row-action|data-lucide="pencil"/, 'kein Stift als einziges Ziel');
   const html = health.preventionRowMarkup(zeile, false);
   assert.doesNotMatch(html, /data-prevention-edit/);
   assert.doesNotMatch(html, /<button/);
@@ -3627,17 +3771,15 @@ test('Vorsorge-Zeile: Bearbeiten weg, Datum und Charge bleiben', () => {
 // Uebersicht
 // -------------------------------------------------------------------------
 
-test('Schnellerfassung der Uebersicht faellt bei `health: read` ganz weg', () => {
+test('Das Erfassen-Menue der Uebersicht faellt bei `health: read` ganz weg (R24 E9, vorher „Schnell erfassen")', () => {
   mitView('overview', { meId: 1, personId: 1, __reset: {} }, () => {
     withAccess({ health: 'write' }, () => {
-      const html = health.quickCaptureMarkup();
-      assert.match(html, /data-action="ov-add-vital"/);
-      assert.match(html, /data-action="ov-add-activity"/);
-      assert.match(html, /data-action="ov-go-meds"/);
+      const actions = health.overviewCaptureItems().map((item) => item.action);
+      assert.ok(actions.includes('ov-add-vital') && actions.includes('ov-add-activity') && actions.includes('ov-go-meds'), actions.join(','));
     });
     withAccess({ health: 'read' }, () => {
-      assert.equal(health.quickCaptureMarkup(), '',
-        'drei Knoepfe, die nur anlegen - es bleibt nichts zu zeigen');
+      assert.deepEqual(health.overviewCaptureItems(), [],
+        'Wege, die nur anlegen - es bleibt nichts anzubieten, der FAB geht');
     });
   });
 });
@@ -3730,7 +3872,11 @@ test('Zyklus-Kalender: die eigene Zelle bleibt ansagbar, die fremde bleibt verst
 
 test('Zyklus-Historie und -Fuss: Bearbeiten, Einfuhr und Einstellungen weg, der Export bleibt', () => {
   mitView('cycle', { meId: 1, personId: 1, periods: [periode()], logs: [], settings: {}, __reset: { periods: [], logs: [] } }, () => {
-    assert.match(health.cycleHistoryMarkup(true), /data-cycle-edit="55"/);
+    const eigen = health.cycleHistoryMarkup(true);
+    assert.match(eigen, /data-cycle-edit="55"/);
+    // R23 S11b: DIE ZEILE OEFFNET - Zeitraum und Dauer sind der Knopf.
+    assert.match(eigen, /<li class="list-row cycle-history__row">[\s\S]*?<button type="button" class="list-row__main list-row__main--interactive cycle-history__body" data-cycle-edit="55">/);
+    assert.doesNotMatch(eigen, /row-action|data-lucide="pencil"/, 'kein Stift als einziges Ziel');
     const historie = health.cycleHistoryMarkup(false);
     assert.doesNotMatch(historie, /data-cycle-edit/);
     assert.doesNotMatch(historie, /<button/);
@@ -3813,8 +3959,10 @@ test('READ_SAFE_ACTIONS ist eine Positivliste und enthaelt nur lesende Aktionen'
   // R16: dazu der dritte Tabwechsel (Kartentitel "Letzte Vitalwerte") und der
   // CSV-Export im Kopf - ein Download, der schon als Karte ohne Schreibrecht
   // offenstand (dort als blosse Links, deshalb ohne `data-action`).
-  assert.deepEqual(erlaubt, ['cancel', 'health-export', 'ov-go-cycle', 'ov-go-meds', 'ov-go-vitals'],
-    'Dialog schliessen, drei Tabwechsel und der Export-Dialog - alles andere dieser Seite schreibt');
+  // R24 (E9): `ov-go-meds` stand in der Karte „Schnell erfassen" - die ist weg,
+  // das Erfassen-Menue am FAB gibt es nur mit Schreibrecht.
+  assert.deepEqual(erlaubt, ['cancel', 'health-export', 'ov-go-cycle', 'ov-go-vitals'],
+    'Dialog schliessen, zwei Bereichswechsel und der Export-Dialog - alles andere dieser Seite schreibt');
 
   // Und die Gegenprobe gegen den Quelltext: JEDE andere `data-action` der Seite
   // ist damit gesperrt. Kaeme morgen eine dazu, waere sie es auch - das ist der
@@ -4356,7 +4504,8 @@ test('Erledigen: der Toast nimmt es zurueck - auf den VORHERIGEN Zeitpunkt, nich
   const anfragen = await mitHkApi(async () => {
     globalThis.window.yuvomi.showToast = (...args) => toasts.push(args);
     await withAccess({ housekeeping: 'write' }, () => hk.completeTask({ id: 3, last_completed: '2026-09-07T07:00:00Z' }, hkContainer()));
-    const undo = toasts.find((args) => args[0] === 'housekeeping.taskDoneToast')?.[3];
+    // Seit R24 nennt die Quittung die Arbeit (housekeeping.taskDoneNamed) und steht vor der Antwort.
+    const undo = toasts.find((args) => String(args[0]).startsWith('housekeeping.taskDoneNamed'))?.[3];
     assert.equal(typeof undo, 'function', 'der Erledigt-Toast traegt einen Rueckweg');
     await withAccess({ housekeeping: 'write' }, () => undo());
   });
@@ -4453,18 +4602,24 @@ test('Personal-Tab mit `housekeeping: read`: kein Bearbeiten, die Auswahl und da
   }
 });
 
-test('Bezahlen im Mehr-Knopf der Besuchszeile: nur wo der Server es zugesteht, nie gesperrt', () => {
+// R24 (G2-Haushaltshilfe-P2-2): Bezahlen ist die sichtbare Handlung der
+// Zeile (visitRowHtml), nicht mehr ein Menueeintrag - dieselbe Regel: nur wo
+// der Server es zugesteht, nie gesperrt, bei `read` gar nicht.
+test('Bezahlen in der Besuchszeile: nur wo der Server es zugesteht, nie gesperrt', () => {
   const offen = hkBesuch();
   const bezahlt = hkBesuch({ paid_at: '2026-08-07T10:00:00Z', can_mark_paid: false });
+  const zeile = (v) => hk.visitRowHtml(v, { dateText: 'x' });
   withAccess({ housekeeping: 'read' }, () => {
     assert.equal(hk.visitMenuHtml(offen, 'x'), '');
+    assert.doesNotMatch(zeile(offen), /data-pay-visit/);
     assert.equal(hk.visitMenuHtml(bezahlt, 'x'), '', 'der Zahlstatus steht in der Metazeile, nicht an einem Knopf');
   });
   withAccess({ housekeeping: 'write' }, () => {
-    assert.match(hk.visitMenuHtml(offen, 'x'), /data-pay-visit="12"/, 'mit Schreibrecht da');
-    assert.doesNotMatch(hk.visitMenuHtml(offen, 'x'), /disabled/, 'und offen');
-    // Der Server bietet das Bezahlen nicht an: der Eintrag fehlt.
-    assert.doesNotMatch(hk.visitMenuHtml(hkBesuch({ can_mark_paid: false }), 'x'), /data-pay-visit/);
+    assert.match(zeile(offen), /class="btn btn--secondary btn--sm housekeeping-visit-pay" data-pay-visit="12"/, 'mit Schreibrecht da');
+    assert.doesNotMatch(zeile(offen), /housekeeping-visit-pay"[^>]*disabled/, 'und offen');
+    assert.doesNotMatch(hk.visitMenuHtml(offen, 'x'), /data-pay-visit/, 'nicht zweimal');
+    // Der Server bietet das Bezahlen nicht an: der Knopf fehlt.
+    assert.doesNotMatch(zeile(hkBesuch({ can_mark_paid: false })), /data-pay-visit/);
     // Seit D6 auch am bezahlten Besuch kein gesperrter Knopf mehr: ein Eintrag
     // "Als bezahlt markieren" an einem bezahlten Besuch versprache nichts.
     assert.doesNotMatch(hk.visitMenuHtml(hkBesuch({ paid_at: '2026-08-07T10:00:00Z' }), 'x'), /data-pay-visit/);
@@ -4586,7 +4741,7 @@ test('Profil bei `housekeeping: read`: die Leseansicht zeigt jeden Wert des Bear
   const werte = [
     ['Ana Lopez', 'Ana Lopez'], ['ana.l', 'ana.l'], ['0151 2345', '0151 2345'],
     ['ana@example.org', 'ana@example.org'], ['1990-04-12', '1990-04-12'],
-    ['housekeeping.rateHourly', 'housekeeping.rateHourly'], ['value="14.5"', '14,50'],
+    ['housekeeping.rateHourly', 'housekeeping.rateHourly'], ['value="14,50"', '14,50'],
     ['housekeeping.scheduleTwiceMonthly', 'housekeeping.scheduleTwiceMonthly'],
     ['#12AB34', '#12AB34'], ['#FF8800', '#FF8800'], ['Schluessel beim Nachbarn', 'Schluessel beim Nachbarn'],
   ];
@@ -4619,7 +4774,7 @@ test('Besuch bei `housekeeping: read`: der Einsatzbericht zeigt jeden Wert des E
   });
   const werte = [
     ['2026-08-06', '2026-08-06'], ['value="135"', '135'], ['31,50', '31,50'],
-    ['value="4"', '4,00'], ['Beleg - Ana - 06.08.', 'Beleg - Ana - 06.08.'],
+    ['value="4,00"', '4,00'], ['Beleg - Ana - 06.08.', 'Beleg - Ana - 06.08.'],
   ];
 
   const [editor] = mitModal(() => withAccess({ housekeeping: 'write' }, () => hk.openVisitEditModal(stunden, hkContainer())));
@@ -5005,7 +5160,7 @@ test('Termin-Dialog: Anhang-Absagen des Servers kommen uebersetzt, der Entfernen
     'calendar.attachmentChangeRefused');
   assert.equal(calendar.calendarSaveErrorMessage(fehler({ error: 'Attaching a file needs write access to documents.', reason: 'ATTACHMENT_UPLOAD_REFUSED' })),
     'calendar.attachmentUploadRefused');
-  assert.equal(calendar.calendarSaveErrorMessage(fehler({ error: 'Titel fehlt' })), 'Titel fehlt', 'andere Meldungen wie bisher');
+  assert.equal(calendar.calendarSaveErrorMessage(fehler({ error: 'Titel fehlt' })), 'calendar.saveError', 'der Text des Servers nie (#1909)');
   assert.equal(calendar.calendarSaveErrorMessage(new Error('x')), 'calendar.saveError');
 
   const mit = { attachment_document_id: 12, attachment_name: 'befund.pdf' };
@@ -5255,8 +5410,11 @@ test('Kanon R5: der Lesedialog einer Notiz fuehrt "Bearbeiten" als Primaerknopf,
     const offen = mitEchtemMarkdown(() => withAccess({ notes: 'write' }, () => (
       modalOptionen(() => notes.openNoteModal({ mode: 'edit', note: notiz() }))
     )));
-    assert.match(offen.content, /<button type="button" class="btn btn--primary" id="note-modal-edit" data-reader-only>common\.edit<\/button>/);
-    assert.match(offen.content, /id="note-modal-delete"[^>]*>\s*<i data-lucide="trash-2"/, 'Loeschen als Textknopf mit Icon, links');
+    // R22 D20: Detail-Fuss-Kanon wie das Leseblatt der Kontakte - Bearbeiten
+    // gefuellt MIT Stift, Loeschen umrandet mit Wort (R24: EINE Loeschen-Form).
+    assert.match(offen.content, /<button type="button" class="btn btn--primary" id="note-modal-edit" data-reader-only>\s*<i data-lucide="pencil" class="icon-md" aria-hidden="true"><\/i><span class="btn__label">common\.edit<\/span>/);
+    assert.match(offen.content, /class="btn btn--danger-outline" id="note-modal-delete">\s*<i data-lucide="trash-2"/, 'Loeschen als umrandeter Textknopf mit Icon, links');
+    assert.doesNotMatch(offen.content, /id="note-modal-delete"[^>]*style=/, 'den Anfangsrand haelt .modal-panel__delete, kein Inline-Style');
     const neu = withAccess({ notes: 'write' }, () => modalOptionen(() => notes.openNoteModal({ mode: 'create' })));
     assert.doesNotMatch(neu.content, /note-modal-edit/, 'eine neue Notiz oeffnet im Editor - dort gibt es nichts umzuschalten');
   } finally {
@@ -5298,7 +5456,9 @@ test('Kanon R5: der Kanban-Statusknopf trifft auf --target-base, obwohl er 24px 
   assert.ok(flaeche, 'ohne ::before ist die 24px-Box die ganze Trefferflaeche');
   assert.match(flaeche.body, /content:\s*''/);
   assert.match(flaeche.body, /position:\s*absolute/);
-  assert.match(flaeche.body, /inset:\s*calc\(\(100% - var\(--target-base\)\) \/ 2\)/);
+  // Senkrecht auf --target-base; waagerecht etwas ueber die Kapsel hinaus,
+  // seit sie ihr Verb traegt (R24, G2-Aufgaben-P3-4) und breiter als hoch ist.
+  assert.match(flaeche.body, /inset-block:\s*calc\(\(100% - var\(--target-base\)\) \/ 2\)/);
 });
 
 // -------------------------------------------------------------------------
@@ -5401,4 +5561,70 @@ test('R8 H14: Dokument-Auswahl ist ein Auswahlkreis mit Objektnamen, keine nativ
     documentsPage.setContainerForTest(null);
     globalThis.document = echtesDocument;
   }
+});
+
+// R22, D7: Geburtstag und Kontakt verknuepfen.
+test('D7: der Import-Eintrag traegt das Kontakte-Zeichen, nicht download - er holt Menschen, keine Datei', () => {
+  withAccess({ calendar: 'write', contacts: 'read' }, () => {
+    const html = birthdays.importActionHtml();
+    // R23 S10: `book-user` (das Zeichen der Kontakte) statt `user-plus`.
+    assert.match(html, /book-user/);
+    assert.doesNotMatch(html, /"download"|data-lucide="download"/);
+  });
+});
+
+test('D7: der Dialog verknuepft nur mit Kontakte-Sicht und nie einen Mitglieder-Geburtstag', () => {
+  withAccess({ calendar: 'write', contacts: 'read' }, () => {
+    assert.equal(birthdays.mayLinkContacts({ id: 1 }), true);
+    assert.equal(birthdays.mayLinkContacts(null), true, 'auch beim Anlegen');
+    assert.equal(birthdays.mayLinkContacts({ id: 1, family_user_id: 3 }), false, 'Mitglieder haengen am Konto');
+  });
+  withAccess({ calendar: 'write', contacts: 'none' }, () => {
+    assert.equal(birthdays.mayLinkContacts({ id: 1 }), false, 'ohne Kontakte nur "Keiner" und ein 403');
+  });
+  const html = birthdays.contactLinkFieldHtml({ id: 1, contact_id: 7, contact_name: 'Mike <M>' });
+  assert.match(html, /<option value="7" selected>Mike &lt;M&gt;<\/option>/, 'der verknuepfte steht sofort, mit esc()');
+  assert.match(html, /aria-describedby="bd-contact-hint"/);
+});
+
+test('D7: der Hinweis "Ein Kontakt heisst genauso" nur mit Schreibrecht und nur unverknuepft', () => {
+  const vorschlag = { id: 1, name: 'Mike', birth_date: '1985-11-02', contact_id: null, suggested_contact_id: 7 };
+  const hinweis = (b) => birthdays.birthdayPaneSections(b).some((r) => r?.action?.id === 'birthday-detail-link');
+  withAccess({ calendar: 'write' }, () => {
+    assert.equal(hinweis(vorschlag), true);
+    assert.equal(hinweis({ ...vorschlag, contact_id: 7 }), false, 'verknuepft: kein Hinweis');
+    assert.equal(hinweis({ ...vorschlag, suggested_contact_id: undefined }), false);
+  });
+  withAccess({ calendar: 'read' }, () => {
+    assert.equal(hinweis(vorschlag), false, 'Nur-lesen: nichts zu tun, also keine Zeile');
+  });
+});
+
+test('D7/a3 Klein: das Datum im Detailkopf traegt sein Etikett', () => {
+  const head = birthdays.birthdayDetailHead({ id: 1, name: 'Mike', next_birthday: '2026-11-02', next_age: 41, days_until: 10 });
+  assert.match(head.subtitle, /^birthdays\.nextBirthdayOn/, 'zwei Daten untereinander, eins davon ohne Namen');
+});
+
+// R23 S10 (Critique G1 P3): "Weitere Angaben" im Geburtstag nennt seinen
+// Inhalt, und der Import aus den Kontakten traegt das Zeichen der Kontakte.
+test('R23: Geburtstag - der Aufklapper sagt, was drin ist; der Import zeigt das Kontakte-Zeichen', () => {
+  const src = readFileSync(new URL('../public/pages/birthdays.js', import.meta.url), 'utf8');
+  assert.match(src, /hint: birthdayAdvancedTopics\(mayLinkContacts\(birthday\)\)/);
+  const fn = src.slice(src.indexOf('function birthdayAdvancedTopics('), src.indexOf('function birthdayPreviewHtml('));
+  for (const key of ['newLabel.contacts', 'birthdays.nameDayLabel', 'birthdays.notesLabel', 'reminders.sectionTitle']) assert.ok(fn.includes(`t('${key}')`), key);
+  assert.match(fn, /new Intl\.ListFormat\(getLocale\(\)/);
+  assert.match(src, /\{ action: 'import-contacts', label: t\('birthdays\.importButton'\), icon: 'book-user' \}/);
+});
+
+// R23 G5-P2 (Ulas 25.10.): heisst ein Kontakt anders, hat aber denselben
+// Geburtstag wie ein Eintrag, legte der Haken im Import still eine zweite Zeile
+// an. Die Zeile fragt jetzt "Mit X verknuepfen?" und hat keinen Haken.
+test('R23 G5-P2: Importzeile mit Vorschlag fragt "Mit X verknuepfen?" statt anzulegen', () => {
+  const plain = { id: 4, name: 'Tante Ingrid', birthday: '1961-09-17', birthday_year_unknown: false, already_imported: false };
+  assert.match(birthdays.importCandidateRowHtml(plain), /type="checkbox" value="4"/, 'ohne Vorschlag: der Haken');
+  const html = birthdays.importCandidateRowHtml({ ...plain, suggested_birthday_id: 31, suggested_birthday_name: 'Ingrid <b>' });
+  assert.doesNotMatch(html, /type="checkbox"/, 'kein Haken, der eine zweite Zeile anlegt');
+  assert.match(html, /data-import-link="31" data-contact-id="4"/);
+  assert.match(html, /birthdays\.importLinkSuggest/);
+  assert.match(html, /birthdays\.linkContact/);
 });

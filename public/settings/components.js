@@ -1,8 +1,9 @@
 import { t } from '/i18n.js';
 import { moduleIconHTML } from '/nav-icons.js';
 import { esc } from '/utils/html.js';
-import { getReadableTextColor } from '/utils/color.js';
+import { getReadableTextColor, safeHexColor } from '/utils/color.js';
 import { formRowHtml } from '/utils/form-row.js';
+import { errorSentence } from '/utils/friendly-error.js';
 
 let settingRowIdCounter = 0;
 
@@ -54,6 +55,10 @@ export function createDisclosure({
   section.append(trigger, panel);
   return section;
 }
+
+// Die Erklaerung mit "Mehr dazu" ist seit R24 ein geteilter Baustein
+// (utils/hint-fold.js); die Einstellungen importieren ihn weiter von hier.
+export { hintFoldHtml } from '/utils/hint-fold.js';
 
 // Ein Schalter, eine Form. Vorher erfand jedes Blatt seine eigene: `toggle-row`,
 // `settings-toggle`, der iOS-Switch aus `toggle`/`toggle__track` und nackte
@@ -112,9 +117,10 @@ export function toggleRowHtml({
   // hat keine garantierte Tinte - dieselbe Rechnung macht der Avatar-Stack
   // (components/user-multi-select.js), und zwei Antworten auf dieselbe Frage
   // waeren genau die Spaltung, die #891 an drei Stellen aufgeraeumt hat.
-  const swatchHtml = swatchColor
+  const swatchHex = swatchColor ? safeHexColor(swatchColor) : null;
+  const swatchHtml = swatchHex
     ? `<span class="toggle-row__swatch" aria-hidden="true"`
-      + ` style="--swatch-color:${esc(String(swatchColor))};color:${getReadableTextColor(String(swatchColor))}">`
+      + ` style="--swatch-color:${swatchHex};color:${getReadableTextColor(swatchHex)}">`
       + `${esc(String(swatchLabel ?? ''))}</span>`
     : '';
   const labelClass = labelVisible ? '' : ' class="sr-only"';
@@ -164,7 +170,7 @@ export function bindInstantSwitch(input, { save, savedMessage, onRevert = () => 
     } catch (error) {
       input.checked = !value;
       onRevert(!value);
-      window.yuvomi?.showToast(error?.message || t('common.errorGeneric'), 'danger');
+      window.yuvomi?.showToast(errorSentence(error, 'settings.preferenceSaveFailed'), 'danger');
     } finally {
       if (input.isConnected) input.disabled = false;
     }
@@ -197,6 +203,7 @@ export function createToggleRow(options) {
  * @param {object} options
  * @param {string} options.label
  * @param {string|null} [options.labelFor]  id des Bedienelements - dann ist das Label ein `<label for>`
+ * @param {string} [options.labelExtra]  rohes HTML hinter dem Label, etwa `REQUIRED_MARK`
  * @param {string|null} [options.labelId]   id am Label, fuer `aria-labelledby` einer Gruppe
  * @param {string} [options.description]    Sekundaerzeile: ein Hinweis, der nur DIESE Zeile betrifft
  * @param {string|null} [options.descriptionId]
@@ -208,6 +215,7 @@ export function settingRowHtml({
   label,
   labelFor = null,
   labelId = null,
+  labelExtra = '',
   description = '',
   descriptionId = null,
   control = '',
@@ -226,7 +234,7 @@ export function settingRowHtml({
   // Masse des Blatts -, `form-row*` kommt dazu und bringt, was in der Zeile
   // steht: die randlose Auswahl, das Datum als Wert, das zusammengesetzte Feld.
   return formRowHtml({
-    label, labelFor, labelId, description, descriptionId, control, extra, stacked, field, className, attrs,
+    label, labelFor, labelId, labelExtra, description, descriptionId, control, extra, stacked, field, className, attrs,
     variant: 'settings-setting-row',
   });
 }
@@ -267,6 +275,60 @@ export function formSwitchRowHtml({ hint = '', hintId = null, ...toggle }) {
     + toggleRowHtml({ ...toggle, control: 'switch', attrs })
     + (hint ? `<p class="form-hint form-switch__hint"${attrsHtml({ id: hintId })}>${esc(String(hint))}</p>` : '')
     + '</div>';
+}
+
+/**
+ * EINE DATEIWAHL (Critique R23, D8, G6-2): die Ablagezone der Sicherung - ein
+ * grosses Label ueber dem versteckten `input[type=file]`, mit Ablage per Ziehen
+ * und der gewaehlten Datei darunter. Das native Feld ("Datei auswaehlen, keine
+ * ausgewaehlt") stand daneben als zweiter Dialekt. Texte laufen durch `esc()`.
+ *
+ * @param {{ id: string, inputId: string, accept: string, title: string, titleTouch?: string, hint?: string, icon?: string }} opts
+ */
+export function fileDropzoneHtml({ id, inputId, accept, title, titleTouch = title, hint = '', icon = 'upload-cloud' }) {
+  return `<label class="settings-backup-dropzone" id="${esc(id)}" for="${esc(inputId)}">`
+    + `<i data-lucide="${esc(icon)}" aria-hidden="true"></i>`
+    + `<span><span class="u-pointer-only">${esc(title)}</span><span class="u-touch-only">${esc(titleTouch)}</span></span>`
+    + (hint ? `<small>${esc(hint)}</small>` : '')
+    + '</label>'
+    + `<input class="sr-only" type="file" id="${esc(inputId)}" accept="${esc(accept)}" />`
+    + `<div class="settings-backup-file" data-dropzone-file="${esc(inputId)}" hidden></div>`;
+}
+
+/**
+ * Verdrahtet `fileDropzoneHtml`: Ziehen hebt die Zone hervor, Ablegen setzt die
+ * Datei ins Feld, und die gewaehlte Datei steht unter der Zone. `onFile(file|null)`
+ * bekommt jede Aenderung. Gibt `reset()` zurueck (nach `form.reset()` aufrufen).
+ */
+export function wireFileDropzone(root, inputId, { onFile = () => {}, describe = (file) => file.name } = {}) {
+  const input = root.querySelector(`#${inputId}`);
+  const dropzone = input?.previousElementSibling;
+  const selected = root.querySelector(`[data-dropzone-file="${inputId}"]`);
+  if (!input || !dropzone) return { reset() {} };
+  const show = (file) => {
+    if (selected) {
+      selected.hidden = !file;
+      selected.textContent = file ? describe(file) : '';
+    }
+    onFile(file ?? null);
+  };
+  input.addEventListener('change', () => show(input.files?.[0]));
+  dropzone.addEventListener('dragover', (event) => {
+    event.preventDefault();
+    dropzone.classList.add('settings-backup-dropzone--active');
+  });
+  dropzone.addEventListener('dragleave', () => dropzone.classList.remove('settings-backup-dropzone--active'));
+  dropzone.addEventListener('drop', (event) => {
+    event.preventDefault();
+    dropzone.classList.remove('settings-backup-dropzone--active');
+    const file = event.dataTransfer?.files?.[0];
+    if (!file) return;
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    input.files = transfer.files;
+    show(file);
+  });
+  return { reset: () => show(null) };
 }
 
 export function createSettingRow({ label, description, control }) {

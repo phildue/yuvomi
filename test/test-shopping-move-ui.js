@@ -128,7 +128,9 @@ async function speichere(values, antwort, { listen = null, vorDerAntwort = null 
 
 /** Der Dialog, in seine Formularzeilen zerlegt: das Paar Menge+Kategorie und was darauf folgt. */
 function zeilen(content) {
-  const [, erstesPaar, zweitesPaar] = content.split('<div class="form-pair">');
+  // Das erste Paar traegt seit R24 `--wide` (die Kategorie steht am Telefon
+  // nicht mehr in der halben Zeile).
+  const [, erstesPaar, zweitesPaar] = content.split(/<div class="form-pair(?: form-pair--wide)?">/);
   return { mengeKategorie: erstesPaar, preisLaden: zweitesPaar };
 }
 
@@ -169,6 +171,31 @@ test('Der Dialog sieht mit einer Liste aus wie mit mehreren - nur ohne die Zeile
 });
 
 
+test('Eine nur lesbar gespiegelte Liste steht nicht zur Wahl, die eigene schon (#2283)', () => {
+  zustand();
+  shopping.state.lists = [
+    ...LISTEN(),
+    { id: 3, name: 'Geteilt', item_total: 0, item_checked: 0, accepts_new_items: 0 },
+    { id: 4, name: 'Alt', item_total: 0, item_checked: 0 }, // ohne Feld: wie bisher waehlbar
+  ];
+  const zeile = oeffne().content;
+  assert.match(zeile, /<option value="2" >/);
+  assert.match(zeile, /<option value="4" >Alt<\/option>/);
+  assert.ok(!zeile.includes('value="3"'), 'die nur lesbare Liste wird als Ziel angeboten');
+
+  // Steht der Artikel schon auf ihr, bleibt sie gewaehlt und waehlbar.
+  shopping.state.activeListId = 3;
+  shopping.state.items = [item({ list_id: 3 })];
+  assert.match(oeffne().content, /<option value="3" selected>Geteilt<\/option>/);
+});
+
+test('Bleibt neben der eigenen keine waehlbare Liste, faellt die Zeile ganz weg (#2283)', () => {
+  zustand();
+  shopping.state.lists = [LISTEN()[0], { ...LISTEN()[1], accepts_new_items: 0 }];
+  const { content } = oeffne();
+  assert.ok(!content.includes('item-details-list'), 'eine Auswahl mit nur einer Moeglichkeit');
+});
+
 // -------------------------------------------------------------------------
 // Speichern
 // -------------------------------------------------------------------------
@@ -199,7 +226,7 @@ test('Andere Liste gewaehlt: list_id reist mit den uebrigen Feldern, der Artikel
   const [alt, neu] = shopping.state.lists;
   assert.deepEqual([alt.item_total, alt.item_checked], [1, 1]);
   assert.deepEqual([neu.item_total, neu.item_checked], [5, 0]);
-  assert.deepEqual(geschlossen, [{ force: true }], 'ohne Verwerfen-Rueckfrage');
+  assert.deepEqual(geschlossen, [{ force: true, context: 'test-modal-context' }], 'ohne Verwerfen-Rueckfrage');
   // Der Loader-Stub von t() haengt die Parameter an den Schluessel: gemessen
   // wird, WAS die Meldung nennt - den Artikel und die Zielliste, unmaskiert
   // (der Toast setzt textContent).

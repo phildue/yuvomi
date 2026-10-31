@@ -82,6 +82,14 @@
   min-height: var(--target-base);
 }
 
+/* Die Listen-Kapseln stehen im Kopf neben "..." und "+ Artikel" - am Zeiger
+ * ab 1024px dieselben 40px wie ihre Nachbarn (R22, D8; vorher 44). */
+@media (min-width: 1024px) and (hover: hover) {
+  .list-tab {
+    min-height: var(--target-md);
+  }
+}
+
 .list-tab:hover:not(.list-tab--active) {
   border-color: var(--color-text-secondary);
   color: var(--color-text-primary);
@@ -96,21 +104,29 @@
  * Die ~3.5:1 aus dem Absatz darüber galten vor den Familientönen (v2.1.0):
  * heute hält selbst der rohe Ton 5.04:1 hell und 4.82:1 dunkel, die
  * --tint-ink-Mischung 7.37:1 / 6.61:1. Der Ton darf deshalb wieder Tinte sein,
- * und der Zustand kommt aus der erhabenen Pille (tokens.css, Abschnitt 6c). */
+ * und der Zustand kommt aus der erhabenen Pille (tokens.css, Abschnitt 6c).
+ *
+ * SEIT R24 (E3) DIE FLAECHE DES AKTIVEN REITERS: die Listen-Kapseln sind
+ * Reiter (welche Liste), keine Ansichtswahl, und stehen direkt unter der
+ * Kuechen-Leiste - dort trug der aktive Reiter jetzt die getoente Kapsel, die
+ * Liste darunter noch den weissen Daumen mit Ring. Zwei Zustandsbilder
+ * uebereinander fuer dieselbe Frage. Jetzt dieselbe getoente Kapsel ohne Ring
+ * (sub-tabs.css, `.sub-tab--active`). */
 .list-tab--active {
-  background-color: var(--seg-active-bg);
-  box-shadow: var(--seg-active-shadow);
+  background-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-state), transparent);
+  box-shadow: none;
   border-color: transparent;
   color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-ink), var(--color-text-primary));
   font-weight: var(--font-weight-semibold);
 }
 
-/* Getönte Marke auf der Surface-Pille - gleiche Rechnung wie
- * .sub-tab--active .sub-tab__badge. Die frühere Umkehr (weiß auf Vollton)
- * wäre auf der hellen Pille eine weiße Marke auf Weiß. */
+/* Neutrale Marke auf der getoenten Kapsel - gleiche Rechnung wie
+ * .sub-tab--active .sub-tab__badge (R24, E3): eine Toenung auf der Toenung
+ * naennte den Modulton zweimal blass. Die fruehere Umkehr (weiss auf Vollton)
+ * waere eine weisse Marke auf heller Flaeche. */
 .list-tab--active .list-tab__count {
-  background-color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-state), transparent);
-  color: color-mix(in srgb, var(--module-accent, var(--color-accent)) var(--tint-ink), var(--color-text-primary));
+  background-color: var(--color-fill-well);
+  color: var(--color-text-primary);
 }
 
 .list-tab__count {
@@ -145,6 +161,15 @@
 @media (min-width: 1024px) {
   .list-tab__new {
     min-height: var(--target-base);
+  }
+}
+
+/* Am Zeiger mit den Kapseln auf --target-md (R22, D8, Regel bei `.list-tab`). */
+@media (min-width: 1024px) and (hover: hover) {
+  .list-tab__new {
+    width: var(--target-md);
+    height: var(--target-md);
+    min-height: var(--target-md);
   }
 }
 
@@ -213,20 +238,43 @@
   overflow-y: auto;
 }
 
-/* Name | Menge | Einheit auf einer Zeile, solange der Name seine 10rem hält.
- * Darunter rutschen Menge und Einheit gemeinsam in die zweite Zeile und teilen
- * sie sich - drei Spalten auf einem schmalen Telefon hätten den Namen auf
- * wenige Zeichen zusammengedrückt. Intrinsisch statt per Breakpoint, weil die
- * maßgebliche Breite die des Modals ist, nicht die des Viewports. */
+/* Name | Menge | Einheit | Lagerort auf einer Zeile, solange der Dialog sie
+ * traegt; darunter steht der Name allein oben und die drei Felder teilen sich
+ * die zweite Zeile (R23, D3: der Lagerort kam als viertes Feld dazu). Gefragt
+ * wird die Breite der LISTE, nicht die des Viewports - die massgebliche Breite
+ * ist die des Modals. Ein Raster statt Umbruch: mit vier Feldern brach die
+ * Flex-Zeile auf einem Telefon dreizeilig und jede Zeile anders. */
+.pantry-transfer__list {
+  container-type: inline-size;
+  container-name: pantry-transfer;
+}
+
 .pantry-transfer__row {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 5.5rem minmax(0, 8rem) minmax(0, 10rem);
   align-items: center;
   gap: var(--space-2);
 }
 
+@container pantry-transfer (max-width: 34rem) {
+  .pantry-transfer__row {
+    grid-template-columns: 4.5rem minmax(0, 1fr) minmax(0, 1.3fr);
+    row-gap: var(--space-1);
+  }
+
+  .pantry-transfer__name {
+    grid-column: 1 / -1;
+  }
+
+  /* Zwischen zwei Artikeln mehr Luft als zwischen Name und Feldern derselben
+   * Zeile - sonst liest sich der Name als Ueberschrift der Felder darueber. */
+  .pantry-transfer__row + .pantry-transfer__row {
+    padding-top: var(--space-2);
+    border-top: 1px solid var(--color-border-subtle);
+  }
+}
+
 .pantry-transfer__name {
-  flex: 1 1 10rem;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -234,24 +282,13 @@
 }
 
 .pantry-transfer__qty {
-  flex: 1 1 6rem;
   font-variant-numeric: tabular-nums;
-}
-
-.pantry-transfer__unit {
-  flex: 1 1 8rem;
-}
-
-/* Geometrie, Zielgröße und das eingekleidete Control kommen aus dem geteilten
- * .form-check (layout.css). Hier bleibt nur die Tinte: die Zeile ist eine
- * Nebenoption unter der Artikel-Liste, kein Formularfeld auf Augenhöhe. */
-.pantry-transfer__clear {
-  color: var(--color-text-secondary);
 }
 
 .shopping-import-meals-form {
   display: grid;
-  gap: var(--space-3);
+  /* Feldtakt des Dialogs (layout.css "EIN FELDTAKT IM DIALOG"). */
+  gap: var(--space-4);
 }
 
 /* Der mobile Kopf und seine vierte Ausbaustufe eines Umbruch-Managements sind
@@ -371,9 +408,17 @@
  * braucht, kennt keine Zahl in diesem Blatt. Fest ist nur der Knopf. */
 .quick-add__form {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr) var(--target-base);
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr) auto;
   gap: var(--space-2);
   align-items: stretch;
+  /* EINE HOEHE FUER FELDER UND KNOPF (R24 S14). Die Felder trugen eine
+   * Mindesthoehe UND ihr Polster obendrauf, der Knopf nur seine: am Finger
+   * 50px Name neben 48px Menge, Kategorie und "Hinzufuegen", am Zeiger 41,5
+   * neben 40. Jetzt nennt die Zeile ihre Hoehe einmal - die Zielgroesse der
+   * Geraetewelt (`--target-base`: 48 am Finger), am Zeiger die 40px der Shell
+   * (unten) -, die Felder tragen kein Polster in der Hoehe, und der Knopf
+   * nimmt dieselbe statt der seines Bausteins. */
+  --quick-add-height: var(--target-base);
 }
 
 .quick-add__input-wrap {
@@ -390,17 +435,18 @@
    * Polster der Schnellzeile. */
   font-size: var(--text-base);
   transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
-  min-height: var(--target-base);
+  min-height: var(--quick-add-height);
+  padding-block: 0;
 }
 
 /* DER FOKUS IST DIE EINE STIMME (R18, 2026-10-07): die Felder der
  * Schnellzeile zogen ihren Fokus aus dem Kuechenton (Orange). Seit D5 kommt er
  * mit der Haut aus page-search.css - violett wie jede Suche. */
 
-/* Nur `min-height`, keine `height` (#1372). Die Zeile ist ein Grid mit
- * `align-items: stretch`: Namensfeld und Kategorie wachsen mit ihrem Polster
- * auf 50px, und eine feste Hoehe nahm die Menge als einziges Feld aus der
- * Dehnung - sie stand 6px niedriger daneben (44 gegen 50 bei 1280px).
+/* Nur `min-height`, keine `height` (#1372): eine feste Hoehe nahm die Menge
+ * als einziges Feld aus der Dehnung des Grids - sie stand 6px niedriger
+ * daneben (44 gegen 50 bei 1280px). Seit R24 S14 tragen alle drei Felder
+ * dieselbe Mindesthoehe ohne Polster in der Hoehe (`--quick-add-height`).
  *
  * Seitlich `--space-2` statt `--space-3`: der Inhalt steht mittig und ist kurz,
  * das gesparte Polster geht an den Platzhalter. Reicht die Breite trotzdem
@@ -414,7 +460,8 @@
   font-variant-numeric: tabular-nums;
   text-align: center;
   text-overflow: ellipsis;
-  min-height: var(--target-base);
+  min-height: var(--quick-add-height);
+  padding-block: 0;
 }
 
 
@@ -429,7 +476,8 @@
    * darunter (wie `select.input` in layout.css). */
   text-overflow: ellipsis;
   cursor: pointer;
-  min-height: var(--target-base);
+  min-height: var(--quick-add-height);
+  padding-block: 0;
   /* Das Zeichen der Auswahl wie am Feldkanon (select.form-input, layout.css). */
   -webkit-appearance: none;
   appearance: none;
@@ -449,8 +497,11 @@
   .quick-add__form {
     /* Das Namensfeld behaelt die Haelfte, Menge und Kategorie teilen sich den
      * Rest wieder 2:3. Hier stand fuer die Menge eine feste Spur von 80px: der
-     * Platzhalter passte in 12 von 24 Sprachen nicht hinein („Quantit", #1372). */
-    grid-template-columns: minmax(0, 5fr) minmax(0, 2fr) minmax(0, 3fr) var(--target-base);
+     * Platzhalter passte in 12 von 24 Sprachen nicht hinein („Quantit", #1372).
+     * DIE KATEGORIE BEHAELT IHR WORT (R22 S9, Critique a2): in der ersten der
+     * zwei Spalten (1280) blieben ihr 116px, „Sonstig..." - die Untergrenze
+     * 8.5rem traegt „Sonstiges" samt Chevron, das Namensfeld gibt dafuer nach. */
+    grid-template-columns: minmax(0, 5fr) minmax(0, 2fr) minmax(8.5rem, 3fr) auto;
   }
 
   .quick-add__input-wrap {
@@ -462,29 +513,26 @@
   .quick-add__cat   { font-size: var(--text-base); }
 }
 
-.quick-add__btn {
-  width: var(--target-base);
-  height: var(--target-base);
-  border-radius: var(--radius-full);
-  /* EIN PLUS, UND ES GEHOERT DER PILLE (Re-Critique 2026-09-28, A4 P2-4).
-   * Hier stand ein gefuellter Kreis in der Stimme mit "+" - am Zeiger direkt
-   * unter der angedockten Kopf-Pille "+ Artikel", die dasselbe tut (sie
-   * fokussiert dieses Feld). Zwei violette Plus fuer eine Absicht. Der
-   * Absender ist jetzt die ruhige Return-Glyphe wie in Erinnerungen: wer
-   * tippt, drueckt Enter; der Knopf bleibt fuer Maus und Touch da. */
-  background-color: transparent;
-  color: var(--color-text-secondary);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: none;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: background-color var(--transition-fast);
-  min-height: var(--target-lg);
+/* AM ZEIGER IN DER HOEHE DER SHELL (R24, Critique G3-Einkauf-P3-1): drei
+ * gefuellte 50px-Kapseln (44 Mindesthoehe plus Polster) standen unter einem
+ * Kopf, dessen Felder und Knoepfe 40px messen. Die Fingergroesse bleibt dem
+ * Touch-Fall, wo das Feld per FAB aufgeht. */
+@media (hover: hover) {
+  .quick-add__form {
+    --quick-add-height: var(--target-md);
+  }
 }
 
-.quick-add__btn:hover { background-color: var(--color-surface-2); color: var(--color-text-primary); }
+/* DER ABSENDER IST EIN RUHIGER KNOPF MIT WORT (R24, Critique G3-Einkauf-P3-1).
+ * Bis R24 eine nackte Return-Glyphe im 44px-Kreis (Re-Critique 2026-09-28: das
+ * „+" gehoert der Kopf-Pille). Jetzt `btn--secondary btn--sm` mit „Hinzufuegen":
+ * kein zweites Plus, keine zweite gefuellte Stimme, und das Ziel nennt seine
+ * Handlung. Die Haut kommt vom Knopf-Baustein, die Hoehe von der Zeile. */
+.quick-add .quick-add__btn {
+  align-self: center;
+  min-height: var(--quick-add-height);
+  white-space: nowrap;
+}
 
 /* Autocomplete-Dropdown */
 .autocomplete-dropdown {
@@ -617,17 +665,20 @@
   gap: var(--space-3);
 }
 
-.shopping-page .list-group {
-  gap: var(--space-1);
+/* DIE ERSTE GRUPPE STEHT NICHT AN DER KANTE (R22 D15). Am Finger begann der
+ * Kopf „Obst & Gemuese" 0px unter der Haarlinie des Kuechenkopfs (121 ->
+ * 121) - halb verdeckt, waehrend Vorrat, Rezepte und Aufgaben 12-16px Luft
+ * lassen. Dieselbe Stufe wie der Gruppenabstand dieser Seite. Mit Zeiger und
+ * bei offener Schnellzeile steht diese darueber und bringt ihre Luft mit
+ * (`.quick-add`, unten --space-3). */
+@media (hover: none) {
+  .shopping-page:not(.shopping-page--adding) .list-scroller {
+    padding-block-start: var(--space-3);
+  }
 }
 
-/* EINE GRUPPE OHNE ZEILEN STEHT IM DOM UND NICHT IM BILD (#1816). Abgehaktes
- * wandert in den Abschnitt am Listenende; die Kategorie, die dabei leer wird,
- * behaelt ihren Traeger fuer den Rueckweg, und der Abschnitt selbst wartet
- * leer auf den ersten Haken. `.list-group` setzt `display: grid` und schluege
- * das UA-`[hidden]` (test:hidden-cascade). */
-.shopping-page .list-group[hidden] {
-  display: none;
+.shopping-page .list-group {
+  gap: var(--space-1);
 }
 
 /* DER KOPF VON „ABGEHAKT" IST EIN VOLLES ZIEL (#1816, DESIGN.md: --target-base).
@@ -680,6 +731,43 @@
   display: contents;
 }
 
+/* Lange Listen rechnen nur, was in Sicht ist (Critique R21 S8; dieselbe Regel
+ * wie die Agenda in calendar.css) - NUR in der einen Spalte. Ab 60rem verteilen
+ * Spalten bzw. Masonry die Kategorien nach ihrer Hoehe, und Platzhalterhoehen
+ * liessen Gruppen beim Scrollen die Spalte wechseln (derselbe Grund, aus dem
+ * die Notizen ohne die Regel bleiben). */
+@container shopping-surface (width < 60rem) {
+  @supports (content-visibility: auto) and (contain-intrinsic-size: auto none auto 1px) {
+    .shopping-page .items-lanes > .list-group + .list-group {
+      content-visibility: auto;
+      contain-intrinsic-size: auto none auto 125px;
+      overflow-clip-margin: var(--space-2);
+    }
+  }
+}
+
+/* UND IN DER KATEGORIE ERST AB ZEILE 20 (Critique R22, D4/D22): die erste
+ * Kategorie steht oben ganz, und am Desktop (Spalten) gilt die Gruppenregel
+ * gar nicht - 150 Artikel rechneten dort jede Zeile. Die ersten 19 Zeilen einer
+ * Kategorie stehen immer; der Rest haelt seine Content-Box (48px in jeder
+ * Breite gemessen, 390 bis 1920 - die Haarlinie ist der Rand der Zeile). Weil
+ * der Platzhalter die echte Hoehe IST, wechselt in den Spalten keine Kategorie
+ * beim Scrollen die Spalte; deshalb gilt diese Regel auch ab 60rem. Die Zeile
+ * ist selbst `overflow: hidden` (Wischbuehne). */
+/* Dieselbe Content-Box traegt der Platzhalter einer Zeile, die beim ersten
+ * Aufbau erst nach dem Bild kommt (Critique R22-F, F2.1; utils/row-fill.js,
+ * list-row.css) - ohne @supports, er gilt in jedem Browser. */
+.shopping-page .items-lanes > .list-group .row-carrier {
+  --row-pending-size: 48px;
+}
+
+@supports (content-visibility: auto) and (contain-intrinsic-size: auto none auto 1px) {
+  .shopping-page .items-lanes > .list-group .row-carrier > .swipe-row:nth-child(n+20) {
+    content-visibility: auto;
+    contain-intrinsic-size: auto none auto 48px;
+  }
+}
+
 @container shopping-surface (min-width: 60rem) {
   /* Die Kategorie kappt weiter ueber `--page-measure` (list-row.css) - hier
    * ist das Mass die Spalte selbst, wie im Liste-+-Detail-Baustein. */
@@ -696,6 +784,37 @@
   .shopping-page .items-lanes > .list-group {
     break-inside: avoid;
     margin-block-end: var(--space-3);
+  }
+
+  /* Der eingefrorene Spaltenumbruch (shopping.js, freezeLanes; R23 D13): die
+   * zweite Spalte beginnt dort, wo sie beim Laden begann, und der Ausgleich
+   * schiebt beim Abhaken keine Kategorie mehr hinueber. */
+  .shopping-page .items-lanes.is-frozen > .list-group[data-lane-break] {
+    break-before: column;
+  }
+
+  /* IN DEN SPALTEN RECHNET NUR, WAS IN SICHT IST - MIT DER ECHTEN HOEHE
+   * (Critique R22-F, F2.2). Die Gruppenregel der einen Spalte (oben) fehlt
+   * hier, weil ein geschaetzter Platzhalter Kategorien beim Scrollen die Spalte
+   * wechseln liess. So rechnete jede Aenderung die ganzen Spalten neu: gemessen
+   * am Laptop bei 4x CPU 26 ms je kleinem Anlass, 35-46 ms je Happen beim
+   * Aufbau, 370-400 ms der Wechsel in den Einkauf.
+   *
+   * Jetzt merkt sich jede Kategorie ihre GEZEICHNETE Hoehe (`auto`, die Zahl
+   * dahinter gilt nie: sie ist vor dem Aufschieben schon einmal ganz gelegt),
+   * und aufgeschoben wird erst, wenn die Huelle `is-sized` traegt - shopping.js
+   * setzt das nach dem ersten gezeichneten Bild jedes Aufbaus. Gemessen: Lage
+   * und Spalte jeder Kategorie unveraendert, auch ueber den ganzen Bildlauf,
+   * und 13 statt 26 ms je kleinem Anlass. */
+  .shopping-page .items-lanes > .list-group {
+    contain-intrinsic-size: auto none auto 125px;
+  }
+
+  @supports (content-visibility: auto) and (contain-intrinsic-size: auto none auto 1px) {
+    .shopping-page .items-lanes.is-sized > .list-group + .list-group {
+      content-visibility: auto;
+      overflow-clip-margin: var(--space-2);
+    }
   }
 
   /* Die Eingabezeile endet mit der ersten Spalte statt mitten in der zweiten. */
@@ -994,13 +1113,10 @@
 }
 
 /* Klickbare Link-Vorschau im Detail-Drawer. */
-/* Die Listen-Zeile im Bearbeiten-Dialog (#1700) steht zwischen Feldgruppen,
- * die ihren Abstand selbst mitbringen (`.form-group`, --space-4 darunter). Der
- * Traeger der Formularzeile hat keinen - ohne diesen stiesse "Preis" direkt
- * an sie an. */
-.item-details-form .form-rows {
-  margin-block-end: var(--space-4);
-}
+/* Den Takt des Bearbeiten-Dialogs setzt `.form-stack` (layout.css, EIN
+ * FELDTAKT IM DIALOG): seit R24 steht dort neben Feldern, Paar und Listenzeile
+ * auch "Weitere Angaben", und mit Margen je Feld klebte dessen Kante an der
+ * Kategorie (0px gemessen). Die Marge der Listenzeile (#1700) ist damit weg. */
 
 .item-details__link-wrap:not(:empty) {
   margin-top: var(--space-2);

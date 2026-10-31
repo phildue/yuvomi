@@ -1,9 +1,20 @@
-import { op, jsonBody, idParam, stringPathParam } from '../helpers.js';
+import { op, jsonBody, idParam, stringPathParam, withCaseReasons } from '../helpers.js';
 
 const apiError = (description) => ({
   description,
   content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
 });
+
+/**
+ * Das Vorkommen im Pfad (#2034): Format A, die alte Tagesform wird weiter
+ * angenommen. Eine Beschreibung fuer alle vier Routen.
+ */
+const RECURRENCE_ID_PARAM = 'Original occurrence, as the calendar reads return it in `recurrence_id`: '
+  + '`YYYY-MM-DD` (all-day), `YYYY-MM-DDTHH:MM:SSZ` (original start in UTC) or `YYYY-MM-DDTHH:MM:SS` '
+  + '(floating wall time), URL-encoded. The former date-only form `YYYY-MM-DD` is still accepted for a timed '
+  + 'series with its earlier meaning; when it matches two occurrences (the night of a clock change) the answer '
+  + 'is 409 with reason `ambiguous_recurrence_id`.';
+const AMBIGUOUS_RECURRENCE_ID = apiError('A date-only recurrence_id matches two occurrences (reason `ambiguous_recurrence_id`); send the exact recurrence_id');
 
 /**
  * Gilt fuer POST und PUT gleich (#1364), deshalb einmal: ein Offset wird
@@ -24,7 +35,7 @@ const ATTACHMENT_RIGHTS = ' A new attachment creates a document in the Documents
 // Ein Serienende vor dem Start (#1607). Steht an POST und PUT, weil beide es
 // abweisen - und PUT nur dann, wenn die Anfrage die Serie anfasst.
 const SERIES_END_INPUT = ' A `recurrence_rule` whose `UNTIL` day lies before the start day is rejected with 400 '
-  + '(`recurrence_rule: the series ends before the start date.`); an `UNTIL` on the start day is a series with one '
+  + '(`recurrence_rule: the series ends before the start date.`, `reason: calendar_series_ends_before_start`); an `UNTIL` on the start day is a series with one '
   + 'occurrence and is accepted. PUT checks this only when the request changes the rule or the start day, so an '
   + 'imported series that already carries such a rule stays editable; the start day is compared as the household calendar '
   + 'day, so sending the wall-clock form of a stored instant is not a change. For an event with a time zone of its own, whose '
@@ -37,13 +48,18 @@ const DATETIME_INPUT = ' `start_datetime` and `end_datetime` take the forms of `
   + 'stored as `2026-09-21T18:00`). For an all-day event only the date of such a value counts. Up to v2.68.0 '
   + 'the offset was dropped and its digits kept as wall-clock time.';
 
+// Mehrere Standard-Personen (#1897): dieselbe Eingabe fuer Abo-POST und -PATCH.
+const DEFAULT_ASSIGNEES_INPUT = 'Optional `default_assignee_user_ids`: household members every event newly imported from the '
+  + 'subscription is assigned to (#1897), the first one primary; or the earlier form `default_assignee_user_id` with one person '
+  + 'or null. The answer carries both, the single field holding the first person.';
+
 export function calendarPaths() {
-  return {
+  return withCaseReasons('calendar', CASE_REASONS, {
     '/api/v1/calendar': {
       get: op({
         summary: 'List calendar events',
         tag: 'Calendar',
-        description: 'Events generated from the birthdays module carry `birthday_name` and `birthday_date`. Their `title` is stored in the household data language (see `language` in `/preferences`), so API consumers, the ICS feed and calendar sync all read the same wording; clients that display in a different language can re-render the title from `birthday_name`. While the household has the birthdays module switched off (`disabled_modules` in `/preferences`), these events are left out of this list, of `/calendar/upcoming`, of `/calendar/search` and of the ICS feed; a single one stays reachable by id, and the birthdays routes keep answering.',
+        description: 'Events generated from the birthdays module carry `birthday_name` and `birthday_date` (null for a birthday whose year is unknown, `year_unknown` on the birthday). Their `title` is stored in the household data language (see `language` in `/preferences`), so API consumers, the ICS feed and calendar sync all read the same wording; clients that display in a different language can re-render the title from `birthday_name`. While the household has the birthdays module switched off (`disabled_modules` in `/preferences`), these events are left out of this list, of `/calendar/upcoming`, of `/calendar/search` and of the ICS feed; a single one stays reachable by id, and the birthdays routes keep answering.',
         responses: {
           200: {
             description: 'Calendar events',
@@ -92,10 +108,10 @@ export function calendarPaths() {
     '/api/v1/calendar/apple/mirrored-events': { delete: op({ summary: 'Delete locally mirrored Apple events', tag: 'Calendar', admin: true, stateChanging: true }) },
     '/api/v1/calendar/subscriptions': {
       get: op({ summary: 'List ICS subscriptions', tag: 'Calendar' }),
-      post: op({ summary: 'Create ICS subscription', tag: 'Calendar', stateChanging: true, requestBody: jsonBody(null) }),
+      post: op({ summary: 'Create ICS subscription', tag: 'Calendar', stateChanging: true, requestBody: jsonBody(null), description: DEFAULT_ASSIGNEES_INPUT }),
     },
     '/api/v1/calendar/subscriptions/{id}': {
-      patch: op({ summary: 'Update ICS subscription', tag: 'Calendar', params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
+      patch: op({ summary: 'Update ICS subscription', tag: 'Calendar', params: [idParam()], stateChanging: true, requestBody: jsonBody(null), description: DEFAULT_ASSIGNEES_INPUT }),
       delete: op({ summary: 'Delete ICS subscription', tag: 'Calendar', params: [idParam()], stateChanging: true }),
     },
     '/api/v1/calendar/subscriptions/{id}/sync': {
@@ -106,6 +122,7 @@ export function calendarPaths() {
         summary: 'Import events from an ICS file or shared calendar feed as editable local events',
         tag: 'Calendar',
         stateChanging: true,
+        description: 'Response: { data: { imported, skipped, assigned, total } }. `assigned` (#1940) counts events that already existed and got at least one of the chosen people added; they are also counted in `skipped`.',
         requestBody: jsonBody('#/components/schemas/CalendarImportInput'),
       }),
     },
@@ -121,12 +138,42 @@ export function calendarPaths() {
       get: op({
         summary: 'List local calendars',
         tag: 'Calendar',
-        description: 'Feed URLs and tokens are included only for administrators. `uploads_to_icloud` is true on the default calendar while the legacy Apple Calendar connection is configured: its events upload to iCloud, events in other local calendars stay local.',
+        description: 'Feed URLs and tokens are included only for administrators. `uploads_to_icloud` is true on the default calendar while the legacy Apple Calendar connection is configured: its events upload to iCloud, events in other local calendars stay local. Beside `data` (the local calendars) the answer carries `sources`: every calendar the caller can pick for the calendar tile of the overview, under the keys `GET /dashboard` takes as `events_calendar` - own calendars first in their managed order, then synced calendars that hold an appointment the caller may see and the ICS subscriptions the caller sees (shared or own), sorted by name.',
+        responses: {
+          200: {
+            description: 'Local calendars and the catalogue of selectable calendars',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['data', 'sources'],
+                  properties: {
+                    data: { type: 'array', items: { type: 'object', additionalProperties: true } },
+                    sources: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        required: ['key', 'name', 'color'],
+                        properties: {
+                          key: { type: 'string', pattern: '^(local|cal|sub):[1-9][0-9]{0,14}$', description: '`local:<id>`, `cal:<id>` or `sub:<id>`' },
+                          name: { type: 'string' },
+                          color: { type: ['string', 'null'] },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          401: { $ref: '#/components/responses/Unauthorized' },
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
       }),
       post: op({
         summary: 'Create local calendar',
         tag: 'Calendar',
-        description: 'Requires write access to the calendar module.',
+        description: 'Requires write access to the calendar module. An empty name or one longer than 80 characters returns 400 with `reason: calendar_name_invalid` and `params: { limit }`.',
         stateChanging: true,
         responses: {
           201: { description: 'Local calendar created' },
@@ -142,7 +189,7 @@ export function calendarPaths() {
       patch: op({
         summary: 'Reorder local calendars',
         tag: 'Calendar',
-        description: 'Requires calendar write access. Supply every current calendar ID exactly once in `order`; all sort_order values are updated atomically to consecutive values starting at zero. An incomplete, duplicate or stale list returns 400 without changes.',
+        description: 'Requires calendar write access. Supply every current calendar ID exactly once in `order`; all sort_order values are updated atomically to consecutive values starting at zero. An incomplete, duplicate or stale list returns 400 without changes; a list of distinct IDs that no longer matches the current calendars carries `reason: calendar_order_changed`.',
         stateChanging: true,
         requestBody: jsonBody('#/components/schemas/LocalCalendarReorderInput'),
       }),
@@ -151,7 +198,7 @@ export function calendarPaths() {
       put: op({
         summary: 'Update local calendar',
         tag: 'Calendar',
-        description: 'Requires write access to the calendar module.',
+        description: 'Requires write access to the calendar module. An empty name or one longer than 80 characters returns 400 with `reason: calendar_name_invalid` and `params: { limit }`; an unknown calendar returns 404 with `reason: calendar_calendar_not_found`.',
         params: [idParam()],
         stateChanging: true,
         responses: {
@@ -167,7 +214,7 @@ export function calendarPaths() {
       delete: op({
         summary: 'Delete local calendar and reassign events to the default calendar',
         tag: 'Calendar',
-        description: 'Requires calendar write access. An active feed link also requires admin access.',
+        description: 'Requires calendar write access. An active feed link also requires admin access: otherwise 403 with `reason: calendar_feed_admin_only`. An unknown calendar returns 404 with `reason: calendar_calendar_not_found`.',
         params: [idParam()],
         stateChanging: true,
         responses: {
@@ -190,7 +237,7 @@ export function calendarPaths() {
       get: op({
         summary: 'List selectable sync targets for the event editor',
         tag: 'Calendar',
-        description: 'Available to every authenticated user (#618). Returns `{ data: { google: [{ id, summary, defaultAssigneeUserId }], caldav: [{ accountId, accountName, calendarUrl, calendarName, defaultAssigneeUserId }], outlook: [{ accountId, accountName, calendarId, calendarName }] } }`, pre-filtered to enabled (and, for Google, writable) calendars. `defaultAssigneeUserId` is the default assignee set on that calendar (#459), or null; the event editor reads it backwards to pick the calendar of the person a new event is assigned to (#1060). Carries no credentials, server URLs, or usernames - account management stays admin-only. A provider that cannot be reached yields an empty list instead of failing the request.',
+        description: 'Available to every authenticated user (#618). Returns `{ data: { google: [{ id, summary, defaultAssigneeUserIds, defaultAssigneeUserId }], caldav: [{ accountId, accountName, calendarUrl, calendarName, defaultAssigneeUserIds, defaultAssigneeUserId }], outlook: [{ accountId, accountName, calendarId, calendarName }] } }`, pre-filtered to enabled and writable calendars (#1840: for CalDAV a calendar whose `current-user-privilege-set` grants neither `all`, `write` nor `bind` is left out; a server that does not report privileges counts as writable). POST/PUT /calendar refuse such a calendar as a new `target_caldav_calendar_url` with 400; an event whose stored target became read-only later can still be edited with that target unchanged, and waits locally. `defaultAssigneeUserIds` are the default assignees set on that calendar (#459, #1897), in the order chosen; the event editor reads them backwards to pick the calendar whose people are exactly the people a new event is assigned to (#1060). `defaultAssigneeUserId` carries the person only when there is exactly one, otherwise null. Carries no credentials, server URLs, or usernames - account management stays admin-only. A provider that cannot be reached yields an empty list instead of failing the request.',
       }),
     },
     '/api/v1/calendar/caldav/accounts': {
@@ -210,7 +257,13 @@ export function calendarPaths() {
       delete: op({ summary: 'Delete CalDAV account', tag: 'Calendar', admin: true, params: [idParam()], stateChanging: true }),
     },
     '/api/v1/calendar/caldav/accounts/{id}/calendars': {
-      get: op({ summary: 'List calendars for a CalDAV account', tag: 'Calendar', admin: true, params: [idParam()] }),
+      get: op({
+        summary: 'List calendars for a CalDAV account',
+        tag: 'Calendar',
+        admin: true,
+        description: 'Each calendar carries `writable` (#1840): true when it takes new events, false when it is shared read-only, null when the server does not say (treated as writable). The value is read from `current-user-privilege-set` on every listing and sync run. A read-only calendar can still be enabled for reading; it is not offered as a target, and nothing is uploaded to it. `waitingUploads` counts the local events that name the calendar as their target and have not been uploaded yet - for a read-only calendar these never arrive until they get another calendar. With `?refresh=true` the answer comes from the server and carries `writable` but no `waitingUploads`.',
+        params: [idParam()],
+      }),
       patch: op({ summary: 'Enable or disable a CalDAV calendar', tag: 'Calendar', admin: true, params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
     },
     '/api/v1/calendar/caldav/sync': {
@@ -220,8 +273,14 @@ export function calendarPaths() {
       get: op({ summary: 'Get CalDAV event sync status', tag: 'Calendar' }),
     },
     '/api/v1/calendar/caldav/accounts/{id}/reminder-lists': {
-      get: op({ summary: 'List reminder lists for a CalDAV account', tag: 'Calendar', admin: true, params: [idParam()] }),
-      patch: op({ summary: 'Enable/disable a CalDAV reminder list and target module', tag: 'Calendar', admin: true, params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
+      get: op({
+        summary: 'List reminder lists for a CalDAV account',
+        tag: 'Calendar',
+        admin: true,
+        description: 'Each list carries `writable` (#1840, same meaning as on the calendars of the account) and, when read from the database, `waitingUploads`: for a list mapped to tasks the local tasks that name it as their target, for a list mapped to shopping the local items of its shopping list. A read-only list is still read, is not offered in `GET /tasks/sync-targets`, and nothing is uploaded to it.',
+        params: [idParam()],
+      }),
+      patch: op({ summary: 'Enable/disable a CalDAV reminder list, set its target module and default assignees', tag: 'Calendar', admin: true, params: [idParam()], stateChanging: true, requestBody: jsonBody(null), description: 'Body: { listUrl, enabled?, targetModule?, defaultAssigneeUserIds? }. `defaultAssigneeUserIds` (#1221): household members a task gets when the sync first imports it from this list (the first one primary); an existing task keeps its assignment, including an empty one, and nothing goes back to the server. Only for a list mapped to tasks. `GET` returns them per list as `defaultAssigneeUserIds`.' }),
     },
     '/api/v1/calendar/caldav/reminders/sync': {
       post: op({ summary: 'Run CalDAV reminders sync', tag: 'Calendar', admin: true, stateChanging: true }),
@@ -270,7 +329,7 @@ export function calendarPaths() {
         tag: 'Calendar',
         params: [
           idParam('seriesId', 'Recurring series ID'),
-          stringPathParam('recurrenceId', 'Original occurrence date in YYYY-MM-DD format'),
+          stringPathParam('recurrenceId', RECURRENCE_ID_PARAM),
         ],
         stateChanging: true,
         description: 'Creates or updates a linked replacement for one original slot of an eligible local-only series. Scalar fields, assignments, attachments, and `reminder_offsets` are compared with the expanded series defaults. Saving no actual difference restores the normal series occurrence only when a linked replacement existed for that slot; a slot excluded by a deletion or detached replacement remains excluded.' + ATTACHMENT_RIGHTS,
@@ -284,6 +343,7 @@ export function calendarPaths() {
           401: { $ref: '#/components/responses/Unauthorized' },
           403: { $ref: '#/components/responses/Forbidden' },
           404: apiError('Calendar series not found'),
+          409: AMBIGUOUS_RECURRENCE_ID,
           500: { $ref: '#/components/responses/InternalServerError' },
         },
       }),
@@ -292,7 +352,7 @@ export function calendarPaths() {
         tag: 'Calendar',
         params: [
           idParam('seriesId', 'Recurring series ID'),
-          stringPathParam('recurrenceId', 'Original occurrence date in YYYY-MM-DD format'),
+          stringPathParam('recurrenceId', RECURRENCE_ID_PARAM),
         ],
         stateChanging: true,
         description: 'Deletes a linked replacement when present and keeps an EXDATE on the master so the original slot remains suppressed.',
@@ -302,6 +362,7 @@ export function calendarPaths() {
           401: { $ref: '#/components/responses/Unauthorized' },
           403: { $ref: '#/components/responses/Forbidden' },
           404: apiError('Calendar series not found'),
+          409: AMBIGUOUS_RECURRENCE_ID,
           500: { $ref: '#/components/responses/InternalServerError' },
         },
       }),
@@ -312,7 +373,7 @@ export function calendarPaths() {
         tag: 'Calendar',
         params: [
           idParam('seriesId', 'Recurring series ID'),
-          stringPathParam('recurrenceId', 'Original occurrence date in YYYY-MM-DD format'),
+          stringPathParam('recurrenceId', RECURRENCE_ID_PARAM),
         ],
         stateChanging: true,
         description: 'Truncates the original series before the selected original slot, creates a successor series, transfers every later exclusion except the selected slot, and reparents later linked replacements atomically.' + ATTACHMENT_RIGHTS,
@@ -331,7 +392,7 @@ export function calendarPaths() {
           403: { $ref: '#/components/responses/Forbidden' },
           404: apiError('Calendar series not found'),
           409: {
-            description: 'Linked occurrence replacements require exact-count orphan confirmation',
+            description: 'Linked occurrence replacements require exact-count orphan confirmation, or a date-only recurrence_id matches two occurrences (reason `ambiguous_recurrence_id`)',
             content: { 'application/json': { schema: { $ref: '#/components/schemas/CalendarOverrideOrphanConflict' } } },
           },
           500: { $ref: '#/components/responses/InternalServerError' },
@@ -342,7 +403,7 @@ export function calendarPaths() {
         tag: 'Calendar',
         params: [
           idParam('seriesId', 'Recurring series ID'),
-          stringPathParam('recurrenceId', 'Original occurrence date in YYYY-MM-DD format'),
+          stringPathParam('recurrenceId', RECURRENCE_ID_PARAM),
         ],
         stateChanging: true,
         description: 'Truncates immediately before the selected original slot, removes later linked replacements, and preserves later exclusions. Selecting the first slot deletes the whole series.',
@@ -352,6 +413,7 @@ export function calendarPaths() {
           401: { $ref: '#/components/responses/Unauthorized' },
           403: { $ref: '#/components/responses/Forbidden' },
           404: apiError('Calendar series not found'),
+          409: AMBIGUOUS_RECURRENCE_ID,
           500: { $ref: '#/components/responses/InternalServerError' },
         },
       }),
@@ -406,14 +468,64 @@ export function calendarPaths() {
       post: op({ summary: 'Reset external calendar event to source state', tag: 'Calendar', params: [idParam()], stateChanging: true }),
     },
     '/api/v1/calendar/{id}/exceptions': {
-      post: op({ summary: 'Exclude a single occurrence of a recurring event (EXDATE)', tag: 'Calendar', params: [idParam()], stateChanging: true, requestBody: jsonBody(null) }),
+      post: op({ summary: 'Exclude a single occurrence of a recurring event (EXDATE)', tag: 'Calendar', params: [idParam()], stateChanging: true, requestBody: jsonBody(null), description: 'Body: { recurrence_id } - the occurrence as the calendar reads return it (see the `recurrenceId` path parameter of the occurrence routes for the three forms). The former body { date: `YYYY-MM-DD` } is still accepted with its earlier meaning. The exact key of the matched occurrence is stored and returned as `exception_date` and `recurrence_id`. A key that names no occurrence of the series answers 400 with reason `invalid_recurrence_id`; a date that matches two occurrences (the night of a clock change) answers 409 with reason `ambiguous_recurrence_id`. Up to v2.78.0 any well-formed date was stored unchecked.' }),
     },
     '/api/v1/calendar/external-calendars': {
-      patch: op({ summary: 'Set the default assignee of an external calendar', tag: 'Calendar', admin: true, stateChanging: true, requestBody: jsonBody(null), description: 'Body: { source, external_id, default_assignee_user_id }. Events arriving from that calendar are assigned to this member. Without it the first batch of a newly enabled calendar came in unassigned and had to be filled in by hand (#730). The sync only refreshes name and colour on conflict, so the assignment set here stays.' }),
+      patch: op({ summary: 'Set the default assignees of an external calendar', tag: 'Calendar', admin: true, stateChanging: true, requestBody: jsonBody(null), description: 'Body: { source, external_id, default_assignee_user_ids } - or the earlier form `default_assignee_user_id` with one person or null. Response: { data: { source, external_id, default_assignee_user_ids, default_assignee_user_id } }, the single field carrying the first person. Events arriving from that calendar are assigned to these members (#1897), the first one primary. An event moved to another calendar of the same account follows to that calendar\'s people while its assignment is still exactly the people of the calendar it came from. Without it the first batch of a newly enabled calendar came in unassigned and had to be filled in by hand (#730). The sync only refreshes name and colour on conflict, so the assignment set here stays.' }),
     },
     '/api/v1/calendar/external-calendars/default-assignee-backfill': {
-      get: op({ summary: 'Count imported events a default-assignee backfill would fill', tag: 'Calendar', admin: true, description: 'Query: `moved_after` (optional) - the `moved_next` of the previous page. Response: { data: { count, token, moved, moved_total, moved_offset, moved_next } }. `count` counts already imported events from calendars of every account that carry a default assignee and are not assigned to anyone yet (#1154). `token` fingerprints exactly that set - which events, and which person each would get - and is meant to be sent back as `expected_token` (#1171). `moved` lists, one entry per event, events whose only assignee is still the untouched default assignee of another calendar of the same account (same provider; for CalDAV the same account), in a calendar with a different default assignee, never edited in Yuvomi and not pushed out (#1307): { event_id, title, start_datetime, all_day, calendar_name, from_user_id, from_name, to_user_id, to_name }. Only events the requesting admin may see under the calendar visibility rule are listed, counted or changed (no admin bypass, as everywhere in the calendar); `count` and `token` only count and name no event, as before. The list comes in pages of at most 5000 entries, oldest start first: `moved_total` counts all, `moved_offset` those before this page, and `moved_next` is the cursor for the next page (null on the last), so a page left entirely unticked does not hide the ones after it. Such an event may have been moved between calendars before the move started carrying the assignment along, or it may sit in a calendar whose default assignee was changed later; the data cannot tell the two apart, so these events are not part of `count` and change only when picked one by one.' }),
-      post: op({ summary: 'Apply default assignees to already imported events', tag: 'Calendar', admin: true, stateChanging: true, requestBody: jsonBody(null), description: 'Body: { expected_count, expected_token?, moves? } - the count and the token the confirmation was based on; when the candidate set changed since, the call answers 409 with { data: { count, token, moved, moved_total, moved_offset, moved_next } } (the first page) and changes nothing. With `expected_token` a change of the same size is caught as well (an event assigned by hand while a new import takes its place, or a calendar switched to another person); without it only the count is compared (#1171). `moves` is the list of `moved` entries the admin picked, each as { event_id, from_user_id, to_user_id } exactly as listed, each event at most once and at most 5000 entries, as many as the preview lists; a longer list answers 400 with a message naming the limit (#1307); each entry is checked on its own against the same rule and visibility as the preview, without loading the list and without needing a page, and an entry that does not match that way also answers 409. Without `moves` no existing assignment is changed. Only the confirmed candidate list and the picked moves are processed, each event re-checked when written, so `assigned` can be lower than expected if events changed in the meantime. Response: { data: { assigned } }. Runs in batches so a long history does not block other requests; inherited reminders whose time has passed are marked dismissed. A default assignee only reaches events imported after it was set. This one-off action assigns it to the events already imported from that calendar, across all accounts, but only where an event is not assigned to anyone yet: an assignment made by hand is left alone (#1154). It cannot tell a never-assigned event from one whose assignment was removed by hand. ICS subscriptions are not included.' }),
+      get: op({ summary: 'Count imported events a default-assignee backfill would fill', tag: 'Calendar', admin: true, description: 'Query: `moved_after` (optional) - the `moved_next` of the previous page. Response: { data: { count, token, moved, moved_total, moved_offset, moved_next } }. `count` counts already imported events from calendars of every account that carry a default assignee and are not assigned to anyone yet (#1154). `token` fingerprints exactly that set - which events, and which person each would get - and is meant to be sent back as `expected_token` (#1171). `moved` lists, one entry per event, events whose assignees are still exactly the untouched default assignees of another calendar of the same account (same provider; for CalDAV the same account), in a calendar with different default assignees, never edited in Yuvomi and not pushed out (#1307): { event_id, title, start_datetime, all_day, calendar_name, from_user_ids, from_names, to_user_ids, to_names, from_user_id, from_name, to_user_id, to_name } - the single fields carry the first person and all names joined (#1897). Only events the requesting admin may see under the calendar visibility rule are listed, counted or changed (no admin bypass, as everywhere in the calendar); `count` and `token` only count and name no event, as before. The list comes in pages of at most 5000 entries, oldest start first: `moved_total` counts all, `moved_offset` those before this page, and `moved_next` is the cursor for the next page (null on the last), so a page left entirely unticked does not hide the ones after it. Such an event may have been moved between calendars before the move started carrying the assignment along, or it may sit in a calendar whose default assignee was changed later; the data cannot tell the two apart, so these events are not part of `count` and change only when picked one by one.' }),
+      post: op({ summary: 'Apply default assignees to already imported events', tag: 'Calendar', admin: true, stateChanging: true, requestBody: jsonBody(null), description: 'Body: { expected_count, expected_token?, moves? } - the count and the token the confirmation was based on; when the candidate set changed since, the call answers 409 with { data: { count, token, moved, moved_total, moved_offset, moved_next } } (the first page) and changes nothing. With `expected_token` a change of the same size is caught as well (an event assigned by hand while a new import takes its place, or a calendar switched to another person); without it only the count is compared (#1171). `moves` is the list of `moved` entries the admin picked, each as { event_id, from_user_ids, to_user_ids } exactly as listed (the earlier form { event_id, from_user_id, to_user_id } still works for one person), each event at most once and at most 5000 entries, as many as the preview lists; a longer list answers 400 with a message naming the limit (#1307); each entry is checked on its own against the same rule and visibility as the preview, without loading the list and without needing a page, and an entry that does not match that way also answers 409. Without `moves` no existing assignment is changed. Only the confirmed candidate list and the picked moves are processed, each event re-checked when written, so `assigned` can be lower than expected if events changed in the meantime. Response: { data: { assigned } }. Runs in batches so a long history does not block other requests; inherited reminders whose time has passed are marked dismissed. A default assignee only reaches events imported after it was set. This one-off action assigns it to the events already imported from that calendar, across all accounts, but only where an event is not assigned to anyone yet: an assignment made by hand is left alone (#1154). It cannot tell a never-assigned event from one whose assignment was removed by hand. ICS subscriptions are not included.' }),
     },
-  };
+  });
 }
+
+// #1909: die Faelle, die ein Nutzer erreicht, tragen einen `reason` neben dem
+// `error` - je Operation der Satz, der sie nennt.
+const NOT_OWNER = '`not_owner` (403, without the module\'s `*_edit_others` capability only events you created or are assigned to can be changed or deleted - R23)';
+const EVENT_GONE = '`calendar_event_not_found` (404, the event does not exist or is not visible to the caller)';
+const SERIES_GONE = '`calendar_series_not_found` (404, the series does not exist or is not visible to the caller)';
+const SELECTED_CALENDAR_GONE = '`calendar_selected_calendar_not_found` (400, the `local_calendar_id` names a local calendar that no longer exists)';
+const SERIES_CASES = '`calendar_series_no_occurrence` (400, the `recurrence_rule` has no occurrence on or after the start date), '
+  + '`calendar_series_ends_before_start` (400, its `UNTIL` lies before the start day)';
+// Die Verwaltung der eigenen Kalender und die Liste der Sync-Ziele brauchen
+// Schreibzugriff auf den Kalender (#2267) - ein Leser bekommt sie nicht.
+const CALENDAR_WRITE_REQUIRED = '`cross_module_access` (403, the caller has no write access to the calendar module - for API tokens a `calendar:write` scope)';
+// Personen einer Quelle (#1897, #1221, #1940): dieselbe Pruefung fuer alle fuenf Routen.
+const ASSIGNEE_REASONS = '`calendar_assignee_invalid` (400, not a list of user ids), `calendar_assignee_unknown` (400, a user id names no account), `calendar_assignee_not_member` (400, a person who is not a household member; people already stored on the source stay valid)';
+
+const CASE_REASONS = {
+  '/api/v1/calendar/calendars': { post: CALENDAR_WRITE_REQUIRED },
+  '/api/v1/calendar/calendars/reorder': { patch: CALENDAR_WRITE_REQUIRED },
+  '/api/v1/calendar/calendars/{id}': { put: CALENDAR_WRITE_REQUIRED, delete: CALENDAR_WRITE_REQUIRED },
+  '/api/v1/calendar/sync-targets': { get: CALENDAR_WRITE_REQUIRED },
+  '/api/v1/calendar/external-calendars': { patch: ASSIGNEE_REASONS },
+  '/api/v1/calendar/subscriptions': { post: ASSIGNEE_REASONS },
+  '/api/v1/calendar/subscriptions/{id}': { patch: ASSIGNEE_REASONS },
+  '/api/v1/calendar/import': { post: ASSIGNEE_REASONS },
+  '/api/v1/calendar/caldav/accounts/{id}/reminder-lists': {
+    patch: `${ASSIGNEE_REASONS}, \`reminder_list_assignee_not_tasks\` (400, default assignees for a list mapped to shopping)`,
+  },
+  '/api/v1/calendar': { post: `${SELECTED_CALENDAR_GONE}, ${SERIES_CASES}` },
+  '/api/v1/calendar/{id}': {
+    get: EVENT_GONE,
+    put: `${NOT_OWNER}, ${EVENT_GONE}, ${SELECTED_CALENDAR_GONE}, ${SERIES_CASES}`,
+    delete: `${NOT_OWNER}, ${EVENT_GONE}`,
+  },
+  '/api/v1/calendar/{seriesId}/occurrences/{recurrenceId}': {
+    put: `${NOT_OWNER}, ${SERIES_GONE}`,
+    delete: `${NOT_OWNER}, ${SERIES_GONE}`,
+  },
+  '/api/v1/calendar/{seriesId}/occurrences/{recurrenceId}/following': {
+    put: `${NOT_OWNER}, ${SERIES_GONE}, ${SELECTED_CALENDAR_GONE}, `
+      + '`empty_successor_series` (400, the successor series has no occurrence on or after its start date)',
+    delete: `${NOT_OWNER}, ${SERIES_GONE}`,
+  },
+  '/api/v1/calendar/{id}/reset': { post: EVENT_GONE },
+  '/api/v1/calendar/{id}/exceptions': {
+    post: `${NOT_OWNER}, ${EVENT_GONE}, `
+      + '`malformed_recurrence_id` (400, `recurrence_id` or `date` is not an occurrence key), '
+      + '`invalid_recurrence_id` (400, the key names no occurrence of this series), '
+      + '`ambiguous_recurrence_id` (409, a date-only key matches two occurrences)',
+  },
+};

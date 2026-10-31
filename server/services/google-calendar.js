@@ -30,9 +30,10 @@ import {
   configuredHouseholdTimeZone, householdTimeZone, isValidTimeZone, localToUTCPrecise,
 } from '../utils/timezone.js';
 import { localDayEndUtc, utcStamp } from '../utils/rrule-until.js';
-import { authoredAfterInbound, outboundEvent } from './outbound-dtstart.js';
+import { authoredAfterInbound, outboundEvent, outboundRecurrenceRule } from './outbound-dtstart.js';
 import { alignmentMoved, googleReading, isEcho, sentSnapshot } from './outbound-echo.js';
-import { assignDefaultToEvent, reassignDefaultOnCalendarMove } from './sync-assignment.js';
+import { assignNewOverride, calendarDefaultAssignees, reassignDefaultOnCalendarMove } from './sync-assignment.js';
+import { assigneeFields, readAllDefaultAssignees } from './default-assignees.js';
 import { countSourceEvents, deleteSourceEvents } from './calendar-prune.js';
 import { readSyncOutcome, withSyncOutcome } from './sync-outcome.js';
 import { rruleValue } from './recurrence.js';
@@ -159,7 +160,87 @@ function isCurrentRefreshToken(token) {
  * "neu verbinden". Durchgereicht landet sie in withReauthGuard.
  */
 function passOnRefusal(err) {
-  if (isInvalidGrant(err)) throw err;
+  if (isInvalidGrant(err) || err instanceof GoogleConnectionReplacedError) throw err;
+}
+
+// --------------------------------------------------------
+// Abgelöste Verbindung mitten im Lauf (#2035)
+// Neu verbinden und Trennen laufen außerhalb der google-Sperre: das OAuth-
+// Callback soll nicht auf einen langen Sync warten, und disconnect() ist
+// synchron. Ein Durchgang, der gerade auf Google wartet, arbeitet danach mit dem
+// Client der alten Verbindung weiter. Er hört deshalb selbst auf, sobald das
+// gespeicherte Refresh-Token nicht mehr seines ist: keine weitere Anfrage an das
+// alte Konto, kein Import, keine Buchung, kein syncToken, kein Ergebnis in der
+// Statuszeile der neuen Verbindung.
+// --------------------------------------------------------
+
+class GoogleConnectionReplacedError extends Error {
+  constructor() {
+    super('Google connection was replaced while the run was in progress.');
+    this.name = 'GoogleConnectionReplacedError';
+    // Der Ausgang gehört zu einer Verbindung, die es nicht mehr gibt (sync-outcome.js).
+    this.superseded = true;
+  }
+}
+
+// Die Ressourcen, über die Sync und Sofortversuch mit Google sprechen.
+const GUARDED_RESOURCES = new Set(['events', 'calendarList', 'colors']);
+
+/**
+ * Bindet einen Kalender-Client an die Verbindung, für die er gebaut wurde. Jede
+ * Anfrage prüft vor dem Absenden und nach der Antwort, ob das gespeicherte
+ * Refresh-Token noch das des Clients ist; sonst wirft sie
+ * GoogleConnectionReplacedError, auch statt eines Fehlers von Google, damit kein
+ * Handler ihn als Fehlversuch einer Vormerkung verbucht. Nach der Prüfung folgt
+ * bis zum Schreiben kein await mehr.
+ *
+ * Das Token des Clients zieht der `tokens`-Listener bei einer Rotation mit; eine
+ * Attrappe ohne Auth-Client (Suiten) gilt mit dem Token beim Start.
+ * @returns {{ calendar: object, assertCurrent: () => void }}
+ */
+function bindToConnection(calendar) {
+  const startToken = cfgGet('google_refresh_token');
+  // Gleichheit statt isCurrentRefreshToken: eine Attrappe, die ohne gespeichertes
+  // Token startet (Suiten), bleibt bei "kein Token" gültig. Ein echter Client
+  // entsteht nie ohne (loadAuthorizedClient wirft).
+  const assertCurrent = () => {
+    if (cfgGet('google_refresh_token') !== (refreshTokenOf(calendar) ?? startToken)) {
+      throw new GoogleConnectionReplacedError();
+    }
+  };
+  const wrapResource = (resource) => new Proxy(resource, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop);
+      if (typeof value !== 'function') return value;
+      return async (...args) => {
+        assertCurrent();
+        let result;
+        try {
+          result = await value.apply(target, args);
+        } catch (err) {
+          assertCurrent();
+          throw err;
+        }
+        assertCurrent();
+        return result;
+      };
+    },
+  });
+  // Kein Proxy um den Kalender selbst: googleapis legt `events` & Co. als nicht
+  // konfigurierbare Eigenschaften an, die ein Proxy unverändert liefern müsste.
+  // Das Objekt erbt alles Übrige (`context` für refreshTokenOf) vom Original.
+  const bound = Object.create(calendar);
+  for (const name of GUARDED_RESOURCES) {
+    const resource = calendar[name];
+    if (resource && typeof resource === 'object') {
+      Object.defineProperty(bound, name, { value: wrapResource(resource) });
+    }
+  }
+  return { calendar: bound, assertCurrent };
+}
+
+function logSuperseded(what) {
+  log.info(`${what} stopped: the Google connection was replaced or removed while it was running.`);
 }
 
 /** Das Refresh-Token, das ein OAuth2-Client (oder der Kalender darüber) gerade trägt. */
@@ -291,16 +372,30 @@ function pendingDeletionCount() {
 }
 
 /**
+ * Fehlerregel und Stopp für die Handler in calendar-outbound.js (#2136): eine
+ * Absage für das ganze Konto (Ratenlimit, Kontingent, 5xx, Netz) verbraucht
+ * keinen Versuch und hält den Durchgang an.
+ */
+function googleRefusal(stop) {
+  return { failureAction: outbound.googleFailureAction, onWait: (refusal) => stop.trip(refusal) };
+}
+
+/**
  * Arbeitet die vorgemerkten Löschungen bei Google ab.
  * @param {import('googleapis').calendar_v3.Calendar} calendar
+ * @param {{stop?: object}} [scope] Stoppsignal des Durchgangs
+ *   (`createRefusalStop`, #2136); Löschen und Ändern teilen sich eines.
  * @returns {Promise<number>} erledigte Tombstones
  */
-async function processPendingDeletions(calendar) {
+async function processPendingDeletions(calendar, { stop = outbound.createRefusalStop() } = {}) {
   const rows = outbound.pendingDeletions('google');
   if (rows.length === 0) return 0;
 
   let done = 0;
   for (const row of rows) {
+    // Nach einer kontoweiten Absage in diesem Durchgang geht keine Anfrage
+    // mehr an Google; der Auftrag bleibt ohne Versuch für den nächsten.
+    if (stop.blocks()) continue;
     try {
       await calendar.events.delete({
         calendarId: row.calendar_external_id,
@@ -310,9 +405,10 @@ async function processPendingDeletions(calendar) {
       done++;
     } catch (err) {
       passOnRefusal(err);
-      // 404/410 zählen als erledigt (bei Google bereits weg), alles andere
-      // wandert in den Retry bis zum gemeinsamen Versuchslimit.
-      if (outbound.handleDeletionError(err, row, 'Google')
+      // 404/410 zählen als erledigt (bei Google bereits weg), eine kontoweite
+      // Absage wartet, alles andere wandert in den Retry bis zum gemeinsamen
+      // Versuchslimit.
+      if (outbound.handleDeletionError(err, row, 'Google', googleRefusal(stop))
           && outbound.classifyOutboundError(err) === 'settled') {
         done++;
       }
@@ -331,9 +427,10 @@ function pendingUpdateCount() {
  * @param {import('googleapis').calendar_v3.Calendar} calendar
  * @param {Record<string,string>} colorMap
  * @param {Map} metaCache
+ * @param {{stop?: object}} [scope] Stoppsignal des Durchgangs (#2136)
  * @returns {Promise<number>} erfolgreich gepushte Events
  */
-async function processPendingUpdates(calendar, colorMap = {}, metaCache = new Map()) {
+async function processPendingUpdates(calendar, colorMap = {}, metaCache = new Map(), { stop = outbound.createRefusalStop() } = {}) {
   const events = outbound.pendingUpdates('google');
   if (events.length === 0) return 0;
 
@@ -354,25 +451,43 @@ async function processPendingUpdates(calendar, colorMap = {}, metaCache = new Ma
   `);
 
   const handleError = (err, event, what, giveUp) =>
-    outbound.handleUpdateError(err, event, what, 'Google', giveUp);
+    outbound.handleUpdateError(err, event, what, 'Google', giveUp, googleRefusal(stop));
 
   // Ein gescheiterter Metadaten-Abruf ist kein Kalender ohne Schreibrecht:
   // calendarList.get scheitert auch an Netz, Token-Refresh oder Ratenlimit. Eine
   // deshalb verworfene Vormerkung erreichte Google nie, und kein Inbound brächte den
   // Unterschied zurück. Es gilt dieselbe Regel wie für einen gescheiterten Aufruf:
   // verworfen wird nur bei 404/410 (nicht mehr zugänglich), 400 oder verbrauchten
-  // Versuchen. `now` ist der nachgeladene Stand, dessen Zähler gilt.
+  // Versuchen. `now` ist der nachgeladene Stand, dessen Zähler gilt. Eine
+  // kontoweite Absage kommt hier nicht mehr an (`refusedForAccount`).
   // @returns {boolean} true, wenn der Termin auf den nächsten Lauf wartet
   const waitsForMeta = (now, calendarId) => {
     const err = metaFailure(metaCache, calendarId);
-    if (!err || outbound.outboundFailureAction(err, now.outbound_attempts) !== 'retry') return false;
+    if (!err || outbound.googleFailureAction(err, now.outbound_attempts) !== 'retry') return false;
     outbound.failOutbound(now.id);
     log.warn(`Calendar metadata for ${calendarId} is unavailable, outbound work for event ${now.id} stays queued (attempt ${now.outbound_attempts + 1}):`, err.message);
     return true;
   };
 
+  // Scheiterte der Metadaten-Abruf an einer Absage für das ganze Konto
+  // (Ratenlimit, 5xx, Netz), wartet der Termin ohne Versuch, und der Durchgang
+  // hält an (#2136) - gleich, ob der Termin inzwischen anders vorgemerkt ist.
+  // @returns {boolean} true, wenn der Durchgang damit anhält
+  const refusedForAccount = (calendarId, eventId) => {
+    const err = metaFailure(metaCache, calendarId);
+    if (!err || !outbound.isGoogleAccountWideRefusal(err)) return false;
+    stop.trip(err);
+    log.warn(`Calendar metadata for ${calendarId} was refused for the whole account, outbound work for event ${eventId} waits without using up an attempt:`, err.message);
+    return true;
+  };
+
   let done = 0;
   for (const event of events) {
+    // Je Termin, nicht einmal je Liste: nach der ersten kontoweiten Absage geht
+    // aus diesem Durchgang keine Anfrage mehr an Google (#2136). Jede Absage
+    // weiter unten beendet ihren Termin mit `continue`, deshalb genügt die
+    // Probe hier vor der ersten Anfrage des nächsten.
+    if (stop.blocks()) continue;
     let calendarId = googleCalendarIdForEvent(event);
     let eventId    = event.external_calendar_id;
     if (!calendarId) {
@@ -382,6 +497,7 @@ async function processPendingUpdates(calendar, colorMap = {}, metaCache = new Ma
     }
 
     const meta = await loadCalendarMeta(calendar, calendarId, metaCache);
+    if (!meta && refusedForAccount(calendarId, event.id)) continue;
     if (!isWritableRole(meta?.role ?? null)) {
       const now = outbound.reloadEvent(event.id);
       if (!now) continue; // parallel gelöscht - der Tombstone-Pfad übernimmt
@@ -399,6 +515,7 @@ async function processPendingUpdates(calendar, colorMap = {}, metaCache = new Ma
     const moveTo = event.outbound_move_to;
     if (moveTo && moveTo !== calendarId) {
       const destMeta = await loadCalendarMeta(calendar, moveTo, metaCache);
+      if (!destMeta && refusedForAccount(moveTo, event.id)) continue;
       if (!isWritableRole(destMeta?.role ?? null)) {
         const now = outbound.reloadEvent(event.id);
         if (!now) continue; // parallel gelöscht - der Tombstone-Pfad übernimmt
@@ -435,6 +552,9 @@ async function processPendingUpdates(calendar, colorMap = {}, metaCache = new Ma
           // gewähltes Ziel ist ein neuer Umzug, der mit diesem nicht fallen darf.
           const now = outbound.reloadEvent(event.id);
           if (now?.outbound_move_to === moveTo) handleError(err, now, 'move', clearMove);
+          // Ohne Urteil über den Termin hält eine kontoweite Absage den
+          // Durchgang trotzdem an (#2136).
+          else if (outbound.isGoogleAccountWideRefusal(err)) stop.trip(err);
           continue;
         }
       }
@@ -497,16 +617,24 @@ async function runFlushOutbound(createCalendar) {
   const hasUpdates   = pendingUpdateCount() > 0;
   if (!hasDeletions && !hasUpdates) return idle;
 
-  return withReauthGuard((track) =>
-    runFlushWith(() => track(createCalendar()), hasDeletions, hasUpdates));
+  try {
+    return await withReauthGuard((track) =>
+      runFlushWith(() => track(createCalendar()), hasDeletions, hasUpdates));
+  } catch (err) {
+    if (!(err instanceof GoogleConnectionReplacedError)) throw err;
+    logSuperseded('Outbound pass');
+    return idle;
+  }
 }
 
 async function runFlushWith(createCalendar, hasDeletions, hasUpdates) {
-  const calendar = createCalendar();
+  const { calendar } = bindToConnection(createCalendar());
   await ensureAccessToken(calendar);
-  const deleted = hasDeletions ? await processPendingDeletions(calendar) : 0;
-  const updated = hasUpdates
-    ? await processPendingUpdates(calendar, await fetchEventColorMap(calendar), new Map())
+  // Ein Stoppsignal für Löschen und Ändern (#2136).
+  const stop = outbound.createRefusalStop();
+  const deleted = hasDeletions ? await processPendingDeletions(calendar, { stop }) : 0;
+  const updated = hasUpdates && !stop.blocks()
+    ? await processPendingUpdates(calendar, await fetchEventColorMap(calendar), new Map(), { stop })
     : 0;
   return { deleted, updated };
 }
@@ -599,10 +727,12 @@ async function listCalendarsWith(track = (client) => client) {
   const client   = track(loadAuthorizedClient());
   const calendar = google.calendar({ version: 'v3', auth: client });
   const enabledSet = new Set(enabledCalendarIds());
-  // Standard-Zuweisung je Kalender (#459) aus der geteilten external_calendars-Tabelle.
+  // Standard-Personen je Kalender (#459, #1897) aus der geteilten
+  // external_calendars-Tabelle und ihrer Join-Tabelle.
+  const sets = readAllDefaultAssignees(db.get(), 'calendar');
   const assigneeMap = new Map(
-    db.get().prepare(`SELECT external_id, default_assignee_user_id FROM external_calendars WHERE source = 'google'`)
-      .all().map((r) => [r.external_id, r.default_assignee_user_id])
+    db.get().prepare(`SELECT id, external_id FROM external_calendars WHERE source = 'google'`)
+      .all().map((r) => [r.external_id, sets.get(Number(r.id)) ?? []])
   );
 
   const items = [];
@@ -618,7 +748,7 @@ async function listCalendarsWith(track = (client) => client) {
         enabled:         enabledSet.has(cal.id),
         accessRole:      cal.accessRole ?? null,
         writable:        isWritableRole(cal.accessRole),
-        default_assignee_user_id: assigneeMap.get(cal.id) ?? null,
+        ...assigneeFields(assigneeMap.get(cal.id) ?? []),
         synced:          assigneeMap.has(cal.id),
       });
     }
@@ -784,31 +914,54 @@ async function handleCallback(code) {
  * Scheitert der Abruf, bleibt die Auswahl, wie sie ist.
  */
 async function dropUnreachableSelection() {
+  let client = null;
   let offered;
   try {
-    offered = new Set((await listCalendarsWith()).map((cal) => cal.id));
+    offered = new Set((await listCalendarsWith((c) => { client = c; return c; })).map((cal) => cal.id));
   } catch (err) {
     log.warn('Calendar list after reconnecting is not available, selection kept:', err.message);
     return;
   }
-  const del = db.get().prepare('DELETE FROM google_calendar_selection WHERE calendar_id = ?');
-  const gone = listSelection().map((row) => row.calendar_id).filter((id) => !offered.has(id));
-  for (const id of gone) del.run(id);
+  // Während der Abfrage erneut verbunden oder getrennt (#2035): die Liste gehört
+  // zu einem abgelösten Konto und sagt über die aktuelle Auswahl nichts.
+  // Prüfen und Löschen in einer Transaktion, ohne await dazwischen.
+  const gone = db.get().transaction(() => {
+    if (!isCurrentRefreshToken(refreshTokenOf(client))) return null;
+    const del = db.get().prepare('DELETE FROM google_calendar_selection WHERE calendar_id = ?');
+    const ids = listSelection().map((row) => row.calendar_id).filter((id) => !offered.has(id));
+    for (const id of ids) del.run(id);
+    return ids;
+  })();
+  if (gone === null) {
+    log.info('Connection replaced while checking the calendar selection, selection kept.');
+    return;
+  }
   if (gone.length) log.info(`${gone.length} calendar(s) not offered by the reconnected account removed from the selection.`);
 }
 
+/** Die drei Variablen, die der Google-Abgleich zusammen braucht (.env.example). */
+const GOOGLE_ENV_KEYS = ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI'];
+
 /**
  * Verbindungsstatus zurückgeben.
- * @returns {{ configured: boolean, connected: boolean, lastSync: string|null }}
+ *
+ * `missingEnv` nennt die NAMEN der fehlenden Variablen, nie einen Wert: die
+ * Einstellungen machten aus "Nicht konfiguriert" bis #2221 eine Sackgasse, ohne
+ * zu sagen, was fehlt. `redirectUri` ist die eingetragene Rueckrufadresse - eine
+ * oeffentliche URL, die Google ohnehin im Browser sieht, kein Geheimnis.
+ * @returns {{ configured: boolean, connected: boolean, lastSync: string|null, missingEnv: string[], redirectUri: string|null }}
  */
 function getStatus() {
-  const configured = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_REDIRECT_URI);
+  const missingEnv = GOOGLE_ENV_KEYS.filter((key) => !process.env[key]);
+  const configured = missingEnv.length === 0;
   const connected  = !!(cfgGet('google_access_token') && cfgGet('google_refresh_token'));
   const lastSync   = cfgGet('google_last_sync');
   return {
     configured,
     connected,
     lastSync,
+    missingEnv,
+    redirectUri: process.env.GOOGLE_REDIRECT_URI || null,
     // Tokens stehen noch, aber Google nimmt sie nicht mehr an (#2019).
     needsReauth: connected && needsReauth(),
     selectedCount: enabledCalendarIds().length,
@@ -876,12 +1029,19 @@ async function sync({ createCalendar = authorizedCalendar } = {}) {
   // festgehalten haben.
   return runSerialized('google', 'sync', async () => {
     if (needsReauth()) throw new GoogleReauthRequiredError();
-    return withSyncOutcome(db.get(), 'google', () => withReauthGuard((track) => runSync(() => track(createCalendar()))));
+    try {
+      return await withSyncOutcome(db.get(), 'google', () => withReauthGuard((track) => runSync(() => track(createCalendar()))));
+    } catch (err) {
+      // Abgelöst (#2035): kein Fehler der neuen Verbindung, ihr nächster Lauf holt nach.
+      if (!(err instanceof GoogleConnectionReplacedError)) throw err;
+      logSuperseded('Sync');
+      return undefined;
+    }
   });
 }
 
 async function runSync(createCalendar) {
-  const calendar = createCalendar();
+  const { calendar, assertCurrent } = bindToConnection(createCalendar());
   await ensureAccessToken(calendar);
 
   // Event-Farbpalette (colorId → Hex) einmalig für den ganzen Sync laden.
@@ -898,9 +1058,11 @@ async function runSync(createCalendar) {
   // Inbound den alten Google-Stand über sie schreiben könnte.
   // --------------------------------------------------------
   if (!isReadonly()) {
-    const removed = await processPendingDeletions(calendar);
+    // Ein Stoppsignal für Löschen und Ändern (#2136).
+    const stop = outbound.createRefusalStop();
+    const removed = await processPendingDeletions(calendar, { stop });
     if (removed) log.info(`${removed} pending deletion(s) applied at Google.`);
-    const pushed = await processPendingUpdates(calendar, eventColorMap, metaCache);
+    const pushed = await processPendingUpdates(calendar, eventColorMap, metaCache, { stop });
     if (pushed) log.info(`${pushed} local change(s) pushed to Google.`);
   }
 
@@ -1033,6 +1195,7 @@ async function runSync(createCalendar) {
     else log.debug(outboundSummary);
   }
 
+  assertCurrent();
   cfgSet('google_last_sync', new Date().toISOString());
 }
 
@@ -1146,11 +1309,8 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
       AND (? IS NULL OR calendar_ref_id IS NULL OR calendar_ref_id = ?)
   `);
 
-  // Standard-Zuweisung dieses Kalenders (#459) — einmal auflösen.
-  const defaultAssignee = calRefId
-    ? db.get().prepare('SELECT default_assignee_user_id FROM external_calendars WHERE id = ?')
-        .get(calRefId)?.default_assignee_user_id ?? null
-    : null;
+  // Standard-Personen dieses Kalenders (#459, #1897) - einmal auflösen.
+  const defaultAssignees = calendarDefaultAssignees(db.get(), calRefId);
 
   // Ein Event mit offenem Tombstone ist lokal bereits gelöscht und wartet nur
   // noch auf die Löschung bei Google. Solange darf der Inbound es nicht wieder
@@ -1304,7 +1464,7 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
       reassignDefaultOnCalendarMove(db.get(), existing.id, {
         fromCalRefId: existing.calendar_ref_id,
         toCalRefId: calRefId,
-        toDefaultUserId: defaultAssignee,
+        toDefaultUserIds: defaultAssignees,
       });
     } else {
       // Ohne Nutzer gibt es niemanden, dem der Termin gehören könnte. Die Zweige
@@ -1317,7 +1477,10 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
            location, color, external_calendar_id, external_source, recurrence_rule, tzid, calendar_ref_id, created_by)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'google', ?, ?, ?, ?)
       `).run(title, description, startDt, endDt, allDay ? 1 : 0, location, evColor, item.id, rrule, tzid, calRefId, createdBy);
-      assignDefaultToEvent(db.get(), inserted.lastInsertRowid, defaultAssignee);
+      // Ein geaendertes Einzelvorkommen erbt die Zuweisung seiner Serie (#2202),
+      // sonst gilt die Standard-Person des Kalenders.
+      const series = item.recurringEventId ? findLocal.get(item.recurringEventId) : null;
+      assignNewOverride(db.get(), Number(inserted.lastInsertRowid), series?.id ?? null, defaultAssignees);
     }
 
     // EXDATEs, die Google an der Serie selbst führt, als Ausnahmen ablegen.
@@ -1613,8 +1776,11 @@ function googleBody(rawEvent, colorMap, timeZone) {
     gEvent.end   = { dateTime: endDt,   timeZone };
   }
 
+  // Ein UNTIL aus dem alten Formular geht an einer eigenen Serie ohne Zone als
+  // Datum in `normalizeRecurrenceUntil` (#1992, services/outbound-dtstart.js).
   if (event.recurrence_rule) {
-    gEvent.recurrence = [`RRULE:${normalizeRecurrenceUntil(rruleValue(event.recurrence_rule), allDay, timeZone, event.tzid)}`];
+    const rule = outboundRecurrenceRule(event);
+    gEvent.recurrence = [`RRULE:${normalizeRecurrenceUntil(rruleValue(rule), allDay, timeZone, event.tzid)}`];
   }
 
   return gEvent;

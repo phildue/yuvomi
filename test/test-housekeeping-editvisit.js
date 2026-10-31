@@ -15,10 +15,9 @@
  *        ein vom Router abgebrochenes Signal (Seitenwechsel) URL-Bereinigung,
  *        Toast und Retry stilllegt.
  *
- *        Die 403-/404-Meldungstexte kommen aus dem lokalen `friendlyError`-
- *        Stub unten - die echte Zuordnung (`utils/friendly-error.js`:
- *        `common.errorNoPermission`/`common.errorNotFound`/`common.errorServer`)
- *        prueft test:friendly-error, nicht diese Suite.
+ *        Die Saetze kommen aus der echten Zuordnung (`utils/friendly-error.js`,
+ *        `loadErrorSentence`, #1909); `t()` des Loaders gibt den Schluessel
+ *        zurueck.
  *
  *        Der Erfolgsfall verzweigt seit #1170 nach `visit.can_edit` zwischen
  *        Bearbeiten- und Berichtsmodal (#1135: wer einen abgerechneten Besuch
@@ -36,12 +35,9 @@ globalThis.window = globalThis.window ?? {};
 const toastCalls = [];
 globalThis.window.yuvomi = {
   showToast: (...args) => toastCalls.push(args),
-  friendlyError: (err) => {
-    if (err?.status === 404) return 'Der Eintrag wurde nicht gefunden.';
-    if (err?.status === 403) return 'Zugriff verweigert.';
-    return 'Es ist ein Fehler aufgetreten.';
-  },
 };
+// friendly-error.js liest `navigator.onLine`; ohne Wert hielte es jeden Fehler fuer "offline".
+Object.defineProperty(globalThis, 'navigator', { value: { onLine: true }, configurable: true, writable: true });
 
 const openModalCalls = [];
 globalThis.__openModal = (...args) => openModalCalls.push(args);
@@ -75,13 +71,22 @@ function apiError(status, message = `HTTP ${status}`) {
 
 test('describeDeepLinkError: 404 ist ein Endzustand - kein Retry', () => {
   const { message, offerRetry } = describeDeepLinkError(apiError(404));
-  assert.equal(message, 'Der Eintrag wurde nicht gefunden.');
+  assert.equal(message, 'common.errorNotFound');
+  assert.equal(offerRetry, false);
+});
+
+test('describeDeepLinkError: ein geloeschter Einsatz sagt den Satz der App, nie den Text des Servers (#1909)', () => {
+  // So antwortet GET /housekeeping/visits/:id (server/routes/housekeeping.js).
+  const err = apiError(404, 'Visit not found.');
+  err.data = { error: 'Visit not found.', code: 404, reason: 'housekeeping_visit_not_found' };
+  const { message, offerRetry } = describeDeepLinkError(err);
+  assert.equal(message, 'housekeeping.errorVisitGone');
   assert.equal(offerRetry, false);
 });
 
 test('describeDeepLinkError: 403 ist ein Endzustand - kein Retry, keine Besuchsdetails', () => {
   const { message, offerRetry } = describeDeepLinkError(apiError(403));
-  assert.equal(message, 'Zugriff verweigert.');
+  assert.equal(message, 'common.errorNoPermission');
   assert.equal(offerRetry, false);
 });
 
@@ -99,19 +104,20 @@ test('describeDeepLinkError: Serverfehler darf erneut versucht werden', () => {
   assert.equal(offerRetry, true);
 });
 
-test('describeDeepLinkError: 429 (Rate-Limit) darf erneut versucht werden - generische Meldung', () => {
+test('describeDeepLinkError: 429 (Rate-Limit) darf erneut versucht werden - der Satz "kurz warten"', () => {
   // Der apiLimiter zaehlt pro IP, ein Haushalt hinter einem NAT teilt sich
   // eine - ein 429 ist kein Endzustand fuer diese ID, ein Retry kann gelingen.
   const err = apiError(429, 'Too many requests');
   err.data = { error: 'Too many requests', code: 429 };
   const { message, offerRetry } = describeDeepLinkError(err);
   assert.equal(offerRetry, true);
-  assert.equal(message, 'common.errorGeneric');
+  assert.equal(message, 'common.errorRateLimited');
 });
 
 test('describeDeepLinkError: Netzwerkfehler (kein status) darf erneut versucht werden', () => {
-  const { offerRetry } = describeDeepLinkError(new Error('Failed to fetch'));
+  const { message, offerRetry } = describeDeepLinkError(new Error('Failed to fetch'));
   assert.equal(offerRetry, true);
+  assert.equal(message, 'common.loadErrorDescription');
 });
 
 test('openVisitFromDeepLink: fehlende Besuchs-ID (404) zeigt Meldung ohne Retry und raeumt die URL', async () => {
@@ -128,7 +134,7 @@ test('openVisitFromDeepLink: fehlende Besuchs-ID (404) zeigt Meldung ohne Retry 
   assert.equal(replaceStateCalls[0][0], historyState);
   assert.equal(toastCalls.length, 1);
   const [message, type, duration, action] = toastCalls[0];
-  assert.equal(message, 'Der Eintrag wurde nicht gefunden.');
+  assert.equal(message, 'common.errorNotFound');
   assert.equal(type, 'danger');
   assert.equal(duration, undefined);
   assert.equal(action, undefined);
@@ -144,7 +150,7 @@ test('openVisitFromDeepLink: fremder Besuch (403) zeigt Meldung ohne Retry, kein
   assert.equal(replaceStateCalls.length, 1);
   assert.equal(toastCalls.length, 1);
   const [message, , , action] = toastCalls[0];
-  assert.equal(message, 'Zugriff verweigert.');
+  assert.equal(message, 'common.errorNoPermission');
   assert.equal(action, undefined);
 });
 
@@ -189,7 +195,7 @@ test('openVisitFromDeepLink: anderer Fehler bietet ein Retry an, das dieselbe ID
   assert.equal(lastPath, '/housekeeping/visits/13');
   assert.equal(toastCalls.length, 1);
   const [message, type, duration, action] = toastCalls[0];
-  assert.equal(message, 'Es ist ein Fehler aufgetreten.');
+  assert.equal(message, 'common.errorServer');
   assert.equal(type, 'danger');
   assert.equal(duration, 6000);
   assert.equal(typeof action.onClick, 'function');
@@ -219,7 +225,7 @@ test('openVisitFromDeepLink: 429 (Rate-Limit) bietet ein Retry an, das dieselbe 
   assert.equal(replaceStateCalls.length, 1);
   assert.equal(toastCalls.length, 1);
   const [message, type, duration, action] = toastCalls[0];
-  assert.equal(message, 'common.errorGeneric', 'keine rohe Servermeldung, kein friendlyError-Fallback');
+  assert.equal(message, 'common.errorRateLimited', 'keine rohe Servermeldung');
   assert.equal(type, 'danger');
   assert.equal(duration, 6000);
   assert.equal(typeof action?.onClick, 'function', '429 ist voruebergehend und muss ein Retry anbieten');
@@ -403,4 +409,162 @@ test('#1540 Bearbeiten-Formular: Speichern schickt den vorbelegten Tag als origi
   assert.equal(puts.length, 1, 'genau ein PUT');
   assert.equal(puts[0].body.date, '2026-10-05');
   assert.equal(puts[0].body.original_date, '2026-10-01', 'der Tag, den das Formular gezeigt hat');
+});
+
+// -------------------------------------------------------------------------
+// #1997: eine spaete Erfolgsantwort schliesst nur ihren EIGENEN Dialog
+// -------------------------------------------------------------------------
+
+// Kommt die Antwort erst, nachdem der Nutzer den Dialog geschlossen und einen
+// anderen geoeffnet hat, darf das force-Schliessen nur den eigenen treffen. Ob
+// der Slot noch denselben Dialog haelt, entscheidet closeModal({ context }) in
+// components/modal.js (am echten Modul gemessen in test-modal-dead-time.js);
+// hier zaehlt die Verdrahtung: jeder Weg der Seite, der nach einer Anfrage
+// schliesst, reicht den VOR der Anfrage gemerkten Kontext hinein. Gefahren wird
+// je Weg der echte Submit-Handler; die schreibende Anfrage wechselt den
+// Kontext, wie es ein inzwischen geoeffneter Dialog tut.
+
+/** Oeffnet einen Dialog ueber den Modal-Stub; liefert den Submit des Formulars `formSel`. */
+function hkDialog(oeffne, formSel, felder) {
+  let opts = null;
+  const vorher = globalThis.__openModal;
+  globalThis.__openModal = (o) => { opts = o; };
+  try { oeffne(); } finally { globalThis.__openModal = vorher; }
+  assert.ok(opts, 'der Dialog wurde geoeffnet');
+  const handlers = {};
+  const element = (sel) => ({
+    addEventListener(type, fn) { handlers[`${sel}:${type}`] = fn; },
+    querySelector: () => null, querySelectorAll: () => [], setAttribute() {}, removeAttribute() {},
+    classList: { add() {}, remove() {}, toggle() {} }, dataset: {}, style: {},
+  });
+  opts.onSave({ querySelector: element, querySelectorAll: () => [], addEventListener() {} });
+  const elements = Object.fromEntries(Object.entries(felder).map(([k, v]) => [k, { value: v, focus() {} }]));
+  return () => handlers[`${formSel}:submit`]({ preventDefault() {}, currentTarget: { elements, querySelector: () => null } });
+}
+
+const HK_INHALT = {
+  isConnected: false, querySelector: () => null, querySelectorAll: () => [],
+  replaceChildren() {}, insertAdjacentHTML() {}, appendChild() {}, addEventListener() {},
+};
+const HK_ERFOLGSWEGE = [
+  ['Aufgabe anlegen', () => hkDialog(() => hk.openTaskCreateModal(HK_INHALT), '#housekeeping-task-form',
+    { name: 'Fenster', area: 'Wohnzimmer', frequency_days: '14' })],
+  ['Aufgabe bearbeiten', () => hkDialog(() => hk.openTaskEditModal({ id: 5, name: 'Fenster', area: 'Wohnzimmer', frequency_days: 14 }, HK_INHALT),
+    '#housekeeping-task-edit-form', { name: 'Fenster', area: 'Bad', frequency_days: '7' })],
+  ['Einsatz bearbeiten', () => hkDialog(() => hk.openVisitEditModal(
+    { id: 24, worker_id: 7, can_edit: true, rate_type: 'daily', check_in: '2026-09-30T08:00:00.000Z', daily_rate: 40, extras: 0 },
+    HK_INHALT, { onDone() {} }), '#housekeeping-visit-form', { date: '2026-10-05', daily_rate: '40', extras: '0' })],
+  ['Person speichern', () => hkDialog(() => hk.openStaffModal(null, HK_INHALT, { afterSave() {} }), '#housekeeping-worker-form', {
+    id: '', display_name: 'Maria', username: '', phone: '', email: '', birth_date: '', rate_type: 'daily', daily_rate: '40',
+    hourly_rate: '0', payment_schedule: 'monthly', calendar_color: '', avatar_color: '', notes: '',
+  })],
+];
+
+test('Erfolg nach Dialogwechsel - jeder Weg schliesst nur mit dem Kontext von VOR der Anfrage (#1997)', async () => {
+  const s = hk.state();
+  const zuvor = { workers: s.workers, canManageWorkers: s.canManageWorkers, tab: s.tab };
+  // Nach dem Schliessen zeichnet die Seite neu - dafuer genuegt das Mini-DOM.
+  const { installMiniDom } = await import('./mini-dom.js');
+  const deinstalliere = installMiniDom();
+  try {
+    for (const [name, vorbereiten] of HK_ERFOLGSWEGE) {
+      Object.assign(s, { workers: [{ id: 7, display_name: 'Maria' }], canManageWorkers: true, tab: 'staff' });
+      const ausloesen = vorbereiten();
+      toastCalls.length = 0;
+      let kontext = 'eigener-dialog';
+      const geschlossen = [];
+      const geschrieben = [];
+      globalThis.__modalContextId = () => kontext;
+      globalThis.__closeModal = (opts) => { geschlossen.push(opts); };
+      const schreibe = (verb) => async (path) => {
+        geschrieben.push(`${verb} ${path}`);
+        kontext = 'ein-anderer-dialog';
+        return { data: {} };
+      };
+      globalThis.__apiStub = { get: async () => ({ data: [] }), post: schreibe('POST'), put: schreibe('PUT'), patch: schreibe('PATCH') };
+      try {
+        await ausloesen();
+        // Das Anlegen startet seinen Lauf ohne ihn abzuwarten (Submit und
+        // Vorlagen teilen sich `run`): einmal die Warteschlange leerlaufen lassen.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.ok(geschrieben.length > 0, `${name}: der Weg schreibt`);
+        assert.equal(toastCalls.some(([, art]) => art === 'danger'), false, `${name}: der Erfolg ist kein Fehler (${JSON.stringify(toastCalls)})`);
+        assert.equal(geschlossen.length, 1, `${name}: genau ein Schliessen (${JSON.stringify(geschlossen)})`);
+        assert.equal(geschlossen[0].force, true, `${name}: force wie bisher`);
+        assert.equal(geschlossen[0].context, 'eigener-dialog',
+          `${name}: geschlossen wird ohne den Kontext von vor der Anfrage - die spaete Antwort traefe den Dialog, der jetzt offen ist`);
+      } finally {
+        delete globalThis.__modalContextId;
+        delete globalThis.__closeModal;
+        delete globalThis.__apiStub;
+      }
+    }
+  } finally {
+    Object.assign(s, zuvor);
+    deinstalliere();
+  }
+});
+
+// R23 S10 (Critique G2 P2/P3): der Besuchsbericht ist ein Leseblatt - kein
+// "Abbrechen" ohne Eingabe, dafuer Bearbeiten; das Einchecken meldet sich in
+// derselben Form wie das Auschecken; ein Wort fuer den Besuch.
+test('R23: Besuchsbericht mit Bearbeiten statt Abbrechen, Einchecken mit Namen, ein Wort "Besuch"', async () => {
+  const { readFileSync: read } = await import('node:fs');
+  const src = read(new URL('../public/pages/housekeeping.js', import.meta.url), 'utf8');
+  const fn = src.slice(src.indexOf('function openVisitReportModal('), src.indexOf('function renderStaff('));
+  assert.doesNotMatch(fn, /data-action="close-modal">\$\{esc\(t\('common\.cancel'\)\)\}/, 'kein Abbrechen im Leseblatt');
+  assert.match(fn, /id="visit-report-edit"/, 'Bearbeiten im Fuss');
+  assert.match(fn, /const editable = writable && visit\.can_edit;/, 'nur wo der Server es zugesteht');
+  assert.match(fn, /t\('housekeeping\.visitDate'\)/, 'das Datum heisst Besuchsdatum, nicht "Letzter Besuch"');
+  assert.match(src, /t\('housekeeping\.checkedInNamed', \{ name: worker\.display_name \}\)/);
+  const de = JSON.parse(read(new URL('../public/locales/de.json', import.meta.url), 'utf8')).housekeeping;
+  const einsatz = Object.entries(de).filter(([, v]) => /Einsatz|Einsätze/.test(v)).map(([k]) => k);
+  assert.deepEqual(einsatz, [], 'die Haushaltshilfe sagt "Besuch" (Reiter "Besuche"), nicht "Einsatz"');
+});
+
+// #2258: ein Beleg ueber der Upload-Grenze ist eine Eingabe, die nicht
+// durchgeht, kein Fehlschlag des Speicherns. Im try geworfen, ersetzte das
+// allgemeine catch den Satz durch `errorSentence(err)` - der Toast sagte nur,
+// dass nicht gespeichert wurde. Gefahren wird der echte Submit-Handler mit
+// einer Datei, die eine Bytes ueber der Grenze liegt.
+test('#2258 Beleg ueber der Upload-Grenze: der Toast nennt die Grenze, nichts geht raus, der Dialog bleibt offen', async () => {
+  const { maxUploadBytes, maxUploadMb } = await import('../public/utils/upload-limit.js');
+  const s = hk.state();
+  const zuvor = { workers: s.workers };
+  s.workers = [{ id: 7, display_name: 'Maria' }];
+  const geschrieben = [];
+  const geschlossen = [];
+  globalThis.__apiStub = {
+    get: async () => ({ data: [] }),
+    post: async (path) => { geschrieben.push(`POST ${path}`); return { data: { id: 1 } }; },
+    put: async (path) => { geschrieben.push(`PUT ${path}`); return { data: {} }; },
+  };
+  globalThis.__closeModal = (opts) => { geschlossen.push(opts); };
+  let opts = null;
+  const vorher = globalThis.__openModal;
+  globalThis.__openModal = (o) => { opts = o; };
+  try {
+    hk.openVisitEditModal(
+      { id: 24, worker_id: 7, can_edit: true, rate_type: 'daily', check_in: '2026-09-30T08:00:00.000Z', daily_rate: 40, extras: 0 },
+      HK_INHALT, { onDone() {} },
+    );
+    assert.ok(opts, 'der Dialog wurde geoeffnet');
+    let submit = null;
+    const form = { addEventListener: (type, fn) => { if (type === 'submit') submit = fn; } };
+    const fileInput = { files: [{ name: 'beleg.pdf', type: 'application/pdf', size: maxUploadBytes() + 1 }] };
+    opts.onSave({ querySelector: (sel) => ({ '#housekeeping-visit-form': form, '#housekeeping-receipt-file': fileInput })[sel] ?? null });
+    assert.equal(typeof submit, 'function', 'das Formular haengt seinen Submit-Handler an');
+    toastCalls.length = 0;
+    const elements = { date: { value: '2026-10-05' }, daily_rate: { value: '40', focus() {} }, extras: { value: '0', focus() {} } };
+    await submit({ preventDefault() {}, currentTarget: { elements, querySelector: () => null } });
+  } finally {
+    globalThis.__openModal = vorher;
+    delete globalThis.__apiStub;
+    delete globalThis.__closeModal;
+    Object.assign(s, zuvor);
+  }
+  assert.deepEqual(toastCalls.map(([msg, art]) => [msg, art]), [[`documents.fileTooLarge${JSON.stringify({ size: maxUploadMb() })}`, 'danger']],
+    'der Satz nennt die Grenze statt des allgemeinen Speicher-Satzes');
+  assert.deepEqual(geschrieben, [], 'weder Beleg noch Besuch werden geschickt');
+  assert.deepEqual(geschlossen, [], 'der Dialog bleibt offen mit der Eingabe');
 });

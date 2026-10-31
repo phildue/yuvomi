@@ -6,7 +6,7 @@
 import { auth } from '/api.js';
 import { t } from '/i18n.js';
 import { esc } from '/utils/html.js';
-import { authHeroHtml, authErrorHtml, wirePasswordToggle } from '/utils/auth-ui.js';
+import { authHeroHtml, authErrorHtml, wirePasswordToggle, passwordRuleHtml, hideAuthError, showAuthError, getStoredAppName } from '/utils/auth-ui.js';
 
 // Dieselbe Regel wie im Server (POST /auth/invites/accept). Sie hier zu spiegeln
 // erspart dem Nutzer ein 400, das sich sonst nicht von einem toten Token
@@ -28,7 +28,7 @@ export async function render(container) {
     <main class="auth-page" id="main-content">
       ${authHeroHtml({ heading: false })}
       <div class="auth-card card card--padded">
-        <h1 class="auth-card__title">${esc(t('join.title'))}</h1>
+        <h1 class="auth-card__title" id="join-title">${esc(t('join.title'))}</h1>
         <p class="auth-card__intro" id="join-intro">${esc(t('join.intro'))}</p>
         ${authErrorHtml('join-error')}
         <div class="form-success" id="join-success" role="status" aria-live="polite" hidden></div>
@@ -48,7 +48,8 @@ export async function render(container) {
           <div class="form-group" id="join-password-group">
             <label class="label" for="join-password">${esc(t('join.passwordLabel'))}</label>
             <input class="input" type="password" id="join-password" name="password"
-              autocomplete="new-password" required />
+              autocomplete="new-password" minlength="8" aria-describedby="join-password-rule" required />
+            ${passwordRuleHtml('join-password-rule', t('common.passwordMinLength'))}
           </div>
           <div class="form-group" id="join-confirm-group">
             <label class="label" for="join-confirm">${esc(t('join.confirmLabel'))}</label>
@@ -59,7 +60,8 @@ export async function render(container) {
             ${esc(t('join.submit'))}
           </button>
         </form>
-        <p class="auth-form__forgot"><a href="/login" data-link>${esc(t('forgotPassword.backToLogin'))}</a></p>
+        <a class="btn btn--primary auth-form__submit" id="join-to-login" href="/login" data-link hidden>${esc(t('join.toLogin'))}</a>
+        <p class="auth-form__forgot" id="join-login"><a href="/login" data-link>${esc(t('forgotPassword.backToLogin'))}</a></p>
       </div>
     </main>
   `);
@@ -84,10 +86,36 @@ export async function render(container) {
   // Der Fokus wandert in die Fehlermeldung, damit auch sehende Tastaturnutzer
   // sie bemerken und nicht nur Screenreader über role="alert" (wie login.js).
   const fail = (msg) => { show(errorEl, msg); errorEl.focus(); };
-  // Ein toter Token macht das Formular sinnlos: nur die Meldung bleibt stehen.
-  const dead = (msg) => { fail(msg); form.hidden = true; intro.hidden = true; };
+  // Ein toter Token macht das Formular sinnlos: nur die Meldung bleibt stehen -
+  // und der Weg hinaus. KEINE SACKGASSE (Critique R21, a1; D15): die Meldung
+  // sagt, was zu tun ist ("bitte um einen neuen"), und wer schon ein Konto hat,
+  // findet die Anmeldung betont wie nach falschen Zugangsdaten (login.js).
+  //
+  // DIE TOTE EINLADUNG IST DER ZUSTAND DER SEITE (Critique R22, D19). Der
+  // Titel sagte weiter "Konto einrichten", der Ausweg war eine Textzeile, und
+  // ein fehlender und ein ungueltiger Link sprachen zwei verschiedene Saetze
+  // fuer dieselbe Lage. Jetzt nennt der Titel die ungueltige Einladung, EIN
+  // Satz sagt, was zu tun ist, und "Zur Anmeldung" ist der Primaerknopf.
+  const dead = () => {
+    container.querySelector('#join-title').textContent = t('join.invalidTitle');
+    show(errorEl, t('join.invalidToken'));
+    form.hidden = true;
+    intro.hidden = true;
+    container.querySelector('#join-login').hidden = true;
+    const toLogin = container.querySelector('#join-to-login');
+    toLogin.hidden = false;
+    toLogin.focus();
+  };
+  // Voruebergehend (429, Netz, Server): die Einladung kann gelten - Titel und
+  // Rueckweg bleiben, nur das Formular ist zu, bis die Vorschau antwortet.
+  const unknown = (msg) => {
+    fail(msg);
+    form.hidden = true;
+    intro.hidden = true;
+    container.querySelector('#join-login')?.classList.add('auth-form__forgot--emphasis');
+  };
 
-  if (!token) { dead(t('join.missingToken')); return; }
+  if (!token) { dead(); return; }
 
   // Bis die Vorschau da ist, steht noch nicht fest, ob und mit welchen Vorgaben
   // die Einladung gilt.
@@ -100,11 +128,18 @@ export async function render(container) {
     // Serverfehler oder eine abgerissene Verbindung sind vorübergehend, und wer
     // dann "Einladung ungültig" liest, wirft einen intakten Link weg. Das
     // Formular bleibt trotzdem zu: ohne Vorschau sind die Vorgaben unbekannt.
-    dead(t('join.previewFailed'));
+    unknown(t('join.previewFailed'));
     return;
   }
-  if (!preview?.valid) { dead(t('join.invalidToken')); return; }
+  if (!preview?.valid) { dead(); return; }
   btn.disabled = false;
+  // DIE EINLADUNG NENNT, WER EINLAEDT (Critique R24, G6-Zugang-P3-1): "Du
+  // wurdest zu Yuvomi eingeladen" sagte weder wer noch wohin - und trug den
+  // Produktnamen auch dort, wo ein Haushalt seinen eigenen Namen gesetzt hat.
+  // Jetzt Person und Name der App, wie ihn die Marke darueber zeigt.
+  if (preview.invited_by) {
+    intro.textContent = t('join.introNamed', { name: preview.invited_by, app: getStoredAppName() });
+  }
 
   // Was die Einladung vorgibt, steht fest: der Server nimmt ohnehin ihre Werte.
   // Das Feld wird deshalb schreibgeschützt UND sichtbar als vorgegeben markiert -
@@ -136,20 +171,23 @@ export async function render(container) {
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    errorEl.hidden = true;
+    hideAuthError(form, errorEl);
     const username = usernameEl.value.trim();
     const displayName = displayNameEl.value.trim();
     const password = form.password.value;
     const confirm = form.confirm.value;
 
-    if (!username) { fail(t('join.usernameRequired')); return; }
-    if (!USERNAME_PATTERN.test(username)) { fail(t('join.usernameInvalid')); return; }
-    if (displayName.length > MAX_DISPLAY_NAME) { fail(t('join.displayNameTooLong')); return; }
+    // DIE MELDUNG STEHT AM FELD, DER FOKUS AUCH (Critique R24 G6-Zugang-P2-1):
+    // wie Anmeldung und Einrichtung (showAuthError). Bis R24 stand sie im
+    // Kasten ueber dem Formular, der Fokus auf dem Kasten, das Feld blieb grau.
+    if (!username) { showAuthError(errorEl, t('join.usernameRequired'), usernameEl); return; }
+    if (!USERNAME_PATTERN.test(username)) { showAuthError(errorEl, t('join.usernameInvalid'), usernameEl); return; }
+    if (displayName.length > MAX_DISPLAY_NAME) { showAuthError(errorEl, t('join.displayNameTooLong'), displayNameEl); return; }
     if (passwordRequired) {
       // Wie der Server (normalizePassword): auf macOS/Firefox kommen Umlaute als
       // NFD an und zählen roh doppelt, nach NFC bleibt weniger übrig (#608).
-      if (password.normalize('NFC').length < 8) { fail(t('join.tooShort')); return; }
-      if (password !== confirm) { fail(t('join.mismatch')); return; }
+      if (password.normalize('NFC').length < 8) { showAuthError(errorEl, t('join.tooShort'), form.password); return; }
+      if (password !== confirm) { showAuthError(errorEl, t('join.mismatch'), form.confirm); return; }
     }
 
     btn.disabled = true;
@@ -164,7 +202,7 @@ export async function render(container) {
       setTimeout(() => window.yuvomi.navigate('/login'), 1500);
     } catch (err) {
       if (err?.status === 409) {
-        fail(t('join.usernameTaken'));
+        showAuthError(errorEl, t('join.usernameTaken'), usernameEl);
         btn.disabled = false;
         return;
       }
@@ -175,7 +213,7 @@ export async function render(container) {
       // nicht dieselbe Wirkung haben wie ein abgelaufener Link.
       if (err?.status === 400) {
         const stillValid = await auth.previewInvite(token).then((r) => r?.data?.valid).catch(() => true);
-        if (!stillValid) { dead(t('join.invalidToken')); return; }
+        if (!stillValid) { dead(); return; }
       }
       fail(t('join.error'));
       btn.disabled = false;

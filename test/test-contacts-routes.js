@@ -273,6 +273,36 @@ try {
     assert(bad.status === 400, `ungültiges Format → 400, war ${bad.status}`);
   });
 
+  // #2095: ein Geburtstag ohne Jahr. Das Datum traegt das Platzhalterjahr 2000,
+  // die Marke sagt, dass es keines ist; der Export schreibt Apples Form, damit
+  // Apple (und der eigene Import) kein Jahr 1604 oder 2000 als echtes sehen.
+  await asyncTest('birthday_year_unknown: speichern, exportieren, mit Jahr abnehmen (#2095)', async () => {
+    const created = await jsend(`${base}`, 'POST', {
+      name: 'Ohne Jahr', category: 'misc', birthday: '1987-02-29', birthday_year_unknown: true,
+    });
+    assert(created.status === 201, `Status ${created.status} ${JSON.stringify(created.body)}`);
+    assert(created.body.data.birthday === '2000-02-29', `Platzhalterjahr, war ${created.body.data.birthday}`);
+    assert(created.body.data.birthday_year_unknown === 1, 'Marke gesetzt');
+    const bId = created.body.data.id;
+
+    const { text } = await tget(`${base}/${bId}/vcard`);
+    assert(text.includes('BDAY;X-APPLE-OMIT-YEAR=1604:1604-02-29'), `Apple-Form im Export: ${text}`);
+    assert(!text.includes('BDAY:2000'), 'kein Platzhalterjahr als echtes Jahr');
+
+    const untouched = await jsend(`${base}/${bId}`, 'PUT', { notes: 'nur Notiz' });
+    assert(untouched.body.data.birthday_year_unknown === 1, 'Marke bleibt ohne Feld');
+
+    const noYear = await jsend(`${base}/${bId}`, 'PUT', { birthday_year_unknown: false });
+    assert(noYear.status === 400, `Abnehmen ohne Jahr → 400, war ${noYear.status}`);
+
+    const withYear = await jsend(`${base}/${bId}`, 'PUT', { birthday_year_unknown: false, birthday: '1988-02-29' });
+    assert(withYear.status === 200, `Status ${withYear.status}`);
+    assert(withYear.body.data.birthday === '1988-02-29' && withYear.body.data.birthday_year_unknown === 0, 'mit Jahr');
+
+    const cleared = await jsend(`${base}/${bId}`, 'PUT', { birthday: '', birthday_year_unknown: true });
+    assert(cleared.body.data.birthday === null && cleared.body.data.birthday_year_unknown === 0, 'ohne Datum keine Marke');
+  });
+
   // ------------------------------------------------------------------
   // Identitaetsfarbe eines verknuepften Mitglieds (Vollton-Regel, DESIGN.md)
   //
@@ -311,13 +341,14 @@ try {
   // ------------------------------------------------------------------
   // DELETE /:id - Familienmitglied-Schutz (403), Erfolg (204), 404
   // ------------------------------------------------------------------
-  await asyncTest('DELETE /:id eines Familienmitglied-Kontakts → 403', async () => {
+  await asyncTest('DELETE /:id eines Familienmitglied-Kontakts → 403 mit Grund', async () => {
     const famContactId = database.prepare(
       "INSERT INTO contacts (name, category, family_user_id) VALUES ('Fam Kontakt', 'misc', ?)"
     ).run(famUserId).lastInsertRowid;
     const { status, body } = await jsend(`${base}/${famContactId}`, 'DELETE');
     assert(status === 403, `Status ${status}`);
-    assert(/Familienmitglieder/.test(body.error), 'Fehlermeldung nennt Familienmitglieder');
+    assert(body.reason === 'family_member_contact', 'die Absage nennt ihren Grund');
+    assert(/household member/.test(body.error), 'Fehlermeldung nennt das Haushaltsmitglied');
     // Kontakt bleibt bestehen.
     assert(database.prepare('SELECT 1 FROM contacts WHERE id = ?').get(famContactId), 'Familien-Kontakt nicht gelöscht');
   });
@@ -334,6 +365,178 @@ try {
   });
 
   // ------------------------------------------------------------------
+  // Ein abgewiesenes Feld nennt seinen Fall (#1909): der vCard-Import zeigte
+  // bis dahin den englischen Servertext, weil nur der das Feld nannte. Jetzt
+  // traegt die Antwort `reason` und die Grenze als `params.limit`.
+  // ------------------------------------------------------------------
+  await asyncTest('POST / mit zu langem Feld nennt Grund und Grenze (#1909)', async () => {
+    for (const [field, value, reason, limit] of [
+      ['name', 'N'.repeat(201), 'contacts_name_too_long', 200],
+      ['lastName', 'L'.repeat(201), 'contacts_name_too_long', 200],
+      ['namePrefix', 'P'.repeat(101), 'contacts_name_too_long', 100],
+      ['phone', '1'.repeat(101), 'contacts_phone_too_long', 100],
+      ['email', `${'e'.repeat(200)}@x.de`, 'contacts_email_too_long', 200],
+      ['address', 'A'.repeat(5001), 'contacts_address_too_long', 5000],
+      ['notes', 'n'.repeat(5001), 'contacts_notes_too_long', 5000],
+    ]) {
+      const body = field === 'name' ? { name: value } : { name: 'Import Fall', [field]: value };
+      const { status, body: res } = await jsend(base, 'POST', body);
+      assert(status === 400, `${field}: Status ${status}`);
+      assert(res.reason === reason, `${field}: reason ${res.reason}`);
+      assert(res.params?.limit === limit, `${field}: limit ${JSON.stringify(res.params)}`);
+      assert(typeof res.error === 'string' && res.error.length > 0, `${field}: error bleibt fuer API-Clients`);
+    }
+  });
+
+  await asyncTest('POST / mit ungueltigem Geburtstag nennt den Fall, ohne Zahl (#1909)', async () => {
+    const { status, body } = await jsend(base, 'POST', { name: 'Import Fall', birthday: '1990-02-30' });
+    assert(status === 400, `Status ${status}`);
+    assert(body.reason === 'contacts_birthday_invalid', `reason ${body.reason}`);
+    assert(body.params === undefined, 'keine Zahl am Datumsfall');
+  });
+
+  await asyncTest('POST / ohne Namen bleibt ohne Grund - fehlt ist nicht zu lang (#1909)', async () => {
+    const { status, body } = await jsend(base, 'POST', { phone: '123' });
+    assert(status === 400, `Status ${status}`);
+    assert(body.reason === undefined, `reason ${body.reason}`);
+  });
+
+  await asyncTest('POST / mit zwei Befunden nennt das erste Feld, die geloeschte Kategorie nur allein (#1909)', async () => {
+    const two = await jsend(base, 'POST', { name: 'Import Fall', phone: '1'.repeat(101), notes: 'n'.repeat(5001) });
+    assert(two.body.reason === 'contacts_phone_too_long', `reason ${two.body.reason}`);
+    const withCategory = await jsend(base, 'POST', { name: 'Import Fall', category: 'gibt-es-nicht', phone: '1'.repeat(101) });
+    assert(withCategory.body.reason === 'contacts_phone_too_long', `reason ${withCategory.body.reason}`);
+    const onlyCategory = await jsend(base, 'POST', { name: 'Import Fall', category: 'gibt-es-nicht' });
+    assert(onlyCategory.body.reason === 'contacts_selected_category_not_found', `reason ${onlyCategory.body.reason}`);
+  });
+
+  await asyncTest('PUT /:id mit zu langem Feld nennt Grund und Grenze (#1909)', async () => {
+    const created = await jsend(base, 'POST', { name: 'Fall Bearbeiten' });
+    const id = created.body.data.id;
+    const notes = await jsend(`${base}/${id}`, 'PUT', { notes: 'n'.repeat(5001) });
+    assert(notes.status === 400, `Status ${notes.status}`);
+    assert(notes.body.reason === 'contacts_notes_too_long' && notes.body.params?.limit === 5000,
+      `notes: ${JSON.stringify(notes.body)}`);
+    const birthday = await jsend(`${base}/${id}`, 'PUT', { birthday: '2001-13-01' });
+    assert(birthday.body.reason === 'contacts_birthday_invalid', `birthday: ${birthday.body.reason}`);
+  });
+
+  // ------------------------------------------------------------------
+  // Die Mehrfachfelder nennen ihren Fall (#1909): das Kontaktformular schickt
+  // jede Nummer und E-Mail-Adresse als Eintrag, und eine Adresse ohne @ oder
+  // eine zu lange Nummer bekam bis dahin nur den allgemeinen Satz. Jede
+  // Absage traegt jetzt `reason`, eine Grenze als `params.limit`; der englische
+  // `error` bleibt wortgleich fuer API-Clients.
+  // ------------------------------------------------------------------
+  const MV_CASES = [
+    // [Feld, Wert, Grund, Grenze, error]
+    ['phones', 'keine Liste', 'contacts_phone_entry_invalid', undefined, 'Phones must be an array'],
+    ['phones', Array.from({ length: 21 }, (_, i) => ({ label: 'm', value: `0${i}` })), 'contacts_phones_too_many', 20, 'Too many phone entries (max 20)'],
+    ['phones', [null], 'contacts_phone_entry_invalid', undefined, 'Phone entry must be an object'],
+    ['phones', [{ label: 'Mobil' }], 'contacts_phone_entry_invalid', undefined, 'Phone requires label and value'],
+    ['phones', [{ label: '   ', value: '0800' }], 'contacts_phone_entry_invalid', undefined, 'Phone label invalid or too long'],
+    ['phones', [{ label: 'L'.repeat(51), value: '0800' }], 'contacts_phone_label_too_long', 50, 'Phone label invalid or too long'],
+    ['phones', [{ label: 'Mobil', value: 12345 }], 'contacts_phone_entry_invalid', undefined, 'Phone value invalid or too long'],
+    ['phones', [{ label: 'Mobil', value: '1'.repeat(101) }], 'contacts_phone_too_long', 100, 'Phone value invalid or too long'],
+    ['phones', [{ label: 'Mobil', value: '0800', isPrimary: 'ja' }], 'contacts_phone_entry_invalid', undefined, 'Phone isPrimary must be boolean'],
+    ['emails', {}, 'contacts_email_entry_invalid', undefined, 'Emails must be an array'],
+    ['emails', Array.from({ length: 21 }, (_, i) => ({ label: 'p', value: `a${i}@x.de` })), 'contacts_emails_too_many', 20, 'Too many email entries (max 20)'],
+    ['emails', ['a@x.de'], 'contacts_email_entry_invalid', undefined, 'Email entry must be an object'],
+    ['emails', [{ value: 'a@x.de' }], 'contacts_email_entry_invalid', undefined, 'Email requires label and value'],
+    ['emails', [{ label: 'L'.repeat(51), value: 'a@x.de' }], 'contacts_email_label_too_long', 50, 'Email label invalid or too long'],
+    ['emails', [{ label: 'Privat', value: `${'e'.repeat(251)}@x.de` }], 'contacts_email_too_long', 255, 'Email value invalid or too long'],
+    ['emails', [{ label: 'Privat', value: 'kein-at-zeichen' }], 'contacts_email_invalid', undefined, 'Email value must be a valid email address'],
+    ['emails', [{ label: 'Privat', value: 'a@x.de', isPrimary: 1 }], 'contacts_email_entry_invalid', undefined, 'Email isPrimary must be boolean'],
+    ['addresses', 'keine Liste', 'contacts_address_entry_invalid', undefined, 'Addresses must be an array'],
+    ['addresses', Array.from({ length: 21 }, () => ({ label: 'h' })), 'contacts_addresses_too_many', 20, 'Too many address entries (max 20)'],
+    ['addresses', [42], 'contacts_address_entry_invalid', undefined, 'Address entry must be an object'],
+    ['addresses', [{ city: 'Berlin' }], 'contacts_address_entry_invalid', undefined, 'Address requires label'],
+    ['addresses', [{ label: 'L'.repeat(51) }], 'contacts_address_label_too_long', 50, 'Address label invalid or too long'],
+    ['addresses', [{ label: 'Zuhause', street: 'S'.repeat(256) }], 'contacts_address_part_too_long', 255, 'Address street invalid or too long'],
+    ['addresses', [{ label: 'Zuhause', postalCode: 12345 }], 'contacts_address_entry_invalid', undefined, 'Address postalCode invalid or too long'],
+    ['addresses', [{ label: 'Zuhause', country: 'C'.repeat(256) }], 'contacts_address_part_too_long', 255, 'Address country invalid or too long'],
+    ['addresses', [{ label: 'Zuhause', isPrimary: 'ja' }], 'contacts_address_entry_invalid', undefined, 'Address isPrimary must be boolean'],
+  ];
+  const expectMvCase = (where, res, [field, , reason, limit, error]) => {
+    assert(res.status === 400, `${where} ${field} ${reason}: Status ${res.status}`);
+    assert(res.body.reason === reason, `${where} ${field}: reason ${res.body.reason}, erwartet ${reason}`);
+    assert(JSON.stringify(res.body.params) === JSON.stringify(limit === undefined ? undefined : { limit }),
+      `${where} ${field} ${reason}: params ${JSON.stringify(res.body.params)}`);
+    assert(res.body.error === error, `${where} ${field} ${reason}: error ${res.body.error}`);
+  };
+
+  await asyncTest('POST / mit abgewiesenem Mehrfachfeld nennt Grund und Grenze, error bleibt (#1909)', async () => {
+    for (const c of MV_CASES) {
+      expectMvCase('POST', await jsend(base, 'POST', { name: 'Mehrfach Fall', [c[0]]: c[1] }), c);
+    }
+  });
+
+  await asyncTest('PUT /:id mit abgewiesenem Mehrfachfeld nennt Grund und Grenze, error bleibt (#1909)', async () => {
+    const created = await jsend(base, 'POST', { name: 'Mehrfach Bearbeiten' });
+    const id = created.body.data.id;
+    for (const c of MV_CASES) {
+      expectMvCase('PUT', await jsend(`${base}/${id}`, 'PUT', { [c[0]]: c[1] }), c);
+    }
+  });
+
+  await asyncTest('Mehrfachfelder: der erste scheiternde Eintrag wird benannt, Einzelfelder vorher, gueltige gehen durch (#1909)', async () => {
+    // Zwei Befunde in einer Liste: der erste Eintrag.
+    const twoInList = await jsend(base, 'POST', { name: 'Mehrfach Fall',
+      emails: [{ label: 'Privat', value: 'ohne-at' }, { label: 'L'.repeat(51), value: 'a@x.de' }] });
+    assert(twoInList.body.reason === 'contacts_email_invalid', `reason ${twoInList.body.reason}`);
+    // Zwei Felder: phones vor emails vor addresses.
+    const twoFields = await jsend(base, 'POST', { name: 'Mehrfach Fall',
+      addresses: [{ label: 'L'.repeat(51) }], emails: [{ label: 'Privat', value: 'ohne-at' }],
+      phones: [{ label: 'Mobil', value: '1'.repeat(101) }] });
+    assert(twoFields.body.reason === 'contacts_phone_too_long' && twoFields.body.params?.limit === 100,
+      `phones zuerst: ${JSON.stringify(twoFields.body)}`);
+    // Ein Einzelfeld scheitert vorher und wird benannt, wie in der ersten Scheibe.
+    const single = await jsend(base, 'POST', { name: 'Mehrfach Fall', notes: 'n'.repeat(5001),
+      phones: [{ label: 'Mobil', value: '1'.repeat(101) }] });
+    assert(single.body.reason === 'contacts_notes_too_long', `Einzelfeld zuerst: ${single.body.reason}`);
+    // Die geloeschte Kategorie als einziger Befund der Einzelfelder bleibt ihr Fall.
+    const category = await jsend(base, 'POST', { name: 'Mehrfach Fall', category: 'gibt-es-nicht',
+      emails: [{ label: 'Privat', value: 'ohne-at' }] });
+    assert(category.body.reason === 'contacts_selected_category_not_found', `Kategorie: ${category.body.reason}`);
+    // Genau an der Grenze geht es durch.
+    const ok = await jsend(base, 'POST', { name: 'Mehrfach Grenze',
+      phones: [{ label: 'L'.repeat(50), value: '1'.repeat(100) }],
+      emails: [{ label: 'Privat', value: `${'e'.repeat(250)}@x.de` }],
+      addresses: [{ label: 'Zuhause', street: 'S'.repeat(255) }] });
+    assert(ok.status === 201, `Grenze: ${ok.status} ${JSON.stringify(ok.body)}`);
+  });
+
+  await asyncTest('Telefon: Einzelfeld und Liste haben dieselbe Grenze, wie das Formular beide schickt (#1909)', async () => {
+    // Das Formular schickt die erste Nummer als `phone` UND als ersten Eintrag
+    // von `phones`. Bis hierher liess das Einzelfeld 100 Zeichen zu, die Liste
+    // 50: 101 Zeichen hiessen "hoechstens 100", nach dem Kuerzen auf 60
+    // "hoechstens 50".
+    const formBody = (value) => ({ phone: value, phones: [{ label: 'other', value, isPrimary: true }] });
+    for (const length of [60, 100]) {
+      const value = '1'.repeat(length);
+      const created = await jsend(base, 'POST', { name: `Telefon ${length}`, ...formBody(value) });
+      assert(created.status === 201, `POST ${length}: ${created.status} ${JSON.stringify(created.body)}`);
+      const id = created.body.data.id;
+      const updated = await jsend(`${base}/${id}`, 'PUT', formBody('2'.repeat(length)));
+      assert(updated.status === 200, `PUT ${length}: ${updated.status} ${JSON.stringify(updated.body)}`);
+      // Die Liste allein, ohne Einzelfeld davor.
+      const listOnly = await jsend(`${base}/${id}`, 'PUT', { phones: [{ label: 'other', value: '3'.repeat(length) }] });
+      assert(listOnly.status === 200, `PUT nur Liste ${length}: ${listOnly.status} ${JSON.stringify(listOnly.body)}`);
+    }
+    const tooLong = '1'.repeat(101);
+    const expectLimit = (where, res) => {
+      assert(res.status === 400, `${where}: Status ${res.status}`);
+      assert(res.body.reason === 'contacts_phone_too_long', `${where}: reason ${res.body.reason}`);
+      assert(res.body.params?.limit === 100, `${where}: params ${JSON.stringify(res.body.params)}`);
+    };
+    expectLimit('POST Formular', await jsend(base, 'POST', { name: 'Telefon 101', ...formBody(tooLong) }));
+    expectLimit('POST nur Liste', await jsend(base, 'POST', { name: 'Telefon 101', phones: [{ label: 'other', value: tooLong }] }));
+    const created = await jsend(base, 'POST', { name: 'Telefon Bearbeiten' });
+    expectLimit('PUT Formular', await jsend(`${base}/${created.body.data.id}`, 'PUT', formBody(tooLong)));
+    expectLimit('PUT nur Liste', await jsend(`${base}/${created.body.data.id}`, 'PUT', { phones: [{ label: 'other', value: tooLong }] }));
+  });
+
+  // ------------------------------------------------------------------
   // Kategorie-404-Pfade (Ergänzung zu test-contact-categories.js)
   // ------------------------------------------------------------------
   await asyncTest('PUT /categories/:key für unbekannten Key → 404', async () => {
@@ -344,6 +547,22 @@ try {
   await asyncTest('DELETE /categories/:key für unbekannten Key → 404', async () => {
     const { status } = await jsend(`${base}/categories/gibt-es-nicht`, 'DELETE');
     assert(status === 404, `Status ${status}`);
+  });
+  // ------------------------------------------------------------------
+  // D7 (Critique R21): der Weg vom Kontakt zu seinem Geburtstag. Die
+  // Verbindung steht seit Migration 90 im Datenmodell (birthdays.contact_id,
+  // der Import), die Kontaktseite kannte sie aber nicht.
+  // ------------------------------------------------------------------
+  await asyncTest('GET / und GET /:id nennen den verknuepften Geburtstag (birthday_id), sonst null', async () => {
+    const linked = await jsend(base, 'POST', { name: 'Tante Verknuepft', birthday: '1970-05-04' });
+    const loose = await jsend(base, 'POST', { name: 'Onkel Lose', birthday: '1968-02-01' });
+    const bid = database.prepare("INSERT INTO birthdays (name, birth_date, created_by, contact_id) VALUES ('Tante Verknuepft', '1970-05-04', 1, ?)")
+      .run(linked.body.data.id).lastInsertRowid;
+    const list = (await jget(base)).body.data;
+    assert(list.find((c) => c.id === linked.body.data.id)?.birthday_id === Number(bid), `Liste: birthday_id ${JSON.stringify(list.find((c) => c.id === linked.body.data.id))}`);
+    assert(list.find((c) => c.id === loose.body.data.id)?.birthday_id === null, 'ohne Verknuepfung null');
+    const one = (await jget(`${base}/${linked.body.data.id}`)).body.data;
+    assert(one.birthday_id === Number(bid), `Detail: birthday_id ${one.birthday_id}`);
   });
 } finally {
   server.close();

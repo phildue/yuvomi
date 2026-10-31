@@ -1,8 +1,9 @@
 /** Shared fasting preferences and record dialog, on Health, Settings and Dashboard. */
 import { api } from '/api.js';
-import { t, formatDate, formatTime } from '/i18n.js';
+import { t, formatTime } from '/i18n.js';
+import { dateText } from '/utils/date-format.js';
 import { esc } from '/utils/html.js';
-import { openModal, closeModal, confirmModal, refocusAfterRender, captureModalContext, isModalContextCurrent } from '/components/modal.js';
+import { openModal, closeModal, confirmModal, refocusAfterRender, captureModalContext, isModalContextCurrent, reportFieldErrors, constraintErrors } from '/components/modal.js';
 import { FASTING_PRESETS, normalizeGoalHours, fastingDisplayModel, fastingNotificationAvailability, fastingServerDate, fastingServerClock, formatFastingClock } from '/utils/health-fasting.js';
 import { wallTimeValue, wallTimeInstant, wallTimeCandidates } from '/utils/timezone.js';
 import { moduleAccess } from '/permissions.js';
@@ -11,6 +12,7 @@ import { fastingHelpHtml } from '/components/fasting-help.js';
 import { toggleRowHtml } from '/settings/components.js';
 import { wireTablist } from '/utils/tablist.js';
 import { attachSegmentIndicator } from '/utils/segment-indicator.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
 
 export function fastingError(error) {
   if (error?.message === 'FASTING_OFFLINE') return t('health.fasting.offline');
@@ -21,7 +23,7 @@ export function fastingStamp(value, zone = 'UTC') {
   if (!value) return '-';
   const wall = wallTimeValue(value, zone);
   if (!editableWallTime(wall)) return `${wall} (${zone})`;
-  return `${formatDate(wall)} · ${formatTime(wall)}`;
+  return `${dateText(wall)} · ${formatTime(wall)}`;
 }
 
 // Native datetime-local cannot represent astronomical year zero or BCE.
@@ -33,27 +35,45 @@ export function requireFastingWrite() {
 }
 
 let preferencesSequence = 0;
-export function fastingPreferencesHtml(settings = {}) {
+
+/**
+ * DIE ZIEL-WAHL ALLEIN (R24, Critique G5 P2-5). Das Ziel stand nur im
+ * Einstellungsblatt hinter „..." - wer startete, lief „Ohne Ziel" mit leerem
+ * Ring. Jetzt steht dieselbe Leiste auch in der Bereit-Karte des Fastens,
+ * direkt ueber dem Start; das Blatt behaelt sie fuer das laufende Fasten.
+ * `compact` laesst die Ueberschrift sichtbar klein (Gruppenlabel) statt
+ * Abschnittstitel - in der Karte ist sie ein Feldetikett, kein Abschnitt.
+ */
+export function fastingGoalHtml(settings = {}, { compact = false } = {}) {
   const hours = settings.default_goal_minutes ? settings.default_goal_minutes / 60 : null;
   const custom = hours !== null && !FASTING_PRESETS.includes(hours);
-  const available = fastingNotificationAvailability(settings.default_goal_minutes);
   const goalTitleId = `fasting-goal-title-${++preferencesSequence}`;
+  // Die Karte und das Blatt koennen zugleich stehen (Blatt ueber der Karte).
+  const customId = compact ? 'fasting-goal-hours-card' : 'fasting-goal-hours';
   // DIE ZIEL-WAHL IST EINE SEGMENTLEISTE (R14 P3, A6 P2-1): eine Einfachauswahl
   // wie jede andere der App (.segmented, role=radio, gleitende Kapsel), nicht
   // Knoepfe, die sich zwischen Primaer und Sekundaer umfaerben.
   const choice = (value, label, selected) => `<button type="button" class="segmented__item${selected ? ' is-active' : ''}" role="radio" aria-checked="${selected}" tabindex="${selected ? '0' : '-1'}" data-tab-id="${value}" data-fasting-preset="${value}">${esc(label)}</button>`;
-  return `<div class="fasting-preferences">
-    <section><div class="fasting-help-heading"><h3 class="u-section-title" id="${goalTitleId}">${esc(t('health.fasting.goalTitle'))}</h3>${fastingHelpHtml(t('health.fasting.goalTitle'), [t('health.fasting.goalHint'), t('health.fasting.goalNextHint')])}</div>
+  const heading = compact
+    ? `<span class="form-label fasting-goal__label" id="${goalTitleId}">${esc(t('health.fasting.goalTitle'))}</span>`
+    : `<div class="fasting-help-heading"><h3 class="u-section-title" id="${goalTitleId}">${esc(t('health.fasting.goalTitle'))}</h3>${fastingHelpHtml(t('health.fasting.goalTitle'), [t('health.fasting.goalHint'), t('health.fasting.goalNextHint')])}</div>`;
+  return `<section class="fasting-goal${compact ? ' fasting-goal--compact' : ''}">${heading}
       <div class="segmented fasting-presets" role="radiogroup" aria-labelledby="${goalTitleId}">
         ${choice('none', t('health.fasting.noGoal'), hours === null)}
         ${FASTING_PRESETS.map((h) => choice(String(h), `${h}:${24 - h}`, hours === h)).join('')}
         ${choice('custom', t('health.fasting.custom'), custom)}
       </div>
       <div class="form-group fasting-custom" data-fasting-custom ${custom ? '' : 'hidden'}>
-        <label class="form-label" for="fasting-goal-hours">${esc(t('health.fasting.goalHours'))}</label>
-        <input class="form-input" id="fasting-goal-hours" type="number" min="1" max="336" step="1" value="${custom ? hours : ''}" data-fasting-goal>
+        <label class="form-label" for="${customId}">${esc(t('health.fasting.goalHours'))}</label>
+        <input class="form-input" id="${customId}" type="number" min="1" max="336" step="1" value="${custom ? hours : ''}" data-fasting-goal>
       </div>
-    </section>
+    </section>`;
+}
+
+export function fastingPreferencesHtml(settings = {}) {
+  const available = fastingNotificationAvailability(settings.default_goal_minutes);
+  return `<div class="fasting-preferences">
+    ${fastingGoalHtml(settings)}
     <section class="fasting-notifications"><div class="fasting-help-heading"><h3 class="u-section-title">${esc(t('health.fasting.notifications'))}</h3>${fastingHelpHtml(t('health.fasting.notifications'), [t('health.fasting.reminderHint')])}</div>
       ${toggleRowHtml({ label: t('health.fasting.remindGoalToggle'), control: 'switch', checked: !!settings.remind_goal, disabled: !available.goal, attrs: { 'data-fasting-remind-goal': true } })}
       ${toggleRowHtml({ label: t('health.fasting.remindNextToggle'), control: 'switch', checked: !!settings.remind_next_start, disabled: !available.next, attrs: { 'data-fasting-remind-next': true } })}
@@ -92,21 +112,25 @@ export function wireFastingPreferences(root, initial, onSaved = () => {}, active
       const restoreFocus = document.activeElement === focused || document.activeElement === document.body;
       const savedRoot = await onSaved(settings) || root;
       if (savedRoot.isConnected) {
-        savedRoot.querySelector('[data-fasting-preferences-status]').textContent = t('settings.feedExportSaved');
+        const savedStatus = savedRoot.querySelector('[data-fasting-preferences-status]');
+        if (savedStatus) savedStatus.textContent = t('settings.feedExportSaved');
         const focusUnchanged = document.activeElement === focused || document.activeElement === document.body;
         if (restoreFocus && focusUnchanged && focusSelector && isModalContextCurrent(context)) refocus = savedRoot.querySelector(focusSelector);
       }
     } catch (error) {
-      status.textContent = fastingError(error);
+      if (status) status.textContent = fastingError(error);
     } finally {
       pending = false;
       root.querySelectorAll('input, button, select').forEach((el) => { el.disabled = false; });
       const available = fastingNotificationAvailability(settings.default_goal_minutes);
-      root.querySelector('[data-fasting-remind-goal]').disabled = !available.goal;
-      root.querySelector('[data-fasting-remind-next]').disabled = !available.next;
-      root.querySelector('[data-fasting-clock-default]').value = settings.clock_mode || 'auto';
-      root.querySelector('[data-fasting-remind-goal]').checked = !!settings.remind_goal;
-      root.querySelector('[data-fasting-remind-next]').checked = !!settings.remind_next_start;
+      // Die Bereit-Karte traegt nur die Ziel-Leiste (fastingGoalHtml) - die
+      // uebrigen Felder gibt es nur im Blatt.
+      const remindGoal = root.querySelector('[data-fasting-remind-goal]');
+      const remindNext = root.querySelector('[data-fasting-remind-next]');
+      const clockDefault = root.querySelector('[data-fasting-clock-default]');
+      if (remindGoal) { remindGoal.disabled = !available.goal; remindGoal.checked = !!settings.remind_goal; }
+      if (remindNext) { remindNext.disabled = !available.next; remindNext.checked = !!settings.remind_next_start; }
+      if (clockDefault) clockDefault.value = settings.clock_mode || 'auto';
       const hours = settings.default_goal_minutes ? settings.default_goal_minutes / 60 : null;
       const selected = hours === null ? 'none' : FASTING_PRESETS.includes(hours) ? String(hours) : 'custom';
       presets.sync(selected);
@@ -139,10 +163,10 @@ export function wireFastingPreferences(root, initial, onSaved = () => {}, active
     if (!event.target.value || !event.target.reportValidity()) return;
     void save({ default_goal_minutes: normalizeGoalHours(event.target.value) });
   });
-  root.querySelector('[data-fasting-remind-goal]').addEventListener('change', (event) => void save({ remind_goal: event.target.checked }));
-  root.querySelector('[data-fasting-remind-next]').addEventListener('change', (event) => void save({ remind_next_start: event.target.checked }));
-  root.querySelector('[data-fasting-clock-default]').addEventListener('change', (event) => void save({ clock_mode: event.target.value }));
-  root.querySelector('[data-fasting-zone-mode]').addEventListener('change', (event) => void save({ zone_mode: event.target.value }));
+  root.querySelector('[data-fasting-remind-goal]')?.addEventListener('change', (event) => void save({ remind_goal: event.target.checked }));
+  root.querySelector('[data-fasting-remind-next]')?.addEventListener('change', (event) => void save({ remind_next_start: event.target.checked }));
+  root.querySelector('[data-fasting-clock-default]')?.addEventListener('change', (event) => void save({ clock_mode: event.target.value }));
+  root.querySelector('[data-fasting-zone-mode]')?.addEventListener('change', (event) => void save({ zone_mode: event.target.value }));
 }
 
 /** Reads acknowledgement from the server so all entry points share the same gate. */
@@ -200,7 +224,7 @@ export async function finishFasting(row, refresh, isCurrent = () => true) {
         requireFastingWrite();
         await api.patch(`/health/fasting/${data.id}`, { end_at: null, expected_revision: data.revision });
         if (isModalContextCurrent({ ...context, pageRoot: null })) await closeModal({ force: true });
-        await refresh(); refocusAfterRender();
+        await reloadAfterSave(() => refresh()); refocusAfterRender();
       } catch (error) { window.yuvomi?.showToast(fastingError(error), 'danger'); }
     },
   });
@@ -222,7 +246,7 @@ export function openFastingEditor(row, refresh, finished = false) {
   openModal({
     title: t(finished ? 'health.fasting.finishedTitle' : creating ? completed ? 'health.fasting.backfill' : 'health.fasting.earlier' : 'health.fasting.editTitle'),
     size: 'lg',
-    content: `<form data-fasting-edit-form>
+    content: `<form data-fasting-edit-form novalidate>
       ${finished ? `<p class="form-hint">${esc(t('health.fasting.finishedHint'))}</p>` : ''}
       <p class="form-hint">${esc(row.start_tzid)}</p>
       <div class="fasting-editor-grid">
@@ -270,7 +294,8 @@ export function openFastingEditor(row, refresh, finished = false) {
       let saving = false;
       form.addEventListener('submit', async (event) => {
         event.preventDefault();
-        if (saving || !form.reportValidity()) return;
+        // KEINE BROWSER-BLASEN (Critique R21): `novalidate`, die Regeln des Markups melden sich am Feld (constraintErrors, components/modal.js).
+        if (saving || reportFieldErrors(constraintErrors(form))) return;
         const fields = new FormData(form);
         const startValue = fields.get('start');
         const endValue = fields.get('end');
@@ -313,7 +338,7 @@ export function openFastingEditor(row, refresh, finished = false) {
           if (creating) await api.post('/health/fasting', { ...payload, acknowledge_safety: row.acknowledge_safety });
           else await api.patch(`/health/fasting/${row.id}`, payload);
           if (panel.isConnected && isModalContextCurrent({ ...context, pageRoot: null })) {
-            await closeModal({ force: true }); await refresh(); refocusAfterRender();
+            await closeModal({ force: true }); await reloadAfterSave(() => refresh()); refocusAfterRender();
           }
         } catch (error) { form.querySelector('[data-fasting-edit-error]').textContent = fastingError(error); }
         finally { saving = false; submit.disabled = false; }

@@ -24,16 +24,19 @@ test('reminder availability and help retain preferences across goal changes', as
       }, { method, path, body });
       await call('post', '/health/fasting', { start_at: new Date(Date.now() - 3600000).toISOString(), start_tzid: 'UTC', goal_minutes: 960, acknowledge_safety: true });
       await call('put', '/health/fasting/settings', { remind_goal: true, remind_next_start: true });
-      // Die Einstellungen stehen seit R14 (A6 P2-1) im Blatt hinter dem Zahnrad.
-      await gotoRoute(page, '/health/fasting'); await page.waitForSelector('[data-fasting-settings]');
-      await clickFasting(page, '[data-fasting-settings]');
+      // Die Einstellungen stehen seit R14 (A6 P2-1) in einem Blatt, seit R23 D14
+      // hinter dem Eintrag im "..." des Rings (vorher ein Zahnrad).
+      await gotoRoute(page, '/health/fasting'); await page.waitForSelector('[popovertarget="fasting-more-menu"]');
+      await clickFasting(page, '[popovertarget="fasting-more-menu"]');
+      await page.waitForSelector('#fasting-more-menu:popover-open [data-fasting-settings]');
+      await page.click('#fasting-more-menu [data-fasting-settings]');
       await page.waitForSelector('.modal-panel [data-fasting-preset="custom"]'); await settle(page);
-      await clickFasting(page, '[data-fasting-preset="custom"]');
-      assert.equal(await page.$eval('[data-fasting-custom]', (el) => el.hidden), false);
-      assert.equal(await page.$eval('[data-fasting-preset="custom"]', (el) => el.getAttribute('aria-checked')), 'true');
-      await page.type('[data-fasting-goal]', '36');
-      await page.$eval('[data-fasting-goal]', (el) => el.dispatchEvent(new Event('change', { bubbles: true })));
-      await page.waitForFunction(() => !document.querySelector('[data-fasting-goal]').disabled);
+      await clickFasting(page, '.modal-panel [data-fasting-preset="custom"]');
+      assert.equal(await page.$eval('.modal-panel [data-fasting-custom]', (el) => el.hidden), false);
+      assert.equal(await page.$eval('.modal-panel [data-fasting-preset="custom"]', (el) => el.getAttribute('aria-checked')), 'true');
+      await page.type('.modal-panel [data-fasting-goal]', '36');
+      await page.$eval('.modal-panel [data-fasting-goal]', (el) => el.dispatchEvent(new Event('change', { bubbles: true })));
+      await page.waitForFunction(() => !document.querySelector('.modal-panel [data-fasting-goal]').disabled);
       assert.equal((await call('get', '/health/fasting/state')).data.settings.default_goal_minutes, 2160);
       assert.equal(await page.$eval('[data-fasting-remind-next]', (el) => el.disabled), true);
       assert.equal(await page.$eval('[data-fasting-remind-goal]', (el) => el.disabled), false);
@@ -45,12 +48,12 @@ test('reminder availability and help retain preferences across goal changes', as
       }), true);
       await page.keyboard.press('Escape');
       assert.equal(await page.$('.fasting-notifications [role="tooltip"]:popover-open'), null);
-      await clickFasting(page, '[data-fasting-preset="none"]');
-      await page.waitForFunction(() => (() => { const el = document.querySelector('[data-fasting-preset="none"]'); return el?.getAttribute('aria-checked') === 'true' && !el.disabled; })());
+      await clickFasting(page, '.modal-panel [data-fasting-preset="none"]');
+      await page.waitForFunction(() => (() => { const el = document.querySelector('.modal-panel [data-fasting-preset="none"]'); return el?.getAttribute('aria-checked') === 'true' && !el.disabled; })());
       assert.equal(await page.$eval('[data-fasting-remind-goal]', (el) => el.disabled), true);
-      await clickFasting(page, '[data-fasting-preset="16"]');
-      await page.waitForFunction(() => (() => { const el = document.querySelector('[data-fasting-preset="16"]'); return el?.getAttribute('aria-checked') === 'true' && !el.disabled; })());
-      assert.equal(await page.$eval('[data-fasting-custom]', (el) => el.hidden), true);
+      await clickFasting(page, '.modal-panel [data-fasting-preset="16"]');
+      await page.waitForFunction(() => (() => { const el = document.querySelector('.modal-panel [data-fasting-preset="16"]'); return el?.getAttribute('aria-checked') === 'true' && !el.disabled; })());
+      assert.equal(await page.$eval('.modal-panel [data-fasting-custom]', (el) => el.hidden), true);
       assert.equal((await call('get', '/health/fasting/state')).data.settings.remind_goal, 1);
       assert.equal((await call('get', '/health/fasting/state')).data.settings.remind_next_start, 1);
       await page.close();

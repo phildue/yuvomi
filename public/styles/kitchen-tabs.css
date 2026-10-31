@@ -36,18 +36,25 @@
    * legte 2px darauf, viermal (drei Tabs, dazu der Abstandhalter der
    * Werkzeuge). Genau diese 8px fehlten bei 375px: Rezepte lief 3px, Vorrat
    * 9px ueber, und die Leiste scrollte fuer vier Tabs. */
+  /* DIE KAPSEL IST EINE KAPSEL, KEIN FAST-KREIS (Critique R21, D11). Der
+   * aktive Tab war mobil 58x48 mit rund 3px Luft ums Wort, "Vorrat11" klebte.
+   * Die Kapsel bekommt eine eigene Form (utils/segment-indicator.js): 40px
+   * hoch (`--target-md`), mittig im 48px-Ziel, und 4px ueber den Tab hinaus
+   * in dessen Polster - mit den 8px Polster unten 12px Luft ums Wort, ohne
+   * dass die Leiste breiter wird. Die Trefferflaeche bleibt der Tab. */
   .kitchen-tabs-bar {
     gap: 0;
+    --seg-pill-outset: var(--space-1);
+    --seg-pill-block: var(--target-md);
   }
 
-  /* Der Zaehler ruckt ans Wort: 2px Innenpolster statt 4 und kein eigener
-   * Aussenrand - der Abstand zum Label kommt vom Tab (gap unten). Er bleibt
-   * eine Pille (min-width aus sub-tabs.css), nur ohne Luft, die die Zahl
-   * nicht braucht. Zusammen mit dem Abstand oben passt die Leiste bei 375px
-   * in allen vier Tabs; gerechnet in test-kitchen-tabs.js. */
+  /* Der Zaehler ist eine eigene Marke neben dem Wort: 4px Abstand (gap unten)
+   * und 4px Innenpolster, kein eigener Aussenrand. Er bleibt eine Pille
+   * (min-width aus sub-tabs.css). Zusammen mit dem Abstand oben passt die
+   * Leiste bei 375px in allen vier Tabs; gerechnet in test-kitchen-tabs.js. */
   .kitchen-tabs-bar .sub-tab__badge {
     margin-inline-start: 0;
-    padding-inline: var(--space-0h);
+    padding-inline: var(--space-1);
   }
 
   /* Der Modultitel „Küche" entfällt mobil: die Bottom-Nav zeigt dasselbe Wort
@@ -84,7 +91,7 @@
   .kitchen-tabs-bar .sub-tab {
     flex: 0 0 auto;
     justify-content: center;
-    gap: var(--space-0h);
+    gap: var(--space-1);
     /* 8px statt 2px seit dem HIG-Rollout: der aktive Tab ist jetzt eine
      * GEFÜLLTE Kapsel (--target-base = 48px hoch auf Fingergeräten). Mit 2px
      * Polster schrumpfte sie auf Textbreite und las sich als Blase um das Wort
@@ -95,10 +102,13 @@
      *
      * 4px SEIT R9 (M10): die Leiste traegt in Rezepte/Vorrat jetzt auch Lupe und
      * Werkzeugmenue (unten), und 8px je Seite waren genau die 32px, die bei 390px
-     * fehlten - "Vorrat 11" stand angeschnitten am Rand. Die Kapsel bleibt 48px
-     * hoch; sie liest sich weiter als Segment, weil die Labels selbst nie
-     * enger als 4px an ihre Kante ruecken. */
-    padding-inline: var(--space-1);
+     * fehlten - "Vorrat 11" stand angeschnitten am Rand.
+     *
+     * 8px SEIT R21 (D11): seit R9 stehen keine Werkzeuge mehr in der Leiste
+     * (Kontextzeile, unten), die 32px sind wieder frei. Die Kapsel ragt 4px
+     * darueber hinaus (`--seg-pill-outset` oben): 12px Luft ums Wort im
+     * aktiven Tab, zwischen zwei Worten weiter 16px. */
+    padding-inline: var(--space-2);
   }
 
   /* DAS SIEGEL WEICHT MOBIL MIT DEM TITEL (R9 M10). Es wiederholte dasselbe
@@ -118,22 +128,8 @@
    * Regel: die Leiste traegt nur Tabs mit ihren Zahlen, jedes Werkzeug steht
    * in der Kontextzeile seines Tabs (der Kopf der Seite unter der Leiste).
    * Traegt diese Zeile NUR Werkzeuge (Rezepte, Vorrat), faltet sie angedockt
-   * ein und kommt oben wieder (R17 K1) - erkannt von wireCollapsingHeader
+   * ein und kommt beim Hochscrollen wieder (R17 K1, R22 D15) - erkannt von wireCollapsingHeader
    * (utils/ux.js), gefaltet in layout.css ("DIE FALTZEILE"), nicht hier. */
-  /* Mobil weicht das Icon, nicht das Label. Vier Tabs teilen sich auf 393px
-   * ~90px pro Stück; „Mahlzeiten" allein braucht 73px Label + 16px Icon + die
-   * Abstände, also ~95px - beides passt nicht nebeneinander. Das Wort ist der
-   * bessere Anker: die Bottom-Nav trägt dieselben Icons bereits, und ein auf
-   * „Mahlz…" gekürztes Label kostet mehr Orientierung als ein fehlendes
-   * Piktogramm. Gilt im ganzen 640er-Breakpoint statt ab einer eigenen
-   * 480er-Schwelle - der Breakpoint-Kontrakt (tokens.css §11c) lässt nur
-   * 640/768/1024/1440 zu, und ein einheitlicher Mobilzustand ist ohnehin
-   * leichter zu lesen als drei Stufen. Das ellipsis oben bleibt als
-   * Sicherheitsnetz für noch schmalere Geräte und lange Übersetzungen. */
-  .kitchen-tabs-bar .sub-tab__icon,
-  .kitchen-tabs-bar .sub-tab > svg {
-    display: none;
-  }
 }
 
 /* Mahlzeiten + Rezepte: Viewport-Höhe um Tab-Leiste reduzieren (Mobile).

@@ -136,7 +136,7 @@ function knoten(el, tag) {
  * was in der Zeit gebaut wurde - ein Menue, das NICHT aufgeht, ist darin nicht
  * zu finden.
  */
-async function mitElementen(fn) {
+async function mitElementen(fn, { popoverApi = true } = {}) {
   const gebaut = [];
   const bauen = globalThis.document.createElement;
   const koerper = globalThis.document.body.childNodes.length;
@@ -149,7 +149,8 @@ async function mitElementen(fn) {
       contains: (name) => klassen().includes(name),
       toggle() {},
     };
-    Object.assign(el, { showPopover() {}, hidePopover() {}, remove() {}, focus() {}, offsetWidth: 0, offsetHeight: 0 });
+    Object.assign(el, { remove() {}, focus() {}, offsetWidth: 0, offsetHeight: 0 });
+    if (popoverApi) Object.assign(el, { showPopover() {}, hidePopover() {} });
     gebaut.push(el);
     return el;
   };
@@ -273,7 +274,7 @@ test('Inventar (#1463): Bearbeiten ist im Blatt der Primaerknopf, Loeschen bleib
   // (withPrimaryEdit, test:detail-view), keine Option mehr.
   assert.ok(voll.edit?.mount, 'das Blatt traegt Bearbeiten');
   const [loeschen] = voll.actions;
-  assert.equal(loeschen.variant, 'danger-ghost');
+  assert.equal(loeschen.variant, 'danger-outline', 'R24: EINE Loeschen-Form, umrandet mit Wort');
   assert.equal(loeschen.align, 'start', 'Loeschen steht am Anfang der Fusszeile, weg vom Daumen');
 });
 
@@ -318,7 +319,16 @@ async function inventarSchreibwege() {
     await inventory.openCategoryManager();
     // Nicht abgewartet: mit Schreibrecht wartet die Karte auf ihr Schliessen.
     inventory.openCompletionSheet(item, item.tracked_dates[0]);
-    await inventory.removeItem(item);
+    // Loeschen geht seit R23 (D6) mit Rueckgaengig: es sendet erst mit dem Ende
+    // der Toast-Frist - hier sofort, damit der Gegenfall den Weg misst.
+    let fenster = null;
+    globalThis.__undoStub = (opts) => { fenster = opts; };
+    try {
+      await inventory.removeItem(item);
+      await fenster?.commit({ keepalive: false });
+    } finally {
+      delete globalThis.__undoStub;
+    }
   });
   return modale;
 }
@@ -327,7 +337,7 @@ test('Inventar bei `read`: kein Schreibweg oeffnet ein Formular oder sendet etwa
   let modale;
   const gesendet = await withAccess(LESEN, () => aufrufe(async () => { modale = await inventarSchreibwege(); }));
   assert.deepEqual(modale, [], 'Anlegen, Bearbeiten, beide Verwaltungen und die Abschluss-Karte bleiben zu');
-  assert.deepEqual(schreibend(gesendet), [], 'und Loeschen sendet nichts (die Rueckfrage ist im Test bejaht)');
+  assert.deepEqual(schreibend(gesendet), [], 'und Loeschen sendet nichts, auch nicht mit dem Ende der Frist');
 
   let volleModale;
   const voll = await withAccess(SCHREIBEN, () => aufrufe(async () => { volleModale = await inventarSchreibwege(); }));
@@ -419,12 +429,12 @@ test('Dokumente: der Kebab folgt dem Dokument - `read` nie, `write` nur am eigen
   assert.equal(hatKebab(admin.zeile), true, 'ein Admin verwaltet jedes Dokument, wie am Server');
 });
 
-test('Dokumente: die kompakte Zeile behaelt ihr Auge, wenn kein Kebab da ist', () => {
-  // Unter 30rem faellt das Auge weg, weil das Kebab-Menue „Ansehen" fuehrt.
-  // Ohne Kebab waere die Zeile dann fuer die Tastatur zu.
+test('Dokumente: die Zeile behaelt ihr Auge, wenn kein Kebab da ist', () => {
+  // In der Zeile faellt das Auge weg, weil das Kebab-Menue „Ansehen" fuehrt
+  // (seit R21 in jeder Breite, D10). Ohne Kebab waere die Zeile dann fuer die
+  // Tastatur zu.
   const css = readFileSync(new URL('../public/styles/documents.css', import.meta.url), 'utf8');
-  const kompakt = [...eachRule(css)].filter((rule) => rule.at.some((a) => /@container list-rows \(max-width: 30rem\)/.test(a)));
-  const versteckt = kompakt.filter((rule) => /\[data-action="view"\]/.test(rule.selector) && /display:\s*none/.test(rule.body));
+  const versteckt = [...eachRule(css)].filter((rule) => /\[data-action="view"\]/.test(rule.selector) && /display:\s*none/.test(rule.body));
   assert.equal(versteckt.length, 1, 'genau eine Regel blendet das Auge aus');
   assert.match(versteckt[0].selector, /\.document-row__actions:not\(\[data-read-bar\]\)/,
     'und sie nimmt die kebablose Leiste aus');
@@ -674,6 +684,30 @@ test('Dokumente bei `read`: die Ordnerleiste traegt weder „+" noch Kebab, und 
   assert.deepEqual([...voll.menues[0].matchAll(/data-menu-action="([a-z]+)"/g)].map((m) => m[1]),
     ['subfolder', 'rename', 'move', 'delete'], 'mit seinen vier Schreib-Eintraegen');
   assert.equal(voll.knopf['aria-expanded'], 'true');
+});
+
+// OHNE POPOVER-API (#2107: Chrome < 114, Firefox < 125, Safari < 17) ist das
+// Kontextmenue nicht verfuegbar. Vorher hing das Panel schon im Body, bevor
+// `showPopover()` warf - jeder Klick auf den Kebab haengte ein weiteres
+// unsichtbares Panel dazu, und der Fehler landete in der Konsole.
+test('Dokumente ohne Popover-API: das Ordner-Menue haengt kein Panel ein und wirft nicht', async () => {
+  const attribute = {};
+  const knopf = {
+    attribute, isConnected: false, focus() {},
+    setAttribute(name, wert) { attribute[name] = wert; },
+    getBoundingClientRect: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
+  };
+  const ergebnis = await withAccess(SCHREIBEN, () => mitSeite({ user: { id: ICH } }, async () => {
+    const vorher = globalThis.document.body.childNodes.length;
+    let fehler = null;
+    await mitElementen(async () => {
+      try { await documents.openFolderMenu(ORDNER[0], knopf); } catch (err) { fehler = err; }
+    }, { popoverApi: false });
+    return { fehler, eingehaengt: globalThis.document.body.childNodes.length - vorher };
+  }));
+  assert.equal(ergebnis.fehler, null, `openFolderMenu() wirft ohne Popover-API: ${ergebnis.fehler}`);
+  assert.equal(ergebnis.eingehaengt, 0, 'kein Panel im Body');
+  assert.deepEqual(attribute, {}, 'der Ausloeser meldet kein offenes Menue');
 });
 
 test('Dokumente bei `read`: ein Ordner zieht nicht um - mit Schreibrecht geht genau der Umzug raus', async () => {

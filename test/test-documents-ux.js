@@ -11,7 +11,7 @@ import { getSupportedLocales } from '../public/i18n.js';
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import { eachRule } from './css-rules.js';
+import { eachRule, globalHiddenRule } from './css-rules.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const read = (rel) => readFileSync(resolve(HERE, rel), 'utf8');
@@ -48,7 +48,7 @@ test('Such- und Filter-Leerzustand bieten die auflösende Aktion an, nicht "Hoch
   assert.match(page, /function resetFilters\(\)/);
   assert.match(page, /function clearSearch\(\)/);
   // Die Suchvariante darf nicht die Upload-Aktion als Primäraktion führen.
-  const searchBranch = page.slice(page.indexOf('if (state.query)'), page.indexOf('if (hasActiveFilter())'));
+  const searchBranch = page.slice(page.indexOf('if (state.query)'), page.indexOf('const folderOnly'));
   assert.doesNotMatch(searchBranch, /documents-empty-upload/);
 });
 
@@ -200,7 +200,8 @@ test('die Listenansicht trägt Datum und Größe als eigene Spalten', () => {
   // Vorher zeigte die Zeile kein Datum — der Wechsel Raster→Liste nahm Information weg.
   assert.match(page, /document-row__stats/);
   assert.match(page, /document-row__date/);
-  assert.match(page, /renderMeta\(doc, \{ showSize: false \}\)/);
+  // Seit R22 (D11) reicht die Zeile Datum und Groesse zusaetzlich als schmale Fassung mit.
+  assert.match(page, /renderMeta\(doc, \{ showSize: false, stats: /);
   assert.match(css, /\.document-row__stats\s*\{/);
 });
 
@@ -319,7 +320,8 @@ test('Mehrfachauswahl ist opt-in, und ihre Leiste ist die Pille der Shell (R11 H
   // `.btn` setzt ein eigenes display und schlaegt sonst das UA-`[hidden]
   // { display: none }` - der DMS-Button blieb dadurch sichtbar, obwohl kein
   // DMS-Konto existierte.
-  assert.match(css, /\.documents-dms-link-btn\[hidden\]\s*\{[^}]*display:\s*none/);
+  // Seit R21 S9a haelt das die EINE globale [hidden]-Regel (reset.css, D13).
+  assert.ok(globalHiddenRule(), 'der ausgeblendete DMS-Knopf verschwindet');
   for (const fn of ['enterSelectMode', 'exitSelectMode', 'toggleSelectAll', 'moveSelected', 'archiveSelected', 'deleteSelected']) {
     assert.ok(page.includes(`function ${fn}`), `${fn} fehlt`);
   }
@@ -350,10 +352,23 @@ test('nicht konfigurierte Upload-Ziele sind nicht auswählbar', () => {
   assert.match(storageSettings, /option\.disabled\s*=\s*!availableBackends\.has\(backend\)/);
 });
 
-test('die Speicher-Einstellungen sind von der Seite aus verlinkt — nur für Admins', () => {
+test('R24 D4: der Auswahl-Dialog der Belege sperrt "Uebernehmen" nicht, ohne Wahl sagt er, was fehlt', () => {
+  const attach = read('../public/components/document-attach.js');
+  assert.match(attach, /<button class="btn btn--primary" type="button" data-picker-confirm>/, 'nie gesperrt');
+  assert.doesNotMatch(attach, /confirmEl\.disabled/);
+  assert.match(attach, /if \(!selected\.size\) \{\s*reasonEl\.textContent = t\('documentAttach\.pickNone'\);\s*reasonEl\.hidden = false;/);
+});
+
+test('der Speicherort steht als Satz fuer Admins - ohne Link aus dem halb ausgefuellten Dialog (R24)', () => {
   // Seit R10 (2026-09-27) ein Abschnitt im Modulblatt Dokumente; der Link
   // zielt direkt dorthin, nicht ueber die Umleitung der Alt-Adresse.
-  assert.match(page, /state\.isAdmin \? `<a class="document-storage-target__link" href="\/settings\/modules\/documents\?section=documents-storage"/);
+  // Seit R22 (D11) gehoert die ganze Auskunft dem Admin, nicht nur der Link:
+  // "Neue Dateien werden gespeichert in: Lokal" stand fuer jedes Mitglied da.
+  // Seit R24 (Critique G4-Dokumente-P3-2) ohne den Link "Speicher-Einstellungen":
+  // er verliess das halb ausgefuellte Formular.
+  assert.match(page, /\$\{state\.isAdmin \? `<p class="document-storage-target">[\s\S]*?documents\.activeUploadTarget[\s\S]*?<\/p>` : ''\}/);
+  assert.doesNotMatch(page, /document-storage-target__link|documents\.storageSettingsLink/);
+  assert.equal((page.match(/class="document-storage-target"/g) ?? []).length, 1, 'kein zweiter Weg zur Auskunft');
   const routes = read('../server/routes/documents.js');
   assert.match(routes, /is_admin: isAdminRequest\(req\)/);
 });
@@ -376,7 +391,7 @@ test('das Speichern referenziert den Submit-Button am Panel, nicht am Formular (
   // dann null, und submit.disabled würfe einen unbehandelten TypeError, der als
   // generischer Fehler-Toast erscheint, statt das Dokument zu speichern.
   assert.match(page, /async function saveDocument\(event, doc, panel\)/);
-  const save = page.slice(page.indexOf('async function saveDocument'), page.indexOf('async function saveDocument') + 900);
+  const save = page.slice(page.indexOf('async function saveDocument'), page.indexOf('async function saveDocument') + 1200);
   assert.match(save, /panel\.querySelector\('#document-submit'\)/);
   assert.doesNotMatch(save, /form\.querySelector\('#document-submit'\)/);
   // Der Submit-Handler reicht das Panel an saveDocument durch.
@@ -622,8 +637,8 @@ test('Teilen gibt es nur im Viewer, gated ueber die eine Probe, nie ueber "share
   assert.doesNotMatch(page, /'share' in navigator/, 'das ist auch dort wahr, wo nur Links teilbar sind');
   assert.doesNotMatch(page, /navigator\.share\b[^(]/, 'navigator.share wird aufgerufen, nicht abgefragt');
   // Der Knopf existiert nur bei 'ok'; sonst steht die Erklaerung, kein toter Knopf.
-  // Der Knopf ist die geteilte Zeilenaktion (Runde 5): rowActionHtml rendert <button type="button">.
-  assert.match(page, /\$\{shareSupport === 'ok' \? `\s*\$\{rowActionHtml\(\{ icon: 'share-2', action: 'share',/);
+  // Seit R24 (G4-Dokumente-P3-3) ein Knopf mit Zeichen UND Wort.
+  assert.match(page, /\$\{shareSupport === 'ok' \? `\s*<button type="button" class="btn btn--secondary btn--sm document-viewer__action" data-action="share"/);
   assert.match(page, /shareSupport !== 'ok' \? `<p class="document-viewer__note">\$\{t\(SHARE_NOTE_KEYS\[shareSupport\]\)\}<\/p>`/);
   // Die Zeile bleibt bei Ansehen/Download/Kebab.
   const actions = page.slice(page.indexOf('function renderActions(doc)'), page.indexOf('function renderSelectBox'));
@@ -645,7 +660,7 @@ test('die Datei wird beim Oeffnen geholt, der Klick muendet ohne await in naviga
   assert.match(close, /shareAbort\.abort\(\)/);
   assert.match(close, /shareFile = null/);
   // Der Knopf startet gesperrt und beschaeftigt, bis die Datei da ist.
-  assert.match(page, /action: 'share',[^\n]*attrs: \{ disabled: true, 'aria-busy': 'true'/);
+  assert.match(page, /data-action="share" disabled aria-busy="true"/);
   assert.match(prep, /btn\.disabled = false;\s*btn\.removeAttribute\('aria-busy'\)/);
   for (const key of ['shareAction', 'sharePreparing', 'shareUnsupportedType', 'shareInsecure', 'shareBrowserUnsupported', 'shareFailed']) {
     assert.equal(typeof de.documents[key], 'string', `de.json: documents.${key} fehlt`);
@@ -894,9 +909,9 @@ test('der Viewer nennt das Ablaufdatum in seiner Meta-Zeile', () => {
   assert.match(viewer, /\$\{expiryViewerHtml\(doc\)\}/);
   const fn = page.slice(page.indexOf('function expiryViewerHtml('), page.indexOf('function storageBadgeHtml'));
   assert.match(fn, /expiryViewerSpec\(dateStatus\(doc\.expires_at\)\)/);
-  // Das Datum ist ein Tagesschluessel: formatDate() liest ihn als Wanduhrzeit,
+  // Das Datum ist ein Tagesschluessel: dateText() liest ihn als Schluessel,
   // ein Umweg ueber new Date()/toISOString() kippte je nach Zone auf den Vortag.
-  assert.match(fn, /formatDate\(spec\.dateKey\)/);
+  assert.match(fn, /dateText\(spec\.dateKey\)/);
   assert.doesNotMatch(fn, /new Date|toISOString/);
   assert.match(fn, /esc\(/);
 });
@@ -1171,11 +1186,14 @@ test('Kategorie und Ordner sagen, wofuer sie stehen - im Dialog und im Filter', 
   // Zwei Ordnungsachsen nebeneinander ("Versicherung" und "Versicherungen"),
   // und nirgends stand, wann welche gilt (Critique H10). Option A: beide
   // bleiben, die Rolle steht dabei - Art des Dokuments gegen Ablageort.
+  // Seit R24 (G4-Dokumente-P3-2) stehen die Saetze hinter "Mehr dazu" (hintFoldHtml)
+  // statt unter jedem Feld.
   const modal = fnBody('openDocumentModal', 'bindDropzone');
-  assert.match(modal, /<select class="input" id="document-category" aria-describedby="document-category-hint">/);
-  assert.match(modal, /<p class="document-form__hint" id="document-category-hint">\$\{t\('documents\.categoryHint'\)\}<\/p>/);
-  assert.match(modal, /<select class="input" id="document-folder" aria-describedby="document-folder-hint">/);
-  assert.match(modal, /<p class="document-form__hint" id="document-folder-hint">\$\{t\('documents\.folderHint'\)\}<\/p>/);
+  assert.match(modal, /<select class="input" id="document-category">/);
+  assert.match(modal, /<select class="input" id="document-folder">/);
+  assert.match(modal, /hintFoldHtml\(\{\s*className: 'document-form__help',\s*moreHtml: \[isEdit \? '' : t\('documents\.nameHint'\), t\('documents\.categoryHint'\), t\('documents\.folderHint'\)\]/);
+  assert.doesNotMatch(modal, /id="document-(?:name|category|folder)-hint"/, 'kein Satz mehr unter jedem Feld');
+  assert.match(modal, /initialFocus: isEdit \? 'edit' : 'none'/, 'Hochladen holt keine Tastatur fuer den Namen');
   assert.match(page, /id="documents-category" role="group" aria-label="\$\{t\('documents\.categoryFilterLabel'\)\}"/);
   assert.match(page, /<aside class="documents-folder-browser" aria-label="\$\{t\('documents\.folderFilterLabel'\)\}">/);
   assert.match(de.documents.categoryHint, /Art/);
@@ -1215,12 +1233,13 @@ test('das Raster hat mobil zwei Spalten und bei 1280px drei statt zwei', () => {
   assert.match(grid.body, /gap:\s*var\(--space-4\)/);
 });
 
-test('die Karte: Blatt-Rahmen 3:4, Titel zweizeilig, Meta einzeilig, kein Mindest-Leerraum, nicht gestreckt', () => {
+test('die Karte: Blatt-Rahmen mit fester Form, Titel zweizeilig, Meta einzeilig, kein Mindest-Leerraum, nicht gestreckt', () => {
   const rules = topRules(css);
   const media = rules.find((rule) => rule.selector === '.document-card__media');
-  // R18 (2026-10-07): der Rahmen ist hochkant wie das Blatt, das ganz darin
-  // liegt (vorher 4:3 mit dem oberen Drittel als Ausschnitt).
-  assert.match(media.body, /aspect-ratio:\s*3\s*\/\s*4/, 'feste Form, hochkant wie ein Blatt');
+  // R18 (2026-10-07): das Blatt liegt ganz im Rahmen (vorher 4:3 mit dem
+  // oberen Drittel als Ausschnitt). Seit R21 S7 ist der Rahmen quadratisch
+  // (zwei Reihen bei 1440x900, Test "R21 S7" unten) - das Blatt bleibt ganz.
+  assert.match(media.body, /aspect-ratio:\s*4\s*\/\s*3/, 'feste Form (seit R22 D11 quer), das Blatt ganz darin');
   // Und die Karten einer Reihe strecken sich nicht mehr: die Aktionszeile
   // schliesst an den Text an, statt unter einem Loch zu stehen.
   assert.match(rules.find((rule) => rule.selector === '.documents-list--grid').body, /align-items:\s*start/);
@@ -1253,7 +1272,8 @@ test('der Ansichtsumschalter ist das Kanon-Segment (D1) und so hoch wie Suche un
     && /(?:^|[;{\s])(?:background|box-shadow|border-radius|padding|width|height)\s*:/.test(rule.body));
   assert.deepEqual(own.map((r) => r.selector.trim()), [], 'keine eigene Pille, Flaeche oder Hoehe mehr');
   const panel = readFileSync(new URL('../public/styles/panel.css', import.meta.url), 'utf8');
-  const item = [...eachRule(panel)].find((r) => r.selector.trim() === '.page-toolbar .segmented__item' && !r.at.length);
+  // Seit R22 (D8) teilt der Dokumenten-Status die Regel (Selektorliste).
+  const item = [...eachRule(panel)].find((r) => r.selector.split(',').map((x) => x.trim()).includes('.page-toolbar .segmented__item') && !r.at.length);
   assert.match(item?.body ?? '', /min-height:\s*calc\(var\(--target-base\) - 4 \* var\(--space-px\)\)/, 'Kopf-Segment aussen so hoch wie ein Kopfknopf');
 });
 
@@ -1532,18 +1552,22 @@ test('Fristen: der Ablauf-Chip steht VOR den Kategorien, abgesetzt, und heisst n
   }
 });
 
-test('kompakte Zeile: kein Auge, die Zeile oeffnet, und das Menue traegt Ansehen fuer die Tastatur', () => {
+test('Zeile: kein Auge (in jeder Breite), die Zeile oeffnet, und das Menue traegt Ansehen fuer die Tastatur', () => {
   // Re-Critique P2: mobil blieben dem Titel 153px, weil Auge und Kebab je 48px
-  // standen - und ein Tipp auf die Zeile oeffnet ohnehin den Betrachter.
-  const compact = [...eachRule(css)].filter((rule) => rule.at.some((a) => /@container list-rows \(max-width: 30rem\)/.test(a)));
-  const hides = compact.find((rule) => rule.selector.split(',').map((x) => x.trim()).includes('.document-row__actions:not([data-read-bar]) [data-action="view"]'));
+  // standen - und ein Tipp auf die Zeile oeffnet ohnehin den Betrachter. Seit
+  // R21 (D10 Zeilen-Endzone) auch in der breiten Liste: dort standen Auge,
+  // Herunterladen und Kebab, drei Icon-Aktionen statt [eine Handlung][Mehr].
+  const hides = [...eachRule(css)].find((rule) => rule.selector.split(',').map((x) => x.trim()).includes('.document-row__actions:not([data-read-bar]) [data-action="view"]'));
   // Seit #1265 nur dort, wo ein Kebab steht: ohne Verwaltungsrecht gibt es
   // kein Menue, das „Ansehen" fuehren koennte, also bleibt das Auge (`data-read-bar`).
-  assert.ok(hides, 'das Auge faellt unter 30rem weg - ausser in einer Leiste ohne Kebab');
+  assert.ok(hides, 'das Auge faellt in der Zeile weg - ausser in einer Leiste ohne Kebab');
   assert.match(hides.body, /display:\s*none/);
-  // Raster und breite Liste behalten es: sonst blendet es keine Regel aus.
-  const elsewhere = [...eachRule(css)].filter((rule) => /\[data-action="view"\]/.test(rule.selector)
-    && /display:\s*none/.test(rule.body) && !rule.at.some((a) => /list-rows \(max-width: 30rem\)/.test(a)));
+  assert.deepEqual(hides.at, [], 'in jeder Breite, nicht nur unter 30rem');
+  // Ohne Kebab bleibt das Auge die eine Handlung: das Herunterladen geht dort.
+  assert.ok(hides.selector.split(',').map((x) => x.trim()).includes('.document-row__actions[data-read-bar] a[download]'));
+  // Das Raster behaelt es (eine Karte ist keine Zeile): keine weitere Regel blendet es aus.
+  const elsewhere = [...eachRule(css)].filter((rule) => rule.selector !== hides.selector && /\[data-action="view"\]/.test(rule.selector)
+    && /display:\s*none/.test(rule.body));
   assert.deepEqual(elsewhere.map((rule) => rule.selector), []);
   assert.match(fnBody('handleDocumentAction', 'runDocumentAction'), /if \(doc\) openDocumentViewer\(doc\);/, 'die Zeile oeffnet den Betrachter');
   // Die Zeile ist kein Tab-Stopp. Wer per Tastatur kommt, landet auf dem Kebab
@@ -1644,13 +1668,17 @@ test('der Betrachter bietet Bearbeiten an, schliesst sich dafuer und gibt den Au
   // Die geteilte Zeilenaktion (Runde 5): Name mit Objekt, "<Dokument> bearbeiten".
   // Seit #1265 fragt der Stift das DOKUMENT (Modulrecht UND Besitzregel), nicht
   // nur das Modul; das Verhalten faehrt test-inventory-documents-readonly-ui.js.
-  assert.match(actions, /\$\{mayManage\(doc\) \? `\s*\$\{rowActionHtml\(\{ icon: 'pencil', action: 'edit-document', label: t\('common\.editNamed', \{ name: doc\.name \}\)/);
+  // Seit R24 (G4-Dokumente-P3-3) mit Wort; der Name nennt das Dokument.
+  assert.match(actions, /\$\{mayManage\(doc\) \? `\s*<button type="button" class="btn btn--secondary btn--sm document-viewer__action" data-action="edit-document"\s+aria-label="\$\{esc\(t\('common\.editNamed', \{ name: doc\.name \}\)\)\}">\s*<i data-lucide="pencil" class="icon-md" aria-hidden="true"><\/i><span>\$\{t\('common\.edit'\)\}<\/span>/);
+  assert.match(actions, /<a class="btn btn--primary btn--sm document-viewer__action" href="\$\{downloadUrl\}" download data-viewer-download>\s*<i data-lucide="download"[^>]*><\/i><span>\$\{t\('documents\.downloadAction'\)\}<\/span>/, 'Herunterladen mit Wort, der eine Primaerknopf');
   // Der Ausloeser des Betrachters wird VOR dem Oeffnen gemerkt; beim Wechsel
   // bekommt er den Fokus zurueck, damit der Bearbeiten-Dialog ihn als seinen
   // Ausloeser merkt (modal.js merkt document.activeElement). Mobil schliesst
   // der Betrachter animiert, und der Fokus stuende sonst auf einem Knopf, der
-  // gleich aus dem DOM faellt.
-  assert.match(viewer.slice(0, viewer.indexOf('openSharedModal({')), /const opener = document\.activeElement;/);
+  // gleich aus dem DOM faellt. Nach einem Blaetterschritt ist es der Ausloeser
+  // in der Liste, den der vorige Betrachter weiterreicht (Codex zu #2142; das
+  // Verhalten faehrt test-documents-viewer-focus.js).
+  assert.match(viewer.slice(0, viewer.indexOf('openSharedModal({')), /const trigger = document\.activeElement;\s*const opener = listOpener \?\? trigger;/);
   const edit = viewer.slice(viewer.indexOf("querySelector('[data-action=\"edit-document\"]')"));
   assert.match(edit, /if \(opener\?\.isConnected && opener !== document\.body\) opener\.focus\(\);\s*openDocumentModal\(doc\);/);
   assert.doesNotMatch(edit.slice(0, edit.indexOf('openDocumentModal(doc)')), /closeModal\(/, 'kein eigenes Schliessen: openModal ersetzt den Betrachter, EIN History-Marker');
@@ -1950,8 +1978,8 @@ test('der Betrachter ist schmal vollflaechig, und der Meta-Block klappt hinter d
   assert.ok(hidden && /display:\s*none/.test(hidden.body), 'eingeklappt blendet der Meta-Block aus');
   assert.match(hidden.selector, /\.document-viewer__note/, 'samt Teilen-Hinweis');
   assert.match(hidden.selector, /\.document-viewer__details/, 'und Lesezeilen');
-  assert.match(hidden.selector, /> span:not\(\.document-viewer__actions\):not\(\.doc-badge\)/,
-    'die Aktionen und ein Ablauf in Warnfarbe bleiben stehen');
+  assert.match(hidden.selector, /> span:not\(\.document-viewer__actions\):not\(\.document-viewer__pager\):not\(\.document-viewer__more\):not\(\.doc-badge\)/,
+    'die Aktionen (schmal: ihr Mehr-Menue, S10-F4), das Vor/Zurueck-Paar (R22) und ein Ablauf in Warnfarbe bleiben stehen');
   // Die Regeln stehen NACH den Grundregeln des Betrachters (gleiche Spezifitaet).
   assert.ok(css.lastIndexOf('.document-viewer__pdf {') > css.indexOf('height: 65vh'), 'die schmale Regel folgt der Grundregel');
 
@@ -1975,7 +2003,7 @@ test('R18: der PDF-Betrachter am Desktop blendet die Leiste des Browsers aus, de
   assert.match(viewer, /<iframe class="document-viewer__pdf" src="\$\{previewUrl\}\$\{PDF_EMBED_FRAGMENT\}"/,
     'das Fragment haengt an der Adresse des eingebetteten Betrachters');
   // "In neuem Tab oeffnen" traegt die nackte Adresse - dort bleiben Zoom und Druck des Browsers.
-  assert.match(page, /rowActionHtml\(\{ icon: 'external-link', href: previewUrl,/);
+  assert.match(page, /<a class="btn btn--secondary btn--sm document-viewer__action" href="\$\{esc\(previewUrl\)\}" target="_blank"/);
   assert.equal((page.match(/PDF_EMBED_FRAGMENT/g) ?? []).length, 2, 'das Fragment steht nur am iframe, an keinem Link');
 });
 
@@ -1993,7 +2021,7 @@ test('Dokumente mobil: der Ordner-Umschalter ist der erste Chip der Filterzeile 
   const chip = spur.indexOf('id="documents-folder-toggle"');
   assert.ok(chip > -1, 'der Auslöser steht in der Chip-Spur');
   assert.ok(chip < spur.indexOf('id="documents-expiring-filter"') && chip < spur.indexOf('id="documents-category"'), 'und zwar als erster Chip');
-  assert.match(spur, /class="filter-chip filter-chip--sm documents-folder-chip" id="documents-folder-toggle" type="button"\s+aria-expanded="false" aria-controls="documents-folder-browser">/,
+  assert.match(spur, /class="filter-chip filter-chip--sm documents-folder-chip" id="documents-folder-toggle" type="button"\s+aria-expanded="false" aria-controls="documents-folder-browser(?: documents-category-browser)?">/,
     'Chip-Haut, Zustand und Ziel des Aufklappens');
   assert.equal((page.match(/id="documents-folder-toggle"/g) ?? []).length, 1, 'genau EIN Auslöser');
   assert.match(page, /toggleAttribute\('data-folder-active', Boolean\(state\.folderId\)\)/, 'ein gewaehlter Ordner zeigt sich am Chip');
@@ -2004,6 +2032,54 @@ test('Dokumente mobil: der Ordner-Umschalter ist der erste Chip der Filterzeile 
   assert.ok(rules.some((r) => tablet(r) && r.selector.trim() === '.documents-folder-chip' && /display:\s*inline-flex/.test(r.body)));
   assert.ok(rules.some((r) => tablet(r) && r.selector.trim() === '.documents-folder-browser:not(.documents-folder-browser--open)' && /display:\s*none/.test(r.body)),
     'zugeklappt belegt die Ordnerauswahl keine Zeile');
+});
+
+// R21 S9b (Critique a4, D7): am Telefon standen drei Filterachsen in EINER
+// Zeile - Status-Segment, Ordner-Chip und sechs Kategorie-Chips -, und bei
+// 390px war keine Kategorie ganz im Bild (Spur 775px ueber). D7: beide
+// Ordnungen bleiben, nur die Zeile ordnet sich. Unter 768px stehen die
+// Kategorien als zweite Gruppe in der Auswahl, die der Ordner-Chip aufklappt;
+// die Chips weichen dort, der Chip nennt die gewaehlte Kategorie.
+test('R21 S9b: am Telefon stehen die Kategorien in der Auswahl des Ordner-Chips', () => {
+  const aside = page.slice(page.indexOf('<aside class="documents-folder-browser"'), page.indexOf('</aside>'));
+  assert.match(aside, /<ul class="documents-folder-browser__list documents-category-browser row-carrier" id="documents-category-browser" aria-labelledby="documents-category-browser-title"><\/ul>/,
+    'die Kategorie-Gruppe steht in der Auswahl, unter den Ordnern');
+  assert.ok(aside.indexOf('id="documents-folder-browser"') < aside.indexOf('id="documents-category-browser"'), 'Ordner zuerst, dann Kategorien');
+  assert.match(page, /aria-controls="documents-folder-browser documents-category-browser"/, 'der Chip klappt beide Gruppen auf');
+  const fn = page.slice(page.indexOf('function renderCategoryBrowser()'), page.indexOf('function renderExpiringChip()'));
+  assert.match(fn, /data-category="\$\{esc\(row\.id\)\}"/, 'die Zeile traegt data-category wie der Chip');
+  assert.match(fn, /toggleAttribute\('data-category-active', Boolean\(state\.category\)\)/, 'eine gewaehlte Kategorie zeigt sich am Chip');
+  assert.match(page.slice(page.indexOf('function renderAll('), page.indexOf('function renderBreadcrumb(')), /renderCategoryBrowser\(\);/,
+    'jedes Zeichnen haelt die Gruppe aktuell');
+  const bind = page.slice(page.indexOf("querySelector('#documents-category-browser')?.addEventListener"), page.indexOf('folderBrowser?.addEventListener'));
+  assert.match(bind, /state\.category = row\.dataset\.category;[\s\S]*applyFilters\(\);[\s\S]*setFolderListOpen\(false\);/,
+    'die Wahl filtert wie der Chip und klappt zu');
+  const rules = [...eachRule(css)];
+  const phone = (r) => r.at.some((a) => /max-width:\s*767px/.test(a));
+  assert.ok(rules.some((r) => r.at.length === 0 && /\.documents-category-browser(?![\w-])/.test(r.selector) && /display:\s*none/.test(r.body)),
+    'ab 768px keine Kategorie-Gruppe - dort stehen die Chips');
+  assert.ok(rules.some((r) => phone(r) && r.selector.trim() === '#documents-category' && /display:\s*none/.test(r.body)),
+    'am Telefon weichen die Kategorie-Chips');
+  assert.ok(rules.some((r) => phone(r) && r.selector.trim() === '.documents-folder-browser--open .documents-category-browser' && /display:\s*block/.test(r.body)),
+    'aufgeklappt steht die Kategorie-Gruppe');
+});
+
+/* Codex-Review zu #2142: unter 768px blieben die Zaehler der Kategorie-Gruppe
+ * beim Suchen auf dem alten Stand. Suche und clearSearch() zeichnen die
+ * Facetten ueber renderFacets() (die Verdrahtung halten die Proben weiter
+ * oben), und das kannte die Gruppe nicht - nur renderAll() rief sie. EIN Leser
+ * fuer beide Seiten: jede Facette, die renderAll() zeichnet, zeichnet auch
+ * renderFacets(); eine morgen ergaenzte Facette faellt hier ebenso auf.
+ */
+test('R21 S9b: die Suche frischt die Zaehler der Kategorie-Gruppe mit auf', () => {
+  const calls = (body) => new Set([...body.matchAll(/^\s*(render\w+)\(/gm)].map((m) => m[1]));
+  const facetsOfAll = [...calls(fnBody('renderAll', 'renderBreadcrumb'))]
+    .filter((name) => name !== 'renderBreadcrumb' && name !== 'renderDocuments');
+  assert.ok(facetsOfAll.includes('renderCategoryBrowser') && facetsOfAll.includes('renderCategoryChips'),
+    'der Leser findet die Facetten in renderAll() nicht mehr - die Probe waere blind');
+  const facets = calls(fnBody('renderFacets', 'bindPageEvents'));
+  assert.deepEqual(facetsOfAll.filter((name) => !facets.has(name)), [],
+    'renderFacets() laesst eine Facette aus, die renderAll() zeichnet - beim Suchen bliebe sie auf dem alten Stand');
 });
 
 // Re-Critique 2026-10-17 (A4 P2-3, P3): im Raster klemmte die leere Suche in
@@ -2017,4 +2093,126 @@ test('R20: der Leerzustand nimmt im Raster die ganze Breite, und der Titel haelt
   const title = rules.find((r) => r.selector.trim() === '.documents-list--grid .document-card__title');
   assert.ok(title, 'keine Rasterregel fuer den Kartentitel');
   assert.match(title.body, /min-block-size:\s*2lh/, 'ein einzeiliger Titel haelt die zweite Zeile frei');
+});
+
+/* "DATEI HIER ABLEGEN" AUF DEM TELEFON (Critique R21, a4). Jede Ablage sagte
+ * auch auf Touch "ablegen" - dort gibt es nichts abzulegen, man tippt. Jede
+ * Ablage traegt jetzt ihren Satz fuer den Zeiger UND seinen Zwilling fuer den
+ * Finger; welcher steht, entscheidet `hover: none` (reset.css). */
+test('jede Ablage sagt auf Touch "tippen" statt "ablegen" - zwei Fassungen, eine Medienabfrage (Critique R21)', () => {
+  const sites = [
+    ['../public/pages/documents.js', 'documents.dropzoneTitle'],
+    ['../public/pages/calendar.js', 'documents.dropzoneTitle'],
+    ['../public/settings/pages/admin-backup.js', 'settings.backupDropzoneTitle'],
+    ['../public/settings/pages/modules-install.js', 'settings.installModuleDropzoneTitle'],
+  ];
+  for (const [file, key] of sites) {
+    const src = read(file);
+    const esc = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    assert.match(src, new RegExp(`<span class="u-pointer-only">\\$\\{(?:esc\\()?t\\('${esc}'\\)\\)?\\}</span><span class="u-touch-only">\\$\\{(?:esc\\()?t\\('${esc}Touch'\\)\\)?\\}</span>`),
+      `${file}: ${key} ohne Touch-Zwilling`);
+  }
+  const reset = read('../public/styles/reset.css');
+  const rules = [...eachRule(reset)];
+  const base = rules.find((r) => r.selector.trim() === '.u-touch-only' && r.at.length === 0);
+  assert.match(base?.body ?? '', /display:\s*none/, 'der Touch-Satz ist am Zeiger weg');
+  const touch = rules.filter((r) => r.at.some((a) => /\(hover:\s*none\)/.test(a)));
+  assert.match(touch.find((r) => r.selector.trim() === '.u-pointer-only')?.body ?? '', /display:\s*none/, 'der Zeiger-Satz ist am Finger weg');
+  assert.match(touch.find((r) => r.selector.trim() === '.u-touch-only')?.body ?? '', /display:\s*inline/, 'und der Touch-Satz steht da');
+  const de = JSON.parse(read('../public/locales/de.json'));
+  for (const key of ['documents.dropzoneTitleTouch', 'settings.backupDropzoneTitleTouch', 'settings.installModuleDropzoneTitleTouch']) {
+    const value = key.split('.').reduce((o, k) => o?.[k], de);
+    assert.match(value ?? '', /^Tippen/, `${key}: der Finger tippt`);
+    assert.doesNotMatch(value, /ablegen|ziehen|klicken/, `${key}: kein Wort des Zeigers`);
+  }
+});
+
+// R21 S7 (Critique a4): die Rasterkarte war 417px hoch (Rahmen 3:4), bei
+// 1440x900 stand die zweite Reihe nur halb im Bild. Quadratischer Rahmen, das
+// Blatt darin ganz (`contain`): Karte 357px, zwei Reihen (1920: 463 -> 393).
+// R22 (D11): das Raster ist nicht mehr Standard, die Vorschau kleiner - 4:3.
+test('R21 S7 / R22 D11: die Vorschau der Rasterkarte hat einen festen queren Rahmen, das Blatt bleibt ganz', () => {
+  const css = readFileSync(resolve(HERE, '../public/styles/documents.css'), 'utf8');
+  const rules = [...eachRule(css)];
+  const media = rules.find((r) => r.selector.trim() === '.document-card__media' && !r.at.length);
+  assert.match(media?.body ?? '', /aspect-ratio:\s*4 \/ 3/, 'querer Rahmen, kleiner als das Quadrat aus R21');
+  const img = rules.find((r) => r.selector.trim() === '.document-thumb__img' && !r.at.length);
+  assert.match(img?.body ?? '', /object-fit:\s*contain/, 'das Blatt wird nicht beschnitten');
+});
+
+
+// --------------------------------------------------------
+// R21 S8 (Critique a4): die Vorschau zeigt sofort das Poster der Kachel
+
+test('R21 S8: der Betrachter zeigt sofort das Poster der Kachel und ein Ladezeichen, nie eine leere Buehne', () => {
+  const content = fnBody('renderViewerContent', 'renderViewerFallback');
+  const image = content.slice(content.indexOf("if (kind === 'image')"), content.indexOf("if (kind === 'text')"));
+  assert.match(image, /const poster = viewerPoster\(doc\);/, 'das Bild nimmt das Poster der Kachel');
+  assert.match(image, /class="document-viewer__stage" data-stage-loading/);
+  assert.match(image, /class="document-viewer__image document-viewer__poster" src="\$\{esc\(poster\)\}" alt="" aria-hidden="true"/,
+    'das Poster traegt die Masse des Bildes (dieselbe Klasse) und schweigt fuer den Screenreader');
+  assert.match(image, /\$\{viewerStageStatusHtml\(\)\}/);
+  assert.doesNotMatch(image, /loading="lazy"/);
+  // Das Poster kommt aus dem Seitenspeicher der Kacheln, nie aus einem Abruf.
+  const poster = fnBody('viewerPoster', 'viewerStageStatusHtml');
+  assert.match(poster, /_thumbs\?\.peek\(doc\)/);
+  assert.match(poster, /startsWith\('data:image\/'\)/, 'nur ein gerastertes Bild (data:-URL) ist ein Poster');
+  // Das PDF am Telefon zeigt seine erste Seite, bis pdf.js sie gezeichnet hat.
+  const pdf = content.slice(content.indexOf('const pdfPoster = viewerPoster(doc);'), content.indexOf("if (kind === 'image')"));
+  assert.match(pdf, /document-viewer__poster document-viewer__poster--page/);
+  const pages = page.slice(page.indexOf('function renderPdfPages('));
+  assert.match(pages, /const poster = content\.querySelector\('\.document-viewer__poster--page'\);/);
+  assert.match(pages, /if \(n === 1 && poster\) wrap\.appendChild\(poster\);/, 'das Poster zieht in den Platz der ersten Seite');
+  // Die Buehne ist eine Zelle: Poster, Bild und Ladezeichen liegen uebereinander.
+  const rules = [...eachRule(css)];
+  const cell = rules.find((r) => r.selector.trim() === '.document-viewer__stage > *');
+  assert.match(cell?.body ?? '', /grid-area:\s*1 \/ 1/);
+  const hide = rules.find((r) => r.selector.includes('.document-viewer__stage[data-stage-loading] > .document-viewer__image:not(.document-viewer__poster)'));
+  assert.match(hide?.body ?? '', /opacity:\s*0/, 'das noch leere Bild deckte das Poster zu');
+  assert.ok(hide.selector.includes('.document-viewer__stage:not([data-stage-loading]) > .document-viewer__poster'),
+    'nach dem Laden tritt das Poster zurueck (ein Bild mit Transparenz liesse es sonst durchscheinen)');
+  const status = rules.find((r) => r.selector.trim() === '.document-viewer__stage:not([data-stage-loading]) > .document-viewer__stage-status');
+  assert.match(status?.body ?? '', /display:\s*none/);
+});
+
+// Critique R22 (D11, a4): Desktop-Standard ist die Liste, mobil traegt die Zeile
+// Datum und Groesse, und der FAB zeigt "+" wie jeder Anlegen-Knopf.
+test('R22 D11: Liste als Standard, Datum und Groesse auch schmal, FAB mit Plus', () => {
+  assert.match(page, /view: localStorage\.getItem\('yuvomi-documents-view'\) \|\| 'list',/, 'ohne gespeicherte Wahl die Liste - auf jedem Geraet');
+  assert.match(page, /id="fab-new-document"[^>]*>\s*<i data-lucide="plus"/);
+  assert.match(page, /renderMeta\(doc, \{ showSize: false, stats: `<span class="document-row__meta-stats">\$\{dateText\(doc\.updated_at\)\} · \$\{formatFileSize\(doc\.file_size\)\}<\/span>` \}\)/);
+  const meta = page.slice(page.indexOf('function renderMeta('), page.indexOf('function docSupportsThumbnail('));
+  assert.ok(meta.indexOf('${stats}') < meta.indexOf('${categoryLabel}</span>'), 'Datum und Groesse stehen vor der Kategorie (die nennt das Zeichen)');
+  const css = read('../public/styles/documents.css');
+  const rules = [...eachRule(css)].filter((r) => r.selector.trim() === '.document-row__meta > .document-row__meta-stats');
+  assert.ok(rules.some((r) => !r.at.length && /display:\s*none/.test(r.body)), 'breit aus dem Baum');
+  assert.ok(rules.some((r) => r.at.some((a) => /list-rows \(max-width: 30rem\)/.test(a)) && /display:\s*inline-flex/.test(r.body)), 'schmal sichtbar');
+});
+
+// R23 S10 (Critique G4 P3): eine zu grosse Datei meldet sich bei der Wahl,
+// nicht erst beim Absenden.
+test('R23: die Ablage prueft die Groesse gleich bei der Wahl', () => {
+  const fn = page.slice(page.indexOf('function bindDropzone('), page.indexOf('function reportDropzoneError('));
+  assert.match(fn, /const tooBig = files\.find\(\(file\) => file\.size > maxSize\);/);
+  assert.match(fn, /setTimeout\(\(\) => reportDropzoneError\(form, t\('documents\.fileTooLargeNamed', \{ name: tooBig\.name \}\)\), 0\)/);
+});
+
+// R24 S10-F4 (Ulas 28.10.): schmal stehen die Handlungen des Betrachters im
+// Mehr-Menue, der Kopf ist EINE Zeile (Kategorie, Blaettern, Menue). Gemessen
+// 390px: Vorschau ab y206 -> y150. Die Eintraege loesen die Knoepfe der
+// breiten Leiste aus (ein Weg je Handlung, Teilen bleibt im Tipp).
+test('R24 S10-F4: schmal ein Mehr-Menue statt einer zweiten Knopfzeile, breit bleibt die Leiste', () => {
+  const viewer = fnBody('openDocumentViewer', 'renderViewerContent');
+  assert.match(viewer, /<span class="document-viewer__more">\$\{popoverMenuHtml\(\{\s*id: 'document-viewer-more-menu'/, 'ein Menue am Ende der Meta-Zeile');
+  for (const action of ['viewer-open-tab', 'viewer-edit', 'viewer-share', 'viewer-download']) {
+    assert.match(viewer, new RegExp(`action: '${action}'`), `${action} steht im Menue`);
+  }
+  assert.match(viewer, /'viewer-download': '\[data-viewer-download\]'/, 'der Eintrag loest den Knopf der Leiste aus');
+  assert.match(viewer, /target\.click\(\);/, 'synchron im Tipp (Teilen, Herunterladen)');
+  const css = readFileSync(new URL('../public/styles/documents.css', import.meta.url), 'utf8');
+  const rules = [...eachRule(css)];
+  const narrow = (r) => r.at.some((a) => /max-width:\s*639px/.test(a));
+  assert.match(rules.find((r) => !r.at.length && r.selector.trim() === '.document-viewer__meta > .document-viewer__more')?.body ?? '', /display:\s*none/, 'breit kein Menue');
+  assert.match(rules.find((r) => narrow(r) && r.selector.trim() === '.document-viewer__meta > .document-viewer__more')?.body ?? '', /display:\s*inline-flex/, 'schmal das Menue');
+  assert.match(rules.find((r) => narrow(r) && r.selector.trim() === '.document-viewer__meta > .document-viewer__actions')?.body ?? '', /display:\s*none/, 'schmal keine zweite Knopfzeile');
 });

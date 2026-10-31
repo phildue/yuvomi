@@ -72,10 +72,18 @@ const STUBS = {
   `,
   '/i18n.js': `
     export const t = (key, values = {}) => {
+      // Wer echte Saetze braucht (der Intervall-Satz waehlt seine Pluralform an
+      // der Vorlage, R24 S4), setzt globalThis.__tDict auf flache Schluessel ->
+      // Text; Platzhalter werden wie im Original eingesetzt, unbekannte bleiben.
+      const dict = globalThis.__tDict;
+      if (dict && Object.prototype.hasOwnProperty.call(dict, key)) {
+        return String(dict[key]).replace(/\{\{(\w+)\}\}/g, (m, name) => (values && name in values ? String(values[name]) : m));
+      }
       if (!values || Object.keys(values).length === 0) return key;
       return key + JSON.stringify(values);
     };
     export const initI18n = async () => {};
+    export const whenI18nReady = async () => {};
     export const setLocale = async () => {};
     // Wie __formatLocale: Tests, die lokalisierte Monatsnamen pruefen, setzen
     // globalThis.__locale; ohne das bleibt es bei 'de'.
@@ -110,7 +118,7 @@ const STUBS = {
         ...parts.slice(last + 1).map((part) => part.value),
       ].join('');
     };
-    export const getSupportedLocales = () => ['de', 'en'];
+    export const getSupportedLocales = () => globalThis.__supportedLocales ?? ['de', 'en'];
     export const formatDate = (d) => String(d);
     // Tag+Monat und volles Datum sehen im Stub gleich aus. Wer pruefen will,
     // WELCHES von beiden gerufen wurde (relativeDateLabel), setzt
@@ -169,7 +177,12 @@ const STUBS = {
     export const intervalUnitLabel = () => '';
   `,
   '/components/modal.js': `
+    // Dialogregel Erstfokus (Critique R24 S3): wie das Original, rein.
+    export const dialogInitialFocus = (isEdit, required = 'first-field') => (isEdit ? 'edit' : required);
     export const openModal = (...args) => globalThis.__openModal?.(...args);
+    // Die letzte Eingabe (Taste oder Zeiger); wer den Tastaturweg meint, setzt
+    // globalThis.__lastInputKeyboard = true.
+    export const lastInputWasKeyboard = () => globalThis.__lastInputKeyboard === true;
     // Suiten, die pruefen wollen, OB und WANN ein Handler schliesst (das
     // Formular bleibt nach einem Abbrechen offen), setzen globalThis.__closeModal.
     // Liefert, was der Haken liefert: das Original sagt mit false, dass das
@@ -233,7 +246,15 @@ const STUBS = {
       }
       return any;
     };
+    // Die Regeln des Markups (components/modal.js, Critique R21): das Original
+    // liest den ValidityState der Felder - die Attrappen-Panels der Suiten
+    // haben keinen, also meldet der Stub nichts. Wer den Weg messen will,
+    // setzt globalThis.__constraintErrors.
+    export const constraintErrors = (...args) => (
+      typeof globalThis.__constraintErrors === 'function' ? globalThis.__constraintErrors(...args) : []
+    );
     export const mountFooter = () => null;
+    export const decorateFooterDelete = () => [];
     // Wer sehen will, WOHIN ein Formular sich legt (R19, Bearbeiten in der
     // Detailspalte), setzt globalThis.__dockNextModal.
     export const dockNextModal = (...args) => globalThis.__dockNextModal?.(...args);
@@ -247,11 +268,20 @@ const STUBS = {
         : swap()
     );
     export const captureModalContext = () => globalThis.__modalContextId?.() ?? 'test-modal-context';
-    export const isModalContextCurrent = (context) => (
-      globalThis.__modalContextId?.() === undefined
+    // Wie das Original: ein Platz in der Reihe der Oeffnungswuensche, und nur
+    // der neueste gilt (#1997, Codex an #2132). Der Kontext selbst bleibt der
+    // von captureModalContext().
+    let openIntent = 0;
+    export const captureOpenContext = () => ({ openContext: captureModalContext(), intent: ++openIntent });
+    export const isModalContextCurrent = (context) => {
+      if (context && typeof context === 'object' && 'openContext' in context) {
+        if (context.intent !== openIntent) return false;
+        context = context.openContext;
+      }
+      return globalThis.__modalContextId?.() === undefined
         ? true
-        : globalThis.__modalContextId() === context
-    );
+        : globalThis.__modalContextId() === context;
+    };
     // Ob der festgehaltene Dialog noch offen ist (#1997). Ohne Sonde: ja - wer
     // die spaete Antwort messen will, setzt globalThis.__isOwnModalOpen.
     export const isOwnModalOpen = (context) => (
@@ -293,6 +323,8 @@ const STUBS = {
       return { update: () => true, isOpen: () => true };
     };
     export const closeDetailView = () => {};
+    // R21 D7: Sprung aus der Leseansicht in ein anderes Modul - hier nur Merker.
+    export const leaveDetailTo = (url) => { globalThis.__leftDetailTo = url; };
     // Dieselbe Regel wie im Original (R19): Bearbeiten als der eine
     // Primaerknopf am Ende, andere Primaerknoepfe treten zurueck.
     export const withPrimaryEdit = (actions = [], edit = null) => {
@@ -331,6 +363,18 @@ const STUBS = {
     // setzen globalThis.__undoStub = (opts) => {} und bekommen commit/restore
     // in die Hand - dasselbe Muster wie __apiStub in /api.js.
     export const scheduleUndoableDelete = (opts) => { globalThis.__undoStub?.(opts); };
+    // Die Quittung einer Statusaktion (R23, D6): dieselbe Form wie das Original,
+    // damit ein Test am showToast-Stub Satz und Rueckgaengig in die Hand bekommt.
+    // Seit R24 mit pending (Quittung im Tipp) und update (Satz nachtragen).
+    export const offerUndo = ({ message, undo, onError, label, duration = 5000, pending = null, scope = null }) => {
+      const run = async () => {
+        if (pending) { try { await pending; } catch { return; } }
+        try { await undo(); } catch (err) { onError?.(err); }
+      };
+      const handle = {};
+      const shown = globalThis.window?.yuvomi?.showToast?.(message, 'default', duration, label ? { label, onClick: run } : run, { scope, handle }) === true;
+      return { shown, update: (text) => { handle.setMessage?.(text); globalThis.__offerUndoUpdate?.(text); } };
+    };
     // Im Test gibt es keine Animation, die ausspielen koennte - der Aufrufer
     // awaitet das Ergebnis, also loest der Stub sofort auf.
     export const acknowledgeCheck = () => Promise.resolve();
@@ -341,7 +385,8 @@ const STUBS = {
     export const expandIn = (el) => { globalThis.__expandIn?.(el); return Promise.resolve(); };
     // Token-Leser ohne Stylesheet: der Rueckfall ist der Wert (utils/flip.js).
     // Region auf-/zuklappen: ohne Layout bleibt nur der Zustand selbst (hidden).
-    export const toggleRegion = (region, open) => { if (region) region.hidden = !open; return Promise.resolve(); };
+    // Wer sehen will, DASS geklappt wird, setzt globalThis.__motionStub (wie swapContent).
+    export const toggleRegion = (region, open) => { globalThis.__motionStub?.('toggleRegion', region, open); if (region) region.hidden = !open; return Promise.resolve(); };
     // Ohne Layout kein Ladezustand am Knopf: nur die Arbeit selbst.
     export const withBusy = (_el, work) => work();
     // Balken wachsen lassen: ohne Layout nichts zu tun, der Endwert steht im Markup.
@@ -349,6 +394,14 @@ const STUBS = {
     export const drawChartOnce = () => 0;
     export const durationToken = (name, fallback) => fallback;
     export const easingToken = (name, fallback = 'ease-out') => fallback;
+    // Den Kopf mit der Flaeche falten (Telefon-Monat): ohne Shell-Kopf nichts zu tun.
+    // Wer pruefen will, OB die Seite fragt, setzt globalThis.__headCollapse.
+    export const requestHeadCollapse = (toolbar, collapsed) => { globalThis.__headCollapse?.(toolbar, collapsed); };
+    // Reine Pruefung ohne DOM - der Stub rechnet wie das Original.
+    export const isImeComposing = (event) => Boolean(event?.isComposing || event?.keyCode === 229);
+    // Zeichen in Sicht-Reihenfolge (R22): wer sehen will, WIE eine Seite
+    // zeichnen laesst, setzt globalThis.__iconStub; das Original haelt test:ux-utils.
+    export const drawIconsInSightOrder = (listEl, opts) => { globalThis.__iconStub?.(listEl, opts); };
   `,
   // Inhaltswechsel und Listenbewegung (R16): ohne Layout gibt es nichts zu
   // bewegen - der Tausch selbst muss trotzdem laufen, genau einmal und
@@ -395,6 +448,12 @@ const STUBS = {
     // Der Pflichtstern (R16): dieselbe Zeichenkette wie in public/utils/html.js;
     // test-frontend-audit.js haelt das Original fest.
     export const REQUIRED_MARK = '<span class="required-marker" aria-hidden="true"> *</span>';
+    // Rechnet wie das Original (test:detail-view prueft es dort).
+    export const externalHref = (value) => {
+      const url = String(value ?? '').trim();
+      // Doppelte Backslashes: der Stub ist ein Template-Literal.
+      return /^https?:\\/\\/\\S/i.test(url) ? url : '';
+    };
     // Wie __renderUserMultiSelect weiter unten: Suiten, die pruefen wollen, WAS
     // ein Aufrufer dem Markdown-Renderer uebergibt (die Checklisten-Optionen
     // etwa), setzen globalThis.__renderMarkdownLight. Ohne das bleibt es beim
@@ -414,6 +473,24 @@ const STUBS = {
     // Ablegezone, die gar nicht erst verdrahtet wird, sieht im HTML aus wie
     // jede andere.
     export const isDragActive = () => false;
+    // Der Merker der Dialog-Instanzen (#2152): reicht an makeSortable unten
+    // durch, damit __sortableCalls auch diese Aufrufe sieht. Sein eigenes
+    // Verhalten misst test:manager-endzone am echten Modul.
+    export const sortableSet = () => ({
+      add: (listEl, opts) => makeSortable(listEl, opts),
+      clear() {},
+      size: () => 0,
+    });
+    // Wie das Original: gespeicherte Folge nach einem gescheiterten Zug.
+    // test:manager-endzone misst das Original UND den Weg der Seiten hierher.
+    export const restoreOrder = (listEl, ids, idOf) => {
+      if (!listEl) return;
+      const rows = new Map([...listEl.children].map((row) => [String(idOf(row)), row]));
+      for (const id of ids) {
+        const row = rows.get(String(id));
+        if (row) listEl.appendChild(row);
+      }
+    };
     export const makeSortable = async (listEl, opts) => {
       if (Array.isArray(globalThis.__sortableCalls)) {
         globalThis.__sortableCalls.push({ el: listEl, opts });

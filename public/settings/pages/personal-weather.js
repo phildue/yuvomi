@@ -1,4 +1,5 @@
 import { t } from '/i18n.js';
+import { esc } from '/utils/html.js';
 import { getPreferences, savePreferences } from '/settings/preferences-cache.js';
 import {
   PERSONAL_WEATHER_SCOPE as SCOPE,
@@ -9,6 +10,7 @@ import {
   reportMissingWeatherPlace,
   weatherLocationFieldsHtml,
 } from '/settings/weather-location.js';
+import { errorSentence } from '/utils/friendly-error.js';
 
 /**
  * Persönlicher Standort je Mitglied; überschreibt den Haushaltsstandort aus
@@ -19,7 +21,7 @@ function hasOwnLocation(wu) {
   return Boolean(wu && (wu.lat !== null || wu.lon !== null));
 }
 
-function renderPage(container, prefs) {
+function renderPage(container, prefs, { admin = false } = {}) {
   const wu = prefs.weather_user ?? { lat: null, lon: null, city: null, units: null, auto_locate: null };
   const providerIsOpenMeteo = prefs.weather_provider === 'open-meteo'
     || (!prefs.weather_provider && hasOwnLocation(wu));
@@ -49,6 +51,13 @@ function renderPage(container, prefs) {
           </div>
         </form>
       </div>
+      ${/* WETTER AN ZWEI ORTEN, GEGENSEITIG VERWIESEN (R22, D13): der eigene
+           Standort hier, der des Haushalts unter "Fotos und Wetter" - fuer
+           Admins der Weg dorthin, wie beim Zyklus (personal-health.js). */ ''}
+      ${admin ? `<p class="form-hint settings-group__footer" id="pweather-household">
+        ${esc(t('settings.weatherHouseholdLinkHint'))}
+        <a href="/settings/admin/integrations?section=admin-weather" id="pweather-household-link">${esc(t('settings.pageIntegrations'))}</a>
+      </p>` : ''}
     </section>
   `);
 }
@@ -83,7 +92,7 @@ function bindEvents(container, user) {
       window.yuvomi?.showToast(t('settings.personalWeatherSaved'), 'success');
       await render(container, { user });
     } catch (error) {
-      errorElement.textContent = error.message || t('common.errorGeneric');
+      errorElement.textContent = errorSentence(error, 'settings.preferenceSaveFailed');
       errorElement.hidden = false;
     }
   });
@@ -96,14 +105,14 @@ function bindEvents(container, user) {
       window.yuvomi?.showToast(t('settings.personalWeatherReset'), 'success');
       await render(container, { user });
     } catch (error) {
-      window.yuvomi?.showToast(error.message || t('common.errorGeneric'), 'danger');
+      window.yuvomi?.showToast(errorSentence(error, 'settings.preferenceSaveFailed'), 'danger');
     }
   });
 }
 
 export async function render(container, { user }) {
   const prefs = await getPreferences();
-  renderPage(container, prefs);
+  renderPage(container, prefs, { admin: user?.role === 'admin' });
   bindEvents(container, user);
   window.lucide?.createIcons({ el: container });
 }

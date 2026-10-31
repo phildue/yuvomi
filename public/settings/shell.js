@@ -3,6 +3,9 @@ import { moduleAccentVar } from '/utils/module-accent.js';
 import { renderSkeletonList, placeSkeletonUntilContent } from '/utils/skeleton.js';
 import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
 import { swapRegion } from '/utils/content-swap.js';
+import { wireScrollFade } from '/utils/ux.js';
+import { searchEmptyEl } from '/utils/empty-state.js';
+import { MODULE_ICON, moduleIconHTML } from '/nav-icons.js';
 import { createRetryState } from './components.js';
 import { watchLeafForms } from './dirty-guard.js';
 import { KITCHEN_CHILD_IDS } from './module-order.js';
@@ -12,6 +15,7 @@ import {
   findSettingsLeaf,
   firstSettingsSheet,
   searchSettings,
+  orderSettingsHits,
   settingsOptionUrl,
   settingsOverviewUrl,
   settingsSectionUrl,
@@ -168,6 +172,19 @@ function createNavigationResult({ entry, href, label, context, activeLeaf, exact
 }
 
 /**
+ * "Suche zuruecksetzen" im Leerzustand: das Feld leeren wie sein eigenes X
+ * (`input` laesst wirePageSearch den Leeren-Knopf verstecken und die Liste
+ * zurueckholen) und den Fokus dort lassen, wo weitergetippt wird.
+ * @param {HTMLInputElement|null} input
+ */
+function resetSearchField(input) {
+  if (!input) return;
+  input.value = '';
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.focus();
+}
+
+/**
  * Suchfeld der Seitenleiste - AN DER LISTENKANTE (S3): am Desktop ist die
  * Seitenleiste die Liste der Liste-+-Detail-Form, und ihre Suche filtert
  * genau diese Liste. Seit 2026-09-26 findet sie auch die EINZELNE Option
@@ -208,43 +225,49 @@ function createNavigationSearch(navigation, domains, user, activeLeaf) {
 
     if (!searching) {
       results.replaceChildren();
+      empty.replaceChildren();
+      empty.hidden = true;
       status.textContent = '';
       return;
     }
 
     const hits = searchSettings(query, { user, translate: t });
-    results.replaceChildren(
-      ...hits.leaves.map((entry) => createNavigationResult({
-        entry,
-        href: entry.path,
-        label: settingsLeafLabel(entry, t),
-        context: domainLabels.get(entry.domainId) ?? '',
-        activeLeaf,
-      })),
-      ...hits.sections.map(({ leaf, section, label }) => createNavigationResult({
-        entry: leaf,
-        href: settingsSectionUrl(leaf, section.id),
-        label,
-        context: settingsLeafLabel(leaf, t),
-        activeLeaf,
-        exact: false,
-      })),
-      ...hits.options.map(({ leaf, key, label }) => createNavigationResult({
-        entry: leaf,
-        href: settingsOptionUrl(leaf, key),
-        label,
-        context: settingsLeafLabel(leaf, t),
-        activeLeaf,
-        exact: false,
-      })),
-    );
+    // Wer so heisst wie das Gesuchte, steht vorn (orderSettingsHits, R24).
+    results.replaceChildren(...orderSettingsHits(hits, query, t).map((hit) => createNavigationResult(
+      hit.kind === 'leaf'
+        ? { entry: hit.leaf, href: hit.leaf.path, label: hit.label, context: domainLabels.get(hit.leaf.domainId) ?? '', activeLeaf }
+        : {
+          entry: hit.leaf,
+          href: hit.kind === 'section' ? settingsSectionUrl(hit.leaf, hit.section.id) : settingsOptionUrl(hit.leaf, hit.key),
+          label: hit.label,
+          context: settingsLeafLabel(hit.leaf, t),
+          activeLeaf,
+          exact: false,
+        },
+    )));
     hydrateIcons(results);
 
     const count = hits.leaves.length + hits.sections.length + hits.options.length;
-    status.textContent = count ? t('settings.searchResults', { count }) : t('search.noResults');
+    // OHNE TREFFER DER LEERZUSTAND DER APP (Critique R24, G6-Einst-P3-5): hier
+    // stand der nackte Satz "Keine Ergebnisse gefunden." - jede andere Suche
+    // nennt den Begriff und bietet "Suche zuruecksetzen" (searchEmptyEl). Er
+    // ist selbst die Live-Region (`role="status"`), die Zahlzeile schweigt.
+    status.textContent = count ? t('settings.searchResults', { count }) : '';
+    status.hidden = !count;
+    empty.hidden = Boolean(count);
+    empty.replaceChildren(...(count ? [] : [searchEmptyEl({
+      query,
+      className: 'settings-shell__navigation-empty-state',
+      onReset: () => resetSearchField(navigation.querySelector('#settings-navigation-search')),
+    })]));
+    if (!count) hydrateIcons(empty);
   };
 
-  field.after(status, results);
+  const empty = document.createElement('div');
+  empty.className = 'settings-shell__navigation-empty';
+  empty.hidden = true;
+
+  field.after(status, results, empty);
   wirePageSearch(navigation, { id: 'settings-navigation-search', delay: 0, onQuery: applyFilter });
 }
 
@@ -288,7 +311,86 @@ function createNavigation(domains, user, activeLeaf) {
 
   createNavigationSearch(navigation, domains, user, activeLeaf);
   navigation.prepend(createSheetSkipLink());
+  navigation.appendChild(createNavigationIndex(navigation, domains));
   return navigation;
+}
+
+/**
+ * DIE BEREICHE ALS WEG, WENN DIE LISTE UEBERLAEUFT (R22, D13; Critique a5).
+ * 29 Eintraege in drei Gruppen: bei 1280x800 stand "Module" unter der Falz,
+ * und die Leiste scrollt fuer sich ohne sichtbaren Balken - sie sah aus wie
+ * vollstaendig. Kein Umbau der Liste: am unteren Rand klebt eine Zeile mit
+ * den drei Gruppennamen, ein Tipp scrollt die Leiste zur Gruppe, die Gruppe
+ * am oberen Rand ist markiert. Nur, solange die Liste ueberlaeuft und nicht
+ * gesucht wird (settings.css, `--overflowing`).
+ */
+function createNavigationIndex(navigation, domains) {
+  const index = document.createElement('div');
+  index.className = 'settings-shell__navigation-index';
+  index.setAttribute('role', 'group');
+  index.setAttribute('aria-label', t('search.goTo'));
+  const buttons = domains.map((domain) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'settings-shell__navigation-index-item';
+    button.dataset.domainId = domain.id;
+    button.textContent = t(domain.labelKey);
+    button.addEventListener('click', () => {
+      const group = navigation.querySelector(`.settings-shell__navigation-group[data-domain-id="${domain.id}"]`);
+      if (!group) return;
+      const search = navigation.querySelector('.settings-shell__navigation-search');
+      const covered = search ? search.getBoundingClientRect().bottom - navigation.getBoundingClientRect().top : 0;
+      navigation.scrollTop += group.getBoundingClientRect().top - navigation.getBoundingClientRect().top - Math.max(0, covered);
+    });
+    return button;
+  });
+  index.append(...buttons);
+
+  // Welche Gruppe steht oben? Die letzte, deren Kopf die Suchkante erreicht hat.
+  const markCurrent = () => {
+    const search = navigation.querySelector('.settings-shell__navigation-search');
+    const edge = (search ?? navigation).getBoundingClientRect().bottom + 1;
+    let current = null;
+    // MARKIERT IST, WAS MAN SIEHT (R23 S10, Critique G6 P3 "Index-Zeile
+    // markiert falsch"). Gezaehlt wurde die Gruppe, deren Kopf die Suchkante
+    // erreicht hatte: mit dem Blatt "Kalender-Synchronisation" offen standen
+    // Haushalt und Module im Bild, markiert war "Konto", von dem oben eine
+    // halbe Zeile hereinragte. Jetzt: vor dem ersten eigenen Scrollen die
+    // Gruppe des offenen Blatts (die Leiste hat sich zu ihm gedreht), danach
+    // die Gruppe ueber dem oberen Drittel des sichtbaren Teils, ganz oben die
+    // erste und am Ende der Liste die letzte - deren Kopf erreicht die Kante nie.
+    const active = !userScrolled && navigation.querySelector('.settings-shell__navigation-link--active');
+    const own = active?.closest?.('.settings-shell__navigation-group')?.dataset.domainId;
+    const bottom = navigation.getBoundingClientRect().bottom;
+    const line = edge + (bottom - edge) / 3;
+    const atEnd = navigation.scrollTop > 0
+      && navigation.scrollTop + navigation.clientHeight >= navigation.scrollHeight - 2;
+    for (const group of navigation.querySelectorAll('.settings-shell__navigation-group')) {
+      const top = group.getBoundingClientRect().top;
+      if (top <= line || !current || (atEnd && top < bottom)) current = group.dataset.domainId;
+    }
+    if (navigation.scrollTop <= 0) current = navigation.querySelector('.settings-shell__navigation-group')?.dataset.domainId ?? current;
+    if (own) current = own;
+    for (const button of buttons) button.classList.toggle('is-current', button.dataset.domainId === current);
+  };
+  const syncOverflow = () => {
+    if (!navigation.isConnected) return;
+    const was = navigation.classList.contains('settings-shell__navigation--overflowing');
+    const now = navigation.scrollHeight > navigation.clientHeight + 2;
+    navigation.classList.toggle('settings-shell__navigation--overflowing', now);
+    // Erscheint die Zeile, verdeckt sie unten eine Zeile: der aktive Eintrag
+    // bleibt sichtbar.
+    if (now && !was) revealActiveNavigationLink(navigation);
+    markCurrent();
+  };
+  // Erst eine Geste in der Leiste loest die Markierung vom offenen Blatt.
+  let userScrolled = false;
+  const byUser = () => { userScrolled = true; };
+  for (const type of ['wheel', 'touchmove', 'keydown', 'pointerdown']) navigation.addEventListener(type, byUser, { passive: true });
+  navigation.addEventListener('scroll', markCurrent, { passive: true });
+  if (typeof ResizeObserver === 'function') new ResizeObserver(syncOverflow).observe(navigation);
+  requestAnimationFrame(syncOverflow);
+  return index;
 }
 
 /**
@@ -355,8 +457,13 @@ function revealActiveNavigationLink(navigation) {
   // einer skalierenden Eintrittsanimation weichen die beiden voneinander ab.
   const scale = (view.height > 0 && navigation.offsetHeight > 0) ? view.height / navigation.offsetHeight : 1;
   const top = view.top + covered;
+  // Unten klebt die Bereichszeile (createNavigationIndex), solange die Liste
+  // ueberlaeuft: was sie verdeckt, zaehlt wie die Suche oben.
+  const index = navigation.querySelector('.settings-shell__navigation-index');
+  const indexBox = index && index.getClientRects().length ? index.getBoundingClientRect() : null;
+  const bottom = indexBox ? Math.min(view.bottom, indexBox.top) : view.bottom;
   if (box.top < top) navigation.scrollTop -= (top - box.top) / scale;
-  else if (box.bottom > view.bottom) navigation.scrollTop += (box.bottom - view.bottom) / scale;
+  else if (box.bottom > bottom) navigation.scrollTop += (box.bottom - bottom) / scale;
 }
 
 // Aktualisiert nur den Aktivzustand der bestehenden Navigation, ohne die Links
@@ -392,7 +499,7 @@ function updateNavigationActiveState(navigation, activeLeaf) {
  * Liste, gescrollt auf den Abschnitt - am Desktop auf dem ersten Blatt des
  * Bereichs.
  */
-function createOverviewRow(entry) {
+function createOverviewRow(entry, user) {
   const link = createLink(entry.path, 'settings-overview__row');
   link.dataset.leafId = entry.id;
   link.appendChild(createLeafMark(entry, 'settings-overview__row-mark'));
@@ -406,7 +513,7 @@ function createOverviewRow(entry) {
 
   const description = document.createElement('span');
   description.className = 'settings-overview__row-description';
-  description.textContent = settingsLeafDescription(entry, t);
+  description.textContent = settingsLeafDescription(entry, t, user);
 
   copy.append(label, description);
   link.append(
@@ -447,15 +554,14 @@ function renderOverview(content, domains, user) {
     const heading = document.createElement('h2');
     heading.className = 'settings-overview__heading';
     heading.id = `${section.id}-heading`;
-    heading.append(
-      createIcon(domain.icon, 'settings-overview__heading-icon'),
-      document.createTextNode(domainLabel),
-    );
+    // Ohne Glyphe (R24): die Gruppe spricht wie in der Spalte und der
+    // Seitenleiste, das Zeichen tragen ihre Blaetter.
+    heading.textContent = domainLabel;
     section.setAttribute('aria-labelledby', heading.id);
 
     const list = document.createElement('div');
     list.className = 'settings-overview__list';
-    for (const entry of leaves) list.appendChild(createOverviewRow(entry));
+    for (const entry of leaves) list.appendChild(createOverviewRow(entry, user));
 
     section.append(heading, list);
     overview.appendChild(section);
@@ -471,10 +577,7 @@ function renderOverview(content, domains, user) {
   const optionsHeading = document.createElement('h2');
   optionsHeading.className = 'settings-overview__heading';
   optionsHeading.id = 'settings-overview-options-heading';
-  optionsHeading.append(
-    createIcon('sliders-horizontal', 'settings-overview__heading-icon'),
-    document.createTextNode(t('settings.searchOptionsHeading')),
-  );
+  optionsHeading.textContent = t('settings.searchOptionsHeading');
   optionsSection.setAttribute('aria-labelledby', optionsHeading.id);
   const optionsList = document.createElement('div');
   optionsList.className = 'settings-overview__list';
@@ -531,23 +634,59 @@ function filterOverview(content, value) {
   }
 
   const optionsSection = overview.querySelector('.settings-overview__section--options');
-  const extra = [
-    ...hits.sections.map(({ leaf, section, label }) => ({ leaf, label, href: settingsSectionUrl(leaf, section.id) })),
-    ...hits.options.map(({ leaf, key, label }) => ({ leaf, label, href: settingsOptionUrl(leaf, key) })),
-  ];
+  const ordered = orderSettingsHits(hits, query, t);
+  const extra = ordered
+    .filter((hit) => hit.kind !== 'leaf')
+    .map(({ kind, leaf, section, key, label }) => ({
+      leaf,
+      label,
+      href: kind === 'section' ? settingsSectionUrl(leaf, section.id) : settingsOptionUrl(leaf, key),
+    }));
   if (optionsSection) {
     const list = optionsSection.querySelector('.settings-overview__list');
     list.replaceChildren(...extra.map(createOptionRow));
     optionsSection.hidden = extra.length === 0;
     hydrateIcons(list);
+    // Heisst eine Option so wie das Gesuchte und kein Blatt (Rang, R24), steht
+    // ihr Abschnitt VOR den Blaettern: "passwort" zeigt zuerst "Passwort
+    // aendern", nicht Konto und E-Mail (SMTP), die nur ihre Beschreibung traf.
+    const firstLeaf = ordered.findIndex((hit) => hit.kind === 'leaf');
+    const firstOther = ordered.findIndex((hit) => hit.kind !== 'leaf');
+    const optionsFirst = firstOther >= 0 && (firstLeaf < 0 || firstOther < firstLeaf);
+    const empty = emptyOf(overview);
+    if (optionsFirst) {
+      if (status) status.after(optionsSection);
+      else overview.prepend(optionsSection);
+    } else if (optionsSection.nextElementSibling !== empty) {
+      overview.insertBefore(optionsSection, empty);
+    }
   }
 
   if (!status) return;
   const count = hits.leaves.length + extra.length;
-  status.hidden = !query;
-  status.textContent = !query
-    ? ''
-    : (count ? t('settings.searchResults', { count }) : t('search.noResults'));
+  // OHNE TREFFER DER LEERZUSTAND DER APP (R24, G6-Einst-P3-5) - wie in der
+  // Seitenleiste; die Zahlzeile schweigt, der Leerzustand ist die Ansage.
+  status.hidden = !query || count === 0;
+  status.textContent = query && count ? t('settings.searchResults', { count }) : '';
+  const empty = emptyOf(overview);
+  empty.hidden = !query || count > 0;
+  empty.replaceChildren(...(query && !count ? [searchEmptyEl({
+    query,
+    onReset: () => resetSearchField(document.getElementById('settings-search')),
+  })] : []));
+  if (query && !count) hydrateIcons(empty);
+}
+
+/** Der Platz des Leerzustands am Ende der Wurzel (legt ihn beim ersten Mal an). */
+function emptyOf(overview) {
+  let empty = overview.querySelector(':scope > .settings-overview__empty');
+  if (!empty) {
+    empty = document.createElement('div');
+    empty.className = 'settings-overview__empty';
+    empty.hidden = true;
+    overview.appendChild(empty);
+  }
+  return empty;
 }
 
 /**
@@ -594,9 +733,27 @@ function renderToolbar(toolbar, content, { activeLeaf, domain }) {
     // Name hier ist die Ortsangabe der Shell wie in jedem Modul.
     const moduleTitle = document.createElement('p');
     moduleTitle.className = 'page-toolbar__title settings-toolbar__module-title';
-    moduleTitle.textContent = t('settings.title');
+    const moduleName = document.createElement('span');
+    moduleName.className = 'settings-toolbar__module-name';
+    moduleName.textContent = t('settings.title');
+    // DIE LEISTE TRAEGT DEN LARGE TITLE (R24, E4, Ulas 2026-10-28). Mobil
+    // stand „< Einstellungen" allein in einer 65px-Zeile, darunter Zahnrad,
+    // Large Title und Beschreibung - die erste Karte bei y180, die Rechte erst
+    // bei y750 bedienbar. Jetzt EINE Zeile wie im Gesundheitsbereich: Rueckweg,
+    // das Zeichen des BLATTS (nicht das Zahnrad) und sein Name im Large Title;
+    // der Kopf ist einzeilig (Kopfregel 1a) und steht in jedem Scrollstand
+    // gleich. Der Name hier ist Bild, die Ueberschrift bleibt das <h1> des
+    // Blatts (mobil im Baum, settings.css) - darum aria-hidden.
+    const leafName = document.createElement('span');
+    leafName.className = 'settings-toolbar__leaf-name';
+    leafName.setAttribute('aria-hidden', 'true');
+    const leafLabel = document.createElement('span');
+    leafLabel.className = 'settings-toolbar__leaf-label';
+    leafLabel.textContent = settingsLeafLabel(activeLeaf, t);
+    leafName.append(createLeafMark(activeLeaf, 'settings-toolbar__leaf-seal'), leafLabel);
+    moduleTitle.append(moduleName, leafName);
     toolbar.dataset.mode = 'leaf';
-    toolbar.classList.remove('page-toolbar--title-tools');
+    toolbar.classList.add('page-toolbar--title-tools');
     toolbar.replaceChildren(back, moduleTitle);
     hydrateIcons(toolbar);
     return;
@@ -672,17 +829,30 @@ function createBreadcrumb(domain, leaf) {
   return breadcrumb;
 }
 
-function createLeafHeader(leaf) {
+function createLeafHeader(leaf, user) {
   const header = document.createElement('header');
   header.className = 'settings-leaf-header';
 
   const heading = document.createElement('h1');
   heading.className = 'settings-leaf-header__title';
-  heading.textContent = settingsLeafLabel(leaf, t);
+  // DAS SIEGEL STEHT AM TITEL, NICHT AM RUECKWEG (R22, D13; Critique a5).
+  // Mobil stand das Zahnrad im Kopf neben "< Einstellungen" - der Kopf
+  // blendet dort den Modulnamen aus, und das Siegel haengte an einem Wort,
+  // das nicht mehr stand. Wie im Gesundheitsbereich ("< Gesundheit", darunter
+  // Siegel + Large Title) traegt es jetzt der Blatt-Titel; settings.css zeigt
+  // es nur dort, wo der Kopf es nicht traegt (unter 1024px). Die Kopfrolle
+  // (`module-seal--head`) baut nur die Shell; dieses Siegel nennt seine
+  // Herkunft (settings.css) und hat den Large-Title-Rang. Dekor: der
+  // Titel daneben und der Rueckweg nennen das Modul schon.
+  const seal = document.createElement('span');
+  seal.className = 'module-seal settings-leaf-header__seal';
+  seal.setAttribute('aria-hidden', 'true');
+  seal.insertAdjacentHTML('beforeend', moduleIconHTML(MODULE_ICON.settings));
+  heading.append(seal, settingsLeafLabel(leaf, t));
 
   header.appendChild(heading);
   // Extension sheets without a manifest description get no empty paragraph.
-  const text = settingsLeafDescription(leaf, t);
+  const text = settingsLeafDescription(leaf, t, user);
   if (text) {
     const description = document.createElement('p');
     description.className = 'settings-leaf-header__description';
@@ -713,6 +883,9 @@ function moduleEnabled(moduleId) {
  */
 function createModuleStatus(leaf, user) {
   if (!leaf.module || leaf.module === 'dashboard' || leaf.extensionModule) return null;
+  // Ein zweites Blatt desselben Moduls (R23 D14, Kalender-Synchronisation)
+  // nennt den Zustand nicht noch einmal - und nicht mit seinem eigenen Namen.
+  if (leaf.moduleStatus === false) return null;
   const enabled = moduleEnabled(leaf.module);
   const row = document.createElement('div');
   row.className = `settings-sheet-status settings-sheet-status--${enabled ? 'on' : 'off'}`;
@@ -891,7 +1064,9 @@ function createSheetJump(leaf, user, leafContainer, headingId) {
   for (const target of targets) {
     const item = document.createElement('li');
     const link = document.createElement('a');
-    link.className = 'filter-chip filter-chip--sm settings-sheet-jump__link';
+    // EIN LINK, KEIN CHIP (Critique R21, a5 P3): in der Optik der Filter-Chips
+    // sahen die Marken aus wie die Auswahl darunter (Erinnerungs-Chips).
+    link.className = 'settings-sheet-jump__link';
     link.href = target.url;
     link.dataset.jumpSection = target.id;
     link.textContent = t(target.labelKey);
@@ -907,6 +1082,12 @@ function createSheetJump(leaf, user, leafContainer, headingId) {
     list.appendChild(item);
   }
   nav.appendChild(list);
+  // DIE ZEILE ZEIGT, DASS ES WEITERGEHT (R22, D13; Critique a5 P3): mobil
+  // scrollt sie ohne Leiste - im Gesundheitsblatt 540px Marken in 366px, und
+  // die Kante schnitt das letzte Wort ab, als sei die Zeile zu Ende. Der
+  // geteilte Anriss (wireScrollFade, wie Tab-Leisten); ab 768px
+  // bricht die Zeile um und laeuft nicht ueber, dort bleibt er aus.
+  wireScrollFade(list);
   return nav;
 }
 
@@ -997,7 +1178,7 @@ async function renderLeafContent(content, leaf, domain, user, query) {
 
   // Der Leaf-Header wird zentral aus der Registry gerendert (Prio 5/B1): die
   // Abschnitte liefern nur noch Content.
-  const header = createLeafHeader(leaf);
+  const header = createLeafHeader(leaf, user);
   const heading = header.querySelector('.settings-leaf-header__title');
 
   const leafContainer = document.createElement('div');
@@ -1049,6 +1230,7 @@ async function renderLeafContent(content, leaf, domain, user, query) {
       title.id = `settings-scope-${leaf.id}-${scope}`;
       title.textContent = t(scope === 'mine' ? 'settings.scopeMine' : 'settings.scopeHousehold');
       group.setAttribute('aria-labelledby', title.id);
+      group.dataset.pending = '';
       group.appendChild(title);
       leafContainer.appendChild(group);
       parent = group;
@@ -1058,6 +1240,7 @@ async function renderLeafContent(content, leaf, domain, user, query) {
       host.className = 'settings-sheet-section';
       host.id = sheetSectionId(section.id);
       host.dataset.sectionId = section.id;
+      host.dataset.pending = '';
       if (section.props?.part) host.dataset.part = section.props.part;
       parent.appendChild(host);
       hosts.push([host, section]);
@@ -1071,12 +1254,12 @@ async function renderLeafContent(content, leaf, domain, user, query) {
   // wenn der Abschnitt seinen Inhalt HINTER das Skelett haengt, statt den
   // Traeger zu ersetzen (Critique R19, placeSkeletonUntilContent).
   leafContainer.setAttribute('aria-busy', 'true');
-  const skeletonTimer = setTimeout(() => {
-    for (const [host] of hosts) placeSkeletonUntilContent(host, renderSkeletonList({ rows: 2, lines: 3 }));
-  }, SKELETON_DELAY_MS);
+  const reveal = revealSectionsInOrder(hosts.map(([host]) => host), leafContainer);
+  const skeletonTimer = setTimeout(reveal.placeSkeleton, SKELETON_DELAY_MS);
 
   const finishLeaf = () => {
     clearTimeout(skeletonTimer);
+    reveal.all();
     // Kam das Blatt erst nach einem Wechsel zu Ende, steht schon ein anderes:
     // dann weder Fokus noch Formularwache fuer ein abgehaengtes Blatt.
     if (!leafContainer.isConnected) return;
@@ -1101,12 +1284,74 @@ async function renderLeafContent(content, leaf, domain, user, query) {
   // Nicht blockierend: ein haengender Abschnitt haelt weder die Shell noch die
   // Navigationssperre des Routers (siehe SECTION_WAIT_MS).
   await awaitSections(
-    hosts.map(([host, section]) => renderSheetSection(host, section, user, query)),
+    hosts.map(([host, section]) => renderSheetSection(host, section, user, query).finally(() => reveal.done(host))),
     finishLeaf,
   );
   // Nach der Frist stehen die Marken in jedem Fall, notfalls mit dem
-  // Rueckfallnamen eines Abschnitts, der noch laedt.
+  // Rueckfallnamen eines Abschnitts, der noch laedt - und jeder Abschnitt
+  // steht im Fluss, ein haengender mit seinem eigenen Skelett.
+  clearTimeout(skeletonTimer);
+  reveal.all({ skeletons: true });
   jump?.classList.remove('settings-sheet-jump--pending');
+}
+
+/**
+ * EIN ABSCHNITT ERSCHEINT GANZ UND IN DER REIHENFOLGE DES BLATTS (Critique R22,
+ * D4). Die Traeger standen leer im Blatt und fuellten sich, wie ihre Daten
+ * kamen: jeder fertige Abschnitt schob die darunter weg (Kaltstart mobil
+ * Mitglieder CLS 0,25, Kalender 0,53, Gesundheit 0,20; Desktop Kalender 0,13).
+ * Jetzt liegt ein Traeger, bis sein render() fertig ist UND alle darueber
+ * stehen, ausserhalb des Flusses (`[data-pending]`, settings.css: absolut,
+ * unsichtbar, voll breit - er misst sich beim Aufbau wie im Fluss). Erscheinen
+ * kann so nur, was unter allem Sichtbaren liegt, und nichts Sichtbares rueckt.
+ * Ein Reichweitenblock folgt seinem ersten Traeger. Das Skelett steht an der
+ * Kante zum ersten wartenden Traeger und ist bei jedem Schritt ein NEUER Knoten
+ * - ein verschobenes Skelett waere selbst ein Sprung.
+ *
+ * @param {HTMLElement[]} hosts  Traeger in Dokumentreihenfolge
+ * @param {HTMLElement} leafContainer
+ */
+function revealSectionsInOrder(hosts, leafContainer) {
+  const finished = new Set();
+  let next = 0;
+  let skeleton = null;
+  let skeletonDue = false;
+  const show = (host) => {
+    delete host.dataset.pending;
+    const group = host.parentElement;
+    if (group && group !== leafContainer) delete group.dataset.pending;
+  };
+  const frontier = () => {
+    skeleton?.remove();
+    skeleton = null;
+    const host = hosts[next];
+    if (!skeletonDue || !host) return;
+    const group = host.parentElement;
+    const anchor = group && group !== leafContainer && group.dataset.pending !== undefined ? group : host;
+    anchor.insertAdjacentHTML('beforebegin', renderSkeletonList({ rows: 2, lines: 3 }));
+    skeleton = anchor.previousElementSibling;
+  };
+  return {
+    done(host) {
+      finished.add(host);
+      if (hosts[next] !== host) return;
+      while (next < hosts.length && finished.has(hosts[next])) show(hosts[next++]);
+      frontier();
+    },
+    placeSkeleton() {
+      skeletonDue = true;
+      frontier();
+    },
+    all({ skeletons = false } = {}) {
+      skeletonDue = false;
+      frontier();
+      for (; next < hosts.length; next += 1) {
+        const host = hosts[next];
+        show(host);
+        if (skeletons && !finished.has(host)) placeSkeletonUntilContent(host, renderSkeletonList({ rows: 2, lines: 3 }));
+      }
+    },
+  };
 }
 
 /**
@@ -1280,7 +1525,9 @@ export async function renderSettingsShell(container, {
 
   const page = shell.closest('.settings-page');
   const wasLeaf = Boolean(page?.classList.contains('settings-page--leaf'));
-  page?.classList.toggle('settings-page--leaf', Boolean(activeLeaf));
+  // Die Ebene markieren (Titelhierarchie, Kopf). Beim Drill-down erst IM
+  // Wechsel (Critique R21): vorher stand die Marke schon im alten Bild.
+  const markLeaf = () => page?.classList.toggle('settings-page--leaf', Boolean(activeLeaf));
   // DRILL-DOWN MIT RICHTUNG (Critique R18, Bewegung). Ohne Seitenleiste ist die
   // Uebersicht die Seite und ein Blatt eine Ebene tiefer - der Wechsel war ein
   // harter Schnitt (gemessen mobil: 0 Animationen, der Soft-Update-Zweig des
@@ -1293,6 +1540,7 @@ export async function renderSettingsShell(container, {
   const drill = existingShell && !isSplit(shell) && wasLeaf !== Boolean(activeLeaf)
     ? (activeLeaf ? 1 : -1)
     : 0;
+  if (!drill) markLeaf();
   const toolbar = page?.querySelector(':scope > .page-toolbar');
 
   const focusDomain = view === 'domain'
@@ -1322,12 +1570,19 @@ export async function renderSettingsShell(container, {
     // hinaus - vorher kam nur das neue Bild 8px von der Seite, die alte Ebene
     // war schlagartig weg. Der synchrone Teil laeuft im Wechsel, das Laden
     // danach wie bisher.
+    //
+    // SEIT R21 OHNE ZWISCHENBILD: das neue Bild wartet auf das Blatt
+    // (hoechstens FIRST_RENDER_WAIT_MS, swapRegion), und der Kopf blendet an
+    // Ort und Stelle ueber (`fade`). Vorher stand im ersten Frame schon
+    // "< Einstellungen" ueber der auf zwei Zeilen gekappten Uebersicht.
     if (drill) {
       let loading = null;
       await swapRegion(content, () => {
+        markLeaf();
         if (toolbar) renderToolbar(toolbar, content, { activeLeaf, domain: leafDomain });
         loading = renderLeafContent(content, activeLeaf, leafDomain, user, query);
-      }, { direction: drill });
+        return loading;
+      }, { direction: drill, fade: toolbar });
       await loading;
       return;
     }
@@ -1340,11 +1595,15 @@ export async function renderSettingsShell(container, {
     hydrateIcons(content);
     if (toolbar) renderToolbar(toolbar, content, {});
   };
-  if (drill) await swapRegion(content, paintOverview, { direction: drill });
-  else paintOverview();
+  if (drill) {
+    await swapRegion(content, () => {
+      markLeaf();
+      paintOverview();
+    }, { direction: drill, fade: toolbar });
+  } else paintOverview();
   revealOverviewSection(content, focusDomain?.id);
   if (page) watchSplit(container, page, { user, domainId: focusDomain?.id ?? null });
 }
 
 /** Nur fuer Tests (test-settings-navigation.js). */
-export const __test = { awaitSections, SECTION_WAIT_MS, revealActiveNavigationLink, renderLeafContent };
+export const __test = { awaitSections, SECTION_WAIT_MS, revealActiveNavigationLink, renderLeafContent, revealSectionsInOrder };

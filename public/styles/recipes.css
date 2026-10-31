@@ -48,6 +48,18 @@
 
 /* Geometrie, Fläche, Trennlinie und Hover: .list-row. */
 
+/* Lange Listen rechnen nur, was in Sicht ist - dieselbe Regel wie bei den
+ * Kontakten (contacts.css, Modern-Web-Guidance-Audit Befund 18). 300 Rezepte:
+ * 460 ms am Stueck bei 4x CPU, mit der Regel 357 ms. Zeile 64px, gemessen -
+ * sie hat kein Polster, Content-Box und Zeile sind gleich hoch. Seit R22 (D4)
+ * erst ab Zeile 20: die Falz steht immer. */
+@supports (content-visibility: auto) and (contain-intrinsic-size: auto none auto 1px) {
+  .recipes-list .recipe-row-item:nth-child(n+20) {
+    content-visibility: auto;
+    contain-intrinsic-size: auto none auto 64px;
+  }
+}
+
 .recipe-row__heading {
   /* Die Überschrift ist der Flex-Slot, der Button füllt ihn. Ohne Reset brächte
    * h2 seine Blockmargen und die eigene Schriftgröße mit. */
@@ -204,32 +216,19 @@
  *   2. Die Zutatenzahl rückt unter den Namen, damit er die Zeile allein hat.
  *
  * Danach: Textspalte 202px statt 98px, Namensbreite 186px statt 8px.
+ *
+ * SEIT R21 GILT ZUG 1 AUF JEDER BREITE (Zeilen-Endzone, DESIGN.md D10): ab
+ * 30rem standen Stift, Duplizieren und ein sichtbarer Papierkorb in der Zeile,
+ * die Detailspalte daneben trug dieselben drei. Die Zeile hat nur noch den
+ * Mehr-Knopf; die Query regelt nur noch die Stapelung von Name und Meta.
  * -------------------------------------------------------- */
 
-/* Basiszustand ZUERST: `@container` erhöht die Spezifität nicht, es entscheidet die
- * Quellreihenfolge. Standen diese beiden Regeln hinter der Query, gewannen sie -
- * und die Aktionen blieben sichtbar, obwohl die Query griff (gemessen: Textspalte
- * 46px statt 202px). */
-.recipe-row__inline-actions {
+.recipe-row__more {
   display: flex;
   align-items: center;
-  gap: var(--space-1);
-}
-
-.recipe-row__more {
-  display: none;
 }
 
 @container list-rows (max-width: 30rem) {
-  .recipe-row__inline-actions {
-    display: none;
-  }
-
-  .recipe-row__more {
-    display: flex;
-    align-items: center;
-  }
-
   /* `order`, damit die Vorlesereihenfolge Name → Zutatenzahl → Chevron bleibt. */
   .recipe-row__toggle {
     flex-wrap: wrap;
@@ -265,6 +264,13 @@
      * Strut der groesseren Namensschrift an und wird 1-2px hoeher als die
      * Meta allein (gemessen 390px: 65/66 statt 64px). */
     font-size: var(--text-sm);
+    /* EINE Zeile, auch in langen Sprachen (F4.7): "· Diese Woche geplant"
+     * steht seither auch am Telefon; ru/el brachen bei 390px um (Zeile 64 ->
+     * 103px), bei 320px lief die Angabe aus der Zeile. Die Zahl steht vorn
+     * und bleibt ganz, die Planungsangabe endet mit Auslassung. */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .recipe-row__toggle .list-row__meta {
@@ -309,27 +315,19 @@
   color: var(--color-text-tertiary);
 }
 
-/* In der Schmalfassung der Zeile ist die Angabe verzichtbar: sie ist eine
- * Zweitinformation, und die Zutatenzahl behaelt ihren Platz (dieselbe
- * Rangfolge wie beim Badge-Slot). */
-@container list-rows (max-width: 26rem) {
-  .recipe-row__planned { display: none; }
-}
+/* AUCH AM TELEFON (Sammel-Ticket R22-F, F4.7). Unter 26rem Zeilenbreite fiel
+ * die Angabe weg - geschrieben am 27.08., als die Zutatenzahl schmal noch neben
+ * dem Namen stand und um ihren Platz rang. Seit dem Slot `.recipe-row__sub`
+ * (#1477) steht sie in einer eigenen zweiten Zeile, die beide Angaben als Satz
+ * fuehrt; dort hat "· Diese Woche geplant" Platz: gemessen 390px ganz in
+ * de/fr/vi/nl, mit Auslassung in ru/el und bei 320px, Zeile 64px wie vorher. Desktop zeigte sie, das Telefon
+ * nicht - dieselbe Liste sagte zweierlei ueber den Wochenplan. In langen
+ * Sprachen endet sie mit Auslassung, die Zeile bleibt einzeilig (Slot oben). */
 
-.recipe-row__chevron {
-  flex-shrink: 0;
-  color: var(--color-text-tertiary);
-  /* Ein Wegweiser (chevron-right): die Zeile oeffnet das Rezept als
-   * Leseblatt (R19). Bis dahin drehte sich hier ein Aufklapp-Winkel. */
-}
-
-/* Gespiegelte Zeile ganz ohne Detail (recipes.js, isMirrored && !hasDetail):
- * derselbe Chevron als reiner Breiten-Platzhalter, unsichtbar statt entfernt.
- * `display: none` würde ihn wieder aus dem Flex-Fluss nehmen und das Badge
- * erneut verschieben - genau das Problem, das er lösen soll. */
-.recipe-row__chevron--placeholder {
-  visibility: hidden;
-}
+/* KEIN CHEVRON IN DER REZEPTZEILE (R21, D10): sie oeffnet ein Objekt und
+ * traegt einen Mehr-Knopf - der Wegweiser gehoert nur reiner Navigation. Damit
+ * entfaellt auch sein unsichtbarer Platzhalter in gespiegelten Zeilen ohne
+ * Detail: keine Zeile traegt ihn mehr, das Badge steht ueberall gleich. */
 
 /* --------------------------------------------------------
  * Rezept-Detail: EIN Inhalt fuer Leseblatt (unter der Schwelle) und
@@ -383,6 +381,17 @@
 .recipe-detail__section-title {
   margin: 0;
   color: var(--color-text-primary);
+}
+
+/* Ueberschrift und Portionen-Stepper in einer Zeile (R24, E12): der Stepper
+ * gehoert zu den Zutaten, die er umrechnet, und steht an ihrem Kopf rechts.
+ * Wird es eng (Telefon, langes Wort), rueckt er unter die Ueberschrift. */
+.recipe-detail__section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-3);
 }
 
 /* ZUTATEN IN PRIMAERTEXT: sie sind der Inhalt des Rezepts, nicht seine
@@ -516,12 +525,6 @@ button.recipe-detail__ingredient-match:hover {
   display: contents;
 }
 
-/* `display: contents` schlaegt das UA-`[hidden]` wie jede andere Angabe - ohne
- * gespiegelte Rezepte bliebe der Trigger sonst stehen. */
-.recipes-source-filter[hidden] {
-  display: none;
-}
-
 /* Das Häkchen-Muster der Einfachauswahl (.popover-menu__item-check--hidden)
  * wohnt seit 2026-08-31 beim restlichen popover-menu-Vokabular in layout.css -
  * es hat mit dem Personen-Umschalter der Gesundheit einen zweiten Nutzer. */
@@ -573,6 +576,12 @@ button.recipe-detail__ingredient-match:hover {
 /* Die Zeilen-Aktions-Buttons (Bearbeiten/Duplizieren/Löschen) nutzen die
  * geteilte .row-action-Grammatik aus layout.css in der geteilten
  * .list-row__actions. Kein eigenes Reveal-Layout mehr. */
+
+/* Portionen sind eine Zahl mit ein, zwei Ziffern - das Feld so breit wie ein
+ * Mengenfeld der Zutatenzeile, nicht wie der Name daneben (R24, E12). */
+.recipe-servings-field > .form-input {
+  max-inline-size: 6.5rem;
+}
 
 .recipe-ingredient-list {
   display: grid;
@@ -646,8 +655,13 @@ button.recipe-detail__ingredient-match:hover {
  * nach der gerechneten Darstellung der Spalte (syncRowMode).
  * -------------------------------------------------------- */
 
-.recipes-list--split .recipe-row__chevron {
-  display: none;
+/* DIE SPALTE FLUCHTET MIT DER LISTE (R22 S9, Critique a2). Die Liste beginnt
+ * mit dem oberen Auslauf ihres Scrollports (`.recipes-list`, --space-4) bei
+ * y 141, das Detail stand ohne ihn bei 125 - zwei Oberkanten nebeneinander.
+ * Dieselbe Stufe oben; unten haelt die Hoehe beide Rand-Stufen frei. */
+.recipes-page .split-view__detail {
+  margin-block-start: var(--space-4);
+  max-block-size: calc(100% - var(--space-8));
 }
 
 /* Derselbe Inhalt wie der Aufklapper, aber mit dem Polster der Spalte: der

@@ -4,8 +4,10 @@
  * Abhängigkeiten: /i18n.js
  */
 
-import { t, formatDate, formatDateInput, parseDateInput, isDateInputValid } from '/i18n.js';
+import { t, formatDateInput, parseDateInput, isDateInputValid } from '/i18n.js';
+import { dateText } from '/utils/date-format.js';
 import { hasExplicitZone, isValidTimeZone, wallTimeValue } from '/utils/timezone.js';
+import { formSwitchRowHtml } from '/settings/components.js';
 
 const FREQ_OPTIONS = () => [
   { value: '',        label: t('rrule.freqNone') },
@@ -254,11 +256,11 @@ export function monthEndHintText(startDate, { expandsFromStart = false, rule = n
   }
 
   if (dateKey === firstDate) {
-    return t('rrule.lastDayOfMonthHintSame', { date: formatDate(dateKey) });
+    return t('rrule.lastDayOfMonthHintSame', { date: dateText(dateKey, { year: true }) });
   }
   return t('rrule.lastDayOfMonthHintOverride', {
-    startDate: formatDate(dateKey),
-    firstDate: formatDate(firstDate),
+    startDate: dateText(dateKey, { year: true }),
+    firstDate: dateText(firstDate, { year: true }),
   });
 }
 
@@ -340,7 +342,7 @@ export function renderRRuleFields(prefix, existingRule, opts = {}) {
 
       <div class="rrule-details" id="${prefix}-rrule-details" ${parsed.freq ? '' : 'hidden'}>
         <div class="rrule-row">
-          <div class="form-group" style="margin-bottom:0">
+          <div class="form-group">
             <label class="label form-label" for="${prefix}-rrule-interval">${t('rrule.labelEvery')}</label>
             <div class="rrule-interval-wrap">
               <input class="input form-input" type="number" id="${prefix}-rrule-interval"
@@ -348,7 +350,7 @@ export function renderRRuleFields(prefix, existingRule, opts = {}) {
               <span class="rrule-interval-unit" id="${prefix}-rrule-unit">${intervalUnitLabel(parsed.freq, parsed.interval)}</span>
             </div>
           </div>
-          <div class="form-group" style="margin-bottom:0">
+          <div class="form-group">
             <label class="label form-label" for="${prefix}-rrule-end">${t('rrule.labelEnds')}</label>
             <select class="input form-input" id="${prefix}-rrule-end">
               ${endOpts}
@@ -357,12 +359,12 @@ export function renderRRuleFields(prefix, existingRule, opts = {}) {
         </div>
 
         <div class="rrule-row rrule-end-inputs">
-          <div class="form-group rrule-until-field" id="${prefix}-rrule-until-wrap" ${endType === 'until' ? '' : 'hidden'} style="margin-bottom:0">
+          <div class="form-group rrule-until-field" id="${prefix}-rrule-until-wrap" ${endType === 'until' ? '' : 'hidden'}>
             <label class="label form-label" for="${prefix}-rrule-until">${t('rrule.labelUntil')}</label>
             <yuvomi-datepicker type="date" id="${prefix}-rrule-until"
                    value="${formatDateInput(parsed.until)}"></yuvomi-datepicker>
           </div>
-          ${allowCount ? `<div class="form-group rrule-count-field" id="${prefix}-rrule-count-wrap" ${endType === 'count' ? '' : 'hidden'} style="margin-bottom:0">
+          ${allowCount ? `<div class="form-group rrule-count-field" id="${prefix}-rrule-count-wrap" ${endType === 'count' ? '' : 'hidden'}>
             <label class="label form-label" for="${prefix}-rrule-count">${t('rrule.labelCount')}</label>
             <div class="rrule-interval-wrap">
               <input class="input form-input" type="number" id="${prefix}-rrule-count"
@@ -385,13 +387,10 @@ export function renderRRuleFields(prefix, existingRule, opts = {}) {
              kurzen Monat. Nur bei MONTHLY sichtbar, aus demselben Grund, aus
              dem buildRRule sie nur dort schreibt. -->
         <div class="rrule-monthday" id="${prefix}-rrule-monthday" ${parsed.freq === 'MONTHLY' ? '' : 'hidden'}>
-          <label class="toggle" style="margin:0">
-            <input type="checkbox" id="${prefix}-rrule-last-day" ${parsed.lastDay ? 'checked' : ''}${
-              parsed.lastDay ? ` aria-describedby="${prefix}-rrule-monthday-hint"` : ''
-            }>
-            <span class="toggle__track"></span>
-            <span>${t('rrule.lastDayOfMonth')}</span>
-          </label>
+          ${formSwitchRowHtml({ label: t('rrule.lastDayOfMonth'), checked: Boolean(parsed.lastDay), attrs: {
+            id: `${prefix}-rrule-last-day`,
+            'aria-describedby': parsed.lastDay ? `${prefix}-rrule-monthday-hint` : null,
+          } })}
           <!-- DAS EINGETRAGENE DATUM BLEIBT STEHEN (#960) - was daraus folgt,
                ist aber in den beiden Modulen VERSCHIEDEN, und ein Hinweis, der
                das Gegenteil verspricht, ist schlimmer als keiner.
@@ -412,11 +411,7 @@ export function renderRRuleFields(prefix, existingRule, opts = {}) {
 
         ${allowFromCompletion ? `
         <div class="rrule-anchor">
-          <label class="toggle" style="margin:0">
-            <input type="checkbox" id="${prefix}-rrule-from-completion" ${fromCompletion ? 'checked' : ''}>
-            <span class="toggle__track"></span>
-            <span>${t('rrule.fromCompletionLabel')}</span>
-          </label>
+          ${formSwitchRowHtml({ label: t('rrule.fromCompletionLabel'), checked: Boolean(fromCompletion), attrs: { id: `${prefix}-rrule-from-completion` } })}
           <p class="rrule-anchor__hint">${t('rrule.fromCompletionHint')}</p>
         </div>` : ''}
 
@@ -496,7 +491,7 @@ export function describeRRule(rule, opts = {}) {
   let rhythm = parts.join(' ');
   if (opts.fromCompletion) rhythm += ` · ${t('rrule.summaryFromCompletion')}`;
   if (p.count) return `${rhythm} · ${t('rrule.summaryCount', { count: p.count })}`;
-  if (p.until) return `${rhythm} · ${t('rrule.summaryUntil', { date: formatDate(p.until) })}`;
+  if (p.until) return `${rhythm} · ${t('rrule.summaryUntil', { date: dateText(p.until) })}`;
   return rhythm;
 }
 

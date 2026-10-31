@@ -121,6 +121,27 @@ test('following delete from a moved child overlays by original slot across reloa
   ]);
 });
 
+test('following delete orders exact keys within one UTC day and across key forms (#2034)', () => {
+  // Europe/Berlin 01:30: zwei Vorkommen am selben UTC-Tag, dazu ein
+  // verknuepftes Einzelvorkommen, das noch die alte Form traegt.
+  const state = {
+    events: [
+      { id: 7, series_id: 7, recurrence_id: '2035-03-24T00:30:00Z', title: 'Sat', start_datetime: '2035-03-24T00:30:00Z' },
+      { id: 7, series_id: 7, recurrence_id: '2035-03-24T23:30:00Z', title: 'Sun', start_datetime: '2035-03-24T23:30:00Z' },
+      { id: 99, series_id: 7, recurrence_id: '2035-03-26', title: 'Legacy child', start_datetime: '2035-03-27T10:00:00Z' },
+      { id: 98, series_id: 7, recurrence_id: '2035-03-22', title: 'Earlier legacy child', start_datetime: '2035-03-22T10:00:00Z' },
+    ],
+  };
+  beginOptimisticCalendarDelete(state, {
+    eventId: 7,
+    seriesId: 7,
+    scope: 'following',
+    occurrenceDate: '2035-03-25',
+    recurrenceId: '2035-03-24T23:30:00Z',
+  });
+  assert.deepEqual(state.events.map(({ title }) => title), ['Sat', 'Earlier legacy child']);
+});
+
 test('single-occurrence transition hides only the selected recurrence date', () => {
   const state = makeState();
   beginOptimisticCalendarDelete(state, {
@@ -817,11 +838,18 @@ test('every calendar delete passes the focus keeper to the scheduler (#1083)', (
   const calls = src.split('scheduleCalendarDeleteWithUndo({').slice(1)
     .map((part) => part.slice(0, part.indexOf('\n  });')));
   assert.ok(calls.length >= 3, `expected the three delete paths, found ${calls.length}`);
+  // Since R22-F the view hooks come from ONE place (deleteViewHooks): on the
+  // calendar page its own view, over another page (openEventById) the page
+  // below. Every call takes them from there, and the calendar branch keeps both.
   for (const call of calls) {
-    assert.match(call, /\n\s*keepFocus: renderKeepingFocus,/,
-      'without it the default keeps no focus, and the commit render drops it to body');
-    assert.match(call, /\n\s*refocusAfterUndo: refocusAfterRender,/,
-      'without it a keyboard Undo leaves focus on body - the toast removed its button first');
+    assert.match(call, /\n\s*\.\.\.deleteViewHooks\(deleteScope\),/,
+      'every delete path takes the view hooks from deleteViewHooks()');
   }
+  const hooks = src.slice(src.indexOf('function deleteViewHooks('), src.indexOf('async function deleteEvent('));
+  const hosted = hooks.slice(0, hooks.indexOf('let removed'));
+  assert.match(hosted, /\n\s*keepFocus: renderKeepingFocus,/,
+    'without it the default keeps no focus, and the commit render drops it to body');
+  assert.match(hosted, /\n\s*refocusAfterUndo: refocusAfterRender,/,
+    'without it a keyboard Undo leaves focus on body - the toast removed its button first');
   assert.match(src, /import \{[^}]*\brenderKeepingFocus\b[^}]*\} from '\/components\/modal\.js'/);
 });

@@ -11,6 +11,18 @@ const noteInputProperties = {
     ],
   },
   category_ids: { type: 'array', maxItems: 50, uniqueItems: true, items: { type: 'integer', minimum: 1 } },
+  visibility: {
+    type: 'string',
+    enum: ['all', 'private'],
+    description: '`private`: only the creator sees the note, administrators included. Only the creator can change it.',
+  },
+  locked: {
+    oneOf: [
+      { type: 'integer', enum: [0, 1] },
+      { type: 'boolean' },
+    ],
+    description: 'Locked notes can only be changed by their creator and administrators - ticking checklist items included. Only they can set or lift the lock.',
+  },
 };
 
 // Die Erinnerungsfelder spiegeln `validateReminder()` in
@@ -19,7 +31,14 @@ const BIRTHDAY_REMINDER_MAX_MINUTES = 999 * 10080;
 
 const birthdayInputProperties = {
   name: { type: 'string', maxLength: 200 },
-  birth_date: { type: 'string', format: 'date' },
+  birth_date: { type: 'string', format: 'date', description: 'The birth date. With `year_unknown` its year is a placeholder: the server stores 2000 (a leap year, so 29 February stays valid) whatever year is sent.' },
+  year_unknown: {
+    description: 'The year of birth is unknown (#2095): only day and month of `birth_date` count, and `next_age` is null. Responses carry it as 0 or 1. Omitted on update, the stored value stays; turning it off needs a `birth_date` with its real year in the same request.',
+    oneOf: [
+      { type: 'boolean' },
+      { type: 'integer', enum: [0, 1] },
+    ],
+  },
   name_day: { type: ['string', 'null'], pattern: '^\\d{2}-\\d{2}$', description: 'Month and day (`MM-DD`), or null to clear it.' },
   notes: { type: ['string', 'null'], maxLength: 5000 },
   photo_data: { type: ['string', 'null'], description: 'A base64 image data URL (png, jpeg, webp, gif), or null to remove it.' },
@@ -45,11 +64,20 @@ const birthdayInputProperties = {
     type: ['string', 'null'],
     enum: ['minutes', 'hours', 'days', 'weeks', '', null],
   },
+  contact_id: {
+    type: ['integer', 'null'],
+    minimum: 1,
+    description: 'Links the birthday to a contact of the household (Critique R22, D7), or null to unlink it. Linking needs read access to the `contacts` module as well (for API tokens `contacts:read`), otherwise 403. A contact can carry one birthday: one already linked elsewhere is refused with 409. Birthdays of household members cannot be linked. Linking does not copy or follow the contact\'s date. Omitted on update, the link stays; the value already stored is accepted unchanged.',
+  },
 };
 
 const calendarOccurrenceProperties = {
   series_id: { type: 'integer', minimum: 1 },
-  recurrence_id: { type: 'string', format: 'date' },
+  recurrence_id: {
+    type: 'string',
+    pattern: '^\\d{4}-\\d{2}-\\d{2}(T\\d{2}:\\d{2}:\\d{2}Z?)?$',
+    description: 'The original occurrence, as RFC 5545 RECURRENCE-ID (#2034): `YYYY-MM-DD` for an all-day series, `YYYY-MM-DDTHH:MM:SSZ` (the original start in UTC) for a series with a time zone, `YYYY-MM-DDTHH:MM:SS` (floating wall time) for a local series without one. Up to v2.78.0 a timed occurrence was named by a `YYYY-MM-DD` day; linked occurrences stored before the change may still carry that form.',
+  },
   is_occurrence_override: { type: 'boolean' },
   is_local_recurring_series: { type: 'boolean' },
   can_override_occurrence: { type: 'boolean' },
@@ -121,6 +149,11 @@ export const schemas = {
             url: { type: 'string', format: 'uri', description: 'Shared calendar URL. Required when ics is omitted.' },
             color: { type: 'string', pattern: '^#[0-9A-Fa-f]{6}$', description: 'Fallback event color for imported events without their own color.' },
             local_calendar_id: { type: 'integer', minimum: 1, description: 'Target local calendar. Omit to use the default calendar.' },
+            assignee_user_ids: {
+              type: 'array', uniqueItems: true, items: { type: 'integer', minimum: 1 },
+              description: 'People for this run (#1940), household members only; not stored. Every new event of the run is assigned to them (the first one primary). An event the caller already imported with the same UID - in any local calendar - is not created again: the people are added to the ones already on it, nobody is removed and nothing else changes. Omit for the behaviour without people.',
+            },
+            assignee_user_id: { type: 'integer', minimum: 1, description: 'One person, the short form of `assignee_user_ids`.' },
           },
           oneOf: [{ required: ['ics'] }, { required: ['url'] }],
         },
@@ -199,6 +232,8 @@ export const schemas = {
             content: { type: 'string' },
             color: { type: 'string' },
             pinned: { type: 'integer', enum: [0, 1] },
+            visibility: { type: 'string', enum: ['all', 'private'] },
+            locked: { type: 'integer', enum: [0, 1] },
             created_by: { type: ['integer', 'null'] },
             creator_name: { type: ['string', 'null'] },
             categories: { type: 'array', items: { $ref: '#/components/schemas/NoteCategory' } },
@@ -821,6 +856,7 @@ export const schemas = {
             phone: { type: ['string', 'null'] },
             email: { type: ['string', 'null'] },
             birth_date: { type: ['string', 'null'], format: 'date' },
+            birth_year_unknown: { type: 'boolean', description: 'Only day and month of `birth_date` are known (#2095); the server then stores the placeholder year 2000 whatever year is sent. Without it, the stored flag only goes when a different date arrives.' },
             onboarding_pending: {
               type: 'boolean',
               description: 'Whether this account still needs the onboarding walkthrough. Derived from '
@@ -856,6 +892,7 @@ export const schemas = {
             phone: { type: ['string', 'null'] },
             email: { type: ['string', 'null'] },
             birth_date: { type: ['string', 'null'], format: 'date' },
+            birth_year_unknown: { type: 'boolean', description: 'Only day and month of `birth_date` are known (#2095); the server then stores the placeholder year 2000 whatever year is sent. Without it, the stored flag only goes when a different date arrives.' },
             created_at: { type: 'string', format: 'date-time' },
             sort_order: {
               type: ['integer', 'null'],
@@ -976,6 +1013,7 @@ export const schemas = {
             phone: { type: ['string', 'null'] },
             email: { type: ['string', 'null'] },
             birth_date: { type: ['string', 'null'], format: 'date' },
+            birth_year_unknown: { type: 'boolean', description: 'Only day and month of `birth_date` are known (#2095); the server then stores the placeholder year 2000 whatever year is sent. Without it, the stored flag only goes when a different date arrives.' },
           },
           required: ['username', 'display_name'],
         },
@@ -998,6 +1036,7 @@ export const schemas = {
             phone: { type: ['string', 'null'] },
             email: { type: ['string', 'null'] },
             birth_date: { type: ['string', 'null'], format: 'date' },
+            birth_year_unknown: { type: 'boolean', description: 'Only day and month of `birth_date` are known (#2095); the server then stores the placeholder year 2000 whatever year is sent. Without it, the stored flag only goes when a different date arrives.' },
           },
         },
         ProfileUpdateRequest: {
@@ -1081,6 +1120,8 @@ export const schemas = {
                 valid: { type: 'boolean' },
                 display_name: { type: ['string', 'null'] },
                 username: { type: ['string', 'null'] },
+                invited_by: { type: ['string', 'null'], description: 'Display name of the member who created the invitation, or null when that account is gone.' },
+                password_required: { type: 'boolean' },
               },
               required: ['valid'],
             },
@@ -1734,14 +1775,17 @@ export const schemas = {
             source_id: { type: 'integer' },
             original_label: { type: 'string' },
             normalized_label: { type: 'string' },
-            type_id: { type: ['integer', 'null'] },
-            ignored: { type: 'boolean' },
+            type_ids: { type: 'array', items: { type: 'integer' }, description: 'Every type this label maps to, ascending; one pickup per type is created for each of its entries. Empty when the label is ignored.' },
+            type_id: { type: ['integer', 'null'], deprecated: true, description: 'The lowest of type_ids, or null. Kept for callers from before a label could map to several types; read type_ids instead.' },
+            ignored: { type: 'boolean', description: 'True exactly when type_ids is empty.' },
           },
         },
         WasteSourceMappingUpdateInput: {
           type: 'object',
+          description: 'Either ignored: true, or the label\'s full new type set as type_ids (or a single type_id) - never both, and never type_id together with type_ids.',
           properties: {
-            type_id: { type: 'integer', description: 'Required unless ignored is true.' },
+            type_ids: { type: 'array', items: { type: 'integer' }, minItems: 1, description: 'Replaces the label\'s whole type set.' },
+            type_id: { type: 'integer', description: 'Shorthand for type_ids with one entry.' },
             ignored: { type: 'boolean', default: false },
           },
         },
@@ -1765,7 +1809,8 @@ export const schemas = {
             count: { type: 'integer' },
             sample_summary: { type: ['string', 'null'] },
             suggested_type_id: { type: ['integer', 'null'], description: 'A same-name (case-insensitive) match against an existing type; a convenience default only, never applied on its own.' },
-            remembered_type_id: { type: ['integer', 'null'], description: 'The type this label was mapped to on the source\'s last commit, on a re-import preview.' },
+            remembered_type_ids: { type: 'array', items: { type: 'integer' }, description: 'Every type this label was mapped to on the source\'s last commit, on a re-import preview; empty otherwise.' },
+            remembered_type_id: { type: ['integer', 'null'], deprecated: true, description: 'The lowest of remembered_type_ids, or null. Kept for callers from before a label could map to several types.' },
             remembered_ignored: { type: 'boolean' },
           },
         },
@@ -1798,10 +1843,11 @@ export const schemas = {
         WasteImportMappingDecision: {
           type: 'object',
           required: ['normalized_label'],
-          description: 'Exactly one of type_id / new_type / ignored must be set. One decision is required per distinct label reported by the preview.',
+          description: 'Either ignored: true, or at least one type: existing ones as type_ids (or a single type_id), a new_type to create inline, or both together. One decision is required per distinct label reported by the preview; each entry of a label becomes one pickup per type.',
           properties: {
             normalized_label: { type: 'string' },
-            type_id: { type: 'integer' },
+            type_ids: { type: 'array', items: { type: 'integer' } },
+            type_id: { type: 'integer', description: 'Shorthand for type_ids with one entry; not together with type_ids.' },
             new_type: { $ref: '#/components/schemas/WasteTypeInput' },
             ignored: { type: 'boolean' },
           },

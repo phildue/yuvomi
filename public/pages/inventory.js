@@ -9,34 +9,42 @@
 
 import { api } from '/api.js';
 import { t } from '/i18n.js';
+import { dateText } from '/utils/date-format.js';
 import { esc, REQUIRED_MARK } from '/utils/html.js';
-import { metricGlanceHtml, wireMetricGlance } from '/utils/metric-glance.js';
+import { metricGlanceHtml } from '/utils/metric-glance.js';
 import {
   openModal as openSharedModal,
   closeModal as closeSharedModal,
   advancedSection,
   wireBlurValidation,
   reportFieldError,
-  confirmModal,
   refocusAfterRender,
+  captureModalContext,
+  captureOpenContext,
+  isModalContextCurrent,
 } from '/components/modal.js';
+import { errorSentence, isGone, isAlreadyDeleted, loadErrorSentence } from '/utils/friendly-error.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
 import { emptyStateEl, searchEmptyOptions } from '/utils/empty-state.js';
 import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
 import { pageToolsMenuHtml, pageToolsActionEl, installPopoverMenus } from '/utils/popover-menu.js';
-import { formatMoney } from '/utils/money.js';
+import { formatMoney, parseAmountInput, amountToInput } from '/utils/money.js';
+import { amountInputAttrs, amountFieldError } from '/utils/amount-field.js';
 import { todayKey } from '/utils/date.js';
-import { formatDate, getLocale, getNumberFormat } from '/i18n.js';
+import { getLocale, getNumberFormat } from '/i18n.js';
 import { renderDocumentAttachField, bindDocumentAttachField } from '/components/document-attach.js';
 import { pathAccess, mayWritePath } from '/utils/module-access.js';
+import { canChangeRecord, canSeeInventoryPrices } from '/permissions.js';
 import { warrantyStatus, hasUpcomingDeadline, dateStatus, countUpcomingDeadlines, deadlineChipSpec } from '/utils/inventory-warranty.js';
 import { openDetailView, closeDetailView } from '/components/detail-view.js';
 import { mountMasterDetail, splitViewDetailHtml } from '/utils/master-detail.js';
-import { wireScrollFade } from '/utils/ux.js';
+import { wireScrollFade, scheduleUndoableDelete } from '/utils/ux.js';
 import { redrawList, collapseRow } from '/utils/list-motion.js';
 import { attachOverlay, whenHistorySettled } from '/utils/overlay-history.js';
+import { inertOutside } from '/utils/background-inert.js';
 import { setNavBadge } from '/utils/nav-badges.js';
 import { CHART, chartScales, chartY, chartGridMarkup, niceDomain, chartTimePositions, chartTimeLabelsMarkup } from '/utils/chart.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
 
 let _container = null;
 let _search = null;
@@ -77,6 +85,20 @@ function readOnly() {
   return !mayWritePath('/inventory');
 }
 
+// Wer bin ich - fuer "eigen" (R23, D5). Kommt aus render({ user }).
+let _userId = null;
+
+/**
+ * Darf ich DIESEN Gegenstand aendern? Ohne `inventory_edit_others` nur, was ich
+ * angelegt habe: ein fremder steht als vollstaendige Leseansicht da, ohne
+ * Bearbeiten, Loeschen und "Erledigt" (der Server antwortet sonst 403
+ * `not_owner`).
+ */
+function mayChangeItem(item) {
+  if (readOnly() || !item) return false;
+  return canChangeRecord('inventory', item.created_by != null && Number(item.created_by) === Number(_userId));
+}
+
 async function loadLocations() {
   const res = await api.get('/inventory/locations');
   state.locations = res.data;
@@ -98,7 +120,11 @@ function categoryTracksOdometer(categoryKey) {
 // --------------------------------------------------------
 async function openLocationManager() {
   if (readOnly()) return;
+  // Laedt die Komponente erst, nachdem der Nutzer einen anderen Dialog
+  // geoeffnet oder die Seite verlassen hat, geht die Verwaltung nicht mehr auf (#1997).
+  const context = captureOpenContext();
   await import('/components/category-manager.js');
+  if (!isModalContextCurrent(context)) return;
 
   // Die Auffrischung haengt am Ereignis, nicht am Schliessen: beim Loeschen
   // raeumt `confirmOverModal` das Modal darunter ab, bevor `api.delete` laeuft
@@ -122,7 +148,9 @@ async function openLocationManager() {
       // Auffrischung, und ohne Meldung zeigte die Seite den alten Stand
       // weiter, obwohl der Server die Gegenstaende bereits umgehaengt hat.
       console.error('[Inventory] Auffrischen nach Ort-Aenderung fehlgeschlagen:', err);
-      window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+      // Ein Ladefehler: sein Satz (Netz, Bremse, Server), nie der Text des
+      // Servers (#1909).
+      window.yuvomi?.showToast(loadErrorSentence(err) ?? t('common.errorGeneric'), 'danger');
     }
   };
 
@@ -142,6 +170,11 @@ async function openLocationManager() {
         addPlaceholderKey: 'inventory.addLocation',
         deleteDetailKey: 'inventory.locationDeleteConfirmDetail',
         subDeleteDetailKey: 'inventory.locationDeleteConfirmDetail',
+        // Die Orte nennen ihre Faelle (#1909): den Namen gibt es schon, den Ort
+        // gibt es nicht mehr. Alles andere sagt den allgemeinen Satz, nie den
+        // des Servers; ein Loeschen, dem jemand zuvorkam, ist ein Erfolg.
+        errorFallbackKey: 'common.errorGeneric',
+        alreadyDeletedReason: 'inventory_location_not_found',
       });
     },
     // Bewusst KEIN onClose, das den Listener abmeldet - es liefe vor dem
@@ -154,7 +187,11 @@ async function openLocationManager() {
 // --------------------------------------------------------
 async function openCategoryManager() {
   if (readOnly()) return;
+  // Laedt die Komponente erst, nachdem der Nutzer einen anderen Dialog
+  // geoeffnet oder die Seite verlassen hat, geht die Verwaltung nicht mehr auf (#1997).
+  const context = captureOpenContext();
   await import('/components/category-manager.js');
+  if (!isModalContextCurrent(context)) return;
 
   // Wie bei den Orten: das Ereignis traegt die Auffrischung, nicht das
   // Schliessen (siehe `_notifyChanged` in components/category-manager.js).
@@ -172,7 +209,7 @@ async function openCategoryManager() {
       // Wie beim Ort-Manager: hier landet nur ein Fehler der Auffrischung,
       // nie einer der Mutation - die hat der Manager schon quittiert.
       console.error('[Inventory] Auffrischen nach Kategorie-Aenderung fehlgeschlagen:', err);
-      window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+      window.yuvomi?.showToast(loadErrorSentence(err) ?? t('common.errorGeneric'), 'danger');
     }
   };
 
@@ -190,6 +227,10 @@ async function openCategoryManager() {
         hintKey: 'inventory.manageCategoriesHint',
         addPlaceholderKey: 'inventory.addCategory',
         deleteDetailKey: 'inventory.categoryDeleteConfirmDetail',
+        // Wie bei den Orten (#1909): `category_exists` sagt der Verwalter
+        // selbst, die verschwundene Kategorie ihr eigener Satz.
+        errorFallbackKey: 'common.errorGeneric',
+        alreadyDeletedReason: 'inventory_category_not_found',
       });
     },
     // Bewusst KEIN onClose, das den Listener abmeldet - es liefe vor dem
@@ -361,6 +402,7 @@ function updateFilterChips() {
   const host = _container?.querySelector('#inventory-filters');
   if (!host) return;
   const chips = categoryChips();
+  host.removeAttribute('data-pending');
   host.hidden = chips.length === 0;
   host.replaceChildren();
   if (!chips.length) return;
@@ -409,60 +451,49 @@ function updateAttentionBadge() {
     'warning');
 }
 
-// Mobil ist die Kennzahl-Zeile EINE Kurzzeile (utils/metric-glance.js), die
-// die Karten aufklappt (R16): drei Kacheln standen als 136px vor der ersten
-// Kategorie, eine davon fuer „0". Der Merker haelt den Zustand ueber den
-// Neuaufbau der Liste.
-let _metricsExpanded = false;
-
+/* DIE KENNZAHL IST EINE KURZZEILE IN JEDER BREITE (R24, E2; Critique
+ * G4-Inventar-P3-1). Am Desktop standen zwei plus eine Kachel (150px vor der
+ * ersten Zeile), und "Braucht Aufmerksamkeit 1" war eine Kachel, kein Weg zu
+ * dem einen Gegenstand. Jetzt die Zeile oben (Gegenstaende, Wert) und
+ * darunter - nur wenn es Fristen gibt oder der Filter steht - ein Filterchip
+ * "Braucht Aufmerksamkeit 1", derselbe Baustein wie "Laeuft bald ab" in den
+ * Dokumenten: ein Tipp zeigt genau diese Gegenstaende. */
 function renderMetrics() {
   const { count, totalValue, needsAttention } = computeMetrics(state.items);
-  // Ein aktiver Filter bleibt sichtbar: seine Kachel ist der Schalter, also
-  // steht die Zeile dann aufgeklappt.
-  const expanded = _metricsExpanded || state.filterAttention;
-  const attentionEmpty = needsAttention === 0 && !state.filterAttention;
+  const attention = needsAttention > 0 || state.filterAttention
+    ? `<div class="page-chip-row inventory-attention" role="group" aria-label="${esc(t('inventory.metricAttentionLabel'))}">
+        <button type="button" class="filter-chip filter-chip--sm${state.filterAttention ? ' filter-chip--active' : ''}"
+                data-action="toggle-attention-filter" aria-pressed="${state.filterAttention}">
+          <i data-lucide="calendar-clock" class="icon-md" aria-hidden="true"></i>${esc(t('inventory.metricAttentionLabel'))}<span class="filter-chip__count">${needsAttention}</span>
+        </button>
+      </div>`
+    : '';
   return `
     ${metricGlanceHtml({
-    id: 'inventory-glance-more',
-    controls: 'inventory-metrics',
-    expanded,
     label: t('inventory.metricItemsLabel'),
     value: String(count),
+    everywhere: true,
     flows: [
-      { label: t('inventory.metricValueLabel'), amount: formatMoney(totalValue, _householdCurrency) },
-      // Eine leere Kennzahl entfaellt in der Kurzzeile.
-      needsAttention > 0 ? { label: t('inventory.metricAttentionLabel'), amount: String(needsAttention) } : null,
+      // Ohne Preisrecht (R23) gibt es keinen Wert - die Antwort traegt keine Preise.
+      canSeeInventoryPrices() ? { label: t('inventory.metricValueLabel'), amount: formatMoney(totalValue, _householdCurrency) } : null,
     ],
   })}
-    <div class="metric-grid budget-glance-details${expanded ? ' is-expanded' : ''}" id="inventory-metrics">
-      <div class="metric-card">
-        <div class="metric-card__label">${esc(t('inventory.metricItemsLabel'))}</div>
-        <div class="metric-card__value">${count}</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-card__label">${esc(t('inventory.metricValueLabel'))}</div>
-        <div class="metric-card__value">${esc(formatMoney(totalValue, _householdCurrency))}</div>
-      </div>
-      <button type="button" class="metric-card metric-card--select${state.filterAttention ? ' is-active' : ''}${attentionEmpty ? ' metric-card--empty' : ''}"
-              data-action="toggle-attention-filter" aria-pressed="${state.filterAttention}">
-        <div class="metric-card__label">${esc(t('inventory.metricAttentionLabel'))}</div>
-        <div class="metric-card__value">${needsAttention}</div>
-      </button>
-    </div>`;
+    ${attention}`;
 }
 
 /**
  * Gruppiert nach Kategorie, in der Reihenfolge von state.categories
  * (DB-Sortierung), unbekannte Kategorien ans Ende - gleiches Muster wie
  * public/pages/shopping.js#groupItemsByCategory. Anders als dort liefert
- * die API bereits category_name/category_icon je Item mit (JOIN gegen
- * inventory_categories), also keine separate catIcon()-Nachschau noetig.
+ * die API bereits category_name je Item mit (JOIN gegen inventory_categories).
+ * Der Gruppentitel traegt kein Zeichen (R23, D10); das Kategorie-Icon steht
+ * im Kategorie-Verwalter und in der Auswahl.
  */
 function groupItemsByCategory(items) {
   const grouped = new Map();
   for (const item of items) {
     if (!grouped.has(item.category)) {
-      grouped.set(item.category, { key: item.category, name: itemCategoryLabel(item), icon: item.category_icon || 'package', items: [] });
+      grouped.set(item.category, { key: item.category, name: itemCategoryLabel(item), items: [] });
     }
     grouped.get(item.category).items.push(item);
   }
@@ -502,7 +533,7 @@ function groupItemsByLocation(items) {
     const root = item.location_id != null ? lookup.get(item.location_id) : null;
     const key = root ? String(root.id) : UNLOCATED_KEY;
     if (!grouped.has(key)) {
-      grouped.set(key, { key, name: root ? root.name : t('inventory.unlocated'), icon: 'map-pin', items: [] });
+      grouped.set(key, { key, name: root ? root.name : t('inventory.unlocated'), items: [] });
     }
     grouped.get(key).items.push(item);
   }
@@ -524,7 +555,6 @@ function renderGroupedItems(groups) {
   return groups.map((g) => `
     <div class="list-group" data-group-key="${esc(g.key)}">
       <div class="list-group__title">
-        <i data-lucide="${esc(g.icon)}" class="icon-sm" aria-hidden="true"></i>
         ${esc(g.name)}
         <span class="list-group__count">${g.items.length}</span>
       </div>
@@ -547,7 +577,7 @@ function renderGroupedItems(groups) {
 function deadlineChipHtml(item) {
   const spec = deadlineChipSpec(item);
   if (!spec) return '';
-  const date = formatDate(spec.endDateKey);
+  const date = dateText(spec.endDateKey);
   let text;
   if (spec.kind === 'warranty') {
     text = spec.state === 'expired' ? t('inventory.warrantyChipExpired') : t('inventory.warrantyChipUntil', { date });
@@ -589,7 +619,7 @@ function renderItemRow(item) {
         </span>
         ${item.location_path ? `<span class="list-row__meta">${esc(item.location_path)}</span>` : ''}
       </button>
-      <span class="inventory-row__value">${item.purchase_price != null ? esc(formatMoney(item.purchase_price, item.currency)) : ''}</span>
+      ${canSeeInventoryPrices() ? `<span class="inventory-row__value">${item.purchase_price != null ? esc(formatMoney(item.purchase_price, item.currency)) : ''}</span>` : ''}
     </div>`;
 }
 
@@ -739,7 +769,6 @@ function renderListBody() {
 
   list.replaceChildren();
   list.insertAdjacentHTML('beforeend', renderMetrics());
-  wireMetricGlance(list, 'inventory-glance-more', (expanded) => { _metricsExpanded = expanded; });
   list.querySelector('[data-action="toggle-attention-filter"]')?.addEventListener('click', () => {
     state.filterAttention = !state.filterAttention;
     renderList();
@@ -773,7 +802,43 @@ function renderListBody() {
 
 async function loadItems() {
   const res = await api.get('/inventory/items');
-  state.items = res.data;
+  state.items = (res.data ?? []).filter((entry) => !pendingItemDeletes.has(entry.id));
+}
+
+/**
+ * "GIBT ES NICHT MEHR" (#1909): ein anderes Haushaltsmitglied war schneller.
+ * Der Gegenstand selbst ist weg -> er faellt aus dem Stand, ohne die Liste neu
+ * zu holen. Eine Frist fehlt -> der Gegenstand hat sich geaendert, er kommt
+ * frisch. Gezeichnet wird nur, solange die Seite, von der die Anfrage kam,
+ * noch die gezeigte ist (`owner`, vor der Anfrage genommen).
+ */
+async function applyGone(err, itemId, owner) {
+  if (err?.data?.reason === 'inventory_item_not_found') {
+    state.items = state.items.filter((i) => i.id !== itemId);
+  } else if (err?.data?.reason === 'inventory_tracked_date_not_found') {
+    try {
+      await loadItems();
+    } catch {
+      return;
+    }
+  } else {
+    return;
+  }
+  if (!owner || _container !== owner) return;
+  renderList({ repaint: true });
+  updateAttentionBadge();
+}
+
+/** Die Optionen der Ortsauswahl: ohne Ort, dann jeder Ort mit seinen Unterorten. */
+function locationOptionsHtml() {
+  const options = [`<option value="">${esc(t('inventory.unlocated'))}</option>`];
+  for (const root of state.locations) {
+    options.push(`<option value="${root.id}">${esc(root.name)}</option>`);
+    for (const child of root.subcategories ?? []) {
+      options.push(`<option value="${child.id}">${esc(root.name)} · ${esc(child.name)}</option>`);
+    }
+  }
+  return options.join('');
 }
 
 // --------------------------------------------------------
@@ -837,7 +902,7 @@ function warrantyDetailValue(item) {
   // Der Key direkt, ohne Date-Umweg: `new Date(key + 'T00:00:00')` ist
   // Mitternacht der BROWSER-Zone, und in einer Haushaltszone westlich davon
   // faellt der angezeigte Tag dann auf den Vortag (#829 Teil 3).
-  const formattedDate = formatDate(status.endDateKey);
+  const formattedDate = dateText(status.endDateKey);
   let stand;
   if (status.state === 'expired') stand = t('inventory.warrantyStatusExpired', { date: formattedDate });
   else if (status.state === 'expiring') stand = t('inventory.warrantyStatusExpiringSoon', { count: status.days });
@@ -870,7 +935,7 @@ function trackedDateDetailEntries(item) {
     const distanceHint = d.interval_distance
       ? t('inventory.trackedDateDistanceHint', { value: formatOdometer(d.interval_distance), count: d.interval_distance, unit: odometerUnitLabel(item.odometer_unit) })
       : '';
-    const sub = [countdown ? `${formatDate(d.date)} · ${countdown}` : formatDate(d.date), distanceHint, ...trackedDateFormOnlyValues(d)]
+    const sub = [countdown ? `${dateText(d.date)} · ${countdown}` : dateText(d.date), distanceHint, ...trackedDateFormOnlyValues(d)]
       .filter(Boolean).join(' · ');
     return { text: d.label, sub };
   });
@@ -938,7 +1003,7 @@ function historyEntryLine(entry, odometerUnit) {
   label.textContent = entry.label;
   main.appendChild(label);
 
-  const subParts = [formatDate(entry.date)];
+  const subParts = [dateText(entry.date)];
   if (entry.type === 'service_log') {
     if (entry.vendor) subParts.push(entry.vendor);
     if (entry.odometer != null) {
@@ -1003,13 +1068,13 @@ function odometerChartMarkup(points, unit) {
 
   const spine = points.map((p, i) => `${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(' ');
   const area = `<polygon class="inventory-chart__area" points="${x(0).toFixed(1)},${bottom.toFixed(1)} ${spine} ${x(points.length - 1).toFixed(1)},${bottom.toFixed(1)}" />`;
-  const dots = points.map((p, i) => `<circle cx="${x(i).toFixed(1)}" cy="${y(p.value).toFixed(1)}" r="3.5" fill="var(--module-inventory)"><title>${esc(`${formatDate(p.date)}: ${formatOdometer(p.value)} ${unit}`)}</title></circle>`).join('');
+  const dots = points.map((p, i) => `<circle cx="${x(i).toFixed(1)}" cy="${y(p.value).toFixed(1)}" r="3.5" fill="var(--module-inventory)"><title>${esc(`${dateText(p.date)}: ${formatOdometer(p.value)} ${unit}`)}</title></circle>`).join('');
 
   const grid = chartGridMarkup(min, max, (val) => formatOdometer(Math.round(val)), CHART, steps);
-  const xLabels = chartTimeLabelsMarkup(from, to, formatDate);
+  const xLabels = chartTimeLabelsMarkup(from, to, dateText);
   const titleText = t('inventory.odometerChartTitle');
   const table = chartTableMarkup(titleText, [t('inventory.completePerformedOnLabel'), t('inventory.odometerLabel')],
-    points.map((p) => [formatDate(p.date), `${formatOdometer(p.value)} ${unit}`]));
+    points.map((p) => [dateText(p.date), `${formatOdometer(p.value)} ${unit}`]));
 
   return `
     <div class="inventory-chart-section">
@@ -1117,7 +1182,7 @@ function attachmentDetailEntries(attachments) {
 function renderItemDetail(item, history, onDoneTrackedDate, historyLoadFailed) {
   const bookingEntries = (item.linked_entries || []).map((link) => ({
     text: `${link.title} · ${formatMoney(link.amount, _householdCurrency)}`,
-    sub: `${roleLabel(link.role)} · ${formatDate(link.date)}`,
+    sub: `${roleLabel(link.role)} · ${dateText(link.date)}`,
   }));
   const attachmentEntries = attachmentDetailEntries(item.attachments);
 
@@ -1135,8 +1200,8 @@ function renderItemDetail(item, history, onDoneTrackedDate, historyLoadFailed) {
         { icon: 'building-2', label: t('inventory.brandLabel'), value: item.brand || '' },
         { icon: 'package', label: t('inventory.modelLabel'), value: item.model || '' },
         { icon: 'hash', label: t('inventory.serialNumberLabel'), value: item.serial_number || '' },
-        { icon: 'calendar', label: t('inventory.purchaseDateLabel'), value: item.purchase_date ? formatDate(item.purchase_date) : '' },
-        { icon: 'banknote', label: t('inventory.purchasePriceLabel'), value: item.purchase_price != null ? formatMoney(item.purchase_price, item.currency) : '' },
+        { icon: 'calendar', label: t('inventory.purchaseDateLabel'), value: item.purchase_date ? dateText(item.purchase_date) : '' },
+        { icon: 'banknote', label: t('inventory.purchasePriceLabel'), value: canSeeInventoryPrices() && item.purchase_price != null ? formatMoney(item.purchase_price, item.currency) : '' },
         { icon: 'store', label: t('inventory.vendorLabel'), value: item.vendor || '' },
         // Konto, unter dem das Geraet registriert ist (#1004) - eine Adresse oder ein
         // Benutzername, nie ein Passwort. Steht bei den uebrigen Herkunftsangaben,
@@ -1191,7 +1256,7 @@ function formatOdometer(value) {
 function odometerDetailValue(item) {
   if (item.odometer == null) return '';
   const value = `${formatOdometer(item.odometer)} ${odometerUnitLabel(item.odometer_unit)}`;
-  return item.odometer_on ? `${value} · ${formatDate(item.odometer_on)}` : value;
+  return item.odometer_on ? `${value} · ${dateText(item.odometer_on)}` : value;
 }
 
 /**
@@ -1221,7 +1286,7 @@ async function openItemDetail(item, { pane = null, signal = null } = {}) {
   // gewaehlt sein - dann gehoert die Spalte ihr, nicht diesem Gegenstand.
   if (signal?.aborted) return;
 
-  const ro = readOnly();
+  const ro = !mayChangeItem(item);
   const onDoneTrackedDate = ro ? null : async (trackedDate) => {
     if (pane) {
       // In der Spalte liegt kein Overlay offen: die Abschluss-Karte geht direkt
@@ -1279,17 +1344,18 @@ async function openItemDetail(item, { pane = null, signal = null } = {}) {
     actions: ro ? [] : [{
       id: 'inventory-detail-delete',
       label: t('common.delete'),
-      variant: 'danger-ghost',
+      variant: 'danger-outline',
       icon: 'trash-2',
       align: 'start',
       onClick: async ({ close }) => {
         await close({ force: true });
         await removeItem(item);
+        refocusAfterRender();
       },
     }],
     edit: ro ? null : {
       label: t('common.edit'),
-      title: t('common.editItem'),
+      title: t('inventory.editItem'),
       // Bearbeiten steht als Hauptaktion unten (detail-view.js,
       // withPrimaryEdit); Loeschen bleibt zurueckgenommen am Anfang und fragt
       // weiter nach (removeItem), wie im Kalender (#1460, #1463).
@@ -1313,7 +1379,7 @@ async function openItemDetail(item, { pane = null, signal = null } = {}) {
  * @returns {Promise<boolean>} true, wenn die Frist erledigt wurde
  */
 function openCompletionSheet(item, trackedDate) {
-  if (readOnly()) return Promise.resolve(false);
+  if (!mayChangeItem(item)) return Promise.resolve(false);
   return new Promise((resolve) => {
     let settled = false;
     const settle = (result) => { if (!settled) { settled = true; resolve(result); } };
@@ -1363,6 +1429,8 @@ function openCompletionSheet(item, trackedDate) {
             note: panel.querySelector('#inv-complete-note').value.trim() || null,
           };
           saveBtn.disabled = true;
+          const owner = _container;
+          const dialog = captureModalContext();
           try {
             await api.post(`/inventory/items/${item.id}/dates/${trackedDate.id}/complete`, payload);
             // ERST settle(true), DANN das Modal schliessen: das Schliessen
@@ -1373,11 +1441,22 @@ function openCompletionSheet(item, trackedDate) {
             // und der Abschluss saehe fuer den Aufrufer wie ein Abbruch aus,
             // obwohl die Frist bereits serverseitig erledigt ist.
             settle(true);
-            await closeSharedModal({ force: true });
+            // Nur diese Karte, nicht ein Dialog, der waehrend der Anfrage
+            // aufgegangen ist (#1997).
+            await closeSharedModal({ force: true, context: dialog });
             window.yuvomi?.showToast(t('inventory.completed'), 'success');
           } catch (err) {
             saveBtn.disabled = false;
-            window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+            window.yuvomi?.showToast(errorSentence(err), 'danger');
+            // Gegenstand oder Frist gibt es nicht mehr (#1909): nichts mehr zu
+            // erledigen - die Karte geht zu, solange sie noch die offene ist,
+            // und die Liste zeigt den aktuellen Stand.
+            if (isGone(err)) {
+              settle(false);
+              closeSharedModal({ force: true, context: dialog });
+              await applyGone(err, item.id, owner);
+              refocusAfterRender();
+            }
           }
         });
         if (window.lucide) window.lucide.createIcons({ el: panel });
@@ -1495,6 +1574,9 @@ function openBookingPicker(panel, { initialMonth, includeRole = false } = {}) {
     panel.append(overlay);
     if (window.lucide) window.lucide.createIcons({ el: overlay });
     const opener = document.activeElement;
+    // Das Formular darunter ist gesperrt, solange der Picker offen ist
+    // (utils/background-inert.js); freigegeben VOR der Fokus-Rueckgabe.
+    const releaseBackground = inertOutside(overlay);
     overlay.querySelector('[data-picker-close]').focus();
 
     const listEl = overlay.querySelector('[data-picker-list]');
@@ -1504,6 +1586,7 @@ function openBookingPicker(panel, { initialMonth, includeRole = false } = {}) {
 
     const close = (result) => {
       overlay.remove();
+      releaseBackground();
       if (opener?.isConnected) opener.focus();
       resolve(result);
     };
@@ -1523,7 +1606,7 @@ function openBookingPicker(panel, { initialMonth, includeRole = false } = {}) {
         listEl.insertAdjacentHTML('beforeend', `
           <button class="inventory-booking-picker__item" type="button" data-picker-item="${entry.id}">
             <span class="inventory-booking-picker__item-title">${esc(entry.title)}</span>
-            <span class="inventory-booking-picker__item-meta">${esc(formatDate(entry.date))}</span>
+            <span class="inventory-booking-picker__item-meta">${esc(dateText(entry.date))}</span>
             <span class="inventory-booking-picker__item-amount">${esc(formatMoney(entry.amount, _householdCurrency))}</span>
           </button>`);
       }
@@ -1599,7 +1682,7 @@ function renderLinkedEntries(panel, item) {
     <div class="inventory-linked-entry-row" data-entry-id="${link.entry_id}">
       <span class="inventory-linked-entry-row__title">${esc(link.title)}</span>
       <span class="inventory-linked-entry-row__role">${esc(roleLabel(link.role))}</span>
-      <span class="inventory-linked-entry-row__date">${esc(formatDate(link.date))}</span>
+      <span class="inventory-linked-entry-row__date">${esc(dateText(link.date))}</span>
       <span class="inventory-linked-entry-row__amount">${esc(formatMoney(link.amount, _householdCurrency))}</span>
       <button class="btn btn--icon btn--sm" type="button" data-remove-entry="${link.entry_id}"
               aria-label="${esc(t('inventory.removeBookingAction', { title: link.title }))}">
@@ -1635,7 +1718,7 @@ function updateWarrantyStatus(panel) {
   // Der Key direkt, ohne Date-Umweg: `new Date(key + 'T00:00:00')` ist
   // Mitternacht der BROWSER-Zone, und in einer Haushaltszone westlich davon
   // faellt der angezeigte Tag dann auf den Vortag (#829 Teil 3).
-  const formattedDate = formatDate(status.endDateKey);
+  const formattedDate = dateText(status.endDateKey);
   if (status.state === 'expired') {
     statusEl.textContent = t('inventory.warrantyStatusExpired', { date: formattedDate });
   } else if (status.state === 'expiring') {
@@ -1764,6 +1847,14 @@ function photoPreviewHtml(photoData) {
  *
  * @returns {{title: string, content: string, wire: (panel: HTMLElement) => void}}
  */
+/**
+ * Die Waehrung eines Kaufpreises: die gespeicherte des Gegenstands, sonst die
+ * des Haushalts (so legt der Server ihn auch an).
+ */
+function itemCurrency(item) {
+  return item?.currency || _householdCurrency || 'EUR';
+}
+
 function buildItemForm({ mode, item = null }) {
   const isEdit = mode === 'edit';
   // Verknuepfte Buchungen kommen aus dem Budget: ohne dessen Leserecht liefert
@@ -1776,13 +1867,9 @@ function buildItemForm({ mode, item = null }) {
   let photoData = isEdit && item.photo_data ? item.photo_data : null;
 
   const categoryOptions = categoryOptionsHtml(state.categories);
-  const locationOptions = [`<option value="">${esc(t('inventory.unlocated'))}</option>`];
-  for (const root of state.locations) {
-    locationOptions.push(`<option value="${root.id}">${esc(root.name)}</option>`);
-    for (const child of root.subcategories || []) {
-      locationOptions.push(`<option value="${child.id}">${esc(root.name)} · ${esc(child.name)}</option>`);
-    }
-  }
+  // Derselbe Helfer baut die Auswahl neu, wenn der gewaehlte Ort beim
+  // Speichern weg ist (#1909).
+  const locationOptions = locationOptionsHtml();
   const conditionOptions = CONDITIONS.map((c) => `<option value="${c}">${esc(t(`inventory.condition${c.charAt(0).toUpperCase()}${c.slice(1)}`))}</option>`).join('');
   const statusOptions = STATUSES.map((s) => `<option value="${s}">${esc(t(`inventory.status${s.charAt(0).toUpperCase()}${s.slice(1)}`))}</option>`).join('');
   const documentCategoryOptions = DOCUMENT_CATEGORIES
@@ -1800,7 +1887,7 @@ function buildItemForm({ mode, item = null }) {
         </div>
         <div class="form-group">
           <label class="form-label" for="inv-location">${esc(t('inventory.locationLabel'))}</label>
-          <select id="inv-location" class="form-input">${locationOptions.join('')}</select>
+          <select id="inv-location" class="form-input">${locationOptions}</select>
         </div>
       </div>
       <div class="form-group">
@@ -1827,10 +1914,10 @@ function buildItemForm({ mode, item = null }) {
             <yuvomi-datepicker id="inv-purchase-date" type="date"
                                value="${esc(isEdit && item.purchase_date ? item.purchase_date : '')}"></yuvomi-datepicker>
           </div>
-          <div class="form-group">
+          ${canSeeInventoryPrices() ? `<div class="form-group">
             <label class="form-label" for="inv-purchase-price">${esc(t('inventory.purchasePriceLabel'))}</label>
-            <input id="inv-purchase-price" class="form-input" type="number" min="0" step="0.01" inputmode="decimal">
-          </div>
+            <input id="inv-purchase-price" class="form-input"${amountInputAttrs(itemCurrency(item))}>
+          </div>` : ''}
         </div>
         ${!isEdit && showsBookings ? `
         <div class="form-group">
@@ -1947,7 +2034,7 @@ function buildItemForm({ mode, item = null }) {
           || item.odometer != null || categoryTracksOdometer(item.category)),
       })}
       <div class="modal-panel__footer modal-panel__footer--plain">
-        ${isEdit ? `<button type="button" class="btn btn--danger-ghost" id="inv-delete">${esc(t('common.delete'))}</button>` : ''}
+        ${isEdit ? `<button type="button" class="btn btn--danger-outline" id="inv-delete"><i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${esc(t('common.delete'))}</button>` : ''}
         <button type="button" class="btn btn--secondary" data-action="close-modal">${esc(t('common.cancel'))}</button>
         <button type="button" class="btn btn--primary" id="inv-save">${esc(isEdit ? t('common.save') : t('common.add'))}</button>
       </div>`;
@@ -1956,7 +2043,8 @@ function buildItemForm({ mode, item = null }) {
     panel.querySelector('#inv-name').value = isEdit ? item.name : '';
     panel.querySelector('#inv-category').value = isEdit ? item.category : 'other';
     panel.querySelector('#inv-location').value = isEdit && item.location_id ? String(item.location_id) : '';
-    panel.querySelector('#inv-purchase-price').value = isEdit && item.purchase_price != null ? String(item.purchase_price) : '';
+    const priceField = panel.querySelector('#inv-purchase-price');
+    if (priceField) priceField.value = isEdit && item.purchase_price != null ? amountToInput(item.purchase_price, itemCurrency(item)) : '';
     panel.querySelector('#inv-status').value = isEdit ? item.status : 'active';
     panel.querySelector('#inv-brand').value = isEdit && item.brand ? item.brand : '';
     panel.querySelector('#inv-model').value = isEdit && item.model ? item.model : '';
@@ -2000,8 +2088,10 @@ function buildItemForm({ mode, item = null }) {
       // `change`-Event - nach einem abgebrochenen Zuschnitt ließe sie sich
       // nicht erneut wählen.
       e.target.value = '';
+      let ImageProblemType = null;
       try {
-        const { pickCroppedImage } = await import('/utils/avatar-crop.js');
+        const { pickCroppedImage, ImageProblem } = await import('/utils/avatar-crop.js');
+        ImageProblemType = ImageProblem;
         const cropped = await pickCroppedImage(file, {
           // Nur der Ergebnis-Text ist inventarspezifisch: „Profilbild" wäre
           // für ein Gegenstandsfoto die falsche Vokabel.
@@ -2012,7 +2102,12 @@ function buildItemForm({ mode, item = null }) {
         photoData = cropped;
         renderPhotoPreview();
       } catch (err) {
-        window.yuvomi?.showToast(err.message, 'danger');
+        // Die Pruefung des Bildes sagt ihren Satz; jeder andere Wurf den
+        // allgemeinen, nie seinen eigenen, unuebersetzten Text (#1909).
+        window.yuvomi?.showToast(
+          ImageProblemType && err instanceof ImageProblemType ? err.sentence : t('common.errorGeneric'),
+          'danger',
+        );
       }
     });
     panel.querySelector('#inv-remove-photo')?.addEventListener('click', () => {
@@ -2038,21 +2133,26 @@ function buildItemForm({ mode, item = null }) {
           initialMonth: item.purchase_date ? item.purchase_date.slice(0, 7) : undefined,
         });
         if (!picked) return;
+        const owner = _container;
+        const dialog = captureModalContext();
         try {
           const res = await api.post(`/inventory/items/${item.id}/entries`, {
             entry_id: picked.entry.id, role: picked.role,
           });
           item = res.data;
           renderLinkedEntries(panel, item);
-          await loadItems();
+          await reloadAfterSave(() => loadItems());
           renderList({ repaint: true });
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+          window.yuvomi?.showToast(errorSentence(err), 'danger');
+          await closeIfItemGone(err, item.id, owner, dialog);
         }
       });
       panel.querySelector('[data-linked-entries]').addEventListener('click', async (event) => {
         const button = event.target.closest('[data-remove-entry]');
         if (!button) return;
+        const owner = _container;
+        const dialog = captureModalContext();
         try {
           const res = await api.delete(`/inventory/items/${item.id}/entries/${button.dataset.removeEntry}`);
           item = res.data;
@@ -2060,7 +2160,8 @@ function buildItemForm({ mode, item = null }) {
           await loadItems();
           renderList({ repaint: true });
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+          window.yuvomi?.showToast(errorSentence(err), 'danger');
+          await closeIfItemGone(err, item.id, owner, dialog);
         }
       });
     } else if (showsBookings) {
@@ -2086,7 +2187,7 @@ function buildItemForm({ mode, item = null }) {
         });
         if (window.lucide) window.lucide.createIcons({ el: chip });
         const priceInput = panel.querySelector('#inv-purchase-price');
-        if (!priceInput.value.trim()) priceInput.value = String(Math.abs(picked.entry.amount));
+        if (priceInput && !priceInput.value.trim()) priceInput.value = amountToInput(Math.abs(picked.entry.amount), itemCurrency(item));
       });
     }
 
@@ -2106,7 +2207,9 @@ function buildItemForm({ mode, item = null }) {
     if (window.lucide) window.lucide.createIcons({ el: panel });
   }
 
-  return { title: isEdit ? t('common.editItem') : t('inventory.addItem'), content, wire };
+  // EIN NOMEN FUER BEIDE WEGE (R22, a4 P3): angelegt wird ein "Gegenstand",
+  // bearbeitet wurde ein "Artikel" (`common.editItem`, das Wort des Einkaufs).
+  return { title: isEdit ? t('inventory.editItem') : t('inventory.addItem'), content, wire };
 }
 
 function openItemModal(mode, item = null) {
@@ -2114,8 +2217,10 @@ function openItemModal(mode, item = null) {
   // Leerzustand, Tastenkuerzel „n" (klickt den FAB), Enter auf der Zeile und
   // „Bearbeiten" aus der Detailspalte.
   if (readOnly()) return;
+  if (mode === 'edit' && !mayChangeItem(item)) return;
   const form = buildItemForm({ mode, item });
-  openSharedModal({ title: form.title, size: 'md', content: form.content, onSave: form.wire });
+  // Anlegen: Buehne zuerst, Felder nach dem ersten Bild (modal.js `staged`, R21 a6).
+  openSharedModal({ title: form.title, size: 'md', content: form.content, onSave: form.wire, staged: mode === 'create' });
 }
 
 async function saveItem(panel, mode, item, attachments, pickedBooking, photoData) {
@@ -2125,7 +2230,15 @@ async function saveItem(panel, mode, item, attachments, pickedBooking, photoData
   const name = nameInput.value.trim();
   if (!name) { reportFieldError(nameInput, t('common.nameRequired')); return; }
 
-  const priceRaw = panel.querySelector('#inv-purchase-price').value.trim();
+  // Der Kaufpreis als TEXT (D1): "1.200" unter de ist abgewiesen und benannt,
+  // nie still 1,2. 0 ist erlaubt (Geschenk), leer heisst "kein Preis".
+  // Ohne Preisrecht (R23) steht das Feld nicht da; der Server laesst den
+  // gespeicherten Preis dann stehen.
+  const priceInput = panel.querySelector('#inv-purchase-price');
+  const priceProblem = priceInput ? amountFieldError(priceInput, itemCurrency(item), {
+    sign: 'nonNegative', original: item?.purchase_price ?? null, originalCurrency: item?.currency ?? null,
+  }) : null;
+  if (priceProblem) { reportFieldError(...priceProblem); return; }
   const warrantyRaw = panel.querySelector('#inv-warranty').value.trim();
   const category = panel.querySelector('#inv-category').value;
   // Kilometerstand ist auf odometer-tragende Kategorien begrenzt - unabhaengig
@@ -2139,7 +2252,7 @@ async function saveItem(panel, mode, item, attachments, pickedBooking, photoData
     category,
     location_id: panel.querySelector('#inv-location').value || null,
     purchase_date: panel.querySelector('#inv-purchase-date').value || null,
-    purchase_price: priceRaw === '' ? null : Number(priceRaw),
+    ...(priceInput ? { purchase_price: parseAmountInput(priceInput.value) } : {}),
     status: panel.querySelector('#inv-status').value,
     brand: panel.querySelector('#inv-brand').value.trim() || null,
     model: panel.querySelector('#inv-model').value.trim() || null,
@@ -2157,50 +2270,105 @@ async function saveItem(panel, mode, item, attachments, pickedBooking, photoData
   };
 
   saveBtn.disabled = true;
+  const owner = _container;
+  const dialog = captureModalContext();
   try {
     if (attachments) payload.attachment_document_ids = await attachments.commit();
     if (pickedBooking) payload.entry_id = pickedBooking.entry.id;
     if (mode === 'create') await api.post('/inventory/items', payload);
     else await api.put(`/inventory/items/${item.id}`, payload);
-    await loadItems();
-    closeSharedModal({ force: true });
+    await reloadAfterSave(() => loadItems());
+    // Nur dieser Dialog, nicht einer, der waehrend der Anfrage aufgegangen
+    // ist (#1997).
+    closeSharedModal({ force: true, context: dialog });
     renderList({ repaint: true, motion: true });
     updateAttentionBadge();
     window.yuvomi?.showToast(mode === 'create' ? t('inventory.created') : t('inventory.updated'), 'success');
   } catch (err) {
     saveBtn.disabled = false;
-    window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+    window.yuvomi?.showToast(errorSentence(err), 'danger');
+    const reason = err?.data?.reason;
+    if (reason === 'inventory_selected_location_not_found') {
+      // Der gewaehlte Ort ist weg (#1909): das Formular bleibt offen und bietet
+      // die aktuellen Orte an - mit demselben Helfer wie beim Oeffnen.
+      await offerCurrentLocations(panel);
+    } else if (reason === 'inventory_booking_not_found') {
+      // Die vorgemerkte Buchung ist weg: die Vormerkung faellt, der Rest des
+      // Formulars bleibt stehen.
+      panel.querySelector('[data-clear-picked-booking]')?.click();
+    } else if (mode !== 'create') {
+      await closeIfItemGone(err, item.id, owner, dialog);
+    }
   }
 }
 
-async function removeItem(item) {
-  if (readOnly()) return;
-  const ok = await confirmModal(t('inventory.deleteConfirm', { name: item.name }), {
-    danger: true,
-    detail: t('inventory.deleteConfirmDetail'),
-  });
-  if (!ok) return;
+/**
+ * Das Formular gehoert zu einem Gegenstand, den es nicht mehr gibt (#1909):
+ * es geht zu, solange es noch das offene ist, und der Gegenstand faellt aus
+ * der Liste.
+ */
+async function closeIfItemGone(err, itemId, owner, dialog) {
+  if (err?.data?.reason !== 'inventory_item_not_found') return;
+  closeSharedModal({ force: true, context: dialog });
+  await applyGone(err, itemId, owner);
+  refocusAfterRender();
+}
+
+/** Die Orte frisch holen und die Auswahl im offenen Formular neu bauen. */
+async function offerCurrentLocations(panel) {
   try {
-    await api.delete(`/inventory/items/${item.id}`);
-    await loadItems();
-    // Die Zeile klappt aus, die Nachbarn ruecken nach - erst dann steht die
-    // Liste ohne sie neu (ohne Bewegung loest collapseRow sofort auf).
-    await collapseRow(_container?.querySelector(`#inventory-list .list-row[data-id="${item.id}"]`) ?? null);
-    // ERST WENN DIE HISTORY WIEDER DER SEITE GEHOERT (R17). Die Rueckfrage
-    // gibt ihren Marker per `history.back()` zurueck, und das kommt erst nach
-    // ihrem Ausblenden an (~220ms). Antwortet der Server schneller, raeumte der
-    // Listenaufbau `?open=<id>` vom MARKER-Eintrag ab - das `back()` trug den
-    // Browser danach auf den Eintrag darunter, und in der Adresse stand wieder
-    // der geloeschte Gegenstand (gemessen bei aktiver Suche: Spalte leer,
-    // Adresse `?open=9`; ein Neuladen zeigte „nicht gefunden").
-    await whenHistorySettled();
-    renderList({ repaint: true, motion: true });
-    refocusAfterRender();
-    updateAttentionBadge();
-    window.yuvomi?.showToast(t('inventory.deleted'), 'success');
-  } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+    await loadLocations();
+  } catch {
+    return;
   }
+  const select = panel.querySelector('#inv-location');
+  if (!select) return;
+  select.replaceChildren();
+  select.insertAdjacentHTML('beforeend', locationOptionsHtml());
+  select.value = '';
+  select.focus();
+}
+
+/** Gegenstaende in der Ruecknahmefrist: lokal weg, am Server noch da (R23, D6). */
+const pendingItemDeletes = new Set();
+
+// LOESCHEN MIT RUECKGAENGIG STATT RUECKFRAGE (Critique R23, D6). Ein Gegenstand
+// ist kein Behaelter: was an ihm haengt (Fristen, Wartungsbuch, Verknuepfungen),
+// geht mit ihm, und bis die Frist des Toasts endet, ist am Server nichts davon
+// geschehen (`scheduleUndoableDelete`).
+async function removeItem(item) {
+  if (!mayChangeItem(item)) return;
+  const id = item.id;
+  pendingItemDeletes.add(id);
+  state.items = state.items.filter((entry) => entry.id !== id);
+  // Die Zeile klappt aus, die Nachbarn ruecken nach - erst dann steht die
+  // Liste ohne sie neu (ohne Bewegung loest collapseRow sofort auf).
+  await collapseRow(_container?.querySelector(`#inventory-list .list-row[data-id="${id}"]`) ?? null);
+  await whenHistorySettled();
+  renderList({ repaint: true, motion: true });
+  updateAttentionBadge();
+  scheduleUndoableDelete({
+    commit: async ({ keepalive } = {}) => {
+      try {
+        await api.delete(`/inventory/items/${id}`, { keepalive });
+      } catch (err) {
+        // SCHON GELOESCHT IST EIN ERFOLG (#1909): ein anderes Haushaltsmitglied
+        // war schneller. Gegenstaende haben keine Sichtbarkeit - die 404 heisst
+        // nur "gibt es nicht mehr". Alles andere bleibt ein Fehler.
+        if (!isAlreadyDeleted(err, 'inventory_item_not_found')) throw err;
+      }
+      pendingItemDeletes.delete(id);
+    },
+    restore: async (err) => {
+      pendingItemDeletes.delete(id);
+      if (err) window.yuvomi?.showToast(errorSentence(err), 'danger');
+      try { await loadItems(); } catch { /* der Stand von eben bleibt */ }
+      if (!_container?.isConnected) return;
+      renderList({ repaint: true, motion: true });
+      updateAttentionBadge();
+    },
+    message: t('common.deletedNamed', { name: item.name }),
+  });
 }
 
 /**
@@ -2223,8 +2391,9 @@ function inventoryToolsHtml() {
     </div>`;
 }
 
-export async function render(container, { signal } = {}) {
+export async function render(container, { signal, user } = {}) {
   _container = container;
+  _userId = user?.id ?? null;
   _md = null;
 
   const page = document.createElement('div');
@@ -2270,7 +2439,11 @@ export async function render(container, { signal } = {}) {
   filters.id = 'inventory-filters';
   filters.setAttribute('role', 'group');
   filters.setAttribute('aria-label', t('inventory.filterGroupLabel'));
-  filters.hidden = true;
+  // Die Reihe haelt ihren Platz, bis die Daten da sind (R23 S11, wie die
+  // Kontakte): versteckt geladen erschien sie mit den Chips und schob Liste
+  // und Detail um ihre Hoehe nach unten (1440x900, 4x CPU: Layout-Shift
+  // 0,035). Ob es Chips gibt, entscheidet erst updateFilterChips().
+  filters.dataset.pending = '';
 
   const list = document.createElement('div');
   list.className = 'inventory-list split-view__list';
@@ -2396,6 +2569,12 @@ export async function render(container, { signal } = {}) {
       root: split,
       signal,
       address: mdAddress,
+      // `?open=` AUCH AM TELEFON (R22, aus S1): die globale Suche fuehrt mit
+      // `/inventory?open=<id>` hierher, und unter der Schwelle stand dann nur
+      // die Liste - der Treffer blieb zu. Wie in den Kontakten oeffnet der
+      // Link jetzt das Leseblatt (openItemNarrow); Schliessen nimmt den
+      // Parameter wieder aus der Adresse (Baustein, narrow 'sheet').
+      deepLinkNarrow: true,
       renderDetail: (id, body, ctx) => {
         const item = state.items.find((i) => String(i.id) === id);
         if (!item) return false;
@@ -2404,14 +2583,14 @@ export async function render(container, { signal } = {}) {
       openNarrow: openItemNarrow,
       onEnter: (id) => {
         const item = state.items.find((i) => String(i.id) === id);
-        if (item && !readOnly()) openItemModal('edit', item);
+        if (item && mayChangeItem(item)) openItemModal('edit', item);
       },
       onModeChange: onInventoryModeChange,
     });
     signal?.addEventListener('abort', () => { _md = null; }, { once: true });
     updateAttentionBadge();
   } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+    window.yuvomi?.showToast(loadErrorSentence(err) ?? t('common.errorGeneric'), 'danger');
     list.replaceChildren();
   }
 }
@@ -2518,4 +2697,6 @@ export const __test = {
   removeItem,
   // Review R11: Kilometerstand-Trend auf der Zeitachse, auch am selben Tag.
   odometerChartMarkup,
+  // #1909: die Fehlerwege laufen ueber eine angezeigte Seite.
+  setContainerForTest(container) { _container = container; },
 };

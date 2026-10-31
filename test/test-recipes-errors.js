@@ -187,13 +187,19 @@ test('Server: der deutsche Satz zur Rezept-ID ist englisch', async () => {
 });
 
 const SERVER_REASONS = ['recipes_recipe_not_found', 'recipes_ingredient_not_found', 'recipes_selected_pantry_item_not_found', 'meals_selected_recipe_not_found'];
+// Gruende, die KEIN "gibt es nicht mehr" sind: das Ziel steht, nur anders.
+const SERVER_CHANGED = ['recipes_ingredients_changed'];
 
 test('Server: jeder Grund der Rezepte hat einen Satz, und jeder "gibt es nicht mehr" ist als solcher bekannt', () => {
   for (const reason of [...SERVER_REASONS, 'shopping_list_not_found']) {
     assert.ok(CASE_MESSAGES.has(reason), `${reason}: kein Satz`);
     assert.ok(GONE_REASONS.has(reason), `${reason}: nicht in GONE_REASONS`);
   }
-  assert.deepEqual([...CASE_MESSAGES.keys()].filter((r) => /^(recipes|meals)_/.test(r)).sort(), [...SERVER_REASONS].sort(),
+  for (const reason of SERVER_CHANGED) {
+    assert.ok(CASE_MESSAGES.has(reason), `${reason}: kein Satz`);
+    assert.ok(!GONE_REASONS.has(reason), `${reason}: ist kein "gibt es nicht mehr"`);
+  }
+  assert.deepEqual([...CASE_MESSAGES.keys()].filter((r) => /^(recipes|meals)_/.test(r)).sort(), [...SERVER_REASONS, ...SERVER_CHANGED].sort(),
     'ein Grund in CASE_MESSAGES, den kein Server dieser Suite nennt');
 });
 
@@ -543,6 +549,31 @@ test('Seite: auf die Einkaufsliste - Rezept oder Liste weg nimmt genau das aus d
     assert.deepEqual(stand, standNach(was), `${label}: der Stand danach`);
     assertNoServerText();
   }
+});
+
+// Codex an #2364 (P2): die umgerechneten Mengen lagen positionsweise auf den
+// Zutaten des Servers - nach einer Aenderung des Rezepts bei den falschen.
+test('Seite: auf die Einkaufsliste mit anderen Portionen - jede Menge nennt ihre Zutat; hat sich das Rezept geaendert, steht der neue Stand da und der Satz sagt es', async () => {
+  const jetzt = rezept({
+    servings: 2,
+    ingredients: [{ id: 12, name: 'Salz', quantity: '1 TL', pantry_item_id: null }, { id: 11, name: 'Mehl', quantity: '200 g', pantry_item_id: null }],
+  });
+  const err = fehler(409, 'recipes_ingredients_changed');
+  err.data.recipe = jetzt;
+  let gesendet = null;
+  const geladen = rezept({
+    servings: 2,
+    ingredients: [{ id: 1, name: 'Mehl', quantity: '200 g', pantry_item_id: null }, { id: 2, name: 'Salz', quantity: '1 TL', pantry_item_id: null }],
+  });
+  const { gets, stand } = await mitSeite({ recipes: [geladen], servingsChoice: new Map([[5, 4]]) }, () => mit({
+    post: async (_path, body) => { gesendet = body; throw err; },
+  }, () => page.transferRecipe(page.state.recipes[0], null)));
+  assert.deepEqual(gesendet.ingredientIds, [1, 2], 'die Zeilen-IDs gehen mit, in der Reihenfolge der Mengen');
+  assert.equal(gesendet.quantities.length, 2);
+  assert.deepEqual(toasts, [['recipes.errorIngredientsChanged', 'danger']]);
+  assert.equal(reloaded(gets), false, `nachgeladen ${gets.join(', ')}`);
+  assert.deepEqual(stand.zutaten, ['Salz', 'Mehl'], 'die Seite zeigt das Rezept, wie es jetzt ist');
+  assertNoServerText();
 });
 
 test('Seite: auf die Einkaufsliste - nach "Liste weg" faellt genau die gewaehlte Liste aus der Auswahl', async () => {
@@ -1023,5 +1054,84 @@ test('Seite: Zuordnen-Erfolg - gezeichnet nur auf der Seite, die noch steht; Fok
     }
   } finally {
     delete globalThis.__refocusAfterRender;
+  }
+});
+
+// --- #1997: Essensplan - eine spaete Erfolgsantwort schliesst nur ihren Dialog --
+
+// Dasselbe fuer den Essensplan: Mahlzeit anlegen und aendern (einzeln und als
+// Serie) und "Woche zufaellig fuellen" reichen den Kontext von VOR der Anfrage
+// an closeModal. Dazu der Seitenstand: der Mahlzeit-Dialog haelt seine Absicht
+// in `state.modal`, und ein inzwischen geoeffneter zweiter Mahlzeit-Dialog
+// schreibt dort seine eigene hinein. Raeumte die spaete Antwort `state.modal`
+// trotzdem ab, stuende der zweite Dialog ohne Absicht da - sein Speichern liefe
+// in einen Fehler, mit allem, was darin getippt ist.
+test('Essensplan: Erfolg nach Dialogwechsel - schliesst nur mit dem Kontext von VOR der Anfrage und laesst den Stand des anderen Dialogs stehen (#1997)', async () => {
+  const mahlzeitFormular = () => {
+    const felder = {
+      '#modal-save': { disabled: false, textContent: '' },
+      '#modal-date': { value: '20.10.2026' }, '#modal-type': { value: 'dinner' }, '#modal-title': { value: 'Curry' },
+      '#modal-notes': { value: '' }, '#modal-recipe-url': { value: '' }, '#modal-recipe-id': { value: '' },
+      '#modal-edit-scope': null,
+    };
+    return { querySelector: (sel) => felder[sel] ?? null, querySelectorAll: () => [] };
+  };
+  const serienFormular = () => {
+    const form = mahlzeitFormular();
+    const lies = form.querySelector;
+    return { ...form, querySelector: (sel) => (sel === '#modal-edit-scope' ? { value: 'series' } : lies(sel)) };
+  };
+  const WEGE = [
+    ['Mahlzeit anlegen', { mode: 'create' }, () => meals.saveModal(mahlzeitFormular())],
+    ['Mahlzeit aendern', { mode: 'edit', meal: { id: 9, ingredients: [] } }, () => meals.saveModal(mahlzeitFormular())],
+    ['Serie aendern', { mode: 'edit', meal: { id: 9, ingredients: [] } }, () => meals.saveModal(serienFormular())],
+    ['Woche zufaellig fuellen', null, () => {
+      const knopf = { disabled: false };
+      const panel = { querySelector: (sel) => (sel === '#meal-randomize-run' ? knopf : sel === '#meal-randomize-replace' ? { checked: false } : null) };
+      return meals.runRandomize(panel);
+    }],
+  ];
+  const ANDERER = { mode: 'edit', meal: { id: 77, ingredients: [] } };
+  for (const [name, absicht, lauf] of WEGE) {
+    for (const eigenerOffen of [true, false]) {
+      let kontext = 'eigener-dialog';
+      globalThis.__modalContextId = () => kontext;
+      globalThis.__isOwnModalOpen = (ctx) => eigenerOffen && ctx === 'eigener-dialog';
+      const zuvor = { ...meals.state };
+      Object.assign(meals.state, {
+        currentWeek: '2026-10-19', visibleMealTypes: ['dinner'], meals: [],
+        recipes: [{ id: 5, title: 'Suppe', meal_types: ['dinner'], ingredients: [] }],
+        modal: absicht,
+      });
+      meals.setContainerForTest({ querySelector: () => null, querySelectorAll: () => [] });
+      // Waehrend die Anfrage laeuft, schliesst der Nutzer den Dialog und oeffnet
+      // einen anderen Mahlzeit-Dialog: der Kontext wechselt, state.modal ist dessen.
+      const wechsel = (antwort) => {
+        if (!eigenerOffen) { kontext = 'ein-anderer-dialog'; meals.state.modal = ANDERER; }
+        return antwort;
+      };
+      const label = `${name}${eigenerOffen ? '' : ', inzwischen ein anderer Dialog offen'}`;
+      try {
+        const { calls, closed } = await mit({
+          post: () => wechsel({ data: { id: 9, date: '2026-10-20', meal_type: 'dinner', title: 'Curry', ingredients: [] } }),
+          put: () => wechsel({ data: {} }),
+        }, lauf);
+        assert.ok(calls.some(([verb]) => verb === 'POST' || verb === 'PUT'), `${label}: Vorbedingung: geschrieben (${JSON.stringify(calls)})`);
+        assert.equal(toasts.some(([, art]) => art === 'danger'), false, `${label}: der Erfolg ist kein Fehler (${JSON.stringify(toasts)})`);
+        assert.equal(closed.length, 1, `${label}: genau ein Schliessen (${JSON.stringify(closed)})`);
+        assert.equal(closed[0].force, true, `${label}: force wie bisher`);
+        assert.equal(closed[0].context, 'eigener-dialog',
+          `${label}: geschlossen wird ohne den Kontext von vor der Anfrage - die spaete Antwort traefe den Dialog, der jetzt offen ist`);
+        if (absicht) {
+          assert.equal(meals.state.modal, eigenerOffen ? null : ANDERER,
+            `${label}: ${eigenerOffen ? 'der eigene Dialog ist zu, seine Absicht faellt weg' : 'die Absicht des anderen Dialogs bleibt stehen'}`);
+        }
+      } finally {
+        delete globalThis.__modalContextId;
+        delete globalThis.__isOwnModalOpen;
+        meals.setContainerForTest(null);
+        Object.assign(meals.state, zuvor);
+      }
+    }
   }
 });

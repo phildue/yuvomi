@@ -42,15 +42,27 @@
   padding-inline: var(--page-inline-pad);
 }
 
-/* .metric-grid (panel.css) traegt bewusst KEIN max-width - Budget (dessen
- * Herkunft) hat direkt darunter keine schmal gekappte Liste und darf die
- * volle Spalte fuellen. Hier steht darunter aber .list-group/.list-rows mit
- * ihrem eigenen 720px-Lesemass (list-row.css) - ohne dieselbe Kappung lief
- * die Kennzahlreihe 500px weiter nach rechts als die Gruppe darunter
- * (gemessen 1440 vs. 940px bei 1440px Viewport). Scoped statt am geteilten
- * Selektor, damit Budgets eigene volle Breite unangetastet bleibt. */
-.inventory-list .metric-grid {
+/* Die Kurzzeile und der Fristen-Chip (R24, E2) stehen auf dem Lesemass der
+ * Gruppen darunter - ohne Kappung liefen sie bis zur Kopfkante. */
+.inventory-list > .budget-glance,
+.inventory-list > .inventory-attention {
   max-width: var(--page-measure, var(--layout-reading));
+}
+
+.inventory-list > .inventory-attention {
+  margin-block: var(--space-2) 0;
+  padding-block: 0;
+}
+
+/* Lange Listen rechnen nur, was in Sicht ist (Critique R21 S8; dieselbe Regel
+ * wie die Agenda in calendar.css): ab der zweiten Gruppe ueberspringt der
+ * Browser Gruppen ausser Sicht; Schatten und Fokusring bleiben ganz. */
+@supports (content-visibility: auto) and (contain-intrinsic-size: auto none auto 1px) {
+  .inventory-list > .list-group + .list-group {
+    content-visibility: auto;
+    contain-intrinsic-size: auto none auto 210px;
+    overflow-clip-margin: var(--space-2);
+  }
 }
 
 /* --------------------------------------------------------
@@ -74,13 +86,19 @@
   scrollbar-width: none;
 }
 
-.inventory-filters::-webkit-scrollbar {
-  display: none;
+/* Platzhalter waehrend des Ladens (R23 S11): eine Chiphoehe plus Polster,
+ * dieselbe Rechnung wie .page-chip-row. */
+.inventory-filters[data-pending] {
+  min-block-size: calc(var(--target-md) + 2 * var(--space-3));
 }
 
-/* [hidden] hat gegenüber display:flex zu geringe Spezifität - explizit
- * übersteuern (gleiches Muster wie .pantry-filters[hidden] in list-row.css). */
-.inventory-filters[hidden] {
+@media (hover: none) {
+  .inventory-filters[data-pending] {
+    min-block-size: calc(var(--target-base) + 2 * var(--space-3));
+  }
+}
+
+.inventory-filters::-webkit-scrollbar {
   display: none;
 }
 
@@ -176,10 +194,13 @@
 }
 
 /* Kaufpreis, trailing außerhalb des Klickbereichs (wie der Stepper im Vorrat) -
- * reine Anzeige, kein eigenes Bedienelement, deshalb kein .list-row__actions. */
+ * reine Anzeige, kein eigenes Bedienelement, deshalb kein .list-row__actions.
+ * DIE BETRAGSREGEL (DESIGN.md, R16) gilt auch hier (R21 S9b, Critique a4): ein
+ * Betrag in einer Zeile steht semibold, in Tabellenziffern und in Textfarbe -
+ * der Preis stand als einziger Betrag der App regulaer und sekundaer. */
 .inventory-row__value {
   flex-shrink: 0;
-  color: var(--color-text-secondary);
+  font-weight: var(--font-weight-semibold);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -217,7 +238,6 @@
 }
 
 .inventory-detail-list__sub {
-  font-size: var(--type-caption);
   color: var(--color-text-tertiary);
 }
 
@@ -361,12 +381,6 @@
   gap: var(--space-1);
 }
 
-/* [hidden] hat gegenüber display:flex zu geringe Spezifität - explizit übersteuern. */
-.inventory-booking-picker__list[hidden],
-.inventory-booking-picker__nav[hidden] {
-  display: none;
-}
-
 .inventory-booking-picker__status {
   margin: auto;
   color: var(--color-text-tertiary);
@@ -454,7 +468,7 @@
 
 .inventory-tracked-dates-hint {
   margin: 0 0 var(--space-2);
-  font-size: var(--text-sm);
+  font-size: var(--type-caption);
   color: var(--color-text-secondary);
 }
 
@@ -557,7 +571,6 @@
 }
 
 .inventory-history-entry__sub {
-  font-size: var(--type-caption);
   color: var(--color-text-tertiary);
 }
 
@@ -622,72 +635,12 @@
     /* Von der GEMESSENEN Oberkante bis zur Luft ueber dem Fensterrand
      * (inventory.js, syncDetailTop): in Ruhe steht die Filterzeile zwischen
      * Kopf und Spalte, beim Kleben nicht mehr. Ohne Messwert (erster Frame)
-     * gilt der Klebestand. Volle Hoehe statt Hoechstmass: die Spalte ist ein
-     * Ort, keine Karte, die mit ihrem Inhalt waechst. */
-    height: calc(var(--viewport-height) - var(--inventory-detail-top, calc(var(--inventory-head-block, 0px) + var(--space-3))) - var(--space-4) - var(--shell-tail, 0px));
-  }
-
-  /* KENNZAHLEN ALS ZEILEN, NICHT ALS DREI KACHELN IN 424PX. Drei Kacheln je
-   * 136px brachen „Braucht Aufmerksamkeit" auf drei Zeilen und mitten im Wort
-   * („AUFMERKSAMKE/IT", A8). In der Listenspur stehen sie wie eine gruppierte
-   * Liste bei Apple: ein Traeger, je Kennzahl eine Zeile, Wort links, Zahl
-   * rechts; die waehlbare Zeile (Fristen-Filter) traegt einen Chevron und
-   * liest sich damit als Knopf, nicht als dritte statische Kachel (A6). */
-  .inventory-list .metric-grid {
-    grid-template-columns: minmax(0, 1fr);
-    grid-auto-rows: auto;
-    gap: 0;
-    padding: 0;
-    margin-block: var(--space-3);
-    background-color: var(--color-surface);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-sm);
-    overflow: hidden;
-  }
-
-  .inventory-list .metric-grid > .metric-card {
-    flex-direction: row;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-3);
-    min-height: var(--target-md);
-    padding: var(--space-2) var(--space-4);
-    background-color: transparent;
-    border: 0;
-    border-radius: 0;
-    box-shadow: none;
-    text-align: start;
-  }
-
-  .inventory-list .metric-grid > .metric-card + .metric-card {
-    border-block-start: var(--space-px) solid var(--color-border-subtle);
-  }
-
-  .inventory-list .metric-grid .metric-card__label {
-    overflow-wrap: normal;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .inventory-list .metric-grid .metric-card__value {
-    font-size: var(--text-lg);
-    flex-shrink: 0;
-  }
-
-  /* Die waehlbare Zeile (Fristen-Filter) spricht in Akzenttinte wie eine
-   * Aktionszeile bei Apple - sie ist ein Knopf, keine dritte Kennzahl. */
-  .inventory-list .metric-grid > .metric-card--select .metric-card__label {
-    color: var(--color-accent);
-  }
-
-  .inventory-list .metric-grid > .metric-card--select:hover {
-    background-color: var(--color-surface-elevated-hover);
-  }
-
-  /* Gedrueckt (Filter an): dieselbe Flaeche wie eine ausgewaehlte Zeile. */
-  .inventory-list .metric-grid > .metric-card--select.is-active {
-    background-color: color-mix(in srgb, var(--color-accent) var(--tint-state), var(--color-surface));
+     * gilt der Klebestand. HOECHSTMASS STATT VOLLER HOEHE (R21, D9: "Detail-
+     * spalten nicht kuenstlich strecken"): bis dahin galt die Spalte als Ort,
+     * der bis zum Fensterrand reicht - und trug bei 1920 ein Leerband ueber
+     * dem Fuss. Jetzt endet sie unter ihrem Inhalt und scrollt, wo er laenger
+     * ist, wie Kontakte, Rezepte und Aufgaben. */
+    max-height: calc(var(--viewport-height) - var(--inventory-detail-top, calc(var(--inventory-head-block, 0px) + var(--space-3))) - var(--space-4) - var(--shell-tail, 0px));
   }
 }
 
@@ -715,7 +668,12 @@
     column-gap: var(--space-6);
   }
 
-  .inventory-page .detail-group__rows > .detail-row--multiline,
+  .inventory-page .detail-group__rows > .detail-row--multiline {
+    grid-column: 1 / -1;
+  }
+
+  /* Eigene Regel: ein `:has()` in einer Selektorliste verwirft ohne
+   * `:has()`-Unterstuetzung die ganze Liste (F4.2). */
   .inventory-page .detail-group__rows > .detail-row:has(> .detail-row__text > .detail-row__value:not(span)) {
     grid-column: 1 / -1;
   }

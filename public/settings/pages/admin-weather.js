@@ -10,6 +10,7 @@ import {
   reportMissingWeatherPlace,
   weatherLocationFieldsHtml,
 } from '/settings/weather-location.js';
+import { errorSentence } from '/utils/friendly-error.js';
 
 /**
  * Haushalts-Standardstandort für das Wetter-Widget. Lag bis zum IA-Umbau in
@@ -97,7 +98,10 @@ function renderPage(container, preferences) {
             },
           })}
           <p class="form-hint">${t('settings.weatherSwitchHint')}</p>
-          <p class="form-hint">${t('settings.householdWeatherOverrideHint')}</p>
+          ${/* WETTER AN ZWEI ORTEN, GEGENSEITIG VERWIESEN (R22, D13): der
+               Satz nannte "Mein Wetter" schon, jetzt fuehrt er auch hin. */ ''}
+          <p class="form-hint" id="weather-personal">${esc(t('settings.householdWeatherOverrideHint'))}
+            <a href="/settings/personal/weather" id="weather-personal-link">${esc(t('settings.pageWeather'))}</a></p>
           <div id="weather-form-error" class="form-error" role="alert" hidden></div>
           <div class="settings-form-actions">
             ${canRemoveStoredWeather(weatherSource) ? `
@@ -139,7 +143,7 @@ function bindWeatherEvents(container, user) {
       window.yuvomi?.showToast(t('settings.weatherSaved'), 'success');
       await render(container, { user });
     } catch (error) {
-      errorElement.textContent = error.message || t('common.errorGeneric');
+      errorElement.textContent = errorSentence(error, 'settings.preferenceSaveFailed');
       errorElement.hidden = false;
     }
   });
@@ -156,7 +160,7 @@ function bindWeatherEvents(container, user) {
       );
       await render(container, { user });
     } catch (error) {
-      window.yuvomi?.showToast(error.message || t('common.errorGeneric'), 'danger');
+      window.yuvomi?.showToast(errorSentence(error, 'settings.preferenceSaveFailed'), 'danger');
     }
   });
 

@@ -6,6 +6,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
+import { eachRule } from './css-rules.js';
 import { MIGRATIONS_SQL } from '../server/db-schema-test.js';
 import { url } from '../server/middleware/validate.js';
 import { aggregateMealIngredients, parseQuantity } from '../server/services/shopping-import.js';
@@ -68,7 +69,10 @@ test('Shopping-Löschaktionen importieren den gemeinsamen Undo-Helper', () => {
   // invertiert: der einzelne Artikel hatte Undo und keine Rückfrage, die Liste des
   // ganzen Haushalts eine Rückfrage und kein Undo.
   const calls = source.match(/\bscheduleUndoableDelete\s*\(/g) ?? [];
-  assert(calls.length === 3, `Einzel-, Sammel- und Listenlöschung müssen den Undo-Helper nutzen, gefunden: ${calls.length}`);
+  // Seit R23 (D3) traegt auch die Uebernahme in den Vorrat ohne Abraeumen der
+  // Liste ihr Rueckgaengig ueber denselben Helfer (mit Abraeumen laeuft sie
+  // durch „Abgehakt löschen").
+  assert(calls.length === 4, `Einzel-, Sammel-, Listenlöschung und Vorrats-Übernahme müssen den Undo-Helper nutzen, gefunden: ${calls.length}`);
   // Die Liste behält ZUSÄTZLICH ihre Rückfrage - eine Rückfrage schützt vor dem
   // Fehlgriff, ein Undo vor dem falschen Entschluss.
   const deleteList = source.slice(source.indexOf("action === 'delete-list'"));
@@ -697,9 +701,15 @@ test('shopping-Route validiert und persistiert notes/url', () => {
 test('shopping-Route bietet einen Datumsbereich-Import aus dem Essensplan an', () => {
   const source = readFileSync(new URL('../server/routes/shopping.js', import.meta.url), 'utf8');
   assert(/router\.post\('\/:listId\/import-meal-plan'/.test(source), 'Shopping-Route muss eine Import-Route für den Essensplan bereitstellen');
-  assert(/aggregateMealIngredients/.test(source), 'Import-Route muss aggregierte Zutaten verwenden');
-  assert(/m\.date BETWEEN \? AND \?/.test(source), 'Import-Route muss Mahlzeiten nach Datumsbereich filtern');
-  assert(/mi\.on_shopping_list = 0/.test(source), 'Bereits übertragene Zutaten dürfen nicht erneut importiert werden');
+  // Seit R23 (D2) liest die Route den Essensplan ueber die geteilte Quelle der
+  // Kueche und schreibt ueber die eine Dublettenregel; das Verhalten belegt
+  // test:shopping-routes, hier steht nur die Verdrahtung.
+  const service = readFileSync(new URL('../server/services/kitchen-handover.js', import.meta.url), 'utf8');
+  assert(/mealPlanSource\(db\.get\(\), range\)/.test(source), 'Import-Route muss den Essensplan ueber mealPlanSource lesen');
+  assert(/handOverToShoppingList\(/.test(source), 'Import-Route muss ueber die geteilte Dublettenregel schreiben');
+  assert(/aggregateMealIngredients/.test(service), 'die Quelle muss aggregierte Zutaten liefern');
+  assert(/date BETWEEN \? AND \?/.test(service), 'die Quelle muss Mahlzeiten nach Datumsbereich filtern');
+  assert(/on_shopping_list = 0/.test(service), 'Bereits übertragene Zutaten dürfen nicht erneut importiert werden');
 });
 
 // --------------------------------------------------------
@@ -739,8 +749,16 @@ test('Der Listen-Scroller traegt einen duennen, getoenten Scrollbalken (#1039)',
     'Firefox braucht scrollbar-width/scrollbar-color direkt an .list-scroller');
   assert(/\.list-scroller::-webkit-scrollbar\s*\{\s*width:\s*10px;\s*\}/.test(css),
     'WebKit/Chromium brauchen die eigene Pseudo-Element-Fassung');
-  assert(/\.list-scroller::-webkit-scrollbar-thumb:hover/.test(css),
+  const hover = [...eachRule(css)].filter((r) => r.selector.trim() === '.list-scroller::-webkit-scrollbar-thumb:hover');
+  assert(hover.length > 0,
     'eine reine --tint-hint-Kante braucht laut tokens.css einen Hover-Bezug, sonst traegt sie nicht allein');
+  // Der Hover wechselt nur die Toenung. Die Kurzschreibweise `background:` setzt
+  // background-clip auf border-box zurueck, und der Daumen fuellt dann auch den
+  // 3px-Rand: gemessen 4 -> 10px breit auf dem ::-webkit-scrollbar-Pfad (Safari vor 26.2).
+  for (const { body } of hover) {
+    assert(!/(^|[;\s])background\s*:/.test(body) || /background-clip:\s*padding-box/.test(body),
+      'der Hover des Daumens darf background-clip nicht zuruecksetzen - background-color statt background');
+  }
 });
 
 // --------------------------------------------------------

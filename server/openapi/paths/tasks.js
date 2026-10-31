@@ -1,11 +1,11 @@
-import { op, jsonBody, idParam, stringPathParam, DOCUMENT_LINK_REFUSAL } from '../helpers.js';
+import { op, jsonBody, idParam, stringPathParam, DOCUMENT_LINK_REFUSAL, withCaseReasons } from '../helpers.js';
 
 // Die verknuepften Dokumente einer Aufgabe gehoeren dem Dokumente-Modul (#1358).
 const TASK_DOCUMENTS_NOTE = '`document_count` counts the linked documents the caller may see; `GET /api/v1/tasks/{id}` also carries them as `documents`. '
   + 'Without access to the Documents module (for API tokens a `documents:read` scope) both are `null` - not told, which is not the same as `0` or an empty list.';
 
 export function tasksPaths() {
-  return {
+  return withCaseReasons('tasks', CASE_REASONS, {
     '/api/v1/tasks': {
       // Die Filter stehen als echte Parameter da, nicht nur im Fließtext: ein
       // generierter Client und die MCP-Brücke (get_api_operation) lesen die
@@ -40,7 +40,7 @@ export function tasksPaths() {
       get: op({
         summary: 'List completed tasks, newest first',
         tag: 'Tasks',
-        description: 'The household history of who completed which task, and when (#791). Each entry carries both people: `user_id` is who ticked it off and `done_by_user_id` is who was named as having done it (#1205, null when nobody was), with `person_user_id` resolving the two into the one the entry displays. Recording started with the release that introduced it, so nothing before that appears. Timestamps are UTC instants; which calendar day one belongs to is a question for the display timezone, which is why there is no date range here. Only tasks the caller may see are returned, evaluated live against the task - a task later set to private disappears from the history too. Subtasks are never recorded: a checklist item is part of its parent instruction, and the completion of the parent is the event.',
+        description: 'The household history of who completed which task, and when (#791). Each entry carries both people: `user_id` is who ticked it off and `done_by_user_id` is who was named as having done it (#1205, null when nobody was), with `person_user_id` resolving the two into the one the entry displays. `source` is `null` for a completion in Yuvomi and `"caldav"` for one taken over by the inbound CalDAV sync when the task was ticked off in a reminders app (#1836); such an entry carries no person, since the sync cannot tell who ticked it off, and its time is the COMPLETED stamp of the reminder where it has one. Recording started with the release that introduced it, so nothing before that appears. Timestamps are UTC instants; which calendar day one belongs to is a question for the display timezone, which is why there is no date range here. Only tasks the caller may see are returned, evaluated live against the task - a task later set to private disappears from the history too. Subtasks are never recorded: a checklist item is part of its parent instruction, and the completion of the parent is the event.',
         params: [
           { name: 'limit',     in: 'query', required: false, schema: { type: 'integer', minimum: 1, maximum: 200, default: 50 } },
           { name: 'user_id',   in: 'query', required: false, schema: { type: 'integer' }, description: 'Only completions attributed to this member. That is whoever was named as having done the task (#1205), and the person who ticked it off where nobody was named - the same person the entry displays, so filtering and display cannot disagree.' },
@@ -70,7 +70,7 @@ export function tasksPaths() {
       get: op({
         summary: 'List selectable CalDAV reminder lists for the task editor',
         tag: 'Tasks',
-        description: 'Available to every authenticated user (#695). Returns `{ data: { caldav: [{ accountId, accountName, listUrl, listName }] } }`, restricted to reminder lists the household has enabled **for tasks** - a list pointing at shopping is omitted, because a task sent there would come back as a shopping item. Carries no credentials or server URLs; account management stays admin-only. The identifier for `sync_target` on POST/PUT /tasks is `caldav:<accountId>|<listUrl>`.',
+        description: 'Available to every authenticated user (#695). Returns `{ data: { caldav: [{ accountId, accountName, listUrl, listName }] } }`, restricted to reminder lists the household has enabled **for tasks** - a list pointing at shopping is omitted, because a task sent there would come back as a shopping item - and that take new entries (#1840: a list shared read-only is omitted; one whose server does not report privileges stays). POST/PUT /tasks refuse a read-only list as a new `sync_target` with 400; a task whose stored target became read-only later keeps it and waits locally. Carries no credentials or server URLs; account management stays admin-only. The identifier for `sync_target` on POST/PUT /tasks is `caldav:<accountId>|<listUrl>`.',
       }),
     },
     '/api/v1/tasks/tags': {
@@ -138,5 +138,33 @@ export function tasksPaths() {
       patch: op({ summary: 'Edit a comment', tag: 'Tasks', params: [idParam(), idParam('commentId', 'Comment ID')], stateChanging: true, requestBody: jsonBody(null), description: 'Body: { comment }. The author only; sets updated_at.' }),
       delete: op({ summary: 'Delete a comment', tag: 'Tasks', params: [idParam(), idParam('commentId', 'Comment ID')], stateChanging: true, description: 'The author, or an admin moderating.' }),
     },
-  };
+  });
 }
+
+// #1909: die Faelle, die ein Nutzer erreicht, tragen einen `reason` neben dem
+// englischen `error` - je Operation der Satz, der sie nennt.
+const TASK_GONE = '`tasks_task_not_found` (404, the task does not exist or is not visible to you - deleted, or made private)';
+const PARENT_GONE = '`tasks_parent_not_found` (404, `parent_task_id` names a task that does not exist or is not visible to you)';
+const COMMENT_GONE = `${TASK_GONE}, \`tasks_comment_not_found\` (404, the task is there, the comment is not - deleted in the meantime)`;
+const REORDER_DENIED = '`reorder_not_allowed` (403, the caller lacks `tasks_reorder_family` - the hand order belongs to the household, R23)';
+const CAT_EXISTS = '`category_exists` (409, a category with this name already exists)';
+const CAT_DELETE = '`category_in_use` (409, tasks still use the category; `count` carries how many), `category_last` (409, the last category cannot be deleted)';
+const CASE_REASONS = {
+  '/api/v1/tasks': { post: PARENT_GONE },
+  '/api/v1/tasks/reorder': { patch: `${TASK_GONE}, ${REORDER_DENIED}` },
+  '/api/v1/tasks/reorder/reset': { post: `${TASK_GONE}, ${REORDER_DENIED}` },
+  '/api/v1/tasks/{id}': { get: TASK_GONE, put: TASK_GONE, delete: TASK_GONE },
+  '/api/v1/tasks/{id}/status': { patch: `${TASK_GONE}, \`display_action\` (403, a paired display can only tick a task off)` },
+  '/api/v1/tasks/{id}/archive': { patch: TASK_GONE },
+  '/api/v1/tasks/{id}/check': { patch: TASK_GONE },
+  '/api/v1/tasks/{id}/documents': {
+    get: `${TASK_GONE}, \`cross_module_access\` (403, reading linked documents needs access to the documents module)`,
+    put: TASK_GONE,
+  },
+  '/api/v1/tasks/sync-targets': { get: '`cross_module_access` (403, the list is only for callers who may write tasks - for API tokens a `tasks:write` scope)' },
+  '/api/v1/tasks/categories': { post: CAT_EXISTS },
+  '/api/v1/tasks/categories/{key}': { put: CAT_EXISTS, delete: CAT_DELETE },
+  '/api/v1/tasks/{id}/completions': { get: TASK_GONE },
+  '/api/v1/tasks/{id}/comments': { get: TASK_GONE, post: TASK_GONE },
+  '/api/v1/tasks/{id}/comments/{commentId}': { patch: COMMENT_GONE, delete: COMMENT_GONE },
+};

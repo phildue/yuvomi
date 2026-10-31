@@ -4,9 +4,8 @@
  */
 
 import { api } from '/api.js';
-import { closeModal, confirmModal, confirmOverModal, openModal, advancedSection, reportFieldError, reportFieldErrors, refocusAfterRender, captureModalContext, isModalContextCurrent, isOwnModalOpen } from '/components/modal.js';
+import { closeModal, confirmModal, confirmOverModal, openModal, advancedSection, reportFieldError, reportFieldErrors, constraintErrors, refocusAfterRender, captureModalContext, captureOpenContext, isModalContextCurrent, isOwnModalOpen } from '/components/modal.js';
 import {
-  formatDate,
   getLocale,
   getNumberFormat,
   isDateInputValid,
@@ -14,26 +13,36 @@ import {
   t,
 } from '/i18n.js';
 import { esc, REQUIRED_MARK } from '/utils/html.js';
+import { isImeComposing, offerUndo, scheduleUndoableDelete } from '/utils/ux.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
-import { emptyStateHTML, mountLoadError } from '/utils/empty-state.js';
+import { emptyStateHTML, searchEmptyHTML, mountLoadError } from '/utils/empty-state.js';
 import { todayKey } from '/utils/date.js';
+import { dateText, percentText, daysFromTodayText } from '/utils/date-format.js';
+import { COUNTDOWN_EXACT_DAYS } from '/utils/countdown.js';
 import { CURRENCY_CODES } from '/utils/currency-codes.js';
 import { wireSwipeRows, maybeShowSwipeHint } from '/utils/swipe-row.js';
 import { redrawList, collapseRow } from '/utils/list-motion.js';
-import { formatMoney, amountPlaceholder, amountStep, applyAmountFormat, amountIsSavable, smallestUnitLabel } from '/utils/money.js';
+import { formatMoney, parseAmountInput } from '/utils/money.js';
+import { amountFieldHtml, amountInputAttrs, setAmountCurrency, amountFieldError } from '/utils/amount-field.js';
+import { mediaPickerBadgeHtml } from '/utils/media-picker.js';
 import { attachOverlay } from '/utils/overlay-history.js';
+import { inertOutside } from '/utils/background-inert.js';
 import { isNavModuleReadOnly } from '/permissions.js';
-import { openDetailView } from '/components/detail-view.js';
-import { rowActionHtml } from '/utils/row-action.js';
+import { openDetailView, closeDetailView, withPrimaryEdit } from '/components/detail-view.js';
+import { rowActionHtml, rowMenuHtml } from '/utils/row-action.js';
+import { installPopoverMenus } from '/utils/popover-menu.js';
+import { sortableSet, restoreOrder } from '/utils/sortable.js';
 import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
-import { metricGlanceHtml, wireMetricGlance } from '/utils/metric-glance.js';
-import { toggleRowHtml } from '/settings/components.js';
-import { leadCardClass } from '/utils/metric-card.js';
+import { metricGlanceHtml, metricGlanceSkeletonHtml } from '/utils/metric-glance.js';
+import { toggleRowHtml, formSwitchRowHtml } from '/settings/components.js';
+import { fitMetricLeads } from '/utils/metric-card.js';
 import { errorSentence, isGone, isAlreadyDeleted } from '/utils/friendly-error.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
+import { colorPickerHtml, familyColorOptions, setColorPickerValue, wireColorPicker } from '/utils/color-picker.js';
+import { intervalSentenceHtml, UNIT_SENTENCE_KEYS } from '/utils/interval-sentence.js';
 
-// Auslastung, ab der ein Budget „knapp" ist - dieselbe Zahl wie im Plan
-// (budget-plans.js `toneForRatio`), damit beide Tabs dieselbe Grenze ziehen.
-const PLAN_NEAR_RATIO = 0.85;
+const SUBSCRIPTION_COLOR_DEFAULT = '#0F766E';
+
 
 let state = {
   subscriptions: [],
@@ -47,7 +56,6 @@ let state = {
   status: 'all',
   sort: 'due',
   user: null,
-  summaryExpanded: false, // mobil: Kennzahl-Karten unter der Glance-Zeile aufgeklappt (R14 P1)
 };
 let container = null;
 /** Handle des geteilten Suchfelds (wirePageSearch) - Zuruecksetzen leert es mit. */
@@ -187,6 +195,8 @@ const READ_SAFE_ACTIONS = new Set(['view']);
 function setHtml(element, html) {
   element.replaceChildren();
   element.insertAdjacentHTML('afterbegin', html);
+  // Leitzahl in fester Stufe, kleiner nur bei Ueberlauf (R23, D12).
+  fitMetricLeads(element);
 }
 
 // Format aus utils/money.js - EINE Quelle für das ganze Budget-Modul. Vorher
@@ -278,14 +288,17 @@ function monthLabel(key) {
   return new Intl.DateTimeFormat(getLocale(), { month: 'short' }).format(new Date(year, month - 1, 1));
 }
 
+// Die Zeile sagt denselben Satz wie der Dialog (R24 S4): "Alle 2 Monate" aus
+// dem Satz der Einheit, mit der Pluralform der Zahl - "Co 2 miesiące" neben
+// "Co 5 miesięcy". Bis dahin setzte sie ein festes Pluralwort ein
+// (`subscriptions.cyclePlural`), das im Polnischen, Tschechischen, Russischen
+// und Ukrainischen bei 2-4 falsch war. Bei 1 bleibt das Adverb ("Monatlich").
 function cycleLabel(subscription) {
   const key = `subscriptions.cycle.${subscription.billing_cycle}`;
-  return subscription.cycle_interval === 1
+  const sentence = UNIT_SENTENCE_KEYS[subscription.billing_cycle];
+  return subscription.cycle_interval === 1 || !sentence
     ? t(key)
-    : t('subscriptions.everyCycle', {
-      count: subscription.cycle_interval,
-      cycle: t(`subscriptions.cyclePlural.${subscription.billing_cycle}`),
-    });
+    : t(sentence, { count: subscription.cycle_interval });
 }
 
 function daysUntil(date) {
@@ -299,6 +312,11 @@ function dueLabel(subscription) {
   if (days < 0) return t('subscriptions.overdueDays', { count: Math.abs(days) });
   if (days === 0) return t('subscriptions.dueToday');
   if (days === 1) return t('subscriptions.dueTomorrow');
+  // UEBER EINEN MONAT DIE GROBE STUFE (R23 D11, Rest aus S7): "Faellig in
+  // 140 Tagen" verlangte Kopfrechnen fuer eine Jahreszahlung. Wie jeder
+  // Abstand in der App (utils/date-format.js): bis 30 Tage genau, dann
+  // Wochen, Monate, Jahre - das Datum davor nennt den Tag.
+  if (days > COUNTDOWN_EXACT_DAYS) return daysFromTodayText(days);
   return t('subscriptions.dueInDays', { count: days });
 }
 
@@ -335,7 +353,7 @@ async function loadOnce({ refreshRates = false } = {}) {
   }
   if (outdated()) return newest();
   const [list, meta, settings] = answers;
-  state.subscriptions = list.data?.subscriptions || [];
+  state.subscriptions = (list.data?.subscriptions || []).filter((entry) => !pendingDeletes.has(entry.id));
   state.summary = list.data?.summary || null;
   state.rates = list.data?.rates || null;
   state.meta = meta.data || state.meta;
@@ -378,7 +396,8 @@ export async function render(target, { user } = {}) {
            Liste, waehrend "Transaktionen" und "Kategorie-Budgets" nebenan
            ueber ihrem Traeger stehen. Jetzt h2.u-section-title mit den
            Werkzeugen rechts, darunter der Zeilentraeger (.row-carrier). -->
-      <div class="subscriptions-summary" id="subscriptions-summary"></div>
+      <div class="subscriptions-summary" id="subscriptions-summary">${/* Der Kennzahl-Slot steht ab dem ersten Bild in seiner Form (R22, D4). */ ''}${metricGlanceSkeletonHtml({ lead: true, controls: false, flows: 2, everywhere: true })}
+      </div>
       <section class="subscriptions-list-section" aria-labelledby="subscriptions-list-title">
         <div class="subscriptions-section-head section-toolbar">
           <div class="subscriptions-section-head__lead">
@@ -760,6 +779,7 @@ function drawContent() {
         </button>`);
   }
   setHtml(content, `
+      ${renderOverBudgetNote()}
       <div class="subscriptions-list row-carrier" id="subscriptions-list">
         ${rows.length ? rows.map(renderCard).join('') : renderEmpty()}
       </div>
@@ -781,13 +801,9 @@ function renderSummary() {
   const budget = Number(summary.monthly_budget || 0);
   const used = Number(summary.monthly_total || 0);
   const hasBudget = budget > 0;
-  // Balkenbreite ist bei 100% gecappt, das Label nennt die echte Auslastung (121% statt „100%").
-  const realPercentage = hasBudget ? Math.round((used / budget) * 100) : 0;
-  const percentage = Math.min(100, realPercentage);
+  // Die echte Auslastung (121 % statt "100 %") nennt die Fussnote vor der
+  // Liste (renderOverBudgetNote).
   const isOverBudget = hasBudget && summary.remaining_budget < 0;
-  // Dieselbe Schwelle wie der Plan (budget-plans.js `toneForRatio`): ab 85 %
-  // Auslastung der Warnton, darueber hinaus die Tatsache.
-  const isNearBudget = hasBudget && !isOverBudget && used / budget > PLAN_NEAR_RATIO;
   // Geteilte Kennzahl-Zeile und -Karte des Budget-Moduls (budget.css). Die
   // frühere eigene .subscriptions-summary-card war die zweite von fünf
   // Bauarten im selben Modul (Critique 2026-07-30, P0).
@@ -795,7 +811,7 @@ function renderSummary() {
   //
   // UEBER BUDGET SAGT DASSELBE WIE IM PLAN (Critique 2026-09-25). Eine
   // tatsaechliche Ueberschreitung ist eine Tatsache und traegt den Danger-Ton
-  // wie die ueberzogene Plan-Kategorie (`.metric-card--over`, Symbol und
+  // wie die ueberzogene Plan-Kategorie (seit R21 S7 am Balken, Symbol und
   // Label als Text); die Annaeherung ab 85 % traegt den Warnton am Balken -
   // wie im Plan. Neu ist der Weg zur Handlung: zur Liste, teuerste zuerst.
   // Das ist Lesen, kein Schreiben - der Weg steht bei jedem Recht.
@@ -812,48 +828,43 @@ function renderSummary() {
   // Unbegrenzt". Wo kein Budget gesetzt ist, gibt es keine Zahl dafuer; den
   // Zustand nennt die Karte daneben. Drei Karten sind die Grundform der Reihe
   // (panel.css) - seit R19 auch MIT Budget: es steht in der Kostenkarte.
+  /* EINE KENNZAHL, EINE ZEILE, IN JEDER BREITE (R24, E2; Critique
+   * G4-Budget-P2-3). Bis R24 standen rechts drei Karten - Monatskosten mit
+   * Balken, "Ueber Budget 23,60 €" (die zweite Fassung des roten Balkens) und
+   * die Jahresprognose -, mobil dieselben hinter einem Aufklapper. Jetzt die
+   * Kurzzeile oben in der Bahn: die Monatskosten fuehren, daneben der
+   * Budgetstand (ueber dem Budget im Danger-Ton) und das Jahr. Die Zahl der
+   * Abos steht am Kopf der Liste, die sie zaehlt. Der Weg zur Handlung bei
+   * einer Ueberschreitung ("Teuerste zuerst") steht seit S13 vor der Liste. */
   const budgetFlow = hasBudget
     ? { label: t(isOverBudget ? 'subscriptions.overBudget' : 'subscriptions.remainingBudget'),
       amount: money(Math.abs(summary.remaining_budget)), tone: isOverBudget ? 'negative' : '' }
     : null;
   return `
     ${metricGlanceHtml({
-    id: 'subscriptions-glance-more',
-    controls: 'subscriptions-summary-details',
-    expanded: state.summaryExpanded,
     label: t('subscriptions.monthlyCost'),
     value: money(used),
     lead: true,
-    flows: [{ label: t('subscriptions.activeCount', { count: summary.active_count }) }, budgetFlow],
+    everywhere: true,
+    flows: [budgetFlow, { label: t('subscriptions.yearlyProjection'), amount: money(used * 12) }],
   })}
-    <section class="metric-grid metric-grid--led budget-glance-details${state.summaryExpanded ? ' is-expanded' : ''}" id="subscriptions-summary-details">
-      ${/* KOSTEN UND BUDGET IN EINER KARTE (R19, Critique 2026-10-16). Zwei
-         Karten sagten "113,60 €" und "90,00 €" nebeneinander, den Vergleich
-         musste man selbst ziehen. Jetzt "113,60 € von 90,00 €" mit dem Balken
-         darunter - dieselbe Form wie das Ziel im Plan (budget.planTargetOf);
-         die Reihe hat damit immer drei Karten. */ ''}
-      <article class="metric-card ${leadCardClass(money(used))}">
-        <div class="metric-card__label">${t('subscriptions.monthlyCost')}</div>
-        <div class="metric-card__value">${money(used)}${hasBudget ? ` <span class="metric-card__of">${esc(t('budget.planTargetOf', { amount: money(budget) }))}</span>` : ''}</div>
-        ${hasBudget ? `<div class="metric-card__progress${isOverBudget ? ' metric-card__progress--over' : isNearBudget ? ' metric-card__progress--near' : ''}"
-             role="progressbar" aria-label="${esc(t('subscriptions.monthlyBudget'))}"
-             aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percentage}" aria-valuetext="${realPercentage}%">
-          <span style="--fill:${percentage / 100}"></span>
-        </div>` : ''}
-        <div class="metric-card__note">${t('subscriptions.activeCount', { count: summary.active_count })}</div>
-      </article>
-      <article class="metric-card${isOverBudget ? ' metric-card--over' : ''}">
-        <div class="metric-card__label">${isOverBudget ? '<i data-lucide="triangle-alert" class="icon-sm" aria-hidden="true"></i>' : ''}${hasBudget ? (isOverBudget ? t('subscriptions.overBudget') : t('subscriptions.remainingBudget')) : t('subscriptions.noBudgetLimit')}</div>
-        <div class="metric-card__value">${hasBudget ? money(Math.abs(summary.remaining_budget)) : t('subscriptions.unlimited')}</div>
-        <div class="metric-card__note">${hasBudget ? `${realPercentage}% ${t('subscriptions.budgetUsed')}` : (readOnly() ? '' : t('subscriptions.setBudgetHint'))}${isOverBudget ? ` <button type="button" class="subscriptions-over-budget-action" id="subscriptions-over-budget-action">${t('subscriptions.overBudgetAction')}</button>` : ''}</div>
-      </article>
-      <article class="metric-card">
-        <div class="metric-card__label">${t('subscriptions.yearlyProjection')}</div>
-        <div class="metric-card__value">${money(used * 12)}</div>
-        <div class="metric-card__note">${t('subscriptions.yearlyProjectionNote')}</div>
-      </article>
-    </section>
   `;
+}
+
+/* DIE FUSSNOTE STEHT VOR DER LISTE, DIE SIE SORTIERT (R24 S13, S12-F3).
+ * "126 % des Budgets genutzt - Teuerste zuerst" stand unter der Kurzzeile.
+ * Deren Skelett (82px) kannte sie nicht, die echte Zeile wuchs auf 111px und
+ * schob beim Reiterwechsel den Listenkopf (Shift 0,0233 mobil, 0,0068
+ * Desktop). Jetzt ist der Kennzahl-Slot so hoch wie sein Skelett, und die
+ * Fussnote kommt im selben Bild wie die Zeilen, die das Listen-Skelett
+ * ersetzen - neue Knoten verschieben nichts. Der Weg steht so auch dort, wo
+ * er wirkt: direkt ueber den Zeilen, die er umsortiert. */
+function renderOverBudgetNote() {
+  const summary = state.summary;
+  const budget = Number(summary?.monthly_budget || 0);
+  if (!(budget > 0) || !(summary.remaining_budget < 0)) return '';
+  const realPercentage = Math.round((Number(summary.monthly_total || 0) / budget) * 100);
+  return `<p class="subscriptions-over-budget">${esc(percentText(realPercentage))} ${t('subscriptions.budgetUsed')} <button type="button" class="subscriptions-over-budget-action" id="subscriptions-over-budget-action">${t('subscriptions.overBudgetAction')}</button></p>`;
 }
 
 /** „Teuerste zuerst": sortiert die Liste und bringt ihren Kopf in den Blick. */
@@ -987,8 +998,8 @@ function renderBreakdown(title, rows) {
       <div class="subscriptions-chart__card">
       ${rows.length ? `<ul class="subscriptions-chart-rows">${rows.map((row) => `
         <li class="subscriptions-chart-row">
-          <span class="subscriptions-chart-row__label" title="${esc(row.label)}">${esc(row.label)}</span>
-          <span class="subscriptions-chart-row__track" aria-hidden="true"><i style="width:${Math.round((row.amount / max) * 100)}%"></i></span>
+          <span class="subscriptions-chart-row__label">${esc(row.label)}</span>
+          <span class="subscriptions-chart-row__track" aria-hidden="true"><span class="budget-bar-row__fill budget-bar-row__fill--expenses" style="--bar-scale:${(row.amount / max).toFixed(4)}"></span></span>
           <strong>${money(row.amount)}</strong>
           <span class="subscriptions-chart-row__share">${percent.format(row.amount / total)}</span>
         </li>
@@ -1013,11 +1024,12 @@ function statusMeta(subscription) {
 // Ende-Zeile in der Card (#594): abgeschlossen, Enddatum oder Restzahlungen.
 function endInfoLabel(subscription) {
   if (subscription.status === 'completed') {
-    const day = subscription.completed_at ? String(subscription.completed_at).slice(0, 10) : null;
-    return { icon: 'circle-check', text: day ? t('subscriptions.completedOn', { date: formatDate(day) }) : t('subscriptions.completed') };
+    // completed_at ist ein ZEITPUNKT: dateText rechnet ihn in die Haushaltszone
+    // (R23) - der abgeschnittene UTC-String nannte abends den Folgetag.
+    return { icon: 'circle-check', text: subscription.completed_at ? t('subscriptions.completedOn', { date: dateText(subscription.completed_at) }) : t('subscriptions.completed') };
   }
   if (subscription.end_type === 'on_date' && subscription.end_date) {
-    return { icon: 'calendar-x', text: t('subscriptions.endsOn', { date: formatDate(subscription.end_date) }) };
+    return { icon: 'calendar-x', text: t('subscriptions.endsOn', { date: dateText(subscription.end_date) }) };
   }
   if (subscription.end_type === 'after_count') {
     return { icon: 'list-ordered', text: t('subscriptions.endsAfter', { count: Number(subscription.occurrences_remaining ?? 0) }) };
@@ -1039,8 +1051,16 @@ function endInfoLabel(subscription) {
 // WCAG 1.3.1/4.1.2) und `contacts.js`. Aus demselben Grund tragen Name und
 // Beschreibung `<span>` statt `<h3>`/`<p>`: Content-Model eines `<button>` ist
 // Phrasing Content. Was der Knopf TUT, kommt als sr-only Zusatz ans Ende.
+/** Der Standard der Erinnerung (Dialog und Route: 3 Tage vorher). */
+const DEFAULT_REMINDER_DAYS = 3;
+
+/** Weicht die Erinnerung dieses Abos vom Standard ab (aus oder andere Frist)? */
+function reminderDiffers(subscription) {
+  return subscription.reminder_enabled === false || Number(subscription.reminder_days ?? DEFAULT_REMINDER_DAYS) !== DEFAULT_REMINDER_DAYS;
+}
+
 function renderCard(subscription) {
-  const brandColor = subscription.brand_color || subscription.category_color || '#0F766E';
+  const brandColor = subscription.brand_color || subscription.category_color || SUBSCRIPTION_COLOR_DEFAULT;
   const status = statusMeta(subscription);
   const endInfo = endInfoLabel(subscription);
   // BEI `budget: read` OEFFNET DER ZEILENKOERPER DIE LESEANSICHT statt des
@@ -1094,8 +1114,8 @@ function renderCard(subscription) {
     <article class="subscription-card ${status.cardClass}"
              data-id="${subscription.id}" style="--subscription-color:${esc(brandColor)}">
       <button type="button" class="subscription-card__main list-row__main--interactive"
-              data-action="${ro ? 'view' : 'edit'}">
-        <span class="subscription-card__brand">
+              data-action="view">
+        <span class="subscription-card__brand budget-tile">
           ${subscription.logo_data
             ? `<img src="${esc(subscription.logo_data)}" alt="">`
             : `<span>${esc(subscription.name.slice(0, 2).toUpperCase())}</span>`}
@@ -1113,11 +1133,20 @@ function renderCard(subscription) {
                  ("Microsoft 365 Fa..."). Immer genau eine der beiden Fassungen
                  (subscriptions.css), wie beim Turnus. */ ''}
             <span class="subscription-card__meta-desc">${esc(subscription.description || rowCategoryLabel(subscription))}</span>
-            ${completed ? '' : `<span class="subscription-card__due${overdue ? ' subscription-card__due--overdue' : ''}"><i data-lucide="${overdue ? 'triangle-alert' : 'calendar-clock'}" aria-hidden="true"></i><span>${formatDate(subscription.next_payment_date)} ·</span> <span>${dueLabel(subscription)}</span></span>`}
+            ${completed ? '' : `<span class="subscription-card__due${overdue ? ' subscription-card__due--overdue' : ''}"><i data-lucide="${overdue ? 'triangle-alert' : 'calendar-clock'}" aria-hidden="true"></i><span>${esc(dateText(subscription.next_payment_date))} ·</span> <span>${dueLabel(subscription)}</span></span>`}
             <span class="subscription-card__meta-cycle">${cycleLabel(subscription)}</span>
-            <span class="subscription-card__meta-extra">${esc(rowPaymentMethodLabel(subscription))}</span>
-            ${completed ? '' : `<span class="subscription-card__meta-extra"><i data-lucide="${subscription.reminder_enabled === false ? 'bell-off' : 'bell'}" aria-hidden="true"></i>${subscription.reminder_enabled === false ? t('subscriptions.noReminder') : t('subscriptions.reminderMeta', { count: subscription.reminder_days })}</span>`}
+            ${/* DIE METAZEILE SAGT, WAS DIESES ABO UNTERSCHEIDET (Critique R24
+                 G4-Budget-P3-2): Zahlart und "3 Tage vorher" standen in JEDER
+                 Zeile - fuenf Angaben, zwei davon ueberall gleich. Die Zahlart
+                 steht im Leseblatt; die Erinnerung nur, wo sie vom Standard
+                 (3 Tage) abweicht oder aus ist. */ ''}
+            ${completed || !reminderDiffers(subscription) ? '' : `<span class="subscription-card__meta-extra"><i data-lucide="${subscription.reminder_enabled === false ? 'bell-off' : 'bell'}" aria-hidden="true"></i>${subscription.reminder_enabled === false ? t('subscriptions.noReminder') : t('subscriptions.reminderMeta', { count: subscription.reminder_days })}</span>`}
             ${endInfo ? `<span><i data-lucide="${endInfo.icon}" aria-hidden="true"></i>${esc(endInfo.text)}</span>` : ''}
+            ${/* RUHIG, ABER AUCH AM TELEFON (Entscheidung zu #1277): das Konto
+                 ist archiviert, das Abo bucht ohne Konto. Eine Metaangabe wie
+                 die anderen, kein Warnton - nichts ist kaputt, es fehlt nur
+                 die Zuordnung, bis jemand ein anderes Konto waehlt. */ ''}
+            ${subscription.account_archived && !completed ? `<span class="subscription-card__meta-account"><i data-lucide="archive" aria-hidden="true"></i>${esc(t('subscriptions.accountArchivedMeta', { name: subscription.account_name || '' }))}</span>` : ''}
           </span>
         </span>
         <span class="subscription-card__cost">
@@ -1125,11 +1154,26 @@ function renderCard(subscription) {
           ${converted ? `<span>${converted}</span>` : ''}
           <span class="subscription-card__cost-cycle">${cycleLabel(subscription)}</span>
         </span>
-        ${ro ? '' : `<span class="sr-only">${t('common.edit')}</span>`}
       </button>
-      ${canRenew ? `<div class="row-actions subscription-card__actions">
-        ${rowActionHtml({ icon: 'calendar-check', action: 'renew', label: t('subscriptions.markRenewedNamed', { name: subscription.name }) })}
-      </div>` : ''}
+      ${/* DIE ENDZONE WIE IN JEDEM BUDGET-REITER (R22, D9 nach R21-D10):
+           [eine Handlung][Mehr-Knopf]. Bis dahin stand am Zeiger nur der
+           Kalenderhaken und am Finger ein Wisch-Chevron - Loeschen gab es nur
+           per Geste und im Dialog. Der Mehr-Knopf traegt Verlaengern und
+           Loeschen sichtbar auf jedem Geraet; der Haken bleibt am Zeiger die
+           EINE Handlung davor, am Finger ist er das Wischen zum Zeilenanfang. */ ''}
+      ${ro ? '' : `<div class="row-actions subscription-card__actions">
+        ${canRenew ? rowActionHtml({ icon: 'calendar-check', action: 'renew', label: t('subscriptions.markRenewedNamed', { name: subscription.name }) }) : ''}
+        ${rowMenuHtml({
+          id: `subscription-menu-${subscription.id}`,
+          label: t('common.moreActionsNamed', { name: subscription.name }),
+          className: 'row-action--slim',
+          defer: true,
+          items: [
+            canRenew ? { action: 'renew', icon: 'calendar-check', label: t('subscriptions.markRenewed') } : null,
+            { action: 'delete', icon: 'trash-2', label: t('common.delete'), danger: true },
+          ],
+        })}
+      </div>`}
     </article>
     </div>
   `;
@@ -1183,13 +1227,15 @@ function renderEmpty() {
   // erste braucht eine Anlegen-Aktion, der zweite einen Weg zurück. Die
   // Variante traegt den Unterschied jetzt mit: `no-results` wird als
   // `role="status"` angesagt und fuehrt einen sekundaeren CTA.
+  //
+  // Seit Critique R23 (Q4) der geteilte Leerzustand der Suche: Suchbegriff und
+  // Filter als Chips, "Suche zuruecksetzen" nimmt beides zurueck - dieselbe
+  // Form wie in Budget, Kontakten und Notizen statt eines eigenen "Filter"-Satzes.
   if (hasActiveFilters()) {
-    return emptyStateHTML({
-      variant: 'no-results',
-      icon: 'filter-x',
-      title: t('subscriptions.noMatchesTitle'),
-      description: t('subscriptions.noMatchesDescription'),
-      action: { label: t('subscriptions.resetFilters'), attrs: { id: 'subscriptions-empty-reset' } },
+    return searchEmptyHTML({
+      query: state.query,
+      filters: activeFilters().map((filter) => filter.value),
+      resetAttrs: { id: 'subscriptions-empty-reset' },
     });
   }
   // Bei `budget: read` bleibt nur der Titel: Beschreibung und CTA sind die
@@ -1205,7 +1251,6 @@ function renderEmpty() {
 }
 
 function bindContent() {
-  wireMetricGlance(container, 'subscriptions-glance-more', (on) => { state.summaryExpanded = on; });
   container.querySelector('#subscriptions-refresh-rates')?.addEventListener('click', () => reload({ refreshRates: true }));
   container.querySelector('#subscriptions-empty-add')?.addEventListener('click', () => openSubscriptionModal());
   container.querySelector('#subscriptions-empty-reset')?.addEventListener('click', resetFilters);
@@ -1226,7 +1271,7 @@ function bindContent() {
     // eine klickbare Zeile). Ein blosser Tap-Handler auf dem `<article>` haette
     // den Bearbeiten-Knopf entfernt, ohne einen Tastaturweg an seine Stelle zu
     // setzen - das waere kein Aufraeumen, sondern ein Regress.
-    if (action.dataset.action === 'view') openSubscriptionReadView(subscription);
+    if (action.dataset.action === 'view') openSubscriptionReadView(subscription, { editable: !readOnly() });
     if (action.dataset.action === 'edit') openSubscriptionModal(subscription);
     if (action.dataset.action === 'renew') await renewSubscription(subscription);
     if (action.dataset.action === 'delete') await deleteSubscription(subscription);
@@ -1334,12 +1379,17 @@ function wireCombobox(panel, id) {
       open();
       (visible[Math.min(active + 1, visible.length - 1)] || visible[0])?.focus();
     }
-    if (event.key === 'Enter' && visible.length) {
+    if (event.key === 'Enter' && visible.length && !isImeComposing(event)) {
       event.preventDefault();
       event.stopPropagation();
       selectFromKeyboard(visible[0]);
     }
-    if (event.key === 'Escape') close();
+    if (event.key === 'Escape' && !root.querySelector('.subscriptions-combobox__options').hidden) {
+      // Offene Liste: Esc schliesst nur sie. preventDefault sagt dem Modal
+      // (onEscape), dass das Esc verbraucht ist - sonst ginge das Formular mit.
+      event.preventDefault();
+      close();
+    }
   });
   options.forEach((option) => {
     option.addEventListener('pointerdown', (event) => {
@@ -1357,6 +1407,7 @@ function wireCombobox(panel, id) {
         visible[Math.max(0, Math.min(visible.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)))]?.focus();
       }
       if (event.key === 'Escape') {
+        event.preventDefault();
         close();
         search.focus();
       }
@@ -1389,7 +1440,7 @@ function subscriptionReadSections(subscription) {
     { icon: 'calendar-clock', label: t('subscriptions.detailNextPaymentLabel'),
       // Abgeschlossen: keine naechste Zahlung (#2009, wie die Karte).
       value: subscription.next_payment_date && !isCompleted(subscription)
-        ? `${formatDate(subscription.next_payment_date)} · ${dueLabel(subscription)}` : '' },
+        ? `${dateText(subscription.next_payment_date, { weekday: true })} · ${dueLabel(subscription)}` : '' },
     // Abgeschlossen: keine Erinnerung (#2011) - syncReminder hat sie entfernt.
     { icon: subscription.reminder_enabled === false ? 'bell-off' : 'bell', label: t('subscriptions.reminderDaysLabel'),
       value: isCompleted(subscription) ? '' : subscription.reminder_enabled === false ? t('subscriptions.noReminder') : t('subscriptions.reminderMeta', { count: subscription.reminder_days }) },
@@ -1397,22 +1448,50 @@ function subscriptionReadSections(subscription) {
     { icon: 'tags', label: t('subscriptions.categoryLabel'), value: subscription.category_id ? rowCategoryLabel(subscription) : '' },
     { icon: 'wallet-cards', label: t('subscriptions.paymentMethodLabel'),
       value: subscription.payment_method_id ? rowPaymentMethodLabel(subscription) : '' },
+    { icon: 'wallet', label: t('budget.accountLabel'),
+      value: subscription.account_id == null ? ''
+        : (subscription.account_archived
+          ? t('subscriptions.accountArchivedMeta', { name: subscription.account_name || '' })
+          : subscription.account_name || '') },
     { icon: 'at-sign', label: t('subscriptions.accountUsernameLabel'), value: subscription.account_username || '' },
     { icon: 'sticky-note', label: t('subscriptions.notesLabel'), value: subscription.notes || '', multiline: true },
   ];
 }
 
 /**
- * Das Abo bei `budget: read`: eine Leseansicht, sonst nichts. Dieselbe Bauart
- * wie die Buchung in budget.js (P1-Muster: der Einstieg in den Editor verzweigt,
- * die geteilte Leseansicht ohne `edit` und ohne `actions`).
+ * DAS ABO ALS LESEBLATT (R24, E1; Critique G4-Budget-P2-4). Bis R24 oeffnete
+ * der Tipp auf die Zeile das Formular, den Namen fokussiert - am Telefon mit
+ * der Tastatur ueber dem halben Blatt. Jetzt zuerst das Blatt mit Betrag,
+ * Turnus, naechster Zahlung, Zahlart und Konto; Bearbeiten ist der EINE
+ * Primaerknopf (withPrimaryEdit), "Verlaengert" steht sekundaer davor, solange
+ * das Abo eine naechste Zahlung hat. Bei `budget: read` (P1-Muster) dasselbe
+ * Blatt ohne Fuss.
  */
-function openSubscriptionReadView(subscription) {
+function openSubscriptionReadView(subscription, { editable = false } = {}) {
+  const leave = (next) => async ({ close } = {}) => {
+    await (close ?? closeDetailView)({ force: true });
+    await next();
+  };
+  const actions = editable ? withPrimaryEdit([
+    !isCompleted(subscription) && {
+      id: 'subscription-read-renew',
+      label: t('subscriptions.markRenewed'),
+      icon: 'calendar-check',
+      variant: 'secondary',
+      onClick: leave(() => renewSubscription(subscription)),
+    },
+  ], {
+    id: 'subscription-read-edit',
+    label: t('common.edit'),
+    onClick: leave(() => openSubscriptionModal(subscription)),
+  }) : [];
   return openDetailView({
     title: subscription.name,
+    key: `subscription:${subscription.id}`,
     accentColor: subscription.brand_color || subscription.category_color || 'var(--module-budget)',
     size: 'sm',
     sections: subscriptionReadSections(subscription),
+    actions,
   });
 }
 
@@ -1469,6 +1548,84 @@ async function offerCurrentMeta(panel, id, reason, owner) {
   panel.querySelector(`#${id}-search`)?.focus();
 }
 
+/**
+ * DAS KONTO DES ABOS (#1277): die Vorgabe fuer jede Buchung, die es bucht.
+ * Zur Wahl stehen die aktiven Konten; ein archiviertes nur, wenn es das
+ * gewaehlte ist - dann bucht das Abo ohne Konto (Entscheidung zu #1277), und
+ * der Hinweis darunter sagt es. Ohne Konten gibt es das Feld nicht, wie im
+ * Buchungsdialog.
+ */
+function accountFieldHtml(subscription) {
+  const accounts = state.meta.accounts ?? [];
+  if (!accounts.length) return '';
+  const current = subscription?.account_id ?? null;
+  const options = accounts
+    .filter((account) => !account.archived || account.id === current)
+    .map((account) => `<option value="${account.id}"${account.id === current ? ' selected' : ''}${account.archived ? ' data-archived="true"' : ''}>${esc(account.archived
+      ? t('subscriptions.accountArchivedOption', { name: account.name })
+      : account.name)}</option>`)
+    .join('');
+  const archived = accounts.some((account) => account.id === current && account.archived);
+  return `
+        <div class="form-group" data-subscription-account-field>
+          <label class="form-label" for="subscription-account-id">${t('budget.accountLabel')}</label>
+          <select class="form-input" id="subscription-account-id"
+                  aria-describedby="subscription-account-id-hint subscription-account-id-archived">
+            <option value=""${current === null ? ' selected' : ''}>${t('budget.noAccount')}</option>${options}
+          </select>
+          <p class="form-hint" id="subscription-account-id-hint">${t('subscriptions.accountHint')}</p>
+          <p class="form-hint" id="subscription-account-id-archived"${archived ? '' : ' hidden'}>${t('subscriptions.accountArchivedHint')}</p>
+        </div>`;
+}
+
+/** Der Archiv-Hinweis folgt der Wahl: er steht, solange ein archiviertes gewaehlt ist. */
+function wireAccountField(panel) {
+  const select = panel.querySelector('#subscription-account-id');
+  if (!select) return;
+  select.addEventListener('change', () => {
+    const hint = panel.querySelector('#subscription-account-id-archived');
+    if (hint) hint.hidden = select.selectedOptions?.[0]?.dataset.archived !== 'true';
+  });
+}
+
+/**
+ * DIE SICHTBARKEIT DES ABOS (#1701): dieselbe Wahl unter derselben Bedingung
+ * wie im Buchungsdialog (budget.js) - nur im persoenlichen Budget-Modus, im
+ * geteilten sieht ohnehin jeder alles. Ein neues Abo steht auf "geteilt" wie
+ * eine neue Buchung; die Buchungen des Abos folgen seiner Stufe.
+ */
+function visibilityFieldHtml(subscription) {
+  if (state.meta.budget_mode !== 'personal') return '';
+  const level = subscription?.visibility === 'private' ? 'private' : 'shared';
+  return `
+        <div class="form-group">
+          <label class="form-label" for="subscription-visibility">${t('budget.visibilityLabel')}</label>
+          <select class="form-input" id="subscription-visibility" aria-describedby="subscription-visibility-hint">
+            ${['private', 'shared'].map((option) => `<option value="${option}"${option === level ? ' selected' : ''}>${t(`budget.visibility_${option}`)}</option>`).join('')}
+          </select>
+          <p class="form-hint" id="subscription-visibility-hint">${t(`subscriptions.visibilityHint_${level}`)}</p>
+        </div>`;
+}
+
+/**
+ * Das gewaehlte Konto gibt es nicht mehr (#1277): wie bei Kategorie und
+ * Zahlungsart bleibt der Dialog offen, die Seite laedt neu, und die Wahl kommt
+ * aus dem frischen Stand, auf "Kein Konto".
+ */
+async function offerCurrentAccounts(panel, owner) {
+  const goneId = Number(panel.querySelector('#subscription-account-id')?.value) || null;
+  if (!isCurrentOwner(owner)) return;
+  await reload(undefined, { owner, quiet: true });
+  if (!isCurrentOwner(owner)) return;
+  const field = panel.querySelector('[data-subscription-account-field]');
+  if (!field) return;
+  state.meta.accounts = (state.meta.accounts ?? []).filter((account) => account.id !== goneId);
+  field.insertAdjacentHTML('afterend', accountFieldHtml(null));
+  field.remove();
+  wireAccountField(panel);
+  panel.querySelector('#subscription-account-id')?.focus();
+}
+
 export function openSubscriptionModal(subscription = null) {
   // Der Riegel steht VOR jeder Vorbereitung: der Anlegeweg entfaellt ganz, ein
   // bestehendes Abo geht als Leseansicht auf (P1-Muster wie openNoteModal).
@@ -1480,10 +1637,7 @@ export function openSubscriptionModal(subscription = null) {
   // Jedes Abo trägt seine eigene Währung; das Betragsfeld richtet sich danach
   // und wird beim Wechsel der Währungs-Combobox nachgezogen.
   const formCurrency = subscription?.currency || state.settings.base_currency;
-  const cycleItems = state.meta.billing_cycles.map((cycle) => ({
-    value: cycle,
-    label: t(`subscriptions.cycle.${cycle}`),
-  }));
+  const formCycle = subscription?.billing_cycle || 'monthly';
   const initialLogo = subscription?.logo_data || '';
   const initialName = subscription?.name || '';
 
@@ -1492,26 +1646,28 @@ export function openSubscriptionModal(subscription = null) {
   const advancedOpen = edit && (
     !!subscription.category_id
     || !!subscription.payment_method_id
-    || (!!subscription.brand_color && subscription.brand_color !== '#0F766E')
+    || (!!subscription.brand_color && subscription.brand_color !== SUBSCRIPTION_COLOR_DEFAULT)
     || !!subscription.notes
     || subscription.enabled === false
+    || (state.meta.budget_mode === 'personal' && subscription.visibility === 'private')
   );
 
   const advancedFieldsHtml = `
       <section class="subscription-form__section">
-        <h3><i data-lucide="tags" aria-hidden="true"></i>${t('subscriptions.organizationDetails')}</h3>
+        <h3 class="subscription-form__title">${t('subscriptions.organizationDetails')}</h3>
+        ${visibilityFieldHtml(subscription)}
         <div class="subscription-form__organization-grid">
           ${metaComboboxMarkup('subscription-category', subscription?.category_id || '')}
           ${metaComboboxMarkup('subscription-method', subscription?.payment_method_id || '')}
           <div class="form-group subscription-form__color">
-            <label class="form-label" for="subscription-color">${t('subscriptions.brandColorLabel')}</label>
-            <input class="form-input form-input--color" id="subscription-color" type="color" value="${esc(subscription?.brand_color || '#0F766E')}">
+            <span class="form-label" id="subscription-color-label">${t('subscriptions.brandColorLabel')}</span>
+            ${colorPickerHtml({ id: 'subscription-color', value: subscription?.brand_color || SUBSCRIPTION_COLOR_DEFAULT, labelledBy: 'subscription-color-label', options: subscriptionColorOptions() })}
           </div>
         </div>
       </section>
 
       <section class="subscription-form__section">
-        <h3><i data-lucide="panel-top" aria-hidden="true"></i>${t('subscriptions.serviceDetails')}</h3>
+        <h3 class="subscription-form__title">${t('subscriptions.serviceDetails')}</h3>
         <div class="form-group">
           <label class="form-label" for="subscription-account">${t('subscriptions.accountUsernameLabel')}</label>
           <input class="form-input" type="text" id="subscription-account" maxlength="200"
@@ -1522,32 +1678,34 @@ export function openSubscriptionModal(subscription = null) {
           <label class="form-label" for="subscription-notes">${t('subscriptions.notesLabel')}</label>
           <textarea class="form-input" id="subscription-notes" rows="3">${esc(subscription?.notes || '')}</textarea>
         </div>
-        <div class="subscriptions-enabled-row">
-          <div>
-            <strong>${t('subscriptions.enabledLabel')}</strong>
-            <small>${t('subscriptions.enabledHint')}</small>
-          </div>
-          <label class="toggle">
-            <input id="subscription-enabled" type="checkbox" ${subscription?.enabled === false ? '' : 'checked'}>
-            <span class="toggle__track"></span>
-          </label>
-        </div>
+        ${formSwitchRowHtml({
+          label: t('subscriptions.enabledLabel'), checked: subscription?.enabled !== false,
+          hint: t('subscriptions.enabledHint'), hintId: 'subscription-enabled-hint', attrs: { id: 'subscription-enabled' },
+        })}
       </section>`;
 
   const content = `
-    <form id="subscription-form" class="subscription-form">
+    <form id="subscription-form" class="subscription-form" novalidate>
       <section class="subscription-form__section subscription-form__identity">
+        ${/* DAS LOGO IST EIN BEDIENELEMENT (Critique R24 G4-Budget-P3-3,
+             Baustein `.media-picker`): die Kachel IST die Dateiwahl, das
+             Abzeichen an ihrer Ecke sagt es - "Logo hochladen" als zweite
+             Beschriftung darunter ist weg. "Logo finden" bleibt eine eigene
+             Handlung (Suche im Netz), als ruhiger Knopf darunter. */ ''}
         <div class="subscription-logo-tools">
-          <label class="subscription-logo-picker" for="subscription-logo" title="${t('subscriptions.logoLabel')}">
-            <span id="subscription-logo-preview">
-              ${initialLogo
-                ? `<img src="${esc(initialLogo)}" alt="">`
-                : `<strong>${esc(initialName.slice(0, 2).toUpperCase() || '+')}</strong>`}
-            </span>
-            <small><i data-lucide="upload" aria-hidden="true"></i>${t('subscriptions.logoLabel')}</small>
-            <input id="subscription-logo" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml">
-          </label>
-          <button class="btn btn--secondary subscription-find-logo-btn" type="button" id="subscription-find-logo">
+          <span class="media-picker">
+            <button type="button" class="subscription-logo-picker" id="subscription-logo-button" aria-label="${esc(t('subscriptions.logoLabel'))}">
+              <span id="subscription-logo-preview">
+                ${initialLogo
+                  ? `<img src="${esc(initialLogo)}" alt="">`
+                  : `<strong>${esc(initialName.slice(0, 2).toUpperCase() || '+')}</strong>`}
+              </span>
+            </button>
+            ${mediaPickerBadgeHtml()}
+          </span>
+          <input class="sr-only" id="subscription-logo" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml"
+                 aria-label="${esc(t('subscriptions.logoLabel'))}" tabindex="-1">
+          <button class="btn btn--secondary btn--sm subscription-find-logo-btn" type="button" id="subscription-find-logo">
             <i data-lucide="scan-search" aria-hidden="true"></i>${t('subscriptions.findLogo')}
           </button>
         </div>
@@ -1564,56 +1722,52 @@ export function openSubscriptionModal(subscription = null) {
       </section>
 
       <section class="subscription-form__section">
-        <h3><i data-lucide="receipt-text" aria-hidden="true"></i>${t('subscriptions.billingDetails')}</h3>
+        <h3 class="subscription-form__title">${t('subscriptions.billingDetails')}</h3>
         <div class="subscription-form__billing-grid">
+          ${/* DIE WAEHRUNG STEHT IM BETRAG (R22 D9, Critique R24
+               G4-Budget-P1-1): bis R24 eine eigene Such-Combobox mit Lupe
+               ("EUR · Euro") neben dem Betrag. Jetzt die Wahl als Code im
+               Suffix des Felds, derselbe Baustein wie Ausgabe und Serie. */ ''}
           <div class="form-group">
             <label class="form-label" for="subscription-amount">${t('subscriptions.amountLabel')}${REQUIRED_MARK}</label>
-            <input class="form-input" id="subscription-amount" type="number"
-                   min="0"
-                   step="${amountStep(formCurrency, subscription?.amount ?? '')}"
-                   placeholder="${amountPlaceholder(formCurrency)}"
-                   inputmode="decimal" required value="${subscription?.amount ?? ''}">
+            ${amountFieldHtml({ id: 'subscription-amount', currency: formCurrency, value: subscription?.amount ?? '', currencies: CURRENCY_CODES, currencyId: 'subscription-currency', currencyName: 'currency' })}
           </div>
-          ${comboboxMarkup({
-            id: 'subscription-currency',
-            label: t('subscriptions.currencyLabel'),
-            required: true,
-            items: currencyItems(),
-            value: subscription?.currency || state.settings.base_currency,
-            placeholder: t('subscriptions.currencySearchPlaceholder'),
-          })}
-          ${comboboxMarkup({
-            id: 'subscription-cycle',
-            label: t('subscriptions.billingCycleLabel'),
-            items: cycleItems,
-            value: subscription?.billing_cycle || 'monthly',
-            placeholder: t('subscriptions.billingCycleLabel'),
-          })}
-          <div class="form-group">
-            <label class="form-label" for="subscription-interval">${t('subscriptions.intervalLabel')}</label>
-            <input class="form-input" id="subscription-interval" type="number" min="1" max="365" step="1" value="${subscription?.cycle_interval || 1}">
+          ${/* DER ZYKLUS IST EIN SATZ (Critique R24 G4-Budget-P3-3): "Alle [1] [Monat]"
+               statt "Abrechnungszyklus" als Suchfeld und daneben "Alle" ueber einer
+               nackten 1 (utils/interval-sentence.js). Die Woerter der Wahl folgen der
+               Zahl und kommen aus dem Satz der Einheit (S4, F1). */ ''}
+          <div class="form-group subscription-form__cycle">
+            <span class="form-label" id="subscription-cycle-label">${t('subscriptions.billingCycleLabel')}</span>
+            ${intervalSentenceHtml({
+              units: { id: 'subscription-cycle', options: state.meta.billing_cycles, selected: formCycle },
+              labelledBy: 'subscription-cycle-label',
+              count: subscription?.cycle_interval || 1,
+              countHtml: `<input class="form-input" id="subscription-interval" type="number" min="1" max="365" step="1" inputmode="numeric" value="${esc(String(subscription?.cycle_interval || 1))}" aria-labelledby="subscription-cycle-label">`,
+            })}
+          </div>
+          ${/* DIE NAECHSTE ZAHLUNG GEHOERT ZUR ABRECHNUNG (Critique R24
+               G4-Budget-P3-3): sie hing unter dem Erinnerungs-Schalter, weit
+               weg von Betrag und Turnus, aus denen sie folgt. */ ''}
+          <div class="form-group subscription-form__next">
+            <label class="form-label" for="subscription-next-date">${t('subscriptions.nextPaymentLabel')}${REQUIRED_MARK}</label>
+            <yuvomi-datepicker id="subscription-next-date" type="date" required
+                   value="${esc(subscription?.next_payment_date || todayKey())}"></yuvomi-datepicker>
+            ${isCompleted(subscription) ? `<p class="form-hint" id="subscription-next-date-hint">${t('subscriptions.nextPaymentCompletedHint')}</p>` : ''}
           </div>
         </div>
+        ${accountFieldHtml(subscription)}
       </section>
 
       <section class="subscription-form__section">
-        <h3><i data-lucide="calendar-clock" aria-hidden="true"></i>${t('subscriptions.renewalDetails')}</h3>
+        <h3 class="subscription-form__title">${t('subscriptions.renewalDetails')}</h3>
         ${toggleRowHtml({
           label: t('subscriptions.reminderEnabledLabel'), control: 'switch',
           checked: subscription?.reminder_enabled !== false,
           attrs: { id: 'subscription-reminder-enabled' },
         })}
-        <div class="form-grid-2">
-          <div class="form-group">
-            <label class="form-label" for="subscription-next-date">${t('subscriptions.nextPaymentLabel')}${REQUIRED_MARK}</label>
-            <yuvomi-datepicker id="subscription-next-date" type="date"
-                   value="${esc(subscription?.next_payment_date || todayKey())}"></yuvomi-datepicker>
-            ${isCompleted(subscription) ? `<p class="form-hint" id="subscription-next-date-hint">${t('subscriptions.nextPaymentCompletedHint')}</p>` : ''}
-          </div>
-          <div class="form-group">
-            <label class="form-label" for="subscription-reminder">${t('subscriptions.reminderDaysLabel')}</label>
-            <input class="form-input" id="subscription-reminder" type="number" min="0" max="365" step="1" value="${subscription?.reminder_days ?? 3}"${subscription?.reminder_enabled === false ? ' disabled' : ''}>
-          </div>
+        <div class="form-group">
+          <label class="form-label" for="subscription-reminder">${t('subscriptions.reminderDaysLabel')}</label>
+          <input class="form-input" id="subscription-reminder" type="number" min="0" max="365" step="1" value="${subscription?.reminder_days ?? DEFAULT_REMINDER_DAYS}"${subscription?.reminder_enabled === false ? ' disabled' : ''}>
         </div>
         <div class="form-group">
           <label class="form-label" for="subscription-end-type">${t('subscriptions.endLabel')}</label>
@@ -1636,11 +1790,11 @@ export function openSubscriptionModal(subscription = null) {
         </div>
       </section>
 
-      ${advancedSection(advancedFieldsHtml, { open: advancedOpen })}
+      ${advancedSection(advancedFieldsHtml, { open: advancedOpen, hint: t('subscriptions.moreDetailsHint') })}
       <div class="modal-panel__footer subscriptions-modal-footer">
         ${edit ? `<button type="button" class="btn btn--danger-outline" id="subscription-delete"
-                aria-label="${esc(t('common.deleteNamed', { name: subscription.name }))}" style="margin-inline-end:auto">
-          <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i><span>${esc(t('common.delete'))}</span>
+                aria-label="${esc(t('common.deleteNamed', { name: subscription.name }))}">
+          <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${esc(t('common.delete'))}
         </button>` : ''}
         <button class="btn btn--secondary" type="button" id="subscription-cancel">${t('common.cancel')}</button>
         <button class="btn btn--primary" type="submit">${edit ? t('common.save') : t('common.add')}</button>
@@ -1648,10 +1802,13 @@ export function openSubscriptionModal(subscription = null) {
     </form>
   `;
   openModal({
+    staged: !edit, // Buehne zuerst, Felder nach dem ersten Bild (modal.js, R21 a6)
     title: edit ? t('subscriptions.editTitle') : t('subscriptions.addTitle'),
+    initialFocus: edit ? 'edit' : 'first-field',
     content,
     size: 'lg',
     onSave(panel) {
+      wireColorPicker(panel);
       let searchedLogoData = null;
       const logoPreview = panel.querySelector('#subscription-logo-preview');
       const showLogo = (data) => {
@@ -1662,16 +1819,21 @@ export function openSubscriptionModal(subscription = null) {
           logoPreview.insertAdjacentHTML('afterbegin', `<strong>${esc(panel.querySelector('#subscription-name').value.slice(0, 2).toUpperCase() || '+')}</strong>`);
         }
       };
-      wireCombobox(panel, 'subscription-currency');
-      // Ohne `required`: ein Abo darf 0 kosten (Gratis-Tarif, Server prüft
-      // amount >= 0), die Untergrenze bleibt also bei null statt bei einer
-      // kleinsten Einheit.
+      // Die Kachel oeffnet die Dateiwahl (media-picker): das Feld selbst ist
+      // versteckt und nicht im Tab-Lauf.
+      panel.querySelector('#subscription-logo-button').addEventListener('click', () => panel.querySelector('#subscription-logo').click());
+      // Ein Abo darf 0 kosten (Gratis-Tarif, Server prüft amount >= 0): das
+      // Speichern prueft deshalb mit `sign: 'nonNegative'`.
       panel.querySelector('#subscription-currency').addEventListener('change', (event) => {
-        applyAmountFormat(panel.querySelector('#subscription-amount'), event.target.value);
+        setAmountCurrency(panel.querySelector('#subscription-amount'), event.target.value);
       });
-      wireCombobox(panel, 'subscription-cycle');
       wireCombobox(panel, 'subscription-category');
       wireCombobox(panel, 'subscription-method');
+      wireAccountField(panel);
+      const visibility = panel.querySelector('#subscription-visibility');
+      visibility?.addEventListener('change', () => {
+        panel.querySelector('#subscription-visibility-hint').textContent = t(`subscriptions.visibilityHint_${visibility.value}`);
+      });
       const reminderEnabled = panel.querySelector('#subscription-reminder-enabled');
       reminderEnabled.addEventListener('change', () => {
         panel.querySelector('#subscription-reminder').disabled = !reminderEnabled.checked;
@@ -1755,9 +1917,9 @@ async function saveSubscription(panel, existing, searchedLogoData = null) {
     fieldErrors.push([dateInput, t('subscriptions.invalidDate')]);
   }
   if (!currencyInput.value) {
-    // Die Meldung klebt am sichtbaren Suchfeld der Combobox, nicht am
-    // versteckten Wert-Input.
-    fieldErrors.push([panel.querySelector('#subscription-currency-search'), t('subscriptions.currencyRequired')]);
+    // Seit R24 eine Wahl im Suffix des Betrags - leer kann sie nur ein
+    // Nachbau sein; die Meldung steht dann an ihr.
+    fieldErrors.push([currencyInput, t('subscriptions.currencyRequired')]);
   }
   // Ende-Bedingung (#594): nur das aktive Zusatzfeld liefert einen Wert.
   const endType = panel.querySelector('#subscription-end-type').value;
@@ -1788,22 +1950,24 @@ async function saveSubscription(panel, existing, searchedLogoData = null) {
     }
     occurrenceCount = count;
   }
-  // Bei einem Bestandsbetrag neben dem Raster liefert amountStep "any", damit
-  // sich das vorhandene Abo überhaupt noch speichern lässt. Das gilt aber fürs
-  // ganze Feld: ohne diese Prüfung wäre aus 12,5 JPY anschliessend auch
-  // 12,555 JPY speicherbar, also mehr Bruch als die feste Schrittweite zuliess.
-  // Ohne Waehrung gibt es kein Raster - dann meldet nur das Waehrungsfeld.
+  // Der Betrag als TEXT (D1): "1.200" unter de ist abgewiesen und benannt,
+  // nie still 1,2. Ein Bestandsbetrag neben dem Raster bleibt unangetastet
+  // speicherbar (`original`), ein neuer nicht. Ohne Waehrung gibt es kein
+  // Raster - dann meldet fuer die Stellen nur das Waehrungsfeld. Leer meldet
+  // `constraintErrors` unten (Pflichtfeld).
   const amountInput = panel.querySelector('#subscription-amount');
-  const amountValue = Number(amountInput.value);
   const targetCurrency = currencyInput.value.trim().toUpperCase();
-  if (targetCurrency && !amountIsSavable(amountValue, targetCurrency, {
+  const amountProblem = amountFieldError(amountInput, targetCurrency || state.settings.base_currency, {
+    sign: 'nonNegative',
     original: existing?.amount ?? null,
     originalCurrency: existing?.currency ?? null,
-  })) {
-    fieldErrors.push([amountInput, t('common.amountPrecisionRequired', {
-      currency: targetCurrency,
-      step: smallestUnitLabel(targetCurrency),
-    })]);
+    precision: Boolean(targetCurrency),
+  });
+  if (amountProblem) fieldErrors.push(amountProblem);
+  // KEINE BROWSER-BLASEN (Critique R21): `novalidate`, die Regeln des Markups melden sich am Feld (constraintErrors, components/modal.js).
+  // Was die eigenen Pruefungen oben schon nennen, steht nicht doppelt.
+  for (const entry of constraintErrors(panel.querySelector('#subscription-form'))) {
+    if (!fieldErrors.some(([field]) => field === entry[0])) fieldErrors.push(entry);
   }
   if (reportFieldErrors(fieldErrors)) return;
 
@@ -1818,7 +1982,7 @@ async function saveSubscription(panel, existing, searchedLogoData = null) {
     const payload = {
       name: panel.querySelector('#subscription-name').value.trim(),
       description: panel.querySelector('#subscription-description').value.trim() || null,
-      amount: Number(panel.querySelector('#subscription-amount').value),
+      amount: parseAmountInput(panel.querySelector('#subscription-amount').value),
       currency: panel.querySelector('#subscription-currency').value.trim().toUpperCase(),
       billing_cycle: panel.querySelector('#subscription-cycle').value,
       cycle_interval: Number(panel.querySelector('#subscription-interval').value),
@@ -1839,18 +2003,30 @@ async function saveSubscription(panel, existing, searchedLogoData = null) {
       end_date: endDate,
       occurrence_count: occurrenceCount,
     };
+    // Konto und Sichtbarkeit nur, wenn der Dialog sie zeigt (#1277, #1701):
+    // ohne Kontofeld bleibt das Konto des Abos stehen, im geteilten Modus
+    // entscheidet der Server die Sichtbarkeit.
+    const accountSelect = panel.querySelector('#subscription-account-id');
+    if (accountSelect) payload.account_id = Number(accountSelect.value) || null;
+    const visibilitySelect = state.meta.budget_mode === 'personal' ? panel.querySelector('#subscription-visibility') : null;
+    if (visibilitySelect) payload.visibility = visibilitySelect.value === 'private' ? 'private' : 'shared';
     if (existing) await api.put(`/budget/subscriptions/${existing.id}`, payload);
     else await api.post('/budget/subscriptions', payload);
     // Nur DIESEN Dialog: einen inzwischen geoeffneten anderen laesst die
     // spaete Antwort stehen (#1997).
     await closeModal({ force: true, context: dialog });
-    if (await reload(undefined, { motion: true, owner })) refocusAfterRender();
+    if (await reloadAfterSave(() => reload(undefined, { motion: true, owner }))) refocusAfterRender();
     window.yuvomi?.showToast(t(existing ? 'subscriptions.savedToast' : 'subscriptions.addedToast'), 'success');
   } catch (err) {
     const goneSelect = selectedMetaGone(err);
     if (goneSelect) {
       window.yuvomi?.showToast(errorText(err), 'danger');
       await offerCurrentMeta(panel, goneSelect, err.data.reason, owner);
+      return;
+    }
+    if (err?.data?.reason === 'subscriptions_account_not_found') {
+      window.yuvomi?.showToast(errorText(err), 'danger');
+      await offerCurrentAccounts(panel, owner);
       return;
     }
     reportError(err, { owner, dialog });
@@ -1869,7 +2045,11 @@ function logoOptionsMarkup(options) {
 }
 
 function openLogoPickerModal(panel, initialQuery, onSelect) {
-  panel.querySelector('.subscriptions-logo-picker-modal')?.remove();
+  // Der Knopf "Logo suchen", der den Picker oeffnet - dorthin geht der Fokus zurueck.
+  const opener = document.activeElement;
+  const stale = panel.querySelector('.subscriptions-logo-picker-modal');
+  stale?._releaseBackground?.();
+  stale?.remove();
   panel.insertAdjacentHTML('beforeend', `
     <div class="subscriptions-logo-picker-modal" role="dialog" aria-modal="true" aria-labelledby="subscription-logo-picker-title">
       <div class="subscriptions-logo-picker-panel">
@@ -1896,10 +2076,22 @@ function openLogoPickerModal(panel, initialQuery, onSelect) {
     </div>
   `);
   const overlay = panel.querySelector('.subscriptions-logo-picker-modal');
+  // Das Abo-Formular darunter ist gesperrt, solange der Picker offen ist
+  // (utils/background-inert.js); freigegeben VOR der Fokus-Rueckgabe.
+  overlay._releaseBackground = inertOutside(overlay);
   const results = overlay.querySelector('#subscription-logo-results');
   const input = overlay.querySelector('#subscription-logo-search-input');
   let options = [];
-  const close = () => overlay.remove();
+  const close = () => {
+    // Mit dem Picker ginge das fokussierte Suchfeld weg, und der Fokus fiele auf
+    // body - aus der Fokusfalle des Abo-Formulars heraus (Codex-Review zu #2055).
+    const hadFocus = overlay.contains(document.activeElement);
+    overlay._releaseBackground();
+    overlay.remove();
+    if (!hadFocus) return;
+    const target = opener?.isConnected ? opener : panel.querySelector('#subscription-find-logo');
+    target?.focus();
+  };
   // Der Picker liegt ueber dem Abo-Formular; die Zurueck-Geste meint ihn (#871).
   attachOverlay(overlay, close);
   const search = async () => {
@@ -1932,7 +2124,12 @@ function openLogoPickerModal(panel, initialQuery, onSelect) {
     close();
   });
   overlay.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') close();
+    if (event.key === 'Escape') {
+      // Esc meint den Picker, nicht das Abo-Formular darunter (onEscape in
+      // modal.js wertet preventDefault als "schon erledigt").
+      event.preventDefault();
+      close();
+    }
   });
   overlay.querySelector('#subscription-logo-picker-close').addEventListener('click', close);
   overlay.querySelector('#subscription-logo-search-form').addEventListener('submit', async (event) => {
@@ -1944,26 +2141,39 @@ function openLogoPickerModal(panel, initialQuery, onSelect) {
 }
 
 // Eine Zahlung zu buchen schiebt das Faelligkeitsdatum und legt einen
-// Budget-Eintrag an. Beides ist mit einem zweiten Wisch NICHT umkehrbar - anders
-// als das Abhaken einer Aufgabe, das dieselbe Kante traegt. Deshalb fragt die
-// Aktion nach, und deshalb fragt sie an BEIDEN Wegen nach, Geste wie Knopf: eine
-// Bestaetigung, die nur an einem der beiden haengt, ist keine Regel, sondern
-// eine Eigenschaft des Wegs.
+// Budget-Eintrag an. Bis R23 fragte die Aktion deshalb an BEIDEN Wegen nach
+// (Geste wie Knopf), weil sich nichts zurueckholen liess - die Rueckfrage stand
+// an der Stelle eines Rueckwegs (N4). Seit R23 (D6) nimmt "Rueckgaengig" im
+// Toast die Zahlung am Server ECHT zurueck (POST /renew/undo: Datum, Zaehler,
+// Abschluss, beide Buchungen), und keiner der beiden Wege fragt mehr.
 async function renewSubscription(subscription) {
   if (readOnly()) return;
   // Ein abgeschlossenes Abo hat keine naechste Zahlung (#2011): weder Knopf
-  // noch Geste fragen nach, der Server lehnt es ohnehin ab.
+  // noch Geste tun etwas, der Server lehnt es ohnehin ab.
   if (isCompleted(subscription)) return;
-  const confirmed = await confirmModal(
-    t('subscriptions.renewConfirm', { name: subscription.name }),
-    { detail: t('subscriptions.renewConfirmDetail', { date: formatDate(subscription.next_payment_date) }) });
-  if (!confirmed) return;
   const owner = pageOwner();
   try {
     const response = await api.post(`/budget/subscriptions/${subscription.id}/renew`, {});
-    if (await reload(undefined, { motion: true, owner })) refocusAfterRender();
+    if (await reloadAfterSave(() => reload(undefined, { motion: true, owner }))) refocusAfterRender();
     const completed = response.data?.status === 'completed';
-    window.yuvomi?.showToast(t(completed ? 'subscriptions.completedToast' : 'subscriptions.renewedToast'), 'success');
+    const message = completed
+      ? t('subscriptions.completedNamed', { name: subscription.name })
+      : t('subscriptions.renewedNamed', { name: subscription.name, date: dateText(response.data?.next_payment_date, { weekday: true }) });
+    if (!response.undo?.token) {
+      window.yuvomi?.showToast(message, 'success');
+      return;
+    }
+    offerUndo({
+      message,
+      undo: async () => {
+        await api.post(`/budget/subscriptions/${subscription.id}/renew/undo`, response.undo);
+        if (await reload(undefined, { motion: true, owner })) refocusAfterRender();
+      },
+      onError: async (err) => {
+        await reportError(err, { owner });
+        if (isCurrentOwner(owner)) await reload(undefined, { owner, quiet: true });
+      },
+    });
   } catch (err) {
     await reportError(err, { owner });
     // Schon abgeschlossen (#2011): die Karte war veraltet - ein anderes
@@ -1975,43 +2185,52 @@ async function renewSubscription(subscription) {
   }
 }
 
+/**
+ * Abos in der Ruecknahmefrist: lokal schon weg, am Server noch da, bis ihr
+ * Loeschen nach der Frist des Toasts laeuft. Ein Neuladen in dieser Zeit
+ * (Speichern eines anderen Abos) holte sie sonst zurueck.
+ */
+const pendingDeletes = new Set();
+
+// LOESCHEN MIT RUECKGAENGIG STATT RUECKFRAGE (Critique R23, D6). Das Loeschen
+// laeuft erst, wenn die Frist des Toasts endet (`scheduleUndoableDelete`):
+// bis dahin ist am Server nichts geschehen - auch nicht an Erinnerungen und
+// der Buchung der naechsten Zahlung, die mit dem Abo gehen.
 async function deleteSubscription(subscription) {
   if (readOnly()) return;
-  const confirmed = await confirmModal(t('subscriptions.deleteConfirm', { name: subscription.name }),
-    { danger: true, detail: t('subscriptions.deleteConfirmDetail') });
-  if (!confirmed) return;
   const owner = pageOwner();
-  try {
-    await api.delete(`/budget/subscriptions/${subscription.id}`);
-  } catch (err) {
-    // SCHON GELOESCHT IST EIN ERFOLG (#1909): ein anderes Haushaltsmitglied war
-    // schneller. Die 404 eines Abos heisst nur das - die Route liest es ohne
-    // Sichtbarkeitsfilter, ein fremdes privates Abo endet dort mit 403.
-    if (!isAlreadyDeleted(err, 'subscriptions_subscription_not_found')) {
-      reportError(err, { owner });
-      return;
-    }
-  }
-  // Die Zeile klappt aus, die Nachbarn ruecken nach - erst dann steht die
-  // Liste ohne sie neu (der Server hat schon geloescht; ohne Bewegung loest
-  // collapseRow sofort auf). Ist die Seite inzwischen eine andere Instanz,
-  // bleibt sie unberuehrt; der Toast sagt trotzdem, dass geloescht ist.
-  if (isCurrentOwner(owner)) await collapseRow(container.querySelector(`#subscriptions-list .swipe-row[data-swipe-id="${subscription.id}"]`));
-  // Ob gerade geloescht oder schon geloescht: die Liste kommt vom Server.
+  const id = subscription.id;
+  pendingDeletes.add(id);
+  if (isCurrentOwner(owner)) await collapseRow(container.querySelector(`#subscriptions-list .swipe-row[data-swipe-id="${id}"]`));
+  state.subscriptions = state.subscriptions.filter((entry) => entry.id !== id);
   if (await reload(undefined, { motion: true, owner })) refocusAfterRender();
-  window.yuvomi?.showToast(t('subscriptions.deletedToast'), 'success');
+  scheduleUndoableDelete({
+    commit: async ({ keepalive } = {}) => {
+      try {
+        await api.delete(`/budget/subscriptions/${id}`, { keepalive });
+      } catch (err) {
+        // SCHON GELOESCHT IST EIN ERFOLG (#1909): ein anderes Haushaltsmitglied
+        // war schneller.
+        if (!isAlreadyDeleted(err, 'subscriptions_subscription_not_found')) throw err;
+      }
+      pendingDeletes.delete(id);
+    },
+    restore: async (err) => {
+      pendingDeletes.delete(id);
+      if (err) await reportError(err, { owner });
+      if (isCurrentOwner(owner) && await reload(undefined, { motion: true, owner })) refocusAfterRender();
+    },
+    message: t('common.deletedNamed', { name: subscription.name }),
+  });
 }
 
 async function openSettingsModal() {
   if (readOnly()) return;
   const content = `
-    <form id="subscriptions-settings-form">
+    <form id="subscriptions-settings-form" novalidate>
       <div class="form-group">
         <label class="form-label" for="subscriptions-budget">${t('subscriptions.monthlyBudgetLabel')}</label>
-        <input class="form-input" id="subscriptions-budget" type="number" min="0"
-               step="${amountStep(state.settings.base_currency, state.settings.monthly_budget)}"
-               placeholder="${amountPlaceholder(state.settings.base_currency)}"
-               value="${state.settings.monthly_budget}">
+        <input class="form-input" id="subscriptions-budget"${amountInputAttrs(state.settings.base_currency, state.settings.monthly_budget)}>
       </div>
       ${comboboxMarkup({
         id: 'subscriptions-base-currency',
@@ -2036,39 +2255,39 @@ async function openSettingsModal() {
     onSave(panel) {
       wireCombobox(panel, 'subscriptions-base-currency');
       panel.querySelector('#subscriptions-base-currency').addEventListener('change', (event) => {
-        applyAmountFormat(panel.querySelector('#subscriptions-budget'), event.target.value);
+        setAmountCurrency(panel.querySelector('#subscriptions-budget'), event.target.value);
       });
       panel.querySelector('#subscriptions-settings-cancel').addEventListener('click', closeModal);
       panel.querySelector('#subscriptions-settings-form').addEventListener('submit', async (event) => {
         event.preventDefault();
         if (readOnly()) return;
+        // KEINE BROWSER-BLASEN (Critique R21): `novalidate`, die Regeln des Markups melden sich am Feld (constraintErrors, components/modal.js).
+        if (reportFieldErrors(constraintErrors(event.currentTarget))) return;
         const baseCurrency = panel.querySelector('#subscriptions-base-currency').value;
         if (!baseCurrency) {
           reportFieldError(panel.querySelector('#subscriptions-base-currency-search'), t('subscriptions.currencyRequired'));
           return;
         }
-        // Auch hier gilt: bei einem Bestandsbudget neben dem Raster steht das
-        // Feld auf step="any", die Prüfung muss also hier stattfinden.
-        const budgetInput = panel.querySelector('#subscriptions-budget');
-        if (!amountIsSavable(Number(budgetInput.value), baseCurrency, {
+        // Der Betrag als TEXT (D1); ein Bestandsbudget neben dem Raster bleibt
+        // unangetastet speicherbar. Leer heisst kein Budget (0).
+        const budgetProblem = amountFieldError(panel.querySelector('#subscriptions-budget'), baseCurrency, {
+          sign: 'nonNegative',
           original: state.settings.monthly_budget ?? null,
           originalCurrency: state.settings.base_currency ?? null,
-        })) {
-          reportFieldError(budgetInput, t('common.amountPrecisionRequired', {
-            currency: baseCurrency,
-            step: smallestUnitLabel(baseCurrency),
-          }));
+        });
+        if (budgetProblem) {
+          reportFieldError(...budgetProblem);
           return;
         }
         const owner = pageOwner();
         const dialog = captureModalContext();
         try {
           await api.put('/budget/subscriptions/settings', {
-            monthly_budget: Number(panel.querySelector('#subscriptions-budget').value),
+            monthly_budget: parseAmountInput(panel.querySelector('#subscriptions-budget').value) ?? 0,
             base_currency: baseCurrency,
           });
           await closeModal({ force: true, context: dialog });
-          if (await reload({ refreshRates: true }, { owner })) refocusAfterRender();
+          if (await reloadAfterSave(() => reload({ refreshRates: true }, { owner }))) refocusAfterRender();
           window.yuvomi?.showToast(t('subscriptions.settingsSaved'), 'success');
         } catch (err) {
           reportError(err, { owner });
@@ -2087,21 +2306,41 @@ function metadataRows(items, kind) {
     // Screenreader in jeder Zeile dieselben (Komponenten-Kanon, DESIGN.md).
     const name = isCat ? categoryLabel(item) : paymentMethodLabel(item);
     const named = (catKey, methodKey) => t(isCat ? catKey : methodKey, { name });
+    // D10 ZEILEN-ENDZONE (#2152): [Mehr-Knopf][Griff]. Bis dahin standen hier
+    // vier Icons nebeneinander - Auf, Ab, Stift und ein dauerhaft roter
+    // Papierkorb - und schoben den Namen mobil in eine zweite Zeile. Der Name
+    // oeffnet die Bearbeitung, das Menue fuehrt Bearbeiten, die zwei Schritte
+    // fuer Schalter und Screenreader ohne Pfeiltasten und das Loeschen; der
+    // Griff zieht und nimmt am Fokus die Pfeiltasten.
+    const editLabelNamed = named('subscriptions.editCategoryNamed', 'subscriptions.editPaymentMethodNamed');
+    const sortable = items.length > 1;
+    const handleLabel = `${t('shopping.reorderHandle', { name })}, ${t('shopping.reorderPosition', { index: index + 1, total: items.length })}`;
     return `
     <li data-id="${item.id}" data-kind="${kind}">
       <div class="subscriptions-metadata-row__view">
         ${isCat ? `<i style="background:${esc(item.color)}"></i>` : '<i data-lucide="credit-card" aria-hidden="true"></i>'}
-        <span>${esc(name)}</span>
+        <button type="button" class="subscriptions-metadata-row__name" data-act="edit" title="${esc(editLabelNamed)}">${esc(name)}</button>
         <div class="row-actions subscriptions-metadata-row__actions">
-          ${rowActionHtml({ icon: 'chevron-up', label: t('subscriptions.moveUpNamed', { name }), attrs: { 'data-move': '-1', 'aria-disabled': index === 0 ? 'true' : null } })}
-          ${rowActionHtml({ icon: 'chevron-down', label: t('subscriptions.moveDownNamed', { name }), attrs: { 'data-move': '1', 'aria-disabled': index === items.length - 1 ? 'true' : null } })}
-          ${rowActionHtml({ icon: 'pencil', label: named('subscriptions.editCategoryNamed', 'subscriptions.editPaymentMethodNamed'), attrs: { 'data-act': 'edit' } })}
-          ${rowActionHtml({ icon: 'trash-2', tone: 'danger', label: named('subscriptions.deleteCategoryNamed', 'subscriptions.deletePaymentMethodNamed'), attrs: { 'data-act': 'delete' } })}
+          ${rowMenuHtml({
+    id: `subscriptions-meta-menu-${kind}-${item.id}`,
+    label: t('common.moreActionsNamed', { name }),
+    items: [
+      { action: 'meta-edit', icon: 'pencil', label: editLabelNamed, attrs: { 'data-act': 'edit' } },
+      sortable && { action: 'meta-up', icon: 'chevron-up', label: t('subscriptions.moveUpNamed', { name }), disabled: index === 0, attrs: { 'data-move': '-1' } },
+      sortable && { action: 'meta-down', icon: 'chevron-down', label: t('subscriptions.moveDownNamed', { name }), disabled: index === items.length - 1, attrs: { 'data-move': '1' } },
+      { action: 'meta-delete', icon: 'trash-2', danger: true, label: named('subscriptions.deleteCategoryNamed', 'subscriptions.deletePaymentMethodNamed'), attrs: { 'data-act': 'delete' } },
+    ],
+  })}
+          ${sortable ? `<button type="button" class="row-action list-row__drag subscriptions-metadata-row__handle" data-meta-handle
+                  aria-label="${esc(handleLabel)}"
+                  title="${esc(t('shopping.reorderHandleHint'))}">
+            <i data-lucide="grip-vertical" class="icon-md" aria-hidden="true"></i>
+          </button>` : ''}
         </div>
       </div>
       <div class="subscriptions-metadata-row__edit" hidden>
         <input class="form-input subscriptions-metadata-edit-name" value="${esc(isCat ? categoryLabel(item) : paymentMethodLabel(item))}" data-original-name="${esc(item.name ?? '')}" maxlength="100" aria-label="${editLabel}">
-        ${isCat ? `<input class="form-input form-input--color subscriptions-metadata-edit-color" type="color" value="${esc(item.color)}" aria-label="${t('subscriptions.brandColorLabel')}">` : ''}
+        ${isCat ? colorPickerHtml({ value: item.color, label: t('subscriptions.brandColorLabel'), options: subscriptionColorOptions(), inputClass: 'subscriptions-metadata-edit-color', className: 'subscriptions-metadata-row__color' }) : ''}
         <div class="subscriptions-metadata-row__actions">
           <button class="btn btn--icon" data-act="save" aria-label="${t('common.save')}">
             <i data-lucide="check" aria-hidden="true"></i>
@@ -2150,6 +2389,96 @@ async function saveMetadata(write, goneId = null) {
   return true;
 }
 
+/**
+ * Wohin der Fokus geht, wenn der Verwalten-Dialog nach einer Handlung neu
+ * aufgebaut ist (#2152): jede Schreibhandlung schliesst ihn und baut ihn mit
+ * dem frischen Stand neu (saveMetadata), und ohne Ziel fiele der Fokus auf den
+ * Anfang - wer per Pfeiltaste am Griff schiebt, verloere nach einem Schritt
+ * die Zeile. `{ kind, id, target: 'handle' | 'more', index }`: die Zeile
+ * selbst, sonst die, die jetzt an `index` steht.
+ */
+let metaFocus = null;
+
+/** Die Sortable-Instanzen des Verwalten-Dialogs: frei beim Neuaufbau und beim Schliessen. */
+const metaSortables = sortableSet();
+
+function restoreMetaFocus(panel) {
+  const intent = metaFocus;
+  metaFocus = null;
+  if (!intent) return;
+  const list = panel.querySelector(intent.kind === 'categories' ? '#subscription-category-list' : '#subscription-method-list');
+  const rows = [...(list?.querySelectorAll(':scope > li') ?? [])];
+  const row = rows.find((li) => Number(li.dataset.id) === intent.id)
+    ?? rows[Math.min(intent.index ?? 0, rows.length - 1)];
+  if (!row) return;
+  const handle = intent.target === 'handle' ? row.querySelector('[data-meta-handle]') : null;
+  (handle ?? row.querySelector('.row-action--more') ?? row.querySelector('[data-act="edit"]'))?.focus();
+}
+
+/**
+ * Die Zuege, die gerade speichern, JE LISTE (`categories` / `payment_methods`
+ * -> `{ ids }`). Je Liste, nicht fuer den Dialog (Codex an #2177): ein
+ * geteilter Merker nahm einen Zug der Zahlungsarten mit der Folge der
+ * Kategorien zurueck.
+ */
+const metaOrderRuns = new Map();
+
+const metaKeyOf = (list) => (list.id.includes('category') ? 'categories' : 'payment_methods');
+
+/** Neue Reihenfolge einer Liste speichern - Pfeiltaste, Menue und Drag-Ende teilen diesen Weg. */
+async function persistMetaOrder(list, ids) {
+  // Der Riegel am Schreibweg selbst: Pfeiltaste, Menue und Drag-Ende kommen
+  // alle hier vorbei (Nur-lesen-Regel, test:budget-readonly-ui).
+  if (readOnly()) return null;
+  const key = metaKeyOf(list);
+  // EIN ZUG ZUR ZEIT JE LISTE (Codex an #2177): waehrend einer speichert,
+  // entfaellt der naechste derselben Liste. Ein gezogener Zug wird
+  // zurueckgenommen - die Liste zeigt dann wieder, was gerade gespeichert wird.
+  const running = metaOrderRuns.get(key);
+  if (running) {
+    restoreOrder(list, running.ids, (li) => li.dataset.id);
+    return null;
+  }
+  metaOrderRuns.set(key, { ids });
+  let saved;
+  try {
+    saved = await saveMetadata(() => api.put('/budget/subscriptions/meta/order', { [key]: ids }));
+  } finally {
+    metaOrderRuns.delete(key);
+  }
+  if (!saved) {
+    // GESCHEITERT, OHNE DASS DER DIALOG NEU AUFGEHT (Codex an #2177): das
+    // Ziehen hat die Zeile schon umgehaengt. Zurueck auf den gespeicherten
+    // Stand, sonst stuenden Reihenfolge, Griff-Positionen und gesperrtes
+    // Auf/Ab falsch da. Der Fokuswunsch des Schritts verfaellt mit ihm.
+    restoreOrder(list, state.meta[key].map((row) => row.id), (li) => li.dataset.id);
+    metaFocus = null;
+  }
+  return saved;
+}
+
+function moveMetaRow(row, delta, target) {
+  const list = row?.closest('ul');
+  if (!list) return null;
+  const rows = [...list.querySelectorAll(':scope > li')];
+  const index = rows.indexOf(row);
+  const next = index + delta;
+  if (index < 0 || next < 0 || next >= rows.length) return null;
+  if (metaOrderRuns.has(metaKeyOf(list))) return null;
+  [rows[index], rows[next]] = [rows[next], rows[index]];
+  metaFocus = { kind: row.dataset.kind, id: Number(row.dataset.id), target, index: next };
+  return persistMetaOrder(list, rows.map((li) => Number(li.dataset.id)));
+}
+
+/**
+ * DIE FARBREIHE DER ABOS (Critique R24 E6): vorn die Standardfarbe des Moduls
+ * (`#0F766E`, auch der Rueckfall jeder Zeile ohne Markenfarbe), dahinter die
+ * Familientoene und "Eigene" fuer die echte Markenfarbe.
+ */
+function subscriptionColorOptions() {
+  return [{ value: SUBSCRIPTION_COLOR_DEFAULT, label: t('colorPicker.standard') }, ...familyColorOptions()];
+}
+
 function openMetadataModal() {
   if (readOnly()) return;
   const content = `
@@ -2159,8 +2488,8 @@ function openMetadataModal() {
         <ul id="subscription-category-list">${metadataRows(state.meta.categories, 'categories')}</ul>
         <div class="subscriptions-metadata-add">
           <input class="form-input" id="subscription-new-category" placeholder="${t('subscriptions.newCategoryPlaceholder')}">
-          <input class="form-input form-input--color" id="subscription-new-category-color" type="color" value="#0F766E">
           <button class="btn btn--primary" id="subscription-add-category">${t('common.add')}</button>
+          ${colorPickerHtml({ id: 'subscription-new-category-color', value: SUBSCRIPTION_COLOR_DEFAULT, label: t('subscriptions.brandColorLabel'), options: subscriptionColorOptions(), className: 'subscriptions-metadata-add__color' })}
         </div>
       </section>
       <section>
@@ -2180,7 +2509,9 @@ function openMetadataModal() {
     title: t('subscriptions.manageMetadata'),
     content,
     size: 'xl',
+    onClose: () => metaSortables.clear(),
     onSave(panel) {
+      wireColorPicker(panel);
       panel.querySelector('#subscriptions-metadata-close').addEventListener('click', closeModal);
       panel.querySelector('#subscription-add-category').addEventListener('click', async () => {
         if (readOnly()) return;
@@ -2199,21 +2530,37 @@ function openMetadataModal() {
         if (!name) return;
         await saveMetadata(() => api.post('/budget/subscriptions/payment-methods', { name }));
       });
+      // Die Mehr-Menues der Zeilen (#2152): Lage, Schliessen nach der Wahl, Pfeiltasten.
+      installPopoverMenus(panel);
+      // Auf/Ab im Menue: am Listenrand ist der Eintrag gesperrt (`disabled`).
       panel.querySelectorAll('[data-move]').forEach((button) => {
-        button.addEventListener('click', async () => {
-          if (readOnly()) return;
-          // aria-disabled statt disabled: der Button bleibt fokussierbar, der
-          // No-op-Klick am Listenrand wird hier verworfen (siehe layout.css).
-          if (button.getAttribute('aria-disabled') === 'true') return;
-          const list = button.closest('ul');
-          const rows = [...list.querySelectorAll('li')];
-          const index = rows.indexOf(button.closest('li'));
-          const target = index + Number(button.dataset.move);
-          [rows[index], rows[target]] = [rows[target], rows[index]];
-          const key = list.id.includes('category') ? 'categories' : 'payment_methods';
-          await saveMetadata(() => api.put('/budget/subscriptions/meta/order', { [key]: rows.map((row) => Number(row.dataset.id)) }));
+        button.addEventListener('click', () => {
+          if (readOnly() || button.disabled) return;
+          moveMetaRow(button.closest('li'), Number(button.dataset.move), 'more');
         });
       });
+      // Der Griff: Pfeiltasten bei Fokus (wie im Einkauf) und Ziehen.
+      panel.querySelectorAll('[data-meta-handle]').forEach((handle) => {
+        handle.addEventListener('keydown', (event) => {
+          if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+          event.preventDefault();
+          if (readOnly()) return;
+          moveMetaRow(handle.closest('li'), event.key === 'ArrowUp' ? -1 : 1, 'handle');
+        });
+      });
+      // Jeder Aufbau gibt die Instanzen des vorigen frei (Codex an #2177).
+      metaSortables.clear();
+      for (const list of panel.querySelectorAll('#subscription-category-list, #subscription-method-list')) {
+        if (list.children.length < 2) continue;
+        metaSortables.add(list, {
+          handle: '[data-meta-handle]',
+          onEnd: (evt) => {
+            if (readOnly() || evt.oldIndex === evt.newIndex) return;
+            persistMetaOrder(list, [...list.querySelectorAll(':scope > li')].map((li) => Number(li.dataset.id)));
+          },
+        }).catch(() => { /* ohne SortableJS bleiben Pfeiltasten und Menue */ });
+      }
+      restoreMetaFocus(panel);
 
       // Inline-Bearbeitung: die vorgerenderte Edit-Zeile ein-/ausblenden.
       panel.querySelectorAll('[data-act="edit"]').forEach((button) => {
@@ -2232,12 +2579,13 @@ function openMetadataModal() {
           const nameInput = editRow.querySelector('.subscriptions-metadata-edit-name');
           nameInput.value = nameInput.defaultValue;
           const colorInput = editRow.querySelector('.subscriptions-metadata-edit-color');
-          if (colorInput) colorInput.value = colorInput.defaultValue;
+          if (colorInput) setColorPickerValue(colorInput, colorInput.defaultValue);
           editRow.hidden = true;
           li.querySelector('.subscriptions-metadata-row__view').hidden = false;
-          // Fokus zurück auf den Auslöser, statt ins Leere (der Cancel-Button
-          // wird gerade versteckt) - sonst verliert die Tastatur die Position.
-          li.querySelector('[data-act="edit"]').focus();
+          // Fokus zurück, statt ins Leere (der Cancel-Button wird gerade
+          // versteckt): an den Mehr-Knopf der Zeile, aus dem "Bearbeiten" kam,
+          // sonst an den Namen, der es ebenso oeffnet.
+          (li.querySelector('.row-action--more') ?? li.querySelector('[data-act="edit"]')).focus();
         });
       });
       // Tastatur im Inline-Edit: Enter speichert, Escape bricht ab. stopPropagation
@@ -2245,6 +2593,7 @@ function openMetadataModal() {
       // im Panel zu klicken bzw. das ganze Modal via Escape zu schließen.
       panel.querySelectorAll('.subscriptions-metadata-row__edit input').forEach((input) => {
         input.addEventListener('keydown', (event) => {
+          if (isImeComposing(event)) return;
           if (event.key !== 'Enter' && event.key !== 'Escape') return;
           event.preventDefault();
           event.stopPropagation();
@@ -2269,6 +2618,7 @@ function openMetadataModal() {
             : typed;
           const colorInput = editRow.querySelector('.subscriptions-metadata-edit-color');
           const isCat = li.dataset.kind === 'categories';
+          metaFocus = { kind: li.dataset.kind, id, target: 'more', index: [...li.parentElement.children].indexOf(li) };
           const saved = await saveMetadata(() => (isCat
             ? api.put(`/budget/subscriptions/categories/${id}`, { name, color: colorInput.value })
             : api.put(`/budget/subscriptions/payment-methods/${id}`, { name })), id);
@@ -2303,7 +2653,14 @@ function openMetadataModal() {
             },
           );
           if (!confirmed) return;
+          // Nach dem Neuaufbau an den Mehr-Knopf der Zeile, die jetzt an
+          // ihrem Platz steht (#2152).
+          metaFocus = { kind: li.dataset.kind, id, target: 'more', index: [...li.parentElement.children].indexOf(li) };
           const owner = pageOwner();
+          // Die Verwaltung ist jetzt zu. Was der Nutzer waehrend des Loeschens
+          // und Ladens oeffnet, gehoert ihm: openMetadataModal() schloesse es
+          // ebenso wie ein closeModal() ohne Kontext (#1997).
+          const afterConfirm = captureOpenContext();
           try {
             await api.delete(`/budget/subscriptions/${isCat ? 'categories' : 'payment-methods'}/${id}`);
           } catch (err) {
@@ -2311,7 +2668,7 @@ function openMetadataModal() {
             // Zahlungsarten haben keine Sichtbarkeit, die 404 heisst nur das.
             if (!isAlreadyDeleted(err, isCat ? 'subscriptions_category_not_found' : 'subscriptions_payment_method_not_found')) {
               window.yuvomi?.showToast(errorText(err), 'danger');
-              if (isCurrentOwner(owner)) openMetadataModal();
+              if (isCurrentOwner(owner) && isModalContextCurrent(afterConfirm)) openMetadataModal();
               return;
             }
           }
@@ -2319,8 +2676,9 @@ function openMetadataModal() {
           // Ein Filter auf die geloeschte geht vor dem Laden auf "alle".
           resetGoneFilter(isCat ? 'subscriptions_category_not_found' : 'subscriptions_payment_method_not_found', id);
           if (!await reload(undefined, { owner })) return;
-          refocusAfterRender();
           window.yuvomi?.showToast(t('subscriptions.metaDeletedToast'), 'success');
+          if (!isModalContextCurrent(afterConfirm)) return;
+          refocusAfterRender();
           openMetadataModal();
         });
       });
@@ -2333,11 +2691,16 @@ function openMetadataModal() {
  * Renderer sind reine Funktionen ueber `state`.
  */
 export const __test = {
-  readOnly, READ_SAFE_ACTIONS, renderCard, renderEmpty, renderSummary, state, toolsMenuHtml, activeFilters,
+  readOnly, READ_SAFE_ACTIONS, renderCard, renderEmpty, renderSummary, renderOverBudgetNote, state, toolsMenuHtml, activeFilters,
   renderBreakdown, renderAreaChart,
   subscriptionReadSections, openSubscriptionModal, saveSubscription,
+  // R24 E1: der Tipp auf ein Abo oeffnet das Leseblatt (test-budget-readonly-ui.js).
+  openSubscriptionReadView,
   // #1909: die Fehlerwege der Seite (test:subscriptions-errors).
   reload, renewSubscription, deleteSubscription, openSettingsModal, openMetadataModal, openLogoPickerModal,
+  // #2152: die Zeilen des Verwalten-Dialogs (test:manager-endzone).
+  metadataRows, persistMetaOrder,
+  dueLabel,
   // Eine neue Instanz der Seite, wie ein render() sie anlegt.
   setContainerForTest: (target) => { container = target; pageGeneration += 1; },
 };

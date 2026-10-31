@@ -1,11 +1,14 @@
 import { api } from '/api.js';
-import { formatDate, formatTime, getLocale, t } from '/i18n.js';
+import { getLocale, t } from '/i18n.js';
+import { dateTimeText } from '/utils/date-format.js';
 import { esc } from '/utils/html.js';
 import { weekStartIndex, weekdayOrder } from '/utils/date.js';
 import { bindInstantSwitch, settingRowHtml, settingSwitchRowHtml } from '/settings/components.js';
+import { colorPickerHtml, wireColorPicker } from '/utils/color-picker.js';
 import { wireTablist } from '/utils/tablist.js';
 import { attachSegmentIndicator } from '/utils/segment-indicator.js';
 import { getPreferences, savePreferences } from '/settings/preferences-cache.js';
+import { errorSentence, loadErrorSentence } from '/utils/friendly-error.js';
 
 // Wochenstart-Optionen; Labels aus dem bestehenden Kalender-i18n (kein neuer
 // Übersetzungsbedarf für die Wochentagsnamen).
@@ -35,7 +38,7 @@ function formatSyncTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return t('settings.holidayNeverSynced');
   return t('settings.holidayLastSync', {
-    date: `${formatDate(date)} ${formatTime(date)}`.trim(),
+    date: dateTimeText(date),
   });
 }
 
@@ -150,9 +153,9 @@ function renderPage(container, preferences) {
               attrs: { id: 'holiday-show-public', 'data-instant-save': true },
             })}
             ${settingRowHtml({
-              label: t('settings.holidayPublicColor'), labelFor: 'holiday-public-color',
+              label: t('settings.holidayPublicColor'), labelId: 'holiday-public-color-label', stacked: true,
               attrs: { id: 'holiday-public-color-group', hidden: !preferences.holiday_show_public },
-              control: `<input class="form-input" type="color" id="holiday-public-color" value="${esc(preferences.holiday_public_color)}">`,
+              control: colorPickerHtml({ id: 'holiday-public-color', value: preferences.holiday_public_color, labelledBy: 'holiday-public-color-label' }),
             })}
             ${settingSwitchRowHtml({
               label: t('settings.holidaySchoolLabel'),
@@ -161,9 +164,9 @@ function renderPage(container, preferences) {
               extra: `<p class="form-hint" id="holiday-school-unavailable-hint" hidden>${t('settings.holidaySchoolUnavailable')}</p>`,
             })}
             ${settingRowHtml({
-              label: t('settings.holidaySchoolColor'), labelFor: 'holiday-school-color',
+              label: t('settings.holidaySchoolColor'), labelId: 'holiday-school-color-label', stacked: true,
               attrs: { id: 'holiday-school-color-group', hidden: !preferences.holiday_show_school },
-              control: `<input class="form-input" type="color" id="holiday-school-color" value="${esc(preferences.holiday_school_color)}">`,
+              control: colorPickerHtml({ id: 'holiday-school-color', value: preferences.holiday_school_color, labelledBy: 'holiday-school-color-label' }),
             })}
           </div>
           <div id="holidays-form-error" class="form-error" role="alert" hidden></div>
@@ -603,7 +606,7 @@ function bindWeekStart(container, preferences) {
         reverting = true;
         tablist.setActive(previous); // Rollback bei Fehler
         reverting = false;
-        window.yuvomi?.showToast(error.message || t('common.errorGeneric'), 'danger');
+        window.yuvomi?.showToast(errorSentence(error, 'settings.preferenceSaveFailed'), 'danger');
       }
     },
   });
@@ -633,13 +636,14 @@ async function bindEvents(container, preferences) {
     } catch (error) {
       persistedDuration = previous;
       durationSelect.value = previous; // Rollback bei Fehler
-      window.yuvomi?.showToast(error.message || t('common.errorGeneric'), 'danger');
+      window.yuvomi?.showToast(errorSentence(error, 'settings.preferenceSaveFailed'), 'danger');
     } finally {
       if (durationSelect.isConnected) durationSelect.disabled = false;
     }
   });
 
   const form = container.querySelector('#holidays-form');
+  wireColorPicker(form);
   const countrySelect = container.querySelector('#holiday-country');
   const subdivisionSelect = container.querySelector('#holiday-subdivision');
   const groupSelect = container.querySelector('#holiday-group');
@@ -685,7 +689,7 @@ async function bindEvents(container, preferences) {
   };
 
   const showDiscoveryError = (error) => {
-    errorElement.textContent = error.message || t('common.errorGeneric');
+    errorElement.textContent = loadErrorSentence(error) ?? t('common.errorGeneric');
     errorElement.hidden = false;
   };
 
@@ -783,7 +787,7 @@ async function bindEvents(container, preferences) {
       discoveryState.persistedGroup = preferenceData.holiday_group;
       window.yuvomi?.showToast(t('settings.holidaySaved'), 'success');
     } catch (error) {
-      errorElement.textContent = error.message || t('common.errorGeneric');
+      errorElement.textContent = errorSentence(error, 'settings.preferenceSaveFailed');
       errorElement.hidden = false;
     }
   });
@@ -826,7 +830,7 @@ async function bindEvents(container, preferences) {
       }
       window.yuvomi?.showToast(t('settings.holidaySynced'), 'success');
     } catch (error) {
-      window.yuvomi?.showToast(error.message || t('settings.holidaySyncError'), 'danger');
+      window.yuvomi?.showToast(errorSentence(error, 'settings.holidaySyncError'), 'danger');
     } finally {
       updateSyncState();
     }

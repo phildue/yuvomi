@@ -171,9 +171,11 @@ test('R17: schmal bekommt der Medikamentenname die Zeile, die Aktionen stehen da
   const { eachRule } = await import('./css-rules.js');
   const css = readFileSync(new URL('../public/styles/health.css', import.meta.url), 'utf8');
   const narrow = [...eachRule(css)].filter((r) => r.at.some((a) => /@container list-rows \(max-width: 26rem\)/.test(a)));
-  const row = narrow.find((r) => r.selector.trim() === '.health-dose');
+  // Seit R24 (E10) traegt die Zeile mit Abhak-Ring keinen Knopf mit Wort mehr
+  // und bleibt eine Zeile; der Umbruch gilt nur noch der Zeile OHNE Ring.
+  const row = narrow.find((r) => r.selector.trim() === '.health-dose:not(.health-dose--check)');
   assert.match(row?.body ?? '', /flex-wrap:\s*wrap/, 'nur diese Zeile, nur schmal, bricht um');
-  const name = narrow.find((r) => r.selector.trim() === '.health-dose > .health-dose__name');
+  const name = narrow.find((r) => r.selector.trim() === '.health-dose:not(.health-dose--check) > .health-dose__name');
   assert.match(name?.body ?? '', /flex:\s*1 0 100%/, 'der Name nimmt die ganze erste Zeile (vorher 81px, Bruch mitten im Wort)');
   assert.match(name?.body ?? '', /order:\s*-1/, 'vor der Uhrzeit - Uhrzeit und Aktionen teilen die zweite Zeile');
   // Die geteilte Zeile bleibt nowrap: die Regel steht NUR in der Container-Abfrage.
@@ -192,13 +194,19 @@ test('R17: schmal bekommt der Medikamentenname die Zeile, die Aktionen stehen da
 // Test es sagt - so ist sichtbar, welche Abrufe gleichzeitig offen sind.
 // --------------------------------------------------------
 
-async function loadOverviewHarness({ cycleEnabled, personId, meId, meds = [] }) {
+async function loadOverviewHarness({ cycleEnabled, personId, meId, meds = [], hidden = {} }) {
   const { readFileSync } = await import('node:fs');
   const src = readFileSync(new URL('../public/pages/health.js', import.meta.url), 'utf8');
   const start = src.indexOf('async function loadOverview() {');
   const end = src.indexOf('\nfunction overviewAllSchedules()');
   assert.ok(start > 0 && end > start, 'loadOverview() nicht gefunden');
-  const body = src.slice(start, end);
+  // Die Helfer der gebuendelten Anfrage (R23 S11) laufen mit: ohne sie gaebe
+  // es im Stand davor nichts zu laden, und der Fall unten wuerde dort nicht
+  // rot, sondern stolperte.
+  const helpersStart = src.indexOf('const MED_LOG_WINDOW_MAX_DAYS');
+  const helpersEnd = src.indexOf('// Nur die Plaene der Medikamente, die heute zaehlen');
+  const helpers = helpersStart > 0 && helpersEnd > helpersStart ? src.slice(helpersStart, helpersEnd) : '';
+  const body = `${helpers}\n${src.slice(start, end)}`;
 
   const open = [];
   const api = {
@@ -207,10 +215,15 @@ async function loadOverviewHarness({ cycleEnabled, personId, meId, meds = [] }) 
   const overview = { personId, meId, vitals: null, meds: null, cyclePeriods: null, cycleLogs: null, cycleSettings: undefined };
   const AsyncFunction = (async () => {}).constructor;
   const run = new AsyncFunction(
-    'overview', 'api', 'cycleEnabled', 'todayKey', 'addLocalDays', 'medLogWindowDays', 'OVERVIEW_ADHERENCE_DAYS',
+    'overview', 'api', 'cycleEnabled', 'todayKey', 'addLocalDays', 'medLogWindowDays', 'OVERVIEW_ADHERENCE_DAYS', 'doseAttempts', 'visibleRows',
     `${body}\nreturn loadOverview();`,
   );
-  const done = run(overview, api, cycleEnabled, () => '2026-10-07', (key) => key, () => 30, 30);
+  // Seit #2069 klaert ein gelungenes Laden offene Dosis-Versuche; die Wellen
+  // betrifft das nicht, deshalb hier nur ein Stellvertreter.
+  const doseAttempts = { confirmedBy() {} };
+  // Wie health.js: ein Eintrag in der Loeschfrist faellt aus der Liste.
+  const visibleRows = (area, rows) => (rows ?? []).filter((row) => !(hidden[area] ?? new Set()).has(row.id));
+  const done = run(overview, api, cycleEnabled, () => '2026-10-07', (key) => key, () => 30, 30, doseAttempts, visibleRows);
   // Eine Welle = alles, was offen ist, sobald der Code nicht mehr weiterkommt.
   const settle = () => new Promise((resolve) => setImmediate(resolve));
   const answer = (pick) => {
@@ -244,13 +257,46 @@ test('overview: vitals, medications and all three cycle requests are one wave', 
     '/health/medications', '/health/vitals',
   ], 'fuenf Abrufe gleichzeitig offen, keiner wartet auf einen anderen');
 
+  // KEINE ZWEITE WELLE JE MEDIKAMENT (R23 S11, N+1): die Liste bringt Plaene
+  // und Eintraege mit (`include=schedules,logs`). Vorher folgten ihr je
+  // Medikament zwei Anfragen - der Einstieg schickte 27.
+  const medsReq = h.open.find((req) => req.path.startsWith('/health/medications'));
+  assert.match(medsReq.path, /[?&]include=schedules,logs(&|$)/);
+  assert.match(medsReq.path, /[?&]logs_from=\d{4}-\d{2}-\d{2}T00:00&logs_to=2026-10-07T23:59$/);
   h.answer();
   await h.settle();
-  assert.deepEqual(paths(h.open), ['/health/medications/9/logs', '/health/medications/9/schedules'],
-    'erst die zweite Welle haengt an der Medikamentenliste');
-  h.answer();
+  assert.deepEqual(paths(h.open), [], 'nach der einen Welle ist nichts mehr offen');
   await h.finished();
   assert.deepEqual(h.overview.cycleSettings, {});
+});
+
+test('overview: each medication keeps its own log window from the bundled answer', async () => {
+  const meds = [
+    { id: 9, logs: [{ id: 1, scheduled_at: '2026-10-07T08:00' }, { id: 2, scheduled_at: '2026-09-01T08:00' }], schedules: [{ id: 5 }] },
+    { id: 10, prn: 1, min_interval_hours: 600, logs: [{ id: 3, taken_at: '2026-09-15T10:00' }] },
+  ];
+  const h = await loadOverviewHarness({ cycleEnabled: false, personId: 4, meId: 4, meds });
+  await h.settle();
+  h.answer();
+  await h.finished();
+  // addLocalDays im Harness ist die Identitaet: die Grenze ist dann der Tag
+  // selbst - Eintraege davor fallen, der Rest bleibt je Medikament.
+  assert.deepEqual(h.overview.logsByMed[9].map((row) => row.id), [1]);
+  assert.deepEqual(h.overview.schedulesByMed[9].map((row) => row.id), [5]);
+  assert.deepEqual(h.overview.schedulesByMed[10], []);
+  assert.equal('logs' in h.overview.meds[0], false, 'die Liste traegt die Zusaetze nicht weiter');
+});
+
+// R23 S11 (Rest aus S4): ein geloeschter Dosis-Eintrag stand fuer die Dauer
+// der Loeschfrist weiter in der Uebersicht - reloadMedViews zeichnet sie neu,
+// und der Server kennt den Eintrag noch.
+test('overview: a dose entry in its undo window is left out like in the meds area', async () => {
+  const meds = [{ id: 9, logs: [{ id: 1, scheduled_at: '2026-10-07T08:00' }, { id: 2, scheduled_at: '2026-10-07T20:00' }], schedules: [] }];
+  const h = await loadOverviewHarness({ cycleEnabled: false, personId: 4, meId: 4, meds, hidden: { medLogs: new Set([2]) } });
+  await h.settle();
+  h.answer();
+  await h.finished();
+  assert.deepEqual(h.overview.logsByMed[9].map((row) => row.id), [1]);
 });
 
 test('overview: the cycle rule still decides what is requested at all', async () => {
@@ -265,7 +311,7 @@ test('overview: the cycle rule still decides what is requested at all', async ()
   await other.settle();
   assert.deepEqual(paths(other.open), ['/health/cycle/logs', '/health/cycle/periods', '/health/medications', '/health/vitals'],
     'fremde Person: die privaten Einstellungen werden nicht angefragt');
-  assert.ok(other.open.every((req) => req.path.endsWith('?user_id=5')));
+  assert.ok(other.open.every((req) => /\?user_id=5(&|$)/.test(req.path)));
   other.answer();
   await other.finished();
   assert.equal(other.overview.cycleSettings, null);
@@ -288,7 +334,11 @@ test('overview: members and data load side by side once the person is known', as
   const { readFileSync } = await import('node:fs');
   const src = readFileSync(new URL('../public/pages/health.js', import.meta.url), 'utf8');
   const mount = src.slice(src.indexOf('async function mountOverview() {'), src.indexOf('async function loadOverview() {'));
-  assert.match(mount, /const person = overview\.personId \?\? overview\.meId;/);
+  // R23 (D4): die Person kommt aus der Sitzung (utils/health-person.js). Steht
+  // dort eine fremde und ist die Liste noch nicht da, erst die Liste - sonst
+  // laufen beide nebeneinander wie bisher.
+  assert.match(mount, /const unchecked = stored != null && stored !== overview\.meId && !overview\.members\.length;/);
+  assert.match(mount, /pickHealthPerson\(\{ members: overview\.members, meId: overview\.meId, stored \}\)/);
   assert.match(mount, /await Promise\.all\(\[loadHealthMembers\(overview, healthUser\), loadOverview\(\)\]\);/);
   assert.match(mount, /\} else \{\s*await loadHealthMembers\(overview, healthUser\);\s*await loadOverview\(\);/,
     'ohne bekannte Person bestimmt weiter die Mitgliederliste, wer gezeigt wird');

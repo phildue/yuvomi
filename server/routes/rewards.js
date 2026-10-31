@@ -262,7 +262,7 @@ router.patch('/catalog/:id', requireAdmin, (req, res) => {
   try {
     const id = toInt(req.params.id);
     const existing = db.get().prepare('SELECT * FROM reward_catalog WHERE id = ?').get(id);
-    if (!existing) return res.status(404).json({ error: 'Reward not found.', code: 404 });
+    if (!existing) return res.status(404).json({ error: 'Reward not found.', code: 404, reason: 'rewards_reward_not_found' });
 
     const name = req.body?.name != null ? String(req.body.name).trim() : existing.name;
     if (!name) return res.status(400).json({ error: 'name is required.', code: 400 });
@@ -317,7 +317,7 @@ router.patch('/catalog/:id', requireAdmin, (req, res) => {
 router.delete('/catalog/:id', requireAdmin, (req, res) => {
   try {
     const result = db.get().prepare('DELETE FROM reward_catalog WHERE id = ?').run(toInt(req.params.id));
-    if (result.changes === 0) return res.status(404).json({ error: 'Reward not found.', code: 404 });
+    if (result.changes === 0) return res.status(404).json({ error: 'Reward not found.', code: 404, reason: 'rewards_reward_not_found' });
     res.json({ ok: true });
   } catch (err) {
     log.error('DELETE /catalog/:id error:', err);
@@ -521,13 +521,13 @@ router.post('/redemptions', (req, res) => {
     if (!targetId) return res.status(400).json({ error: 'user_id is required.', code: 400 });
 
     const item = d.prepare('SELECT * FROM reward_catalog WHERE id = ? AND is_active = 1').get(toInt(req.body?.catalog_id));
-    if (!item) return res.status(404).json({ error: 'Reward not found.', code: 404 });
+    if (!item) return res.status(404).json({ error: 'Reward not found.', code: 404, reason: 'rewards_reward_not_found' });
     if (!isEnrolled(d, targetId))
-      return res.status(400).json({ error: 'User does not participate in the reward system.', code: 400 });
+      return res.status(400).json({ error: 'User does not participate in the reward system.', code: 400, reason: 'rewards_not_participating' });
 
     const balance = getBalance(d, targetId);
     if (balance < item.cost)
-      return res.status(400).json({ error: 'Insufficient points.', code: 400 });
+      return res.status(400).json({ error: 'Insufficient points.', code: 400, reason: 'rewards_insufficient_points' });
 
     const note = req.body?.note != null ? String(req.body.note).trim().slice(0, 500) || null : null;
     // Ohne Eltern-Freigabe (haushaltweit deaktiviert) wird die Einlösung sofort
@@ -705,9 +705,88 @@ function decideMoneyRequest(res, d, row, action, me) {
   return res.json({ data: updated });
 }
 
+/** So lange nach der Entscheidung nimmt "Rueckgaengig" sie zurueck (Minuten). */
+export const REOPEN_WINDOW_MINUTES = 10;
+
+/*
+ * EINE ENTSCHEIDUNG ZURUECKNEHMEN (Critique R23, D6). "Freigegeben" stand ohne
+ * Rueckweg da, waehrend das harmlosere Ablehnen nachfragte (N4). Jetzt fragt
+ * keine der beiden vorher, und der Toast danach nimmt sie ECHT zurueck: die
+ * Anfrage steht wieder offen, und das Guthaben steht, wie es vor der
+ * Entscheidung stand.
+ *
+ *  - Praemie freigegeben: die Punkte waren schon beim Stellen reserviert, die
+ *    Freigabe hat nur den Status gesetzt (und eine Einheit verbraucht, die
+ *    `soldOut` aus den erfuellten Anfragen zaehlt). Zurueck heisst: offen.
+ *  - Praemie abgelehnt/zurueckgezogen: die Ablehnung hat die Reservierung per
+ *    `reversal` zurueckgebucht. Genau diese Zeile geht wieder - dieselbe
+ *    Reservierung, keine zweite Buchung. Reicht das Guthaben dafuer nicht mehr
+ *    (die Punkte sind inzwischen ausgegeben), bleibt die Entscheidung.
+ *  - Geld freigegeben: die Ein- oder Auszahlung (`postMoney`) geht wieder. Ein
+ *    Konto, das danach im Minus stuende, behaelt die Freigabe.
+ *  - Geld abgelehnt/zurueckgezogen: es war nichts gebucht, also nur offen.
+ *
+ * Zuruecknehmen darf nur, wer entschieden hat, und nur kurz danach: das ist
+ * der Rueckweg des Toasts, keine nachtraegliche Korrektur fremder Entscheidungen.
+ * Freigabe und Ablehnung nur ein Admin, eine Auto-Erfuellung nie (siehe unten).
+ */
+function reopenRedemption(req, res, d, row, me) {
+  if (row.status === 'pending') {
+    return res.status(409).json({ error: 'This request is still open.', code: 409, reason: 'rewards_redemption_open' });
+  }
+  if (row.decided_by !== me) {
+    return res.status(403).json({ error: 'Only who decided can take the decision back.', code: 403, reason: 'rewards_reopen_not_allowed' });
+  }
+  // FREIGEBEN UND ABLEHNEN NIMMT NUR EIN FREIGEBER ZURUECK, und nie eine
+  // Auto-Erfuellung (Sicherheitspruefung zu R23). Ohne Freigabepflicht traegt
+  // die Anfrage `decided_by = requested_by`: der Antragsteller haette die
+  // erfuellte Praemie wieder geoeffnet, danach zurueckgezogen und die Punkte
+  // zurueckbekommen - die Praemie hatte er da schon. Das Zurueckziehen selbst
+  // bleibt fuer den, der es tat, umkehrbar: es reserviert nur wieder, was es
+  // zurueckgegeben hat (Richtung: weniger Guthaben, nie mehr).
+  // Auto-Erfuellung = beim Stellen erfuellt: derselbe Schritt schreibt Antrag
+  // und Entscheidung (decided_at == created_at, decided_by == requested_by). Ein
+  // Admin, der fuer ein Kind beantragt und SPAETER freigibt, bleibt Freigeber.
+  const autoFulfilled = row.decided_by === row.requested_by && row.decided_at === row.created_at;
+  if (row.status !== 'cancelled' && (!isAdminRequest(req) || autoFulfilled)) {
+    return res.status(403).json({ error: 'This decision cannot be taken back here.', code: 403, reason: 'rewards_reopen_not_allowed' });
+  }
+  const decidedMs = Date.parse(row.decided_at ?? '');
+  if (!Number.isFinite(decidedMs) || Date.now() - decidedMs > REOPEN_WINDOW_MINUTES * 60_000) {
+    return res.status(409).json({ error: 'This decision can no longer be taken back.', code: 409, reason: 'rewards_reopen_expired' });
+  }
+  const refused = d.transaction(() => {
+    const money = row.kind !== 'reward';
+    const settle = money
+      ? (row.status === 'fulfilled' ? d.prepare(`SELECT id, delta FROM reward_ledger WHERE redemption_id = ? AND unit = 'money'`).all(row.id) : [])
+      : (row.status !== 'fulfilled' ? d.prepare(`SELECT id, delta FROM reward_ledger WHERE redemption_id = ? AND unit = 'points' AND type = 'reversal'`).all(row.id) : []);
+    const back = settle.reduce((sum, entry) => sum + entry.delta, 0);
+    if (back > 0) {
+      const balance = d.prepare('SELECT COALESCE(SUM(delta), 0) AS bal FROM reward_ledger WHERE user_id = ? AND unit = ?')
+        .get(row.user_id, money ? 'money' : 'points').bal;
+      if (balance < back) return money ? 'insufficient_funds' : 'insufficient_points';
+    }
+    const drop = d.prepare('DELETE FROM reward_ledger WHERE id = ?');
+    for (const entry of settle) drop.run(entry.id);
+    d.prepare(`
+      UPDATE reward_redemptions SET status = 'pending', decision_reason = NULL, decided_by = NULL, decided_at = NULL,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      WHERE id = ?
+    `).run(row.id);
+    return null;
+  })();
+  if (refused === 'insufficient_funds') {
+    return res.status(409).json({ error: 'The balance no longer allows taking this back.', code: 409, reason: 'insufficient_funds' });
+  }
+  if (refused) {
+    return res.status(409).json({ error: 'The balance no longer allows taking this back.', code: 409, reason: 'insufficient_points' });
+  }
+  return res.json({ data: d.prepare('SELECT * FROM reward_redemptions WHERE id = ?').get(row.id) });
+}
+
 // --------------------------------------------------------
 // PATCH /redemptions/:id — Anfrage entscheiden.
-// action: 'fulfill' | 'reject' (Admin) | 'cancel' (Eigentümer oder Admin).
+// action: 'fulfill' | 'reject' (Admin) | 'cancel' (Eigentümer oder Admin) | 'reopen' (wer entschieden hat, R23).
 // Bei reject/cancel werden die reservierten Punkte zurückgebucht.
 // --------------------------------------------------------
 router.patch('/redemptions/:id', (req, res) => {
@@ -726,9 +805,10 @@ router.patch('/redemptions/:id', (req, res) => {
       SELECT r.* FROM reward_redemptions r
       WHERE r.id = @id AND (r.kind = 'reward' OR ${moneyVisibleSql(reader, 'r.user_id')})
     `).get({ id: toInt(req.params.id), ...moneyParams(reader) });
-    if (!row) return res.status(404).json({ error: 'Redemption not found.', code: 404 });
+    if (!row) return res.status(404).json({ error: 'Redemption not found.', code: 404, reason: 'rewards_redemption_not_found' });
+    if (action === 'reopen') return reopenRedemption(req, res, d, row, me);
     if (row.status !== 'pending')
-      return res.status(409).json({ error: 'Redemption already decided.', code: 409 });
+      return res.status(409).json({ error: 'Redemption already decided.', code: 409, reason: 'rewards_redemption_decided' });
 
     const isAdmin = isAdminRequest(req);
     if ((action === 'fulfill' || action === 'reject') && !isAdmin)
@@ -806,7 +886,7 @@ router.post('/bonus', requireAdmin, (req, res) => {
     if (Math.abs(delta) > MAX_BONUS)
       return res.status(400).json({ error: 'delta out of range.', code: 400 });
     if (!isEnrolled(d, userId))
-      return res.status(400).json({ error: 'User does not participate in the reward system.', code: 400 });
+      return res.status(400).json({ error: 'User does not participate in the reward system.', code: 400, reason: 'rewards_not_participating' });
 
     postLedger(d, {
       userId, delta, type: delta > 0 ? 'bonus' : 'adjust', reason, createdBy: actingUser(req),
@@ -957,7 +1037,7 @@ router.post('/money/accounts', requireAdmin, (req, res) => {
 router.delete('/money/accounts/:userId', requireAdmin, (req, res) => {
   try {
     const outcome = closeMoneyAccount(db.get(), toInt(req.params.userId));
-    if (outcome === 'not_found') return res.status(404).json({ error: 'Account not found.', code: 404 });
+    if (outcome === 'not_found') return res.status(404).json({ error: 'Account not found.', code: 404, reason: 'rewards_money_account_not_found' });
     if (outcome === 'not_empty') {
       return res.status(409).json({
         error: 'Only an empty account can be closed: no balance, no plan, no open request.',
@@ -1004,7 +1084,7 @@ router.put('/money/plans/:userId', requireAdmin, (req, res) => {
 router.delete('/money/plans/:userId', requireAdmin, (req, res) => {
   try {
     const result = db.get().prepare('DELETE FROM reward_allowances WHERE user_id = ?').run(toInt(req.params.userId));
-    if (result.changes === 0) return res.status(404).json({ error: 'Plan not found.', code: 404 });
+    if (result.changes === 0) return res.status(404).json({ error: 'Plan not found.', code: 404, reason: 'rewards_money_plan_not_found' });
     res.json({ ok: true });
   } catch (err) {
     log.error('DELETE /money/plans/:userId error:', err);

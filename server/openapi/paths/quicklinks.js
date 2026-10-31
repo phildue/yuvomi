@@ -1,7 +1,7 @@
-import { op, jsonBody, idParam } from '../helpers.js';
+import { op, jsonBody, idParam, withCaseReasons } from '../helpers.js';
 
 export function quickLinksPaths() {
-  return {
+  return withCaseReasons('quick-links', CASE_REASONS, {
     '/api/v1/quick-links': {
       get: op({
         summary: 'List quick links',
@@ -45,5 +45,15 @@ export function quickLinksPaths() {
         stateChanging: true,
       }),
     },
-  };
+  });
 }
+
+// #1909: die Faelle, die ein Nutzer erreicht, tragen einen `reason` neben dem
+// englischen `error` - je Operation der Satz, der sie nennt.
+const LINK_GONE = '`quick_links_link_not_found` (404, the tile was deleted or is private to someone else)';
+const CASE_REASONS = {
+  '/api/v1/quick-links': {
+    post: '`quick_links_limit_reached` (400, the household has the maximum number of tiles; `params.limit` names it)',
+  },
+  '/api/v1/quick-links/{id}': { put: LINK_GONE, delete: LINK_GONE },
+};
