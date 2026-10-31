@@ -1645,6 +1645,7 @@
         "statsTrendTitleCumulative": "Lũy kế",
         "statsCategoryTitle": "Theo danh mục",
         "statsCompareNote": "Thay đổi so với {{period}}",
+        "statsUntilNote": "Tính đến {{date}}: chỉ các kỳ đã kết thúc",
         "statsDonutTitle": "Tỷ lệ chi tiêu",
         "statsExport": "Xuất CSV",
         "statsEmptyTitle": "Không có dữ liệu trong kỳ",

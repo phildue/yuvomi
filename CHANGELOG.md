@@ -85,6 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The budget statistics count completed periods only.** The year view adds up months through
+  the last completed one, so a half-finished month no longer drags the yearly totals, the category
+  bars, the average and the median. The week and month views count through today. Entries dated
+  later never count, including recurring entries that were already created for future months and
+  previously inflated a year's totals. The comparison with the previous period covers the same
+  stretch (January to September against January to September), and a note above the charts says how
+  far the current period is counted.
 - **Settings -> Members: inviting sits with the invitations.** "Create invitation" moved from under
   the member list into the Invitations card, which had no action of its own; "Add member" stays
   under the list. The note on the member order is two short sentences instead of five lines.

@@ -1661,6 +1661,7 @@
         "statsTrendTitleCumulative": "Tumatakbong kabuuan",
         "statsCategoryTitle": "Ayon sa kategorya",
         "statsCompareNote": "Pagbabago kumpara sa {{period}}",
+        "statsUntilNote": "Binilang hanggang {{date}}: mga natapos na panahon lamang",
         "statsDonutTitle": "Bahagi ng gastos",
         "statsExport": "I-export ang CSV",
         "statsEmptyTitle": "Walang datos sa saklaw",
