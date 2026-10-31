@@ -2027,6 +2027,7 @@
         "statsTrendTitleCumulative": "المجموع التراكمي",
         "statsCategoryTitle": "حسب الفئة",
         "statsCompareNote": "التغيّر مقارنةً بـ {{period}}",
+        "statsUntilNote": "محسوب حتى {{date}}؛ الفترات المكتملة فقط",
         "statsDonutTitle": "توزيع المصروفات",
         "statsExport": "تصدير CSV",
         "statsEmptyTitle": "لا بيانات في الفترة",

@@ -1939,6 +1939,7 @@
         "statsTrendTitleCumulative": "Наростаючий підсумок",
         "statsCategoryTitle": "За категоріями",
         "statsCompareNote": "Зміна порівняно з: {{period}}",
+        "statsUntilNote": "Враховано по {{date}}: лише завершені періоди",
         "statsDonutTitle": "Частки витрат",
         "statsExport": "Експорт CSV",
         "statsEmptyTitle": "Немає даних за період",

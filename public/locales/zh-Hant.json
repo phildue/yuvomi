@@ -1762,6 +1762,7 @@
         "statsTrendTitle": "趨勢",
         "statsAverage": "平均值",
         "statsMedian": "中位數",
+        "statsUntilNote": "統計至 {{date}}，僅含已結束的時段",
         "statsTrendTitleCumulative": "累計",
         "statsCategoryTitle": "按類別",
         "statsCompareNote": "與{{period}}相比的變化",

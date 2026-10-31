@@ -1765,6 +1765,7 @@
         "statsTrendTitleCumulative": "Løpende sum",
         "statsCategoryTitle": "Etter kategori",
         "statsCompareNote": "Endring sammenlignet med {{period}}",
+        "statsUntilNote": "Telt til og med {{date}}: kun avsluttede perioder",
         "statsDonutTitle": "Utgiftsandeler",
         "statsExport": "Eksporter CSV",
         "statsEmptyTitle": "Ingen data i området",

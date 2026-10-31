@@ -1765,6 +1765,7 @@
         "statsTrendTitleCumulative": "Totale progressivo",
         "statsCategoryTitle": "Per categoria",
         "statsCompareNote": "Variazione rispetto a {{period}}",
+        "statsUntilNote": "Conteggiato fino al {{date}}: solo periodi conclusi",
         "statsDonutTitle": "Quote spese",
         "statsExport": "Esporta CSV",
         "statsEmptyTitle": "Nessun dato nel periodo",

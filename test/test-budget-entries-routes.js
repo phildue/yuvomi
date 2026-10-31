@@ -153,12 +153,12 @@ test('GET /summary: Savings chart grouping preserves hidden category details', a
 test('salary and an account transfer keep income, spending, and account balances distinct', async () => {
   const from = (await call('POST', '/accounts', { body: { name: 'Transfer source', type: 'checking', starting_balance: 0 } })).body.data;
   const to = (await call('POST', '/accounts', { body: { name: 'Transfer target', type: 'savings', starting_balance: 0 } })).body.data;
-  insertEntry({ title: 'Salary', amount: 1000, category: 'Erwerbseinkommen', date: '2042-03-01', account_id: from.id });
+  insertEntry({ title: 'Salary', amount: 1000, category: 'Erwerbseinkommen', date: '2019-03-01', account_id: from.id });
   const transfer = await call('POST', '/transfers', { body: {
-    title: 'Save', amount: 10, date: '2042-03-01', from_account_id: from.id, to_account_id: to.id,
+    title: 'Save', amount: 10, date: '2019-03-01', from_account_id: from.id, to_account_id: to.id,
   } });
   assert.equal(transfer.status, 201);
-  const r = await call('GET', '/summary?month=2042-03');
+  const r = await call('GET', '/summary?month=2019-03');
   assert.equal(r.status, 200);
   const summary = r.body.data;
   assert.equal(summary.income, 1000);
@@ -168,18 +168,18 @@ test('salary and an account transfer keep income, spending, and account balances
   assert.deepEqual(summary.byCategory.find(c => c.category === '__saving__'),
     { category: '__saving__', income: 0, expenses: 0, total: 0, transfers: 10 });
   assert.equal(summary.byCategory.some(c => c.category === 'Geschenke & Transfers'), false);
-  const stats = (await call('GET', '/stats?range=month&anchor=2042-03-01')).body.data;
+  const stats = (await call('GET', '/stats?range=month&anchor=2019-03-01')).body.data;
   assert.deepEqual(stats.totals, { income: 1000, expenses: 0, balance: 1000 });
   assert.equal(stats.series.reduce((sum, row) => sum + row.income, 0), 1000);
   assert.equal(stats.series.reduce((sum, row) => sum + row.expenses, 0), 0);
   assert.equal(stats.byCategory.some(c => c.category === 'financial_other'), false);
-  const plans = (await call('GET', '/plans?month=2042-03')).body.data;
+  const plans = (await call('GET', '/plans?month=2019-03')).body.data;
   assert.equal(plans.totalActual, 0);
   const accounts = (await call('GET', '/accounts')).body.data.accounts;
   assert.equal(accounts.find(a => a.id === from.id).projected_balance, 990);
   assert.equal(accounts.find(a => a.id === to.id).projected_balance, 10);
   for (const [account, income, transfers] of [[from, 1000, 10], [to, 0, 0]]) {
-    const filtered = await call('GET', `/summary?month=2042-03&account_id=${account.id}`);
+    const filtered = await call('GET', `/summary?month=2019-03&account_id=${account.id}`);
     assert.equal(filtered.status, 200);
     assert.equal(filtered.body.data.income, income);
     assert.equal(filtered.body.data.expenses, 0, 'a transfer is not account spending');

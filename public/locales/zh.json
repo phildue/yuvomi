@@ -1765,6 +1765,7 @@
         "statsTrendTitleCumulative": "累计",
         "statsCategoryTitle": "按类别",
         "statsCompareNote": "与{{period}}相比的变化",
+        "statsUntilNote": "统计至 {{date}}，仅含已结束的时段",
         "statsDonutTitle": "支出占比",
         "statsExport": "导出 CSV",
         "statsEmptyTitle": "该时段无数据",

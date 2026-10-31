@@ -685,6 +685,42 @@ export function computeStatsRange(range, anchor) {
   };
 }
 
+/**
+ * Bis wohin der Statistik-Tab zaehlt: nur abgeschlossene Einheiten.
+ *
+ * Im Jahr sind die Abschnitte Monate - der laufende zaehlt erst, wenn er vorbei
+ * ist, sonst zieht ein halber Oktober Jahressumme, Vergleich und Durchschnitt.
+ * In Woche und Monat sind es Tage, und heute zaehlt mit: eine eben angelegte
+ * Buchung soll sofort auftauchen. Was danach datiert ist, zaehlt nie - auch
+ * nicht die schon materialisierten Vorkommen wiederkehrender Buchungen, die
+ * als gebucht (is_pending = 0) in der Zukunft stehen.
+ *
+ * Der Vorzeitraum wird auf dieselbe Strecke gekuerzt (Jan-Sep gegen Jan-Sep),
+ * sonst verglich ein dreiviertel Jahr gegen ein ganzes.
+ *
+ * @param {ReturnType<typeof computeStatsRange>} r
+ * @param {string} today   YYYY-MM-DD, Tag der Haushaltszone
+ * @param {string} [until] YYYY-MM-DD, zusaetzliche Obergrenze (Vorzeitraum-Abruf des Clients)
+ * @returns {{until: string, prevUntil: string}}  until < r.from: nichts gezaehlt
+ */
+export function statsCutoff(r, today, until) {
+  const [ty, tm] = today.split('-').map(Number);
+  let cut = r.range === 'year' ? ymd(new Date(Date.UTC(ty, tm - 1, 0))) : today;
+  if (until && until < cut) cut = until;
+  if (cut >= r.to) return { until: r.to, prevUntil: r.prevTo };
+  if (cut < r.from) return { until: cut, prevUntil: ymd(new Date(Date.parse(`${r.prevFrom}T00:00:00Z`) - MS_PER_DAY)) };
+  if (r.range === 'week') {
+    const days = (Date.parse(`${cut}T00:00:00Z`) - Date.parse(`${r.from}T00:00:00Z`)) / MS_PER_DAY;
+    return { until: cut, prevUntil: ymd(new Date(Date.parse(`${r.prevFrom}T00:00:00Z`) + days * MS_PER_DAY)) };
+  }
+  // Monat und Jahr: derselbe Tag im Vorzeitraum, am Monatsende gekappt
+  // (31.03. -> 28.02., 29.02. -> 28.02. des Vorjahres).
+  const [y, m, d] = cut.split('-').map(Number);
+  const back = r.range === 'year' ? 12 : 1;
+  const lastDay = new Date(Date.UTC(y, m - 1 - back + 1, 0)).getUTCDate();
+  return { until: cut, prevUntil: ymd(new Date(Date.UTC(y, m - 1 - back, Math.min(d, lastDay)))) };
+}
+
 export function slugify(value) {
   return String(value || '')
     .normalize('NFD')

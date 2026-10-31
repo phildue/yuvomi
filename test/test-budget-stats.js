@@ -4,6 +4,7 @@
  * Ausführen: node --experimental-sqlite test/test-budget-stats.js
  */
 import { computeStatsRange, computeStats, statsHandler, resolveExportRange } from '../server/routes/budget.js';
+import { statsCutoff } from '../server/routes/budget/helpers.js';
 import { DatabaseSync } from 'node:sqlite';
 
 let passed = 0, failed = 0;
@@ -180,6 +181,70 @@ test('computeStats leer: alles 0, series zero-filled', () => {
   eq(r.series[0].balance, 0, 'bucket 0');
 });
 
+// --- nur abgeschlossene Einheiten (statsCutoff) ---
+test('statsCutoff year: bis Ende des Vormonats, Vorjahr gleich lang', () => {
+  const c = statsCutoff(computeStatsRange('year', '2026-10-19'), '2026-10-19');
+  eq(c.until, '2026-09-30', 'until');
+  eq(c.prevUntil, '2025-09-30', 'prevUntil');
+});
+
+test('statsCutoff year: Februar im Schaltjahr kappt im Vorjahr', () => {
+  const c = statsCutoff(computeStatsRange('year', '2028-03-05'), '2028-03-05');
+  eq(c.until, '2028-02-29', 'until');
+  eq(c.prevUntil, '2027-02-28', 'prevUntil');
+});
+
+test('statsCutoff year im Januar: nichts gezaehlt', () => {
+  const c = statsCutoff(computeStatsRange('year', '2027-01-10'), '2027-01-10');
+  eq(c.until < '2027-01-01', true, 'until vor from');
+  eq(c.prevUntil < '2026-01-01', true, 'prevUntil vor prevFrom');
+});
+
+test('statsCutoff month: heute zaehlt mit, Vormonat am Monatsende gekappt', () => {
+  const c = statsCutoff(computeStatsRange('month', '2026-03-31'), '2026-03-31');
+  eq(c.until, '2026-03-31', 'until = heute = Monatsende -> vollstaendig');
+  const d = statsCutoff(computeStatsRange('month', '2026-03-30'), '2026-03-30');
+  eq(d.until, '2026-03-30', 'until');
+  eq(d.prevUntil, '2026-02-28', 'prevUntil gekappt');
+});
+
+test('statsCutoff week: gleiche Zahl Tage in der Vorwoche', () => {
+  const c = statsCutoff(computeStatsRange('week', '2026-06-17'), '2026-06-17'); // Mittwoch
+  eq(c.until, '2026-06-17', 'until');
+  eq(c.prevUntil, '2026-06-10', 'prevUntil');
+});
+
+test('statsCutoff: vergangener Zeitraum bleibt vollstaendig, until kappt zusaetzlich', () => {
+  const r = computeStatsRange('year', '2025-06-15');
+  eq(statsCutoff(r, '2026-10-19').until, '2025-12-31', 'vollstaendig');
+  eq(statsCutoff(r, '2026-10-19', '2025-09-30').until, '2025-09-30', 'until-Parameter');
+});
+
+test('computeStats year: laufender Monat und kuenftige Serien-Instanzen zaehlen nicht', () => {
+  const db = freshDb();
+  add(db, '2026-09-05', -1000, 'housing');  // abgeschlossener Monat
+  add(db, '2026-10-05', -1000, 'housing');  // laufender Monat
+  add(db, '2026-11-05', -1000, 'housing');  // materialisierte Zukunft, gebucht
+  add(db, '2025-09-05', -900, 'housing');   // Vorjahr, gleiche Strecke
+  add(db, '2025-10-05', -900, 'housing');   // Vorjahr, ausserhalb der Strecke
+  const r = computeStats(db, { range: 'year', anchor: '2026-10-19', today: '2026-10-19' });
+  eq(r.until, '2026-09-30', 'until gemeldet');
+  eq(r.to, '2026-12-31', 'to bleibt Zeitraumende');
+  eq(r.totals.expenses, -1000, 'nur September');
+  eq(r.byCategory[0].expenses, -1000, 'byCategory ebenso');
+  eq(r.series[9].expenses, 0, 'Oktober-Bucket leer');
+  eq(r.series.length, 12, 'trotzdem 12 Buckets');
+  eq(r.comparison.expenses, -900, 'Vorjahr nur bis September');
+});
+
+test('computeStats month: heute zaehlt, spaeter datierte Buchungen nicht', () => {
+  const db = freshDb();
+  add(db, '2026-10-19', -50, 'food');
+  add(db, '2026-10-25', -700, 'housing');
+  const r = computeStats(db, { range: 'month', anchor: '2026-10-19', today: '2026-10-19' });
+  eq(r.totals.expenses, -50, 'nur bis heute');
+});
+
 // --- statsHandler (HTTP-Validierung) ---
 function mockRes() {
   return {
@@ -198,6 +263,12 @@ test('statsHandler: 400 bei ungültigem range', () => {
 test('statsHandler: 400 bei ungültigem anchor', () => {
   const res = mockRes();
   statsHandler({ query: { range: 'month', anchor: 'xx' } }, res);
+  eq(res.statusCode, 400, 'status');
+});
+
+test('statsHandler: 400 bei ungültigem until', () => {
+  const res = mockRes();
+  statsHandler({ query: { range: 'month', anchor: '2026-06-15', until: '2026-6-1' } }, res);
   eq(res.statusCode, 400, 'status');
 });
 

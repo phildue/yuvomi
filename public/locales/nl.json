@@ -1765,6 +1765,7 @@
         "statsTrendTitleCumulative": "Lopend totaal",
         "statsCategoryTitle": "Per categorie",
         "statsCompareNote": "Verandering ten opzichte van {{period}}",
+        "statsUntilNote": "Geteld tot en met {{date}}: alleen afgeronde perioden",
         "statsDonutTitle": "Uitgavenaandelen",
         "statsExport": "CSV exporteren",
         "statsEmptyTitle": "Geen gegevens in periode",

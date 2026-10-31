@@ -45,6 +45,10 @@ export async function renderStats(panel, ctx) {
 
 function fmtAmount(v) { return view.ctx.formatAmount(v); }
 
+// Letzter Tag, den die Auswertung zaehlt (Server: statsCutoff) - aeltere
+// Antworten ohne das Feld zaehlten bis zum Zeitraumende.
+function statsUntil() { return view.data?.until ?? view.data?.to; }
+
 // Ansichts-Scope (#476/#505): im personal-Modus folgen Statistik und Export dem
 // Mein/Haushalt-Umschalter, sonst ignoriert der Server den Parameter.
 function scopeQuery() {
@@ -104,7 +108,10 @@ async function loadStats() {
 async function loadPrevious(data) {
   if (!data?.from) return null;
   try {
-    const res = await api.get(`/budget/stats?range=${view.range}&anchor=${addLocalDays(data.from, -1)}${scopeQuery()}`);
+    // Dieselbe Strecke wie der laufende Zeitraum (Jan-Sep gegen Jan-Sep): der
+    // Server meldet ihr Ende als prevUntil.
+    const until = data.prevUntil ? `&until=${data.prevUntil}` : '';
+    const res = await api.get(`/budget/stats?range=${view.range}&anchor=${addLocalDays(data.from, -1)}${until}${scopeQuery()}`);
     return res.data;
   } catch (err) {
     console.error('[Budget] stats comparison load error:', err);
@@ -263,7 +270,13 @@ function renderBodyContent(body) {
    * Seitenleiste. Der Verlauf bleibt links, weil sein SVG mit der Breite auch
    * in der Hoehe und in der Schrift waechst. */
   body.replaceChildren();
+  // Laufender Zeitraum: sagen, bis wohin gezaehlt ist - sonst fehlt der
+  // angebrochene Monat ohne Erklaerung.
+  const untilNote = d.until && d.until < d.to && d.until >= d.from
+    ? `<p class="budget-stats__note budget-stats__until">${view.ctx.esc(t('budget.statsUntilNote', { date: dateText(d.until) }))}</p>`
+    : '';
   body.insertAdjacentHTML('beforeend', `
+    ${untilNote}
     ${/* DER RING IST DER KOPF DER KATEGORIELISTE (R16 Schritt 2b). Er stand im
         * Markup HINTER den Balken: mobil 874px von ihnen entfernt, am Desktop in
         * einer Seitenleiste, die unter ihm leer blieb, waehrend links 700px
@@ -314,6 +327,8 @@ function categoryAmounts(byCategory, kind) {
 // Der Vorzeitraum als Text: „August 2026", „2025" oder „01.09. - 07.09.".
 function previousPeriodLabel(prev) {
   if (!prev?.from) return '';
+  // Gekuerzter Vorzeitraum (nur abgeschlossene Einheiten): die echte Strecke.
+  if (prev.until && prev.until < prev.to) return dateRangeText(prev.from, prev.until);
   if (view.range === 'year') return prev.from.slice(0, 4);
   if (view.range === 'month') {
     const [y, m] = prev.from.split('-').map(Number);
@@ -525,12 +540,16 @@ async function loadEntries() {
   const list = view.root.querySelector('#budget-stats-entries-list');
   if (!list) return;
   list.insertAdjacentHTML('beforeend', renderSkeletonList({ rows: 3, lines: 1 }));
-  const { from, to } = view.data;
+  // Dieselben Tage wie die Summen darueber: bis zum letzten gezaehlten.
+  const { from } = view.data;
+  const to = statsUntil();
   const f = view.filter;
   const cat = f.category ? `&category=${encodeURIComponent(f.category)}` : '';
   const sub = f.subcategory ? `&subcategory=${encodeURIComponent(f.subcategory)}` : '';
   try {
-    const res = await api.get(`/budget?from=${from}&to=${to}&booked_only=1${cat}${sub}${scopeQuery()}`);
+    const res = to < from
+      ? { data: [] }
+      : await api.get(`/budget?from=${from}&to=${to}&booked_only=1${cat}${sub}${scopeQuery()}`);
     // Ein späterer Klick hat die Anfrage überholt: seine Antwort gilt, nicht diese.
     if (seq !== view.entriesSeq) return;
     view.entries = res.data;
@@ -732,7 +751,7 @@ function renderExport() {
 
 function entriesKey() {
   const f = view.filter;
-  return [view.data?.from, view.data?.to, f.category ?? '', f.subcategory ?? ''].join('|');
+  return [view.data?.from, view.data?.until ?? view.data?.to, f.category ?? '', f.subcategory ?? ''].join('|');
 }
 
 /**
@@ -757,18 +776,19 @@ export function bucketEntries(base, entries) {
 /**
  * Durchschnitt und Median über die Abschnitte einer Kurve.
  *
- * ABSCHNITTE IN DER ZUKUNFT ZÄHLEN NICHT MIT: im laufenden Jahr stehen Oktober
- * bis Dezember als Nullen in der Serie, und mit ihnen läge der Durchschnitt im
- * September um ein Viertel zu tief. Ein vergangener Abschnitt ohne Buchung
- * zählt dagegen als 0 - ein Monat ohne Ausgabe ist eine Auskunft, keine Lücke.
+ * NUR GEZAEHLTE ABSCHNITTE: im laufenden Jahr stehen der laufende Monat und
+ * die folgenden als Nullen in der Serie (der Server zaehlt nur abgeschlossene
+ * Monate), und mit ihnen laege der Durchschnitt im Oktober um ein Viertel zu
+ * tief. Ein vergangener Abschnitt ohne Buchung zaehlt dagegen als 0 - ein
+ * Monat ohne Ausgabe ist eine Auskunft, keine Luecke.
  *
  * @param {number[]} values
  * @param {string[]} periods  'YYYY-MM' oder 'YYYY-MM-DD', parallel zu values
- * @param {string} today      'YYYY-MM-DD'
+ * @param {string} until      'YYYY-MM-DD', letzter gezaehlter Tag (Antwort `until`)
  * @returns {{average: number, median: number, count: number}}
  */
-export function seriesStats(values, periods, today) {
-  const past = values.filter((_, i) => periods[i] <= today.slice(0, periods[i].length));
+export function seriesStats(values, periods, until) {
+  const past = values.filter((_, i) => periods[i] <= until.slice(0, periods[i].length));
   const used = past.length ? past : values;
   if (!used.length) return { average: 0, median: 0, count: 0 };
   const sorted = [...used].sort((x, y) => x - y);
@@ -850,7 +870,11 @@ function renderTrendChart() {
   // die Ausgaben trugen bis dahin zusaetzlich eine Strichelung, und mit der
   // punktierten Zukunft standen drei Strichmuster in einem Bild.
   const todayIndex = cumulative ? futureStartIndex(s.map((p) => p.period), todayKey()) : -1;
-  const lastPast = todayIndex >= 0 ? todayIndex : s.length - 1;
+  // Im Jahr endet die Linie am letzten abgeschlossenen Monat: danach stehen
+  // nur Nullen, weil der Server noch nicht zaehlt - kein Absturz auf die Null.
+  const until = statsUntil();
+  const lastCounted = s.reduce((acc, p, i) => (p.period <= until.slice(0, p.period.length) ? i : acc), 0);
+  const lastPast = todayIndex >= 0 ? todayIndex : cumulative ? s.length - 1 : lastCounted;
   const points = (arr, from = 0, to = arr.length - 1) => arr
     .map((v, i) => (i < from || i > to ? null : `${chartX(i, s.length, geo).toFixed(1)},${chartY(v, 0, axis.max, geo).toFixed(1)}`))
     .filter(Boolean).join(' ');
@@ -874,7 +898,7 @@ function renderTrendChart() {
   // waere ein Mittelwert der Laufsumme keine Auskunft. Als waagerechte Linie
   // steht er deshalb nur im Monatsraster (Jahr), wo die Kurve die Rohwerte
   // zeigt; aufsummiert nennt ihn die Legende.
-  const stats = seriesStats(showExpenses ? rawExpenses : rawIncomes, s.map((p) => p.period), todayKey());
+  const stats = seriesStats(showExpenses ? rawExpenses : rawIncomes, s.map((p) => p.period), until);
   const avgText = `${t('budget.statsAverage')} ${fmtAmount(stats.average)}`;
   const medText = `${t('budget.statsMedian')} ${fmtAmount(stats.median)}`;
   const drawRefs = stats.count > 0 && !cumulative && !pending;

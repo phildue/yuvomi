@@ -1765,6 +1765,7 @@
         "statsTrendTitleCumulative": "संचयी योग",
         "statsCategoryTitle": "श्रेणी के अनुसार",
         "statsCompareNote": "{{period}} की तुलना में बदलाव",
+        "statsUntilNote": "{{date}} तक गिना गया: केवल पूर्ण अवधियाँ",
         "statsDonutTitle": "व्यय हिस्सेदारी",
         "statsExport": "CSV निर्यात करें",
         "statsEmptyTitle": "अवधि में कोई डेटा नहीं",

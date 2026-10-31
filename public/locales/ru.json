@@ -1939,6 +1939,7 @@
         "statsTrendTitleCumulative": "Нарастающий итог",
         "statsCategoryTitle": "По категориям",
         "statsCompareNote": "Изменение по сравнению с: {{period}}",
+        "statsUntilNote": "Учтено по {{date}}: только завершённые периоды",
         "statsDonutTitle": "Доли расходов",
         "statsExport": "Экспорт CSV",
         "statsEmptyTitle": "Нет данных за период",

@@ -1765,6 +1765,7 @@
         "statsTrendTitleCumulative": "Total acumulado",
         "statsCategoryTitle": "Por categoria",
         "statsCompareNote": "Variação em relação a {{period}}",
+        "statsUntilNote": "Contabilizado até {{date}}: apenas períodos concluídos",
         "statsDonutTitle": "Distribuição de despesas",
         "statsExport": "Exportar CSV",
         "statsEmptyTitle": "Sem dados no período",

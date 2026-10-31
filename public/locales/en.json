@@ -1765,6 +1765,7 @@
         "statsTrendTitleCumulative": "Running total",
         "statsCategoryTitle": "By category",
         "statsCompareNote": "Change compared with {{period}}",
+        "statsUntilNote": "Counted through {{date}}: completed periods only",
         "statsDonutTitle": "Expense shares",
         "statsExport": "Export CSV",
         "statsEmptyTitle": "No data in range",

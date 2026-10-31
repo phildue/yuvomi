@@ -1765,6 +1765,7 @@
         "statsTrendTitleCumulative": "Σωρευτικό σύνολο",
         "statsCategoryTitle": "Ανά κατηγορία",
         "statsCompareNote": "Μεταβολή σε σχέση με {{period}}",
+        "statsUntilNote": "Μετρήθηκε έως {{date}}: μόνο ολοκληρωμένες περίοδοι",
         "statsDonutTitle": "Μερίδια εξόδων",
         "statsExport": "Εξαγωγή CSV",
         "statsEmptyTitle": "Δεν υπάρχουν δεδομένα στην περίοδο",
