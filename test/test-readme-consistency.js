@@ -139,8 +139,9 @@ test('docs/installation.md: kein Copy-Block legt die .env an und startet', () =>
     + 'Secrets erzeugen, .env von Hand fuellen, dann erst in einem eigenen Block starten.');
   // Ohne diese Vorbedingung waere der Test gruen, weil es gar keinen
   // Kurzweg mehr gibt, den er pruefen koennte.
-  const quick = md.split(/^### /m).find((s) => /^Option C .*Manual/.test(s));
-  assert.ok(quick, 'Abschnitt "Option C - Manual" nicht gefunden - Muster veraltet?');
+  // Seit #2582 ohne Optionsbuchstaben: die zaehlt nur die Schritt-fuer-Schritt-Liste.
+  const quick = md.split(/^### /m).find((s) => /^Manual \(Docker or Podman/.test(s));
+  assert.ok(quick, 'Abschnitt "Manual (Docker or Podman ...)" im Quick Install nicht gefunden - Muster veraltet?');
   assert.match(quick, /openssl rand -hex 32/, 'Der Kurzweg sagt nicht, wie man die Secrets erzeugt.');
   assert.match(quick, /REPLACE_WITH_/, 'Der Kurzweg nennt den Platzhalter nicht, den man ersetzen muss.');
 });
@@ -445,8 +446,9 @@ test('der Gruppen-Guard erkennt den Schaden, gegen den er gebaut ist', () => {
   const oldForm = groupFindings(md.replace(summary, `${asList}\n<details>\n<summary><b>Every module in one line</b></summary>`), html, 'en');
   assert.ok(hit(oldForm, /0 Gruppenzeilen, die Homepage zeigt 5 Gruppen/), oldForm.join(' | '));
   // Die Homepage bekommt ein Modul, das die Gruppenzeilen nicht kennen.
-  const more = html.replace('<h4 data-t="m_backup_t">', '<h4 data-t="m_backup_t">x</h4></div><div class="mod-card"><h4 data-t="m_bday_t">');
-  assert.notEqual(more, html, 'Vorbedingung: m_backup_t steht als <h4> im Markup');
+  // Seit S4 (Critique 2026-10-30) steht der Name in einem <span> der <h4>, neben dem Symbol.
+  const more = html.replace('<span data-t="m_backup_t">', '<span data-t="m_backup_t">x</span></h4></div><div class="mod-card"><h4><span data-t="m_bday_t">');
+  assert.notEqual(more, html, 'Vorbedingung: m_backup_t steht als Name einer <h4> im Markup');
   assert.ok(hit(groupFindings(md, more, 'en'), /Gruppe "Settings"/));
 });
 

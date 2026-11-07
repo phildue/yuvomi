@@ -269,10 +269,16 @@ test('kein Compose-Manifest nutzt die env_file-Langform (Compose <2.24 lehnt sie
   }
 });
 
-test('install.html setzt im Reverse-Proxy-Pfad SESSION_SECURE=true', () => {
-  const src = readFileSync(new URL('../tools/installer/install.html', import.meta.url), 'utf8');
-  assert.match(src, /S\.SESSION_SECURE\s*=\s*'true'/,
+test('install.html setzt im Reverse-Proxy-Pfad SESSION_SECURE=true', async () => {
+  // Seit dem Rerun-Schutz rechnet accessEnv() (rerun-prefill.js) das Paar; die
+  // Zusage bleibt dieselbe: eine Erstinstallation hinter dem Proxy bekommt
+  // sichere Cookies, und cfg-next nimmt genau diesen Wert.
+  const { accessEnv } = await import('../tools/installer/rerun-prefill.js');
+  assert.equal(accessEnv('proxy', null).SESSION_SECURE, 'true',
     'Proxy-Pfad schreibt SESSION_SECURE nicht auf true');
+  const src = readFileSync(new URL('../tools/installer/install.html', import.meta.url), 'utf8');
+  assert.match(src, /Object\.assign\(S, accessEnv\(choice, rerunValues\)\)/,
+    'cfg-next setzt SESSION_SECURE nicht aus accessEnv');
 });
 
 // ── env-schema deckt die neuen Settings ab ─────────────────────────────────────
@@ -348,8 +354,13 @@ test('die statische Auslieferung bleibt ohne Origin erreichbar', async () => {
 //
 // Als Regel formuliert, nicht als Liste der beiden heutigen Buttons: ein
 // dritter Schreibpfad fällt damit beim Hinzufügen auf, nicht erst im Critique.
+//
+// Seit der Re-Critique (29.10.2026, Entscheidung B) gilt die Bestätigung nur,
+// wenn Speichern etwas überschreibt oder neu startet (needsConfirm(): bestehende
+// .env, laufender Container oder unbekannter Bestand). Die Erstinstallation
+// speichert mit dem ersten Klick; ausgeführt prüft das test-installer-rerun.js.
 
-test('jeder Pfad, der die .env schreibt, verlangt vorher eine Bestätigung', () => {
+test('jeder Pfad, der die .env schreibt, verlangt vorher eine Bestätigung, wenn er etwas überschreibt', () => {
   const src = readFileSync(new URL('../tools/installer/install.html', import.meta.url), 'utf8');
   const schreibstellen = [...src.matchAll(/fetch\('\/api\/save-env'/g)].map(m => m.index);
   assert.ok(schreibstellen.length >= 2,
@@ -357,7 +368,7 @@ test('jeder Pfad, der die .env schreibt, verlangt vorher eine Bestätigung', () 
 
   for (const idx of schreibstellen) {
     const handler = src.slice(Math.max(0, idx - 1500), idx);
-    assert.match(handler, /if \(!\w*[Cc]onfirmed\)/,
+    assert.match(handler, /if \(needsConfirm\(\) && !\w*[Cc]onfirmed\)/,
       'ein Pfad schreibt die .env ohne vorherige Zwei-Klick-Bestätigung');
   }
 });
@@ -377,12 +388,13 @@ test('der Erweitert-Pfad zeigt die Warnung über eine bestehende .env', () => {
   assert.match(banner[2], /class="warn-icon"/, 'cfg-existing trägt kein Warn-Icon');
   assert.match(banner[2], /<span data-i18n="config\.existing">/,
     'cfg-existing trägt den falschen i18n-Schlüssel, oder er sitzt nicht im inneren span');
-  // Ein Banner, das der Preflight nie einblendet, ist so gut wie keins - und
-  // .warn-banner ist ein Flex-Container: mit display 'block' fiele das Icon
-  // aus der Zeile.
+  // Ein Banner, das der Preflight nie einblendet, ist so gut wie keins. Per
+  // hidden, nicht style.display: .warn-banner ist ein Flex-Container, und ein
+  // gesetztes display 'block' stellte das Icon aus der Zeile.
   const preflight = src.slice(src.indexOf('d.envExists'), src.indexOf('d.envExists') + 300);
-  assert.ok(preflight.includes("$('cfg-existing').style.display = 'flex'"),
-    'cfg-existing wird bei envExists nicht als Flex-Banner eingeblendet');
+  assert.ok(preflight.includes("$('cfg-existing').hidden = false"),
+    'cfg-existing wird bei envExists nicht eingeblendet');
+  assert.match(src, /<div class="warn-banner" id="cfg-existing"[^>]*\shidden[\s>]/, 'cfg-existing steht schon vor dem Preflight da');
 });
 
 // ── Der Wartebildschirm: eine Phase ist kein Fehlschlag ───────────────────────
@@ -561,11 +573,13 @@ test('ein Retry raeumt das laufende Polling ab, statt ein zweites zu starten', (
   const startDocker = html.match(/async function startDocker\(\) \{([\s\S]*?)\n\}/);
   assert.ok(startDocker, 'startDocker() nicht gefunden');
   const body = startDocker[1];
-  const clearIdx = body.indexOf('clearInterval(pollInterval)');
-  const setIdx = body.indexOf('setInterval(pollDocker');
-  assert.ok(clearIdx !== -1, 'startDocker() raeumt kein laufendes Intervall ab');
-  assert.ok(setIdx !== -1, 'startDocker() setzt kein Polling-Intervall');
-  assert.ok(clearIdx < setIdx, 'das Abraeumen muss VOR dem neuen setInterval stehen');
+  // Seit der setTimeout-Kette (test-installer-validation.js) heisst das
+  // Abraeumen stopPolling() und das Planen schedulePoll().
+  const clearIdx = body.indexOf('stopPolling()');
+  const setIdx = body.indexOf('schedulePoll(run)');
+  assert.ok(clearIdx !== -1, 'startDocker() raeumt keine laufende Kette ab');
+  assert.ok(setIdx !== -1, 'startDocker() plant kein Polling');
+  assert.ok(clearIdx < setIdx, 'das Abraeumen muss VOR dem neuen Planen stehen');
 
   // Zweiter Riegel: pollDocker ist async, also kann ein Tick seine Antwort noch
   // auswerten, nachdem ein anderer den Endzustand gemeldet hat.

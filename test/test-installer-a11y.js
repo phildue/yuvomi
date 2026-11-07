@@ -52,6 +52,31 @@ test('jedes error-banner trägt role="alert"', () => {
   }
 });
 
+/* Sichtbarkeit laeuft ueber das hidden-Attribut, wie in renderStepNav und
+ * renderKeyFile - nicht ueber style.display. Vorher standen 38 Zuweisungen und
+ * zehn Inline-`display:none` daneben, und jede musste die Anzeigeart des CSS
+ * kennen: 'flex' fuer .warn-banner, 'inline-flex' fuer den Knopf, 'block' fuer
+ * den Rest. Ein falscher Wert stellte das Icon unter den Text. Mit hidden
+ * bleibt die Anzeigeart beim CSS ([hidden] traegt !important). Weil das CSS die
+ * Fehlerbanner und das Protokoll nicht mehr selbst versteckt, muss jedes davon
+ * im Markup verborgen starten - sonst stuende ein leerer roter Kasten da. */
+test('Sichtbarkeit nur per hidden: kein style.display, Banner starten verborgen', () => {
+  const script = html.slice(html.indexOf('<script', html.indexOf('</style>')));
+  const uses = [...script.matchAll(/\.style\.display\s*(?:=|!==|===|!=|==)|setProperty\(\s*['"]display/g)];
+  assert.deepEqual(uses.map(m => m[0]), [], `style.display im Skript (${uses.length}x) - hidden setzen`);
+  const inline = [...html.matchAll(/<[a-z][^>]*\sstyle="[^"]*\bdisplay\s*:[^>]*>/gi)].map(m => m[0]);
+  assert.deepEqual(inline, [], 'Inline-display im Markup - hidden-Attribut verwenden');
+  const css = [...html.matchAll(/<style>([\s\S]*?)<\/style>/g)].map(m => m[1]).join('\n');
+  for (const sel of ['.error-banner', '.log-box']) {
+    const rule = css.match(new RegExp(`(?:^|\\})\\s*\\${sel}\\s*\\{([^}]*)\\}`, 'm'));
+    assert.ok(rule, `${sel} fehlt im CSS`);
+    assert.doesNotMatch(rule[1], /display\s*:\s*none/, `${sel} versteckt sich per CSS - hidden im Markup tut das`);
+  }
+  const boxes = [...html.matchAll(/<div[^>]*class="(?:error-banner|log-box)\b[^"]*"[^>]*>/g)].map(m => m[0]);
+  assert.ok(boxes.length >= 14, `erwartet 13 Fehlerbanner und das Protokoll, gefunden ${boxes.length}`);
+  for (const tag of boxes) assert.match(tag, /\shidden[\s>]/, `startet sichtbar: ${tag}`);
+});
+
 test('die Docker-Statuszeile ist eine Live-Region', () => {
   // Seit der Phasen-Checkliste ist sie visuell versteckt (class="vh status-row"):
   // sichtbar steht dasselbe in der Liste, die Region traegt nur die Ansage.
@@ -647,43 +672,70 @@ test('der Installer nutzt kein --color-text-on-accent (folgt dem Theme nicht)', 
  * Nichts hat das geprueft: die Werte sind zwei Kopien ohne Naht dazwischen.
  * Dieser Guard ist die Naht. Er prueft nur Tokens, die BEIDE Seiten fuehren -
  * der Fallback darf bewusst kleiner sein als tokens.css. */
+/* Die zweite Fassung loest var() AUF, statt nur Namen mit einem privaten
+ * --_-Gegenstueck zu vergleichen. Die erste blieb gruen, waehrend zwei Werte
+ * drifteten (Critique 2026-10-29): --color-border-control steht in tokens.css
+ * dunkel eigens auf #857F76 (kein --_-Token), der Fallback leitete es aus
+ * --neutral-500 (#948E85) ab; und --ease-glass ist in tokens.css hinter
+ * @supports eine linear()-Feder, im Fallback nur die Bezier. Verglichen wird
+ * jetzt der AUFGELOESTE Wert jedes Fallback-Tokens in drei Schichten: hell,
+ * hell mit linear() (der @supports-Rahmen), dunkel. */
 test('der Inline-Fallback stimmt Wert fuer Wert mit tokens.css ueberein', () => {
-  const darkHtml = html.indexOf('@media (prefers-color-scheme: dark)');
-  const darkTokens = tokensCss.indexOf('@media (prefers-color-scheme: dark)');
-  assert.ok(darkHtml > 0 && darkTokens > 0, 'Dark-Block nicht gefunden');
-
-  // Die :root-Deklarationen des Fallbacks, je Theme.
-  const fallbackVars = (from, to) => {
-    const map = new Map();
-    // Nicht nur Hex: auch Werte, die mit einer Zahl beginnen (Schatten, Radien,
-    // Typo-Stufen), driften sonst stumm. Gemessen 2026-08-31: der Dark-
-    // Kantenring aus tokens.css (0 0 0 1px rgba(255,255,255,.06)) fehlte im
-    // Fallback, und dieser Guard blieb gruen, weil er nur Hex verglich - Guard
-    // prueft Schreibweise, nicht Sache. Verglichen wird weiterhin nur, was
-    // tokens.css als privates --_-Token fuehrt.
-    for (const [, name, value] of html.slice(from, to).matchAll(/(--[\w-]+)\s*:\s*(#[0-9a-fA-F]{3,8}|[\d.][^;]*)/g)) {
-      map.set(name, value.replace(/\s+/g, ' ').trim().toLowerCase());
+  const strip = css => css.replace(/\/\*[\s\S]*?\*\//g, '');
+  /** Inhalt des Blocks, dessen Kopf `head` ist (Klammerzaehlung). */
+  const block = (src, head, from = 0) => {
+    const at = src.indexOf(head, from);
+    if (at === -1) return null;
+    let depth = 0;
+    for (let k = src.indexOf('{', at); k < src.length; k++) {
+      if (src[k] === '{') depth++;
+      else if (src[k] === '}' && --depth === 0) return src.slice(src.indexOf('{', at) + 1, k);
     }
-    return map;
+    return null;
   };
-  const light = fallbackVars(0, darkHtml);
-  const dark = fallbackVars(darkHtml, html.indexOf('</style>', darkHtml));
+  /** Deklarationen der OBERSTEN Ebene eines Blocks (verschachtelte Regeln fallen weg). */
+  const decls = body => {
+    const flat = body.replace(/[^{}]*\{[^{}]*\}/g, '');
+    return Object.fromEntries([...flat.matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)].map(m => [m[1], m[2].trim()]));
+  };
+  const resolve = (value, env, depth = 0) => {
+    assert.ok(depth < 20, `var()-Kette zu tief: ${value}`);
+    const out = value.replace(/var\(\s*(--[\w-]+)\s*(?:,\s*([^()]*))?\)/g,
+      (_, name, fb) => env[name] !== undefined ? resolve(env[name], env, depth + 1) : (fb ?? `<${name}?>`));
+    return out
+      .replace(/calc\(\s*([\d.]+)\s*\*\s*([\d.]+)\s*\)/g, (_, a, b) => String(Number((a * b).toFixed(4))))
+      .replace(/(?<![\w#.])(\d+\.\d+)(?!\d)/g, n => String(Number(n)))
+      .replace(/\s+/g, ' ').trim().toLowerCase();
+  };
+
+  const fbCss = strip(html.slice(html.indexOf('<style>'), html.indexOf('</style>')));
+  const tkCss = strip(tokensCss);
+  const linear = '@supports (transition-timing-function: linear(0, 1))';
+  const fbBase = decls(block(fbCss, ':root'));
+  const fbLinear = decls(block(block(fbCss, linear) ?? '', ':root') ?? '');
+  const fbDark = decls(block(block(fbCss, '@media (prefers-color-scheme: dark)') ?? '', ':root') ?? '');
+  assert.ok(Object.keys(fbDark).length > 0, 'Dark-Block im Inline-Fallback nicht gefunden');
+  const tkBase = decls(block(tkCss, ':root {'));
+  const tkLinear = decls(block(block(tkCss, linear), ':root'));
+  const tkDark = decls(block(tkCss, ':root:not([data-theme="light"]) {'));
+  assert.ok(Object.keys(tkDark).length > 0, 'Dark-Block in tokens.css nicht gefunden');
 
   const drift = [];
-  for (const [theme, vars, tokensFrom] of [['light', light, 0], ['dark', dark, darkTokens]]) {
-    for (const [name, value] of vars) {
-      // tokens.css fuehrt die Basiswerte auf privaten --_-Variablen.
-      const privateName = name.replace(/^--/, '--_');
-      const re = new RegExp(`${privateName}:\\s*([^;]+);`, 'g');
-      re.lastIndex = tokensFrom;
-      const hit = re.exec(tokensCss);
-      if (!hit) continue; // Token nur im Fallback - erlaubt
-      const tokensValue = hit[1].replace(/\s+/g, ' ').trim().toLowerCase();
-      if (tokensValue !== value) {
-        drift.push(`${theme}: ${name} = ${value}, tokens.css = ${tokensValue}`);
-      }
+  const layers = [
+    ['hell', { ...fbBase }, { ...tkBase }],
+    ['hell mit linear()', { ...fbBase, ...fbLinear }, { ...tkBase, ...tkLinear }],
+    ['dunkel', { ...fbBase, ...fbLinear, ...fbDark }, { ...tkBase, ...tkLinear, ...tkDark }],
+  ];
+  for (const [theme, fb, tk] of layers) {
+    for (const name of Object.keys(fb)) {
+      // Nur Tokens, die BEIDE Seiten fuehren: color-scheme ist keine Variable,
+      // und der Fallback darf bewusst kleiner sein als tokens.css.
+      if (tk[name] === undefined) continue;
+      const a = resolve(fb[name], fb), b = resolve(tk[name], tk);
+      if (a !== b) drift.push(`${theme}: ${name} = ${a}, tokens.css = ${b}`);
     }
   }
+  assert.ok(Object.keys(fbBase).length >= 40, `nur ${Object.keys(fbBase).length} Fallback-Tokens gelesen - der Leser greift nicht`);
   assert.deepEqual(drift, [],
     `Fallback-Tokens weichen von tokens.css ab (der Fallback greift nur, wenn tokens.css fehlt - dort waere die Abweichung dann sichtbar): ${drift.join(' | ')}`);
 });
@@ -841,22 +893,46 @@ test('Buttons stehen auf 48px, und .open-link gleicht .btn-primary', () => {
     '.open-link hat eine andere Primaerflaeche als .btn-primary');
 });
 
-/* Der Klassentausch am Abschluss animierte die Flaeche, die Schriftfarbe sprang
- * sofort: 120ms Violett auf Violett. setDoneEmphasis() muss die Transition fuer
- * den Tausch abschalten, den Stil festschreiben und sie danach zurueckgeben -
- * in dieser Reihenfolge, sonst wirkt einer der drei Schritte nicht. */
-test('der Tausch der Abschlussknoepfe blendet keine Farbe ueber', () => {
-  const fn = html.match(/function setDoneEmphasis\(\) \{([\s\S]*?)\n\}/);
-  assert.ok(fn, 'setDoneEmphasis nicht gefunden');
-  const body = fn[1];
-  const off = body.indexOf("style.transition = 'none'");
-  const swap = body.indexOf('dl.className');
-  const reflow = body.search(/void \w+\.offsetWidth/);
-  const back = body.indexOf("style.transition = ''");
-  assert.ok(off !== -1 && swap !== -1 && reflow !== -1 && back !== -1,
-    'setDoneEmphasis schaltet die Transition fuer den Klassentausch nicht ab und wieder an');
-  assert.ok(off < swap && swap < reflow && reflow < back,
-    'Reihenfolge muss sein: Transition aus, Klassen tauschen, Reflow, Transition zurueck');
+/* Der Abschluss: der Erfolg fuehrt, die Schluesseldatei ist eine Checkzeile
+ * (Re-Critique 2026-10-29, Entscheidung D). Vorher stand die Bildmarke im
+ * gruenen Ring UNTER derselben Marke im Kopf (zwei Logos), ein Warnbanner
+ * fuehrte, und der Download stand als Primaerknopf ueber "Yuvomi oeffnen". */
+test('der Abschluss: ein Erfolgszeichen, Open fuehrt, die Schluesseldatei hakt sich ab', () => {
+  const done = html.slice(html.indexOf('<div class="step" id="step-done">'), html.indexOf('<div class="next-steps">'));
+  assert.ok(done.length > 100, 'Abschluss-Schritt nicht gefunden');
+  const mark = done.match(/<div class="done-mark"[^>]*>([\s\S]*?)<\/div>/);
+  assert.ok(mark, 'kein Erfolgszeichen');
+  assert.doesNotMatch(mark[1], /<circle/, 'das Erfolgszeichen traegt wieder die Kreise der Bildmarke - zwei Logos');
+  assert.doesNotMatch(done, /class="warn-banner"/, 'der Abschluss fuehrt wieder mit einer Warnung');
+  // Reihenfolge: Checkzeile vor dem Oeffnen, der Download ist kein Primaerknopf.
+  const row = done.indexOf('id="done-keyfile"');
+  const open = done.indexOf('id="done-link"');
+  assert.ok(row !== -1 && open !== -1 && row < open, 'die Schluesselzeile steht nicht vor "Yuvomi oeffnen"');
+  assert.match(done, /<a id="done-link" class="open-link"/, '"Yuvomi oeffnen" ist nicht der Primaerknopf');
+  assert.match(done, /<button type="button" class="btn btn-ghost btn-sm keyfile__action" id="done-download">/,
+    'der Download ist wieder ein Primaerknopf statt der Aktion einer Zeile');
+  // renderKeyFile wird AUSGEFUEHRT: offen gegen gesichert.
+  const nodes = {
+    'done-keyfile': { dataset: {} }, 'done-download-label': { textContent: '' }, 'done-server-stops': { hidden: false },
+  };
+  const spans = [{ dataset: { keyfileState: 'open' }, hidden: true }, { dataset: { keyfileState: 'saved' }, hidden: false }];
+  const render = saved => new Function('keysDownloaded', '$', 'document', 't', `${fnSource('renderKeyFile')}; renderKeyFile();`)(
+    saved, id => nodes[id], { querySelectorAll: () => spans }, k => k);
+  render(false);
+  assert.equal(nodes['done-keyfile'].dataset.state, 'open');
+  assert.deepEqual(spans.map(x => x.hidden), [false, true]);
+  assert.equal(nodes['done-download-label'].textContent, 'done.download');
+  assert.equal(nodes['done-server-stops'].hidden, false, 'der Zeitdruck-Satz fehlt, solange die Datei nicht gesichert ist');
+  render(true);
+  assert.equal(nodes['done-keyfile'].dataset.state, 'saved');
+  assert.deepEqual(spans.map(x => x.hidden), [true, false]);
+  assert.equal(nodes['done-download-label'].textContent, 'done.downloadAgain');
+  assert.equal(nodes['done-server-stops'].hidden, true, 'der Zeitdruck-Satz bleibt nach dem Download stehen');
+  // Gesichert zeigt der Haken in Erfolgsgruen.
+  assert.equal(declared(sel => sel === '.keyfile[data-state="saved"] .keyfile__mark::before', 'background'), 'var(--color-success)');
+  // Und der Download-Handler hakt erst NACH dem Erfolg ab.
+  const handler = html.slice(html.indexOf("$('done-download').addEventListener('click'"));
+  assert.ok(handler.indexOf('renderKeyFile()') > handler.indexOf('keysDownloaded = true'), 'die Zeile hakt sich vor dem Erfolg ab');
 });
 
 /* Der Zurueck-Knopf stand auf --color-surface-2, das im Dark Mode TIEFER liegt
@@ -1030,9 +1106,9 @@ test('die Schrittliste folgt dem Weg: erledigt anklickbar, aktuell markiert, kom
   const UNNUMBERED = literal('UNNUMBERED');
   const numbered = new Set([...FLOWS.simple, ...FLOWS.advanced].filter(s => !UNNUMBERED.has(s)));
   const navItems = [...html.matchAll(/<li class="steps-nav__item" data-nav-step="([a-z]+)"[^>]*>(.*?)<\/li>/g)];
-  // Dazu der Containerstart: ohne Nummer, aber mit Platz (eigener Test unten).
-  assert.deepEqual(new Set(navItems.map(m => m[1])), new Set([...numbered, 'docker']), 'die Liste fuehrt andere Schritte als die Wege');
-  for (const m of navItems.filter(i => numbered.has(i[1]))) {
+  assert.deepEqual(new Set(navItems.map(m => m[1])), numbered, 'die Liste fuehrt andere Schritte als die Wege');
+  // Der Containerstart ist kein Knopf (eigener Test unten).
+  for (const m of navItems.filter(i => i[1] !== 'docker')) {
     assert.match(m[2], new RegExp(`<button type="button" class="steps-nav__link" data-goto="${m[1]}"`),
       `Eintrag ${m[1]} ist kein Knopf mit data-goto`);
   }
@@ -1042,13 +1118,17 @@ test('die Schrittliste folgt dem Weg: erledigt anklickbar, aktuell markiert, kom
   assert.match(fnSource('showStep'), /renderStep\(\)/, 'showStep zeichnet den Schritt nicht');
   assert.match(fnSource('renderStep'), /renderStepNav\(\)/, 'renderStep aktualisiert die Liste nicht');
 
-  const run = (flow, currentStep, dockerOutcome = null) => {
-    const items = navFakes([...numbered, 'docker']);
+  // stepSetUp: was in den optionalen Schritten eingerichtet ist. Standard:
+  // alles eingerichtet, damit "erledigt" der Normalfall dieses Tests bleibt.
+  const run = (flow, currentStep, dockerOutcome = null, setUp = () => true) => {
+    const items = navFakes([...numbered]);
     const document = { querySelectorAll: () => items };
-    new Function('flow', 'currentStep', 'UNNUMBERED', 'dockerOutcome', 'document', `${fnSource('renderStepNav')}; renderStepNav();`)(
-      flow, currentStep, UNNUMBERED, dockerOutcome, document);
+    const stepSetUp = name => (OPTIONAL.has(name) ? setUp(name) : undefined);
+    new Function('flow', 'currentStep', 'UNNUMBERED', 'dockerOutcome', 'document', 'stepSetUp', `${fnSource('renderStepNav')}; renderStepNav();`)(
+      flow, currentStep, UNNUMBERED, dockerOutcome, document, stepSetUp);
     return Object.fromEntries(items.map(i => [i.name, i]));
   };
+  const OPTIONAL = new Set(['weather', 'calendar', 'email', 'storage', 'advanced']);
 
   const adv = FLOWS.advanced;
   let r = run(adv, adv.indexOf('calendar'));
@@ -1065,6 +1145,16 @@ test('die Schrittliste folgt dem Weg: erledigt anklickbar, aktuell markiert, kom
     assert.equal(r[next].button.disabled, true, `${next} kommt erst noch und ist trotzdem anklickbar`);
     assert.equal(r[next].button.attrs['aria-current'], undefined);
   }
+
+  // Uebersprungen: ein optionaler Schritt ohne Einrichtung traegt keinen
+  // Haken, fuehrt aber zurueck wie ein erledigter (Re-Critique 2026-10-29).
+  r = run(adv, adv.indexOf('review'), null, name => name === 'calendar');
+  for (const skipped of ['weather', 'email', 'storage', 'advanced']) {
+    assert.equal(r[skipped].dataset.state, 'skipped', `${skipped} ist ohne Einrichtung als erledigt abgehakt`);
+    assert.equal(r[skipped].button.disabled, false, `${skipped} ist uebersprungen und fuehrt nicht zurueck`);
+  }
+  assert.equal(r.calendar.dataset.state, 'done', 'ein eingerichteter optionaler Schritt ist nicht erledigt');
+  assert.equal(r.secrets.dataset.state, 'done', 'ein Pflichtschritt gilt als uebersprungen');
 
   r = run(adv, adv.indexOf('docker'));
   assert.equal(r.review.dataset.state, 'done');
@@ -1150,8 +1240,8 @@ test('der Rueckweg zur Pruefseite prueft jeden Schritt dazwischen erneut', () =>
 /* Die Pruefseite: nach Schritten gruppiert, jede Gruppe mit "Aendern", und KEINE
  * nackte "-"-Zeile mehr. Vorher 20 ungegliederte Zeilen, 11 davon mit Strich
  * (Critique 2026-09-29). renderReview wird mit leerem und mit vollem Zustand
- * AUSGEFUEHRT: jede sichtbare Zeile traegt einen Wert, was fehlt, steht je
- * Gruppe in EINER Zeile "Nicht eingerichtet". */
+ * AUSGEFUEHRT: jede Zeile traegt einen Wert, was fehlt, sagt "Nicht
+ * eingerichtet" in seiner eigenen Wertspalte. */
 test('die Pruefseite hat Gruppen mit Aendern-Link und keine Strich-Zeile', () => {
   const FLOWS = literal('FLOWS');
   const review = stepSource('review');
@@ -1177,40 +1267,48 @@ test('die Pruefseite hat Gruppen mit Aendern-Link und keine Strich-Zeile', () =>
   // Zellen aus dem Markup: id -> Beschriftung.
   const cells = new Map();
   for (const m of review.matchAll(/<dt data-i18n="([^"]+)">[^<]*<\/dt><dd id="([^"]+)"><\/dd>/g)) {
-    cells.set(m[2], { key: m[1], textContent: 'VORHER', parentElement: { hidden: false }, previousElementSibling: { textContent: m[1] } });
+    const classes = new Set();
+    cells.set(m[2], { key: m[1], textContent: 'VORHER', parentElement: { hidden: false, classes,
+      classList: { toggle: (c, on) => (on ? classes.add(c) : classes.delete(c)) } } });
   }
   assert.ok(cells.size >= 20, `nur ${cells.size} Zellen gefunden - der Scanner greift nicht`);
+  // Schluessel links, Wert rechts: "Nicht eingerichtet" ist ein WERT und steht
+  // nie in der Beschriftungsspalte (Critique 2026-10-29: dort stand es, die
+  // fehlenden Dienste in der Wertspalte - Schluessel und Wert vertauscht).
+  assert.doesNotMatch(review, /<dt[^>]*data-i18n="review\.notSetUp"/, '"Nicht eingerichtet" steht in der Beschriftungsspalte');
 
   const run = (overrides) => {
-    for (const c of cells.values()) { c.textContent = 'VORHER'; c.parentElement.hidden = false; }
+    for (const c of cells.values()) { c.textContent = 'VORHER'; c.parentElement.classes.clear(); }
     const S = { ...literal('S'), ...overrides };
-    new Function('S', '$', 't', 'preservedKeys', 'deriveBaseUrl',
+    // Hinweis und Entfernt-Zeile (Re-Critique 29.10.) haben eigene Tests in
+    // test-installer-rerun.js; hier nur so weit gestubbt, dass renderReview laeuft.
+    const extra = id => ({ hidden: true, textContent: '', id });
+    new Function('S', '$', 't', 'preservedKeys', 'deriveBaseUrl', 'isLoopbackHost', 'originHost',
+      'pendingClears', 'buildEnv',
       `${fnSource('fillReviewGroup')}; ${fnSource('renderReview')}; renderReview();`)(
-      S, id => cells.get(id), key => `T:${key}`, new Set(), () => 'http://localhost:3000');
+      S, id => cells.get(id) ?? extra(id), key => `T:${key}`, new Set(), () => 'http://localhost:3000',
+      () => false, () => '', () => [], () => ({}));
     return cells;
   };
 
   const check = (label) => {
     for (const [id, c] of cells) {
-      if (c.parentElement.hidden) continue;
-      assert.ok(c.textContent.trim() !== '', `${label}: sichtbare Zeile ${id} ohne Wert`);
+      assert.equal(c.parentElement.hidden, false, `${label}: Zeile ${id} verschwindet`);
+      assert.ok(c.textContent.trim() !== '' && c.textContent !== 'VORHER', `${label}: Zeile ${id} ohne Wert`);
       assert.doesNotMatch(c.textContent, /^\s*[-\u2013\u2014]\s*$/, `${label}: ${id} zeigt einen nackten Strich`);
     }
   };
 
-  // Frischer Zustand: nichts eingerichtet.
+  // Frischer Zustand: nichts eingerichtet - jede Integration sagt es in IHRER Zeile.
   run({ host: 'localhost', port: '3000', tz: 'Europe/Berlin' });
   check('leer');
-  const unset = cells.get('rv-integrations-unset');
-  assert.equal(unset.parentElement.hidden, false, 'nichts eingerichtet, aber keine Zeile "Nicht eingerichtet"');
-  // Reihenfolge wie im Kalenderschritt: Apple (Legacy) steht nach Outlook.
-  assert.equal(unset.textContent, 'review.weather, review.google, review.outlook, review.apple, review.email',
-    'die Zeile "Nicht eingerichtet" nennt nicht alles, was fehlt');
-  for (const id of ['rv-weather', 'rv-google', 'rv-outlook', 'rv-apple', 'rv-email']) {
-    assert.equal(cells.get(id).parentElement.hidden, true, `${id} steht leer als eigene Zeile`);
+  for (const id of ['rv-weather', 'rv-google', 'rv-outlook', 'rv-apple', 'rv-email', 'rv-oidc']) {
+    assert.equal(cells.get(id).textContent, 'T:review.notSetUp', `${id}: "Nicht eingerichtet" steht nicht in der Wertspalte`);
+    assert.ok(cells.get(id).parentElement.classes.has('rv-row--unset'), `${id} ist nicht als leer gedaempft`);
   }
+  assert.equal(cells.get('rv-host').parentElement.classes.has('rv-row--unset'), false);
 
-  // Voller Zustand: alles eingerichtet, keine "Nicht eingerichtet"-Zeile.
+  // Voller Zustand: alles eingerichtet, keine Zeile meldet "Nicht eingerichtet".
   run({
     host: 'nas.local', port: '3000', tz: 'Europe/Berlin', BASE_URL: 'https://yuvomi.example.com',
     WEATHER_LAT: '52.5', WEATHER_LON: '13.4', GOOGLE_CLIENT_ID: 'id', APPLE_USERNAME: 'a@b.c',
@@ -1219,8 +1317,9 @@ test('die Pruefseite hat Gruppen mit Aendern-Link und keine Strich-Zeile', () =>
     DOCUMENT_STORAGE_WEBDAV_ENABLED: 'true', GOOGLE_DRIVE_REDIRECT_URI: 'https://x/cb', OIDC_ISSUER: 'https://idp',
   });
   check('voll');
-  for (const id of ['rv-integrations-unset', 'rv-storage-unset', 'rv-advanced-unset']) {
-    assert.equal(cells.get(id).parentElement.hidden, true, `${id} steht, obwohl alles eingerichtet ist`);
+  for (const [id, c] of cells) {
+    assert.notEqual(c.textContent, 'T:review.notSetUp', `${id} meldet "Nicht eingerichtet", obwohl alles eingerichtet ist`);
+    assert.equal(c.parentElement.classes.has('rv-row--unset'), false, `${id} bleibt gedaempft`);
   }
 });
 
@@ -1273,7 +1372,7 @@ test('jedes Feld und jedes Akkordeon steht in einer Inset-Gruppe', () => {
   const loose = [];
   for (const name of ['config', 'secrets', 'weather', 'calendar', 'email', 'storage', 'advanced', 'admin']) {
     const seg = stepSource(name);
-    const groups = [...seg.matchAll(/<(?:div|dl) class="inset-group">/g)].map(m => elementRange(seg, m.index));
+    const groups = [...seg.matchAll(/<(?:div|dl) class="inset-group"[ >]/g)].map(m => elementRange(seg, m.index));
     assert.ok(groups.length > 0, `step-${name} hat keine Inset-Gruppe`);
     const inside = i => groups.some(([a, b]) => i > a && i < b);
     for (const m of seg.matchAll(/<div class="(field|toggle-card)"/g)) {
@@ -1655,7 +1754,7 @@ test('swapStep: View Transition mit Richtung, sonst sofort mit CSS-Rueckfall', a
       doc.startViewTransition = cb => {
         let resolve;
         const vt = {
-          cb, skipped: false, ready: Promise.resolve(),
+          cb, skipped: false, ready: Promise.resolve(), updateCallbackDone: Promise.resolve(),
           finished: new Promise(r => { resolve = r; }),
           skipTransition() { this.skipped = true; },
           end() { resolve(); },
@@ -1744,7 +1843,129 @@ test('showStep: Richtung aus dem Zustand, nur der juengste Wechsel zeichnet, Ket
   const next = fnSource('next');
   assert.match(next, /showStep\(target, \{ animate: !\(reviewReturn !== null && target > reviewReturn\) \}\)/,
     'next() wechselt in der Kette zur Pruefseite mit Bildwechsel');
-  assert.match(fnSource('renderStep'), /\.focus\(\{ preventScroll: true \}\)/, 'renderStep fokussiert die H2 nicht');
+  assert.match(fnSource('focusStep'), /\.focus\(\{ preventScroll: true \}\)/, 'focusStep fokussiert die H2 nicht');
+  assert.match(fnSource('showStep'), /focusStep\(\)/, 'showStep fuehrt den Fokus nicht nach');
+});
+
+/* Das erste Bild nimmt keinen Fokus. showStep(0) beim Laden fokussierte die H2
+ * des Einstiegs: der Ring stand ohne jede Navigation auf der Ueberschrift, und
+ * der Screenreader begann dort statt beim Seitentitel (Critique 2026-10-29).
+ * Ausgefuehrt, nicht gelesen: der Settle-Rueckruf von swapStep wird
+ * aufgerufen und gezaehlt. */
+test('showStep: das erste Bild fokussiert nicht, ein echter Wechsel schon', () => {
+  const settles = [];
+  let focused = 0;
+  const h = new Function('swapStep', 'renderStep', 'onEnterStep', 'focusStep', `
+    let currentStep = 0, stepSwap = 0;
+    const flow = ['welcome', 'config', 'secrets'];
+    const clearInvalid = () => {}, setProgress = () => {};
+    ${fnSource('showStep')}
+    return { showStep };
+  `)((update, dir, animate, settle) => settles.push(settle), () => {}, () => {}, () => { focused++; });
+  h.showStep(0);
+  settles.at(-1)?.();
+  assert.equal(focused, 0, 'das erste Bild setzt den Fokus auf die Ueberschrift');
+  h.showStep(1);
+  settles.at(-1)?.();
+  assert.equal(focused, 1, 'ein Schrittwechsel fuehrt den Fokus nicht nach');
+  h.showStep(0);
+  settles.at(-1)?.();
+  assert.equal(focused, 2, 'der Weg zurueck fuehrt den Fokus nicht nach');
+});
+
+/* Der Rueckruf der View Transition erzwang ein Layout: renderStep fokussierte
+ * die neue H2 (focus() rechnet synchron das Layout des ganzen neuen Schritts)
+ * und scrollte NACH dem Klassentausch (gemessen 42 ms bei 4x CPU, Critique
+ * 2026-10-29). Jetzt: im Rueckruf zuerst scrollen, dann tauschen, kein
+ * focus(); der Fokus folgt als `settle` - sofort ohne Transition, mit
+ * Transition erst nach `finished`. Nach `ready` war es noch zu frueh: die
+ * Re-Critique (29.10.) mass dort 31 ms erzwungenen Reflow, weil focus() mitten
+ * in der laufenden Animation Stil und Layout neu rechnete. swapStep wird
+ * AUSGEFUEHRT. */
+test('Schrittwechsel: kein focus() im Rueckruf der View Transition, Fokus folgt nach finished', async () => {
+  const render = fnSource('renderStep');
+  assert.doesNotMatch(render, /\.focus\(/, 'renderStep fokussiert im Rueckruf der View Transition');
+  assert.ok(render.indexOf('scrollTo(') !== -1 && render.indexOf('scrollTo(') < render.indexOf("classList.toggle('active'"),
+    'renderStep scrollt erst nach dem Klassentausch (erzwingt das Layout des neuen Schritts)');
+
+  const src = `${fnSource('canViewTransition')}\nlet stepTransition = null;\n${fnSource('swapStep')}\nreturn swapStep;`;
+  const make = (api) => {
+    const order = [];
+    const root = fakeEl();
+    let resolveReady, resolveFinished;
+    const doc = { documentElement: root, visibilityState: 'visible', addEventListener() {}, removeEventListener() {} };
+    if (api) {
+      doc.startViewTransition = cb => {
+        let done;
+        const vt = {
+          updateCallbackDone: new Promise(r => { done = r; }),
+          ready: new Promise(r => { resolveReady = r; }),
+          finished: new Promise(r => { resolveFinished = r; }), skipTransition() {},
+        };
+        doc.run = () => { cb(); done(); };
+        return vt;
+      };
+    }
+    const swapStep = new Function('document', 'matchMedia', src)(doc, () => ({ matches: false }));
+    return { swapStep, doc, order, ready: () => resolveReady(), finished: () => resolveFinished() };
+  };
+  // Ohne Transition: Tausch, dann sofort Fokus.
+  {
+    const { swapStep, order } = make(false);
+    swapStep(() => order.push('update'), 'forward', true, () => order.push('focus'));
+    assert.deepEqual(order, ['update', 'focus']);
+  }
+  // Mit Transition: Fokus weder vor dem Tausch noch waehrend der Animation.
+  {
+    const { swapStep, doc, order, ready, finished } = make(true);
+    swapStep(() => order.push('update'), 'forward', true, () => order.push('focus'));
+    await new Promise(r => setTimeout(r, 0));
+    assert.deepEqual(order, [], 'Fokus vor der Aufnahme des alten Bildes');
+    doc.run();
+    await new Promise(r => setTimeout(r, 0));
+    assert.deepEqual(order, ['update'], 'Fokus vor ready - er erzwingt das Layout des neuen Bildes');
+    ready();
+    await new Promise(r => setTimeout(r, 0));
+    assert.deepEqual(order, ['update'], 'Fokus waehrend der Animation - erzwungener Reflow (31 ms)');
+    finished();
+    await new Promise(r => setTimeout(r, 0));
+    assert.deepEqual(order, ['update', 'focus'], 'der Fokus folgt nach finished nicht');
+  }
+  // Verworfen (finished lehnt ab): der Fokus folgt trotzdem, sobald der Tausch steht.
+  {
+    const order = [];
+    const doc = {
+      documentElement: fakeEl(), visibilityState: 'visible', addEventListener() {}, removeEventListener() {},
+      startViewTransition: cb => {
+        cb();
+        return {
+          updateCallbackDone: Promise.resolve(), ready: Promise.reject(new Error('skip')),
+          finished: Promise.reject(new Error('skip')), skipTransition() {},
+        };
+      },
+    };
+    const src2 = `${fnSource('canViewTransition')}\nlet stepTransition = null;\n${fnSource('swapStep')}\nreturn swapStep;`;
+    const swapStep = new Function('document', 'matchMedia', src2)(doc, () => ({ matches: false }));
+    swapStep(() => order.push('update'), 'forward', true, () => order.push('focus'));
+    await new Promise(r => setTimeout(r, 0));
+    assert.deepEqual(order, ['update', 'focus'], 'eine verworfene Transition verliert den Fokus');
+  }
+  // Scheitert schon der Tausch, gibt es nichts zu fokussieren.
+  {
+    const order = [];
+    const doc = {
+      documentElement: fakeEl(), visibilityState: 'visible', addEventListener() {}, removeEventListener() {},
+      startViewTransition: () => ({
+        updateCallbackDone: Promise.reject(new Error('boom')), ready: Promise.reject(new Error('boom')),
+        finished: Promise.reject(new Error('boom')), skipTransition() {},
+      }),
+    };
+    const src3 = `${fnSource('canViewTransition')}\nlet stepTransition = null;\n${fnSource('swapStep')}\nreturn swapStep;`;
+    const swapStep = new Function('document', 'matchMedia', src3)(doc, () => ({ matches: false }));
+    swapStep(() => order.push('update'), 'forward', true, () => order.push('focus'));
+    await new Promise(r => setTimeout(r, 0));
+    assert.deepEqual(order, [], 'Fokus nach gescheitertem Tausch');
+  }
 });
 
 /* Akkordeons gleiten auf und zu (Rasterzeile 0fr -> 1fr, --ease-in-out wie jede
@@ -1819,9 +2040,9 @@ test('Docker-Schirm: Phasen-Checkliste, Erfolg mit neuem Titel und Fokus, Fehler
       const PHASE_KEYS = { pull: 'docker.phasePull', boot: 'docker.phaseBoot', health: 'docker.phaseHealth' };
       const PHASE_ORDER = ${JSON.stringify(literal('PHASE_ORDER'))};
       let phaseReached = 0, dockerOutcome = null, dockerDoneSecs = null, dockerTextKey = 'docker.phasePull';
-      let dockerDone = false, pollInterval = null, dockerStart = Date.now() - 34_000;
+      let dockerDone = false, dockerStart = Date.now() - 34_000;
       let flow = ['review', 'docker'], currentStep = 1;
-      const clearInterval = () => {}, setDockerPrimary = () => {}, next = () => {}, restartDocker = () => {};
+      const stopPolling = () => {}, setDockerPrimary = () => {}, next = () => {}, restartDocker = () => {};
       const renderStepNav = () => {};   // eigener Test: "Docker in der Schrittliste"
       ${fnSource('setDockerText')}
       ${fnSource('reachPhase')}
@@ -1865,8 +2086,8 @@ test('Docker-Schirm: Phasen-Checkliste, Erfolg mit neuem Titel und Fokus, Fehler
     assert.equal(states(rows), 'done failed waiting', 'die gescheiterte Phase ist nicht markiert');
     assert.equal(rows[1].note.textContent, 'docker.stepFailed');
     assert.equal(els['dkr-title'].dataset.i18n, 'docker.failed');
-    assert.equal(els['dkr-log'].style.display, 'block', 'das Protokoll bleibt im Fehler nicht stehen');
-    assert.equal(els['dkr-foot'].style.display, 'flex', 'Erneut versuchen fehlt im Fehler');
+    assert.equal(els['dkr-log'].hidden, false, 'das Protokoll bleibt im Fehler nicht stehen');
+    assert.equal(els['dkr-foot'].hidden, false, 'Erneut versuchen fehlt im Fehler');
     assert.equal(els['dkr-title'].focused, 0, 'der Fehler reisst den Fokus an sich');
   }
   {
@@ -2023,7 +2244,9 @@ test('die Einfach-Karte zeigt keinen Haken, der wie "schon ausgewaehlt" liest', 
 test('Warnbanner tragen ein Lucide-SVG, kein Unicode-Glyph', () => {
   assert.doesNotMatch(html, /&#x26A0;|⚠/, 'U+26A0 steht wieder als Icon im Markup');
   const icons = [...html.matchAll(/<span class="warn-icon"[^>]*>([\s\S]*?)<\/span>/g)];
-  assert.ok(icons.length >= 5, `nur ${icons.length} Warn-Icons gefunden`);
+  // 4 seit der Re-Critique 2026-10-29: der Abschluss traegt keine Warnung mehr
+  // (die Schluesseldatei ist dort eine Checkzeile).
+  assert.ok(icons.length >= 4, `nur ${icons.length} Warn-Icons gefunden`);
   for (const [, inner] of icons) assert.match(inner, /^<svg viewBox="0 0 24 24">/, 'Warn-Icon ohne SVG');
 });
 
@@ -2116,12 +2339,13 @@ test('jede Boolean-Einstellung ist ein Schalter der App, keine nackte Checkbox',
 
 /* Der Docker-Schritt hatte in der Liste keinen Eintrag: waehrend des laengsten
  * Wartens stand sie ohne aktuellen Schritt und ohne aria-current da. Jetzt ein
- * unnummerierter Eintrag zwischen Pruefung/Einfach-Start und Admin, kein Knopf,
- * mit dem Ausgang des Starts. renderStepNav wird AUSGEFUEHRT. */
-test('Docker in der Schrittliste: eigener Eintrag ohne Nummer, genau ein aria-current, Ausgang sichtbar', () => {
+ * Eintrag zwischen Pruefung/Einfach-Start und Admin, kein Knopf, mit dem
+ * Ausgang des Starts - und seit 2026-10-29 mit seiner Nummer (eigener Test:
+ * "Rail und Zaehler"). renderStepNav wird AUSGEFUEHRT. */
+test('Docker in der Schrittliste: eigener Eintrag mit Nummer, genau ein aria-current, Ausgang sichtbar', () => {
   const FLOWS = literal('FLOWS');
   const UNNUMBERED = literal('UNNUMBERED');
-  assert.ok(UNNUMBERED.has('docker'), 'der Docker-Schritt traegt eine Nummer - Regel pruefen');
+  assert.ok(!UNNUMBERED.has('docker'), 'der Docker-Schritt traegt keine Nummer, steht aber in der Liste');
 
   const li = html.match(/<li class="steps-nav__item" data-nav-step="docker"[^>]*>(.*?)<\/li>/);
   assert.ok(li, 'kein Listeneintrag fuer den Docker-Schritt');
@@ -2138,8 +2362,8 @@ test('Docker in der Schrittliste: eigener Eintrag ohne Nummer, genau ein aria-cu
   const names = ['simple', 'config', 'secrets', 'weather', 'calendar', 'email', 'storage', 'advanced', 'review', 'docker', 'admin'];
   const run = (flow, currentStep, dockerOutcome) => {
     const items = navFakes(names);
-    new Function('flow', 'currentStep', 'UNNUMBERED', 'dockerOutcome', 'document', `${fnSource('renderStepNav')}; renderStepNav();`)(
-      flow, currentStep, UNNUMBERED, dockerOutcome, { querySelectorAll: () => items });
+    new Function('flow', 'currentStep', 'UNNUMBERED', 'dockerOutcome', 'document', 'stepSetUp', `${fnSource('renderStepNav')}; renderStepNav();`)(
+      flow, currentStep, UNNUMBERED, dockerOutcome, { querySelectorAll: () => items }, () => true);
     return Object.fromEntries(items.map(i => [i.name, i]));
   };
   const currentOf = r => Object.values(r).filter(i => !i.hidden && i.button.attrs['aria-current'] === 'step').map(i => i.name);
@@ -2150,7 +2374,8 @@ test('Docker in der Schrittliste: eigener Eintrag ohne Nummer, genau ein aria-cu
     assert.equal(r.docker.hidden, false, 'der Docker-Eintrag fehlt im Weg');
     assert.equal(r.docker.dataset.state, 'upcoming');
     assert.equal(r.docker.dataset.run, undefined);
-    assert.equal(r.docker.mark.textContent, '', 'der Docker-Eintrag traegt eine Ziffer');
+    assert.equal(r.docker.mark.textContent, String(flow.filter(s => !UNNUMBERED.has(s)).indexOf('docker') + 1),
+      'der Docker-Eintrag traegt nicht die Ziffer seines Zaehlers');
     for (const [outcome, shown] of [[null, 'running'], ['running', 'ok'], ['failed', 'failed']]) {
       r = run(flow, d, outcome);
       assert.deepEqual(currentOf(r), ['docker'], `waehrend Docker (${shown}) traegt nicht genau der Docker-Eintrag aria-current`);
@@ -2177,6 +2402,97 @@ test('Docker in der Schrittliste: eigener Eintrag ohne Nummer, genau ein aria-cu
   assert.ok(RULES.some(r => r.selector === '.steps-nav__item[data-run="ok"] .steps-nav__mark::before'), 'Erfolg zeigt keinen Haken');
   assert.equal(declared(sel('.steps-nav__item:not([data-run="failed"]) .steps-nav__failed'), 'display'), 'none',
     '"fehlgeschlagen" steht auch ohne Fehler im Namen');
+});
+
+/* Rail und Zaehler zaehlten verschiedene Mengen (Critique 2026-10-29): die
+ * Liste zeigte den Docker-Schritt als Eintrag ohne Ziffer ("8, o, 9"), der
+ * Zaehler sagte "Schritt 8 von 9" bei zehn Eintraegen und im Einfach-Weg
+ * "1 von 2" bei dreien. Fuer JEDEN Schritt beider Wege, der eine Liste zeigt,
+ * werden renderStepNav, stepPosition und applyStepCounters AUSGEFUEHRT: die
+ * Ziffer am Eintrag ist das N des Zaehlers, M ist die Zahl der sichtbaren
+ * Eintraege, und jeder sichtbare Eintrag traegt eine Ziffer. */
+test('Rail und "Schritt N von M" zaehlen in beiden Wegen dieselben Schritte', () => {
+  const FLOWS = literal('FLOWS');
+  const UNNUMBERED = literal('UNNUMBERED');
+  const SOLO = literal('SOLO_STEPS');
+  const names = [...html.matchAll(/<li class="steps-nav__item" data-nav-step="([a-z]+)"/g)].map(m => m[1]);
+  for (const [way, flow] of Object.entries(FLOWS)) {
+    flow.forEach((step, currentStep) => {
+      if (SOLO.has(step)) return;   // Einstieg und Abschluss zeigen keine Liste
+      const items = navFakes(names);
+      new Function('flow', 'currentStep', 'UNNUMBERED', 'dockerOutcome', 'document', 'stepSetUp', `${fnSource('renderStepNav')}; renderStepNav();`)(
+        flow, currentStep, UNNUMBERED, null, { querySelectorAll: () => items }, () => true);
+      const visible = items.filter(i => !i.hidden);
+      const tags = {};
+      new Function('flow', 'UNNUMBERED', 'document', 't', `${fnSource('stepPosition')}; ${fnSource('applyStepCounters')}; applyStepCounters();`)(
+        flow, UNNUMBERED, { querySelector: q => (tags[q.match(/#step-(\w+)/)[1]] ??= { textContent: '' }) }, (k, p) => `${p.n}/${p.total}`);
+      const tag = tags[step]?.textContent;
+      assert.ok(tag, `${way}/${step}: kein Zaehler, obwohl die Liste den Schritt zeigt`);
+      const [n, total] = tag.split('/').map(Number);
+      assert.equal(total, visible.length, `${way}/${step}: "von ${total}", die Liste zeigt ${visible.length} Eintraege`);
+      const own = items.find(i => i.name === step);
+      assert.equal(own.mark.textContent, String(n), `${way}/${step}: Liste zeigt ${own.mark.textContent || 'keine Ziffer'}, der Zaehler ${n}`);
+      for (const i of visible) assert.notEqual(i.mark.textContent, '', `${way}: Eintrag ${i.name} ohne Ziffer`);
+    });
+  }
+});
+
+/* Zugriff war ein <select> mit zwei Optionen (Critique 2026-10-29): eine Wahl,
+ * die man aufklappen musste, um zu sehen, dass es nur zwei gibt. Jetzt das
+ * Segment der App aus nativen Radios. Geprueft: Radiogruppe mit Namen,
+ * zwei Radios mit den Werten des Selects, 44px-Ziel, Fokusring am Segment, und
+ * die Fassade segmentedAsField AUSGEFUEHRT - value/focus sprechen wie das
+ * Select, also greift die Rerun-Vorbelegung (applyRerunPrefill setzt el.value)
+ * und fail() fokussiert die gewaehlte Option. */
+test('Zugriff ist ein Segment aus nativen Radios und spricht wie das Select davor', () => {
+  const config = stepSource('config');
+  assert.doesNotMatch(config, /<select id="adv-proxy"/, 'Zugriff ist noch ein Select');
+  const group = config.match(/<div class="segmented" id="adv-proxy"[^>]*>/);
+  assert.ok(group, 'kein Segment #adv-proxy');
+  assert.match(group[0], /role="radiogroup"/);
+  const label = group[0].match(/aria-labelledby="([^"]+)"/)?.[1];
+  assert.ok(label && new RegExp(`id="${label}"[^>]*data-i18n="advanced\\.proxyLabel"`).test(config), 'die Gruppe hat keinen sichtbaren Namen');
+  const [a, b] = elementRange(config, config.indexOf(group[0]));
+  const radios = [...config.slice(a, b).matchAll(/<label class="segmented__item"><input type="radio" name="adv-proxy" value="([a-z]+)"( checked)?>/g)];
+  assert.deepEqual(radios.map(r => r[1]), ['proxy', 'direct'], 'die Werte des Selects fehlen');
+  assert.equal(radios.filter(r => r[2]).length, 1, 'genau eine Option muss vorgewaehlt sein');
+
+  // Ziel und Ring wie .segmented der App.
+  assert.equal(toPx(declared(r => r === '.field .segmented__item', 'min-height')), 44, 'Segment unter 44px');
+  assert.match(declared(r => r === '.segmented__item:has(input:focus-visible)', 'outline') ?? '', /^2px solid var\(--color-accent\)/, 'kein Fokusring am Segment');
+  assert.ok(RULES.some(r => r.selector === '.segmented__item:has(input:checked)'), 'die Wahl ist nicht sichtbar');
+
+  // Die Fassade ausfuehren.
+  const inputs = ['proxy', 'direct'].map((value, i) => ({ type: 'radio', value, checked: i === 0, focused: 0, focus() { this.focused++; } }));
+  const el = { querySelectorAll: () => inputs };
+  new Function('group', `${fnSource('segmentedAsField')}; segmentedAsField(group);`)(el);
+  assert.equal(el.value, 'proxy');
+  el.value = 'direct';   // so setzt applyRerunPrefill die Vorbelegung
+  assert.deepEqual(inputs.map(r => r.checked), [false, true]);
+  assert.equal(el.value, 'direct');
+  el.focus({ preventScroll: true });
+  assert.equal(inputs[1].focused, 1, 'focus() landet nicht auf der gewaehlten Option');
+  assert.match(html, /segmentedAsField\(\$\('adv-proxy'\)\)/, 'die Fassade wird nie angelegt');
+  // Der touched-Merker gehoert an die Gruppe, nicht an das Radio, das das Ereignis ausloest.
+  assert.match(html, /\$\('adv-proxy'\)\.addEventListener\('change', e => \{ e\.currentTarget\.dataset\.touched = '1'; \}\)/);
+});
+
+/* Die Heimnetz-Schalter heben den SSRF-Schutz auf. Sie standen unter einer
+ * Ueberschrift, aber nicht in einer GRUPPE: per Tab hoerte man nur "... im
+ * Heimnetz erlauben, Schalter", ohne die Warnung darueber. Jetzt eine benannte
+ * Gruppe mit Beschreibung, die genau diese vier Schalter traegt - kein
+ * Komfortfeld dazwischen, keiner der vier ausserhalb. */
+test('die Heimnetz-Schalter stehen in einer eigenen, benannten Gruppe', () => {
+  const adv = stepSource('advanced');
+  const open = adv.match(/<div class="inset-group" role="group" aria-labelledby="([^"]+)" aria-describedby="([^"]+)">/);
+  assert.ok(open, 'keine benannte Gruppe fuer die Heimnetz-Schalter');
+  assert.match(adv, new RegExp(`id="${open[1]}" data-i18n="advanced\\.sectionPrivateNetwork"`), 'die Gruppe traegt nicht den Heimnetz-Namen');
+  assert.match(adv, new RegExp(`id="${open[2]}" data-i18n="advanced\\.privateNetworkHint"`), 'die Warnung beschreibt die Gruppe nicht');
+  const [a, b] = elementRange(adv, adv.indexOf(open[0]));
+  const inside = [...adv.slice(a, b).matchAll(/<(?:input|select|textarea)\b[^>]*\bid="([^"]+)"/g)].map(m => m[1]);
+  assert.deepEqual(inside, ['adv-ics-private', 'adv-recipe-provider-private', 'adv-waste-source-private', 'adv-document-webdav-private']);
+  const outside = adv.slice(0, a) + adv.slice(b);
+  assert.doesNotMatch(outside, /id="adv-[a-z-]+-private"/, 'ein Heimnetz-Schalter steht ausserhalb der Gruppe');
 });
 
 /* Balken und Zaehler rechneten mit verschiedenen Nennern: der Balken durch alle
@@ -2220,5 +2536,357 @@ test('Balken und Zaehler folgen derselben Rechnung, der Docker-Schirm liegt zwis
     assert.ok(bar[d - 1] < bar[d] && bar[d] < bar[d + 1],
       `der Balken steht waehrend Docker nicht zwischen den Nachbarn (${bar[d - 1]} / ${bar[d]} / ${bar[d + 1]})`);
     for (let i = 1; i < flow.length; i++) assert.ok(bar[i] >= bar[i - 1], `der Balken laeuft bei ${flow[i]} zurueck`);
+  }
+});
+
+// ── Bedienelemente (Critique 2026-10-29, Schritt 7) ──────────────────────────
+
+/* Maschinenwerte bekommen die Tastatur und die Schreibhilfen, die zu ihnen
+ * passen: URLs sind type=url, Hosts inputmode=url, Ports inputmode=numeric;
+ * keiner wird gross geschrieben, korrigiert oder in RTL gespiegelt. Vorher
+ * waren alle type=text - iOS schrieb "Smtp.example.com" gross, und die
+ * Rechtschreibpruefung unterstrich jeden Host. Die Felder werden aus dem
+ * Markup ERKANNT (Id-Endung, https-Platzhalter), nicht aufgezaehlt: ein neues
+ * URL-Feld faellt sonst durch. */
+test('URL-, Host- und Portfelder tragen passende Tastatur und keine Schreibhilfen', () => {
+  const inputs = [...html.matchAll(/<input\b[^>]*>/g)].map(m => m[0])
+    .map(tag => ({ tag, id: tag.match(/\bid="([\w-]+)"/)?.[1], attr: name => tag.match(new RegExp(`\\s${name}="([^"]*)"`))?.[1] }))
+    .filter(f => f.id);
+  const isUrl = f => /-(url|issuer|redirect)$/.test(f.id) || /^https?:\/\//.test(f.attr('placeholder') ?? '');
+  const isHost = f => /-host$/.test(f.id);
+  const isPort = f => /-port$/.test(f.id);
+  const urls = inputs.filter(isUrl), hosts = inputs.filter(isHost), ports = inputs.filter(isPort);
+  assert.ok(urls.length >= 6 && hosts.length >= 3 && ports.length >= 2,
+    `zu wenige Felder erkannt (URL ${urls.length}, Host ${hosts.length}, Port ${ports.length}) - der Leser greift nicht`);
+  const bad = [];
+  for (const f of urls) if (f.attr('type') !== 'url') bad.push(`${f.id}: type=${f.attr('type')} statt url`);
+  for (const f of hosts) if (f.attr('inputmode') !== 'url') bad.push(`${f.id}: inputmode fehlt (url)`);
+  for (const f of ports) if (f.attr('inputmode') !== 'numeric') bad.push(`${f.id}: inputmode fehlt (numeric)`);
+  for (const f of [...urls, ...hosts]) {
+    if (f.attr('autocapitalize') !== 'off') bad.push(`${f.id}: autocapitalize`);
+    if (f.attr('spellcheck') !== 'false') bad.push(`${f.id}: spellcheck`);
+  }
+  for (const f of [...urls, ...hosts, ...ports]) if (f.attr('dir') !== 'ltr') bad.push(`${f.id}: dir=ltr fehlt`);
+  // Enter loest die Primaeraktion des Schritts aus (globaler keydown-Handler):
+  // die Bildschirmtastatur sagt das mit enterkeyhint an, in jedem Textfeld.
+  for (const f of inputs) {
+    if (/^(checkbox|radio)$/.test(f.attr('type'))) continue;
+    if (!/^(next|done|go)$/.test(f.attr('enterkeyhint') ?? '')) bad.push(`${f.id}: enterkeyhint fehlt`);
+  }
+  assert.deepEqual(bad, []);
+  // type=url muss dieselbe Feldoptik bekommen wie type=text (Kante, 44px mobil).
+  assert.ok(RULES.some(r => r.selector === 'input[type=url]' && r.media === null && /border:/.test(r.body)),
+    'input[type=url] fehlt in der Feldregel - URL-Felder staenden als UA-Kasten');
+  // Seit der Re-Critique 2026-10-29 steht die Mindesthoehe in der Feldregel
+  // selbst (--target-lg, jede Breite) statt in einer eigenen 44px-Regel mobil.
+  assert.ok(RULES.some(r => r.selector === 'input[type=url]' && r.media === null && /min-height:\s*var\(--target-lg\)/.test(r.body)),
+    'input[type=url] fehlt in der Feldregel mit --target-lg');
+});
+
+/* Lange Komposita ragten in die Wertspalte der Pruefseite
+ * ("Datenbank-Verschluesselungsschluessel" 59px bei 390px, gemessen im
+ * Browser). Die Schluesselspalte muss trennen und notfalls brechen duerfen. */
+test('die Schluesselspalte der Pruefseite trennt lange Woerter, statt in die Werte zu ragen', () => {
+  assert.equal(declared(s => s === '.rv-row dt', 'overflow-wrap'), 'anywhere', '.rv-row dt bricht unzerbrechliche Woerter nicht');
+  assert.equal(declared(s => s === '.rv-row dt', 'hyphens'), 'auto', '.rv-row dt trennt nicht');
+  assert.equal(declared(s => s === '.rv-row dt', 'min-width'), '0', 'die Grid-Spalte waechst mit dem Wort statt zu brechen');
+});
+
+/* Feldkante und Primaerknopf wie in der App: 1px-Kante (.form-input,
+ * layout.css) statt 1,5px; Tiefe plus Glanzkante wie .btn--primary
+ * (glass.css). Gelesen wird die App-Quelle, nicht eine Zahl hier. */
+test('Feldkante und Primaerknopf folgen der App', () => {
+  const layoutCss = readFileSync(new URL('../public/styles/layout.css', import.meta.url), 'utf8');
+  const glassCss = readFileSync(new URL('../public/styles/glass.css', import.meta.url), 'utf8');
+  const appBorder = layoutCss.match(/\.form-input\s*\{[^}]*?\bborder:\s*([^;]+);/)?.[1].trim();
+  assert.ok(appBorder, 'Feldkante der App nicht gefunden');
+  assert.equal(declared(s => s === 'input[type=text]', 'border'), appBorder, 'die Feldkante weicht von .form-input der App ab');
+  const appShadow = glassCss.match(/\.btn--primary\s*\{\s*box-shadow:\s*([^;]+);/)?.[1].replace(/\s+/g, ' ').trim();
+  assert.ok(appShadow, 'Schatten von .btn--primary nicht gefunden');
+  assert.equal(declared(s => s === '.btn-primary:not(:disabled)', 'box-shadow')?.replace(/\s+/g, ' '), appShadow,
+    'der Primaerknopf traegt nicht die Tiefe der App');
+  for (const name of ['--glass-inset-medium', '--glass-inset-soft']) {
+    assert.ok(ROOT_VARS.has(name), `${name} fehlt im Inline-Fallback`);
+  }
+});
+
+/* :user-invalid zeigt, was der Browser selbst prueft (type=url), erst nach der
+ * Eingabe; aria-invalid folgt im selben Moment, sonst saehe der Sehende Rot,
+ * und der Screenreader schwiege. Ausgefuehrt mit einem Feld-Double. */
+test(':user-invalid zeichnet rot, und aria-invalid folgt demselben Zustand', () => {
+  assert.ok(RULES.some(r => r.selector === 'input:user-invalid' && /border-color:\s*var\(--color-danger\)/.test(r.body)),
+    'input:user-invalid zeichnet nicht rot');
+  const sync = new Function(`${fnSource('syncNativeInvalid')}; return syncNativeInvalid;`)();
+  const attrs = new Map();
+  let invalid = true;
+  const el = {
+    dataset: {},
+    matches: sel => sel === ':user-invalid' ? invalid : true,
+    setAttribute: (k, v) => attrs.set(k, v), removeAttribute: k => attrs.delete(k),
+  };
+  sync({ target: el });
+  assert.equal(attrs.get('aria-invalid'), 'true', 'aria-invalid folgt :user-invalid nicht');
+  invalid = false;
+  sync({ target: el });
+  assert.equal(attrs.has('aria-invalid'), false, 'die eigene Markierung bleibt nach der Korrektur stehen');
+  // Eine von fail() gesetzte Markierung nimmt der Abgleich NICHT weg.
+  attrs.set('aria-invalid', 'true');
+  sync({ target: el });
+  assert.equal(attrs.get('aria-invalid'), 'true', 'der Abgleich loescht die Markierung von fail()');
+  assert.match(html, /addEventListener\('blur', syncNativeInvalid, true\)/, 'der Abgleich laeuft nicht beim Verlassen des Feldes');
+});
+
+/* Browserleiste in der Buehnenfarbe, je Theme - und genau die Werte des
+ * Fallback-Tokens --color-bg (ein meta kann kein var() lesen). */
+test('theme-color folgt --color-bg in beiden Themes', () => {
+  const metas = [...html.matchAll(/<meta name="theme-color" content="(#[0-9A-Fa-f]{6})" media="\(prefers-color-scheme: (light|dark)\)">/g)];
+  const byScheme = Object.fromEntries(metas.map(m => [m[2], m[1].toLowerCase()]));
+  const fb = html.slice(html.indexOf('<style>'), html.indexOf('</style>'));
+  const dark = fb.indexOf('@media (prefers-color-scheme: dark)');
+  const light = fb.slice(0, dark).match(/--color-bg:\s*(#[0-9A-Fa-f]{6})/)?.[1].toLowerCase();
+  const darkBg = fb.slice(dark).match(/--color-bg:\s*(#[0-9A-Fa-f]{6})/)?.[1].toLowerCase();
+  assert.deepEqual(byScheme, { light, dark: darkBg });
+});
+
+// ── Re-Critique 2026-10-29: Kopierfehler und Autofill ─────────────────────────
+
+/* Kopieren meldete "Kopiert" auch, wenn die Zwischenablage ablehnte (Rechte,
+ * unsicherer Kontext): der catch war leer, die Erfolgsmeldung stand dahinter.
+ * Wer danach einfuegte, hatte nichts - ausgerechnet bei den Schluesseln und
+ * Redirect-URIs, die zeichengenau woanders hin muessen. Jetzt meldet nur der
+ * Erfolg Erfolg; scheitert es, ist der Wert markiert und die Meldung sagt,
+ * was zu tun ist. copyValue wird AUSGEFUEHRT. */
+test('Kopieren meldet nur bei Erfolg "Kopiert", sonst markiert es den Wert', async () => {
+  const make = (writeText) => {
+    const els = {};
+    const selection = { all: null, selectAllChildren(n) { this.all = n; } };
+    const $ = id => els[id];
+    const run = new Function('$', 't', 'navigator', 'document', 'window', 'setTimeout', 'clearTimeout',
+      `return (async ${fnSource('copyValue')});\n${fnSource('selectForManualCopy')}`)(
+      $, k => k, { clipboard: { writeText } }, { querySelector: () => null },
+      { getSelection: () => selection }, () => 0, () => {});
+    return { els, run, selection };
+  };
+  // Erfolg
+  {
+    const { els, run } = make(async () => {});
+    els.a = fakeEl({ value: 'geheim', type: 'text', select() { this.selected = true; } });
+    els['a-copied'] = fakeEl();
+    await run('a');
+    assert.equal(els['a-copied'].textContent, 'common.copied');
+    assert.ok(!els.a.selected, 'bei Erfolg wird nichts markiert');
+  }
+  // Abgelehnt: Feld
+  {
+    const { els, run } = make(async () => { throw new Error('denied'); });
+    els.a = fakeEl({ value: 'geheim', type: 'password', select() { this.selected = true; } });
+    els['a-copied'] = fakeEl();
+    await run('a');
+    assert.notEqual(els['a-copied'].textContent, 'common.copied', 'ein gescheitertes Kopieren meldet Erfolg');
+    assert.equal(els['a-copied'].textContent, 'common.copyFailed');
+    assert.ok(els.a.selected, 'der Wert ist zum manuellen Kopieren nicht markiert');
+    assert.equal(els.a.type, 'text', 'ein verdecktes Feld laesst sich nicht kopieren - es muss sichtbar werden');
+    assert.ok(els['a-copied'].classes.has('copied-note--fail'), 'die Fehlermeldung steht in Erfolgsgruen');
+  }
+  // Abgelehnt: <code> ohne value
+  {
+    const { els, run, selection } = make(async () => { throw new Error('denied'); });
+    els.c = fakeEl({ textContent: 'https://x.test/cb' });
+    els['c-copied'] = fakeEl();
+    await run('c');
+    assert.equal(els['c-copied'].textContent, 'common.copyFailed');
+    assert.equal(selection.all, els.c, 'die Redirect-URI ist nicht markiert');
+  }
+  // Ganz ohne Clipboard-API (unsicherer Kontext): derselbe Weg, kein TypeError nach aussen.
+  {
+    const els = {};
+    const run = new Function('$', 't', 'navigator', 'document', 'window', 'setTimeout', 'clearTimeout',
+      `return (async ${fnSource('copyValue')});\n${fnSource('selectForManualCopy')}`)(
+      id => els[id], k => k, {}, { querySelector: () => null },
+      { getSelection: () => ({ selectAllChildren() {} }) }, () => 0, () => {});
+    els.a = fakeEl({ value: 'x', type: 'text', select() {} });
+    els['a-copied'] = fakeEl();
+    await run('a');
+    assert.equal(els['a-copied'].textContent, 'common.copyFailed');
+  }
+  assert.match(html, /const copyBtn = e\.target\.closest\('\[data-copy\]'\);\s*if \(copyBtn\) \{\s*await copyValue\(copyBtn\.dataset\.copy\);/,
+    'der Klick-Handler kopiert nicht ueber copyValue');
+});
+
+/* Secret- und Passwortfelder ohne autocomplete: Chrome sah in apple-user
+ * (type=email) plus apple-pass ein Login, bot gespeicherte Passwoerter an und
+ * fuellte im schlimmsten Fall ein fremdes Passwort als App-Passwort ein.
+ * Gilt fuer JEDES Passwortfeld: autocomplete steht ausdruecklich, und nur
+ * "new-password" (fuellt nie ein bestehendes) oder "off". */
+test('jedes Passwort-/Secret-Feld traegt ein autocomplete, das nie ein gespeichertes Passwort einfuellt', () => {
+  const inputs = [...html.matchAll(/<input\b[^>]*>/g)].map(m => m[0]);
+  const pw = inputs.filter(tag => /\btype="password"/.test(tag));
+  assert.ok(pw.length >= 13, `nur ${pw.length} Passwortfelder gefunden - der Test misst nichts`);
+  const bad = pw.filter(tag => !/\bautocomplete="(new-password|off)"/.test(tag)).map(tag => tag.match(/id="([^"]+)"/)?.[1]);
+  assert.deepEqual(bad, [], 'Passwortfelder ohne autocomplete="new-password"/"off"');
+  // Das Feld direkt vor einem Passwortfeld macht daraus fuer Chrome ein Login-Paar.
+  const missing = [];
+  inputs.forEach((tag, i) => {
+    if (!/\btype="password"/.test(tag) || i === 0) return;
+    const prev = inputs[i - 1];
+    if (/\btype="(email|text)"/.test(prev) && !/\bautocomplete="/.test(prev)) missing.push(prev.match(/id="([^"]+)"/)?.[1]);
+  });
+  assert.deepEqual(missing, [], 'Nutzerfeld vor einem Passwortfeld ohne autocomplete');
+  assert.match(html, /<input type="email" id="apple-user"[^>]*autocomplete="off"/, 'apple-user sieht weiter wie ein Login aus');
+});
+
+// ── Re-Critique 2026-10-29, Optik und Wortlaut (Agent 2) ─────────────────────
+
+/* Die Felder sind die Feldhaut der App (.form-input, layout.css): Mulde
+ * --color-field-bg und 48px. Vorher 41px auf --color-surface - im Dark Mode
+ * ein Feld ohne Boden auf der Karte, und neben dem 48px-Knopf sprang die Zeile. */
+test('Eingabefelder tragen die Feldhaut der App: Mulde und --target-lg', () => {
+  const base = media => media === null;
+  for (const sel of ['input[type=text]', 'input[type=url]', 'input[type=password]', 'input[type=email]', 'input[type=number]', 'select']) {
+    assert.equal(declared(s => s === sel, 'background-color', base), 'var(--color-field-bg)', `${sel}: keine Feldmulde`);
+    assert.equal(declared(s => s === sel, 'min-height', base), 'var(--target-lg)', `${sel}: nicht 48px wie .form-input`);
+  }
+  assert.equal(toPx('var(--target-lg)'), 48, 'der Fallback kennt --target-lg nicht als 48px');
+  assert.ok(ROOT_VARS.has('--color-field-bg'), 'der Fallback kennt --color-field-bg nicht - ohne tokens.css waere das Feld transparent');
+});
+
+/* Das Auge am Passwort war 43x41px, das kleinste Ziel des Wizards. Symbol-
+ * knoepfe in einer Feldzeile stehen quadratisch auf Feldhoehe. */
+test('Augen- und Kopierknoepfe sind mindestens 44x44px, in jeder Breite', () => {
+  for (const media of [null, '@media (max-width: 640px)']) {
+    const at = m => m === null || m === media;
+    const h = toPx(declared(s => s === '.secret-row .btn-sm', 'min-height', at));
+    const w = toPx(declared(s => s === '.secret-row [data-eye]', 'min-width', at));
+    const wc = toPx(declared(s => s === '.secret-row [data-copy]', 'min-width', at));
+    assert.ok(h >= 44 && w >= 44 && wc >= 44, `${media ?? 'Desktop'}: Auge/Kopieren ${w}x${h}px, Kopieren ${wc}px breit`);
+  }
+  const eyes = [...html.matchAll(/<div class="secret-row[^"]*">[\s\S]*?<button[^>]*data-eye=/g)];
+  assert.ok(eyes.length >= 8, `nur ${eyes.length} Augen in einer .secret-row gefunden - die Groessenregel griffe nicht`);
+});
+
+/* Uebersprungene optionale Schritte trugen den gruenen Haken. Der eigene
+ * Zustand ist ruhig (Strich, Tertiaertext) und fuer Screenreader benannt. */
+test('die Schrittliste kennt "uebersprungen": eigenes Zeichen, kein Gruen, benannt', () => {
+  const sel = '.steps-nav__item[data-state="skipped"] .steps-nav__mark::before';
+  const bg = declared(s => s === sel, 'background');
+  assert.ok(bg, 'kein Zeichen fuer uebersprungene Schritte');
+  assert.doesNotMatch(bg, /success/, 'uebersprungen traegt wieder Erfolgsgruen');
+  for (const step of ['weather', 'calendar', 'email', 'storage', 'advanced']) {
+    const li = html.match(new RegExp(`<li class="steps-nav__item" data-nav-step="${step}"[^>]*>(.*?)</li>`));
+    assert.match(li?.[1] ?? '', /class="vh steps-nav__skipped" data-i18n="common\.stepSkipped"/, `${step}: "(uebersprungen)" fehlt fuer Screenreader`);
+  }
+  // stepSetUp wird ausgefuehrt: leer ist uebersprungen, eingerichtet nicht,
+  // Pflichtschritte kennen die Frage nicht.
+  const run = (name, S) => new Function('S', `${fnSource('stepSetUp')}; return stepSetUp(${JSON.stringify(name)});`)(S);
+  assert.equal(run('weather', { WEATHER_LAT: '' }), false);
+  assert.equal(run('weather', { WEATHER_LAT: '52.5' }), true);
+  assert.equal(run('calendar', { APPLE_USERNAME: 'a@b.c' }), true);
+  assert.equal(run('storage', { DATA_DIR: './data', BACKUP_ENABLED: '' }), false, 'die Vorgabe ./data zaehlt als eingerichtet');
+  assert.equal(run('storage', { BACKUP_ENABLED: 'false' }), true, 'abgeschaltete Backups zaehlen nicht als Entscheidung');
+  assert.equal(run('advanced', { ICS_SUBSCRIPTION_ALLOW_PRIVATE_NETWORK: 'true' }), true);
+  assert.equal(run('config', {}), undefined, 'ein Pflichtschritt koennte als uebersprungen gelten');
+});
+
+/* Englische Beispiele in einer deutschen Oberflaeche: "localhost or
+ * 192.168.1.x", "jane", "Jane Smith". Jeder Platzhalter, der Sprache traegt
+ * (Woerter mit Leerzeichen) oder einen Menschen meint (Namens-/Nutzerfelder),
+ * kommt aus der Locale. */
+test('Platzhalter mit Sprache oder Personennamen sind uebersetzt', () => {
+  const inputs = [...html.matchAll(/<input\b[^>]*>/g)].map(m => m[0]);
+  const bad = [];
+  for (const tag of inputs) {
+    const ph = tag.match(/\splaceholder="([^"]*)"/)?.[1];
+    if (!ph) continue;
+    const id = tag.match(/\sid="([^"]*)"/)?.[1];
+    const prose = /\p{L}\s+\p{L}/u.test(ph);
+    const person = /\sautocomplete="(username|name|given-name|family-name|nickname)"/.test(tag);
+    if ((prose || person) && !/\sdata-i18n-ph="/.test(tag)) bad.push(`${id}: "${ph}"`);
+  }
+  assert.deepEqual(bad, [], `Platzhalter ohne Uebersetzung: ${bad.join(', ')}`);
+  const en = loadLocale('en').config.hostPlaceholder;
+  for (const locale of SUPPORTED_LOCALES.filter(l => l !== 'en')) {
+    assert.notEqual(loadLocale(locale).config.hostPlaceholder, en, `${locale}: config.hostPlaceholder ist englisch`);
+  }
+});
+
+/* "Alle Felder sind erforderlich" liess raten, welches fehlt. createAdmin
+ * wird bis zur Pruefung AUSGEFUEHRT: die Meldung nennt das erste leere Feld
+ * mit seinem Label, und genau dieses Feld bekommt den Fokus. */
+test('ein fehlendes Pflichtfeld wird benannt und fokussiert', async () => {
+  const src = fnSource('createAdmin');
+  for (const [filled, expectId, expectLabel] of [
+    [{}, 'adm-user', 'admin.userLabel'],
+    [{ 'adm-user': 'anna' }, 'adm-name', 'admin.nameLabel'],
+    [{ 'adm-user': 'anna', 'adm-name': 'Anna' }, 'adm-pass', 'admin.passLabel'],
+    [{ 'adm-user': 'anna', 'adm-name': 'Anna', 'adm-pass': 'geheim123' }, 'adm-conf', 'admin.confLabel'],
+  ]) {
+    const calls = [];
+    const fn = new Function('$', 't', 'fail', 'clearInvalid', 'fetch',
+      `async ${src}; return createAdmin();`);
+    await fn(id => ({ value: filled[id] ?? '' }), (k, p) => (p ? `${k}:${JSON.stringify(p)}` : k),
+      (banner, msg, id) => calls.push({ msg, id }), () => {}, () => { throw new Error('fetch trotz fehlendem Feld'); });
+    assert.equal(calls.length, 1, `kein Fehler fuer leeres ${expectId}`);
+    assert.equal(calls[0].id, expectId, 'falsches Feld fokussiert');
+    assert.equal(calls[0].msg, `admin.errMissing:${JSON.stringify({ field: expectLabel })}`, 'die Meldung nennt das Feld nicht');
+  }
+  for (const locale of SUPPORTED_LOCALES) {
+    assert.match(loadLocale(locale).admin.errMissing, /\{\{field\}\}/, `${locale}: admin.errMissing nennt das Feld nicht`);
+  }
+  assert.doesNotMatch(html, /admin\.errAll/, 'die Sammelmeldung ist zurueck');
+});
+
+/* Die rohe Server-/Netzwerkmeldung stand als Klammer am Satzende. Sie steht
+ * jetzt als eigene, benannte Zeile darunter (showErr detail). */
+test('rohe Servermeldungen stehen als eigene Zeile, nicht in einer Klammer', () => {
+  assert.doesNotMatch(html, /\}\s\(\$\{(?:e\.message|d\.error|d\?\.error)\}\)/, 'eine Meldung haengt das rohe Detail wieder in Klammern an');
+  const nodes = { x: { textContent: '', style: {} } };
+  const show = new Function('$', 't', `${fnSource('showErr')}; return showErr;`)(id => nodes[id], (k, p) => `${k}=${p?.detail}`);
+  show('x', 'Konnte nicht speichern.', 'Port in use');
+  assert.equal(nodes.x.textContent, 'Konnte nicht speichern.\ncommon.errorDetail=Port in use');
+  show('x', 'Konnte nicht speichern.');
+  assert.equal(nodes.x.textContent, 'Konnte nicht speichern.');
+  assert.equal(declared(s => s === '.error-banner', 'white-space'), 'pre-line', 'der Umbruch erreicht den Bildschirm nicht');
+});
+
+/* Der Hover der Sekundaerkarte zog staerker als der der empfohlenen. */
+test('der Willkommens-Hover folgt der Rangordnung und versetzt keinen Text', () => {
+  assert.equal(declared(s => s === '.mode-card:hover', 'transform'), null, 'der Hover verschiebt die Karte (unscharfer Text)');
+  assert.equal(declared(s => s === '.mode-card:hover', 'box-shadow'), 'var(--shadow-sm)');
+  assert.equal(declared(s => s === '.mode-card.is-primary:hover', 'box-shadow'), 'var(--shadow-md)', 'die empfohlene Karte hebt sich nicht staerker');
+  assert.equal(declared(s => s === '.mode-card.is-primary:hover', 'border-color'), 'var(--color-accent)');
+});
+
+/* Die Bildmarke im Kopf ist die der App: Verlauf + weisse Kreise, in beiden
+ * Themes gleich. Vorher Akzentkachel mit Tinte-auf-Akzent - dunkel matt. */
+test('die Bildmarke im Kopf folgt der App und kippt nicht mit dem Theme', () => {
+  assert.equal(declared(s => s === '.brand__mark', 'background-color'), null, 'die Kachel haengt wieder an einer Theme-Farbe');
+  assert.equal(declared(s => s === '.brand__mark .brand-mark__circles', 'fill'), 'var(--brand-mark-ink)');
+  const brand = html.match(/<span class="brand__mark"[^>]*>([\s\S]*?)<\/span>/)?.[1] ?? '';
+  assert.match(brand, /<rect width="160" height="160" rx="36" fill="url\(#installer-brand-mark\)"\/>/, 'die Kachel ist nicht Teil der Marke');
+  assert.equal((brand.match(/<circle/g) || []).length, 3);
+  for (const t of ['--brand-mark-from', '--brand-mark-to', '--brand-mark-ink']) assert.ok(ROOT_VARS.has(t), `Fallback ohne ${t}`);
+});
+
+/* Docker-Warten: ein Zeitfenster ab Sekunde 0, und kein Sekundentakt. */
+test('der Docker-Schirm nennt ein Zeitfenster und zaehlt ruhig in Minuten', () => {
+  for (const locale of SUPPORTED_LOCALES) {
+    assert.match(loadLocale(locale).docker.firstRunHint, /[13１３۱۳][-‐][3３۳]|1 (?:y|a|e|und|to|и|és|à) 3|1 a 3|de 1 a 3/u,
+      `${locale}: docker.firstRunHint nennt kein Zeitfenster`);
+  }
+  const src = fnSource('tickElapsed');
+  assert.doesNotMatch(src, /'docker\.elapsed'/, 'der Zaehler springt wieder jede Sekunde');
+  assert.match(src, /60000/, 'der Zaehler rechnet nicht in Minuten');
+});
+
+/* Fachjargon im Erweitert-Pfad: verstaendlich zuerst, der Fachbegriff als
+ * Nebeninfo. Geprueft an de und en, die anderen folgen derselben Vorlage. */
+test('Fachbegriffe stehen als Nebeninfo hinter einer verstaendlichen Bezeichnung', () => {
+  for (const locale of ['de', 'en']) {
+    const l = loadLocale(locale);
+    assert.doesNotMatch(l.secrets.sessionLabel, /^Session/i, `${locale}: das Label beginnt mit dem Fachbegriff`);
+    assert.doesNotMatch(l.review.sessionSecret, /secret/i, `${locale}: die Pruefseite nennt nur den Fachbegriff`);
+    for (const k of ['icsPrivateNetworkHint', 'recipeProviderPrivateNetworkHint', 'wasteSourcePrivateNetworkHint', 'documentWebdavPrivateNetworkHint']) {
+      assert.match(l.advanced[k], /\([^)]*SSRF[^)]*\)/, `${locale}: advanced.${k} fuehrt mit "SSRF" statt es nachzustellen`);
+    }
   }
 });

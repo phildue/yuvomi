@@ -167,6 +167,17 @@ and your data*.
 [Umbrel](https://yuvomi.cloud/install.html#umbrel) or [Unraid](https://yuvomi.cloud/install.html#unraid):
 search for Yuvomi in the catalog and install, no terminal.
 
+**In Home Assistant** on Home Assistant OS: add the repository
+[ulsklyc/yuvomi-home-assistant](https://github.com/ulsklyc/yuvomi-home-assistant) under Settings → Apps
+and install Yuvomi as an app ([steps](https://yuvomi.cloud/install.html#homeassistant)).
+
+**On YunoHost** 12.1.17 or newer: `sudo yunohost app install https://github.com/ulsklyc/yuvomi_ynh`
+installs the [YunoHost package](https://github.com/ulsklyc/yuvomi_ynh), not in the catalog yet
+([steps](https://yuvomi.cloud/install.html#yunohost)).
+
+**On Proxmox** a [community helper script](https://community-scripts.org/scripts/yuvomi) sets up a
+Debian LXC with Yuvomi in one command ([steps](https://yuvomi.cloud/install.html#proxmox)).
+
 **With Docker** on any server. The image `ghcr.io/ulsklyc/yuvomi:latest` is about 500 MB and runs
 on amd64 and arm64 (Raspberry Pi 4/5); Yuvomi needs one port, 3000 by default.
 
@@ -181,7 +192,8 @@ openssl rand -hex 32   # DB_ENCRYPTION_KEY
 > **Now open `.env` and replace both `REPLACE_WITH_…` placeholders** with the two values, in that
 > order, and write the second one down: it is the database key, and a lost or changed key never
 > opens the database again, not by you and not by us. With a placeholder left in, Yuvomi refuses
-> to start. To run without encryption, clear the `DB_ENCRYPTION_KEY` line instead of filling it.
+> to start. Or delete both lines, and Yuvomi generates them on the first start. To run without
+> encryption, delete the `DB_ENCRYPTION_KEY` line and set `DB_ENCRYPTION_AUTO_KEY=false`.
 
 ```bash
 docker compose up -d
@@ -200,10 +212,12 @@ and the [installation guide](docs/installation.md).
 - **Page does not load** - `docker compose logs` (on Podman,
   `podman compose -f podman-compose.yml logs`) usually names the reason, and the
   [troubleshooting guide](docs/installation.md#troubleshooting) covers the common ones.
-- **Proxmox** - the same steps run inside a small Debian LXC: see the
+- **Proxmox** - the community helper script installs Yuvomi without Docker; to keep the Docker
+  setup, the same steps run inside a small Debian LXC: see the
   [Proxmox guide on yuvomi.cloud](https://yuvomi.cloud/install.html#proxmox).
-- **Encryption key** - optional, but there is no way back. The guided setup and Umbrel generate
-  one for you; with Compose, TrueNAS or Unraid you set it yourself, so write it down.
+- **Encryption key** - optional, but there is no way back. Left unset, a new installation
+  generates one on its first start; an admin finds it under Settings → Household → Backup and
+  restore. Write it down either way: without it, backups cannot be opened.
 - **Guided setup** - a localized setup wizard in your browser. It detects Docker or Podman, sets
   up single sign-on and scheduled backups, prepares Yuvomi for an HTTPS reverse proxy (the
   certificate stays with your proxy), then starts the container and creates your admin account.
@@ -227,7 +241,7 @@ and the [installation guide](docs/installation.md).
 - **Writes** - four volumes you own: data, backups, modules, documents.
 - **Outbound** - on its own, one update check against the GitHub releases API. Block it and nothing breaks, only the hint about a newer version stays away. Everything else reaches out only when you use or switch on a feature that needs it:
   - **When you use it** - opening the calendar settings loads the list of holiday countries from openholidaysapi.org; finding a logo for a subscription looks up the service's website.
-  - **If the operator turns it on** - fetching your profile picture from Gravatar sends a hash of your email address to gravatar.com or the mirror the operator chose.
+  - **If the operator turns it on** - fetching your profile picture from Gravatar sends a hash of your email address to gravatar.com or the mirror the operator chose; with web install allowed, an admin can install extension modules from GitHub.
   - **Once you switch them on** - weather, public holidays, exchange rates, calendar and contact sync, recipe mirrors, Immich, Paperless or Papra, push and notification channels, cloud storage and backup.
 - **Your LAN** - calendar subscriptions, notification channels (webhook, Gotify, ntfy), WebDAV document storage, recipe mirrors and waste-collection feeds on private or internal addresses stay blocked until you opt in ([how](docs/installation.md#environment-variables)). Paperless and Papra are the exception: they may reach the LAN out of the box.
 - **Your data** - one SQLite file at `/data/yuvomi.db`, plus the folder, WebDAV or Drive if you moved documents there.

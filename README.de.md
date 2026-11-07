@@ -169,6 +169,17 @@ unter *Voraussetzungen, Netzwerk und eure Daten*.
 [Umbrel](https://yuvomi.cloud/install.html#umbrel) oder [Unraid](https://yuvomi.cloud/install.html#unraid):
 im Katalog nach Yuvomi suchen und installieren, ganz ohne Terminal.
 
+**In Home Assistant** auf Home Assistant OS: das Repository
+[ulsklyc/yuvomi-home-assistant](https://github.com/ulsklyc/yuvomi-home-assistant) unter Einstellungen → Apps
+hinzufügen und Yuvomi als App installieren ([Schritte](https://yuvomi.cloud/install.html#homeassistant)).
+
+**Auf YunoHost** ab 12.1.17: `sudo yunohost app install https://github.com/ulsklyc/yuvomi_ynh`
+installiert das [YunoHost-Paket](https://github.com/ulsklyc/yuvomi_ynh), das noch nicht im Katalog
+steht ([Schritte](https://yuvomi.cloud/install.html#yunohost)).
+
+**Auf Proxmox** richtet ein [Community-Helferskript](https://community-scripts.org/scripts/yuvomi)
+mit einem Befehl einen Debian-LXC mit Yuvomi ein ([Schritte](https://yuvomi.cloud/install.html#proxmox)).
+
 **Mit Docker** auf jedem Server. Das Image `ghcr.io/ulsklyc/yuvomi:latest` ist rund 500 MB groß und
 läuft auf amd64 und arm64 (Raspberry Pi 4/5); Yuvomi braucht einen Port, standardmäßig 3000.
 
@@ -183,8 +194,9 @@ openssl rand -hex 32   # DB_ENCRYPTION_KEY
 > **Öffnet jetzt `.env` und ersetzt beide `REPLACE_WITH_…`-Platzhalter** durch die zwei Werte, in
 > dieser Reihenfolge, und schreibt den zweiten auf: er ist der Datenbankschlüssel, und ein
 > verlorener oder geänderter Schlüssel öffnet die Datenbank nie wieder, weder für euch noch für
-> uns. Bleibt ein Platzhalter stehen, startet Yuvomi nicht. Ohne Verschlüsselung: die Zeile
-> `DB_ENCRYPTION_KEY` leeren statt sie zu füllen.
+> uns. Bleibt ein Platzhalter stehen, startet Yuvomi nicht. Oder löscht beide Zeilen, dann erzeugt
+> Yuvomi sie beim ersten Start. Ohne Verschlüsselung: die Zeile `DB_ENCRYPTION_KEY` löschen und
+> `DB_ENCRYPTION_AUTO_KEY=false` setzen.
 
 ```bash
 docker compose up -d
@@ -203,10 +215,12 @@ und die [Installationsanleitung im Repository](docs/installation.md).
 - **Seite lädt nicht** - `docker compose logs` (unter Podman
   `podman compose -f podman-compose.yml logs`) nennt meist den Grund, und die
   [Fehlersuche](docs/installation.md#troubleshooting) deckt die häufigen Fälle ab.
-- **Proxmox** - dieselben Schritte laufen in einem kleinen Debian-LXC: siehe die
+- **Proxmox** - das Community-Helferskript installiert Yuvomi ohne Docker; wer beim Docker-Setup
+  bleibt, fährt dieselben Schritte in einem kleinen Debian-LXC: siehe die
   [Proxmox-Anleitung auf yuvomi.cloud](https://yuvomi.cloud/install.html#proxmox).
-- **Schlüssel** - optional, aber ohne Weg zurück. Die geführte Einrichtung und Umbrel erzeugen ihn
-  für euch; mit Compose, TrueNAS oder Unraid setzt ihr ihn selbst, also schreibt ihn auf.
+- **Schlüssel** - optional, aber ohne Weg zurück. Bleibt er leer, erzeugt eine neue Installation
+  ihn beim ersten Start; ein Admin findet ihn unter Einstellungen → Haushalt → Backup und
+  Wiederherstellung. Schreibt ihn in jedem Fall auf: ohne ihn lassen sich Backups nicht öffnen.
 - **Geführte Einrichtung** - ein lokalisierter Einrichtungsassistent im Browser. Er erkennt Docker
   oder Podman, richtet Single Sign-on und geplante Backups ein, bereitet Yuvomi auf einen
   HTTPS-Reverse-Proxy vor (das Zertifikat bleibt Sache des Proxys), startet dann den Container und
@@ -231,7 +245,7 @@ und die [Installationsanleitung im Repository](docs/installation.md).
 - **Schreibt** - vier Volumes, die euch gehören: Daten, Backups, Module, Dokumente.
 - **Nach außen** - von sich aus eine Update-Abfrage an die GitHub-Releases-API. Blockiert sie, und nichts geht kaputt, nur der Hinweis auf eine neuere Version bleibt aus. Alles andere geht erst nach außen, wenn ihr eine Funktion nutzt oder einschaltet, die es braucht:
   - **Wenn ihr sie nutzt** - das Öffnen der Kalender-Einstellungen lädt die Liste der Feiertagsländer von openholidaysapi.org; die Logo-Suche für ein Abo ruft die Website des Dienstes auf.
-  - **Wenn der Betreiber es einschaltet** - das Holen des Profilbilds von Gravatar schickt einen Hash eurer E-Mail-Adresse an gravatar.com oder den vom Betreiber gewählten Spiegel.
+  - **Wenn der Betreiber es einschaltet** - das Holen des Profilbilds von Gravatar schickt einen Hash eurer E-Mail-Adresse an gravatar.com oder den vom Betreiber gewählten Spiegel; ist die Web-Installation erlaubt, kann ein Admin Erweiterungsmodule von GitHub installieren.
   - **Sobald ihr sie einschaltet** - Wetter, Feiertage, Wechselkurse, Kalender- und Kontakte-Sync, Rezept-Spiegel, Immich, Paperless oder Papra, Push- und Benachrichtigungskanäle, Cloud-Speicher und Backup.
 - **Euer LAN** - Kalender-Abos, Benachrichtigungskanäle (Webhook, Gotify, ntfy), WebDAV-Dokumentenspeicher, Rezept-Spiegel und Abfuhr-Feeds unter privaten oder internen Adressen bleiben blockiert, bis ihr sie freigebt ([wie](docs/installation.md#environment-variables)). Paperless und Papra sind die Ausnahme: sie dürfen ab Werk ins LAN.
 - **Eure Daten** - eine SQLite-Datei unter `/data/yuvomi.db`, dazu Ordner, WebDAV oder Drive, falls die Dokumente dort liegen.
