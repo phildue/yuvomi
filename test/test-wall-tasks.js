@@ -1209,9 +1209,14 @@ test('Persoenliches: die Glocke der Shell fragt ueber einer Wand die Haushaltsfa
   // Die Anfragen laufen echt ueber HTTP; erst auf ihre Antworten warten, dann
   // die Mikrotasks der Glocke ablaufen lassen (sonst ein Wettlauf, z. B. unter Windows).
   const inflight = [];
+  // Die Glocke fragt erst in einer Mikrotask nach (fetchPendingReminders), die
+  // Anfrage steht also oft noch nicht in `inflight`, wenn settle beginnt: in
+  // jeder Runde neu nachsehen, sonst kommt die Antwort einen Schritt zu spaet.
   const settle = async () => {
-    await Promise.allSettled(inflight.splice(0));
-    for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    for (let i = 0; i < 20; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+      if (inflight.length) await Promise.allSettled(inflight.splice(0));
+    }
   };
   const bell = await import('../public/reminders.js');
   try {
