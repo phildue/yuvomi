@@ -536,6 +536,7 @@ const RELEASED_SECTION_EDITS = {
 const UPSTREAM_RELEASES_WITHOUT_FORK_TAG = new Set([
   '2.77.0', '2.77.1',
   '2.79.0', '2.80.0', '2.81.0', '2.81.1', '2.81.2', '2.82.0',
+  '2.84.0', '2.85.0',
 ]);
 
 const sectionHash = (section) => createHash('sha256').update(section).digest('hex').slice(0, 12);
