@@ -362,6 +362,132 @@ await (async () => {
       ).get(subId);
       assert(row.title === 'Zahnarzt (verschoben)', `Titel blieb "${row.title}"`);
     });
+
+    // D#2330 (Variante A): der Feed-Stand liegt in feed_original. Jeder Sync
+    // schreibt ihn, auch an einen lokal geänderten Termin, dessen Felder der
+    // Sync nicht anfasst. Sonst stünde beim Zurücksetzen ein veralteter Wert da.
+    await atest('Sync schreibt feed_original auch an lokal geänderte Termine', async () => {
+      syncDb.prepare("UPDATE calendar_events SET title = 'Lokal', user_modified = 1 WHERE subscription_id = ?").run(subId);
+      body = icsWith('Zahnarzt (Feed neu)');
+      await sync(subId);
+      const row = syncDb.prepare(
+        'SELECT title, feed_original FROM calendar_events WHERE subscription_id = ?'
+      ).get(subId);
+      assert(row.title === 'Lokal', `lokale Änderung ging verloren: "${row.title}"`);
+      assert(row.feed_original, 'feed_original blieb leer');
+      assert(JSON.parse(row.feed_original).title === 'Zahnarzt (Feed neu)',
+        `feed_original hält "${JSON.parse(row.feed_original).title}"`);
+    });
+
+    // Altbestand: vor der Migration gesyncte Zeilen haben kein feed_original.
+    // Der nächste Sync füllt es nach, ohne den lokalen Stand zu verwerfen.
+    await atest('Sync füllt feed_original für Altbestand nach', async () => {
+      syncDb.prepare("UPDATE calendar_events SET feed_original = NULL WHERE subscription_id = ?").run(subId);
+      await sync(subId);
+      const row = syncDb.prepare(
+        'SELECT title, feed_original FROM calendar_events WHERE subscription_id = ?'
+      ).get(subId);
+      assert(row.feed_original, 'feed_original wurde nicht nachgefüllt');
+      assert(row.title === 'Lokal', `lokale Änderung ging verloren: "${row.title}"`);
+    });
+
+    // Migration 273: Altbestand bekommt ein leeres ETag und Last-Modified, damit
+    // der nächste Abruf den vollen Feed (200) statt 304 liefert.
+    await atest('Migration 273 leert ETag und Last-Modified der Abos', async () => {
+      const m = MIGRATIONS.find((x) => x.version === 273);
+      assert(m, 'Migration 273 fehlt');
+      const altId = syncDb.prepare(`
+        INSERT INTO ics_subscriptions (name, url, color, created_by, etag, last_modified)
+        VALUES ('Alt', 'https://x.com/alt.ics', '#000000', 1, '"abc"', 'Wed, 01 Jan 2026 00:00:00 GMT')
+      `).run().lastInsertRowid;
+      m.up(syncDb);
+      const r = syncDb.prepare('SELECT etag, last_modified FROM ics_subscriptions WHERE id = ?').get(altId);
+      assert(r.etag === null && r.last_modified === null,
+        `ETag blieb: ${JSON.stringify(r)}`);
+    });
+
+    // #2566: ein Feed, der nicht ausliefert, galt beim Anlegen und beim
+    // Aktualisieren-Knopf als Erfolg - syncOne() schluckte den Abruffehler.
+    // Wer wartet, erfaehrt ihn jetzt; der Scheduler bleibt still.
+    const { create } = await import('../server/services/ics-subscription.js');
+    const dead = http.createServer((req, res) => { res.writeHead(404); res.end('gone'); });
+    await new Promise((r) => dead.listen(0, '127.0.0.1', r));
+    const deadUrl = `http://127.0.0.1:${dead.address().port}/cal.ics`;
+    try {
+      let deadId;
+      await atest('Anlegen meldet den gescheiterten ersten Abruf mit seinem Fall', async () => {
+        const out = await create(1, { name: 'Tot', url: deadUrl, color: '#123456', shared: 0 });
+        deadId = out.sub.id;
+        assert(out.syncError, 'syncError fehlt, der Abruffehler wurde geschluckt');
+        assert(out.syncError.code === 'calendar_ics_http_status' && out.syncError.params?.status === 404,
+          `Fall/Status falsch: ${JSON.stringify({ code: out.syncError.code, params: out.syncError.params })}`);
+      });
+      await atest('Manueller Sync wirft den Abruffehler', async () => {
+        let thrown = null;
+        try { await sync(deadId, { rethrowFetch: true }); } catch (err) { thrown = err; }
+        assert(thrown?.code === 'calendar_ics_http_status', `kein Wurf: ${thrown?.message ?? thrown}`);
+      });
+      await atest('Scheduler-Lauf bleibt still', async () => {
+        await sync(deadId);
+      });
+
+      // Die Antworten der Route: der Fall reist als reason/params, das Abo
+      // steht trotzdem (201), der Knopf bekommt 400 statt 200.
+      process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'test-secret';
+      const { default: express } = await import('express');
+      const { default: calendarRouter } = await import('../server/routes/calendar.js');
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.authUserId = 1; req.authRole = 'admin'; req.session = { userId: 1, role: 'admin' };
+        next();
+      });
+      app.use('/calendar', calendarRouter);
+      const api = app.listen(0, '127.0.0.1');
+      await new Promise((r) => api.on('listening', r));
+      const base = `http://127.0.0.1:${api.address().port}/calendar`;
+      try {
+        await atest('POST /subscriptions: 201 mit syncReason und syncParams', async () => {
+          const res = await fetch(`${base}/subscriptions`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: 'Tot2', url: deadUrl, color: '#123456' }),
+          });
+          const json = await res.json();
+          assert(res.status === 201, `Status ${res.status}`);
+          assert(json.syncReason === 'calendar_ics_http_status' && json.syncParams?.status === 404,
+            `Fall fehlt: ${JSON.stringify(json)}`);
+          assert(json.syncError === 'HTTP 404', `syncError als Text fuer API-Aufrufer: ${JSON.stringify(json.syncError)}`);
+        });
+        await atest('POST /subscriptions/:id/sync: 400 mit reason statt 200', async () => {
+          const res = await fetch(`${base}/subscriptions/${deadId}/sync`, { method: 'POST' });
+          const json = await res.json();
+          assert(res.status === 400 && json.reason === 'calendar_ics_http_status' && json.params?.status === 404,
+            `Antwort: ${res.status} ${JSON.stringify(json)}`);
+        });
+        // Ein Abruf ohne benannten Fall (Verbindung abgelehnt, Zeitueberschreitung)
+        // traegt Adresse und Port im Text: mit erlaubtem privatem Netz waere der
+        // Text ein Port-Scanner. Er bleibt im Log (Security-Review an #2568).
+        await atest('POST /subscriptions: ein Abruf ohne Fall gibt keinen Rohtext heraus', async () => {
+          const closed = http.createServer();
+          await new Promise((r) => closed.listen(0, '127.0.0.1', r));
+          const closedPort = closed.address().port;
+          await new Promise((r) => closed.close(r));
+          const res = await fetch(`${base}/subscriptions`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: 'Zu', url: `http://127.0.0.1:${closedPort}/cal.ics`, color: '#123456' }),
+          });
+          const json = await res.json();
+          assert(res.status === 201 && json.syncReason === null && typeof json.syncError === 'string',
+            `Antwort: ${res.status} ${JSON.stringify(json)}`);
+          assert(!json.syncError.includes(String(closedPort)) && !/ECONNREFUSED/.test(json.syncError),
+            `Rohtext reist mit: ${json.syncError}`);
+        });
+      } finally {
+        await new Promise((r) => api.close(r));
+      }
+    } finally {
+      await new Promise((r) => dead.close(r));
+    }
   } finally {
     dbModule._resetTestDatabase();
     delete process.env[ENV_FLAG];

@@ -1,8 +1,8 @@
 ## Quick Install
 
-Three ways to get Yuvomi running from scratch:
+Three quick ways to get Yuvomi running from scratch. Every way, app stores and Home Assistant included, is under [Step-by-Step Installation](#step-by-step-installation), each with its option letter.
 
-### Option A — Web Installer (recommended, all platforms)
+### Web Installer (recommended, all platforms)
 
 ```bash
 git clone https://github.com/ulsklyc/yuvomi.git && cd yuvomi
@@ -10,9 +10,9 @@ node tools/installer/install-server.js
 # Open http://localhost:8090
 ```
 
-Requires Node.js 22+ on the host. The browser-based wizard is fully localized (27 languages, auto-detected from your browser), detects your container engine (Docker or Podman) first, then configures your `.env` - including optional reverse-proxy/HTTPS, Single Sign-On (OIDC), and automatic backups - starts the container, and creates your admin account. The engine still runs the app itself.
+Requires Node.js 22.14+ or 23.6+ on the host. The browser-based wizard is fully localized (27 languages, auto-detected from your browser), detects your container engine (Docker or Podman) first, then configures your `.env` - including optional reverse-proxy/HTTPS, Single Sign-On (OIDC), and automatic backups - starts the container, and creates your admin account. The engine still runs the app itself.
 
-### Option B — CLI Installer (Linux / macOS)
+### CLI Installer (Linux / macOS)
 
 ```bash
 git clone https://github.com/ulsklyc/yuvomi.git && cd yuvomi
@@ -40,7 +40,7 @@ Non-interactive mode (CI/provisioning — provide your own `.env`):
 bash install.sh --env-file /path/to/.env
 ```
 
-### Option C — Manual (Docker or Podman, no clone required)
+### Manual (Docker or Podman, no clone required)
 
 ```bash
 curl -O https://raw.githubusercontent.com/ulsklyc/yuvomi/main/docker-compose.yml
@@ -52,8 +52,9 @@ openssl rand -hex 32   # DB_ENCRYPTION_KEY
 
 > **Now open `.env` and replace both `REPLACE_WITH_…` placeholders** with the two values you just
 > generated, in that order, and write the second one down: it is the database key, and nothing can
-> recover it. With a placeholder left in, Yuvomi refuses to start. To run without encryption, clear
-> the `DB_ENCRYPTION_KEY` line instead of filling it.
+> recover it. With a placeholder left in, Yuvomi refuses to start. Or delete both lines: Yuvomi then
+> generates both on the first start (see [Secrets generated on first start](#secrets-generated-on-first-start)).
+> To run without encryption, delete the `DB_ENCRYPTION_KEY` line and set `DB_ENCRYPTION_AUTO_KEY=false`.
 
 ```bash
 docker compose up -d
@@ -228,13 +229,13 @@ second row from this table, so a change to the floor changes the guard with it.
 
 ## Step-by-Step Installation
 
-There are seven ways to get Yuvomi running. **Option A** (web installer) is recommended for most users — it walks you through every step in your browser. **Option B** (pre-built image) is a quick manual alternative. **Option C** (build from source) is for contributors or custom builds. **Options D–F** install directly from a NAS/home-server app store with no terminal required: **Option D** (TrueNAS SCALE), **Option E** (Umbrel), and **Option F** (Unraid). **Option G** covers Portainer, whether you paste the stack or let it follow this repository via Git.
+There are nine ways to get Yuvomi running. **Option A** (web installer) is recommended for most users — it walks you through every step in your browser. **Option B** (pre-built image) is a quick manual alternative. **Option C** (build from source) is for contributors or custom builds. **Options D–F** install directly from a NAS/home-server app store with no terminal required: **Option D** (TrueNAS SCALE), **Option E** (Umbrel), and **Option F** (Unraid). **Option G** covers Portainer, whether you paste the stack or let it follow this repository via Git. **Option H** runs Yuvomi as an app next to Home Assistant, **Option I** as a YunoHost app. On Proxmox, a community helper script sets up a container in one command ([Proxmox](#proxmox) below Option I); the other paths run in a Debian LXC as they do on any Linux server.
 
 ---
 
 ### Option A — Web Installer (Recommended)
 
-Requires Node.js 22+ and Docker on the host.
+Requires Node.js 22.14+ or 23.6+ and Docker on the host.
 
 #### 1. Clone the Repository
 
@@ -251,9 +252,9 @@ node tools/installer/install-server.js
 
 #### 3. Open the Wizard
 
-Open your browser and navigate to **http://localhost:8090**. The wizard detects your browser language (27 languages supported), verifies that a container engine is available (Docker with Compose v2, or Podman with `podman compose` / `podman-compose`), and reports an existing `.env` file as well as a running container before you start. When it finds one, the **simple setup is disabled** and you continue with the advanced setup: the simple path writes fixed values for host, port, `SESSION_SECURE` and `TRUST_PROXY`, which would silently downgrade an installation that already runs behind a reverse proxy. The wizard then guides you through:
+Open your browser and navigate to **http://localhost:8090**. The wizard detects your browser language (27 languages supported), verifies that a container engine is available (Docker with Compose v2, or Podman with `podman compose` / `podman-compose`), and reports an existing `.env` file as well as a running container before you start. The **simple setup** sets the public address (`BASE_URL`) to this computer's private address on your home network, for example `http://192.168.1.20:3000`, so invitation and password-reset links and the app on your phones work on the home Wi-Fi; it skips Docker bridges and VPN tunnels when it looks for that address, and the summary screen lets you change it. When it finds none, it says plainly that Yuvomi is then reachable only on this computer (`http://localhost:3000`). When it finds an existing `.env`, the **simple setup is disabled** and you continue with the advanced setup: the simple path writes fixed values for host, port, `SESSION_SECURE` and `TRUST_PROXY`, which would silently downgrade an installation that already runs behind a reverse proxy. The advanced setup instead fills its fields with the values from your `.env` - port, public address, exposure, timezone, weather, email, sign-on, storage and the rest - so whatever you leave untouched is written back unchanged, a hand-tuned `TRUST_PROXY=2` included, and the review page lists those values instead of "not set up". Passwords, client secrets and keys are never sent to the browser: their fields stay empty with the note "Current value is kept", and the installer puts the existing line back when it saves. The wizard then guides you through:
 
-- Basics - domain/IP, HTTP host port (`OIKOS_HTTP_PORT`), timezone (`TZ`, which pre-sets the household zone; that one is changeable later under Settings → Account → Appearance → Region), how Yuvomi is exposed (`SESSION_SECURE`, `TRUST_PROXY`) and the public address (`BASE_URL`). The exposure choice follows the host you enter, and the wizard rejects an `http://` address combined with enforced secure cookies - nobody could sign in to that combination. A typed public address only counts once it names a full `http://` or `https://` origin; until then the wizard keeps the address it derives from host and port. A timezone the browser does not recognise (`Europe/Berln`) is refused on the spot instead of silently falling back to UTC
+- Basics - domain/IP, HTTP host port (`OIKOS_HTTP_PORT`), timezone (`TZ`, which pre-sets the household zone; that one is changeable later under Settings → Account → Appearance → Region), how Yuvomi is exposed (`SESSION_SECURE`, `TRUST_PROXY`) and the public address (`BASE_URL`). The exposure choice follows the host you enter, and the wizard rejects an `http://` address combined with enforced secure cookies - nobody could sign in to that combination. A public address without `http://` or `https://` is refused with a message instead of being silently replaced by the address derived from host and port. A timezone the browser does not recognise (`Europe/Berln`) is refused on the spot instead of silently falling back to UTC
 - Security key generation (`SESSION_SECRET`, `DB_ENCRYPTION_KEY`) — on a re-run, keys already present in your `.env` are kept rather than regenerated, so running the wizard again on a live installation cannot lock you out of your encrypted database
 - Optional integrations (weather, Google Calendar, Outlook, Apple CalDAV)
 - Email/SMTP for the "forgot password" flow (`EMAIL_SMTP_*`, `EMAIL_FROM_*`)
@@ -288,7 +289,7 @@ curl -O https://raw.githubusercontent.com/ulsklyc/yuvomi/main/.env.example
 cp .env.example .env
 ```
 
-Open `.env` and set at minimum the two required secrets:
+Open `.env` and set the two secrets:
 
 ```bash
 SESSION_SECRET=<YOUR-SECRET>
@@ -302,7 +303,7 @@ openssl rand -hex 32
 openssl rand -hex 32
 ```
 
-That prints **two** values: paste one as `SESSION_SECRET` and the other as `DB_ENCRYPTION_KEY`. See [Environment Variables](#environment-variables) for all options.
+That prints **two** values: paste one as `SESSION_SECRET` and the other as `DB_ENCRYPTION_KEY`. Alternatively, delete both lines and Yuvomi generates them on the first start (see [Secrets generated on first start](#secrets-generated-on-first-start)). See [Environment Variables](#environment-variables) for all options.
 
 #### 3. Start the Container
 
@@ -313,9 +314,9 @@ docker compose up -d
 Docker pulls `ghcr.io/ulsklyc/yuvomi:latest` automatically. No build step, no Node.js installation needed.
 
 > **Pinning a version.** Every release is also published under immutable tags:
-> `2.83.0` (exact version), `2.83` (latest patch of that minor), plus a moving `main`
+> `2.86.0` (exact version), `2.86` (latest patch of that minor), plus a moving `main`
 > tag for the current development state. To pin production to a known-good release,
-> set `image: ghcr.io/ulsklyc/yuvomi:2.83.0` in your compose file and bump it
+> set `image: ghcr.io/ulsklyc/yuvomi:2.86.0` in your compose file and bump it
 > deliberately; `latest` always points at the newest release.
 
 > **Verifying what you pull.** Every image the publish workflow builds is signed at build
@@ -324,7 +325,7 @@ Docker pulls `ghcr.io/ulsklyc/yuvomi:latest` automatically. No build step, no No
 > image you are about to run is one GitHub built from a release tag of this repository:
 >
 > ```bash
-> cosign verify ghcr.io/ulsklyc/yuvomi:2.83.0 \
+> cosign verify ghcr.io/ulsklyc/yuvomi:2.86.0 \
 >   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
 >   --certificate-identity-regexp '^https://github.com/ulsklyc/yuvomi/.github/workflows/docker-publish.yml@refs/tags/v'
 > ```
@@ -333,7 +334,7 @@ Docker pulls `ghcr.io/ulsklyc/yuvomi:latest` automatically. No build step, no No
 > anything else means the image is not one this repository released. The `main` tag is
 > signed too, under `refs/heads/main`, which the pattern above deliberately excludes. Tags
 > published before September 2026 carry no signature. Provenance and SBOM travel inside the
-> image: `docker buildx imagetools inspect ghcr.io/ulsklyc/yuvomi:2.83.0 --format '{{ json .Provenance }}'`.
+> image: `docker buildx imagetools inspect ghcr.io/ulsklyc/yuvomi:2.86.0 --format '{{ json .Provenance }}'`.
 
 Continue with [Step 4 — Verify](#4-verify-the-container-is-running).
 
@@ -378,7 +379,7 @@ docker compose logs -f
 You should see output like:
 
 ```
-yuvomi  | [Yuvomi] Server running on port 3000 | Version 2.83.0
+yuvomi  | [Yuvomi] Server running on port 3000 | Version 2.86.0
 yuvomi  | [Yuvomi] Environment: production
 yuvomi  | [Sync] Auto-sync active every 15 minutes.
 ```
@@ -427,8 +428,8 @@ In your TrueNAS SCALE web UI, go to **Apps → Discover Apps** and search for **
 
 Click **Install**. Fill in the configuration form:
 
-- **Session Secret** (required) — use a long random string
-- **Database Encryption Key** (recommended) — generate with `openssl rand -hex 32`; back it up, it cannot be recovered or changed on an existing database
+- **Session Secret** (optional) — leave empty and Yuvomi generates one on the first start, kept in `.secrets/` next to the database (see [Secrets generated on first start](#secrets-generated-on-first-start)); or set a long random string of your own
+- **Database Encryption Key** (optional) — same: left empty on a new installation, Yuvomi generates one. Set your own with `openssl rand -hex 32` to keep it under your control. Either way back it up — **Settings → Household → Backup and restore** shows it — it cannot be recovered or changed on an existing database
 - Adjust port and storage paths as needed
 
 Click **Install** to start the container.
@@ -473,8 +474,8 @@ In Unraid, open the **Apps** tab (the Community Applications plugin) and search 
 
 Click **Install**. In the template, set:
 
-- **SESSION_SECRET** (required) — a long random string
-- **DB_ENCRYPTION_KEY** (recommended) — generate with `openssl rand -hex 32`; back it up, it cannot be recovered or changed on an existing database. If you are upgrading an installation whose database is still unencrypted, it is encrypted once on the next start and the untouched original is kept as `<DB_PATH>.plaintext-backup`; delete that copy once you have verified the app starts and your data is complete
+- **SESSION_SECRET** (optional) — a long random string. Left empty, Yuvomi generates one on the first start and keeps it in `.secrets/` in the appdata folder (see [Secrets generated on first start](#secrets-generated-on-first-start))
+- **DB_ENCRYPTION_KEY** (recommended) — generate with `openssl rand -hex 32`; back it up, it cannot be recovered or changed on an existing database. Left empty on a new installation, Yuvomi generates one on the first start and keeps it in `.secrets/` in the appdata folder (see [Secrets generated on first start](#secrets-generated-on-first-start)). If you are upgrading an installation whose database is still unencrypted, it is encrypted once on the next start and the untouched original is kept as `<DB_PATH>.plaintext-backup`; delete that copy once you have verified the app starts and your data is complete
 - Adjust the WebUI port and the appdata path if needed
 
 #### 3. Apply and Open
@@ -493,7 +494,9 @@ Portainer never places a `.env` file next to the compose file. Whatever you type
 
 #### Web editor stack
 
-**Stacks → Add stack → Web editor**, paste the contents of [`docker-compose.portainer.yml`](docker-compose.portainer.yml), then add at least these two under **Environment variables**:
+**Stacks → Add stack → Web editor**, paste the contents of [`docker-compose.portainer.yml`](docker-compose.portainer.yml) and deploy. No **Environment variables** are required on a new installation: Yuvomi generates `SESSION_SECRET` and `DB_ENCRYPTION_KEY` on its first start and keeps them in `.secrets/` next to the database, on the `oikos_data` volume (see [Secrets generated on first start](#secrets-generated-on-first-start)). If you are redeploying onto a volume whose database is already encrypted, put that database's key back in `DB_ENCRYPTION_KEY`: an empty field does not generate a replacement, the start is refused. Keep a copy of the database key somewhere else — **Settings → Household → Backup and restore** shows it — because a backup only opens with it.
+
+To keep the two values under your own control instead, add them under **Environment variables**:
 
 - `SESSION_SECRET` — a long random string (`openssl rand -hex 32`)
 - `DB_ENCRYPTION_KEY` — same generator; back it up, it cannot be recovered or changed on an existing database
@@ -508,13 +511,65 @@ Every other variable is optional and falls back to the default shown in the file
 docs/docker-compose.portainer.yml
 ```
 
-Add the same environment variables as above. Auto-update then follows `main` on its own.
+Leave **Environment variables** empty, or add the same ones as above to keep your own values. Auto-update then follows `main` on its own.
 
 #### App template
 
-Yuvomi is in the community catalog [Lissy93/portainer-templates](https://github.com/Lissy93/portainer-templates). Under **Settings → App Templates**, set the URL to `https://raw.githubusercontent.com/Lissy93/portainer-templates/main/templates.json`, then pick **Yuvomi** under **App Templates**. The form asks for `SESSION_SECRET` and `DB_ENCRYPTION_KEY` (generated as above), the host port and `BASE_URL`; everything else keeps the default of [`docker-compose.portainer.yml`](docker-compose.portainer.yml), which the template deploys.
+Yuvomi is in the community catalog [Lissy93/portainer-templates](https://github.com/Lissy93/portainer-templates). Under **Settings → App Templates**, set the URL to `https://raw.githubusercontent.com/Lissy93/portainer-templates/main/templates.json`, then pick **Yuvomi** under **App Templates**. The form offers `SESSION_SECRET` and `DB_ENCRYPTION_KEY` — on a new installation leave both empty and Yuvomi generates them on its first start — plus the host port and `BASE_URL`; everything else keeps the default of [`docker-compose.portainer.yml`](docker-compose.portainer.yml), which the template deploys.
 
-> **Do not point a Git stack at the repository's `docker-compose.yml`.** That file is written for a local clone with a generated `.env` beside it, so it passes most of its configuration through `env_file` — and Portainer clones the repository without one. The deploy then fails on the missing file, and even if it did not, the container would start without `SESSION_SECRET` and exit (issues #698, #765).
+> **Do not point a Git stack at the repository's `docker-compose.yml`.** That file is written for a local clone with a generated `.env` beside it, so it passes most of its configuration through `env_file` — and Portainer clones the repository without one. The deploy then fails on the missing file, and even if it did not, the container would come up without the variables that file expects to find in the `.env` (issues #698, #765).
+
+---
+
+### Option H - Home Assistant (App)
+
+No terminal required. The app from [ulsklyc/yuvomi-home-assistant](https://github.com/ulsklyc/yuvomi-home-assistant) runs the published Yuvomi image next to Home Assistant. It needs Home Assistant OS or a Supervised installation on amd64 or aarch64 (for example a Raspberry Pi 4/5 or Home Assistant Green). This is Yuvomi itself, not an integration: it adds no entities to Home Assistant.
+
+#### 1. Add the Repository
+
+In Home Assistant, go to **Settings → Apps → Install app**, open the menu at the top right, choose **Repositories** and add `https://github.com/ulsklyc/yuvomi-home-assistant`.
+
+#### 2. Install and Start
+
+Search for **Yuvomi**, install it and start it. The app generates `SESSION_SECRET` itself. Database encryption is the **Encrypt database** option on the app's **Configuration** tab: leave the key empty and the app creates one and writes a copy to `db_encryption_key.txt` in its config folder (`/addon_configs/<id>_yuvomi/`). Keep a copy of it outside Home Assistant.
+
+#### 3. Open Yuvomi
+
+Select **Open Web UI**. Yuvomi answers on port 3880 of the Home Assistant host, for example `http://homeassistant.local:3880` (another port is set on the app's **Configuration** tab under **Network**). The first visit guides you through creating your admin account in the browser.
+
+Further environment variables go under **Additional environment variables** on the **Configuration** tab; paths, the session secret and the database key stay with the app. Every option is described on the app's **Documentation** tab.
+
+---
+
+### Option I - YunoHost (Package)
+
+The package from [ulsklyc/yuvomi_ynh](https://github.com/ulsklyc/yuvomi_ynh) installs the official Yuvomi release unchanged, as a systemd service behind YunoHost's nginx, and puts it in every YunoHost backup. It needs YunoHost 12.1.17 or newer on amd64 or arm64. The package is not in the YunoHost catalog yet, so it is installed from its repository.
+
+#### 1. Install the Package
+
+```bash
+sudo yunohost app install https://github.com/ulsklyc/yuvomi_ynh
+```
+
+#### 2. Answer the Install Questions
+
+Pick a domain or subdomain of its own, for example `family.example.com`: Yuvomi cannot run under a sub path yet ([discussion #2231](https://github.com/ulsklyc/yuvomi/discussions/2231)). Then pick the YunoHost user who becomes the Yuvomi administrator and give that account a password; it is separate from the YunoHost password. Keep the app public (visitors), so the installed app on phones, calendar feeds and API tokens work outside the YunoHost portal.
+
+#### 3. Open Yuvomi
+
+Open the domain and sign in with that account. The package generates `SESSION_SECRET` and `DB_ENCRYPTION_KEY` itself; encryption is always on and the key lives in the app settings, so every YunoHost backup carries it. To move by hand instead, `yunohost app setting yuvomi db_encryption_key` prints it. `.env` is rewritten from the app settings on every upgrade, so variables added there do not survive one. Admin notes are in the package's [doc/ADMIN.md](https://github.com/ulsklyc/yuvomi_ynh/blob/main/doc/ADMIN.md).
+
+---
+
+### Proxmox
+
+The [community-scripts](https://community-scripts.org/scripts/yuvomi) project ships a helper script that creates a Debian 13 LXC and installs Yuvomi in it directly with Node.js, without Docker. Run it on the Proxmox host shell:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/yuvomi.sh)"
+```
+
+It is maintained there, not in this repository, so read it before you run it. It enables database encryption and writes both secrets to `/opt/yuvomi/.env` inside the container: copy `DB_ENCRYPTION_KEY` from there and keep it safe. Running the same command inside the container updates Yuvomi. To run the Docker setup instead, create an unprivileged Debian LXC with `nesting=1` (or a VM) and follow Option B inside it; the [Proxmox guide on yuvomi.cloud](https://yuvomi.cloud/install.html#proxmox) has the commands.
 
 ---
 
@@ -542,7 +597,7 @@ All configuration happens in the `.env` file. The container reads these values o
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
-| `SESSION_SECRET` | Secret key for signing session cookies. The placeholder that `.env.example` ships (`REPLACE_WITH_...`) is refused at startup: it is printed in this repository, so anyone who can reach your instance could forge a session cookie and sign in as any user. Generate one with `openssl rand -base64 48`. Changing it later only signs everyone out once. | - | **Yes** |
+| `SESSION_SECRET` | Secret key for signing session cookies. The placeholder that `.env.example` ships (`REPLACE_WITH_...`) is refused at startup: it is printed in this repository, so anyone who can reach your instance could forge a session cookie and sign in as any user. Generate one with `openssl rand -base64 48`, or leave it unset and Yuvomi generates one on the first start (see [Secrets generated on first start](#secrets-generated-on-first-start)). Changing it later only signs everyone out once. | generated | No |
 | `SESSION_SECURE` | Set to `true` when running behind an HTTPS reverse proxy (Caddy, Nginx, Traefik). Leave unset for direct HTTP access (e.g. TrueNAS, bare Docker). | `false` | No |
 | `RATE_LIMIT_WINDOW_MS` | Time window for rate limiting (ms) | `60000` | No |
 | `RATE_LIMIT_MAX_ATTEMPTS` | Max attempts per window on the credential routes: sign-in, the second factor, and password reset | `5` | No |
@@ -554,6 +609,19 @@ Generate a secure `SESSION_SECRET`:
 ```bash
 openssl rand -hex 32
 ```
+
+### Secrets generated on first start
+
+`SESSION_SECRET` and `DB_ENCRYPTION_KEY` can be left unset. Yuvomi then generates each on the first start (32 random bytes as hex, the same as `openssl rand -hex 32`) and keeps it in a `.secrets/` folder next to the database: `<directory of DB_PATH>/.secrets/<NAME>`, which is `/data/.secrets/SESSION_SECRET` and `/data/.secrets/DB_ENCRYPTION_KEY` in the container. The folder has mode `0700`, each file `0600`, owned by the user Yuvomi runs as. Every later start reads the same files. The log names the variable and the path, never the value.
+
+- **Order.** A value you set wins: `<NAME>` first, then `<NAME>_FILE`, then the stored file, and only then a new one is generated. If you set a value while a stored file exists, the stored file is ignored and the start logs a warning naming it.
+- **Existing installations do not change.** The database key is generated only for a new installation - no `yuvomi.db` (or legacy `oikos.db`) at the resolved path yet, and `DB_PATH` is not `:memory:`. A database that already runs without a key keeps running unencrypted; to encrypt it, set a key yourself (see `DB_ENCRYPTION_KEY` below). `SESSION_SECRET` is generated whenever it is missing.
+- **What the generated key protects.** It lies on the same volume as the database, so it protects a database file or backup that leaves the machine - a backup copied elsewhere, a file shared by mistake. It does not protect against someone who gets the whole volume: the key is right next to the database. A key of your own through `DB_ENCRYPTION_KEY` or `DB_ENCRYPTION_KEY_FILE`, kept off that volume, is stronger. For the same reason a copy of the whole data folder holds the key and needs the same care as an unencrypted database.
+- **Keep a copy of the key.** An admin finds it under **Settings → Household → Backup and restore** (**Show key**). Without it, the backups are unreadable once the volume is lost. When the key comes from your own configuration, that page says so and does not show it.
+- **Unencrypted on purpose.** Set `DB_ENCRYPTION_AUTO_KEY=false` before the first start, for development or a test instance. It only stops generating: a key already stored in `.secrets/` is still read.
+- **Do not edit or delete the stored files.** An empty or unreadable `.secrets/DB_ENCRYPTION_KEY` stops the start instead of generating a new one, and an encrypted database with no key anywhere stops with a message naming the path. A new key would never open the existing database.
+
+> **For packagers** (NAS catalogs, app stores, one-click templates): you no longer need to ask for these secrets or build them in. Leave both unset and let the first start generate them on the data volume. Never ship a fixed value: a key printed in a template or repository is public and protects nothing.
 
 ### Secrets from Files (Optional)
 
@@ -580,7 +648,7 @@ secrets:
 - A missing, unreadable or empty file stops the start. There is no silent fallback, because for `DB_ENCRYPTION_KEY` that would start on a new, unencrypted database.
 - Line breaks at the end of the file are ignored; everything else, spaces included, belongs to the value. Keep a copy of the database key elsewhere: it cannot be recovered or changed on an existing database.
 - Remove the matching `<NAME>=` lines from `.env`.
-- This is for setups where you write the compose file yourself (Docker Compose, Podman, Quadlet). The TrueNAS, Umbrel, Unraid and Portainer templates always set `SESSION_SECRET` themselves, so adding `SESSION_SECRET_FILE` there stops the start.
+- This is for setups where you write the compose file yourself (Docker Compose, Podman, Quadlet). On TrueNAS, Unraid and Portainer you can use the `_FILE` variants too: those descriptors leave the secret empty unless you fill it in, and an empty value counts as unset. Umbrel is the exception - it sets both secrets from `APP_SEED`, so adding `SESSION_SECRET_FILE` there stops the start.
 
 **File permissions.** The file is read by the user the app runs as, not by root: the image's entrypoint switches to `node` (uid 1000) before the server starts, and TrueNAS starts the container as uid 568 from the outset. This differs from the postgres image, which reads its secret files as root. A file that belongs to root with mode `600` therefore stops the start with `EACCES`. With Docker Compose the secret is a bind mount that keeps the owner and mode from the host, so create the file under `umask 077` and hand it to that uid:
 
@@ -745,7 +813,8 @@ letter hashes differently from Gravatar and gets "no picture".
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `DB_PATH` | Path to the SQLite database file inside the container | `/data/yuvomi.db` | No |
-| `DB_ENCRYPTION_KEY` | SQLCipher AES-256 key for encryption at rest. Leave it empty and the database stays unencrypted. Once set there is no way back: it cannot be recovered and cannot be changed on an existing database. The placeholder that `.env.example` ships (`REPLACE_WITH_...`) is refused on a fresh install, because it is printed in this repository and would protect nothing. | - | No, but strongly recommended |
+| `DB_ENCRYPTION_KEY` | SQLCipher AES-256 key for encryption at rest. Leave it unset and a **new** installation generates one on its first start (see [Secrets generated on first start](#secrets-generated-on-first-start)); an existing database without a key stays unencrypted. Once set there is no way back: it cannot be recovered and cannot be changed on an existing database. The placeholder that `.env.example` ships (`REPLACE_WITH_...`) is refused on a fresh install, because it is printed in this repository and would protect nothing. | generated on a new installation | No, but strongly recommended |
+| `DB_ENCRYPTION_AUTO_KEY` | `false` stops a new installation from generating `DB_ENCRYPTION_KEY`, for a deliberately unencrypted database (development). It only prevents generating: a key already stored in `.secrets/` is still read. | `true` | No |
 | `DB_ALLOW_NEWER_SCHEMA` | Emergency switch, normally unset. An older Yuvomi refuses to start on a database a newer version has opened (see [Going back](#going-back)); `1` starts it anyway, at your own risk, with a warning on every start. | - | No |
 | `DATA_DIR` | Host directory mounted at `/data` inside the container (set in `.env` or `docker-compose.yml`). | `./data` | No |
 | `MODULES_DIR` | Host directory mounted at `/app/modules` inside the container - the drop-in folder for [third-party modules](../MODULES.md). Like `BACKUP_DIR`, the app also reads this name itself as the directory *inside* the container, which is why `docker-compose.yml`, `podman-compose.yml` and the Quadlet pin it to `/app/modules` there. With Compose the value in `.env` therefore only moves the mount source; the Quadlet keeps its host folder in the unit file, and Portainer uses a named volume. | `./modules` | No |
@@ -779,8 +848,9 @@ openssl rand -hex 32
 > **The placeholder is not a key.** `.env.example` ships
 > `DB_ENCRYPTION_KEY=REPLACE_WITH_A_STRONG_ENCRYPTION_KEY`, not an empty line. Copying the file and
 > starting without editing it would encrypt the database against a constant that is printed in this
-> repository. A fresh installation therefore refuses to start with that value and tells you both ways
-> out: put a real key in, or clear the line to run unencrypted. An installation that already runs on
+> repository. A fresh installation therefore refuses to start with that value and tells you the ways
+> out: put a real key in, or delete the line and let Yuvomi generate one - and to run unencrypted,
+> delete the line and set `DB_ENCRYPTION_AUTO_KEY=false`. An installation that already runs on
 > the placeholder keeps starting - taking a working instance away would not undo anything - and gets
 > a warning with the rotation steps on every start instead.
 
@@ -1251,7 +1321,7 @@ SESSION_SECURE=true
 TRUST_PROXY=1
 ```
 
-> Both installers set these for you. The web installer's **Advanced** step asks for your deployment type; the CLI installer derives them from the scheme of the base URL you enter — `https://` means proxy (`SESSION_SECURE=true`, `TRUST_PROXY=1`), anything else means direct access (`SESSION_SECURE=false`, `TRUST_PROXY=loopback`). A value already present in your `.env` always wins, so a hand-tuned `TRUST_PROXY=2` survives a re-run.
+> Both installers set these for you. The web installer's **Basic Configuration** step asks how Yuvomi is exposed (direct or behind a reverse proxy); the CLI installer derives them from the scheme of the base URL you enter — `https://` means proxy (`SESSION_SECURE=true`, `TRUST_PROXY=1`), anything else means direct access (`SESSION_SECURE=false`, `TRUST_PROXY=loopback`). On a re-run both keep a hand-tuned `TRUST_PROXY=2`: the CLI installer keeps any value already in your `.env`, and the web installer keeps it as long as you leave the exposure choice it pre-selects from your `.env` unchanged.
 
 Then restart the container so the new values take effect:
 
@@ -1271,6 +1341,10 @@ yuvomi.example.com {
 ```
 
 Set `SESSION_SECURE=true` and `TRUST_PROXY=1` in `.env` as above, then reload Caddy.
+
+For a new installation where Caddy runs in Docker next to Yuvomi, [`deploy/caddy/`](../deploy/caddy/README.md)
+has an example Compose deployment with automatic Let's Encrypt certificates. Like
+`nginx.conf.example`, it is an example and not tested in CI.
 
 ---
 
@@ -1389,7 +1463,7 @@ Scheduled backups are written to the host folder configured through `BACKUP_DIR`
 Use the built-in backup helper to create a consistent SQLite backup from the running container, then copy it to your host:
 
 ```bash
-docker compose exec yuvomi node -e "import('./server/db.js').then(async db => { await db.backupToFile('/data/yuvomi-backup.db'); process.exit(0); })"
+docker compose exec yuvomi node --import ./server/utils/load-secrets-readonly.js -e "import('./server/db.js').then(async db => { await db.backupToFile('/data/yuvomi-backup.db'); process.exit(0); })"
 docker cp yuvomi:/data/yuvomi-backup.db ./yuvomi-backup-$(date +%Y%m%d).db
 ```
 
@@ -1462,7 +1536,7 @@ crontab -e
 Add this line:
 
 ```
-0 3 * * * docker compose exec -T yuvomi node -e "import('./server/db.js').then(async db => { await db.backupToFile('/data/yuvomi-cron-backup.db'); process.exit(0); })" && docker cp yuvomi:/data/yuvomi-cron-backup.db /path/to/backups/yuvomi-$(date +\%Y\%m\%d).db
+0 3 * * * docker compose exec -T yuvomi node --import ./server/utils/load-secrets-readonly.js -e "import('./server/db.js').then(async db => { await db.backupToFile('/data/yuvomi-cron-backup.db'); process.exit(0); })" && docker cp yuvomi:/data/yuvomi-cron-backup.db /path/to/backups/yuvomi-$(date +\%Y\%m\%d).db
 ```
 
 This creates a backup at 3:00 AM every day.
@@ -1649,7 +1723,7 @@ and rate limits count all clients as one.
 <details>
 <summary>Database encryption error</summary>
 
-If the logs show SQLCipher errors, the `DB_ENCRYPTION_KEY` in your `.env` file is either missing or does not match the key used when the database was created.
+If the logs show SQLCipher errors, the `DB_ENCRYPTION_KEY` in your `.env` file (or, for a key Yuvomi generated itself, the file `.secrets/DB_ENCRYPTION_KEY` next to the database) is either missing or does not match the key used when the database was created.
 
 If this is a fresh install, remove the database folder and start over. The compose file
 uses bind mounts, so `docker compose down -v` does **not** delete anything here — the

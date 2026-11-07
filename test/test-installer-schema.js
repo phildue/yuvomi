@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
+import { resolveDbPath } from '../server/utils/db-path.js';
 import { ENV_SCHEMA } from '../tools/installer/env-schema.js';
 
 const ORIGINAL_KEYS = [
@@ -123,9 +125,12 @@ const INTENTIONALLY_NOT_IN_INSTALLER = {
   DB_PATH: 'Vom Descriptor auf /data/yuvomi.db gesetzt.',
   BACKUP_DIR:
     'Die App liest diesen Namen selbst (backup-scheduler.js) und meint damit das Ziel IM '
-    + 'Container. Ein Host-Pfad in der .env wird dort zu /app/backups, ausserhalb des Mounts - '
-    + 'das war #579. Anders als DATA_DIR, das die App nie liest und deshalb im Wizard stehen '
-    + 'darf. Der Host-Ordner der Sicherungen wird ueber den Mount gesetzt, nicht hierueber.',
+    + 'Container; ungepinnt landete ein Host-Pfad aus der .env dort ausserhalb des Mounts - '
+    + 'das war #579. Seither pinnt jeder Descriptor ihn unter environment auf /backups (Guard '
+    + 'unten). Bei Compose verschiebt ein .env-Wert damit nur die Mount-Quelle '
+    + '(docker-compose.yml: ${BACKUP_DIR:-./backups}:/backups), wie bei MODULES_DIR. Der Wizard '
+    + 'fragt ihn trotzdem nicht ab: dieselbe Zeile hiesse im Container etwas anderes als auf dem '
+    + 'Host, und das Quadlet interpoliert nicht.',
   MODULES_DIR:
     'Dieselbe Regel wie bei BACKUP_DIR: die App liest den Namen selbst (services/modules.js) '
     + 'und meint das Verzeichnis IM Container. Docker, Podman und Quadlet laden die .env in den '
@@ -206,6 +211,11 @@ const INTENTIONALLY_NOT_IN_INSTALLER = {
     + 'mit invalid_client beantwortet (#2144). Leer ist fuer jede neue Installation richtig, und '
     + 'der Wizard kennt den Anbieter nicht: ein Feld waere eine Frage, die niemand vor der ersten '
     + 'Anmeldung beantworten kann. Ein Schema-Eintrag ohne Feld verbietet der Guard weiter unten.',
+  DB_ENCRYPTION_AUTO_KEY:
+    'Schaltet nur das Erzeugen eines Schluessels beim ersten Start ab (server/utils/auto-secrets.js). '
+    + 'Der Wizard schreibt DB_ENCRYPTION_KEY immer selbst in die .env, dort erzeugt die App also nie '
+    + 'einen - der Schalter haette in jeder Wizard-Installation keine Wirkung, und ein Feld dafuer '
+    + 'waere eine Frage ohne Folge. Er ist fuer Installationen ohne Wizard (Kataloge, Compose von Hand).',
   DB_ALLOW_NEWER_SCHEMA:
     'Notfallschalter, keine Installationsentscheidung: laesst eine aeltere App auf einer '
     + 'neueren Datenbank starten, obwohl das dabei Geschriebene beim naechsten Update verloren '
@@ -376,7 +386,12 @@ function fieldSources() {
   const body = script.match(/function buildEnv\(\)\s*\{\s*return\s*\{([\s\S]*?)\n\s*\};/);
   assert.ok(body, 'buildEnv() in install.html nicht gefunden');
   const pairs = [...body[1].matchAll(/\b([A-Z][A-Z0-9_]*)\s*:\s*S\.(\w+)/g)].map(m => [m[1], m[2]]);
-  const controls = new Set([...html.matchAll(/<(?:input|select|textarea)\b[^>]*\bid="([^"]+)"/g)].map(m => m[1]));
+  // Steuernde Felder: Eingabeelemente und Radiogruppen (das Segment fuer den
+  // Zugriff, #adv-proxy, ist seit 2026-10-29 eine Gruppe nativer Radios).
+  const controls = new Set([
+    ...[...html.matchAll(/<(?:input|select|textarea)\b[^>]*\bid="([^"]+)"/g)].map(m => m[1]),
+    ...[...html.matchAll(/<div\b[^>]*\bid="([^"]+)"[^>]*\brole="radiogroup"/g)].map(m => m[1]),
+  ]);
   const esc = str => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const all = re => [...script.matchAll(re)].map(m => m[1]);
   const expand = (expr, depth, seen) => {
@@ -452,7 +467,8 @@ test('das Upload-Limit prueft dieselben Grenzen wie der Server und meldet am Fel
   assert.ok(cond, 'storage-next prueft adv-max-upload nicht mit Meldung am Feld');
   assert.match(block, /S\.MAX_UPLOAD_MB = maxUpload;/, 'der gepruefte Wert wird nicht in S geschrieben');
   // Die Bedingung AUSFUEHREN, nicht nachlesen.
-  const rejects = new Function('maxUpload', `return Boolean(${cond[1]});`);
+  // untouched() ist ohne Rerun immer false (Erstinstallation: alles wird geprueft).
+  const rejects = maxUpload => new Function('maxUpload', 'untouched', `return Boolean(${cond[1]});`)(maxUpload, () => false);
   for (const ok of ['', String(min), String(def), String(max)]) assert.equal(rejects(ok), false, `${JSON.stringify(ok)} muss durchgehen`);
   for (const bad of [String(min - 1), String(max + 1), '7.5', '1e2', '-5', 'abc', '05']) {
     assert.ok(rejects(bad), `${JSON.stringify(bad)} muss abgelehnt werden - der Server naehme etwas anderes`);
@@ -641,6 +657,24 @@ test('Jedes Container-Deployment schreibt Backups nach /backups (issue #579)', (
   assert.ok(backupVar, 'Unraid deklariert BACKUP_DIR nicht');
   assert.match(backupVar[0], /Default="\/backups"/, 'Unraid BACKUP_DIR muss /backups defaulten');
   assert.match(unraid, /Target="\/backups"[^>]+Type="Path"/, 'Unraid mountet kein /backups');
+});
+
+test('Das Image legt die Datenbank ohne DB_PATH auf das /data-Volume', () => {
+  // Ohne DB_PATH fiele die App auf ihren Bare-Metal-Default zurueck: yuvomi.db im
+  // Projektverzeichnis, also /app im Container. Dort darf der node-User nichts
+  // anlegen; die automatisch erzeugten Secrets (.secrets neben der Datenbank)
+  // scheitern mit EACCES und der Container beendet sich. Ein schlichtes
+  // `docker run -v daten:/data` muss trotzdem starten und auf dem Volume schreiben.
+  const dockerfile = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
+  assert.match(
+    dockerfile,
+    /^ENV DB_PATH=\/data\/yuvomi\.db$/m,
+    'Dockerfile muss DB_PATH=/data/yuvomi.db als Image-Default setzen'
+  );
+  const imageDefault = dockerfile.match(/^ENV DB_PATH=(.+)$/m)[1];
+  const { dbPath } = resolveDbPath({ DB_PATH: imageDefault });
+  assert.equal(path.dirname(dbPath), '/data', 'Image-Default muss auf dem /data-Volume landen');
+  assert.match(dockerfile, /mkdir -p \/data /, 'Dockerfile legt /data nicht an');
 });
 
 test('Wer die .env in den Container laedt, pinnt MODULES_DIR auf /app/modules', () => {
@@ -1245,13 +1279,21 @@ test('das Portainer-App-Template fragt genau ab, was der verlinkte Stack braucht
   assert.deepEqual(unknown, [],
     `Diese Formularfelder interpoliert ${template.repository.stackfile} nicht.`);
 
-  const required = [...stack.matchAll(/\$\{([A-Z0-9_]+):\?/g)].map((m) => m[1]);
-  assert.ok(required.length >= 2,
-    `Nur ${required.length} Pflichtvariablen im Stack gefunden (gemessen: SESSION_SECRET, `
-    + 'DB_ENCRYPTION_KEY) - die Suche greift nicht mehr.');
-  for (const name of required) {
+  // Seit v2.85.0 (#2507) erzeugt der Server beide Secrets beim ersten Start,
+  // wenn sie leer bleiben. Der Stack darf sie deshalb NICHT mehr per
+  // `${VAR:?...}` erzwingen: ein Deploy ohne sie ist der Normalfall, kein
+  // Fehler. Das Formular bietet sie weiter an - wer eigene Werte halten will,
+  // trägt sie ein -, und ein Default bleibt verboten, weil er für jede
+  // Installation derselbe wäre.
+  const erzwungen = [...stack.matchAll(/\$\{([A-Z0-9_]+):\?/g)].map((m) => m[1]);
+  assert.deepEqual(erzwungen, [],
+    `Diese Variablen brechen den Deploy ab, obwohl der Start sie selbst erzeugt: ${erzwungen.join(', ')}`);
+
+  for (const name of ['SESSION_SECRET', 'DB_ENCRYPTION_KEY']) {
+    assert.match(stack, new RegExp(`\\$\\{${name}:-\\}`),
+      `${name} muss im Stack mit leerem Default stehen (\${${name}:-})`);
     const field = env.find((e) => e.name === name);
-    assert.ok(field, `${name} ist im Stack Pflicht, fehlt aber im Formular`);
+    assert.ok(field, `${name} fehlt im Formular - niemand koennte einen eigenen Wert setzen`);
     assert.equal(field.default ?? '', '',
       `${name} darf keinen Default tragen - er waere fuer jede Installation derselbe`);
   }

@@ -30,6 +30,7 @@ import { attachSegmentIndicator } from '/utils/segment-indicator.js';
 import { wireScrollFade } from '/utils/ux.js';
 import { createRetryState, hintFoldHtml, settingRowHtml } from '/settings/components.js';
 import { resolveExtensionLabel } from '/utils/extension-i18n.js';
+import { errorSentence, loadErrorSentence } from '/utils/friendly-error.js';
 import {
   effectiveCapabilityAccess as resolveCapabilityAccess,
   isPermissionDeviation,
@@ -653,7 +654,7 @@ function persist(onFail) {
       return true;
     } catch (err) {
       onFail?.();
-      window.yuvomi?.showToast(err.message || t('common.errorGeneric'), 'danger');
+      window.yuvomi?.showToast(errorSentence(err), 'danger');
       return false;
     }
   };
@@ -856,7 +857,7 @@ export async function render(container, { user } = {}) {
     catalog = res.data;
   } catch (err) {
     container.querySelector('#perm-matrix')?.replaceChildren(createRetryState({
-      message: err.message || t('common.errorGeneric'),
+      message: loadErrorSentence(err) ?? t('common.errorGeneric'),
       onRetry: () => render(container, { user }),
     }));
     return;

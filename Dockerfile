@@ -1,7 +1,7 @@
 # Digest des Multi-Arch-Index von node:24.22.1-slim (bookworm), Stand 26.10.2026.
 # Ein Tag allein ist eine Behauptung, der Digest ist das Image, das gebaut wurde;
 # Dependabot (docker) hebt ihn mit dem Tag. Beide FROM-Zeilen tragen denselben.
-FROM node:24-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS build
+FROM node:24-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c AS build
 
 # Toolchain als Notnagel für native Module. Seit v13 ist
 # better-sqlite3-multiple-ciphers auf Node-API gebaut und liefert die Binaries
@@ -31,11 +31,13 @@ COPY scripts/check-runtime-deps.mjs ./scripts/
 RUN node scripts/check-runtime-deps.mjs
 
 # ---- Runtime stage ----
-FROM node:24-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205
+FROM node:24-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c
 
-RUN apt-get update && apt-get install -y \
-    gosu \
-    && rm -rf /var/lib/apt/lists/*
+# Der Entrypoint wechselt mit setpriv (util-linux, im Basis-Image enthalten) zum
+# node-User. Kein eigenes Paket mehr wie früher gosu - aber falls ein neues
+# Basis-Image setpriv nicht mehr mitbringt, bricht der Build hier ab statt erst
+# der Start des Containers.
+RUN setpriv --version
 
 WORKDIR /app
 
@@ -54,6 +56,13 @@ RUN mkdir -p /data /backups /app/modules /documents
 # Deployments, die BACKUP_DIR selbst setzen (Compose, TrueNAS, Umbrel, Quadlet),
 # überschreiben diesen Wert wie gehabt.
 ENV BACKUP_DIR=/backups
+
+# Container-Default für die Datenbank, aus demselben Grund: ohne DB_PATH läge
+# yuvomi.db unter /app, wo der node-User weder die Datenbank noch die beim ersten
+# Start erzeugten Secrets (.secrets daneben) anlegen darf - der Container beendete
+# sich sofort. Mit diesem Default reicht ein Volume auf /data. Gesetzte Werte
+# (Compose, Quadlet, Kataloge, auch das Legacy-/data/oikos.db) gelten weiter.
+ENV DB_PATH=/data/yuvomi.db
 
 # Entrypoint: korrigiert Volume-Permissions und startet als node-User
 COPY entrypoint.sh /entrypoint.sh

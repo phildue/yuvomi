@@ -75,6 +75,16 @@ dort war der Abstand zu Upstream am 2026-09-14 null.
   die Datenbank wirklich (vorher war er wirkungslos). Er **darf sich nie ändern**:
   ein anderer Wert macht eine bestehende Datenbank unlesbar. `${APP_SEED}` ist pro
   Installation stabil und erfüllt genau das.
+- **Beide Zeilen bleiben, obwohl der Server seit v2.85.0 selbst Secrets erzeugt**
+  (entschieden am 2026-11-04, #2507). Die anderen Ziele (Portainer, Unraid, TrueNAS)
+  haben ihre Secret-Felder optional gestellt, weil sie den NUTZER danach fragten und
+  ein leeres Feld den Deploy abbrach. Dieses Paket fragt niemanden: `${APP_SEED}`
+  kommt von Umbrel und ist immer gesetzt, der Reibungspunkt existiert hier also nicht.
+  `DB_ENCRYPTION_KEY` zu entfernen wäre dagegen Datenverlust - Bestandsdatenbanken
+  sind mit `${APP_SEED}` verschlüsselt, und ohne die Zeile sucht der Start einen
+  Schlüssel in `.secrets/`, den es dort nie gab. Ein Wechsel auf die erzeugten
+  Secrets bräuchte also eine Migration, einen Versions-Bump und einen Upstream-PR,
+  ohne dass ein Nutzer etwas davon hätte.
 - **`backupIgnore`** hält zwei Dinge aus Umbrels Backup heraus:
   `data/app/yuvomi.db.plaintext-backup*` (die Kopie, die die einmalige
   Verschlüsselungs-Migration unverschlüsselt zurücklässt) und `data/backups/*.db`
@@ -91,7 +101,7 @@ dort war der Abstand zu Upstream am 2026-09-14 null.
   deshalb nicht; das steht auch in `MODULES.md` und `docs/installation.md` (Option E).
   Beim `diff` gegen Upstream also keine Drift, die zu beheben wäre.
 - **Kein `user:`-Override** - der Entrypoint läuft nur zum Chown als root und wechselt
-  per gosu auf den unprivilegierten `node`-User. Der Linter meldet das als Info.
+  auf den unprivilegierten `node`-User. Der Linter meldet das als Info.
 - **`SESSION_SECURE=false`** - Umbrel liefert Apps im LAN über einfaches HTTP aus.
 - **`gallery`** ist im veröffentlichten Manifest gefüllt (`1.webp` … `5.webp`). Leer
   bleiben musste sie nur für die Ersteinreichung.

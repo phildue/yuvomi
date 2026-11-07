@@ -33,10 +33,14 @@ const SERVER_DIR = path.join(ROOT, 'server');
  * aus `public/` importieren darf. Reine Funktionen, front- und backend-identisch.
  */
 const SHARED_ISOMORPHIC = new Set([
+  // #2436: The API and tablet agree on the five display options; no DOM or storage.
+  'public/utils/display-device-settings.js',
   // The Savings chart bucket must identify the same stored category/subcategory in API and UI.
   'public/utils/budget-chart-category.js',
   // One recurrence maximum for the API validation and both budget dialogs; pure constant only.
   'public/utils/budget-recurrence.js',
+  // #1705: One day for "expiring soon" on the document chip and the Key dates tile.
+  'public/utils/document-expiry.js',
   // Notes category identity must match in the API and duplicate-name picker.
   // This pure Unicode normalization has no browser or server dependencies.
   'public/utils/note-category-name.js',
@@ -56,6 +60,11 @@ const SHARED_ISOMORPHIC = new Set([
   // Fehler. Rein: trim, Leerraum, toLowerCase, kein DOM und kein Node.
   'public/utils/ingredient-match-key.js',
   'public/utils/contact-name.js',
+  // #2375: Welche Einheit eine Messart fuehrt und was sich umrechnen laesst. Das
+  // Diagramm rechnet damit, die Route nimmt genau das an und prueft die harten
+  // Grenzen am umgerechneten Wert. Zwei Fassungen liefen bei der naechsten
+  // Einheit auseinander. Rein: Tabellen und Rechnung, kein DOM und kein Node.
+  'public/utils/vital-units.js',
   // #1748: der Schritt einer Serie (`addInterval`, `nextRunNotBefore`). Der
   // Dialog der geteilten Ausgaben nennt vor dem Speichern, wie viele Termine
   // der Server bei `missed: skip` ueberspringt und auf welchem er landet; eine

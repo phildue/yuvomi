@@ -12,6 +12,10 @@ const MAX_TEXT     = 5000;
 const MAX_SHORT    = 100;
 const MAX_RRULE    = 300;
 const MAX_URL      = 2000;
+// Passwoerter und Tokens fremder Dienste (CardDAV, CalDAV, Apple, #2575):
+// App-Tokens wie JWTs sind oft ueber 1000 Zeichen lang. Vorbild ist
+// BACKUP_KEY_MAX_LENGTH in server/routes/backup.js.
+const MAX_SECRET   = 4096;
 
 // Regex-Muster
 const DATE_RE     = /^\d{4}-\d{2}-\d{2}$/;
@@ -57,6 +61,29 @@ function str(val, field, { max = MAX_TITLE, required = true } = {}) {
   if (required && !s) return { value: null, error: `${field} must not be empty.` };
   if (s.length > max)  return { value: null, error: `${field} may be at most ${max} characters long.` };
   return { value: s || null, error: null };
+}
+
+/**
+ * Validiert ein Passwort oder Token eines fremden Dienstes (#2575).
+ * Anders als `str()` wird NICHT getrimmt: Leerzeichen am Rand gehoeren zum
+ * Geheimnis, und ein still gekuerztes Passwort scheitert erst beim Server.
+ * Ein Wert nur aus Leerzeichen gilt trotzdem als leer.
+ * @param {any}    val
+ * @param {string} field
+ * @param {object} opts
+ * @param {boolean}[opts.required=true]
+ * @returns {{ value: string|null, error: string|null }}
+ */
+function secret(val, field, { required = true } = {}) {
+  // Nur Leerzeichen zaehlt als fehlend (Pflicht ueber trim), gespeichert wird
+  // aber der ungetrimmte Wert.
+  if (val === undefined || val === null || (typeof val === 'string' && val.trim() === '')) {
+    if (required) return { value: null, error: `${field} is required.` };
+    return { value: null, error: null };
+  }
+  if (typeof val !== 'string') return { value: null, error: `${field} must be a string.` };
+  if (val.length > MAX_SECRET) return { value: null, error: `${field} may be at most ${MAX_SECRET} characters long.` };
+  return { value: val, error: null };
 }
 
 /**
@@ -345,8 +372,25 @@ function bool(val, field) {
   return { value: val, error: null };
 }
 
+/**
+ * Prüft nur die Form eines Textfelds, vor `str()`: `str()` wandelt per
+ * `String(val)` um, und eine Zahl landete so als Text oder lief später in
+ * `.trim()` auf einen 500. Ein fehlendes Feld ist immer in Ordnung, `null`
+ * nur mit `nullable`.
+ * @param {any}    val
+ * @param {string} field
+ * @param {object} [opts]
+ * @param {boolean}[opts.nullable=false]
+ * @returns {{ value: null, error: string|null }}
+ */
+function textShape(val, field, { nullable = false } = {}) {
+  if (val === undefined || typeof val === 'string') return { value: null, error: null };
+  if (val === null && nullable) return { value: null, error: null };
+  return { value: null, error: `${field} must be text${nullable ? ' or null' : ''}.` };
+}
+
 export {
-  str, oneOf, date, time, datetime, month, num, color, url, rrule, id, bool, collectErrors,
-  MAX_TITLE, MAX_TEXT, MAX_SHORT, MAX_RRULE, MAX_URL,
+  str, secret, oneOf, date, time, datetime, month, num, color, url, rrule, id, bool, textShape, collectErrors,
+  MAX_TITLE, MAX_TEXT, MAX_SHORT, MAX_RRULE, MAX_URL, MAX_SECRET,
   DATE_RE, TIME_RE, DATETIME_RE, COLOR_RE, MONTH_RE, RRULE_RE,
 };

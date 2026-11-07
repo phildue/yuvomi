@@ -36,6 +36,612 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stretch (January to September against January to September), and a note above the charts says how
   far the current period is counted.
 
+## [2.86.0] - 2026-11-07
+
+### Added
+- **Late completion decay (opt-in).** Households can have late completions pay less: administrators
+  switch it on in the rewards settings, off by default. A task ticked off after its due day earns one
+  point less for each day it is past due, and always at least one point - finishing still pays. What a
+  completion earned stands with the booking: later changes of the due date, the point value or the
+  setting never rewrite booked amounts, and for every late earning the ledger shows the base it came
+  from and how many days it was late.
+- **Kitchen search is now in the tab bar on phones (#2043).** Recipes and Pantry show a search
+  icon at the right end of the kitchen tab bar, keeping the second header row collapsed until you
+  tap it. Meals and Shopping clear the zone so nothing appears there.
+- **Administrators set night hours and screensaver options for each wall tablet.**
+  Settings > Wall tablets offers each tablet's night window, idle delay, clock and photo
+  fill. Online tablets pick up changes automatically; existing local choices stay in use
+  until an administrator saves, and personal browser preferences are preserved (#2436).
+- **Shopping: purchase price history** (part 1 of #1003). Ticking off or clearing a priced
+  shopping item records the purchase: item name, price paid in cents, the shop, and the date.
+  Purchases match by item name, case-insensitively, and remain after the item is cleared.
+  The item details sheet displays the last purchase for known items. CalDAV completion sync
+  does not record purchases immediately, but clearing checked items records them dated at the clean-up.
+
+### Fixed
+- **The container image starts with just a `/data` volume.** Started without `DB_PATH`, for
+  example with a plain `docker run -v yuvomi:/data`, the container stopped right away: the
+  database and the secrets generated on first start would have gone under `/app`, where the app
+  may not write. The image now defaults to `/data/yuvomi.db`. Setups that set `DB_PATH`
+  themselves, such as the compose files and the app catalogs, are unchanged.
+- **CardDAV accepts long app passwords and tokens** (#2575). Saving a CardDAV account refused
+  any password over 200 characters, and the password field cut longer input off without a word, so
+  app tokens such as JWTs could not be used. Passwords for CardDAV, CalDAV and Apple Calendar now
+  share one limit of 4096 characters and are kept exactly as typed, including spaces at the start
+  or end.
+- **Editing a task through the API keeps its primary assignee (#2569).** A `PUT /api/v1/tasks/:id`
+  that left out `assigned_to` made the person with the lowest user id the primary assignee. It now
+  stays who it was, as it already did for calendar events. `assigned_users` lists the primary
+  assignee first, as the API reference says, in task lists, details and the dashboard.
+- **The last settings and managers that showed server text speak your language** (#1909). Managing
+  the categories of budget, tasks, contacts and notes, or the storage locations of the pantry,
+  showed English server text when someone else had deleted the entry meanwhile, when a storage
+  location name was taken or when you tried to delete the last one; each case now has its own
+  sentence, and deleting an entry that is already gone simply counts as done. Connecting a DMS
+  explains an empty field, an address without http:// or https:// and an address that is
+  already connected. Load errors on the DMS, document storage, module install and calendar feed
+  pages, a failed app install on the device page and failed steps of a folder upload say what
+  happened in your language. API clients get the cases as `reason`.
+- **Chinese and Japanese questions end in the full-width question mark.** Confirmations such as
+  signing out other devices or replacing a link used the narrow "?", which ran straight into the next
+  sentence.
+- **A damaged backup is no longer handed out as a good one (#2520).** Every backup is now checked
+  for integrity right after it is written. One that fails is discarded: the download answers with
+  an error instead of the file, a scheduled backup is reported as failed and does not push the
+  oldest good backup out of rotation, and nothing is uploaded to WebDAV. Before, a damaged backup
+  only showed up when you tried to restore it.
+- **Mirrored Mealie recipes show their preparation steps as readable text (#2558).** A step with
+  an inserted image showed the raw `<img>` tag, and formatting or HTML entities appeared as
+  symbols. Steps now arrive as plain text with their lists and links; images in steps are left
+  out, because they live on the Mealie server. Recipes mirrored from Mealie or Tandoor also bring
+  their serving count, so the servings stepper starts from the right base (#2355). Already
+  mirrored recipes are corrected on the next sync.
+- **A new event in a synced calendar reaches CalDAV, iCloud and Google when you save it (#2565).**
+  Edits, moves and deletions were sent right away, but a newly created event waited for the next
+  sync run, up to `SYNC_INTERVAL_MINUTES` later, although the documentation promised an attempt on
+  save. Creating an event with a sync target, or giving an existing local event one, now tries the
+  upload immediately. If the server cannot be reached the event is still saved and the next sync
+  run uploads it, as before.
+- **A calendar subscription that does not deliver says so** (#2566). Adding a subscription whose
+  address answered with an error (not found, too large, a private address) reported "Subscription
+  added", and the refresh button reported "Subscription synced", while no event ever arrived. Adding
+  now warns that the first fetch failed and why, in your language, and the refresh button shows the
+  reason instead of success. Scheduled refreshes stay quiet. API clients get the case as
+  `syncReason` when adding and as `reason` with a `400` when syncing.
+- **Backup, system and API settings say what went wrong in your language** (#1909). Restoring an
+  empty file, a database that is not from Yuvomi or a backup from a newer version showed the
+  server's English text; it now says what to do next. Creating an API token with a past expiry
+  date or for a person who no longer exists or was deactivated, and load errors on the three
+  pages, are explained in your language too. API clients get the cases as `reason`.
+- **Date pickers start the week on the household week start** (#2533). With Sunday or Saturday
+  set as the week start in the calendar settings, the calendar sheet of every date field (events,
+  tasks, budget, health and the others) showed Monday-first weeks. Its weekday header and the
+  position of the first of the month now follow the setting, like the calendar views do. When
+  someone else in the household changes it, the pickers follow as soon as the calendar, the meal
+  plan or Schedule is opened, not only after the app restarts.
+- **Health: in the month view, the series names no longer cover the bars of the last days** (#2538).
+  "Systolic" and "Diastolic" stood left of the last bar, and "Pulse" above its last dot, hiding the
+  readings underneath when a month is full. A short line above the blood pressure chart now says
+  which end of a bar is which, and the pulse chart is named by its own unit axis.
+- **Calendar and contact sync settings say what went wrong in your language** (#1909).
+  Connecting a CalDAV or Apple account, subscribing to or importing a calendar feed and saving
+  a CardDAV account showed the server's English text for cases the app knows: the account is
+  already connected or has no calendars, the name or address is not valid, the address is on a
+  private network, or the feed answered with an error status or is too large. These now say so
+  in your language; what the remote server itself answers stays visible to administrators as
+  before. API clients get the case as `reason`.
+- **Wall tablet settings say what went wrong in your language** (#1909). When another
+  administrator had already deleted a wall tablet or one of its devices, the page showed the
+  server's English text. It now says in your language that the tablet or device no longer
+  exists and refreshes the list; deleting a tablet that is already gone simply counts as done.
+  API clients get the case as `reason`.
+- **Your account page says what went wrong in your language** (#1909). Linking or unlinking
+  SSO, turning on two-factor authentication and fetching a Gravatar showed the server's English
+  text for some errors. They now say in your language that the account is already linked or no
+  longer linked, that an account without a password cannot unlink, that SSO is no longer set up,
+  or that two-factor authentication is already on or its setup has expired. API clients get the
+  case as `reason`.
+- **Adding, editing and inviting family members say what went wrong in your language** (#1909).
+  The error line in these dialogs showed the server's English text. It now says in your language
+  that the username is invalid or already taken, that an account without a password needs an
+  email address that no other member has, or that at least one administrator (or the last one
+  linked to SSO) must stay, also when you demote yourself. A member another administrator removed
+  in the meantime closes the dialog and leaves the list. Errors while loading members, invitations,
+  two-factor status and roles and permissions are in your language too. API clients get the case
+  as `reason`.
+- **An event the provider cancels no longer reminds anyone** (#2499). When an ICS subscription,
+  a CalDAV calendar or iCloud marks an event as cancelled without deleting it, its reminders stay
+  silent, and the dashboard, the Today sheet, the wall tablet and the countdowns leave it out. The
+  calendar still shows it, struck through and marked "Cancelled", so nobody wonders where it
+  went. If the provider confirms it again, everything comes back. A cancelled single occurrence of
+  a series only affects that occurrence. A one-time ICS import skips cancelled events. Your own
+  calendar feed passes the cancellation on, and API clients find it in `provider_status`.
+- **Contacts synced from Nextcloud or another CardDAV server no longer merge into one** (#2513).
+  Cards with an empty phone or email field, or cards that share a landline or email address,
+  used to collapse into a single Yuvomi contact carrying the name of the last card. Each card now
+  stays its own contact; only a contact that no address book is linked to yet is matched by
+  phone or email. Empty phone and email entries are no longer saved, and ones saved earlier
+  disappear on the next sync. A contact that has already merged keeps its mixed data: delete it
+  in Yuvomi and sync again to get the separate contacts back.
+- **Repeating reminders from iOS Reminders or Tasks.org now repeat in Yuvomi, and ticking one off
+  keeps the series running there** (#2506, #2515). Daily, weekly, monthly and yearly reminders,
+  also every few days or weeks, every weekday, weekly on chosen weekdays, on the last day of the
+  month or until an end date, arrive as a Yuvomi series. Ticking one off in Yuvomi or on a wall tablet does what the
+  other app does: the reminder moves on to its next date there, and a completed copy keeps the
+  history. Undoing the tick moves it back. A rule Yuvomi cannot follow exactly (a fixed number of
+  times, a fixed day of the month such as the 15th, "every second Tuesday", a monthly reminder
+  due on the 29th to 31st, a series with skipped or extra dates) shows "Repeats in
+  another app" and is ticked off there; Yuvomi never sends a completion that would end such a
+  series. For API clients, ticking off one of those through `PATCH /api/v1/tasks/:id/status` or
+  `PUT /api/v1/tasks/:id` answers 409 with the reason `task_foreign_series`, and tasks carry the
+  other app's rule in `external_rrule`.
+- **The app added to the iPhone Home Screen reaches the bottom edge again** (refs #2417). On iOS 27
+  the installed app ended a status bar's height above the bottom of the screen, with an empty strip
+  below the tab bar. It now takes the full screen height; Yuvomi in a Safari tab is unchanged.
+
+### Security
+- **Database backup downloads are limited to ten per hour for each administrator** (#2524). Every
+  download builds a full copy of the database on the server, so a hijacked admin session could
+  keep it busy by requesting one after another. Further downloads in the same hour are refused;
+  other administrators are not affected, and members still get no download at all.
+
+### Changed
+- **The app stores and catalogs no longer ask for a session secret.** Since 2.85.0 a new
+  installation generates `SESSION_SECRET` and `DB_ENCRYPTION_KEY` on its first start, but four
+  deploy descriptors still demanded one: the Portainer stack stopped the deploy outright
+  (`${SESSION_SECRET:?...}`), the Portainer app template and the Unraid template labelled the
+  field "required", and the TrueNAS form refused to install without it. All four now offer both
+  secrets as optional fields with an empty default, and say that Yuvomi generates them and keeps
+  them in `.secrets/` next to the database; setting your own still wins. A Portainer stack, an
+  Unraid container and a TrueNAS app can therefore be installed without running `openssl` first,
+  which is what the 2.85.0 note already promised. Umbrel keeps `${APP_SEED}` for both: it asks
+  nobody for anything, and an existing database is encrypted with that value
+  (`deploy/umbrel/README.md` records the decision). The TrueNAS change needs a pull request
+  upstream before it reaches the catalog (`deploy/truenas/MAINTAINING.md`). (#2507)
+
+## [2.85.0] - 2026-11-04
+
+### Added
+- **Stock: the minimum belongs to the product, and running low is read over all its batches**
+  (part 3 of #1448). Toothpaste with 1 in the bathroom, 8 in the attic and a minimum of 3 no
+  longer reads as running low: the household has 9. Milk with 1 l, 1 l and 2 l against a minimum
+  of 5 is running low once, as one product. Existing minimums move to their product once on
+  update; where batches of one product had different ones, the highest is kept, which warns early
+  rather than late. The minimum in the item dialog now sets it for the product with all its
+  batches, and a new batch leaves it alone unless you change the field. A product with several
+  batches shows "Running low" or "Out of stock" with a cart that puts the shortfall over all
+  batches on the shopping list; its batches keep their expiry but no longer say "Running low"
+  each. A product whose last batch is used up shows its minimum and counts as out of stock only
+  when it has one; without a minimum it is listed plainly and adds nothing to the number on the
+  pantry tab. Renaming an item, or changing its unit, takes its minimum along, unless the new name
+  already has one of its own; the old name, left without items, keeps none, so a rename does not
+  change the number on the pantry tab. The running low filter lists products, and "Add all to
+  shopping list" adds each product once. The number on the pantry tab counts a product once, also
+  when it is running low and has an expired batch. For API clients, `products` in
+  `GET /api/v1/pantry` additionally returns `min_quantity` and `total_quantity`, `import-pantry`
+  takes a `quantity` with `pantry_product_id`, and `GET /api/v1/kitchen/summary` counts `low` and `out`
+  per product.
+- **A Caddy example for automatic HTTPS.** `deploy/caddy/` holds an example Compose deployment
+  that puts Yuvomi behind Caddy, which obtains and renews Let's Encrypt certificates and keeps the
+  app port off the host. It is an example next to `nginx.conf.example`, not tested in CI; the Caddy
+  image is pinned by version and digest and Dependabot keeps it current. (#2445)
+- **A new installation generates its own session secret and database key.** Leave `SESSION_SECRET`
+  and `DB_ENCRYPTION_KEY` unset and the first start creates both and keeps them in `.secrets/` next to
+  the database (`/data/.secrets/` in the container, readable only by the user Yuvomi runs as). Every
+  later start reads the same files, so nobody has to run `openssl` before the first start, and app
+  stores and NAS catalogs no longer need to ask for the secrets or build them in. A value you set
+  yourself, directly or through `_FILE`, still wins. **Existing installations do not change:** a
+  database that runs without a key today keeps running without one, because a key now would encrypt it
+  without anyone having asked. The generated key lies on the same volume as the database, so it
+  protects a database file or backup that leaves the machine, not a stolen volume; a key of your own
+  kept elsewhere is stronger. To start a new installation unencrypted on purpose, set
+  `DB_ENCRYPTION_AUTO_KEY=false`; deleting the `DB_ENCRYPTION_KEY` line no longer does that.
+- **Admins can see the generated database key to keep a copy.** Settings → Household → Backup and
+  restore shows it on request, because without it your backups cannot be opened once the server's
+  storage is lost. The key appears only after a click and is not cached; viewing it is logged without
+  the value. A key from your own configuration is never shown - the page says where it comes from -
+  and a signed-in device of the native app cannot read it.
+- **Settings → Account lists the phones signed in with the native app and pairs a new one.** Each
+  signed-in device shows its name, platform and when it was last used, and can be signed out after a
+  confirmation. "Pair a device" shows a code that is valid for five minutes and once: as a QR code for a
+  second device, behind "Open in app" for the phone the page is open on, and as text to type. A household
+  that signs in only with single sign-on has no password to type into an app, and this is its way in.
+  While a code is open, the page names a device that has just signed in, so a phone you do not recognise
+  stands out and can be signed out on the spot.
+- **The Overview has its own tile arrangement on the phone.** On a phone, tapping Customize shows
+  a "Phone tiles" mode that lets you reorder and show or hide tiles independently of the desktop
+  layout. Options (calendar limit, task filters, shopping-list selection, etc.) follow the desktop
+  arrangement, so only the order and visibility are separate. "Same as desktop" removes the phone
+  arrangement and goes back to following the desktop. (#2109)
+- **A recurring task can hand itself along.** A series like "take out the bin" used to hang on the
+  same person forever; a rotation pool of at least two people now gives each follow-up instance to
+  the next member in a fixed order (#1763, migration 277). The order chosen in the pool is the order
+  the task is handed along in. The series remembers a position, not a person: a member who leaves the
+  pool does not restart it at the first person - Kevin's round stays Kevin's, then Max, then Kevin
+  again - and a deactivated account (#1381) is skipped while it cannot sign in. If the running
+  instance already belongs to the first member, the first hand-over goes to the second one (Kevin,
+  Anna, Max - not Kevin, Kevin). The detail view names the next member up from the same calculation
+  that hands out the next instance, and a task without rotation behaves exactly as before.
+
+### Deprecated
+- **`min_quantity` on a pantry item (`/api/v1/pantry`) is deprecated and will be removed in the
+  first minor release on or after 2027-03-01** (part 3 of #1448), at least 90 days after this
+  release, as MODULES.md promises for `/api/v1`. The minimum belongs to the product now. Until the
+  field goes, it returns the minimum of the item's product, and writing it on an item (create with
+  a number, replace or partial update when the field is sent, null clears) sets the minimum of the
+  product for all its batches, so a client that worked yesterday keeps working. A replace or create
+  without the field no longer clears it. Read the minimum from `products` in `GET /api/v1/pantry`;
+  writing it on the product itself comes with a later part of #1448, before the field goes.
+
+### Fixed
+- **A birthday keeps the color you give it in the calendar.** The birthday sync wrote its own red
+  back onto every birthday event each time it ran, which is on every visit to Birthdays and every
+  reminder check. Giving several birthdays the same color looked as if a color could be used only
+  once: the one changed last kept it, the earlier ones fell back to red. New birthdays still start
+  in red; after that the color is the calendar's. Reported by email.
+- **The weather tile no longer shows your coordinates as the place name.** With coordinates but no
+  place name set, the tile and the API showed the raw position in full precision
+  (`54.31665773950043, 10.116079422296027`), the exact location of the home for everyone who sees
+  the overview. Without a name the tile now shows none, and `city` in `/api/v1/weather` is `null`.
+  Reported for the Home Assistant app in ulsklyc/yuvomi-home-assistant#4.
+- **The Budget title stands in full next to the month in every language.** From 390px up the title
+  was cut off in eleven languages ("Presupues..." in Spanish even at 430px), because the month only
+  moved to a row of its own below 390px. The head now measures: whenever the title would be cut off
+  next to the month, the month takes the row below it, at any width; a short title such as Japanese
+  keeps the month beside it also on a narrow phone. Paging through the months and scrolling the head
+  away behave as before. The Greek Budget page title is shorter ("Οικονομικά"), the navigation keeps
+  the full name. (#2443)
+- **"Sign out on other devices" says that it signs out the native app too.** The server already
+  ended signed-in devices along with the other sessions; the hint under the button did not mention it.
+- **Deleting the first occurrence of a recurring event also stops its reminder.** A reminder on a series
+  belongs to its first occurrence, and after that occurrence was deleted it still showed in the bell and
+  arrived as a notification, also for a deleted first occurrence coming from an imported calendar (ICS,
+  CalDAV, Apple, Google). The reminder now stays silent and returns if the occurrence is restored.
+  Reminders of later occurrences and of a first occurrence that was moved rather than deleted are
+  unchanged.
+- **Long page titles stand in full next to search and a tool on phones.** Below 390px the search
+  button and the one tool beside the title (the import in Birthdays, categories in Notes) move into
+  a "..." menu, and in Documents the search joins the menu that is already there, so the head stays
+  on one row and the title is no longer cut off. "Search" is the first entry and opens the same
+  search field; a search term you entered keeps the field visible. The Waste page title is shorter
+  in every width ("Waste" instead of "Waste collection"), the navigation keeps the full name.
+- **Copying a new API token or a calendar feed link over plain HTTP no longer claims success.** On an
+  installation reached without HTTPS the browser offers no clipboard, yet both copy buttons said
+  "copied". They now say that copying did not work and select the value, so you can copy it by hand -
+  which matters most for an API token, since it is shown only once.
+- **The command-line backup check and backup command find a key Yuvomi stored itself.** The restore
+  check (`node server/check-backup.js`) and the Docker Compose backup command shown on the backup page
+  and in the installation guide now read the key the same way the server does: from
+  `DB_ENCRYPTION_KEY`, from `DB_ENCRYPTION_KEY_FILE`, or from `.secrets/`. Before, both stopped on an
+  installation whose key came from a file. Neither ever creates a key. If you copied the backup command
+  into a cron job, copy it again from the installation guide.
+- **The message about the `DB_ENCRYPTION_KEY` placeholder no longer suggests clearing the line to run
+  unencrypted.** On a new installation that now generates a key. It names `DB_ENCRYPTION_AUTO_KEY=false`
+  instead.
+- **Running `install.sh` again keeps a session secret or database key that comes from a file.** With
+  `SESSION_SECRET_FILE` or `DB_ENCRYPTION_KEY_FILE` in `.env`, a rerun asked for a new value or
+  generated one and wrote it next to the `_FILE` line. Yuvomi then refused to start because both were
+  set, and a new database key would not have opened the existing database anyway. The installer now
+  keeps the `_FILE` line, writes no second value and says the secret is reused. The web installer
+  already did this.
+- **Stopping the container no longer takes ten seconds and a hard kill.** Inside the image the server runs as
+  process 1, which ignores a stop signal it has no handler for, so `docker stop` and `podman stop` waited out
+  their timeout and then killed it in the middle of requests, syncs and backups. The server now handles
+  SIGTERM and SIGINT: it stops taking connections, lets running requests, syncs and backups finish for up to
+  eight seconds, closes the database (the write-ahead log is folded back in) and exits with code 0. A second
+  signal exits at once.
+- **Renaming a shopping category also renames it in recipes, meals and stock.** Until now only the items on
+  the shopping lists followed the new name. Recipe ingredients, meal ingredients, recurring meals and stock
+  kept the old one, so their ingredients landed under a name that no longer exists: at the bottom of the
+  list, and ticking them off failed with "Invalid category". Deleting a category now moves these rows to the
+  same fallback category as the shopping items.
+- **Task defaults follow the new-task dialog in a one-person household.** Visibility and
+  editing-lock defaults stay out of the way when nobody else can read tasks. Saved choices
+  remain intact and reappear when needed. The editing-lock switch and its hint no longer
+  overlap. The defaults description also uses the same form of address as its neighbouring
+  hints (#2366).
+
+### Security
+- **Document storage names no longer use a regular expression that slows down on long runs of
+  dashes.** Trimming the dashes around the folder and file part of a stored document's name used a
+  pattern CodeQL flags as polynomial. The step before it already collapsed every run into one dash,
+  so uploads were not slowed down in practice; the name stays exactly the same.
+- **A shared-expense guest only reaches its own account routes (GHSA-q7gc-2cc9-w8fj).** A guest
+  account is meant to see Shared expenses and nothing else, and every other module already refused
+  it. The account routes did not: they answer before that check, so a signed-in guest could read the
+  household's account list with the members' contact details. The account routes now ask the same
+  list as the rest of the API. A guest keeps signing in and out, its own account details and the
+  changelog; everything else there is refused, and members notice nothing.
+
+## [2.84.0] - 2026-11-02
+
+### Added
+- **`GET /api/v1/version` now says what it is talking about.** Two new public fields: `product` identifies a
+  Yuvomi instance, and `client_api` is a whole number for the contract a native client relies on. A client can
+  recognise a server and tell whether it is new enough before anyone signs in. The exact version stays
+  behind sign-in. This release sets `client_api` to 1: signed-in devices and pairing, upcoming reminders,
+  and the API operations a native client is built from.
+- **Upcoming reminders for a native client.** `GET /api/v1/reminders/upcoming` lists your reminders that
+  are not due yet within a window of up to 14 days, so an app can schedule them on the device. Each row says
+  exactly when it fires in `fires_at`, in UTC, also for older reminders stored with an offset. `types` can
+  narrow the list, for example to tasks and events, and it follows the same rules as the reminders you
+  already see: nothing private, nothing from a module that is switched off. A task that is done or archived
+  stays out of the list.
+- **Signed-in devices, the groundwork for a native client.** New routes under `/api/v1/auth/devices` let a
+  household member exchange a sign-in for a device credential, list their own devices and sign one out. A
+  device acts as the person with less reach than a browser session: an administrator is an ordinary member
+  on it, and it can change neither password nor email nor second factor. It ends after 90 days without use
+  and with everything that ends a session, so "sign out other devices" now counts these too. An
+  administrator cannot see a member's devices, but can sign a member out of all of them with
+  `POST /api/v1/auth/users/{id}/devices/sign-out`. Nothing changes for browsers or existing API tokens.
+- **The API spec now holds for the operations a native client is built from.** 39 operations have an
+  `operationId`, a typed response and a typed body, checked by `test:openapi-client-contract`. A second
+  suite, `test:openapi-client-responses`, holds real responses against these schemas. This corrected
+  the spec where it was wrong: `POST /tasks`, `POST /shopping` and `POST /shopping/{listId}/items` answer
+  201, `DELETE /calendar/{id}` answers 204, `POST /auth/login` has a second answer shape for two-factor
+  sign-in, and `CalendarEvent` names its fields instead of allowing anything. Three nullable response
+  fields now carry `null` in their type rather than in a `oneOf` branch, which the Swift generator
+  dropped together with the field. The API itself did not change.
+- **Pairing a device, for households without passwords.** `POST /api/v1/auth/devices/pair` creates a
+  short code from a browser session, and `POST /api/v1/auth/devices/pair/redeem` exchanges it for a device
+  credential. The code holds for five minutes and once, and comes back as text, as a `yuvomi://pair` link
+  and as a QR code. It cannot open a wall display, and a display code cannot sign in a device.
+- **A document can name who it is about.** The document dialog has a new "About" field for one
+  household member, and the Documents page can filter by person. The person also gets the expiry
+  reminder, along with whoever filed the document, and once if that is the same person. This never
+  changes who can see the document: if the person cannot open it, the dialog says so and they get
+  no reminder until they can.
+- **Expiring documents appear in Key dates.** A document about to expire now shows up on the
+  overview tile next to your events and tasks, with the person's name, and opens directly in the
+  viewer. Archived documents stay out, and the tile follows the Documents module switch and your
+  rights.
+
+### Changed
+- **A document's lead time now also decides when it shows as expiring.** The "expiring" chip and
+  the Deadlines filter used a fixed 30 days, whatever lead time the reminder had. They now follow
+  the document's own lead time, and stay at 30 days if it has none, so a document with a 90-day
+  reminder is marked from the day the reminder arrives, and one with 7 days is no longer marked
+  three weeks early.
+- **The website tells Yuvomi as one story instead of a feature list.** The homepage at yuvomi.cloud
+  now starts with the problem it takes off your hands - many apps, and one person who keeps it all
+  in their head - then shows how the parts work together, a day at home from morning to evening,
+  what the family gets, and why it stays yours: no subscription, your data on your own disk and
+  encrypted if you want, and one update check as the only call out of the box. Setup comes last,
+  with one main route, the NAS app stores as one-click options, the other ways behind "More ways
+  to install" and the technical details folded away, and the questions worth asking first open one
+  answer at a time. The text is plainer in
+  English and German, technical terms are explained where they appear, and the list of outbound
+  connections now also names Gravatar profile pictures and installing extension modules from GitHub.
+  The screens are staged instead of pasted in: the top of the page shows the desktop, the kitchen
+  wall tablet and a phone together, each connection between two parts shows both ends as real
+  excerpts from the app, the day at home shows each moment as a focused crop, and the overview,
+  wall and health screenshots are current again. On a phone the page is nearly a third shorter.
+  The top bar is the same on every page of the site and groups the jump menu, language and theme in
+  one glass control: EN and DE are two buttons, and pressing the language you are already reading
+  no longer switches to the other one; the theme names its mode on wide screens, and GitHub is a
+  single icon. The jump menu marks the section you are in. The floating Install button on phones
+  gets out of the way while you scroll down and comes back when you scroll up, and stays away over
+  the setup section and at the end of the page; "Back to top" appears only after half the page.
+  The family section shows the kitchen wall tablet large, with the shared notes board on a phone in
+  front, device frames stay visible in dark mode, and the excerpts are sharp on high-density phone
+  screens. The overview image at the top now starts loading right away on phones too, and the
+  footer says "MIT-Lizenz" on the German pages.
+
+### Security
+- **Channel routes only manage household channels.** The admin routes for notification channels now
+  always create a household channel, and a personal channel cannot be pointed at a member through
+  the admin API or changed by it. A member's private reminders stay out of reach of anything an
+  admin sets up, in line with how private entries already work.
+
+### Fixed
+- **A reminder you have already seen stays seen when its event is saved again.** Saving the reminders of an
+  event replaced all of them, so one that had already fired came back unread with a new id and showed up
+  again. A time that stays in the set now keeps its row, its read state and its push state; only new times
+  are added.
+- **Tasks starting today show up on the household's today.** The task list and the MCP `list_tasks` tool
+  hid tasks by start date using the server's own day instead of the household time zone, so near midnight a
+  task could appear a day early or late.
+- **The API refuses malformed task, shopping and calendar input with 400.** A number as a title or item name,
+  `null` as a task category or priority, or `null` as a category when editing an item ended in a server error.
+  Numbers in text fields were stored as text such as "5.0", an empty title was saved when editing a task or
+  event, editing an item checked no lengths, `is_checked: "false"` ticked an item off, and empty date fields
+  of a task were stored as empty text instead of no date. These now answer 400 or are stored as no value;
+  `is_checked` still accepts 0 and 1. Clearing checked items of a list that does not exist answers 404
+  instead of 200.
+- **Saving a recurring event no longer moves its reminders.** In the calendar view, every occurrence named
+  the last occurrence in view as the start of its series. The event dialog then showed a lead time weeks
+  too long, and saving wrote that lead time back, so a reminder could fire weeks early. Saving a series
+  from an external calendar also moved reminders nobody had changed onto the opened occurrence. Reminders
+  already moved by this stay as they are: if one looks wrong, set it again.
+- **A shared event reminds a household channel once.** An event assigned to several people sent the
+  same reminder to a household notification channel once per person. The channel now hears it once,
+  and a reminder someone set for a different time still arrives on its own. Each person's Web Push
+  and personal channels are unchanged.
+- **A waste pickup reminds a household channel once.** Everyone who turned on a reminder for the
+  same waste type sent the same pickup to a household notification channel once per person. The
+  channel now hears it once, and someone with a different lead time still gets their own message.
+  Each person's Web Push and personal channels are unchanged.
+- **The Budget title stands in full on narrow phones** (#2440). Below 390px wide the title sat next
+  to the month stepper and read "Bud..." at 360px. There the month now takes a row of its own under
+  the title, with the arrows at the ends of the row, and the title keeps its size. The tabs without
+  a month use the same row for their note, so the tab bar stays put between these tabs, and paging
+  through the months moves nothing. From 390px up nothing changes.
+- **Error messages in Settings speak your language.** Saving, syncing or removing something in
+  Settings could show the server's or browser's raw English sentence in a toast. Now the app says
+  it in your language, and names the cause where it knows one: the last administrator, a tag or
+  subscription that is already gone, an Outlook series with exceptions, or location access turned
+  off in the browser. Only what another server answered, such as a WebDAV or CalDAV server refusing
+  a connection, still appears as its original text, inside a translated sentence, so an admin can
+  fix it.
+- **"Today at a glance" fits narrow phones again.** On a phone, the summary next to the title
+  ("2 events left · 1 task overdue") was not allowed to wrap. When it did not fit - in German
+  already on a 375px screen - the card's content became wider than the card and every row was cut
+  off at the right edge, including "All day" and "Overdue". The summary now moves below the title,
+  right-aligned, when there is no room beside it, and the card's column never grows past the card
+  (#2297).
+- **The Tasks title stands in full on narrow phones** (#2425). Below 390px wide the title sat next
+  to three buttons and read "Aufgab…" at 360px. There the filter now moves into the "..." menu, and
+  the number of active filters stands on the "..." button and in the menu entry. From 390px up
+  nothing changes.
+- **Repeating tasks keep their time on CalDAV servers across clock changes.** A repeating task with
+  a time now goes out in the household's time zone, so a daily 07:00 task stays at 07:00 after the
+  clocks change, and a weekday repeat near midnight stays on its day. Its start now lies before its
+  due time, which strict servers require. Yuvomi fixes a task already on the server the next time
+  you change it. If another app added a reminder or skipped a date there, the task keeps its old
+  timing until you tick it off, so those still line up.
+- **A new app name reaches installed apps.** After renaming the app in Settings, a browser that
+  had loaded the app before kept the old name for the installed app, even after uninstalling and
+  installing it again: the service worker answered `/manifest.webmanifest` from its cache and only
+  asked the server after the next release. It now asks the server first, like it already did for
+  `manifest.json`, and uses the cached copy only when the network is slow or offline.
+- **Vitals take the units Yuvomi can convert, and impossible values no longer slip past in them**
+  (#2375). The API took any text as a unit, so 9,000,000 g went past the limits that stop 9,000 kg,
+  and a typo like `kgs` was drawn unconverted next to kilograms. `POST` and `PATCH
+  /api/v1/health/vitals` now accept the units a measurement lists plus those the chart can convert,
+  in any capitalisation (weight also `g`, `lbs` and `stone`, height and head circumference also `m`
+  and `mm`, temperature also `C` and `F`), and check the limits on the converted value: 700,001 g
+  is refused like 700.001 kg. Any other unit is refused with 400 and the reason
+  `health_vital_unit_invalid`, and the message names the ones that work. Weights in stone now also
+  convert in the chart. `unit` stays optional, stored readings stay as they were sent, and older
+  readings in any unit can still be edited.
+- **A calendar series that gets a new first date on its way out keeps its exact time.** When Yuvomi
+  moves the start of a series like "last day of the month" onto the first day the rule hits, fractions of a
+  second that came from the calendar provider were dropped from the start and end. They now stay.
+- **The container starts with `no-new-privileges`.** Hardened setups (Podman Quadlet
+  `NoNewPrivileges=true`, `--security-opt no-new-privileges`, Compose `security_opt`) never got
+  past the entrypoint: `gosu` hung as root at 100 % CPU before it switched to the `node` user, so
+  the server did not start (#2380). The entrypoint now drops to `node` with `setpriv` from
+  util-linux, which is already in the base image, and sets `HOME` to node's home as `gosu` did.
+  The `gosu` package is gone from the image. Starting as root without the option, or directly as
+  `node`, works as before.
+- **Reset to original restores a subscribed event at once.** Resetting a changed event from an ICS
+  subscription only cleared the edit mark, so the changed text stayed until the next sync. Each sync
+  now keeps the feed's values, and the reset restores them straight away, without a network call.
+  Subscriptions synced before this update have no stored values yet: their reset clears the mark
+  and says so, and the next sync fills them in (Refs D#2330).
+- **Calendar responses no longer carry internal sync state.** The event data sent to the app
+  included the snapshots Yuvomi keeps to match calendar syncs. The app never reads them, so they
+  are gone from the responses now; nothing you see changes.
+- **Tasks remember how you group them.** Grouping the list by due date instead of category now
+  stays after a reload, on that device, like the choice between list, board and history.
+- **The Podman Quadlet health check passes.** The `HealthCmd` in `tools/quadlet/oikos.container`
+  reached Podman as a shell command with a missing closing quote, so every check failed with
+  `Syntax error: Unterminated quoted string` and the container stayed `unhealthy` although the app
+  was running. The quotes are swapped - single quotes around the `node -e` argument, double quotes
+  inside the JavaScript.
+- **The end of a long recipe list stays reachable on the iPhone.** The last recipes used to sit behind the
+  bottom menu and sprang back out of reach when you let go. The list now ends above the menu, and
+  the bounce at the end of a list no longer brings the search row back. The same holds for the other
+  kitchen lists.
+- **A meal stays on the wall until the next planned meal.** Since 2.83.0 "Today at a glance" dropped
+  a meal the moment its slot began, so breakfast was gone at 08:00 and dinner at 18:30. A meal now
+  stays until the next meal planned for today starts, and the last one until the end of the day.
+  The smaller Today sheet on phones and tablets follows the same rule, and the timeline dot is
+  unchanged.
+- **Vietnamese counts show the real number.** In browsers with current language data, Vietnamese
+  picks the singular wording for 0 as well as for 1, so eleven messages such as the active filter
+  count said "1" when nothing was selected. They now show the actual count.
+- **The website no longer says contacts sync both ways.** Contacts come in over CardDAV and are
+  not written back; the homepage and the install page promised a two-way sync for them.
+- **Running the web installer again keeps your settings.** On an existing installation the advanced
+  setup now fills its fields with the values from your `.env` - port, public address, reverse-proxy
+  settings, timezone, weather, email, sign-on, storage and backups - so a second run no longer resets
+  them to defaults when you only wanted to add something. A hand-tuned `TRUST_PROXY=2` stays as long
+  as you keep the pre-selected access choice, and the review page shows the kept values instead of
+  "Not set up". Passwords, client secrets and keys never reach the browser: their fields stay empty
+  with the note "Current value is kept", and the existing values are written back. Lines you leave
+  unchanged stay exactly as written, inline comments and quotes included, and a secret read from a
+  file (`GOOGLE_CLIENT_SECRET_FILE`, `SESSION_SECRET_FILE` and the other `_FILE` variables) counts as
+  kept instead of being written a second time, which stopped Yuvomi from starting. A setting you
+  leave as it was is no longer checked against the installer's stricter rules either: a port or
+  address written as a Compose variable (`${HTTP_PORT:-3000}`), a backup schedule with a seconds
+  field or a full weekday name, and OAuth redirect addresses registered under a different host all
+  stay as they are until you change the address or the client.
+- **The simple setup makes Yuvomi reachable on your home network.** It used to write
+  `http://localhost:3000` as the address, so invitation and password-reset links and the app on
+  your phones pointed at a device that could not be reached. It now uses this computer's address on
+  the home network (for example `http://192.168.1.20:3000`), skips Docker bridges and VPN tunnels when
+  looking for it, and lets you change it with "Change". If it finds none, it says plainly that Yuvomi
+  is then reachable only on this computer.
+- **A public address without `http://` or `https://` is refused in the installer** instead of being
+  silently replaced by an address derived from host and port.
+- **The installer catches settings the server would reject before saving them.** A backup schedule
+  like `99 * * * *` used to pass and then switched backups off at startup; the schedule is now
+  checked field by field (minute 0-59, hour 0-23, day 1-31, month 1-12, weekday 0-7). Google,
+  Outlook and iCloud need their ID and secret together, WebDAV switched on needs its URL, the
+  document folder inside the container must start with `/`, and the `REPLACE_WITH_` placeholder
+  from `.env.example` is no longer accepted as a key. A failed key generation now shows a message
+  instead of leaving the key fields silently empty, and the start screen no longer piles up status
+  requests when the server answers slowly.
+- **Clearer wording in the installer.** The key warning is now a calm notice that says what happens:
+  you get a key file (`.env`) at the end, and without the database key your data is lost. It used
+  to be a red alarm that asked you to save the keys "now". The start screen talks about
+  downloading, starting and checking Yuvomi instead of images, containers and health checks, the
+  start button reads "Save & Start Yuvomi" for Docker and Podman alike, and the iCloud row no longer
+  carries a "Legacy" label.
+- **The installer's step count matches its step list.** "Start Yuvomi" is now a numbered step like
+  the others, so the list and "Step N of M" count the same steps: the advanced setup used to show
+  "Step 8 of 9" next to ten entries, the simple setup "Step 1 of 2" next to three.
+- **How you reach Yuvomi is a two-way switch in the installer** instead of a drop-down with two
+  entries, and the home-network switches in the advanced step form their own named group, so screen
+  readers announce the warning above them. On the review page, anything not set up says so in its
+  own row ("Not set up") instead of one row that listed the missing services in the value column. A
+  failed save now reads "The settings could not be saved." instead of naming the `.env` file.
+- **The installer opens faster and in your language right away.** The language files load in
+  parallel and the scripts are fetched with the first byte, the page stays hidden until it can show
+  your language (with a safety timeout), and HTML, scripts and language files go out compressed:
+  about 160 kB instead of 520 kB per visit. Every response now forbids embedding the installer in
+  another page (it shows your keys) and sends no referrer, and the browser tab shows the Yuvomi icon
+  instead of a missing-icon error.
+- **Installer fields behave like the app's.** Address fields open the URL keyboard on phones and are
+  no longer capitalised or spell-checked, ports open the number pad, and the Enter key on the
+  on-screen keyboard says "Next". A field the browser itself recognises as invalid (an address
+  without `https://`) turns red after you leave it, and screen readers hear the same. Long labels
+  on the review page ("Database encryption key") are hyphenated instead of running into the value,
+  addresses like `./data` read correctly in Arabic and Persian, and the page no longer puts a focus
+  ring on the first heading when it opens. Field borders, the main button and the browser bar now
+  match the app, and the language picker on phones is only as wide as the language it shows.
+- **No more long dashes in the installer's texts.** All 27 languages of the web and command-line
+  installer use a plain hyphen, also for ranges and negative numbers.
+- **Emptying a field when you run the installer again removes the setting.** A pre-filled value you
+  clear (for example the weather city or the sender name) used to come back from the old `.env`; it is
+  now removed, and the review page lists it under "Will be removed from .env". Fields you leave
+  alone, passwords and keys are never removed this way.
+- **The installer asks for a second click only when it replaces something.** A first installation
+  saves and starts with one click; with an existing `.env` or a running container the confirmation
+  stays, and a line above the button now says what you confirm - the old `.env` is replaced after a
+  backup, the running container restarts, or both.
+- **The advanced setup also starts with your home-network address.** Like the simple setup it fills
+  in this computer's address on the home network instead of `localhost`, and the review page says
+  calmly when an address is reachable only on this device.
+- **Backup schedules the scheduler would never run are refused.** A day that no chosen month has
+  (`0 3 31 2 *`, February 31) used to pass and switched backups off at startup. The message now also
+  names the six-field form with seconds and shorthands such as `@daily`.
+- **Copying in the installer says when it did not work.** If the clipboard refuses, the value is
+  selected for manual copying and the note says so, instead of claiming "Copied".
+- **Browsers no longer offer saved passwords in the installer's secret fields.** Calendar, sign-on
+  and app-password fields are marked as new secrets, so a password manager does not fill in an
+  unrelated login.
+- **The installer's last screen leads with the success.** One check mark says Yuvomi is ready, and
+  saving the key file is a quiet checklist row that ticks itself off after the download, instead of
+  a warning banner, a second logo and a download button above "Open Yuvomi". The note that the
+  installer shuts down soon stays as a small line until the file is saved.
+- **Skipped steps look skipped in the installer's step list.** Weather, calendar, email, storage and
+  advanced steps you leave empty show a dash instead of a green check mark.
+- **Installer fields match the app's.** Fields are 48 pixels high on the app's field background, the
+  show-password and copy buttons are full-size touch targets, the Yuvomi mark in the header looks
+  the same as in the app in dark mode, and hovering the advanced option no longer pulls harder than
+  the recommended one.
+- **Clearer installer messages.** A missing field in the admin step is named and focused instead of
+  "All fields are required", a server's own error text appears as a separate "Details" line, the
+  example values in the address and name fields are in your language, the start screen says that a
+  first run usually takes 1-3 minutes and counts in minutes, and technical terms like "session
+  secret", "SSRF protection" and "Compose file" follow a plain description instead of leading it.
+- **Installer hints read at a calmer line length.** Explanations under fields wrap at about 80
+  characters instead of 90, spacing follows the app's scale, a failed copy shows its note on its own
+  line instead of breaking around the button, and the "taking longer than usual" note no longer
+  touches the line above it.
+
 ## [2.83.0] - 2026-10-29
 
 ### Added
