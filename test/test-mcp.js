@@ -754,7 +754,7 @@ test('tools/call list_expenses: baut Query aus month/category/account_id', async
     );
     assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
     assert.deepEqual(parseContent(res), { data: [{ id: 1, title: 'Miete', amount: -800 }] });
-    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget?month=2026-07&category=housing&account_id=3');
+    assert.equal(calls[0].url, `${LOOPBACK}/api/v1/budget?month=2026-07&category=housing&account_id=3`);
     assert.equal(calls[0].options.method, 'GET');
   } finally {
     global.fetch = realFetch;
@@ -771,7 +771,7 @@ test('tools/call create_expense: sendet Betrag als negativ (money out)', async (
     );
     assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
     assert.equal(calls[0].options.method, 'POST');
-    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget');
+    assert.equal(calls[0].url, `${LOOPBACK}/api/v1/budget`);
     const body = JSON.parse(calls[0].options.body);
     assert.equal(body.amount, -800, 'amount must be stored negative (money out)');
     assert.equal(body.title, 'Miete');
@@ -823,7 +823,7 @@ test('tools/call update_expense: sendet nur gesetzte Felder, Betrag negativ', as
     );
     assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
     assert.equal(calls[0].options.method, 'PUT');
-    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget/5');
+    assert.equal(calls[0].url, `${LOOPBACK}/api/v1/budget/5`);
     assert.deepEqual(JSON.parse(calls[0].options.body), { amount: -850 });
   } finally {
     global.fetch = realFetch;
@@ -851,7 +851,7 @@ test('tools/call delete_expense: DELETE auf /budget/:id, leere Antwort ist kein 
   try {
     const res = await toolCallWithHeaders('delete_expense', { id: 5 }, { authorization: 'Bearer test-token' });
     assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
-    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget/5');
+    assert.equal(calls[0].url, `${LOOPBACK}/api/v1/budget/5`);
     assert.equal(calls[0].options.method, 'DELETE');
   } finally {
     global.fetch = realFetch;
@@ -880,7 +880,7 @@ test('tools/call list_budget_categories: ohne type liefert alle Kategorien', asy
   try {
     const res = await toolCallWithHeaders('list_budget_categories', {}, { authorization: 'Bearer test-token' });
     assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
-    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget/categories');
+    assert.equal(calls[0].url, `${LOOPBACK}/api/v1/budget/categories`);
     assert.equal(parseContent(res).data.length, 2);
   } finally {
     global.fetch = realFetch;
@@ -909,7 +909,7 @@ test('tools/call get_budget_summary: leitet month als Query weiter', async () =>
   try {
     const res = await toolCallWithHeaders('get_budget_summary', { month: '2026-07' }, { authorization: 'Bearer test-token' });
     assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
-    assert.equal(calls[0].url, 'http://mcp.test/api/v1/budget/summary?month=2026-07');
+    assert.equal(calls[0].url, `${LOOPBACK}/api/v1/budget/summary?month=2026-07`);
   } finally {
     global.fetch = realFetch;
   }
@@ -925,7 +925,7 @@ test('tools/call list_meals: leitet week als Query weiter', async () => {
   try {
     const res = await toolCallWithHeaders('list_meals', { week: '2026-07-28' }, { authorization: 'Bearer test-token' });
     assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
-    assert.equal(calls[0].url, 'http://mcp.test/api/v1/meals?week=2026-07-28');
+    assert.equal(calls[0].url, `${LOOPBACK}/api/v1/meals?week=2026-07-28`);
     assert.equal(calls[0].options.method, 'GET');
   } finally {
     global.fetch = realFetch;
@@ -942,7 +942,7 @@ test('tools/call create_meal: sendet Pflichtfelder und optionale Zutaten', async
     );
     assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
     assert.equal(calls[0].options.method, 'POST');
-    assert.equal(calls[0].url, 'http://mcp.test/api/v1/meals');
+    assert.equal(calls[0].url, `${LOOPBACK}/api/v1/meals`);
     const body = JSON.parse(calls[0].options.body);
     assert.equal(body.title, 'Pasta');
     assert.equal(body.meal_type, 'dinner');
@@ -973,7 +973,7 @@ test('tools/call update_meal: sendet nur gesetzte Felder', async () => {
     const res = await toolCallWithHeaders('update_meal', { id: 9, title: 'Pasta Bolognese' }, { authorization: 'Bearer test-token' });
     assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
     assert.equal(calls[0].options.method, 'PUT');
-    assert.equal(calls[0].url, 'http://mcp.test/api/v1/meals/9');
+    assert.equal(calls[0].url, `${LOOPBACK}/api/v1/meals/9`);
     assert.deepEqual(JSON.parse(calls[0].options.body), { title: 'Pasta Bolognese' });
   } finally {
     global.fetch = realFetch;
@@ -985,7 +985,7 @@ test('tools/call delete_meal: DELETE auf /meals/:id', async () => {
   try {
     const res = await toolCallWithHeaders('delete_meal', { id: 9 }, { authorization: 'Bearer test-token' });
     assert.equal(res.result.isError, false, res.result.content?.[0]?.text);
-    assert.equal(calls[0].url, 'http://mcp.test/api/v1/meals/9');
+    assert.equal(calls[0].url, `${LOOPBACK}/api/v1/meals/9`);
     assert.equal(calls[0].options.method, 'DELETE');
   } finally {
     global.fetch = realFetch;
