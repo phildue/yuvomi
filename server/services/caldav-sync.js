@@ -377,6 +377,18 @@ function getAllAccounts() {
   return db.get().prepare('SELECT * FROM caldav_accounts').all();
 }
 
+/**
+ * Whether the account exists (#2810, group 10b): the routes with an account in
+ * the path ask this before the service, so an unknown account is a 404 of its
+ * own instead of the plain Error the service throws for it (500, or 502
+ * `remote_failed` as if the server had refused).
+ * @param {number} accountId
+ * @returns {boolean}
+ */
+function accountExists(accountId) {
+  return db.get().prepare('SELECT 1 FROM caldav_accounts WHERE id = ?').get(accountId) !== undefined;
+}
+
 // --------------------------------------------------------
 // Connection Testing
 // --------------------------------------------------------
@@ -413,7 +425,8 @@ async function testConnection(caldavUrl, username, password, { createClient } = 
     return { ok: true, calendars };
   } catch (err) {
     log.error('Connection test failed:', err.message);
-    const failed = new Error(`CalDAV connection failed: ${err.message}`);
+    // `cause` keeps status and network code for the route's answer (Phase 0 H).
+    const failed = new Error(`CalDAV connection failed: ${err.message}`, { cause: err });
     // Der eine Fall, den die App selbst kennt (#1909): der Server hat
     // geantwortet, das Konto hat nur keine Kalender. Alles andere ist die
     // Angabe des fremden Servers und bleibt ohne Code.
@@ -1856,6 +1869,7 @@ function getStatus() {
 // --------------------------------------------------------
 
 export {
+  accountExists,
   addAccount,
   listAccounts,
   updateAccount,

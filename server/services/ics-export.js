@@ -6,7 +6,7 @@
  */
 
 import { localCalendarIdSql } from './local-calendars.js';
-import { visibilityWhere } from './visibility.js';
+import { visibleWhere } from '../authorize/index.ts';
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import {
@@ -17,13 +17,13 @@ import { outboundDateRange, outboundRecurrenceRule } from './outbound-dtstart.js
 import { rruleLine } from './recurrence.js';
 import { timedSeriesUntil } from '../utils/rrule-until.js';
 import { activeAccountSql } from './account-state.js';
-import { icsSubscriptionVisibleWhere } from './visibility.js';
 import { birthdaysSwitchedOff, notBirthdayEventSql } from './household-modules.js';
 import {
   BODY_FREE_EVENT_COLUMNS, eventProjectionSql, resolveProjectedEventRows,
 } from './calendar-event-reader.js';
 import { baseOccurrenceFor, isLinkedOccurrence } from './calendar-occurrence-overrides.js';
 import { occurrenceSlotOf } from './calendar-events.js';
+import { sqlInList } from '../utils/sql-in-list.ts';
 
 function escapeICSText(s) {
   if (s == null) return '';
@@ -318,18 +318,23 @@ function buildVEvent(
   return lines.map(foldLine);
 }
 
+const CALENDAR_FEED_PRODID = '-//Yuvomi//Calendar Feed//DE';
+
 function buildFeed(conn, userId, now = new Date(), tz = householdTimeZone(conn), options = {}) {
   const windowStart = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000)
     .toISOString().slice(0, 10);
   const feedZone = resolveFeedZone(tz);
   const calendarFilterSql = options.localCalendarId
-    ? `AND ${localCalendarIdSql()} = ? AND ${visibilityWhere('e', 'event_assignments', 'event_id', 'NULL')}`
+    ? `AND ${localCalendarIdSql()} = ? AND ${visibleWhere('events', 'e', 'NULL')}`
     : '';
   const calendarFilterParams = options.localCalendarId ? [options.localCalendarId] : [];
   const calendarName = options.calendarName || 'Yuvomi';
 
-  // Identische Sichtbarkeitslogik wie GET /api/v1/calendar:
-  // alle Events außer fremden, nicht-geteilten ICS-Abos.
+  // Not the visibility rule of GET /api/v1/calendar: this feed only drops other
+  // members' unshared ICS subscriptions (icsSubscriptionVisibleWhere() below)
+  // and deliberately does not filter by `visibility` - private and
+  // assignee-only events are exported too, visibility being an in-app control
+  // (#474, docs/SPEC.md "deliberately not filtered", test-ics-export.js).
   const showAssignees = options.showAssignees ?? !!conn.prepare(
     `SELECT calendar_feed_show_assignees AS v FROM users WHERE id = ?`
   ).get(userId)?.v;
@@ -357,7 +362,7 @@ function buildFeed(conn, userId, now = new Date(), tz = householdTimeZone(conn),
   const queriedRows = conn.prepare(`
     SELECT ${eventProjectionSql(conn, 'e', BODY_FREE_EVENT_COLUMNS)}${assigneeSelect}
     FROM calendar_events e
-    WHERE ${icsSubscriptionVisibleWhere('e')}
+    WHERE ${visibleWhere('ics_subscriptions', 'e', '?')}
     AND (
       e.recurrence_rule IS NOT NULL
       OR DATE(e.start_datetime) >= ?
@@ -376,10 +381,10 @@ function buildFeed(conn, userId, now = new Date(), tz = householdTimeZone(conn),
   const recurringIds = rows.filter(ev => ev.recurrence_rule).map(ev => ev.id);
   const exceptionsByEvent = new Map();
   if (recurringIds.length) {
-    const placeholders = recurringIds.map(() => '?').join(',');
+    const recurringIdList = sqlInList(recurringIds);
     const exRows = conn.prepare(
-      `SELECT event_id, exception_date FROM calendar_event_exceptions WHERE event_id IN (${placeholders})`
-    ).all(...recurringIds);
+      `SELECT event_id, exception_date FROM calendar_event_exceptions WHERE event_id IN (${recurringIdList.sql})`
+    ).all(recurringIdList.param);
     for (const r of exRows) {
       if (!exceptionsByEvent.has(r.event_id)) exceptionsByEvent.set(r.event_id, []);
       exceptionsByEvent.get(r.event_id).push(r.exception_date);
@@ -424,13 +429,14 @@ function buildFeed(conn, userId, now = new Date(), tz = householdTimeZone(conn),
       .map((event) => Number(event.assignment_owner_id ?? event.id))
       .filter((id) => Number.isInteger(id) && id > 0))];
     if (ownerIds.length) {
+      const ownerIdList = sqlInList(ownerIds);
       const nameRows = conn.prepare(`
         SELECT ea.event_id, u.display_name
         FROM event_assignments ea
         JOIN users u ON u.id = ea.user_id
-        WHERE ea.event_id IN (${ownerIds.map(() => '?').join(',')})
+        WHERE ea.event_id IN (${ownerIdList.sql})
         ORDER BY ea.event_id, u.display_name
-      `).all(...ownerIds);
+      `).all(ownerIdList.param);
       const namesByOwner = new Map();
       for (const row of nameRows) {
         if (!namesByOwner.has(row.event_id)) namesByOwner.set(row.event_id, []);
@@ -447,7 +453,7 @@ function buildFeed(conn, userId, now = new Date(), tz = householdTimeZone(conn),
   const out = [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
-    'PRODID:-//Yuvomi//Calendar Feed//DE',
+    `PRODID:${CALENDAR_FEED_PRODID}`,
     'CALSCALE:GREGORIAN',
     'METHOD:PUBLISH',
     `X-WR-CALNAME:${escapeICSText(calendarName)}`,
@@ -471,6 +477,37 @@ function buildFeed(conn, userId, now = new Date(), tz = householdTimeZone(conn),
   }
   out.push('END:VCALENDAR');
   return out.join('\r\n') + '\r\n';
+}
+
+/**
+ * A calendar without events, for a subscriber whose module is `none` (#2615).
+ *
+ * The header lines are the ones the full feed opens with, so a calendar app
+ * keeps the subscription as it is (name, zone) and only sees it empty; once the
+ * permission is given back, the next poll fills it again - skip, do not delete,
+ * as in the delivery of reminders (#1289). No VTIMEZONE: the full feeds only
+ * write one for the events that use it.
+ *
+ * @param {{ prodId: string, calendarName: string, timeZone?: string|null }} head
+ * @returns {string}
+ */
+function emptyFeed({ prodId, calendarName, timeZone = null }) {
+  const out = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    `PRODID:${prodId}`,
+    'CALSCALE:GREGORIAN',
+    'METHOD:PUBLISH',
+    `X-WR-CALNAME:${escapeICSText(calendarName)}`,
+  ];
+  if (timeZone) out.push(`X-WR-TIMEZONE:${timeZone}`);
+  out.push('END:VCALENDAR');
+  return out.map(foldLine).join('\r\n') + '\r\n';
+}
+
+/** The personal feed of `buildFeed()` without its events (#2615). */
+function buildEmptyFeed(conn, tz = householdTimeZone(conn)) {
+  return emptyFeed({ prodId: CALENDAR_FEED_PRODID, calendarName: 'Yuvomi', timeZone: resolveFeedZone(tz) });
 }
 
 function buildCalendarFeed(conn, calendarId, now = new Date(), tz = householdTimeZone(conn)) {
@@ -551,7 +588,7 @@ function setFeedShowAssignees(conn, userId, value) {
 }
 
 export {
-  escapeICSText, foldLine, buildFeed, buildCalendarFeed,
+  escapeICSText, foldLine, buildFeed, buildCalendarFeed, emptyFeed, buildEmptyFeed,
   getFeedToken, regenerateFeedToken, clearFeedToken, findUserIdByFeedToken,
   getFeedShowAssignees, setFeedShowAssignees,
   getFeedIncludeBirthdays, setFeedIncludeBirthdays,

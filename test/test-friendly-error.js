@@ -17,6 +17,7 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
+import { isPrecachedSource } from './dist-build.js';
 
 const load = () => import('../public/utils/friendly-error.js');
 
@@ -92,8 +93,7 @@ test('der Router nimmt die Zuordnung aus dem Modul und hat keine eigene', () => 
   const router = readFileSync(new URL('../public/router.js', import.meta.url), 'utf8');
   assert.match(router, /import \{ unhandledErrorSentence \} from '\/utils\/friendly-error\.js';/);
   assert.doesNotMatch(router, /function (?:friendlyError|unhandledErrorSentence)\(/, 'router.js hat wieder eine eigene Zuordnung');
-  const sw = readFileSync(new URL('../public/sw.js', import.meta.url), 'utf8');
-  assert.ok(sw.includes("'/utils/friendly-error.js'"), 'das Modul fehlt in der Shell-Liste des Service Workers');
+  assert.ok(isPrecachedSource('/utils/friendly-error.js'), 'das Modul fehlt in der Shell-Liste des Service Workers (dist/sw.js)');
 });
 
 // ---------------------------------------------------------------------------
@@ -293,7 +293,26 @@ test('jeder Fall hat seinen Satz in jeder Sprache, und der Server nennt ihn', ()
     // Kategorien des Budgets im Kategorie-Verwalter (#1909); die echte Antwort
     // misst test:budget-categories-routes.
     '../server/routes/budget/categories.js',
-  ].map(read).join('\n').replace(/NoteCategoryInputError\([^)]*?,\s*\d+,\s*'([a-z_]+)'\)/g, "reason: '$1'");
+    // Ein fremder Server hat abgelehnt oder war nicht erreichbar (Phase 0,
+    // Abschnitt H): die Klasse bestimmt remoteFailure, je Klasse misst sie
+    // test:http, die echte Antwort test:caldav-http-refusals.
+    '../server/utils/http.js',
+    // A WebDAV backup route failed on this server (#2622); the real answer
+    // measures test:backup-routes.
+    '../server/routes/backup.js',
+    // A kitchen handover whose undo would not fit into one request (#2810,
+    // follow-up 5b): the answer is built in the service; the real answers
+    // measure test:shopping-routes, test:meals-routes and test:recipes-routes.
+    '../server/services/kitchen-handover.js',
+  ].map(read).join('\n').replace(/NoteCategoryInputError\([^)]*?,\s*\d+,\s*'([a-z_]+)'\)/g, "reason: '$1'")
+    // A reason the request schema names (`x-reason`, #2810): since group 2A
+    // step (b) the address checks of the recipe providers stand only there.
+    // The real answer, with `fields`, measures test:recipe-provider-routes.
+    + `\n${read('../server/openapi/paths/recipeproviders.js').replace(/'x-reason': (?:\{ [a-zA-Z]+: )?'([a-z_]+)'/g, "reason: '$1'")}`
+    // Since group 4 step (b) the bounds and the time of a waste reminder
+    // setting are refused by the schema only; the real answer, with `fields`,
+    // measures test:waste-schedule-answers.
+    + `\n${read('../server/openapi/waste-inputs.js').replace(/'x-reason': (?:\{ [a-zA-Z]+: )?'([a-z_]+)'/g, "reason: '$1'")}`;
   const routes = `${read('../server/routes/shopping.js')}\n${healthServer}\n${documentsServer}\n${recipesServer}\n${subscriptionsServer}\n${restServer}\n${wasteServer.replace(/,\s*'([a-z_]+)'\s*[),]/g, ", reason: '$1')")}\n${importCodes}`;
   return load().then(({ CASE_MESSAGES, REFUSAL_MESSAGES }) => {
     for (const [reason, key] of CASE_MESSAGES) {
@@ -422,7 +441,8 @@ test('ein Fall, bei dem die Seite selbst nachlaedt, sagt in jeder Sprache nur, w
 // Sprache und in westlichen Ziffern.
 test('die Grenzen in den Abfuhr-Saetzen sind die des Servers', async () => {
   const { WEEKLY_INTERVAL_MAX, MONTHLY_INTERVAL_MAX } = await import('../server/services/waste-domain.js');
-  const reminders = readFileSync(new URL('../server/services/waste-reminders.js', import.meta.url), 'utf8');
+  // The bounds live in waste-fields.js since #2810 (read by the handler and the OpenAPI document).
+  const reminders = readFileSync(new URL('../server/services/waste-fields.js', import.meta.url), 'utf8');
   const bound = (name) => Number(reminders.match(new RegExp(`export const ${name} = (\\d+);`))[1]);
   const dir = new URL('../public/locales/', import.meta.url);
   const files = readdirSync(dir).filter((name) => name.endsWith('.json'));
@@ -567,10 +587,14 @@ test('errorSentenceWithDetail: der Text des Servers nur im Rahmen, und nur als A
   assert.match(sentence, /^settings\.connectionFailedDetail/);
   assert.match(sentence, /401 Unauthorized/);
 
-  // Ein Fall ohne eigene Angabe bleibt beim Rahmen, wenn der Dienst etwas sagt.
+  // A case with its own sentence keeps it when no class comes along, whatever
+  // `error` says (#2622); with a class in `detail` the class is framed.
   const storage = answer(502, 'WebDAV 507', 'documents_storage_failed');
   storage.data.error = 'WebDAV 507';
-  assert.match(errorSentenceWithDetail(storage, FRAME), /WebDAV 507/);
+  assert.equal(errorSentenceWithDetail(storage, FRAME), 'documents.errorStorageFailed');
+  storage.data.detail = 'HTTP 507';
+  assert.match(errorSentenceWithDetail(storage, FRAME), /HTTP 507/);
+  delete storage.data.detail;
   storage.data.error = '';
   assert.equal(errorSentenceWithDetail(storage, FRAME), 'documents.errorStorageFailed');
 
@@ -586,6 +610,62 @@ test('errorSentenceWithDetail: der Text des Servers nur im Rahmen, und nur als A
   assert.equal(errorSentenceWithDetail(answer(429, 'Too many requests.'), FRAME), 'common.errorRateLimited');
   assert.equal(errorSentenceWithDetail(Object.assign(new Error('x'), { status: 0 }), FRAME), 'common.errorOfflineMutation');
   assert.equal(errorSentenceWithDetail({ status: 503, data: { error: 'offline' } }, FRAME), 'common.errorOffline');
+});
+
+// Phase 0, Abschnitt H: ein fremder Dienst kommt als Klasse (`detail`) und mit
+// einem festen englischen Satz in `error`. Im Rahmen steht die Klasse, nie der
+// englische Satz; ohne Klasse sagt der `remote_*`-Grund seinen eigenen Satz.
+test('errorSentenceWithDetail: die Klasse eines fremden Dienstes im Rahmen, nie der englische Satz', async () => {
+  const { errorSentenceWithDetail, errorSentence } = await load();
+  const FRAME = 'settings.connectionFailedDetail';
+  const ENGLISH = 'The CalDAV server refused the request or could not be reached.';
+  const remote = (reason, detail, params) => Object.assign(answer(502, ENGLISH, reason), {}, {
+    data: { error: ENGLISH, code: 502, reason, ...(detail === undefined ? {} : { detail }), ...(params ? { params } : {}) },
+  });
+  for (const [reason, detail] of [
+    ['remote_auth_failed', 'HTTP 401'], ['remote_unreachable', 'ECONNREFUSED'], ['remote_unreachable', 'timeout'],
+    ['remote_unreachable', 'blocked'], ['remote_http_status', 'HTTP 503'],
+  ]) {
+    const sentence = errorSentenceWithDetail(remote(reason, detail, reason === 'remote_http_status' ? { status: 503 } : undefined), FRAME);
+    assert.match(sentence, /^settings\.connectionFailedDetail/, `${reason}: im Rahmen`);
+    assert.ok(sentence.includes(detail), `${reason}: die Klasse steht drin`);
+    assert.ok(!sentence.includes('CalDAV server'), `${reason}: nie der englische Satz`);
+  }
+  // Ohne Klasse: der Satz des Grundes, nie der englische Satz im Rahmen.
+  assert.equal(errorSentenceWithDetail(remote('remote_failed'), FRAME), 'settings.remoteErrorFailed');
+  assert.equal(errorSentenceWithDetail(remote('remote_auth_failed'), FRAME), 'settings.remoteErrorAuthFailed');
+  // Freier Text in `detail` ist keine Klasse und kommt nicht in den Rahmen.
+  const smuggled = remote('remote_unreachable', 'connect ECONNREFUSED 10.0.0.5:8443');
+  assert.equal(errorSentenceWithDetail(smuggled, FRAME), 'settings.remoteErrorUnreachable');
+  // Die Stellen ohne Angabe sagen den Satz des Grundes, der Status als Zahl.
+  assert.match(errorSentence(remote('remote_http_status', 'HTTP 503', { status: 503 })), /^settings\.remoteErrorStatus/);
+  assert.equal(errorSentence(remote('remote_unreachable', 'ECONNREFUSED')), 'settings.remoteErrorUnreachable');
+});
+
+// #2622: since section H the server sends fixed English sentences in `error`
+// ("The document storage refused the request or could not be reached.",
+// "WebDAV upload failed."). A case the app knows says its translated sentence;
+// the English one never lands in the translated frame.
+test('errorSentenceWithDetail: a known case without a class says its sentence, never the fixed English one (#2622)', async () => {
+  const { errorSentenceWithDetail } = await load();
+  const FRAME = 'settings.documentStorageTestFailed';
+  const fixed = (status, error, reason) => answer(status, error, reason);
+  assert.equal(
+    errorSentenceWithDetail(fixed(502, 'The document storage refused the request or could not be reached.', 'documents_storage_failed'), FRAME),
+    'documents.errorStorageFailed',
+  );
+  for (const sentence of ['Connection test failed.', 'WebDAV upload failed.', 'The local backup could not be created.', 'Failed to list remote files.']) {
+    const result = errorSentenceWithDetail(fixed(500, sentence, 'backup_local_failed'), 'settings.connectionFailedDetail');
+    assert.equal(result, 'settings.backupLocalFailed', sentence);
+  }
+  // A `remote_http_status` without its number has no sentence: the sentence of
+  // the place, not the English text in the frame.
+  assert.equal(
+    errorSentenceWithDetail(fixed(502, 'The WebDAV server refused the request or could not be reached.', 'remote_http_status'), FRAME, 'settings.backupWebdavTestFailed'),
+    'settings.backupWebdavTestFailed',
+  );
+  // An answer without a known case still frames the service's own sentence.
+  assert.match(errorSentenceWithDetail(fixed(400, 'Bad gateway config', undefined), FRAME), /Bad gateway config/);
 });
 
 test('die Faelle der Einstellungen haben ihren Satz, und die Toasts sagen ihn (#1909)', async () => {

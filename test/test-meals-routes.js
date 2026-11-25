@@ -7,7 +7,7 @@
  *        (Template/Exceptions/Instanzen), Zutaten-CRUD und die Transfer-Semantik
  *        „Zutaten → Einkaufsliste" (nur offene übertragen, Idempotenz, Wochen-Scope).
  *        Meals sind haushaltsweit (kein owner/visibility), daher kein Auth-Gate-Teil.
- * Ausführen: node --experimental-sqlite --test test/test-meals-routes.js
+ * Ausführen: node --test test/test-meals-routes.js
  */
 
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'test-secret';
@@ -15,10 +15,9 @@ process.env.DB_PATH = ':memory:';
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import express from 'express';
+import { createContactsMealsApp } from './contacts-meals-app.js';
 
 const dbmod = await import('../server/db.js');
-const { default: mealsRouter } = await import('../server/routes/meals.js');
 // Der Einkaufs-Router hängt mit drin, weil die Rücknahme eines Transfers über
 // ihn läuft (POST /shopping/items/undo-transfer). Beim Mahlzeit-Pfad gehört das
 // `on_shopping_list`-Flag zum Übertrag und muss mit zurück - das ist ohne beide
@@ -32,21 +31,25 @@ const LIST = db.prepare(`INSERT INTO shopping_lists (name, created_by) VALUES ('
 const RECIPE = db.prepare(`INSERT INTO recipes (title, created_by) VALUES ('Suppe', ?)`).run(U).lastInsertRowid;
 
 let actor = { id: U, role: 'member' };
-const app = express();
-app.use(express.json());
-app.use((req, _res, next) => {
-  req.authUserId = actor.id;
-  req.authRole = actor.role;
-  req.session = { userId: actor.id, role: actor.role };
-  next();
+// Am echten Praefix samt Fehlerhandler (#2810): validateRequest() findet die
+// Operation ueber `req.baseUrl`. Die Pfade der Faelle bleiben relativ zum
+// Essensplan, `call()` setzt das Praefix davor.
+const app = await createContactsMealsApp({
+  mount: ['meals'],
+  auth: (req, _res, next) => {
+    req.authUserId = actor.id;
+    req.authRole = actor.role;
+    req.session = { userId: actor.id, role: actor.role };
+    next();
+  },
+  after: [['/api/v1/shopping', shoppingRouter]],
 });
-app.use('/shopping', shoppingRouter);
-app.use('/', mealsRouter);
 const server = app.listen(0, '127.0.0.1');
 const baseUrl = await new Promise((r) => server.on('listening', () => r(`http://127.0.0.1:${server.address().port}`)));
 
 async function call(method, path, body) {
-  const res = await fetch(`${baseUrl}${path}`, {
+  const prefix = path.startsWith('/shopping') ? '/api/v1' : '/api/v1/meals';
+  const res = await fetch(`${baseUrl}${prefix}${path}`, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : undefined,
     body: body ? JSON.stringify(body) : undefined,
@@ -85,7 +88,9 @@ test('GET /suggestions: Präfix-Treffer liefert distinct Titel + Typ', async () 
 test('POST /: fehlender meal_type → 400', async () => {
   const r = await call('POST', '/', { date: '2026-06-15', title: 'X' });
   assert.equal(r.status, 400);
-  assert.match(r.body.error, /Mahlzeit-Typ/);
+  // Seit #2810 das Schema vor der Route (vorher der deutsche Satz der Route).
+  assert.equal(r.body.reason, 'validation');
+  assert.ok(r.body.fields.some((/** @type {any} */ f) => f.path === 'body/meal_type' && f.rule === 'required'), JSON.stringify(r.body));
 });
 
 test('POST /: ungültiger meal_type → 400', async () => {
@@ -436,7 +441,8 @@ test('POST /apply-plan: skip_occupied, das kein Boolean ist -> 400 statt still a
       assignments: [{ date: '2045-01-15', meal_type: 'dinner', title: 'Import' }],
     });
     assert.equal(r.status, 400, `skip_occupied: ${JSON.stringify(value)}`);
-    assert.match(r.body.error, /skip_occupied/);
+    // Seit #2810 das Schema vor der Route; das Feld ist benannt.
+    assert.ok(r.body.fields.some((/** @type {any} */ f) => f.path === 'body/skip_occupied'), JSON.stringify(r.body));
   }
   assert.deepEqual(mealsIn('2045-01-15', 'dinner'), ['Bestand']);
 });
@@ -771,6 +777,26 @@ test('POST /:id/to-shopping-list: überträgt nur offene, markiert sie, idempote
   const r2 = await call('POST', `/${m.id}/to-shopping-list`, { listId: LIST });
   assert.equal(r2.body.data.transferred, 0);
   assert.deepEqual(r2.body.data.added_ids, []);
+});
+
+test('POST /:id/to-shopping-list und /week-to-shopping-list: mehr Zutaten, als ein Rueckgaengig fasst, sind 400 vor dem Schreiben (#2810)', async () => {
+  // Gespeicherte Altdaten koennen mehr Zutaten tragen als das Schema heute nimmt.
+  const { MAX_SHOPPING_ITEMS } = await import('../server/openapi/array-limits.js');
+  const meal = Number(db.prepare(`INSERT INTO meals (date, meal_type, title, created_by) VALUES ('2034-03-01', 'dinner', 'Riesig', ?)`).run(U).lastInsertRowid);
+  const ins = db.prepare(`INSERT INTO meal_ingredients (meal_id, name, quantity, category) VALUES (?, ?, NULL, 'Sonstiges')`);
+  db.transaction(() => { for (let i = 0; i <= MAX_SHOPPING_ITEMS; i++) ins.run(meal, `Zutat ${i}`); })();
+  const before = db.prepare('SELECT COUNT(*) c FROM shopping_items WHERE list_id = ?').get(LIST).c;
+  const expected = {
+    error: `A transfer takes at most ${MAX_SHOPPING_ITEMS} ingredients at a time.`, code: 400,
+    reason: 'kitchen_transfer_too_large', params: { limit: MAX_SHOPPING_ITEMS },
+  };
+  const one = await call('POST', `/${meal}/to-shopping-list`, { listId: LIST });
+  assert.deepEqual([one.status, one.body], [400, expected]);
+  const week = await call('POST', '/week-to-shopping-list', { listId: LIST, week: '2034-03-01' });
+  assert.deepEqual([week.status, week.body], [400, expected]);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM shopping_items WHERE list_id = ?').get(LIST).c, before, 'kein Artikel');
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM meal_ingredients WHERE meal_id = ? AND on_shopping_list = 1').get(meal).c, 0, 'keine Zutat markiert');
+  db.prepare('DELETE FROM meals WHERE id = ?').run(meal);
 });
 
 /**

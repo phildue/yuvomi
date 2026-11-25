@@ -3,6 +3,8 @@ import { refuseWhileRestoring } from '../middleware/restore-gate.js';
 import { requireAdmin } from '../auth.js';
 import { createLogger } from '../logger.js';
 import * as googleDriveStorage from '../services/google-drive-storage.js';
+import { remoteFailure } from '../utils/http.js';
+import { validateRequest } from '../api/validate-request.ts';
 
 const log = createLogger('GoogleDriveStorageRoutes');
 const router = express.Router();
@@ -19,14 +21,22 @@ function sendStorageError(res, error) {
       )
       ? 400
       : 502;
+  // Phase 0 section H: a misconfiguration (400/409) keeps the service's own
+  // sentence; anything else - googleapis, the network, the database - never
+  // carries its text, only its class in `detail` when it has one.
+  const detail = status === 502 ? remoteFailure(error)?.detail : undefined;
   return res.status(status).json({
-    error: error?.message || 'Google Drive document storage operation failed.',
+    error: status !== 502 && error?.message ? error.message : 'Google Drive document storage operation failed.',
     code: status,
     storage_code: storageCode || 'DOCUMENT_STORAGE_OPERATION_FAILED',
+    ...(detail ? { detail } : {}),
   });
 }
 
-router.get('/auth', requireAdmin, refuseWhileRestoring, (req, res) => {
+// validateRequest() steht hinter requireAdmin und refuseWhileRestoring (#2810):
+// ein Mitglied bekommt seine 403, eine laufende Wiederherstellung ihre 503 vor
+// jeder Pruefung der Anfrage.
+router.get('/auth', requireAdmin, refuseWhileRestoring, validateRequest(), (req, res) => {
   try {
     res.redirect(googleDriveStorage.getAuthUrl(req.session));
   } catch (error) {
@@ -35,7 +45,7 @@ router.get('/auth', requireAdmin, refuseWhileRestoring, (req, res) => {
   }
 });
 
-router.get('/callback', requireAdmin, refuseWhileRestoring, async (req, res) => {
+router.get('/callback', requireAdmin, refuseWhileRestoring, validateRequest(), async (req, res) => {
   const { code, error, state } = req.query;
   if (error || !code) {
     delete req.session.googleDriveOAuthState;
@@ -61,7 +71,7 @@ router.get('/callback', requireAdmin, refuseWhileRestoring, async (req, res) => 
   }
 });
 
-router.post('/test', requireAdmin, async (_req, res) => {
+router.post('/test', requireAdmin, validateRequest(), async (_req, res) => {
   try {
     const data = await googleDriveStorage.testConnection();
     res.json({ data });
@@ -71,7 +81,7 @@ router.post('/test', requireAdmin, async (_req, res) => {
   }
 });
 
-router.delete('/disconnect', requireAdmin, (req, res) => {
+router.delete('/disconnect', requireAdmin, validateRequest(), (req, res) => {
   try {
     googleDriveStorage.disconnect();
     res.json({ data: googleDriveStorage.getStatus() });

@@ -66,7 +66,8 @@ function createClient() {
   const redirectUri  = process.env.GOOGLE_REDIRECT_URI;
 
   if (!clientId || !clientSecret || !redirectUri) {
-    throw new Error('[Google] GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI must be set.');
+    // `code`: the route answers this own case with its sentence (Phase 0 H).
+    throw Object.assign(new Error('[Google] GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI must be set.'), { code: 'google_not_configured' });
   }
 
   return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
@@ -783,7 +784,8 @@ function loadAuthorizedClient() {
   const refreshToken = cfgGet('google_refresh_token');
 
   if (!accessToken || !refreshToken) {
-    throw new Error('[Google] Not configured - complete OAuth first.');
+    // `code`: the route answers this own case with its sentence (Phase 0 H).
+    throw Object.assign(new Error('[Google] Not configured - complete OAuth first.'), { code: 'google_not_configured' });
   }
 
   const client = createClient();
@@ -1637,7 +1639,7 @@ function inboundFields(item, calTimeZone) {
 }
 
 // Yuvomi speichert getimte Events als "YYYY-MM-DDTHH:MM" (ohne Sekunden,
-// siehe validate.js). Die Google Calendar API verlangt RFC 3339 mit
+// siehe api/formats.ts). Die Google Calendar API verlangt RFC 3339 mit
 // Sekunden, sonst "Bad Request" bzw. bei Wiederholungen "Invalid
 // recurrence rule" (Issue #217). Sekunden ergänzen, falls sie fehlen.
 function toRfc3339(dt) {

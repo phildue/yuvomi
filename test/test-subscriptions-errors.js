@@ -34,7 +34,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import express from 'express';
+import { createBudgetApp } from './budget-app.js';
 
 process.env.DB_PATH = ':memory:';
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'subscriptions-errors-test-secret';
@@ -79,15 +79,18 @@ const setMode = (mode) => db.prepare(`INSERT INTO sync_config (key, value) VALUE
             ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(mode);
 
 let actor = { id: ADA, role: 'admin' };
-const app = express();
-app.use(express.json({ limit: '2mb' }));
-app.use((req, _res, next) => {
-  req.authUserId = actor.id;
-  req.authRole = actor.role;
-  req.session = { userId: actor.id, role: actor.role };
-  next();
+// At their real prefix with the central error handler (#2810): validateRequest()
+// finds its operation by the mount and answers through next(err).
+const app = await createBudgetApp({
+  mount: ['subscriptions'],
+  jsonLimit: '2mb',
+  auth: (req, _res, next) => {
+    req.authUserId = actor.id;
+    req.authRole = actor.role;
+    req.session = { userId: actor.id, role: actor.role };
+    next();
+  },
 });
-app.use('/api/v1/budget/subscriptions', routes.default);
 const server = http.createServer(app);
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 test.after(() => new Promise((r) => server.close(r)));
@@ -202,6 +205,28 @@ test('Server: die Logo-Suche findet nichts - 404 mit subscriptions_no_logo_found
   routes._setLogoFinderForTest?.(async () => []);
   const r = await call('POST', '/logo-search', { query: 'netflix' });
   assert.deepEqual([r.status, r.body?.reason, r.body?.error], [404, 'subscriptions_no_logo_found', 'No supported logo could be found.']);
+});
+
+// Phase 0, Abschnitt H: ein eigener Satz der Logo-Suche bleibt (400); was DNS
+// oder der Socket sagen, nennt den Host und kommt als Klasse (502).
+test('Server: die Logo-Suche sagt ihre eigenen Saetze, fremde Fehler nur als Klasse', async () => {
+  routes._setLogoFinderForTest?.(async () => {
+    throw Object.assign(new Error('Logo search only supports HTTPS websites.'), { code: 'logo_search_refused' });
+  });
+  const own = await call('POST', '/logo-search', { query: 'http://example.com' });
+  assert.deepEqual([own.status, own.body?.error], [400, 'Logo search only supports HTTPS websites.']);
+  routes._setLogoFinderForTest?.(async () => {
+    throw Object.assign(new Error('getaddrinfo ENOTFOUND intranet.lan'), { code: 'ENOTFOUND' });
+  });
+  try {
+    const foreign = await call('POST', '/logo-search', { query: 'intranet.lan' });
+    assert.equal(foreign.status, 502, JSON.stringify(foreign.body));
+    assert.equal(foreign.body.reason, 'remote_unreachable');
+    assert.equal(foreign.body.detail, 'ENOTFOUND');
+    assert.doesNotMatch(foreign.body.error, /getaddrinfo|intranet/);
+  } finally {
+    routes._setLogoFinderForTest?.(null);
+  }
 });
 
 test('Server: das Abo verschwindet, waehrend seine Buchung den Kurs holt - 404 statt 500, und keine Buchung ohne Abo', async () => {

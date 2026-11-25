@@ -14,12 +14,13 @@
  * Kopien derselben Regel wären eine wandernde Annahme - fiele eine Seite zurück,
  * unterschieden sich die Tags derselben Aufgabe je nach Herkunft.
  *
- * Abhängigkeiten: server/services/visibility.js (reiner SQL-Fragment-Bauer ohne
+ * Abhängigkeiten: server/authorize/rows/assignees.ts (reiner SQL-Fragment-Bauer ohne
  * eigene Abhängigkeiten - die Sichtbarkeitsregel gehört zu jeder Tag-Abfrage,
  * die eine Liste an eine Person ausliefert).
  */
 
-import { visibilityWhere } from '../services/visibility.js';
+import { taskVisibleWhere, visibleWhere } from '../authorize/index.ts';
+import { sqlInList } from './sql-in-list.ts';
 
 // Identisch zu den Grenzen im Parser (server/services/ics-parser.js): was von
 // dort hereinkommt, ist bereits gedeckelt, was aus der Oberfläche kommt, wird es
@@ -136,12 +137,12 @@ function loadFor(database, { table, fk }, ids) {
   const map = new Map();
   if (!ids?.length) return map;
 
-  const placeholders = ids.map(() => '?').join(',');
+  const idList = sqlInList(ids);
   const rows = database.prepare(`
     SELECT ${fk} AS owner_id, tag FROM ${table}
-    WHERE ${fk} IN (${placeholders})
+    WHERE ${fk} IN (${idList.sql})
     ORDER BY tag COLLATE NOCASE ASC
-  `).all(...ids);
+  `).all(idList.param);
 
   for (const { owner_id, tag } of rows) {
     if (!map.has(owner_id)) map.set(owner_id, []);
@@ -206,17 +207,24 @@ export function setItemTags(database, itemId, tags) {
  * Fehlt `me`, bleibt nur übrig, was ohnehin für alle sichtbar ist - ein
  * vergessener Parameter zeigt also zu wenig statt zu viel.
  *
+ * A paired display lists under the wall rule: the routes hand in the reader of the
+ * request (taskReader in server/authorize), and a tag that hangs only on tasks the
+ * whole household does not see stays off the wall. Without `reader` the person rule
+ * for `me` applies, so existing callers keep their answer.
+ *
  * @param {number|null} me betrachtende User-ID
+ * @param {{ reader?: import('../authorize/index.ts').TaskReader }} [opts]
  */
-export function allTags(database, me = null) {
+export function allTags(database, me = null, opts = {}) {
+  const r = opts.reader ?? { userId: me, wall: false };
   return database.prepare(`
     SELECT MIN(tt.tag) AS tag, COUNT(*) AS count
     FROM task_tags tt
     JOIN tasks t ON t.id = tt.task_id
-    WHERE ${visibilityWhere('t', 'task_assignments', 'task_id', '@me')}
+    WHERE ${taskVisibleWhere(r, 't')}
     GROUP BY tt.tag_key
     ORDER BY count DESC, tag COLLATE NOCASE ASC
-  `).all({ me });
+  `).all({ me: r.userId });
 }
 
 // --------------------------------------------------------
@@ -241,7 +249,7 @@ export function taskIdsWithTag(database, tag, me = null) {
     FROM task_tags tt
     JOIN tasks t ON t.id = tt.task_id
     WHERE tt.tag_key = ?
-      AND ${visibilityWhere('t', 'task_assignments', 'task_id', '@me')}
+      AND ${visibleWhere('tasks', 't', '@me')}
     ORDER BY t.id
   `).all(tagKey(tag), { me }).map((r) => r.id);
 }

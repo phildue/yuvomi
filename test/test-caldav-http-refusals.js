@@ -30,7 +30,7 @@
  * dann den Folgelauf, in dem der Schaden entstand, und zuletzt, dass der Weg
  * nach der Absage wieder frei ist.
  *
- * Ausführen: node --experimental-sqlite --test test/test-caldav-http-refusals.js
+ * Ausführen: node --test test/test-caldav-http-refusals.js
  */
 
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'test-secret';
@@ -2292,17 +2292,15 @@ test('Gesehen: eine nie gesehene Aufgabe mit UID nach dem alten Muster bleibt Sp
 test('CardDAV-Konto anlegen: eine Absage des Servers kommt als Meldung an, nicht als "Internal error"', async () => {
   reset();
   dav.addCollection('book', { name: 'Kontakte', kind: 'addressbook' });
-  const express = (await import('express')).default;
-  const { default: cardavRouter } = await import('../server/routes/cardav.js');
-  const app = express();
-  app.use(express.json());
-  app.use((req, _res, next) => { req.authRole = 'admin'; next(); });
-  app.use('/cardav', cardavRouter);
+  // At its real prefix with the error handler: validateRequest() reads the
+  // operation from the mount (#2810).
+  const { createContactsMealsApp } = await import('./contacts-meals-app.js');
+  const app = await createContactsMealsApp({ mount: ['cardav'], auth: (req, _res, next) => { req.authRole = 'admin'; next(); } });
   const server = app.listen(0, '127.0.0.1');
   await new Promise((resolve) => server.once('listening', resolve));
   try {
     dav.refuse({ method: 'PROPFIND', path: '/cal/', status: 403 });
-    const res = await fetch(`http://127.0.0.1:${server.address().port}/cardav/accounts`, {
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/api/v1/contacts/cardav/accounts`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'Fake', cardavUrl: dav.url, username: 'u', password: 'p' }),
@@ -2310,10 +2308,39 @@ test('CardDAV-Konto anlegen: eine Absage des Servers kommt als Meldung an, nicht
     const body = await res.json();
     assert.equal(res.status, 502);
     assert.equal(body.errorCode, 'connection_failed');
-    assert.match(body.error, /refused to list the address books \(HTTP 403/);
+    // Die Klasse der Absage, nie der Text des Servers oder von tsdav (Phase 0,
+    // Abschnitt H): der nannte Adresse und Pfad.
+    assert.equal(body.reason, 'remote_auth_failed');
+    assert.equal(body.detail, 'HTTP 403');
+    assert.ok(!JSON.stringify(body).includes(dav.url), 'die Antwort nennt die Adresse nicht');
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM carddav_accounts').get().n, 0);
   } finally {
     server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+// Phase 0, Abschnitt H (Review #2619): caldav-client schreibt den Status einer
+// Absage an den Fehler der Kontosuche - aber nur den der LETZTEN Anfrage. Eine
+// 404 auf /.well-known/ darf einen spaeteren Netzfehler nicht als "HTTP 404"
+// ausgeben.
+test('Kontosuche: eine fruehere 404 ueberdeckt keinen spaeteren Netzfehler', async () => {
+  const { createCalDAVClient } = await import('../server/utils/caldav-client.js');
+  const { remoteFailure } = await import('../server/utils/http.js');
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) return new Response('', { status: 404, statusText: 'Not Found' });
+    throw new TypeError('fetch failed', { cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }) });
+  };
+  try {
+    const err = await createCalDAVClient({ caldav_url: 'https://dav.example.invalid/', username: 'u', password: 'p' })
+      .then(() => null, (e) => e);
+    assert.ok(err, 'die Kontosuche scheitert');
+    assert.ok(calls >= 2, `die zweite Anfrage lief (${calls})`);
+    assert.deepEqual(remoteFailure(err), { reason: 'remote_unreachable', detail: 'ECONNRESET' });
+  } finally {
+    globalThis.fetch = realFetch;
   }
 });

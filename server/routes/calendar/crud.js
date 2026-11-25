@@ -5,9 +5,11 @@
 
 import { createLogger } from '../../logger.js';
 import express from 'express';
+import { validateRequest } from '../../api/validate-request.ts';
+import { sqlInList } from '../../utils/sql-in-list.ts';
+import { MAX_REMINDER_OFFSETS } from '../../services/calendar-fields.js';
 import * as db from '../../db.js';
-import { str, color, datetime, rrule, textShape, collectErrors, MAX_TITLE, MAX_TEXT, DATE_RE } from '../../middleware/validate.js';
-import { icsSubscriptionVisibleWhere, normalizeVisibility, visibilityWhere } from '../../services/visibility.js';
+import { str, color, datetime, rrule, textShape, collectErrors, MAX_TITLE, MAX_TEXT, DATE_RE } from '../../api/formats.ts';
 import { hasAnyOccurrence, endsBeforeStart } from '../../services/recurrence.js';
 import { startOrRuleChanged } from '../../services/outbound-dtstart.js';
 import { resolveProjectedEventRows } from '../../services/calendar-event-reader.js';
@@ -28,9 +30,18 @@ import {
 import { newNonMembers, nonMemberMessage } from '../../services/household-members.js';
 import { documentViewer } from '../../services/document-links.js';
 import {
-  ATTACHMENT_NARROW_ONLY, documentClonePredicate, documentWidenPredicate,
-} from '../../services/document-access.js';
-import { mayChangeRecord, mayWriteModule, sendNotOwner } from '../../permissions.js';
+  mayChangeRecord,
+  mayWriteModule,
+  sendNotOwner,
+  normalizeVisibility,
+  ATTACHMENT_NARROW_ONLY,
+  documentClonePredicate,
+  documentWidenPredicate,
+  readerBinds,
+  readerVisibleWhere,
+  rowReader,
+  visibleWhere,
+} from '../../authorize/index.ts';
 import { recordLocalColorChoice } from '../../services/legacy-color-snapshot.js';
 import { localCalendarColorSql, localCalendarIdSql, localCalendarProjection, resolveLocalCalendarId, validateCalendarId } from '../../services/local-calendars.js';
 import {
@@ -50,14 +61,14 @@ import {
   updateSeriesWithOverrides,
   followInboundStartChange,
 } from '../../services/calendar-occurrence-overrides.js';
+import { isAdminRequest } from '../../middleware/require-admin.js';
 import {
   ASSIGNED_USERS_SQL,
   getUserId,
-  isAdminUser,
   eventIcon,
   parseAttachment,
-  attachmentUploadRefused, storedAttachmentLocked,
-  ATTACHMENT_UPLOAD_REFUSAL, ATTACHMENT_CHANGE_REFUSAL,
+  refuseUploadWithoutDocumentsWrite, storedAttachmentLocked,
+  ATTACHMENT_CHANGE_REFUSAL,
   caldavTarget,
   caldavTargetOffered,
   cloneAttachmentDocument,
@@ -72,6 +83,15 @@ import {
 
 const log = createLogger('Calendar');
 const router = express.Router();
+
+/**
+ * Die Kennung im Pfad: das Schema laesst nur Dezimalziffern durch (#2810).
+ * @param {any} req
+ * @param {string} [name]
+ */
+function pathId(req, name = 'id') {
+  return Number(req.params[name]);
+}
 
 // #1909: die Faelle, die ein Nutzer beim Speichern, Zuruecksetzen oder Loeschen
 // eines Termins erreicht, tragen einen `reason`; die App sagt dazu ihren Satz
@@ -124,7 +144,7 @@ function sendSeriesWithoutOccurrence(res) {
 function attachmentRights(req) {
   const actor = {
     actorId: getUserId(req),
-    isAdmin: isAdminUser(req),
+    isAdmin: isAdminRequest(req),
     documentsWritable: mayWriteModule(req, 'documents'),
   };
   const mayManage = documentWidenPredicate(db.get(), actor);
@@ -250,9 +270,10 @@ function validateOccurrenceAssignments(database, value) {
     return { value: null, error: 'Assignment: choose each person at most once.' };
   }
   if (ids.length > 0) {
+    const idList = sqlInList(ids);
     const found = database.prepare(`
-      SELECT COUNT(*) AS count FROM users WHERE id IN (${ids.map(() => '?').join(',')})
-    `).get(...ids).count;
+      SELECT COUNT(*) AS count FROM users WHERE id IN (${idList.sql})
+    `).get(idList.param).count;
     if (Number(found) !== ids.length) {
       return { value: null, error: 'An assigned person no longer exists.' };
     }
@@ -401,10 +422,7 @@ function validateOccurrenceMutationBody(database, body, { following = false, mas
       values[field] = null;
       return;
     }
-    if (typeof body[field] !== 'string') {
-      errors.push(`${label} must be text${nullable ? ' or null' : ''}.`);
-      return;
-    }
+    // Text (oder null, wo erlaubt) sagt das Schema davor (#2810).
     const result = str(body[field], label, {
       max: options.max,
       required: options.required !== false,
@@ -435,34 +453,22 @@ function validateOccurrenceMutationBody(database, body, { following = false, mas
   validateDateTime('end_datetime', 'end_datetime', { nullable: true });
   validateString('location', 'location', { max: MAX_TITLE, required: false, nullable: true });
 
+  // Die Form der Felder - Text oder null, `all_day`/`countdown` als Boolean,
+  // `visibility` aus EVENT_VISIBILITY - sagt das Schema beider Routen davor
+  // (CalendarOccurrenceOnlyMutation, CalendarOccurrenceFollowingMutation,
+  // #2810); hier bleibt der Inhalt.
   if (Object.hasOwn(body, 'color')) {
-    if (body.color !== null && typeof body.color !== 'string') {
-      errors.push('color must be text or null.');
-    } else {
-      const result = color(body.color, 'color');
-      if (result.error) errors.push('color: choose a valid color in the format #RRGGBB.');
-      else values.color = result.value;
-    }
+    const result = color(body.color, 'color');
+    if (result.error) errors.push('color: choose a valid color in the format #RRGGBB.');
+    else values.color = result.value;
   }
   if (following && Object.hasOwn(body, 'recurrence_rule')) {
-    if (body.recurrence_rule !== null && typeof body.recurrence_rule !== 'string') {
-      errors.push('recurrence_rule must be text or null.');
-    } else {
-      const result = rrule(body.recurrence_rule, 'recurrence_rule');
-      if (result.error) errors.push('recurrence_rule is invalid.');
-      else values.recurrence_rule = result.value;
-    }
+    const result = rrule(body.recurrence_rule, 'recurrence_rule');
+    if (result.error) errors.push('recurrence_rule is invalid.');
+    else values.recurrence_rule = result.value;
   }
-  for (const field of ['all_day', 'countdown']) {
-    if (Object.hasOwn(body, field)) {
-      if (typeof body[field] !== 'boolean') errors.push(`${field} must be true or false.`);
-      else values[field] = body[field];
-    }
-  }
-  if (Object.hasOwn(body, 'visibility')) {
-    if (!['all', 'assignees', 'private'].includes(body.visibility)) {
-      errors.push('visibility must be one of: all, assignees, private.');
-    } else values.visibility = body.visibility;
+  for (const field of ['all_day', 'countdown', 'visibility']) {
+    if (Object.hasOwn(body, field)) values[field] = body[field];
   }
   const assignments = validateOccurrenceAssignments(database, body.assigned_to);
   if (assignments.error) errors.push(assignments.error);
@@ -478,60 +484,57 @@ function validateOccurrenceMutationBody(database, body, { following = false, mas
 // Einzelnen Termin abrufen.
 // Response: { data: Event }
 // --------------------------------------------------------
-router.get('/:id', (req, res) => {
-  try {
-    const id    = parseInt(req.params.id, 10);
-    const event = db.get().prepare(`
-      SELECT e.*,
-             u_assigned.display_name AS assigned_name,
-             u_assigned.avatar_color AS assigned_color,
-             u_created.display_name  AS creator_name,
-             -- Derselbe Name und dieselbe geerbte Farbe wie im Lesepfad, damit
-             -- jede Antwort dieses Moduls dasselbe Event-Objekt liefert:
-             -- CalDAV/Google ueber calendar_ref_id, ICS-Abos ueber
-             -- subscription_id (#891). Der Name fehlte hier ganz (#1064): die
-             -- Zusage dieser Zeilen galt nur der Farbe, und ein frisch
-             -- angelegter oder geaenderter Termin kam ohne ihn zurueck.
-             COALESCE(ec.name, isub.name)   AS cal_name,
-             COALESCE(ec.color, isub.color) AS cal_color,
-             lc.id AS local_calendar_id,
-             lc.name  AS local_calendar_name,
-             ${localCalendarColorSql()} AS local_calendar_color,
-             ${SOURCE_CALENDAR_COLUMNS},
-             COALESCE(bd.name, nd.name) AS birthday_name,
-             CASE WHEN bd.year_unknown = 1 THEN NULL ELSE bd.birth_date END AS birthday_date,
-             nd.name_day   AS name_day,
-             CASE WHEN nd.id IS NOT NULL THEN 'name_day'
-                  WHEN bd.id IS NOT NULL THEN 'birthday' END AS birthday_event_kind,
-             ${ASSIGNED_USERS_SQL},
-             (SELECT hws.id FROM housekeeping_work_sessions hws WHERE hws.calendar_event_id = e.id LIMIT 1) AS housekeeping_visit_id
-      FROM calendar_events e
-      LEFT JOIN users u_assigned ON u_assigned.id = e.assigned_to
-      LEFT JOIN users u_created  ON u_created.id  = e.created_by
-      LEFT JOIN external_calendars ec ON ec.id = e.calendar_ref_id
-      LEFT JOIN local_calendars lc ON lc.id = ${localCalendarIdSql()}
-      ${SOURCE_CALENDAR_JOIN}
-      LEFT JOIN ics_subscriptions isub ON isub.id = e.subscription_id
-      LEFT JOIN birthdays bd ON bd.calendar_event_id = e.id
-      LEFT JOIN birthdays nd ON nd.name_day_calendar_event_id = e.id
-      WHERE e.id = ?
-        AND ${icsSubscriptionVisibleWhere('e')}
-        AND ${visibilityWhere('e', 'event_assignments', 'event_id')}
-    `).get(id, getUserId(req), getUserId(req), getUserId(req));
+router.get('/:id', validateRequest(), (req, res) => {
+  const id    = pathId(req);
+  // A paired display reads under the wall rule (rowReader), people under the row rule.
+  const reader = rowReader(req);
+  const event = db.get().prepare(`
+    SELECT e.*,
+           u_assigned.display_name AS assigned_name,
+           u_assigned.avatar_color AS assigned_color,
+           u_created.display_name  AS creator_name,
+           -- Derselbe Name und dieselbe geerbte Farbe wie im Lesepfad, damit
+           -- jede Antwort dieses Moduls dasselbe Event-Objekt liefert:
+           -- CalDAV/Google ueber calendar_ref_id, ICS-Abos ueber
+           -- subscription_id (#891). Der Name fehlte hier ganz (#1064): die
+           -- Zusage dieser Zeilen galt nur der Farbe, und ein frisch
+           -- angelegter oder geaenderter Termin kam ohne ihn zurueck.
+           COALESCE(ec.name, isub.name)   AS cal_name,
+           COALESCE(ec.color, isub.color) AS cal_color,
+           lc.id AS local_calendar_id,
+           lc.name  AS local_calendar_name,
+           ${localCalendarColorSql()} AS local_calendar_color,
+           ${SOURCE_CALENDAR_COLUMNS},
+           COALESCE(bd.name, nd.name) AS birthday_name,
+           CASE WHEN bd.year_unknown = 1 THEN NULL ELSE bd.birth_date END AS birthday_date,
+           nd.name_day   AS name_day,
+           CASE WHEN nd.id IS NOT NULL THEN 'name_day'
+                WHEN bd.id IS NOT NULL THEN 'birthday' END AS birthday_event_kind,
+           ${ASSIGNED_USERS_SQL},
+           (SELECT hws.id FROM housekeeping_work_sessions hws WHERE hws.calendar_event_id = e.id LIMIT 1) AS housekeeping_visit_id
+    FROM calendar_events e
+    LEFT JOIN users u_assigned ON u_assigned.id = e.assigned_to
+    LEFT JOIN users u_created  ON u_created.id  = e.created_by
+    LEFT JOIN external_calendars ec ON ec.id = e.calendar_ref_id
+    LEFT JOIN local_calendars lc ON lc.id = ${localCalendarIdSql()}
+    ${SOURCE_CALENDAR_JOIN}
+    LEFT JOIN ics_subscriptions isub ON isub.id = e.subscription_id
+    LEFT JOIN birthdays bd ON bd.calendar_event_id = e.id
+    LEFT JOIN birthdays nd ON nd.name_day_calendar_event_id = e.id
+    WHERE e.id = ?
+      AND ${readerVisibleWhere(reader, 'ics_subscriptions', 'e', '?')}
+      AND ${readerVisibleWhere(reader, 'events', 'e', '?')}
+  `).get(id, ...readerBinds(reader, 'ics_subscriptions'), ...readerBinds(reader, 'events'));
 
-    if (!event) return sendEventGone(res);
-    const database = db.get();
-    const resolved = resolveProjectedEventRows(database, [event])[0];
-    res.json({ data: serializeEvent(resolved, {
-      viewer: documentViewer(req),
-      database,
-      actorId: getUserId(req),
-      isAdmin: isAdminUser(req),
-    }) });
-  } catch (err) {
-    log.error('', err);
-    res.status(500).json({ error: 'Internal error.', code: 500 });
-  }
+  if (!event) return sendEventGone(res);
+  const database = db.get();
+  const resolved = resolveProjectedEventRows(database, [event])[0];
+  res.json({ data: serializeEvent(resolved, {
+    viewer: documentViewer(req),
+    database,
+    actorId: getUserId(req),
+    isAdmin: isAdminRequest(req),
+  }) });
 });
 
 // --------------------------------------------------------
@@ -544,7 +547,7 @@ const SERIES_ENDS_BEFORE_START = 'recurrence_rule: the series ends before the st
 //         recurrence_rule?, countdown? }
 // Response: { data: Event }
 // --------------------------------------------------------
-router.post('/', async (req, res) => {
+router.post('/', refuseUploadWithoutDocumentsWrite, validateRequest(), async (req, res) => {
   let stagedUpload;
   try {
     const userId = getUserId(req);
@@ -557,10 +560,8 @@ router.post('/', async (req, res) => {
       });
       return res.status(401).json({ error: 'Not authenticated.', code: 401 });
     }
-    // Hochladen braucht das Dokumente-Schreibrecht (DECISIONS.md Eintrag 10).
-    if (attachmentUploadRefused(req)) {
-      return res.status(403).json({ error: ATTACHMENT_UPLOAD_REFUSAL, code: 403, reason: 'ATTACHMENT_UPLOAD_REFUSED' });
-    }
+    // Hochladen braucht das Dokumente-Schreibrecht (DECISIONS.md Eintrag 10):
+    // `refuseUploadWithoutDocumentsWrite` steht vor der Pruefung der Anfrage.
 
     const vTitle = str(req.body.title, 'title', { max: MAX_TITLE });
     const vDesc  = str(req.body.description, 'description', { max: MAX_TEXT, required: false });
@@ -582,13 +583,15 @@ router.post('/', async (req, res) => {
     const vGoogle = googleTarget(req.body);
     const vOutlook = outlookTarget(req.body);
     const vLocalCalendar = validateCalendarId(db.get(), req.body.local_calendar_id);
-    // Die Form vor dem Inhalt: `str()` machte aus einer Zahl Text ("5").
-    const shapes = [
-      textShape(req.body.title, 'title'),
-      textShape(req.body.description, 'description', { nullable: true }),
-      textShape(req.body.location, 'location', { nullable: true }),
-    ];
-    const checks = [...shapes, vTitle, vDesc, vStart, vEnd, vColor, vLoc, vRrule, vCaldav, vGoogle, vOutlook, vLocalCalendar];
+    // Eine Person ohne Konto lief bis in den Fremdschluessel von
+    // `event_assignments` (500); dieselbe Pruefung wie an den Vorkommen (#2810).
+    const vAssigned = validateOccurrenceAssignments(db.get(), req.body.assigned_to);
+    // Ein Anhang, den die Route nicht nehmen kann, ist eine 400 vor jedem
+    // Schreiben (#2810); bis dahin warf parseAttachment, und es wurde 500.
+    const vAttachment = parseAttachment(req.body.attachment_data);
+    // Die Form (Text, bei Beschreibung und Ort auch null) prueft das Schema
+    // davor (CalendarEventCreateInput, #2810); `str()` prueft den Inhalt.
+    const checks = [vTitle, vDesc, vStart, vEnd, vColor, vLoc, vRrule, vCaldav, vGoogle, vOutlook, vLocalCalendar, vAssigned, vAttachment];
     if (collectErrors(checks).length) return sendValidationErrors(res, checks);
     if (req.body.local_calendar_id !== undefined
         && ((req.body.external_source && req.body.external_source !== 'local')
@@ -626,9 +629,8 @@ router.post('/', async (req, res) => {
     const userIds  = parseAssignedTo(req.body.assigned_to);
     const firstUid = userIds[0] ?? null;
 
-    const attachment = req.body.attachment_data
-      ? parseAttachment(req.body.attachment_data)
-      : { mime: null, size: null, buffer: null };
+    // Ein Befund ist oben schon eine 400 geworden.
+    const attachment = /** @type {import('./helpers.js').Attachment} */ (vAttachment.value);
     if (attachment.buffer) {
       stagedUpload = await stageDocumentUpload({
         buffer: attachment.buffer,
@@ -722,7 +724,7 @@ router.post('/', async (req, res) => {
       viewer: documentViewer(req),
       database: db.get(),
       actorId: getUserId(req),
-      isAdmin: isAdminUser(req),
+      isAdmin: isAdminRequest(req),
       master: event,
     }) });
 
@@ -740,7 +742,8 @@ router.post('/', async (req, res) => {
       log.error('POST / storage error:', err);
       return sendStorageError(res, err, 'Calendar attachment storage upload failed.');
     }
-    log.error('', err);
+    // Ein unerwarteter Fehler geht an den zentralen Handler (#2810) - aber
+    // erst, wenn der bereitgestellte Anhang wieder weg ist.
     if (stagedUpload) {
       try {
         await cleanupStagedUpload(stagedUpload);
@@ -753,7 +756,7 @@ router.post('/', async (req, res) => {
         );
       }
     }
-    res.status(500).json({ error: 'Internal error.', code: 500 });
+    throw err;
   }
 });
 
@@ -770,8 +773,8 @@ function loadVisibleEvent(id, req) {
   return db.get().prepare(`
     SELECT e.* FROM calendar_events e
     WHERE e.id = ?
-      AND ${icsSubscriptionVisibleWhere('e')}
-      AND ${visibilityWhere('e', 'event_assignments', 'event_id')}
+      AND ${visibleWhere('ics_subscriptions', 'e', '?')}
+      AND ${visibleWhere('events', 'e', '?')}
   `).get(id, me, me, me);
 }
 
@@ -856,15 +859,13 @@ function rejectLinkedOccurrenceResource(res, event, req) {
 // Body: alle Felder optional außer title + start_datetime
 // Response: { data: Event }
 // --------------------------------------------------------
-router.put('/:id', async (req, res) => {
+router.put('/:id', refuseUploadWithoutDocumentsWrite, validateRequest(), async (req, res) => {
   let stagedUpload;
   const stagedClones = [];
   try {
-    // Vor der Suche: die Absage verraet nicht, ob es den Termin gibt.
-    if (attachmentUploadRefused(req)) {
-      return res.status(403).json({ error: ATTACHMENT_UPLOAD_REFUSAL, code: 403, reason: 'ATTACHMENT_UPLOAD_REFUSED' });
-    }
-    const id    = parseInt(req.params.id, 10);
+    // Das Dokumente-Schreibrecht fragt `refuseUploadWithoutDocumentsWrite` vor
+    // der Suche: die Absage verraet nicht, ob es den Termin gibt.
+    const id    = pathId(req);
     const event = loadVisibleEvent(id, req);
     if (!event) return sendEventGone(res);
     if (refuseForeignEvent(req, res, event)) return;
@@ -897,11 +898,10 @@ router.put('/:id', async (req, res) => {
     // Ein mitgeschickter Titel muss Text sein und darf nicht leer sein: eine Zahl
     // lief in `.trim()` auf einen 500, '' wurde gespeichert, und `null` blieb
     // still ohne Wirkung. Fehlt er, bleibt der alte (Kuerzen einer Serie).
-    checks.push(
-      textShape(req.body.title, 'title'),
-      textShape(req.body.description, 'description', { nullable: true }),
-      textShape(req.body.location, 'location', { nullable: true }),
-    );
+    // Die Form von Beschreibung und Ort prueft das Schema davor (#2810); die
+    // des Titels bleibt, weil das Update unten `title.trim()` auf dem Rohwert
+    // ruft (Senke, nicht Route).
+    checks.push(textShape(req.body.title, 'title'));
     if (req.body.title          !== undefined) checks.push(str(req.body.title, 'title', { max: MAX_TITLE, required: typeof req.body.title === 'string' }));
     if (req.body.description    !== undefined) checks.push(str(req.body.description, 'description', { max: MAX_TEXT, required: false }));
     if (vStart) checks.push(vStart);
@@ -944,26 +944,13 @@ router.put('/:id', async (req, res) => {
       ? validateCalendarId(db.get(), req.body.local_calendar_id, { required: true })
       : null;
     if (vLocalCalendar) checks.push(vLocalCalendar);
+    // Eine Person ohne Konto und ein unlesbarer Anhang endeten als 500 (#2810).
+    if (req.body.assigned_to !== undefined) checks.push(validateOccurrenceAssignments(db.get(), req.body.assigned_to));
+    const vAttachment = parseAttachment(req.body.attachment_data);
+    checks.push(vAttachment);
     if (collectErrors(checks).length) return sendValidationErrors(res, checks);
-    if (event.recurrence_rule && req.body.confirmed_orphan_count !== undefined
-        && (!Number.isInteger(req.body.confirmed_orphan_count)
-          || req.body.confirmed_orphan_count < 0)) {
-      return res.status(400).json({
-        error: 'confirmed_orphan_count must be a whole number from 0.',
-        code: 400,
-      });
-    }
     const vIcon = req.body.icon !== undefined ? eventIcon(req.body.icon) : event.icon;
     if (!vIcon) return res.status(400).json({ error: 'icon: invalid calendar event icon.', code: 400 });
-    if (
-      req.body.remove_attachment !== undefined
-      && typeof req.body.remove_attachment !== 'boolean'
-    ) {
-      return res.status(400).json({
-        error: 'remove_attachment must be a boolean.',
-        code: 400,
-      });
-    }
     const {
       title, description,
       all_day, color: colorVal, recurrence_rule,
@@ -1071,8 +1058,9 @@ router.put('/:id', async (req, res) => {
         && storedAttachmentLocked(req, db.get(), event.attachment_document_id)) {
       return res.status(403).json({ error: ATTACHMENT_CHANGE_REFUSAL, code: 403, reason: 'ATTACHMENT_CHANGE_REFUSED' });
     }
+    // Ein Befund ist oben schon eine 400 geworden.
     const attachment = replacementRequested
-      ? parseAttachment(req.body.attachment_data)
+      ? /** @type {import('./helpers.js').Attachment} */ (vAttachment.value)
       : null;
     if (attachment?.buffer) {
       stagedUpload = await stageDocumentUpload({
@@ -1333,7 +1321,7 @@ router.put('/:id', async (req, res) => {
           mayWidenAttachment: rights.mayWidenAttachment,
           seriesId: id,
           actorId: getUserId(req),
-          isAdmin: isAdminUser(req),
+          isAdmin: isAdminRequest(req),
           changes: seriesChanges,
           assignments: assignedTouched ? userIds : undefined,
           confirmedOrphanCount: req.body.confirmed_orphan_count,
@@ -1399,7 +1387,7 @@ router.put('/:id', async (req, res) => {
       viewer: documentViewer(req),
       database: db.get(),
       actorId: getUserId(req),
-      isAdmin: isAdminUser(req),
+      isAdmin: isAdminRequest(req),
       master: updated,
     }) });
 
@@ -1420,7 +1408,8 @@ router.put('/:id', async (req, res) => {
       log.error('PUT /:id storage error:', err);
       return sendStorageError(res, err, 'Calendar attachment storage upload failed.');
     }
-    log.error('', err);
+    // Ein unerwarteter Fehler geht an den zentralen Handler (#2810) - aber
+    // erst, wenn Anhang und Kopien wieder weg sind.
     if (staged.length > 0) {
       try {
         await cleanupCalendarUploads(staged);
@@ -1437,7 +1426,7 @@ router.put('/:id', async (req, res) => {
       return sendStorageError(res, err, 'Calendar attachment storage upload failed.');
     }
     if (err instanceof CalendarOccurrenceError) return sendCalendarOccurrenceError(res, err);
-    res.status(500).json({ error: 'Internal error.', code: 500 });
+    throw err;
   }
 });
 
@@ -1445,19 +1434,16 @@ router.put('/:id', async (req, res) => {
 // PUT /api/v1/calendar/:seriesId/occurrences/:recurrenceId
 // Creates or updates one linked local recurrence replacement atomically.
 // --------------------------------------------------------
-router.put('/:seriesId/occurrences/:recurrenceId', async (req, res) => {
+router.put('/:seriesId/occurrences/:recurrenceId', refuseUploadWithoutDocumentsWrite, validateRequest(), async (req, res) => {
   if (Object.hasOwn(req.body, 'local_calendar_id')) {
     return res.status(400).json({ error: 'Calendar membership applies to the whole series.', code: 400 });
   }
   let stagedUpload;
   try {
-    const seriesId = parseInt(req.params.seriesId, 10);
+    const seriesId = pathId(req, 'seriesId');
     const actorId = getUserId(req);
-    const isAdmin = isAdminUser(req);
-    if (attachmentUploadRefused(req)) {
-      return res.status(403).json({ error: ATTACHMENT_UPLOAD_REFUSAL, code: 403, reason: 'ATTACHMENT_UPLOAD_REFUSED' });
-    }
-    const master = Number.isInteger(seriesId) ? loadVisibleEvent(seriesId, req) : null;
+    const isAdmin = isAdminRequest(req);
+    const master = loadVisibleEvent(seriesId, req);
     if (!master) {
       return sendCalendarOccurrenceError(res, new CalendarOccurrenceError(
         'Calendar series not found.',
@@ -1477,19 +1463,20 @@ router.put('/:seriesId/occurrences/:recurrenceId', async (req, res) => {
     baseOccurrenceFor(master, req.params.recurrenceId, householdTimeZone(db.get()), { ambiguous: 'reject' });
 
     const mutation = validateOccurrenceMutationBody(db.get(), req.body, { master });
-    const { values: validated, errors } = mutation;
+    const { values: validated } = mutation;
+    // Ein Anhang, den die Route nicht nehmen kann, ist eine 400 vor jedem
+    // Hochladen und Schreiben (#2810); bis dahin warf parseAttachment (500).
+    const vAttachment = parseAttachment(req.body.attachment_data);
+    const errors = vAttachment.error ? [...mutation.errors, vAttachment.error] : mutation.errors;
     if (errors.length) return res.status(400).json({ error: errors.join(' '), code: 400 });
 
     const vIcon = req.body.icon !== undefined ? eventIcon(req.body.icon) : undefined;
     if (req.body.icon !== undefined && !vIcon) {
       return res.status(400).json({ error: 'icon: invalid calendar event icon.', code: 400 });
     }
-    if (req.body.remove_attachment !== undefined && typeof req.body.remove_attachment !== 'boolean') {
-      return res.status(400).json({ error: 'remove_attachment must be a boolean.', code: 400 });
-    }
     if (req.body.reminder_offsets !== undefined
         && (!Array.isArray(req.body.reminder_offsets)
-          || req.body.reminder_offsets.length > 5
+          || req.body.reminder_offsets.length > MAX_REMINDER_OFFSETS
           || new Set(req.body.reminder_offsets).size !== req.body.reminder_offsets.length
           || req.body.reminder_offsets.some((value) =>
             !Number.isInteger(value) || value < 0))) {
@@ -1514,8 +1501,9 @@ router.put('/:seriesId/occurrences/:recurrenceId', async (req, res) => {
         && storedAttachmentLocked(req, db.get(), storedOccurrenceAttachmentDocument(db.get(), master, req.params.recurrenceId))) {
       return res.status(403).json({ error: ATTACHMENT_CHANGE_REFUSAL, code: 403, reason: 'ATTACHMENT_CHANGE_REFUSED' });
     }
+    // Ein Befund ist oben schon eine 400 geworden.
     const parsedAttachment = replacementRequested
-      ? parseAttachment(req.body.attachment_data)
+      ? /** @type {import('./helpers.js').Attachment} */ (vAttachment.value)
       : null;
     if (parsedAttachment?.buffer) {
       stagedUpload = await stageDocumentUpload({
@@ -1591,7 +1579,8 @@ router.put('/:seriesId/occurrences/:recurrenceId', async (req, res) => {
     }
     if (err instanceof NonMemberAssignmentError) return sendNonMemberAssignment(res, err, [stagedUpload].filter(Boolean));
     if (err instanceof AttachmentLockedError) return sendAttachmentLocked(res, [stagedUpload].filter(Boolean));
-    log.error('PUT occurrence failed:', err);
+    // Ein unerwarteter Fehler geht an den zentralen Handler (#2810) - aber
+    // erst, wenn der bereitgestellte Anhang wieder weg ist.
     if (stagedUpload) {
       try {
         await cleanupStagedUpload(stagedUpload);
@@ -1605,21 +1594,18 @@ router.put('/:seriesId/occurrences/:recurrenceId', async (req, res) => {
       }
     }
     if (err instanceof CalendarOccurrenceError) return sendCalendarOccurrenceError(res, err);
-    res.status(500).json({ error: 'Internal error.', code: 500 });
+    throw err;
   }
 });
 
-router.put('/:seriesId/occurrences/:recurrenceId/following', async (req, res) => {
+router.put('/:seriesId/occurrences/:recurrenceId/following', refuseUploadWithoutDocumentsWrite, validateRequest(), async (req, res) => {
   let stagedUpload;
   const stagedClones = [];
   try {
-    const seriesId = parseInt(req.params.seriesId, 10);
+    const seriesId = pathId(req, 'seriesId');
     const actorId = getUserId(req);
-    const isAdmin = isAdminUser(req);
-    if (attachmentUploadRefused(req)) {
-      return res.status(403).json({ error: ATTACHMENT_UPLOAD_REFUSAL, code: 403, reason: 'ATTACHMENT_UPLOAD_REFUSED' });
-    }
-    const master = Number.isInteger(seriesId) ? loadVisibleEvent(seriesId, req) : null;
+    const isAdmin = isAdminRequest(req);
+    const master = loadVisibleEvent(seriesId, req);
     if (!master) {
       return sendCalendarOccurrenceError(res, new CalendarOccurrenceError(
         'Calendar series not found.',
@@ -1648,9 +1634,12 @@ router.put('/:seriesId/occurrences/:recurrenceId/following', async (req, res) =>
     const vCaldav = caldavProvided ? caldavTarget(req.body) : null;
     const vGoogle = googleProvided ? googleTarget(req.body) : null;
     const vOutlook = outlookProvided ? outlookTarget(req.body) : null;
+    // Ein Anhang, den die Route nicht nehmen kann, ist eine 400 vor jedem
+    // Hochladen und Schreiben (#2810); bis dahin warf parseAttachment (500).
+    const vAttachment = parseAttachment(req.body.attachment_data);
     const errors = [
       ...mutation.errors,
-      ...[vCaldav, vGoogle, vOutlook].filter(Boolean),
+      ...[vCaldav, vGoogle, vOutlook, vAttachment].filter(Boolean),
       // Ein NEUES Ziel muss angeboten sein; das der Serie kommt durch (#1860).
       ...(vCaldav && !vCaldav.error ? [caldavTargetOffered(db.get(), vCaldav.value, master)] : []),
     ].flatMap((result) => typeof result === 'string' ? [result] : (result.error ? [result.error] : []));
@@ -1665,20 +1654,9 @@ router.put('/:seriesId/occurrences/:recurrenceId/following', async (req, res) =>
     if (req.body.icon !== undefined && !vIcon) {
       return res.status(400).json({ error: 'icon: invalid calendar event icon.', code: 400 });
     }
-    if (req.body.remove_attachment !== undefined && typeof req.body.remove_attachment !== 'boolean') {
-      return res.status(400).json({ error: 'remove_attachment must be a boolean.', code: 400 });
-    }
-    if (req.body.confirmed_orphan_count !== undefined
-        && (!Number.isInteger(req.body.confirmed_orphan_count)
-          || req.body.confirmed_orphan_count < 0)) {
-      return res.status(400).json({
-        error: 'confirmed_orphan_count must be a whole number from 0.',
-        code: 400,
-      });
-    }
     if (req.body.reminder_offsets !== undefined
         && (!Array.isArray(req.body.reminder_offsets)
-          || req.body.reminder_offsets.length > 5
+          || req.body.reminder_offsets.length > MAX_REMINDER_OFFSETS
           || new Set(req.body.reminder_offsets).size !== req.body.reminder_offsets.length
           || req.body.reminder_offsets.some((value) =>
             !Number.isInteger(value) || value < 0))) {
@@ -1710,8 +1688,9 @@ router.put('/:seriesId/occurrences/:recurrenceId/following', async (req, res) =>
         && storedAttachmentLocked(req, db.get(), storedOccurrenceAttachmentDocument(db.get(), master, req.params.recurrenceId))) {
       return res.status(403).json({ error: ATTACHMENT_CHANGE_REFUSAL, code: 403, reason: 'ATTACHMENT_CHANGE_REFUSED' });
     }
+    // Ein Befund ist oben schon eine 400 geworden.
     const parsedAttachment = replacementRequested
-      ? parseAttachment(req.body.attachment_data)
+      ? /** @type {import('./helpers.js').Attachment} */ (vAttachment.value)
       : null;
     if (parsedAttachment?.buffer) {
       stagedUpload = await stageDocumentUpload({
@@ -1810,7 +1789,8 @@ router.put('/:seriesId/occurrences/:recurrenceId/following', async (req, res) =>
     }
     if (err instanceof NonMemberAssignmentError) return sendNonMemberAssignment(res, err, staged);
     if (err instanceof AttachmentLockedError) return sendAttachmentLocked(res, staged);
-    log.error('PUT occurrence following failed:', err);
+    // Ein unerwarteter Fehler geht an den zentralen Handler (#2810) - aber
+    // erst, wenn Anhang und Kopien wieder weg sind.
     if (staged.length > 0) {
       try {
         await cleanupCalendarUploads(staged);
@@ -1826,14 +1806,14 @@ router.put('/:seriesId/occurrences/:recurrenceId/following', async (req, res) =>
       return sendStorageError(res, err, 'Calendar attachment storage upload failed.');
     }
     if (err instanceof CalendarOccurrenceError) return sendCalendarOccurrenceError(res, err);
-    res.status(500).json({ error: 'Internal error.', code: 500 });
+    throw err;
   }
 });
 
-router.delete('/:seriesId/occurrences/:recurrenceId', (req, res) => {
+router.delete('/:seriesId/occurrences/:recurrenceId', validateRequest(), (req, res) => {
   try {
-    const seriesId = parseInt(req.params.seriesId, 10);
-    const master = Number.isInteger(seriesId) ? loadVisibleEvent(seriesId, req) : null;
+    const seriesId = pathId(req, 'seriesId');
+    const master = loadVisibleEvent(seriesId, req);
     if (!master) {
       return sendCalendarOccurrenceError(res, new CalendarOccurrenceError(
         'Calendar series not found.',
@@ -1845,20 +1825,19 @@ router.delete('/:seriesId/occurrences/:recurrenceId', (req, res) => {
       seriesId,
       recurrenceId: req.params.recurrenceId,
       actorId: getUserId(req),
-      isAdmin: isAdminUser(req),
+      isAdmin: isAdminRequest(req),
     });
     res.status(204).end();
   } catch (err) {
     if (err instanceof CalendarOccurrenceError) return sendCalendarOccurrenceError(res, err);
-    log.error('DELETE occurrence failed:', err);
-    res.status(500).json({ error: 'Internal error.', code: 500 });
+    throw err;
   }
 });
 
-router.delete('/:seriesId/occurrences/:recurrenceId/following', (req, res) => {
+router.delete('/:seriesId/occurrences/:recurrenceId/following', validateRequest(), (req, res) => {
   try {
-    const seriesId = parseInt(req.params.seriesId, 10);
-    const master = Number.isInteger(seriesId) ? loadVisibleEvent(seriesId, req) : null;
+    const seriesId = pathId(req, 'seriesId');
+    const master = loadVisibleEvent(seriesId, req);
     if (!master) {
       return sendCalendarOccurrenceError(res, new CalendarOccurrenceError(
         'Calendar series not found.',
@@ -1870,13 +1849,12 @@ router.delete('/:seriesId/occurrences/:recurrenceId/following', (req, res) => {
       seriesId,
       recurrenceId: req.params.recurrenceId,
       actorId: getUserId(req),
-      isAdmin: isAdminUser(req),
+      isAdmin: isAdminRequest(req),
     });
     res.status(204).end();
   } catch (err) {
     if (err instanceof CalendarOccurrenceError) return sendCalendarOccurrenceError(res, err);
-    log.error('DELETE occurrence following failed:', err);
-    res.status(500).json({ error: 'Internal error.', code: 500 });
+    throw err;
   }
 });
 
@@ -1886,66 +1864,60 @@ router.delete('/:seriesId/occurrences/:recurrenceId/following', (req, res) => {
 // Nur Event-Creator, Subscription-Creator oder Admin.
 // Response: { data: { reset: true } }
 // --------------------------------------------------------
-router.post('/:id/reset', (req, res) => {
-  try {
-    const id    = parseInt(req.params.id, 10);
-    if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid ID.', code: 400 });
-    const event = db.get().prepare(`
-      SELECT e.*, s.created_by AS sub_created_by
-      FROM calendar_events e
-      LEFT JOIN ics_subscriptions s ON s.id = e.subscription_id
-      WHERE e.id = ?
-    `).get(id);
-    // Unsichtbar heisst auch hier "gibt es nicht" (wie GET/PUT/DELETE /:id):
-    // sonst verriete die 400 einen fremden privaten Termin und die 403 einen
-    // Termin aus einem fremden ungeteilten Abo, und ein Admin setzte einen
-    // Termin zurueck, den er nicht sieht. Die Rechteregel darunter bleibt.
-    if (!event || !loadVisibleEvent(id, req)) return sendEventGone(res);
-    if (event.external_source !== 'ics')
-      return res.status(400).json({ error: 'Only events from an ICS subscription can be reset.', code: 400 });
+router.post('/:id/reset', validateRequest(), (req, res) => {
+  const id    = pathId(req);
+  const event = db.get().prepare(`
+    SELECT e.*, s.created_by AS sub_created_by
+    FROM calendar_events e
+    LEFT JOIN ics_subscriptions s ON s.id = e.subscription_id
+    WHERE e.id = ?
+  `).get(id);
+  // Unsichtbar heisst auch hier "gibt es nicht" (wie GET/PUT/DELETE /:id):
+  // sonst verriete die 400 einen fremden privaten Termin und die 403 einen
+  // Termin aus einem fremden ungeteilten Abo, und ein Admin setzte einen
+  // Termin zurueck, den er nicht sieht. Die Rechteregel darunter bleibt.
+  if (!event || !loadVisibleEvent(id, req)) return sendEventGone(res);
+  if (event.external_source !== 'ics')
+    return res.status(400).json({ error: 'Only events from an ICS subscription can be reset.', code: 400 });
 
-    const userId  = getUserId(req);
-    const isAdmin = isAdminUser(req);
-    if (!isAdmin && event.created_by !== userId && event.sub_created_by !== userId)
-      return res.status(403).json({ error: 'Not authorized.', code: 403 });
+  const userId  = getUserId(req);
+  const isAdmin = isAdminRequest(req);
+  if (!isAdmin && event.created_by !== userId && event.sub_created_by !== userId)
+    return res.status(403).json({ error: 'Not authorized.', code: 403 });
 
-    // D#2330: der gespeicherte Feed-Stand stellt den Termin sofort her, ohne Netz.
-    // Fehlt er (Altbestand vor Migration 273 oder unlesbar), wird nur das Flag
-    // zurückgenommen und restored=false gemeldet: der nächste Abgleich schreibt
-    // den Stand, bis dahin ist der Reset nicht vollständig.
-    let feed = null;
-    if (event.feed_original) {
-      try { feed = JSON.parse(event.feed_original); } catch { feed = null; }
-    }
-
-    // `color_modified` geht mit: Zurücksetzen heisst "der Feed führt diesen
-    // Termin wieder", und das schliesst seine Farbe ein (#899).
-    db.get().transaction(() => {
-      if (feed) {
-        // Titel und Start sind NOT NULL: fehlt der Wert im Feed-Stand, bleibt der aktuelle.
-        const startDt = feed.start_datetime ?? event.start_datetime;
-        db.get().prepare(`
-          UPDATE calendar_events
-          SET user_modified = 0, color_modified = 0,
-              title = ?, description = ?, start_datetime = ?, end_datetime = ?,
-              all_day = ?, location = ?, color = ?
-          WHERE id = ?
-        `).run(
-          feed.title ?? event.title, feed.description ?? null, startDt, feed.end_datetime ?? null,
-          feed.all_day ? 1 : 0, feed.location ?? null, feed.color ?? null, id,
-        );
-        // Ein verlegter Start zieht die Erinnerungen mit, wie beim Abgleich (#1377).
-        if (startDt !== event.start_datetime)
-          followInboundStartChange(db.get(), id, event.start_datetime, startDt);
-      } else {
-        db.get().prepare('UPDATE calendar_events SET user_modified = 0, color_modified = 0 WHERE id = ?').run(id);
-      }
-    })();
-    res.json({ data: { reset: true, restored: feed !== null } });
-  } catch (err) {
-    log.error('', err);
-    res.status(500).json({ error: 'Internal error.', code: 500 });
+  // D#2330: der gespeicherte Feed-Stand stellt den Termin sofort her, ohne Netz.
+  // Fehlt er (Altbestand vor Migration 273 oder unlesbar), wird nur das Flag
+  // zurückgenommen und restored=false gemeldet: der nächste Abgleich schreibt
+  // den Stand, bis dahin ist der Reset nicht vollständig.
+  let feed = null;
+  if (event.feed_original) {
+    try { feed = JSON.parse(event.feed_original); } catch { feed = null; }
   }
+
+  // `color_modified` geht mit: Zurücksetzen heisst "der Feed führt diesen
+  // Termin wieder", und das schliesst seine Farbe ein (#899).
+  db.get().transaction(() => {
+    if (feed) {
+      // Titel und Start sind NOT NULL: fehlt der Wert im Feed-Stand, bleibt der aktuelle.
+      const startDt = feed.start_datetime ?? event.start_datetime;
+      db.get().prepare(`
+        UPDATE calendar_events
+        SET user_modified = 0, color_modified = 0,
+            title = ?, description = ?, start_datetime = ?, end_datetime = ?,
+            all_day = ?, location = ?, color = ?
+        WHERE id = ?
+      `).run(
+        feed.title ?? event.title, feed.description ?? null, startDt, feed.end_datetime ?? null,
+        feed.all_day ? 1 : 0, feed.location ?? null, feed.color ?? null, id,
+      );
+      // Ein verlegter Start zieht die Erinnerungen mit, wie beim Abgleich (#1377).
+      if (startDt !== event.start_datetime)
+        followInboundStartChange(db.get(), id, event.start_datetime, startDt);
+    } else {
+      db.get().prepare('UPDATE calendar_events SET user_modified = 0, color_modified = 0 WHERE id = ?').run(id);
+    }
+  })();
+  res.json({ data: { reset: true, restored: feed !== null } });
 });
 
 // --------------------------------------------------------
@@ -1959,10 +1931,9 @@ router.post('/:id/reset', (req, res) => {
 // Nur lokale (nicht extern synchronisierte) wiederkehrende Termine.
 // Response: 201 { data: { event_id, exception_date } }
 // --------------------------------------------------------
-router.post('/:id/exceptions', (req, res) => {
+router.post('/:id/exceptions', validateRequest(), (req, res) => {
   try {
-    const id = parseInt(req.params.id, 10);
-    if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid ID.', code: 400 });
+    const id = pathId(req);
 
     const requested = req.body?.recurrence_id ?? req.body?.date;
     // Beide Formfehler tragen einen Grund (#1909-Muster): der Browser sagt dazu
@@ -2005,8 +1976,7 @@ router.post('/:id/exceptions', (req, res) => {
     res.status(201).json({ data: { event_id: id, exception_date: exceptionKey, recurrence_id: exceptionKey } });
   } catch (err) {
     if (err instanceof CalendarOccurrenceError) return sendCalendarOccurrenceError(res, err);
-    log.error('', err);
-    res.status(500).json({ error: 'Internal error.', code: 500 });
+    throw err;
   }
 });
 
@@ -2017,50 +1987,46 @@ router.post('/:id/exceptions', (req, res) => {
 // mitsamt der Google-Event-ID weg), ausgeführt asynchron nach der Antwort.
 // Response: 204 No Content
 // --------------------------------------------------------
-router.delete('/:id', (req, res) => {
-  try {
-    const id    = parseInt(req.params.id, 10);
-    const event = loadVisibleEvent(id, req);
-    if (!event) return sendEventGone(res);
-    if (refuseForeignEvent(req, res, event)) return;
-    if (rejectLinkedOccurrenceResource(res, event, req)) return;
-    const queued = queueEventDeletion(event);
+router.delete('/:id', validateRequest(), (req, res) => {
+  const id    = pathId(req);
+  const event = loadVisibleEvent(id, req);
+  if (!event) return sendEventGone(res);
+  if (refuseForeignEvent(req, res, event)) return;
+  if (rejectLinkedOccurrenceResource(res, event, req)) return;
+  const queued = queueEventDeletion(event);
 
-    // Die Erinnerungen abzuraeumen ist seit Migration v217 Sache eines
-    // AFTER-DELETE-Triggers auf `calendar_events` - dieser Block hier ist
-    // seitdem der Guertel zum Hosentraeger und findet im Normalfall nichts
-    // mehr. Er bleibt stehen, weil er die Absicht an der Stelle ausspricht, an
-    // der sie entsteht; die Regel selbst darf nur nicht in dieser Route WOHNEN
-    // (Google-/ICS-/CalDAV-Sync und calendar-prune.js loeschen Termine ohne je
-    // hier vorbeizukommen).
-    const result = db.get().transaction(() => {
-      const ownedIds = db.get().prepare(`
-        SELECT id FROM calendar_events
-        WHERE id = ? OR recurrence_parent_id = ?
-      `).all(id, id).map((row) => Number(row.id));
-      if (ownedIds.length) {
-        db.get().prepare(`
-          DELETE FROM reminders
-          WHERE entity_type = 'event'
-            AND entity_id IN (${ownedIds.map(() => '?').join(',')})
-        `).run(...ownedIds);
-      }
-      return db.get().prepare('DELETE FROM calendar_events WHERE id = ?').run(id);
-    })();
-    if (result.changes === 0) return sendEventGone(res);
-
-    res.status(204).end();
-
-    // Bewusst nach der Antwort: der Provider-Aufruf darf das lokale Löschen weder
-    // verzögern noch scheitern lassen. Schlägt er fehl, bleibt der Tombstone
-    // liegen und der nächste Sync-Lauf holt die Löschung nach.
-    if (queued) {
-      flushOutbound()
-        .catch((err) => log.warn('Löschung vorgemerkt, Sofortversuch fehlgeschlagen:', err.message));
+  // Die Erinnerungen abzuraeumen ist seit Migration v217 Sache eines
+  // AFTER-DELETE-Triggers auf `calendar_events` - dieser Block hier ist
+  // seitdem der Guertel zum Hosentraeger und findet im Normalfall nichts
+  // mehr. Er bleibt stehen, weil er die Absicht an der Stelle ausspricht, an
+  // der sie entsteht; die Regel selbst darf nur nicht in dieser Route WOHNEN
+  // (Google-/ICS-/CalDAV-Sync und calendar-prune.js loeschen Termine ohne je
+  // hier vorbeizukommen).
+  const result = db.get().transaction(() => {
+    const ownedIds = db.get().prepare(`
+      SELECT id FROM calendar_events
+      WHERE id = ? OR recurrence_parent_id = ?
+    `).all(id, id).map((row) => Number(row.id));
+    if (ownedIds.length) {
+      const ownedList = sqlInList(ownedIds);
+      db.get().prepare(`
+        DELETE FROM reminders
+        WHERE entity_type = 'event'
+          AND entity_id IN (${ownedList.sql})
+      `).run(ownedList.param);
     }
-  } catch (err) {
-    log.error('', err);
-    res.status(500).json({ error: 'Internal error.', code: 500 });
+    return db.get().prepare('DELETE FROM calendar_events WHERE id = ?').run(id);
+  })();
+  if (result.changes === 0) return sendEventGone(res);
+
+  res.status(204).end();
+
+  // Bewusst nach der Antwort: der Provider-Aufruf darf das lokale Löschen weder
+  // verzögern noch scheitern lassen. Schlägt er fehl, bleibt der Tombstone
+  // liegen und der nächste Sync-Lauf holt die Löschung nach.
+  if (queued) {
+    flushOutbound()
+      .catch((err) => log.warn('Löschung vorgemerkt, Sofortversuch fehlgeschlagen:', err.message));
   }
 });
 
