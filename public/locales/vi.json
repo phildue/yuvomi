@@ -63,6 +63,7 @@
         "errorOffline": "Không có kết nối mạng. Vui lòng kiểm tra mạng của bạn.",
         "errorModuleNoAccess": "Bạn không có quyền truy cập mô-đun này.",
         "errorNoPermission": "Bạn không có quyền thực hiện thao tác này.",
+        "errorSyncTargetRequired": "Mọi thứ ở đây đều được đồng bộ. Hãy chọn một lịch hoặc danh sách, hoặc đặt mục tiêu mặc định trong phần cài đặt.",
         "errorFormExpired": "Trang đã mở quá lâu. Hãy tải lại trang và thử lại.",
         "unknownAddress": "Địa chỉ này không tồn tại. Thay vào đó, trang gần nhất được hiển thị.",
         "errorNotFound": "Không tìm thấy mục nhập.",

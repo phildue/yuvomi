@@ -63,6 +63,7 @@
         "errorOffline": "Nincs internetkapcsolat. Ellenőrizze a hálózati kapcsolatot.",
         "errorModuleNoAccess": "Nincs hozzáférésed ehhez a modulhoz.",
         "errorNoPermission": "Ehhez nincs jogosultságod.",
+        "errorSyncTargetRequired": "Itt minden szinkronizálva van. Válassz naptárat vagy listát, vagy állíts be alapértelmezett célt a beállításokban.",
         "errorFormExpired": "Az oldal túl sokáig volt nyitva. Töltsd újra, és próbáld meg még egyszer.",
         "unknownAddress": "Ez a cím nem létezik. Helyette a legközelebbi oldalt látod.",
         "errorNotFound": "A bejegyzés nem található.",

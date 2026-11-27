@@ -63,6 +63,7 @@
         "errorOffline": "Geen internetverbinding. Controleer uw netwerk.",
         "errorModuleNoAccess": "Je hebt geen toegang tot deze module.",
         "errorNoPermission": "Je hebt hiervoor geen toestemming.",
+        "errorSyncTargetRequired": "Hier wordt alles gesynchroniseerd. Kies een agenda of lijst, of stel in de instellingen een standaarddoel in.",
         "errorFormExpired": "De pagina heeft te lang opengestaan. Laad de pagina opnieuw en probeer het nog eens.",
         "unknownAddress": "Dit adres bestaat niet. Je ziet in plaats daarvan de dichtstbijzijnde pagina.",
         "errorNotFound": "De vermelding is niet gevonden.",

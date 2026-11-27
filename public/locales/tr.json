@@ -63,6 +63,7 @@
         "errorOffline": "İnternet bağlantısı yok. Lütfen ağınızı kontrol edin.",
         "errorModuleNoAccess": "Bu modüle erişiminiz yok.",
         "errorNoPermission": "Bunu yapmak için yetkiniz yok.",
+        "errorSyncTargetRequired": "Burada her şey eşzamanlanır. Bir takvim veya liste seçin ya da ayarlarda varsayılan bir hedef belirleyin.",
         "errorFormExpired": "Sayfa çok uzun süre açık kaldı. Sayfayı yeniden yükleyip tekrar deneyin.",
         "unknownAddress": "Bu adres mevcut değil. Bunun yerine en yakın sayfa gösteriliyor.",
         "errorNotFound": "Kayıt bulunamadı.",

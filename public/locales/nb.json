@@ -63,6 +63,7 @@
         "errorOffline": "Ingen internettforbindelse. Vennligst sjekk nettverket ditt.",
         "errorModuleNoAccess": "Du har ikke tilgang til denne modulen.",
         "errorNoPermission": "Du har ikke tillatelse til å gjøre dette.",
+        "errorSyncTargetRequired": "Alt synkroniseres her. Velg en kalender eller liste, eller angi et standardmål i innstillingene.",
         "errorFormExpired": "Siden har vært åpen for lenge. Last den inn på nytt og prøv igjen.",
         "unknownAddress": "Denne adressen finnes ikke. Du ser den nærmeste siden i stedet.",
         "errorNotFound": "Oppføringen ble ikke funnet.",

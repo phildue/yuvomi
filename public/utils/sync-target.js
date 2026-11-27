@@ -173,3 +173,32 @@ export function assigneeSyncTarget(targets, assigneeIds) {
   const severalAssignees = ids.length > 1 && calendars.some(({ set }) => set.some((id) => wanted.has(id)));
   return { value: null, ambiguous: false, severalAssignees };
 }
+
+/**
+ * Fork: "Sync erforderlich" - darf ein Formular "lokal speichern" anbieten?
+ *
+ * Mit dem Schalter AUS immer. Mit dem Schalter AN nicht fuer einen neuen
+ * Eintrag und nicht fuer einen, der schon ein Ziel traegt (er zieht nicht auf
+ * lokal um). Ein schon lokaler Eintrag behaelt die Wahl: wer ihn nur umbenennt,
+ * darf nicht gezwungen werden, ihn zu verschieben.
+ *
+ * @param {{requireSync: boolean, isNew: boolean, hasTarget: boolean}} state
+ * @returns {boolean}
+ */
+export function localChoiceAllowed({ requireSync, isNew, hasTarget }) {
+  return !requireSync || (!isNew && !hasTarget);
+}
+
+/**
+ * Fork: die Vorauswahl eines NEUEN Eintrags - das erste Ziel aus den
+ * Kandidaten (eigenes Standardziel, dann Haushaltsziel), das die Auswahl auch
+ * anbietet. Ein nicht mehr angebotenes wird uebersprungen, genau wie auf dem
+ * Server.
+ *
+ * @param {Array<string | null | undefined>} candidates
+ * @param {string[]} offered  die Werte der Optionen
+ * @returns {string} '' wenn keines in Frage kommt
+ */
+export function pickDefaultSyncTarget(candidates, offered) {
+  return candidates.find((value) => value && offered.includes(value)) || '';
+}

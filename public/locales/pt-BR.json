@@ -63,6 +63,7 @@
         "errorOffline": "Sem conexão com a internet. Por favor, verifique a sua rede.",
         "errorModuleNoAccess": "Não tem acesso a este módulo.",
         "errorNoPermission": "Você não tem permissão para fazer isso.",
+        "errorSyncTargetRequired": "Aqui tudo é sincronizado. Escolha um calendário ou uma lista, ou defina um destino padrão nas configurações.",
         "errorFormExpired": "A página ficou aberta por tempo demais. Recarregue-a e tente novamente.",
         "unknownAddress": "Este endereço não existe. A página mais próxima é exibida no lugar.",
         "errorNotFound": "O registro não foi encontrado.",

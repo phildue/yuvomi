@@ -64,6 +64,7 @@
         "errorOffline": "Žádné připojení k internetu. Zkontrolujte prosím síť.",
         "errorModuleNoAccess": "K tomuto modulu nemáte přístup.",
         "errorNoPermission": "K tomu nemáte oprávnění.",
+        "errorSyncTargetRequired": "Zde se synchronizuje vše. Vyberte kalendář nebo seznam, nebo nastavte výchozí cíl v nastavení.",
         "errorFormExpired": "Stránka byla otevřená příliš dlouho. Načtěte ji znovu a zkuste to ještě jednou.",
         "unknownAddress": "Tato adresa neexistuje. Místo ní vidíte nejbližší stránku.",
         "errorNotFound": "Záznam nebyl nalezen.",

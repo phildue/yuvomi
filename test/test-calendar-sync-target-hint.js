@@ -68,6 +68,12 @@ class FakeEl {
     };
   }
 
+  /** Wie Element.remove(): aus dem Elternknoten nehmen (der Dialog entfernt "Lokal", Fork). */
+  remove() {
+    if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this);
+    this.parent = null;
+  }
+
   get options() { return this.tagName === 'SELECT' ? this.querySelectorAll('option') : undefined; }
 
   get value() {
@@ -547,4 +553,70 @@ test('#1840: ein gespeichertes CalDAV-Ziel, das die Liste nicht mehr nennt, blei
   const panel = await openForm({ mode: 'edit', event });
   assert.equal(target(panel), `caldav:4|${sharedUrl}`, 'das gespeicherte Ziel bleibt gewaehlt');
   assert.equal(panel.querySelectorAll('option').filter((o) => o.value === `caldav:4|${sharedUrl}`).length, 1);
+});
+
+// ── Fork: "Sync erforderlich" im Termin-Dialog ───────────────────────────────
+
+const offered = (panel) => panel.querySelector('#event-sync-target').options.map((o) => o.value);
+async function withRequiredSync(household, run) {
+  calendar.state.requireSync = true;
+  calendar.state.householdSyncTarget = household;
+  try { await run(); } finally {
+    calendar.state.requireSync = false;
+    calendar.state.householdSyncTarget = '';
+  }
+}
+
+test('Sync erforderlich: ein neuer Termin bietet "Lokal" nicht an und waehlt den eigenen Standard', async () => {
+  await withRequiredSync('', async () => {
+    const panel = await openForm({ defaultTarget: LEO });
+    assert.ok(!offered(panel).includes(''), 'keine Option "Lokal speichern"');
+    assert.equal(target(panel), LEO);
+  });
+});
+
+test('Sync erforderlich: ohne eigenen Standard gilt das Haushaltsziel', async () => {
+  await withRequiredSync(LEO, async () => {
+    const panel = await openForm({ defaultTarget: '' });
+    assert.equal(target(panel), LEO);
+  });
+});
+
+test('Sync erforderlich: ein nicht angebotener eigener Standard wird uebersprungen', async () => {
+  await withRequiredSync(LEO, async () => {
+    const panel = await openForm({ defaultTarget: 'caldav:9|https://gone.example.org/' });
+    assert.equal(target(panel), LEO);
+  });
+});
+
+test('Sync erforderlich: ohne jeden Standard steht das erste Ziel da, die Auswahl bleibt nicht leer', async () => {
+  await withRequiredSync('', async () => {
+    const panel = await openForm({ defaultTarget: '' });
+    assert.equal(target(panel), EMMA, 'das erste angebotene Ziel');
+  });
+});
+
+test('Sync erforderlich: ein schon lokaler Termin behaelt "Lokal" und bleibt dort', async () => {
+  const event = {
+    id: 21, title: 'Alt', start_datetime: '2026-10-02T19:00', end_datetime: '2026-10-02T20:00',
+    all_day: 0, created_by: 1, recurrence_rule: null, assigned_users: [],
+  };
+  await withRequiredSync(LEO, async () => {
+    const panel = await openForm({ mode: 'edit', event });
+    assert.ok(offered(panel).includes(''), 'die Option "Lokal speichern" bleibt');
+    assert.equal(target(panel), '');
+  });
+});
+
+test('Sync erforderlich: ein Termin mit Ziel bietet "Lokal" nicht mehr an', async () => {
+  const event = {
+    id: 22, title: 'Synchron', start_datetime: '2026-10-02T19:00', end_datetime: '2026-10-02T20:00',
+    all_day: 0, created_by: 1, recurrence_rule: null, assigned_users: [],
+    target_caldav_account_id: 4, target_caldav_calendar_url: 'https://dav.example.org/cal/leo/',
+  };
+  await withRequiredSync('', async () => {
+    const panel = await openForm({ mode: 'edit', event });
+    assert.ok(!offered(panel).includes(''));
+    assert.equal(target(panel), LEO);
+  });
 });

@@ -63,6 +63,7 @@
         "errorOffline": "Ingen internetanslutning. Kontrollera ditt nätverk.",
         "errorModuleNoAccess": "Du har inte åtkomst till denna modul.",
         "errorNoPermission": "Du har inte behörighet att göra detta.",
+        "errorSyncTargetRequired": "Här synkroniseras allt. Välj en kalender eller lista, eller ange ett standardmål i inställningarna.",
         "errorFormExpired": "Sidan har varit öppen för länge. Ladda om den och försök igen.",
         "unknownAddress": "Den här adressen finns inte. Du ser den närmaste sidan i stället.",
         "errorNotFound": "Posten hittades inte.",

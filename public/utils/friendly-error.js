@@ -39,6 +39,9 @@ export const REFUSAL_MESSAGES = new Map([
   ['reorder_not_allowed', 'tasks.errorReorderNotAllowed'],
   // Die eine Absage jedes Admin-Gates (Phase 2, C2): derselbe Satz wie ohne Grund.
   ['admin_required', 'common.errorNoPermission'],
+  // Fork: "Sync erforderlich" - ein neuer Termin oder eine neue Aufgabe braucht ein
+  // Ziel, und keines ist verfuegbar (server/services/sync-required.js).
+  ['sync_target_required', 'common.errorSyncTargetRequired'],
 ]);
 
 /**

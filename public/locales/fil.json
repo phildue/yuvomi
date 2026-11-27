@@ -63,6 +63,7 @@
         "errorOffline": "Walang koneksyon sa internet. Pakisuri ang iyong network.",
         "errorModuleNoAccess": "Wala kang access sa modyul na ito.",
         "errorNoPermission": "Wala kang pahintulot na gawin iyon.",
+        "errorSyncTargetRequired": "Lahat dito ay naka-sync. Pumili ng kalendaryo o listahan, o magtakda ng default na target sa mga setting.",
         "errorFormExpired": "Masyadong matagal na nakabukas ang pahina. I-reload ito at subukang muli.",
         "unknownAddress": "Walang ganitong address. Ang pinakamalapit na pahina ang ipinapakita sa halip.",
         "errorNotFound": "Hindi natagpuan ang entry.",

@@ -63,6 +63,7 @@
         "errorOffline": "Tidak ada koneksi internet. Harap periksa jaringan Anda.",
         "errorModuleNoAccess": "Anda tidak memiliki akses ke modul ini.",
         "errorNoPermission": "Anda tidak memiliki izin untuk melakukan itu.",
+        "errorSyncTargetRequired": "Semua di sini disinkronkan. Pilih kalender atau daftar, atau tetapkan target default di pengaturan.",
         "errorFormExpired": "Halaman terlalu lama terbuka. Muat ulang halaman lalu coba lagi.",
         "unknownAddress": "Alamat ini tidak ada. Sebagai gantinya, halaman terdekat ditampilkan.",
         "errorNotFound": "Entri tidak ditemukan.",

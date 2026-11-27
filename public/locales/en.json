@@ -63,6 +63,7 @@
         "errorOffline": "No internet connection. Please check your network.",
         "errorModuleNoAccess": "You do not have access to this module.",
         "errorNoPermission": "You do not have permission to do that.",
+        "errorSyncTargetRequired": "Everything here is synced. Choose a calendar or list, or set a default in the settings.",
         "errorFormExpired": "The page was open for too long. Reload it and try again.",
         "unknownAddress": "That address does not exist. You are seeing the closest page instead.",
         "errorNotFound": "The entry was not found.",

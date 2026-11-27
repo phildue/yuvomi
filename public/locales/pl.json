@@ -65,6 +65,7 @@
         "errorOffline": "Brak połączenia z internetem. Sprawdź sieć.",
         "errorModuleNoAccess": "Nie masz dostępu do tego modułu.",
         "errorNoPermission": "Nie masz do tego uprawnień.",
+        "errorSyncTargetRequired": "Tutaj wszystko jest synchronizowane. Wybierz kalendarz lub listę albo ustaw domyślny cel w ustawieniach.",
         "errorFormExpired": "Strona była otwarta zbyt długo. Załaduj ją ponownie i spróbuj jeszcze raz.",
         "unknownAddress": "Ten adres nie istnieje. Zamiast niego widzisz najbliższą stronę.",
         "errorNotFound": "Wpis nie został znaleziony.",

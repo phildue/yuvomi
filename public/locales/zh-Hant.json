@@ -63,6 +63,7 @@
         "errorOffline": "無網路連線。請檢查您的網路。",
         "errorModuleNoAccess": "您沒有此模組的存取權限。",
         "errorNoPermission": "您沒有執行此操作的權限。",
+        "errorSyncTargetRequired": "這裡的所有內容都會同步。請選擇行事曆或清單，或在設定中指定預設目標。",
         "errorFormExpired": "頁面開啟時間過長。請重新載入後再試一次。",
         "unknownAddress": "此網址不存在。已為您顯示最接近的頁面。",
         "errorNotFound": "未找到該條目。",
