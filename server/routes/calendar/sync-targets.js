@@ -100,7 +100,7 @@ async function listCaldavTargets() {
  * holt nach dem Reconnect nach.
  * @returns {Array<{accountId: number, accountName: string, calendarId: string, calendarName: string}>}
  */
-function listOutlookTargets() {
+export function listOutlookTargets() {
   const targets = [];
   for (const account of outlookCalendar.listAccounts()) {
     for (const cal of outlookCalendar.listCalendarSelection(account.id)) {

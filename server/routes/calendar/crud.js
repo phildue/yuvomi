@@ -64,6 +64,8 @@ import {
 import { isAdminRequest } from '../../middleware/require-admin.js';
 import { parseSyncTargetValue } from '../../../public/utils/sync-target.js';
 import { isSyncRequired, targetCandidates, SYNC_TARGET_REQUIRED } from '../../services/sync-required.js';
+import * as googleCalendar from '../../services/google-calendar.js';
+import { listOutlookTargets } from './sync-targets.js';
 import {
   ASSIGNED_USERS_SQL,
   getUserId,
@@ -85,6 +87,27 @@ import {
 
 const log = createLogger('Calendar');
 const router = express.Router();
+
+/**
+ * Fork: nimmt dieses Google- oder Outlook-Ziel jetzt neue Termine an? Wie bei
+ * CalDAV (`caldavTargetOffered`) entscheidet der gespeicherte Stand, nicht das
+ * Netz: ein Google-Ziel muss verbunden, nicht im Nur-Lesen-Modus und in der
+ * Auswahl aktiviert sein, ein Outlook-Ziel steht in der Liste der aktivierten,
+ * beschreibbaren Kalender (dieselbe wie `GET /calendar/sync-targets`). Ein
+ * Aufruf gegen die Google-API wuerde das Anlegen bei einer Stoerung dort
+ * blockieren; ob Google den Kalender beschreibbar nennt, prueft der Upload.
+ *
+ * @param {{kind: 'google', calendarId: string} | {kind: 'outlook', accountId: number, calendarId: string}} parsed
+ * @returns {boolean}
+ */
+function nonCaldavTargetOffered(parsed) {
+  if (parsed.kind === 'google') {
+    const status = googleCalendar.getStatus();
+    return Boolean(status.connected) && !status.readonly && !status.needsReauth
+      && googleCalendar.listSelection().some((cal) => cal.calendar_id === parsed.calendarId && cal.enabled);
+  }
+  return listOutlookTargets().some((cal) => cal.accountId === parsed.accountId && cal.calendarId === parsed.calendarId);
+}
 
 /**
  * Fork: "Sync erforderlich" - das Ziel eines NEUEN Termins.
@@ -115,6 +138,7 @@ function fillDefaultEventTarget(req, userId) {
   for (const candidate of targetCandidates(db.get(), 'calendar', userId)) {
     const parsed = parseSyncTargetValue(candidate);
     if (!parsed || parsed.kind === 'local') continue;
+    if (parsed.kind !== 'caldav' && !nonCaldavTargetOffered(parsed)) continue;
     const trial = {
       target_caldav_account_id: null, target_caldav_calendar_url: null, target_google_calendar_id: null,
       target_outlook_account_id: null, target_outlook_calendar_id: null,
@@ -1093,6 +1117,17 @@ router.put('/:id', refuseUploadWithoutDocumentsWrite, validateRequest(), async (
       return res.status(400).json({ error: SERIES_ENDS_BEFORE_START, code: 400, reason: 'calendar_series_ends_before_start' });
     }
 
+    // Fork: mit "Sync erforderlich" zieht ein Termin mit Ziel nicht auf lokal um.
+    // Ein schon lokaler Termin bleibt bearbeitbar (er verliert nichts). Wie jede
+    // Abweisung VOR dem Staging (siehe unten): aus den schon geprueften Zielen.
+    if ((event.target_caldav_account_id || event.target_google_calendar_id || event.target_outlook_account_id)
+        && !((vCaldav ? vCaldav.value.accountId : event.target_caldav_account_id)
+          || (vGoogle ? vGoogle.value : event.target_google_calendar_id)
+          || (vOutlook ? vOutlook.value.accountId : event.target_outlook_account_id))
+        && isSyncRequired(db.get())) {
+      return res.status(400).json({ ...SYNC_TARGET_REQUIRED });
+    }
+
     // JEDE ABWEISUNG GEHOERT VOR DAS STAGING. Ab hier laedt
     // `stageDocumentUpload` den Anhang in den Speicher (lokaler Ordner, WebDAV
     // oder Cloud); aufgeraeumt wird er nur im catch-Block ganz unten. Ein
@@ -1197,13 +1232,6 @@ router.put('/:id', refuseUploadWithoutDocumentsWrite, validateRequest(), async (
     const outlookCalendarId = vOutlook ? vOutlook.value.calendarId : event.target_outlook_calendar_id;
     if (localCalendarProvided && (caldavAccountId || googleTargetId)) {
       return res.status(400).json({ error: 'Choose either a sync target or a local calendar.', code: 400 });
-    }
-    // Fork: mit "Sync erforderlich" zieht ein Termin mit Ziel nicht auf lokal um.
-    // Ein schon lokaler Termin bleibt bearbeitbar (er verliert nichts).
-    if ((event.target_caldav_account_id || event.target_google_calendar_id || event.target_outlook_account_id)
-        && !(caldavAccountId || googleTargetId || outlookAccountId)
-        && isSyncRequired(db.get())) {
-      return res.status(400).json({ ...SYNC_TARGET_REQUIRED });
     }
     const localCalendarId = (caldavAccountId || googleTargetId) ? null
       : vLocalCalendar ? vLocalCalendar.value : event.local_calendar_id;

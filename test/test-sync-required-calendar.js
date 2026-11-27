@@ -14,6 +14,8 @@ process.env.DB_PATH = ':memory:';
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readdirSync } from 'node:fs';
+import { tempDir } from './tmp-dir.js';
 
 const dbmod = await import('../server/db.js');
 const db = dbmod.get();
@@ -64,9 +66,11 @@ const EVENT = (extra = {}) => ({ title: 'Termin', start_datetime: '2026-12-01T10
 function reset({ switchOn }) {
   for (const table of [
     'calendar_pending_deletions', 'calendar_events', 'caldav_calendar_selection', 'caldav_accounts',
-    'local_calendars',
+    'local_calendars', 'google_calendar_selection', 'outlook_calendar_selection', 'outlook_accounts',
   ]) db.prepare(`DELETE FROM ${table}`).run();
-  db.prepare("DELETE FROM sync_config WHERE key LIKE 'calendar_%target%' OR key = 'sync_required'").run();
+  db.prepare(
+    "DELETE FROM sync_config WHERE key LIKE 'calendar_%target%' OR key IN ('sync_required', 'google_access_token', 'google_refresh_token', 'google_readonly')"
+  ).run();
   accountId = Number(db.prepare(
     "INSERT INTO caldav_accounts (name, caldav_url, username, password) VALUES ('Fake', 'http://dav.invalid/', 'u', 'p')"
   ).run().lastInsertRowid);
@@ -116,13 +120,80 @@ test('AN: ohne eigenes Standardziel greift das Haushaltsziel', async () => {
   assert.equal(row(res.body.data.id).target_caldav_calendar_url, CAL_B);
 });
 
-test('AN: das Haushaltsziel darf auch ein Google-Kalender sein (anbieterunabhaengig)', async () => {
+const GOOGLE = 'familie@example.com';
+/** Ein verbundenes Google-Konto mit diesem Kalender in der Auswahl (kein Netz noetig). */
+function connectGoogle({ enabled = 1 } = {}) {
+  cfg('google_access_token', 'access');
+  cfg('google_refresh_token', 'token');
+  db.prepare('INSERT INTO google_calendar_selection (calendar_id, name, enabled) VALUES (?, ?, ?)').run(GOOGLE, 'Familie', enabled);
+}
+
+test('AN: das Haushaltsziel darf auch ein verbundener, aktivierter Google-Kalender sein (anbieterunabhaengig)', async () => {
   reset({ switchOn: true });
-  cfg('calendar_household_target', 'google:familie@example.com');
+  connectGoogle();
+  cfg('calendar_household_target', `google:${GOOGLE}`);
   const res = await api('POST', '/calendar', EVENT());
   assert.equal(res.status, 201, JSON.stringify(res.body));
-  assert.equal(row(res.body.data.id).target_google_calendar_id, 'familie@example.com');
+  assert.equal(row(res.body.data.id).target_google_calendar_id, GOOGLE);
   assert.equal(row(res.body.data.id).target_caldav_calendar_url, null);
+});
+
+test('AN: ein Google-Standard ohne Verbindung wird uebersprungen, nicht still gespeichert', async () => {
+  reset({ switchOn: true });
+  cfg('calendar_household_target', `google:${GOOGLE}`);
+  const res = await api('POST', '/calendar', EVENT());
+  assert.equal(res.status, 400);
+  assert.equal(res.body.reason, 'sync_target_required');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM calendar_events').get().n, 0);
+});
+
+test('AN: ein abgewaehlter Google-Kalender wird uebersprungen, der naechste Kandidat gilt', async () => {
+  reset({ switchOn: true });
+  connectGoogle({ enabled: 0 });
+  cfg(`calendar_default_target:user:${userId}`, `google:${GOOGLE}`);
+  cfg('calendar_household_target', target(CAL_A));
+  const res = await api('POST', '/calendar', EVENT());
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  assert.equal(row(res.body.data.id).target_caldav_calendar_url, CAL_A);
+  assert.equal(row(res.body.data.id).target_google_calendar_id, null);
+});
+
+test('AN: Google im Nur-Lesen-Modus nimmt keine neuen Termine an -> uebersprungen', async () => {
+  reset({ switchOn: true });
+  connectGoogle();
+  cfg('google_readonly', '1');
+  cfg('calendar_household_target', `google:${GOOGLE}`);
+  assert.equal((await api('POST', '/calendar', EVENT())).status, 400);
+});
+
+function outlookCalendar({ canEdit }) {
+  const account = Number(db.prepare(
+    "INSERT INTO outlook_accounts (name, access_token, refresh_token) VALUES ('MS', 'a', 'r')"
+  ).run().lastInsertRowid);
+  db.prepare(`
+    INSERT INTO outlook_calendar_selection (account_id, calendar_id, calendar_name, can_edit, enabled)
+    VALUES (?, 'cal-1', 'Outlook', ?, 1)
+  `).run(account, canEdit);
+  return account;
+}
+
+test('AN: ein angebotener Outlook-Kalender als Haushaltsziel wird gesetzt', async () => {
+  reset({ switchOn: true });
+  const account = outlookCalendar({ canEdit: 1 });
+  cfg('calendar_household_target', `outlook:${account}|cal-1`);
+  const res = await api('POST', '/calendar', EVENT());
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  assert.equal(row(res.body.data.id).target_outlook_account_id, account);
+  assert.equal(row(res.body.data.id).target_outlook_calendar_id, 'cal-1');
+});
+
+test('AN: ein nur lesbarer oder entfernter Outlook-Kalender wird uebersprungen', async () => {
+  reset({ switchOn: true });
+  const account = outlookCalendar({ canEdit: 0 });
+  cfg('calendar_household_target', `outlook:${account}|cal-1`);
+  assert.equal((await api('POST', '/calendar', EVENT())).body.reason, 'sync_target_required');
+  cfg('calendar_household_target', 'outlook:999|gone');
+  assert.equal((await api('POST', '/calendar', EVENT())).body.reason, 'sync_target_required');
 });
 
 test('AN: ein nicht mehr angebotenes eigenes Standardziel wird uebersprungen', async () => {
@@ -200,5 +271,29 @@ test('AN: Housekeeping bleibt lokal - Besuchstermin und Zahlungsaufgabe bekommen
   }
   for (const task of db.prepare('SELECT * FROM tasks').all()) {
     assert.equal(task.target_caldav_list_url, null);
+  }
+});
+
+const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+test('AN: eine abgelehnte Aenderung laesst keinen hochgeladenen Anhang als Waise liegen', async () => {
+  reset({ switchOn: true });
+  cfg('calendar_household_target', target(CAL_A));
+  const created = await api('POST', '/calendar', EVENT());
+  const id = created.body.data.id;
+  const root = tempDir('yuvomi-sync-required-');
+  process.env.DOCUMENT_STORAGE_LOCAL_ENABLED = '1';
+  process.env.DOCUMENT_STORAGE_LOCAL_PATH = root;
+  try {
+    const res = await api('PUT', `/calendar/${id}`, {
+      target_caldav_account_id: null, target_caldav_calendar_url: null,
+      attachment_data: PNG, attachment_name: 'a.png',
+    });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.reason, 'sync_target_required');
+    assert.deepEqual(readdirSync(root, { recursive: true }), [], 'die Abweisung kommt vor dem Staging');
+  } finally {
+    delete process.env.DOCUMENT_STORAGE_LOCAL_ENABLED;
+    delete process.env.DOCUMENT_STORAGE_LOCAL_PATH;
   }
 });

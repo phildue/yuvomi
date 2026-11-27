@@ -136,6 +136,8 @@ test('errorSentence: ein bekannter Fall bekommt seinen Satz, an jedem Status', a
   // Der Fall aus dem Issue, ausgeschrieben.
   assert.equal(errorSentence(answer(400, 'Unknown list.', 'shopping_list_not_found')), 'shopping.errorListGone');
   assert.equal(errorSentence(answer(409, 'Category already exists.', 'category_exists')), 'category.errorExists');
+  // Fork: "Sync erforderlich" antwortet mit 400 (Aufgaben und Termine), nicht mit 403.
+  assert.equal(errorSentence(answer(400, 'A sync target is required.', 'sync_target_required')), 'common.errorSyncTargetRequired');
 });
 
 test('errorSentence: unbekannter oder fehlender Grund ergibt den allgemeinen Satz, nie den des Servers', async () => {
@@ -251,6 +253,9 @@ test('jeder Fall hat seinen Satz in jeder Sprache, und der Server nennt ihn', ()
     // Aufgaben (#1909); die echte Antwort misst test:tasks-errors, Teilaufgabe
     // und Kommentar test:task-detail-errors.
     '../server/routes/tasks.js',
+    // Fork: "Sync erforderlich" - der Grund steht im Dienst, den Termin- und
+    // Aufgaben-Route teilen; die echte Antwort messen test:sync-required-calendar/-tasks.
+    '../server/services/sync-required.js',
     // Dienstplan (#1909); die echte Antwort misst test:task-detail-errors.
     '../server/routes/schedule.js', '../server/routes/schedule-extras.js',
     // Haushaltshilfe und Belohnungen (#1909); die echte Antwort messen
