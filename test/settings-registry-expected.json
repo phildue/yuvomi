@@ -87,6 +87,9 @@
       "holiday_public_color": "#FF3B30",
       "holiday_school_color": "#34C759",
       "holiday_last_sync": null,
+      "sync_required": false,
+      "calendar_household_target": "",
+      "tasks_household_target": "",
       "screensaver_enabled": false
      }
     }
@@ -177,6 +180,9 @@
       "holiday_public_color": "#FF3B30",
       "holiday_school_color": "#34C759",
       "holiday_last_sync": null,
+      "sync_required": false,
+      "calendar_household_target": "",
+      "tasks_household_target": "",
       "screensaver_enabled": false
      }
     }
@@ -369,6 +375,9 @@
       "holiday_public_color": "#112233",
       "holiday_school_color": "#445566",
       "holiday_last_sync": "2035-01-02T03:04:05Z",
+      "sync_required": false,
+      "calendar_household_target": "",
+      "tasks_household_target": "",
       "screensaver_enabled": true
      }
     }
@@ -523,6 +532,9 @@
       "holiday_public_color": "#112233",
       "holiday_school_color": "#445566",
       "holiday_last_sync": "2035-01-02T03:04:05Z",
+      "sync_required": false,
+      "calendar_household_target": "",
+      "tasks_household_target": "",
       "screensaver_enabled": true
      }
     }
@@ -678,6 +690,9 @@
       "holiday_public_color": "red",
       "holiday_school_color": "",
       "holiday_last_sync": "",
+      "sync_required": false,
+      "calendar_household_target": "",
+      "tasks_household_target": "",
       "screensaver_enabled": false
      }
     }
@@ -763,6 +778,9 @@
       "holiday_public_color": "red",
       "holiday_school_color": "",
       "holiday_last_sync": "",
+      "sync_required": false,
+      "calendar_household_target": "",
+      "tasks_household_target": "",
       "screensaver_enabled": false
      }
     }
@@ -904,6 +922,9 @@
       "holiday_public_color": "#FF3B30",
       "holiday_school_color": "#34C759",
       "holiday_last_sync": null,
+      "sync_required": false,
+      "calendar_household_target": "",
+      "tasks_household_target": "",
       "screensaver_enabled": false
      }
     }
@@ -1010,6 +1031,9 @@
       "holiday_public_color": "#FF3B30",
       "holiday_school_color": "#34C759",
       "holiday_last_sync": null,
+      "sync_required": false,
+      "calendar_household_target": "",
+      "tasks_household_target": "",
       "screensaver_enabled": false
      }
     }
@@ -1142,7 +1166,10 @@
    "holiday_show_school": false,
    "holiday_public_color": "#FF3B30",
    "holiday_school_color": "#34C759",
-   "holiday_last_sync": null
+   "holiday_last_sync": null,
+   "sync_required": false,
+   "calendar_household_target": "",
+   "tasks_household_target": ""
   },
   "member": {
    "visible_meal_types": [
@@ -1218,7 +1245,10 @@
    "holiday_show_school": false,
    "holiday_public_color": "#FF3B30",
    "holiday_school_color": "#34C759",
-   "holiday_last_sync": null
+   "holiday_last_sync": null,
+   "sync_required": false,
+   "calendar_household_target": "",
+   "tasks_household_target": ""
   }
  },
  "put": {
@@ -5106,6 +5136,123 @@
      "app_name": "X",
      "housekeeping_payment_tasks": true,
      "calendar_default_duration": 30
+    }
+   },
+   "member": {
+    "status": 403,
+    "rows": {},
+    "body": {
+     "error": "Admin access required.",
+     "code": 403,
+     "reason": "admin_required"
+    }
+   }
+  },
+  "sync_required true": {
+   "admin": {
+    "status": 200,
+    "rows": {
+     "sync_required": "1"
+    },
+    "changed": {
+     "sync_required": true
+    }
+   },
+   "member": {
+    "status": 403,
+    "rows": {},
+    "body": {
+     "error": "Admin access required.",
+     "code": 403,
+     "reason": "admin_required"
+    }
+   }
+  },
+  "sync_required not boolean": {
+   "admin": {
+    "status": 400,
+    "rows": {},
+    "body": {
+     "error": "sync_required must be a boolean",
+     "code": 400
+    }
+   },
+   "member": {
+    "status": 403,
+    "rows": {},
+    "body": {
+     "error": "Admin access required.",
+     "code": 403,
+     "reason": "admin_required"
+    }
+   }
+  },
+  "calendar_household_target caldav": {
+   "admin": {
+    "status": 200,
+    "rows": {
+     "calendar_household_target": "caldav:1|https://x/"
+    },
+    "changed": {
+     "calendar_household_target": "caldav:1|https://x/"
+    }
+   },
+   "member": {
+    "status": 403,
+    "rows": {},
+    "body": {
+     "error": "Admin access required.",
+     "code": 403,
+     "reason": "admin_required"
+    }
+   }
+  },
+  "calendar_household_target invalid": {
+   "admin": {
+    "status": 400,
+    "rows": {},
+    "body": {
+     "error": "calendar_household_target: expected \"google:<id>\", \"caldav:<accountId>|<url>\" or \"outlook:<accountId>|<calendarId>\".",
+     "code": 400
+    }
+   },
+   "member": {
+    "status": 403,
+    "rows": {},
+    "body": {
+     "error": "Admin access required.",
+     "code": 403,
+     "reason": "admin_required"
+    }
+   }
+  },
+  "tasks_household_target caldav": {
+   "admin": {
+    "status": 200,
+    "rows": {
+     "tasks_household_target": "caldav:1|https://x/"
+    },
+    "changed": {
+     "tasks_household_target": "caldav:1|https://x/"
+    }
+   },
+   "member": {
+    "status": 403,
+    "rows": {},
+    "body": {
+     "error": "Admin access required.",
+     "code": 403,
+     "reason": "admin_required"
+    }
+   }
+  },
+  "tasks_household_target google": {
+   "admin": {
+    "status": 400,
+    "rows": {},
+    "body": {
+     "error": "tasks_household_target: expected \"caldav:<accountId>|<url>\".",
+     "code": 400
     }
    },
    "member": {

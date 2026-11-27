@@ -594,6 +594,12 @@ const PUT_CASES = [
   { name: 'tasks_default_points too large', body: { tasks_default_points: 10001 } },
   { name: 'tasks_late_decay_enabled true', body: { tasks_late_decay_enabled: true } },
   { name: 'tasks_late_decay_enabled not boolean', body: { tasks_late_decay_enabled: 'x' } },
+  { name: 'sync_required true', body: { sync_required: true } },
+  { name: 'sync_required not boolean', body: { sync_required: 'x' } },
+  { name: 'calendar_household_target caldav', body: { calendar_household_target: 'caldav:1|https://x/' } },
+  { name: 'calendar_household_target invalid', body: { calendar_household_target: 'junk' } },
+  { name: 'tasks_household_target caldav', body: { tasks_household_target: 'caldav:1|https://x/' } },
+  { name: 'tasks_household_target google', body: { tasks_household_target: 'google:x@example.com' } },
   { name: 'countdown_grace_days zero', body: { countdown_grace_days: 0 } },
   { name: 'countdown_grace_days ninety', body: { countdown_grace_days: 90 } },
   { name: 'countdown_grace_days negative', body: { countdown_grace_days: -1 } },
@@ -1054,8 +1060,8 @@ const SINGLE_FIELD_CASES = Object.groupBy(
 
 const catalogByField = () => new Map(settingsCatalog().map((entry) => [entry.field, entry]));
 
-test('registry: the measured fields are what this suite expects (52 PUT fields, the route views)', () => {
-  assert.equal(PUT_FIELDS.length, 52, PUT_FIELDS.join(', '));
+test('registry: the measured fields are what this suite expects (55 PUT fields, the route views)', () => {
+  assert.equal(PUT_FIELDS.length, 55, PUT_FIELDS.join(', '));
   for (const field of PUT_FIELDS) assert.ok(SINGLE_FIELD_CASES[field]?.length, `a single-field case for ${field}`);
   for (const view of ROUTE_VIEWS) assert.ok(GET_FIELDS.includes(view), view);
 });
