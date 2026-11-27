@@ -5,14 +5,12 @@
  *        Standardziele, die der Server einsetzt, wenn jemand keines gewaehlt hat
  *        (server/services/sync-required.js). Das Blatt ist adminOnly; die
  *        Felder stehen in der Registry als Haushaltswerte (nur ein Admin schreibt).
- * Abhaengigkeiten: utils/sync-target.js (Kennungsformat), pages/personal-tasks.js
- *        (Optionen der Erinnerungslisten), settings/preferences-cache.js
+ * Abhaengigkeiten: utils/sync-target.js (Kennungsformat), settings/preferences-cache.js
  */
 
 import { t } from '/i18n.js';
 import { esc } from '/utils/html.js';
-import { buildSyncTargetOptions } from '/utils/sync-target.js';
-import { reminderTargetOptions } from './personal-tasks.js';
+import { buildSyncTargetOptions, caldavTargetValue, SYNC_TARGET_LOCAL } from '/utils/sync-target.js';
 import { settingRowHtml, settingSwitchRowHtml } from '/settings/components.js';
 import { savePreferences } from '/settings/preferences-cache.js';
 import { errorSentence } from '/utils/friendly-error.js';
@@ -40,6 +38,28 @@ function optionsHtml(options, current) {
 }
 
 /**
+ * Optionen des Aufgabenfeldes: die Erinnerungslisten (nur CalDAV), "kein
+ * Standard" als leere Option, ein gespeichertes, nicht mehr angebotenes Ziel
+ * nachgetragen. Bewusst nicht aus pages/personal-tasks.js importiert: ein
+ * statischer Import machte dieses Blatt zu einem geteilten Chunk, und es fiele
+ * aus der Precache-Liste des Service Workers (test:sw-precache).
+ * @param {any[]} lists
+ * @param {{local: string, unavailable: string}} labels
+ * @param {string} current
+ * @returns {Array<{value: string, label: string, group: string | null}>}
+ */
+function taskListOptions(lists, labels, current) {
+  const options = [{ value: SYNC_TARGET_LOCAL, label: labels.local, group: null }];
+  for (const list of lists) {
+    options.push({ value: caldavTargetValue(list.accountId, list.listUrl), label: list.listName || list.listUrl, group: list.accountName });
+  }
+  if (current && !options.some((option) => option.value === current)) {
+    options.push({ value: current, label: labels.unavailable, group: null });
+  }
+  return options;
+}
+
+/**
  * @param {{
  *   preferences: Record<string, any>,
  *   calendarTargets: {google?: any[], caldav?: any[], outlook?: any[]} | null,
@@ -60,7 +80,7 @@ export function syncRequiredSectionHtml({ preferences, calendarTargets, taskList
     caldav: t('calendar.syncTargetCaldavGroup'),
     unavailable,
   }, calendarCurrent);
-  const taskOptions = reminderTargetOptions(taskLists ?? [], { local: noDefault, unavailable }, tasksCurrent);
+  const taskOptions = taskListOptions(taskLists ?? [], { local: noDefault, unavailable }, tasksCurrent);
 
   return `
     <section class="settings-section" id="sync-required-section">
