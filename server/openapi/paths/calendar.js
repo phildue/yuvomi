@@ -667,6 +667,8 @@ const REMOTE_FAILURE = 'a refusal of the server answers 502 with `remote_auth_fa
   + '`remote_http_status` (another HTTP status, `params.status`), `remote_unreachable` (network, TLS or timeout) '
   + 'or `remote_failed`, the class in `detail` (`HTTP 401`, `ECONNREFUSED`, `timeout`), never the server\'s text';
 
+// Fork: "Sync erforderlich" (server/services/sync-required.js).
+const SYNC_REQUIRED = '`sync_target_required` (400, the household requires a sync target and none is available: pick a calendar, or set a default calendar in the settings; also refused when an event with a target is moved back to local, or placed in a local calendar without one)';
 const CASE_REASONS = {
   '/api/v1/calendar/caldav/accounts': {
     post: '`caldav_account_exists` (409, an account with this URL and username is already connected), '
@@ -719,10 +721,10 @@ const CASE_REASONS = {
     get: `${CALDAV_ACCOUNT_GONE}; ${REMOTE_FAILURE}`,
     patch: `${ASSIGNEE_REASONS}, \`reminder_list_assignee_not_tasks\` (400, default assignees for a list mapped to shopping), ${CALDAV_ACCOUNT_GONE}`,
   },
-  '/api/v1/calendar': { post: `${SELECTED_CALENDAR_GONE}, ${SERIES_CASES}` },
+  '/api/v1/calendar': { post: `${SELECTED_CALENDAR_GONE}, ${SERIES_CASES}, ${SYNC_REQUIRED}` },
   '/api/v1/calendar/{id}': {
     get: EVENT_GONE,
-    put: `${NOT_OWNER}, ${EVENT_GONE}, ${SELECTED_CALENDAR_GONE}, ${SERIES_CASES}`,
+    put: `${NOT_OWNER}, ${EVENT_GONE}, ${SELECTED_CALENDAR_GONE}, ${SERIES_CASES}, ${SYNC_REQUIRED}`,
     delete: `${NOT_OWNER}, ${EVENT_GONE}`,
   },
   '/api/v1/calendar/{seriesId}/occurrences/{recurrenceId}': {
