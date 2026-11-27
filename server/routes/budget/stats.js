@@ -4,17 +4,17 @@
  */
 
 import express from 'express';
-import { createLogger } from '../../logger.js';
+import { validateRequest } from '../../api/validate-request.ts';
 import * as db from '../../db.js';
 import { bookedOnly, computeStatsRange, statsCutoff, cents, budgetFilter, budgetCategoryExpr, budgetSubcategoryExpr, todayLocalDateKey, STATS_RANGES, DATE_RE } from './helpers.js';
 import { BUDGET_SAVINGS_KEY } from './plans.js';
 
-const log = createLogger('Budget');
 const router = express.Router();
 
 /**
  * Aggregiert Budget-Daten für den Statistik-Tab.
  * @param {object} database  better-sqlite3/node:sqlite-Instanz mit .prepare()
+ * @param {{ range: string, anchor: string, today?: string, until?: string }} period
  */
 export function computeStats(database, { range, anchor, today = todayLocalDateKey(), until }, filter = { clause: '', params: [] },
                              categoryExpr = { expr: 'category', params: [] },
@@ -118,28 +118,23 @@ export function computeStats(database, { range, anchor, today = todayLocalDateKe
  * Query: ?range=week|month|year&anchor=YYYY-MM-DD[&until=YYYY-MM-DD]
  */
 export function statsHandler(req, res) {
-  try {
-    const range  = req.query.range || 'month';
-    const anchor = req.query.anchor || todayLocalDateKey();
-    const until  = req.query.until;
-    if (!STATS_RANGES.has(range))
-      return res.status(400).json({ error: 'range must be one of: week, month, year.', code: 400 });
-    if (!DATE_RE.test(anchor))
-      return res.status(400).json({ error: 'anchor must be in YYYY-MM-DD format.', code: 400 });
-    if (until !== undefined && !DATE_RE.test(until))
-      return res.status(400).json({ error: 'until must be in YYYY-MM-DD format.', code: 400 });
+  const range  = req.query.range || 'month';
+  const anchor = req.query.anchor || todayLocalDateKey();
+  const until  = req.query.until;
+  if (!STATS_RANGES.has(range))
+    return res.status(400).json({ error: 'range must be one of: week, month, year.', code: 400 });
+  if (!DATE_RE.test(anchor))
+    return res.status(400).json({ error: 'anchor must be in YYYY-MM-DD format.', code: 400 });
+  if (until !== undefined && !DATE_RE.test(until))
+    return res.status(400).json({ error: 'until must be in YYYY-MM-DD format.', code: 400 });
 
-    res.json({
-      data: computeStats(db.get(), { range, anchor, until },
-        budgetFilter(req, 'budget_entries'), budgetCategoryExpr(req, 'budget_entries'),
-        budgetSubcategoryExpr(req, 'budget_entries')),
-    });
-  } catch (err) {
-    log.error('', err);
-    res.status(500).json({ error: 'Internal error', code: 500 });
-  }
+  res.json({
+    data: computeStats(db.get(), { range, anchor, until },
+      budgetFilter(req, 'budget_entries'), budgetCategoryExpr(req, 'budget_entries'),
+      budgetSubcategoryExpr(req, 'budget_entries')),
+  });
 }
 
-router.get('/stats', statsHandler);
+router.get('/stats', validateRequest(), statsHandler);
 
 export default router;

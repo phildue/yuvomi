@@ -11,17 +11,32 @@
  *        Weg durch den Laden abbildet), Nutzertexte escaped, drei
  *        unterscheidbare Absagegruende statt einem "ging nicht", und der
  *        Listenname im Betreff ohne Zeilenumbruch.
- * Ausfuehren: node --experimental-sqlite --test test/test-shopping-send.js
+ * Ausfuehren: npm run test:shopping-send
  */
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'test-secret';
 process.env.DB_PATH = ':memory:';
 
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
-import express from 'express';
+import { createShoppingDocumentsApp } from './shopping-documents-app.js';
+
+// The mail renderer is pure; a failure while rendering cannot be provoked from
+// the data. The route imports it through this mock, which passes through to
+// the real builder unless a test sets `renderFailure` (#2622).
+const realMail = await import('../server/services/shopping-mail.js');
+let renderFailure = null;
+mock.module(new URL('../server/services/shopping-mail.js', import.meta.url).href, {
+  namedExports: {
+    ...realMail,
+    buildShoppingListMail: (args) => {
+      if (renderFailure) throw renderFailure;
+      return realMail.buildShoppingListMail(args);
+    },
+  },
+});
 
 const dbmod = await import('../server/db.js');
-const { default: shoppingRouter, __test: shoppingInternals } = await import('../server/routes/shopping.js');
+const { __test: shoppingInternals } = await import('../server/routes/shopping.js');
 const db = dbmod.get();
 
 const SENDER = db.prepare(
@@ -74,19 +89,20 @@ function resetMailer({ configured = true } = {}) {
   return mailer;
 }
 
-const app = express();
-app.use(express.json());
-app.use((req, _res, next) => {
-  req.authUserId = SENDER;
-  req.authRole = 'admin';
-  next();
+// At its real prefix with the central error handler (#2810): call() puts the prefix in front.
+const app = await createShoppingDocumentsApp({
+  mount: ['shopping'],
+  auth: (req, _res, next) => {
+    req.authUserId = SENDER;
+    req.authRole = 'admin';
+    next();
+  },
 });
-app.use('/', shoppingRouter);
 const server = app.listen(0, '127.0.0.1');
 const baseUrl = await new Promise((r) => server.on('listening', () => r(`http://127.0.0.1:${server.address().port}`)));
 
 async function call(method, path, body) {
-  const res = await fetch(`${baseUrl}${path}`, {
+  const res = await fetch(`${baseUrl}/api/v1/shopping${path}`, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : undefined,
     body: body ? JSON.stringify(body) : undefined,
@@ -285,6 +301,25 @@ test('ein Fehler beim Versand wird nicht als Erfolg gemeldet (#944)', async () =
   // Die Ursache gehoert ins Log, nicht in die Antwort: sie kann den Hostnamen
   // des Mailservers und Teile der Zugangsdaten enthalten.
   assert.doesNotMatch(JSON.stringify(res.body), /smtp exploded/);
+});
+
+// #2622, test gap: only the empty list keeps its sentence (422 nothing_open);
+// any other failure while rendering is a fixed 500 without the engine's text,
+// and no mail goes out.
+test('ein Fehler beim Rendern der Mail ist ein fester 500, keine Mail (#2622)', async () => {
+  const sent = resetMailer();
+  const listId = seedList();
+  renderFailure = new TypeError("Cannot read properties of undefined (reading 'name') at /srv/yuvomi/server/services/shopping-mail.js");
+  try {
+    const res = await call('POST', `/${listId}/send`, { userId: OMA });
+    assert.equal(res.status, 500, JSON.stringify(res.body));
+    assert.equal(res.body.error, 'Internal server error.');
+    assert.equal(res.body.reason, undefined);
+    assert.doesNotMatch(JSON.stringify(res.body), /Cannot read|\/srv\/yuvomi/);
+    assert.equal(sent.sent.length, 0, 'no mail after a failed render');
+  } finally {
+    renderFailure = null;
+  }
 });
 
 test('die Empfaengerliste kennt nur erreichbare Mitglieder (#944)', async () => {

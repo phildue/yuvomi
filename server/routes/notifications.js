@@ -6,9 +6,12 @@
 import express from 'express';
 import * as db from '../db.js';
 import { createLogger } from '../logger.js';
-import { isAdminRequest } from '../middleware/require-admin.js';
+import { requireAdmin } from '../middleware/require-admin.js';
+import { validateRequest } from '../api/validate-request.ts';
 import { createNotificationChannelStore, NOTIFICATION_PROVIDERS } from '../services/notification-channels.js';
 import { notificationService as defaultNotificationService } from '../services/notifications.js';
+import { NotificationProviderError } from '../services/notification-providers/provider-error.js';
+import { remoteFailure } from '../utils/http.js';
 
 const log = createLogger('NotificationRoutes');
 
@@ -23,9 +26,32 @@ function parseId(value) {
 // aus dem Body nur durch, was ein Haushaltskanal braucht: eine Allowlist, damit
 // keine Schreibweise von Besitzer oder Reichweite den Store erreicht. Die
 // Zustellung an persoenliche Kanaele bleibt davon unberuehrt.
+/**
+ * What a failed channel test stores as `last_error`: a provider's own sentence,
+ * the code of a network error, or a fixed sentence (Phase 0 section H).
+ */
+function storedTestError(err) {
+  if (err instanceof NotificationProviderError) return err.message;
+  const failure = remoteFailure(err);
+  if (failure?.reason === 'remote_unreachable') return failure.detail;
+  return 'The test notification could not be delivered.';
+}
+
 function householdChannelInput(body) {
   const { provider, name, enabled, config, secrets, clearSecrets } = body || {};
   return { provider, name, enabled, config, secrets, clearSecrets };
+}
+
+/**
+ * Validation and the database used to share one catch that sent every message
+ * as a 400 - SQLite's included (Phase 0 section H). The channel checks mark
+ * their own sentences (`notification_channel_invalid`); everything else goes
+ * on to the central error handler, which logs it and answers 500 with its fixed
+ * sentence (#2810).
+ */
+function sendChannelWriteFailure(res, err) {
+  if (err?.code === 'notification_channel_invalid') return res.status(400).json({ error: err.message, code: 400 });
+  throw err;
 }
 
 export function buildRouter({
@@ -37,62 +63,49 @@ export function buildRouter({
   const store = channelStore || createNotificationChannelStore({ db: getDb() });
   const router = express.Router();
 
-  function requireAdmin(req, res, next) {
-    if (!isAdminRequest(req)) {
-      return res.status(403).json({ error: 'Admin access required.', code: 403 });
-    }
-    next();
-  }
-
+  // The admin gate first: a member gets 403, never a 400 that names fields (#2810).
   router.use(requireAdmin);
 
-  router.get('/providers', (req, res) => {
-    try {
-      void req;
-      // `available` heisst „der Server kennt diesen Adapter", nicht „er kann
-      // senden". Ein Provider, der eine Voraussetzung ausserhalb seines Kanals
-      // hat - Mail braucht den app-weiten SMTP-Zugang -, sagt das ueber
-      // `isAvailable()`. Wer keine hat, gilt unveraendert als bereit.
-      const available = NOTIFICATION_PROVIDERS
-        .filter((provider) => notificationService.providers?.[provider.id])
-        .map((provider) => {
-          const adapter = notificationService.providers[provider.id];
-          if (typeof adapter.isAvailable !== 'function') return provider;
-          let ready = false;
-          try {
-            ready = adapter.isAvailable() === true;
-          } catch (err) {
-            log.warn(`Provider ${provider.id} availability check failed:`, err.message);
-          }
-          return { ...provider, ready };
-        });
-      res.json({ data: available });
-    } catch (err) {
-      log.error('Error reading notification providers:', err.message);
-      res.status(500).json({ error: 'Internal error.', code: 500 });
-    }
+  // A route answers only what it expects (a refused input, not found, a
+  // personal channel); an unexpected error goes on to the central error
+  // handler: 500 with its fixed sentence, logged with method and route (#2810).
+  router.get('/providers', validateRequest(), (req, res) => {
+    void req;
+    // `available` heisst „der Server kennt diesen Adapter", nicht „er kann
+    // senden". Ein Provider, der eine Voraussetzung ausserhalb seines Kanals
+    // hat - Mail braucht den app-weiten SMTP-Zugang -, sagt das ueber
+    // `isAvailable()`. Wer keine hat, gilt unveraendert als bereit.
+    const available = NOTIFICATION_PROVIDERS
+      .filter((provider) => notificationService.providers?.[provider.id])
+      .map((provider) => {
+        const adapter = notificationService.providers[provider.id];
+        if (typeof adapter.isAvailable !== 'function') return provider;
+        let ready = false;
+        try {
+          ready = adapter.isAvailable() === true;
+        } catch (err) {
+          log.warn(`Provider ${provider.id} availability check failed:`, err.message);
+        }
+        return { ...provider, ready };
+      });
+    res.json({ data: available });
   });
 
-  router.get('/channels', (req, res) => {
-    try {
-      void req;
-      res.json({ data: store.listChannels() });
-    } catch (err) {
-      log.error('Error reading notification channels:', err.message);
-      res.status(500).json({ error: 'Internal error.', code: 500 });
-    }
+  router.get('/channels', validateRequest(), (req, res) => {
+    void req;
+    res.json({ data: store.listChannels() });
   });
 
-  router.post('/channels', (req, res) => {
+  router.post('/channels', validateRequest(), (req, res) => {
     try {
       const channel = store.createChannel(householdChannelInput(req.body));
       res.status(201).json({ data: channel });
     } catch (err) {
-      res.status(400).json({ error: err.message || 'Invalid notification channel.', code: 400 });
+      sendChannelWriteFailure(res, err);
     }
   });
 
-  router.put('/channels/:id', (req, res) => {
+  router.put('/channels/:id', validateRequest(), (req, res) => {
     try {
       const id = parseId(req.params.id);
       if (!id) return res.status(400).json({ error: 'Invalid channel id.', code: 400 });
@@ -106,24 +119,19 @@ export function buildRouter({
       const channel = store.updateChannel(id, householdChannelInput(req.body));
       res.json({ data: channel });
     } catch (err) {
-      res.status(400).json({ error: err.message || 'Invalid notification channel.', code: 400 });
+      sendChannelWriteFailure(res, err);
     }
   });
 
-  router.delete('/channels/:id', (req, res) => {
-    try {
-      const id = parseId(req.params.id);
-      if (!id) return res.status(400).json({ error: 'Invalid channel id.', code: 400 });
-      const deleted = store.deleteChannel(id);
-      if (!deleted) return res.status(404).json({ error: 'Notification channel not found.', code: 404 });
-      res.json({ data: { deleted: true } });
-    } catch (err) {
-      log.error('Error deleting notification channel:', err.message);
-      res.status(500).json({ error: 'Internal error.', code: 500 });
-    }
+  router.delete('/channels/:id', validateRequest(), (req, res) => {
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ error: 'Invalid channel id.', code: 400 });
+    const deleted = store.deleteChannel(id);
+    if (!deleted) return res.status(404).json({ error: 'Notification channel not found.', code: 404 });
+    res.json({ data: { deleted: true } });
   });
 
-  router.post('/channels/:id/test', async (req, res) => {
+  router.post('/channels/:id/test', validateRequest(), async (req, res) => {
     try {
       const id = parseId(req.params.id);
       if (!id) return res.status(400).json({ error: 'Invalid channel id.', code: 400 });
@@ -140,10 +148,15 @@ export function buildRouter({
       store.markChannelTestResult(id, { ok: true });
       res.json({ data: result });
     } catch (err) {
-      log.error('Error testing notification channel:', err.message);
       const id = parseId(req.params.id);
-      if (id) store.markChannelTestResult(id, { ok: false, error: err.message });
-      res.status(500).json({ error: 'Internal error.', code: 500 });
+      // Stored as the channel's `last_error` and listed to the admin. The
+      // providers' own sentences ("Webhook authentication failed.") stay; a
+      // network error is stored as its code, anything else - nodemailer's
+      // "Invalid login: 535 ...", a TypeError - as a fixed sentence. Their text
+      // names host, port or the server's reply (Phase 0 section H). The answer
+      // and the log line are the central error handler's.
+      if (id) store.markChannelTestResult(id, { ok: false, error: storedTestError(err) });
+      throw err;
     }
   });
 

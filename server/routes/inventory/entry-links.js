@@ -30,10 +30,11 @@
  */
 
 import * as db from '../../db.js';
-import { resolveBudgetMode, budgetDetailsVisibleWhere } from '../../services/budget-visibility.js';
-import { mayReadModule } from '../../permissions.js';
+import { mayReadModule, resolveBudgetMode, budgetDetailsVisibleWhere } from '../../authorize/index.ts';
+import { sqlInList } from '../../utils/sql-in-list.ts';
 
-export const ROLES = ['purchase', 'refund', 'instalment', 'maintenance', 'accessory'];
+// Die Liste steht in fields.js, einer Quelle mit dem OpenAPI-Dokument (#2810).
+export { ROLES } from './fields.js';
 
 function mode() {
   return resolveBudgetMode(db.get());
@@ -137,8 +138,8 @@ export function loadLinkedEntriesForItems(itemIds, viewer) {
 
   const m = mode();
   const visClause = budgetDetailsVisibleWhere('be', '?', { mode: m });
-  const placeholders = ids.map(() => '?').join(', ');
-  const params = [...ids];
+  const idList = sqlInList(ids);
+  const params = [idList.param];
   if (m === 'personal') params.push(viewer.userId);
 
   const rows = db.get().prepare(`
@@ -146,7 +147,7 @@ export function loadLinkedEntriesForItems(itemIds, viewer) {
            be.title, be.amount, be.date
     FROM inventory_item_entries iie
     JOIN budget_entries be ON be.id = iie.entry_id
-    WHERE iie.item_id IN (${placeholders}) AND be.is_pending = 0 AND ${visClause}
+    WHERE iie.item_id IN (${idList.sql}) AND be.is_pending = 0 AND ${visClause}
     ORDER BY be.date DESC, iie.id DESC
   `).all(...params);
 

@@ -26,11 +26,12 @@
  */
 
 import { localToUTCPrecise, householdTimeZone, todayKey, shiftDateKey } from '../utils/timezone.js';
-import { resolvePermissions } from '../permissions.js';
+import { actorForUser, authorize } from '../authorize/index.ts';
 import { createLogger } from '../logger.js';
 import { householdDisabledModules } from './household-modules.js';
 import { scheduleData } from './schedule.js';
 import { activeAccountSql } from './account-state.js';
+import { sqlInList } from '../utils/sql-in-list.ts';
 
 const log = createLogger('ScheduleReminders');
 
@@ -78,9 +79,7 @@ function scheduleDisabled(database) {
 }
 
 function lacksSchedule(database, userId) {
-  const user = database.prepare('SELECT id, role, family_role FROM users WHERE id = ?').get(userId);
-  if (!user) return true;
-  return resolvePermissions(database, user).modules.schedule === 'none';
+  return !authorize(actorForUser(database, userId), 'receive', { module: 'schedule' }).allowed;
 }
 
 /**
@@ -173,7 +172,8 @@ function syncScheduleRemindersForUser(database, userId, now = new Date()) {
     const anchors = database.prepare('SELECT id FROM schedule_reminder_entries WHERE user_id = ?').all(userId);
     if (anchors.length) {
       const ids = anchors.map((a) => a.id);
-      database.prepare(`DELETE FROM reminders WHERE entity_type = 'schedule_entry' AND entity_id IN (${ids.map(() => '?').join(',')})`).run(...ids);
+      const idList = sqlInList(ids);
+      database.prepare(`DELETE FROM reminders WHERE entity_type = 'schedule_entry' AND entity_id IN (${idList.sql})`).run(idList.param);
     }
     database.prepare('DELETE FROM schedule_reminder_entries WHERE user_id = ?').run(userId);
   };

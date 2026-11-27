@@ -1,30 +1,31 @@
 /**
- * Modul: Herkunft einer Erinnerung (entity_type -> Modul)
- * Zweck: EINE Karte fuer die Frage, zu welchem Modul eine `reminders`-Zeile
- *        gehoert. Gelesen von GET /reminders/pending (server/routes/reminders.js:
- *        Token-Scopes, Mitgliedsrechte, Haushaltsschalter) und von der Zustellung
- *        (server/services/notifications.js#processDueNotifications:
- *        Haushaltsschalter und Mitgliedsrechte). Bis #1279 stand die Karte nur
- *        im Router, und die Zustellung fragte gar nicht nach dem Modul; bis
- *        #1289 fragte sie nicht nach den Rechten des Empfaengers.
- * Abhaengigkeiten: server/services/household-modules.js, server/permissions.js
+ * Module: origin of a reminder (entity_type -> module)
+ * Purpose: ONE map for the question which module a `reminders` row belongs
+ *          to. Read by GET /reminders/pending (server/routes/reminders.js:
+ *          token scopes, member permissions, household switch) and by the
+ *          delivery (server/services/notifications.js#processDueNotifications:
+ *          household switch and member permissions). Until #1279 the map lived
+ *          only in the router, and the delivery did not ask about the module at
+ *          all; until #1289 it did not ask about the recipient's permissions.
+ *          The medication scheduler, which sends without `reminders` rows,
+ *          asks the same recipient verdict since #2602.
+ * Dependencies: server/services/household-modules.js,
+ *   server/authorize/ (actorForUser, authorize; it loads no server/db.js either)
  */
 import { householdDisabledModules } from './household-modules.js';
-// Nur die Aufloesung, nicht server/db.js: die Zustellung reicht ihre eigene
-// Verbindung herein, und permissions.js haengt bewusst an nichts weiter als
-// scopes.js/display-scopes.js (siehe dessen Kommentarkopf).
-import { resolvePermissions, buildSessionModuleAccess, deniedModules } from '../permissions.js';
+// The delivery passes in its own connection; the actor without a request
+// (server/authorize/, phase 2 B1) reads through exactly that connection.
+import { actorForUser, authorize } from '../authorize/index.ts';
 
-/* EINE KARTE UEBER ALLE HERKUENFTE, OHNE AUSNAHME FUER DIE NEUESTE.
+/* ONE MAP OVER ALL ORIGINS, WITH NO EXCEPTION FOR THE NEWEST ONE.
  *
- * `/api/v1/reminders` loest ueber `moduleForPath()` auf `calendar` auf, die
- * Zeilen stammen aber aus vielen Modulen (siehe den Kommentar ueber
- * `mayTouchOrigin()` in server/routes/reminders.js). Was hier fehlt, liefert
- * der Router nicht aus: `mayTouchOrigin()` lehnt eine unbekannte Herkunft ab.
- * Eine neue Herkunft, die nur in VALID_ENTITY_TYPES und der CHECK-Liste der
- * Migration landet, verschwaende also still aus `/pending` - dagegen haelt
- * test/test-disabled-module-reminders.js jeden Wert beider Listen an diese
- * Karte. */
+ * `/api/v1/reminders` resolves to `calendar` via `moduleForPath()`, but the
+ * rows come from many modules (see the comment above `mayTouchOrigin()` in
+ * server/routes/reminders.js). Whatever is missing here, the router does not
+ * hand out: `mayTouchOrigin()` refuses an unknown origin. A new origin that
+ * only lands in VALID_ENTITY_TYPES and the migration's CHECK list would
+ * therefore vanish silently from `/pending` - test/test-disabled-module-reminders.js
+ * holds every value of both lists against this map. */
 export const ORIGIN_MODULE = Object.freeze({
   task:                   'tasks',
   event:                  'calendar',
@@ -44,11 +45,30 @@ export const ORIGIN_MODULE = Object.freeze({
   shopping_move_returned: 'shopping',
 });
 
+/* THE SAME QUESTION FOR THE SUBSCRIPTION ADDRESSES (#2615).
+ *
+ * Each `/feed/<name>/:token.ics` route in server/index.js belongs to one
+ * permission module. A member for whom that module is `none` gets an empty
+ * calendar (`receive` of server/authorize/, as for the delivery below); the household switch stays
+ * deliberately open for feeds (docs/DECISIONS.md). Birthdays follow
+ * `calendar`, as in the delivery: `birthdays` is a nav id under it, not a
+ * permission module of its own. A local calendar's feed is not here - its token
+ * belongs to the calendar, not to a member.
+ * test/test-denied-module-feeds.js holds every value against PERMISSION_MODULES. */
+export const FEED_MODULE = Object.freeze({
+  calendar:              'calendar',
+  birthdays:             'calendar',
+  'inventory-deadlines': 'inventory',
+  cycle:                 'health',
+  schedule:              'schedule',
+  waste:                 'waste',
+});
+
 /**
- * Gehoert dieser Termin einem Geburtstag? Geburtstage schreiben ihre
- * Erinnerungen als `event` an den Kalendertermin, den sie selbst anlegen
- * (services/birthdays.js#syncBirthdayReminder), die Karte oben sieht darin
- * also Kalender. Fuer den Haushaltsschalter sind es aber zwei Module.
+ * Does this event belong to a birthday? Birthdays write their reminders as
+ * `event` on the calendar event they create themselves
+ * (services/birthdays.js#syncBirthdayReminder), so the map above sees
+ * calendar in it. For the household switch, though, these are two modules.
  */
 function isBirthdayEvent(database, eventId) {
   return Boolean(database.prepare(`
@@ -57,29 +77,28 @@ function isBirthdayEvent(database, eventId) {
 }
 
 /**
- * Die Zeilen ohne die, deren Modul im Haushalt abgeschaltet ist (#1279).
+ * The rows without those whose module is switched off in the household (#1279).
  *
- * UEBERSPRINGEN, NICHT LOESCHEN. Eine Aufgaben- oder Termin-Erinnerung hat
- * jemand von Hand gesetzt; Abo-, Inventar- und Dokument-Erinnerungen entstehen
- * nur beim SCHREIBEN ihres Datensatzes. Keine davon legt ein Lauf wieder an -
- * geloescht kaeme sie nach dem Wiedereinschalten nie zurueck. Die Zeile bleibt
- * deshalb ausstehend und wird nach dem Wiedereinschalten zugestellt wie nach
- * einem Serverausfall (die Zustellung kennt keine Altersgrenze). Quellen, die
- * ein Lauf periodisch neu herstellt (Vorrat, Schichtplan, Muell, Zyklus,
- * Geburtstage), raeumen ihre Zeilen zusaetzlich selbst ab; fuer sie ist dieser
- * Filter nur der Riegel zwischen zwei Laeufen.
+ * SKIP, DO NOT DELETE. A task or event reminder was set by hand; subscription,
+ * inventory and document reminders are created only when their record is
+ * WRITTEN. No run recreates any of them - deleted, it would never come back
+ * after switching the module on again. The row therefore stays pending and is
+ * delivered after switching back on, as after a server outage (the delivery
+ * knows no age limit). Sources that a run recreates periodically (pantry,
+ * schedule, waste, cycle, birthdays) additionally clean up their rows
+ * themselves; for them this filter is only the latch between two runs.
  *
- * GEBURTSTAGE SIND DIE EINE AUSNAHME VON DER KARTE: ihre `event`-Zeilen folgen
- * dem Schalter `birthdays`, nicht `calendar`. Ohne diese Unterscheidung naehme
- * ein abgeschalteter Kalender einem Haushalt mit eingeschalteten Geburtstagen
- * deren Meldungen weg. Nachgeschlagen wird nur, wenn einer der beiden Schalter
- * ueberhaupt steht.
+ * BIRTHDAYS ARE THE ONE EXCEPTION TO THE MAP: their `event` rows follow the
+ * `birthdays` switch, not `calendar`. Without this distinction a switched-off
+ * calendar would take the messages away from a household with birthdays
+ * switched on. The lookup only happens when one of the two switches is set
+ * at all.
  *
- * Synchron, ohne `await`: die Aufrufer lesen die Zeilen unmittelbar davor.
+ * Synchronous, without `await`: the callers read the rows right before.
  *
  * @param {object} database
  * @param {Array<{entity_type: string, entity_id: number}>} rows
- * @returns {Array} dieselben Zeilenobjekte, gefiltert
+ * @returns {Array} the same row objects, filtered
  */
 export function withoutSwitchedOffModules(database, rows) {
   const off = householdDisabledModules(database);
@@ -94,87 +113,59 @@ export function withoutSwitchedOffModules(database, rows) {
 }
 
 /**
- * Die Module, die DIESEM Empfaenger ganz entzogen sind - oder `null`, wenn es
- * ihn gar nicht (mehr) gibt.
+ * The rows without those whose module is denied to the RECIPIENT (#1289).
  *
- * DIESELBEN ZWEI SCHRITTE WIE IM ROUTER, nicht eine zweite Schreibweise:
- * `resolvePermissions()` -> `buildSessionModuleAccess()` -> `deniedModules()`
- * ist genau der Weg, den `req.sessionModuleAccess` in server/auth.js nimmt und
- * den `mayTouchOrigin()` in server/routes/reminders.js auswertet. Damit zaehlt
- * hier wie dort nur `none`, nicht `read`: wer ein Modul lesen darf, darf auch
- * von ihm hoeren - ein Filter, der ihm die Meldung naehme, haette aus einer
- * Leseberechtigung eine Sperre gemacht. Ein Admin faellt ueber
- * `buildSessionModuleAccess()` auf `null` und damit auf die leere Menge.
+ * THE SECOND AXIS OF THE DELIVERY, NEXT TO THE HOUSEHOLD SWITCH ABOVE.
+ * `GET /reminders/pending` has asked it for a long time (`mayTouchOrigin()`),
+ * Web Push and the channels did not: a member with `tasks: none` no longer saw
+ * the toast but kept getting the task title on their phone, for subscriptions
+ * including amount and date, and tapping it opened a page the route guard
+ * refuses.
  *
- * `null` STATT DER LEEREN MENGE FUER EINEN UNBEKANNTEN EMPFAENGER, und das ist
- * kein Geschmack (siehe `creatorLacksPantry()` in services/pantry-reminders.js):
- * eine Denylist beantwortet "unbekannte ID" mit "nichts gesperrt", also mit JA.
- * Ohne Konto gibt es niemanden, dem die Meldung gehoert. `created_by` ist zwar
- * NOT NULL mit Fremdschluessel auf `users` - aber genau darauf zu bauen hiesse,
- * die Antwort von einem PRAGMA abhaengig zu machen.
- */
-function recipientDeniedModules(database, userId) {
-  const user = database.prepare('SELECT id, role, family_role FROM users WHERE id = ?').get(userId);
-  if (!user) return null;
-  return deniedModules(buildSessionModuleAccess(resolvePermissions(database, user)));
-}
-
-/**
- * Die Zeilen ohne die, deren Modul dem EMPFAENGER entzogen ist (#1289).
+ * THE CHECK LIVES HERE, at the ONE place every row has to pass, and not at
+ * every source that writes rows: pantry, schedule, waste and cycle already ask
+ * when creating, and still the gap stayed open - a permission can also be
+ * revoked AFTER creation. A rule that lives on the write side would have to
+ * stand in seven files and would be forgotten in the eighth.
  *
- * DIE ZWEITE ACHSE DER ZUSTELLUNG, NEBEN DEM HAUSHALTSSCHALTER DARUEBER.
- * `GET /reminders/pending` fragt sie laengst (`mayTouchOrigin()`), Web Push und
- * die Kanaele taten es nicht: ein Mitglied mit `tasks: none` sah den Toast
- * nicht mehr, bekam den Aufgabentitel aber weiter aufs Telefon, bei Abos samt
- * Betrag und Datum, und der Tipp darauf oeffnete eine Seite, die der
- * Routen-Guard abweist.
+ * NO TOKEN SCOPES. The router's second axis has no counterpart here: a scope
+ * belongs to an API token, i.e. to a REQUEST, and a delivery run is not one.
+ * The account decides, not a credential that is not in play right now.
  *
- * DIE PRUEFUNG STEHT HIER, an der EINEN Stelle, durch die jede Zeile muss, und
- * nicht bei jeder Quelle, die Zeilen schreibt: Vorrat, Schichtplan, Muell und
- * Zyklus fragen beim Anlegen schon danach, und trotzdem blieb die Luecke offen -
- * ein Recht kann auch NACH dem Anlegen entzogen werden. Eine Regel, die an der
- * Schreibseite wohnt, muesste in sieben Dateien stehen und waere in der achten
- * vergessen.
+ * SKIP, DO NOT DELETE - same reason as for the household switch above, and
+ * here even more so: a revoked permission is an administrative decision that
+ * can be reversed, and the row belongs to the member themselves (they set it
+ * or got it assigned). `pushed_at` stays empty, the message goes out once the
+ * permission is given back.
  *
- * KEINE TOKEN-SCOPES. Die zweite Achse des Routers hat hier kein Gegenstueck:
- * ein Scope gehoert einem API-Token, also einer ANFRAGE, und ein Zustelllauf
- * ist keine. Das Konto entscheidet, nicht ein Credential, das gerade nicht im
- * Spiel ist.
+ * BIRTHDAYS NEED NO EXCEPTION HERE, unlike for the household switch:
+ * `birthdays` is not a permission module but a nav id under `calendar`
+ * (PERMISSION_MODULES in server/authorize/catalog.ts). Whoever lacks the calendar
+ * lacks the birthdays - special handling would invent a distinction the
+ * permission matrix does not even offer.
  *
- * UEBERSPRINGEN, NICHT LOESCHEN - gleicher Grund wie beim Haushaltsschalter
- * darueber, und hier noch etwas staerker: ein entzogenes Recht ist eine
- * Verwaltungsentscheidung, die zurueckgenommen werden kann, und die Zeile
- * gehoert dem Mitglied selbst (es hat sie gesetzt oder bekam sie zugewiesen).
- * `pushed_at` bleibt leer, die Meldung geht nach der Rueckgabe des Rechts raus.
+ * An origin WITHOUT a module passes, as for the household switch: the map
+ * above is complete, and the guard in test/test-disabled-module-reminders.js
+ * keeps it that way. Blocking on suspicion would be the wrong answer here - it
+ * would let a future origin vanish silently instead of delivering it.
  *
- * GEBURTSTAGE BRAUCHEN HIER KEINE AUSNAHME, anders als beim Haushaltsschalter:
- * `birthdays` ist kein Rechte-Modul, sondern eine Nav-ID unter `calendar`
- * (PERMISSION_MODULES in server/permissions.js). Wer den Kalender nicht hat,
- * hat die Geburtstage nicht - eine Sonderbehandlung wuerde eine Unterscheidung
- * erfinden, die die Rechtematrix gar nicht anbietet.
+ * Synchronous, without `await`: the caller reads the rows right before.
  *
- * Eine Herkunft OHNE Modul geht durch, wie beim Haushaltsschalter: die Karte
- * oben ist vollstaendig, und dass sie es bleibt, haelt der Guard in
- * test/test-disabled-module-reminders.js fest. Eine Sperre auf Verdacht waere
- * hier die falsche Antwort - sie liesse eine kuenftige Herkunft stumm
- * verschwinden, statt sie zuzustellen.
- *
- * Synchron, ohne `await`: der Aufrufer liest die Zeilen unmittelbar davor.
- *
- * @param {object} database
+ * @param {import('../authorize/index.ts').Database} database
  * @param {Array<{entity_type: string, created_by: number}>} rows
- * @returns {Array} dieselben Zeilenobjekte, gefiltert
+ * @returns {Array} the same row objects, filtered
  */
 export function withoutModulesDeniedToRecipient(database, rows) {
   if (!rows.length) return rows;
-  // Einmal je Empfaenger, nicht je Zeile: ein Lauf traegt typischerweise
-  // mehrere Meldungen derselben Person, und jede Aufloesung sind zwei Abfragen.
+  // The actor once per recipient, not per row: a run typically carries several
+  // messages of the same person, and every resolution is up to three queries.
   const byUser = new Map();
   return rows.filter((row) => {
-    if (!byUser.has(row.created_by)) byUser.set(row.created_by, recipientDeniedModules(database, row.created_by));
-    const denied = byUser.get(row.created_by);
-    if (!denied) return false;
+    if (!byUser.has(row.created_by)) byUser.set(row.created_by, actorForUser(database, row.created_by));
+    const actor = byUser.get(row.created_by);
+    // An unknown recipient: nobody the message belongs to, whatever its origin.
+    if (!actor) return false;
     const moduleKey = ORIGIN_MODULE[row.entity_type];
-    return !moduleKey || !denied.has(moduleKey);
+    return !moduleKey || authorize(actor, 'receive', { module: moduleKey }).allowed;
   });
 }

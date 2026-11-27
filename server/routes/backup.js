@@ -16,6 +16,8 @@ import { createLogger } from '../logger.js';
 import { secretOrigin, storedSecretPath } from '../utils/auto-secrets.js';
 import { createLocalBackup, getStatus as getSchedulerStatus, triggerBackup } from '../services/backup-scheduler.js';
 import * as webdavBackup from '../services/backup-webdav.js';
+import { isLocalFailure, remoteFailure } from '../utils/http.js';
+import { validateRequest } from '../api/validate-request.ts';
 
 const router = express.Router();
 const log = createLogger('Backup');
@@ -120,7 +122,7 @@ const databaseDownloadLimiter = rateLimit({
   message: { error: 'Too many backup downloads. Please wait before downloading again.', code: 429 },
 });
 
-router.get('/status', requireAdmin, (req, res) => {
+router.get('/status', requireAdmin, validateRequest(), (req, res) => {
   const schedulerStatus = getSchedulerStatus();
   res.json({
     data: {
@@ -144,7 +146,7 @@ router.get('/status', requireAdmin, (req, res) => {
  * Datenbank herunterladen darf, hat ihren Inhalt ohnehin. Ein Geraet kommt
  * nicht durch - `requireAuth` macht einen Admin dort zum Mitglied.
  */
-router.get('/database-key', requireAdmin, databaseKeyLimiter, (req, res) => {
+router.get('/database-key', requireAdmin, databaseKeyLimiter, validateRequest(), (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   const status = databaseKeyStatus();
   if (!databaseKeyIsRevealable(status)) {
@@ -161,7 +163,7 @@ router.get('/database-key', requireAdmin, databaseKeyLimiter, (req, res) => {
   });
 });
 
-router.get('/database', requireAdmin, databaseDownloadLimiter, async (req, res) => {
+router.get('/database', requireAdmin, databaseDownloadLimiter, validateRequest(), async (req, res) => {
   let tmpPath = null;
   try {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'yuvomi-backup-'));
@@ -176,14 +178,15 @@ router.get('/database', requireAdmin, databaseDownloadLimiter, async (req, res) 
       }
     });
   } catch (err) {
-    log.error('Database backup failed:', err);
     if (tmpPath) {
       try { await fs.rm(path.dirname(tmpPath), { recursive: true, force: true }); } catch { /* best effort */ }
     }
     // Das Backup hat die Integritaetspruefung nicht bestanden (#2520): fester
-    // Grund statt des Satzes, der Befund steht im Log.
-    const reason = err?.reason === 'backup_verify_failed' ? { reason: 'backup_verify_failed' } : {};
-    res.status(500).json({ error: 'Database backup failed.', code: 500, ...reason });
+    // Grund statt des Satzes, der Befund steht im Log. Jeder andere Fehler
+    // geht an den zentralen Fehlerhandler (#2810).
+    if (err?.reason !== 'backup_verify_failed') throw err;
+    log.error('Database backup failed:', err);
+    res.status(500).json({ error: 'Database backup failed.', code: 500, reason: 'backup_verify_failed' });
   }
 });
 
@@ -194,6 +197,9 @@ router.post(
   (_req, res, next) => { untrackWriteRequest(res); next(); },
   requireAdmin,
   express.raw({ type: 'application/octet-stream', limit: RESTORE_LIMIT }),
+  // Nach dem Lesen des Rumpfs (#2810): das Dokument beschreibt ihn als
+  // application/octet-stream, den Rumpf und `X-Backup-Key` prueft der Handler.
+  validateRequest(),
   async (req, res) => {
     let dir = null;
     let backupKey = null;
@@ -235,21 +241,18 @@ router.post(
   }
 );
 
-router.post('/trigger', requireAdmin, async (req, res) => {
-  try {
-    const result = await triggerBackup();
-    res.json({ data: result });
-  } catch (err) {
-    log.error('Manual backup trigger failed:', err);
-    res.status(500).json({ error: 'Backup trigger failed.', code: 500 });
-  }
+router.post('/trigger', requireAdmin, validateRequest(), async (req, res) => {
+  const result = await triggerBackup();
+  res.json({ data: result });
 });
 
 // ─── WebDAV backup target ──────────────────────────────────────────────────────
 
 /**
  * Neuer Server oder Benutzer ohne neues Passwort - eine fehlende Eingabe, keine
- * Stoerung. `errorCode` uebersetzt der Client (admin-backup.js).
+ * Stoerung. `errorCode` uebersetzt der Client (admin-backup.js). The WebDAV
+ * routes name their own cases in this one field (`password_required`,
+ * `url_invalid`, `config_incomplete`, #2622).
  */
 function passwordRequiredResponse(res) {
   return res.status(400).json({
@@ -263,7 +266,7 @@ function passwordRequiredResponse(res) {
  * GET /api/v1/backup/webdav/config
  * Returns current WebDAV configuration (password masked).
  */
-router.get('/webdav/config', requireAdmin, (req, res) => {
+router.get('/webdav/config', requireAdmin, validateRequest(), (req, res) => {
   res.json({ data: webdavBackup.getStatus() });
 });
 
@@ -271,43 +274,51 @@ router.get('/webdav/config', requireAdmin, (req, res) => {
  * PUT /api/v1/backup/webdav/config
  * Persists WebDAV configuration.
  * Body: { enabled?, url?, username?, password?, remotePath?, keep? }
+ * Types and `keep` from 1 are the schema's (#2810): `enabled` a boolean,
+ * `url`, `username`, `password`, `remotePath` text or null, `keep` an integer.
+ * The route keeps the address form (`url_invalid`) and the password rule
+ * (`password_required`); anything unexpected reaches the central error handler.
  */
-router.put('/webdav/config', requireAdmin, async (req, res) => {
-  try {
-    const { enabled, url, username, password, remotePath, keep } = req.body;
+router.put('/webdav/config', requireAdmin, validateRequest(), async (req, res) => {
+  const { enabled, url, username, password, remotePath, keep } = req.body;
 
-    if (enabled !== undefined && typeof enabled !== 'boolean') {
-      return res.status(400).json({ error: 'enabled must be a boolean.', code: 400 });
-    }
-    if (url !== undefined && url !== null && url !== '' && typeof url !== 'string') {
-      return res.status(400).json({ error: 'url must be a string.', code: 400 });
-    }
-    if (url && !/^https?:\/\/.+/.test(url.trim())) {
-      return res.status(400).json({ error: 'url must start with http:// or https://.', errorCode: 'url_invalid', code: 400 });
-    }
-    if (keep !== undefined && (typeof keep !== 'number' || keep < 1)) {
-      return res.status(400).json({ error: 'keep must be a positive integer.', code: 400 });
-    }
-
-    // Neuer Server oder Benutzer braucht das Passwort neu (passwordRequired).
-    if (webdavBackup.passwordRequired({ url, username, password })) {
-      return passwordRequiredResponse(res);
-    }
-
-    webdavBackup.saveConfig({ enabled, url, username, password, remotePath, keep });
-    res.json({ data: webdavBackup.getStatus() });
-  } catch (err) {
-    log.error('WebDAV config save failed:', err);
-    res.status(500).json({ error: 'Failed to save WebDAV config.', code: 500 });
+  if (url && !/^https?:\/\/.+/.test(url.trim())) {
+    return res.status(400).json({ error: 'url must start with http:// or https://.', errorCode: 'url_invalid', code: 400 });
   }
+
+  // Neuer Server oder Benutzer braucht das Passwort neu (passwordRequired).
+  if (webdavBackup.passwordRequired({ url, username, password })) {
+    return passwordRequiredResponse(res);
+  }
+
+  webdavBackup.saveConfig({ enabled, url, username, password, remotePath, keep });
+  res.json({ data: webdavBackup.getStatus() });
 });
+
+/**
+ * The answer of a WebDAV route once its own cases are handled (Phase 0 section
+ * H): a refusal of the server as its class (502, `reason` + `detail` such as
+ * `HTTP 401` or `ECONNREFUSED`, which the backup page shows the admin). A
+ * failure on this server - the database, or a filesystem or crypto error
+ * without an HTTP status (isLocalFailure, #2622) - is a fixed 500 with
+ * `backup_local_failed`. Any other error counts as the remote side
+ * (`remote_failed`, no `detail`). Never the text of the server, of fetch or of
+ * the filesystem - it names URLs, status lines and absolute paths.
+ */
+function sendWebdavFailure(res, err, sentence) {
+  const failure = isLocalFailure(err) ? null : remoteFailure(err);
+  if (failure) {
+    return res.status(502).json({ error: 'The WebDAV server refused the request or could not be reached.', code: 502, ...failure });
+  }
+  return res.status(500).json({ error: sentence, code: 500, reason: 'backup_local_failed' });
+}
 
 /**
  * POST /api/v1/backup/webdav/test
  * Tests the WebDAV connection.
  * Body: { url?, username?, password?, remotePath? }  (optional overrides)
  */
-router.post('/webdav/test', requireAdmin, async (req, res) => {
+router.post('/webdav/test', requireAdmin, validateRequest(), async (req, res) => {
   try {
     const { url, username, password, remotePath } = req.body ?? {};
     // VOR jeder Anfrage: sonst ginge das gespeicherte Passwort an die neue Adresse.
@@ -324,7 +335,10 @@ router.post('/webdav/test', requireAdmin, async (req, res) => {
     res.json({ data: result });
   } catch (err) {
     log.error('WebDAV connection test failed:', err);
-    res.status(400).json({ error: err.message ?? 'Connection test failed.', code: 400 });
+    if (err.code === 'webdav_config_incomplete') {
+      return res.status(400).json({ error: 'URL, username and password are required.', code: 400, errorCode: 'config_incomplete' });
+    }
+    sendWebdavFailure(res, err, 'Connection test failed.');
   }
 });
 
@@ -332,13 +346,13 @@ router.post('/webdav/test', requireAdmin, async (req, res) => {
  * GET /api/v1/backup/webdav/files
  * Lists backup files stored on the remote WebDAV server.
  */
-router.get('/webdav/files', requireAdmin, async (req, res) => {
+router.get('/webdav/files', requireAdmin, validateRequest(), async (req, res) => {
   try {
     const files = await webdavBackup.getRemoteFiles();
     res.json({ data: files });
   } catch (err) {
     log.error('WebDAV file listing failed:', err);
-    res.status(500).json({ error: err.message ?? 'Failed to list remote files.', code: 500 });
+    sendWebdavFailure(res, err, 'Failed to list remote files.');
   }
 });
 
@@ -348,14 +362,22 @@ router.get('/webdav/files', requireAdmin, async (req, res) => {
  * A fresh, uniquely named file is created on every trigger so manual uploads
  * never overwrite a previous remote backup.
  */
-router.post('/webdav/trigger', requireAdmin, async (req, res) => {
+router.post('/webdav/trigger', requireAdmin, validateRequest(), async (req, res) => {
   try {
-    const filePath = await createLocalBackup();
+    // Two steps with two kinds of failure: the local snapshot (filesystem,
+    // a fixed 500) and the upload (the server's answer, its class).
+    let filePath;
+    try {
+      filePath = await createLocalBackup();
+    } catch (err) {
+      log.error('WebDAV manual upload: local snapshot failed:', err);
+      return res.status(500).json({ error: 'The local backup could not be created.', code: 500, reason: 'backup_local_failed' });
+    }
     await webdavBackup.uploadBackup(filePath);
     res.json({ data: { file: path.basename(filePath), timestamp: new Date().toISOString() } });
   } catch (err) {
     log.error('WebDAV manual upload failed:', err);
-    res.status(500).json({ error: err.message ?? 'WebDAV upload failed.', code: 500 });
+    sendWebdavFailure(res, err, 'WebDAV upload failed.');
   }
 });
 

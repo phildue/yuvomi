@@ -28,15 +28,15 @@
  *      Orakel fuer die verborgene ID. Eine leere Liste ist kein Verknuepfen und
  *      loest nach Regel 2 nichts, weil ohne Leserecht nichts sichtbar ist.
  *
- * Die Sichtbarkeit des einzelnen Dokuments kommt aus document-access.js, die
+ * Die Sichtbarkeit des einzelnen Dokuments kommt aus authorize/rows/documents.ts, die
  * Modulachse aus `mayReadDocuments()` hier - EINE Stelle fuer beide Achsen
  * (Mitgliedsrecht und Token-Scope), die jeder Aufrufer ueber
  * `documentViewer(req)` bekommt statt sie nachzubauen.
  */
 
-import { mayReadModule } from '../permissions.js';
-import { documentVisibleSql, filterVisibleDocumentIds } from './document-access.js';
+import { mayReadModule, visibleWhere, filterVisible } from '../authorize/index.ts';
 import { assertDocumentsNotDeleting } from './document-deletion-lock.js';
+import { sqlInList } from '../utils/sql-in-list.ts';
 
 /** Felder, die ein Beleg preisgibt. Bewusst ohne Dateiinhalt. */
 const DOCUMENT_COLUMNS = 'd.name, d.original_name, d.mime_type, d.file_size';
@@ -106,15 +106,15 @@ export function loadDocumentLinks(database, { table, ownerColumn, ownerIds, view
   const byOwner = new Map();
   if (!ids.length || !readsDocuments(viewer)) return byOwner;
 
-  const placeholders = ids.map(() => '?').join(', ');
+  const idList = sqlInList(ids);
   const extra = extraColumns.length ? `, ${extraColumns.map((c) => `a.${c}`).join(', ')}` : '';
   const rows = database.prepare(`
     SELECT a.${ownerColumn} AS ownerId, a.id, a.document_id, a.created_at${extra}, ${DOCUMENT_COLUMNS}
     FROM ${table} a
     JOIN family_documents d ON d.id = a.document_id
-    WHERE a.${ownerColumn} IN (${placeholders}) AND ${documentVisibleSql('d')}
+    WHERE a.${ownerColumn} IN (${idList.sql}) AND ${visibleWhere('documents', 'd', '@userId')}
     ORDER BY a.id ASC
-  `).all(...ids, { userId: viewer?.userId ?? null });
+  `).all(idList.param, { userId: viewer?.userId ?? null });
 
   for (const { ownerId, ...attachment } of rows) {
     if (!byOwner.has(ownerId)) byOwner.set(ownerId, []);
@@ -168,7 +168,7 @@ export function replaceDocumentLinks(database, { table, ownerColumn, ownerId, do
     SELECT a.document_id
     FROM ${table} a
     JOIN family_documents d ON d.id = a.document_id
-    WHERE a.${ownerColumn} = @ownerId AND ${documentVisibleSql('d')}
+    WHERE a.${ownerColumn} = @ownerId AND ${visibleWhere('documents', 'd', '@userId')}
   `).all({ ownerId, userId: viewer.userId }).map((row) => row.document_id);
 
   const keep = new Set(wanted);
@@ -204,7 +204,7 @@ export function assertDocumentLinkTargetsAvailable(database, documentIds, viewer
     if (requested.length) throw new DocumentLinkRefusedError();
     return [];
   }
-  const visibleIds = filterVisibleDocumentIds(database, requested, viewer.userId);
+  const visibleIds = filterVisible(database, 'documents', requested, viewer.userId);
   assertDocumentsNotDeleting(visibleIds);
   return visibleIds;
 }
@@ -227,5 +227,5 @@ export function visibleDocumentRef(database, rawId, viewer) {
  */
 export function documentRefForViewer(database, storedId, viewer) {
   if (storedId == null || !readsDocuments(viewer)) return null;
-  return filterVisibleDocumentIds(database, [storedId], viewer.userId)[0] ?? null;
+  return filterVisible(database, 'documents', [storedId], viewer.userId)[0] ?? null;
 }

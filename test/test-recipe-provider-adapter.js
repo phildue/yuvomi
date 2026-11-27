@@ -18,6 +18,7 @@ import assert from 'node:assert/strict';
 import test, { before, after, beforeEach } from 'node:test';
 import http from 'node:http';
 import { MealieAdapter } from '../server/services/recipe-providers/mealie.js';
+import { getAdapter, SUPPORTED_PROVIDERS } from '../server/services/recipe-providers/index.js';
 import { categorizeIngredient } from '../server/services/recipe-providers/categorize.js';
 import {
   classifyProbe, classifyProviderFailure, ProviderResponseError,
@@ -108,7 +109,9 @@ test('testConnection: Netzwerkfehler → ok=false, status=0, error gesetzt', asy
   const out = await adapter.testConnection();
   assert.equal(out.ok, false);
   assert.equal(out.status, 0);
-  assert.match(out.error, /ECONNREFUSED/);
+  // Phase 0, Abschnitt H: der Fall, nie der Text des Netzes (Adresse, Port).
+  assert.equal(out.error, 'The recipe provider could not be reached.');
+  assert.equal(out.reason, 'recipe_providers_sync_unreachable');
 });
 
 test('listRecipeSummaries: paginiert bis total_pages erreicht ist', async () => {
@@ -501,4 +504,20 @@ test('Fall: Fehlercodes von Netz und TLS nach Klasse, Unbekanntes ohne Fall', ()
   // Ein Verbindungstest ohne eingeordneten Wurf hat keinen Fall; ein ok-Test nie.
   assert.equal(classifyProbe({ ok: false, status: 0, error: 'x', reason: null }), null);
   assert.equal(classifyProbe({ ok: true, status: 200 }), null);
+});
+
+// The adapter lookup takes only the table's own keys (#2810, CodeQL
+// js/unvalidated-dynamic-method-call): `provider` comes from a request body,
+// and since group 2A the request schema's enum is the only check before it.
+// A name the plain object inherits (`constructor`, `toString`, `__proto__`)
+// must not reach `new Adapter(...)`.
+test('getAdapter: an inherited name is an unknown provider, never an adapter', () => {
+  for (const provider of ['constructor', 'toString', '__proto__', 'hasOwnProperty', 'valueOf']) {
+    assert.throws(() => getAdapter({ provider, base_url: 'https://x.example', api_token: 't' }),
+      { message: `Unknown recipe provider: "${provider}". Supported: ${SUPPORTED_PROVIDERS.join(', ')}` }, provider);
+  }
+  assert.throws(() => getAdapter({ provider: 'chefkoch' }), /Unknown recipe provider: "chefkoch"/);
+  for (const provider of SUPPORTED_PROVIDERS) {
+    assert.ok(getAdapter({ provider, base_url: 'https://x.example', api_token: 't' }), `${provider} still has its adapter`);
+  }
 });

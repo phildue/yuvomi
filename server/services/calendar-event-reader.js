@@ -14,14 +14,16 @@ import {
 } from './calendar-events.js';
 import { resolveEventRows } from './calendar-occurrence-overrides.js';
 import {
-  householdVisibleWhere, icsSubscriptionSharedWhere, icsSubscriptionVisibleWhere, visibilityWhere,
-} from './visibility.js';
+  readerBinds,
+  readerVisibleWhere,
+} from '../authorize/index.ts';
 import { birthdaysSwitchedOff, notBirthdayEventSql } from './household-modules.js';
 import { calendarSelectionSql } from './calendar-selection.js';
 import { notCancelledEventSql } from './reminder-deleted-occurrence.js';
 import {
   householdTimeZone, localToUTC, shiftDateKey, storedToInstantMs, todayKey,
 } from '../utils/timezone.js';
+import { sqlInList } from '../utils/sql-in-list.ts';
 
 // Explicit read projections keep legacy inline attachment bodies out of compact
 // paths. The schema filter keeps focused test fixtures and older upgrade states
@@ -69,7 +71,7 @@ export function eventProjectionSql(database, alias = 'e', columns = RESOLVER_EVE
 
 function loadResolverMasters(database, parentIds) {
   if (parentIds.length === 0) return [];
-  const placeholders = parentIds.map(() => '?').join(',');
+  const parentIdList = sqlInList(parentIds);
   return database.prepare(`
     SELECT ${eventProjectionSql(database)},
            u_assigned.display_name AS assigned_name,
@@ -77,8 +79,8 @@ function loadResolverMasters(database, parentIds) {
            ${ASSIGNED_USERS_SQL}
     FROM calendar_events e
     LEFT JOIN users u_assigned ON u_assigned.id = e.assigned_to
-    WHERE e.id IN (${placeholders})
-  `).all(...parentIds);
+    WHERE e.id IN (${parentIdList.sql})
+  `).all(parentIdList.param);
 }
 
 /**
@@ -93,11 +95,12 @@ export function hydrateEventAttachmentBodies(database, rows) {
     .filter((id) => Number.isInteger(id) && id > 0))];
   if (ownerIds.length === 0) return rows;
 
+  const ownerIdList = sqlInList(ownerIds);
   const bodies = database.prepare(`
     SELECT id, attachment_data
     FROM calendar_events
-    WHERE id IN (${ownerIds.map(() => '?').join(',')})
-  `).all(...ownerIds);
+    WHERE id IN (${ownerIdList.sql})
+  `).all(ownerIdList.param);
   const bodyByOwner = new Map(bodies.map((row) => [Number(row.id), row.attachment_data]));
   return rows.map((event) => ({
     ...event,
@@ -215,14 +218,24 @@ function birthdayFilter(d, wantsBirthdays) {
  * (`household`) gilt, was jeder sehen darf - Stufe `all` und geteiltes Abo -,
  * ohne Betrachter: auch der Urheber eines privaten Termins sieht ihn dort
  * nicht, weil nicht er hinsieht, sondern die Kueche.
+ *
+ * Both answers come from the one reader in server/authorize (rows/reader.ts): a
+ * paired display reads as the wall with or without `household`, so its personal
+ * answer is the wall too. `reader` is the reader of the request; without it the
+ * person rule for `userId` applies (or the wall with `household`), so callers
+ * without a request keep their answer.
+ *
+ * @param {unknown} userId
+ * @param {boolean} household
+ * @param {import('../authorize/index.ts').RowReader | null | undefined} reader
  */
-function eventAudience(userId, household) {
-  return household
-    ? { where: `${icsSubscriptionSharedWhere('e')}\n    AND ${householdVisibleWhere('e')}`, params: [] }
-    : {
-      where: `${icsSubscriptionVisibleWhere('e')}\n    AND ${visibilityWhere('e', 'event_assignments', 'event_id')}`,
-      params: [userId, userId, userId],
-    };
+function eventAudience(userId, household, reader) {
+  const r = reader ?? { userId, wall: household === true };
+  const audience = household === true ? { ...r, wall: true } : r;
+  return {
+    where: `${readerVisibleWhere(audience, 'ics_subscriptions', 'e', '?')}\n    AND ${readerVisibleWhere(audience, 'events', 'e', '?')}`,
+    params: [...readerBinds(audience, 'ics_subscriptions'), ...readerBinds(audience, 'events')],
+  };
 }
 
 /**
@@ -233,9 +246,9 @@ function eventAudience(userId, household) {
 export function getUpcomingEvents(d, {
   userId = null, limit = 5, windowDays = 90, fromToday = false, assignedTo = null,
   includeBirthdays: wantsBirthdays = true, now = new Date(), keepEndedToday = 0, household = false,
-  calendars = null,
+  calendars = null, reader = /** @type {import('../authorize/index.ts').RowReader | null} */ (null),
 } = {}) {
-  const audience = eventAudience(userId, household);
+  const audience = eventAudience(userId, household, reader);
   const { includeBirthdays, birthdaySql } = birthdayFilter(d, wantsBirthdays);
   // Die Kalender-Auswahl der Kachel (#2062) in SQL, also VOR Expansion und
   // Deckel - dieselbe Lehre wie bei „nur meine" und den Geburtstagen unten.
@@ -434,14 +447,16 @@ export function getUpcomingEvents(d, {
  * @param {number|null} [opts.assignedTo]
  * @param {boolean} [opts.includeBirthdays=true]
  * @param {string[]|null} [opts.calendars]  Kalender-Auswahl der Kachel (#2062), siehe calendar-selection.js
+ * @param {import('../authorize/index.ts').RowReader | null} [opts.reader]  the reader of the request
+ *        (rowReader): a paired display reads under the wall rule; without it the person rule for userId
  * @param {number} [opts.limit=300]  Sicherung gegen einen entgleisten Import
  * @returns {object[]} aufgeloeste Zeilen, nach Beginn sortiert
  */
 export function getEventsOverlappingDays(d, {
   userId = null, fromKey, days, assignedTo = null, includeBirthdays: wantsBirthdays = true, limit = 300, household = false,
-  calendars = null,
+  calendars = null, reader = null,
 } = {}) {
-  const audience = eventAudience(userId, household);
+  const audience = eventAudience(userId, household, reader);
   const { includeBirthdays, birthdaySql } = birthdayFilter(d, wantsBirthdays);
   const selection = calendarSelectionSql(calendars);
   const tz = householdTimeZone(d);

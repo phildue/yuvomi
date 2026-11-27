@@ -17,7 +17,8 @@ import {
   hasExplicitZone, householdTimeZone, shiftDateKey, storedDayDiffersFromSeriesDay, storedToInstantMsPrecise,
 } from '../utils/timezone.js';
 import { createLogger } from '../logger.js';
-import { applyDocumentAccess, attachmentAccessMode, eventAudienceChanged } from './document-access.js';
+import { applyDocumentAccess, attachmentAccessMode, eventAudienceChanged, rowVisible } from '../authorize/index.ts';
+import { sqlInList } from '../utils/sql-in-list.ts';
 
 const log = createLogger('CalendarOccurrenceOverrides');
 
@@ -324,7 +325,7 @@ function copyMarkedProperties(target, child, fields) {
 
 function loadOccurrenceMasters(database, parentIds) {
   if (parentIds.length === 0) return [];
-  const placeholders = parentIds.map(() => '?').join(',');
+  const parentList = sqlInList(parentIds);
   return database.prepare(`
     SELECT e.*,
            u_assigned.display_name AS assigned_name,
@@ -332,8 +333,8 @@ function loadOccurrenceMasters(database, parentIds) {
            ${ASSIGNED_USERS_SQL}
     FROM calendar_events e
     LEFT JOIN users u_assigned ON u_assigned.id = e.assigned_to
-    WHERE e.id IN (${placeholders})
-  `).all(...parentIds);
+    WHERE e.id IN (${parentList.sql})
+  `).all(parentList.param);
 }
 
 /**
@@ -441,8 +442,9 @@ export function loadLinkedOverrides(database, parentIds, from = null, to = null)
     .filter((id) => Number.isInteger(id) && id > 0))];
   if (ids.length === 0) return [];
 
-  const where = [`recurrence_parent_id IN (${ids.map(() => '?').join(',')})`];
-  const params = [...ids];
+  const idList = sqlInList(ids);
+  const where = [`recurrence_parent_id IN (${idList.sql})`];
+  const params = [idList.param];
   if (from) {
     where.push('DATE(COALESCE(end_datetime, start_datetime)) >= DATE(?)');
     params.push(from);
@@ -511,16 +513,14 @@ function hasConfiguredOutlookAutoSyncTarget(database, row, assignments,
   const assignedIds = assignments === undefined
     ? canonicalIds(assignmentIds(database, row.id))
     : canonicalIds(assignments);
-  const assigned = new Set(assignedIds.map(Number));
   return targets.some((target) => {
     const calendarId = Number(row.target_outlook_account_id) === Number(target.id)
       ? row.target_outlook_calendar_id
       : target.auto_sync_calendar_id;
-    return calendarId === target.calendar_id && (
-      row.visibility === 'all'
-      || Number(row.created_by) === Number(target.owner_user_id)
-      || (row.visibility === 'assignees' && assigned.has(Number(target.owner_user_id)))
-    );
+    // Would the target's owner see the series? The assignments are handed in: the
+    // row may carry proposed values that are not stored yet, so nothing is read.
+    return calendarId === target.calendar_id
+      && rowVisible(database, 'events', row, target.owner_user_id, { assignedIds });
   });
 }
 
@@ -563,8 +563,7 @@ export function classifyLocalSeriesBatch(database, rows) {
   const candidates = masters.filter((row) => result.get(Number(row.id)) === null);
   if (candidates.length === 0) return result;
 
-  const ids = candidates.map((row) => Number(row.id));
-  const placeholders = ids.map(() => '?').join(',');
+  const idList = sqlInList(candidates.map((row) => Number(row.id)));
   const disqualified = new Set();
   const generatedOwnerColumns = [
     ['birthdays', 'calendar_event_id'],
@@ -573,8 +572,8 @@ export function classifyLocalSeriesBatch(database, rows) {
   ].filter(([table, column]) => hasColumn(database, table, column));
   if (generatedOwnerColumns.length > 0) {
     const unions = generatedOwnerColumns.map(([table, column]) =>
-      `SELECT ${column} AS event_id FROM ${table} WHERE ${column} IN (${placeholders})`);
-    const params = generatedOwnerColumns.flatMap(() => ids);
+      `SELECT ${column} AS event_id FROM ${table} WHERE ${column} IN (${idList.sql})`);
+    const params = generatedOwnerColumns.map(() => idList.param);
     for (const row of database.prepare(unions.join('\nUNION\n')).all(...params)) {
       disqualified.add(Number(row.event_id));
     }
@@ -582,8 +581,8 @@ export function classifyLocalSeriesBatch(database, rows) {
   if (hasColumn(database, 'outlook_event_links', 'event_id')) {
     for (const row of database.prepare(`
       SELECT DISTINCT event_id FROM outlook_event_links
-      WHERE event_id IN (${placeholders})
-    `).all(...ids)) disqualified.add(Number(row.event_id));
+      WHERE event_id IN (${idList.sql})
+    `).all(idList.param)) disqualified.add(Number(row.event_id));
   }
 
   const autoSyncTargets = configuredOutlookWritableTargets(database);
@@ -591,8 +590,8 @@ export function classifyLocalSeriesBatch(database, rows) {
     const assignments = new Map();
     for (const row of database.prepare(`
       SELECT event_id, user_id FROM event_assignments
-      WHERE event_id IN (${placeholders})
-    `).all(...ids)) {
+      WHERE event_id IN (${idList.sql})
+    `).all(idList.param)) {
       if (!assignments.has(Number(row.event_id))) assignments.set(Number(row.event_id), []);
       assignments.get(Number(row.event_id)).push(Number(row.user_id));
     }
@@ -629,16 +628,6 @@ export function isLocallyOwnedSeries(database, row) {
   return classifyLocalSeriesBatch(database, [row]).get(Number(row?.id))?.local === true;
 }
 
-function actorCanSeeSeries(database, row, actorId) {
-  // Visibility deliberately has no admin bypass (#474). Occurrence mutations
-  // must use the same policy as the whole-series routes that loaded the row.
-  if (Number(row.created_by) === Number(actorId) || row.visibility === 'all') return true;
-  if (row.visibility !== 'assignees') return false;
-  return !!database.prepare(`
-    SELECT 1 FROM event_assignments WHERE event_id = ? AND user_id = ?
-  `).get(row.id, actorId);
-}
-
 /** Builds request-local capability metadata once per distinct recurring master. */
 export function buildRecurrenceCapabilityMap(database, events, {
   actorId = null,
@@ -654,9 +643,10 @@ export function buildRecurrenceCapabilityMap(database, events, {
   }
   const missing = [...mastersById].filter(([, master]) => !master).map(([id]) => id);
   if (missing.length > 0) {
+    const missingList = sqlInList(missing);
     const loaded = database.prepare(`
-      SELECT * FROM calendar_events WHERE id IN (${missing.map(() => '?').join(',')})
-    `).all(...missing);
+      SELECT * FROM calendar_events WHERE id IN (${missingList.sql})
+    `).all(missingList.param);
     for (const master of loaded) mastersById.set(Number(master.id), master);
   }
 
@@ -669,11 +659,15 @@ export function buildRecurrenceCapabilityMap(database, events, {
     const classification = classifications.get(Number(master.id));
     return classification?.local && !classification.eligible;
   }).map((master) => Number(master.id));
+  const legacyList = sqlInList(legacyCandidates);
   const linkedParents = new Set(legacyCandidates.length === 0 ? [] : database.prepare(`
     SELECT DISTINCT recurrence_parent_id FROM calendar_events
-    WHERE recurrence_parent_id IN (${legacyCandidates.map(() => '?').join(',')})
-  `).all(...legacyCandidates).map((row) => Number(row.recurrence_parent_id)));
+    WHERE recurrence_parent_id IN (${legacyList.sql})
+  `).all(legacyList.param).map((row) => Number(row.recurrence_parent_id)));
   const capabilities = new Map();
+  // Whether the actor sees a master: rowVisible(database, 'events', ...), the
+  // rule of the whole-series routes that loaded the row. Visibility deliberately
+  // has no admin bypass (#474).
   for (const [seriesId, master] of mastersById) {
     if (!master) continue;
     const classification = classifications.get(seriesId)
@@ -682,10 +676,10 @@ export function buildRecurrenceCapabilityMap(database, events, {
       master,
       isLocalRecurringSeries: classification.local === true,
       canOverrideOccurrence: classification.eligible
-        && actorCanSeeSeries(database, master, actorId),
+        && rowVisible(database, 'events', master, actorId),
       canDetachOccurrence: classification.local === true && !classification.eligible
         && !linkedParents.has(seriesId)
-        && actorCanSeeSeries(database, master, actorId),
+        && rowVisible(database, 'events', master, actorId),
     });
   }
   return capabilities;
@@ -695,7 +689,9 @@ export function buildRecurrenceCapabilityMap(database, events, {
 export function isEligibleLocalSeries(database, row, actorId) {
   const classification = classifyLocalSeries(database, row);
   if (!classification.eligible) return classification;
-  if (!actorCanSeeSeries(database, row, actorId)) {
+  // Occurrence mutations use the same policy as the whole-series routes that
+  // loaded the row; no admin bypass (#474).
+  if (!rowVisible(database, 'events', row, actorId)) {
     return { eligible: false, reason: 'not_authorized' };
   }
   return classification;
@@ -1432,10 +1428,11 @@ export function upsertOccurrenceOverride(database, {
 function deleteEventReminders(database, eventIds) {
   const ids = [...new Set(eventIds.map(Number).filter((id) => Number.isInteger(id) && id > 0))];
   if (ids.length === 0) return;
+  const idList = sqlInList(ids);
   database.prepare(`
     DELETE FROM reminders
-    WHERE entity_type = 'event' AND entity_id IN (${ids.map(() => '?').join(',')})
-  `).run(...ids);
+    WHERE entity_type = 'event' AND entity_id IN (${idList.sql})
+  `).run(idList.param);
 }
 
 function previousDateKey(dateKey) {

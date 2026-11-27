@@ -1,12 +1,12 @@
-<!-- version: 2.86.0 -->
-This update remembers what you paid when shopping, lets households make late chores pay less, and gives each wall tablet its own night hours.
+<!-- version: 2.95.0 -->
+Passwords are now stored with Argon2id instead of bcrypt. Existing passwords keep working: each account switches over on its next successful sign-in, and nobody has to reset anything. A password longer than 72 bytes now counts in full. Please note: once you are on this version, going back to an older one means every account that has signed in or changed its password since has to reset it, because older versions cannot read the new hashes.
 
-Ticking off a shopping item with a price now records the purchase, and the item sheet shows what you paid last time. Households that use rewards can switch on late completion decay: a task finished after its due day earns one point less per day, never below one. Administrators set night hours, idle delay, clock and photo fill per wall tablet under Settings, Wall tablets. On phones, the kitchen search moves into the tab bar.
+A request with broken JSON no longer writes part of its body into the server log. Before, that could put part of a password into the log at sign-in.
 
-Calendar and reminder sync got several fixes. A new event in a synced calendar is uploaded when you save it, an event the provider cancels stops reminding, repeating reminders from iOS Reminders or Tasks.org arrive as a series and keep running there when ticked off here, and contacts from CardDAV no longer merge into one. Date pickers follow the household week start, CardDAV accepts long app passwords, and many settings pages now explain errors in your language instead of showing English server text.
+This update is otherwise mostly about the API. If you use it with your own scripts or integrations: the calendar, the tasks, the preferences and push, sign-in and your own account, account administration and the calendar feeds now check every request against the published API description, like the modules before them. Every list in a request has a maximum length, and calendar events with an unreadable attachment or an assignee without an account are refused with a 400 instead of an internal error. The app itself sends nothing that is refused. An undocumented "role": "admin" no longer creates an administrator; use "system_admin": true.
 
-Every backup is now checked right after it is written, so a damaged one is discarded instead of handed out. Backup downloads are limited to ten per hour for each administrator.
+Editing a task moves its "last changed" time again; this had been frozen since a much older update. A member whose stored colour is in an old format can change their profile again.
 
-This update changes the database. The changes are applied automatically on the first start and need no action from you; as always, a backup before updating is a good idea.
+This update changes the database once on start to restore the task timestamp. No action is needed from you.
 
-Full release notes are available at https://github.com/ulsklyc/yuvomi/releases/tag/v2.86.0
+Full release notes are available at https://github.com/ulsklyc/yuvomi/releases/tag/v2.95.0

@@ -6,11 +6,14 @@
  * Ausführen: node --test test/test-medication-scheduler.js
  */
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import test from 'node:test';
 import Database from 'better-sqlite3-multiple-ciphers';
 
 const { MIGRATIONS } = await import('../server/db.js');
 const { processDueMedications } = await import('../server/services/medication-scheduler.js');
+const { createNotificationChannelStore } = await import('../server/services/notification-channels.js');
+const { removeUser } = await import('../server/services/user-removal.js');
 
 function buildTestDb() {
   const db = new Database(':memory:');
@@ -26,14 +29,14 @@ function buildTestDb() {
   return db;
 }
 
-function seedUser(db, username) {
-  return db.prepare(`INSERT INTO users (username, display_name, password_hash, role)
-    VALUES (?, ?, '$2b$12$x', 'member')`).run(username, username).lastInsertRowid;
+function seedUser(db, username, { role = 'member', familyRole = 'other' } = {}) {
+  return db.prepare(`INSERT INTO users (username, display_name, password_hash, role, family_role)
+    VALUES (?, ?, '$2b$12$x', ?, ?)`).run(username, username, role, familyRole).lastInsertRowid;
 }
 
-function seedMed(db, userId, { name = 'Ibuprofen', active = 1 } = {}) {
+function seedMed(db, userId, { name = 'Ibuprofen', active = 1, visibility = 'private' } = {}) {
   return db.prepare(`INSERT INTO medications (user_id, name, active, visibility)
-    VALUES (?, ?, ?, 'private')`).run(userId, name, active).lastInsertRowid;
+    VALUES (?, ?, ?, ?)`).run(userId, name, active, visibility).lastInsertRowid;
 }
 
 function seedSchedule(db, medId, { time = '08:00', daysMask = null, dose = 1, active = 1, startDate = null, endDate = null } = {}) {
@@ -52,7 +55,9 @@ function makeMocks() {
       async sendPushToUser(userId, payload) { pushed.push({ userId, payload }); return 1; },
     },
     channelStore: {
-      listEnabledChannelsForUser() { return [{ id: 7, provider: 'gotify', name: 'Test' }]; },
+      // `scope: 'user'`: ein Kanal der Person selbst. Ohne `scope` zaehlt er als
+      // Haushaltskanal, und der bekommt nie eine Medikamenten-Erinnerung (#2598).
+      listEnabledChannelsForUser() { return [{ id: 7, provider: 'gotify', name: 'Test', scope: 'user' }]; },
     },
     providers: {
       gotify: { async send({ channel, payload }) { channelSent.push({ channel, payload }); } },
@@ -177,7 +182,7 @@ function makeRecordingChannelStore() {
     asked,
     listEnabledChannelsForUser(userId) {
       asked.push(userId);
-      return [{ id: 100 + userId, provider: 'gotify', name: `Kanal ${userId}` }];
+      return [{ id: 100 + userId, provider: 'gotify', name: `Kanal ${userId}`, scope: 'user' }];
     },
   };
 }
@@ -212,6 +217,31 @@ test('Betreuer bekommen die Erinnerung mit dem Namen der betreuten Person, die P
     m.channelSent.map((c) => [c.channel.id, c.payload.body]),
     [[100 + child, 'Ibuprofen'], [100 + parent, 'anna: Ibuprofen']],
   );
+});
+
+// Phase 2 B9: the delivery order to two caregivers is the order of their ids, not
+// the order the grants were entered in. PRAGMA reverse_unordered_selects reverses
+// every list without ORDER BY, so the order is held as a promise of the query.
+test('zwei Betreuer bekommen die Erinnerung in der Reihenfolge ihrer IDs, nicht der Eintragung', async () => {
+  const db = buildTestDb();
+  const child = seedUser(db, 'anna');
+  const first = seedUser(db, 'berta');
+  const second = seedUser(db, 'carl');
+  grantCare(db, child, second);
+  grantCare(db, child, first);
+  db.pragma('reverse_unordered_selects = ON');
+  const med = seedMed(db, child, { name: 'Ibuprofen' });
+  seedSchedule(db, med, { time: '08:00' });
+  const m = makeMocks();
+  const store = makeRecordingChannelStore();
+
+  await processDueMedications({ database: db, now: MONDAY_0900, ...m, channelStore: store });
+
+  assert.deepEqual(
+    m.pushed.map((p) => [p.userId, p.payload.body]),
+    [[child, 'Ibuprofen'], [first, 'anna: Ibuprofen'], [second, 'anna: Ibuprofen']],
+  );
+  assert.deepEqual(store.asked, [child, first, second]);
 });
 
 test('eine Betreuung fuer eine ANDERE Person loest keine Erinnerung aus', async () => {
@@ -418,4 +448,304 @@ test('Health wieder eingeschaltet: nur die Dosen von HEUTE kommen, die Tage dazw
   const logs = db.prepare('SELECT scheduled_at FROM medication_logs ORDER BY scheduled_at').all();
   assert.deepEqual(logs.map((l) => l.scheduled_at), ['2026-06-16T08:00', '2026-06-16T11:00']);
   assert.equal(on.pushed.length, 2, 'eine Meldung je heutigem Zeitpunkt, keine Flut');
+});
+
+// --------------------------------------------------------
+// Empfaenger mit `health: none` (#2602)
+// --------------------------------------------------------
+// Die Zustellung der `reminders`-Zeilen fragt seit #1289 die Rechte des
+// Empfaengers (`withoutModulesDeniedToRecipient()`), der Scheduler sendet aber
+// selbst und fragte nur den Haushaltsschalter. Wem Health entzogen ist, bekam
+// trotzdem "Ibuprofen" aufs Telefon - als Betreuer sogar die Dosis einer
+// ANDEREN Person ("anna: Ibuprofen"). Push und Kanal stehen in EINER
+// Zusicherung, damit die rote Zeile beide Wege nennt.
+
+/** Ein Modul einem Subjekt entziehen bzw. setzen (sparse, wie die Admin-UI schreibt). */
+function setModuleAccess(db, subjectType, subjectId, moduleKey, access) {
+  db.prepare(`
+    INSERT INTO access_permissions (subject_type, subject_id, resource_type, resource_key, access)
+    VALUES (?, ?, 'module', ?, ?)
+    ON CONFLICT(subject_type, subject_id, resource_type, resource_key) DO UPDATE SET access = excluded.access
+  `).run(subjectType, String(subjectId), moduleKey, access);
+}
+
+/** Was rausging, je Weg: Push als [Empfaenger, Rumpf], Kanal als [Kanal-ID, Rumpf]. */
+function delivered(m) {
+  return {
+    push: m.pushed.map((p) => [p.userId, p.payload.body]),
+    channel: m.channelSent.map((c) => [c.channel.id, c.payload.body]),
+  };
+}
+
+async function runCareCase(db) {
+  const m = makeMocks();
+  m.channelStore = makeRecordingChannelStore();
+  const res = await processDueMedications({ database: db, now: MONDAY_0900, ...m });
+  return { res, m };
+}
+
+test('#2602: Eigentuemer und Betreuer mit health none bekommen nichts, die Dosis entsteht trotzdem', async () => {
+  const db = buildTestDb();
+  const anna = seedUser(db, 'anna');
+  const parent = seedUser(db, 'dominik');
+  grantCare(db, anna, parent);
+  const med = seedMed(db, anna, { name: 'Ibuprofen' });
+  seedSchedule(db, med, { time: '08:00' });
+  setModuleAccess(db, 'user', anna, 'health', 'none');
+  setModuleAccess(db, 'user', parent, 'health', 'none');
+
+  const { res, m } = await runCareCase(db);
+
+  assert.deepEqual(delivered(m), { push: [], channel: [] },
+    'Health ist beiden entzogen und die Erinnerung ging trotzdem raus');
+  assert.equal(res.created, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM medication_logs WHERE medication_id = ?').get(med).n, 1,
+    'ueberspringen, nicht loeschen: der Dosis-Log entsteht weiter');
+});
+
+test('#2602: Eigentuemer mit health none, Betreuer mit read - nur der Betreuer bekommt die Erinnerung', async () => {
+  const db = buildTestDb();
+  const anna = seedUser(db, 'anna');
+  const parent = seedUser(db, 'dominik');
+  grantCare(db, anna, parent);
+  seedSchedule(db, seedMed(db, anna, { name: 'Ibuprofen' }), { time: '08:00' });
+  setModuleAccess(db, 'user', anna, 'health', 'none');
+  setModuleAccess(db, 'user', parent, 'health', 'read');
+
+  const { m } = await runCareCase(db);
+
+  assert.deepEqual(delivered(m), {
+    push: [[parent, 'anna: Ibuprofen']],
+    channel: [[100 + parent, 'anna: Ibuprofen']],
+  }, 'none zaehlt, read nicht: wer lesen darf, hoert weiter davon');
+});
+
+test('#2602: ein Admin-Betreuer bleibt beliefert, auch mit einer Sperrzeile auf seiner ID', async () => {
+  const db = buildTestDb();
+  const anna = seedUser(db, 'anna');
+  const admin = seedUser(db, 'admin', { role: 'admin' });
+  grantCare(db, anna, admin);
+  seedSchedule(db, seedMed(db, anna, { name: 'Ibuprofen' }), { time: '08:00' });
+  setModuleAccess(db, 'user', admin, 'health', 'none');
+
+  const { m } = await runCareCase(db);
+
+  assert.deepEqual(delivered(m), {
+    push: [[anna, 'Ibuprofen'], [admin, 'anna: Ibuprofen']],
+    channel: [[100 + anna, 'Ibuprofen'], [100 + admin, 'anna: Ibuprofen']],
+  }, 'ein Admin faellt nie heraus');
+});
+
+test('#2602: der Entzug zaehlt auch aus dem Rollenprofil, nicht nur aus dem Mitglied-Override', async () => {
+  const db = buildTestDb();
+  const anna = seedUser(db, 'anna', { familyRole: 'child' });
+  const parent = seedUser(db, 'dominik', { familyRole: 'parent' });
+  grantCare(db, anna, parent);
+  seedSchedule(db, seedMed(db, anna, { name: 'Ibuprofen' }), { time: '08:00' });
+  // Kein Mitglied-Override: die Sperre steht am Rollenprofil `child`.
+  setModuleAccess(db, 'role', 'child', 'health', 'none');
+
+  const { m } = await runCareCase(db);
+
+  assert.deepEqual(delivered(m), {
+    push: [[parent, 'anna: Ibuprofen']],
+    channel: [[100 + parent, 'anna: Ibuprofen']],
+  }, 'die Rolle sperrt Health und das Kind bekam die Erinnerung trotzdem - oder die Rolle des Betreuers wurde mitgesperrt');
+});
+
+// --------------------------------------------------------
+// Display und Ausgaben-Gast hoeren nichts von einer Dosis (#2745)
+// --------------------------------------------------------
+// Der Akteur ohne Request stuft beide ein wie der Anfrageweg: ein Gast empfaengt
+// aus keinem Modul, ein Display nur aus seiner Scope-Liste - Health steht nicht
+// darauf. Die Dosis entsteht trotzdem (ueberspringen, nicht loeschen).
+
+/** @param {any} db @param {number|bigint} userId */
+function markGuest(db, userId) {
+  const groupId = db.prepare('INSERT INTO expense_groups (name, created_by) VALUES (?, ?)').run('Trip', userId).lastInsertRowid;
+  db.prepare('INSERT INTO split_expense_guest_users (user_id, group_id) VALUES (?, ?)').run(userId, groupId);
+}
+
+/** @param {any} db @param {number|bigint} userId */
+function markDisplay(db, userId) {
+  db.prepare('INSERT INTO display_accounts (user_id) VALUES (?)').run(userId);
+}
+
+for (const [kind, mark] of /** @type {Array<[string, (db: any, userId: number|bigint) => void]>} */ (
+  [['Display', markDisplay], ['Ausgaben-Gast', markGuest]])) {
+  test(`${kind} als Eigentuemer und als Betreuer hoert nichts, die Dosis entsteht trotzdem`, async () => {
+    const db = buildTestDb();
+    const owner = seedUser(db, 'owner');
+    const anna = seedUser(db, 'anna');
+    const carer = seedUser(db, 'carer');
+    mark(db, owner);
+    mark(db, carer);
+    grantCare(db, anna, carer);
+    const ownMed = seedMed(db, owner, { name: 'Eigen' });
+    const annaMed = seedMed(db, anna, { name: 'Ibuprofen' });
+    seedSchedule(db, ownMed, { time: '08:00' });
+    seedSchedule(db, annaMed, { time: '08:00' });
+
+    const { res, m } = await runCareCase(db);
+
+    assert.deepEqual(delivered(m), {
+      push: [[anna, 'Ibuprofen']],
+      channel: [[100 + anna, 'Ibuprofen']],
+    }, `nur das Mitglied hoert von seiner Dosis, ${kind} weder von der eigenen noch als Betreuer`);
+    assert.equal(/** @type {any} */ (res).created, 2);
+    for (const med of [ownMed, annaMed]) {
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM medication_logs WHERE medication_id = ?').get(med).n, 1,
+        'ueberspringen, nicht loeschen: der Dosis-Log entsteht weiter');
+    }
+  });
+}
+
+// --------------------------------------------------------
+// Haushaltskanaele bekommen nie eine Medikamenten-Erinnerung (#2598, E1)
+// --------------------------------------------------------
+// Jede Health-Herkunft ist im Haushaltskanal `'personal'`
+// (HOUSEHOLD_CHANNEL_POLICY in server/authorize/rows/reminders.ts), und
+// SECURITY.md sagt es zu: ein Kanal, den der Haushalt teilt, bekommt nie eine
+// Health-Erinnerung. Die Sichtbarkeit des Medikaments aendert daran nichts -
+// auch ein fuer die Familie sichtbares geht nur per Push und an Kanaele der
+// Person selbst (`scope = 'user'`). Fall und Fixture stammen aus PR #2598,
+// die Zusicherung ist umgedreht.
+
+test('ein Haushaltskanal bekommt keine Medikamenten-Erinnerung, auch nicht fuer ein family-sichtbares', async () => {
+  const db = buildTestDb();
+  const user = seedUser(db, 'alice');
+  seedSchedule(db, seedMed(db, user, { name: 'Sertraline' }), { time: '08:00' });
+  seedSchedule(db, seedMed(db, user, { name: 'Vitamin D', visibility: 'family' }), { time: '08:00' });
+  createNotificationChannelStore({ db }).createChannel({
+    provider: 'ntfy', name: 'Familie', enabled: true,
+    config: { baseUrl: 'https://ntfy.test', topic: 'familie' }, secrets: {},
+  });
+  const { pushService, providers, channelSent, pushed } = makeMocks();
+
+  await processDueMedications({ database: db, now: MONDAY_0900, pushService, providers: { ntfy: providers.gotify } });
+
+  assert.deepEqual(channelSent.map((s) => s.payload.body), [], 'der Haushaltskanal hoerte von einem Medikament');
+  assert.deepEqual(pushed.map((p) => p.payload.body).sort(), ['Sertraline', 'Vitamin D'], 'Push bleibt der Weg');
+});
+
+test('ein eigener Kanal (scope user) bekommt die Erinnerung, der Haushaltskanal daneben nicht', async () => {
+  const db = buildTestDb();
+  const user = seedUser(db, 'alice');
+  const other = seedUser(db, 'ben');
+  seedSchedule(db, seedMed(db, user, { name: 'Vitamin D', visibility: 'family' }), { time: '08:00' });
+  const store = createNotificationChannelStore({ db });
+  const config = { baseUrl: 'https://ntfy.test', topic: 't' };
+  store.createChannel({ provider: 'ntfy', name: 'Familie', enabled: true, config, secrets: {} });
+  const own = store.createChannel({ provider: 'ntfy', name: 'Alice', enabled: true, scope: 'user', userId: user, config, secrets: {} });
+  store.createChannel({ provider: 'ntfy', name: 'Ben', enabled: true, scope: 'user', userId: other, config, secrets: {} });
+  const { pushService, providers, channelSent } = makeMocks();
+
+  await processDueMedications({ database: db, now: MONDAY_0900, pushService, providers: { ntfy: providers.gotify } });
+
+  assert.deepEqual(channelSent.map((s) => [s.channel.name, s.payload.body]), [['Alice', 'Vitamin D']]);
+  assert.equal(channelSent[0].channel.id, own.id);
+});
+
+test('ein entfernter Betreuer bekommt nichts mehr, weder per Push noch ueber einen Kanal', async () => {
+  const db = buildTestDb();
+  const anna = seedUser(db, 'anna');
+  const parent = seedUser(db, 'dominik');
+  grantCare(db, anna, parent);
+  seedSchedule(db, seedMed(db, anna, { name: 'Ibuprofen' }), { time: '08:00' });
+  // Eine angelegte Aufgabe ist eine Spur in geteilten Daten: das Konto wird
+  // deaktiviert, nicht geloescht - der schwerere Fall, die users-Zeile bleibt.
+  db.prepare("INSERT INTO tasks (title, created_by) VALUES ('Einkauf', ?)").run(parent);
+  const store = createNotificationChannelStore({ db });
+  const config = { baseUrl: 'https://ntfy.test', topic: 't' };
+  store.createChannel({ provider: 'ntfy', name: 'Familie', enabled: true, config, secrets: {} });
+  store.createChannel({ provider: 'ntfy', name: 'Dominik', enabled: true, scope: 'user', userId: parent, config, secrets: {} });
+  // Die Tabelle legt sonst der Session-Store in server/auth.js an; das Entfernen beendet die Sitzungen.
+  db.exec('CREATE TABLE IF NOT EXISTS sessions (sid TEXT PRIMARY KEY, sess TEXT NOT NULL, expired_at INTEGER NOT NULL)');
+  assert.equal(removeUser(db, parent).outcome, 'deactivated');
+  const { pushService, providers, channelSent, pushed } = makeMocks();
+
+  await processDueMedications({ database: db, now: MONDAY_0900, pushService, providers: { ntfy: providers.gotify } });
+
+  assert.deepEqual({
+    push: pushed.map((p) => [p.userId, p.payload.body]),
+    channel: channelSent.map((c) => [c.channel.name, c.payload.body]),
+  }, { push: [[anna, 'Ibuprofen']], channel: [] });
+});
+
+// --------------------------------------------------------
+// The person's own channel is reached through the SSRF guard
+// --------------------------------------------------------
+// The person's own channel is reached through the guarded fetch that
+// channel-delivery.js sets as the one default for every sender. Real providers
+// and the real default here: no `fetchImpl`, no `providers`.
+
+/**
+ * @param {import('node:http').RequestListener} handler
+ * @returns {Promise<{ base: string, close: () => Promise<unknown> }>}
+ */
+function startLocalServer(handler) {
+  const server = http.createServer(handler);
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve({
+      base: `http://127.0.0.1:${/** @type {import('node:net').AddressInfo} */ (server.address()).port}`,
+      close: () => new Promise((done) => {
+        server.close(done);
+        // A kept-alive socket would hold close() open.
+        server.closeAllConnections();
+      }),
+    }));
+  });
+}
+
+test('ohne fetchImpl geht die Erinnerung an den eigenen Kanal ueber den SSRF-Schutz - ein privates Ziel bleibt unerreicht', async () => {
+  /** @type {string[]} */
+  const hits = [];
+  const { base, close } = await startLocalServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      hits.push(String(req.url));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  // One fresh household per run: a dose is announced once, a second run over
+  // the same database would have nothing left to send.
+  const runOnce = async () => {
+    const db = buildTestDb();
+    const user = seedUser(db, 'alice');
+    seedSchedule(db, seedMed(db, user), { time: '08:00' });
+    const run = await processDueMedications({
+      database: db, now: MONDAY_0900,
+      // Push reaches nobody, so `sent` counts the channel alone.
+      pushService: { async sendPushToUser() { return 0; } },
+      channelStore: {
+        listEnabledChannelsForUser() {
+          return [{ id: 7, provider: 'webhook', name: 'Alice', scope: 'user', config: { baseUrl: `${base}/hook` }, secrets: {} }];
+        },
+      },
+    });
+    if (!('sent' in run)) assert.fail('the run was skipped, nothing was measured');
+    return { created: run.created, sent: run.sent, failed: run.failed };
+  };
+  const before = process.env.NOTIFICATION_ALLOW_PRIVATE_NETWORK;
+  try {
+    delete process.env.NOTIFICATION_ALLOW_PRIVATE_NETWORK;
+    const guarded = await runOnce();
+    assert.deepEqual(hits, [], 'the local server must not have been reached');
+    assert.deepEqual(
+      guarded, { created: 1, sent: 0, failed: 1 },
+      'the refused delivery counts as failed, the dose log is written all the same',
+    );
+
+    // Counter-check: the deployment switch opens the private network for this
+    // path as for every other channel delivery, and the same run arrives.
+    process.env.NOTIFICATION_ALLOW_PRIVATE_NETWORK = 'true';
+    const opened = await runOnce();
+    assert.deepEqual(hits, ['/hook'], 'with the switch set exactly one request arrives');
+    assert.deepEqual(opened, { created: 1, sent: 1, failed: 0 });
+  } finally {
+    if (before === undefined) delete process.env.NOTIFICATION_ALLOW_PRIVATE_NETWORK;
+    else process.env.NOTIFICATION_ALLOW_PRIVATE_NETWORK = before;
+    await close();
+  }
 });
