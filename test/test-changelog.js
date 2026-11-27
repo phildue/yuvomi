@@ -630,6 +630,13 @@ function firstDifference(section, published) {
   return `Zeile ${i + 1}: jetzt ${cut(now[i])}, am Tag ${cut(then[i])}`;
 }
 
+/**
+ * @param {string} headText
+ * @param {string} referenceText
+ * @param {string} referenceVersion
+ * @param {Record<string, string>} [edits]
+ * @param {{ packageVersion?: string, untagged?: Set<string> }} [options]
+ */
 function releasedSectionDrift(headText, referenceText, referenceVersion, edits = {}, { packageVersion, untagged = new Set() } = {}) {
   const current = releasedSections(headText);
   const published = releasedSections(referenceText);

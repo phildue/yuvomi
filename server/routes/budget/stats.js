@@ -14,6 +14,7 @@ const router = express.Router();
 /**
  * Aggregiert Budget-Daten für den Statistik-Tab.
  * @param {object} database  better-sqlite3/node:sqlite-Instanz mit .prepare()
+ * @param {{ range: string, anchor: string, today?: string, until?: string }} period
  */
 export function computeStats(database, { range, anchor, today = todayLocalDateKey(), until }, filter = { clause: '', params: [] },
                              categoryExpr = { expr: 'category', params: [] },
