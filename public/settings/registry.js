@@ -490,6 +490,7 @@ export const SETTINGS_SECTIONS = freezeEntries([
     descriptionKey: 'settings.pageSyncCalendarDescription',
     options: [
       { key: 'settings.caldavTitle', terms: ['CalDAV', 'Nextcloud'] },
+      { key: 'settings.syncRequiredTitle', terms: ['sync', 'local', 'lokal', 'Nextcloud'] },
       { key: 'settings.moreProviders', terms: ['Google', 'Apple', 'iCloud', 'Outlook'] },
       'settings.sync.backfillTitle',
     ],

@@ -26,6 +26,8 @@ import { withBusy } from '/utils/ux.js';
 import { formRowHtml, formRowsHtml } from '/utils/form-row.js';
 import { esc, REQUIRED_MARK } from '/utils/html.js';
 import { loadFamilyUsers } from '/settings/family-users.js';
+import { getPreferences } from '/settings/preferences-cache.js';
+import { syncRequiredSectionHtml, bindSyncRequiredSection } from './sync-required.js';
 import { buildAssigneeMenu } from '/settings/assignee-menu.js';
 import { reloadAfterSave } from '/utils/reload-after-save.js';
 import { CASE_MESSAGES, errorSentence, loadErrorSentence, errorSentenceWithDetail } from '/utils/friendly-error.js';
@@ -103,7 +105,7 @@ function renderPage(container, user) {
       </div>
     </section>
 
-
+    ${user?.role === 'admin' ? '<div id="sync-required-container"></div>' : ''}
 
     <section class="settings-section">
       <div id="sync-more-providers-container"></div>
@@ -1889,12 +1891,34 @@ function handleOAuthCallback(container, query) {
 // Entry point
 // --------------------------------------------------------------------------
 
+/**
+ * Fork: "Sync erforderlich". Die Zielfelder sind Netzaufrufe gegen Google und
+ * CalDAV und duerfen das Blatt nicht mitreissen: scheitern die Einstellungen
+ * selbst, fehlt der Abschnitt, die Konten bleiben bedienbar.
+ */
+async function renderSyncRequired(container) {
+  const host = container.querySelector('#sync-required-container');
+  if (!host) return;
+  try {
+    const [preferences, calendarTargets, taskLists] = await Promise.all([
+      getPreferences(),
+      api.get('/calendar/sync-targets').then((res) => res.data ?? null).catch(() => null),
+      api.get('/tasks/sync-targets').then((res) => res.data?.caldav ?? null).catch(() => null),
+    ]);
+    host.insertAdjacentHTML('beforeend', syncRequiredSectionHtml({ preferences, calendarTargets, taskLists }));
+    bindSyncRequiredSection(host);
+  } catch (err) {
+    console.warn('[Settings] Sync erforderlich nicht ladbar:', err);
+  }
+}
+
 export async function render(container, { user, query } = {}) {
   renderPage(container, user);
   bindCalDAVAddButton(container, user);
   bindDefaultAssigneeBackfill(container);
 
   await loadCalDAVAccounts(container, user);
+  await renderSyncRequired(container);
   await renderMoreProviders(container, user);
 
   handleOAuthCallback(container, query);
