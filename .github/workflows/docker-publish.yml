@@ -29,14 +29,11 @@ on:
       - 'docs/**'
   workflow_dispatch:
 
+# Read-only by default. The fork has two jobs (build and deploy), so the write
+# permissions sit on the job that needs them: at workflow level the deploy job
+# would inherit them too (zizmor: excessive-permissions).
 permissions:
   contents: read
-  packages: write
-  actions: read
-  # For keyless signing: cosign asks GitHub for an OIDC token that names this
-  # workflow, and Sigstore issues a short-lived certificate for that identity.
-  # No key is stored anywhere; the identity IS the workflow file at a tag.
-  id-token: write
 
 env:
   REGISTRY: ghcr.io
@@ -46,6 +43,13 @@ jobs:
   build-and-push:
     name: Build & Push Image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # For keyless signing: cosign asks GitHub for an OIDC token that names this
+      # workflow, and Sigstore issues a short-lived certificate for that identity.
+      # No key is stored anywhere; the identity IS the workflow file at a tag.
+      id-token: write
     # Gemessene Laufzeit 0.7-3.1 min, kein absichtliches Warten im Job -
     # 30 ist ~10x Puffer fuer einen kalten buildx-Cache.
     timeout-minutes: 30
@@ -150,6 +154,10 @@ jobs:
     needs: build-and-push
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: self-hosted
+    # Only the "Wait for CI" step reads anything from GitHub: the workflow runs of
+    # this commit, through the API. It checks out nothing.
+    permissions:
+      actions: read
     # Der "Wait for CI"-Schritt deckelt sich selbst auf 35 Minuten; der Rest ist
     # ein SSH-Deploy. Die 15 Minuten davor reichten nicht mehr: CI braucht seit
     # dem Upstream-Sync auf 2.77.2 rund 24 Minuten, und v2.77.2 fiel deshalb beim

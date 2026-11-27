@@ -36,6 +36,11 @@ permissions: {}
 jobs:
   drill:
     name: Restore every corpus database
+    # FORK (phildue/yuvomi): the corpus databases are assets of upstream's releases
+    # (corpus.yml, run by hand there). The fork's releases carry none, so here the
+    # drill would always end in "no corpus database on any release". The job
+    # is skipped, which counts as passed for the caller in ci.yml.
+    if: github.repository == 'ulsklyc/yuvomi'
     runs-on: ubuntu-latest
     permissions:
       contents: read
