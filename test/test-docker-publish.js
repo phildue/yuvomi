@@ -118,8 +118,15 @@ test('the image carries provenance and an SBOM, and is signed by digest under bo
   assert.match(signStep, /oikos|MIRROR/);
   assert.doesNotMatch(signStep, /cosign sign --yes "[^"]*:\$\{\{/, 'never sign by tag');
 
-  const permissions = workflow.slice(workflow.indexOf('\npermissions:'), workflow.indexOf('\nenv:'));
-  assert.match(permissions, /^\s+id-token: write$/m, 'keyless signing needs the OIDC token');
+  // FORK: the fork has a second job (deploy), so the write permissions sit on the
+  // build job and not at workflow level (zizmor: excessive-permissions).
+  /** @param {string} name */
+  const jobHead = (name) => {
+    const start = workflow.indexOf(`\n  ${name}:`);
+    return start < 0 ? '' : workflow.slice(start, workflow.indexOf('\n    steps:', start));
+  };
+  assert.match(jobHead('build-and-push'), /^\s+id-token: write$/m, 'keyless signing needs the OIDC token');
+  assert.doesNotMatch(jobHead('deploy'), /(id-token|packages|contents): write/, 'the deploy job gets no write permissions');
   assert.match(workflow, /uses: sigstore\/cosign-installer@[0-9a-f]{40} # v/);
 
   // DIE COSIGN-VERSION WIRD GEPINNT, NICHT GEERBT. Ohne `cosign-release` nimmt die
