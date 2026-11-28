@@ -10,6 +10,7 @@ import rateLimit from 'express-rate-limit';
 import crypto from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import * as db from './db.js';
+import { withTx } from './db/tx.ts';
 import { generateToken, csrfMiddleware } from './middleware/csrf.js';
 import { refuseWhileRestoring } from './middleware/restore-gate.js';
 import { restoreInProgressError } from './utils/restore-messages.js';
@@ -61,7 +62,8 @@ import {
   applyChildStartPermissions, INVITE_PRESET_DEFAULT,
   userForRequest,
 } from './authorize/index.ts';
-import { isAdminRequest, requireAdmin } from './middleware/require-admin.js';
+import { isAdminRequest, requireAdmin, sendNotAuthenticated } from './middleware/require-admin.js';
+import { gateRefusalNow } from './middleware/gate-now.js';
 import { resolveRequestModuleAccess } from './authorize/index.ts';
 import { actorForAccount, authorize } from './authorize/index.ts';
 import { EMAIL_IN_USE_MESSAGE, emailsTakenByOtherAccounts, storedAccountEmails } from './services/contact-identity.js';
@@ -1198,7 +1200,7 @@ function requireAuth(req, res, next) {
     // holen. Der Request selbst bleibt abgewiesen; erst der naechste kommt ohne
     // das tote Cookie und wird normal behandelt.
     res.clearCookie(DISPLAY_COOKIE, displayCookieIdentity());
-    return res.status(401).json({ error: 'Not authenticated.', code: 401 });
+    return sendNotAuthenticated(res);
   }
 
   // EINE SITZUNG EINES EHEMALIGEN GILT NICHT, AUCH WENN SIE NOCH DASTEHT (#1381).
@@ -1228,7 +1230,7 @@ function requireAuth(req, res, next) {
     ? db.get().prepare(`SELECT u.role FROM users u WHERE u.id = ? AND ${activeAccountSql('u')}`).get(req.session.userId)
     : null;
   if (req.session && req.session.userId && !sessionAccount) {
-    return res.status(401).json({ error: 'Not authenticated.', code: 401 });
+    return sendNotAuthenticated(res);
   }
 
   if (sessionAccount) {
@@ -1241,7 +1243,7 @@ function requireAuth(req, res, next) {
     applyRoleModuleAccess(req);
     return next();
   }
-  res.status(401).json({ error: 'Not authenticated.', code: 401 });
+  sendNotAuthenticated(res);
 }
 
 /**
@@ -1629,7 +1631,7 @@ export function findOrCreateOidcUser(database, claims) {
     : undefined;
 
   // oidc_provider = Issuer-URL (zukunftssicher für mehrere Provider)
-  const userId = database.transaction(() => {
+  const userId = withTx(database, () => {
     const result = database.prepare(`
       INSERT INTO users (username, display_name, password_hash, avatar_color, role, oidc_sub, oidc_provider)
       VALUES (?, ?, ?, ?, 'member', ?, ?)
@@ -1640,7 +1642,7 @@ export function findOrCreateOidcUser(database, claims) {
       actorUserId: result.lastInsertRowid,
     });
     return result.lastInsertRowid;
-  })();
+  });
 
   return database.prepare('SELECT * FROM users WHERE id = ?').get(userId);
 }
@@ -2186,8 +2188,19 @@ export function buildResetRoutes(targetRouter, {
       return res.status(400).json({ error: 'Invalid or expired token.', code: 400 });
     }
     const hash = await hashPassword(password);
-    getDb().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, userId);
-    resetService.consumeToken(token);
+    // Das Hashen war ein await: ein zweiter Antrag mit demselben Token oder ein
+    // Admin kann dazwischen gelaufen sein (#2938). Erst hier, ohne await
+    // dazwischen, gilt das Gepruefte: wer die Token-Zeile entfernt, setzt das
+    // Passwort, jeder weitere bekommt die Antwort fuer einen ungueltigen Token.
+    const written = withTx(getDb(), () => {
+      if (!resetService.redeemToken(token)) return false;
+      if (!accountAcceptsReset(userId)) return false;
+      getDb().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, userId);
+      return true;
+    });
+    if (!written) {
+      return res.status(400).json({ error: 'Invalid or expired token.', code: 400 });
+    }
     // Best-effort: invalidate existing sessions for this user.
     try { invalidateUserSessions(userId, null, getDb()); }
     catch { /* sessions table may not exist in tests */ }
@@ -2412,7 +2425,7 @@ export function buildInviteRoutes(targetRouter, {
 
       const ACCEPT_LOST = Symbol('accept_lost');
       try {
-        getDb().transaction(() => {
+        withTx(getDb(), () => {
           const created = getDb().prepare(`
             INSERT INTO users (username, display_name, password_hash, avatar_color, role, family_role)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -2454,7 +2467,7 @@ export function buildInviteRoutes(targetRouter, {
           // In derselben Transaktion: von zwei parallelen Einlösungen desselben
           // Tokens sieht nur eine changes === 1, die andere rollt zurück.
           if (inviteService.markAccepted(token, newUserId) === 0) throw ACCEPT_LOST;
-        })();
+        });
       } catch (txErr) {
         if (txErr === ACCEPT_LOST) {
           return res.status(400).json({ error: 'Invalid or expired token.', code: 400 });
@@ -2877,7 +2890,7 @@ router.post('/setup', loginLimiter, requireSetupOpen, validateRequest(), async (
     const SETUP_DONE = Symbol('setup_done');
     let result;
     try {
-      result = db.transaction(() => {
+      result = withTx(db.get(), () => {
         const { count: liveCount } = db.get().prepare('SELECT COUNT(*) as count FROM users').get();
         if (liveCount > 0) throw SETUP_DONE;
         const created = db.get()
@@ -3383,7 +3396,7 @@ router.post('/devices', requireAuth, csrfMiddleware, requireSignInSession('devic
   }
 
   let issued = null;
-  db.transaction(() => {
+  withTx(db.get(), () => {
     issued = issueDeviceCredential(req.authUserId, fields);
   });
 
@@ -3433,7 +3446,7 @@ router.post('/devices/pair/redeem', devicePairingLimiter, validateRequest(), (re
   if (fields.error) return res.status(400).json({ error: fields.error, code: 400 });
 
   let issued = null;
-  db.transaction(() => {
+  withTx(db.get(), () => {
     const userId = spendDevicePairingCode(db.get(), req.body?.code);
     if (userId == null || !mayHaveDevice(userId)) return;
     issued = issueDeviceCredential(userId, fields);
@@ -3918,7 +3931,11 @@ router.post('/users', requireAuth, requireAdmin, csrfMiddleware, validateRequest
 
     const hash = ssoOnly ? OIDC_PASSWORD_SENTINEL : await hashPassword(password);
 
-    const result = db.transaction(() => {
+    // Das Recht gilt am Schreiben, nicht am Eingang (#2947): wer waehrend des
+    // Hashens die Administratorrolle verlor, legt kein Konto mehr an.
+    const outcome = withTx(db.get(), () => {
+      const refusedNow = gateRefusalNow(db.get(), req, { admin: true });
+      if (refusedNow) return { refusedNow, created: null };
       const created = db.get()
         .prepare(`
           INSERT INTO users (username, display_name, password_hash, avatar_color, avatar_data, role, family_role)
@@ -3939,8 +3956,10 @@ router.post('/users', requireAuth, requireAdmin, csrfMiddleware, validateRequest
         avatarData: normalizedAvatarData ?? null,
         actorUserId: req.authUserId,
       });
-      return created;
+      return { refusedNow: null, created };
     });
+    if (outcome.refusedNow) return outcome.refusedNow(res);
+    const result = /** @type {NonNullable<typeof outcome.created>} */ (outcome.created);
 
     const createdUser = adminUserRow(result.lastInsertRowid);
 
@@ -4085,7 +4104,7 @@ router.patch('/users/:id', requireAuth, requireAdmin, csrfMiddleware, validateRe
     // The last-admin checks run inside the same transaction as the write
     // (#2612). A better-sqlite3 transaction is synchronous and cannot hold an
     // `await`, so check and write can never be split again by a yield point.
-    const refusal = db.transaction(() => {
+    const refusal = withTx(db.get(), () => {
       // Dieselben Gruende wie beim Entfernen (#1909): die Verwaltung sagt den
       // Satz dazu, auch wenn ein Admin sich selbst herabstuft.
       const adminError = assertAdminWouldRemain(userId, nextRole);
@@ -4192,7 +4211,7 @@ router.patch('/me/profile', requireAuth, csrfMiddleware, validateRequest(), (req
     }
   }
 
-  db.transaction(() => {
+  withTx(db.get(), () => {
     db.get().prepare(`
       UPDATE users
       SET display_name = ?, avatar_color = ?, avatar_data = ?
@@ -4347,7 +4366,7 @@ export function buildGravatarRoute(targetRouter, { fetch = fetchGravatar, limite
     // Synchron: zwischen dem zweiten Blick und dem Schreiben liegt kein await.
     // Der Adressvergleich laeuft ueber emailMatchKey() - eine Aenderung nur
     // der Grossschreibung ergibt denselben Hash und ist kein Grund zur Absage.
-    const stored = db.transaction(() => {
+    const stored = withTx(db.get(), () => {
       const now = db.get().prepare('SELECT avatar_data FROM users WHERE id = ?').get(userId);
       if (!now
         || !isHouseholdMember(userId, { db: db.get() })
@@ -4400,10 +4419,18 @@ router.patch('/me/password', requireAuth, csrfMiddleware, validateRequest(), asy
   // sich beim alten Passwort vertippte, landete ohne Meldung auf der
   // Anmeldung, die Eingaben verloren, obwohl die Sitzung gueltig war.
   // Dieselbe Form wie ein falscher Code beim zweiten Faktor (invalid_code).
-  if (!valid) return res.status(400).json({ error: 'Current password is incorrect.', code: 400, reason: 'wrong_password' });
+  const wrongPassword = () => res.status(400).json({ error: 'Current password is incorrect.', code: 400, reason: 'wrong_password' });
+  if (!valid) return wrongPassword();
 
   const hash = await hashPassword(new_password);
-  db.get().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, req.authUserId);
+  // Der Hash, gegen den eben geprueft wurde, steht in der Bedingung (#2939):
+  // aenderte sich das Passwort waehrend der awaits (zweite Aenderung, Reset,
+  // Admin), ist das bewiesene "aktuelle" Passwort keins mehr - nichts wird
+  // geschrieben, keine Sitzung endet, die Antwort ist die eines falschen.
+  const { changes } = db.get()
+    .prepare('UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?')
+    .run(hash, req.authUserId, user.password_hash);
+  if (changes === 0) return wrongPassword();
 
   invalidateUserSessions(req.authUserId, req.sessionID);
 
