@@ -45,6 +45,158 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stretch (January to September against January to September), and a note above the charts says how
   far the current period is counted.
 
+## [2.96.0] - 2026-11-26
+
+### Foundation
+- **Each migration is its own file, and a new installation starts from a schema baseline.** The
+  284 database migrations lived in one `server/db.js` of almost 14,000 lines. Each is now its
+  own file under `server/migrations/`, and a test holds every one of them byte for byte to what
+  existing installations have already applied. A new database is created from one generated
+  baseline instead of replaying all migrations; a test checks on both SQLite drivers that the
+  baseline plus any later migration gives the same schema and the same rows as replaying them
+  from the first. `server/db.js` is down to about 1,200 lines; the migration runner, backup,
+  restore and the baseline live under `server/db/`.
+- **Every database transaction runs through one function.** Transactions were opened in about
+  25 places, each in its own way. They now all go through `withTx` in `server/db/tx.ts`, which
+  only accepts synchronous work, and a lint rule refuses a transaction opened any other way.
+  Where the server waits for something before it saves (a file upload, a feed, a connection
+  test, a password hash), it now reads again what it checked, and the rights of whoever sent
+  the request, in the same step as the write; the corrections this brought to light are listed
+  under "Fixed".
+- **One migration, so the way back is the backup.** Unlike the earlier foundation releases,
+  this one brings a migration (284, search index, see "Fixed"). Once 2.96.0 has opened a
+  database, 2.95.0 refuses to start on it, as described in the installation guide ("Going
+  back"): going back means the previous image with the backup taken before the update. Before
+  the tag, a database from 2.95.0 was updated by this build, a backup taken on 2.95.0 before the
+  update was restored on 2.95.0 afterwards, and this build started on a new database created
+  from the baseline and again on it after a restart.
+
+### Changed
+- **A new installation creates its database in one step.** The first start used to run every
+  migration since the first release one after another (284 of them, each with its own line in the
+  log); it now applies one schema baseline with the same result and logs
+  `Schema baseline applied: migrations 1 to 284`. Existing installations are not touched: they
+  keep running only the migrations they have not seen yet. If the baseline cannot be used, the
+  start falls back to the migrations and says so in the log.
+
+### Fixed
+- **A save that collides with a change made at the same moment now says so.** When a series or
+  a CalDAV account is changed elsewhere while it is being saved, the app now shows "changed
+  elsewhere, please save again" instead of a general error.
+- **Changes made while the app waits for a server or an upload are no longer lost or
+  overruled.** Several actions check something, wait for a server or a file upload, and only then
+  save; a change made in that moment was not seen. A document shared with someone, or about
+  someone, who leaves the household during the upload is now refused like before the upload, and
+  nothing is stored. A calendar import from a link no longer assigns people who left the household
+  while the feed was loading, and if the chosen calendar is deleted meanwhile, the import says so
+  (`400`, reason `calendar_selected_calendar_not_found`) instead of claiming the feed could not be
+  fetched. Refreshing the calendars, reminder lists or address books of an account that is
+  deleted meanwhile now answers "not found" instead of an error, and an account moved to another
+  server meanwhile keeps nothing from the old one. Changing the server or user of a CalDAV
+  account checks again against the account as it is after the connection test, so a password
+  saved for another server in the meantime is never sent to the old one; if the account changes
+  during each of three connection tests, the change stops with a conflict (`409`, reason
+  `caldav_account_changed`), nothing is saved, and it can be sent again. A task or shopping item
+  is no longer uploaded to a reminder list that was switched off while the list was fetched.
+  Rights now count at the moment of saving, not only when the request arrived: an administrator
+  demoted while a new member's or housekeeper's password is being prepared gets "admin access
+  required" and no account is created, and whoever loses write access to documents while an
+  event attachment uploads gets the refusal for attachments, with no attachment, copy or change
+  to the document's sharing left behind. The same holds for the right to change other people's
+  events, for read or write access to a module (calendar, documents) and for the administrator
+  role behind the CalDAV and CardDAV settings: whoever loses one of them while an attachment, a
+  document, a calendar feed or a connection test is on its way gets the same refusal as before
+  it, and nothing is saved. An account that is deactivated during that wait gets "not signed in"
+  (`401`), the answer it would get when it next opened the app, and the app signs out.
+- **Saving a series with an attachment no longer fails when the series changes at the same
+  moment.** When a change to a recurring event left single changed dates on their own, each of
+  them first got its own copy of the attachment, and only then was the series saved. If the
+  series was changed in the meantime - its repetition removed, or one changed date replaced by
+  another - the save could be refused with a wrong message or end in an error. Now the save
+  follows the series as it is after the copies, and a changed date that needs a copy gets one.
+  If the series keeps changing while the copies are made, the save stops after three tries with a
+  conflict (`409`, reason `calendar_series_changed`) instead of an error: nothing is saved, the
+  copies are removed, and the change can be sent again. This also applies to changing "this and
+  following" dates of a series. If the attached document is deleted while the copies are made,
+  the changed dates are saved without a copy of it. Changing a single date or "this and
+  following" dates with an attachment now checks the series again after the upload: if it was
+  deleted or made private in the meantime, the answer is the same "not found" as before the
+  upload and nothing is saved. A new event with an attachment likewise checks again that the
+  chosen people and the chosen CalDAV calendar are still available. A save that is refused after an attachment upload now also says why with what was checked,
+  not with what happened while the upload was being removed.
+- **Changing the document storage no longer cuts off documents stored at the same moment.** The
+  WebDAV settings and the Google Drive connection check that existing documents stay reachable,
+  but they checked before testing the new connection over the network and saved afterwards. A
+  first document stored during that test ended up behind a WebDAV connection or a Google account
+  that could not reach it, and two WebDAV changes saved at the same time could combine into a
+  connection that was never tested. Now the check is repeated on the documents and settings as
+  they are when saving; if they changed in the meantime, the change is refused and can be made
+  again. The same holds the other way round: a document or calendar attachment uploaded while the
+  storage settings are changed is no longer saved behind the old connection; the upload is
+  refused with a note to send it again, and the file is removed from where it was put.
+- **Outlook and CardDAV syncs of one account no longer get in each other's way.** When the
+  regular sync and "Sync now" (or, for Outlook, connecting the account) ran at the same time, an
+  event could be created twice in Outlook, and the extra copy stayed there for good; a CardDAV
+  sync could delete a contact the other sync had just imported, which then came back later as a
+  new contact without what was attached to it. Now only one sync runs at a time; a second one
+  waits for it and then runs once. An event made private, deleted, given another calendar or
+  left out of the automatic sync while an Outlook sync is running is no longer sent by that
+  sync, and an address book switched off during a CardDAV sync is no longer imported. An
+  Outlook account removed while its sync is creating an event no longer leaves that new copy
+  behind in Outlook: the sync deletes it again and does not report the account as synced.
+- **A reminder is no longer sent twice when a push or a channel answers slowly.** Reminders go
+  out once a minute; when sending them took longer than that (a slow push service or an ntfy,
+  Gotify, webhook or e-mail channel that answers late), the next run started anyway and sent the
+  reminders the first one had not finished yet a second time. Now a new run starts only once the
+  previous one is done, and a reminder that is being sent is never sent again in the meantime.
+  A reminder also goes out only if it is still due when its turn comes: one deleted, dismissed or
+  moved to a later time, or whose module was switched off or taken away while earlier reminders
+  were being sent, no longer goes out, and a channel switched off, deleted or made a household
+  channel in that time no longer hears it.
+- **A recipe provider sync no longer deletes a recipe another sync just imported.** When the
+  hourly sync and "Sync now" ran for the same Mealie or Tandoor account at the same time, one of
+  them could delete a recipe the other had just imported, so the meal plan lost its link to it,
+  or both tried to add the same recipe and the sync ended with an error, skipping the remaining
+  accounts. Now only one sync runs per account at a time; a second one waits for it and then
+  runs once, with the account's address and token as they are when it starts. An account that
+  is deleted meanwhile is skipped and the other accounts are still synced ("Sync now" answers
+  that the account was not found); an account switched off meanwhile is left out of the sync of
+  all accounts.
+- **A calendar chosen for an event while its changes are being sent is kept.** When several
+  events waited to go out to Google Calendar or a CalDAV server, a calendar picked for one of
+  them while an earlier one was still being sent could be dropped, and the event stayed where it
+  was while the app showed the new calendar. An event could also still be moved to the
+  calendar picked before, even after it had been set back. Now the event goes to the calendar
+  that is chosen when its turn comes, and a later choice is never cleared with an earlier one.
+- **A sync no longer undoes a change made while it runs.** A task or shopping item edited
+  while the CalDAV reminders sync was fetching from the server got the server's old state back,
+  and that old state was then sent to the server; one deleted in that moment came back. The same
+  held for a calendar event deleted during an iCloud or CalDAV sync, and for a CalDAV calendar
+  that was deselected with its events during a sync: its events were read in once more. A sync
+  now asks for each entry whether a local change is waiting at the moment it writes it.
+- **Replacing a calendar attachment no longer undoes a change made in the meantime.** While a
+  new attachment was still uploading (WebDAV or a cloud storage can take seconds), a second save
+  of the same event could change its description, location or end, and the attachment save then
+  wrote the old values back. It now keeps what the event holds when it saves, the occurrences
+  of a series stay in the calendar the series is in, and a new start that the series changed in
+  the meantime no longer allows is refused as before. Every check of the save now runs again
+  against the event as it is when it is saved: an event deleted or made private during the upload
+  answers "not found", one that got a sync target refuses a local calendar, and in every refused
+  case the uploaded file is removed again.
+- **Changing your password twice at the same time keeps one of the two.** Two password
+  changes for the same account that overlapped could both succeed, each signing out the other,
+  and the one that finished last counted. Now the second one gets the same answer as a wrong
+  current password and nobody is signed out by it.
+- **A password reset link works exactly once.** Two requests with the same link that
+  arrived at almost the same time could both set a password, and the one that finished last
+  counted. Now only the first one sets the password; the second gets the same answer as an
+  expired link. An account that is deactivated while the new password is being saved no longer
+  gets it.
+- **Large shopping lists, calendars and task lists change quickly again.** Every change to a
+  searchable entry read the whole search index, so renaming or clearing 4000 shopping items took
+  seconds and a CalDAV sync of a large calendar slowed down with every event; each entry is now
+  found in the index directly (migration 284, the index is rebuilt once on update).
+
 ## [2.95.0] - 2026-11-24
 
 ### Changed

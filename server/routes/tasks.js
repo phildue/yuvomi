@@ -13,6 +13,7 @@ import {
 } from '../authorize/index.ts';
 import express from 'express';
 import * as db from '../db.js';
+import { withTx } from '../db/tx.ts';
 import { sendDocumentDeletionConflict } from '../services/document-deletion-lock.js';
 import { assertDocumentLinkTargetsAvailable, documentViewer, sendDocumentLinkRefusal } from '../services/document-links.js';
 import { nextDueAfterCompletion } from '../services/recurrence.js';
@@ -810,8 +811,8 @@ router.post('/tags/apply', validateRequest(), (req, res) => {
   // eine stille Teilausfuehrung waere schlimmer als ein Fehler.
   const targets = visibleTaskIds(ids, me);
   const allowed = editableTaskIds(targets, req);
-  const changed = db.get().transaction(() =>
-    applyTagChanges(db.get(), { taskIds: allowed, add, remove }))();
+  const changed = withTx(db.get(), () =>
+    applyTagChanges(db.get(), { taskIds: allowed, add, remove }));
 
   res.json({ data: { updated: changed.length, skipped: targets.length - allowed.length, tags: allTags(db.get(), me) } });
   pushTagChanges(changed, 'Tag-Vergabe');
@@ -842,8 +843,8 @@ router.post('/archive', validateRequest(), (req, res) => {
   const allowed = editableTaskIds(targets, req);
   const stamp = nowStamp();
   const update = db.get().prepare('UPDATE tasks SET archived_at = ? WHERE id = ? AND archived_at IS NULL');
-  const archived = db.get().transaction(() =>
-    allowed.reduce((n, id) => n + update.run(stamp, id).changes, 0))();
+  const archived = withTx(db.get(), () =>
+    allowed.reduce((n, id) => n + update.run(stamp, id).changes, 0));
 
   res.json({ data: { archived, skipped: targets.length - allowed.length } });
 });
@@ -873,8 +874,8 @@ router.put('/tags/:tag', validateRequest(), (req, res) => {
     ...taskIdsWithTag(db.get(), to, me),
   ])];
   const allowed = editableTaskIds(affected, req);
-  const changed = db.get().transaction(() =>
-    renameTag(db.get(), { from: req.params.tag, to, me, ids: allowed }))();
+  const changed = withTx(db.get(), () =>
+    renameTag(db.get(), { from: req.params.tag, to, me, ids: allowed }));
 
   res.json({ data: { updated: changed.length, skipped: affected.length - allowed.length, tag: to, tags: allTags(db.get(), me) } });
   pushTagChanges(changed, 'Tag-Umbenennung');
@@ -892,8 +893,8 @@ router.delete('/tags/:tag', validateRequest(), (req, res) => {
 
   // Wie beim Umbenennen: an gesperrten Aufgaben bleibt der Tag haengen (#830).
   const allowed = editableTaskIds(affected, req);
-  const changed = db.get().transaction(() =>
-    removeTagEverywhere(db.get(), { tag: req.params.tag, me, ids: allowed }))();
+  const changed = withTx(db.get(), () =>
+    removeTagEverywhere(db.get(), { tag: req.params.tag, me, ids: allowed }));
 
   res.json({ data: { updated: changed.length, skipped: affected.length - allowed.length, tags: allTags(db.get(), me) } });
   pushTagChanges(changed, 'Tag-Löschung');
@@ -923,7 +924,7 @@ router.post('/categories', validateRequest(), (req, res) => {
 router.patch('/categories/reorder', validateRequest(), (req, res) => {
   const order = Array.isArray(req.body.order) ? req.body.order : [];
   const update = db.get().prepare('UPDATE task_categories SET sort_order = ? WHERE key = ?');
-  db.get().transaction(() => order.forEach((key, i) => update.run(i, key)))();
+  withTx(db.get(), () => order.forEach((key, i) => update.run(i, key)));
   res.json({ data: loadTaskCategories() });
 });
 
@@ -999,7 +1000,7 @@ router.patch('/reorder', requireTasksReorderFamily, validateRequest(), (req, res
 
   const idList = sqlInList(ids);
   let ranks;
-  db.get().transaction(() => {
+  withTx(db.get(), () => {
     // Jeder gehaltene Rang wird nur EINMAL ausgeteilt. Dieselbe Zahl kann im
     // Pool zweimal stehen: die Folgeinstanz einer Wiederholung erbt den Rang
     // ihrer erledigten Vorgaengerin, und mit angezeigten erledigten Aufgaben
@@ -1016,7 +1017,7 @@ router.patch('/reorder', requireTasksReorderFamily, validateRequest(), (req, res
     for (let i = 0; ranks.length < ids.length; i++) ranks.push(max + 1 + i);
     const update = db.get().prepare('UPDATE tasks SET sort_order = ? WHERE id = ?');
     ids.forEach((id, idx) => update.run(ranks[idx], id));
-  })();
+  });
   res.json({ data: ids.map((id, idx) => ({ id, sort_order: ranks[idx] })) });
 });
 
@@ -1030,7 +1031,7 @@ router.post('/reorder/reset', requireTasksReorderFamily, validateRequest(), (req
   const ids = parseReorderIds(req, res, req.body?.ids);
   if (!ids) return;
   const clear = db.get().prepare('UPDATE tasks SET sort_order = NULL WHERE id = ?');
-  db.get().transaction(() => ids.forEach((id) => clear.run(id)))();
+  withTx(db.get(), () => ids.forEach((id) => clear.run(id)));
   res.json({ data: ids.map((id) => ({ id, sort_order: null })) });
 });
 
@@ -1356,7 +1357,7 @@ router.post('/', validateRequest(), (req, res) => {
     if (!mayEditTaskDefinition(parent, req)) return res.status(403).json(LOCKED_ERROR);
   }
 
-  const taskId = db.get().transaction(() => {
+  const taskId = withTx(db.get(), () => {
     const result = db.get().prepare(`
       INSERT INTO tasks
         (title, description, category, priority, status, start_date, due_date, due_time,
@@ -1402,7 +1403,7 @@ router.post('/', validateRequest(), (req, res) => {
       }
     }
     return result.lastInsertRowid;
-  })();
+  });
 
   const task = db.get().prepare(`
     SELECT t.*, u.display_name AS assigned_name, u.avatar_color AS assigned_color,
@@ -1604,7 +1605,7 @@ router.put('/:id', validateRequest(), (req, res) => {
   let spawned = false;
   let nextDueDate = null;
   let updated;
-  db.get().transaction(() => {
+  withTx(db.get(), () => {
     db.get().prepare(`
       UPDATE tasks SET
         title = ?, description = ?, category = ?, priority = ?,
@@ -1695,7 +1696,7 @@ router.put('/:id', validateRequest(), (req, res) => {
     // Und es sagt genauso, wann es weitergeht (#1620): dieselbe Regel wie in
     // PATCH /:id/status, ueber denselben Helfer.
     nextDueDate = nextDueDateAfter(req, task.id, task.status, status);
-  })();
+  });
 
   addAssignedUsers(updated);
   updated.subtasks = loadSubtasks(updated.id, taskReader(req));
@@ -2040,7 +2041,7 @@ function spawnRecurrenceFollowup(task) {
   const rotation = pickRotationTarget(db.get(), task);
   let handedOver = false;
 
-  db.get().transaction(() => {
+  withTx(db.get(), () => {
     const newTask = db.get().prepare(`
       INSERT INTO tasks (title, description, category, priority, status,
         start_date, due_date, due_time, assigned_to, created_by, is_recurring, recurrence_rule,
@@ -2139,7 +2140,7 @@ function spawnRecurrenceFollowup(task) {
       setAssignments(db.get(), newSub.lastInsertRowid, subAssignments);
       setTags(db.get(), newSub.lastInsertRowid, subTags);
     }
-  })();
+  });
   return !!syncTarget || handedOver;
 }
 
@@ -2302,7 +2303,7 @@ router.patch('/:id/status', validateRequest(), (req, res) => {
   let undone  = 0;
   let spawned = false;
   let nextDueDate = null;
-  db.get().transaction(() => {
+  withTx(db.get(), () => {
     db.get().prepare('UPDATE tasks SET status = ? WHERE id = ?').run(status, pathId(req));
     pending = markTodoOutbound('tasks', prev, { ...prev, status });
 
@@ -2326,7 +2327,7 @@ router.patch('/:id/status', validateRequest(), (req, res) => {
     }
     // Nach dem Spawn, in derselben Transaktion; die Regel steht im Helfer.
     nextDueDate = nextDueDateAfter(req, prev.id, prev.status, status);
-  })();
+  });
 
   res.json({
     data: {
@@ -2422,13 +2423,13 @@ router.patch('/:id/check', validateRequest(), (req, res) => {
   // meldete der CalDAV-Gegenstelle eine Änderung, die keine ist.
   let pending = false;
   if (result.changed) {
-    db.get().transaction(() => {
+    withTx(db.get(), () => {
       db.get().prepare('UPDATE tasks SET description = ? WHERE id = ?').run(result.content, id);
       // Die Beschreibung ist ein gespiegeltes Feld: ohne diesen Marker bliebe
       // ein Haken auf einer CalDAV-Aufgabe lokal und der nächste Inbound
       // überschriebe ihn wieder.
       pending = markTodoOutbound('tasks', task, { ...task, description: result.content });
-    })();
+    });
   }
 
   res.json({ data: { id, description: result.content } });
@@ -2578,7 +2579,7 @@ router.put('/:id/documents', validateRequest(), (req, res) => {
     // Ohne Leserecht ist nichts sichtbar - eine leere Liste loest also nichts.
     if (!viewer.readsDocuments) return res.json({ data: null });
 
-    db.get().transaction(() => {
+    withTx(db.get(), () => {
       // Nur die für diese Person sichtbaren Alt-Verknüpfungen entfernen.
       db.get().prepare(`
         DELETE FROM task_documents
@@ -2590,7 +2591,7 @@ router.put('/:id/documents', validateRequest(), (req, res) => {
         'INSERT OR IGNORE INTO task_documents (task_id, document_id, created_by) VALUES (?, ?, ?)'
       );
       for (const id of visibleIds) ins.run(task.id, id, me);
-    })();
+    });
 
     res.json({ data: loadTaskDocuments(task.id, viewer) });
   } catch (err) {

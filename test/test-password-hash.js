@@ -21,6 +21,10 @@
  *              rewrites nothing; a password set while the migration hashes is
  *              not overwritten; an SSO-only and an unknown account answer as
  *              before;
+ *            - PASSWORD CHANGE (#2939): a change that waits in its check of
+ *              the current password while a second change of the same
+ *              account runs is refused like a wrong current password; the
+ *              second change stays and no session ends;
  *            - TIMING: every failed check costs the same whatever the account
  *              (unknown, SSO-only, broken hash, bcrypt, Argon2id): one Argon2id
  *              computation plus one bcrypt comparison per candidate form of
@@ -346,6 +350,101 @@ test('login: a password set while the migration hashes is not overwritten', asyn
   assert.equal(/** @type {any} */ (result).status, 200);
   assert.equal(calls, 1);
   assert.equal(hashOf('racer'), newer, 'the newer password stays');
+});
+
+/** Signs in and keeps the session. @param {string} username @param {string} password */
+async function signIn(username, password) {
+  const res = await fetch(`${origin}${AUTH_PREFIX}/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  return { cookie: res.headers.getSetCookie().map((c) => c.split(';')[0]).join('; '), csrf: body.csrfToken };
+}
+
+/**
+ * @param {{ cookie: string, csrf: string }} session
+ * @param {string} method @param {string} path @param {unknown} [body]
+ */
+async function asSession(session, method, path, body) {
+  /** @type {Record<string, string>} */
+  const headers = { Cookie: session.cookie, 'X-CSRF-Token': session.csrf };
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  const res = await fetch(`${origin}${AUTH_PREFIX}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  return { status: res.status, body: await res.json() };
+}
+
+test('password change: a change that overlaps another one in the hashing is refused and keeps the other (#2939)', async () => {
+  const old = 'old-password-1';
+  account('overlap', await hashPassword(old));
+  const first = await signIn('overlap', old);
+  const second = await signIn('overlap', old);
+
+  // The first request waits inside its first Argon2id computation (the check
+  // of the current password) until the test lets it go; the second request
+  // runs in between, start to finish.
+  const original = crypto.argon2;
+  /** @type {() => void} */
+  let release = () => {};
+  /** @type {(value?: unknown) => void} */
+  let reached = () => {};
+  const atCheck = new Promise((r) => { reached = r; });
+  let held = false;
+  crypto.argon2 = /** @type {any} */ (/** @this {any} */ function hold(/** @type {any[]} */ ...args) {
+    if (held) return /** @type {any} */ (original).apply(this, args);
+    held = true;
+    const callback = args.pop();
+    const gate = new Promise((r) => { release = () => r(undefined); });
+    /** @type {any} */ (original).call(this, ...args, (/** @type {any[]} */ ...result) => { gate.then(() => callback(...result)); });
+    reached();
+    return undefined;
+  });
+  try {
+    const pending = asSession(first, 'PATCH', '/me/password', { current_password: old, new_password: 'first-new-password-1' });
+    await atCheck;
+    const other = await asSession(second, 'PATCH', '/me/password', { current_password: old, new_password: 'second-new-password-1' });
+    assert.equal(other.status, 200, JSON.stringify(other.body));
+    release();
+    const late = await pending;
+    assert.equal(late.status, 400, 'the password it proved is no longer the current one');
+    assert.deepEqual(late.body, { error: 'Current password is incorrect.', code: 400, reason: 'wrong_password' });
+  } finally {
+    crypto.argon2 = original;
+  }
+
+  assert.deepEqual(await verifyPassword('second-new-password-1', hashOf('overlap')), { valid: true, needsRehash: false }, 'the second change stays');
+  const me = await asSession(second, 'GET', '/me');
+  assert.equal(me.status, 200, 'a refused change ends no session');
+});
+
+test('create member: an admin demoted while the new password is hashed creates no account and gets the admin refusal (#2947)', async () => {
+  account('demoted-2947', await hashPassword('admin-password-1'));
+  const session = await signIn('demoted-2947', 'admin-password-1');
+  const body = { username: 'created-2947', display_name: 'Neu', password: 'longenough1' };
+  const demote = () => db.prepare("UPDATE users SET role = 'member' WHERE username = 'demoted-2947'").run();
+  const { calls, result } = await countArgon2(() => asSession(session, 'POST', '/users', body), demote);
+  assert.equal(calls, 1, 'the hash of the new password');
+  const direct = await asSession(session, 'POST', '/users', body);
+  assert.equal(direct.status, 403, JSON.stringify(direct.body));
+  const answer = /** @type {any} */ (result);
+  assert.deepEqual([answer.status, answer.body], [403, direct.body], 'the answer requireAdmin gives after the demotion');
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM users WHERE username = 'created-2947'").get().n, 0, 'no account');
+});
+
+test('create member: an admin deactivated while the new password is hashed gets the 401 of requireAuth, no account (#2947)', async () => {
+  account('gone-2947', await hashPassword('admin-password-1'));
+  const session = await signIn('gone-2947', 'admin-password-1');
+  const body = { username: 'created-gone-2947', display_name: 'Neu', password: 'longenough1' };
+  const deactivate = () => db.prepare("UPDATE users SET deactivated_at = '2059-01-01T00:00:00Z' WHERE username = 'gone-2947'").run();
+  const { calls, result } = await countArgon2(() => asSession(session, 'POST', '/users', body), deactivate);
+  assert.equal(calls, 1, 'the hash of the new password');
+  const direct = await asSession(session, 'POST', '/users', body);
+  const answer = /** @type {any} */ (result);
+  assert.deepEqual([direct.status, direct.body], [401, { error: 'Not authenticated.', code: 401 }], 'requireAuth now');
+  assert.deepEqual([answer.status, answer.body], [401, direct.body], 'the same answer after the hash');
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM users WHERE username = 'created-gone-2947'").get().n, 0, 'no account');
 });
 
 test('login: an SSO-only and an unknown account answer as before, a wrong password too', async () => {
