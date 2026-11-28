@@ -65,7 +65,7 @@ import { canChangeRecord, isNavModuleReadOnly } from '/permissions.js';
 // in eine eigene Runde. Der Import benennt die Schuld, statt sie zu umgehen.
 import { toggleRowHtml, formSwitchRowHtml } from '/settings/components.js';
 import { localizeBirthdayEvent } from '/utils/birthday-event.js';
-import { googleTargetValue, caldavTargetValue, outlookTargetValue, assigneeSyncTarget } from '/utils/sync-target.js';
+import { googleTargetValue, caldavTargetValue, outlookTargetValue, assigneeSyncTarget, localChoiceAllowed, pickDefaultSyncTarget } from '/utils/sync-target.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
 import { findPageFab } from '/utils/fab.js';
 import { lendPageStyle } from '/utils/component-style.js';
@@ -533,6 +533,9 @@ let state = {
   holidayPrefs:  {},       // subset of /preferences
   weekStart:     1,        // getDay()-Index des Wochenstarts (0=So,1=Mo,6=Sa)
   documentUploadBackend: 'local',
+  // Fork: "Sync erforderlich" (aus den Preferences, siehe applyDefaultSyncTarget).
+  requireSync: false,
+  householdSyncTarget: '',
   layerHolidays: true,     // toggle for public holiday layer
   layerSchool:   true,     // toggle for school holiday layer
   layerBirthdays: true,    // toggle for the birthday layer (#778)
@@ -1987,6 +1990,10 @@ function applyEventFormPreferences(prefs = {}, documentOptions = {}) {
   state.defaultAssignMe  = !!prefs?.calendar_default_assign_me;
   // Standard-Sync-Ziel für eigene neue Termine (#620).
   state.defaultSyncTarget = prefs?.calendar_default_target || '';
+  // Fork: "Sync erforderlich" - der Haushalt legt nichts mehr nur lokal an.
+  const household = /** @type {Record<string, any>} */ (prefs);
+  state.requireSync = household.sync_required === true;
+  state.householdSyncTarget = household.calendar_household_target || '';
   state.documentUploadBackend = documentOptions?.active_upload_backend ?? 'local';
 }
 
@@ -8856,6 +8863,16 @@ async function loadSyncTargets(selectElement, currentEvent = null) {
     outlookGroup.appendChild(option);
   }
 
+  // Fork: "Sync erforderlich" - "Lokal speichern" ist dann keine Wahl mehr, ausser
+  // fuer einen Termin, der schon lokal ist und es bleiben darf.
+  if (!localChoiceAllowed({
+    requireSync: Boolean(state.requireSync),
+    isNew: !currentEvent,
+    hasTarget: eventHasSyncTarget(currentEvent),
+  })) {
+    localOption.remove();
+  }
+
   // Pre-select the editing event's existing target
   if (currentEvent?.target_google_calendar_id) {
     const value = googleTargetValue(currentEvent.target_google_calendar_id);
@@ -8919,10 +8936,27 @@ async function loadSyncTargets(selectElement, currentEvent = null) {
  * annehmen kann.
  */
 function applyDefaultSyncTarget(selectElement) {
-  const target = state.defaultSyncTarget;
-  if (!target) return;
-  const available = Array.from(selectElement.options).some((o) => o.value === target);
-  if (available) selectElement.value = target;
+  // Fork: mit "Sync erforderlich" folgt dem eigenen Standard der des Haushalts.
+  const target = pickDefaultSyncTarget(
+    [state.defaultSyncTarget, state.requireSync ? state.householdSyncTarget : ''],
+    Array.from(selectElement.options).map((o) => o.value),
+  );
+  if (target) {
+    selectElement.value = target;
+  } else if (selectElement.selectedIndex < 0 && selectElement.options.length) {
+    // Ohne die "Lokal"-Option bliebe die Auswahl sonst leer.
+    selectElement.selectedIndex = 0;
+  }
+}
+
+/**
+ * Traegt der Termin ein Sync-Ziel (Google, CalDAV oder Outlook)?
+ * @param {Record<string, any> | null | undefined} event
+ */
+function eventHasSyncTarget(event) {
+  return Boolean(event && (event.target_google_calendar_id
+    || (event.target_caldav_account_id && event.target_caldav_calendar_url)
+    || (event.target_outlook_account_id && event.target_outlook_calendar_id)));
 }
 
 function defaultLocalCalendar() {

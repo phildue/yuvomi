@@ -8,6 +8,7 @@ import { api } from '/api.js';
 import { renderRRuleFields, bindRRuleEvents, getRRuleValues } from '/rrule-ui.js';
 import { openModal as openSharedModal, closeModal, whenModalClosed, wireBlurValidation, validateAll, btnError, btnLoading, promptModal, confirmModal, advancedSection, refocusAfterRender, captureModalContext, dialogInitialFocus } from '/components/modal.js';
 import { whenHistorySettled } from '/utils/overlay-history.js';
+import { localChoiceAllowed, pickDefaultSyncTarget } from '/utils/sync-target.js';
 import { beginRowFill, drawRowIcons, flushRowFill } from '/utils/row-fill.js';
 import { stagger, vibrate, scheduleUndoableDelete, offerUndo, acknowledgeCheck, collapseOut, expandIn, wireScrollFade, isImeComposing, drawIconsInSightOrder } from '/utils/ux.js';
 import { wireSwipeRows, maybeShowSwipeHint, deferredRevealHtml } from '/utils/swipe-row.js';
@@ -461,9 +462,20 @@ async function wireSyncTarget(panel, task) {
     select.appendChild(option);
   }
 
-  const wanted = current || (task ? '' : state.defaultSyncTarget);
+  // Fork: "Sync erforderlich" - "nur lokal" ist dann keine Wahl mehr, ausser fuer
+  // eine Aufgabe, die schon lokal ist und es bleiben darf.
+  if (!localChoiceAllowed({ requireSync: Boolean(state.requireSync), isNew: !task, hasTarget: Boolean(current) })) {
+    select.querySelector('option[value=""]')?.remove();
+  }
+
+  const wanted = current || (task ? '' : pickDefaultSyncTarget(
+    [state.defaultSyncTarget, state.requireSync ? state.householdSyncTarget : ''],
+    Array.from(select.options).map((o) => o.value),
+  ));
   if (wanted && Array.from(select.options).some((o) => o.value === wanted)) {
     select.value = wanted;
+  } else if (select.selectedIndex < 0 && select.options.length) {
+    select.selectedIndex = 0;
   }
 }
 
@@ -1673,6 +1685,8 @@ let state = {
   // Persönliche Standard-Erinnerungsliste für neue Aufgaben (#695), leer = nur
   // lokal. Wird beim Öffnen des Dialogs als Vorauswahl gesetzt.
   defaultSyncTarget: '',
+  requireSync: false,
+  householdSyncTarget: '',
   expandedTasks:   new Set(),
   // Eingeklappte Gruppen (#812), als "<modus>:<gruppen-id>" - derselbe Name
   // kann in beiden Gruppierungen vorkommen und meint dort Verschiedenes.
@@ -6735,6 +6749,10 @@ async function ensureAwayMeta(user) {
  */
 function applyNewTaskDefaults(prefs) {
   state.defaultSyncTarget = prefs?.tasks_default_target || '';
+  // Fork: "Sync erforderlich" - der Haushalt legt nichts mehr nur lokal an.
+  const household = /** @type {Record<string, any> | null | undefined} */ (prefs);
+  state.requireSync = household?.sync_required === true;
+  state.householdSyncTarget = household?.tasks_household_target || '';
   state.defaultVisibility = prefs?.tasks_default_visibility || 'all';
   state.defaultLocked = prefs?.tasks_default_locked === true;
 }
@@ -7091,6 +7109,8 @@ export async function render(container, { user, signal } = {}) {
 // Testfläche: nur reine Funktionen, deren Vertrag außerhalb dieser Datei zählt.
 export const __test = {
   groupBy, groupKey, formatDueDate, normalizeFilterSet, taskQuery, state,
+  // Fork: "Sync erforderlich" - die Zielwahl des Aufgaben-Dialogs.
+  wireSyncTarget,
   // Critique R21 (D15): der Satz eines zurueckgerollten Hakens.
   toggleFailedSentence,
   // E13: am Desktop haengen die Filter als Popover am Knopf (utils/filter-sheet.js).

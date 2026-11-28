@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **"Require a sync target": nothing is created local-only any more (Settings > Calendar sync).** With the new
+  household switch on, a new event or task always goes to a synced calendar or list: the one chosen in the form, else
+  the person's own default, else a household default that an administrator sets next to the switch (calendars from
+  Google, CalDAV or Outlook; task lists from CalDAV). The forms stop offering "save locally" and preselect that
+  default, the API and the MCP tools get the same default filled in, and when nothing usable is left the request is
+  refused with a clear message instead of silently staying local. A synced item can no longer be moved back to local;
+  existing local items stay as they are and can still be edited, and you can move them over by hand. Birthdays,
+  housekeeping visits and payment tasks, generated feeds and the ICS file import are not affected. Off by default.
+
 - **The budget statistics tab can now be drilled into, just like a single month.** Click a category
   bar to see its subcategories and, below them, the individual entries behind it for the whole
   selected week, month or year; click a subcategory to narrow further, or income or expenses in the

@@ -62,6 +62,10 @@ import {
   followInboundStartChange,
 } from '../../services/calendar-occurrence-overrides.js';
 import { isAdminRequest } from '../../middleware/require-admin.js';
+import { parseSyncTargetValue } from '../../../public/utils/sync-target.js';
+import { isSyncRequired, targetCandidates, SYNC_TARGET_REQUIRED } from '../../services/sync-required.js';
+import * as googleCalendar from '../../services/google-calendar.js';
+import { listOutlookTargets } from './sync-targets.js';
 import {
   ASSIGNED_USERS_SQL,
   getUserId,
@@ -83,6 +87,81 @@ import {
 
 const log = createLogger('Calendar');
 const router = express.Router();
+
+/**
+ * Fork: nimmt dieses Google- oder Outlook-Ziel jetzt neue Termine an? Wie bei
+ * CalDAV (`caldavTargetOffered`) entscheidet der gespeicherte Stand, nicht das
+ * Netz: ein Google-Ziel muss verbunden, nicht im Nur-Lesen-Modus und in der
+ * Auswahl aktiviert sein, ein Outlook-Ziel steht in der Liste der aktivierten,
+ * beschreibbaren Kalender (dieselbe wie `GET /calendar/sync-targets`). Ein
+ * Aufruf gegen die Google-API wuerde das Anlegen bei einer Stoerung dort
+ * blockieren; ob Google den Kalender beschreibbar nennt, prueft der Upload.
+ *
+ * @param {{kind: 'google', calendarId: string} | {kind: 'outlook', accountId: number, calendarId: string}} parsed
+ * @returns {boolean}
+ */
+function nonCaldavTargetOffered(parsed) {
+  if (parsed.kind === 'google') {
+    const status = /** @type {Record<string, any>} */ (googleCalendar.getStatus());
+    return Boolean(status.connected) && !status.readonly && !status.needsReauth
+      && googleCalendar.listSelection().some(
+        (/** @type {{ calendar_id: string, enabled: number }} */ cal) => cal.calendar_id === parsed.calendarId && cal.enabled);
+  }
+  return listOutlookTargets().some((cal) => cal.accountId === parsed.accountId && cal.calendarId === parsed.calendarId);
+}
+
+/**
+ * Fork: "Sync erforderlich" - das Ziel eines NEUEN Termins.
+ *
+ * Mit dem Schalter AUS ist die Funktion ohne Wirkung. Mit dem Schalter AN gilt
+ * ein Termin ohne Ziel (auch mit leeren Zielfeldern, wie sie ein aelterer
+ * Client fuer "lokal" schickt) als nicht angegeben: sein Ziel kommt aus dem
+ * eigenen Standardziel, dann dem des Haushalts. Jeder Kandidat laeuft durch
+ * dieselben Pruefungen wie ein ausdruecklich gewaehltes Ziel (`caldavTarget` +
+ * `caldavTargetOffered`, `googleTarget`, `outlookTarget`); ein nicht mehr
+ * angebotenes wird uebersprungen. Ein ausdruecklich angegebenes Ziel, auch ein
+ * fehlerhaftes, bleibt unberuehrt: die Pruefungen der Route melden es.
+ *
+ * @param {{ body: Record<string, any> }} req  der Rumpf wird um das Ziel ergaenzt
+ * @param {number} userId
+ * @returns {object | null} die 400-Antwort oder null
+ */
+function fillDefaultEventTarget(req, userId) {
+  if (!isSyncRequired(db.get())) return null;
+  const caldav = caldavTarget(req.body);
+  const google = googleTarget(req.body);
+  const outlook = outlookTarget(req.body);
+  if (caldav.error || google.error || outlook.error) return null;
+  if (caldav.value?.accountId || google.value || outlook.value?.accountId) return null;
+  const local = req.body.local_calendar_id;
+  if (local !== undefined && local !== null && local !== '') return { ...SYNC_TARGET_REQUIRED };
+
+  for (const candidate of targetCandidates(db.get(), 'calendar', userId)) {
+    const parsed = parseSyncTargetValue(candidate);
+    if (!parsed || parsed.kind === 'local') continue;
+    if (parsed.kind !== 'caldav' && !nonCaldavTargetOffered(parsed)) continue;
+    /** @type {{ target_caldav_account_id: number | null, target_caldav_calendar_url: string | null, target_google_calendar_id: string | null, target_outlook_account_id: number | null, target_outlook_calendar_id: string | null }} */
+    const trial = {
+      target_caldav_account_id: null, target_caldav_calendar_url: null, target_google_calendar_id: null,
+      target_outlook_account_id: null, target_outlook_calendar_id: null,
+    };
+    if (parsed.kind === 'caldav') {
+      trial.target_caldav_account_id = parsed.accountId;
+      trial.target_caldav_calendar_url = parsed.calendarUrl;
+    } else if (parsed.kind === 'google') {
+      trial.target_google_calendar_id = parsed.calendarId;
+    } else {
+      trial.target_outlook_account_id = parsed.accountId;
+      trial.target_outlook_calendar_id = parsed.calendarId;
+    }
+    const form = caldavTarget(trial);
+    if (form.error || caldavTargetOffered(db.get(), /** @type {any} */ (form.value)).error) continue;
+    if (googleTarget(trial).error || outlookTarget(trial).error) continue;
+    Object.assign(req.body, trial);
+    return null;
+  }
+  return { ...SYNC_TARGET_REQUIRED };
+}
 
 /**
  * Die Kennung im Pfad: das Schema laesst nur Dezimalziffern durch (#2810).
@@ -577,6 +656,9 @@ router.post('/', refuseUploadWithoutDocumentsWrite, validateRequest(), async (re
     const vIcon  = eventIcon(req.body.icon);
     const vLoc   = str(req.body.location, 'location', { max: MAX_TITLE, required: false });
     const vRrule = rrule(req.body.recurrence_rule, 'recurrence_rule');
+    // Fork: "Sync erforderlich" setzt das Standardziel ein oder weist ab.
+    const syncRefusal = fillDefaultEventTarget(req, userId);
+    if (syncRefusal) return res.status(400).json(syncRefusal);
     // Erst die Form, dann der Inhalt: ein Paar aus der eingeschalteten Auswahl (#1860).
     const vCaldavForm = caldavTarget(req.body);
     const vCaldav = vCaldavForm.error ? vCaldavForm : caldavTargetOffered(db.get(), vCaldavForm.value);
@@ -1035,6 +1117,17 @@ router.put('/:id', refuseUploadWithoutDocumentsWrite, validateRequest(), async (
     const endeGefragt = zonenUnsicher ? regelGeaendert : (regelGeaendert || startTagGeaendert);
     if (endeGefragt && startKandidaten.every((tag) => endsBeforeStart(tag, regelDanach))) {
       return res.status(400).json({ error: SERIES_ENDS_BEFORE_START, code: 400, reason: 'calendar_series_ends_before_start' });
+    }
+
+    // Fork: mit "Sync erforderlich" zieht ein Termin mit Ziel nicht auf lokal um.
+    // Ein schon lokaler Termin bleibt bearbeitbar (er verliert nichts). Wie jede
+    // Abweisung VOR dem Staging (siehe unten): aus den schon geprueften Zielen.
+    if ((event.target_caldav_account_id || event.target_google_calendar_id || event.target_outlook_account_id)
+        && !((vCaldav ? vCaldav.value?.accountId : event.target_caldav_account_id)
+          || (vGoogle ? vGoogle.value : event.target_google_calendar_id)
+          || (vOutlook ? vOutlook.value?.accountId : event.target_outlook_account_id))
+        && isSyncRequired(db.get())) {
+      return res.status(400).json({ ...SYNC_TARGET_REQUIRED });
     }
 
     // JEDE ABWEISUNG GEHOERT VOR DAS STAGING. Ab hier laedt

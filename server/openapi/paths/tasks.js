@@ -258,12 +258,14 @@ const CAT_DELETE = '`category_in_use` (409, tasks still use the category; `count
 const TAG_GONE = '`tasks_tag_not_found` (404, renamed or removed in the meantime)';
 const FOREIGN_SERIES = '`task_foreign_series` (409, the task repeats in another app with a rule Yuvomi cannot follow - it is in `external_rrule` - and is ticked off there, #2506)';
 
+// Fork: "Sync erforderlich" (server/services/sync-required.js).
+const SYNC_REQUIRED = '`sync_target_required` (400, the household requires a sync target and none is available: pick a CalDAV reminder list, or set a default list in the settings; also refused when a task with a target is moved back to local)';
 const CASE_REASONS = {
   '/api/v1/tasks/tags/{tag}': { put: TAG_GONE, delete: TAG_GONE },
-  '/api/v1/tasks': { post: PARENT_GONE },
+  '/api/v1/tasks': { post: `${PARENT_GONE}, ${SYNC_REQUIRED}` },
   '/api/v1/tasks/reorder': { patch: `${TASK_GONE}, ${REORDER_DENIED}` },
   '/api/v1/tasks/reorder/reset': { post: `${TASK_GONE}, ${REORDER_DENIED}` },
-  '/api/v1/tasks/{id}': { get: TASK_GONE, put: `${TASK_GONE}, ${FOREIGN_SERIES}`, delete: TASK_GONE },
+  '/api/v1/tasks/{id}': { get: TASK_GONE, put: `${TASK_GONE}, ${FOREIGN_SERIES}, ${SYNC_REQUIRED}`, delete: TASK_GONE },
   '/api/v1/tasks/{id}/status': { patch: `${TASK_GONE}, \`display_action\` (403, a paired display can only tick a task off), ${FOREIGN_SERIES}` },
   '/api/v1/tasks/{id}/archive': { patch: TASK_GONE },
   '/api/v1/tasks/{id}/check': { patch: TASK_GONE },

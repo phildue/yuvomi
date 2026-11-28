@@ -400,6 +400,10 @@ export const CASE_MESSAGES = new Map([
   // Dialog bleibt offen und bietet die aktuellen an. Die Gruende einer
   // Einzelausnahme ohne Praefix (invalid_recurrence_id ...) liest die Seite
   // selbst (occurrenceErrorMessage in pages/calendar.js).
+  // Fork: "Sync erforderlich" - ein neuer Termin oder eine neue Aufgabe braucht ein
+  // Ziel, und keines ist verfuegbar (server/services/sync-required.js). Eine 400,
+  // keine Absage: darum bei den Faellen, nicht bei den Absagen.
+  ['sync_target_required', 'common.errorSyncTargetRequired'],
   ['calendar_event_not_found', 'calendar.errorEventGone'],
   ['calendar_selected_calendar_not_found', 'calendar.errorSelectedCalendarGone'],
   // Eine Wiederholung ohne ein einziges Vorkommen ab dem Start (#960) und ein

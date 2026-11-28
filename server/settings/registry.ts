@@ -819,6 +819,44 @@ const ENTRIES: readonly Entry[] = [
       return null;
     },
   },
+  // FORK: "Sync erforderlich" - kein Termin und keine Aufgabe mehr nur lokal.
+  // Der Schalter und die Haushalts-Standardziele gelten fuer alle, schreibt nur
+  // ein Admin. Die Ziele haben die Formregeln der persoenlichen (oben); die
+  // Erstellrouten pruefen beim Anlegen, ob das Ziel noch angeboten ist.
+  householdFlag('sync_required', 'admin', 'sync_required must be a boolean', (v) => v === '1'),
+  {
+    field: 'calendar_household_target',
+    storage: ['calendar_household_target'],
+    scope: 'household',
+    write: 'admin',
+    read: (ctx) => ctx.get('calendar_household_target') || '',
+    apply(input, ctx) {
+      const checked = checkTarget('calendar_household_target', input);
+      if ('kind' in checked) return checked;
+      if (parseSyncTargetValue(checked.target) === null) {
+        return invalid('calendar_household_target: expected "google:<id>", "caldav:<accountId>|<url>" or "outlook:<accountId>|<calendarId>".');
+      }
+      ctx.set('calendar_household_target', checked.target);
+      return null;
+    },
+  },
+  {
+    field: 'tasks_household_target',
+    storage: ['tasks_household_target'],
+    scope: 'household',
+    write: 'admin',
+    read: (ctx) => ctx.get('tasks_household_target') || '',
+    apply(input, ctx) {
+      const checked = checkTarget('tasks_household_target', input);
+      if ('kind' in checked) return checked;
+      const parsed = parseSyncTargetValue(checked.target) as { kind?: string } | null;
+      if (parsed === null || parsed.kind === 'google') {
+        return invalid('tasks_household_target: expected "caldav:<accountId>|<url>".');
+      }
+      ctx.set('tasks_household_target', checked.target);
+      return null;
+    },
+  },
   // Visibility and lock as personal presets for new tasks (#2125). Defaults "all"
   // and false, so the dialog works unchanged as long as nobody set anything.
   {
@@ -1210,6 +1248,7 @@ const ANSWER_ORDER = [
   'weather_user',
   'holiday_country', 'holiday_subdivision', 'holiday_group', 'holiday_show_public', 'holiday_show_school',
   'holiday_public_color', 'holiday_school_color', 'holiday_last_sync',
+  'sync_required', 'calendar_household_target', 'tasks_household_target',
 ];
 
 const BY_FIELD = new Map(ENTRIES.map((entry) => [entry.field, entry]));

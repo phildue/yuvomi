@@ -20,6 +20,8 @@ import {
   parseSyncTargetValue,
   buildSyncTargetOptions,
   assigneeSyncTarget,
+  localChoiceAllowed,
+  pickDefaultSyncTarget,
 } from '../public/utils/sync-target.js';
 
 const LABELS = { local: 'Lokal', google: 'Google', caldav: 'CalDAV', outlook: 'Outlook', unavailable: 'Nicht verfügbar' };
@@ -225,4 +227,29 @@ test('#1897: eine Teilmenge oder Obermenge ist kein Treffer', () => {
 test('#1897: zwei Kalender mit derselben Menge - es wird nicht geraten', () => {
   const doppelt = { google: [...MENGEN.google, { id: 'z2', summary: 'Auch zusammen', defaultAssigneeUserIds: [4, 3] }] };
   assert.deepEqual(assigneeSyncTarget(doppelt, [3, 4]), { value: null, ambiguous: true, severalAssignees: false });
+});
+
+// ── Fork: "Sync erforderlich" ────────────────────────────────────────────────
+
+test('localChoiceAllowed: ohne Schalter bleibt "lokal" immer waehlbar', () => {
+  assert.equal(localChoiceAllowed({ requireSync: false, isNew: true, hasTarget: false }), true);
+  assert.equal(localChoiceAllowed({ requireSync: false, isNew: false, hasTarget: true }), true);
+});
+
+test('localChoiceAllowed: mit Schalter nicht fuer Neues und nicht fuer einen Eintrag mit Ziel', () => {
+  assert.equal(localChoiceAllowed({ requireSync: true, isNew: true, hasTarget: false }), false);
+  assert.equal(localChoiceAllowed({ requireSync: true, isNew: false, hasTarget: true }), false);
+});
+
+test('localChoiceAllowed: ein schon lokaler Eintrag behaelt seine Wahl (nichts wird entzogen)', () => {
+  assert.equal(localChoiceAllowed({ requireSync: true, isNew: false, hasTarget: false }), true);
+});
+
+test('pickDefaultSyncTarget: das erste angebotene Ziel der Kandidaten, sonst leer', () => {
+  const offered = ['', 'caldav:1|https://x/home/', 'google:g@example.com'];
+  assert.equal(pickDefaultSyncTarget(['caldav:1|https://x/mine/', 'caldav:1|https://x/home/'], offered),
+    'caldav:1|https://x/home/', 'ein nicht angebotenes eigenes Ziel wird uebersprungen');
+  assert.equal(pickDefaultSyncTarget(['google:g@example.com', 'caldav:1|https://x/home/'], offered), 'google:g@example.com');
+  assert.equal(pickDefaultSyncTarget(['', null, undefined], offered), '', 'leere Kandidaten zaehlen nicht');
+  assert.equal(pickDefaultSyncTarget(['caldav:9|https://gone/'], offered), '');
 });

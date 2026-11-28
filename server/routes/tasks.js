@@ -31,6 +31,7 @@ import {
 } from '../services/caldav-todo-outbound.js';
 import { uniqueKey } from '../utils/category-slug.js';
 import { parseSyncTargetValue } from '../../public/utils/sync-target.js';
+import { isSyncRequired, targetCandidates, SYNC_TARGET_REQUIRED } from '../services/sync-required.js';
 import { mentionedUserIds } from '../../public/utils/mentions.js';
 import { toggleChecklistLine } from '../../public/utils/markdown-checklist.js';
 import {
@@ -107,6 +108,39 @@ function resolveTaskSyncTarget(value, current = null) {
     return { ok: false, error: 'sync_target: this list does not accept new entries.' };
   }
   return { ok: true, target: { accountId: parsed.accountId, listUrl: parsed.calendarUrl } };
+}
+
+/**
+ * Das Ziel einer NEUEN Aufgabe (Fork: "Sync erforderlich").
+ *
+ * Mit dem Schalter AUS wie bisher: kein Ziel heisst lokal. Mit dem Schalter AN
+ * zaehlt ein fehlendes oder leeres Ziel (ein aelterer Client schickt '' fuer
+ * "lokal") als nicht angegeben und wird aus dem eigenen Standardziel, dann dem
+ * des Haushalts gefuellt. Jeder Kandidat laeuft durch dieselbe Pruefung wie ein
+ * ausdruecklich gewaehltes Ziel; ein nicht mehr angebotenes wird uebersprungen.
+ * Bleibt keines, ist das die 400 mit dem Fallcode.
+ *
+ * @param {unknown} requested sync_target aus dem Rumpf
+ * @param {number} userId
+ * @returns {{ok: true, target: {accountId: number, listUrl: string}|null}
+ *          |{ok: false, status: 400, body: object}}
+ */
+function resolveCreateSyncTarget(requested, userId) {
+  const required = isSyncRequired(db.get());
+  if (typeof requested === 'string' && requested.trim() !== '') {
+    const explicit = resolveTaskSyncTarget(requested);
+    return explicit.ok ? explicit : { ok: false, status: 400, body: { error: explicit.error, code: 400 } };
+  }
+  if (!required) {
+    if (requested === undefined) return { ok: true, target: null };
+    const kept = resolveTaskSyncTarget(requested);
+    return kept.ok ? kept : { ok: false, status: 400, body: { error: kept.error, code: 400 } };
+  }
+  for (const candidate of targetCandidates(db.get(), 'tasks', userId)) {
+    const resolved = resolveTaskSyncTarget(candidate);
+    if (resolved.ok && resolved.target) return resolved;
+  }
+  return { ok: false, status: 400, body: { ...SYNC_TARGET_REQUIRED } };
 }
 
 const router = express.Router();
@@ -1299,9 +1333,9 @@ router.post('/', validateRequest(), (req, res) => {
   // abgewiesen - der Dialog bietet es gar nicht erst an, und ein 400 mitten im
   // Anlegen einer Checkliste wäre für den Aufrufer nicht nachvollziehbar.
   let syncTarget = null;
-  if (req.body.sync_target !== undefined && !parent_task_id) {
-    const resolved = resolveTaskSyncTarget(req.body.sync_target);
-    if (!resolved.ok) return res.status(400).json({ error: resolved.error, code: 400 });
+  if (!parent_task_id) {
+    const resolved = resolveCreateSyncTarget(req.body.sync_target, req.authUserId || req.session.userId);
+    if (!resolved.ok) return res.status(resolved.status).json(resolved.body);
     syncTarget = resolved.target;
   }
 
@@ -1489,6 +1523,11 @@ router.put('/:id', validateRequest(), (req, res) => {
   if (req.body.sync_target !== undefined && targetEditable && !task.parent_task_id) {
     const resolved = resolveTaskSyncTarget(req.body.sync_target, task);
     if (!resolved.ok) return res.status(400).json({ error: resolved.error, code: 400 });
+    // Fork: mit "Sync erforderlich" kein Umzug einer Aufgabe mit Ziel auf lokal.
+    // Eine schon lokale Aufgabe darf lokal bleiben (nichts wird entzogen).
+    if (resolved.target === null && task.target_caldav_list_url && isSyncRequired(db.get())) {
+      return res.status(400).json({ ...SYNC_TARGET_REQUIRED });
+    }
     syncTarget = resolved.target;
   }
 
