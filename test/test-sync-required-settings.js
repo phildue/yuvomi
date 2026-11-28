@@ -33,7 +33,12 @@ async function startApp() {
   });
 }
 
+/** @param {string} baseUrl */
 const get = async (baseUrl) => (await (await fetch(`${baseUrl}/`)).json()).data;
+/**
+ * @param {string} baseUrl
+ * @param {Record<string, unknown>} body
+ */
 const put = async (baseUrl, body) => {
   const res = await fetch(`${baseUrl}/`, {
     method: 'PUT',

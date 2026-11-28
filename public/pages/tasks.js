@@ -6750,8 +6750,9 @@ async function ensureAwayMeta(user) {
 function applyNewTaskDefaults(prefs) {
   state.defaultSyncTarget = prefs?.tasks_default_target || '';
   // Fork: "Sync erforderlich" - der Haushalt legt nichts mehr nur lokal an.
-  state.requireSync = prefs?.sync_required === true;
-  state.householdSyncTarget = prefs?.tasks_household_target || '';
+  const household = /** @type {Record<string, any> | null | undefined} */ (prefs);
+  state.requireSync = household?.sync_required === true;
+  state.householdSyncTarget = household?.tasks_household_target || '';
   state.defaultVisibility = prefs?.tasks_default_visibility || 'all';
   state.defaultLocked = prefs?.tasks_default_locked === true;
 }

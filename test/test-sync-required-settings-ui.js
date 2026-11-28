@@ -12,8 +12,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 globalThis.window = globalThis.window ?? {};
+/** @type {Array<[string, string]>} */
 const toasts = [];
-globalThis.window.yuvomi = { showToast: (text, kind) => toasts.push([text, kind]) };
+globalThis.window.yuvomi = /** @type {any} */ ({ showToast: (/** @type {string} */ text, /** @type {string} */ kind) => toasts.push([text, kind]) });
 
 const { syncRequiredSectionHtml, bindSyncRequiredSection } = await import('../public/settings/pages/sync-required.js');
 
@@ -28,22 +29,32 @@ const OFF = { sync_required: false, calendar_household_target: '', tasks_househo
 const html = (preferences = OFF, extra = {}) => syncRequiredSectionHtml({
   preferences, calendarTargets: CALENDAR_TARGETS, taskLists: TASK_LISTS, ...extra,
 });
-/** Die <option>-Werte des Feldes mit dieser id. */
+/**
+ * Die <option>-Werte des Feldes mit dieser id.
+ * @param {string} markup
+ * @param {string} id
+ */
 const optionValues = (markup, id) => {
   const select = new RegExp(`<select[^>]*id="${id}"[\\s\\S]*?</select>`).exec(markup)?.[0] ?? '';
   return [...select.matchAll(/<option value="([^"]*)"/g)].map((m) => m[1]);
 };
+/**
+ * @param {string} markup
+ * @param {string} id
+ */
 const selectedValue = (markup, id) => {
   const select = new RegExp(`<select[^>]*id="${id}"[\\s\\S]*?</select>`).exec(markup)?.[0] ?? '';
   return /<option value="([^"]*)"[^>]*selected/.exec(select)?.[1];
 };
 
+/** @param {string} markup */
+const switchTag = (markup) => /<input[^>]*id="sync-required-switch"[^>]*>/.exec(markup)?.[0] ?? '';
+
 test('Schalter: aus ohne Haken, an mit Haken', () => {
   const off = html();
   assert.match(off, /id="sync-required-switch"/);
-  assert.doesNotMatch(/<input[^>]*id="sync-required-switch"[^>]*>/.exec(off)[0], /\schecked/);
-  const on = html({ ...OFF, sync_required: true });
-  assert.match(/<input[^>]*id="sync-required-switch"[^>]*>/.exec(on)[0], /\schecked/);
+  assert.doesNotMatch(switchTag(off), /\schecked/);
+  assert.match(switchTag(html({ ...OFF, sync_required: true })), /\schecked/);
 });
 
 test('Terminfeld: kein Standard, Google und CalDAV; das gespeicherte Ziel ist gewaehlt', () => {
@@ -75,22 +86,30 @@ test('Werte und Namen aus dem Haushalt werden maskiert', () => {
 
 // ── Speichern ────────────────────────────────────────────────────────────────
 
+/** @param {Record<string, any>} props */
 function fakeControl(props) {
-  return { listeners: {}, isConnected: true, disabled: false, addEventListener(type, fn) { this.listeners[type] = fn; }, ...props };
+  /** @type {Record<string, any>} */
+  const listeners = {};
+  return {
+    listeners, isConnected: true, disabled: false,
+    addEventListener(/** @type {string} */ type, /** @type {Function} */ fn) { listeners[type] = fn; },
+    ...props,
+  };
 }
 function wired() {
-  const controls = {
+  const controls = /** @type {Record<string, any>} */ ({
     '#sync-required-switch': fakeControl({ checked: false }),
     '#sync-required-calendar-target': fakeControl({ value: '' }),
     '#sync-required-tasks-target': fakeControl({ value: '' }),
-  };
-  bindSyncRequiredSection({ querySelector: (selector) => controls[selector] ?? null }, OFF);
+  });
+  bindSyncRequiredSection({ querySelector: (/** @type {string} */ selector) => controls[selector] ?? null });
   return controls;
 }
+/** @type {Array<[string, unknown]>} */
 const puts = [];
 let putOutcome = 'ok';
-globalThis.__apiStub = {
-  put: async (path, body) => {
+/** @type {any} */ (globalThis).__apiStub = {
+  put: async (/** @type {string} */ path, /** @type {unknown} */ body) => {
     puts.push([path, body]);
     if (putOutcome === 'fail') throw new Error('nope');
     return { data: {} };

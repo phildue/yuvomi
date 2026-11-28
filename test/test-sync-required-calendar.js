@@ -41,6 +41,11 @@ const server = await new Promise((resolve) => {
 const base = `http://127.0.0.1:${server.address().port}/api/v1`;
 test.after(() => server.close());
 
+/**
+ * @param {string} method
+ * @param {string} path
+ * @param {unknown} [body]
+ */
 async function api(method, path, body) {
   const res = await fetch(`${base}${path}`, {
     method, headers: { 'Content-Type': 'application/json' },
@@ -49,20 +54,29 @@ async function api(method, path, body) {
   return { status: res.status, body: await res.json().catch(() => null) };
 }
 
+/**
+ * @param {string} key
+ * @param {string} value
+ */
 const cfg = (key, value) => db.prepare(`
   INSERT INTO sync_config (key, value) VALUES (?, ?)
   ON CONFLICT(key) DO UPDATE SET value = excluded.value
 `).run(key, value);
+/** @param {number} id */
 const row = (id) => db.prepare('SELECT * FROM calendar_events WHERE id = ?').get(id);
 
 const CAL_A = 'http://dav.invalid/cal/a/';
 const CAL_B = 'http://dav.invalid/cal/b/';
 const CAL_OFF = 'http://dav.invalid/cal/off/';
+/** @type {number} */
 let accountId;
+/** @param {string} url */
 const target = (url) => `caldav:${accountId}|${url}`;
+/** @param {string} url */
 const fields = (url) => ({ target_caldav_account_id: accountId, target_caldav_calendar_url: url });
 const EVENT = (extra = {}) => ({ title: 'Termin', start_datetime: '2026-12-01T10:00:00', ...extra });
 
+/** @param {{ switchOn: boolean }} options */
 function reset({ switchOn }) {
   for (const table of [
     'calendar_pending_deletions', 'calendar_events', 'caldav_calendar_selection', 'caldav_accounts',
@@ -166,6 +180,7 @@ test('AN: Google im Nur-Lesen-Modus nimmt keine neuen Termine an -> uebersprunge
   assert.equal((await api('POST', '/calendar', EVENT())).status, 400);
 });
 
+/** @param {{ canEdit: number }} options */
 function outlookCalendar({ canEdit }) {
   const account = Number(db.prepare(
     "INSERT INTO outlook_accounts (name, access_token, refresh_token) VALUES ('MS', 'a', 'r')"

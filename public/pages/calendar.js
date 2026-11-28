@@ -533,6 +533,9 @@ let state = {
   holidayPrefs:  {},       // subset of /preferences
   weekStart:     1,        // getDay()-Index des Wochenstarts (0=So,1=Mo,6=Sa)
   documentUploadBackend: 'local',
+  // Fork: "Sync erforderlich" (aus den Preferences, siehe applyDefaultSyncTarget).
+  requireSync: false,
+  householdSyncTarget: '',
   layerHolidays: true,     // toggle for public holiday layer
   layerSchool:   true,     // toggle for school holiday layer
   layerBirthdays: true,    // toggle for the birthday layer (#778)
@@ -1988,8 +1991,9 @@ function applyEventFormPreferences(prefs = {}, documentOptions = {}) {
   // Standard-Sync-Ziel für eigene neue Termine (#620).
   state.defaultSyncTarget = prefs?.calendar_default_target || '';
   // Fork: "Sync erforderlich" - der Haushalt legt nichts mehr nur lokal an.
-  state.requireSync = prefs?.sync_required === true;
-  state.householdSyncTarget = prefs?.calendar_household_target || '';
+  const household = /** @type {Record<string, any>} */ (prefs);
+  state.requireSync = household.sync_required === true;
+  state.householdSyncTarget = household.calendar_household_target || '';
   state.documentUploadBackend = documentOptions?.active_upload_backend ?? 'local';
 }
 
@@ -8945,7 +8949,10 @@ function applyDefaultSyncTarget(selectElement) {
   }
 }
 
-/** Traegt der Termin ein Sync-Ziel (Google, CalDAV oder Outlook)? */
+/**
+ * Traegt der Termin ein Sync-Ziel (Google, CalDAV oder Outlook)?
+ * @param {Record<string, any> | null | undefined} event
+ */
 function eventHasSyncTarget(event) {
   return Boolean(event && (event.target_google_calendar_id
     || (event.target_caldav_account_id && event.target_caldav_calendar_url)

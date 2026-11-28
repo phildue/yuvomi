@@ -70,7 +70,7 @@ class FakeEl {
 
   /** Wie Element.remove(): aus dem Elternknoten nehmen (der Dialog entfernt "Lokal", Fork). */
   remove() {
-    if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this);
+    if (this.parent) this.parent.children = this.parent.children.filter((/** @type {any} */ child) => child !== this);
     this.parent = null;
   }
 
@@ -557,7 +557,12 @@ test('#1840: ein gespeichertes CalDAV-Ziel, das die Liste nicht mehr nennt, blei
 
 // ── Fork: "Sync erforderlich" im Termin-Dialog ───────────────────────────────
 
-const offered = (panel) => panel.querySelector('#event-sync-target').options.map((o) => o.value);
+/** @param {any} panel */
+const offered = (panel) => panel.querySelector('#event-sync-target').options.map((/** @type {{ value: string }} */ o) => o.value);
+/**
+ * @param {string} household
+ * @param {() => Promise<void>} run
+ */
 async function withRequiredSync(household, run) {
   calendar.state.requireSync = true;
   calendar.state.householdSyncTarget = household;
@@ -602,7 +607,7 @@ test('Sync erforderlich: ein schon lokaler Termin behaelt "Lokal" und bleibt dor
     all_day: 0, created_by: 1, recurrence_rule: null, assigned_users: [],
   };
   await withRequiredSync(LEO, async () => {
-    const panel = await openForm({ mode: 'edit', event });
+    const panel = await openForm({ mode: 'edit', event: /** @type {any} */ (event) });
     assert.ok(offered(panel).includes(''), 'die Option "Lokal speichern" bleibt');
     assert.equal(target(panel), '');
   });
@@ -615,7 +620,7 @@ test('Sync erforderlich: ein Termin mit Ziel bietet "Lokal" nicht mehr an', asyn
     target_caldav_account_id: 4, target_caldav_calendar_url: 'https://dav.example.org/cal/leo/',
   };
   await withRequiredSync('', async () => {
-    const panel = await openForm({ mode: 'edit', event });
+    const panel = await openForm({ mode: 'edit', event: /** @type {any} */ (event) });
     assert.ok(!offered(panel).includes(''));
     assert.equal(target(panel), LEO);
   });

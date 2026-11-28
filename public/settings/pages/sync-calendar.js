@@ -105,7 +105,12 @@ function renderPage(container, user) {
       </div>
     </section>
 
-    ${user?.role === 'admin' ? '<div id="sync-required-container"></div>' : ''}
+    ${user?.role === 'admin' ? `
+      <section class="settings-section" id="sync-required-section">
+        <h2 class="settings-section__title">${t('settings.syncRequiredTitle')}</h2>
+        <div id="sync-required-container"></div>
+      </section>
+    ` : ''}
 
     <section class="settings-section">
       <div id="sync-more-providers-container"></div>
@@ -1896,6 +1901,7 @@ function handleOAuthCallback(container, query) {
  * CalDAV und duerfen das Blatt nicht mitreissen: scheitern die Einstellungen
  * selbst, fehlt der Abschnitt, die Konten bleiben bedienbar.
  */
+/** @param {HTMLElement} container */
 async function renderSyncRequired(container) {
   const host = container.querySelector('#sync-required-container');
   if (!host) return;
@@ -1909,6 +1915,8 @@ async function renderSyncRequired(container) {
     bindSyncRequiredSection(host);
   } catch (err) {
     console.warn('[Settings] Sync erforderlich nicht ladbar:', err);
+    // Ohne Inhalt keine leere Ueberschrift.
+    container.querySelector('#sync-required-section')?.remove();
   }
 }
 

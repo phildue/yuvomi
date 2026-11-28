@@ -18,23 +18,44 @@ globalThis.customElements = globalThis.customElements ?? { define() {}, get() {}
 globalThis.localStorage = globalThis.localStorage ?? { getItem: () => null, setItem() {}, removeItem() {}, clear() {} };
 const { installMiniDom } = await import('./mini-dom.js');
 installMiniDom();
-globalThis.document.documentElement.classList = { toggle() {}, add() {}, remove() {}, contains: () => false };
+/** @type {any} */ (globalThis.document.documentElement).classList = { toggle() {}, add() {}, remove() {}, contains: () => false };
 globalThis.CSS = globalThis.CSS ?? { escape: (v) => String(v) };
-globalThis.window.yuvomi = { ...globalThis.window.yuvomi, showToast: () => {} };
+globalThis.window.yuvomi = /** @type {any} */ ({ ...globalThis.window.yuvomi, showToast: () => {} });
 Object.defineProperty(globalThis, 'navigator', { value: { ...globalThis.navigator, onLine: true }, configurable: true, writable: true });
 
 class Option {
-  constructor(value = '') { this.value = value; this.textContent = ''; this.selected = false; this.parent = null; }
+  /** @param {string} [value] */
+  constructor(value = '') {
+    this.value = value;
+    this.textContent = '';
+    this.selected = false;
+    /** @type {Group | null} */
+    this.parent = null;
+  }
   remove() { this.parent?.detach(this); }
 }
 class Group {
-  constructor() { this.children = []; this.label = ''; this.parent = null; }
+  constructor() {
+    /** @type {Array<Option | Group>} */
+    this.children = [];
+    this.label = '';
+    /** @type {Group | null} */
+    this.parent = null;
+  }
+  /**
+   * @template {Option | Group} T
+   * @param {T} node
+   * @returns {T}
+   */
   appendChild(node) { node.parent = this; this.children.push(node); return node; }
+  /** @param {Option | Group} node */
   detach(node) { this.children = this.children.filter((child) => child !== node); }
+  /** @returns {Option[]} */
   get flat() { return this.children.flatMap((child) => (child instanceof Group ? child.flat : [child])); }
 }
 class Select extends Group {
   get options() { return this.flat; }
+  /** @param {string} selector */
   querySelector(selector) {
     const value = /^option\[value="(.*)"\]$/.exec(selector)?.[1];
     return value === undefined ? null : this.options.find((o) => o.value === value) ?? null;
@@ -48,7 +69,7 @@ class Select extends Group {
   }
 }
 // Nur die zwei Knoten, die wireSyncTarget baut: ein Doppel, das Optionen fuehrt.
-globalThis.document.createElement = (tag) => (tag === 'optgroup' ? new Group() : new Option());
+/** @type {any} */ (globalThis.document).createElement = (/** @type {string} */ tag) => (tag === 'optgroup' ? new Group() : new Option());
 
 const { __test: tasks } = await import('../public/pages/tasks.js');
 
@@ -61,20 +82,24 @@ const LISTS = {
   ],
 };
 
-/** Das Formular, wie wireSyncTarget es findet: ein Feld mit der Option "nur lokal". */
+/**
+ * Das Formular, wie wireSyncTarget es findet: ein Feld mit der Option "nur lokal".
+ * @param {{ task?: object, own?: string, household?: string, requireSync?: boolean }} options
+ */
 async function wire({ task, own = '', household = '', requireSync = true }) {
   tasks.state.defaultSyncTarget = own;
   tasks.state.householdSyncTarget = household;
   tasks.state.requireSync = requireSync;
   const select = new Select();
   select.appendChild(new Option(''));
-  globalThis.__apiStub = { get: async () => ({ data: LISTS }) };
-  await tasks.wireSyncTarget({ querySelector: (selector) => (selector === '#task-sync-target' ? select : null) }, task);
-  delete globalThis.__apiStub;
+  /** @type {any} */ (globalThis).__apiStub = { get: async () => ({ data: LISTS }) };
+  await tasks.wireSyncTarget({ querySelector: (/** @type {string} */ selector) => (selector === '#task-sync-target' ? select : null) }, task);
+  delete (/** @type {any} */ (globalThis)).__apiStub;
   tasks.state.requireSync = false;
   tasks.state.householdSyncTarget = '';
   return select;
 }
+/** @param {Select} select */
 const values = (select) => select.options.map((o) => o.value);
 
 test('Sync erforderlich: eine neue Aufgabe bietet "nur lokal" nicht an und waehlt den eigenen Standard', async () => {

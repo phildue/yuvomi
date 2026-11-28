@@ -102,9 +102,10 @@ const router = express.Router();
  */
 function nonCaldavTargetOffered(parsed) {
   if (parsed.kind === 'google') {
-    const status = googleCalendar.getStatus();
+    const status = /** @type {Record<string, any>} */ (googleCalendar.getStatus());
     return Boolean(status.connected) && !status.readonly && !status.needsReauth
-      && googleCalendar.listSelection().some((cal) => cal.calendar_id === parsed.calendarId && cal.enabled);
+      && googleCalendar.listSelection().some(
+        (/** @type {{ calendar_id: string, enabled: number }} */ cal) => cal.calendar_id === parsed.calendarId && cal.enabled);
   }
   return listOutlookTargets().some((cal) => cal.accountId === parsed.accountId && cal.calendarId === parsed.calendarId);
 }
@@ -139,6 +140,7 @@ function fillDefaultEventTarget(req, userId) {
     const parsed = parseSyncTargetValue(candidate);
     if (!parsed || parsed.kind === 'local') continue;
     if (parsed.kind !== 'caldav' && !nonCaldavTargetOffered(parsed)) continue;
+    /** @type {{ target_caldav_account_id: number | null, target_caldav_calendar_url: string | null, target_google_calendar_id: string | null, target_outlook_account_id: number | null, target_outlook_calendar_id: string | null }} */
     const trial = {
       target_caldav_account_id: null, target_caldav_calendar_url: null, target_google_calendar_id: null,
       target_outlook_account_id: null, target_outlook_calendar_id: null,
@@ -153,7 +155,7 @@ function fillDefaultEventTarget(req, userId) {
       trial.target_outlook_calendar_id = parsed.calendarId;
     }
     const form = caldavTarget(trial);
-    if (form.error || caldavTargetOffered(db.get(), form.value).error) continue;
+    if (form.error || caldavTargetOffered(db.get(), /** @type {any} */ (form.value)).error) continue;
     if (googleTarget(trial).error || outlookTarget(trial).error) continue;
     Object.assign(req.body, trial);
     return null;
@@ -1121,9 +1123,9 @@ router.put('/:id', refuseUploadWithoutDocumentsWrite, validateRequest(), async (
     // Ein schon lokaler Termin bleibt bearbeitbar (er verliert nichts). Wie jede
     // Abweisung VOR dem Staging (siehe unten): aus den schon geprueften Zielen.
     if ((event.target_caldav_account_id || event.target_google_calendar_id || event.target_outlook_account_id)
-        && !((vCaldav ? vCaldav.value.accountId : event.target_caldav_account_id)
+        && !((vCaldav ? vCaldav.value?.accountId : event.target_caldav_account_id)
           || (vGoogle ? vGoogle.value : event.target_google_calendar_id)
-          || (vOutlook ? vOutlook.value.accountId : event.target_outlook_account_id))
+          || (vOutlook ? vOutlook.value?.accountId : event.target_outlook_account_id))
         && isSyncRequired(db.get())) {
       return res.status(400).json({ ...SYNC_TARGET_REQUIRED });
     }

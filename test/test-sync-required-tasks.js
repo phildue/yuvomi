@@ -32,6 +32,11 @@ const server = await new Promise((resolve) => {
 const base = `http://127.0.0.1:${server.address().port}${TASKS_PREFIX}`;
 test.after(() => server.close());
 
+/**
+ * @param {string} method
+ * @param {string} path
+ * @param {unknown} [body]
+ */
 async function api(method, path, body) {
   const res = await fetch(`${base}${path}`, {
     method, headers: { 'Content-Type': 'application/json' },
@@ -40,18 +45,26 @@ async function api(method, path, body) {
   return { status: res.status, body: await res.json().catch(() => null) };
 }
 
+/**
+ * @param {string} key
+ * @param {string} value
+ */
 const cfg = (key, value) => db.prepare(`
   INSERT INTO sync_config (key, value) VALUES (?, ?)
   ON CONFLICT(key) DO UPDATE SET value = excluded.value
 `).run(key, value);
+/** @param {number} id */
 const row = (id) => db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
 
 const LIST_A = 'http://dav.invalid/lists/a/';
 const LIST_B = 'http://dav.invalid/lists/b/';
 const LIST_OFF = 'http://dav.invalid/lists/off/';
+/** @type {number} */
 let accountId;
+/** @param {string} url */
 const target = (url) => `caldav:${accountId}|${url}`;
 
+/** @param {{ switchOn: boolean }} options */
 function reset({ switchOn }) {
   for (const table of ['caldav_todo_pending_deletions', 'tasks', 'caldav_reminder_selection', 'caldav_accounts']) {
     db.prepare(`DELETE FROM ${table}`).run();

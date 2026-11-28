@@ -292,6 +292,10 @@ export const ROWS = [
     ['tasks_subtasks_expanded', 'x'],
     ['tasks_default_points', 'x'],
     ['tasks_late_decay_enabled', 'x'],
+    // Fork: "Sync erforderlich" (Schalter und Haushalts-Standardziele).
+    ['sync_required', 'x'],
+    ['calendar_household_target', 1],
+    ['tasks_household_target', 1],
     ['countdown_grace_days', 'x'],
     ['weather_units', 'x'],
     ['holiday_public_color', 'x'],
